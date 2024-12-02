@@ -354,6 +354,7 @@ checksum = "675e35c02a51bb4d4618cb4885b3839ce6d1787c97b664474d9208d074742e20"
 [[package]]
 name = "egglog"
 version = "0.3.0"
+source = "git+https://github.com/Alex-Fischman/egglog.git?branch=remove-r64#555faf4cc5b48d0a3f87a553c7a0d60b1d610915"
 dependencies = [
  "chrono",
  "clap",

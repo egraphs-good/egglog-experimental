@@ -8,7 +8,7 @@ harness = false
 name = "files"
 
 [dependencies]
-egglog = { path = "../egglog" }
+egglog = { git = "https://github.com/Alex-Fischman/egglog.git", branch = "remove-r64" }
 
 num = "0.4.3"
 lazy_static = "1.4"
