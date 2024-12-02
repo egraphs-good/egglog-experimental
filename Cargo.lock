@@ -354,7 +354,6 @@ checksum = "675e35c02a51bb4d4618cb4885b3839ce6d1787c97b664474d9208d074742e20"
 [[package]]
 name = "egglog"
 version = "0.3.0"
-source = "git+https://github.com/egraphs-good/egglog.git#86cb822cdff4481b9950126a70e21e70320814b0"
 dependencies = [
  "chrono",
  "clap",
@@ -384,7 +383,9 @@ dependencies = [
  "codspeed-criterion-compat",
  "egglog",
  "glob",
+ "lazy_static",
  "libtest-mimic",
+ "num",
 ]
 
 [[package]]
