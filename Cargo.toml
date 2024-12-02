@@ -3,5 +3,14 @@ name = "egglog-experimental"
 version = "0.1.0"
 edition = "2021"
 
+[[test]]
+harness = false
+name = "files"
+
 [dependencies]
-egglog = "0.3.0"
+egglog = { git = "https://github.com/egraphs-good/egglog.git" }
+
+[dev-dependencies]
+codspeed-criterion-compat = "2.7.2"
+glob = "0.3.1"
+libtest-mimic = "0.6.1"

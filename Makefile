@@ -1,3 +1,5 @@
+WWW=${PWD}/target/www/
+
 all: test nits docs
 
 test:
