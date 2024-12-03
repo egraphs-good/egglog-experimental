@@ -4,12 +4,8 @@ use std::sync::Arc;
 mod rational;
 pub use rational::*;
 
-pub struct EGraph(pub egglog::EGraph);
-
-impl Default for EGraph {
-    fn default() -> EGraph {
-        let mut inner = egglog::EGraph::default();
-        inner.add_arcsort(Arc::new(RationalSort)).unwrap();
-        EGraph(inner)
-    }
+pub fn new_experimental_egraph() -> EGraph {
+    let mut egraph = EGraph::default();
+    egraph.add_arcsort(Arc::new(RationalSort)).unwrap();
+    egraph
 }

@@ -21,11 +21,10 @@ impl Run {
                 "Top level error",
             );
         } else {
-            let mut egraph = EGraph::default();
-            egraph.0.run_mode = RunMode::ShowDesugaredEgglog;
-            egraph.0.set_reserved_symbol("__".into());
+            let mut egraph = new_experimental_egraph();
+            egraph.run_mode = RunMode::ShowDesugaredEgglog;
+            egraph.set_reserved_symbol("__".into());
             let desugared_str = egraph
-                .0
                 .parse_and_run_program(self.path.to_str().map(String::from), &program)
                 .unwrap()
                 .join("\n");
@@ -39,9 +38,9 @@ impl Run {
     }
 
     fn test_program(&self, filename: Option<String>, program: &str, message: &str) {
-        let mut egraph = EGraph::default();
-        egraph.0.set_reserved_symbol("___".into());
-        match egraph.0.parse_and_run_program(filename, program) {
+        let mut egraph = new_experimental_egraph();
+        egraph.set_reserved_symbol("___".into());
+        match egraph.parse_and_run_program(filename, program) {
             Ok(msgs) => {
                 if self.should_fail() {
                     panic!(
@@ -53,14 +52,14 @@ impl Run {
                         println!("  {}", msg);
                     }
                     // Test graphviz dot generation
-                    let mut serialized = egraph.0.serialize(SerializeConfig {
+                    let mut serialized = egraph.serialize(SerializeConfig {
                         max_functions: Some(40),
                         max_calls_per_function: Some(40),
                         ..Default::default()
                     });
                     serialized.to_dot();
                     // Also try splitting and inlining
-                    serialized.split_classes(|id, _| egraph.0.from_node_id(id).is_primitive());
+                    serialized.split_classes(|id, _| egraph.from_node_id(id).is_primitive());
                     serialized.inline_leaves();
                     serialized.to_dot();
                 }
