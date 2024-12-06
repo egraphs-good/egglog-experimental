@@ -1,0 +1,19 @@
+[package]
+name = "egglog-experimental"
+version = "0.1.0"
+edition = "2021"
+
+[[test]]
+harness = false
+name = "files"
+
+[dependencies]
+egglog = { git = "https://github.com/egraphs-good/egglog.git", rev = "7abceef4b2ef94f67b69835bbeabbb2815d5820b" }
+
+num = "0.4.3"
+lazy_static = "1.4"
+
+[dev-dependencies]
+codspeed-criterion-compat = "2.7.2"
+glob = "0.3.1"
+libtest-mimic = "0.6.1"
