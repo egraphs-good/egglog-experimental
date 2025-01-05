@@ -1,12 +1,10 @@
 pub use egglog::*;
-use sugar::{For, WithRuleset};
 use std::sync::Arc;
+use sugar::{For, WithRuleset};
 
 mod rational;
 mod sugar;
 pub use rational::*;
-
-
 
 pub fn new_experimental_egraph() -> EGraph {
     let mut egraph = EGraph::default();
