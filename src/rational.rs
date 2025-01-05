@@ -1,4 +1,4 @@
-use egglog::ast::Symbol;
+use egglog::ast::{Expr, GenericExpr, Symbol, DUMMY_SPAN};
 use egglog::sort::{FromSort, IntoSort, Sort};
 use lazy_static::lazy_static;
 use num::integer::Roots;
@@ -109,20 +109,23 @@ impl Sort for RationalSort {
         add_primitives!(eg, ">=" = |a: R, b: R| -> Opt { if a.0 >= b.0 {Some(())} else {None} });
    }
 
-    fn extract_term(
-        &self,
-        _egraph: &EGraph,
-        value: Value,
-        _extractor: &extract::Extractor,
-        termdag: &mut TermDag,
-    ) -> Option<(extract::Cost, Term)> {
+    fn make_expr(&self, _egraph: &egglog::EGraph, value: Value) -> (usize, Expr) {
         #[cfg(debug_assertions)]
         debug_assert_eq!(value.tag, self.name());
 
         let rat = R::load(self, &value);
-        let numer = termdag.lit(Literal::Int(*rat.0.numer()));
-        let denom = termdag.lit(Literal::Int(*rat.0.denom()));
-        Some((1, termdag.app("rational".into(), vec![numer, denom])))
+        let numer = *rat.0.numer();
+        let denom = *rat.0.denom();
+        (
+            1,
+            Expr::call_no_span(
+                "rational",
+                vec![
+                    GenericExpr::Lit(DUMMY_SPAN.clone(), Literal::Int(numer)),
+                    GenericExpr::Lit(DUMMY_SPAN.clone(), Literal::Int(denom)),
+                ],
+            ),
+        )
     }
 }
 
