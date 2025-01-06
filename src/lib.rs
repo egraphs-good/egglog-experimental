@@ -3,8 +3,8 @@ use std::sync::Arc;
 use sugar::{For, WithRuleset};
 
 mod rational;
-mod sugar;
 pub use rational::*;
+mod sugar;
 
 pub fn new_experimental_egraph() -> EGraph {
     let mut egraph = EGraph::default();
