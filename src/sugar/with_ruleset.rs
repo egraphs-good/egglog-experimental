@@ -3,8 +3,8 @@ use egglog::ast::*;
 pub struct WithRuleset;
 
 impl Macro<Vec<Command>> for WithRuleset {
-    fn get_head(&self) -> String {
-        "with-ruleset".to_string()
+    fn name(&self) -> Symbol {
+        "with-ruleset".into()
     }
 
     fn parse(
@@ -31,23 +31,25 @@ impl Macro<Vec<Command>> for WithRuleset {
                                 rule,
                             } => {
                                 if rule_ruleset != "".into() {
-                                    return Err(ParseError::new(
+                                    return Err(ParseError(
                                         rule.span,
-                                        "expected rules in `with-ruleset` to have empty ruleset",
+                                        "expected rules in `with-ruleset` to have empty ruleset"
+                                            .to_string(),
                                     ));
                                 }
 
                                 Command::Rule {
                                     ruleset,
                                     name,
-                                    rule: rule.clone(),
+                                    rule,
                                 }
                             }
                             Command::Rewrite(rule_ruleset, rewrite, subsume) => {
                                 if rule_ruleset != "".into() {
-                                    return Err(ParseError::new(
+                                    return Err(ParseError(
                                         rewrite.span,
-                                        "expected rules in `with-ruleset` to have empty ruleset",
+                                        "expected rules in `with-ruleset` to have empty ruleset"
+                                            .to_string(),
                                     ));
                                 }
 
@@ -55,9 +57,10 @@ impl Macro<Vec<Command>> for WithRuleset {
                             }
                             Command::BiRewrite(rule_ruleset, rewrite) => {
                                 if rule_ruleset != "".into() {
-                                    return Err(ParseError::new(
+                                    return Err(ParseError(
                                         rewrite.span,
-                                        "expected rules in `with-ruleset` to have empty ruleset",
+                                        "expected rules in `with-ruleset` to have empty ruleset"
+                                            .to_string(),
                                     ));
                                 }
 
@@ -66,18 +69,18 @@ impl Macro<Vec<Command>> for WithRuleset {
                             _ => {
                                 // Ideally the span should be the current command's span (i.e. cmd.span()),
                                 // but currently not all of our commands have a span field.
-                                return Err(ParseError::new(
+                                return Err(ParseError(
                                     span.clone(),
-                                    "expected rule or rewrite",
+                                    "expected rule or rewrite".to_string(),
                                 ));
                             }
                         })
                     })
                     .collect()
             }
-            _ => Err(ParseError::new(
+            _ => Err(ParseError(
                 span,
-                "expected (with-ruleset <ruleset> <command>*)",
+                "expected (with-ruleset <ruleset> <command>*)".to_string(),
             )),
         }
     }
