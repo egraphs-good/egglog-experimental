@@ -354,7 +354,7 @@ checksum = "675e35c02a51bb4d4618cb4885b3839ce6d1787c97b664474d9208d074742e20"
 [[package]]
 name = "egglog"
 version = "0.3.0"
-source = "git+https://github.com/egraphs-good/egglog.git?rev=acc74bb#acc74bbb89150fd883531cf96a21d7c97424929e"
+source = "git+https://github.com/egraphs-good/egglog.git?rev=bb79e34#bb79e34428784eb975ecf82e875e2d40461b21b4"
 dependencies = [
  "chrono",
  "clap",
