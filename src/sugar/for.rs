@@ -3,8 +3,8 @@ use egglog::{ast::*, util::FreshGen};
 pub struct For;
 
 impl Macro<Vec<Command>> for For {
-    fn get_head(&self) -> String {
-        "for".to_string()
+    fn name(&self) -> Symbol {
+        "for".into()
     }
 
     fn parse(
@@ -14,7 +14,10 @@ impl Macro<Vec<Command>> for For {
         parser: &mut Parser,
     ) -> Result<Vec<Command>, ParseError> {
         if args.len() != 2 {
-            return Err(ParseError::new(span, "expected (for <query> <action>)"));
+            return Err(ParseError(
+                span,
+                "expected (for <query> <action>)".to_string(),
+            ));
         }
 
         let ruleset = parser.symbol_gen.fresh(&"for_ruleset".into());

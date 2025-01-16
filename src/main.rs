@@ -1,3 +1,3 @@
 fn main() {
-    todo!();
+    egglog::cli(egglog_experimental::new_experimental_egraph())
 }
