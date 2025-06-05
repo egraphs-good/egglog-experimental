@@ -6,6 +6,8 @@ mod rational;
 pub use rational::*;
 mod sugar;
 pub use sugar::*;
+mod scheduling;
+pub use scheduling::*;
 
 mod set_cost;
 pub use set_cost::*;
