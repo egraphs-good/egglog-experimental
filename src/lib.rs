@@ -6,6 +6,8 @@ mod rational;
 pub use rational::*;
 mod sugar;
 pub use sugar::*;
+mod scheduling;
+pub use scheduling::*;
 
 pub fn new_experimental_egraph() -> EGraph {
     let mut egraph = EGraph::default();
