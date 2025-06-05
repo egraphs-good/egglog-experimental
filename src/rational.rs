@@ -1,7 +1,7 @@
 use egglog::ast::Span;
 use egglog::ast::Symbol;
 use egglog::sort::F;
-use egglog::sort::{Primitives, ExecutionState};
+use egglog::sort::{ExecutionState, Primitives};
 use num::integer::Roots;
 use num::rational::Rational64;
 use num::traits::{CheckedAdd, CheckedDiv, CheckedMul, CheckedSub, One, Signed, ToPrimitive, Zero};
