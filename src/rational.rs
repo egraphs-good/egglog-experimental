@@ -1,60 +1,51 @@
+use egglog::ast::Span;
 use egglog::ast::Symbol;
-use egglog::sort::{FromSort, IntoSort, Sort};
-use lazy_static::lazy_static;
+use egglog::sort::F;
+use egglog::sort::{Primitives, ExecutionState};
 use num::integer::Roots;
 use num::rational::Rational64;
 use num::traits::{CheckedAdd, CheckedDiv, CheckedMul, CheckedSub, One, Signed, ToPrimitive, Zero};
-use std::any::Any;
-use std::sync::{Arc, Mutex};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-struct R(Rational64); // orphan rule
-use crate::{ast::Literal, util::IndexSet};
+pub struct R(Rational64);
+use crate::ast::Literal;
 
 use super::*;
 
-lazy_static! {
-    static ref RATIONAL_SORT_NAME: Symbol = "Rational".into();
-    static ref RATS: Mutex<IndexSet<R>> = Default::default();
-}
+static RATIONAL_SORT_NAME: &str = "Rational";
 
 #[derive(Debug)]
 pub struct RationalSort;
 
-impl Sort for RationalSort {
-    fn name(&self) -> Symbol {
-        *RATIONAL_SORT_NAME
-    }
-
-    fn as_arc_any(self: Arc<Self>) -> Arc<dyn Any + Send + Sync + 'static> {
-        self
+impl LeafSort for RationalSort {
+    type Leaf = R;
+    fn name(&self) -> &str {
+        RATIONAL_SORT_NAME
     }
 
     #[rustfmt::skip]
-    fn register_primitives(self: Arc<Self>, eg: &mut TypeInfo) {
-        type Opt<T=()> = Option<T>;
-
+    fn register_primitives(&self, eg: &mut EGraph) {
         // TODO we can't have primitives take borrows just yet, since it
         // requires returning a reference to the locked sort
-        add_primitives!(eg, "+" = |a: R, b: R| -> Opt<R> { a.0.checked_add(&b.0).map(R) });
-        add_primitives!(eg, "-" = |a: R, b: R| -> Opt<R> { a.0.checked_sub(&b.0).map(R) });
-        add_primitives!(eg, "*" = |a: R, b: R| -> Opt<R> { a.0.checked_mul(&b.0).map(R) });
-        add_primitives!(eg, "/" = |a: R, b: R| -> Opt<R> { a.0.checked_div(&b.0).map(R) });
+        add_primitive!(eg, "+" = |a: R, b: R| -?> R { a.0.checked_add(&b.0).map(R) });
+        add_primitive!(eg, "-" = |a: R, b: R| -?> R { a.0.checked_sub(&b.0).map(R) });
+        add_primitive!(eg, "*" = |a: R, b: R| -?> R { a.0.checked_mul(&b.0).map(R) });
+        add_primitive!(eg, "/" = |a: R, b: R| -?> R { a.0.checked_div(&b.0).map(R) });
 
-        add_primitives!(eg, "min" = |a: R, b: R| -> R { R(a.0.min(b.0)) });
-        add_primitives!(eg, "max" = |a: R, b: R| -> R { R(a.0.max(b.0)) });
-        add_primitives!(eg, "neg" = |a: R| -> R { R(-a.0) });
-        add_primitives!(eg, "abs" = |a: R| -> R { R(a.0.abs()) });
-        add_primitives!(eg, "floor" = |a: R| -> R { R(a.0.floor()) });
-        add_primitives!(eg, "ceil" = |a: R| -> R { R(a.0.ceil()) });
-        add_primitives!(eg, "round" = |a: R| -> R { R(a.0.round()) });
-        add_primitives!(eg, "rational" = |a: i64, b: i64| -> R { R(Rational64::new(a, b)) });
-        add_primitives!(eg, "numer" = |a: R| -> i64 { *a.0.numer() });
-        add_primitives!(eg, "denom" = |a: R| -> i64 { *a.0.denom() });
+        add_primitive!(eg, "min" = |a: R, b: R| -> R { R(a.0.min(b.0)) });
+        add_primitive!(eg, "max" = |a: R, b: R| -> R { R(a.0.max(b.0)) });
+        add_primitive!(eg, "neg" = |a: R| -> R { R(-a.0) });
+        add_primitive!(eg, "abs" = |a: R| -> R { R(a.0.abs()) });
+        add_primitive!(eg, "floor" = |a: R| -> R { R(a.0.floor()) });
+        add_primitive!(eg, "ceil" = |a: R| -> R { R(a.0.ceil()) });
+        add_primitive!(eg, "round" = |a: R| -> R { R(a.0.round()) });
+        add_primitive!(eg, "rational" = |a: i64, b: i64| -> R { R(Rational64::new(a, b)) });
+        add_primitive!(eg, "numer" = |a: R| -> i64 { *a.0.numer() });
+        add_primitive!(eg, "denom" = |a: R| -> i64 { *a.0.denom() });
 
-        add_primitives!(eg, "to-f64" = |a: R| -> f64 { a.0.to_f64().unwrap() });
+        add_primitive!(eg, "to-f64" = |a: R| -> F { egglog::sort::OrderedFloat(a.0.to_f64().unwrap()) });
 
-        add_primitives!(eg, "pow" = |a: R, b: R| -> Option<R> {
+        add_primitive!(eg, "pow" = |a: R, b: R| -?> R {
             if a.0.is_zero() {
                 if b.0.is_positive() {
                     Some(R(Rational64::zero()))
@@ -74,14 +65,14 @@ impl Sort for RationalSort {
                 None
             }
         });
-        add_primitives!(eg, "log" = |a: R| -> Option<R> {
+        add_primitive!(eg, "log" = |a: R| -?> R {
             if a.0.is_one() {
                 Some(R(Rational64::zero()))
             } else {
                 todo!()
             }
         });
-        add_primitives!(eg, "sqrt" = |a: R| -> Option<R> {
+        add_primitive!(eg, "sqrt" = |a: R| -?> R {
             if a.0.numer().is_positive() && a.0.denom().is_positive() {
                 let s1 = a.0.numer().sqrt();
                 let s2 = a.0.denom().sqrt();
@@ -95,7 +86,7 @@ impl Sort for RationalSort {
                 None
             }
         });
-        add_primitives!(eg, "cbrt" = |a: R| -> Option<R> {
+        add_primitive!(eg, "cbrt" = |a: R| -?> R {
             if a.0.is_one() {
                 Some(R(Rational64::one()))
             } else {
@@ -103,45 +94,26 @@ impl Sort for RationalSort {
             }
         });
 
-        add_primitives!(eg, "<" = |a: R, b: R| -> Opt { if a.0 < b.0 {Some(())} else {None} });
-        add_primitives!(eg, ">" = |a: R, b: R| -> Opt { if a.0 > b.0 {Some(())} else {None} });
-        add_primitives!(eg, "<=" = |a: R, b: R| -> Opt { if a.0 <= b.0 {Some(())} else {None} });
-        add_primitives!(eg, ">=" = |a: R, b: R| -> Opt { if a.0 >= b.0 {Some(())} else {None} });
+        add_primitive!(eg, "<" = |a: R, b: R| -?> () { if a.0 < b.0 {Some(())} else {None} });
+        add_primitive!(eg, ">" = |a: R, b: R| -?> () { if a.0 > b.0 {Some(())} else {None} });
+        add_primitive!(eg, "<=" = |a: R, b: R| -?> () { if a.0 <= b.0 {Some(())} else {None} });
+        add_primitive!(eg, ">=" = |a: R, b: R| -?> () { if a.0 >= b.0 {Some(())} else {None} });
    }
 
-    fn extract_term(
+    fn reconstruct_termdag(
         &self,
-        _egraph: &EGraph,
+        primitives: &Primitives,
         value: Value,
-        _extractor: &extract::Extractor,
         termdag: &mut TermDag,
-    ) -> Option<(extract::Cost, Term)> {
-        #[cfg(debug_assertions)]
-        debug_assert_eq!(value.tag, self.name());
+    ) -> Term {
+        let rat = primitives.unwrap_ref::<R>(value);
 
-        let rat = R::load(self, &value);
-        let numer = termdag.lit(Literal::Int(*rat.0.numer()));
-        let denom = termdag.lit(Literal::Int(*rat.0.denom()));
-        Some((1, termdag.app("rational".into(), vec![numer, denom])))
-    }
-}
+        let numer = rat.0.numer();
+        let denom = rat.0.denom();
 
-impl FromSort for R {
-    type Sort = RationalSort;
-    fn load(_sort: &Self::Sort, value: &Value) -> Self {
-        let i = value.bits as usize;
-        *RATS.lock().unwrap().get_index(i).unwrap()
-    }
-}
+        let numer = termdag.lit(Literal::Int(*numer));
+        let denom = termdag.lit(Literal::Int(*denom));
 
-impl IntoSort for R {
-    type Sort = RationalSort;
-    fn store(self, _sort: &Self::Sort) -> Option<Value> {
-        let (i, _) = RATS.lock().unwrap().insert_full(self);
-        Some(Value {
-            #[cfg(debug_assertions)]
-            tag: RationalSort.name(),
-            bits: i as u64,
-        })
+        termdag.app("rational".into(), vec![numer, denom])
     }
 }

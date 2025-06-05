@@ -42,14 +42,14 @@ impl Macro<Vec<Command>> for For {
         };
 
         Ok(vec![
-            Command::AddRuleset(ruleset),
+            Command::AddRuleset(span.clone(), ruleset),
             Command::Rule {
                 name: rulename,
                 ruleset,
                 rule,
             },
             Command::RunSchedule(Schedule::Run(
-                span,
+                span.clone(),
                 RunConfig {
                     ruleset,
                     until: None,
