@@ -34,13 +34,15 @@ impl ScheduleState {
             "saturate" => {
                 let mut report = RunReport::default();
                 loop {
+                    let mut iter_report= RunReport::default();
                     for expr in exprs {
                         let res = self.run(egraph, expr)?;
-                        report.union(&res);
+                        iter_report.union(&res);
                     }
-                    if !report.updated {
+                    if !iter_report.updated {
                         break;
                     }
+                    report.union(&iter_report);
                 }
                 Ok(report)
             }
