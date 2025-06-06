@@ -168,13 +168,6 @@ impl UserDefinedCommand for RunExtendedSchedule {
     }
 }
 
-pub enum ExtendedSchedule {
-    Saturate(Span, Box<ExtendedSchedule>),
-    Repeat(Span, usize, Box<ExtendedSchedule>),
-    Run(Span, usize),
-    Sequence(Span, Vec<ExtendedSchedule>),
-}
-
 pub struct Scheduling;
 
 impl Macro<Vec<Command>> for Scheduling {
