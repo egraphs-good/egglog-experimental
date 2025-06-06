@@ -14,5 +14,8 @@ pub fn new_experimental_egraph() -> EGraph {
     add_leaf_sort(&mut egraph, RationalSort, span!()).unwrap();
     egraph.parser.add_command_macro(Arc::new(For));
     egraph.parser.add_command_macro(Arc::new(WithRuleset));
+
+    egraph.parser.add_command_macro(Arc::new(Scheduling));
+    egraph.add_command("run-schedule*".into(), Arc::new(RunExtendedSchedule)).unwrap();
     egraph
 }
