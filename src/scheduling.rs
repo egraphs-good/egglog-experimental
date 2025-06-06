@@ -42,6 +42,16 @@ impl ScheduleState {
         let Expr::Call(span, head, exprs) = arg else {
             return err();
         };
+
+        macro_rules! new_scope {
+            ($f:expr) => {{
+                let curr_scope = self.schedulers.len();
+                let res: Result<RunReport, egglog::Error> = $f();
+                self.schedulers.truncate(curr_scope);
+                res
+            }};
+        }
+
         match head.as_str() {
             "let-scheduler" => match exprs.as_slice() {
                 [Expr::Var(_, name), Expr::Call(_, scheduler_name, args)] => {
@@ -111,44 +121,51 @@ impl ScheduleState {
                 Ok(run_report)
             }
             "saturate" => {
-                let mut report = RunReport::default();
-                loop {
-                    let mut iter_report = RunReport::default();
-                    for expr in exprs {
-                        let res = self.run(egraph, expr)?;
-                        iter_report.union(&res);
+                new_scope!(|| {
+                    let mut report = RunReport::default();
+                    loop {
+                        let mut iter_report = RunReport::default();
+                        for expr in exprs {
+                            let res = self.run(egraph, expr)?;
+                            iter_report.union(&res);
+                        }
+                        if !iter_report.updated {
+                            break;
+                        }
+                        report.union(&iter_report);
                     }
-                    if !iter_report.updated {
-                        break;
-                    }
-                    report.union(&iter_report);
-                }
-                Ok(report)
+
+                    Ok(report)
+                })
             }
             "seq" => {
-                let mut report = RunReport::default();
-                for expr in exprs {
-                    // Recursively run each expression in the sequence
-                    let res = self.run(egraph, expr)?;
-                    report.union(&res);
-                }
-                Ok(report)
+                new_scope!(|| {
+                    let mut report = RunReport::default();
+                    for expr in exprs {
+                        // Recursively run each expression in the sequence
+                        let res = self.run(egraph, expr)?;
+                        report.union(&res);
+                    }
+                    Ok(report)
+                })
             }
             "repeat" => {
-                match exprs.as_slice() {
-                    [Expr::Lit(_span, Literal::Int(n)), rest @ ..] => {
-                        let mut report = RunReport::default();
-                        for _ in 0..*n {
-                            // Recursively run the rest of the expressions
-                            for expr in rest {
-                                let res = self.run(egraph, expr)?;
-                                report.union(&res);
+                new_scope!(|| {
+                    match exprs.as_slice() {
+                        [Expr::Lit(_span, Literal::Int(n)), rest @ ..] => {
+                            let mut report = RunReport::default();
+                            for _ in 0..*n {
+                                // Recursively run the rest of the expressions
+                                for expr in rest {
+                                    let res = self.run(egraph, expr)?;
+                                    report.union(&res);
+                                }
                             }
+                            Ok(report)
                         }
-                        Ok(report)
+                        _ => err(),
                     }
-                    _ => err(),
-                }
+                })
             }
             _ => Err(egglog::Error::ParseError(ParseError(
                 span.clone(),
@@ -181,7 +198,6 @@ impl Macro<Vec<Command>> for Scheduling {
         span: Span,
         parser: &mut Parser,
     ) -> Result<Vec<Command>, egglog::ast::ParseError> {
-        // let schedules = map_fallible(args, parser, parse_schedule)?;
         let args = args
             .iter()
             .map(|arg| parser.parse_expr(arg))
@@ -192,5 +208,20 @@ impl Macro<Vec<Command>> for Scheduling {
             "run-schedule*".into(),
             args.to_vec(),
         )])
+    }
+}
+
+mod schedulers {
+    use egglog::scheduler::{Matches, Scheduler};
+
+    #[derive(Clone)]
+    pub struct BackOffScheduler {
+        n: usize,
+    }
+
+    impl Scheduler for BackOffScheduler {
+        fn filter_matches(&self, matches: &mut Matches) {
+            matches.choose(self.n);
+        }
     }
 }
