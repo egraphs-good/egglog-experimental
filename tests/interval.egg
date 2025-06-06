@@ -33,4 +33,4 @@
 (check (= (lo e) (rational 100 1)))
 
 ;; testing extraction of rationals
-(query-extract (lo e))
+(extract (lo e))
