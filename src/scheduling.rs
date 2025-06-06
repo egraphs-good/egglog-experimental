@@ -22,7 +22,7 @@ impl ScheduleState {
         };
 
         if let Expr::Var(_, ruleset) = arg {
-            run_ruleset(egraph, &ruleset.as_str())?;
+            run_ruleset(egraph, ruleset.as_str())?;
 
             return Ok(egraph.get_run_report().clone().unwrap());
         }
@@ -68,7 +68,7 @@ impl ScheduleState {
                         }
                         Ok(report)
                     }
-                    _ => return err(),
+                    _ => err(),
                 }
             }
             "run" => {
@@ -76,7 +76,7 @@ impl ScheduleState {
                 let (ruleset, rest) = match exprs.first() {
                     None => ("".into(), &exprs[..]),
                     Some(Expr::Var(_span, v)) if *v == ":until".into() => ("".into(), &exprs[..]),
-                    Some(Expr::Var(_span, ruleset)) => (ruleset.clone(), &exprs[1..]),
+                    Some(Expr::Var(_span, ruleset)) => (*ruleset, &exprs[1..]),
                     _ => unreachable!(),
                 };
 
@@ -95,7 +95,7 @@ impl ScheduleState {
                 }
 
                 // Running the ruleset
-                run_ruleset(egraph, &ruleset.as_str())?;
+                run_ruleset(egraph, ruleset.as_str())?;
 
                 Ok(egraph.get_run_report().clone().unwrap())
             }
