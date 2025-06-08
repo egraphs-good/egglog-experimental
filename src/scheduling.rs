@@ -13,13 +13,28 @@ pub trait SchedulerGen {
     fn new_scheduler(&self, egraph: &egglog::EGraph, args: &[Expr]) -> Box<dyn Scheduler>;
 }
 
-#[derive(Default)]
 struct ScheduleState {
     schedulers: Vec<(Symbol, SchedulerId)>,
-    scheduler_libs: HashMap<Symbol, Box<dyn SchedulerGen>>,
+    pub(crate) scheduler_libs:
+        HashMap<Symbol, Box<dyn Fn(&egglog::EGraph, &[Expr]) -> Box<dyn Scheduler>>>,
 }
 
 impl ScheduleState {
+    fn new() -> Self {
+        let mut scheduler_libs: HashMap<
+            Symbol,
+            Box<dyn Fn(&egglog::EGraph, &[Expr]) -> Box<dyn Scheduler>>,
+        > = Default::default();
+        scheduler_libs.insert(
+            "back-off".into(),
+            Box::new(schedulers::new_back_off_scheduler),
+        );
+        Self {
+            schedulers: vec![],
+            scheduler_libs,
+        }
+    }
+
     // Current limitation: because it relies on the publicly available Rust APIs to access
     // the egraph, it has to split the same schedule into multiple runs. This means
     // - the same condition may be compiled and type checked multiple times
@@ -61,11 +76,8 @@ impl ScheduleState {
                             "Scheduler name already exists".into(),
                         )));
                     }
-                    let scheduler = self
-                        .scheduler_libs
-                        .get(scheduler_name)
-                        .unwrap()
-                        .new_scheduler(egraph, args);
+                    let scheduler =
+                        (self.scheduler_libs.get(scheduler_name).unwrap())(egraph, args);
                     let id = egraph.add_scheduler(scheduler);
                     self.schedulers.push((name.clone(), id));
                     Ok(RunReport::default())
@@ -75,13 +87,13 @@ impl ScheduleState {
             "run" | "run-with" => {
                 let mut scheduler = None;
                 let exprs = if head.as_str() == "run-with" {
-                    let Expr::Var(_, schedule_name) = exprs[0] else {
+                    let Expr::Var(_, scheduler_name) = exprs[0] else {
                         return err();
                     };
                     scheduler = Some(
                         self.schedulers
                             .iter()
-                            .rfind(|(n, _)| *n == schedule_name)
+                            .rfind(|(n, _)| *n == scheduler_name)
                             .unwrap()
                             .1,
                     );
@@ -177,7 +189,7 @@ impl ScheduleState {
 
 impl UserDefinedCommand for RunExtendedSchedule {
     fn update(&self, egraph: &mut egglog::EGraph, args: &[Expr]) -> Result<(), egglog::Error> {
-        let mut schedule = ScheduleState::default();
+        let mut schedule = ScheduleState::new();
         for arg in args {
             schedule.run(egraph, arg)?;
         }
@@ -211,17 +223,190 @@ impl Macro<Vec<Command>> for Scheduling {
     }
 }
 
-mod schedulers {
-    use egglog::scheduler::{Matches, Scheduler};
+pub(crate) fn parse_tags(args: &[Expr]) -> HashMap<String, Literal> {
+    let mut tags = HashMap::new();
+    assert!(args.len() % 2 == 0);
+    for arg in args.chunks(2) {
+        let Expr::Var(_, tag_name) = arg[0] else {
+            panic!("Invalid tag name: {:?}", arg[0]);
+        };
+        let Expr::Lit(_, lit) = &arg[1] else {
+            panic!("Invalid tag value: {:?}", arg[1]);
+        };
+        if tags.contains_key(&tag_name.to_string()) {
+            panic!("Tag name already exists: {:?}", tag_name);
+        }
+        tags.insert(tag_name.to_string(), lit.clone());
+    }
+    tags
+}
 
-    #[derive(Clone)]
+mod schedulers {
+    use std::collections::HashMap;
+
+    use egglog::{
+        ast::{Expr, Literal, Symbol},
+        scheduler::{Matches, Scheduler},
+    };
+    use log::{debug, info};
+
+    use crate::parse_tags;
+
+    pub(super) fn new_back_off_scheduler(
+        _egraph: &egglog::EGraph,
+        args: &[Expr],
+    ) -> Box<dyn Scheduler> {
+        let tags = parse_tags(args);
+        let default_match_limit = tags
+            .get(":match-limit")
+            .map(|lit| {
+                let Literal::Int(n) = lit else {
+                    panic!("Invalid match limit: {:?}", lit);
+                };
+                *n as usize
+            })
+            .unwrap_or(1000);
+        let default_ban_length = tags
+            .get(":ban-length")
+            .map(|lit| {
+                let Literal::Int(n) = lit else {
+                    panic!("Invalid ban length: {:?}", lit);
+                };
+                *n as usize
+            })
+            .unwrap_or(5);
+        Box::new(BackOffScheduler {
+            default_match_limit,
+            default_ban_length,
+            stats: HashMap::new(),
+        })
+    }
+
+    #[derive(Debug, Clone)]
     pub struct BackOffScheduler {
-        n: usize,
+        default_match_limit: usize,
+        default_ban_length: usize,
+        stats: HashMap<Symbol, RuleStats>,
+    }
+
+    #[derive(Debug, Clone)]
+    struct RuleStats {
+        iteration: usize,
+        times_applied: usize,
+        banned_until: usize,
+        times_banned: usize,
+        match_limit: usize,
+        ban_length: usize,
+    }
+
+    impl BackOffScheduler {
+        fn get_stats(&mut self, rule: Symbol) -> &mut RuleStats {
+            let stats = self.stats.entry(rule).or_insert_with(|| RuleStats {
+                times_applied: 0,
+                banned_until: 0,
+                times_banned: 0,
+                match_limit: self.default_match_limit,
+                ban_length: self.default_ban_length,
+                iteration: 0,
+            });
+            stats
+        }
     }
 
     impl Scheduler for BackOffScheduler {
-        fn filter_matches(&self, matches: &mut Matches) {
-            matches.choose(self.n);
+        fn can_stop(&mut self, rules: &[Symbol], _ruleset: Symbol) -> bool {
+            let stats = &mut self.stats;
+            let n_stats = stats.len();
+
+            let mut banned: Vec<(Symbol, RuleStats)> = rules
+                .iter()
+                .filter_map(|rule| {
+                    let s = stats.remove(rule).unwrap();
+                    if s.banned_until > s.iteration {
+                        Some((*rule, s))
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+
+            let result = if banned.is_empty() {
+                true
+            } else {
+                let min_delta = banned
+                    .iter()
+                    .map(|(_, s)| {
+                        assert!(s.banned_until >= s.iteration);
+                        s.banned_until - s.iteration
+                    })
+                    .min()
+                    .expect("banned cannot be empty here");
+
+                let mut unbanned = vec![];
+                for (name, s) in &mut banned {
+                    s.banned_until -= min_delta;
+                    if s.banned_until == s.iteration {
+                        unbanned.push(name.as_str());
+                    }
+                }
+
+                assert!(!unbanned.is_empty());
+                info!(
+                    "Banned {}/{}, fast-forwarded by {} to unban {}",
+                    banned.len(),
+                    n_stats,
+                    min_delta,
+                    unbanned.join(", "),
+                );
+
+                false
+            };
+
+            // Recover the banned stats
+            for (rule, s) in banned {
+                stats.insert(rule, s);
+            }
+
+            result
+        }
+
+        fn filter_matches(
+            &mut self,
+            rule: Symbol,
+            _ruleset: Symbol,
+            matches: &mut Matches,
+        ) -> bool {
+            let stats = self.get_stats(rule);
+            stats.iteration += 1;
+
+            if stats.iteration < stats.banned_until {
+                debug!(
+                    "Skipping {} ({}-{}), banned until {}...",
+                    rule, stats.times_applied, stats.times_banned, stats.banned_until,
+                );
+                return false;
+            }
+
+            let threshold = stats
+                .match_limit
+                .checked_shl(stats.times_banned as u32)
+                .unwrap();
+            let total_len: usize = matches.match_size();
+            if total_len > threshold {
+                let ban_length = stats.ban_length << stats.times_banned;
+                stats.times_banned += 1;
+                stats.banned_until = stats.iteration + ban_length;
+                info!(
+                    "Banning {} ({}-{}) for {} iters: {} < {}",
+                    rule, stats.times_applied, stats.times_banned, ban_length, threshold, total_len,
+                );
+                return false;
+            } else {
+                stats.times_applied += 1;
+                debug!("Choosing all matches for {} ({}-{})", rule, stats.times_applied, stats.times_banned);
+                matches.choose_all();
+                return true;
+            }
         }
     }
 }
