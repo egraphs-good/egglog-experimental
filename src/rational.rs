@@ -1,4 +1,4 @@
-use egglog::sort::{Primitives, F};
+use egglog::sort::{Primitives, F, OrderedFloat};
 use num::integer::Roots;
 use num::rational::Rational64;
 use num::traits::{CheckedAdd, CheckedDiv, CheckedMul, CheckedSub, One, Signed, ToPrimitive, Zero};
@@ -19,8 +19,6 @@ impl LeafSort for RationalSort {
 
     #[rustfmt::skip]
     fn register_primitives(&self, eg: &mut EGraph) {
-        // TODO we can't have primitives take borrows just yet, since it
-        // requires returning a reference to the locked sort
         add_primitive!(eg, "+" = |a: R, b: R| -?> R { a.0.checked_add(&b.0).map(R::new) });
         add_primitive!(eg, "-" = |a: R, b: R| -?> R { a.0.checked_sub(&b.0).map(R::new) });
         add_primitive!(eg, "*" = |a: R, b: R| -?> R { a.0.checked_mul(&b.0).map(R::new) });
@@ -37,7 +35,7 @@ impl LeafSort for RationalSort {
         add_primitive!(eg, "numer" = |a: R| -> i64 { *a.0.numer() });
         add_primitive!(eg, "denom" = |a: R| -> i64 { *a.0.denom() });
 
-        add_primitive!(eg, "to-f64" = |a: R| -> F { F::new(egglog::sort::OrderedFloat(a.0.to_f64().unwrap())) });
+        add_primitive!(eg, "to-f64" = |a: R| -> F { F::new(OrderedFloat(a.0.to_f64().unwrap())) });
 
         add_primitive!(eg, "pow" = |a: R, b: R| -?> R {
             if a.0.is_zero() {
