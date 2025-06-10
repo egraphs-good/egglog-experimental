@@ -1,5 +1,5 @@
 use egglog::prelude::LeafSort;
-use egglog::sort::{Primitives, F, OrderedFloat, Boxed};
+use egglog::sort::{Boxed, OrderedFloat, Primitives, F};
 use num::integer::Roots;
 use num::rational::Rational64;
 use num::traits::{CheckedAdd, CheckedDiv, CheckedMul, CheckedSub, One, Signed, ToPrimitive, Zero};
