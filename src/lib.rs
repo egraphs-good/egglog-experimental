@@ -1,3 +1,4 @@
+use egglog::prelude::add_leaf_sort;
 pub use egglog::*;
 use std::sync::Arc;
 

@@ -8,7 +8,7 @@ harness = false
 name = "files"
 
 [dependencies]
-# egglog = { git = "https://github.com/egraphs-good/egglog.git", rev = "bea58735" }
+# egglog = { git = "https://github.com/egraphs-good/egglog.git", rev = "56f96ce" }
 egglog = { path = "../egglog" }
 
 num = "0.4.3"

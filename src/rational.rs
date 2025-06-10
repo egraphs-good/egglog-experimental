@@ -1,9 +1,10 @@
-use egglog::sort::{Primitives, F, OrderedFloat};
+use egglog::prelude::LeafSort;
+use egglog::sort::{Primitives, F, OrderedFloat, Boxed};
 use num::integer::Roots;
 use num::rational::Rational64;
 use num::traits::{CheckedAdd, CheckedDiv, CheckedMul, CheckedSub, One, Signed, ToPrimitive, Zero};
 
-pub type R = egglog::Boxed<Rational64>;
+pub type R = Boxed<Rational64>;
 use crate::ast::Literal;
 
 use super::*;
