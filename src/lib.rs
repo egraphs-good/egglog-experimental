@@ -24,6 +24,5 @@ pub fn new_experimental_egraph() -> EGraph {
     egraph
         .add_command("run-schedule*".into(), Arc::new(RunExtendedSchedule))
         .unwrap();
-
     egraph
 }

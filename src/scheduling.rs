@@ -13,18 +13,16 @@ pub trait SchedulerGen {
     fn new_scheduler(&self, egraph: &egglog::EGraph, args: &[Expr]) -> Box<dyn Scheduler>;
 }
 
+type SchedulerBuilder = Box<dyn Fn(&egglog::EGraph, &[Expr]) -> Box<dyn Scheduler>>;
+
 struct ScheduleState {
     schedulers: Vec<(Symbol, SchedulerId)>,
-    pub(crate) scheduler_libs:
-        HashMap<Symbol, Box<dyn Fn(&egglog::EGraph, &[Expr]) -> Box<dyn Scheduler>>>,
+    pub(crate) scheduler_libs: HashMap<Symbol, SchedulerBuilder>,
 }
 
 impl ScheduleState {
     fn new() -> Self {
-        let mut scheduler_libs: HashMap<
-            Symbol,
-            Box<dyn Fn(&egglog::EGraph, &[Expr]) -> Box<dyn Scheduler>>,
-        > = Default::default();
+        let mut scheduler_libs: HashMap<Symbol, SchedulerBuilder> = Default::default();
         scheduler_libs.insert(
             "back-off".into(),
             Box::new(schedulers::new_back_off_scheduler),
@@ -79,7 +77,7 @@ impl ScheduleState {
                     let scheduler =
                         (self.scheduler_libs.get(scheduler_name).unwrap())(egraph, args);
                     let id = egraph.add_scheduler(scheduler);
-                    self.schedulers.push((name.clone(), id));
+                    self.schedulers.push((*name, id));
                     Ok(RunReport::default())
                 }
                 _ => err(),
@@ -103,8 +101,8 @@ impl ScheduleState {
                 };
                 // Parsing
                 let (ruleset, rest) = match exprs.first() {
-                    None => ("".into(), &exprs[..]),
-                    Some(Expr::Var(_span, v)) if *v == ":until".into() => ("".into(), &exprs[..]),
+                    None => ("".into(), exprs),
+                    Some(Expr::Var(_span, v)) if *v == ":until".into() => ("".into(), exprs),
                     Some(Expr::Var(_span, ruleset)) => (*ruleset, &exprs[1..]),
                     _ => unreachable!(),
                 };
@@ -124,7 +122,7 @@ impl ScheduleState {
                 }
 
                 let run_report = if let Some(scheduler) = scheduler {
-                    egraph.step_rules_with_scheduler(scheduler, ruleset.clone())
+                    egraph.step_rules_with_scheduler(scheduler, ruleset)
                 } else {
                     // Running the ruleset
                     egraph.step_rules(ruleset)
@@ -400,12 +398,15 @@ mod schedulers {
                     "Banning {} ({}-{}) for {} iters: {} < {}",
                     rule, stats.times_applied, stats.times_banned, ban_length, threshold, total_len,
                 );
-                return false;
+                false
             } else {
                 stats.times_applied += 1;
-                debug!("Choosing all matches for {} ({}-{})", rule, stats.times_applied, stats.times_banned);
+                debug!(
+                    "Choosing all matches for {} ({}-{})",
+                    rule, stats.times_applied, stats.times_banned
+                );
                 matches.choose_all();
-                return true;
+                true
             }
         }
     }
