@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use egglog::{
     ast::{Command, Expr, Fact, Facts, Literal, Macro, ParseError, Parser, Sexp, Span, Symbol},
-    query, run_ruleset,
+    prelude::{query, run_ruleset},
     scheduler::{Scheduler, SchedulerId},
     RunReport, UserDefinedCommand,
 };
