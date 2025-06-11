@@ -16,8 +16,5 @@ pub fn new_experimental_egraph() -> EGraph {
     egraph.parser.add_command_macro(Arc::new(For));
     egraph.parser.add_command_macro(Arc::new(WithRuleset));
     add_set_cost(&mut egraph);
-    // egraph
-    //     .add_command("run-schedule*".into(), Arc::new(RunExtendedSchedule))
-    //     .unwrap();
     egraph
 }

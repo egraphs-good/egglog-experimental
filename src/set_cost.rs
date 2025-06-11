@@ -1,4 +1,4 @@
-use std::{iter, sync::Arc};
+use std::sync::Arc;
 
 use egglog::{
     ast::{
@@ -7,7 +7,7 @@ use egglog::{
     },
     extract::{CostModel, Extractor, TreeAdditiveCostModel},
     util::FreshGen,
-    ArcSort, EGraph, Error, Term, TermDag, TypeError, UserDefinedCommand, Value,
+    EGraph, Error, Term, TermDag, TypeError, UserDefinedCommand,
 };
 
 pub fn add_set_cost(egraph: &mut EGraph) {
@@ -62,7 +62,7 @@ impl Macro<Vec<Action>> for SetCost {
             }
             _ => Err(ParseError(
                 span,
-                "usage: (set (<table name> <expr>*) <expr>)".into(),
+                "usage: (set-cost (<table name> <expr>*) <expr>)".to_string(),
             )),
         };
         actions
@@ -79,116 +79,62 @@ impl Macro<Vec<Command>> for SetCostDeclarations {
     fn parse(
         &self,
         decls: &[Sexp],
-        _span: Span,
+        span: Span,
         parser: &mut Parser,
     ) -> Result<Vec<Command>, ParseError> {
-        let mut commands = Vec::new();
-        for decl in decls {
-            let (head, args, span) = decl.expect_call("datatype declaration")?;
-            let command = parse_decl(head, args, span, parser)?;
-            commands.extend(command);
-        }
-        Ok(commands)
-    }
-}
-
-fn parse_decl(
-    head: Symbol,
-    args: &[Sexp],
-    span: Span,
-    parser: &mut Parser,
-) -> Result<Vec<Command>, ParseError> {
-    match head.as_str() {
-        "datatype" => match args {
-            [name, variants @ ..] => {
-                let variants = map_fallible(variants, parser, Parser::variant)?;
-                let mut commands = generate_cost_table_commands_from_variants(&variants);
-                commands.insert(
-                    0,
-                    Command::Datatype {
-                        span: span.clone(),
-                        name: name.expect_atom("sort name")?,
-                        variants,
-                    },
-                );
-                Ok(commands)
-            }
-            _ => Err(ParseError(
-                span,
-                "usage: (datatype <name> <variant>*)".to_string(),
-            )),
-        },
-        "datatype*" => {
-            let datatypes = map_fallible(args, parser, Parser::rec_datatype)?;
-            let mut commands: Vec<_> = datatypes
-                .iter()
-                .flat_map(|(_span, _name, subdatatypes)| match subdatatypes {
-                    Subdatatypes::Variants(variants) => {
-                        generate_cost_table_commands_from_variants(variants)
-                    }
-                    _ => vec![],
-                })
-                .collect();
-            commands.insert(0, Command::Datatypes { span, datatypes });
-            Ok(commands)
-        }
-        "constructor" => {
-            let result = match args {
-                [name, inputs, output, rest @ ..] => {
-                    let mut cost = None;
-                    let mut unextractable = false;
-                    match parser.parse_options(rest)?.as_slice() {
-                        [] => {}
-                        [(":unextractable", [])] => unextractable = true,
-                        [(":cost", [c])] => cost = Some(c.expect_uint("cost")?),
-                        _ => {
-                            return Err(ParseError(
-                                span,
-                                "could not parse constructor options".to_string(),
-                            ))
-                        }
-                    }
-
-                    let name = name.expect_atom("constructor name")?;
-                    let schema = parser.parse_schema(inputs, output)?;
-
-                    let cost_table_command = if !unextractable {
-                        let cost_table_name = get_cost_table_name(name);
+        let decls = map_fallible(decls, parser, Parser::parse_command)?
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
+        let mut cost_table_commands = vec![];
+        for decl in decls.iter() {
+            match decl {
+                Command::Datatype { variants, .. } => {
+                    let commands = generate_cost_table_commands_from_variants(variants);
+                    cost_table_commands.extend(commands);
+                }
+                Command::Datatypes { datatypes, .. } => {
+                    let commands =
+                        datatypes.iter().flat_map(
+                            |(_span, _name, subdatatypes)| match subdatatypes {
+                                Subdatatypes::Variants(variants) => {
+                                    generate_cost_table_commands_from_variants(variants)
+                                }
+                                Subdatatypes::NewSort(..) => vec![],
+                            },
+                        );
+                    cost_table_commands.extend(commands);
+                }
+                Command::Constructor {
+                    name,
+                    schema,
+                    span,
+                    unextractable,
+                    ..
+                } => {
+                    if !*unextractable {
+                        let cost_table_name = get_cost_table_name(*name);
                         let mut cost_table_schema = schema.clone();
                         cost_table_schema.output = "i64".into();
-
-                        Some(Command::Function {
+                        cost_table_commands.push(Command::Function {
                             span: span.clone(),
                             name: cost_table_name,
                             schema: cost_table_schema,
                             merge: None,
-                        })
-                    } else {
-                        None
-                    };
-
-                    let commands: Vec<_> = iter::once(Command::Constructor {
-                        span: span.clone(),
-                        name,
-                        schema,
-                        cost,
-                        unextractable,
-                    })
-                    .chain(cost_table_command)
-                    .collect();
-
-                    commands
+                        });
+                    }
                 }
                 _ => {
-                    let a = "(constructor <name> (<input sort>*) <output sort>)";
-                    let b = "(constructor <name> (<input sort>*) <output sort> :cost <cost>)";
-                    let c = "(constructor <name> (<input sort>*) <output sort> :unextractable)";
-                    return Err(ParseError(span, format!("usages:\n{a}\n{b}\n{c}")));
+                    return Err(ParseError(
+                        span,
+                        "Expect a datatype declaration".to_string(),
+                    ));
                 }
-            };
-            Ok(result)
+            }
         }
-        _ => Err(ParseError(span, format!("unknown declaration: {head}"))),
+        let mut commands = decls;
+        commands.extend(cost_table_commands);
+        Ok(commands)
     }
 }
 
@@ -253,20 +199,6 @@ impl CostModel<usize> for CustomCostModel {
         } else {
             TreeAdditiveCostModel {}.enode_cost(egraph, func, row)
         }
-    }
-
-    fn container_primitive(
-        &self,
-        egraph: &EGraph,
-        sort: &ArcSort,
-        value: Value,
-        element_costs: &[usize],
-    ) -> usize {
-        TreeAdditiveCostModel {}.container_primitive(egraph, sort, value, element_costs)
-    }
-
-    fn leaf_primitive(&self, egraph: &EGraph, sort: &ArcSort, value: Value) -> usize {
-        TreeAdditiveCostModel {}.leaf_primitive(egraph, sort, value)
     }
 }
 
