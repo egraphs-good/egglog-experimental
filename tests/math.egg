@@ -142,3 +142,5 @@
 (check (= start-expr2 end-expr2))
 
 (extract start-expr2)
+
+(extract start-expr2 10)

@@ -8,10 +8,13 @@ harness = false
 name = "files"
 
 [dependencies]
-egglog = { git = "https://github.com/egraphs-good/egglog.git", rev = "41cb1de" }
+egglog = { git = "https://github.com/egraphs-good/egglog.git", rev = "4a477d9" }
 
 num = "0.4.3"
 lazy_static = "1.4"
+
+env_logger = { version = "0.10", optional = true }
+log = "0.4"
 
 [dev-dependencies]
 codspeed-criterion-compat = "2.7.2"

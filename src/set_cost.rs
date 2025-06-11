@@ -13,16 +13,14 @@ use egglog::{
 pub fn add_set_cost(egraph: &mut EGraph) {
     egraph
         .parser
-        .add_command_macro(Arc::new(SetCostConstructors));
-    egraph.parser.add_command_macro(Arc::new(SetCostDatatype));
-    egraph.parser.add_command_macro(Arc::new(SetCostDatatypes));
+        .add_command_macro(Arc::new(SetCostDeclarations));
     egraph.parser.add_action_macro(Arc::new(SetCost));
     egraph
         .add_command("extract".into(), Arc::new(CustomExtract))
         .unwrap();
 }
 
-pub struct SetCost;
+struct SetCost;
 
 impl Macro<Vec<Action>> for SetCost {
     fn name(&self) -> Symbol {
@@ -71,77 +69,132 @@ impl Macro<Vec<Action>> for SetCost {
     }
 }
 
-pub struct SetCostConstructors;
+struct SetCostDeclarations;
 
-impl Macro<Vec<Command>> for SetCostConstructors {
+impl Macro<Vec<Command>> for SetCostDeclarations {
     fn name(&self) -> Symbol {
-        "constructor".into()
+        "with-custom-cost".into()
     }
 
     fn parse(
         &self,
-        args: &[Sexp],
-        span: Span,
+        decls: &[Sexp],
+        _span: Span,
         parser: &mut Parser,
     ) -> Result<Vec<Command>, ParseError> {
-        let result = match args {
-            [name, inputs, output, rest @ ..] => {
-                let mut cost = None;
-                let mut unextractable = false;
-                match parser.parse_options(rest)?.as_slice() {
-                    [] => {}
-                    [(":unextractable", [])] => unextractable = true,
-                    [(":cost", [c])] => cost = Some(c.expect_uint("cost")?),
-                    _ => {
-                        return Err(ParseError(
-                            span,
-                            format!("could not parse constructor options"),
-                        ))
-                    }
-                }
-
-                let name = name.expect_atom("constructor name")?;
-                let schema = parser.parse_schema(inputs, output)?;
-
-                let cost_table_command = if !unextractable {
-                    let cost_table_name = get_cost_table_name(name);
-                    let mut cost_table_schema = schema.clone();
-                    cost_table_schema.output = "i64".into();
-
-                    Some(Command::Function {
-                        span: span.clone(),
-                        name: cost_table_name.into(),
-                        schema: cost_table_schema,
-                        merge: None,
-                    })
-                } else {
-                    None
-                };
-
-                let commands: Vec<_> = iter::once(Command::Constructor {
-                    span: span.clone(),
-                    name,
-                    schema,
-                    cost,
-                    unextractable,
-                })
-                .chain(cost_table_command)
-                .collect();
-
-                commands
-            }
-            _ => {
-                let a = "(constructor <name> (<input sort>*) <output sort>)";
-                let b = "(constructor <name> (<input sort>*) <output sort> :cost <cost>)";
-                let c = "(constructor <name> (<input sort>*) <output sort> :unextractable)";
-                return Err(ParseError(span, format!("usages:\n{a}\n{b}\n{c}")));
-            }
-        };
-        Ok(result)
+        let mut commands = Vec::new();
+        for decl in decls {
+            let (head, args, span) = decl.expect_call("datatype declaration")?;
+            let command = parse_decl(head, args, span, parser)?;
+            commands.extend(command);
+        }
+        Ok(commands)
     }
 }
 
-pub fn generate_cost_table_commands_from_variants(variants: &[Variant]) -> Vec<Command> {
+fn parse_decl(head: Symbol, args: &[Sexp], span: Span, parser: &mut Parser) -> Result<Vec<Command>, ParseError> {
+    match head.as_str() {
+        "datatype" => match args {
+            [name, variants @ ..] => {
+                let variants = map_fallible(variants, parser, Parser::variant)?;
+                let mut commands = generate_cost_table_commands_from_variants(&variants);
+                commands.insert(
+                    0,
+                    Command::Datatype {
+                        span: span.clone(),
+                        name: name.expect_atom("sort name")?,
+                        variants,
+                    },
+                );
+                Ok(commands)
+            }
+            _ => Err(ParseError(
+                span,
+                format!("usage: (datatype <name> <variant>*)"),
+            )),
+        },
+        "datatype*" => {
+            let datatypes = map_fallible(args, parser, Parser::rec_datatype)?;
+            let mut commands: Vec<_> = datatypes
+                .iter()
+                .flat_map(|(_span, _name, subdatatypes)| match subdatatypes {
+                    Subdatatypes::Variants(variants) => {
+                        let commands =
+                            generate_cost_table_commands_from_variants(&variants);
+                        commands
+                    }
+                    _ => vec![],
+                })
+                .collect();
+            commands.insert(0, Command::Datatypes { span, datatypes });
+            Ok(commands)
+        }
+        "constructor" => {
+            let result = match args {
+                [name, inputs, output, rest @ ..] => {
+                    let mut cost = None;
+                    let mut unextractable = false;
+                    match parser.parse_options(rest)?.as_slice() {
+                        [] => {}
+                        [(":unextractable", [])] => unextractable = true,
+                        [(":cost", [c])] => cost = Some(c.expect_uint("cost")?),
+                        _ => {
+                            return Err(ParseError(
+                                span,
+                                format!("could not parse constructor options"),
+                            ))
+                        }
+                    }
+
+                    let name = name.expect_atom("constructor name")?;
+                    let schema = parser.parse_schema(inputs, output)?;
+
+                    let cost_table_command = if !unextractable {
+                        let cost_table_name = get_cost_table_name(name);
+                        let mut cost_table_schema = schema.clone();
+                        cost_table_schema.output = "i64".into();
+
+                        Some(Command::Function {
+                            span: span.clone(),
+                            name: cost_table_name.into(),
+                            schema: cost_table_schema,
+                            merge: None,
+                        })
+                    } else {
+                        None
+                    };
+
+                    let commands: Vec<_> = iter::once(Command::Constructor {
+                        span: span.clone(),
+                        name,
+                        schema,
+                        cost,
+                        unextractable,
+                    })
+                    .chain(cost_table_command)
+                    .collect();
+
+                    commands
+                }
+                _ => {
+                    let a = "(constructor <name> (<input sort>*) <output sort>)";
+                    let b =
+                        "(constructor <name> (<input sort>*) <output sort> :cost <cost>)";
+                    let c =
+                        "(constructor <name> (<input sort>*) <output sort> :unextractable)";
+                    return Err(ParseError(span, format!("usages:\n{a}\n{b}\n{c}")));
+                }
+            };
+            Ok(result)
+        }
+        _ => Err(ParseError(
+            span,
+            format!("unknown declaration: {head}"),
+        )),
+    }
+}
+
+fn generate_cost_table_commands_from_variants(variants: &[Variant]) -> Vec<Command> {
     let commands = variants
         .iter()
         .map(|v| {
@@ -160,72 +213,8 @@ pub fn generate_cost_table_commands_from_variants(variants: &[Variant]) -> Vec<C
     commands
 }
 
-pub struct SetCostDatatype;
-
-impl Macro<Vec<Command>> for SetCostDatatype {
-    fn name(&self) -> Symbol {
-        "datatype".into()
-    }
-
-    fn parse(
-        &self,
-        args: &[Sexp],
-        span: Span,
-        parser: &mut Parser,
-    ) -> Result<Vec<Command>, ParseError> {
-        match args {
-            [name, variants @ ..] => {
-                let variants = map_fallible(variants, parser, Parser::variant)?;
-                let mut commands = generate_cost_table_commands_from_variants(&variants);
-                commands.insert(
-                    0,
-                    Command::Datatype {
-                        span: span.clone(),
-                        name: name.expect_atom("sort name")?,
-                        variants,
-                    },
-                );
-                Ok(commands)
-            }
-            _ => Err(ParseError(
-                span,
-                format!("usage: (datatype <name> <variant>*)"),
-            )),
-        }
-    }
-}
-
-pub struct SetCostDatatypes;
-
-impl Macro<Vec<Command>> for SetCostDatatypes {
-    fn name(&self) -> Symbol {
-        "datatype*".into()
-    }
-
-    fn parse(
-        &self,
-        args: &[Sexp],
-        span: Span,
-        parser: &mut Parser,
-    ) -> Result<Vec<Command>, ParseError> {
-        let datatypes = map_fallible(args, parser, Parser::rec_datatype)?;
-        let mut commands: Vec<_> = datatypes
-            .iter()
-            .flat_map(|(_span, _name, subdatatypes)| match subdatatypes {
-                Subdatatypes::Variants(variants) => {
-                    let commands = generate_cost_table_commands_from_variants(&variants);
-                    commands
-                }
-                _ => vec![],
-            })
-            .collect();
-        commands.insert(0, Command::Datatypes { span, datatypes });
-        Ok(commands)
-    }
-}
-
 fn get_cost_table_name(name: Symbol) -> Symbol {
-    format!("<experimental>cost_table_{name}").into()
+    format!("cost_table_{name}").into()
 }
 
 fn map_fallible<T>(
@@ -239,7 +228,7 @@ fn map_fallible<T>(
         .collect::<Result<_, _>>()
 }
 
-pub struct CustomCostModel;
+struct CustomCostModel;
 
 impl CostModel<usize> for CustomCostModel {
     fn fold(&self, _head: Symbol, children_cost: &[usize], head_cost: usize) -> usize {
@@ -254,14 +243,18 @@ impl CostModel<usize> for CustomCostModel {
     ) -> usize {
         let name = get_cost_table_name(func.name());
         let key = row.vals.split_last().unwrap().1;
-        egraph
-            .lookup_function(&name, key)
-            .map(|c| {
-                let cost = egraph.value_to_rust::<i64>(c);
-                assert!(cost >= 0);
-                cost as usize
-            })
-            .unwrap_or_else(|| TreeAdditiveCostModel {}.enode_cost(egraph, func, row))
+        if egraph.get_function(&name).is_some() {
+            egraph
+                .lookup_function(&name, key)
+                .map(|c| {
+                    let cost = egraph.value_to_rust::<i64>(c);
+                    assert!(cost >= 0);
+                    cost as usize
+                })
+                .unwrap_or_else(|| TreeAdditiveCostModel {}.enode_cost(egraph, func, row))
+        } else {
+            TreeAdditiveCostModel {}.enode_cost(egraph, func, row)
+        }
     }
 
     fn container_primitive(
@@ -279,7 +272,7 @@ impl CostModel<usize> for CustomCostModel {
     }
 }
 
-pub struct CustomExtract;
+struct CustomExtract;
 
 impl UserDefinedCommand for CustomExtract {
     fn update(&self, egraph: &mut EGraph, args: &[Expr]) -> Result<(), Error> {
@@ -288,7 +281,7 @@ impl UserDefinedCommand for CustomExtract {
         let n = args.get(1).map(|arg| egraph.eval_expr(&arg)).transpose()?;
         let n = if let Some(nv) = n {
             // TODO: egglog does not yet support u64
-            if nv.0.name().as_str() == "i64" {
+            if nv.0.name().as_str() != "i64" {
                 let i64sort = egraph.get_arcsort_by(|s| s.name().as_str() == "i64");
                 return Err(Error::TypeError(TypeError::Mismatch {
                     expr: args[1].clone(),
