@@ -20,9 +20,8 @@ pub fn new_experimental_egraph() -> EGraph {
 
     add_set_cost(&mut egraph);
 
-    egraph.parser.add_command_macro(Arc::new(Scheduling));
     egraph
-        .add_command("run-schedule*".into(), Arc::new(RunExtendedSchedule))
+        .add_command("run-schedule".into(), Arc::new(RunExtendedSchedule))
         .unwrap();
     egraph
 }

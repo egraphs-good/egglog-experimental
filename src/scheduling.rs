@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use egglog::{
-    ast::{Command, Expr, Fact, Facts, Literal, Macro, ParseError, Parser, Sexp, Span, Symbol},
+    ast::{Expr, Fact, Facts, Literal, ParseError, Symbol},
     prelude::{query, run_ruleset},
     scheduler::{Scheduler, SchedulerId},
     RunReport, UserDefinedCommand,
@@ -192,32 +192,6 @@ impl UserDefinedCommand for RunExtendedSchedule {
             schedule.run(egraph, arg)?;
         }
         Ok(())
-    }
-}
-
-pub struct Scheduling;
-
-impl Macro<Vec<Command>> for Scheduling {
-    fn name(&self) -> Symbol {
-        "run-schedule".into()
-    }
-
-    fn parse(
-        &self,
-        args: &[Sexp],
-        span: Span,
-        parser: &mut Parser,
-    ) -> Result<Vec<Command>, egglog::ast::ParseError> {
-        let args = args
-            .iter()
-            .map(|arg| parser.parse_expr(arg))
-            .collect::<Result<Vec<_>, _>>()?;
-
-        Ok(vec![Command::UserDefined(
-            span,
-            "run-schedule*".into(),
-            args.to_vec(),
-        )])
     }
 }
 
