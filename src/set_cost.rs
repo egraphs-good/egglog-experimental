@@ -92,7 +92,12 @@ impl Macro<Vec<Command>> for SetCostDeclarations {
     }
 }
 
-fn parse_decl(head: Symbol, args: &[Sexp], span: Span, parser: &mut Parser) -> Result<Vec<Command>, ParseError> {
+fn parse_decl(
+    head: Symbol,
+    args: &[Sexp],
+    span: Span,
+    parser: &mut Parser,
+) -> Result<Vec<Command>, ParseError> {
     match head.as_str() {
         "datatype" => match args {
             [name, variants @ ..] => {
@@ -110,7 +115,7 @@ fn parse_decl(head: Symbol, args: &[Sexp], span: Span, parser: &mut Parser) -> R
             }
             _ => Err(ParseError(
                 span,
-                format!("usage: (datatype <name> <variant>*)"),
+                "usage: (datatype <name> <variant>*)".to_string(),
             )),
         },
         "datatype*" => {
@@ -119,9 +124,7 @@ fn parse_decl(head: Symbol, args: &[Sexp], span: Span, parser: &mut Parser) -> R
                 .iter()
                 .flat_map(|(_span, _name, subdatatypes)| match subdatatypes {
                     Subdatatypes::Variants(variants) => {
-                        let commands =
-                            generate_cost_table_commands_from_variants(&variants);
-                        commands
+                        generate_cost_table_commands_from_variants(variants)
                     }
                     _ => vec![],
                 })
@@ -141,7 +144,7 @@ fn parse_decl(head: Symbol, args: &[Sexp], span: Span, parser: &mut Parser) -> R
                         _ => {
                             return Err(ParseError(
                                 span,
-                                format!("could not parse constructor options"),
+                                "could not parse constructor options".to_string(),
                             ))
                         }
                     }
@@ -156,7 +159,7 @@ fn parse_decl(head: Symbol, args: &[Sexp], span: Span, parser: &mut Parser) -> R
 
                         Some(Command::Function {
                             span: span.clone(),
-                            name: cost_table_name.into(),
+                            name: cost_table_name,
                             schema: cost_table_schema,
                             merge: None,
                         })
@@ -178,19 +181,14 @@ fn parse_decl(head: Symbol, args: &[Sexp], span: Span, parser: &mut Parser) -> R
                 }
                 _ => {
                     let a = "(constructor <name> (<input sort>*) <output sort>)";
-                    let b =
-                        "(constructor <name> (<input sort>*) <output sort> :cost <cost>)";
-                    let c =
-                        "(constructor <name> (<input sort>*) <output sort> :unextractable)";
+                    let b = "(constructor <name> (<input sort>*) <output sort> :cost <cost>)";
+                    let c = "(constructor <name> (<input sort>*) <output sort> :unextractable)";
                     return Err(ParseError(span, format!("usages:\n{a}\n{b}\n{c}")));
                 }
             };
             Ok(result)
         }
-        _ => Err(ParseError(
-            span,
-            format!("unknown declaration: {head}"),
-        )),
+        _ => Err(ParseError(span, format!("unknown declaration: {head}"))),
     }
 }
 
@@ -278,7 +276,7 @@ impl UserDefinedCommand for CustomExtract {
     fn update(&self, egraph: &mut EGraph, args: &[Expr]) -> Result<(), Error> {
         assert!(args.len() <= 2);
         let (sort, value) = egraph.eval_expr(&args[0])?;
-        let n = args.get(1).map(|arg| egraph.eval_expr(&arg)).transpose()?;
+        let n = args.get(1).map(|arg| egraph.eval_expr(arg)).transpose()?;
         let n = if let Some(nv) = n {
             // TODO: egglog does not yet support u64
             if nv.0.name().as_str() != "i64" {
@@ -298,7 +296,7 @@ impl UserDefinedCommand for CustomExtract {
 
         let extractor = Extractor::compute_costs_from_rootsorts(
             Some(vec![sort.clone()]),
-            &egraph,
+            egraph,
             CustomCostModel,
         );
         if n == 0 {
