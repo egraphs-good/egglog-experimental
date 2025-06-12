@@ -3,8 +3,8 @@ use egglog::{ast::*, util::FreshGen};
 pub struct For;
 
 impl Macro<Vec<Command>> for For {
-    fn name(&self) -> Symbol {
-        "for".into()
+    fn name(&self) -> &str {
+        "for"
     }
 
     fn parse(
@@ -20,8 +20,8 @@ impl Macro<Vec<Command>> for For {
             ));
         }
 
-        let ruleset = parser.symbol_gen.fresh(&"for_ruleset".into());
-        let rulename = parser.symbol_gen.fresh(&"for_rule".into());
+        let ruleset = parser.symbol_gen.fresh("for_ruleset");
+        let rulename = parser.symbol_gen.fresh("for_rule");
         let query = args[0]
             .expect_list("query")?
             .iter()
@@ -42,10 +42,10 @@ impl Macro<Vec<Command>> for For {
         };
 
         Ok(vec![
-            Command::AddRuleset(span.clone(), ruleset),
+            Command::AddRuleset(span.clone(), ruleset.clone()),
             Command::Rule {
                 name: rulename,
-                ruleset,
+                ruleset: ruleset.clone(),
                 rule,
             },
             Command::RunSchedule(Schedule::Run(

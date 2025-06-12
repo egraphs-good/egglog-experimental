@@ -8,7 +8,7 @@ harness = false
 name = "files"
 
 [dependencies]
-egglog = { git = "https://github.com/egraphs-good/egglog.git", rev = "4a477d9" }
+egglog = { git = "https://github.com/egraphs-good/egglog.git", rev = "c7cfe8b" }
 
 num = "0.4.3"
 lazy_static = "1.4"
