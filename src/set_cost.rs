@@ -1,10 +1,7 @@
 use std::sync::Arc;
 
 use egglog::{
-    ast::{
-        Action, Command, Expr, Macro, ParseError, Parser, Schema, Sexp, Span, Subdatatypes, Symbol,
-        Variant,
-    },
+    ast::*,
     extract::{CostModel, Extractor, TreeAdditiveCostModel},
     util::FreshGen,
     EGraph, Error, Term, TermDag, TypeError, UserDefinedCommand,
@@ -23,8 +20,8 @@ pub fn add_set_cost(egraph: &mut EGraph) {
 struct SetCost;
 
 impl Macro<Vec<Action>> for SetCost {
-    fn name(&self) -> Symbol {
-        "set-cost".into()
+    fn name(&self) -> &str {
+        "set-cost"
     }
 
     fn parse(
@@ -33,22 +30,22 @@ impl Macro<Vec<Action>> for SetCost {
         span: Span,
         parser: &mut Parser,
     ) -> Result<Vec<Action>, ParseError> {
-        let actions = match args {
+        match args {
             [call, value] => {
                 let (func, args, call_span) = call.expect_call("table lookup")?;
-                let cost_table_name = get_cost_table_name(func);
+                let cost_table_name = get_cost_table_name(&func);
                 let args = map_fallible(args, parser, Parser::parse_expr)?;
                 let value = parser.parse_expr(value)?;
 
                 let vs = (0..args.len())
-                    .map(|_| parser.symbol_gen.fresh(&"set_cost_var".into()))
-                    .collect::<Vec<Symbol>>();
+                    .map(|_| parser.symbol_gen.fresh("set_cost_var"))
+                    .collect::<Vec<_>>();
                 let (args, mut actions): (Vec<Expr>, Vec<Action>) = vs
-                    .iter()
+                    .into_iter()
                     .zip(args)
                     .map(|(v, e)| {
                         let span = e.span().clone();
-                        (Expr::Var(span.clone(), *v), Action::Let(span, *v, e))
+                        (Expr::Var(span.clone(), v.clone()), Action::Let(span, v, e))
                     })
                     .unzip();
 
@@ -64,16 +61,15 @@ impl Macro<Vec<Action>> for SetCost {
                 span,
                 "usage: (set-cost (<table name> <expr>*) <expr>)".to_string(),
             )),
-        };
-        actions
+        }
     }
 }
 
 struct SetCostDeclarations;
 
 impl Macro<Vec<Command>> for SetCostDeclarations {
-    fn name(&self) -> Symbol {
-        "with-custom-cost".into()
+    fn name(&self) -> &str {
+        "with-custom-cost"
     }
 
     fn parse(
@@ -113,7 +109,7 @@ impl Macro<Vec<Command>> for SetCostDeclarations {
                     ..
                 } => {
                     if !*unextractable {
-                        let cost_table_name = get_cost_table_name(*name);
+                        let cost_table_name = get_cost_table_name(name);
                         let mut cost_table_schema = schema.clone();
                         cost_table_schema.output = "i64".into();
                         cost_table_commands.push(Command::Function {
@@ -142,7 +138,7 @@ fn generate_cost_table_commands_from_variants(variants: &[Variant]) -> Vec<Comma
     let commands = variants
         .iter()
         .map(|v| {
-            let cost_table_name = get_cost_table_name(v.name);
+            let cost_table_name = get_cost_table_name(&v.name);
             let cost_table_schema = Schema::new(v.types.clone(), "i64".into());
 
             Command::Function {
@@ -157,8 +153,8 @@ fn generate_cost_table_commands_from_variants(variants: &[Variant]) -> Vec<Comma
     commands
 }
 
-fn get_cost_table_name(name: Symbol) -> Symbol {
-    format!("cost_table_{name}").into()
+fn get_cost_table_name(name: &str) -> String {
+    format!("cost_table_{name}")
 }
 
 fn map_fallible<T>(
@@ -175,7 +171,7 @@ fn map_fallible<T>(
 struct CustomCostModel;
 
 impl CostModel<usize> for CustomCostModel {
-    fn fold(&self, _head: Symbol, children_cost: &[usize], head_cost: usize) -> usize {
+    fn fold(&self, _head: &str, children_cost: &[usize], head_cost: usize) -> usize {
         TreeAdditiveCostModel {}.fold(_head, children_cost, head_cost)
     }
 
@@ -211,8 +207,8 @@ impl UserDefinedCommand for CustomExtract {
         let n = args.get(1).map(|arg| egraph.eval_expr(arg)).transpose()?;
         let n = if let Some(nv) = n {
             // TODO: egglog does not yet support u64
-            if nv.0.name().as_str() != "i64" {
-                let i64sort = egraph.get_arcsort_by(|s| s.name().as_str() == "i64");
+            if nv.0.name() != "i64" {
+                let i64sort = egraph.get_arcsort_by(|s| s.name() == "i64");
                 return Err(Error::TypeError(TypeError::Mismatch {
                     expr: args[1].clone(),
                     expected: i64sort,

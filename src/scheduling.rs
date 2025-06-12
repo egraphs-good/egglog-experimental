@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use egglog::{
-    ast::{Expr, Fact, Facts, Literal, ParseError, Symbol},
+    ast::{Expr, Fact, Facts, Literal, ParseError},
     prelude::{query, run_ruleset},
     scheduler::{Scheduler, SchedulerId},
     RunReport, UserDefinedCommand,
@@ -16,13 +16,13 @@ pub trait SchedulerGen {
 type SchedulerBuilder = Box<dyn Fn(&egglog::EGraph, &[Expr]) -> Box<dyn Scheduler>>;
 
 struct ScheduleState {
-    schedulers: Vec<(Symbol, SchedulerId)>,
-    pub(crate) scheduler_libs: HashMap<Symbol, SchedulerBuilder>,
+    schedulers: Vec<(String, SchedulerId)>,
+    pub(crate) scheduler_libs: HashMap<String, SchedulerBuilder>,
 }
 
 impl ScheduleState {
     fn new() -> Self {
-        let mut scheduler_libs: HashMap<Symbol, SchedulerBuilder> = Default::default();
+        let mut scheduler_libs: HashMap<String, SchedulerBuilder> = Default::default();
         scheduler_libs.insert(
             "back-off".into(),
             Box::new(schedulers::new_back_off_scheduler),
@@ -77,7 +77,7 @@ impl ScheduleState {
                     let scheduler =
                         (self.scheduler_libs.get(scheduler_name).unwrap())(egraph, args);
                     let id = egraph.add_scheduler(scheduler);
-                    self.schedulers.push((*name, id));
+                    self.schedulers.push((name.clone(), id));
                     Ok(RunReport::default())
                 }
                 _ => err(),
@@ -85,13 +85,13 @@ impl ScheduleState {
             "run" | "run-with" => {
                 let mut scheduler = None;
                 let exprs = if head.as_str() == "run-with" {
-                    let Expr::Var(_, scheduler_name) = exprs[0] else {
+                    let Expr::Var(_, ref scheduler_name) = exprs[0] else {
                         return err();
                     };
                     scheduler = Some(
                         self.schedulers
                             .iter()
-                            .rfind(|(n, _)| *n == scheduler_name)
+                            .rfind(|(n, _)| n == scheduler_name)
                             .unwrap()
                             .1,
                     );
@@ -101,15 +101,15 @@ impl ScheduleState {
                 };
                 // Parsing
                 let (ruleset, rest) = match exprs.first() {
-                    None => ("".into(), exprs),
-                    Some(Expr::Var(_span, v)) if *v == ":until".into() => ("".into(), exprs),
-                    Some(Expr::Var(_span, ruleset)) => (*ruleset, &exprs[1..]),
+                    None => ("", exprs),
+                    Some(Expr::Var(_span, v)) if *v == ":until" => ("", exprs),
+                    Some(Expr::Var(_span, ruleset)) => (ruleset.as_str(), &exprs[1..]),
                     _ => unreachable!(),
                 };
 
                 let until = match rest {
                     [] => None,
-                    [Expr::Var(_span, ut), cond] if *ut == ":until".into() => Some(cond.clone()),
+                    [Expr::Var(_span, ut), cond] if ut == ":until" => Some(cond.clone()),
                     _ => return err(),
                 };
 
@@ -137,12 +137,12 @@ impl ScheduleState {
                         let mut iter_report = RunReport::default();
                         for expr in exprs {
                             let res = self.run(egraph, expr)?;
-                            iter_report.union(&res);
+                            iter_report.union(res);
                         }
                         if !iter_report.updated {
                             break;
                         }
-                        report.union(&iter_report);
+                        report.union(iter_report);
                     }
 
                     Ok(report)
@@ -154,7 +154,7 @@ impl ScheduleState {
                     for expr in exprs {
                         // Recursively run each expression in the sequence
                         let res = self.run(egraph, expr)?;
-                        report.union(&res);
+                        report.union(res);
                     }
                     Ok(report)
                 })
@@ -168,7 +168,7 @@ impl ScheduleState {
                                 // Recursively run the rest of the expressions
                                 for expr in rest {
                                     let res = self.run(egraph, expr)?;
-                                    report.union(&res);
+                                    report.union(res);
                                 }
                             }
                             Ok(report)
@@ -199,7 +199,7 @@ pub(crate) fn parse_tags(args: &[Expr]) -> HashMap<String, Literal> {
     let mut tags = HashMap::new();
     assert!(args.len() % 2 == 0);
     for arg in args.chunks(2) {
-        let Expr::Var(_, tag_name) = arg[0] else {
+        let Expr::Var(_, ref tag_name) = arg[0] else {
             panic!("Invalid tag name: {:?}", arg[0]);
         };
         let Expr::Lit(_, lit) = &arg[1] else {
@@ -217,7 +217,7 @@ mod schedulers {
     use std::collections::HashMap;
 
     use egglog::{
-        ast::{Expr, Literal, Symbol},
+        ast::{Expr, Literal},
         scheduler::{Matches, Scheduler},
     };
     use log::{debug, info};
@@ -258,7 +258,7 @@ mod schedulers {
     pub struct BackOffScheduler {
         default_match_limit: usize,
         default_ban_length: usize,
-        stats: HashMap<Symbol, RuleStats>,
+        stats: HashMap<String, RuleStats>,
     }
 
     #[derive(Debug, Clone)]
@@ -272,7 +272,7 @@ mod schedulers {
     }
 
     impl BackOffScheduler {
-        fn get_stats(&mut self, rule: Symbol) -> &mut RuleStats {
+        fn get_stats(&mut self, rule: String) -> &mut RuleStats {
             let stats = self.stats.entry(rule).or_insert_with(|| RuleStats {
                 times_applied: 0,
                 banned_until: 0,
@@ -286,14 +286,14 @@ mod schedulers {
     }
 
     impl Scheduler for BackOffScheduler {
-        fn can_stop(&mut self, rules: &[Symbol], _ruleset: Symbol) -> bool {
+        fn can_stop(&mut self, rules: &[&str], _ruleset: &str) -> bool {
             let stats = &mut self.stats;
             let n_stats = stats.len();
 
-            let mut banned: Vec<(Symbol, RuleStats)> = rules
+            let mut banned: Vec<(&str, RuleStats)> = rules
                 .iter()
                 .filter_map(|rule| {
-                    let s = stats.remove(rule).unwrap();
+                    let s = stats.remove(*rule).unwrap();
                     if s.banned_until > s.iteration {
                         Some((*rule, s))
                     } else {
@@ -318,7 +318,7 @@ mod schedulers {
                 for (name, s) in &mut banned {
                     s.banned_until -= min_delta;
                     if s.banned_until == s.iteration {
-                        unbanned.push(name.as_str());
+                        unbanned.push(*name);
                     }
                 }
 
@@ -336,19 +336,14 @@ mod schedulers {
 
             // Recover the banned stats
             for (rule, s) in banned {
-                stats.insert(rule, s);
+                stats.insert(rule.to_owned(), s);
             }
 
             result
         }
 
-        fn filter_matches(
-            &mut self,
-            rule: Symbol,
-            _ruleset: Symbol,
-            matches: &mut Matches,
-        ) -> bool {
-            let stats = self.get_stats(rule);
+        fn filter_matches(&mut self, rule: &str, _ruleset: &str, matches: &mut Matches) -> bool {
+            let stats = self.get_stats(rule.to_owned());
             stats.iteration += 1;
 
             if stats.iteration < stats.banned_until {
