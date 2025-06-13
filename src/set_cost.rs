@@ -187,7 +187,7 @@ impl CostModel<usize> for CustomCostModel {
             egraph
                 .lookup_function(&name, key)
                 .map(|c| {
-                    let cost = egraph.value_to_rust::<i64>(c);
+                    let cost = egraph.value_to_base::<i64>(c);
                     assert!(cost >= 0);
                     cost as usize
                 })
@@ -215,7 +215,7 @@ impl UserDefinedCommand for CustomExtract {
                     actual: nv.0,
                 }));
             }
-            egraph.value_to_rust::<i64>(nv.1)
+            egraph.value_to_base::<i64>(nv.1)
         } else {
             0
         };

@@ -1,5 +1,5 @@
-use egglog::prelude::LeafSort;
-use egglog::sort::{Boxed, OrderedFloat, Primitives, F};
+use egglog::prelude::BaseSort;
+use egglog::sort::{BaseValues, Boxed, OrderedFloat, F};
 use num::integer::Roots;
 use num::rational::Rational64;
 use num::traits::{CheckedAdd, CheckedDiv, CheckedMul, CheckedSub, One, Signed, ToPrimitive, Zero};
@@ -12,8 +12,9 @@ use super::*;
 #[derive(Debug)]
 pub struct RationalSort;
 
-impl LeafSort for RationalSort {
-    type Leaf = R;
+impl BaseSort for RationalSort {
+    type Base = R;
+
     fn name(&self) -> &str {
         "Rational"
     }
@@ -95,11 +96,11 @@ impl LeafSort for RationalSort {
 
     fn reconstruct_termdag(
         &self,
-        primitives: &Primitives,
+        base_values: &BaseValues,
         value: Value,
         termdag: &mut TermDag,
     ) -> Term {
-        let rat = primitives.unwrap::<R>(value);
+        let rat = base_values.unwrap::<R>(value);
 
         let numer = rat.0.numer();
         let denom = rat.0.denom();
