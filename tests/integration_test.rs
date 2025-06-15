@@ -6,7 +6,7 @@ fn test_extract() {
         .parse_and_run_program(
             None,
             "
-        (with-custom-cost
+        (with-dynamic-cost
             (datatype E (Add E E) (Sub E E :cost 200) (Num i64))
         )
 
@@ -49,7 +49,7 @@ fn test_extract_set_cost_multiple_times_should_fail() {
     egraph
         .parse_and_run_program(
             None,
-            "(with-custom-cost
+            "(with-dynamic-cost
                 (datatype E (Add E E) (Sub E E :cost 200) (Num i64))
             )
             (set-cost (Num 2) 1000)",
@@ -71,7 +71,7 @@ fn test_extract_set_cost_decls() {
     egraph
         .parse_and_run_program(
             None,
-            "(with-custom-cost
+            "(with-dynamic-cost
                 (datatype E (Add E E) (Sub E E :cost 200) (Num i64))
                 (constructor Mul (E E) E :cost 100)
                 (datatype* 
