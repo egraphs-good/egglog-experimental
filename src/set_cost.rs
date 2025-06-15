@@ -69,7 +69,7 @@ struct SetCostDeclarations;
 
 impl Macro<Vec<Command>> for SetCostDeclarations {
     fn name(&self) -> &str {
-        "with-custom-cost"
+        "with-dynamic-cost"
     }
 
     fn parse(
@@ -168,9 +168,11 @@ fn map_fallible<T>(
         .collect::<Result<_, _>>()
 }
 
-struct CustomCostModel;
+/// The cost model that handles dynamic costs. Use this cost model if you use the `with-dynamic-cost` / `set-cost`
+/// extensions in your egglog program
+pub struct DynamicCostModel;
 
-impl CostModel<usize> for CustomCostModel {
+impl CostModel<usize> for DynamicCostModel {
     fn fold(&self, _head: &str, children_cost: &[usize], head_cost: usize) -> usize {
         TreeAdditiveCostModel {}.fold(_head, children_cost, head_cost)
     }
@@ -225,7 +227,7 @@ impl UserDefinedCommand for CustomExtract {
         let extractor = Extractor::compute_costs_from_rootsorts(
             Some(vec![sort.clone()]),
             egraph,
-            CustomCostModel,
+            DynamicCostModel,
         );
         if n == 0 {
             if let Some((cost, term)) = extractor.extract_best(egraph, &mut termdag, value) {
