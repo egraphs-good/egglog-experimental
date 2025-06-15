@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::{collections::HashMap, sync::Mutex};
 
 use egglog::{
     ast::{Expr, Fact, Facts, Literal, ParseError},
@@ -6,6 +6,7 @@ use egglog::{
     scheduler::{Scheduler, SchedulerId},
     RunReport, UserDefinedCommand,
 };
+use lazy_static::lazy_static;
 
 pub struct RunExtendedSchedule;
 
@@ -13,24 +14,28 @@ pub trait SchedulerGen {
     fn new_scheduler(&self, egraph: &egglog::EGraph, args: &[Expr]) -> Box<dyn Scheduler>;
 }
 
-type SchedulerBuilder = Box<dyn Fn(&egglog::EGraph, &[Expr]) -> Box<dyn Scheduler>>;
+type SchedulerBuilder = Box<dyn Fn(&egglog::EGraph, &[Expr]) -> Box<dyn Scheduler> + Send + Sync>;
 
 struct ScheduleState {
     schedulers: Vec<(String, SchedulerId)>,
-    pub(crate) scheduler_libs: HashMap<String, SchedulerBuilder>,
+}
+
+lazy_static! {
+    static ref scheduler_libs: Mutex<HashMap<String, SchedulerBuilder>> = {
+        Mutex::new(HashMap::from_iter([(
+            "back-off".into(),
+            Box::new(schedulers::new_back_off_scheduler) as SchedulerBuilder,
+        )]))
+    };
+}
+
+pub fn add_scheduler_builder(name: String, builder: SchedulerBuilder) {
+    scheduler_libs.lock().unwrap().insert(name, builder);
 }
 
 impl ScheduleState {
     fn new() -> Self {
-        let mut scheduler_libs: HashMap<String, SchedulerBuilder> = Default::default();
-        scheduler_libs.insert(
-            "back-off".into(),
-            Box::new(schedulers::new_back_off_scheduler),
-        );
-        Self {
-            schedulers: vec![],
-            scheduler_libs,
-        }
+        Self { schedulers: vec![] }
     }
 
     // Current limitation: because it relies on the publicly available Rust APIs to access
@@ -75,7 +80,7 @@ impl ScheduleState {
                         )));
                     }
                     let scheduler =
-                        (self.scheduler_libs.get(scheduler_name).unwrap())(egraph, args);
+                        (scheduler_libs.lock().unwrap().get(scheduler_name).unwrap())(egraph, args);
                     let id = egraph.add_scheduler(scheduler);
                     self.schedulers.push((name.clone(), id));
                     Ok(RunReport::default())

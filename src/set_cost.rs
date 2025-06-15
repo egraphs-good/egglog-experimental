@@ -168,7 +168,7 @@ fn map_fallible<T>(
         .collect::<Result<_, _>>()
 }
 
-struct CustomCostModel;
+pub struct CustomCostModel;
 
 impl CostModel<usize> for CustomCostModel {
     fn fold(&self, _head: &str, children_cost: &[usize], head_cost: usize) -> usize {
