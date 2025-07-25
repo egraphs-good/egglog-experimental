@@ -1,4 +1,4 @@
-use egglog::prelude::add_leaf_sort;
+use egglog::prelude::add_base_sort;
 pub use egglog::*;
 use std::sync::Arc;
 
@@ -14,7 +14,7 @@ pub use set_cost::*;
 
 pub fn new_experimental_egraph() -> EGraph {
     let mut egraph = EGraph::default();
-    add_leaf_sort(&mut egraph, RationalSort, span!()).unwrap();
+    add_base_sort(&mut egraph, RationalSort, span!()).unwrap();
     egraph.parser.add_command_macro(Arc::new(For));
     egraph.parser.add_command_macro(Arc::new(WithRuleset));
 

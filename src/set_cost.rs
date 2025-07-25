@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use egglog::{
     ast::*,
-    extract::{CostModel, Extractor, TreeAdditiveCostModel},
+    extract::{CostModel, DefaultCost, Extractor, TreeAdditiveCostModel},
     util::FreshGen,
     EGraph, Error, Term, TermDag, TypeError, UserDefinedCommand,
 };
@@ -172,8 +172,13 @@ fn map_fallible<T>(
 /// extensions in your egglog program
 pub struct DynamicCostModel;
 
-impl CostModel<usize> for DynamicCostModel {
-    fn fold(&self, _head: &str, children_cost: &[usize], head_cost: usize) -> usize {
+impl CostModel<DefaultCost> for DynamicCostModel {
+    fn fold(
+        &self,
+        _head: &str,
+        children_cost: &[DefaultCost],
+        head_cost: DefaultCost,
+    ) -> DefaultCost {
         TreeAdditiveCostModel {}.fold(_head, children_cost, head_cost)
     }
 
@@ -182,7 +187,7 @@ impl CostModel<usize> for DynamicCostModel {
         egraph: &EGraph,
         func: &egglog::Function,
         row: &egglog::FunctionRow<'_>,
-    ) -> usize {
+    ) -> DefaultCost {
         let name = get_cost_table_name(func.name());
         let key = row.vals.split_last().unwrap().1;
         if egraph.get_function(&name).is_some() {
@@ -191,7 +196,7 @@ impl CostModel<usize> for DynamicCostModel {
                 .map(|c| {
                     let cost = egraph.value_to_base::<i64>(c);
                     assert!(cost >= 0);
-                    cost as usize
+                    cost as DefaultCost
                 })
                 .unwrap_or_else(|| TreeAdditiveCostModel {}.enode_cost(egraph, func, row))
         } else {
