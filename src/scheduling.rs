@@ -76,7 +76,7 @@ impl ScheduleState {
                     if self.schedulers.iter().any(|(n, _)| n == name) {
                         return Err(egglog::Error::ParseError(ParseError(
                             span.clone(),
-                            "Scheduler name already exists".into(),
+                            format!("Scheduler {name} already exists"),
                         )));
                     }
                     let scheduler =
@@ -136,22 +136,22 @@ impl ScheduleState {
                 Ok(run_report)
             }
             "saturate" => {
-                new_scope!(|| {
-                    let mut report = RunReport::default();
-                    loop {
+                let mut report = RunReport::default();
+                loop {
+                    let iter_report = new_scope!(|| {
                         let mut iter_report = RunReport::default();
                         for expr in exprs {
                             let res = self.run(egraph, expr)?;
                             iter_report.union(res);
                         }
-                        if !iter_report.updated {
-                            break;
-                        }
-                        report.union(iter_report);
+                        Ok(iter_report)
+                    })?;
+                    if !iter_report.updated {
+                        break;
                     }
-
-                    Ok(report)
-                })
+                    report.union(iter_report);
+                }
+                Ok(report)
             }
             "seq" => {
                 new_scope!(|| {
@@ -165,22 +165,25 @@ impl ScheduleState {
                 })
             }
             "repeat" => {
-                new_scope!(|| {
-                    match exprs.as_slice() {
-                        [Expr::Lit(_span, Literal::Int(n)), rest @ ..] => {
-                            let mut report = RunReport::default();
-                            for _ in 0..*n {
+                match exprs.as_slice() {
+                    [Expr::Lit(_span, Literal::Int(n)), rest @ ..] => {
+                        let mut report = RunReport::default();
+                        for _ in 0..*n {
+                            let sub_report = new_scope!(|| {
+                                let mut report = RunReport::default();
                                 // Recursively run the rest of the expressions
                                 for expr in rest {
                                     let res = self.run(egraph, expr)?;
                                     report.union(res);
                                 }
-                            }
-                            Ok(report)
+                                Ok(report)
+                            })?;
+                            report.union(sub_report);
                         }
-                        _ => err(),
+                        Ok(report)
                     }
-                })
+                    _ => err(),
+                }
             }
             _ => Err(egglog::Error::ParseError(ParseError(
                 span.clone(),
