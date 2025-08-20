@@ -7,7 +7,7 @@ You can use the egglog [Zulip](https://egraphs.zulipchat.com/#narrow/stream/3757
 
 ## Trying it out
 
-The easiest way to try out `egglog-experimental` is to use the [web demo](https://egraphs-good.github.io/egglog-demo), which builsd on top of latest egglog-experimental.
+The easiest way to try out `egglog-experimental` is to use the [web demo](https://egraphs-good.github.io/egglog-demo), which builds on top of latest egglog-experimental.
 
 To install egglog-experimental binary locally, you need to install `cargo` and run
 
