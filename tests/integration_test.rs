@@ -35,11 +35,11 @@ fn test_extract() {
         .unwrap();
 
     assert_eq!(result.len(), 5);
-    assert_eq!(result[0], "(Add (Num 1) (Num 1))");
-    assert_eq!(result[1], "(Num 2)");
-    assert_eq!(result[2], "(Add (Num 1) (Num 1))");
-    assert_eq!(result[3], "(Add (Num 1) (Num 1))");
-    assert_eq!(result[4], "(Sub (Num 5) (Num 3))");
+    assert_eq!(result[0].to_string(), "(Add (Num 1) (Num 1))\n");
+    assert_eq!(result[1].to_string(), "(Num 2)\n");
+    assert_eq!(result[2].to_string(), "(Add (Num 1) (Num 1))\n");
+    assert_eq!(result[3].to_string(), "(Add (Num 1) (Num 1))\n");
+    assert_eq!(result[4].to_string(), "(Sub (Num 5) (Num 3))\n");
 }
 
 #[test]
@@ -74,7 +74,7 @@ fn test_extract_set_cost_decls() {
             "(with-dynamic-cost
                 (datatype E (Add E E) (Sub E E :cost 200) (Num i64))
                 (constructor Mul (E E) E :cost 100)
-                (datatype* 
+                (datatype*
                   (E2 (Add2 E2 E2) (Sub2 E2 E2 :cost 200) (List VecE2) (Num2 i64))
                   (sort VecE2 (Vec E2))
                 )
