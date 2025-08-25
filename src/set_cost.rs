@@ -15,6 +15,12 @@ pub fn add_set_cost(egraph: &mut EGraph) {
     egraph
         .add_command("extract".into(), Arc::new(CustomExtract))
         .unwrap();
+    egraph
+        .add_command(
+            "enable-dynamic-cost".into(),
+            Arc::new(EnableCostsDeclarations),
+        )
+        .unwrap();
 }
 
 struct SetCost;
@@ -109,15 +115,8 @@ impl Macro<Vec<Command>> for SetCostDeclarations {
                     ..
                 } => {
                     if !*unextractable {
-                        let cost_table_name = get_cost_table_name(name);
-                        let mut cost_table_schema = schema.clone();
-                        cost_table_schema.output = "i64".into();
-                        cost_table_commands.push(Command::Function {
-                            span: span.clone(),
-                            name: cost_table_name,
-                            schema: cost_table_schema,
-                            merge: None,
-                        });
+                        let cmd = generate_cost_command(span.clone(), name, schema.input.clone());
+                        cost_table_commands.push(cmd);
                     }
                 }
                 _ => {
@@ -134,23 +133,47 @@ impl Macro<Vec<Command>> for SetCostDeclarations {
     }
 }
 
+struct EnableCostsDeclarations;
+
+/// Use (enable-dynamic-cost <function name>) to retroactively enable dynamic costs for a function.
+/// Will error if the function has dynamic cost already activated.
+impl UserDefinedCommand for EnableCostsDeclarations {
+    fn update(&self, egraph: &mut EGraph, args: &[Expr]) -> Result<(), Error> {
+        let span = args[0].span();
+        if let [GenericExpr::Lit(_, Literal::String(name))] = args {
+            let function = egraph.get_function(name).unwrap();
+            let input_sorts: Vec<_> = function
+                .schema()
+                .input
+                .iter()
+                .map(|s| s.name().to_string())
+                .collect();
+            egraph.run_program(vec![generate_cost_command(span, name, input_sorts)])?;
+            return Ok(());
+        }
+        Err(Error::ParseError(ParseError(
+            span,
+            "Must call as (enable-dynamic-cost <function name>)".to_string(),
+        )))
+    }
+}
+
 fn generate_cost_table_commands_from_variants(variants: &[Variant]) -> Vec<Command> {
     let commands = variants
         .iter()
-        .map(|v| {
-            let cost_table_name = get_cost_table_name(&v.name);
-            let cost_table_schema = Schema::new(v.types.clone(), "i64".into());
-
-            Command::Function {
-                span: v.span.clone(),
-                name: cost_table_name,
-                schema: cost_table_schema,
-                merge: None,
-            }
-        })
+        .map(|v| generate_cost_command(v.span.clone(), &v.name, v.types.clone()))
         .collect::<Vec<_>>();
 
     commands
+}
+
+fn generate_cost_command(span: Span, name: &String, input_sorts: Vec<String>) -> Command {
+    Command::Function {
+        span,
+        name: get_cost_table_name(name),
+        schema: Schema::new(input_sorts, "i64".into()),
+        merge: None,
+    }
 }
 
 fn get_cost_table_name(name: &str) -> String {

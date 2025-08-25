@@ -74,7 +74,7 @@ fn test_extract_set_cost_decls() {
             "(with-dynamic-cost
                 (datatype E (Add E E) (Sub E E :cost 200) (Num i64))
                 (constructor Mul (E E) E :cost 100)
-                (datatype* 
+                (datatype*
                   (E2 (Add2 E2 E2) (Sub2 E2 E2 :cost 200) (List VecE2) (Num2 i64))
                   (sort VecE2 (Vec E2))
                 )
@@ -84,6 +84,21 @@ fn test_extract_set_cost_decls() {
             (set-cost (Num2 2) 1000)
             (set-cost (Mul (Num 2) (Num 2)) 1000)
             (set-cost (Sub2 (Num2 2) (Num2 2)) 1000)",
+        )
+        .unwrap();
+}
+
+#[test]
+fn test_extract_enable_cost() {
+    let mut egraph = egglog_experimental::new_experimental_egraph();
+
+    egraph
+        .parse_and_run_program(
+            None,
+            "
+            (datatype E (Add E E) (Sub E E :cost 200) (Num i64))
+            (enable-dynamic-cost \"Num\")
+            (set-cost (Num 2) 1000)",
         )
         .unwrap();
 }
