@@ -141,7 +141,12 @@ impl UserDefinedCommand for EnableCostsDeclarations {
     fn update(&self, egraph: &mut EGraph, args: &[Expr]) -> Result<(), Error> {
         let span = args[0].span();
         if let [GenericExpr::Lit(_, Literal::String(name))] = args {
-            let function = egraph.get_function(name).unwrap();
+            let function = egraph.get_function(name).ok_or_else(|| {
+                Error::ParseError(ParseError(
+                    span.clone(),
+                    format!("Function not found: {name}"),
+                ))
+            })?;
             let input_sorts: Vec<_> = function
                 .schema()
                 .input
