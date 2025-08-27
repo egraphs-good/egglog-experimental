@@ -167,7 +167,7 @@ fn generate_cost_table_commands_from_variants(variants: &[Variant]) -> Vec<Comma
     commands
 }
 
-fn generate_cost_command(span: Span, name: &String, input_sorts: Vec<String>) -> Command {
+fn generate_cost_command(span: Span, name: &str, input_sorts: Vec<String>) -> Command {
     Command::Function {
         span,
         name: get_cost_table_name(name),
