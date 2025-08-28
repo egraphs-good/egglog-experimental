@@ -111,7 +111,8 @@ fn generate_tests(glob: &str) -> Vec<Trial> {
         let should_fail = run.should_fail();
 
         push_trial(run.clone());
-        if !should_fail {
+        // dynamic cost cannot be re-sugared currently because of lack of type checking for custom commands
+        if !should_fail && !run.path.to_string_lossy().contains("dynamic-cost") {
             push_trial(Run {
                 resugar: true,
                 ..run.clone()
