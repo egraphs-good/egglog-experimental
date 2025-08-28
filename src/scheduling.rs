@@ -1,7 +1,4 @@
-use std::{
-    collections::HashMap,
-    sync::{Arc, Mutex},
-};
+use std::{collections::HashMap, sync::Mutex};
 
 use egglog::{
     ast::{Expr, Fact, Facts, Literal, ParseError},
@@ -199,21 +196,6 @@ impl ScheduleState {
     }
 }
 
-#[derive(Debug, Clone)]
-struct RunExtendedScheduleOutput {
-    reports: Vec<RunReport>,
-}
-
-impl std::fmt::Display for RunExtendedScheduleOutput {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        writeln!(f, "Ran schedules:")?;
-        for report in &self.reports {
-            writeln!(f, "{}", report)?;
-        }
-        Ok(())
-    }
-}
-
 impl UserDefinedCommand for RunExtendedSchedule {
     fn update(
         &self,
@@ -221,13 +203,11 @@ impl UserDefinedCommand for RunExtendedSchedule {
         args: &[Expr],
     ) -> Result<Option<CommandOutput>, egglog::Error> {
         let mut schedule = ScheduleState::new();
-        let mut reports = Vec::new();
+        let mut report = RunReport::default();
         for arg in args {
-            reports.push(schedule.run(egraph, arg)?);
+            report.union(schedule.run(egraph, arg)?);
         }
-        Ok(Some(CommandOutput::UserDefined(Arc::new(
-            RunExtendedScheduleOutput { reports },
-        ))))
+        Ok(Some(CommandOutput::RunSchedule(report)))
     }
 }
 
