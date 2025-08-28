@@ -97,7 +97,7 @@ fn test_extract_enable_cost() {
             None,
             "
             (datatype E (Add E E) (Sub E E :cost 200) (Num i64))
-            (enable-dynamic-cost \"Num\")
+            (enable-dynamic-cost Num)
             (set-cost (Num 2) 1000)",
         )
         .unwrap();
