@@ -1,0 +1,7 @@
+(datatype Math (Var String) (Add Math Math))
+(enable-dynamic-cost Var)
+(let y (Var "y"))
+(let x (Var "x"))
+(union x (Add y y))
+(set-cost (Var "x") 100)
+(extract x)
