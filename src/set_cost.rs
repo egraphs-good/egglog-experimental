@@ -139,7 +139,7 @@ struct EnableCostsDeclarations;
 /// Use (enable-dynamic-cost <function name>) to retroactively enable dynamic costs for a function.
 /// Will error if the function has dynamic cost already activated.
 impl UserDefinedCommand for EnableCostsDeclarations {
-    fn update(&self, egraph: &mut EGraph, args: &[Expr]) -> Result<(), Error> {
+    fn update(&self, egraph: &mut EGraph, args: &[Expr]) -> Result<Option<CommandOutput>, Error> {
         let span = args[0].span();
         if let [GenericExpr::Var(_, name)] = args {
             let function = egraph.get_function(name).ok_or_else(|| {
@@ -155,7 +155,7 @@ impl UserDefinedCommand for EnableCostsDeclarations {
                 .map(|s| s.name().to_string())
                 .collect();
             egraph.run_program(vec![generate_cost_command(span, name, input_sorts)])?;
-            return Ok(());
+            return Ok(None);
         }
         Err(Error::ParseError(ParseError(
             span,
