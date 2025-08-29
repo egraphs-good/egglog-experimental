@@ -35,11 +35,11 @@ fn test_extract() {
         .unwrap();
 
     assert_eq!(result.len(), 5);
-    assert_eq!(result[0], "(Add (Num 1) (Num 1))");
-    assert_eq!(result[1], "(Num 2)");
-    assert_eq!(result[2], "(Add (Num 1) (Num 1))");
-    assert_eq!(result[3], "(Add (Num 1) (Num 1))");
-    assert_eq!(result[4], "(Sub (Num 5) (Num 3))");
+    assert_eq!(result[0].to_string(), "(Add (Num 1) (Num 1))\n");
+    assert_eq!(result[1].to_string(), "(Num 2)\n");
+    assert_eq!(result[2].to_string(), "(Add (Num 1) (Num 1))\n");
+    assert_eq!(result[3].to_string(), "(Add (Num 1) (Num 1))\n");
+    assert_eq!(result[4].to_string(), "(Sub (Num 5) (Num 3))\n");
 }
 
 #[test]

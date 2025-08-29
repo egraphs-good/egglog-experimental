@@ -4,7 +4,7 @@ use egglog::{
     ast::{Expr, Fact, Facts, Literal, ParseError},
     prelude::{query, run_ruleset},
     scheduler::{Scheduler, SchedulerId},
-    RunReport, UserDefinedCommand,
+    CommandOutput, RunReport, UserDefinedCommand,
 };
 use lazy_static::lazy_static;
 
@@ -52,9 +52,12 @@ impl ScheduleState {
         };
 
         if let Expr::Var(_, ruleset) = arg {
-            run_ruleset(egraph, ruleset.as_str())?;
-
-            return Ok(egraph.get_run_report().clone().unwrap());
+            let output = run_ruleset(egraph, ruleset.as_str())?;
+            assert!(output.len() == 1);
+            if let CommandOutput::RunSchedule(report) = &output[0] {
+                return Ok(report.clone());
+            }
+            panic!("Expected a RunSchedule, got {:?}", output[0]);
         }
 
         let Expr::Call(span, head, exprs) = arg else {
@@ -194,12 +197,17 @@ impl ScheduleState {
 }
 
 impl UserDefinedCommand for RunExtendedSchedule {
-    fn update(&self, egraph: &mut egglog::EGraph, args: &[Expr]) -> Result<(), egglog::Error> {
+    fn update(
+        &self,
+        egraph: &mut egglog::EGraph,
+        args: &[Expr],
+    ) -> Result<Option<CommandOutput>, egglog::Error> {
         let mut schedule = ScheduleState::new();
+        let mut report = RunReport::default();
         for arg in args {
-            schedule.run(egraph, arg)?;
+            report.union(schedule.run(egraph, arg)?);
         }
-        Ok(())
+        Ok(Some(CommandOutput::RunSchedule(report)))
     }
 }
 

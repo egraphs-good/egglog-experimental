@@ -22,9 +22,8 @@ impl Run {
             );
         } else {
             let mut egraph = new_experimental_egraph();
-            egraph.run_mode = RunMode::ShowDesugaredEgglog;
             let desugared_str = egraph
-                .parse_and_run_program(self.path.to_str().map(String::from), &program)
+                .resugar_program(self.path.to_str().map(String::from), &program)
                 .unwrap()
                 .join("\n");
 
@@ -39,22 +38,28 @@ impl Run {
     fn test_program(&self, filename: Option<String>, program: &str, message: &str) {
         let mut egraph = new_experimental_egraph();
         match egraph.parse_and_run_program(filename, program) {
-            Ok(msgs) => {
+            Ok(outputs) => {
                 if self.should_fail() {
                     panic!(
                         "Program should have failed! Instead, logged:\n {}",
-                        msgs.join("\n")
+                        outputs
+                            .iter()
+                            .map(|output| output.to_string())
+                            .collect::<Vec<_>>()
+                            .join("\n")
                     );
                 } else {
-                    for msg in msgs {
-                        println!("  {}", msg);
+                    for output in outputs {
+                        print!("  {}", output);
                     }
                     // Test graphviz dot generation
-                    let mut serialized = egraph.serialize(SerializeConfig {
-                        max_functions: Some(40),
-                        max_calls_per_function: Some(40),
-                        ..Default::default()
-                    });
+                    let mut serialized = egraph
+                        .serialize(SerializeConfig {
+                            max_functions: Some(40),
+                            max_calls_per_function: Some(40),
+                            ..Default::default()
+                        })
+                        .egraph;
                     serialized.to_dot();
                     // Also try splitting and inlining
                     serialized.split_classes(|id, _| egraph.from_node_id(id).is_primitive());

@@ -4,8 +4,9 @@ use egglog::{
     ast::*,
     extract::{CostModel, DefaultCost, Extractor, TreeAdditiveCostModel},
     util::FreshGen,
-    EGraph, Error, Term, TermDag, TypeError, UserDefinedCommand,
+    CommandOutput, EGraph, Error, Term, TermDag, TypeError, UserDefinedCommand,
 };
+use log::log_enabled;
 
 pub fn add_set_cost(egraph: &mut EGraph) {
     egraph
@@ -236,7 +237,11 @@ impl CostModel<DefaultCost> for DynamicCostModel {
 struct CustomExtract;
 
 impl UserDefinedCommand for CustomExtract {
-    fn update(&self, egraph: &mut EGraph, args: &[Expr]) -> Result<(), Error> {
+    fn update(
+        &self,
+        egraph: &mut EGraph,
+        args: &[Expr],
+    ) -> Result<Option<CommandOutput>, egglog::Error> {
         assert!(args.len() <= 2);
         let (sort, value) = egraph.eval_expr(&args[0])?;
         let n = args.get(1).map(|arg| egraph.eval_expr(arg)).transpose()?;
@@ -264,26 +269,15 @@ impl UserDefinedCommand for CustomExtract {
         );
         if n == 0 {
             if let Some((cost, term)) = extractor.extract_best(egraph, &mut termdag, value) {
-                // dont turn termdag into a string if we have messages disabled for performance reasons
-                if egraph.messages_enabled() {
-                    let extracted = termdag.to_string(&term);
-                    log::info!("extracted with cost {cost}: {extracted}");
-                    egraph.print_msg(extracted);
+                if log_enabled!(log::Level::Info) {
+                    log::info!("extracted with cost {cost}: {}", termdag.to_string(&term));
                 }
-                // TODO: egraph.extract_report is private
-                // A future implementation should make a egglog_experimental::EGraph
-                // that provides a similar set of methods and overrides its own extract_report.
-                //
-                // egraph.extract_report = Some(ExtractReport::Best {
-                //     termdag,
-                //     cost,
-                //     term,
-                // });
+                Ok(Some(CommandOutput::ExtractBest(termdag, cost, term)))
             } else {
-                return Err(Error::ExtractError(
+                Err(Error::ExtractError(
                     "Unable to find any valid extraction (likely due to subsume or delete)"
                         .to_string(),
-                ));
+                ))
             }
         } else {
             if n < 0 {
@@ -294,24 +288,8 @@ impl UserDefinedCommand for CustomExtract {
                 .iter()
                 .map(|e| e.1.clone())
                 .collect();
-            // Same as above, avoid turning termdag into a string if we have messages disabled for performance
-            if egraph.messages_enabled() {
-                log::info!("extracted variants:");
-                let mut msg = String::default();
-                msg += "(\n";
-                assert!(!terms.is_empty());
-                for expr in &terms {
-                    let str = termdag.to_string(expr);
-                    log::info!("   {str}");
-                    msg += &format!("   {str}\n");
-                }
-                msg += ")";
-                egraph.print_msg(msg);
-            }
-            // TODO: Same as above. EGraph::extract_report is private.
-            //
-            // egraph.extract_report = Some(ExtractReport::Variants { termdag, terms });
+            log::info!("extracted variants:");
+            Ok(Some(CommandOutput::ExtractVariants(termdag, terms)))
         }
-        Ok(())
     }
 }

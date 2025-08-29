@@ -4,8 +4,8 @@ version = 4
 
 [[package]]
 name = "add_primitive"
-version = "0.1.0"
-source = "git+https://github.com/egraphs-good/egglog.git?rev=5542549#55425498b92bab18fcf3ea35224e42e2ad0afff6"
+version = "1.0.0"
+source = "git+https://github.com/egraphs-good/egglog.git?rev=0be495630546acffbd545ba60feb9302281ce95c#0be495630546acffbd545ba60feb9302281ce95c"
 dependencies = [
  "quote",
  "syn 2.0.102",
@@ -135,6 +135,15 @@ name = "cast"
 version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "37b2a672a2cb129a2e41c10b1224bb368f9f37a2b16b612598138befd7b37eb5"
+
+[[package]]
+name = "cc"
+version = "1.2.33"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3ee0f8803222ba5a7e2777dd72ca451868909b1ac410621b676adf07280e9b5f"
+dependencies = [
+ "shlex",
+]
 
 [[package]]
 name = "cfg-if"
@@ -287,8 +296,8 @@ dependencies = [
 
 [[package]]
 name = "concurrency"
-version = "0.1.0"
-source = "git+https://github.com/egraphs-good/egglog-backend.git?rev=cd51d04#cd51d048f9ef8e0bd9eac2966c35e054ac5c8368"
+version = "1.0.0"
+source = "git+https://github.com/egraphs-good/egglog.git?rev=0be495630546acffbd545ba60feb9302281ce95c#0be495630546acffbd545ba60feb9302281ce95c"
 dependencies = [
  "arc-swap",
  "rayon",
@@ -296,8 +305,8 @@ dependencies = [
 
 [[package]]
 name = "core-relations"
-version = "0.1.0"
-source = "git+https://github.com/egraphs-good/egglog-backend.git?rev=cd51d04#cd51d048f9ef8e0bd9eac2966c35e054ac5c8368"
+version = "1.0.0"
+source = "git+https://github.com/egraphs-good/egglog.git?rev=0be495630546acffbd545ba60feb9302281ce95c#0be495630546acffbd545ba60feb9302281ce95c"
 dependencies = [
  "anyhow",
  "bumpalo",
@@ -461,8 +470,8 @@ checksum = "1c7a8fb8a9fbf66c1f703fe16184d10ca0ee9d23be5b4436400408ba54a95005"
 
 [[package]]
 name = "egglog"
-version = "0.5.0"
-source = "git+https://github.com/egraphs-good/egglog.git?rev=5542549#55425498b92bab18fcf3ea35224e42e2ad0afff6"
+version = "1.0.0"
+source = "git+https://github.com/egraphs-good/egglog.git?rev=0be495630546acffbd545ba60feb9302281ce95c#0be495630546acffbd545ba60feb9302281ce95c"
 dependencies = [
  "add_primitive",
  "chrono",
@@ -477,9 +486,11 @@ dependencies = [
  "indexmap",
  "lazy_static",
  "log",
+ "mimalloc",
  "num",
  "numeric-id",
  "ordered-float",
+ "rayon",
  "rustc-hash",
  "thiserror 2.0.12",
  "web-time",
@@ -487,8 +498,8 @@ dependencies = [
 
 [[package]]
 name = "egglog-bridge"
-version = "0.1.0"
-source = "git+https://github.com/egraphs-good/egglog-backend.git?rev=cd51d04#cd51d048f9ef8e0bd9eac2966c35e054ac5c8368"
+version = "1.0.0"
+source = "git+https://github.com/egraphs-good/egglog.git?rev=0be495630546acffbd545ba60feb9302281ce95c#0be495630546acffbd545ba60feb9302281ce95c"
 dependencies = [
  "anyhow",
  "core-relations",
@@ -843,6 +854,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d750af042f7ef4f724306de029d18836c26c1765a54a6a3f094cbd23a7267ffa"
 
 [[package]]
+name = "libmimalloc-sys"
+version = "0.1.43"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bf88cd67e9de251c1781dbe2f641a1a3ad66eaae831b8a2c38fbdc5ddae16d4d"
+dependencies = [
+ "cc",
+ "libc",
+]
+
+[[package]]
 name = "libtest-mimic"
 version = "0.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -880,6 +901,15 @@ name = "memchr"
 version = "2.7.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32a282da65faaf38286cf3be983213fcf1d2e2a58700e808f83f4ea9a4804bc0"
+
+[[package]]
+name = "mimalloc"
+version = "0.1.47"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b1791cbe101e95af5764f06f20f6760521f7158f69dbf9d6baf941ee1bf6bc40"
+dependencies = [
+ "libmimalloc-sys",
+]
 
 [[package]]
 name = "num"
@@ -966,8 +996,8 @@ dependencies = [
 
 [[package]]
 name = "numeric-id"
-version = "0.1.0"
-source = "git+https://github.com/egraphs-good/egglog-backend.git?rev=cd51d04#cd51d048f9ef8e0bd9eac2966c35e054ac5c8368"
+version = "1.0.0"
+source = "git+https://github.com/egraphs-good/egglog.git?rev=0be495630546acffbd545ba60feb9302281ce95c#0be495630546acffbd545ba60feb9302281ce95c"
 dependencies = [
  "lazy_static",
  "rayon",
@@ -1336,6 +1366,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "shlex"
+version = "1.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0fda2ff0d084019ba4d7c6f371c95d8fd75ce3524c3cb8fb653a3023f6323e64"
+
+[[package]]
 name = "sized-chunks"
 version = "0.6.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1480,8 +1516,8 @@ checksum = "5a5f39404a5da50712a4c1eecf25e90dd62b613502b7e925fd4e4d19b5c96512"
 
 [[package]]
 name = "union-find"
-version = "0.1.0"
-source = "git+https://github.com/egraphs-good/egglog-backend.git?rev=cd51d04#cd51d048f9ef8e0bd9eac2966c35e054ac5c8368"
+version = "1.0.0"
+source = "git+https://github.com/egraphs-good/egglog.git?rev=0be495630546acffbd545ba60feb9302281ce95c#0be495630546acffbd545ba60feb9302281ce95c"
 dependencies = [
  "concurrency",
  "crossbeam",
