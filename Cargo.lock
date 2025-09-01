@@ -480,7 +480,7 @@ dependencies = [
  "dyn-clone",
  "egglog-bridge",
  "egraph-serialize",
- "env_logger 0.11.8",
+ "env_logger",
  "hashbrown 0.15.4",
  "im-rc",
  "indexmap",
@@ -524,7 +524,6 @@ version = "0.1.0"
 dependencies = [
  "codspeed-criterion-compat",
  "egglog",
- "env_logger 0.10.2",
  "glob",
  "lazy_static",
  "libtest-mimic",
@@ -560,19 +559,6 @@ checksum = "186e05a59d4c50738528153b83b0b0194d3a29507dfec16eccd4b342903397d0"
 dependencies = [
  "log",
  "regex",
-]
-
-[[package]]
-name = "env_logger"
-version = "0.10.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4cd405aab171cb85d6735e5c8d9db038c17d3ca007a4d2c25f337935c3d90580"
-dependencies = [
- "humantime",
- "is-terminal",
- "log",
- "regex",
- "termcolor",
 ]
 
 [[package]]
@@ -721,12 +707,6 @@ name = "hermit-abi"
 version = "0.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "fc0fef456e4baa96da950455cd02c081ca953b141298e41db3fc7e36b1da849c"
-
-[[package]]
-name = "humantime"
-version = "2.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9b112acc8b3adf4b107a8ec20977da0273a8c386765a3ec0229bd500a1443f9f"
 
 [[package]]
 name = "im-rc"

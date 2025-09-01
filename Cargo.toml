@@ -12,8 +12,6 @@ egglog = { git = "https://github.com/egraphs-good/egglog.git", rev = "0be4956305
 
 num = "0.4.3"
 lazy_static = "1.4"
-
-env_logger = { version = "0.10", optional = true }
 log = "0.4"
 
 [dev-dependencies]
