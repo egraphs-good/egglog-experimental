@@ -7,13 +7,15 @@ edition = "2021"
 harness = false
 name = "files"
 
+[features]
+default = ["bin"]
+bin = ["egglog/bin"]
+
 [dependencies]
-egglog = { git = "https://github.com/egraphs-good/egglog.git", rev = "0be495630546acffbd545ba60feb9302281ce95c" }
+egglog = { git = "https://github.com/egraphs-good/egglog.git", rev = "0be495630546acffbd545ba60feb9302281ce95c", default-features = false }
 
 num = "0.4.3"
 lazy_static = "1.4"
-
-env_logger = { version = "0.10", optional = true }
 log = "0.4"
 
 [dev-dependencies]
