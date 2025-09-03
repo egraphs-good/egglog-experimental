@@ -16,12 +16,12 @@ fn test_extract() {
         (extract (Num 2))
 
         (push)
-        (set-cost (Add (Num 1) (Num 1)) 801)
+        (set-cost (Add (Num 1) (Num 1)) 800)
         (extract (Num 2))
         (pop)
 
         (push)
-        (set-cost (Add (Num 1) (Num 1)) 799)
+        (set-cost (Add (Num 1) (Num 1)) 798)
         (extract (Num 2))
         (pop)
 
