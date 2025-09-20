@@ -1,4 +1,5 @@
 use egglog::ast::*;
+use egglog_ast::span::Span;
 
 pub struct WithRuleset;
 
@@ -24,12 +25,8 @@ impl Macro<Vec<Command>> for WithRuleset {
                     .flatten()
                     .map(|cmd| {
                         Ok(match cmd {
-                            Command::Rule {
-                                ruleset: rule_ruleset,
-                                name,
-                                rule,
-                            } => {
-                                if !rule_ruleset.is_empty() {
+                            Command::Rule { rule } => {
+                                if !rule.ruleset.is_empty() {
                                     return Err(ParseError(
                                         rule.span,
                                         "expected rules in `with-ruleset` to have empty ruleset"
@@ -38,9 +35,10 @@ impl Macro<Vec<Command>> for WithRuleset {
                                 }
 
                                 Command::Rule {
-                                    ruleset: ruleset.clone(),
-                                    name,
-                                    rule,
+                                    rule: GenericRule {
+                                        ruleset: ruleset.clone(),
+                                        ..rule
+                                    },
                                 }
                             }
                             Command::Rewrite(rule_ruleset, rewrite, subsume) => {

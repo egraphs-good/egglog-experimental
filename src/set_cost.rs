@@ -1,10 +1,11 @@
+use egglog_ast::span::Span;
 use std::sync::Arc;
 
 use egglog::{
+    CommandOutput, EGraph, Error, Term, TermDag, TypeError, UserDefinedCommand,
     ast::*,
     extract::{CostModel, DefaultCost, Extractor, TreeAdditiveCostModel},
     util::FreshGen,
-    CommandOutput, EGraph, Error, Term, TermDag, TypeError, UserDefinedCommand,
 };
 use log::log_enabled;
 
@@ -136,7 +137,7 @@ impl Macro<Vec<Command>> for SetCostDeclarations {
 }
 
 fn generate_cost_table_commands_from_variants(variants: &[Variant]) -> Vec<Command> {
-    let commands = variants
+    variants
         .iter()
         .map(|v| {
             let cost_table_name = get_cost_table_name(&v.name);
@@ -149,9 +150,7 @@ fn generate_cost_table_commands_from_variants(variants: &[Variant]) -> Vec<Comma
                 merge: None,
             }
         })
-        .collect::<Vec<_>>();
-
-    commands
+        .collect::<Vec<_>>()
 }
 
 fn get_cost_table_name(name: &str) -> String {
