@@ -1,4 +1,5 @@
 use egglog::{ast::*, util::FreshGen};
+use egglog_ast::span::Span;
 
 pub struct For;
 
@@ -39,15 +40,13 @@ impl Macro<Vec<Command>> for For {
             span: span.clone(),
             head: Actions::new(action),
             body: query,
+            name: rulename,
+            ruleset: ruleset.clone(),
         };
 
         Ok(vec![
             Command::AddRuleset(span.clone(), ruleset.clone()),
-            Command::Rule {
-                name: rulename,
-                ruleset: ruleset.clone(),
-                rule,
-            },
+            Command::Rule { rule },
             Command::RunSchedule(Schedule::Run(
                 span.clone(),
                 RunConfig {

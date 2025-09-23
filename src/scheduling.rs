@@ -1,10 +1,10 @@
 use std::{collections::HashMap, sync::Mutex};
 
 use egglog::{
+    CommandOutput, RunReport, UserDefinedCommand,
     ast::{Expr, Fact, Facts, Literal, ParseError},
     prelude::{query, run_ruleset},
     scheduler::{Scheduler, SchedulerId},
-    CommandOutput, RunReport, UserDefinedCommand,
 };
 use lazy_static::lazy_static;
 
@@ -92,7 +92,7 @@ impl ScheduleState {
             },
             "run" | "run-with" => {
                 let mut scheduler = None;
-                let exprs = if head.as_str() == "run-with" {
+                let exprs: &[egglog::ast::Expr] = if head.as_str() == "run-with" {
                     let Expr::Var(_, ref scheduler_name) = exprs[0] else {
                         return err();
                     };
@@ -289,15 +289,14 @@ mod schedulers {
 
     impl BackOffScheduler {
         fn get_stats(&mut self, rule: String) -> &mut RuleStats {
-            let stats = self.stats.entry(rule).or_insert_with(|| RuleStats {
+            self.stats.entry(rule).or_insert_with(|| RuleStats {
                 times_applied: 0,
                 banned_until: 0,
                 times_banned: 0,
                 match_limit: self.default_match_limit,
                 ban_length: self.default_ban_length,
                 iteration: 0,
-            });
-            stats
+            })
         }
     }
 
