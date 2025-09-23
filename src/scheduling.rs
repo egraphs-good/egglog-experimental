@@ -92,22 +92,21 @@ impl ScheduleState {
             },
             "run" | "run-with" => {
                 let mut scheduler = None;
-                let exprs: &[egglog::ast::GenericExpr<String, String>] =
-                    if head.as_str() == "run-with" {
-                        let Expr::Var(_, ref scheduler_name) = exprs[0] else {
-                            return err();
-                        };
-                        scheduler = Some(
-                            self.schedulers
-                                .iter()
-                                .rfind(|(n, _)| n == scheduler_name)
-                                .unwrap()
-                                .1,
-                        );
-                        &exprs[1..]
-                    } else {
-                        &exprs[..]
+                let exprs: &[egglog::ast::Expr] = if head.as_str() == "run-with" {
+                    let Expr::Var(_, ref scheduler_name) = exprs[0] else {
+                        return err();
                     };
+                    scheduler = Some(
+                        self.schedulers
+                            .iter()
+                            .rfind(|(n, _)| n == scheduler_name)
+                            .unwrap()
+                            .1,
+                    );
+                    &exprs[1..]
+                } else {
+                    &exprs[..]
+                };
                 // Parsing
                 let (ruleset, rest) = match exprs.first() {
                     None => ("", exprs),
