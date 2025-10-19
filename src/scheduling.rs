@@ -129,14 +129,12 @@ impl ScheduleState {
                     }
                 }
 
-                let run_report = if let Some(scheduler) = scheduler {
+                if let Some(scheduler) = scheduler {
                     egraph.step_rules_with_scheduler(scheduler, ruleset)
                 } else {
                     // Running the ruleset
                     egraph.step_rules(ruleset)
-                };
-
-                Ok(run_report)
+                }
             }
             "saturate" => {
                 let mut report = RunReport::default();
