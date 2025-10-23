@@ -1,6 +1,5 @@
 use egglog::prelude::BaseSort;
 use egglog::sort::{BaseValues, Boxed, F, OrderedFloat};
-use egglog_ast::span::Span;
 use num::integer::Roots;
 use num::rational::Rational64;
 use num::traits::{CheckedAdd, CheckedDiv, CheckedMul, CheckedSub, One, Signed, ToPrimitive, Zero};
