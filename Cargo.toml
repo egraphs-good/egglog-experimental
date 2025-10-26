@@ -14,6 +14,7 @@ bin = ["egglog/bin"]
 [dependencies]
 egglog = { git = "https://github.com/egraphs-good/egglog.git", branch = "main", default-features = false }
 egglog-ast = { git = "https://github.com/egraphs-good/egglog.git", branch = "main", default-features = false }
+egglog-reports = { git = "https://github.com/egraphs-good/egglog.git", branch = "main", default-features = false }
 
 num = "0.4.3"
 lazy_static = "1.4"
