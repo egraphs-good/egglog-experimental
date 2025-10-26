@@ -1,11 +1,12 @@
 use std::{collections::HashMap, sync::Mutex};
 
 use egglog::{
-    CommandOutput, RunReport, UserDefinedCommand,
+    CommandOutput, UserDefinedCommand,
     ast::{Expr, Fact, Facts, Literal, ParseError},
     prelude::{query, run_ruleset},
     scheduler::{Scheduler, SchedulerId},
 };
+use egglog_reports::RunReport;
 use lazy_static::lazy_static;
 
 pub struct RunExtendedSchedule;
