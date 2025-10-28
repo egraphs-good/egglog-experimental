@@ -19,7 +19,7 @@
 // This should be in egglog:
 // (let p (smt-bool-const "p"))
 // (check (is-unsat "QF_UF" (and p (not p))))
-
+pub struct smt-bool-const
 // ; Integer arithmetic
 // (set-logic QF_LIA)
 // (declare-const x Int)
@@ -133,13 +133,13 @@ impl Debug for BackendValue {
 }
 
 #[derive(Debug)]
-pub struct SMTBackendSort;
+pub struct SMTBool;
 
-impl BaseSort for SMTBackendSort {
+impl BaseSort for SMTBool {
     type Base = BackendValue;
 
     fn name(&self) -> &str {
-        "SMTBackend"
+        "SMTBool"
     }
 
     fn reconstruct_termdag(&self, _: &BaseValues, _: Value, _: &mut TermDag) -> Term {
