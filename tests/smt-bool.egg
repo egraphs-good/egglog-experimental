@@ -1,0 +1,4 @@
+(let p (smt-bool-const "p"))
+(check (= (smt-bool-const "p") (smt-bool-const "p")))
+(check (!= (smt-bool-const "p") (smt-bool-const "q")))
+(extract p)
