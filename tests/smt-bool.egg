@@ -2,5 +2,5 @@
 (check (= (smt-bool-const "p") (smt-bool-const "p")))
 (check (!= (smt-bool-const "p") (smt-bool-const "q")))
 
-(check (smt-unsat (and p (not p))))
-(fail (check (smt-unsat (and p p))))
+(check (unsat (and p (not p))))
+(fail (check (unsat (and p p))))

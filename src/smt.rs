@@ -104,10 +104,10 @@ impl BaseSort for SMTBool {
             eg,
             "not" = |a: SMTBoolValue| -> SMTBoolValue { SMTBoolValue::Not(Box::new(a)) }
         );
-        // (smt-unsat (smt-bool-const "p") (smt-bool-const "q"))
+        // (unsat (smt-bool-const "p") (smt-bool-const "q"))
         add_primitive!(
             eg,
-            "smt-unsat" = [asserts: SMTBoolValue] -?> () { {
+            "unsat" = [asserts: SMTBoolValue] -?> () { {
                 let st = Storage::new();
                 let mut solver = Solver::new(&st, Z3Binary::new("z3").unwrap()).unwrap();
                 for b in asserts {
