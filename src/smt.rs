@@ -26,10 +26,10 @@ pub enum SMTBoolValue {
 impl SMTBoolValue {
     pub fn to_bool<'s>(&self, st: &'s Storage) -> Bool<'s> {
         match self {
-            SMTBoolValue::Const(name) => Bool::new_const(&st, name).into(),
-            SMTBoolValue::Or(a, b) => a.to_bool(&st) | (b.to_bool(&st)),
-            SMTBoolValue::And(a, b) => a.to_bool(&st) & (b.to_bool(&st)),
-            SMTBoolValue::Not(a) => !a.to_bool(&st),
+            SMTBoolValue::Const(name) => Bool::new_const(st, name).into(),
+            SMTBoolValue::Or(a, b) => a.to_bool(st) | (b.to_bool(st)),
+            SMTBoolValue::And(a, b) => a.to_bool(st) & (b.to_bool(st)),
+            SMTBoolValue::Not(a) => !a.to_bool(st),
         }
     }
 
