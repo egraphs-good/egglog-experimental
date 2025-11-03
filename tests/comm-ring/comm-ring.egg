@@ -1,0 +1,20 @@
+(datatype Expr
+  (Num i64)
+  (Var String)
+  (Add Expr Expr)
+  (Mul Expr Expr))
+
+; a simple expression that can be rewritten using CRing axioms
+; (x + y) * (x + y)
+(let e1 (Mul (Add (Var "x") (Var "y")) (Add (Var "x") (Var "y"))))
+
+; a rewriting of e1, written in a way to ensure distributivity, associativity,
+; commutativity, and negation are all used
+; x * x + (((y * --y) + (x * y)) + (y * x))
+(let e2 (Add (Mul (Var "x") (Var "x")) (Add (Add (Mul (Var "y") (Mul (Num -1) (Mul (Num -1) (Var "y")))) (Mul (Var "x") (Var "y"))) (Mul (Var "y") (Var "x")))))
+
+(comm-ring Expr (Num 0) (Num 1) (x (Mul (Num -1) x)) (x y (Add x y)) (x y (Mul x y)))
+
+(run-schedule (saturate (run)))
+
+(check (= e1 e2))
