@@ -17,6 +17,7 @@ pub fn new_experimental_egraph() -> EGraph {
     add_base_sort(&mut egraph, RationalSort, span!()).unwrap();
     egraph.parser.add_command_macro(Arc::new(For));
     egraph.parser.add_command_macro(Arc::new(WithRuleset));
+    egraph.parser.add_command_macro(Arc::new(CommRing));
 
     add_set_cost(&mut egraph);
 
