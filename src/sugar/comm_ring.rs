@@ -22,22 +22,22 @@ impl Macro<Vec<Command>> for CommRing {
         }
 
         let datatype = args[0].expect_atom("datatype").unwrap();
-        let zero = args[1];
-        let one = args[2];
+        let zero = &args[1];
+        let one = &args[2];
 
         let inv = args[3].expect_list("inverse").unwrap();
         let inv_v = inv[0].expect_atom("inverse");
-        let inv_body = inv[1];
+        let inv_body = &inv[1];
 
         let add = args[4].expect_list("inverse").unwrap();
         let add_v1 = add[0].expect_atom("add");
         let add_v2 = add[1].expect_atom("add");
-        let add_body = add[2];
+        let add_body = &add[2];
 
         let mul = args[5].expect_list("inverse").unwrap();
         let mul_v1 = mul[0].expect_atom("mul");
         let mul_v2 = mul[1].expect_atom("mul");
-        let mul_body = mul[2];
+        let mul_body = &mul[2];
 
         let cr_dt = parser.symbol_gen.fresh(&format!("cr_{datatype}_dt"));
         let cr_zero = parser.symbol_gen.fresh(&format!("cr_{datatype}_zero"));
@@ -88,9 +88,10 @@ impl Macro<Vec<Command>> for CommRing {
                         unextractable: true,
                     },
                 ],
-            }, // map between user-defined datatype and CRing
+            },
+            // map between user-defined datatype and CRing
 
-               // CRing axioms
+            // CRing axioms
         ]) // TODO: add rewrites for CRing axioms
     }
 }
