@@ -45,6 +45,7 @@ impl Macro<Vec<Command>> for CommRing {
         let cr_inv = parser.symbol_gen.fresh(&format!("cr_{datatype}_inv"));
         let cr_add = parser.symbol_gen.fresh(&format!("cr_{datatype}_add"));
         let cr_mul = parser.symbol_gen.fresh(&format!("cr_{datatype}_mul"));
+        let cr_of_orig = parser.symbol_gen.fresh(&format!("cr_{datatype}_crof"));
 
         Ok(vec![
             // create datatype for CRing
@@ -52,6 +53,13 @@ impl Macro<Vec<Command>> for CommRing {
                 span: span.clone(),
                 name: cr_dt.clone(),
                 variants: vec![
+                    Variant {
+                        span: span.clone(),
+                        name: cr_of_orig,
+                        types: vec![datatype],
+                        cost: None,
+                        unextractable: true,
+                    },
                     Variant {
                         span: span.clone(),
                         name: cr_zero,
