@@ -19,6 +19,8 @@ egglog-reports = { git = "https://github.com/egraphs-good/egglog.git", branch = 
 num = "0.4.3"
 lazy_static = "1.4"
 log = "0.4"
+smtlib = { version = "0.3.0" }
+smtlib-lowlevel = { version = "0.3.0" }
 
 [dev-dependencies]
 glob = "0.3.1"

@@ -12,6 +12,9 @@ pub use scheduling::*;
 mod set_cost;
 pub use set_cost::*;
 
+mod smt;
+pub use smt::*;
+
 pub fn new_experimental_egraph() -> EGraph {
     let mut egraph = EGraph::default();
     add_base_sort(&mut egraph, RationalSort, span!()).unwrap();
@@ -23,5 +26,7 @@ pub fn new_experimental_egraph() -> EGraph {
     egraph
         .add_command("run-schedule".into(), Arc::new(RunExtendedSchedule))
         .unwrap();
+
+    add_smt(&mut egraph);
     egraph
 }
