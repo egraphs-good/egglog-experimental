@@ -8,10 +8,12 @@ use egglog::{
 use egglog::{add_primitive, ast::Literal};
 use smtlib::backend::z3_binary::Z3Binary;
 use smtlib::terms::StaticSorted;
-use smtlib::{Bool, SatResult, Solver, Storage};
+use smtlib::{Bool, Int, SatResult, Solver, Sorted, Storage};
 use std::{fmt::Debug, hash::Hash};
 
 pub fn add_smt(egraph: &mut EGraph) {
+    // important to add ints as base sort before bools bc bools reference ints
+    add_base_sort(egraph, SMTInt, span!()).unwrap();
     add_base_sort(egraph, SMTBool, span!()).unwrap();
 }
 
@@ -21,6 +23,7 @@ pub enum SMTBoolValue {
     Or(Box<SMTBoolValue>, Box<SMTBoolValue>),
     And(Box<SMTBoolValue>, Box<SMTBoolValue>),
     Not(Box<SMTBoolValue>),
+    IntEq(Box<SMTIntValue>, Box<SMTIntValue>),
 }
 
 impl SMTBoolValue {
@@ -30,6 +33,7 @@ impl SMTBoolValue {
             SMTBoolValue::Or(a, b) => a.to_bool(st) | (b.to_bool(st)),
             SMTBoolValue::And(a, b) => a.to_bool(st) & (b.to_bool(st)),
             SMTBoolValue::Not(a) => !a.to_bool(st),
+            SMTBoolValue::IntEq(a, b) => a.to_int(st)._eq(b.to_int(st)),
         }
     }
 
@@ -52,6 +56,11 @@ impl SMTBoolValue {
             SMTBoolValue::Not(a) => {
                 let a_term = a.to_term(termdag);
                 termdag.app("not".into(), vec![a_term])
+            }
+            SMTBoolValue::IntEq(a, b) => {
+                let a_term = a.to_term(termdag);
+                let b_term = b.to_term(termdag);
+                termdag.app("smt-=".into(), vec![a_term, b_term])
             }
         }
     }
@@ -104,6 +113,13 @@ impl BaseSort for SMTBool {
             eg,
             "not" = |a: SMTBoolValue| -> SMTBoolValue { SMTBoolValue::Not(Box::new(a)) }
         );
+        // (= a b)
+        add_primitive!(
+            eg,
+            "smt-=" = |a: SMTIntValue, b: SMTIntValue| -> SMTBoolValue {
+                SMTBoolValue::IntEq(Box::new(a), Box::new(b))
+            }
+        );
         // (unsat (smt-bool-const "p") (smt-bool-const "q"))
         add_primitive!(
             eg,
@@ -119,6 +135,112 @@ impl BaseSort for SMTBool {
                     None
                 }
             }}
+        );
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum SMTIntValue {
+    Const(String),
+    Int64(i64),
+    Plus(Box<SMTIntValue>, Box<SMTIntValue>),
+    Minus(Box<SMTIntValue>, Box<SMTIntValue>),
+    Mult(Box<SMTIntValue>, Box<SMTIntValue>),
+}
+
+impl SMTIntValue {
+    pub fn to_int<'s>(&self, st: &'s Storage) -> Int<'s> {
+        match self {
+            SMTIntValue::Const(name) => Int::new_const(st, name).into(),
+            SMTIntValue::Int64(num) => Int::new(st, *num),
+            SMTIntValue::Plus(a, b) => a.to_int(st) + (b.to_int(st)),
+            SMTIntValue::Minus(a, b) => a.to_int(st) - (b.to_int(st)),
+            SMTIntValue::Mult(a, b) => a.to_int(st) * b.to_int(st),
+        }
+    }
+
+    pub fn to_term(&self, termdag: &mut TermDag) -> Term {
+        match self {
+            SMTIntValue::Const(name) => {
+                let arg = termdag.lit(Literal::String(name.clone()));
+                termdag.app("smt-int-const".into(), vec![arg])
+            }
+            SMTIntValue::Int64(value) => {
+                let arg = termdag.lit(Literal::Int(*value));
+                termdag.app("smt-int".into(), vec![arg])
+            }
+            SMTIntValue::Plus(a, b) => {
+                let a_term = a.to_term(termdag);
+                let b_term = b.to_term(termdag);
+                termdag.app("+".into(), vec![a_term, b_term])
+            }
+            SMTIntValue::Minus(a, b) => {
+                let a_term = a.to_term(termdag);
+                let b_term = b.to_term(termdag);
+                termdag.app("-".into(), vec![a_term, b_term])
+            }
+            SMTIntValue::Mult(a, b) => {
+                let a_term = a.to_term(termdag);
+                let b_term = b.to_term(termdag);
+                termdag.app("*".into(), vec![a_term, b_term])
+            }
+        }
+    }
+}
+
+impl BaseValue for SMTIntValue {}
+
+#[derive(Debug)]
+pub struct SMTInt;
+
+impl BaseSort for SMTInt {
+    type Base = SMTIntValue;
+
+    fn name(&self) -> &str {
+        "SMTInt"
+    }
+
+    fn reconstruct_termdag(
+        &self,
+        base_values: &BaseValues,
+        value: Value,
+        termdag: &mut TermDag,
+    ) -> Term {
+        let int = base_values.unwrap::<SMTIntValue>(value);
+        int.to_term(termdag)
+    }
+
+    fn register_primitives(&self, eg: &mut EGraph) {
+        // (smt-int-const "p")
+        add_primitive!(
+            eg,
+            "smt-int-const" = |value: S| -> SMTIntValue { { SMTIntValue::Const(value.0) } }
+        );
+        // (smt-int 1)
+        add_primitive!(
+            eg,
+            "smt-int" = |value: i64| -> SMTIntValue { { SMTIntValue::Int64(value) } }
+        );
+        // (+ b1 b2)
+        add_primitive!(
+            eg,
+            "+" = |a: SMTIntValue, b: SMTIntValue| -> SMTIntValue {
+                SMTIntValue::Plus(Box::new(a), Box::new(b))
+            }
+        );
+        // (- b1 b2)
+        add_primitive!(
+            eg,
+            "-" = |a: SMTIntValue, b: SMTIntValue| -> SMTIntValue {
+                SMTIntValue::Minus(Box::new(a), Box::new(b))
+            }
+        );
+        // (* a b)
+        add_primitive!(
+            eg,
+            "*" = |a: SMTIntValue, b: SMTIntValue| -> SMTIntValue {
+                SMTIntValue::Mult(Box::new(a), Box::new(b))
+            }
         );
     }
 }

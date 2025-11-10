@@ -4,3 +4,9 @@
 
 (check (unsat (and p (not p))))
 (fail (check (unsat (and p p))))
+
+(let x (smt-int-const "x"))
+(let y (smt-int-const "y"))
+
+(check (unsat (smt-= x (+ x (smt-int 1)))))
+(check (unsat (smt-= (- x y) (+ (- x y) (smt-int 1)))))
