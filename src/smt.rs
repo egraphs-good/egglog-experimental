@@ -529,6 +529,27 @@ impl BaseSort for SMTSolved {
                 }
             }}
         );
+        // (+ b1 b2)
+        add_primitive!(
+            eg,
+            "+" = |a: SMTIntValue, b: SMTIntValue| -> SMTIntValue {
+                SMTIntValue::Plus(Box::new(a), Box::new(b))
+            }
+        );
+        // (- b1 b2)
+        add_primitive!(
+            eg,
+            "-" = |a: SMTIntValue, b: SMTIntValue| -> SMTIntValue {
+                SMTIntValue::Minus(Box::new(a), Box::new(b))
+            }
+        );
+        // (* a b)
+        add_primitive!(
+            eg,
+            "*" = |a: SMTIntValue, b: SMTIntValue| -> SMTIntValue {
+                SMTIntValue::Mult(Box::new(a), Box::new(b))
+            }
+        );
     }
 }
 

@@ -24,6 +24,7 @@
 (check (= false (smt-sat? (smt-solve (smt-= x (+ x (smt-int 1)))))))
 
 
+<<<<<<< HEAD
 ; Getting values or models
 ; (set-option :print-success false)
 ; (set-option :produce-models true)
@@ -56,3 +57,14 @@
 (let p_model (smt-solve p))
 (check (= true (smt-sat? p_model)))
 (check (= true (smt-value p_model p)))
+=======
+(let x (smt-fn-int "x" "Int"))
+(let t (smt-fn-int "t" "Int"))
+(let y (smt-fn-int "y" "Int"))
+
+(let cond1 (smt-= (smt-call x (smt-int 0)) (smt-call t (smt-int 0))))
+(let cond2 (smt-= (smt-call y (smt-int 1)) (smt-call t (smt-int 0))))
+(let cond3 (smt-= (smt-call x (smt-int 1)) (smt-call y (smt-int 1))))
+
+(fail (check (unsat cond1 cond2 cond3)))
+>>>>>>> 3e668c0 (to_term)
