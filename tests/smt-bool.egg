@@ -45,7 +45,7 @@
 (let two (smt-int 2))
 (let twenty (smt-int 20))
 (let model (smt-solve (smt-= (+ x (* two y)) twenty)
-                   (smt-= (- x y) two)))
+        (smt-= (- x y) two)))
 (extract model)
 ; (smt-model (smt-value "x" 8) (smt-value "y" 6))
 (check (= true (smt-sat? model)))

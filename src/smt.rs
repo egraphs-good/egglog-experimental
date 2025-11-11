@@ -8,6 +8,8 @@ use egglog::{
 };
 use egglog::{add_primitive, ast::Literal};
 use smtlib::backend::z3_binary::Z3Binary;
+use smtlib::funs::Fun;
+use smtlib::sorts::Sort;
 use smtlib::terms::StaticSorted;
 use smtlib::{Bool, Int, Real, SatResultWithModel, Solver, Sorted, Storage};
 use smtlib_lowlevel::lexicon::Symbol;
