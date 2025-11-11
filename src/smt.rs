@@ -345,10 +345,7 @@ impl BaseSort for SMTSolved {
         let solved = base_values.unwrap::<SMTSolvedValue>(value);
         match &solved.0 {
             Some(model) => {
-                let args = model
-                    .into_iter()
-                    .map(|v| v.to_term(termdag))
-                    .collect::<Vec<_>>();
+                let args = model.iter().map(|v| v.to_term(termdag)).collect::<Vec<_>>();
                 termdag.app("smt-model".into(), args)
             }
             None => termdag.app("smt-unsat".into(), vec![]),
@@ -450,7 +447,7 @@ impl Constants {
     /**
      * Traverse a bool value and collect all constants
      */
-    fn bool(&mut self, v: SMTBoolValue) -> () {
+    fn bool(&mut self, v: SMTBoolValue) {
         match v {
             SMTBoolValue::Const(name) => {
                 self.bools.insert(name);
@@ -472,7 +469,7 @@ impl Constants {
     /**
      * Traverse an int value and collect all constants
      */
-    fn int(&mut self, v: SMTIntValue) -> () {
+    fn int(&mut self, v: SMTIntValue) {
         match v {
             SMTIntValue::Const(name) => {
                 self.ints.insert(name);
