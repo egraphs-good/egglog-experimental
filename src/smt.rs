@@ -1,3 +1,4 @@
+use crate::smt_real::{SMTReal, SMTRealValue};
 use egglog::sort::S;
 use egglog::{
     BaseValue, EGraph, Term, TermDag, Value,
@@ -14,6 +15,7 @@ use std::{fmt::Debug, hash::Hash};
 pub fn add_smt(egraph: &mut EGraph) {
     // important to add ints as base sort before bools bc bools reference ints
     add_base_sort(egraph, SMTInt, span!()).unwrap();
+    add_base_sort(egraph, SMTReal, span!()).unwrap();
     add_base_sort(egraph, SMTBool, span!()).unwrap();
 }
 
@@ -24,6 +26,7 @@ pub enum SMTBoolValue {
     And(Box<SMTBoolValue>, Box<SMTBoolValue>),
     Not(Box<SMTBoolValue>),
     IntEq(Box<SMTIntValue>, Box<SMTIntValue>),
+    RealEq(Box<SMTRealValue>, Box<SMTRealValue>),
 }
 
 impl SMTBoolValue {
@@ -34,6 +37,7 @@ impl SMTBoolValue {
             SMTBoolValue::And(a, b) => a.to_bool(st) & (b.to_bool(st)),
             SMTBoolValue::Not(a) => !a.to_bool(st),
             SMTBoolValue::IntEq(a, b) => a.to_int(st)._eq(b.to_int(st)),
+            SMTBoolValue::RealEq(a, b) => a.to_real(st)._eq(b.to_real(st)),
         }
     }
 
@@ -61,6 +65,11 @@ impl SMTBoolValue {
                 let a_term = a.to_term(termdag);
                 let b_term = b.to_term(termdag);
                 termdag.app("smt-=".into(), vec![a_term, b_term])
+            }
+            SMTBoolValue::RealEq(a, b) => {
+                let a_term = a.to_term(termdag);
+                let b_term = b.to_term(termdag);
+                termdag.app("smt-real-=".into(), vec![a_term, b_term])
             }
         }
     }
@@ -120,6 +129,14 @@ impl BaseSort for SMTBool {
                 SMTBoolValue::IntEq(Box::new(a), Box::new(b))
             }
         );
+        // (smt-real-= a b)
+        add_primitive!(
+            eg,
+            "smt-real-=" = |a: SMTRealValue, b: SMTRealValue| -> SMTBoolValue {
+                SMTBoolValue::RealEq(Box::new(a), Box::new(b))
+            }
+        );
+
         // (unsat (smt-bool-const "p") (smt-bool-const "q"))
         add_primitive!(
             eg,
