@@ -1,0 +1,28 @@
+(datatype Expr
+  (Num f64)
+  (Var String)
+  (Add Expr Expr)
+  (Mul Expr Expr)
+  (Smt SMTReal))
+
+(datatype Bool
+  (True)
+  (False)
+  (SmtBool SMTBool)
+  (Eq Expr Expr))
+
+(rewrite (Num i) (Smt (smt-real i)))
+(rewrite (Var x) (Smt (smt-real-const x)))
+(rewrite (Add (Smt x) (Smt y)) (Smt (+ x y)))
+(rewrite (Mul (Smt x) (Smt y)) (Smt (* x y)))
+
+(rule ((= x (SmtBool y)) (unsat y)) ((union x (False))))
+(rewrite (Eq (Smt e1) (Smt e2)) (SmtBool (smt-real-= e1 e2)))
+
+(let e1 (Mul (Var "x") (Num 2.0)))
+(let e2 (Add (Num 2.0) (Mul (Num 2.0) (Var "x"))))
+(let e3 (Eq e1 e2))
+
+(run 100)
+
+(extract e3)
