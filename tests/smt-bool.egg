@@ -1,12 +1,58 @@
+; https://smt-lib.org/examples.shtml
+
+; Basic Boolean example
+; (set-option :print-success false)
+; (set-logic QF_UF)
+; (declare-const p Bool)
+; (assert (and p (not p)))
+; (check-sat) ; returns 'unsat'
+; (exit)
 (let p (smt-bool-const "p"))
-(check (= (smt-bool-const "p") (smt-bool-const "p")))
-(check (!= (smt-bool-const "p") (smt-bool-const "q")))
+(check (= false (smt-sat? (smt-solve (and p (not p))))))
+(check (= true (smt-sat? (smt-solve (and p p)))))
 
-(check (unsat (and p (not p))))
-(fail (check (unsat (and p p))))
-
+; Integer arithmetic
+; (set-logic QF_LIA)
+; (declare-const x Int)
+; (declare-const y Int)
+; (assert (= (- x y) (+ x (- y) 1)))
+; (check-sat)
+; ; unsat
+; (exit)
 (let x (smt-int-const "x"))
 (let y (smt-int-const "y"))
+(check (= false (smt-sat? (smt-solve (smt-= x (+ x (smt-int 1)))))))
 
-(check (unsat (smt-= x (+ x (smt-int 1)))))
-(check (unsat (smt-= (- x y) (+ (- x y) (smt-int 1)))))
+
+; Getting values or models
+; (set-option :print-success false)
+; (set-option :produce-models true)
+; (set-logic QF_LIA)
+; (declare-const x Int)
+; (declare-const y Int)
+; (assert (= (+ x (* 2 y)) 20))
+; (assert (= (- x y) 2))
+; (check-sat)
+; ; sat
+; (get-value (x y))
+; ; ((x 8) (y 6))
+; (get-model)
+; ; ((define-fun x () Int 8)
+; ;  (define-fun y () Int 6)
+; ; )
+; (exit)
+
+(let two (smt-int 2))
+(let twenty (smt-int 20))
+(let model (smt-solve (smt-= (+ x (* two y)) twenty)
+                   (smt-= (- x y) two)))
+(extract model)
+; (smt-model (smt-value "x" 8) (smt-value "y" 6))
+(check (= true (smt-sat? model)))
+(check (= 8 (smt-value model x)))
+(check (= 6 (smt-value model y)))
+
+;; verify that getting boolean values from model works
+(let p_model (smt-solve p))
+(check (= true (smt-sat? p_model)))
+(check (= true (smt-value p_model p)))
