@@ -1,5 +1,5 @@
 use crate::smt_real::{SMTReal, SMTRealValue};
-use egglog::sort::S;
+use egglog::sort::{F, OrderedFloat, S};
 use egglog::{
     BaseValue, EGraph, Term, TermDag, Value,
     prelude::{BaseSort, RustSpan, Span, add_base_sort},
@@ -9,7 +9,7 @@ use egglog::{
 use egglog::{add_primitive, ast::Literal};
 use smtlib::backend::z3_binary::Z3Binary;
 use smtlib::terms::StaticSorted;
-use smtlib::{Bool, Int, SatResultWithModel, Solver, Sorted, Storage};
+use smtlib::{Bool, Int, Real, SatResultWithModel, Solver, Sorted, Storage};
 use smtlib_lowlevel::lexicon::Symbol;
 use std::collections::BTreeSet;
 use std::{fmt::Debug, hash::Hash};
@@ -259,6 +259,7 @@ impl BaseSort for SMTInt {
 pub enum SMTTerm {
     Bool(bool),
     Int(i64),
+    Real(OrderedFloat<f64>),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -270,6 +271,7 @@ impl SMTValueValue {
         let term_term = match &self.1 {
             SMTTerm::Bool(b) => termdag.lit(Literal::Bool(*b)),
             SMTTerm::Int(i) => termdag.lit(Literal::Int(*i)),
+            SMTTerm::Real(f) => termdag.lit(Literal::Float(*f)),
         };
         termdag.app("smt-value".into(), vec![name_term, term_term])
     }
@@ -338,6 +340,21 @@ impl SMTSolvedValue {
         }
         None
     }
+
+    pub fn get_real_value(&self, expr: SMTRealValue) -> Option<OrderedFloat<f64>> {
+        if let SMTRealValue::Const(name) = expr {
+            if let Some(vals) = &self.0 {
+                for v in vals {
+                    if let SMTTerm::Real(f) = &v.1 {
+                        if v.0 == name {
+                            return Some(*f);
+                        }
+                    }
+                }
+            }
+        }
+        None
+    }
 }
 
 impl BaseValue for SMTSolvedValue {}
@@ -399,6 +416,12 @@ impl BaseSort for SMTSolved {
                model.get_int_value(c)
             } }
         );
+        add_primitive!(
+            eg,
+            "smt-value" = |model: SMTSolvedValue, c: SMTRealValue| -?> F { {
+               Some(F::from(model.get_real_value(c)?))
+            } }
+        );
         // (smt-solve (smt-bool-const "p") (smt-bool-const "q"))
         add_primitive!(
             eg,
@@ -417,28 +440,31 @@ impl BaseSort for SMTSolved {
                         }
                         let mut values = vec![];
                         for name in constants.bools {
-                            let term = match model.eval(Bool::new_const(&st, &name)).unwrap().term() {
-                                smtlib_lowlevel::ast::Term::Identifier(smtlib_lowlevel::ast::QualIdentifier::Identifier(smtlib_lowlevel::ast::Identifier::Simple(Symbol(s)))) => {
-                                    if *s == "true" {
-                                        SMTTerm::Bool(true)
-                                    } else if *s == "false" {
-                                        SMTTerm::Bool(false)
-                                    } else {
-                                        panic!("Expected bool literal");
-                                    }
-                                }
-                                _ => panic!("Expected bool literal"),
+                            let Some(term) = model.eval(Bool::new_const(&st, &name)) else {
+                                continue;
                             };
-                            values.push(SMTValueValue(name, term));
+                            let smtlib_lowlevel::ast::Term::Identifier(smtlib_lowlevel::ast::QualIdentifier::Identifier(smtlib_lowlevel::ast::Identifier::Simple(Symbol(s)))) = term.term() else {
+                                panic!("Expected bool literal");
+                            };
+                            values.push(SMTValueValue(name, SMTTerm::Bool(s.parse().unwrap())));
                         }
                         for name in constants.ints {
-                            let term = match model.eval(Int::new_const(&st, &name)).unwrap().term() {
-                                smtlib_lowlevel::ast::Term::SpecConstant(smtlib_lowlevel::ast::SpecConstant::Numeral(n)) => {
-                                    SMTTerm::Int(n.into_u128().unwrap().try_into().unwrap())
-                                }
-                                _ => panic!("Expected int literal"),
+                            let Some(term) = model.eval(Int::new_const(&st, &name)) else {
+                                continue;
                             };
-                            values.push(SMTValueValue(name, term));
+                            let smtlib_lowlevel::ast::Term::SpecConstant(smtlib_lowlevel::ast::SpecConstant::Numeral(n)) = term.term() else {
+                                panic!("Expected int literal");
+                            };
+                            values.push(SMTValueValue(name, SMTTerm::Int(n.into_u128().unwrap().try_into().unwrap())));
+                        }
+                        for name in constants.reals {
+                            let Some(term) = model.eval(Real::new_const(&st, &name)) else {
+                                continue;
+                            };
+                            let smtlib_lowlevel::ast::Term::SpecConstant(smtlib_lowlevel::ast::SpecConstant::Decimal(d)) = term.term() else {
+                                panic!("Expected real literal");
+                            };
+                            values.push(SMTValueValue(name, SMTTerm::Real(OrderedFloat(d.0.parse::<f64>().unwrap()))));
                         }
                         SMTSolvedValue(Some(values))
                     }
@@ -457,6 +483,7 @@ impl BaseSort for SMTSolved {
 struct Constants {
     bools: BTreeSet<String>,
     ints: BTreeSet<String>,
+    reals: BTreeSet<String>,
 }
 
 impl Constants {
@@ -479,6 +506,10 @@ impl Constants {
                 self.int(*a);
                 self.int(*b);
             }
+            SMTBoolValue::RealEq(a, b) => {
+                self.real(*a);
+                self.real(*b);
+            }
         }
     }
 
@@ -494,6 +525,25 @@ impl Constants {
             SMTIntValue::Plus(a, b) | SMTIntValue::Minus(a, b) | SMTIntValue::Mult(a, b) => {
                 self.int(*a);
                 self.int(*b);
+            }
+        }
+    }
+
+    fn real(&mut self, v: SMTRealValue) {
+        match v {
+            SMTRealValue::Const(name) => {
+                self.reals.insert(name);
+            }
+            SMTRealValue::Float64(_) => {}
+            SMTRealValue::Add(a, b)
+            | SMTRealValue::Sub(a, b)
+            | SMTRealValue::Mul(a, b)
+            | SMTRealValue::Div(a, b) => {
+                self.real(*a);
+                self.real(*b);
+            }
+            SMTRealValue::Neg(a) => {
+                self.real(*a);
             }
         }
     }
