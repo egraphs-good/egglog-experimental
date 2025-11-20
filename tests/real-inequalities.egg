@@ -1,0 +1,52 @@
+(datatype Expr
+  (Num f64)
+  (Var String)
+  (Add Expr Expr)
+  (Mul Expr Expr)
+  (Smt SMTReal))
+
+(datatype Bool
+  (Bool_ bool)
+  (SmtBool SMTBool)
+  (Lt Expr Expr)
+  (Gt Expr Expr)
+  (Lte Expr Expr)
+  (Gte Expr Expr))
+
+(rewrite (Num i) (Smt (smt-real i)))
+(rewrite (Var x) (Smt (smt-real-const x)))
+(rewrite (Add (Smt x) (Smt y)) (Smt (+ x y)))
+(rewrite (Mul (Smt x) (Smt y)) (Smt (* x y)))
+(rewrite (Lt (Smt e1) (Smt e2)) (SmtBool (smt-real-< e1 e2)))
+(rewrite (Gt (Smt e1) (Smt e2)) (SmtBool (smt-real-> e1 e2)))
+(rewrite (Lte (Smt e1) (Smt e2)) (SmtBool (smt-real-<= e1 e2)))
+(rewrite (Gte (Smt e1) (Smt e2)) (SmtBool (smt-real->= e1 e2)))
+(rewrite (SmtBool y) (Bool_ (smt-sat? (smt-solve y))))
+
+(let x (Var "x"))
+(let two (Num 2.0))
+(let three (Num 3.0))
+
+; SAT
+(let test1 (Lt x three))
+(let test2 (Gt three two))
+(let test3 (Lte two x))
+(let test4 (Gte (Mul three x) (Mul two x)))
+
+; UNSAT
+(let test5 (Lt x x))
+(let test6 (Gt (Add (Mul three x) two) (Add (Mul three x) three)))
+(let test7 (Lte (Add three x) (Add two x)))
+(let test8 (Gte (Add three two) (Mul three two)))
+
+
+(run 100)
+
+(check (= test1 (Bool_ true)))
+(check (= test2 (Bool_ true)))
+(check (= test3 (Bool_ true)))
+(check (= test4 (Bool_ true)))
+(check (= test5 (Bool_ false)))
+(check (= test6 (Bool_ false)))
+(check (= test7 (Bool_ false)))
+(check (= test8 (Bool_ false)))
