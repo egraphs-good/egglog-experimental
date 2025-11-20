@@ -13,7 +13,9 @@ mod set_cost;
 pub use set_cost::*;
 
 mod smt;
+mod smt_real;
 pub use smt::*;
+pub use smt_real::*;
 
 pub fn new_experimental_egraph() -> EGraph {
     let mut egraph = EGraph::default();

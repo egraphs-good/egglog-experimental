@@ -1348,8 +1348,7 @@ checksum = "67b1b7a3b5fe4f1376887184045fcf45c69e92af734b7aaddc05fb777b6fbd03"
 [[package]]
 name = "smtlib"
 version = "0.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "516ce9fd6e1ac140108629c5039128abd5b3f116ed75861bd1fbbdc20c0d37bf"
+source = "git+https://github.com/noahhuck/smtlib-rs.git?branch=real-builtin#563d52ef89c0ca90cb2545ff50850c2bbb67a162"
 dependencies = [
  "indexmap",
  "itertools",
@@ -1361,8 +1360,7 @@ dependencies = [
 [[package]]
 name = "smtlib-lowlevel"
 version = "0.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2e48ee399efb51e84d25d4ac02b7e61141f47781d84d8bfc934b8791b30f6c52"
+source = "git+https://github.com/noahhuck/smtlib-rs.git?branch=real-builtin#563d52ef89c0ca90cb2545ff50850c2bbb67a162"
 dependencies = [
  "bumpalo",
  "itertools",
