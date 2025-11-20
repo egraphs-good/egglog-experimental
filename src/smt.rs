@@ -547,7 +547,7 @@ fn extract_real_value(term: &smtlib_lowlevel::ast::Term) -> f64 {
             ) = identifier
             {
                 if *op == "-" && arguments.len() == 1 {
-                    return -extract_real_value(&arguments[0]);
+                    return -extract_real_value(arguments[0]);
                 }
             }
             // Rational numbers: (/ 1 3) represents 1/3
@@ -556,8 +556,8 @@ fn extract_real_value(term: &smtlib_lowlevel::ast::Term) -> f64 {
             ) = identifier
             {
                 if *op == "/" && arguments.len() == 2 {
-                    let numerator = extract_real_value(&arguments[0]);
-                    let denominator = extract_real_value(&arguments[1]);
+                    let numerator = extract_real_value(arguments[0]);
+                    let denominator = extract_real_value(arguments[1]);
                     return numerator / denominator;
                 }
             }
