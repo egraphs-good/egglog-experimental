@@ -1,10 +1,5 @@
 use egglog::sort::S;
-use egglog::{
-    BaseValue, EGraph, Term, TermDag, Value,
-    prelude::{BaseSort, RustSpan, Span, add_base_sort},
-    sort::BaseValues,
-    span,
-};
+use egglog::{BaseValue, EGraph, Term, TermDag, Value, prelude::BaseSort, sort::BaseValues};
 use egglog::{
     add_primitive,
     ast::Literal,
@@ -13,10 +8,6 @@ use egglog::{
 use smtlib::terms::{IntoWithStorage, StaticSorted};
 use smtlib::{Real, Storage};
 use std::{fmt::Debug, hash::Hash};
-
-pub fn add_smt_real(egraph: &mut EGraph) {
-    add_base_sort(egraph, SMTReal, span!()).unwrap();
-}
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum SMTRealValue {
