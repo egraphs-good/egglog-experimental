@@ -224,7 +224,7 @@ impl SMTIntValue {
             SMTIntValue::Mult(a, b) => a.to_int(st, solver) * b.to_int(st, solver),
             SMTIntValue::FuncApplication(func, args) => {
                 let smt_fun = func.to_uf(st);
-                solver.declare_fun(&smt_fun);
+                let _ = solver.declare_fun(&smt_fun);
                 smt_fun
                     .call(
                         &args
