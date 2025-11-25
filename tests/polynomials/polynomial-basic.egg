@@ -1,0 +1,107 @@
+; Given two polynomials, egglog should be able to confirm they are identical.
+
+; The polynomial datatype
+(datatype Polynomial
+  (Zero) ; (Zero) := 0, which = (Coefficient 0.0 x) for any x
+  (One) ; (One) := 1, which = (Power x 0) for any x
+  (Var String) ; (Var "x") := x
+  (Add Polynomial Polynomial) ; (Add p1 p2) := p1 + p2
+  (Mul Polynomial Polynomial) ; (Mul p1 p2) := p1 * p2
+  (Coefficient f64 Polynomial) ; (Coefficient n p) := n * p
+  (Power Polynomial i64)) ; (Power p e) := p ^ e
+
+; Associativity rules
+(rewrite (Add (Add a b) c) (Add a (Add b c)))
+(rewrite (Mul (Mul a b) c) (Mul a (Mul b c)))
+
+; Commutativity rules
+(rewrite (Add a b) (Add b a))
+(rewrite (Mul a b) (Mul b a))
+
+; Distributivity rules
+(birewrite (Mul a (Add b c)) (Add (Mul a b) (Mul a c)))
+(birewrite (Mul (Add a b) c) (Add (Mul a c) (Mul b c)))
+
+; Identity elements
+(rewrite (Add a (Zero)) a)
+(rewrite (Add (Zero) a) a)
+(rewrite (Mul a (One)) a)
+(rewrite (Mul (One) a) a)
+
+; Zero element
+(rewrite (Mul a (Zero)) (Zero))
+(rewrite (Mul (Zero) a) (Zero))
+
+; Coefficient rules
+(rewrite (Coefficient c1 (Coefficient c2 p)) (Coefficient (* c1 c2) p))
+(rewrite (Coefficient 0.0 p) (Zero))
+(rewrite (Coefficient 1.0 p) p)
+(rewrite (Add a a) (Coefficient 2.0 a))
+
+; Power rules
+(rewrite (Power p 0) (One))
+(rewrite (Power p 1) p)
+(rewrite (Power (Power p n1) n2) (Power p (* n1 n2)))
+
+; Coefficient distribution over addition
+(rewrite (Coefficient c (Add a b)) (Add (Coefficient c a) (Coefficient c b)))
+
+; Multiplication of coefficients
+(rewrite (Mul (Coefficient c1 p1) (Coefficient c2 p2)) (Coefficient (* c1 c2) (Mul p1 p2)))
+
+; Power expansion rule - general rule for expanding (expr)^n where n > 1
+(rule ((Power p n) (> n 1))
+  ((union (Power p n) (Mul p (Power p (- n 1))))))
+
+; More coefficient rules for combining like terms
+(rewrite (Add (Coefficient c1 p) (Coefficient c2 p)) (Coefficient (+ c1 c2) p))
+
+; Coefficient multiplication with variables
+(rewrite (Mul (Coefficient c p1) p2) (Coefficient c (Mul p1 p2)))
+(rewrite (Mul p1 (Coefficient c p2)) (Coefficient c (Mul p1 p2)))
+
+; Rule for multiplying powers of same variable
+(rewrite (Mul (Power (Var x) n1) (Power (Var x) n2)) (Power (Var x) (+ n1 n2)))
+(rewrite (Mul (Power (Var x) n) (Var x)) (Power (Var x) (+ n 1)))
+(rewrite (Mul (Var x) (Power (Var x) n)) (Power (Var x) (+ n 1)))
+(rewrite (Mul (Var x) (Var x)) (Power (Var x) 2))
+
+; Additional normalization rules
+(rewrite (Add p (Coefficient c p)) (Coefficient (+ 1.0 c) p))
+(rewrite (Add (Coefficient c p) p) (Coefficient (+ c 1.0) p))
+
+; Original polynomial: (x + y)^3 + (x - z)^2 + 3xy^2z - 2w^2
+(let e1 (Add
+    (Add
+      (Add
+        (Power
+          (Add (Var "x") (Var "y"))
+          3)
+        (Power
+          (Add (Var "x") (Coefficient -1.0 (Var "z")))
+          2))
+      (Coefficient 3.0 (Mul (Var "x") (Mul (Power (Var "y") 2) (Var "z")))))
+    (Coefficient -2.0 (Power (Var "w") 2))))
+
+; The simplified/expanded form of e1: x^3 + 3x^2y + 3xy^2 + y^3 + x^2 - 2xz + z^2 + 3xy^2z - 2w^2
+(let e2 (Add
+    (Add
+      (Add
+        (Add
+          (Add
+            (Add
+              (Add
+                (Add
+                  (Power (Var "x") 3)
+                  (Coefficient 3.0 (Mul (Power (Var "x") 2) (Var "y"))))
+                (Coefficient 3.0 (Mul (Var "x") (Power (Var "y") 2))))
+              (Power (Var "y") 3))
+            (Power (Var "x") 2))
+          (Coefficient -2.0 (Mul (Var "x") (Var "z"))))
+        (Power (Var "z") 2))
+      (Coefficient 3.0 (Mul (Var "x") (Mul (Power (Var "y") 2) (Var "z")))))
+    (Coefficient -2.0 (Power (Var "w") 2))))
+
+(run-schedule (saturate (run)))
+
+(check (= e1 e2))
