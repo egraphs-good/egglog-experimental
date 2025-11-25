@@ -50,7 +50,7 @@ impl Run {
                     );
                 } else {
                     for output in outputs {
-                        print!("  {}", output);
+                        print!("  {output}");
                     }
                     // Test graphviz dot generation
                     let mut serialized = egraph
@@ -69,7 +69,7 @@ impl Run {
             }
             Err(err) => {
                 if !self.should_fail() {
-                    panic!("{}: {err}", message)
+                    panic!("{message}: {err}")
                 }
             }
         };
