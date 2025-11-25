@@ -23,8 +23,39 @@
 (let y (smt-int-const "y"))
 (check (= false (smt-sat? (smt-solve (smt-= x (+ x (smt-int 1)))))))
 
+; Uninterpreted functions
+; (declare-fun x (Int) Int)  (declare-fun y (Int) Int)
+; (declare-fun t (Int) Int)
+; (assert (= (t 0) (x 0)))
+; (assert (= (y 1) (t 0)))
+; (assert (= (x 1) (y 1)))
 
-<<<<<<< HEAD
+; (assert (not 
+;   (and (= (x 1) (y 0)) 
+;        (= (y 1) (x 0)))))
+; (check-sat)
+; (get-value ((x 0) (y 0) (x 1) (y 1)))
+(let x_fun (smt-fn-int "x" "Int"))
+(let t_fun (smt-fn-int "t" "Int"))
+(let y_fun (smt-fn-int "y" "Int"))
+
+(let false_cond1 (smt-= (smt-call x_fun (smt-int 0)) (smt-int 0)))
+(let false_cond2 (smt-= (smt-call x_fun (smt-int 0)) (smt-int 1)))
+(let uf_false_model (smt-solve false_cond1 false_cond2))
+(check (= false (smt-sat? uf_false_model)))
+
+(let cond1 (smt-= (smt-call x_fun (smt-int 0)) (smt-call t_fun (smt-int 0))))
+(let cond2 (smt-= (smt-call y_fun (smt-int 1)) (smt-call t_fun (smt-int 0))))
+(let cond3 (smt-= (smt-call x_fun (smt-int 1)) (smt-call y_fun (smt-int 1))))
+
+(let cond4 (not (and (smt-= (smt-call x_fun (smt-int 1)) (smt-call y_fun (smt-int 0)))
+            (smt-= (smt-call y_fun (smt-int 1)) (smt-call x_fun (smt-int 0))))))
+
+(let f_model (smt-solve cond1 cond2 cond3 cond4))
+(check (= true (smt-sat? f_model)))
+(extract f_model)
+
+
 ; Getting values or models
 ; (set-option :print-success false)
 ; (set-option :produce-models true)
@@ -57,14 +88,3 @@
 (let p_model (smt-solve p))
 (check (= true (smt-sat? p_model)))
 (check (= true (smt-value p_model p)))
-=======
-(let x (smt-fn-int "x" "Int"))
-(let t (smt-fn-int "t" "Int"))
-(let y (smt-fn-int "y" "Int"))
-
-(let cond1 (smt-= (smt-call x (smt-int 0)) (smt-call t (smt-int 0))))
-(let cond2 (smt-= (smt-call y (smt-int 1)) (smt-call t (smt-int 0))))
-(let cond3 (smt-= (smt-call x (smt-int 1)) (smt-call y (smt-int 1))))
-
-(fail (check (unsat cond1 cond2 cond3)))
->>>>>>> 3e668c0 (to_term)
