@@ -19,8 +19,8 @@ egglog-reports = { git = "https://github.com/egraphs-good/egglog.git", branch = 
 num = "0.4.3"
 lazy_static = "1.4"
 log = "0.4"
-smtlib = { git="https://github.com/noahhuck/smtlib-rs.git", branch="real-builtin" }
-smtlib-lowlevel = { git="https://github.com/noahhuck/smtlib-rs.git", branch="real-builtin" }
+smtlib = { git = "https://github.com/noahhuck/smtlib-rs.git", branch = "real-builtin" }
+smtlib-lowlevel = { git = "https://github.com/noahhuck/smtlib-rs.git", branch = "real-builtin" }
 
 [dev-dependencies]
 glob = "0.3.1"

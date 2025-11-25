@@ -1,21 +1,26 @@
 use crate::smt_real::{SMTReal, SMTRealValue};
-use egglog::sort::{F, OrderedFloat, S};
+use egglog::constraint::{self, Constraint, TypeConstraint};
+use egglog::sort::{BaseValues, Boxed, F, OrderedFloat, S};
+use egglog::{ArcSort, AtomTerm, ExecutionState, Primitive, TypeInfo};
 use egglog::{
     BaseValue, EGraph, Term, TermDag, Value,
     prelude::{BaseSort, RustSpan, Span, add_base_sort},
-    sort::BaseValues,
     span,
 };
 use egglog::{add_primitive, ast::Literal};
 use smtlib::backend::z3_binary::Z3Binary;
+use smtlib::funs::Fun;
+use smtlib::sorts::Sort;
 use smtlib::terms::StaticSorted;
 use smtlib::{Bool, Int, Real, SatResultWithModel, Solver, Sorted, Storage};
 use smtlib_lowlevel::lexicon::Symbol;
+use std::any::TypeId;
 use std::collections::BTreeSet;
 use std::{fmt::Debug, hash::Hash};
 
 pub fn add_smt(egraph: &mut EGraph) {
     // important to add ints as base sort before bools bc bools reference ints
+    add_base_sort(egraph, SMTUFInt, span!()).unwrap();
     add_base_sort(egraph, SMTInt, span!()).unwrap();
     add_base_sort(egraph, SMTReal, span!()).unwrap();
     add_base_sort(egraph, SMTBool, span!()).unwrap();
@@ -38,13 +43,13 @@ pub enum SMTBoolValue {
 }
 
 impl SMTBoolValue {
-    pub fn to_bool<'s>(&self, st: &'s Storage) -> Bool<'s> {
+    pub fn to_bool<'s>(&self, st: &'s Storage, solver: &mut Solver<'s, Z3Binary>) -> Bool<'s> {
         match self {
             SMTBoolValue::Const(name) => Bool::new_const(st, name).into(),
-            SMTBoolValue::Or(a, b) => a.to_bool(st) | (b.to_bool(st)),
-            SMTBoolValue::And(a, b) => a.to_bool(st) & (b.to_bool(st)),
-            SMTBoolValue::Not(a) => !a.to_bool(st),
-            SMTBoolValue::IntEq(a, b) => a.to_int(st)._eq(b.to_int(st)),
+            SMTBoolValue::Or(a, b) => a.to_bool(st, solver) | (b.to_bool(st, solver)),
+            SMTBoolValue::And(a, b) => a.to_bool(st, solver) & (b.to_bool(st, solver)),
+            SMTBoolValue::Not(a) => !a.to_bool(st, solver),
+            SMTBoolValue::IntEq(a, b) => a.to_int(st, solver)._eq(b.to_int(st, solver)),
             SMTBoolValue::RealEq(a, b) => a.to_real(st)._eq(b.to_real(st)),
             SMTBoolValue::RealLt(a, b) => a.to_real(st).lt(b.to_real(st)),
             SMTBoolValue::RealGt(a, b) => a.to_real(st).gt(b.to_real(st)),
@@ -206,16 +211,39 @@ pub enum SMTIntValue {
     Plus(Box<SMTIntValue>, Box<SMTIntValue>),
     Minus(Box<SMTIntValue>, Box<SMTIntValue>),
     Mult(Box<SMTIntValue>, Box<SMTIntValue>),
+    FuncApplication(SMTUFIntValue, Vec<SMTBaseValue>),
 }
 
 impl SMTIntValue {
-    pub fn to_int<'s>(&self, st: &'s Storage) -> Int<'s> {
+    pub fn to_int<'s>(&self, st: &'s Storage, solver: &mut Solver<'s, Z3Binary>) -> Int<'s> {
         match self {
             SMTIntValue::Const(name) => Int::new_const(st, name).into(),
             SMTIntValue::Int64(num) => Int::new(st, *num),
-            SMTIntValue::Plus(a, b) => a.to_int(st) + (b.to_int(st)),
-            SMTIntValue::Minus(a, b) => a.to_int(st) - (b.to_int(st)),
-            SMTIntValue::Mult(a, b) => a.to_int(st) * b.to_int(st),
+            SMTIntValue::Plus(a, b) => a.to_int(st, solver) + b.to_int(st, solver),
+            SMTIntValue::Minus(a, b) => a.to_int(st, solver) - b.to_int(st, solver),
+            SMTIntValue::Mult(a, b) => a.to_int(st, solver) * b.to_int(st, solver),
+            SMTIntValue::FuncApplication(func, args) => {
+                let smt_fun = func.to_uf(st);
+                let _ = solver.declare_fun(&smt_fun);
+                smt_fun
+                    .call(
+                        &args
+                            .iter()
+                            .map(|val| match val {
+                                SMTBaseValue::BoolValue(val) => {
+                                    val.to_bool(st, solver).into_dynamic()
+                                }
+                                SMTBaseValue::IntValue(val) => {
+                                    val.to_int(st, solver).into_dynamic()
+                                }
+                                SMTBaseValue::RealValue(val) => val.to_real(st).into_dynamic(),
+                            })
+                            .collect::<Vec<_>>()[..],
+                    )
+                    .unwrap()
+                    .as_int()
+                    .unwrap()
+            }
         }
     }
 
@@ -243,6 +271,12 @@ impl SMTIntValue {
                 let a_term = a.to_term(termdag);
                 let b_term = b.to_term(termdag);
                 termdag.app("*".into(), vec![a_term, b_term])
+            }
+            SMTIntValue::FuncApplication(func, args) => {
+                let func_term = func.to_term(termdag);
+                let mut children: Vec<Term> = args.iter().map(|arg| arg.to_term(termdag)).collect();
+                children.insert(0, func_term);
+                termdag.app("smt-call".into(), children)
             }
         }
     }
@@ -485,7 +519,8 @@ impl BaseSort for SMTSolved {
                 let st = Storage::new();
                 let mut solver = Solver::new(&st, Z3Binary::new("z3").unwrap()).unwrap();
                 for b in asserts.clone() {
-                    solver.assert(b.to_bool(&st)).unwrap();
+                    let smt_bool = b.to_bool(&st, &mut solver);
+                    solver.assert(smt_bool).unwrap();
 
                 }
                 match solver.check_sat_with_model().unwrap() {
@@ -527,6 +562,246 @@ impl BaseSort for SMTSolved {
                 }
             }}
         );
+        // (smt-call f arg1 arg2 ...)
+        eg.add_primitive(UFApply {
+            args: eg
+                .get_arcsorts_by(|s| {
+                    s.value_type() == Some(TypeId::of::<SMTIntValue>())
+                        || s.value_type() == Some(TypeId::of::<SMTBoolValue>())
+                        || s.value_type() == Some(TypeId::of::<SMTRealValue>())
+                })
+                .clone(),
+            out_sort: eg
+                .get_arcsort_by(|s| s.value_type() == Some(TypeId::of::<SMTIntValue>()))
+                .clone(),
+            fun_sort: eg
+                .get_arcsort_by(|s| s.value_type() == Some(TypeId::of::<SMTUFIntValue>()))
+                .clone(),
+        });
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum SMTUFIntValue {
+    Declaration(String, Vec<String>),
+}
+
+impl SMTUFIntValue {
+    pub fn to_uf<'s>(&self, st: &'s Storage) -> Fun<'s> {
+        match self {
+            SMTUFIntValue::Declaration(name, types) => {
+                let sorts: Result<Vec<Sort>, String> = types
+                    .iter()
+                    .map(|type_name| match type_name.as_str() {
+                        "Int" => Ok(Int::sort()),
+                        "Bool" => Ok(Bool::sort()),
+                        other => Err(format!("unknown type {other}")),
+                    })
+                    .collect();
+                Fun::new(st, name.to_string(), sorts.unwrap(), Int::sort())
+            }
+        }
+    }
+
+    pub fn to_term(&self, termdag: &mut TermDag) -> Term {
+        match self {
+            SMTUFIntValue::Declaration(name, types) => {
+                let name = termdag.lit(Literal::String(name.clone()));
+                let mut children: Vec<Term> = types
+                    .iter()
+                    .map(|type_name| termdag.lit(Literal::String(type_name.clone())))
+                    .collect();
+                children.insert(0, name);
+                termdag.app("smt-fn-int".into(), children)
+            }
+        }
+    }
+}
+
+impl BaseValue for SMTUFIntValue {}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum SMTBaseValue {
+    BoolValue(SMTBoolValue),
+    IntValue(SMTIntValue),
+    RealValue(SMTRealValue),
+}
+
+impl BaseValue for SMTBaseValue {}
+
+impl SMTBaseValue {
+    pub fn to_term(&self, termdag: &mut TermDag) -> Term {
+        match self {
+            SMTBaseValue::BoolValue(arg) => arg.to_term(termdag),
+            SMTBaseValue::IntValue(arg) => arg.to_term(termdag),
+            SMTBaseValue::RealValue(arg) => arg.to_term(termdag),
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct SMTUFInt;
+impl BaseSort for SMTUFInt {
+    type Base = SMTUFIntValue;
+
+    fn name(&self) -> &str {
+        "SMTUFInt"
+    }
+
+    fn reconstruct_termdag(
+        &self,
+        base_values: &BaseValues,
+        value: Value,
+        termdag: &mut TermDag,
+    ) -> Term {
+        let uf = base_values.unwrap::<SMTUFIntValue>(value);
+        uf.to_term(termdag)
+    }
+
+    fn register_primitives(&self, eg: &mut EGraph) {
+        // (smt-uf-int "f" "Int" "Int")
+        add_primitive!(
+            eg,
+            "smt-fn-int" = [args: S] -> SMTUFIntValue { {
+                let mut args_iter = args.into_iter();
+                let name = args_iter.next().unwrap();
+                let types: Vec<String> = args_iter.map(Boxed::into_inner).collect();
+                SMTUFIntValue::Declaration(name.0, types)
+            } }
+        );
+    }
+}
+
+#[derive(Clone)]
+struct UFApply {
+    args: Vec<ArcSort>,
+    out_sort: ArcSort,
+    fun_sort: ArcSort,
+}
+impl Primitive for UFApply {
+    fn name(&self) -> &str {
+        "smt-call"
+    }
+    fn get_type_constraints(&self, _span: &Span) -> Box<dyn TypeConstraint> {
+        SMTUFTypeConstraint::default()
+            .with_all_arguments_possible_sorts(self.args.clone())
+            .with_output_sort(self.out_sort.clone())
+            .with_func_sort(self.fun_sort.clone())
+            .into_box()
+    }
+    fn apply(&self, exec_state: &mut ExecutionState, args: &[Value]) -> Option<Value> {
+        let (fun_val, args) = args.split_first().unwrap();
+        let fun = exec_state.base_values().unwrap::<SMTUFIntValue>(*fun_val);
+        let arg_vals: Vec<SMTBaseValue> = match fun.clone() {
+            SMTUFIntValue::Declaration(name, arg_types) => {
+                assert!(
+                    arg_types.len() == args.len(),
+                    "Expected function {} to be called with {} args, but got {}",
+                    name,
+                    arg_types.len(),
+                    args.len()
+                );
+                arg_types
+                    .iter()
+                    .zip(args)
+                    .map(|(arg_type, arg)| match arg_type.as_str() {
+                        "Int" => {
+                            let int_val = exec_state.base_values().unwrap::<SMTIntValue>(*arg);
+                            SMTBaseValue::IntValue(int_val)
+                        }
+                        "Bool" => SMTBaseValue::BoolValue(
+                            exec_state.base_values().unwrap::<SMTBoolValue>(*arg),
+                        ),
+                        "Real" => SMTBaseValue::RealValue(
+                            exec_state.base_values().unwrap::<SMTRealValue>(*arg),
+                        ),
+                        other => panic!("unknown type {other}"),
+                    })
+                    .collect::<Vec<SMTBaseValue>>()
+            }
+        };
+
+        let fun_app: SMTIntValue = { SMTIntValue::FuncApplication(fun, arg_vals) };
+        Some(exec_state.base_values().get::<SMTIntValue>(fun_app))
+    }
+}
+
+/// A type constraint that requires all arguments to have one of the SMT base types.
+pub struct SMTUFTypeConstraint {
+    func_sort: Option<ArcSort>,
+    possible_sorts: Vec<ArcSort>,
+    output: Option<ArcSort>,
+}
+
+impl Default for SMTUFTypeConstraint {
+    /// Creates the `SMTUFTypeConstraint`.
+    fn default() -> Self {
+        SMTUFTypeConstraint {
+            func_sort: None,
+            possible_sorts: Vec::new(),
+            output: None,
+        }
+    }
+}
+
+impl SMTUFTypeConstraint {
+    /// Converts self into a boxed type constraint.
+    pub fn into_box(self) -> Box<dyn TypeConstraint> {
+        Box::new(self)
+    }
+
+    /// Requires function being called to be the given sort.
+    pub fn with_func_sort(mut self, sort: ArcSort) -> Self {
+        self.func_sort = Some(sort);
+        self
+    }
+
+    /// Requires all arguments to be one of the given sorts.
+    pub fn with_all_arguments_possible_sorts(mut self, sort: Vec<ArcSort>) -> Self {
+        self.possible_sorts = sort;
+        self
+    }
+
+    /// Requires the output argument to have the given sort.
+    pub fn with_output_sort(mut self, output_sort: ArcSort) -> Self {
+        self.output = Some(output_sort);
+        self
+    }
+}
+
+impl TypeConstraint for SMTUFTypeConstraint {
+    fn get(
+        &self,
+        mut arguments: &[AtomTerm],
+        _typeinfo: &TypeInfo,
+    ) -> Vec<Box<dyn Constraint<AtomTerm, ArcSort>>> {
+        if arguments.is_empty() {
+            panic!("all arguments should have length > 0")
+        }
+
+        let mut constraints = vec![];
+        if let Some(output) = self.output.clone() {
+            let (out, inputs) = arguments.split_last().unwrap();
+            constraints.push(constraint::assign(out.clone(), output));
+            arguments = inputs;
+        }
+
+        if let Some(func_sort) = self.func_sort.clone() {
+            let (func, inputs) = arguments.split_first().unwrap();
+            constraints.push(constraint::assign(func.clone(), func_sort));
+            arguments = inputs;
+        }
+
+        constraints.extend(arguments.iter().cloned().map(|arg| {
+            constraint::xor(
+                self.possible_sorts
+                    .clone()
+                    .into_iter()
+                    .map(|sort| constraint::assign(arg.clone(), sort.clone()))
+                    .collect(),
+            )
+        }));
+        constraints
     }
 }
 
@@ -562,11 +837,10 @@ fn extract_real_value(term: &smtlib_lowlevel::ast::Term) -> f64 {
                 }
             }
             panic!(
-                "Unsupported real application format: identifier={:?}, arguments={:?}",
-                identifier, arguments
+                "Unsupported real application format: identifier={identifier:?}, arguments={arguments:?}",
             );
         }
-        _ => panic!("Unsupported real term format: {:?}", term),
+        _ => panic!("Unsupported real term format: {term:?}",),
     }
 }
 
@@ -623,6 +897,15 @@ impl Constants {
             SMTIntValue::Plus(a, b) | SMTIntValue::Minus(a, b) | SMTIntValue::Mult(a, b) => {
                 self.int(*a);
                 self.int(*b);
+            }
+            SMTIntValue::FuncApplication(_, args) => {
+                for arg in args {
+                    match arg {
+                        SMTBaseValue::BoolValue(bool_value) => self.bool(bool_value),
+                        SMTBaseValue::IntValue(int_value) => self.int(int_value),
+                        SMTBaseValue::RealValue(int_value) => self.real(int_value),
+                    }
+                }
             }
         }
     }
