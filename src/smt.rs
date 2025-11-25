@@ -743,6 +743,10 @@ impl SMTUFTypeConstraint {
         }
     }
 
+    fn default() -> Self {
+        Self::new()
+    }
+
     /// Converts self into a boxed type constraint.
     pub fn into_box(self) -> Box<dyn TypeConstraint> {
         Box::new(self)
