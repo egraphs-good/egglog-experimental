@@ -31,6 +31,10 @@ pub enum SMTBoolValue {
     Not(Box<SMTBoolValue>),
     IntEq(Box<SMTIntValue>, Box<SMTIntValue>),
     RealEq(Box<SMTRealValue>, Box<SMTRealValue>),
+    RealLt(Box<SMTRealValue>, Box<SMTRealValue>),
+    RealGt(Box<SMTRealValue>, Box<SMTRealValue>),
+    RealLte(Box<SMTRealValue>, Box<SMTRealValue>),
+    RealGte(Box<SMTRealValue>, Box<SMTRealValue>),
 }
 
 impl SMTBoolValue {
@@ -42,6 +46,10 @@ impl SMTBoolValue {
             SMTBoolValue::Not(a) => !a.to_bool(st),
             SMTBoolValue::IntEq(a, b) => a.to_int(st)._eq(b.to_int(st)),
             SMTBoolValue::RealEq(a, b) => a.to_real(st)._eq(b.to_real(st)),
+            SMTBoolValue::RealLt(a, b) => a.to_real(st).lt(b.to_real(st)),
+            SMTBoolValue::RealGt(a, b) => a.to_real(st).gt(b.to_real(st)),
+            SMTBoolValue::RealLte(a, b) => a.to_real(st).le(b.to_real(st)),
+            SMTBoolValue::RealGte(a, b) => a.to_real(st).ge(b.to_real(st)),
         }
     }
 
@@ -74,6 +82,26 @@ impl SMTBoolValue {
                 let a_term = a.to_term(termdag);
                 let b_term = b.to_term(termdag);
                 termdag.app("smt-real-=".into(), vec![a_term, b_term])
+            }
+            SMTBoolValue::RealLt(a, b) => {
+                let a_term = a.to_term(termdag);
+                let b_term = b.to_term(termdag);
+                termdag.app("smt-real-<".into(), vec![a_term, b_term])
+            }
+            SMTBoolValue::RealGt(a, b) => {
+                let a_term = a.to_term(termdag);
+                let b_term = b.to_term(termdag);
+                termdag.app("smt-real->".into(), vec![a_term, b_term])
+            }
+            SMTBoolValue::RealLte(a, b) => {
+                let a_term = a.to_term(termdag);
+                let b_term = b.to_term(termdag);
+                termdag.app("smt-real-<=".into(), vec![a_term, b_term])
+            }
+            SMTBoolValue::RealGte(a, b) => {
+                let a_term = a.to_term(termdag);
+                let b_term = b.to_term(termdag);
+                termdag.app("smt-real->=".into(), vec![a_term, b_term])
             }
         }
     }
@@ -138,6 +166,34 @@ impl BaseSort for SMTBool {
             eg,
             "smt-real-=" = |a: SMTRealValue, b: SMTRealValue| -> SMTBoolValue {
                 SMTBoolValue::RealEq(Box::new(a), Box::new(b))
+            }
+        );
+        // (smt-real-< a b)
+        add_primitive!(
+            eg,
+            "smt-real-<" = |a: SMTRealValue, b: SMTRealValue| -> SMTBoolValue {
+                SMTBoolValue::RealLt(Box::new(a), Box::new(b))
+            }
+        );
+        // (smt-real-> a b)
+        add_primitive!(
+            eg,
+            "smt-real->" = |a: SMTRealValue, b: SMTRealValue| -> SMTBoolValue {
+                SMTBoolValue::RealGt(Box::new(a), Box::new(b))
+            }
+        );
+        // (smt-real-<= a b)
+        add_primitive!(
+            eg,
+            "smt-real-<=" = |a: SMTRealValue, b: SMTRealValue| -> SMTBoolValue {
+                SMTBoolValue::RealLte(Box::new(a), Box::new(b))
+            }
+        );
+        // (smt-real->= a b)
+        add_primitive!(
+            eg,
+            "smt-real->=" = |a: SMTRealValue, b: SMTRealValue| -> SMTBoolValue {
+                SMTBoolValue::RealGte(Box::new(a), Box::new(b))
             }
         );
     }
@@ -461,10 +517,8 @@ impl BaseSort for SMTSolved {
                             let Some(term) = model.eval(Real::new_const(&st, &name)) else {
                                 continue;
                             };
-                            let smtlib_lowlevel::ast::Term::SpecConstant(smtlib_lowlevel::ast::SpecConstant::Decimal(d)) = term.term() else {
-                                panic!("Expected real literal");
-                            };
-                            values.push(SMTValueValue(name, SMTTerm::Real(OrderedFloat(d.0.parse::<f64>().unwrap()))));
+                            let real_value = extract_real_value(term.term());
+                            values.push(SMTValueValue(name, SMTTerm::Real(OrderedFloat(real_value))));
                         }
                         SMTSolvedValue(Some(values))
                     }
@@ -473,6 +527,46 @@ impl BaseSort for SMTSolved {
                 }
             }}
         );
+    }
+}
+
+fn extract_real_value(term: &smtlib_lowlevel::ast::Term) -> f64 {
+    match term {
+        // Positive decimal: 1.5
+        smtlib_lowlevel::ast::Term::SpecConstant(smtlib_lowlevel::ast::SpecConstant::Decimal(
+            d,
+        )) => d.0.parse::<f64>().unwrap(),
+        // Positive numeral: 42
+        smtlib_lowlevel::ast::Term::SpecConstant(smtlib_lowlevel::ast::SpecConstant::Numeral(
+            n,
+        )) => n.into_u128().unwrap() as f64,
+        // Negative numbers: (- 1.5) or (- 42)
+        smtlib_lowlevel::ast::Term::Application(identifier, arguments) => {
+            if let smtlib_lowlevel::ast::QualIdentifier::Identifier(
+                smtlib_lowlevel::ast::Identifier::Simple(smtlib_lowlevel::lexicon::Symbol(op)),
+            ) = identifier
+            {
+                if *op == "-" && arguments.len() == 1 {
+                    return -extract_real_value(arguments[0]);
+                }
+            }
+            // Rational numbers: (/ 1 3) represents 1/3
+            if let smtlib_lowlevel::ast::QualIdentifier::Identifier(
+                smtlib_lowlevel::ast::Identifier::Simple(smtlib_lowlevel::lexicon::Symbol(op)),
+            ) = identifier
+            {
+                if *op == "/" && arguments.len() == 2 {
+                    let numerator = extract_real_value(arguments[0]);
+                    let denominator = extract_real_value(arguments[1]);
+                    return numerator / denominator;
+                }
+            }
+            panic!(
+                "Unsupported real application format: identifier={:?}, arguments={:?}",
+                identifier, arguments
+            );
+        }
+        _ => panic!("Unsupported real term format: {:?}", term),
     }
 }
 
@@ -506,7 +600,11 @@ impl Constants {
                 self.int(*a);
                 self.int(*b);
             }
-            SMTBoolValue::RealEq(a, b) => {
+            SMTBoolValue::RealEq(a, b)
+            | SMTBoolValue::RealLt(a, b)
+            | SMTBoolValue::RealGt(a, b)
+            | SMTBoolValue::RealLte(a, b)
+            | SMTBoolValue::RealGte(a, b) => {
                 self.real(*a);
                 self.real(*b);
             }
