@@ -683,7 +683,7 @@ impl Primitive for UFApply {
         "smt-call"
     }
     fn get_type_constraints(&self, _span: &Span) -> Box<dyn TypeConstraint> {
-        SMTUFTypeConstraint::new()
+        SMTUFTypeConstraint::default()
             .with_all_arguments_possible_sorts(self.args.clone())
             .with_output_sort(self.out_sort.clone())
             .with_func_sort(self.fun_sort.clone())
@@ -733,20 +733,18 @@ pub struct SMTUFTypeConstraint {
     output: Option<ArcSort>,
 }
 
-impl SMTUFTypeConstraint {
-    /// Creates the `AllEqualTypeConstraint`.
-    pub fn new() -> SMTUFTypeConstraint {
+impl Default for SMTUFTypeConstraint {
+    /// Creates the `SMTUFTypeConstraint`.
+    fn default() -> Self {
         SMTUFTypeConstraint {
             func_sort: None,
             possible_sorts: Vec::new(),
             output: None,
         }
     }
+}
 
-    fn default() -> Self {
-        Self::new()
-    }
-
+impl SMTUFTypeConstraint {
     /// Converts self into a boxed type constraint.
     pub fn into_box(self) -> Box<dyn TypeConstraint> {
         Box::new(self)
