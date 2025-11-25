@@ -837,11 +837,10 @@ fn extract_real_value(term: &smtlib_lowlevel::ast::Term) -> f64 {
                 }
             }
             panic!(
-                "Unsupported real application format: identifier={:?}, arguments={:?}",
-                identifier, arguments
+                "Unsupported real application format: identifier={identifier:?}, arguments={arguments:?}",
             );
         }
-        _ => panic!("Unsupported real term format: {:?}", term),
+        _ => panic!("Unsupported real term format: {term:?}",),
     }
 }
 
