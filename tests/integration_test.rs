@@ -1,3 +1,10 @@
+use std::sync::Arc;
+
+use egglog::{
+    ast::Expr,
+    prelude::{RustSpan, Span},
+};
+
 #[test]
 fn test_extract() {
     let mut egraph = egglog_experimental::new_experimental_egraph();
@@ -40,6 +47,40 @@ fn test_extract() {
     assert_eq!(result[2].to_string(), "(Add (Num 1) (Num 1))\n");
     assert_eq!(result[3].to_string(), "(Add (Num 1) (Num 1))\n");
     assert_eq!(result[4].to_string(), "(Sub (Num 5) (Num 3))\n");
+}
+
+#[test]
+fn test_get_size_primitive() {
+    let mut egraph = egglog_experimental::new_experimental_egraph();
+
+    let size_expr = Expr::Call(
+        Span::Rust(Arc::new(RustSpan {
+            file: "integration_test",
+            line: 0,
+            column: 0,
+        })),
+        "get-size!".into(),
+        vec![],
+    );
+    let (_, value) = egraph.eval_expr(&size_expr).unwrap();
+    let initial_size = egraph.value_to_base::<i64>(value);
+    assert_eq!(initial_size, egraph.num_tuples() as i64);
+
+    egraph
+        .parse_and_run_program(
+            None,
+            "
+            (datatype Foo (MkFoo i64))
+            (MkFoo 1)
+            (MkFoo 2)
+        ",
+        )
+        .unwrap();
+
+    let (_, value) = egraph.eval_expr(&size_expr).unwrap();
+    let updated_size = egraph.value_to_base::<i64>(value);
+    assert_eq!(updated_size, egraph.num_tuples() as i64);
+    assert!(updated_size >= initial_size);
 }
 
 #[test]
