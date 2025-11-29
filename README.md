@@ -29,4 +29,4 @@ egglog-experimental = "1.0"
 * Rationals ([demo](https://egraphs-good.github.io/egglog-demo/?example=rational), see `src/rational.rs` for supported primitives)
 * Dynamic cost model with `set-cost` ([demo](https://egraphs-good.github.io/egglog-demo/?example=05-cost-model-and-extraction))
 * Running custom schedulers with `run-with` ([demo](https://egraphs-good.github.io/egglog-demo/?example=math-backoff))
-* `(get-size!)` primitive for querying the total number of tuples in the database (optionally restricted to a list of table names)
+* `(get-size!)` primitive for querying the total number of tuples in the database (optionally restricted to a list of table names) ([demo](tests/web-demo/node-limit.egg))
