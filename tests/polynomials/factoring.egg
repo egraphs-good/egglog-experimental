@@ -5,7 +5,7 @@
 ; Polynomial representations should not be mixed in inputs or rules,
 ; but must be the same datatype to be equated in the egraph.
 (datatype Monomial
-  (Term f64 i64)) ; (Term a b) = ax^b
+  (Term f64 f64)) ; (Term a b) = ax^b | b must be an integer
 (datatype Factor
   (Fact f64 i64)) ; (Fact a b) = (x-a)^b
 (datatype Polynomial
@@ -18,5 +18,10 @@
   (Mul)
 
   ; backend values and tags
-  (Smt SMTReal) ; backend value used for factoring
+  (Smt SMTReal) ; backend value for factoring
   (Factorable Polynomial)) ; tag to indicate we should factor this polynomial
+
+; Rewrite rules to convert polynomials in monomial-sum form to their smt form
+(ruleset to-smt)
+(rewrite (Zero) (Smt (smt-real 0.0)) :ruleset to-smt)
+(rewrite (Add (Term a b) (Smt p)) (Smt (+ (* (smt-real a) (^ (smt-real-const "x") (smt-real b))) p)) :ruleset to-smt)
