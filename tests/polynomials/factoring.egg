@@ -1,7 +1,9 @@
-; A datatype for representing polynomials in a single variable
+; A datatype for representing polynomials in a single variable over R
 ; Polynomials are lists of monomials representing their sum
 (datatype Monomial
   (Term f64 i64)) ; (Term a b) = ax^b
 (datatype Polynomial
   (Zero) ; (Zero) := 0
-  (Add Monomial Polynomial)) ; (Add m p) := m + p
+  (Add Monomial Polynomial) ; (Add m p) := m + p
+  (Smt SMTReal) ; backend value used for factoring
+  (Factorable Polynomial)) ; tag to indicate we should factor this polynomial
