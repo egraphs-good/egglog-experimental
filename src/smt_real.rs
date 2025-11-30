@@ -18,6 +18,7 @@ pub enum SMTRealValue {
     Sub(Box<SMTRealValue>, Box<SMTRealValue>),
     Mul(Box<SMTRealValue>, Box<SMTRealValue>),
     Div(Box<SMTRealValue>, Box<SMTRealValue>),
+    Pow(Box<SMTRealValue>, Box<SMTRealValue>),
 }
 
 impl SMTRealValue {
@@ -30,6 +31,7 @@ impl SMTRealValue {
             SMTRealValue::Sub(a, b) => a.to_real(st) - b.to_real(st),
             SMTRealValue::Mul(a, b) => a.to_real(st) * b.to_real(st),
             SMTRealValue::Div(a, b) => a.to_real(st) / b.to_real(st),
+            SMTRealValue::Pow(a, b) => a.to_real(st).pow(b.to_real(st)),
         }
     }
 
@@ -66,6 +68,11 @@ impl SMTRealValue {
                 let a_term = a.to_term(termdag);
                 let b_term = b.to_term(termdag);
                 termdag.app("/".into(), vec![a_term, b_term])
+            }
+            SMTRealValue::Pow(a, b) => {
+                let a_term = a.to_term(termdag);
+                let b_term = b.to_term(termdag);
+                termdag.app("^".into(), vec![a_term, b_term])
             }
         }
     }
@@ -135,6 +142,13 @@ impl BaseSort for SMTReal {
             eg,
             "/" = |a: SMTRealValue, b: SMTRealValue| -> SMTRealValue {
                 SMTRealValue::Div(Box::new(a), Box::new(b))
+            }
+        );
+        // (^ a b)
+        add_primitive!(
+            eg,
+            "^" = |a: SMTRealValue, b: SMTRealValue| -> SMTRealValue {
+                SMTRealValue::Pow(Box::new(a), Box::new(b))
             }
         );
     }

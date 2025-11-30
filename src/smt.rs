@@ -919,7 +919,8 @@ impl Constants {
             SMTRealValue::Add(a, b)
             | SMTRealValue::Sub(a, b)
             | SMTRealValue::Mul(a, b)
-            | SMTRealValue::Div(a, b) => {
+            | SMTRealValue::Div(a, b)
+            | SMTRealValue::Pow(a, b) => {
                 self.real(*a);
                 self.real(*b);
             }
