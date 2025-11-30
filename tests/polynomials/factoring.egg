@@ -1,9 +1,22 @@
-; A datatype for representing polynomials in a single variable over R
-; Polynomials are lists of monomials representing their sum
+; A datatype for representing polynomials in a single variable over R.
+; Polynomials have two representations:
+; - lists of monomials
+; - lists of factors raised to a power, along with a real coefficient.
+; Polynomial representations should not be mixed in inputs or rules,
+; but must be the same datatype to be equated in the egraph.
 (datatype Monomial
   (Term f64 i64)) ; (Term a b) = ax^b
+(datatype Factor
+  (Fact f64 i64)) ; (Fact a b) = (x-a)^b
 (datatype Polynomial
+  ; sum of monomials representation
   (Zero) ; (Zero) := 0
   (Add Monomial Polynomial) ; (Add m p) := m + p
+
+  ; product of factors representation
+  (Coef f64) ; (Coef a) := a
+  (Mul)
+
+  ; backend values and tags
   (Smt SMTReal) ; backend value used for factoring
   (Factorable Polynomial)) ; tag to indicate we should factor this polynomial
