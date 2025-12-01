@@ -1,16 +1,16 @@
 ; A datatype for representing polynomials in a single variable over R.
 ; Polynomials have two representations:
-; - lists of monomials
+; - lists of monomials, along with a real constant
 ; - lists of factors raised to a power, along with a real coefficient.
 ; Polynomial representations should not be mixed in inputs or rules,
 ; but must be the same datatype to be equated in the egraph.
 (datatype Monomial
-  (Term f64 f64)) ; (Term a b) = ax^b | b must be an integer
+  (Term f64 f64)) ; (Term a b) = ax^b | b must be an integer > 0
 (datatype Factor
   (Fact f64 i64)) ; (Fact a b) = (x-a)^b
 (datatype Polynomial
   ; sum of monomials representation
-  (Zero) ; (Zero) := 0
+  (Const f64) ; (Const a) := a
   (Add Monomial Polynomial) ; (Add m p) := m + p
 
   ; product of factors representation
@@ -23,7 +23,7 @@
 
 ; Rewrite rules to convert polynomials in monomial-sum form to their smt form
 (ruleset to-smt)
-(rewrite (Zero) (Smt (smt-real 0.0)) :ruleset to-smt)
+(rewrite (Const a) (Smt (smt-real a)) :ruleset to-smt)
 (rewrite
   (Add (Term a b) (Smt p))
   (Smt (+ (* (smt-real a) (^ (smt-real-const "x") (smt-real b))) p))
@@ -61,9 +61,12 @@
   :ruleset factorize)
 ; For sat models, add the root to the list
 (rule
-  ((= (model p c) m) (= (roots p) (NEConstraint c)) (smt-sat? m))
+  ((= (model p c) m) (= (roots p) (NEConstraint c)) (= (smt-sat? m) true))
   ((set (roots p) (Cons (smt-value m (smt-real-const "x")) (NEConstraint c))))
   :ruleset factorize)
+
+(let e1 (Add (Term 1.0 2.0) (Const -1.0)))
+(let _ (Factorable e1))
 
 ; Schedule
 (run-schedule (saturate (run to-smt)))
