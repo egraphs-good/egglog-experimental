@@ -15,7 +15,7 @@
 
   ; product of factors representation
   (Coef f64) ; (Coef a) := a
-  (Mul)
+  (Mul Factor Polynomial) ; (Mul f p) := f * p
 
   ; backend values and tags
   (Smt SMTReal) ; backend value for factoring
@@ -24,4 +24,48 @@
 ; Rewrite rules to convert polynomials in monomial-sum form to their smt form
 (ruleset to-smt)
 (rewrite (Zero) (Smt (smt-real 0.0)) :ruleset to-smt)
-(rewrite (Add (Term a b) (Smt p)) (Smt (+ (* (smt-real a) (^ (smt-real-const "x") (smt-real b))) p)) :ruleset to-smt)
+(rewrite
+  (Add (Term a b) (Smt p))
+  (Smt (+ (* (smt-real a) (^ (smt-real-const "x") (smt-real b))) p))
+  :ruleset to-smt)
+
+; Rewrite rules to determine the unique factors/roots of polynomials
+; Backend values and functions
+(datatype ListR
+  (Null)
+  (Cons f64 ListR)
+  (NEConstraint SMTBool))
+(function roots (Polynomial) ListR :merge new)
+(function model (Polynomial SMTBool) SMTSolved :merge new)
+
+; Initialize all tagged polynomials with empty list of roots
+(ruleset init-roots)
+(rule ((Factorable p)) ((set (roots p) (Null))) :ruleset init-roots)
+
+; Fill in the roots of tagged polynomials
+(ruleset factorize)
+; Don't constrain roots when none have been found
+(rewrite
+  (Null)
+  (NEConstraint (smt-real-= (smt-real 0.0) (smt-real 0.0)))
+  :ruleset factorize)
+; Exclude roots we have already found
+(rewrite
+  (Cons r (NEConstraint c))
+  (NEConstraint (and (not (smt-real-= (smt-real-const "x") (smt-real r))) c))
+  :ruleset factorize)
+; Get models containing sat(x->root) or unsat
+(rule
+  ((= (roots (Smt p)) (NEConstraint c)))
+  ((set (model (Smt p) c) (smt-solve (and (smt-real-= p (smt-real 0.0)) c))))
+  :ruleset factorize)
+; For sat models, add the root to the list
+(rule
+  ((= (model p c) m) (= (roots p) (NEConstraint c)) (smt-sat? m))
+  ((set (roots p) (Cons (smt-value m (smt-real-const "x")) (NEConstraint c))))
+  :ruleset factorize)
+
+; Schedule
+(run-schedule (saturate (run to-smt)))
+(run init-roots 1)
+(run-schedule (saturate (run factorize)))
