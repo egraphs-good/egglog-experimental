@@ -30,7 +30,7 @@ pub fn new_experimental_egraph() -> EGraph {
 
     // Register the fresh! macro
     egraph
-        .command_macros
+        .command_macros_mut()
         .register(Arc::new(fresh_macro::FreshMacro::new()));
 
     egraph

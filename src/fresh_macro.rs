@@ -18,14 +18,6 @@ impl FreshMacro {
 type Symbol = String;
 
 impl CommandMacro for FreshMacro {
-    fn matches(&self, command: &Command) -> bool {
-        if let Command::Rule { rule } = command {
-            rule.head.0.iter().any(contains_fresh_action)
-        } else {
-            false
-        }
-    }
-
     fn transform(
         &self,
         command: Command,
@@ -33,7 +25,7 @@ impl CommandMacro for FreshMacro {
         type_info: Option<&TypeInfo>,
     ) -> Result<Vec<Command>, Error> {
         match command {
-            Command::Rule { rule } => {
+            Command::Rule { rule } if rule.head.0.iter().any(contains_fresh_action) => {
                 // Fresh! requires TypeInfo for correct type inference
                 if let Some(type_info) = type_info {
                     desugar_fresh_rule(rule, symbol_gen, type_info)
@@ -187,7 +179,7 @@ fn resolved_to_surface(expr: &ResolvedExpr) -> Expr {
         GenericExpr::Call(ann, call, args) => {
             let head = match call {
                 ResolvedCall::Func(func) => func.name.to_string(),
-                ResolvedCall::Primitive(_prim) => "primitive".to_string(),
+                ResolvedCall::Primitive(prim) => prim.name().to_string(),
             };
             let surface_args = args.iter().map(resolved_to_surface).collect();
             Expr::Call(ann.clone(), head, surface_args)
