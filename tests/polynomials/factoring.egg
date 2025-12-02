@@ -87,16 +87,11 @@
   (Add (Term (* a b) (- b 1.0)) (Deriv p))
   :when ((> b 1.0))
   :ruleset differentiate)
-; Condense to NthDeriv
-(rewrite
-  (Deriv (NthDeriv p n))
-  (NthDeriv p (+ n 1))
-  :ruleset differentiate)
 ; Iteratively increase known multiplicity until derivative is nonzero
 (ruleset more-derivatives)
 (rule
   ((= (multi p r) m) (NthDeriv p (- m 1)))
-  ((Deriv (NthDeriv p (- m 1))))
+  ((union (Deriv (NthDeriv p (- m 1))) (NthDeriv p m)))
   :ruleset more-derivatives)
 (ruleset incr-multiplicity)
 (rule
