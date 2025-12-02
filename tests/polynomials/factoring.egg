@@ -1,16 +1,17 @@
 ; A datatype for representing polynomials in a single variable over R.
 ; Polynomials have two representations:
-; - lists of monomials, along with a real constant
+; - lists of monomials and real constants
 ; - lists of factors raised to a power, along with a real coefficient.
 ; Polynomial representations should not be mixed in inputs or rules,
 ; but must be the same datatype to be equated in the egraph.
 (datatype Monomial
-  (Term f64 f64)) ; (Term a b) = ax^b | b must be an integer > 0
+  (Term f64 f64) ; (Term a b) = ax^b | b must be an integer > 0
+  (Const f64)) ; (Const a) := a
 (datatype Factor
   (Fact f64 i64)) ; (Fact a b) = (x-a)^b
 (datatype Polynomial
   ; sum of monomials representation
-  (Const f64) ; (Const a) := a
+  (Zero) ; (Zero) := 0
   (Add Monomial Polynomial) ; (Add m p) := m + p
 
   ; product of factors representation
@@ -19,15 +20,18 @@
 
   ; backend values and tags
   (Smt SMTReal) ; backend value for factoring
+  (Deriv Polynomial) ; backend value for factoring
+  (NthDeriv Polynomial i64) ; backend value for factoring
   (Factorable Polynomial)) ; tag to indicate we should factor this polynomial
 
 ; Rewrite rules to convert polynomials in monomial-sum form to their smt form
 (ruleset to-smt)
-(rewrite (Const a) (Smt (smt-real a)) :ruleset to-smt)
+(rewrite (Zero) (Smt (smt-real 0.0)) :ruleset to-smt)
 (rewrite
   (Add (Term a b) (Smt p))
   (Smt (+ (* (smt-real a) (^ (smt-real-const "x") (smt-real b))) p))
   :ruleset to-smt)
+(rewrite (Add (Const a) (Smt p)) (Smt (+ (smt-real a) p)) :ruleset to-smt)
 
 ; Rewrite rules to determine the unique factors/roots of polynomials
 ; Backend values and functions
@@ -37,6 +41,7 @@
   (NEConstraint SMTBool))
 (function roots (Polynomial) ListR :merge new)
 (function model (Polynomial SMTBool) SMTSolved :merge new)
+(function multi (Polynomial f64) i64 :merge new)
 
 ; Initialize all tagged polynomials with empty list of roots
 (ruleset init-roots)
@@ -62,13 +67,61 @@
 ; For sat models, add the root to the list
 (rule
   ((= (model p c) m) (= (roots p) (NEConstraint c)) (= (smt-sat? m) true))
-  ((set (roots p) (Cons (smt-value m (smt-real-const "x")) (NEConstraint c))))
+  (
+    (set (roots p) (Cons (smt-value m (smt-real-const "x")) (NEConstraint c)))
+    (set (multi p (smt-value m (smt-real-const "x"))) 1)
+    (union p (NthDeriv p 0)))
   :ruleset factorize)
 
-(let e1 (Add (Term 1.0 2.0) (Const -1.0)))
+; Find the multiplicity of each root of a factorized polynomial
+(ruleset differentiate)
+; Take derivatives
+(rewrite (Deriv (Zero)) (Zero) :ruleset differentiate)
+(rewrite (Deriv (Add (Const a) p)) (Deriv p) :ruleset differentiate)
+(rewrite
+  (Deriv (Add (Term a 1.0) p))
+  (Add (Const a) (Deriv p))
+  :ruleset differentiate)
+(rewrite
+  (Deriv (Add (Term a b) p))
+  (Add (Term (* a b) (- b 1.0)) (Deriv p))
+  :when ((> b 1.0))
+  :ruleset differentiate)
+; Condense to NthDeriv
+(rewrite
+  (Deriv (NthDeriv p n))
+  (NthDeriv p (+ n 1))
+  :ruleset differentiate)
+; Iteratively increase known multiplicity until derivative is nonzero
+(ruleset more-derivatives)
+(rule
+  ((= (multi p r) m) (NthDeriv p (- m 1)))
+  ((Deriv (NthDeriv p (- m 1))))
+  :ruleset more-derivatives)
+(ruleset incr-multiplicity)
+(rule
+  (
+    (= (multi p r) m)
+    (= (NthDeriv p m) (Smt s))
+    (=
+      (smt-sat?
+        (smt-solve
+          (and
+            (smt-real-= (smt-real-const "x") (smt-real r))
+            (smt-real-= s (smt-real 0.0)))))
+      true))
+  ((set (multi p r) (+ m 1)))
+  :ruleset incr-multiplicity)
+
+(let e1 (Add (Term 1.0 2.0) (Add (Term 2.0 1.0) (Add (Const 1.0) (Zero)))))
 (let _ (Factorable e1))
 
 ; Schedule
 (run-schedule (saturate (run to-smt)))
 (run init-roots 1)
 (run-schedule (saturate (run factorize)))
+(run-schedule (saturate (seq
+      (run more-derivatives)
+      (saturate (run differentiate))
+      (saturate (run to-smt))
+      (run incr-multiplicity))))
