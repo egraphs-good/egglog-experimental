@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 //! # egglog-experimental
 //!
 //! This crate layers several experimental features on top of the core
@@ -20,16 +21,18 @@
 //! Each bullet links to a runnable demo so you can explore the feature quickly.
 //! The rest of this crate exposes the Rust APIs and helpers that back these extensions.
 //!
+=======
+use egglog::ast::Parser;
+>>>>>>> a82e001 (first try)
 use egglog::prelude::{RustSpan, Span, add_base_sort};
 pub use egglog::*;
 use std::sync::Arc;
 
 pub mod rational;
 pub use rational::*;
-mod sugar;
-pub use sugar::*;
 mod scheduling;
 pub use scheduling::*;
+mod fresh_macro;
 
 mod set_cost;
 pub use set_cost::*;
@@ -38,18 +41,25 @@ pub use multi_extract::*;
 mod size;
 pub use size::*;
 
+// Sugar modules using parse-time macros
+mod sugar;
+pub use sugar::*;
+
 pub fn new_experimental_egraph() -> EGraph {
     let mut egraph = EGraph::default();
-    add_base_sort(&mut egraph, RationalSort, span!()).unwrap();
-    egraph.parser.add_command_macro(Arc::new(For));
-    egraph.parser.add_command_macro(Arc::new(WithRuleset));
 
+    // Set up the parser with experimental parse-time macros
+    egraph.parser = experimental_parser();
+
+    add_base_sort(&mut egraph, RationalSort, span!()).unwrap();
     add_set_cost(&mut egraph);
     egraph.add_primitive(GetSizePrimitive);
 
+    // Register the fresh! macro
     egraph
-        .add_command("run-schedule".into(), Arc::new(RunExtendedSchedule))
-        .unwrap();
+        .command_macros
+        .register(Arc::new(fresh_macro::FreshMacro::new()));
+
     egraph
         .add_command(
             "multi-extract".into(),
@@ -57,4 +67,12 @@ pub fn new_experimental_egraph() -> EGraph {
         )
         .unwrap();
     egraph
+}
+
+// Create a parser with experimental macros
+pub fn experimental_parser() -> Parser {
+    let mut parser = Parser::default();
+    parser.add_command_macro(Arc::new(sugar::For));
+    parser.add_command_macro(Arc::new(sugar::WithRuleset));
+    parser
 }
