@@ -12,9 +12,9 @@ default = ["bin"]
 bin = ["egglog/bin"]
 
 [dependencies]
-egglog = { git = "https://github.com/egraphs-good/egglog.git", branch = "main", default-features = false }
-egglog-ast = { git = "https://github.com/egraphs-good/egglog.git", branch = "main", default-features = false }
-egglog-reports = { git = "https://github.com/egraphs-good/egglog.git", branch = "main", default-features = false }
+egglog = { path = "../egglog", default-features = false }
+egglog-ast = { path = "../egglog/egglog-ast", default-features = false }
+egglog-reports = { path = "../egglog/egglog-reports", default-features = false }
 
 num = "0.4.3"
 lazy_static = "1.4"
