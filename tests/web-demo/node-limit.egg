@@ -16,7 +16,7 @@
          :ruleset node-limit-demo)
 
 ; Run the ruleset repeatedly via saturate, exiting as soon as `(get-size!) >= 8`.
-(run-schedule (saturate (run node-limit-demo) :until (<= 8 (get-size!))))
+(run-schedule (saturate (run node-limit-demo :until (<= 8 (get-size!)))))
 
 (print-size)
 
