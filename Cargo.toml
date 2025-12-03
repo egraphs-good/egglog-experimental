@@ -4,7 +4,7 @@ version = "1.0.0"
 edition = "2024"
 description = "Experimental extensions to the egglog language."
 repository = "https://github.com/egraphs-good/egglog"
-keywords = ["e-graphs", "egglog", "datalog", "compiler", "equality", "experimental"]
+keywords = ["e-graphs", "egglog", "datalog", "compiler", "equality"]
 license = "MIT"
 readme = "README.md"
 
