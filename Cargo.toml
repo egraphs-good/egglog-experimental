@@ -1,7 +1,12 @@
 [package]
 name = "egglog-experimental"
-version = "0.1.0"
+version = "1.0.0"
 edition = "2024"
+description = "Experimental extensions to the egglog language."
+repository = "https://github.com/egraphs-good/egglog"
+keywords = ["e-graphs", "egglog", "datalog", "compiler", "equality", "experimental"]
+license = "MIT"
+readme = "README.md"
 
 [[test]]
 harness = false
