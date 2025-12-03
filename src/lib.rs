@@ -1,8 +1,29 @@
+//! # egglog-experimental
+//!
+//! This crate layers several experimental features on top of the core
+//! [`egglog`](https://github.com/egraphs-good/egglog) language and runtime.
+//! It can serve as a standard library when building equality
+//! saturation workflows in Rust.
+//!
+//! ## Implemented extensions
+//!
+//! - [`for`-loops](https://egraphs-good.github.io/egglog-demo/?example=for)
+//! - [`with-ruleset`](https://egraphs-good.github.io/egglog-demo/?example=with-ruleset)
+//! - [Rationals support](https://egraphs-good.github.io/egglog-demo/?example=rational)
+//!   (see [`rational`] for the exposed primitives)
+//! - [Dynamic cost models with `set-cost`](https://egraphs-good.github.io/egglog-demo/?example=05-cost-model-and-extraction)
+//! - [Custom schedulers via `run-with`](https://egraphs-good.github.io/egglog-demo/?example=math-backoff)
+//! - [`(get-size!)` primitive](https://github.com/egraphs-good/egglog-experimental/blob/main/tests/web-demo/node-limit.egg)
+//!   for inspecting total tuple counts, optionally restricted to specific tables
+//!
+//! Each bullet links to a runnable demo so you can explore the feature quickly.
+//! The rest of this crate exposes the Rust APIs and helpers that back these extensions.
+//!
 use egglog::prelude::{RustSpan, Span, add_base_sort};
 pub use egglog::*;
 use std::sync::Arc;
 
-mod rational;
+pub mod rational;
 pub use rational::*;
 mod sugar;
 pub use sugar::*;
