@@ -125,7 +125,7 @@ impl ScheduleState {
                 if let Some(until) = until {
                     // Parse the facts from the `until` expression
                     let res = query(egraph, &[], Facts(vec![Fact::Fact(until)]))?;
-                    if res.iter().next().is_none() {
+                    if res.any_matches() {
                         return Ok(RunReport::default());
                     }
                 }
