@@ -1,3 +1,4 @@
+use crate::smt_bitvec::{SMTBitVec, SMTBitVecValue};
 use crate::smt_real::{SMTReal, SMTRealValue};
 use egglog::constraint::{self, Constraint, TypeConstraint};
 use egglog::sort::{BaseValues, Boxed, F, OrderedFloat, S};
@@ -23,6 +24,7 @@ pub fn add_smt(egraph: &mut EGraph) {
     add_base_sort(egraph, SMTUFInt, span!()).unwrap();
     add_base_sort(egraph, SMTInt, span!()).unwrap();
     add_base_sort(egraph, SMTReal, span!()).unwrap();
+    add_base_sort(egraph, SMTBitVec, span!()).unwrap();
     add_base_sort(egraph, SMTBool, span!()).unwrap();
     add_base_sort(egraph, SMTValue, span!()).unwrap();
     add_base_sort(egraph, SMTSolved, span!()).unwrap();
@@ -40,6 +42,9 @@ pub enum SMTBoolValue {
     RealGt(Box<SMTRealValue>, Box<SMTRealValue>),
     RealLte(Box<SMTRealValue>, Box<SMTRealValue>),
     RealGte(Box<SMTRealValue>, Box<SMTRealValue>),
+    // Bitvector comparisons
+    BvEq(Box<SMTBitVecValue>, Box<SMTBitVecValue>),
+    BvSlt(Box<SMTBitVecValue>, Box<SMTBitVecValue>),
 }
 
 impl SMTBoolValue {
@@ -55,6 +60,9 @@ impl SMTBoolValue {
             SMTBoolValue::RealGt(a, b) => a.to_real(st).gt(b.to_real(st)),
             SMTBoolValue::RealLte(a, b) => a.to_real(st).le(b.to_real(st)),
             SMTBoolValue::RealGte(a, b) => a.to_real(st).ge(b.to_real(st)),
+            // Bitvector comparisons
+            SMTBoolValue::BvEq(a, b) => a.to_bool_cmp(st, "=", b),
+            SMTBoolValue::BvSlt(a, b) => a.to_bool_cmp(st, "bvslt", b),
         }
     }
 
@@ -107,6 +115,17 @@ impl SMTBoolValue {
                 let a_term = a.to_term(termdag);
                 let b_term = b.to_term(termdag);
                 termdag.app("smt-real->=".into(), vec![a_term, b_term])
+            }
+            // Bitvector comparisons
+            SMTBoolValue::BvEq(a, b) => {
+                let a_term = a.to_term(termdag);
+                let b_term = b.to_term(termdag);
+                termdag.app("smt-bv-=".into(), vec![a_term, b_term])
+            }
+            SMTBoolValue::BvSlt(a, b) => {
+                let a_term = a.to_term(termdag);
+                let b_term = b.to_term(termdag);
+                termdag.app("smt-bv-slt".into(), vec![a_term, b_term])
             }
         }
     }
@@ -199,6 +218,20 @@ impl BaseSort for SMTBool {
             eg,
             "smt-real->=" = |a: SMTRealValue, b: SMTRealValue| -> SMTBoolValue {
                 SMTBoolValue::RealGte(Box::new(a), Box::new(b))
+            }
+        );
+        // (smt-bv-= a b) - bitvector equality
+        add_primitive!(
+            eg,
+            "smt-bv-=" = |a: SMTBitVecValue, b: SMTBitVecValue| -> SMTBoolValue {
+                SMTBoolValue::BvEq(Box::new(a), Box::new(b))
+            }
+        );
+        // (smt-bv-slt a b) - signed less than
+        add_primitive!(
+            eg,
+            "smt-bv-slt" = |a: SMTBitVecValue, b: SMTBitVecValue| -> SMTBoolValue {
+                SMTBoolValue::BvSlt(Box::new(a), Box::new(b))
             }
         );
     }
@@ -852,6 +885,7 @@ struct Constants {
     bools: BTreeSet<String>,
     ints: BTreeSet<String>,
     reals: BTreeSet<String>,
+    bitvecs: BTreeSet<(String, u32)>, // (name, width)
 }
 
 impl Constants {
@@ -881,6 +915,10 @@ impl Constants {
             | SMTBoolValue::RealGte(a, b) => {
                 self.real(*a);
                 self.real(*b);
+            }
+            SMTBoolValue::BvEq(a, b) | SMTBoolValue::BvSlt(a, b) => {
+                self.bitvec(*a);
+                self.bitvec(*b);
             }
         }
     }
@@ -925,6 +963,19 @@ impl Constants {
             }
             SMTRealValue::Neg(a) => {
                 self.real(*a);
+            }
+        }
+    }
+
+    fn bitvec(&mut self, v: SMTBitVecValue) {
+        match v {
+            SMTBitVecValue::Const(name, width) => {
+                self.bitvecs.insert((name, width));
+            }
+            SMTBitVecValue::Literal(_, _) => {}
+            SMTBitVecValue::BvAdd(a, b) => {
+                self.bitvec(*a);
+                self.bitvec(*b);
             }
         }
     }

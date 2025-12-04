@@ -1,0 +1,44 @@
+; SMT Bitvector tests
+; https://smt-lib.org/logics-all.shtml (QF_BV)
+
+; Create 64-bit bitvector constants
+(let hi_0 (smt-bv-const "hi_0" 64))
+(let hi_1 (smt-bv-const "hi_1" 64))
+(let c (smt-bv-const "c" 64))
+
+; Create bitvector literals
+(let zero64 (smt-bv 0 64))
+(let one64 (smt-bv 1 64))
+
+; x = 0 is satisfiable
+(let x (smt-bv-const "x" 64))
+(check (= true (smt-sat? (smt-solve (smt-bv-= x zero64)))))
+
+; x = 0 AND x = 1 is unsatisfiable
+(check (= false (smt-sat? (smt-solve (smt-bv-= x zero64) (smt-bv-= x one64)))))
+
+; x + 0 = x is always true
+(let zero_add (smt-bv-= (bvadd x zero64) x))
+(check (= false (smt-sat? (smt-solve (not zero_add)))))
+
+; x + 1 = 1 is satisfiable (x = 0)
+(let add_one (smt-bv-= (bvadd x one64) one64))
+(check (= true (smt-sat? (smt-solve add_one))))
+
+; 0 is not signed-less-than 0
+(let zero_slt_zero (smt-bv-slt zero64 zero64))
+(check (= false (smt-sat? (smt-solve zero_slt_zero))))
+
+; Constraint: c is either 0 or 1
+(let c_is_zero_or_one (or (smt-bv-= c zero64) (smt-bv-= c one64)))
+
+(let sum (bvadd (bvadd hi_0 hi_1) c))
+(let basic_constraint (and c_is_zero_or_one (smt-bv-= hi_0 zero64)))
+(check (= true (smt-sat? (smt-solve basic_constraint))))
+
+; Test: if hi_0 = 0 and hi_1 = 0 and c = 0, then sum = 0
+(let all_zero (and 
+    (and (smt-bv-= hi_0 zero64) (smt-bv-= hi_1 zero64)) 
+    (smt-bv-= c zero64)))
+(let sum_is_zero (smt-bv-= sum zero64))
+(check (= false (smt-sat? (smt-solve (and all_zero (not sum_is_zero))))))

@@ -13,8 +13,10 @@ mod set_cost;
 pub use set_cost::*;
 
 mod smt;
+mod smt_bitvec;
 mod smt_real;
 pub use smt::*;
+pub use smt_bitvec::*;
 pub use smt_real::*;
 
 pub fn new_experimental_egraph() -> EGraph {
