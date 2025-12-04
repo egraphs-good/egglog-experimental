@@ -1,0 +1,14 @@
+; Generated polynomial rearranging benchmark test
+(include "polynomial-smt-rules.egg")
+
+; Original expanded polynomial
+(let e1 (Add (Add (Add (Add (Add (Add (Add (Add (Add (Add (Add (Add (Add (Add (Coefficient -5.0 (Var "w")) (Coefficient -5.0 (Power (Var "x") 2))) (Coefficient -4.0 (Power (Var "y") 3))) (Coefficient -3.0 (Var "x"))) (Coefficient 2.0 (Power (Var "w") 3))) (Coefficient 2.0 (Power (Var "x") 3))) (Coefficient 5.0 (Power (Var "y") 2))) (Mul (Var "z") (Power (Var "v") 2))) (Coefficient 4.0 (Mul (Power (Var "x") 2) (Power (Var "y") 2)))) (Mul (Mul (Var "w") (Var "y")) (Power (Var "x") 2))) (Coefficient -5.0 (Mul (Mul (Var "v") (Var "z")) (Power (Var "y") 2)))) (Coefficient 2.0 (Mul (Mul (Var "x") (Var "y")) (Power (Var "z") 3)))) (Coefficient 3.0 (Mul (Mul (Var "w") (Var "y")) (Power (Var "v") 2)))) (Coefficient 3.0 (Mul (Mul (Var "w") (Power (Var "x") 3)) (Power (Var "y") 3)))) (Coefficient 5.0 (Mul (Mul (Var "v") (Power (Var "w") 2)) (Power (Var "x") 2)))))
+
+; Rearranged expanded polynomial
+(let e2 (Add (Add (Add (Add (Add (Add (Add (Add (Add (Add (Add (Add (Add (Add (Coefficient -5.0 (Var "w")) (Coefficient -5.0 (Power (Var "x") 2))) (Coefficient -4.0 (Power (Var "y") 3))) (Coefficient -3.0 (Var "x"))) (Coefficient 2.0 (Power (Var "w") 3))) (Coefficient 2.0 (Power (Var "x") 3))) (Coefficient 5.0 (Power (Var "y") 2))) (Mul (Var "z") (Power (Var "v") 2))) (Coefficient 4.0 (Mul (Power (Var "x") 2) (Power (Var "y") 2)))) (Mul (Mul (Var "w") (Var "y")) (Power (Var "x") 2))) (Coefficient -5.0 (Mul (Mul (Var "v") (Var "z")) (Power (Var "y") 2)))) (Coefficient 2.0 (Mul (Mul (Var "x") (Var "y")) (Power (Var "z") 3)))) (Coefficient 3.0 (Mul (Mul (Var "w") (Var "y")) (Power (Var "v") 2)))) (Coefficient 3.0 (Mul (Mul (Var "w") (Power (Var "x") 3)) (Power (Var "y") 3)))) (Coefficient 5.0 (Mul (Mul (Var "v") (Power (Var "w") 2)) (Power (Var "x") 2)))))
+
+(let _e1 (UseSmt e1))
+(let _e2 (UseSmt e2))
+
+(run-schedule (saturate (run)))
+(check (= e1 e2))

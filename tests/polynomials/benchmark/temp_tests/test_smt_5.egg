@@ -1,0 +1,14 @@
+; Generated polynomial rearranging benchmark test
+(include "polynomial-smt-rules.egg")
+
+; Original expanded polynomial
+(let e1 (Add (Add (Add (Add (Power (Var "x") 3) (Coefficient 2.0 (Var "v"))) (Mul (Power (Var "w") 2) (Power (Var "x") 3))) (Coefficient -1.0 (Mul (Mul (Var "y") (Var "z")) (Power (Var "v") 3)))) (Coefficient 5.0 (Mul (Mul (Var "y") (Power (Var "v") 3)) (Power (Var "z") 2)))))
+
+; Rearranged expanded polynomial
+(let e2 (Add (Add (Add (Add (Power (Var "x") 3) (Coefficient 2.0 (Var "v"))) (Mul (Power (Var "w") 2) (Power (Var "x") 3))) (Coefficient -1.0 (Mul (Mul (Var "y") (Var "z")) (Power (Var "v") 3)))) (Coefficient 5.0 (Mul (Mul (Var "y") (Power (Var "v") 3)) (Power (Var "z") 2)))))
+
+(let _e1 (UseSmt e1))
+(let _e2 (UseSmt e2))
+
+(run-schedule (saturate (run)))
+(check (= e1 e2))

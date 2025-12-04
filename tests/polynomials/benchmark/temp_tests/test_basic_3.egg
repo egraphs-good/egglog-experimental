@@ -1,0 +1,12 @@
+; Generated polynomial rearranging benchmark test
+(include "polynomial-basic-rules.egg")
+
+; Original expanded polynomial
+(let e1 (Add (Add (Coefficient 2.0 (Power (Var "x") 3)) (Coefficient -4.0 (Mul (Var "x") (Var "y")))) (Coefficient 3.0 (Mul (Var "v") (Power (Var "w") 2)))))
+
+; Rearranged expanded polynomial
+(let e2 (Add (Add (Coefficient 2.0 (Power (Var "x") 3)) (Coefficient -4.0 (Mul (Var "x") (Var "y")))) (Coefficient 3.0 (Mul (Var "v") (Power (Var "w") 2)))))
+
+
+(run-schedule (saturate (run)))
+(check (= e1 e2))
