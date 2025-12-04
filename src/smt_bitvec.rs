@@ -29,9 +29,9 @@ impl SMTBitVecValue {
 
     /// Convert to a smtlib STerm
     pub fn to_sterm<'s>(&self, st: &'s Storage) -> STerm<'s> {
-        use smtlib_lowlevel::ast::{Term as AstTerm, Identifier, QualIdentifier, Index};
-        use smtlib_lowlevel::lexicon::{Symbol, Numeral};
-        
+        use smtlib_lowlevel::ast::{Identifier, Index, QualIdentifier, Term as AstTerm};
+        use smtlib_lowlevel::lexicon::{Numeral, Symbol};
+
         match self {
             SMTBitVecValue::Const(name, w) => {
                 // Create (_ BitVec w) sort
@@ -50,38 +50,49 @@ impl SMTBitVecValue {
                 let bv_symbol = format!("bv{}", *value as u64);
                 let ident = Identifier::Indexed(
                     Symbol(st.alloc_str(&bv_symbol)),
-                    st.alloc_slice(&[
-                        Index::Numeral(Numeral::from_usize(*w as usize)),
-                    ]),
+                    st.alloc_slice(&[Index::Numeral(Numeral::from_usize(*w as usize))]),
                 );
                 let qual_id = QualIdentifier::Identifier(ident);
                 STerm::new(st, AstTerm::Identifier(qual_id))
             }
-            SMTBitVecValue::BvAdd(a, b) => {
-                self.binary_op(st, "bvadd", a, b)
-            }
+            SMTBitVecValue::BvAdd(a, b) => self.binary_op(st, "bvadd", a, b),
         }
     }
 
-    fn binary_op<'s>(&self, st: &'s Storage, op: &'static str, a: &SMTBitVecValue, b: &SMTBitVecValue) -> STerm<'s> {
-        use smtlib_lowlevel::ast::{Term as AstTerm, Identifier, QualIdentifier};
+    fn binary_op<'s>(
+        &self,
+        st: &'s Storage,
+        op: &'static str,
+        a: &SMTBitVecValue,
+        b: &SMTBitVecValue,
+    ) -> STerm<'s> {
+        use smtlib_lowlevel::ast::{Identifier, QualIdentifier, Term as AstTerm};
         use smtlib_lowlevel::lexicon::Symbol;
-        
+
         let qual_id = QualIdentifier::Identifier(Identifier::Simple(Symbol(op)));
         let a_term = a.to_sterm(st);
         let b_term = b.to_sterm(st);
-        STerm::new(st, AstTerm::Application(qual_id, st.alloc_slice(&[a_term.term(), b_term.term()])))
+        STerm::new(
+            st,
+            AstTerm::Application(qual_id, st.alloc_slice(&[a_term.term(), b_term.term()])),
+        )
     }
 
     /// Create a Bool term from a comparison operation
-    pub fn to_bool_cmp<'s>(&self, st: &'s Storage, op: &'static str, other: &SMTBitVecValue) -> Bool<'s> {
-        use smtlib_lowlevel::ast::{Term as AstTerm, Identifier, QualIdentifier};
+    pub fn to_bool_cmp<'s>(
+        &self,
+        st: &'s Storage,
+        op: &'static str,
+        other: &SMTBitVecValue,
+    ) -> Bool<'s> {
+        use smtlib_lowlevel::ast::{Identifier, QualIdentifier, Term as AstTerm};
         use smtlib_lowlevel::lexicon::Symbol;
-        
+
         let qual_id = QualIdentifier::Identifier(Identifier::Simple(Symbol(op)));
         let a_term = self.to_sterm(st);
         let b_term = other.to_sterm(st);
-        let cmp_term = AstTerm::Application(qual_id, st.alloc_slice(&[a_term.term(), b_term.term()]));
+        let cmp_term =
+            AstTerm::Application(qual_id, st.alloc_slice(&[a_term.term(), b_term.term()]));
         STerm::new(st, cmp_term).into()
     }
 

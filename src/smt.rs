@@ -916,8 +916,7 @@ impl Constants {
                 self.real(*a);
                 self.real(*b);
             }
-            SMTBoolValue::BvEq(a, b)
-            | SMTBoolValue::BvSlt(a, b) => {
+            SMTBoolValue::BvEq(a, b) | SMTBoolValue::BvSlt(a, b) => {
                 self.bitvec(*a);
                 self.bitvec(*b);
             }
