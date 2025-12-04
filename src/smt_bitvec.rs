@@ -15,6 +15,12 @@ pub enum SMTBitVecValue {
     Literal(i64, u32),
     /// Addition modulo 2^m
     BvAdd(Box<SMTBitVecValue>, Box<SMTBitVecValue>),
+    /// Bitwise XOR
+    BvXor(Box<SMTBitVecValue>, Box<SMTBitVecValue>),
+    /// Bitwise AND
+    BvAnd(Box<SMTBitVecValue>, Box<SMTBitVecValue>),
+    /// Bitwise NOT (one's complement)
+    BvNot(Box<SMTBitVecValue>),
 }
 
 impl SMTBitVecValue {
@@ -24,6 +30,9 @@ impl SMTBitVecValue {
             SMTBitVecValue::Const(_, w) => *w,
             SMTBitVecValue::Literal(_, w) => *w,
             SMTBitVecValue::BvAdd(a, _) => a.width(),
+            SMTBitVecValue::BvXor(a, _) => a.width(),
+            SMTBitVecValue::BvAnd(a, _) => a.width(),
+            SMTBitVecValue::BvNot(a) => a.width(),
         }
     }
 
@@ -56,7 +65,22 @@ impl SMTBitVecValue {
                 STerm::new(st, AstTerm::Identifier(qual_id))
             }
             SMTBitVecValue::BvAdd(a, b) => self.binary_op(st, "bvadd", a, b),
+            SMTBitVecValue::BvXor(a, b) => self.binary_op(st, "bvxor", a, b),
+            SMTBitVecValue::BvAnd(a, b) => self.binary_op(st, "bvand", a, b),
+            SMTBitVecValue::BvNot(a) => self.unary_op(st, "bvnot", a),
         }
+    }
+
+    fn unary_op<'s>(&self, st: &'s Storage, op: &'static str, a: &SMTBitVecValue) -> STerm<'s> {
+        use smtlib_lowlevel::ast::{Identifier, QualIdentifier, Term as AstTerm};
+        use smtlib_lowlevel::lexicon::Symbol;
+
+        let qual_id = QualIdentifier::Identifier(Identifier::Simple(Symbol(op)));
+        let a_term = a.to_sterm(st);
+        STerm::new(
+            st,
+            AstTerm::Application(qual_id, st.alloc_slice(&[a_term.term()])),
+        )
     }
 
     fn binary_op<'s>(
@@ -113,6 +137,20 @@ impl SMTBitVecValue {
                 let b_term = b.to_term(termdag);
                 termdag.app("bvadd".into(), vec![a_term, b_term])
             }
+            SMTBitVecValue::BvXor(a, b) => {
+                let a_term = a.to_term(termdag);
+                let b_term = b.to_term(termdag);
+                termdag.app("bvxor".into(), vec![a_term, b_term])
+            }
+            SMTBitVecValue::BvAnd(a, b) => {
+                let a_term = a.to_term(termdag);
+                let b_term = b.to_term(termdag);
+                termdag.app("bvand".into(), vec![a_term, b_term])
+            }
+            SMTBitVecValue::BvNot(a) => {
+                let a_term = a.to_term(termdag);
+                termdag.app("bvnot".into(), vec![a_term])
+            }
         }
     }
 }
@@ -162,6 +200,28 @@ impl BaseSort for SMTBitVec {
             "bvadd" = |a: SMTBitVecValue, b: SMTBitVecValue| -> SMTBitVecValue {
                 SMTBitVecValue::BvAdd(Box::new(a), Box::new(b))
             }
+        );
+
+        // (bvxor a b) - bitwise XOR
+        add_primitive!(
+            eg,
+            "bvxor" = |a: SMTBitVecValue, b: SMTBitVecValue| -> SMTBitVecValue {
+                SMTBitVecValue::BvXor(Box::new(a), Box::new(b))
+            }
+        );
+
+        // (bvand a b) - bitwise AND
+        add_primitive!(
+            eg,
+            "bvand" = |a: SMTBitVecValue, b: SMTBitVecValue| -> SMTBitVecValue {
+                SMTBitVecValue::BvAnd(Box::new(a), Box::new(b))
+            }
+        );
+
+        // (bvnot a) - bitwise NOT (one's complement)
+        add_primitive!(
+            eg,
+            "bvnot" = |a: SMTBitVecValue| -> SMTBitVecValue { SMTBitVecValue::BvNot(Box::new(a)) }
         );
     }
 }

@@ -1,0 +1,83 @@
+; Carry detection optimization:
+; sign(~(hi0 ^ hi1) & (hi0 ^ (hi0 + hi1 + c)))
+; => (sign(hi0) == sign(hi1)) AND (sign(hi0 + hi1 + c) != sign(hi0))
+
+(datatype BitVec
+  (BvConst String)
+  (BvLit i64)
+  (Add BitVec BitVec)
+  (Xor BitVec BitVec)
+  (And BitVec BitVec)
+  (Not BitVec)
+  (Smt SMTBitVec))
+
+(datatype Boolean
+  (BoolEq Boolean Boolean)
+  (BoolNeq Boolean Boolean)
+  (BoolAnd Boolean Boolean)
+  (IsNeg BitVec)
+  (SmtBool SMTBool))
+
+; Simplify: x ^ -1 = ~x
+(ruleset simplify)
+(rewrite (Xor a (BvLit -1)) (Not a) :ruleset simplify)
+(rewrite (Xor (BvLit -1) a) (Not a) :ruleset simplify)
+
+; Core carry detection rewrite
+(ruleset carry-opt)
+(rewrite 
+  (IsNeg (And (Not (Xor hi0 hi1)) 
+              (Xor hi0 (Add (Add hi0 hi1) c))))
+  (BoolAnd 
+    (BoolEq (IsNeg hi0) (IsNeg hi1))
+    (BoolNeq (IsNeg (Add (Add hi0 hi1) c)) (IsNeg hi0)))
+  :ruleset carry-opt)
+
+; Translation to SMT
+(ruleset to-smt)
+(rewrite (BvConst name) (Smt (smt-bv-const name 64)) :ruleset to-smt)
+(rewrite (BvLit n) (Smt (smt-bv n 64)) :ruleset to-smt)
+(rewrite (Add (Smt a) (Smt b)) (Smt (bvadd a b)) :ruleset to-smt)
+(rewrite (Xor (Smt a) (Smt b)) (Smt (bvxor a b)) :ruleset to-smt)
+(rewrite (And (Smt a) (Smt b)) (Smt (bvand a b)) :ruleset to-smt)
+(rewrite (Not (Smt a)) (Smt (bvnot a)) :ruleset to-smt)
+(rewrite (IsNeg (Smt a)) (SmtBool (smt-bv-slt a (smt-bv 0 64))) :ruleset to-smt)
+(rewrite (BoolAnd (SmtBool a) (SmtBool b)) (SmtBool (and a b)) :ruleset to-smt)
+(rewrite (BoolEq (SmtBool a) (SmtBool b)) 
+         (SmtBool (or (and a b) (and (not a) (not b)))) :ruleset to-smt)
+(rewrite (BoolNeq (SmtBool a) (SmtBool b)) 
+         (SmtBool (or (and a (not b)) (and (not a) b))) :ruleset to-smt)
+
+; Build original expression: sign(~(hi0 ^ hi1) & (hi0 ^ (hi0 + hi1 + c)))
+(let hi0 (BvConst "hi0"))
+(let hi1 (BvConst "hi1"))
+(let c (BvConst "c"))
+(let sum (Add (Add hi0 hi1) c))
+(let b_original (IsNeg (And (Xor (Xor hi0 hi1) (BvLit -1)) (Xor hi0 sum))))
+
+; Run rewrites
+(run-schedule (saturate simplify))
+(run-schedule (saturate carry-opt))
+(run-schedule (saturate to-smt))
+
+; SMT verification
+(let hi0_smt (smt-bv-const "hi0" 64))
+(let hi1_smt (smt-bv-const "hi1" 64))
+(let c_smt (smt-bv-const "c" 64))
+(let zero_smt (smt-bv 0 64))
+(let sum_smt (bvadd (bvadd hi0_smt hi1_smt) c_smt))
+
+(let b_orig_smt (smt-bv-slt (bvand (bvnot (bvxor hi0_smt hi1_smt)) 
+                                   (bvxor hi0_smt sum_smt)) zero_smt))
+
+(let sign_hi0 (smt-bv-slt hi0_smt zero_smt))
+(let sign_hi1 (smt-bv-slt hi1_smt zero_smt))
+(let sign_sum (smt-bv-slt sum_smt zero_smt))
+(let signs_equal (or (and sign_hi0 sign_hi1) (and (not sign_hi0) (not sign_hi1))))
+(let signs_differ (or (and sign_sum (not sign_hi0)) (and (not sign_sum) sign_hi0)))
+(let b_simp_smt (and signs_equal signs_differ))
+
+; Prove equivalence: (orig XOR simp) is UNSAT
+(let not_equivalent (or (and b_orig_smt (not b_simp_smt)) 
+                        (and b_simp_smt (not b_orig_smt))))
+(check (= false (smt-sat? (smt-solve not_equivalent))))
