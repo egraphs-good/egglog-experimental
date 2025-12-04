@@ -977,6 +977,17 @@ impl Constants {
                 self.bitvec(*a);
                 self.bitvec(*b);
             }
+            SMTBitVecValue::BvXor(a, b) => {
+                self.bitvec(*a);
+                self.bitvec(*b);
+            }
+            SMTBitVecValue::BvAnd(a, b) => {
+                self.bitvec(*a);
+                self.bitvec(*b);
+            }
+            SMTBitVecValue::BvNot(a) => {
+                self.bitvec(*a);
+            }
         }
     }
 }

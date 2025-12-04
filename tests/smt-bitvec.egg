@@ -42,3 +42,19 @@
     (smt-bv-= c zero64)))
 (let sum_is_zero (smt-bv-= sum zero64))
 (check (= false (smt-sat? (smt-solve (and all_zero (not sum_is_zero))))))
+
+; x XOR x = 0 is always true
+(let xor_self (smt-bv-= (bvxor x x) zero64))
+(check (= false (smt-sat? (smt-solve (not xor_self)))))
+
+; x AND x = x is always true
+(let and_self (smt-bv-= (bvand x x) x))
+(check (= false (smt-sat? (smt-solve (not and_self)))))
+
+; x AND 0 = 0 is always true
+(let and_zero (smt-bv-= (bvand x zero64) zero64))
+(check (= false (smt-sat? (smt-solve (not and_zero)))))
+
+; NOT(NOT(x)) = x is always true
+(let not_not (smt-bv-= (bvnot (bvnot x)) x))
+(check (= false (smt-sat? (smt-solve (not not_not)))))
