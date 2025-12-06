@@ -192,6 +192,17 @@
     (set (num-roots p) (+ n 1)))
   :ruleset incr-multiplicity)
 
+; Finally, if we finished factoring a polynomial,
+; equate it with its factored form
+(ruleset merge-factored)
+(rule
+  (
+    (= (factorable p) true)
+    (= (num-roots p) (degree p))
+    (= (partial-factored p) f))
+  ((union p f) (set (factorable p) false))
+  :ruleset merge-factored)
+
 ; Some example polynomials
 
 ; 10 = 10
@@ -236,4 +247,11 @@
             (run add-deriv)
             (saturate (run differentiate))
             (saturate (run to-smt))
-            (run incr-multiplicity)))))))
+            (run incr-multiplicity)))
+        (run merge-factored)))))
+
+(extract p-const 2)
+(extract p-rat 2)
+(extract p-alg 2)
+(extract p-complex 2)
+(extract big-p-rat 2)
