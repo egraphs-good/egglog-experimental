@@ -939,7 +939,10 @@ impl Constants {
             SMTRealValue::Const(name) => {
                 self.reals.insert(name);
             }
-            SMTRealValue::Float64(_) | SMTRealValue::OfInt(_) => {}
+            SMTRealValue::Float64(_) => {}
+            SMTRealValue::OfInt(int_val) => {
+                self.int(*int_val);
+            }
             SMTRealValue::Add(a, b)
             | SMTRealValue::Sub(a, b)
             | SMTRealValue::Mul(a, b)
