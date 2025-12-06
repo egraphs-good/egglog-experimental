@@ -1,5 +1,6 @@
 use crate::smt_bitvec::{SMTBitVec, SMTBitVecValue};
 use crate::smt_real::{SMTReal, SMTRealValue};
+use crate::{SMTUFReal, SMTUFRealValue};
 use egglog::constraint::{self, Constraint, TypeConstraint};
 use egglog::sort::{BaseValues, Boxed, F, OrderedFloat, S};
 use egglog::{ArcSort, AtomTerm, ExecutionState, Primitive, TypeInfo};
@@ -21,6 +22,7 @@ use std::{fmt::Debug, hash::Hash};
 
 pub fn add_smt(egraph: &mut EGraph) {
     // important to add ints as base sort before bools bc bools reference ints
+    add_base_sort(egraph, SMTUFReal, span!()).unwrap();
     add_base_sort(egraph, SMTUFInt, span!()).unwrap();
     add_base_sort(egraph, SMTInt, span!()).unwrap();
     add_base_sort(egraph, SMTReal, span!()).unwrap();
@@ -679,6 +681,22 @@ impl BaseSort for SMTSolved {
                 .get_arcsort_by(|s| s.value_type() == Some(TypeId::of::<SMTUFIntValue>()))
                 .clone(),
         });
+        // (smt-call f arg1 arg2 ...)
+        eg.add_primitive(UFApply {
+            args: eg
+                .get_arcsorts_by(|s| {
+                    s.value_type() == Some(TypeId::of::<SMTIntValue>())
+                        || s.value_type() == Some(TypeId::of::<SMTBoolValue>())
+                        || s.value_type() == Some(TypeId::of::<SMTRealValue>())
+                })
+                .clone(),
+            out_sort: eg
+                .get_arcsort_by(|s| s.value_type() == Some(TypeId::of::<SMTRealValue>()))
+                .clone(),
+            fun_sort: eg
+                .get_arcsort_by(|s| s.value_type() == Some(TypeId::of::<SMTUFRealValue>()))
+                .clone(),
+        });
     }
 }
 
@@ -696,6 +714,7 @@ impl SMTUFIntValue {
                     .map(|type_name| match type_name.as_str() {
                         "Int" => Ok(Int::sort()),
                         "Bool" => Ok(Bool::sort()),
+                        "Real" => Ok(Real::sort()),
                         other => Err(format!("unknown type {other}")),
                     })
                     .collect();
@@ -1070,6 +1089,15 @@ impl Constants {
             }
             SMTRealValue::Neg(a) => {
                 self.real(*a);
+            }
+            SMTRealValue::FuncApplication(_, args) => {
+                for arg in args {
+                    match arg {
+                        SMTBaseValue::BoolValue(bool_value) => self.bool(bool_value),
+                        SMTBaseValue::IntValue(int_value) => self.int(int_value),
+                        SMTBaseValue::RealValue(int_value) => self.real(int_value),
+                    }
+                }
             }
         }
     }

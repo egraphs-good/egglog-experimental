@@ -24,7 +24,6 @@ pub enum SMTBitVecValue {
 }
 
 impl SMTBitVecValue {
-
     /// Get the size of the AST rooted at this bitvector value
     pub fn ast_size(&self) -> usize {
         match self {
