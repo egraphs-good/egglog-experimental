@@ -1,0 +1,154 @@
+; Factor rewriting for polynomials with rational roots using SMT.
+
+; A datatype for representing polynomials in a single variable over Q.
+; We rewrite from the form ax^b+...+c to the form (x-a)^b*...*c.
+; If any roots are non-rational (algebraic or complex), they are not rewritten.
+(datatype Polynomial
+  ; (Const a) := a
+  (Const Rational)
+
+  ; (AddTerm a b p) := ax^b + p
+  (AddTerm Rational i64 Polynomial)
+
+  ; (MulFactor a b p) := (x-a)^b * p
+  (MulFactor Rational i64 Polynomial)
+
+  ; Derivatives are used as backend values for the factoring analysis.
+  (Deriv Polynomial :cost 999999)
+  (NthDeriv Polynomial i64 :cost 999999))
+
+; Find the coefficient and degree of the highest-degree term
+(ruleset coeff-deg)
+(function coefficient (Polynomial) Rational :merge new)
+(function degree (Polynomial) i64 :merge new)
+(rule
+  ((Const a))
+  ((set (coefficient (Const a)) a) (set (degree (Const a)) 0))
+  :ruleset coeff-deg)
+(rule
+  ((AddTerm a b p) (= (coefficient p) c) (= (degree p) d) (< b d))
+  ((set (degree (AddTerm a b p)) d) (set (coefficient (AddTerm a b p)) c))
+  :ruleset coeff-deg)
+(rule
+  ((AddTerm a b p) (= (coefficient p) c) (= (degree p) d) (= b d))
+  ((set (degree (AddTerm a b p)) d) (set (coefficient (AddTerm a b p)) (+ a c)))
+  :ruleset coeff-deg)
+(rule
+  ((AddTerm a b p) (= (coefficient p) c) (= (degree p) d) (> b d))
+  ((set (degree (AddTerm a b p)) b) (set (coefficient (AddTerm a b p)) a))
+  :ruleset coeff-deg)
+
+; Initialize an empty list of roots for polynomials tagged with factorable
+(ruleset init-roots)
+(function factorable (Polynomial) bool :merge new)
+(function partial-factored (Polynomial) Polynomial :merge new)
+(function num-roots (Polynomial) i64 :merge new)
+(rule
+  ((= (factorable p) true) (= (coefficient p) c))
+  ((set (partial-factored p) (Const c)) (set (num-roots p) 0))
+  :ruleset init-roots)
+
+; Convert polynomials to an SMT form
+(ruleset to-smt)
+(let _x_ (smt-real-const "x"))
+(let _p_ (smt-int-const "p"))
+(let _q_ (smt-int-const "q"))
+(let _p/q_ (/ (smt-int->real _p_) (smt-int->real _q_)))
+(function smt-repr (Polynomial) SMTReal :merge new)
+(rule
+  ((Const a))
+  ((set
+      (smt-repr (Const a))
+      (/
+        (smt-int->real (smt-int (numer a)))
+        (smt-int->real (smt-int (denom a))))))
+  :ruleset to-smt)
+(rule
+  ((AddTerm a b p) (= (smt-repr p) s))
+  ((set
+      (smt-repr (AddTerm a b p))
+      (+
+        (*
+          (/
+            (smt-int->real (smt-int (numer a)))
+            (smt-int->real (smt-int (denom a))))
+          (^ _x_ (smt-int->real (smt-int b))))
+        s)))
+  :ruleset to-smt)
+
+; Convert the current roots of polynomials tagged with factorable to constraints
+(ruleset make-constraints)
+(function constraints (Polynomial) SMTBool :merge new)
+(rule
+  ((Const a))
+  ((set
+      (constraints (Const a))
+      (and (smt-real-= _x_ _p/q_) (not (smt-= _q_ (smt-int 0)))))) ; TODO: poly = 0 constraint added at solve time
+  :ruleset make-constraints)
+(rule
+  ((MulFactor a b p) (= (constraints p) c))
+  ((set
+      (constraints (MulFactor a b p))
+      (and
+        (not (smt-real-= _x_ (/
+              (smt-int->real (smt-int (numer a)))
+              (smt-int->real (smt-int (denom a))))))
+        c)))
+  :ruleset make-constraints)
+
+; Solve for the next rational root of polynomials tagged with factorable
+(ruleset solve-root)
+(function model (Polynomial) SMTSolved :merge new)
+(rule
+  (
+    (= (factorable p) true)
+    (= (num-roots p) n)
+    (= (degree p) d)
+    (< n d)
+    (= (smt-repr p) s)
+    (= (partial-factored p) f)
+    (= (constraints f) c))
+  ((set (model p) (smt-solve c)))
+  :ruleset solve-root)
+
+; Update the partial factoring of polynomials tagged with factorable
+; If we haven't found all the roots but no rational one can be found,
+; mark the polynomial unfactorable (for this analysis)
+(ruleset update-factors)
+(rule
+  (
+    (= (factorable p) true)
+    (= (num-roots p) n)
+    (= (degree p) d)
+    (< n d)
+    (= (model p) m)
+    (= (smt-sat? m) true)
+    (= (partial-factored p) f))
+  (
+    (set
+      (partial-factored p)
+      (MulFactor (rational (smt-value m _p_) (smt-value m _q_)) 1 f))
+    (set (num-roots p) (+ n 1)))
+  :ruleset update-factors)
+(rule
+  (
+    (= (factorable p) true)
+    (= (num-roots p) n)
+    (= (degree p) d)
+    (< n d)
+    (= (model p) m)
+    (= (smt-sat? m) false))
+  ((set (factorable p) false))
+  :ruleset update-factors)
+
+; TODO: impl rulesets:
+; - differentiate once for the most recent factors
+; - get models against derivatives
+; - update the partial factors
+; - merge full factors with original poly
+
+; TODO: more rules
+; TODO: example polynomials (one with rat roots, one with alg roots, one with complex roots)
+
+; Interleave egglog and SMT operation in schedule
+(run-schedule (seq))

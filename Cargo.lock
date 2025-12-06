@@ -336,7 +336,7 @@ checksum = "d0881ea181b1df73ff77ffaaf9c7544ecc11e82fba9b5f27b262a3c73a332555"
 [[package]]
 name = "egglog"
 version = "1.0.0"
-source = "git+https://github.com/egraphs-good/egglog.git?branch=main#c4025d13c5c4292c553f20b8b9b550bdefbfd307"
+source = "git+https://github.com/egraphs-good/egglog.git?branch=main#33f79948ca25ec170b585515fb47809368ad2897"
 dependencies = [
  "chrono",
  "clap",
@@ -367,7 +367,7 @@ dependencies = [
 [[package]]
 name = "egglog-add-primitive"
 version = "1.0.0"
-source = "git+https://github.com/egraphs-good/egglog.git?branch=main#c4025d13c5c4292c553f20b8b9b550bdefbfd307"
+source = "git+https://github.com/egraphs-good/egglog.git?branch=main#33f79948ca25ec170b585515fb47809368ad2897"
 dependencies = [
  "quote",
  "syn 2.0.111",
@@ -376,7 +376,7 @@ dependencies = [
 [[package]]
 name = "egglog-ast"
 version = "1.0.0"
-source = "git+https://github.com/egraphs-good/egglog.git?branch=main#c4025d13c5c4292c553f20b8b9b550bdefbfd307"
+source = "git+https://github.com/egraphs-good/egglog.git?branch=main#33f79948ca25ec170b585515fb47809368ad2897"
 dependencies = [
  "ordered-float",
 ]
@@ -384,7 +384,7 @@ dependencies = [
 [[package]]
 name = "egglog-bridge"
 version = "1.0.0"
-source = "git+https://github.com/egraphs-good/egglog.git?branch=main#c4025d13c5c4292c553f20b8b9b550bdefbfd307"
+source = "git+https://github.com/egraphs-good/egglog.git?branch=main#33f79948ca25ec170b585515fb47809368ad2897"
 dependencies = [
  "anyhow",
  "dyn-clone",
@@ -408,7 +408,7 @@ dependencies = [
 [[package]]
 name = "egglog-concurrency"
 version = "1.0.0"
-source = "git+https://github.com/egraphs-good/egglog.git?branch=main#c4025d13c5c4292c553f20b8b9b550bdefbfd307"
+source = "git+https://github.com/egraphs-good/egglog.git?branch=main#33f79948ca25ec170b585515fb47809368ad2897"
 dependencies = [
  "arc-swap",
  "rayon",
@@ -417,7 +417,7 @@ dependencies = [
 [[package]]
 name = "egglog-core-relations"
 version = "1.0.0"
-source = "git+https://github.com/egraphs-good/egglog.git?branch=main#c4025d13c5c4292c553f20b8b9b550bdefbfd307"
+source = "git+https://github.com/egraphs-good/egglog.git?branch=main#33f79948ca25ec170b585515fb47809368ad2897"
 dependencies = [
  "anyhow",
  "bumpalo",
@@ -463,7 +463,7 @@ dependencies = [
 [[package]]
 name = "egglog-numeric-id"
 version = "1.0.0"
-source = "git+https://github.com/egraphs-good/egglog.git?branch=main#c4025d13c5c4292c553f20b8b9b550bdefbfd307"
+source = "git+https://github.com/egraphs-good/egglog.git?branch=main#33f79948ca25ec170b585515fb47809368ad2897"
 dependencies = [
  "rayon",
 ]
@@ -471,7 +471,7 @@ dependencies = [
 [[package]]
 name = "egglog-reports"
 version = "1.0.0"
-source = "git+https://github.com/egraphs-good/egglog.git?branch=main#c4025d13c5c4292c553f20b8b9b550bdefbfd307"
+source = "git+https://github.com/egraphs-good/egglog.git?branch=main#33f79948ca25ec170b585515fb47809368ad2897"
 dependencies = [
  "clap",
  "hashbrown 0.16.1",
@@ -485,7 +485,7 @@ dependencies = [
 [[package]]
 name = "egglog-union-find"
 version = "1.0.0"
-source = "git+https://github.com/egraphs-good/egglog.git?branch=main#c4025d13c5c4292c553f20b8b9b550bdefbfd307"
+source = "git+https://github.com/egraphs-good/egglog.git?branch=main#33f79948ca25ec170b585515fb47809368ad2897"
 dependencies = [
  "crossbeam",
  "egglog-concurrency",
@@ -782,9 +782,9 @@ checksum = "bbd2bcb4c963f2ddae06a2efc7e9f3591312473c50c6685e1f298068316e66fe"
 
 [[package]]
 name = "libc"
-version = "0.2.177"
+version = "0.2.178"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2874a2af47a2325c2001a6e6fad9b16a53b802102b528163885171cf92b15976"
+checksum = "37c93d8daa9d8a012fd8ab92f088405fb202ea0b6ab73ee2482ae66af4f42091"
 
 [[package]]
 name = "libmimalloc-sys"
@@ -825,9 +825,9 @@ dependencies = [
 
 [[package]]
 name = "log"
-version = "0.4.28"
+version = "0.4.29"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "34080505efa8e45a4b816c349525ebe327ceaa8559756f0356cba97ef3bf7432"
+checksum = "5e5032e24019045c762d3c0f28f5b6b8bbf38563a65908389bf7978758920897"
 
 [[package]]
 name = "logos"
@@ -1349,7 +1349,7 @@ checksum = "67b1b7a3b5fe4f1376887184045fcf45c69e92af734b7aaddc05fb777b6fbd03"
 [[package]]
 name = "smtlib"
 version = "0.3.0"
-source = "git+https://github.com/noahhuck/smtlib-rs.git?branch=real-builtin#d3a66163ee1d899af9c8088c9118a33def36fd9a"
+source = "git+https://github.com/noahhuck/smtlib-rs.git?branch=real-builtin#e8e453c92075a368ca9c3dedadf2792cbe57ec52"
 dependencies = [
  "indexmap",
  "itertools",
@@ -1361,7 +1361,7 @@ dependencies = [
 [[package]]
 name = "smtlib-lowlevel"
 version = "0.3.0"
-source = "git+https://github.com/noahhuck/smtlib-rs.git?branch=real-builtin#d3a66163ee1d899af9c8088c9118a33def36fd9a"
+source = "git+https://github.com/noahhuck/smtlib-rs.git?branch=real-builtin#e8e453c92075a368ca9c3dedadf2792cbe57ec52"
 dependencies = [
  "bumpalo",
  "itertools",
@@ -1574,18 +1574,18 @@ checksum = "f17a85883d4e6d00e8a97c586de764dabcc06133f7f1d55dce5cdc070ad7fe59"
 
 [[package]]
 name = "zerocopy"
-version = "0.8.30"
+version = "0.8.31"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4ea879c944afe8a2b25fef16bb4ba234f47c694565e97383b36f3a878219065c"
+checksum = "fd74ec98b9250adb3ca554bdde269adf631549f51d8a8f8f0a10b50f1cb298c3"
 dependencies = [
  "zerocopy-derive",
 ]
 
 [[package]]
 name = "zerocopy-derive"
-version = "0.8.30"
+version = "0.8.31"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cf955aa904d6040f70dc8e9384444cb1030aed272ba3cb09bbc4ab9e7c1f34f5"
+checksum = "d8a8d209fdf45cf5138cbb5a506f6b52522a25afccc534d1475dad8e31105c6a"
 dependencies = [
  "proc-macro2",
  "quote",

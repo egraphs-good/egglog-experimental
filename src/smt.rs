@@ -50,11 +50,11 @@ impl SMTBoolValue {
             SMTBoolValue::And(a, b) => a.to_bool(st, solver) & (b.to_bool(st, solver)),
             SMTBoolValue::Not(a) => !a.to_bool(st, solver),
             SMTBoolValue::IntEq(a, b) => a.to_int(st, solver)._eq(b.to_int(st, solver)),
-            SMTBoolValue::RealEq(a, b) => a.to_real(st)._eq(b.to_real(st)),
-            SMTBoolValue::RealLt(a, b) => a.to_real(st).lt(b.to_real(st)),
-            SMTBoolValue::RealGt(a, b) => a.to_real(st).gt(b.to_real(st)),
-            SMTBoolValue::RealLte(a, b) => a.to_real(st).le(b.to_real(st)),
-            SMTBoolValue::RealGte(a, b) => a.to_real(st).ge(b.to_real(st)),
+            SMTBoolValue::RealEq(a, b) => a.to_real(st, solver)._eq(b.to_real(st, solver)),
+            SMTBoolValue::RealLt(a, b) => a.to_real(st, solver).lt(b.to_real(st, solver)),
+            SMTBoolValue::RealGt(a, b) => a.to_real(st, solver).gt(b.to_real(st, solver)),
+            SMTBoolValue::RealLte(a, b) => a.to_real(st, solver).le(b.to_real(st, solver)),
+            SMTBoolValue::RealGte(a, b) => a.to_real(st, solver).ge(b.to_real(st, solver)),
         }
     }
 
@@ -236,7 +236,9 @@ impl SMTIntValue {
                                 SMTBaseValue::IntValue(val) => {
                                     val.to_int(st, solver).into_dynamic()
                                 }
-                                SMTBaseValue::RealValue(val) => val.to_real(st).into_dynamic(),
+                                SMTBaseValue::RealValue(val) => {
+                                    val.to_real(st, solver).into_dynamic()
+                                }
                             })
                             .collect::<Vec<_>>()[..],
                     )
@@ -915,7 +917,7 @@ impl Constants {
             SMTRealValue::Const(name) => {
                 self.reals.insert(name);
             }
-            SMTRealValue::Float64(_) => {}
+            SMTRealValue::Float64(_) | SMTRealValue::OfInt(_) => {}
             SMTRealValue::Add(a, b)
             | SMTRealValue::Sub(a, b)
             | SMTRealValue::Mul(a, b)
