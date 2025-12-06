@@ -16,11 +16,11 @@ egglog = { git = "https://github.com/egraphs-good/egglog.git", branch = "main", 
 egglog-ast = { git = "https://github.com/egraphs-good/egglog.git", branch = "main", default-features = false }
 egglog-reports = { git = "https://github.com/egraphs-good/egglog.git", branch = "main", default-features = false }
 
+smtlib = { path = "../smtlib-rs/smtlib" }
 num = "0.4.3"
 lazy_static = "1.4"
 log = "0.4"
-smtlib = { git = "https://github.com/noahhuck/smtlib-rs.git", branch = "real-builtin" }
-smtlib-lowlevel = { git = "https://github.com/noahhuck/smtlib-rs.git", branch = "real-builtin" }
+smtlib-lowlevel = { path = "../smtlib-rs/lowlevel" }
 
 [dev-dependencies]
 glob = "0.3.1"

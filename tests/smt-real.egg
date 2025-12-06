@@ -20,8 +20,18 @@
 (let e1 (Mul (Var "x") (Num 2.0)))
 (let e2 (Add (Num 2.0) (Mul (Num 2.0) (Var "x"))))
 (let e3 (Eq e1 e2))
-(let e4 (Eq e2 (Mul (Num 2.0) (Add (Num 1.0) (Var "x") ))))
+(let e4 (Eq e2 (Mul (Num 2.0) (Add (Num 1.0) (Var "x")))))
 
 (run 100)
 (check (= e3 (Bool_ false)))
 (check (= e4 (Bool_ true)))
+
+
+; (let x_fun (smt-fn-real "x" "Int"))
+; (let t_fun (smt-fn-real "t" "Int"))
+; (let y_fun (smt-fn-real "y" "Int"))
+
+; (let false_cond1 (smt-= (smt-call x_fun (smt-int 0)) (smt-int 0)))
+; (let false_cond2 (smt-= (smt-call x_fun (smt-int 0)) (smt-int 1)))
+; (let uf_false_model (smt-solve false_cond1 false_cond2))
+; (check (= false (smt-sat? uf_false_model)))
