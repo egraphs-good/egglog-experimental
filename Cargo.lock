@@ -1348,7 +1348,7 @@ checksum = "67b1b7a3b5fe4f1376887184045fcf45c69e92af734b7aaddc05fb777b6fbd03"
 [[package]]
 name = "smtlib"
 version = "0.3.0"
-source = "git+https://github.com/noahhuck/smtlib-rs.git?branch=real-builtin#563d52ef89c0ca90cb2545ff50850c2bbb67a162"
+source = "git+https://github.com/noahhuck/smtlib-rs.git?branch=real-builtin#e8e453c92075a368ca9c3dedadf2792cbe57ec52"
 dependencies = [
  "indexmap",
  "itertools",
@@ -1360,7 +1360,7 @@ dependencies = [
 [[package]]
 name = "smtlib-lowlevel"
 version = "0.3.0"
-source = "git+https://github.com/noahhuck/smtlib-rs.git?branch=real-builtin#563d52ef89c0ca90cb2545ff50850c2bbb67a162"
+source = "git+https://github.com/noahhuck/smtlib-rs.git?branch=real-builtin#e8e453c92075a368ca9c3dedadf2792cbe57ec52"
 dependencies = [
  "bumpalo",
  "itertools",

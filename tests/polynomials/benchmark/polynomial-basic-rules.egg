@@ -1,0 +1,71 @@
+; Basic polynomial rewrite rules with datatype
+
+; The polynomial datatype
+(datatype Polynomial
+  (Zero)
+  (One)
+  (Var String)
+  (Add Polynomial Polynomial)
+  (Mul Polynomial Polynomial)
+  (Coefficient f64 Polynomial)
+  (Power Polynomial i64))
+
+; Associativity rules
+(rewrite (Add (Add a b) c) (Add a (Add b c)))
+(rewrite (Mul (Mul a b) c) (Mul a (Mul b c)))
+
+; Commutativity rules
+(rewrite (Add a b) (Add b a))
+(rewrite (Mul a b) (Mul b a))
+
+; Distributivity rules
+(birewrite (Mul a (Add b c)) (Add (Mul a b) (Mul a c)))
+(birewrite (Mul (Add a b) c) (Add (Mul a c) (Mul b c)))
+
+; Identity elements
+(rewrite (Add a (Zero)) a)
+(rewrite (Add (Zero) a) a)
+(rewrite (Mul a (One)) a)
+(rewrite (Mul (One) a) a)
+
+; Zero element
+(rewrite (Mul a (Zero)) (Zero))
+(rewrite (Mul (Zero) a) (Zero))
+
+; Coefficient rules
+(rewrite (Coefficient c1 (Coefficient c2 p)) (Coefficient (* c1 c2) p))
+(rewrite (Coefficient 0.0 p) (Zero))
+(rewrite (Coefficient 1.0 p) p)
+(rewrite (Add a a) (Coefficient 2.0 a))
+
+; Power rules
+(rewrite (Power p 0) (One))
+(rewrite (Power p 1) p)
+(rewrite (Power (Power p n1) n2) (Power p (* n1 n2)))
+
+; Coefficient distribution over addition
+(rewrite (Coefficient c (Add a b)) (Add (Coefficient c a) (Coefficient c b)))
+
+; Multiplication of coefficients
+(rewrite (Mul (Coefficient c1 p1) (Coefficient c2 p2)) (Coefficient (* c1 c2) (Mul p1 p2)))
+
+; Power expansion rule
+(rule ((Power p n) (> n 1))
+  ((union (Power p n) (Mul p (Power p (- n 1))))))
+
+; More coefficient rules for combining like terms
+(rewrite (Add (Coefficient c1 p) (Coefficient c2 p)) (Coefficient (+ c1 c2) p))
+
+; Coefficient multiplication with variables
+(rewrite (Mul (Coefficient c p1) p2) (Coefficient c (Mul p1 p2)))
+(rewrite (Mul p1 (Coefficient c p2)) (Coefficient c (Mul p1 p2)))
+
+; Rule for multiplying powers of same variable
+(rewrite (Mul (Power (Var x) n1) (Power (Var x) n2)) (Power (Var x) (+ n1 n2)))
+(rewrite (Mul (Power (Var x) n) (Var x)) (Power (Var x) (+ n 1)))
+(rewrite (Mul (Var x) (Power (Var x) n)) (Power (Var x) (+ n 1)))
+(rewrite (Mul (Var x) (Var x)) (Power (Var x) 2))
+
+; Additional normalization rules
+(rewrite (Add p (Coefficient c p)) (Coefficient (+ 1.0 c) p))
+(rewrite (Add (Coefficient c p) p) (Coefficient (+ c 1.0) p))

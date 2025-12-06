@@ -1,0 +1,75 @@
+; Given two polynomials, egglog should be able to confirm they are identical.
+
+; The polynomial datatype
+(datatype Polynomial
+  (Zero) ; (Zero) := 0, which = (Coefficient 0.0 x) for any x
+  (One) ; (One) := 1, which = (Power x 0) for any x
+  (Var String) ; (Var "x") := x
+  (Add Polynomial Polynomial) ; (Add p1 p2) := p1 + p2
+  (Mul Polynomial Polynomial) ; (Mul p1 p2) := p1 * p2
+  (Coefficient f64 Polynomial) ; (Coefficient n p) := n * p
+  (Power Polynomial i64) ; (Power p e) := p ^ e
+  (Smt SMTReal) ; backend smt values for the polynomial
+  (UseSmt Polynomial)) ; (UseSmt p) := p, but will use SMT to check equalities
+
+; Rewrite rules to convert polynomials to SMTReals for verification
+
+; Convert basic polynomial constructors to SMT
+(rewrite (Zero) (Smt (smt-real 0.0)))
+(rewrite (One) (Smt (smt-real 1.0)))
+(rewrite (Var x) (Smt (smt-real-const x)))
+
+; Convert polynomial operations to SMT operations
+(rewrite (Add (Smt a) (Smt b)) (Smt (+ a b)))
+(rewrite (Mul (Smt a) (Smt b)) (Smt (* a b)))
+(rewrite (Coefficient c (Smt p)) (Smt (* (smt-real c) p)))
+
+; Recursive power conversion
+(rewrite (Power (Smt p) 0) (Smt (smt-real 1.0)))
+(rule ((Power (Smt p) n) (> n 0))
+  ((union (Power (Smt p) n) (Mul (Smt p) (Power (Smt p) (- n 1))))))
+
+; UseSmt is only a tag to reduce unnecessary SMT calls, not a semantic difference
+(rewrite (UseSmt x) x)
+
+; Merge polynomials if they are equivalent on all inputs
+(rule ((UseSmt (Smt x)) (UseSmt (Smt y)) (not (smt-sat? (smt-solve (not (smt-real-= x y)))))) ((union (Smt x) (Smt y))))
+
+; Original polynomial: (x + y)^3 + (x - z)^2 + 3xy^2z - 2w^2
+(let e1 (Add
+    (Add
+      (Add
+        (Power
+          (Add (Var "x") (Var "y"))
+          3)
+        (Power
+          (Add (Var "x") (Coefficient -1.0 (Var "z")))
+          2))
+      (Coefficient 3.0 (Mul (Var "x") (Mul (Power (Var "y") 2) (Var "z")))))
+    (Coefficient -2.0 (Power (Var "w") 2))))
+
+; The simplified/expanded form of e1: x^3 + 3x^2y + 3xy^2 + y^3 + x^2 - 2xz + z^2 + 3xy^2z - 2w^2
+(let e2 (Add
+    (Add
+      (Add
+        (Add
+          (Add
+            (Add
+              (Add
+                (Add
+                  (Power (Var "x") 3)
+                  (Coefficient 3.0 (Mul (Power (Var "x") 2) (Var "y"))))
+                (Coefficient 3.0 (Mul (Var "x") (Power (Var "y") 2))))
+              (Power (Var "y") 3))
+            (Power (Var "x") 2))
+          (Coefficient -2.0 (Mul (Var "x") (Var "z"))))
+        (Power (Var "z") 2))
+      (Coefficient 3.0 (Mul (Var "x") (Mul (Power (Var "y") 2) (Var "z")))))
+    (Coefficient -2.0 (Power (Var "w") 2))))
+
+(let _e1 (UseSmt e1))
+(let _e2 (UseSmt e2))
+
+(run-schedule (saturate (run)))
+
+(check (= e1 e2))

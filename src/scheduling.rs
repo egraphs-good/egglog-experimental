@@ -221,7 +221,7 @@ pub(crate) fn parse_tags(args: &[Expr]) -> HashMap<String, Literal> {
             panic!("Invalid tag value: {:?}", arg[1]);
         };
         if tags.contains_key(&tag_name.to_string()) {
-            panic!("Tag name already exists: {:?}", tag_name);
+            panic!("Tag name already exists: {tag_name:?}");
         }
         tags.insert(tag_name.to_string(), lit.clone());
     }
@@ -248,7 +248,7 @@ mod schedulers {
             .get(":match-limit")
             .map(|lit| {
                 let Literal::Int(n) = lit else {
-                    panic!("Invalid match limit: {:?}", lit);
+                    panic!("Invalid match limit: {lit:?}");
                 };
                 *n as usize
             })
@@ -257,7 +257,7 @@ mod schedulers {
             .get(":ban-length")
             .map(|lit| {
                 let Literal::Int(n) = lit else {
-                    panic!("Invalid ban length: {:?}", lit);
+                    panic!("Invalid ban length: {lit:?}");
                 };
                 *n as usize
             })

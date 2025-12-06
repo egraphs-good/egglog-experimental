@@ -15,8 +15,10 @@ mod size;
 pub use size::*;
 
 mod smt;
+mod smt_bitvec;
 mod smt_real;
 pub use smt::*;
+pub use smt_bitvec::*;
 pub use smt_real::*;
 
 pub fn new_experimental_egraph() -> EGraph {
