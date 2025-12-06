@@ -15,7 +15,7 @@
 
   ; Derivatives are used as backend values for the factoring analysis.
   (Deriv Polynomial :cost 999999)
-  (NthDeriv Polynomial i64 :cost 999999))
+  (NthDeriv i64 Polynomial :cost 999999))
 
 ; Find the coefficient and degree of the highest-degree term
 (ruleset coeff-deg)
@@ -64,7 +64,7 @@
         (smt-int->real (smt-int (denom a))))))
   :ruleset to-smt)
 (rule
-  ((AddTerm a b p) (= (smt-repr p) s))
+  ((AddTerm a b p) (!= b 0) (= (smt-repr p) s))
   ((set
       (smt-repr (AddTerm a b p))
       (+
@@ -73,6 +73,16 @@
             (smt-int->real (smt-int (numer a)))
             (smt-int->real (smt-int (denom a))))
           (^ _x_ (smt-int->real (smt-int b))))
+        s)))
+  :ruleset to-smt)
+(rule
+  ((AddTerm a b p) (= b 0) (= (smt-repr p) s))
+  ((set
+      (smt-repr (AddTerm a b p))
+      (+
+        (/
+          (smt-int->real (smt-int (numer a)))
+          (smt-int->real (smt-int (denom a))))
         s)))
   :ruleset to-smt)
 
@@ -128,7 +138,8 @@
     (set
       (partial-factored p)
       (MulFactor (rational (smt-value m _p_) (smt-value m _q_)) 1 f))
-    (set (num-roots p) (+ n 1)))
+    (set (num-roots p) (+ n 1))
+    (union p (NthDeriv 0 p)))
   :ruleset update-factors)
 (rule
   (
@@ -141,18 +152,62 @@
   ((set (factorable p) false))
   :ruleset update-factors)
 
-; TODO: impl rulesets:
-; - differentiate once for the most recent factors
-; - get models against derivatives
-; - update the partial factors
-; - merge full factors with original poly
-; TODO: example polynomials (one with rat roots, one with alg roots, one with complex roots)
+; Add a derivative to the egraph to see if we can increase
+; the multiplicity of a root
+(ruleset add-deriv)
+(rule
+  (
+    (= (factorable p) true)
+    (= (partial-factored p) (MulFactor a b f))
+    (NthDeriv (- b 1) p))
+  ((union (Deriv (NthDeriv (- b 1) p)) (NthDeriv b p)))
+  :ruleset add-deriv)
+
+; Calculate derivatives of polynomials
+(ruleset differentiate)
+(rewrite (Deriv (Const a)) (Const (rational 0 1)) :ruleset differentiate)
+(rewrite (Deriv (AddTerm a 0 p)) (Deriv p) :ruleset differentiate)
+(rewrite
+  (Deriv (AddTerm a b p))
+  (AddTerm (rational (* b (numer a)) (denom a)) (- b 1) (Deriv p))
+  :when ((> b 0))
+  :ruleset differentiate)
+
+; Increment multiplicity of most recently found roots
+(ruleset incr-multiplicity)
+(rule
+  (
+    (= (factorable p) true)
+    (= (partial-factored p) (MulFactor a b f))
+    (= (smt-repr (NthDeriv b p)) s)
+    (= (smt-sat? (smt-solve (and
+            (smt-= _p_ (smt-int (numer a)))
+            (and
+              (smt-= _q_ (smt-int (denom a)))
+              (and
+                (smt-real-= s (smt-real 0.0))
+                (smt-real-= _x_ _p/q_)
+              )))))
+      true)
+    (= (num-roots p) n))
+  (
+    (set (partial-factored p) (MulFactor a (+ b 1) f))
+    (set (num-roots p) (+ n 1)))
+  :ruleset incr-multiplicity)
 
 ; Some example polynomials
 
-; x^2 - 1 = (x-1)(x+1)
-(let p-rat (AddTerm (rational 1 1) 2 (Const (rational -1 1))))
+; x^2 - 1/4 = (x-1/2)(x+1/2)
+(let p-rat (AddTerm (rational 1 1) 2 (Const (rational -1 4))))
 (set (factorable p-rat) true)
+
+; x^2 - 2 = (x-sqrt(2))(x+sqrt(2))
+(let p-alg (AddTerm (rational 1 1) 2 (Const (rational -2 1))))
+(set (factorable p-alg) true)
+
+; x^2 + 1 = (x-i)(x+i)
+(let p-complex (AddTerm (rational 1 1) 2 (Const (rational 1 1))))
+(set (factorable p-complex) true)
 
 ; Interleave egglog and SMT operation in schedule
 (run-schedule (seq
@@ -163,4 +218,9 @@
         (saturate (run make-constraints))
         (run solve-root)
         (run update-factors)
+        (saturate (seq
+            (run add-deriv)
+            (saturate (run differentiate))
+            (saturate (run to-smt))
+            (run incr-multiplicity)))
       ))))
