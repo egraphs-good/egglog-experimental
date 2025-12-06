@@ -1,0 +1,454 @@
+; rewrite of https://github.com/egraphs-good/egglog/blob/main/tests/web-demo/math.egg
+; using SMT
+; Converted from the egg demo at
+; https://github.com/egraphs-good/egg/blob/fb6167957beb5dd7c784121459e08ebd1ccb1a00/tests/math.rs
+
+(datatype Math
+    (Diff Math Math :cost 100)
+    (Integral Math Math :cost 100)
+
+    (Add Math Math)
+    (Sub Math Math)
+    (Mul Math Math)
+    (Div Math Math)
+    (Pow Math Math)
+    (Ln Math)
+    (Sqrt Math)
+
+    (Sin Math)
+    (Cos Math)
+
+    (Const f64)
+    (Var String))
+
+; Need to table for all math expressions since egglog does not allow unbound variables
+(relation MathU (Math))
+(rule ((= e (Diff x y))) ((MathU e)))
+(rule ((= e (Integral x y))) ((MathU e)))
+(rule ((= e (Add x y))) ((MathU e)))
+(rule ((= e (Sub x y))) ((MathU e)))
+(rule ((= e (Mul x y))) ((MathU e)))
+(rule ((= e (Div x y))) ((MathU e)))
+(rule ((= e (Pow x y))) ((MathU e)))
+(rule ((= e (Ln x))) ((MathU e)))
+(rule ((= e (Sqrt x))) ((MathU e)))
+(rule ((= e (Sin x))) ((MathU e)))
+(rule ((= e (Cos x))) ((MathU e)))
+(rule ((= e (Const x))) ((MathU e)))
+(rule ((= e (Var x))) ((MathU e)))
+
+; same as constant fold in egg, but instead of an analysis we just
+; merge with constant nodes.
+; The behavior should be the same since it will union as well in egg.
+(rewrite (Add (Const a) (Const b)) (Const (+ a b)))
+(rewrite (Sub (Const a) (Const b)) (Const (- a b)))
+(rewrite (Mul (Const a) (Const b)) (Const (* a b)))
+(rewrite (Div (Const a) (Const b)) (Const (/ a b)) :when ((!= b 0.0)))
+
+
+;; implement pruning with subsuming, so that it still satures after pruning instead of thrashing
+(ruleset prune)
+(rule ((= (Const _) (Diff x y))) ((subsume (Diff x y))) :ruleset prune)
+(rule ((= (Const _) (Integral x y))) ((subsume (Integral x y))) :ruleset prune)
+(rule ((= (Const _) (Add x y))) ((subsume (Add x y))) :ruleset prune)
+(rule ((= (Const _) (Sub x y))) ((subsume (Sub x y))) :ruleset prune)
+(rule ((= (Const _) (Mul x y))) ((subsume (Mul x y))) :ruleset prune)
+(rule ((= (Const _) (Div x y))) ((subsume (Div x y))) :ruleset prune)
+(rule ((= (Const _) (Pow x y))) ((subsume (Pow x y))) :ruleset prune)
+(rule ((= (Const _) (Ln x))) ((subsume (Ln x))) :ruleset prune)
+(rule ((= (Const _) (Sqrt x))) ((subsume (Sqrt x))) :ruleset prune)
+(rule ((= (Const _) (Sin x))) ((subsume (Sin x))) :ruleset prune)
+(rule ((= (Const _) (Cos x))) ((subsume (Cos x))) :ruleset prune)
+
+; merge by ast size, so that its monotonic and prefers smaller expressions
+(function smt (Math) SMTReal :merge (min-by-ast-size old new))
+; Only create smt functions on demand, to minimize number created
+(relation smt-demand (Math))
+(rule ((smt-demand e)
+       (= e (Const f)))
+      ((set (smt e) (smt-real f))))
+(rule ((smt-demand e) (= e (Var s)))
+      ((set (smt e) (smt-real-const s))))
+(rule ((smt-demand (Add a b)))
+      ((smt-demand a) (smt-demand b)))
+(rule ((= e (Add a b)) (smt-demand e) (= a-smt (smt a)) (= b-smt (smt b)))
+      ((set (smt e) (+ a-smt b-smt))))
+(rule ((smt-demand (Mul a b)))
+      ((smt-demand a) (smt-demand b)))
+(rule ((= e (Mul a b) ) (smt-demand e) (= a-smt (smt a)) (= b-smt (smt b)))
+      ((set (smt e) (* a-smt b-smt))))
+(rule ((smt-demand (Sub a b)))
+      ((smt-demand a) (smt-demand b)))
+(rule ((= e (Sub a b) ) (smt-demand e) (= a-smt (smt a)) (= b-smt (smt b)))
+      ((set (smt e) (- a-smt b-smt))))
+(rule ((smt-demand (Div a b)))
+      ((smt-demand a) (smt-demand b)))
+(rule ((= e (Div a b) ) (smt-demand e) (= a-smt (smt a)) (= b-smt (smt b)))
+      ((set (smt e) (/ a-smt b-smt))))
+
+(push)
+  (let x (Add (Const 10.0) (Var "x")))
+  (smt-demand x)
+  (run 10)
+  (check (= (smt x) (+ (smt-real 10.0) (smt-real-const "x"))))
+(pop)
+
+(let smt-diff (smt-fn-real "diff" "Real" "Real"))
+(let smt-integral (smt-fn-real "integral" "Real" "Real"))
+(let smt-ln (smt-fn-real "ln" "Real"))
+(let smt-sqrt (smt-fn-real "sqrt" "Real"))
+(let smt-sin (smt-fn-real "sin" "Real"))
+(let smt-cos (smt-fn-real "cos" "Real"))
+(rule ((smt-demand (Diff a b)))
+      ((smt-demand a) (smt-demand b)))
+(rule ((= e (Diff a b) ) (smt-demand e) (= a-smt (smt a)) (= b-smt (smt b)))
+      ((set (smt e) (smt-call smt-diff a-smt b-smt)) (delete (smt-demand e))))
+(rule ((smt-demand (Integral a b)))
+      ((smt-demand a) (smt-demand b)))
+(rule ((= e (Integral a b) ) (smt-demand e) (= a-smt (smt a)) (= b-smt (smt b)))
+      ((set (smt e) (smt-call smt-integral a-smt b-smt)) (delete (smt-demand e))))
+(rule ((smt-demand (Ln a)))
+      ((smt-demand a)))
+(rule ((= e (Ln a) ) (smt-demand e) (= a-smt (smt a)))
+      ((set (smt e) (smt-call smt-ln a-smt)) (delete (smt-demand e))))
+(rule ((smt-demand (Sqrt a)))
+      ((smt-demand a)))
+(rule ((= e (Sqrt a) ) (smt-demand e) (= a-smt (smt a)))
+      ((set (smt e) (smt-call smt-sqrt a-smt)) (delete (smt-demand e))))
+(rule ((smt-demand (Sin a)))
+      ((smt-demand a)))
+(rule ((= e (Sin a) ) (smt-demand e) (= a-smt (smt a)))
+      ((set (smt e) (smt-call smt-sin a-smt)) (delete (smt-demand e))))
+(rule ((smt-demand (Cos a)))
+      ((smt-demand a)))
+(rule ((= e (Cos a) ) (smt-demand e) (= a-smt (smt a)))
+      ((set (smt e) (smt-call smt-cos a-smt)) (delete (smt-demand e))))
+
+(relation is-not-zero-demand (Math))
+(relation is-not-zero (Math))
+(rule ((is-not-zero-demand x))
+      ((smt-demand x)))
+; We try to solve for the expression equal to zero, if unsat then it is not zero
+(rule ((is-not-zero-demand x)
+       (= e (smt x))
+       (= (smt-unsat) (smt-solve (smt-real-= e (smt-real 0.0)))))
+      ((is-not-zero x)))
+
+(push)
+  (is-not-zero-demand (Const 1.0))
+  (run-schedule (saturate (seq (run) (run prune))))
+  (check (is-not-zero (Const 1.0)))
+(pop)
+
+(push)
+  (is-not-zero-demand (Const 0.0))
+  (run-schedule (saturate (seq (run) (run prune))))
+  (fail (check (is-not-zero (Const 0.0))))
+(pop)
+
+(push)
+  (let x (Add (Mul (Var "x") (Var "x")) (Const 0.0)))
+  (is-not-zero-demand x)
+  (run-schedule (saturate (seq (run) (run prune))))
+  (fail (check (is-not-zero x)))
+(pop)
+
+(push)
+  (let x (Add (Mul (Var "x") (Var "x")) (Const 1.0)))
+  (is-not-zero-demand x)
+  (run-schedule (saturate (seq (run) (run prune))))
+  (check (is-not-zero x))
+(pop)
+
+; (declare-const k Real)
+; (declare-const y Real)
+; (assert
+;   (not
+;   (exists ((x Real))
+;         (not (= (+ (- x x) 1) k)))))
+; (check-sat)
+; (get-model)
+
+
+
+(relation is-const-or-distinct-var-demand (Math String))
+(relation is-const-or-distinct-var (Math String))
+(rule ((is-const-or-distinct-var-demand (Var w) v)
+       (!= v w))
+      ((is-const-or-distinct-var (Var w) v)))
+(rule ((is-const-or-distinct-var-demand (Const c) v))
+      ((is-const-or-distinct-var (Const c) v)))
+
+(rewrite (Add a b) (Add b a))
+(rewrite (Mul a b) (Mul b a))
+(rewrite (Add a (Add b c)) (Add (Add a b) c))
+(rewrite (Mul a (Mul b c)) (Mul (Mul a b) c))
+
+(rewrite (Sub a b) (Add a (Mul (Const -1.0) b)))
+(rule ((Div a b)) ((is-not-zero-demand b)))
+(rewrite (Div a b) (Mul a (Pow b (Const -1.0))) :when ((is-not-zero b)))
+
+(rewrite (Add a (Const 0.0)) a)
+(rewrite (Mul a (Const 0.0)) (Const 0.0))
+(rewrite (Mul a (Const 1.0)) a)
+
+(rule ((MathU a)) ((union a (Add a (Const 0.0)))))
+(rule ((MathU a)) ((union a (Mul a (Const 1.0)))))
+
+(rewrite (Sub a a) (Const 0.0))
+(rule ((Div a a)) ((is-not-zero-demand a)))
+(rewrite (Div a a) (Const 1.0) :when ((is-not-zero a)))
+
+; Example This would not be possible here
+(push)
+  (let x (Add (Mul (Var "x") (Var "x")) (Const 1.0)))
+  (let y (Div x x))
+  (run-schedule (saturate (seq (run) (run prune))))
+  (check (= y (Const 1.0)))
+(pop)
+
+(rewrite (Mul a (Add b c)) (Add (Mul a b) (Mul a c)))
+(rewrite (Add (Mul a b) (Mul a c)) (Mul a (Add b c)))
+
+(rewrite (Mul (Pow a b) (Pow a c)) (Pow a (Add b c)))
+(rule ((Pow x (Const 0.0))) ((is-not-zero-demand x)))
+(rewrite (Pow x (Const 0.0)) (Const 1.0) :when ((is-not-zero x)))
+(rewrite (Pow x (Const 1.0)) x)
+(rewrite (Pow x (Const 2.0)) (Mul x x))
+(rule ((Pow x (Const -1.0))) ((is-not-zero-demand x)))
+(rewrite (Pow x (Const -1.0)) (Div (Const 1.0) x) :when ((is-not-zero x)))
+(rule ((Mul x (Div (Const 1.0) x))) ((is-not-zero-demand x)))
+(rewrite (Mul x (Div (Const 1.0) x)) (Const 1.0) :when ((is-not-zero x)))
+
+(rewrite (Diff (Var x) (Var x)) (Const 1.0))
+(rule ((Diff (Var x) c))
+      ((is-const-or-distinct-var-demand c x)))
+(rewrite (Diff (Var x) c) (Const 0.0) :when ((is-const-or-distinct-var c x)))
+
+(rewrite (Diff x (Add a b)) (Add (Diff x a) (Diff x b)))
+(rewrite (Diff x (Mul a b)) (Add (Mul a (Diff x b)) (Mul b (Diff x a))))
+
+(rewrite (Diff x (Sin x)) (Cos x))
+(rewrite (Diff x (Cos x)) (Mul (Const -1.0) (Sin x)))
+
+(rule ((Diff x (Ln x))) ((is-not-zero-demand x)))
+(rewrite (Diff x (Ln x)) (Div (Const 1.0) x) :when ((is-not-zero x)))
+
+(rule ((Diff x (Pow f g))) ((is-not-zero-demand f) (is-not-zero-demand g)))
+(rewrite (Diff x (Pow f g))
+         (Mul (Pow f g)
+              (Add (Mul (Diff x f) (Div g f))
+                   (Mul (Diff x g) (Ln f))))
+         :when ((is-not-zero f)
+                (is-not-zero g)))
+
+(rewrite (Integral (Const 1.0) x) x)
+(rewrite (Integral (Pow x (Const c)) x)
+         (Div (Pow x (Add (Const c) (Const 1.0))) (Add (Const c) (Const 1.0))))
+(rewrite (Integral (Cos x) x) (Sin x))
+(rewrite (Integral (Sin x) x) (Mul (Const -1.0) (Cos x)))
+(rewrite (Integral (Add f g) x) (Add (Integral f x) (Integral g x)))
+(rewrite (Integral (Sub f g) x) (Sub (Integral f x) (Integral g x)))
+(rewrite (Integral (Mul a b) x)
+         (Sub (Mul a (Integral b x))
+              (Integral (Mul (Diff x a) (Integral b x)) x)))
+
+; math_associate_adds
+(push)
+  (ruleset add-ac)
+  (rewrite (Add a b) (Add b a) :ruleset add-ac)
+  (rewrite (Add a (Add b c)) (Add (Add a b) c) :ruleset add-ac)
+  ; Add one through seven
+  (let res
+    (Add (Const 1.0)
+         (Add (Const 2.0)
+              (Add (Const 3.0)
+                   (Add (Const 4.0)
+                        (Add (Const 5.0)
+                             (Add (Const 6.0)
+                                  (Const 7.0))))))))
+  (run add-ac 7)
+  (check (= res
+    (Add (Const 7.0)
+         (Add (Const 6.0)
+              (Add (Const 5.0)
+                   (Add (Const 4.0)
+                        (Add (Const 3.0)
+                             (Add (Const 2.0)
+                                  (Const 1.0)))))))))
+(pop)
+
+; math_fail
+(push)
+(let res (Add (Var "x") (Var "y")))
+(run-schedule (saturate (seq (run) (run prune))))
+(fail (check (= res (Div (Var "x") (Var "y")))))
+(pop)
+
+; math_simplify_add
+(push)
+(let x (Var "x"))
+(let res (Add (Add (Add x x) x) x))
+(run-schedule (saturate (seq (run :until (= res (Mul (Const 4.0) x))) (run prune))))
+(check (= res (Mul (Const 4.0) x)))
+(pop)
+
+; math_powers
+(push)
+(let res (Mul (Pow (Const 2.0) (Var "x")) (Pow (Const 2.0) (Var "y"))))
+(run-schedule (saturate (seq
+     (run :until (= res (Pow (Const 2.0) (Add (Var "x") (Var "y")))))
+     (run prune))))
+(check (= res (Pow (Const 2.0) (Add (Var "x") (Var "y")))))
+(pop)
+
+; math_simplify_const
+(push)
+(let res (Add (Const 1.0)
+               (Sub (Var "a")
+                    (Mul (Sub (Const 2.0)
+                              (Const 1.0))
+                         (Var "a")))))
+(run-schedule (saturate (seq (run :until (= res (Const 1.0))) (run prune))))
+(check (= res (Const 1.0)))
+(pop)
+
+; math_simplify_root
+(push)
+(let res (Div (Const 1.0)
+              (Sub (Div (Add (Const 1.0) (Sqrt (Var "five")))
+                        (Const 2.0))
+                  (Div (Sub (Const 1.0) (Sqrt (Var "five")))
+                        (Const 2.0)))))
+(run-schedule (saturate (seq
+  (run :until (= res (Div (Const 1.0) (Sqrt (Var "five")))) )
+  (run prune))))
+(check (= res (Div (Const 1.0) (Sqrt (Var "five")))))
+(pop)
+
+;   math_simplify_factor, rules(),
+(push)
+(let x (Var "x"))
+(let res (Mul (Add x (Const 3.0)) (Add x (Const 1.0))))
+(run-schedule (saturate (seq
+  (run :until (= res (Add (Add (Mul x x) (Mul (Const 4.0) x)) (Const 3.0))))
+  (run prune))))
+(check (= res (Add (Add (Mul x x) (Mul (Const 4.0) x)) (Const 3.0))))
+(pop)
+
+; math_diff_same
+(push)
+(let res (Diff (Var "x") (Var "x")))
+(run-schedule (saturate (seq (run :until (= res (Const 1.0))) (run prune))))
+(check (= res (Const 1.0)))
+(pop)
+
+; math_diff_different
+(push)
+(let res (Diff (Var "x") (Var "y")))
+(run-schedule (saturate (seq (run :until (= res (Const 0.0))) (run prune))))
+(check (= res (Const 0.0)))
+(pop)
+
+; math_diff_simple1
+(push)
+(let res (Diff (Var "x") (Add (Const 1.0) (Mul (Const 2.0) (Var "x")))))
+(run-schedule (saturate (seq (run :until (= res (Const 2.0))) (run prune))))
+(check (= res (Const 2.0)))
+(pop)
+
+; math_diff_simple2
+(push)
+(let res (Diff (Var "x") (Add (Const 1.0) (Mul (Var "y") (Var "x")))))
+(run-schedule (saturate (seq (run :until (= res (Var "y"))) (run prune))))
+(check (= res (Var "y")))
+(pop)
+
+; math_diff_ln
+(push)
+(let res (Diff (Var "x") (Ln (Var "x"))))
+(run-schedule (saturate (seq (run :until (= res (Div (Const 1.0) (Var "x")))) (run prune))))
+(check (= res (Div (Const 1.0) (Var "x"))))
+(pop)
+
+; diff_power_simple
+(push)
+(let res (Diff (Var "x") (Pow (Var "x") (Const 3.0))))
+(run-schedule (saturate (seq
+  (run :until (= res (Mul (Const 3.0) (Pow (Var "x") (Const 2.0))))))
+  (run prune)))
+(check (= res (Mul (Const 3.0) (Pow (Var "x") (Const 2.0)))))
+(pop)
+
+; diff_power_harder
+(push)
+(let res (Diff (Var "x") (Sub (Pow (Var "x") (Const 3.0))
+                              (Mul (Const 7.0) (Pow (Var "x") (Const 2.0))))))
+(Mul (Var "x") (Sub (Mul (Const 3.0) (Var "x")) (Const 14.0)))
+(run-schedule (repeat 60 (seq
+  (run :until (= res (Mul (Var "x") (Sub (Mul (Const 3.0) (Var "x"))
+                                 (Const 14.0)))))
+  (run prune))))
+(check (= res (Mul (Var "x") (Sub (Mul (Const 3.0) (Var "x"))
+                                 (Const 14.0)))))
+(pop)
+
+; integ_one
+(push)
+(let res (Integral (Const 1.0) (Var "x")))
+(run-schedule (saturate (seq (run :until (= res (Var "x"))) (run prune))))
+(check (= res (Var "x")))
+(pop)
+
+; integ_sin
+(push)
+(let res (Integral (Cos (Var "x")) (Var "x")))
+(run-schedule (saturate (seq (run :until (= res (Sin (Var "x")))) (run prune))))
+(check (= res (Sin (Var "x"))))
+(pop)
+
+; integ_x
+(push)
+(let res (Integral (Pow (Var "x") (Const 1.0)) (Var "x")))
+(run-schedule (saturate (seq
+  (run :until (= res (Div (Pow (Var "x") (Const 2.0)) (Const 2.0))))
+  (run prune))))
+(check (= res (Div (Pow (Var "x") (Const 2.0)) (Const 2.0))))
+(pop)
+
+; integ_part1
+(push)
+(let res (Integral (Mul (Var "x") (Cos (Var "x"))) (Var "x")))
+(run-schedule (saturate (seq
+  (run :until (= res (Add (Mul (Var "x") (Sin (Var "x")))
+                          (Cos (Var "x")))))
+  (run prune))))
+(check (= res (Add (Mul (Var "x") (Sin (Var "x")))
+                   (Cos (Var "x")))))
+(pop)
+
+; integ_part2
+(push)
+(let res (Integral (Mul (Cos (Var "x")) (Var "x")) (Var "x")))
+(run-schedule (saturate (seq
+  (run :until (= res (Add (Mul (Var "x") (Sin (Var "x")))
+                          (Cos (Var "x")))))
+  (run prune))))
+(check (= res (Add (Mul (Var "x") (Sin (Var "x")))
+                   (Cos (Var "x")))))
+(pop)
+
+; integ_part3
+(push)
+(let res (Integral (Ln (Var "x")) (Var "x")))
+(run-schedule (saturate (seq
+  (run :until (= res (Sub (Mul (Var "x") (Ln (Var "x"))) (Var "x"))))
+  (run prune))))
+(check (= res (Sub (Mul (Var "x") (Ln (Var "x"))) (Var "x"))))
+(pop)
+
+; assoc_mul_saturates
+(push)
+(Mul (Var "x") (Const 1.0))
+(run-schedule (saturate (seq (run) (run prune))))
+(pop)

@@ -33,6 +33,17 @@ impl SMTRealValue {
         }
     }
 
+    pub fn ast_size(&self) -> usize {
+        match self {
+            SMTRealValue::Const(_) | SMTRealValue::Float64(_) => 1,
+            SMTRealValue::Neg(x) => 1 + x.ast_size(),
+            SMTRealValue::Add(a, b)
+            | SMTRealValue::Sub(a, b)
+            | SMTRealValue::Mul(a, b)
+            | SMTRealValue::Div(a, b) => 1 + a.ast_size() + b.ast_size(),
+        }
+    }
+
     pub fn to_term(&self, termdag: &mut TermDag) -> Term {
         match self {
             SMTRealValue::Const(name) => {
@@ -135,6 +146,14 @@ impl BaseSort for SMTReal {
             eg,
             "/" = |a: SMTRealValue, b: SMTRealValue| -> SMTRealValue {
                 SMTRealValue::Div(Box::new(a), Box::new(b))
+            }
+        );
+        // (min-ast-size a b)
+        // Returns the SMT term with the samller AST size. It biases towards the first argument in case of a tie.
+        add_primitive!(
+            eg,
+            "min-by-ast-size" = |a: SMTRealValue, b: SMTRealValue| -> SMTRealValue {
+                if a.ast_size() <= b.ast_size() { a } else { b }
             }
         );
     }

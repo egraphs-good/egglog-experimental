@@ -8,7 +8,7 @@ use egglog::{
 };
 use egglog::{add_primitive, ast::Literal};
 use smtlib::backend::z3_binary::Z3Binary;
-use smtlib::terms::StaticSorted;
+use smtlib::terms::{StaticSorted, exists};
 use smtlib::{Bool, Int, Real, SatResultWithModel, Solver, Sorted, Storage};
 use smtlib_lowlevel::lexicon::Symbol;
 use std::collections::BTreeSet;
@@ -31,6 +31,7 @@ pub enum SMTBoolValue {
     Not(Box<SMTBoolValue>),
     IntEq(Box<SMTIntValue>, Box<SMTIntValue>),
     RealEq(Box<SMTRealValue>, Box<SMTRealValue>),
+    RealExists(String, Box<SMTBoolValue>),
 }
 
 impl SMTBoolValue {
@@ -42,6 +43,9 @@ impl SMTBoolValue {
             SMTBoolValue::Not(a) => !a.to_bool(st),
             SMTBoolValue::IntEq(a, b) => a.to_int(st)._eq(b.to_int(st)),
             SMTBoolValue::RealEq(a, b) => a.to_real(st)._eq(b.to_real(st)),
+            SMTBoolValue::RealExists(var_name, body) => {
+                exists(st,Real::new_const(st, var_name), body.to_bool(st))
+            }
         }
     }
 
@@ -74,6 +78,12 @@ impl SMTBoolValue {
                 let a_term = a.to_term(termdag);
                 let b_term = b.to_term(termdag);
                 termdag.app("smt-real-=".into(), vec![a_term, b_term])
+            }
+            SMTBoolValue::RealExists(var_name, body) => {
+                let var = SMTRealValue::Const(var_name.clone());
+                let body_term = body.to_term(termdag);
+                let var_term = var.to_term(termdag);
+                termdag.app("smt-exists".into(), vec![var_term, body_term])
             }
         }
     }
@@ -139,6 +149,17 @@ impl BaseSort for SMTBool {
             "smt-real-=" = |a: SMTRealValue, b: SMTRealValue| -> SMTBoolValue {
                 SMTBoolValue::RealEq(Box::new(a), Box::new(b))
             }
+        );
+        // (smt-exists <smt-real-const> <smt-real-bool>)
+        // e.g. (smt-exists (smt-real-const "x") (smt-real-= (smt-real-const "x") (smt-real 0.0))
+        add_primitive!(
+            eg,
+            "smt-exists" = |var: SMTRealValue, body: SMTBoolValue| -> SMTBoolValue { {
+                let SMTRealValue::Const(name) = var else {
+                    panic!("smt-exists first argument must be smt-real-const");
+                };
+                SMTBoolValue::RealExists(name, Box::new(body))
+            } }
         );
     }
 }
@@ -509,6 +530,9 @@ impl Constants {
             SMTBoolValue::RealEq(a, b) => {
                 self.real(*a);
                 self.real(*b);
+            }
+            SMTBoolValue::RealExists(_, body) => {
+                self.bool(*body);
             }
         }
     }

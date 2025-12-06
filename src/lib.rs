@@ -25,9 +25,9 @@ pub fn new_experimental_egraph() -> EGraph {
 
     add_set_cost(&mut egraph);
 
-    egraph
-        .add_command("run-schedule".into(), Arc::new(RunExtendedSchedule))
-        .unwrap();
+    // egraph
+    //     .add_command("run-schedule".into(), Arc::new(RunExtendedSchedule))
+    //     .unwrap();
 
     add_smt(&mut egraph);
     egraph
