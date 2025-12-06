@@ -1,0 +1,9 @@
+Terms,Basic_Time,Basic_Status,SMT_Time,SMT_Status
+3,0.104,success,0.069,success
+5,0.088,success,0.047,success
+8,0.778,success,0.051,success
+11,30.000,timeout,0.061,success
+15,30.000,timeout,0.078,success
+18,30.000,timeout,0.073,success
+19,30.000,timeout,0.099,success
+26,30.000,timeout,0.114,success

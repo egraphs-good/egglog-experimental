@@ -1,0 +1,34 @@
+; SMT-based polynomial rewrite rules with datatype
+
+; The polynomial datatype
+(datatype Polynomial
+  (Zero)
+  (One)
+  (Var String)
+  (Add Polynomial Polynomial)
+  (Mul Polynomial Polynomial)
+  (Coefficient f64 Polynomial)
+  (Power Polynomial i64)
+  (Smt SMTReal)
+  (UseSmt Polynomial))
+
+; Convert basic polynomial constructors to SMT
+(rewrite (Zero) (Smt (smt-real 0.0)))
+(rewrite (One) (Smt (smt-real 1.0)))
+(rewrite (Var x) (Smt (smt-real-const x)))
+
+; Convert polynomial operations to SMT operations
+(rewrite (Add (Smt a) (Smt b)) (Smt (+ a b)))
+(rewrite (Mul (Smt a) (Smt b)) (Smt (* a b)))
+(rewrite (Coefficient c (Smt p)) (Smt (* (smt-real c) p)))
+
+; Recursive power conversion
+(rewrite (Power (Smt p) 0) (Smt (smt-real 1.0)))
+(rule ((Power (Smt p) n) (> n 0))
+  ((union (Power (Smt p) n) (Mul (Smt p) (Power (Smt p) (- n 1))))))
+
+; UseSmt is only a tag to reduce unnecessary SMT calls, not a semantic difference
+(rewrite (UseSmt x) x)
+
+; Merge polynomials if they are equivalent on all inputs
+(rule ((UseSmt (Smt x)) (UseSmt (Smt y)) (not (smt-sat? (smt-solve (not (smt-real-= x y)))))) ((union (Smt x) (Smt y))))
