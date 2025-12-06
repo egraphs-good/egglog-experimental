@@ -400,12 +400,16 @@ impl BaseSort for SMTValue {
  */
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct SMTSolvedValue(Option<Vec<SMTValueValue>>);
+pub enum SMTSolvedValue {
+    Sat(Vec<SMTValueValue>),
+    Unsat,
+    Unknown,
+}
 
 impl SMTSolvedValue {
     pub fn get_bool_value(&self, expr: SMTBoolValue) -> Option<bool> {
         if let SMTBoolValue::Const(name) = expr {
-            if let Some(vals) = &self.0 {
+            if let SMTSolvedValue::Sat(vals) = self {
                 for v in vals {
                     if let SMTTerm::Bool(b) = &v.1 {
                         if v.0 == name {
@@ -420,7 +424,7 @@ impl SMTSolvedValue {
 
     pub fn get_int_value(&self, expr: SMTIntValue) -> Option<i64> {
         if let SMTIntValue::Const(name) = expr {
-            if let Some(vals) = &self.0 {
+            if let SMTSolvedValue::Sat(vals) = self {
                 for v in vals {
                     if let SMTTerm::Int(i) = &v.1 {
                         if v.0 == name {
@@ -435,7 +439,7 @@ impl SMTSolvedValue {
 
     pub fn get_real_value(&self, expr: SMTRealValue) -> Option<OrderedFloat<f64>> {
         if let SMTRealValue::Const(name) = expr {
-            if let Some(vals) = &self.0 {
+            if let SMTSolvedValue::Sat(vals) = self {
                 for v in vals {
                     if let SMTTerm::Real(f) = &v.1 {
                         if v.0 == name {
@@ -468,12 +472,13 @@ impl BaseSort for SMTSolved {
         termdag: &mut TermDag,
     ) -> Term {
         let solved = base_values.unwrap::<SMTSolvedValue>(value);
-        match &solved.0 {
-            Some(model) => {
+        match solved {
+            SMTSolvedValue::Sat(model) => {
                 let args = model.iter().map(|v| v.to_term(termdag)).collect::<Vec<_>>();
                 termdag.app("smt-model".into(), args)
             }
-            None => termdag.app("smt-unsat".into(), vec![]),
+            SMTSolvedValue::Unsat => termdag.app("smt-unsat".into(), vec![]),
+            SMTSolvedValue::Unknown => termdag.app("smt-unknown".into(), vec![]),
         }
     }
 
@@ -481,19 +486,31 @@ impl BaseSort for SMTSolved {
         // (smt-unsat)
         add_primitive!(
             eg,
-            "smt-unsat" = || -> SMTSolvedValue { { SMTSolvedValue(None) } }
+            "smt-unsat" = || -> SMTSolvedValue { { SMTSolvedValue::Unsat } }
+        );
+        // (smt-unknown)
+        add_primitive!(
+            eg,
+            "smt-unknown" = || -> SMTSolvedValue { { SMTSolvedValue::Unknown } }
         );
         // (smt-model v1 v2 ...)
         add_primitive!(
             eg,
             "smt-model" = [values: SMTValueValue] -> SMTSolvedValue { {
-                SMTSolvedValue(Some(values.into_iter().collect()))
+                SMTSolvedValue::Sat(values.into_iter().collect())
             } }
         );
         // (smt-sat? model)
         add_primitive!(
             eg,
-            "smt-sat?" = |model: SMTSolvedValue| -> bool { { model.0.is_some() } }
+            "smt-sat?" =
+                |model: SMTSolvedValue| -> bool { { matches!(model, SMTSolvedValue::Sat(_)) } }
+        );
+        // (smt-unsat? model)
+        add_primitive!(
+            eg,
+            "smt-unsat?" =
+                |model: SMTSolvedValue| -> bool { { matches!(model, SMTSolvedValue::Unsat) } }
         );
         // (smt-value model (smt-bool-const "p"))
         add_primitive!(
@@ -555,10 +572,10 @@ impl BaseSort for SMTSolved {
                             let real_value = extract_real_value(term.term());
                             values.push(SMTValueValue(name, SMTTerm::Real(OrderedFloat(real_value))));
                         }
-                        SMTSolvedValue(Some(values))
+                        SMTSolvedValue::Sat(values)
                     }
-                    SatResultWithModel::Unsat => SMTSolvedValue(None),
-                    SatResultWithModel::Unknown => panic!("SMT solver returned unknown"),
+                    SatResultWithModel::Unsat => SMTSolvedValue::Unsat,
+                    SatResultWithModel::Unknown => SMTSolvedValue::Unknown,
                 }
             }}
         );
