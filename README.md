@@ -5,6 +5,22 @@ Currently, this can be thought of as a standard library to `egglog`.
 
 You can use the egglog [Zulip](https://egraphs.zulipchat.com/#narrow/stream/375765-egglog) to ask questions and suggest improvements to this repo.
 
+## SMT Final Project Reproduction
+
+To reproduce the SMT final project results, you can run the following commands:
+
+```bash
+# Or any other way to install the z3 CLI command
+brew install z3
+# install rust https://rust-lang.org/tools/install/
+git clone git@github.com:RockingMat/egglog-smt.git
+cd egglog-smt
+
+# To run the SMT calculus example:
+env SMT_DEBUG=1 cargo run tests/smt-math.egg
+```
+
+
 ## Trying it out
 
 The easiest way to try out `egglog-experimental` is to use the [web demo](https://egraphs-good.github.io/egglog-demo), which builds on top of latest egglog-experimental.
@@ -21,6 +37,7 @@ To use it in a Rust project, you can add it as a dependency in a `Cargo.toml` fi
 ```
 egglog-experimental = "1.0"
 ```
+
 
 ## Implemented extensions
 

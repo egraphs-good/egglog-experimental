@@ -14,10 +14,11 @@ use smtlib::backend::z3_binary::Z3Binary;
 use smtlib::funs::Fun;
 use smtlib::sorts::Sort;
 use smtlib::terms::{StaticSorted, exists};
-use smtlib::{Bool, Int, Real, SatResultWithModel, Solver, Sorted, Storage};
+use smtlib::{Bool, Int, Logger, Real, SatResultWithModel, Solver, Sorted, Storage};
 use smtlib_lowlevel::lexicon::Symbol;
 use std::any::TypeId;
 use std::collections::BTreeSet;
+use std::env;
 use std::{fmt::Debug, hash::Hash};
 
 pub fn add_smt(egraph: &mut EGraph) {
@@ -623,12 +624,13 @@ impl BaseSort for SMTSolved {
             "smt-solve" = [asserts: SMTBoolValue] -> SMTSolvedValue { {
                 let st = Storage::new();
                 let mut solver = Solver::new(&st, Z3Binary::new("z3").unwrap()).unwrap();
+                solver.set_logger(SMTLogger);
                 for b in asserts.clone() {
                     let smt_bool = b.to_bool(&st, &mut solver);
                     solver.assert(smt_bool).unwrap();
 
                 }
-                match solver.check_sat_with_model().unwrap() {
+                let res = match solver.check_sat_with_model().unwrap() {
                     SatResultWithModel::Sat(model) => {
                         let mut constants = Constants::default();
                         for b in asserts {
@@ -662,7 +664,9 @@ impl BaseSort for SMTSolved {
                     }
                     SatResultWithModel::Unsat => SMTSolvedValue::Unsat,
                     SatResultWithModel::Unknown => SMTSolvedValue::Unknown,
-                }
+                };
+                println!("");
+                res
             }}
         );
         // (smt-call f arg1 arg2 ...)
@@ -1156,6 +1160,18 @@ impl Constants {
             SMTBitVecValue::BvNot(a) => {
                 self.bitvec(*a);
             }
+        }
+    }
+}
+
+struct SMTLogger;
+
+impl Logger for SMTLogger {
+    fn exec(&self, _cmd: smtlib_lowlevel::ast::Command) {}
+
+    fn response(&self, cmd: smtlib_lowlevel::ast::Command, res: &str) {
+        if env::var("SMT_DEBUG").is_ok() {
+            print!("{}; {}", cmd, res);
         }
     }
 }
