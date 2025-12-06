@@ -250,6 +250,9 @@
             (run incr-multiplicity)))
         (run merge-factored)))))
 
+; Expect only p-rat and big-p-rat to have been rewritten.
+; Strictly, p-const was also rewritten,
+; but both forms are syntactically equivalent.
 (extract p-const 2)
 (extract p-rat 2)
 (extract p-alg 2)
