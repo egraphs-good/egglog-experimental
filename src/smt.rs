@@ -545,10 +545,8 @@ impl BaseSort for SMTSolved {
                             let Some(term) = model.eval(Int::new_const(&st, &name)) else {
                                 continue;
                             };
-                            let smtlib_lowlevel::ast::Term::SpecConstant(smtlib_lowlevel::ast::SpecConstant::Numeral(n)) = term.term() else {
-                                panic!("Expected int literal");
-                            };
-                            values.push(SMTValueValue(name, SMTTerm::Int(n.into_u128().unwrap().try_into().unwrap())));
+                            let int_value = extract_int_value(term.term());
+                            values.push(SMTValueValue(name, SMTTerm::Int(int_value)));
                         }
                         for name in constants.reals {
                             let Some(term) = model.eval(Real::new_const(&st, &name)) else {
@@ -804,6 +802,30 @@ impl TypeConstraint for SMTUFTypeConstraint {
             )
         }));
         constraints
+    }
+}
+
+fn extract_int_value(term: &smtlib_lowlevel::ast::Term) -> i64 {
+    match term {
+        // Positive numeral: 42
+        smtlib_lowlevel::ast::Term::SpecConstant(smtlib_lowlevel::ast::SpecConstant::Numeral(
+            n,
+        )) => n.into_u128().unwrap() as i64,
+        // Negative numbers: (- 42)
+        smtlib_lowlevel::ast::Term::Application(identifier, arguments) => {
+            if let smtlib_lowlevel::ast::QualIdentifier::Identifier(
+                smtlib_lowlevel::ast::Identifier::Simple(smtlib_lowlevel::lexicon::Symbol(op)),
+            ) = identifier
+            {
+                if *op == "-" && arguments.len() == 1 {
+                    return -extract_int_value(arguments[0]);
+                }
+            }
+            panic!(
+                "Unsupported int application format: identifier={identifier:?}, arguments={arguments:?}",
+            );
+        }
+        _ => panic!("Unsupported int term format: {term:?}"),
     }
 }
 
