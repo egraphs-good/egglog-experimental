@@ -31,4 +31,4 @@
 (rewrite (UseSmt x) x)
 
 ; Merge polynomials if they are equivalent on all inputs
-(rule ((UseSmt (Smt x)) (UseSmt (Smt y)) (not (smt-sat? (smt-solve (not (smt-real-= x y)))))) ((union (Smt x) (Smt y))))
+(rule ((UseSmt (Smt x)) (UseSmt (Smt y)) (not (smt-sat? (smt-solve (not (smt-= x y)))))) ((union (Smt x) (Smt y))))

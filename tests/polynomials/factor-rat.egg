@@ -99,7 +99,7 @@
   ((set
       (constraints (MulFactor a b p))
       (and
-        (not (smt-real-= _x_ (/
+        (not (smt-= _x_ (/
               (smt-int->real (smt-int (numer a)))
               (smt-int->real (smt-int (denom a))))))
         c)))
@@ -117,7 +117,7 @@
     (= (smt-repr p) s)
     (= (partial-factored p) f)
     (= (constraints f) c))
-  ((set (model p) (smt-solve (and (smt-real-= s (smt-real 0.0)) c))))
+  ((set (model p) (smt-solve (and (smt-= s (smt-real 0.0)) c))))
   :ruleset solve-root)
 
 ; Update the partial factoring of polynomials tagged with factorable
@@ -183,7 +183,7 @@
             (smt-= _p_ (smt-int (numer a)))
             (and
               (smt-= _q_ (smt-int (denom a)))
-              (smt-real-= s (smt-real 0.0))
+              (smt-= s (smt-real 0.0))
             ))))
       true)
     (= (num-roots p) n))

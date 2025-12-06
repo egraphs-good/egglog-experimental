@@ -116,7 +116,7 @@ impl SMTBoolValue {
             SMTBoolValue::RealEq(a, b) => {
                 let a_term = a.to_term(termdag);
                 let b_term = b.to_term(termdag);
-                termdag.app("smt-real-=".into(), vec![a_term, b_term])
+                termdag.app("smt-=".into(), vec![a_term, b_term])
             }
             SMTBoolValue::RealLt(a, b) => {
                 let a_term = a.to_term(termdag);
@@ -213,10 +213,10 @@ impl BaseSort for SMTBool {
                 SMTBoolValue::IntEq(Box::new(a), Box::new(b))
             }
         );
-        // (smt-real-= a b)
+        // (smt-= a b)
         add_primitive!(
             eg,
-            "smt-real-=" = |a: SMTRealValue, b: SMTRealValue| -> SMTBoolValue {
+            "smt-=" = |a: SMTRealValue, b: SMTRealValue| -> SMTBoolValue {
                 SMTBoolValue::RealEq(Box::new(a), Box::new(b))
             }
         );
@@ -263,7 +263,7 @@ impl BaseSort for SMTBool {
             }
         );
         // (smt-exists <smt-real-const> <smt-real-bool>)
-        // e.g. (smt-exists (smt-real-const "x") (smt-real-= (smt-real-const "x") (smt-real 0.0))
+        // e.g. (smt-exists (smt-real-const "x") (smt-= (smt-real-const "x") (smt-real 0.0))
         add_primitive!(
             eg,
             "smt-exists" = |var: SMTRealValue, body: SMTBoolValue| -> SMTBoolValue {
@@ -819,38 +819,71 @@ impl Primitive for UFApply {
     }
     fn apply(&self, exec_state: &mut ExecutionState, args: &[Value]) -> Option<Value> {
         let (fun_val, args) = args.split_first().unwrap();
-        let fun = exec_state.base_values().unwrap::<SMTUFIntValue>(*fun_val);
-        let arg_vals: Vec<SMTBaseValue> = match fun.clone() {
-            SMTUFIntValue::Declaration(name, arg_types) => {
-                assert!(
-                    arg_types.len() == args.len(),
-                    "Expected function {} to be called with {} args, but got {}",
-                    name,
-                    arg_types.len(),
-                    args.len()
-                );
-                arg_types
-                    .iter()
-                    .zip(args)
-                    .map(|(arg_type, arg)| match arg_type.as_str() {
-                        "Int" => {
-                            let int_val = exec_state.base_values().unwrap::<SMTIntValue>(*arg);
-                            SMTBaseValue::IntValue(int_val)
-                        }
-                        "Bool" => SMTBaseValue::BoolValue(
-                            exec_state.base_values().unwrap::<SMTBoolValue>(*arg),
-                        ),
-                        "Real" => SMTBaseValue::RealValue(
-                            exec_state.base_values().unwrap::<SMTRealValue>(*arg),
-                        ),
-                        other => panic!("unknown type {other}"),
-                    })
-                    .collect::<Vec<SMTBaseValue>>()
+        if self.out_sort.name() == "SMTInt" {
+            let fun = exec_state.base_values().unwrap::<SMTUFIntValue>(*fun_val);
+            match fun.clone() {
+                SMTUFIntValue::Declaration(name, arg_types) => {
+                    assert!(
+                        arg_types.len() == args.len(),
+                        "Expected function {} to be called with {} args, but got {}",
+                        name,
+                        arg_types.len(),
+                        args.len()
+                    );
+                    let arg_vals = arg_types
+                        .iter()
+                        .zip(args)
+                        .map(|(arg_type, arg)| match arg_type.as_str() {
+                            "Int" => {
+                                let int_val = exec_state.base_values().unwrap::<SMTIntValue>(*arg);
+                                SMTBaseValue::IntValue(int_val)
+                            }
+                            "Bool" => SMTBaseValue::BoolValue(
+                                exec_state.base_values().unwrap::<SMTBoolValue>(*arg),
+                            ),
+                            "Real" => SMTBaseValue::RealValue(
+                                exec_state.base_values().unwrap::<SMTRealValue>(*arg),
+                            ),
+                            other => panic!("unknown type {other}"),
+                        })
+                        .collect::<Vec<SMTBaseValue>>();
+                    let fun_app: SMTIntValue = { SMTIntValue::FuncApplication(fun, arg_vals) };
+                    Some(exec_state.base_values().get::<SMTIntValue>(fun_app))
+                }
             }
-        };
-
-        let fun_app: SMTIntValue = { SMTIntValue::FuncApplication(fun, arg_vals) };
-        Some(exec_state.base_values().get::<SMTIntValue>(fun_app))
+        } else {
+            let fun = exec_state.base_values().unwrap::<SMTUFRealValue>(*fun_val);
+            match fun.clone() {
+                SMTUFRealValue::Declaration(name, arg_types) => {
+                    assert!(
+                        arg_types.len() == args.len(),
+                        "Expected function {} to be called with {} args, but got {}",
+                        name,
+                        arg_types.len(),
+                        args.len()
+                    );
+                    let arg_vals = arg_types
+                        .iter()
+                        .zip(args)
+                        .map(|(arg_type, arg)| match arg_type.as_str() {
+                            "Int" => {
+                                let int_val = exec_state.base_values().unwrap::<SMTIntValue>(*arg);
+                                SMTBaseValue::IntValue(int_val)
+                            }
+                            "Bool" => SMTBaseValue::BoolValue(
+                                exec_state.base_values().unwrap::<SMTBoolValue>(*arg),
+                            ),
+                            "Real" => SMTBaseValue::RealValue(
+                                exec_state.base_values().unwrap::<SMTRealValue>(*arg),
+                            ),
+                            other => panic!("unknown type {other}"),
+                        })
+                        .collect::<Vec<SMTBaseValue>>();
+                    let fun_app = { SMTRealValue::FuncApplication(fun, arg_vals) };
+                    Some(exec_state.base_values().get::<SMTRealValue>(fun_app))
+                }
+            }
+        }
     }
 }
 

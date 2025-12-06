@@ -9,7 +9,7 @@ use smtlib::backend::z3_binary::Z3Binary;
 use smtlib::funs::Fun;
 use smtlib::sorts::Sort;
 use smtlib::terms::{IntoWithStorage, StaticSorted};
-use smtlib::{Bool, Int};
+use smtlib::{Bool, Int, Sorted as _};
 use smtlib::{Real, Solver, Storage};
 use std::{fmt::Debug, hash::Hash};
 
@@ -41,30 +41,28 @@ impl SMTRealValue {
             SMTRealValue::Mul(a, b) => a.to_real(st, solver) * b.to_real(st, solver),
             SMTRealValue::Div(a, b) => a.to_real(st, solver) / b.to_real(st, solver),
             SMTRealValue::Pow(a, b) => a.to_real(st, solver).pow(b.to_real(st, solver)),
-            SMTRealValue::FuncApplication(func, _args) => {
+            SMTRealValue::FuncApplication(func, args) => {
                 let smt_fun = func.to_uf(st);
                 let _ = solver.declare_fun(&smt_fun);
-                todo!()
-                // smt_fun
-                //     .call(
-                //         &args
-                //             .iter()
-                //             .map(|val| match val {
-                //                 SMTBaseValue::BoolValue(val) => {
-                //                     val.to_bool(st, solver).into_dynamic()
-                //                 }
-                //                 SMTBaseValue::IntValue(val) => {
-                //                     val.to_int(st, solver).into_dynamic()
-                //                 }
-                //                 SMTBaseValue::RealValue(val) => {
-                //                     val.to_real(st, solver).into_dynamic()
-                //                 }
-                //             })
-                //             .collect::<Vec<_>>()[..],
-                //     )
-                //     .unwrap()
-                //     .as_real()
-                //     .unwrap()
+                let dyn_value = smt_fun
+                    .call(
+                        &args
+                            .iter()
+                            .map(|val| match val {
+                                SMTBaseValue::BoolValue(val) => {
+                                    val.to_bool(st, solver).into_dynamic()
+                                }
+                                SMTBaseValue::IntValue(val) => {
+                                    val.to_int(st, solver).into_dynamic()
+                                }
+                                SMTBaseValue::RealValue(val) => {
+                                    val.to_real(st, solver).into_dynamic()
+                                }
+                            })
+                            .collect::<Vec<_>>()[..],
+                    )
+                    .unwrap();
+                Real::from(dyn_value.sterm())
             }
         }
     }

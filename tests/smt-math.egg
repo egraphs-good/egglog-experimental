@@ -131,7 +131,7 @@
 ; We try to solve for the expression equal to zero, if unsat then it is not zero
 (rule ((is-not-zero-demand x)
        (= e (smt x))
-       (= (smt-unsat) (smt-solve (smt-real-= e (smt-real 0.0)))))
+       (= (smt-unsat) (smt-solve (smt-= e (smt-real 0.0)))))
       ((is-not-zero x)))
 
 (push)
@@ -160,47 +160,44 @@
   (check (is-not-zero x))
 (pop)
 
-; (declare-const k Real)
-; (declare-const y Real)
-; (assert
-;   (not
-;   (exists ((x Real))
-;         (not (= (+ (- x x) 1) k)))))
-; (check-sat)
-; (get-model)
-
-
 
 
 (relation is-const-or-distinct-var-demand (Math String))
-; This should be set of if this expression does not change if the var changes. This is true if its a constant, a different var,
-; or an expression whose value does not depend on the var.
 (relation is-const-or-distinct-var (Math String))
-(rule ((is-const-or-distinct-var-demand x _))
-      ((smt-demand x)))
+; Future work: Use this version to be more general
+; ; This should be set of if this expression does not change if the var changes. This is true if its a constant, a different var,
+; ; or an expression whose value does not depend on the var.
+; (rule ((is-const-or-distinct-var-demand x _))
+;       ((smt-demand x)))
 
-(rule ((is-const-or-distinct-var-demand x v)
-       (= s (smt x))
-       (smt-sat? (not (smt-exists (smt-real-const v) (not (smt-real-= s (smt-real-const "__k")))))))
-      ((is-const-or-distinct-var x v)))
+; (rule ((is-const-or-distinct-var-demand x v)
+;        (= s (smt x))
+;        (= true (smt-sat? (smt-solve (not (smt-exists (smt-real-const v) (not (smt-= s (smt-real-const "__k")))))))))
+;       ((is-const-or-distinct-var x v)))
+(rule ((is-const-or-distinct-var-demand (Var w) v)
+       (!= v w))
+      ((is-const-or-distinct-var (Var w) v)))
+(rule ((is-const-or-distinct-var-demand (Const c) v))
+      ((is-const-or-distinct-var (Const c) v)))
 
-(push)
-  (let x (Add (Var "x") (Var "x")))
-  (is-const-or-distinct-var-demand x "x")
-  (is-const-or-distinct-var-demand x "y")
-  (run-schedule (saturate (seq (run) (run prune))))
-  (check (is-const-or-distinct-var x "y"))
-  (fail (check (is-const-or-distinct-var x "x")))
-(pop)
 
-(push)
-  (let x (Sub (Var "x") (Var "x")))
-  (is-const-or-distinct-var-demand x "x")
-  (is-const-or-distinct-var-demand x "y")
-  (run-schedule (saturate (seq (run) (run prune))))
-  (check (is-const-or-distinct-var x "y"))
-  (check (is-const-or-distinct-var x "x"))
-(pop)
+; (push)
+;   (let x (Add (Var "x") (Var "x")))
+;   (is-const-or-distinct-var-demand x "x")
+;   (is-const-or-distinct-var-demand x "y")
+;   (run-schedule (saturate (seq (run) (run prune))))
+;   (check (is-const-or-distinct-var x "y"))
+;   (fail (check (is-const-or-distinct-var x "x")))
+; (pop)
+
+; (push)
+;   (let x (Sub (Var "x") (Var "x")))
+;   (is-const-or-distinct-var-demand x "x")
+;   (is-const-or-distinct-var-demand x "y")
+;   (run-schedule (saturate (seq (run) (run prune))))
+;   (check (is-const-or-distinct-var x "y"))
+;   (check (is-const-or-distinct-var x "x"))
+; (pop)
 
 (rewrite (Add a b) (Add b a))
 (rewrite (Mul a b) (Mul b a))

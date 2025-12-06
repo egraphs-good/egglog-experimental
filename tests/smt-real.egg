@@ -14,7 +14,7 @@
 (rewrite (Var x) (Smt (smt-real-const x)))
 (rewrite (Add (Smt x) (Smt y)) (Smt (+ x y)))
 (rewrite (Mul (Smt x) (Smt y)) (Smt (* x y)))
-(rewrite (Eq (Smt e1) (Smt e2)) (SmtBool (smt-real-= e1 e2)))
+(rewrite (Eq (Smt e1) (Smt e2)) (SmtBool (smt-= e1 e2)))
 (rewrite (SmtBool y) (Bool_ (not (smt-sat? (smt-solve (not y))))))
 
 (let e1 (Mul (Var "x") (Num 2.0)))
@@ -27,11 +27,11 @@
 (check (= e4 (Bool_ true)))
 
 
-; (let x_fun (smt-fn-real "x" "Int"))
-; (let t_fun (smt-fn-real "t" "Int"))
-; (let y_fun (smt-fn-real "y" "Int"))
+(let x_fun (smt-fn-real "x" "Int"))
+(let t_fun (smt-fn-real "t" "Int"))
+(let y_fun (smt-fn-real "y" "Int"))
 
-; (let false_cond1 (smt-= (smt-call x_fun (smt-int 0)) (smt-int 0)))
-; (let false_cond2 (smt-= (smt-call x_fun (smt-int 0)) (smt-int 1)))
-; (let uf_false_model (smt-solve false_cond1 false_cond2))
-; (check (= false (smt-sat? uf_false_model)))
+(let false_cond1 (smt-= (smt-call x_fun (smt-int 0)) (smt-real 0.0)))
+(let false_cond2 (smt-= (smt-call x_fun (smt-int 0)) (smt-real 1.0)))
+(let uf_false_model (smt-solve false_cond1 false_cond2))
+(check (= false (smt-sat? uf_false_model)))

@@ -33,7 +33,7 @@
 (rewrite (UseSmt x) x)
 
 ; Merge polynomials if they are equivalent on all inputs
-(rule ((UseSmt (Smt x)) (UseSmt (Smt y)) (not (smt-sat? (smt-solve (not (smt-real-= x y)))))) ((union (Smt x) (Smt y))))
+(rule ((UseSmt (Smt x)) (UseSmt (Smt y)) (not (smt-sat? (smt-solve (not (smt-= x y)))))) ((union (Smt x) (Smt y))))
 
 ; Original polynomial: (x + y)^3 + (x - z)^2 + 3xy^2z - 2w^2
 (let e1 (Add
