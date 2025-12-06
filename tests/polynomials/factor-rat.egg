@@ -50,10 +50,9 @@
 
 ; Convert polynomials to an SMT form
 (ruleset to-smt)
-(let _x_ (smt-real-const "x"))
 (let _p_ (smt-int-const "p"))
 (let _q_ (smt-int-const "q"))
-(let _p/q_ (/ (smt-int->real _p_) (smt-int->real _q_)))
+(let _x_ (/ (smt-int->real _p_) (smt-int->real _q_)))
 (function smt-repr (Polynomial) SMTReal :merge new)
 (rule
   ((Const a))
@@ -93,7 +92,7 @@
   ((Const a))
   ((set
       (constraints (Const a))
-      (and (smt-real-= _x_ _p/q_) (not (smt-= _q_ (smt-int 0))))))
+      (not (smt-= _q_ (smt-int 0)))))
   :ruleset make-constraints)
 (rule
   ((MulFactor a b p) (= (constraints p) c))
@@ -184,10 +183,8 @@
             (smt-= _p_ (smt-int (numer a)))
             (and
               (smt-= _q_ (smt-int (denom a)))
-              (and
-                (smt-real-= s (smt-real 0.0))
-                (smt-real-= _x_ _p/q_)
-              )))))
+              (smt-real-= s (smt-real 0.0))
+            ))))
       true)
     (= (num-roots p) n))
   (
@@ -196,6 +193,10 @@
   :ruleset incr-multiplicity)
 
 ; Some example polynomials
+
+; 10 = 10
+(let p-const (Const (rational 10 1)))
+(set (factorable p-const) true)
 
 ; x^2 - 1/4 = (x-1/2)(x+1/2)
 (let p-rat (AddTerm (rational 1 1) 2 (Const (rational -1 4))))
@@ -208,6 +209,19 @@
 ; x^2 + 1 = (x-i)(x+i)
 (let p-complex (AddTerm (rational 1 1) 2 (Const (rational 1 1))))
 (set (factorable p-complex) true)
+
+; 3x^7 - (49x^6)/2 + (232x^5)/3 - (697x^4)/6 + (229x^3)/3 - (5x^2)/6 - (70x)/3 + 49/6
+; = 3 * (x-7/3)^2 * (x-1)^4 * (x+1/2)
+(let big-p-rat
+  (AddTerm (rational 3 1) 7
+    (AddTerm (rational -49 2) 6
+      (AddTerm (rational 232 3) 5
+        (AddTerm (rational -697 6) 4
+          (AddTerm (rational 229 3) 3
+            (AddTerm (rational -5 6) 2
+              (AddTerm (rational -70 3) 1
+                (Const (rational 49 6))))))))))
+(set (factorable big-p-rat) true)
 
 ; Interleave egglog and SMT operation in schedule
 (run-schedule (seq
@@ -222,5 +236,4 @@
             (run add-deriv)
             (saturate (run differentiate))
             (saturate (run to-smt))
-            (run incr-multiplicity)))
-      ))))
+            (run incr-multiplicity)))))))
