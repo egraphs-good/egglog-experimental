@@ -83,7 +83,7 @@
   ((Const a))
   ((set
       (constraints (Const a))
-      (and (smt-real-= _x_ _p/q_) (not (smt-= _q_ (smt-int 0)))))) ; TODO: poly = 0 constraint added at solve time
+      (and (smt-real-= _x_ _p/q_) (not (smt-= _q_ (smt-int 0))))))
   :ruleset make-constraints)
 (rule
   ((MulFactor a b p) (= (constraints p) c))
@@ -108,7 +108,7 @@
     (= (smt-repr p) s)
     (= (partial-factored p) f)
     (= (constraints f) c))
-  ((set (model p) (smt-solve c)))
+  ((set (model p) (smt-solve (and (smt-real-= s (smt-real 0.0)) c))))
   :ruleset solve-root)
 
 ; Update the partial factoring of polynomials tagged with factorable
@@ -146,9 +146,21 @@
 ; - get models against derivatives
 ; - update the partial factors
 ; - merge full factors with original poly
-
-; TODO: more rules
 ; TODO: example polynomials (one with rat roots, one with alg roots, one with complex roots)
 
+; Some example polynomials
+
+; x^2 - 1 = (x-1)(x+1)
+(let p-rat (AddTerm (rational 1 1) 2 (Const (rational -1 1))))
+(set (factorable p-rat) true)
+
 ; Interleave egglog and SMT operation in schedule
-(run-schedule (seq))
+(run-schedule (seq
+    (saturate (run coeff-deg))
+    (run init-roots)
+    (saturate (run to-smt))
+    (saturate (seq
+        (saturate (run make-constraints))
+        (run solve-root)
+        (run update-factors)
+      ))))
