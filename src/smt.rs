@@ -665,7 +665,7 @@ impl BaseSort for SMTSolved {
                     SatResultWithModel::Unsat => SMTSolvedValue::Unsat,
                     SatResultWithModel::Unknown => SMTSolvedValue::Unknown,
                 };
-                println!("");
+                println!();
                 res
             }}
         );
@@ -1171,7 +1171,7 @@ impl Logger for SMTLogger {
 
     fn response(&self, cmd: smtlib_lowlevel::ast::Command, res: &str) {
         if env::var("SMT_DEBUG").is_ok() {
-            print!("{}; {}", cmd, res);
+            print!("{cmd}; {res}");
         }
     }
 }
