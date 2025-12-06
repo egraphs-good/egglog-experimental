@@ -1,3 +1,10 @@
+use std::sync::Arc;
+
+use egglog::{
+    ast::{Expr, Literal},
+    prelude::{RustSpan, Span},
+};
+
 #[test]
 fn test_extract() {
     let mut egraph = egglog_experimental::new_experimental_egraph();
@@ -40,6 +47,58 @@ fn test_extract() {
     assert_eq!(result[2].to_string(), "(Add (Num 1) (Num 1))\n");
     assert_eq!(result[3].to_string(), "(Add (Num 1) (Num 1))\n");
     assert_eq!(result[4].to_string(), "(Sub (Num 5) (Num 3))\n");
+}
+
+#[test]
+fn test_get_size_primitive() {
+    let mut egraph = egglog_experimental::new_experimental_egraph();
+
+    let span = Span::Rust(Arc::new(RustSpan {
+        file: "integration_test",
+        line: 0,
+        column: 0,
+    }));
+
+    let make_expr = |names: &[&str]| {
+        Expr::Call(
+            span.clone(),
+            "get-size!".into(),
+            names
+                .iter()
+                .map(|name| Expr::Lit(span.clone(), Literal::String((*name).into())))
+                .collect(),
+        )
+    };
+
+    let eval_size = |egraph: &mut egglog::EGraph, names: &[&str]| -> i64 {
+        let expr = make_expr(names);
+        let (_, value) = egraph.eval_expr(&expr).unwrap();
+        egraph.value_to_base::<i64>(value)
+    };
+
+    assert_eq!(eval_size(&mut egraph, &[]), 0);
+    assert_eq!(eval_size(&mut egraph, &["MkFoo"]), 0);
+    assert_eq!(eval_size(&mut egraph, &["MkBar"]), 0);
+    assert_eq!(eval_size(&mut egraph, &["MkFoo", "MkBar"]), 0);
+
+    egraph
+        .parse_and_run_program(
+            None,
+            "
+            (datatype Foo (MkFoo i64))
+            (datatype Bar (MkBar i64))
+            (MkFoo 1)
+            (MkFoo 2)
+            (MkBar 10)
+        ",
+        )
+        .unwrap();
+
+    assert_eq!(eval_size(&mut egraph, &[]), 3);
+    assert_eq!(eval_size(&mut egraph, &["MkFoo"]), 2);
+    assert_eq!(eval_size(&mut egraph, &["MkBar"]), 1);
+    assert_eq!(eval_size(&mut egraph, &["MkFoo", "MkBar"]), 3);
+    assert_eq!(eval_size(&mut egraph, &["Unknown"]), 0);
 }
 
 #[test]

@@ -11,6 +11,8 @@ pub use scheduling::*;
 
 mod set_cost;
 pub use set_cost::*;
+mod size;
+pub use size::*;
 
 mod smt;
 mod smt_real;
@@ -24,6 +26,7 @@ pub fn new_experimental_egraph() -> EGraph {
     egraph.parser.add_command_macro(Arc::new(WithRuleset));
 
     add_set_cost(&mut egraph);
+    egraph.add_primitive(GetSizePrimitive);
 
     // egraph
     //     .add_command("run-schedule".into(), Arc::new(RunExtendedSchedule))
