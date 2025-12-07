@@ -16,6 +16,11 @@ brew install z3
 git clone git@github.com:RockingMat/egglog-smt.git
 cd egglog-smt
 
+# To run the smt lib examples:
+env SMT_DEBUG=1 cargo run tests/smt-bool.egg
+env SMT_DEBUG=1 cargo run tests/smt-real.egg
+env SMT_DEBUG=1 cargo run tests/smt-bitvec.egg
+
 # To run the SMT calculus example:
 env SMT_DEBUG=1 cargo run tests/smt-math.egg
 ```
