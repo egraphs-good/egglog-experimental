@@ -102,6 +102,6 @@
       (Coefficient 3.0 (Mul (Var "x") (Mul (Power (Var "y") 2) (Var "z")))))
     (Coefficient -2.0 (Power (Var "w") 2))))
 
-(run-schedule (saturate (run)))
+(run-schedule (saturate (run :until (= e1 e2))))
 
 (check (= e1 e2))

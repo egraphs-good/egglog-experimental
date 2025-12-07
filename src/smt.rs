@@ -263,19 +263,20 @@ impl BaseSort for SMTBool {
                 SMTBoolValue::BvSlt(Box::new(a), Box::new(b))
             }
         );
+        // Not working for now
         // (smt-exists <smt-real-const> <smt-real-bool>)
         // e.g. (smt-exists (smt-real-const "x") (smt-= (smt-real-const "x") (smt-real 0.0))
-        add_primitive!(
-            eg,
-            "smt-exists" = |var: SMTRealValue, body: SMTBoolValue| -> SMTBoolValue {
-                {
-                    let SMTRealValue::Const(name) = var else {
-                        panic!("smt-exists first argument must be smt-real-const");
-                    };
-                    SMTBoolValue::RealExists(name, Box::new(body))
-                }
-            }
-        );
+        // add_primitive!(
+        //     eg,
+        //     "smt-exists" = |var: SMTRealValue, body: SMTBoolValue| -> SMTBoolValue {
+        //         {
+        //             let SMTRealValue::Const(name) = var else {
+        //                 panic!("smt-exists first argument must be smt-real-const");
+        //             };
+        //             SMTBoolValue::RealExists(name, Box::new(body))
+        //         }
+        //     }
+        // );
     }
 }
 
