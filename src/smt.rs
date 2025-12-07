@@ -665,7 +665,10 @@ impl BaseSort for SMTSolved {
                     SatResultWithModel::Unsat => SMTSolvedValue::Unsat,
                     SatResultWithModel::Unknown => SMTSolvedValue::Unknown,
                 };
-                println!();
+                if env::var("SMT_DEBUG").is_ok() {
+                    // Print out a newline to separate SMT solver calls
+                    println!();
+                }
                 res
             }}
         );
