@@ -30,6 +30,7 @@ pub fn new_experimental_egraph() -> EGraph {
     add_set_cost(&mut egraph);
     egraph.add_primitive(GetSizePrimitive);
 
+    // Comment this out for now since the run-schedule in experimental doesn't support equality facts
     // egraph
     //     .add_command("run-schedule".into(), Arc::new(RunExtendedSchedule))
     //     .unwrap();

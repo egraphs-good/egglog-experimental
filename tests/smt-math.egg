@@ -21,7 +21,7 @@
     (Const f64)
     (Var String))
 
-; Need to table for all math expressions since egglog does not allow unbound variables
+; Need to track all math expressions since egglog does not allow unbound variables
 (relation MathU (Math))
 (rule ((= e (Diff x y))) ((MathU e)))
 (rule ((= e (Integral x y))) ((MathU e)))

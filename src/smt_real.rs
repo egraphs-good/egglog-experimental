@@ -216,7 +216,7 @@ impl BaseSort for SMTReal {
             }
         );
         // (min-ast-size a b)
-        // Returns the SMT term with the samller AST size. It biases towards the first argument in case of a tie.
+        // Returns the SMT term with the smaller AST size. It biases towards the first argument in case of a tie.
         add_primitive!(
             eg,
             "min-by-ast-size" = |a: SMTRealValue, b: SMTRealValue| -> SMTRealValue {
