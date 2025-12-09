@@ -2,7 +2,7 @@ use egglog::{
     CommandMacro, Error, ResolvedCall, TypeInfo,
     ast::{Action, Actions, Command, Expr, Rule, Schema},
     ast::{ResolvedExpr, ResolvedFact},
-    util::{FreshGen, IndexSet, SymbolGen},
+    util::{IndexSet, SymbolGen},
 };
 use egglog_ast::generic_ast::{GenericExpr, GenericFact, Literal};
 
