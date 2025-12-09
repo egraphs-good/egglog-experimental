@@ -24,13 +24,19 @@ pub fn new_experimental_egraph() -> EGraph {
     // Set up the parser with experimental parse-time macros
     egraph.parser = experimental_parser();
 
+    // Rational support
     add_base_sort(&mut egraph, RationalSort, span!()).unwrap();
+
+    // Support for set cost
     add_set_cost(&mut egraph);
     egraph.add_primitive(GetSizePrimitive);
 
+    // unstable-fresh! macro
     egraph
         .command_macros_mut()
         .register(Arc::new(fresh_macro::FreshMacro::new()));
+
+    // scheduler support
     egraph
         .add_command("run-schedule".into(), Arc::new(RunExtendedSchedule))
         .unwrap();
