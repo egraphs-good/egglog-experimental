@@ -40,7 +40,7 @@ fn desugar_fresh_rule(
     symbol_gen: &mut SymbolGen,
     type_info: &TypeInfo,
 ) -> Result<Vec<Command>, Error> {
-    // Collect fresh! sorts from actions
+    // Collect unstable-fresh! sorts from actions
     let fresh_sorts = collect_fresh_sorts(&rule.head.0);
     if fresh_sorts.is_empty() {
         return Ok(vec![Command::Rule { rule }]);
