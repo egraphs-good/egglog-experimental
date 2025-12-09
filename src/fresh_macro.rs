@@ -22,19 +22,12 @@ impl CommandMacro for FreshMacro {
         &self,
         command: Command,
         symbol_gen: &mut SymbolGen,
-        type_info: Option<&TypeInfo>,
+        type_info: &TypeInfo,
     ) -> Result<Vec<Command>, Error> {
         match command {
             Command::Rule { rule } if rule.head.0.iter().any(contains_fresh_action) => {
-                // Fresh! requires TypeInfo for correct type inference
-                if let Some(type_info) = type_info {
-                    desugar_fresh_rule(rule, symbol_gen, type_info)
-                } else {
-                    Err(Error::ParseError(egglog::ast::ParseError(
-                        rule.span.clone(),
-                        "fresh! macro requires TypeInfo to be available".to_string(),
-                    )))
-                }
+                // unstable-fresh! requires TypeInfo for correct type inference
+                desugar_fresh_rule(rule, symbol_gen, type_info)
             }
             _ => Ok(vec![command]),
         }
