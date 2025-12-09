@@ -25,7 +25,7 @@ impl Run {
             let desugared_str = egraph
                 .desugar_program(self.path.to_str().map(String::from), &program)
                 .unwrap()
-                .into_iter()
+                .iter()
                 .map(|cmd| cmd.to_string())
                 .collect::<Vec<_>>()
                 .join("\n");
@@ -94,7 +94,7 @@ impl Run {
                 let stem_str = stem.to_string_lossy().replace(['.', '-', ' '], "_");
                 write!(f, "{stem_str}")?;
                 if self.0.desugar {
-                    write!(f, "_desugar")?;
+                    write!(f, "_resugar")?;
                 }
                 Ok(())
             }
