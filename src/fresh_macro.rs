@@ -114,7 +114,7 @@ fn desugar_fresh_rule(
 }
 
 // Collect all unique subexpressions from resolved facts with their types
-fn collect_query_columns(resolved_facts: &Vec<ResolvedFact>) -> IndexSet<(Expr, Symbol)> {
+fn collect_query_columns(resolved_facts: &[ResolvedFact]) -> IndexSet<(Expr, Symbol)> {
     let mut columns = IndexSet::default();
 
     for fact in resolved_facts {
