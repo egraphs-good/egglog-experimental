@@ -6,7 +6,7 @@ use egglog::{
 };
 use egglog_ast::generic_ast::{GenericExpr, GenericFact, Literal};
 
-/// Implementation of the fresh! macro for egglog-experimental
+/// Implementation of the unstable-fresh! macro for egglog-experimental
 pub struct FreshMacro;
 
 impl FreshMacro {
