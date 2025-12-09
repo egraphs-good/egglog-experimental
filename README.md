@@ -22,11 +22,7 @@ To use it in a Rust project, you can add it as a dependency in a `Cargo.toml` fi
 egglog-experimental = "1.0"
 ```
 
-## Implemented extensions
+## Documentation
 
-* `for`-loops ([demo](https://egraphs-good.github.io/egglog-demo/?example=for))
-* `with-ruleset` ([demo](https://egraphs-good.github.io/egglog-demo/?example=with-ruleset))
-* Rationals ([demo](https://egraphs-good.github.io/egglog-demo/?example=rational), see `src/rational.rs` for supported primitives)
-* Dynamic cost model with `set-cost` ([demo](https://egraphs-good.github.io/egglog-demo/?example=05-cost-model-and-extraction))
-* Running custom schedulers with `run-with` ([demo](https://egraphs-good.github.io/egglog-demo/?example=math-backoff))
-* `(get-size!)` primitive for querying the total number of tuples in the database (optionally restricted to a list of table names) ([demo](tests/web-demo/node-limit.egg))
+Check out the crate documentation (built locally) for the current list of implemented extensions, API details, and demo links.
+We plan to do a release on crates.io with the release of egglog 2.0.
