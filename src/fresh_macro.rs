@@ -68,7 +68,7 @@ fn desugar_fresh_rule(
     // Add i64 for unique index
     schema.push("i64".to_string());
 
-    // Output sort is the fresh! sort
+    // Output sort is the unstable-fresh! sort
     let output_sort = fresh_sorts[0].clone();
 
     // Create constructor function declaration
