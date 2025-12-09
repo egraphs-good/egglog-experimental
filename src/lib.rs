@@ -28,10 +28,12 @@ pub fn new_experimental_egraph() -> EGraph {
     add_set_cost(&mut egraph);
     egraph.add_primitive(GetSizePrimitive);
 
-    // Register the fresh! macro
     egraph
         .command_macros_mut()
         .register(Arc::new(fresh_macro::FreshMacro::new()));
+    egraph
+        .add_command("run-schedule".into(), Arc::new(RunExtendedSchedule))
+        .unwrap();
 
     egraph
 }
