@@ -1,6 +1,6 @@
 [package]
 name = "egglog-experimental"
-version = "1.0.0"
+version = "0.1.0"
 edition = "2024"
 description = "Experimental extensions to the egglog language."
 repository = "https://github.com/egraphs-good/egglog-experimental"

@@ -24,4 +24,5 @@ egglog-experimental = "1.0"
 
 ## Documentation
 
-Check out the [crate documentation on docs.rs](https://docs.rs/egglog-experimental/latest/egglog_experimental/) for the current list of implemented extensions, API details, and demo links.
+Check out the crate documentation (built locally) for the current list of implemented extensions, API details, and demo links.
+We plan to do a release on crates.io with the release of egglog 2.0.
