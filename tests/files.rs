@@ -23,8 +23,11 @@ impl Run {
         } else {
             let mut egraph = new_experimental_egraph();
             let desugared_str = egraph
-                .resugar_program(self.path.to_str().map(String::from), &program)
+                .desugar_program(self.path.to_str().map(String::from), &program)
                 .unwrap()
+                .into_iter()
+                .map(|desugared| desugared.to_string())
+                .collect::<Vec<_>>()
                 .join("\n");
 
             self.test_program(
