@@ -2,9 +2,10 @@ use egglog_ast::span::Span;
 use std::sync::Arc;
 
 use egglog::{
-    CostModelExtractorBuilder, EGraph,
+    EGraph,
     ast::*,
     extract::{CostModel, DefaultCost, TreeAdditiveCostModel},
+    extractor_from_cost_model,
     util::FreshGen,
 };
 
@@ -13,11 +14,7 @@ pub fn add_set_cost(egraph: &mut EGraph) {
         .parser
         .add_command_macro(Arc::new(SetCostDeclarations));
     egraph.parser.add_action_macro(Arc::new(SetCost));
-    egraph.register_extractor(
-        "dynamic-cost",
-        Arc::new(CostModelExtractorBuilder::new(DynamicCostModel)),
-    );
-    egraph.set_default_extractor("dynamic-cost").unwrap();
+    egraph.set_extractor(extractor_from_cost_model(DynamicCostModel));
 }
 
 struct SetCost;
