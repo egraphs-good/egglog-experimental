@@ -146,3 +146,37 @@ fn test_extract_set_cost_decls() {
         )
         .unwrap();
 }
+#[test]
+fn test_multi_extract() {
+    let mut egraph = egglog_experimental::new_experimental_egraph();
+
+    let result = egraph
+        .parse_and_run_program(
+            None,
+            "
+        (datatype E (Add E E) (Sub E E) (Num i64))
+
+        (union (Num 2) (Add (Num 1) (Num 1)))
+        (multi-extract 2 (Num 2) (Add (Num 1) (Num 1)))
+
+        (push)
+        (union (Num 3) (Sub (Num 5) (Num 2)))
+        (multi-extract 2 (Num 2) (Sub (Num 5) (Num 2)))
+        (pop)",
+        )
+        .unwrap();
+
+    assert_eq!(result.len(), 2);
+    match &result[0] {
+        egglog::CommandOutput::ExtractVariants(_, terms) => {
+            assert_eq!(terms.len(), 4);
+        }
+        _ => panic!("Expected ExtractVariants output"),
+    }
+    match &result[1] {
+        egglog::CommandOutput::ExtractVariants(_, terms) => {
+            assert_eq!(terms.len(), 4);
+        }
+        _ => panic!("Expected ExtractVariants output"),
+    }
+}

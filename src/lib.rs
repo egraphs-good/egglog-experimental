@@ -32,6 +32,8 @@ pub use scheduling::*;
 
 mod set_cost;
 pub use set_cost::*;
+mod multi_extract;
+pub use multi_extract::*;
 mod size;
 pub use size::*;
 
@@ -46,6 +48,9 @@ pub fn new_experimental_egraph() -> EGraph {
 
     egraph
         .add_command("run-schedule".into(), Arc::new(RunExtendedSchedule))
+        .unwrap();
+    egraph
+        .add_command("multi-extract".into(), Arc::new(MultiExtract))
         .unwrap();
     egraph
 }
