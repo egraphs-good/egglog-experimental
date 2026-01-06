@@ -34,6 +34,8 @@ mod set_cost;
 pub use set_cost::*;
 mod size;
 pub use size::*;
+mod stats;
+pub use stats::*;
 
 pub fn new_experimental_egraph() -> EGraph {
     let mut egraph = EGraph::default();
@@ -46,6 +48,9 @@ pub fn new_experimental_egraph() -> EGraph {
 
     egraph
         .add_command("run-schedule".into(), Arc::new(RunExtendedSchedule))
+        .unwrap();
+    egraph
+        .add_command("egraph-detailed-stats".into(), Arc::new(EgraphDetailedStats))
         .unwrap();
     egraph
 }
