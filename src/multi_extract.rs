@@ -75,7 +75,8 @@ impl UserDefinedCommand for MultiExtract {
 
         if log_enabled!(log::Level::Info) {
             log::info!(
-                "extracted {} total variants across all expressions",
+                "extracted {} variants for each of {} expressions",
+                n,
                 terms.len()
             );
         }
