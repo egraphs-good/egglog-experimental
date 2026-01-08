@@ -1,9 +1,29 @@
 use egglog::{
-    CommandOutput, EGraph, Error, TermDag, TypeError, UserDefinedCommand,
+    CommandOutput, EGraph, Error, Term, TermDag, TypeError, UserDefinedCommand,
     ast::Expr,
     extract::{Extractor, TreeAdditiveCostModel},
 };
 use log::log_enabled;
+
+#[derive(Debug)]
+pub struct MultiExtractOutput {
+    termdag: TermDag,
+    terms: Vec<Vec<Term>>,
+}
+
+impl std::fmt::Display for MultiExtractOutput {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        writeln!(f, "(")?;
+        for variants in &self.terms {
+            writeln!(f, "   (")?;
+            for expr in variants {
+                writeln!(f, "      {}", self.termdag.to_string(expr))?;
+            }
+            writeln!(f, "   )")?;
+        }
+        writeln!(f, ")")
+    }
+}
 
 pub struct MultiExtract;
 
@@ -51,7 +71,6 @@ impl UserDefinedCommand for MultiExtract {
                     .map(|e| e.1.clone())
                     .collect::<Vec<_>>()
             })
-            .flatten()
             .collect();
 
         if log_enabled!(log::Level::Info) {
@@ -61,6 +80,8 @@ impl UserDefinedCommand for MultiExtract {
             );
         }
 
-        Ok(Some(CommandOutput::ExtractVariants(termdag, terms)))
+        Ok(Some(CommandOutput::UserDefined(std::sync::Arc::from(
+            MultiExtractOutput { termdag, terms },
+        ))))
     }
 }

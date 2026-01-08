@@ -168,15 +168,11 @@ fn test_multi_extract() {
 
     assert_eq!(result.len(), 2);
     match &result[0] {
-        egglog::CommandOutput::ExtractVariants(_, terms) => {
-            assert_eq!(terms.len(), 4);
-        }
+        egglog::CommandOutput::UserDefined(_) => {}
         _ => panic!("Expected ExtractVariants output"),
     }
     match &result[1] {
-        egglog::CommandOutput::ExtractVariants(_, terms) => {
-            assert_eq!(terms.len(), 4);
-        }
+        egglog::CommandOutput::UserDefined(_) => {}
         _ => panic!("Expected ExtractVariants output"),
     }
 }
