@@ -1,3 +1,11 @@
+//! An implementation of multi-extraction for egraphs.
+//! Adds support for extracting multiple terms with a single command,
+//! reducing the overhead of creating an extractor for each term.
+//! The syntax for multi-extraction is `(multi-extract n t1 ... tm)`,
+//! where n must be a positive i64.
+//! This command will extract n lowest-cost variants of each of the m terms.
+//! `(multi-extract 1 t)` is equivalent to `(extract t)`.
+
 use egglog::{
     ast::Expr,
     extract::{Extractor, TreeAdditiveCostModel},
