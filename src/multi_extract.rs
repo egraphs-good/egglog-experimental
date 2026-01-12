@@ -1,7 +1,7 @@
 use egglog::{
-    CommandOutput, EGraph, Error, Term, TermDag, TypeError, UserDefinedCommand,
     ast::Expr,
     extract::{Extractor, TreeAdditiveCostModel},
+    CommandOutput, EGraph, Error, Term, TermDag, TypeError, UserDefinedCommand,
 };
 use log::log_enabled;
 
@@ -61,15 +61,15 @@ impl UserDefinedCommand for MultiExtract {
             TreeAdditiveCostModel {},
         );
 
-        let terms: Vec<_> = values
+        let terms: Vec<Vec<_>> = values
             .into_iter()
             .zip(sorts)
             .map(|(value, sort)| {
                 extractor
                     .extract_variants_with_sort(egraph, &mut termdag, value, n as usize, sort)
-                    .iter()
-                    .map(|e| e.1.clone())
-                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .map(|e| e.1)
+                    .collect()
             })
             .collect();
 
