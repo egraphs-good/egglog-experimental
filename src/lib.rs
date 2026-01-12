@@ -15,7 +15,7 @@
 //! - [Custom schedulers via `run-with`](https://egraphs-good.github.io/egglog-demo/?example=math-backoff)
 //! - [`(get-size!)` primitive](https://github.com/egraphs-good/egglog-experimental/blob/main/tests/web-demo/node-limit.egg)
 //!   for inspecting total tuple counts, optionally restricted to specific tables
-//! - [Multi-extraction]
+//! - [Multi-extraction](https://github.com/egraphs-good/egglog-experimental/blob/main/tests/web-demo/multi-extract.egg)
 //!
 //! Each bullet links to a runnable demo so you can explore the feature quickly.
 //! The rest of this crate exposes the Rust APIs and helpers that back these extensions.
