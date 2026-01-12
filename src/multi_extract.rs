@@ -6,10 +6,10 @@
 //! This command will extract n lowest-cost variants of each of the m terms.
 //! `(multi-extract 1 t)` is equivalent to `(extract t)`.
 
+use crate::set_cost::DynamicCostModel;
 use egglog::{
-    ast::Expr,
-    extract::{Extractor, TreeAdditiveCostModel},
-    CommandOutput, EGraph, Error, Term, TermDag, TypeError, UserDefinedCommand,
+    ast::Expr, extract::Extractor, CommandOutput, EGraph, Error, Term, TermDag, TypeError,
+    UserDefinedCommand,
 };
 use log::log_enabled;
 
@@ -66,7 +66,7 @@ impl UserDefinedCommand for MultiExtract {
         let extractor = Extractor::compute_costs_from_rootsorts(
             Some(sorts.clone()),
             egraph,
-            TreeAdditiveCostModel {},
+            DynamicCostModel {},
         );
 
         let terms: Vec<Vec<_>> = values
