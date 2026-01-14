@@ -6,12 +6,12 @@
 //! This command will extract n lowest-cost variants of each of the m terms.
 //! `(multi-extract 1 t)` is equivalent to `(extract t)`.
 
-use crate::set_cost::DynamicCostModel;
 use egglog::{
-    ast::Expr, extract::Extractor, CommandOutput, EGraph, Error, Term, TermDag, TypeError,
-    UserDefinedCommand,
+    CommandOutput, EGraph, Error, Term, TermDag, TypeError, UserDefinedCommand, ast::Expr,
+    extract::Cost, extract::CostModel, extract::Extractor,
 };
 use log::log_enabled;
+use std::{fmt::Debug, marker::PhantomData};
 
 #[derive(Debug)]
 pub struct MultiExtractOutput {
@@ -33,14 +33,29 @@ impl std::fmt::Display for MultiExtractOutput {
     }
 }
 
-pub struct MultiExtract;
+pub struct MultiExtract<C: Cost + Ord + Eq + Clone + Debug + Send + Sync, CM: CostModel<C> + Clone>
+{
+    cost_model: CM,
+    _cost_t: PhantomData<C>,
+}
 
-impl UserDefinedCommand for MultiExtract {
-    fn update(
-        &self,
-        egraph: &mut EGraph,
-        args: &[Expr],
-    ) -> Result<Option<CommandOutput>, egglog::Error> {
+impl<C: Cost + Ord + Eq + Clone + Debug + Send + Sync, CM: CostModel<C> + Clone>
+    MultiExtract<C, CM>
+{
+    pub fn new(cost_model: CM) -> Self {
+        MultiExtract {
+            cost_model,
+            _cost_t: PhantomData,
+        }
+    }
+}
+
+impl<
+    C: Cost + Ord + Eq + Clone + Debug + Send + Sync,
+    CM: CostModel<C> + Clone + Send + Sync + 'static,
+> UserDefinedCommand for MultiExtract<C, CM>
+{
+    fn update(&self, egraph: &mut EGraph, args: &[Expr]) -> Result<Option<CommandOutput>, Error> {
         assert!(args.len() >= 2);
 
         let (variants_sort, variants_value) = egraph.eval_expr(&args[0])?;
@@ -66,7 +81,7 @@ impl UserDefinedCommand for MultiExtract {
         let extractor = Extractor::compute_costs_from_rootsorts(
             Some(sorts.clone()),
             egraph,
-            DynamicCostModel {},
+            self.cost_model.clone(),
         );
 
         let terms: Vec<Vec<_>> = values

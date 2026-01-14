@@ -170,6 +170,7 @@ fn map_fallible<T>(
 
 /// The cost model that handles dynamic costs. Use this cost model if you use the `with-dynamic-cost` / `set-cost`
 /// extensions in your egglog program
+#[derive(Clone)]
 pub struct DynamicCostModel;
 
 impl CostModel<DefaultCost> for DynamicCostModel {

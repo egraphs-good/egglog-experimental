@@ -20,7 +20,7 @@
 //! Each bullet links to a runnable demo so you can explore the feature quickly.
 //! The rest of this crate exposes the Rust APIs and helpers that back these extensions.
 //!
-use egglog::prelude::{add_base_sort, RustSpan, Span};
+use egglog::prelude::{RustSpan, Span, add_base_sort};
 pub use egglog::*;
 use std::sync::Arc;
 
@@ -51,7 +51,10 @@ pub fn new_experimental_egraph() -> EGraph {
         .add_command("run-schedule".into(), Arc::new(RunExtendedSchedule))
         .unwrap();
     egraph
-        .add_command("multi-extract".into(), Arc::new(MultiExtract))
+        .add_command(
+            "multi-extract".into(),
+            Arc::new(MultiExtract::new(DynamicCostModel)),
+        )
         .unwrap();
     egraph
 }
