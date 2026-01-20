@@ -15,6 +15,7 @@
 //! - [Custom schedulers via `run-with`](https://egraphs-good.github.io/egglog-demo/?example=math-backoff)
 //! - [`(get-size!)` primitive](https://github.com/egraphs-good/egglog-experimental/blob/main/tests/web-demo/node-limit.egg)
 //!   for inspecting total tuple counts, optionally restricted to specific tables
+//! - [Multi-extraction](https://github.com/egraphs-good/egglog-experimental/blob/main/tests/web-demo/multi-extract.egg)
 //!
 //! Each bullet links to a runnable demo so you can explore the feature quickly.
 //! The rest of this crate exposes the Rust APIs and helpers that back these extensions.
@@ -32,6 +33,8 @@ pub use scheduling::*;
 
 mod set_cost;
 pub use set_cost::*;
+mod multi_extract;
+pub use multi_extract::*;
 mod size;
 pub use size::*;
 
@@ -46,6 +49,12 @@ pub fn new_experimental_egraph() -> EGraph {
 
     egraph
         .add_command("run-schedule".into(), Arc::new(RunExtendedSchedule))
+        .unwrap();
+    egraph
+        .add_command(
+            "multi-extract".into(),
+            Arc::new(MultiExtract::new(DynamicCostModel)),
+        )
         .unwrap();
     egraph
 }

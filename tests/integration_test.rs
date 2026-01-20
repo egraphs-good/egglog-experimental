@@ -146,3 +146,94 @@ fn test_extract_set_cost_decls() {
         )
         .unwrap();
 }
+
+#[test]
+fn test_multi_extract_two_variants_two_terms() {
+    let mut egraph = egglog_experimental::new_experimental_egraph();
+
+    let result = egraph
+        .parse_and_run_program(
+            None,
+            "
+        (with-dynamic-cost
+            (datatype E (Add E E) (Mul E E) (Num i64))
+        )
+
+        (union (Num 2) (Add (Num 1) (Num 1)))
+        (union (Num 2) (Mul (Num 1) (Num 2)))
+
+        (union (Num 4) (Add (Num 2) (Num 2)))
+        (union (Num 4) (Mul (Num 2) (Num 2)))
+
+        (multi-extract 2 (Num 2) (Num 4))",
+        )
+        .unwrap();
+
+    assert_eq!(result.len(), 1);
+    let output = result[0].to_string();
+    assert!(output.contains("(Num 2)"));
+    assert!(output.contains("(Add (Num 1) (Num 1))") || output.contains("(Mul (Num 1) (Num 2))"));
+    assert!(output.contains("(Num 4)"));
+    assert!(output.contains("(Add (Num 2) (Num 2))") || output.contains("(Mul (Num 2) (Num 2))"));
+}
+
+#[test]
+fn test_multi_extract_single_variant_minimal_cost() {
+    let mut egraph = egglog_experimental::new_experimental_egraph();
+
+    let result = egraph
+        .parse_and_run_program(
+            None,
+            "
+        (with-dynamic-cost
+            (datatype E (Add E E :cost 3) (Mul E E :cost 10) (Num i64 :cost 1))
+        )
+
+        (union (Num 5) (Add (Num 2) (Num 3)))
+        (union (Num 5) (Mul (Num 1) (Num 5)))
+        (union (Add (Num 5) (Num 5)) (Mul (Num 2) (Num 5)))
+
+        (multi-extract 1 (Mul (Num 2) (Num 5)))",
+        )
+        .unwrap();
+
+    assert_eq!(result.len(), 1);
+    let output = result[0].to_string();
+    assert!(output.contains("(Add (Num 5) (Num 5))"));
+    assert!(!output.contains("Mul"));
+}
+
+#[test]
+fn test_multi_extract_with_set_cost() {
+    let mut egraph = egglog_experimental::new_experimental_egraph();
+
+    let result = egraph
+        .parse_and_run_program(
+            None,
+            "
+        (with-dynamic-cost
+            (datatype E (Add E E) (Mul E E) (Num i64))
+        )
+
+        (union (Num 10) (Add (Num 5) (Num 5)))
+        (union (Num 10) (Mul (Num 2) (Num 5)))
+
+        (union (Num 6) (Add (Num 3) (Num 3)))
+        (union (Num 6) (Mul (Num 2) (Num 3)))
+
+        (set-cost (Add (Num 5) (Num 5)) 1)
+        (set-cost (Add (Num 3) (Num 3)) 1)
+
+        (set-cost (Mul (Num 2) (Num 5)) 1000)
+        (set-cost (Mul (Num 2) (Num 3)) 1000)
+
+        (multi-extract 2 (Num 10) (Num 6))",
+        )
+        .unwrap();
+
+    assert_eq!(result.len(), 1);
+    let output = result[0].to_string();
+    assert!(output.contains("(Add (Num 5) (Num 5))"));
+    assert!(output.contains("(Add (Num 3) (Num 3))"));
+    assert!(!output.contains("Mul"));
+}
