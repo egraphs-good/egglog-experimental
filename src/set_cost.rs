@@ -258,7 +258,7 @@ impl UserDefinedCommand for CustomExtract {
             let terms: Vec<TermId> = extractor
                 .extract_variants(egraph, &mut termdag, value, n as usize)
                 .iter()
-                .map(|e| e.1.clone())
+                .map(|e| e.1)
                 .collect();
             log::info!("extracted variants:");
             Ok(Some(CommandOutput::ExtractVariants(termdag, terms)))
