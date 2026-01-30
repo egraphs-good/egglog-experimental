@@ -99,7 +99,7 @@ impl BaseSort for RationalSort {
         base_values: &BaseValues,
         value: Value,
         termdag: &mut TermDag,
-    ) -> Term {
+    ) -> TermId {
         let rat = base_values.unwrap::<R>(value);
 
         let numer = rat.0.numer();

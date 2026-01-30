@@ -7,8 +7,9 @@
 //! `(multi-extract 1 t)` is equivalent to `(extract t)`.
 
 use egglog::{
-    CommandOutput, EGraph, Error, Term, TermDag, TypeError, UserDefinedCommand, ast::Expr,
-    extract::Cost, extract::CostModel, extract::Extractor,
+    CommandOutput, EGraph, Error, TermDag, TermId, TypeError, UserDefinedCommand,
+    ast::Expr,
+    extract::{Cost, CostModel, Extractor},
 };
 use log::log_enabled;
 use std::{fmt::Debug, marker::PhantomData};
@@ -16,7 +17,7 @@ use std::{fmt::Debug, marker::PhantomData};
 #[derive(Debug)]
 pub struct MultiExtractOutput {
     termdag: TermDag,
-    terms: Vec<Vec<Term>>,
+    terms: Vec<Vec<TermId>>,
 }
 
 impl std::fmt::Display for MultiExtractOutput {
@@ -25,7 +26,7 @@ impl std::fmt::Display for MultiExtractOutput {
         for variants in &self.terms {
             writeln!(f, "   (")?;
             for expr in variants {
-                writeln!(f, "      {}", self.termdag.to_string(expr))?;
+                writeln!(f, "      {}", self.termdag.to_string(*expr))?;
             }
             writeln!(f, "   )")?;
         }
