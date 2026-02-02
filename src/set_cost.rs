@@ -2,7 +2,7 @@ use egglog_ast::span::Span;
 use std::sync::Arc;
 
 use egglog::{
-    CommandOutput, EGraph, Error, Term, TermDag, TypeError, UserDefinedCommand,
+    CommandOutput, EGraph, Error, TermDag, TermId, TypeError, UserDefinedCommand,
     ast::*,
     extract::{CostModel, DefaultCost, Extractor, TreeAdditiveCostModel},
     util::FreshGen,
@@ -242,7 +242,7 @@ impl UserDefinedCommand for CustomExtract {
         if n == 0 {
             if let Some((cost, term)) = extractor.extract_best(egraph, &mut termdag, value) {
                 if log_enabled!(log::Level::Info) {
-                    log::info!("extracted with cost {cost}: {}", termdag.to_string(&term));
+                    log::info!("extracted with cost {cost}: {}", termdag.to_string(term));
                 }
                 Ok(Some(CommandOutput::ExtractBest(termdag, cost, term)))
             } else {
@@ -255,10 +255,10 @@ impl UserDefinedCommand for CustomExtract {
             if n < 0 {
                 panic!("Cannot extract negative number of variants");
             }
-            let terms: Vec<Term> = extractor
+            let terms: Vec<TermId> = extractor
                 .extract_variants(egraph, &mut termdag, value, n as usize)
                 .iter()
-                .map(|e| e.1.clone())
+                .map(|e| e.1)
                 .collect();
             log::info!("extracted variants:");
             Ok(Some(CommandOutput::ExtractVariants(termdag, terms)))
