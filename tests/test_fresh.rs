@@ -10,7 +10,7 @@ fn test_fresh_desugaring() {
 (relation test_rel (MySort))
 (MySortConstructor)
 (rule ((MySortConstructor))
-      ((set (test_rel (unstable-fresh! MySort)) ())))
+      ((test_rel (unstable-fresh! MySort))))
 
 (run 1)
 

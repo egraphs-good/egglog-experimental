@@ -1,10 +1,10 @@
 use egglog::{
-    CommandMacro, Error, ResolvedCall, TypeInfo,
+    CommandMacro, Error, TypeInfo,
     ast::{Action, Actions, Command, Expr, Rule, Schema},
-    ast::{ResolvedExpr, ResolvedFact},
+    ast::ResolvedFact,
     util::{FreshGen, IndexSet, SymbolGen},
 };
-use egglog_ast::generic_ast::{GenericExpr, GenericFact, Literal};
+use egglog_ast::generic_ast::{GenericFact, Literal};
 
 /// Implementation of the unstable-fresh! macro for egglog-experimental
 pub struct FreshMacro;
@@ -51,8 +51,8 @@ fn desugar_fresh_rule(
     // Typecheck the query to get resolved facts with type information
     let resolved_facts = type_info.typecheck_facts(symbol_gen, &rule.body)?;
 
-    // Collect all unique columns from the resolved facts with their types
-    let query_columns = collect_query_columns(&resolved_facts);
+    // Collect all unique variables from the resolved facts with their types
+    let query_vars = collect_query_vars(&resolved_facts);
 
     // Generate unique constructor name
     let constructor_name = symbol_gen.fresh("GeneratedFreshTable").to_string();
@@ -60,8 +60,8 @@ fn desugar_fresh_rule(
     // Build schema for the constructor - use actual types from resolved facts
     let mut schema = Vec::new();
 
-    // Add a column for each query subexpression with its actual type
-    for (_, sort) in &query_columns {
+    // Add a column for each query variable with its actual type
+    for (_, sort) in &query_vars {
         schema.push(sort.to_string());
     }
 
@@ -83,8 +83,8 @@ fn desugar_fresh_rule(
         unextractable: true,
     };
 
-    // Convert columns back to surface Exprs for rewriting
-    let query_exprs: Vec<Expr> = query_columns.iter().map(|(e, _)| e.clone()).collect();
+    // Get just the variable names for rewriting
+    let query_var_names: Vec<String> = query_vars.iter().map(|(name, _)| name.clone()).collect();
 
     // Rewrite rule actions to use constructor
     let mut fresh_index = 0i64;
@@ -96,7 +96,7 @@ fn desugar_fresh_rule(
             rewrite_fresh_action(
                 action.clone(),
                 &constructor_name,
-                &query_exprs,
+                &query_var_names,
                 &mut fresh_index,
             )
         })
@@ -113,71 +113,35 @@ fn desugar_fresh_rule(
     Ok(vec![constructor_command, Command::Rule { rule: new_rule }])
 }
 
-// Collect all unique subexpressions from resolved facts with their types
-fn collect_query_columns(resolved_facts: &[ResolvedFact]) -> IndexSet<(Expr, Symbol)> {
-    let mut columns = IndexSet::default();
+// Collect all unique variables from resolved facts with their types
+fn collect_query_vars(resolved_facts: &[ResolvedFact]) -> IndexSet<(Symbol, Symbol)> {
+    let mut vars = IndexSet::default();
 
     for fact in resolved_facts {
         match fact {
             GenericFact::Eq(_ann, e1, e2) => {
-                collect_resolved_columns(e1, &mut columns);
-                collect_resolved_columns(e2, &mut columns);
+                collect_vars_from_resolved_expr(e1, &mut vars);
+                collect_vars_from_resolved_expr(e2, &mut vars);
             }
             GenericFact::Fact(e) => {
-                collect_resolved_columns(e, &mut columns);
+                collect_vars_from_resolved_expr(e, &mut vars);
             }
         }
     }
 
-    columns
+    vars
 }
 
-// Recursively collect columns from resolved expressions
-fn collect_resolved_columns(expr: &ResolvedExpr, columns: &mut IndexSet<(Expr, Symbol)>) {
-    // Get the output type of this expression from the call
-    let sort = match expr {
-        GenericExpr::Call(_, call, _) => call.output().name().to_string(),
-        GenericExpr::Var(_, v) => v.sort.name().to_string(),
-        GenericExpr::Lit(_, lit) => {
-            // Infer type from literal
-            match lit {
-                Literal::Int(_) => "i64".to_string(),
-                Literal::Float(_) => "f64".to_string(),
-                Literal::Bool(_) => "bool".to_string(),
-                Literal::String(_) => "String".to_string(),
-                Literal::Unit => "Unit".to_string(),
-            }
-        }
-    };
-
-    // Convert resolved expr to surface expr
-    let surface_expr = resolved_to_surface(expr);
-
-    // Add to columns if not already present
-    columns.insert((surface_expr, sort));
-
-    // Recurse into subexpressions
-    if let GenericExpr::Call(_, _, args) = expr {
-        for arg in args {
-            collect_resolved_columns(arg, columns);
-        }
-    }
-}
-
-// Convert ResolvedExpr to surface Expr
-fn resolved_to_surface(expr: &ResolvedExpr) -> Expr {
-    match expr {
-        GenericExpr::Var(ann, v) => Expr::Var(ann.clone(), v.name.to_string()),
-        GenericExpr::Lit(ann, l) => Expr::Lit(ann.clone(), l.clone()),
-        GenericExpr::Call(ann, call, args) => {
-            let head = match call {
-                ResolvedCall::Func(func) => func.name.to_string(),
-                ResolvedCall::Primitive(prim) => prim.name().to_string(),
-            };
-            let surface_args = args.iter().map(resolved_to_surface).collect();
-            Expr::Call(ann.clone(), head, surface_args)
-        }
-    }
+// Collect variables from a resolved expression using visit_vars
+fn collect_vars_from_resolved_expr(
+    expr: &egglog::ast::ResolvedExpr,
+    vars: &mut IndexSet<(Symbol, Symbol)>,
+) {
+    expr.visit_vars(&mut |_span, resolved_var| {
+        let name = resolved_var.name.to_string();
+        let sort = resolved_var.sort.name().to_string();
+        vars.insert((name, sort));
+    });
 }
 
 fn contains_fresh_action(action: &Action) -> bool {
@@ -240,29 +204,29 @@ fn collect_fresh_from_expr(expr: &Expr, sorts: &mut Vec<Symbol>) {
 fn rewrite_fresh_action(
     action: Action,
     constructor_name: &Symbol,
-    query_exprs: &[Expr],
+    query_var_names: &[String],
     fresh_index: &mut i64,
 ) -> Action {
     match action {
         Action::Let(span, var, expr) => Action::Let(
             span,
             var,
-            rewrite_fresh_expr(expr, constructor_name, query_exprs, fresh_index),
+            rewrite_fresh_expr(expr, constructor_name, query_var_names, fresh_index),
         ),
         Action::Set(span, name, args, expr) => Action::Set(
             span,
             name,
             args,
-            rewrite_fresh_expr(expr, constructor_name, query_exprs, fresh_index),
+            rewrite_fresh_expr(expr, constructor_name, query_var_names, fresh_index),
         ),
         Action::Union(span, e1, e2) => Action::Union(
             span,
-            rewrite_fresh_expr(e1, constructor_name, query_exprs, fresh_index),
-            rewrite_fresh_expr(e2, constructor_name, query_exprs, fresh_index),
+            rewrite_fresh_expr(e1, constructor_name, query_var_names, fresh_index),
+            rewrite_fresh_expr(e2, constructor_name, query_var_names, fresh_index),
         ),
         Action::Expr(span, expr) => Action::Expr(
             span,
-            rewrite_fresh_expr(expr, constructor_name, query_exprs, fresh_index),
+            rewrite_fresh_expr(expr, constructor_name, query_var_names, fresh_index),
         ),
         other => other,
     }
@@ -271,12 +235,15 @@ fn rewrite_fresh_action(
 fn rewrite_fresh_expr(
     expr: Expr,
     constructor_name: &Symbol,
-    query_exprs: &[Expr],
+    query_var_names: &[String],
     fresh_index: &mut i64,
 ) -> Expr {
     match expr {
         Expr::Call(span, head, _args) if head.as_str() == "unstable-fresh!" => {
-            let mut new_args = query_exprs.to_vec();
+            let mut new_args: Vec<Expr> = query_var_names
+                .iter()
+                .map(|name| Expr::Var(span.clone(), name.clone()))
+                .collect();
             new_args.push(Expr::Lit(span.clone(), Literal::Int(*fresh_index)));
             *fresh_index += 1;
             Expr::Call(span, constructor_name.clone(), new_args)
@@ -284,7 +251,7 @@ fn rewrite_fresh_expr(
         Expr::Call(span, head, args) => {
             let new_args = args
                 .into_iter()
-                .map(|arg| rewrite_fresh_expr(arg, constructor_name, query_exprs, fresh_index))
+                .map(|arg| rewrite_fresh_expr(arg, constructor_name, query_var_names, fresh_index))
                 .collect();
             Expr::Call(span, head, new_args)
         }

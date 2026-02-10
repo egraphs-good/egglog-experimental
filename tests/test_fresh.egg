@@ -8,5 +8,5 @@
 (Let (Var "x") (Var "y"))
 (run 1)
 
-(check (= (Let ?x (Var "y")) (Let ?y (Var "y"))))
-(check (!= ?x ?y))
+; Check that fresh values are created and are distinct
+(check (Let ?x (Var "y")) (Let ?y (Var "y")) (!= ?x ?y))
