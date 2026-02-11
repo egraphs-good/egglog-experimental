@@ -1,7 +1,7 @@
 use egglog::{
     CommandMacro, Error, TypeInfo,
-    ast::{Action, Actions, Command, Expr, Rule, Schema},
     ast::ResolvedFact,
+    ast::{Action, Actions, Command, Expr, Rule, Schema},
     util::{FreshGen, IndexSet, SymbolGen},
 };
 use egglog_ast::generic_ast::{GenericFact, Literal};
