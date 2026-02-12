@@ -1,7 +1,7 @@
 use egglog::{
     CommandMacro, Error, TypeInfo,
     ast::ResolvedFact,
-    ast::{Action, Actions, Command, Expr, Rule, Schema},
+    ast::{Actions, Command, Expr, ParseError, Rule, Schema},
     util::{FreshGen, IndexSet, SymbolGen},
 };
 use egglog_ast::generic_ast::{GenericFact, Literal};
@@ -25,9 +25,15 @@ impl CommandMacro for FreshMacro {
         type_info: &TypeInfo,
     ) -> Result<Vec<Command>, Error> {
         match command {
-            Command::Rule { rule } if rule.head.0.iter().any(contains_fresh_action) => {
-                // unstable-fresh! requires TypeInfo for correct type inference
-                desugar_fresh_rule(rule, symbol_gen, type_info)
+            Command::Rule { rule } => {
+                // Collect fresh sorts - if none found, return the rule unchanged
+                let fresh_sorts = collect_fresh_sorts(rule.head.clone())?;
+                if fresh_sorts.is_empty() {
+                    Ok(vec![Command::Rule { rule }])
+                } else {
+                    // unstable-fresh! requires TypeInfo for correct type inference
+                    desugar_fresh_rule(rule, fresh_sorts, symbol_gen, type_info)
+                }
             }
             _ => Ok(vec![command]),
         }
@@ -37,15 +43,10 @@ impl CommandMacro for FreshMacro {
 // Main desugaring function using proper typechecking
 fn desugar_fresh_rule(
     rule: Rule,
+    fresh_sorts: Vec<Symbol>,
     symbol_gen: &mut SymbolGen,
     type_info: &TypeInfo,
 ) -> Result<Vec<Command>, Error> {
-    // Collect unstable-fresh! sorts from actions
-    let fresh_sorts = collect_fresh_sorts(&rule.head.0);
-    if fresh_sorts.is_empty() {
-        return Ok(vec![Command::Rule { rule }]);
-    }
-
     let rule_span = rule.span.clone();
 
     // Typecheck the query to get resolved facts with type information
@@ -86,23 +87,22 @@ fn desugar_fresh_rule(
     // Get just the variable names for rewriting
     let query_var_names: Vec<String> = query_vars.iter().map(|(name, _)| name.clone()).collect();
 
-    // Rewrite rule actions to use constructor
+    // Rewrite rule actions to use constructor using visit_exprs
     let mut fresh_index = 0i64;
-    let new_actions_vec: Vec<Action> = rule
-        .head
-        .0
-        .iter()
-        .map(|action| {
-            rewrite_fresh_action(
-                action.clone(),
-                &constructor_name,
-                &query_var_names,
-                &mut fresh_index,
-            )
-        })
-        .collect();
-
-    let new_actions = Actions::new(new_actions_vec);
+    let new_actions = rule.head.visit_exprs(&mut |expr| {
+        if let Expr::Call(span, head, _args) = &expr {
+            if head.as_str() == "unstable-fresh!" {
+                let mut new_args: Vec<Expr> = query_var_names
+                    .iter()
+                    .map(|name| Expr::Var(span.clone(), name.clone()))
+                    .collect();
+                new_args.push(Expr::Lit(span.clone(), Literal::Int(fresh_index)));
+                fresh_index += 1;
+                return Expr::Call(span.clone(), constructor_name.clone(), new_args);
+            }
+        }
+        expr
+    });
 
     let new_rule = Rule {
         head: new_actions,
@@ -144,117 +144,41 @@ fn collect_vars_from_resolved_expr(
     });
 }
 
-fn contains_fresh_action(action: &Action) -> bool {
-    match action {
-        Action::Let(_, _, expr) => contains_fresh_expr(expr),
-        Action::Set(_, _, _, expr) => contains_fresh_expr(expr),
-        Action::Union(_, e1, e2) => contains_fresh_expr(e1) || contains_fresh_expr(e2),
-        Action::Expr(_, expr) => contains_fresh_expr(expr),
-        _ => false,
-    }
-}
-
-fn contains_fresh_expr(expr: &Expr) -> bool {
-    match expr {
-        Expr::Call(_span, head, _args) if head.as_str() == "unstable-fresh!" => true,
-        Expr::Call(_, _, args) => args.iter().any(contains_fresh_expr),
-        _ => false,
-    }
-}
-
-fn collect_fresh_sorts(actions: &[Action]) -> Vec<Symbol> {
+fn collect_fresh_sorts(actions: Actions) -> Result<Vec<Symbol>, Error> {
     let mut sorts = Vec::new();
-    for action in actions {
-        collect_fresh_from_action(action, &mut sorts);
-    }
-    sorts
-}
+    let mut error: Option<Error> = None;
 
-fn collect_fresh_from_action(action: &Action, sorts: &mut Vec<Symbol>) {
-    match action {
-        Action::Let(_, _, expr) => collect_fresh_from_expr(expr, sorts),
-        Action::Set(_, _, _, expr) => collect_fresh_from_expr(expr, sorts),
-        Action::Union(_, e1, e2) => {
-            collect_fresh_from_expr(e1, sorts);
-            collect_fresh_from_expr(e2, sorts);
+    // Use visit_exprs to traverse all expressions in the actions
+    let _ = actions.visit_exprs(&mut |expr| {
+        if error.is_some() {
+            return expr; // Skip processing if we already have an error
         }
-        Action::Expr(_, expr) => collect_fresh_from_expr(expr, sorts),
-        _ => {}
-    }
-}
 
-fn collect_fresh_from_expr(expr: &Expr, sorts: &mut Vec<Symbol>) {
-    match expr {
-        Expr::Call(_span, head, args) if head.as_str() == "unstable-fresh!" => {
-            if args.len() == 1 {
-                if let Expr::Var(_span, sort_name) = &args[0] {
+        if let Expr::Call(span, head, args) = &expr {
+            if head.as_str() == "unstable-fresh!" {
+                if args.len() != 1 {
+                    error = Some(Error::ParseError(ParseError(
+                        span.clone(),
+                        format!(
+                            "unstable-fresh! expects exactly 1 argument (the sort name), got {}",
+                            args.len()
+                        ),
+                    )));
+                } else if let Expr::Var(_span, sort_name) = &args[0] {
                     sorts.push(sort_name.clone());
+                } else {
+                    error = Some(Error::ParseError(ParseError(
+                        span.clone(),
+                        "unstable-fresh! argument must be a sort name".to_string(),
+                    )));
                 }
             }
         }
-        Expr::Call(_, _, args) => {
-            for arg in args {
-                collect_fresh_from_expr(arg, sorts);
-            }
-        }
-        _ => {}
-    }
-}
+        expr
+    });
 
-fn rewrite_fresh_action(
-    action: Action,
-    constructor_name: &Symbol,
-    query_var_names: &[String],
-    fresh_index: &mut i64,
-) -> Action {
-    match action {
-        Action::Let(span, var, expr) => Action::Let(
-            span,
-            var,
-            rewrite_fresh_expr(expr, constructor_name, query_var_names, fresh_index),
-        ),
-        Action::Set(span, name, args, expr) => Action::Set(
-            span,
-            name,
-            args,
-            rewrite_fresh_expr(expr, constructor_name, query_var_names, fresh_index),
-        ),
-        Action::Union(span, e1, e2) => Action::Union(
-            span,
-            rewrite_fresh_expr(e1, constructor_name, query_var_names, fresh_index),
-            rewrite_fresh_expr(e2, constructor_name, query_var_names, fresh_index),
-        ),
-        Action::Expr(span, expr) => Action::Expr(
-            span,
-            rewrite_fresh_expr(expr, constructor_name, query_var_names, fresh_index),
-        ),
-        other => other,
-    }
-}
-
-fn rewrite_fresh_expr(
-    expr: Expr,
-    constructor_name: &Symbol,
-    query_var_names: &[String],
-    fresh_index: &mut i64,
-) -> Expr {
-    match expr {
-        Expr::Call(span, head, _args) if head.as_str() == "unstable-fresh!" => {
-            let mut new_args: Vec<Expr> = query_var_names
-                .iter()
-                .map(|name| Expr::Var(span.clone(), name.clone()))
-                .collect();
-            new_args.push(Expr::Lit(span.clone(), Literal::Int(*fresh_index)));
-            *fresh_index += 1;
-            Expr::Call(span, constructor_name.clone(), new_args)
-        }
-        Expr::Call(span, head, args) => {
-            let new_args = args
-                .into_iter()
-                .map(|arg| rewrite_fresh_expr(arg, constructor_name, query_var_names, fresh_index))
-                .collect();
-            Expr::Call(span, head, new_args)
-        }
-        _ => expr,
+    match error {
+        Some(e) => Err(e),
+        None => Ok(sorts),
     }
 }
