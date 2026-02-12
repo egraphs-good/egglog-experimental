@@ -4,7 +4,7 @@ use egglog::{
     ast::{Actions, Command, Expr, ParseError, Rule, Schema},
     util::{FreshGen, IndexSet, SymbolGen},
 };
-use egglog_ast::generic_ast::{GenericFact, Literal};
+use egglog_ast::generic_ast::Literal;
 
 /// Implementation of the unstable-fresh! macro for egglog-experimental
 pub struct FreshMacro;
@@ -128,30 +128,14 @@ fn collect_query_vars(resolved_facts: &[ResolvedFact]) -> IndexSet<(Symbol, Symb
     let mut vars = IndexSet::default();
 
     for fact in resolved_facts {
-        match fact {
-            GenericFact::Eq(_ann, e1, e2) => {
-                collect_vars_from_resolved_expr(e1, &mut vars);
-                collect_vars_from_resolved_expr(e2, &mut vars);
-            }
-            GenericFact::Fact(e) => {
-                collect_vars_from_resolved_expr(e, &mut vars);
-            }
-        }
+        fact.visit_vars(&mut |_span, resolved_var| {
+            let name = resolved_var.name.to_string();
+            let sort = resolved_var.sort.name().to_string();
+            vars.insert((name, sort));
+        });
     }
 
     vars
-}
-
-// Collect variables from a resolved expression using visit_vars
-fn collect_vars_from_resolved_expr(
-    expr: &egglog::ast::ResolvedExpr,
-    vars: &mut IndexSet<(Symbol, Symbol)>,
-) {
-    expr.visit_vars(&mut |_span, resolved_var| {
-        let name = resolved_var.name.to_string();
-        let sort = resolved_var.sort.name().to_string();
-        vars.insert((name, sort));
-    });
 }
 
 fn collect_fresh_options(actions: Actions) -> Result<Vec<FreshOptions>, Error> {
