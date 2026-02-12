@@ -17,6 +17,14 @@ impl FreshMacro {
 
 type Symbol = String;
 
+/// Options parsed from unstable-fresh! macro arguments
+#[derive(Clone, Debug)]
+struct FreshOptions {
+    sort: Symbol,
+    cost: Option<u64>,
+    unextractable: bool,
+}
+
 impl CommandMacro for FreshMacro {
     fn transform(
         &self,
@@ -26,13 +34,13 @@ impl CommandMacro for FreshMacro {
     ) -> Result<Vec<Command>, Error> {
         match command {
             Command::Rule { rule } => {
-                // Collect fresh sorts - if none found, return the rule unchanged
-                let fresh_sorts = collect_fresh_sorts(rule.head.clone())?;
-                if fresh_sorts.is_empty() {
+                // Collect fresh options - if none found, return the rule unchanged
+                let fresh_options = collect_fresh_options(rule.head.clone())?;
+                if fresh_options.is_empty() {
                     Ok(vec![Command::Rule { rule }])
                 } else {
                     // unstable-fresh! requires TypeInfo for correct type inference
-                    desugar_fresh_rule(rule, fresh_sorts, symbol_gen, type_info)
+                    desugar_fresh_rule(rule, fresh_options, symbol_gen, type_info)
                 }
             }
             _ => Ok(vec![command]),
@@ -43,7 +51,7 @@ impl CommandMacro for FreshMacro {
 // Main desugaring function using proper typechecking
 fn desugar_fresh_rule(
     rule: Rule,
-    fresh_sorts: Vec<Symbol>,
+    fresh_options: Vec<FreshOptions>,
     symbol_gen: &mut SymbolGen,
     type_info: &TypeInfo,
 ) -> Result<Vec<Command>, Error> {
@@ -69,8 +77,10 @@ fn desugar_fresh_rule(
     // Add i64 for unique index
     schema.push("i64".to_string());
 
-    // Output sort is the unstable-fresh! sort
-    let output_sort = fresh_sorts[0].clone();
+    // Use options from the first fresh! call for the constructor
+    // (all fresh! calls in the same rule share the same constructor)
+    let first_opts = &fresh_options[0];
+    let output_sort = first_opts.sort.clone();
 
     // Create constructor function declaration
     let constructor_command = Command::Constructor {
@@ -80,8 +90,8 @@ fn desugar_fresh_rule(
             input: schema,
             output: output_sort,
         },
-        cost: None,
-        unextractable: true,
+        cost: first_opts.cost,
+        unextractable: first_opts.unextractable,
     };
 
     // Get just the variable names for rewriting
@@ -144,8 +154,8 @@ fn collect_vars_from_resolved_expr(
     });
 }
 
-fn collect_fresh_sorts(actions: Actions) -> Result<Vec<Symbol>, Error> {
-    let mut sorts = Vec::new();
+fn collect_fresh_options(actions: Actions) -> Result<Vec<FreshOptions>, Error> {
+    let mut options_list = Vec::new();
     let mut error: Option<Error> = None;
 
     // Use visit_exprs to traverse all expressions in the actions
@@ -156,21 +166,9 @@ fn collect_fresh_sorts(actions: Actions) -> Result<Vec<Symbol>, Error> {
 
         if let Expr::Call(span, head, args) = &expr {
             if head.as_str() == "unstable-fresh!" {
-                if args.len() != 1 {
-                    error = Some(Error::ParseError(ParseError(
-                        span.clone(),
-                        format!(
-                            "unstable-fresh! expects exactly 1 argument (the sort name), got {}",
-                            args.len()
-                        ),
-                    )));
-                } else if let Expr::Var(_span, sort_name) = &args[0] {
-                    sorts.push(sort_name.clone());
-                } else {
-                    error = Some(Error::ParseError(ParseError(
-                        span.clone(),
-                        "unstable-fresh! argument must be a sort name".to_string(),
-                    )));
+                match parse_fresh_args(span, args) {
+                    Ok(opts) => options_list.push(opts),
+                    Err(e) => error = Some(e),
                 }
             }
         }
@@ -179,6 +177,86 @@ fn collect_fresh_sorts(actions: Actions) -> Result<Vec<Symbol>, Error> {
 
     match error {
         Some(e) => Err(e),
-        None => Ok(sorts),
+        None => Ok(options_list),
     }
+}
+
+/// Parse the arguments to unstable-fresh!
+/// Syntax: (unstable-fresh! SortName [:cost N] [:unextractable])
+fn parse_fresh_args(span: &egglog::ast::Span, args: &[Expr]) -> Result<FreshOptions, Error> {
+    if args.is_empty() {
+        return Err(Error::ParseError(ParseError(
+            span.clone(),
+            "unstable-fresh! requires at least 1 argument (the sort name)".to_string(),
+        )));
+    }
+
+    // First argument must be the sort name
+    let sort = match &args[0] {
+        Expr::Var(_span, sort_name) => sort_name.clone(),
+        _ => {
+            return Err(Error::ParseError(ParseError(
+                span.clone(),
+                "unstable-fresh! first argument must be a sort name".to_string(),
+            )));
+        }
+    };
+
+    // Default values - cost defaults to 1, unextractable defaults to false
+    let mut cost = Some(1);
+    let mut unextractable = false;
+
+    // Parse keyword arguments
+    let mut i = 1;
+    while i < args.len() {
+        match &args[i] {
+            Expr::Var(kw_span, keyword) => {
+                match keyword.as_str() {
+                    ":cost" => {
+                        i += 1;
+                        if i >= args.len() {
+                            return Err(Error::ParseError(ParseError(
+                                kw_span.clone(),
+                                ":cost requires a value".to_string(),
+                            )));
+                        }
+                        match &args[i] {
+                            Expr::Lit(_, Literal::Int(n)) => {
+                                cost = Some(*n as u64);
+                            }
+                            _ => {
+                                return Err(Error::ParseError(ParseError(
+                                    kw_span.clone(),
+                                    ":cost value must be an integer".to_string(),
+                                )));
+                            }
+                        }
+                    }
+                    ":unextractable" => {
+                        // :unextractable is a flag - its presence means true
+                        unextractable = true;
+                    }
+                    _ => {
+                        return Err(Error::ParseError(ParseError(
+                            kw_span.clone(),
+                            format!("unknown option: {}", keyword),
+                        )));
+                    }
+                }
+            }
+            _ => {
+                return Err(Error::ParseError(ParseError(
+                    span.clone(),
+                    "expected keyword argument (:cost or :unextractable)".to_string(),
+                )));
+            }
+        }
+        i += 1;
+    }
+
+    Ok(FreshOptions {
+        sort,
+        cost,
+        unextractable,
+    })
 }
