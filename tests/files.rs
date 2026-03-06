@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use egglog_experimental::ast::sanitize_internal_names;
+use egglog::ast::sanitize_internal_names;
 use egglog_experimental::*;
 use libtest_mimic::Trial;
 
