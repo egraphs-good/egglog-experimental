@@ -119,6 +119,8 @@ impl Macro<Vec<Command>> for SetCostDeclarations {
                             name: cost_table_name,
                             schema: cost_table_schema,
                             merge: None,
+                            hidden: false,
+                            let_binding: false,
                         });
                     }
                 }
@@ -148,6 +150,8 @@ fn generate_cost_table_commands_from_variants(variants: &[Variant]) -> Vec<Comma
                 name: cost_table_name,
                 schema: cost_table_schema,
                 merge: None,
+                hidden: false,
+                let_binding: false,
             }
         })
         .collect::<Vec<_>>()

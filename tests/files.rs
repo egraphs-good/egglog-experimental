@@ -1,5 +1,6 @@
 use std::path::PathBuf;
 
+use egglog_experimental::ast::sanitize_internal_names;
 use egglog_experimental::*;
 use libtest_mimic::Trial;
 
@@ -22,9 +23,10 @@ impl Run {
             );
         } else {
             let mut egraph = new_experimental_egraph();
-            let desugared_str = egraph
-                .desugar_program(self.path.to_str().map(String::from), &program)
-                .unwrap()
+            let resolved = egraph
+                .resolve_program(self.path.to_str().map(String::from), &program)
+                .unwrap();
+            let desugared_str = sanitize_internal_names(&resolved)
                 .iter()
                 .map(|cmd| cmd.to_string())
                 .collect::<Vec<_>>()
