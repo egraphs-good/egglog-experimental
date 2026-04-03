@@ -1,9 +1,45 @@
 use std::sync::Arc;
 
 use egglog::{
+    CommandOutput,
     ast::{Expr, Literal},
     prelude::{RustSpan, Span},
+    scheduler::{Matches, Scheduler},
 };
+
+#[derive(Clone, Default)]
+struct DelayStopScheduler {
+    can_stop_calls: usize,
+}
+
+impl Scheduler for DelayStopScheduler {
+    fn can_stop(&mut self, _rules: &[&str], _ruleset: &str) -> bool {
+        self.can_stop_calls += 1;
+        self.can_stop_calls > 1
+    }
+
+    fn filter_matches(&mut self, _rule: &str, _ruleset: &str, _matches: &mut Matches) -> bool {
+        false
+    }
+}
+
+fn eval_get_size(egraph: &mut egglog::EGraph, names: &[&str]) -> i64 {
+    let span = Span::Rust(Arc::new(RustSpan {
+        file: "integration_test",
+        line: 0,
+        column: 0,
+    }));
+    let expr = Expr::Call(
+        span.clone(),
+        "get-size!".into(),
+        names
+            .iter()
+            .map(|name| Expr::Lit(span.clone(), Literal::String((*name).into())))
+            .collect(),
+    );
+    let (_, value) = egraph.eval_expr(&expr).unwrap();
+    egraph.value_to_base::<i64>(value)
+}
 
 #[test]
 fn test_extract() {
@@ -53,33 +89,10 @@ fn test_extract() {
 fn test_get_size_primitive() {
     let mut egraph = egglog_experimental::new_experimental_egraph();
 
-    let span = Span::Rust(Arc::new(RustSpan {
-        file: "integration_test",
-        line: 0,
-        column: 0,
-    }));
-
-    let make_expr = |names: &[&str]| {
-        Expr::Call(
-            span.clone(),
-            "get-size!".into(),
-            names
-                .iter()
-                .map(|name| Expr::Lit(span.clone(), Literal::String((*name).into())))
-                .collect(),
-        )
-    };
-
-    let eval_size = |egraph: &mut egglog::EGraph, names: &[&str]| -> i64 {
-        let expr = make_expr(names);
-        let (_, value) = egraph.eval_expr(&expr).unwrap();
-        egraph.value_to_base::<i64>(value)
-    };
-
-    assert_eq!(eval_size(&mut egraph, &[]), 0);
-    assert_eq!(eval_size(&mut egraph, &["MkFoo"]), 0);
-    assert_eq!(eval_size(&mut egraph, &["MkBar"]), 0);
-    assert_eq!(eval_size(&mut egraph, &["MkFoo", "MkBar"]), 0);
+    assert_eq!(eval_get_size(&mut egraph, &[]), 0);
+    assert_eq!(eval_get_size(&mut egraph, &["MkFoo"]), 0);
+    assert_eq!(eval_get_size(&mut egraph, &["MkBar"]), 0);
+    assert_eq!(eval_get_size(&mut egraph, &["MkFoo", "MkBar"]), 0);
 
     egraph
         .parse_and_run_program(
@@ -94,11 +107,11 @@ fn test_get_size_primitive() {
         )
         .unwrap();
 
-    assert_eq!(eval_size(&mut egraph, &[]), 3);
-    assert_eq!(eval_size(&mut egraph, &["MkFoo"]), 2);
-    assert_eq!(eval_size(&mut egraph, &["MkBar"]), 1);
-    assert_eq!(eval_size(&mut egraph, &["MkFoo", "MkBar"]), 3);
-    assert_eq!(eval_size(&mut egraph, &["Unknown"]), 0);
+    assert_eq!(eval_get_size(&mut egraph, &[]), 3);
+    assert_eq!(eval_get_size(&mut egraph, &["MkFoo"]), 2);
+    assert_eq!(eval_get_size(&mut egraph, &["MkBar"]), 1);
+    assert_eq!(eval_get_size(&mut egraph, &["MkFoo", "MkBar"]), 3);
+    assert_eq!(eval_get_size(&mut egraph, &["Unknown"]), 0);
 }
 
 #[test]
@@ -236,4 +249,126 @@ fn test_multi_extract_with_set_cost() {
     assert!(output.contains("(Add (Num 5) (Num 5))"));
     assert!(output.contains("(Add (Num 3) (Num 3))"));
     assert!(!output.contains("Mul"));
+}
+
+#[test]
+fn test_scheduler_should_not_report_progress_without_egraph_updates() {
+    let mut egraph = egglog_experimental::new_experimental_egraph();
+
+    egraph
+        .parse_and_run_program(
+            None,
+            r#"
+        (ruleset test)
+        (relation R (i64))
+        (rule ((R x)) ((R x)) :ruleset test :name "noop")
+        (R 1)
+        (R 2)
+        (R 3)
+        (R 4)
+        "#,
+        )
+        .unwrap();
+
+    let before = egraph.get_size("R");
+    let scheduler_id = egraph.add_scheduler(Box::new(DelayStopScheduler::default()));
+    let report = egraph
+        .step_rules_with_scheduler(scheduler_id, "test")
+        .unwrap();
+    let after = egraph.get_size("R");
+
+    assert_eq!(
+        before, after,
+        "the scheduler chose no matches, so the e-graph should remain unchanged"
+    );
+    assert!(
+        !report.updated,
+        "scheduler state alone should not keep saturation alive when the e-graph did not change"
+    );
+    assert!(
+        !report.can_stop,
+        "the custom scheduler explicitly deferred work, so can_stop should remain false"
+    );
+}
+
+#[test]
+fn test_backoff_run_schedule_should_not_report_progress_without_egraph_updates() {
+    let mut egraph = egglog_experimental::new_experimental_egraph();
+
+    egraph
+        .parse_and_run_program(
+            None,
+            r#"
+        (ruleset test)
+        (relation R (i64))
+        (rule ((R x)) ((R x)) :ruleset test :name "noop")
+        (R 1)
+        (R 2)
+        (R 3)
+        (R 4)
+        "#,
+        )
+        .unwrap();
+    let before = eval_get_size(&mut egraph, &["R"]);
+    let outputs = egraph
+        .parse_and_run_program(
+            None,
+            r#"
+        (run-schedule
+          (let-scheduler bo (back-off :match-limit 1 :ban-length 3))
+          (run-with bo test))
+        "#,
+        )
+        .unwrap();
+    let after = eval_get_size(&mut egraph, &["R"]);
+
+    let report = match &outputs[0] {
+        CommandOutput::RunSchedule(report) => report,
+        output => panic!("expected RunSchedule output, got {output:?}"),
+    };
+
+    assert_eq!(before, after);
+    assert!(
+        !report.updated,
+        "the back-off scheduler banned the no-op rule without changing the e-graph, so the run should not report database progress"
+    );
+    assert!(
+        !report.can_stop,
+        "the back-off scheduler still has deferred work after banning the rule once"
+    );
+}
+
+#[test]
+fn test_saturate_stop_when_no_updates_ignores_scheduler_deferred_work() {
+    let mut egraph = egglog_experimental::new_experimental_egraph();
+
+    let outputs = egraph
+        .parse_and_run_program(
+            None,
+            r#"
+        (ruleset test)
+        (relation R (i64))
+        (rule ((R x)) ((R x)) :ruleset test :name "noop")
+        (R 1)
+        (R 2)
+        (R 3)
+        (R 4)
+        (run-schedule
+          (let-scheduler bo (back-off :match-limit 1 :ban-length 3))
+          (saturate :stop-when-no-updates (run-with bo test)))
+        "#,
+        )
+        .unwrap();
+
+    let report = match &outputs[0] {
+        CommandOutput::RunSchedule(report) => report,
+        output => panic!("expected RunSchedule output, got {output:?}"),
+    };
+
+    assert!(!report.updated);
+    assert!(
+        !report.can_stop,
+        "the scheduler still has deferred work, but the explicit stop-when-no-updates mode should stop anyway"
+    );
+    assert_eq!(eval_get_size(&mut egraph, &["R"]), 4);
 }

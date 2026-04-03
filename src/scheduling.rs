@@ -138,20 +138,31 @@ impl ScheduleState {
                 }
             }
             "saturate" => {
+                let (stop_when_no_updates, schedules): (bool, &[Expr]) = match exprs.as_slice() {
+                    [Expr::Var(_, flag), rest @ ..] if flag == ":stop-when-no-updates" => {
+                        (true, rest)
+                    }
+                    _ => (false, exprs),
+                };
                 let mut report = RunReport::default();
                 loop {
                     let iter_report = new_scope!(|| {
                         let mut iter_report = RunReport::default();
-                        for expr in exprs {
+                        for expr in schedules {
                             let res = self.run(egraph, expr)?;
                             iter_report.union(res);
                         }
                         Ok(iter_report)
                     })?;
-                    if !iter_report.updated {
+                    let should_stop = if stop_when_no_updates {
+                        !iter_report.updated
+                    } else {
+                        iter_report.can_stop
+                    };
+                    report.union(iter_report);
+                    if should_stop {
                         break;
                     }
-                    report.union(iter_report);
                 }
                 Ok(report)
             }
