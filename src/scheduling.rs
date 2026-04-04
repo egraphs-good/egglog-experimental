@@ -4,18 +4,19 @@ use egglog::{
     CommandOutput, UserDefinedCommand,
     ast::{Expr, Fact, Facts, Literal, ParseError},
     prelude::{query, run_ruleset},
-    scheduler::{Scheduler, SchedulerId},
+    scheduler::{FreshScheduler, Scheduler, SchedulerId},
 };
 use egglog_reports::RunReport;
 use lazy_static::lazy_static;
 
 pub struct RunExtendedSchedule;
 
-pub trait SchedulerGen {
-    fn new_scheduler(&self, egraph: &egglog::EGraph, args: &[Expr]) -> Box<dyn Scheduler>;
+pub(crate) enum BuiltScheduler {
+    Backlog(Box<dyn Scheduler>),
+    Fresh(Box<dyn FreshScheduler>),
 }
 
-type SchedulerBuilder = Box<dyn Fn(&egglog::EGraph, &[Expr]) -> Box<dyn Scheduler> + Send + Sync>;
+type SchedulerBuilder = Box<dyn Fn(&egglog::EGraph, &[Expr]) -> BuiltScheduler + Send + Sync>;
 
 struct ScheduleState {
     schedulers: Vec<(String, SchedulerId)>,
@@ -23,15 +24,21 @@ struct ScheduleState {
 
 lazy_static! {
     static ref scheduler_libs: Mutex<HashMap<String, SchedulerBuilder>> = {
-        Mutex::new(HashMap::from_iter([(
-            "back-off".into(),
-            Box::new(schedulers::new_back_off_scheduler) as SchedulerBuilder,
-        )]))
+        // `back-off` preserves egglog's backlog behavior. `back-off-egg`
+        // rematches instead: if `copy: R(x) -> S(x)` is skipped while `grow`
+        // adds `R(1)`, backlog replay can still see only `copy(R(0))`, while
+        // fresh rematching sees both `R(0)` and `R(1)`.
+        Mutex::new(HashMap::from_iter([
+            (
+                "back-off".into(),
+                Box::new(schedulers::new_back_off_scheduler) as SchedulerBuilder,
+            ),
+            (
+                "back-off-egg".into(),
+                Box::new(schedulers::new_back_off_egg_scheduler) as SchedulerBuilder,
+            ),
+        ]))
     };
-}
-
-pub fn add_scheduler_builder(name: String, builder: SchedulerBuilder) {
-    scheduler_libs.lock().unwrap().insert(name, builder);
 }
 
 impl ScheduleState {
@@ -85,7 +92,10 @@ impl ScheduleState {
                     }
                     let scheduler =
                         (scheduler_libs.lock().unwrap().get(scheduler_name).unwrap())(egraph, args);
-                    let id = egraph.add_scheduler(scheduler);
+                    let id = match scheduler {
+                        BuiltScheduler::Backlog(scheduler) => egraph.add_scheduler(scheduler),
+                        BuiltScheduler::Fresh(scheduler) => egraph.add_fresh_scheduler(scheduler),
+                    };
                     self.schedulers.push((name.clone(), id));
                     Ok(RunReport::default())
                 }
@@ -244,16 +254,13 @@ mod schedulers {
 
     use egglog::{
         ast::{Expr, Literal},
-        scheduler::{Matches, Scheduler},
+        scheduler::{FreshScheduler, Matches, Scheduler},
     };
     use log::{debug, info};
 
-    use crate::parse_tags;
+    use crate::scheduling::{BuiltScheduler, parse_tags};
 
-    pub(super) fn new_back_off_scheduler(
-        _egraph: &egglog::EGraph,
-        args: &[Expr],
-    ) -> Box<dyn Scheduler> {
+    fn parse_back_off_config(args: &[Expr]) -> (usize, usize) {
         let tags = parse_tags(args);
         let default_match_limit = tags
             .get(":match-limit")
@@ -273,15 +280,31 @@ mod schedulers {
                 *n as usize
             })
             .unwrap_or(5);
-        Box::new(BackOffScheduler {
-            default_match_limit,
-            default_ban_length,
-            stats: HashMap::new(),
-        })
+        (default_match_limit, default_ban_length)
+    }
+
+    pub(super) fn new_back_off_scheduler(
+        _egraph: &egglog::EGraph,
+        args: &[Expr],
+    ) -> BuiltScheduler {
+        let (default_match_limit, default_ban_length) = parse_back_off_config(args);
+        BuiltScheduler::Backlog(Box::new(BackOffScheduler {
+            state: BackOffState::new(default_match_limit, default_ban_length),
+        }))
+    }
+
+    pub(super) fn new_back_off_egg_scheduler(
+        _egraph: &egglog::EGraph,
+        args: &[Expr],
+    ) -> BuiltScheduler {
+        let (default_match_limit, default_ban_length) = parse_back_off_config(args);
+        BuiltScheduler::Fresh(Box::new(BackOffEggScheduler {
+            state: BackOffState::new(default_match_limit, default_ban_length),
+        }))
     }
 
     #[derive(Debug, Clone)]
-    pub struct BackOffScheduler {
+    struct BackOffState {
         default_match_limit: usize,
         default_ban_length: usize,
         stats: HashMap<String, RuleStats>,
@@ -297,7 +320,15 @@ mod schedulers {
         ban_length: usize,
     }
 
-    impl BackOffScheduler {
+    impl BackOffState {
+        fn new(default_match_limit: usize, default_ban_length: usize) -> Self {
+            Self {
+                default_match_limit,
+                default_ban_length,
+                stats: HashMap::new(),
+            }
+        }
+
         fn get_stats(&mut self, rule: String) -> &mut RuleStats {
             self.stats.entry(rule).or_insert_with(|| RuleStats {
                 times_applied: 0,
@@ -308,10 +339,8 @@ mod schedulers {
                 iteration: 0,
             })
         }
-    }
 
-    impl Scheduler for BackOffScheduler {
-        fn can_stop(&mut self, rules: &[&str], _ruleset: &str) -> bool {
+        fn can_stop(&mut self, rules: &[&str]) -> bool {
             let stats = &mut self.stats;
             let n_stats = stats.len();
 
@@ -359,7 +388,6 @@ mod schedulers {
                 false
             };
 
-            // Recover the banned stats
             for (rule, s) in banned {
                 stats.insert(rule.to_owned(), s);
             }
@@ -367,7 +395,7 @@ mod schedulers {
             result
         }
 
-        fn filter_matches(&mut self, rule: &str, _ruleset: &str, matches: &mut Matches) -> bool {
+        fn should_search(&mut self, rule: &str) -> bool {
             let stats = self.get_stats(rule.to_owned());
             stats.iteration += 1;
 
@@ -376,9 +404,14 @@ mod schedulers {
                     "Skipping {} ({}-{}), banned until {}...",
                     rule, stats.times_applied, stats.times_banned, stats.banned_until,
                 );
-                return false;
+                false
+            } else {
+                true
             }
+        }
 
+        fn choose_or_ban(&mut self, rule: &str, matches: &mut Matches) -> bool {
+            let stats = self.get_stats(rule.to_owned());
             let threshold = stats
                 .match_limit
                 .checked_shl(stats.times_banned as u32)
@@ -402,6 +435,40 @@ mod schedulers {
                 matches.choose_all();
                 true
             }
+        }
+    }
+
+    #[derive(Debug, Clone)]
+    pub struct BackOffScheduler {
+        state: BackOffState,
+    }
+
+    impl Scheduler for BackOffScheduler {
+        fn can_stop(&mut self, rules: &[&str], _ruleset: &str) -> bool {
+            self.state.can_stop(rules)
+        }
+
+        fn filter_matches(&mut self, rule: &str, _ruleset: &str, matches: &mut Matches) -> bool {
+            self.state.should_search(rule) && self.state.choose_or_ban(rule, matches)
+        }
+    }
+
+    #[derive(Debug, Clone)]
+    pub struct BackOffEggScheduler {
+        state: BackOffState,
+    }
+
+    impl FreshScheduler for BackOffEggScheduler {
+        fn should_search(&mut self, rule: &str, _ruleset: &str) -> bool {
+            self.state.should_search(rule)
+        }
+
+        fn can_stop(&mut self, rules: &[&str], _ruleset: &str) -> bool {
+            self.state.can_stop(rules)
+        }
+
+        fn filter_matches(&mut self, rule: &str, _ruleset: &str, matches: &mut Matches) {
+            let _ = self.state.choose_or_ban(rule, matches);
         }
     }
 }

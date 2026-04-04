@@ -41,6 +41,47 @@ fn eval_get_size(egraph: &mut egglog::EGraph, names: &[&str]) -> i64 {
     egraph.value_to_base::<i64>(value)
 }
 
+fn run_backoff_copy_grow(scheduler_name: &str) -> i64 {
+    let mut egraph = egglog_experimental::new_experimental_egraph();
+
+    egraph
+        .parse_and_run_program(
+            None,
+            r#"
+        (ruleset copy)
+        (ruleset grow)
+        (relation R (i64))
+        (relation S (i64))
+        (relation Seed ())
+        (R 0)
+        (R 1)
+        (R 2)
+        (Seed)
+        (rule ((R x)) ((S x)) :ruleset copy :name "copy")
+        (rule ((Seed)) ((R 3)) :ruleset grow :name "grow")
+        "#,
+        )
+        .unwrap();
+
+    egraph
+        .parse_and_run_program(
+            None,
+            &format!(
+                r#"
+        (run-schedule
+          (let-scheduler bo ({scheduler_name} :match-limit 2 :ban-length 2))
+          (seq
+            (run-with bo copy)
+            (run grow)
+            (run-with bo copy)))
+        "#
+            ),
+        )
+        .unwrap();
+
+    eval_get_size(&mut egraph, &["S"])
+}
+
 #[test]
 fn test_extract() {
     let mut egraph = egglog_experimental::new_experimental_egraph();
@@ -371,4 +412,22 @@ fn test_saturate_stop_when_no_updates_ignores_scheduler_deferred_work() {
         "the scheduler still has deferred work, but the explicit stop-when-no-updates mode should stop anyway"
     );
     assert_eq!(eval_get_size(&mut egraph, &["R"]), 4);
+}
+
+#[test]
+fn test_backoff_replays_backlog_after_ban_expires() {
+    assert_eq!(
+        run_backoff_copy_grow("back-off"),
+        3,
+        "default back-off should replay the queued copy backlog and miss the newly added R 3 row on the next run"
+    );
+}
+
+#[test]
+fn test_backoff_egg_rematches_fresh_after_ban_expires() {
+    assert_eq!(
+        run_backoff_copy_grow("back-off-egg"),
+        4,
+        "back-off-egg should rematch the rebuilt graph and copy the newly added R 3 row as well"
+    );
 }
