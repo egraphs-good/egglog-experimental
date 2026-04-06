@@ -1,15 +1,27 @@
-use std::{collections::HashMap, sync::Mutex};
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex},
+};
 
 use egglog::{
     CommandOutput, UserDefinedCommand,
     ast::{Expr, Fact, Facts, Literal, ParseError},
+    prelude::{RustSpan, Span},
     prelude::{query, run_ruleset},
     scheduler::{FreshScheduler, Scheduler, SchedulerId},
 };
 use egglog_reports::RunReport;
 use lazy_static::lazy_static;
 
-pub struct RunExtendedSchedule;
+pub type PermanentSchedulers = Arc<Mutex<HashMap<String, SchedulerId>>>;
+
+pub struct RunExtendedSchedule {
+    permanent_schedulers: PermanentSchedulers,
+}
+
+pub struct LetSchedulerCommand {
+    permanent_schedulers: PermanentSchedulers,
+}
 
 pub(crate) enum BuiltScheduler {
     Backlog(Box<dyn Scheduler>),
@@ -19,12 +31,13 @@ pub(crate) enum BuiltScheduler {
 type SchedulerBuilder = Box<dyn Fn(&egglog::EGraph, &[Expr]) -> BuiltScheduler + Send + Sync>;
 
 struct ScheduleState {
+    permanent_schedulers: PermanentSchedulers,
     schedulers: Vec<(String, SchedulerId)>,
 }
 
 lazy_static! {
     static ref scheduler_libs: Mutex<HashMap<String, SchedulerBuilder>> = {
-        // `back-off` preserves egglog's backlog behavior. `back-off-egg`
+        // `back-off` preserves egglog's backlog behavior. `back-off-fresh`
         // rematches instead: if `copy: R(x) -> S(x)` is skipped while `grow`
         // adds `R(1)`, backlog replay can still see only `copy(R(0))`, while
         // fresh rematching sees both `R(0)` and `R(1)`.
@@ -34,16 +47,27 @@ lazy_static! {
                 Box::new(schedulers::new_back_off_scheduler) as SchedulerBuilder,
             ),
             (
-                "back-off-egg".into(),
-                Box::new(schedulers::new_back_off_egg_scheduler) as SchedulerBuilder,
+                "back-off-fresh".into(),
+                Box::new(schedulers::new_back_off_fresh_scheduler) as SchedulerBuilder,
             ),
         ]))
     };
 }
 
 impl ScheduleState {
-    fn new() -> Self {
-        Self { schedulers: vec![] }
+    fn new(permanent_schedulers: PermanentSchedulers) -> Self {
+        Self {
+            permanent_schedulers,
+            schedulers: vec![],
+        }
+    }
+
+    fn lookup_scheduler(&self, name: &str) -> Option<SchedulerId> {
+        self.schedulers
+            .iter()
+            .rfind(|(n, _)| n == name)
+            .map(|(_, id)| *id)
+            .or_else(|| self.permanent_schedulers.lock().unwrap().get(name).copied())
     }
 
     // Current limitation: because it relies on the publicly available Rust APIs to access
@@ -90,12 +114,7 @@ impl ScheduleState {
                             format!("Scheduler {name} already exists"),
                         )));
                     }
-                    let scheduler =
-                        (scheduler_libs.lock().unwrap().get(scheduler_name).unwrap())(egraph, args);
-                    let id = match scheduler {
-                        BuiltScheduler::Backlog(scheduler) => egraph.add_scheduler(scheduler),
-                        BuiltScheduler::Fresh(scheduler) => egraph.add_fresh_scheduler(scheduler),
-                    };
+                    let id = build_scheduler_id(egraph, span, scheduler_name, args)?;
                     self.schedulers.push((name.clone(), id));
                     Ok(RunReport::default())
                 }
@@ -107,13 +126,7 @@ impl ScheduleState {
                     let Expr::Var(_, ref scheduler_name) = exprs[0] else {
                         return err();
                     };
-                    scheduler = Some(
-                        self.schedulers
-                            .iter()
-                            .rfind(|(n, _)| n == scheduler_name)
-                            .unwrap()
-                            .1,
-                    );
+                    scheduler = Some(self.lookup_scheduler(scheduler_name).unwrap());
                     &exprs[1..]
                 } else {
                     &exprs[..]
@@ -148,27 +161,17 @@ impl ScheduleState {
                 }
             }
             "saturate" => {
-                let (stop_when_no_updates, schedules): (bool, &[Expr]) = match exprs.as_slice() {
-                    [Expr::Var(_, flag), rest @ ..] if flag == ":stop-when-no-updates" => {
-                        (true, rest)
-                    }
-                    _ => (false, exprs),
-                };
                 let mut report = RunReport::default();
                 loop {
                     let iter_report = new_scope!(|| {
                         let mut iter_report = RunReport::default();
-                        for expr in schedules {
+                        for expr in exprs {
                             let res = self.run(egraph, expr)?;
                             iter_report.union(res);
                         }
                         Ok(iter_report)
                     })?;
-                    let should_stop = if stop_when_no_updates {
-                        !iter_report.updated
-                    } else {
-                        iter_report.can_stop
-                    };
+                    let should_stop = iter_report.can_stop;
                     report.union(iter_report);
                     if should_stop {
                         break;
@@ -222,13 +225,81 @@ impl UserDefinedCommand for RunExtendedSchedule {
         egraph: &mut egglog::EGraph,
         args: &[Expr],
     ) -> Result<Option<CommandOutput>, egglog::Error> {
-        let mut schedule = ScheduleState::new();
+        let mut schedule = ScheduleState::new(self.permanent_schedulers.clone());
         let mut report = RunReport::default();
         for arg in args {
             report.union(schedule.run(egraph, arg)?);
         }
         Ok(Some(CommandOutput::RunSchedule(report)))
     }
+}
+
+impl RunExtendedSchedule {
+    pub fn new(permanent_schedulers: PermanentSchedulers) -> Self {
+        Self { permanent_schedulers }
+    }
+}
+
+impl UserDefinedCommand for LetSchedulerCommand {
+    fn update(
+        &self,
+        egraph: &mut egglog::EGraph,
+        args: &[Expr],
+    ) -> Result<Option<CommandOutput>, egglog::Error> {
+        match args {
+            [Expr::Var(span, name), Expr::Call(_, scheduler_name, scheduler_args)] => {
+                if self.permanent_schedulers.lock().unwrap().contains_key(name) {
+                    return Ok(None);
+                }
+                let id = build_scheduler_id(egraph, span, scheduler_name, scheduler_args)?;
+                self.permanent_schedulers
+                    .lock()
+                    .unwrap()
+                    .insert(name.clone(), id);
+                Ok(None)
+            }
+            [expr, ..] => Err(egglog::Error::ParseError(ParseError(
+                expr.span(),
+                "Invalid let-scheduler command".into(),
+            ))),
+            [] => Err(egglog::Error::ParseError(ParseError(
+                Span::Rust(Arc::new(RustSpan {
+                    file: "egglog-experimental".into(),
+                    line: 0,
+                    column: 0,
+                })),
+                "Invalid let-scheduler command".into(),
+            ))),
+        }
+    }
+}
+
+impl LetSchedulerCommand {
+    pub fn new(permanent_schedulers: PermanentSchedulers) -> Self {
+        Self { permanent_schedulers }
+    }
+}
+
+fn build_scheduler_id(
+    egraph: &mut egglog::EGraph,
+    span: &egglog::ast::Span,
+    scheduler_name: &str,
+    args: &[Expr],
+) -> Result<SchedulerId, egglog::Error> {
+    let scheduler = scheduler_libs
+        .lock()
+        .unwrap()
+        .get(scheduler_name)
+        .ok_or_else(|| {
+            egglog::Error::ParseError(ParseError(
+                span.clone(),
+                format!("Unknown scheduler: {scheduler_name}"),
+            ))
+        })?(egraph, args);
+    Ok(match scheduler {
+        BuiltScheduler::Backlog(scheduler) => egraph.add_scheduler(scheduler),
+        BuiltScheduler::Fresh(scheduler) => egraph.add_fresh_scheduler(scheduler),
+    })
 }
 
 pub(crate) fn parse_tags(args: &[Expr]) -> HashMap<String, Literal> {
@@ -293,7 +364,7 @@ mod schedulers {
         }))
     }
 
-    pub(super) fn new_back_off_egg_scheduler(
+    pub(super) fn new_back_off_fresh_scheduler(
         _egraph: &egglog::EGraph,
         args: &[Expr],
     ) -> BuiltScheduler {

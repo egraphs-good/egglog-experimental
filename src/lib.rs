@@ -23,7 +23,9 @@
 use egglog::ast::Parser;
 use egglog::prelude::{RustSpan, Span, add_base_sort};
 pub use egglog::*;
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::ops::{Deref, DerefMut};
+use std::sync::{Arc, Mutex};
 
 pub mod rational;
 pub use rational::*;
@@ -42,8 +44,34 @@ pub use size::*;
 mod sugar;
 pub use sugar::*;
 
-pub fn new_experimental_egraph() -> EGraph {
+pub struct ExperimentalEGraph {
+    egraph: EGraph,
+    _permanent_schedulers: PermanentSchedulers,
+}
+
+impl Deref for ExperimentalEGraph {
+    type Target = EGraph;
+
+    fn deref(&self) -> &Self::Target {
+        &self.egraph
+    }
+}
+
+impl DerefMut for ExperimentalEGraph {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.egraph
+    }
+}
+
+impl From<ExperimentalEGraph> for EGraph {
+    fn from(value: ExperimentalEGraph) -> Self {
+        value.egraph
+    }
+}
+
+pub fn new_experimental_egraph() -> ExperimentalEGraph {
     let mut egraph = EGraph::default();
+    let permanent_schedulers = Arc::new(Mutex::new(HashMap::new()));
 
     // Set up the parser with experimental parse-time macros
     egraph.parser = experimental_parser();
@@ -62,16 +90,27 @@ pub fn new_experimental_egraph() -> EGraph {
 
     // scheduler support
     egraph
-        .add_command("run-schedule".into(), Arc::new(RunExtendedSchedule))
+        .add_command(
+            "run-schedule".into(),
+            Arc::new(RunExtendedSchedule::new(permanent_schedulers.clone())),
+        )
         .unwrap();
-
+    egraph
+        .add_command(
+            "let-scheduler".into(),
+            Arc::new(LetSchedulerCommand::new(permanent_schedulers.clone())),
+        )
+        .unwrap();
     egraph
         .add_command(
             "multi-extract".into(),
             Arc::new(MultiExtract::new(DynamicCostModel)),
         )
         .unwrap();
-    egraph
+    ExperimentalEGraph {
+        egraph,
+        _permanent_schedulers: permanent_schedulers,
+    }
 }
 
 // Create a parser with experimental macros

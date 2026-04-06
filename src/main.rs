@@ -1,3 +1,3 @@
 fn main() {
-    egglog::cli(egglog_experimental::new_experimental_egraph())
+    egglog::cli(egglog_experimental::new_experimental_egraph().into())
 }

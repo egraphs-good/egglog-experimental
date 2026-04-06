@@ -82,6 +82,51 @@ fn run_backoff_copy_grow(scheduler_name: &str) -> i64 {
     eval_get_size(&mut egraph, &["S"])
 }
 
+fn run_backoff_copy_grow_with_top_level_scheduler(scheduler_name: &str) -> i64 {
+    let mut egraph = egglog_experimental::new_experimental_egraph();
+
+    egraph
+        .parse_and_run_program(
+            None,
+            r#"
+        (ruleset copy)
+        (ruleset grow)
+        (relation R (i64))
+        (relation S (i64))
+        (relation Seed ())
+        (R 0)
+        (R 1)
+        (R 2)
+        (Seed)
+        (rule ((R x)) ((S x)) :ruleset copy :name "copy")
+        (rule ((Seed)) ((R 3)) :ruleset grow :name "grow")
+        "#,
+        )
+        .unwrap();
+
+    egraph
+        .parse_and_run_program(
+            None,
+            &format!("(let-scheduler bo ({scheduler_name} :match-limit 2 :ban-length 2))"),
+        )
+        .unwrap();
+
+    egraph
+        .parse_and_run_program(
+            None,
+            r#"
+        (run-schedule
+          (seq
+            (run-with bo copy)
+            (run grow)
+            (run-with bo copy)))
+        "#,
+        )
+        .unwrap();
+
+    eval_get_size(&mut egraph, &["S"])
+}
+
 #[test]
 fn test_extract() {
     let mut egraph = egglog_experimental::new_experimental_egraph();
@@ -380,41 +425,6 @@ fn test_backoff_run_schedule_should_not_report_progress_without_egraph_updates()
 }
 
 #[test]
-fn test_saturate_stop_when_no_updates_ignores_scheduler_deferred_work() {
-    let mut egraph = egglog_experimental::new_experimental_egraph();
-
-    let outputs = egraph
-        .parse_and_run_program(
-            None,
-            r#"
-        (ruleset test)
-        (relation R (i64))
-        (rule ((R x)) ((R x)) :ruleset test :name "noop")
-        (R 1)
-        (R 2)
-        (R 3)
-        (R 4)
-        (run-schedule
-          (let-scheduler bo (back-off :match-limit 1 :ban-length 3))
-          (saturate :stop-when-no-updates (run-with bo test)))
-        "#,
-        )
-        .unwrap();
-
-    let report = match &outputs[0] {
-        CommandOutput::RunSchedule(report) => report,
-        output => panic!("expected RunSchedule output, got {output:?}"),
-    };
-
-    assert!(!report.updated);
-    assert!(
-        !report.can_stop,
-        "the scheduler still has deferred work, but the explicit stop-when-no-updates mode should stop anyway"
-    );
-    assert_eq!(eval_get_size(&mut egraph, &["R"]), 4);
-}
-
-#[test]
 fn test_backoff_replays_backlog_after_ban_expires() {
     assert_eq!(
         run_backoff_copy_grow("back-off"),
@@ -426,8 +436,17 @@ fn test_backoff_replays_backlog_after_ban_expires() {
 #[test]
 fn test_backoff_egg_rematches_fresh_after_ban_expires() {
     assert_eq!(
-        run_backoff_copy_grow("back-off-egg"),
+        run_backoff_copy_grow("back-off-fresh"),
         4,
-        "back-off-egg should rematch the rebuilt graph and copy the newly added R 3 row as well"
+        "back-off-fresh should rematch the rebuilt graph and copy the newly added R 3 row as well"
+    );
+}
+
+#[test]
+fn test_top_level_let_scheduler_persists_on_the_egraph() {
+    assert_eq!(
+        run_backoff_copy_grow_with_top_level_scheduler("back-off-fresh"),
+        4,
+        "top-level let-scheduler should keep the scheduler in the egraph registry so later run-schedule calls can reuse it"
     );
 }
