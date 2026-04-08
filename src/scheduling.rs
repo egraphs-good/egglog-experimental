@@ -236,7 +236,9 @@ impl UserDefinedCommand for RunExtendedSchedule {
 
 impl RunExtendedSchedule {
     pub fn new(permanent_schedulers: PermanentSchedulers) -> Self {
-        Self { permanent_schedulers }
+        Self {
+            permanent_schedulers,
+        }
     }
 }
 
@@ -247,7 +249,10 @@ impl UserDefinedCommand for LetSchedulerCommand {
         args: &[Expr],
     ) -> Result<Option<CommandOutput>, egglog::Error> {
         match args {
-            [Expr::Var(span, name), Expr::Call(_, scheduler_name, scheduler_args)] => {
+            [
+                Expr::Var(span, name),
+                Expr::Call(_, scheduler_name, scheduler_args),
+            ] => {
                 if self.permanent_schedulers.lock().unwrap().contains_key(name) {
                     return Ok(None);
                 }
@@ -264,7 +269,7 @@ impl UserDefinedCommand for LetSchedulerCommand {
             ))),
             [] => Err(egglog::Error::ParseError(ParseError(
                 Span::Rust(Arc::new(RustSpan {
-                    file: "egglog-experimental".into(),
+                    file: "egglog-experimental",
                     line: 0,
                     column: 0,
                 })),
@@ -276,7 +281,9 @@ impl UserDefinedCommand for LetSchedulerCommand {
 
 impl LetSchedulerCommand {
     pub fn new(permanent_schedulers: PermanentSchedulers) -> Self {
-        Self { permanent_schedulers }
+        Self {
+            permanent_schedulers,
+        }
     }
 }
 
