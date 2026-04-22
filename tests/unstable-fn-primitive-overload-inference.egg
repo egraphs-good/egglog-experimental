@@ -1,0 +1,18 @@
+;; Reduced from the param_eq container-analysis lowering.
+;; Literal primitive names should constrain unstable-fn containers even when
+;; unrelated Maybe/Unit overloads are in scope.
+
+(sort MaybeF64 (Maybe f64))
+(sort MaybeUnit (Maybe Unit))
+(sort UnitThunk (UnstableFn () Unit))
+(sort UnitToF64 (UnstableFn (Unit) f64))
+(sort F64Thunk (UnstableFn () f64))
+(sort F64ToF64 (UnstableFn (f64) f64))
+
+(primitive f (f64) f64 (+ _0 1.0))
+(primitive h (f64 f64) f64 _1)
+(primitive k (f64 f64 Unit) f64
+  (unstable-maybe-match
+    (unstable-catch (unstable-fn "f" _1))
+    (unstable-fn "h" _0)
+    _1))

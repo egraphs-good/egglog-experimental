@@ -8,8 +8,9 @@
 
 use egglog::{
     CommandOutput, EGraph, Error, TermDag, TermId, TypeError, UserDefinedCommand,
-    ast::Expr,
+    ast::{Expr, ParseError},
     extract::{Cost, CostModel, Extractor},
+    prelude::{RustSpan, Span},
 };
 use log::log_enabled;
 use std::{fmt::Debug, marker::PhantomData};
@@ -57,7 +58,19 @@ impl<
 > UserDefinedCommand for MultiExtract<C, CM>
 {
     fn update(&self, egraph: &mut EGraph, args: &[Expr]) -> Result<Option<CommandOutput>, Error> {
-        assert!(args.len() >= 2);
+        if args.len() < 2 {
+            let span = args.first().map(Expr::span).unwrap_or_else(|| {
+                Span::Rust(std::sync::Arc::new(RustSpan {
+                    file: "egglog-experimental",
+                    line: 0,
+                    column: 0,
+                }))
+            });
+            return Err(Error::ParseError(ParseError(
+                span,
+                "multi-extract expects at least a variant count and one expression".into(),
+            )));
+        }
 
         let (variants_sort, variants_value) = egraph.eval_expr(&args[0])?;
         if variants_sort.name() != "i64" {
@@ -70,7 +83,10 @@ impl<
 
         let n: i64 = egraph.value_to_base(variants_value);
         if n < 0 {
-            panic!("Cannot extract negative number of variants");
+            return Err(Error::ParseError(ParseError(
+                args[0].span(),
+                "Cannot extract negative number of variants".into(),
+            )));
         }
 
         let (sorts, values): (Vec<_>, Vec<_>) = args[1..]

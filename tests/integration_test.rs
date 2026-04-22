@@ -443,10 +443,93 @@ fn test_backoff_egg_rematches_fresh_after_ban_expires() {
 }
 
 #[test]
+fn test_backoff_does_not_match_subsumed_rows() {
+    for scheduler_name in ["back-off", "back-off-fresh"] {
+        let mut egraph = egglog_experimental::new_experimental_egraph();
+
+        egraph
+            .parse_and_run_program(
+                None,
+                r#"
+            (ruleset analysis)
+            (ruleset test)
+            (datatype Math
+              (Add Math Math)
+              (Mul Math Math)
+              (Num i64))
+            (relation Hit (i64))
+            (let expr (Add (Mul (Num 0) (Num 1)) (Num 2)))
+            (rewrite (Mul (Num 0) x) (Num 0) :subsume :ruleset analysis)
+            (rewrite (Add (Num 0) x) x :subsume :ruleset analysis)
+            (rule ((= e (Add (Mul (Num a) x) (Num b)))) ((Hit a)) :ruleset test :name "hit-subsumed-affine")
+            (run-schedule (saturate (run analysis)))
+            "#,
+            )
+            .unwrap();
+
+        egraph
+            .parse_and_run_program(
+                None,
+                &format!(
+                    r#"
+            (run-schedule
+              (let-scheduler bo ({scheduler_name} :match-limit 10 :ban-length 1))
+              (run-with bo test))
+            "#
+                ),
+            )
+            .unwrap();
+
+        assert_eq!(
+            eval_get_size(&mut egraph, &["Hit"]),
+            0,
+            "{scheduler_name} should not fire on subsumed rows"
+        );
+    }
+}
+
+#[test]
 fn test_top_level_let_scheduler_persists_on_the_egraph() {
     assert_eq!(
         run_backoff_copy_grow_with_top_level_scheduler("back-off-fresh"),
         4,
         "top-level let-scheduler should keep the scheduler in the egraph registry so later run-schedule calls can reuse it"
     );
+}
+
+#[test]
+fn test_invalid_run_schedule_returns_error_instead_of_panicking() {
+    let mut egraph = egglog_experimental::new_experimental_egraph();
+
+    let err = egraph
+        .parse_and_run_program(None, "(run-schedule (run 1))")
+        .unwrap_err();
+
+    assert!(err.to_string().contains("Invalid schedule"));
+}
+
+#[test]
+fn test_invalid_scheduler_tags_return_error_instead_of_panicking() {
+    let mut egraph = egglog_experimental::new_experimental_egraph();
+
+    let err = egraph
+        .parse_and_run_program(None, r#"(let-scheduler bo (back-off :match-limit "x"))"#)
+        .unwrap_err();
+
+    assert!(err.to_string().contains(":match-limit"));
+}
+
+#[test]
+fn test_multi_extract_negative_variants_returns_error_instead_of_panicking() {
+    let mut egraph = egglog_experimental::new_experimental_egraph();
+
+    egraph
+        .parse_and_run_program(None, "(datatype E (Num i64))")
+        .unwrap();
+
+    let err = egraph
+        .parse_and_run_program(None, "(multi-extract -1 (Num 1))")
+        .unwrap_err();
+
+    assert!(err.to_string().contains("negative number of variants"));
 }

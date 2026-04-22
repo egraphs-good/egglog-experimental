@@ -28,7 +28,11 @@ pub(crate) enum BuiltScheduler {
     Fresh(Box<dyn FreshScheduler>),
 }
 
-type SchedulerBuilder = Box<dyn Fn(&egglog::EGraph, &[Expr]) -> BuiltScheduler + Send + Sync>;
+type SchedulerBuilder = Box<
+    dyn Fn(&egglog::EGraph, &egglog::ast::Span, &[Expr]) -> Result<BuiltScheduler, egglog::Error>
+        + Send
+        + Sync,
+>;
 
 struct ScheduleState {
     permanent_schedulers: PermanentSchedulers,
@@ -85,11 +89,10 @@ impl ScheduleState {
 
         if let Expr::Var(_, ruleset) = arg {
             let output = run_ruleset(egraph, ruleset.as_str())?;
-            assert!(output.len() == 1);
-            if let CommandOutput::RunSchedule(report) = &output[0] {
+            if let [CommandOutput::RunSchedule(report)] = output.as_slice() {
                 return Ok(report.clone());
             }
-            panic!("Expected a RunSchedule, got {:?}", output[0]);
+            return err();
         }
 
         let Expr::Call(span, head, exprs) = arg else {
@@ -123,11 +126,18 @@ impl ScheduleState {
             "run" | "run-with" => {
                 let mut scheduler = None;
                 let exprs: &[egglog::ast::Expr] = if head.as_str() == "run-with" {
-                    let Expr::Var(_, ref scheduler_name) = exprs[0] else {
+                    let Some((Expr::Var(scheduler_span, scheduler_name), rest)) =
+                        exprs.split_first()
+                    else {
                         return err();
                     };
-                    scheduler = Some(self.lookup_scheduler(scheduler_name).unwrap());
-                    &exprs[1..]
+                    scheduler = Some(self.lookup_scheduler(scheduler_name).ok_or_else(|| {
+                        egglog::Error::ParseError(ParseError(
+                            scheduler_span.clone(),
+                            format!("Unknown scheduler: {scheduler_name}"),
+                        ))
+                    })?);
+                    rest
                 } else {
                     &exprs[..]
                 };
@@ -136,7 +146,7 @@ impl ScheduleState {
                     None => ("", exprs),
                     Some(Expr::Var(_span, v)) if *v == ":until" => ("", exprs),
                     Some(Expr::Var(_span, ruleset)) => (ruleset.as_str(), &exprs[1..]),
-                    _ => unreachable!(),
+                    _ => return err(),
                 };
 
                 let until = match rest {
@@ -302,29 +312,46 @@ fn build_scheduler_id(
                 span.clone(),
                 format!("Unknown scheduler: {scheduler_name}"),
             ))
-        })?(egraph, args);
+        })?(egraph, span, args)?;
     Ok(match scheduler {
         BuiltScheduler::Backlog(scheduler) => egraph.add_scheduler(scheduler),
         BuiltScheduler::Fresh(scheduler) => egraph.add_fresh_scheduler(scheduler),
     })
 }
 
-pub(crate) fn parse_tags(args: &[Expr]) -> HashMap<String, Literal> {
+pub(crate) fn parse_tags(
+    span: &egglog::ast::Span,
+    args: &[Expr],
+) -> Result<HashMap<String, Literal>, egglog::Error> {
+    if args.len() % 2 != 0 {
+        return Err(egglog::Error::ParseError(ParseError(
+            span.clone(),
+            "Scheduler tags must be key/value pairs".into(),
+        )));
+    }
     let mut tags = HashMap::new();
-    assert!(args.len() % 2 == 0);
     for arg in args.chunks(2) {
-        let Expr::Var(_, ref tag_name) = arg[0] else {
-            panic!("Invalid tag name: {:?}", arg[0]);
+        let Expr::Var(ref tag_span, ref tag_name) = arg[0] else {
+            return Err(egglog::Error::ParseError(ParseError(
+                arg[0].span(),
+                "Invalid scheduler tag name".into(),
+            )));
         };
         let Expr::Lit(_, lit) = &arg[1] else {
-            panic!("Invalid tag value: {:?}", arg[1]);
+            return Err(egglog::Error::ParseError(ParseError(
+                arg[1].span(),
+                format!("Invalid value for scheduler tag {tag_name}"),
+            )));
         };
-        if tags.contains_key(&tag_name.to_string()) {
-            panic!("Tag name already exists: {:?}", tag_name);
+        if tags.contains_key(tag_name) {
+            return Err(egglog::Error::ParseError(ParseError(
+                tag_span.clone(),
+                format!("Scheduler tag {tag_name} already exists"),
+            )));
         }
         tags.insert(tag_name.to_string(), lit.clone());
     }
-    tags
+    Ok(tags)
 }
 
 mod schedulers {
@@ -338,47 +365,64 @@ mod schedulers {
 
     use crate::scheduling::{BuiltScheduler, parse_tags};
 
-    fn parse_back_off_config(args: &[Expr]) -> (usize, usize) {
-        let tags = parse_tags(args);
+    fn parse_back_off_config(
+        span: &egglog::ast::Span,
+        args: &[Expr],
+    ) -> Result<(usize, usize), egglog::Error> {
+        let tags = parse_tags(span, args)?;
         let default_match_limit = tags
             .get(":match-limit")
-            .map(|lit| {
-                let Literal::Int(n) = lit else {
-                    panic!("Invalid match limit: {:?}", lit);
-                };
-                *n as usize
+            .map(|lit| match lit {
+                Literal::Int(n) if *n >= 0 => Ok(*n as usize),
+                Literal::Int(_) => Err(egglog::Error::ParseError(egglog::ast::ParseError(
+                    span.clone(),
+                    "Scheduler :match-limit must be non-negative".into(),
+                ))),
+                _ => Err(egglog::Error::ParseError(egglog::ast::ParseError(
+                    span.clone(),
+                    "Scheduler :match-limit must be an integer".into(),
+                ))),
             })
+            .transpose()?
             .unwrap_or(1000);
         let default_ban_length = tags
             .get(":ban-length")
-            .map(|lit| {
-                let Literal::Int(n) = lit else {
-                    panic!("Invalid ban length: {:?}", lit);
-                };
-                *n as usize
+            .map(|lit| match lit {
+                Literal::Int(n) if *n >= 0 => Ok(*n as usize),
+                Literal::Int(_) => Err(egglog::Error::ParseError(egglog::ast::ParseError(
+                    span.clone(),
+                    "Scheduler :ban-length must be non-negative".into(),
+                ))),
+                _ => Err(egglog::Error::ParseError(egglog::ast::ParseError(
+                    span.clone(),
+                    "Scheduler :ban-length must be an integer".into(),
+                ))),
             })
+            .transpose()?
             .unwrap_or(5);
-        (default_match_limit, default_ban_length)
+        Ok((default_match_limit, default_ban_length))
     }
 
     pub(super) fn new_back_off_scheduler(
         _egraph: &egglog::EGraph,
+        span: &egglog::ast::Span,
         args: &[Expr],
-    ) -> BuiltScheduler {
-        let (default_match_limit, default_ban_length) = parse_back_off_config(args);
-        BuiltScheduler::Backlog(Box::new(BackOffScheduler {
+    ) -> Result<BuiltScheduler, egglog::Error> {
+        let (default_match_limit, default_ban_length) = parse_back_off_config(span, args)?;
+        Ok(BuiltScheduler::Backlog(Box::new(BackOffScheduler {
             state: BackOffState::new(default_match_limit, default_ban_length),
-        }))
+        })))
     }
 
     pub(super) fn new_back_off_fresh_scheduler(
         _egraph: &egglog::EGraph,
+        span: &egglog::ast::Span,
         args: &[Expr],
-    ) -> BuiltScheduler {
-        let (default_match_limit, default_ban_length) = parse_back_off_config(args);
-        BuiltScheduler::Fresh(Box::new(BackOffEggScheduler {
+    ) -> Result<BuiltScheduler, egglog::Error> {
+        let (default_match_limit, default_ban_length) = parse_back_off_config(span, args)?;
+        Ok(BuiltScheduler::Fresh(Box::new(BackOffEggScheduler {
             state: BackOffState::new(default_match_limit, default_ban_length),
-        }))
+        })))
     }
 
     #[derive(Debug, Clone)]

@@ -218,7 +218,21 @@ impl UserDefinedCommand for CustomExtract {
         egraph: &mut EGraph,
         args: &[Expr],
     ) -> Result<Option<CommandOutput>, egglog::Error> {
-        assert!(args.len() <= 2);
+        match args {
+            [] => {
+                return Err(Error::ParseError(ParseError(
+                    Span::Panic,
+                    "extract expects an expression and optional variant count".into(),
+                )));
+            }
+            [_, _, _, ..] => {
+                return Err(Error::ParseError(ParseError(
+                    args[2].span(),
+                    "extract expects at most two arguments".into(),
+                )));
+            }
+            _ => {}
+        }
         let (sort, value) = egraph.eval_expr(&args[0])?;
         let n = args.get(1).map(|arg| egraph.eval_expr(arg)).transpose()?;
         let n = if let Some(nv) = n {
@@ -257,7 +271,10 @@ impl UserDefinedCommand for CustomExtract {
             }
         } else {
             if n < 0 {
-                panic!("Cannot extract negative number of variants");
+                return Err(Error::ParseError(ParseError(
+                    args[1].span(),
+                    "Cannot extract negative number of variants".into(),
+                )));
             }
             let terms: Vec<TermId> = extractor
                 .extract_variants(egraph, &mut termdag, value, n as usize)
