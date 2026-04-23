@@ -1,0 +1,2 @@
+(sort MaybeInt (Maybe i64))
+(primitive bad () MaybeInt 1)

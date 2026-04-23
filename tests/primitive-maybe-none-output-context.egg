@@ -1,0 +1,10 @@
+(sort MaybeUnit (Maybe Unit))
+(sort MaybeInt (Maybe i64))
+(primitive none () MaybeInt (maybe-none))
+(check (= (none) (maybe-none)))
+
+(sort Num)
+(sort Map[Num,BigRat] (Map Num BigRat))
+(sort Maybe[Map[Num,BigRat]] (Maybe Map[Num,BigRat]))
+(primitive none-map Unit Maybe[Map[Num,BigRat]] (maybe-none))
+(check (= (none-map ()) (maybe-none)))

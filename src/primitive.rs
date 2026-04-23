@@ -1,7 +1,7 @@
 use egglog::ast::{Expr, Literal};
 use egglog::constraint::SimpleTypeConstraint;
 use egglog::prelude::Span;
-use egglog::sort::{literal_sort, FunctionContainer, ResolvedFunction, ResolvedFunctionId};
+use egglog::sort::{FunctionContainer, ResolvedFunction, ResolvedFunctionId, literal_sort};
 use egglog::{
     ArcSort, CommandOutput, EGraph, Error, ExecutionState, Primitive, ResolvedCall, ResolvedExpr,
     SpecializedPrimitive, TypeError, UserDefinedCommand, Value,
@@ -36,7 +36,11 @@ impl UserDefinedCommand for RegisterPrimitive {
             .enumerate()
             .map(|(index, sort)| (format!("_{index}"), args[3].span(), sort.clone()))
             .collect();
-        let resolved_body = egraph.typecheck_expr_with_bindings(&args[3], &bindings)?;
+        let resolved_body = egraph.typecheck_expr_with_bindings_and_output(
+            &args[3],
+            &bindings,
+            output_sort.clone(),
+        )?;
         let body = compile_resolved_body(egraph, &resolved_body)?;
 
         let body_output = resolved_expr_output_sort(&resolved_body);
@@ -225,7 +229,11 @@ fn compile_unstable_fn(
     primitive: &SpecializedPrimitive,
     children: &[ResolvedExpr],
 ) -> Result<CompiledExpr, Error> {
-    let [ResolvedExpr::Lit(_, Literal::String(name)), partial_children @ ..] = children else {
+    let [
+        ResolvedExpr::Lit(_, Literal::String(name)),
+        partial_children @ ..,
+    ] = children
+    else {
         return Err(backend_error(
             children
                 .first()
