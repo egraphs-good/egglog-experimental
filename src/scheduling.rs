@@ -212,7 +212,7 @@ impl UserDefinedCommand for RunExtendedSchedule {
 
 pub(crate) fn parse_tags(args: &[Expr]) -> HashMap<String, Literal> {
     let mut tags = HashMap::new();
-    assert!(args.len() % 2 == 0);
+    assert!(args.len().is_multiple_of(2));
     for arg in args.chunks(2) {
         let Expr::Var(_, ref tag_name) = arg[0] else {
             panic!("Invalid tag name: {:?}", arg[0]);
