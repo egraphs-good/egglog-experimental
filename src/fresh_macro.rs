@@ -104,15 +104,16 @@ fn desugar_fresh_rule(
     let mut fresh_index = 0i64;
     let new_actions = rule.head.visit_exprs(&mut |expr| {
         if let Expr::Call(span, head, _args) = &expr
-            && head.as_str() == "unstable-fresh!" {
-                let mut new_args: Vec<Expr> = query_var_names
-                    .iter()
-                    .map(|name| Expr::Var(span.clone(), name.clone()))
-                    .collect();
-                new_args.push(Expr::Lit(span.clone(), Literal::Int(fresh_index)));
-                fresh_index += 1;
-                return Expr::Call(span.clone(), constructor_name.clone(), new_args);
-            }
+            && head.as_str() == "unstable-fresh!"
+        {
+            let mut new_args: Vec<Expr> = query_var_names
+                .iter()
+                .map(|name| Expr::Var(span.clone(), name.clone()))
+                .collect();
+            new_args.push(Expr::Lit(span.clone(), Literal::Int(fresh_index)));
+            fresh_index += 1;
+            return Expr::Call(span.clone(), constructor_name.clone(), new_args);
+        }
         expr
     });
 
@@ -151,12 +152,13 @@ fn collect_fresh_options(actions: Actions) -> Result<Vec<FreshOptions>, Error> {
         }
 
         if let Expr::Call(span, head, args) = &expr
-            && head.as_str() == "unstable-fresh!" {
-                match parse_fresh_args(span, args) {
-                    Ok(opts) => options_list.push(opts),
-                    Err(e) => error = Some(e),
-                }
+            && head.as_str() == "unstable-fresh!"
+        {
+            match parse_fresh_args(span, args) {
+                Ok(opts) => options_list.push(opts),
+                Err(e) => error = Some(e),
             }
+        }
         expr
     });
 

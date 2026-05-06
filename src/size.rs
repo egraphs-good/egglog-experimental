@@ -43,9 +43,10 @@ impl Primitive for GetSizePrimitive {
                     return None;
                 }
                 if let Some(filter) = &filters
-                    && !filter.contains(name) {
-                        return None;
-                    }
+                    && !filter.contains(name)
+                {
+                    return None;
+                }
                 Some(exec_state.get_table(table_id).len())
             })
             .sum();
