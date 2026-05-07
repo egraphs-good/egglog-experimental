@@ -42,10 +42,10 @@ impl Primitive for GetSizePrimitive {
                 if name.starts_with(INTERNAL_SYMBOL_PREFIX) {
                     return None;
                 }
-                if let Some(filter) = &filters {
-                    if !filter.contains(name) {
-                        return None;
-                    }
+                if let Some(filter) = &filters
+                    && !filter.contains(name)
+                {
+                    return None;
                 }
                 Some(exec_state.get_table(table_id).len())
             })
