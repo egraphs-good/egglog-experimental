@@ -237,3 +237,109 @@ fn test_multi_extract_with_set_cost() {
     assert!(output.contains("(Add (Num 3) (Num 3))"));
     assert!(!output.contains("Mul"));
 }
+
+#[test]
+fn test_extract_missing_expression_returns_error_instead_of_panicking() {
+    let mut egraph = egglog_experimental::new_experimental_egraph();
+
+    let err = egraph.parse_and_run_program(None, "(extract)").unwrap_err();
+
+    assert!(
+        err.to_string()
+            .contains("extract expects an expression and optional variant count")
+    );
+}
+
+#[test]
+fn test_extract_extra_arguments_return_error_instead_of_panicking() {
+    let mut egraph = egglog_experimental::new_experimental_egraph();
+
+    let err = egraph
+        .parse_and_run_program(None, "(extract 0 1 2)")
+        .unwrap_err();
+
+    assert!(
+        err.to_string()
+            .contains("extract expects at most two arguments")
+    );
+}
+
+#[test]
+fn test_extract_negative_variants_returns_error_instead_of_panicking() {
+    let mut egraph = egglog_experimental::new_experimental_egraph();
+
+    egraph
+        .parse_and_run_program(None, "(datatype E (Num i64))")
+        .unwrap();
+
+    let err = egraph
+        .parse_and_run_program(None, "(extract (Num 1) -1)")
+        .unwrap_err();
+
+    assert!(err.to_string().contains("negative number of variants"));
+}
+
+#[test]
+fn test_extract_zero_variants_preserves_best_extract_behavior() {
+    let mut egraph = egglog_experimental::new_experimental_egraph();
+
+    let result = egraph
+        .parse_and_run_program(
+            None,
+            "
+        (with-dynamic-cost
+            (datatype E (Add E E :cost 10) (Num i64 :cost 1))
+        )
+        (union (Num 2) (Add (Num 1) (Num 1)))
+        (extract (Num 2) 0)",
+        )
+        .unwrap();
+
+    assert_eq!(result.len(), 1);
+    assert_eq!(result[0].to_string(), "(Num 2)\n");
+}
+
+#[test]
+fn test_multi_extract_bad_arity_returns_error_instead_of_panicking() {
+    for program in ["(multi-extract)", "(multi-extract 1)"] {
+        let mut egraph = egglog_experimental::new_experimental_egraph();
+
+        let err = egraph.parse_and_run_program(None, program).unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("multi-extract expects at least a variant count and one expression"),
+            "unexpected error for {program}: {err}"
+        );
+    }
+}
+
+#[test]
+fn test_multi_extract_negative_variants_returns_error_instead_of_panicking() {
+    let mut egraph = egglog_experimental::new_experimental_egraph();
+
+    egraph
+        .parse_and_run_program(None, "(datatype E (Num i64))")
+        .unwrap();
+
+    let err = egraph
+        .parse_and_run_program(None, "(multi-extract -1 (Num 1))")
+        .unwrap_err();
+
+    assert!(err.to_string().contains("negative number of variants"));
+}
+
+#[test]
+fn test_multi_extract_zero_variants_returns_error_instead_of_extracting() {
+    let mut egraph = egglog_experimental::new_experimental_egraph();
+
+    egraph
+        .parse_and_run_program(None, "(datatype E (Num i64))")
+        .unwrap();
+
+    let err = egraph
+        .parse_and_run_program(None, "(multi-extract 0 (Num 1))")
+        .unwrap_err();
+
+    assert!(err.to_string().contains("positive number of variants"));
+}

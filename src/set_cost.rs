@@ -1,4 +1,4 @@
-use egglog_ast::span::Span;
+use egglog_ast::span::{RustSpan, Span};
 use std::sync::Arc;
 
 use egglog::{
@@ -222,7 +222,25 @@ impl UserDefinedCommand for CustomExtract {
         egraph: &mut EGraph,
         args: &[Expr],
     ) -> Result<Option<CommandOutput>, egglog::Error> {
-        assert!(args.len() <= 2);
+        match args {
+            [] => {
+                return Err(Error::ParseError(ParseError(
+                    Span::Rust(Arc::new(RustSpan {
+                        file: "egglog-experimental",
+                        line: 0,
+                        column: 0,
+                    })),
+                    "extract expects an expression and optional variant count".into(),
+                )));
+            }
+            [_, _, _, ..] => {
+                return Err(Error::ParseError(ParseError(
+                    args[2].span(),
+                    "extract expects at most two arguments".into(),
+                )));
+            }
+            _ => {}
+        }
         let (sort, value) = egraph.eval_expr(&args[0])?;
         let n = args.get(1).map(|arg| egraph.eval_expr(arg)).transpose()?;
         let n = if let Some(nv) = n {
@@ -240,6 +258,13 @@ impl UserDefinedCommand for CustomExtract {
             0
         };
 
+        if n < 0 {
+            return Err(Error::ParseError(ParseError(
+                args[1].span(),
+                "Cannot extract negative number of variants".into(),
+            )));
+        }
+
         let mut termdag = TermDag::default();
 
         let extractor = Extractor::compute_costs_from_rootsorts(
@@ -247,6 +272,8 @@ impl UserDefinedCommand for CustomExtract {
             egraph,
             DynamicCostModel,
         );
+        // Preserve egglog's existing convention: omitted or zero variant count
+        // means best extraction. Positive counts request multiple variants.
         if n == 0 {
             if let Some((cost, term)) = extractor.extract_best(egraph, &mut termdag, value) {
                 if log_enabled!(log::Level::Info) {
@@ -260,9 +287,6 @@ impl UserDefinedCommand for CustomExtract {
                 ))
             }
         } else {
-            if n < 0 {
-                panic!("Cannot extract negative number of variants");
-            }
             let terms: Vec<TermId> = extractor
                 .extract_variants(egraph, &mut termdag, value, n as usize)
                 .iter()
