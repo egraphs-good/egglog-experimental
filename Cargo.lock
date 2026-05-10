@@ -330,7 +330,7 @@ checksum = "d0881ea181b1df73ff77ffaaf9c7544ecc11e82fba9b5f27b262a3c73a332555"
 [[package]]
 name = "egglog"
 version = "2.0.0"
-source = "git+https://github.com/egraphs-good/egglog.git?rev=602a6bd#602a6bdc15f1eca596fba1a99d098bd4cd264456"
+source = "git+https://github.com/saulshanabrook/egg-smol.git?branch=codex%2Fsplit-primitive-body-runtime-apis#22481a22fcfce930e215ea31acdb27cf59d028db"
 dependencies = [
  "chrono",
  "clap",
@@ -343,6 +343,7 @@ dependencies = [
  "egglog-numeric-id",
  "egglog-reports",
  "egraph-serialize",
+ "enum-map",
  "env_logger",
  "hashbrown 0.16.0",
  "im-rc",
@@ -361,7 +362,7 @@ dependencies = [
 [[package]]
 name = "egglog-add-primitive"
 version = "2.0.0"
-source = "git+https://github.com/egraphs-good/egglog.git?rev=602a6bd#602a6bdc15f1eca596fba1a99d098bd4cd264456"
+source = "git+https://github.com/saulshanabrook/egg-smol.git?branch=codex%2Fsplit-primitive-body-runtime-apis#22481a22fcfce930e215ea31acdb27cf59d028db"
 dependencies = [
  "quote",
  "syn 2.0.108",
@@ -370,7 +371,7 @@ dependencies = [
 [[package]]
 name = "egglog-ast"
 version = "2.0.0"
-source = "git+https://github.com/egraphs-good/egglog.git?rev=602a6bd#602a6bdc15f1eca596fba1a99d098bd4cd264456"
+source = "git+https://github.com/saulshanabrook/egg-smol.git?branch=codex%2Fsplit-primitive-body-runtime-apis#22481a22fcfce930e215ea31acdb27cf59d028db"
 dependencies = [
  "ordered-float",
 ]
@@ -378,7 +379,7 @@ dependencies = [
 [[package]]
 name = "egglog-bridge"
 version = "2.0.0"
-source = "git+https://github.com/egraphs-good/egglog.git?rev=602a6bd#602a6bdc15f1eca596fba1a99d098bd4cd264456"
+source = "git+https://github.com/saulshanabrook/egg-smol.git?branch=codex%2Fsplit-primitive-body-runtime-apis#22481a22fcfce930e215ea31acdb27cf59d028db"
 dependencies = [
  "anyhow",
  "dyn-clone",
@@ -401,7 +402,7 @@ dependencies = [
 [[package]]
 name = "egglog-concurrency"
 version = "2.0.0"
-source = "git+https://github.com/egraphs-good/egglog.git?rev=602a6bd#602a6bdc15f1eca596fba1a99d098bd4cd264456"
+source = "git+https://github.com/saulshanabrook/egg-smol.git?branch=codex%2Fsplit-primitive-body-runtime-apis#22481a22fcfce930e215ea31acdb27cf59d028db"
 dependencies = [
  "arc-swap",
  "bumpalo",
@@ -413,7 +414,7 @@ dependencies = [
 [[package]]
 name = "egglog-core-relations"
 version = "2.0.0"
-source = "git+https://github.com/egraphs-good/egglog.git?rev=602a6bd#602a6bdc15f1eca596fba1a99d098bd4cd264456"
+source = "git+https://github.com/saulshanabrook/egg-smol.git?branch=codex%2Fsplit-primitive-body-runtime-apis#22481a22fcfce930e215ea31acdb27cf59d028db"
 dependencies = [
  "anyhow",
  "bumpalo",
@@ -456,7 +457,7 @@ dependencies = [
 [[package]]
 name = "egglog-numeric-id"
 version = "2.0.0"
-source = "git+https://github.com/egraphs-good/egglog.git?rev=602a6bd#602a6bdc15f1eca596fba1a99d098bd4cd264456"
+source = "git+https://github.com/saulshanabrook/egg-smol.git?branch=codex%2Fsplit-primitive-body-runtime-apis#22481a22fcfce930e215ea31acdb27cf59d028db"
 dependencies = [
  "rayon",
 ]
@@ -464,7 +465,7 @@ dependencies = [
 [[package]]
 name = "egglog-reports"
 version = "2.0.0"
-source = "git+https://github.com/egraphs-good/egglog.git?rev=602a6bd#602a6bdc15f1eca596fba1a99d098bd4cd264456"
+source = "git+https://github.com/saulshanabrook/egg-smol.git?branch=codex%2Fsplit-primitive-body-runtime-apis#22481a22fcfce930e215ea31acdb27cf59d028db"
 dependencies = [
  "clap",
  "hashbrown 0.16.0",
@@ -478,7 +479,7 @@ dependencies = [
 [[package]]
 name = "egglog-union-find"
 version = "2.0.0"
-source = "git+https://github.com/egraphs-good/egglog.git?rev=602a6bd#602a6bdc15f1eca596fba1a99d098bd4cd264456"
+source = "git+https://github.com/saulshanabrook/egg-smol.git?branch=codex%2Fsplit-primitive-body-runtime-apis#22481a22fcfce930e215ea31acdb27cf59d028db"
 dependencies = [
  "crossbeam",
  "egglog-concurrency",
@@ -504,6 +505,26 @@ name = "either"
 version = "1.15.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "48c757948c5ede0e46177b7add2e67155f70e33c07fea8284df6576da70b3719"
+
+[[package]]
+name = "enum-map"
+version = "2.7.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6866f3bfdf8207509a033af1a75a7b08abda06bbaaeae6669323fd5a097df2e9"
+dependencies = [
+ "enum-map-derive",
+]
+
+[[package]]
+name = "enum-map-derive"
+version = "0.17.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f282cfdfe92516eb26c2af8589c274c7c17681f5ecc03c18255fe741c6aa64eb"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.108",
+]
 
 [[package]]
 name = "env_filter"
