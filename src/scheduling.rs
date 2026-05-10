@@ -66,12 +66,25 @@ impl ScheduleState {
         }
     }
 
-    fn lookup_scheduler(&self, name: &str) -> Option<SchedulerId> {
-        self.schedulers
+    fn lookup_scheduler(&self, egraph: &egglog::EGraph, name: &str) -> Option<SchedulerId> {
+        if let Some(id) = self
+            .schedulers
             .iter()
             .rfind(|(n, _)| n == name)
             .map(|(_, id)| *id)
-            .or_else(|| self.permanent_schedulers.lock().unwrap().get(name).copied())
+        {
+            return Some(id);
+        }
+
+        let mut permanent_schedulers = self.permanent_schedulers.lock().unwrap();
+        match permanent_schedulers.get(name).copied() {
+            Some(id) if egraph.contains_scheduler(id) => Some(id),
+            Some(_) => {
+                permanent_schedulers.remove(name);
+                None
+            }
+            None => None,
+        }
     }
 
     // Current limitation: because it relies on the publicly available Rust APIs to access
@@ -131,12 +144,14 @@ impl ScheduleState {
                     else {
                         return err();
                     };
-                    scheduler = Some(self.lookup_scheduler(scheduler_name).ok_or_else(|| {
-                        egglog::Error::ParseError(ParseError(
-                            scheduler_span.clone(),
-                            format!("Unknown scheduler: {scheduler_name}"),
-                        ))
-                    })?);
+                    scheduler = Some(self.lookup_scheduler(egraph, scheduler_name).ok_or_else(
+                        || {
+                            egglog::Error::ParseError(ParseError(
+                                scheduler_span.clone(),
+                                format!("Unknown scheduler: {scheduler_name}"),
+                            ))
+                        },
+                    )?);
                     rest
                 } else {
                     &exprs[..]
@@ -263,8 +278,14 @@ impl UserDefinedCommand for LetSchedulerCommand {
                 Expr::Var(span, name),
                 Expr::Call(_, scheduler_name, scheduler_args),
             ] => {
-                if self.permanent_schedulers.lock().unwrap().contains_key(name) {
-                    return Ok(None);
+                {
+                    let mut permanent_schedulers = self.permanent_schedulers.lock().unwrap();
+                    if let Some(id) = permanent_schedulers.get(name).copied() {
+                        if egraph.contains_scheduler(id) {
+                            return Ok(None);
+                        }
+                        permanent_schedulers.remove(name);
+                    }
                 }
                 let id = build_scheduler_id(egraph, span, scheduler_name, scheduler_args)?;
                 self.permanent_schedulers

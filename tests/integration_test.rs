@@ -498,6 +498,40 @@ fn test_top_level_let_scheduler_persists_on_the_egraph() {
 }
 
 #[test]
+fn test_top_level_let_scheduler_recreates_after_push_pop() {
+    let mut egraph = egglog_experimental::new_experimental_egraph();
+
+    egraph
+        .parse_and_run_program(
+            None,
+            r#"
+            (ruleset copy)
+            (relation R (i64))
+            (relation S (i64))
+            (R 0)
+            (rule ((R x)) ((S x)) :ruleset copy :name "copy")
+            "#,
+        )
+        .unwrap();
+
+    for _ in 0..2 {
+        egraph.parse_and_run_program(None, "(push)").unwrap();
+        egraph
+            .parse_and_run_program(
+                None,
+                "(let-scheduler bo (back-off-fresh :match-limit 2 :ban-length 2))",
+            )
+            .unwrap();
+        egraph
+            .parse_and_run_program(None, "(run-schedule (run-with bo copy))")
+            .unwrap();
+        assert_eq!(eval_get_size(&mut egraph, &["S"]), 1);
+        egraph.parse_and_run_program(None, "(pop)").unwrap();
+        assert_eq!(eval_get_size(&mut egraph, &["S"]), 0);
+    }
+}
+
+#[test]
 fn test_invalid_run_schedule_returns_error_instead_of_panicking() {
     let mut egraph = egglog_experimental::new_experimental_egraph();
 
