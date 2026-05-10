@@ -12,7 +12,9 @@
 //! - [Rationals support](https://egraphs-good.github.io/egglog-demo/?example=rational)
 //!   (see [`rational`] for the exposed primitives)
 //! - [Dynamic cost models with `set-cost`](https://egraphs-good.github.io/egglog-demo/?example=05-cost-model-and-extraction)
-//! - [Custom schedulers via `run-with`](https://egraphs-good.github.io/egglog-demo/?example=math-backoff)
+//! - [Custom schedulers via `run-with`](https://egraphs-good.github.io/egglog-demo/?example=math-backoff),
+//!   including `(back-off ...)` for backlog replay and `(back-off-fresh ...)`
+//!   for fresh rematching against the rebuilt e-graph each scheduler iteration
 //! - [`(get-size!)` primitive](https://github.com/egraphs-good/egglog-experimental/blob/main/tests/web-demo/node-limit.egg)
 //!   for inspecting total tuple counts, optionally restricted to specific tables
 //! - [Multi-extraction](https://github.com/egraphs-good/egglog-experimental/blob/main/tests/web-demo/multi-extract.egg)
@@ -53,7 +55,7 @@ pub fn new_experimental_egraph() -> EGraph {
 
     // Support for set cost
     add_set_cost(&mut egraph);
-    egraph.add_primitive(GetSizePrimitive);
+    egraph.add_read_primitive(GetSizePrimitive, None);
 
     // unstable-fresh! macro
     egraph

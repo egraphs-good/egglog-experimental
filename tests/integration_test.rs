@@ -237,3 +237,58 @@ fn test_multi_extract_with_set_cost() {
     assert!(output.contains("(Add (Num 3) (Num 3))"));
     assert!(!output.contains("Mul"));
 }
+
+fn run_backoff_copy_grow(scheduler_name: &str) -> usize {
+    let mut egraph = egglog_experimental::new_experimental_egraph();
+
+    egraph
+        .parse_and_run_program(
+            None,
+            r#"
+        (ruleset copy)
+        (ruleset grow)
+        (relation R (i64))
+        (relation S (i64))
+        (relation Seed ())
+        (R 0)
+        (R 1)
+        (R 2)
+        (Seed)
+        (rule ((R x)) ((S x)) :ruleset copy :name "copy")
+        (rule ((Seed)) ((R 3)) :ruleset grow :name "grow")
+        "#,
+        )
+        .unwrap();
+
+    egraph
+        .parse_and_run_program(
+            None,
+            &format!(
+                r#"
+        (run-schedule
+          (let-scheduler bo ({scheduler_name} :match-limit 2 :ban-length 2))
+          (seq
+            (run-with bo copy)
+            (run grow)
+            (run-with bo copy)))
+        "#
+            ),
+        )
+        .unwrap();
+
+    egraph.get_size("S")
+}
+
+#[test]
+fn test_backoff_fresh_rematches_rebuilt_graph_after_ban_expires() {
+    assert_eq!(
+        run_backoff_copy_grow("back-off"),
+        3,
+        "back-off should replay only the queued backlog from before grow adds R 3"
+    );
+    assert_eq!(
+        run_backoff_copy_grow("back-off-fresh"),
+        4,
+        "back-off-fresh should rematch and see the R 3 row added while copy was banned"
+    );
+}
