@@ -1,0 +1,5 @@
+(primitive add-float (f64 f64) f64 (+ _0 _1))
+(check (= (add-float 1.0 2.0) 3.0))
+
+(primitive add-int (i64 i64) i64 (+ _0 _1))
+(check (= (add-int 1 2) 3))

@@ -1,0 +1,2 @@
+(sort IntMap (Map i64 i64))
+(primitive bad () IntMap 1)
