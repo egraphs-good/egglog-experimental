@@ -13,6 +13,15 @@
 //!   (see [`rational`] for the exposed primitives)
 //! - [Dynamic cost models with `set-cost`](https://egraphs-good.github.io/egglog-demo/?example=05-cost-model-and-extraction)
 //! - [Custom schedulers via `run-with`](https://egraphs-good.github.io/egglog-demo/?example=math-backoff)
+//!   and persistent top-level scheduler bindings:
+//!   `(let-scheduler name (back-off :match-limit 1000 :ban-length 5))`.
+//!   A later `(run-schedule (run-with name ruleset))` can reuse the binding.
+//!   Redeclaring a live top-level scheduler name is an error. If `push`/`pop`
+//!   restores an e-graph snapshot where the scheduler id no longer exists, the
+//!   stale binding is rejected and must be declared again before reuse. Bindings
+//!   are keyed to the declaring e-graph owner and scheduler allocation token, so
+//!   cloned e-graphs reject stale names even if another scheduler reuses the same
+//!   numeric id.
 //! - [`(get-size!)` primitive](https://github.com/egraphs-good/egglog-experimental/blob/main/tests/web-demo/node-limit.egg)
 //!   for inspecting total tuple counts, optionally restricted to specific tables
 //! - [Multi-extraction](https://github.com/egraphs-good/egglog-experimental/blob/main/tests/web-demo/multi-extract.egg)
@@ -23,7 +32,7 @@
 use egglog::ast::Parser;
 use egglog::prelude::{RustSpan, Span, add_base_sort};
 pub use egglog::*;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 pub mod rational;
 pub use rational::*;
@@ -44,6 +53,7 @@ pub use sugar::*;
 
 pub fn new_experimental_egraph() -> EGraph {
     let mut egraph = EGraph::default();
+    let permanent_schedulers = Arc::new(Mutex::new(PermanentSchedulerState::default()));
 
     // Set up the parser with experimental parse-time macros
     egraph.parser = experimental_parser();
@@ -53,7 +63,7 @@ pub fn new_experimental_egraph() -> EGraph {
 
     // Support for set cost
     add_set_cost(&mut egraph);
-    egraph.add_primitive(GetSizePrimitive);
+    egraph.add_read_primitive(GetSizePrimitive, None);
 
     // unstable-fresh! macro
     egraph
@@ -62,7 +72,16 @@ pub fn new_experimental_egraph() -> EGraph {
 
     // scheduler support
     egraph
-        .add_command("run-schedule".into(), Arc::new(RunExtendedSchedule))
+        .add_command(
+            "run-schedule".into(),
+            Arc::new(RunExtendedSchedule::new(permanent_schedulers.clone())),
+        )
+        .unwrap();
+    egraph
+        .add_command(
+            "let-scheduler".into(),
+            Arc::new(LetSchedulerCommand::new(permanent_schedulers)),
+        )
         .unwrap();
 
     egraph
