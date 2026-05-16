@@ -1,0 +1,20 @@
+; Test the egraph-detailed-stats command
+
+(datatype Math)
+(constructor add (Math Math) Math)
+(constructor mul (Math Math) Math)
+(constructor num (i64) Math)
+
+; Add some terms
+(num 1)
+(num 2)
+(add (num 1) (num 2))
+(mul (num 1) (num 2))
+
+; Create some equality classes
+(union (num 1) (num 2))
+
+(run-schedule (saturate (run)))
+
+; Get detailed statistics
+(egraph-detailed-stats)
