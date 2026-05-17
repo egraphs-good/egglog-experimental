@@ -15,12 +15,10 @@
 //! function is reported.
 
 use egglog::{
-    CommandOutput, EGraph, Error, FunctionRow, TypeError, UserDefinedCommand, Value,
-    ast::Expr,
+    CommandOutput, EGraph, Error, FunctionRow, TypeError, UserDefinedCommand, Value, ast::Expr,
     prelude::Span,
 };
 use egglog_ast::generic_ast::GenericExpr;
-use log::{Level, log_enabled};
 use std::{
     collections::{HashMap, HashSet},
     fmt::{Display, Formatter},
@@ -213,18 +211,16 @@ fn compute_table_stats(egraph: &EGraph, func_name: &str) -> Result<TableStats, E
         .get_function(func_name)
         .ok_or_else(|| TypeError::UnboundFunction(func_name.to_owned(), Span::Panic))?;
     let schema = func.schema();
-    let mut column_types: Vec<String> =
-        schema.input.iter().map(|s| s.name().to_owned()).collect();
+    let mut column_types: Vec<String> = schema.input.iter().map(|s| s.name().to_owned()).collect();
     column_types.push(schema.output.name().to_owned());
     let n_cols = column_types.len();
     let n_inputs = schema.input.len();
     let output_col = n_cols - 1;
-    let track_combined = n_inputs >= 2 && n_cols >= 2;
+    let track_combined = n_inputs >= 2;
 
     let mut size: usize = 0;
     let mut distinct: Vec<HashSet<Value>> = (0..n_cols).map(|_| HashSet::default()).collect();
-    let mut pair_maps: HashMap<(usize, usize), HashMap<Value, HashSet<Value>>> =
-        HashMap::default();
+    let mut pair_maps: HashMap<(usize, usize), HashMap<Value, HashSet<Value>>> = HashMap::default();
     for i in 0..n_cols {
         for j in 0..n_cols {
             if i != j {
@@ -248,7 +244,7 @@ fn compute_table_stats(egraph: &EGraph, func_name: &str) -> Result<TableStats, E
                         .get_mut(&(i, j))
                         .unwrap()
                         .entry(vals[i])
-                        .or_insert_with(HashSet::default)
+                        .or_default()
                         .insert(vals[j]);
                 }
             }
@@ -257,7 +253,7 @@ fn compute_table_stats(egraph: &EGraph, func_name: &str) -> Result<TableStats, E
             let inputs: Vec<Value> = vals[..n_inputs].to_vec();
             output_to_inputs_map
                 .entry(vals[output_col])
-                .or_insert_with(HashSet::default)
+                .or_default()
                 .insert(inputs);
         }
     })?;
@@ -343,20 +339,11 @@ pub fn print_table_stats(egraph: &EGraph, sym: Option<&str>) -> Result<Vec<Table
             results.push(stats);
         }
     }
-    if log_enabled!(Level::Info) {
-        for table in &results {
-            log::info!("Stats for table {}: size={}", table.name, table.size);
-        }
-    }
     Ok(results)
 }
 
 impl UserDefinedCommand for PrintTableStatsCommand {
-    fn update(
-        &self,
-        egraph: &mut EGraph,
-        args: &[Expr],
-    ) -> Result<Option<CommandOutput>, Error> {
+    fn update(&self, egraph: &mut EGraph, args: &[Expr]) -> Result<Option<CommandOutput>, Error> {
         let name: Option<String> = match args {
             [] => None,
             [arg] => match arg {

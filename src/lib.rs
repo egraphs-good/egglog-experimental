@@ -76,10 +76,7 @@ pub fn new_experimental_egraph() -> EGraph {
 
     // Per-column statistics for function tables.
     egraph
-        .add_command(
-            "print-table-stats".into(),
-            Arc::new(PrintTableStatsCommand),
-        )
+        .add_command("print-table-stats".into(), Arc::new(PrintTableStatsCommand))
         .unwrap();
     egraph
 }

@@ -204,6 +204,77 @@ fn test_multi_extract_single_variant_minimal_cost() {
 }
 
 #[test]
+fn test_print_table_stats() {
+    let mut egraph = egglog_experimental::new_experimental_egraph();
+
+    let result = egraph
+        .parse_and_run_program(
+            None,
+            "
+        (datatype E (Add E E) (Num i64))
+        (Add (Num 1) (Num 2))
+        (Add (Num 1) (Num 3))
+        (print-table-stats Add)",
+        )
+        .unwrap();
+
+    assert_eq!(result.len(), 1);
+    let output = result[0].to_string();
+
+    assert!(output.contains("Add"), "missing table name: {output}");
+    assert!(output.contains("(size 2)"), "missing size: {output}");
+    assert!(
+        output.contains("(columns"),
+        "missing columns section: {output}"
+    );
+    // Both rows share (Num 1) in column 0; col 1 and the output column each
+    // have two distinct eclasses.
+    assert!(output.contains("(0 E 1)"), "wrong col 0 stats: {output}");
+    assert!(output.contains("(1 E 2)"), "wrong col 1 stats: {output}");
+    assert!(
+        output.contains("(2 E 2)"),
+        "wrong output col stats: {output}"
+    );
+    assert!(
+        output.contains("(out-degrees"),
+        "missing out-degrees section: {output}"
+    );
+    // (output -> combined inputs) pair is only emitted when n_inputs >= 2,
+    // which Add satisfies; its target is the tuple "(0 1)".
+    assert!(
+        output.contains("(2 (0 1)"),
+        "missing combined-input out-degree: {output}"
+    );
+}
+
+#[test]
+fn test_print_table_stats_all_tables() {
+    let mut egraph = egglog_experimental::new_experimental_egraph();
+
+    let result = egraph
+        .parse_and_run_program(
+            None,
+            "
+        (datatype E (Add E E) (Num i64))
+        (Add (Num 1) (Num 2))
+        (print-table-stats)",
+        )
+        .unwrap();
+
+    assert_eq!(result.len(), 1);
+    let output = result[0].to_string();
+    assert!(output.contains("Add"), "missing Add: {output}");
+    assert!(output.contains("Num"), "missing Num: {output}");
+}
+
+#[test]
+fn test_print_table_stats_unknown_table_errors() {
+    let mut egraph = egglog_experimental::new_experimental_egraph();
+    let result = egraph.parse_and_run_program(None, "(print-table-stats DoesNotExist)");
+    assert!(result.is_err());
+}
+
+#[test]
 fn test_multi_extract_with_set_cost() {
     let mut egraph = egglog_experimental::new_experimental_egraph();
 
