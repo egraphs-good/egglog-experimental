@@ -237,3 +237,107 @@ fn test_multi_extract_with_set_cost() {
     assert!(output.contains("(Add (Num 3) (Num 3))"));
     assert!(!output.contains("Mul"));
 }
+
+#[test]
+fn test_invalid_run_schedule_returns_error_instead_of_panicking() {
+    let mut egraph = egglog_experimental::new_experimental_egraph();
+
+    let err = egraph
+        .parse_and_run_program(None, "(run-schedule (run 1))")
+        .unwrap_err();
+
+    assert!(err.to_string().contains("Invalid schedule"));
+}
+
+#[test]
+fn test_unknown_scheduler_returns_error_instead_of_panicking() {
+    let mut egraph = egglog_experimental::new_experimental_egraph();
+
+    let err = egraph
+        .parse_and_run_program(None, "(run-schedule (let-scheduler bo (not-a-scheduler)))")
+        .unwrap_err();
+
+    assert!(err.to_string().contains("Unknown scheduler"));
+}
+
+#[test]
+fn test_unknown_scheduler_binding_returns_error_instead_of_panicking() {
+    let mut egraph = egglog_experimental::new_experimental_egraph();
+
+    let err = egraph
+        .parse_and_run_program(None, "(run-schedule (run-with bo))")
+        .unwrap_err();
+
+    assert!(err.to_string().contains("Unknown scheduler"));
+}
+
+#[test]
+fn test_invalid_scheduler_tags_return_error_instead_of_panicking() {
+    let mut egraph = egglog_experimental::new_experimental_egraph();
+
+    let err = egraph
+        .parse_and_run_program(
+            None,
+            r#"(run-schedule (let-scheduler bo (back-off "x" 1)))"#,
+        )
+        .unwrap_err();
+
+    assert!(err.to_string().contains("Invalid scheduler tag name"));
+}
+
+#[test]
+fn test_odd_scheduler_tags_return_error_instead_of_panicking() {
+    let mut egraph = egglog_experimental::new_experimental_egraph();
+
+    let err = egraph
+        .parse_and_run_program(
+            None,
+            "(run-schedule (let-scheduler bo (back-off :match-limit)))",
+        )
+        .unwrap_err();
+
+    assert!(err.to_string().contains("key/value pairs"));
+}
+
+#[test]
+fn test_duplicate_scheduler_tags_return_error_instead_of_panicking() {
+    let mut egraph = egglog_experimental::new_experimental_egraph();
+
+    let err = egraph
+        .parse_and_run_program(
+            None,
+            "(run-schedule (let-scheduler bo (back-off :match-limit 1 :match-limit 2)))",
+        )
+        .unwrap_err();
+
+    assert!(err.to_string().contains("already exists"));
+}
+
+#[test]
+fn test_invalid_scheduler_config_returns_error_instead_of_panicking() {
+    let mut egraph = egglog_experimental::new_experimental_egraph();
+
+    let err = egraph
+        .parse_and_run_program(
+            None,
+            r#"(run-schedule (let-scheduler bo (back-off :match-limit "x")))"#,
+        )
+        .unwrap_err();
+
+    assert!(err.to_string().contains(":match-limit"));
+}
+
+#[test]
+fn test_negative_scheduler_config_returns_error_instead_of_panicking() {
+    for tag in [":match-limit", ":ban-length"] {
+        let mut egraph = egglog_experimental::new_experimental_egraph();
+        let err = egraph
+            .parse_and_run_program(
+                None,
+                &format!("(run-schedule (let-scheduler bo (back-off {tag} -1)))"),
+            )
+            .unwrap_err();
+
+        assert!(err.to_string().contains("non-negative"));
+    }
+}
