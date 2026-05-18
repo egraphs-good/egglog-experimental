@@ -17,9 +17,9 @@ default = ["bin"]
 bin = ["egglog/bin"]
 
 [dependencies]
-egglog = { git = "https://github.com/egraphs-good/egglog.git", default-features = false, rev = "602a6bd" }
-egglog-ast = { git = "https://github.com/egraphs-good/egglog.git", default-features = false, rev = "602a6bd" }
-egglog-reports = { git = "https://github.com/egraphs-good/egglog.git", default-features = false, rev = "602a6bd" }
+egglog = { git = "https://github.com/saulshanabrook/egg-smol.git", branch = "codex/split-scheduler-id-validation", default-features = false }
+egglog-ast = { git = "https://github.com/saulshanabrook/egg-smol.git", branch = "codex/split-scheduler-id-validation", default-features = false }
+egglog-reports = { git = "https://github.com/saulshanabrook/egg-smol.git", branch = "codex/split-scheduler-id-validation", default-features = false }
 
 num = "0.4.3"
 lazy_static = "1.4"
