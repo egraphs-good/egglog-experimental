@@ -1,0 +1,5 @@
+;; Function-container inputs may be table-backed, but the scheduler cannot see
+;; which table will be read when the primitive body applies the container.
+(sort IntToInt (UnstableFn (i64) i64))
+
+(primitive apply-fn (IntToInt i64) i64 (unstable-app _0 _1))

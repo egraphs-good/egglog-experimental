@@ -16,6 +16,12 @@
 //! - [`(get-size!)` primitive](https://github.com/egraphs-good/egglog-experimental/blob/main/tests/web-demo/node-limit.egg)
 //!   for inspecting total tuple counts, optionally restricted to specific tables
 //! - [Multi-extraction](https://github.com/egraphs-good/egglog-experimental/blob/main/tests/web-demo/multi-extract.egg)
+//! - Body-defined primitives with `(primitive name (InputSort*) OutputSort body)`.
+//!   Body variables are positional (`_0`, `_1`, ...), and a partial primitive
+//!   body result propagates as primitive failure. Bodies may call built-in or
+//!   previously registered primitives, but they may not call or capture
+//!   table-backed functions, nor accept or return function-container sorts,
+//!   because those reads are hidden from seminaive rule dependency analysis.
 //!
 //! Each bullet links to a runnable demo so you can explore the feature quickly.
 //! The rest of this crate exposes the Rust APIs and helpers that back these extensions.
@@ -37,6 +43,7 @@ mod multi_extract;
 pub use multi_extract::*;
 mod size;
 pub use size::*;
+mod primitive;
 
 // Sugar modules using parse-time macros
 mod sugar;
@@ -53,7 +60,7 @@ pub fn new_experimental_egraph() -> EGraph {
 
     // Support for set cost
     add_set_cost(&mut egraph);
-    egraph.add_primitive(GetSizePrimitive);
+    egraph.add_read_primitive(GetSizePrimitive, None);
 
     // unstable-fresh! macro
     egraph
@@ -70,6 +77,9 @@ pub fn new_experimental_egraph() -> EGraph {
             "multi-extract".into(),
             Arc::new(MultiExtract::new(DynamicCostModel)),
         )
+        .unwrap();
+    egraph
+        .add_command("primitive".into(), Arc::new(primitive::RegisterPrimitive))
         .unwrap();
     egraph
 }

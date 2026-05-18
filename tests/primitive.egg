@@ -1,0 +1,13 @@
+(primitive add (i64 i64) i64 (+ _0 _1))
+(check (= (add 2 3) 5))
+
+(primitive five () i64 5)
+(check (= (five) 5))
+
+(primitive add1-div (i64 i64) i64 (+ (/ _0 _1) 1))
+(check (= (add1-div 4 2) 3))
+(fail (check (= (add1-div 4 0) 0)))
+
+(sort IntMap (Map i64 i64))
+(primitive singleton-map (i64) IntMap (map-insert (map-empty) _0 (+ _0 1)))
+(check (= (singleton-map 2) (map-insert (map-empty) 2 3)))

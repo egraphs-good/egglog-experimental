@@ -1,0 +1,8 @@
+(sort IntMap (Map i64 i64))
+(primitive empty-int-map () IntMap (map-empty))
+(check (= (empty-int-map) (map-empty)))
+
+(sort Num)
+(sort Map[Num,BigRat] (Map Num BigRat))
+(primitive empty-num-rat-map Unit Map[Num,BigRat] (map-empty))
+(check (= (empty-num-rat-map ()) (map-empty)))
