@@ -2,8 +2,8 @@ use std::{collections::HashMap, sync::Mutex};
 
 use egglog::{
     CommandOutput, UserDefinedCommand,
-    ast::{Expr, Fact, Facts, Literal, ParseError},
-    prelude::{query, run_ruleset},
+    ast::{Command, Expr, Fact, Literal, ParseError},
+    prelude::run_ruleset,
     scheduler::{Scheduler, SchedulerId},
 };
 use egglog_reports::RunReport;
@@ -123,9 +123,11 @@ impl ScheduleState {
                 };
 
                 if let Some(until) = until {
-                    // Parse the facts from the `until` expression
-                    let res = query(egraph, &[], Facts(vec![Fact::Fact(until)]))?;
-                    if res.any_matches() {
+                    let span = until.span();
+                    if egraph
+                        .run_program(vec![Command::Check(span, vec![Fact::Fact(until)])])
+                        .is_ok()
+                    {
                         return Ok(RunReport::default());
                     }
                 }
