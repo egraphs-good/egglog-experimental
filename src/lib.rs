@@ -14,7 +14,7 @@
 //! - [Dynamic cost models with `set-cost`](https://egraphs-good.github.io/egglog-demo/?example=05-cost-model-and-extraction)
 //! - [Custom schedulers via `run-with`](https://egraphs-good.github.io/egglog-demo/?example=math-backoff)
 //! - [`(get-size!)` primitive](https://github.com/egraphs-good/egglog-experimental/blob/main/tests/web-demo/node-limit.egg)
-//!   for inspecting total tuple counts, optionally restricted to specific tables
+//!   for inspecting total tuple counts or counts for specific tables
 //! - [Multi-extraction](https://github.com/egraphs-good/egglog-experimental/blob/main/tests/web-demo/multi-extract.egg)
 //!
 //! Each bullet links to a runnable demo so you can explore the feature quickly.
@@ -53,7 +53,7 @@ pub fn new_experimental_egraph() -> EGraph {
 
     // Support for set cost
     add_set_cost(&mut egraph);
-    egraph.add_primitive(GetSizePrimitive);
+    egraph.add_read_primitive(GetSizePrimitive, None);
 
     // unstable-fresh! macro
     egraph
