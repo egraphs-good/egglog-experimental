@@ -150,11 +150,10 @@ impl ScheduleState {
                         }
                         Ok(iter_report)
                     })?;
-                    let should_stop = iter_report.can_stop;
-                    report.union(iter_report);
-                    if should_stop {
+                    if !iter_report.updated {
                         break;
                     }
+                    report.union(iter_report);
                 }
                 Ok(report)
             }
