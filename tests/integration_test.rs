@@ -245,6 +245,7 @@ fn test_print_table_stats() {
         output.contains("(2 (0 1)"),
         "missing combined-input out-degree: {output}"
     );
+    assert!(output.contains("(median "), "missing median stat: {output}");
 }
 
 #[test]

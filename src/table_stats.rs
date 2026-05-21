@@ -3,7 +3,7 @@
 //! For each function table, this command reports:
 //! 1. The number of distinct values in every column (including the output column).
 //! 2. For every ordered pair of distinct columns `(source, target)`, the
-//!    min / 25th percentile / mean / 75th percentile / max of the
+//!    min / 25th percentile / median / mean / 75th percentile / max of the
 //!    *out-degree* — i.e. for each value in `source`, the number of distinct
 //!    values seen in `target` across rows sharing that source value.
 //! 3. For tables with two or more input columns, the same statistics for
@@ -25,8 +25,8 @@ use std::{
     sync::Arc,
 };
 
-/// Min/max/mean and 25th/75th percentile statistics over the out-degrees of
-/// a (set of) source column(s) with respect to a (set of) target column(s).
+/// Min/max/mean and 25th/50th/75th percentile statistics over the out-degrees
+/// of a (set of) source column(s) with respect to a (set of) target column(s).
 #[derive(Clone, Debug)]
 pub struct OutDegreeStats {
     /// The smallest number of distinct target-tuple values observed for any
@@ -40,6 +40,9 @@ pub struct OutDegreeStats {
     pub mean: f64,
     /// The 25th percentile (linear interpolation between adjacent ranks).
     pub p25: f64,
+    /// The 50th percentile / median (linear interpolation between adjacent
+    /// ranks).
+    pub median: f64,
     /// The 75th percentile (linear interpolation between adjacent ranks).
     pub p75: f64,
 }
@@ -87,13 +90,14 @@ pub struct TableStatsOutput {
 pub struct PrintTableStatsCommand;
 
 impl OutDegreeStats {
-    fn from_counts(inner_len: usize, counts: &[usize]) -> Self {
-        if inner_len == 0 {
+    fn from_counts(counts: &[usize]) -> Self {
+        if counts.is_empty() {
             return OutDegreeStats {
                 min: 0,
                 max: 0,
                 mean: 0.0,
                 p25: 0.0,
+                median: 0.0,
                 p75: 0.0,
             };
         }
@@ -103,6 +107,7 @@ impl OutDegreeStats {
             max: *counts.last().unwrap(),
             mean: (sum as f64) / (counts.len() as f64),
             p25: percentile(counts, 0.25),
+            median: percentile(counts, 0.5),
             p75: percentile(counts, 0.75),
         }
     }
@@ -148,8 +153,8 @@ impl Display for OutDegreeStats {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "(min {}) (p25 {:.4}) (mean {:.4}) (p75 {:.4}) (max {})",
-            self.min, self.p25, self.mean, self.p75, self.max
+            "(min {}) (p25 {:.4}) (median {:.4}) (mean {:.4}) (p75 {:.4}) (max {})",
+            self.min, self.p25, self.median, self.mean, self.p75, self.max
         )
     }
 }
@@ -272,7 +277,7 @@ fn compute_table_stats(egraph: &EGraph, func_name: &str) -> Result<TableStats, E
             out_degrees.push(PairOutDegree {
                 source: vec![i],
                 target: vec![j],
-                stats: OutDegreeStats::from_counts(inner.len(), &counts),
+                stats: OutDegreeStats::from_counts(&counts),
             });
         }
     }
@@ -285,7 +290,7 @@ fn compute_table_stats(egraph: &EGraph, func_name: &str) -> Result<TableStats, E
         out_degrees.push(PairOutDegree {
             source: vec![output_col],
             target: (0..n_inputs).collect(),
-            stats: OutDegreeStats::from_counts(output_to_inputs_map.len(), &counts),
+            stats: OutDegreeStats::from_counts(&counts),
         });
     }
 
@@ -310,7 +315,9 @@ pub fn print_table_stats(egraph: &EGraph, sym: Option<&str>) -> Result<Vec<Table
             .or_else(|| egraph.get_function(sym))
             .ok_or_else(|| TypeError::UnboundFunction(sym.to_owned(), Span::Panic))?;
         if func.is_hidden() || func.is_let_binding() {
-            return Err(TypeError::UnboundFunction(sym.to_owned(), Span::Panic).into());
+            return Err(Error::BackendError(format!(
+                "print-table-stats: function `{sym}` is hidden or a let-binding and cannot be reported"
+            )));
         }
         let actual_name = func.name().to_owned();
         let display_name = func
@@ -358,7 +365,7 @@ impl UserDefinedCommand for PrintTableStatsCommand {
             _ => {
                 return Err(Error::BackendError(format!(
                     "{}\nusage: (print-table-stats <table name>?)",
-                    args[0].span()
+                    args[1].span()
                 )));
             }
         };
