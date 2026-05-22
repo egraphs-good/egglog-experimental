@@ -8,8 +8,8 @@
 //! Each argument must evaluate to a `String` that names an existing function.
 
 use egglog::{
-    ArcSort, CommandOutput, EGraph, Error, TermDag, TermId, TypeError, UserDefinedCommand,
-    Value, Write,
+    ArcSort, CommandOutput, EGraph, Error, TermDag, TermId, TypeError, UserDefinedCommand, Value,
+    Write,
     ast::Expr,
     extract::{Extractor, TreeAdditiveCostModel},
     prelude::{RustSpan, Span},
@@ -77,13 +77,15 @@ impl UserDefinedCommand for KeepBestCommand {
     }
 }
 
+type ExtractedTable = (String, Vec<Vec<TermId>>, TermDag);
+
 /// For each table, collect all rows and extract the best term for each value.
 /// Returns `(table_name, rows, termdag)` triples where each row is a list of
 /// `TermId`s (inputs followed by output) into the shared `termdag`.
 fn collect_and_extract(
     egraph: &EGraph,
     table_names: &[String],
-) -> Result<Vec<(String, Vec<Vec<TermId>>, TermDag)>, Error> {
+) -> Result<Vec<ExtractedTable>, Error> {
     let mut result = Vec::new();
 
     for table_name in table_names {
