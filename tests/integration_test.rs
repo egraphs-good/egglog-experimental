@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use egglog::{
+    CommandOutput,
     ast::{Expr, Literal},
     prelude::{RustSpan, Span},
 };
@@ -311,6 +312,28 @@ fn test_multi_extract_bad_arity_returns_error_instead_of_panicking() {
                 .contains("multi-extract expects at least a variant count and one expression"),
             "unexpected error for {program}: {err}"
         );
+fn add_copy_backoff_program(egraph: &mut egglog::EGraph) {
+    egraph
+        .parse_and_run_program(
+            None,
+            r#"
+        (ruleset copy)
+        (relation R (i64))
+        (relation S (i64))
+        (R 0)
+        (R 1)
+        (R 2)
+        (R 3)
+        (rule ((R x)) ((S x)) :ruleset copy :name "copy")
+        "#,
+        )
+        .unwrap();
+}
+
+fn only_run_report(outputs: &[CommandOutput]) -> &egglog_reports::RunReport {
+    match outputs {
+        [CommandOutput::RunSchedule(report)] => report,
+        other => panic!("expected one RunSchedule output, got {other:?}"),
     }
 }
 
@@ -342,4 +365,57 @@ fn test_multi_extract_zero_variants_returns_error_instead_of_extracting() {
         .unwrap_err();
 
     assert!(err.to_string().contains("positive number of variants"));
+fn test_backoff_run_schedule_should_not_report_progress_without_egraph_updates() {
+    let mut egraph = egglog_experimental::new_experimental_egraph();
+    add_copy_backoff_program(&mut egraph);
+
+    let outputs = egraph
+        .parse_and_run_program(
+            None,
+            r#"
+        (run-schedule
+          (let-scheduler bo (back-off :match-limit 1 :ban-length 3))
+          (run-with bo copy))
+        "#,
+        )
+        .unwrap();
+
+    let report = only_run_report(&outputs);
+    assert_eq!(egraph.get_size("S"), 0);
+    assert!(
+        !report.updated,
+        "banning work in the scheduler is not database progress"
+    );
+    assert!(
+        !report.can_stop,
+        "the scheduler still has deferred work after the ban"
+    );
+}
+
+#[test]
+fn test_saturate_continues_until_scheduler_can_stop_after_no_progress_ban() {
+    let mut egraph = egglog_experimental::new_experimental_egraph();
+    add_copy_backoff_program(&mut egraph);
+
+    let outputs = egraph
+        .parse_and_run_program(
+            None,
+            r#"
+        (run-schedule
+          (let-scheduler bo (back-off :match-limit 1 :ban-length 3))
+          (saturate (run-with bo copy)))
+        "#,
+        )
+        .unwrap();
+
+    let report = only_run_report(&outputs);
+    assert_eq!(
+        egraph.get_size("S"),
+        4,
+        "saturate should keep running while the scheduler reports deferred work"
+    );
+    assert!(
+        report.updated,
+        "the eventual copy applications should be reported as database progress"
+    );
 }
