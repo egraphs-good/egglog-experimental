@@ -42,6 +42,9 @@ pub use size::*;
 mod sugar;
 pub use sugar::*;
 
+mod keep_best;
+pub use keep_best::KeepBestCommand;
+
 pub fn new_experimental_egraph() -> EGraph {
     let mut egraph = EGraph::default();
 
@@ -71,6 +74,11 @@ pub fn new_experimental_egraph() -> EGraph {
             Arc::new(MultiExtract::new(DynamicCostModel)),
         )
         .unwrap();
+
+    egraph
+        .add_command("keep-best".into(), Arc::new(KeepBestCommand))
+        .unwrap();
+
     egraph
 }
 

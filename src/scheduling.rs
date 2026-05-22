@@ -190,10 +190,29 @@ impl ScheduleState {
                     _ => err(),
                 }
             }
-            _ => Err(egglog::Error::ParseError(ParseError(
-                span.clone(),
-                "Invalid schedule".into(),
-            ))),
+            "call-prim" => match exprs.as_slice() {
+                [inner] => {
+                    egraph.eval_expr(inner)?;
+                    Ok(RunReport::default())
+                }
+                _ => err(),
+            },
+            _ => {
+                if egraph.has_command(head) {
+                    let output = egraph.run_user_defined_command(head, exprs)?;
+                    let report = if let Some(CommandOutput::RunSchedule(r)) = output {
+                        r
+                    } else {
+                        RunReport::default()
+                    };
+                    Ok(report)
+                } else {
+                    Err(egglog::Error::ParseError(ParseError(
+                        span.clone(),
+                        format!("Invalid schedule step: {head}"),
+                    )))
+                }
+            }
         }
     }
 }

@@ -330,7 +330,7 @@ checksum = "d0881ea181b1df73ff77ffaaf9c7544ecc11e82fba9b5f27b262a3c73a332555"
 [[package]]
 name = "egglog"
 version = "2.0.0"
-source = "git+https://github.com/saulshanabrook/egg-smol.git?branch=codex%2Fsplit-scheduler-can-stop-report#ebba7bb902bdc1b0f377b6bb22c06ac305912674"
+source = "git+https://github.com/egraphs-good/egglog?rev=15eec00#15eec00c5a8eed0d88b8277be3aa5c0c7b4ed3f7"
 dependencies = [
  "chrono",
  "clap",
@@ -362,7 +362,7 @@ dependencies = [
 [[package]]
 name = "egglog-add-primitive"
 version = "2.0.0"
-source = "git+https://github.com/saulshanabrook/egg-smol.git?branch=codex%2Fsplit-scheduler-can-stop-report#ebba7bb902bdc1b0f377b6bb22c06ac305912674"
+source = "git+https://github.com/egraphs-good/egglog?rev=15eec00#15eec00c5a8eed0d88b8277be3aa5c0c7b4ed3f7"
 dependencies = [
  "quote",
  "syn 2.0.108",
@@ -371,7 +371,7 @@ dependencies = [
 [[package]]
 name = "egglog-ast"
 version = "2.0.0"
-source = "git+https://github.com/saulshanabrook/egg-smol.git?branch=codex%2Fsplit-scheduler-can-stop-report#ebba7bb902bdc1b0f377b6bb22c06ac305912674"
+source = "git+https://github.com/egraphs-good/egglog?rev=15eec00#15eec00c5a8eed0d88b8277be3aa5c0c7b4ed3f7"
 dependencies = [
  "ordered-float",
 ]
@@ -379,7 +379,7 @@ dependencies = [
 [[package]]
 name = "egglog-bridge"
 version = "2.0.0"
-source = "git+https://github.com/saulshanabrook/egg-smol.git?branch=codex%2Fsplit-scheduler-can-stop-report#ebba7bb902bdc1b0f377b6bb22c06ac305912674"
+source = "git+https://github.com/egraphs-good/egglog?rev=15eec00#15eec00c5a8eed0d88b8277be3aa5c0c7b4ed3f7"
 dependencies = [
  "anyhow",
  "dyn-clone",
@@ -402,7 +402,7 @@ dependencies = [
 [[package]]
 name = "egglog-concurrency"
 version = "2.0.0"
-source = "git+https://github.com/saulshanabrook/egg-smol.git?branch=codex%2Fsplit-scheduler-can-stop-report#ebba7bb902bdc1b0f377b6bb22c06ac305912674"
+source = "git+https://github.com/egraphs-good/egglog?rev=15eec00#15eec00c5a8eed0d88b8277be3aa5c0c7b4ed3f7"
 dependencies = [
  "arc-swap",
  "bumpalo",
@@ -414,7 +414,7 @@ dependencies = [
 [[package]]
 name = "egglog-core-relations"
 version = "2.0.0"
-source = "git+https://github.com/saulshanabrook/egg-smol.git?branch=codex%2Fsplit-scheduler-can-stop-report#ebba7bb902bdc1b0f377b6bb22c06ac305912674"
+source = "git+https://github.com/egraphs-good/egglog?rev=15eec00#15eec00c5a8eed0d88b8277be3aa5c0c7b4ed3f7"
 dependencies = [
  "anyhow",
  "bumpalo",
@@ -457,7 +457,7 @@ dependencies = [
 [[package]]
 name = "egglog-numeric-id"
 version = "2.0.0"
-source = "git+https://github.com/saulshanabrook/egg-smol.git?branch=codex%2Fsplit-scheduler-can-stop-report#ebba7bb902bdc1b0f377b6bb22c06ac305912674"
+source = "git+https://github.com/egraphs-good/egglog?rev=15eec00#15eec00c5a8eed0d88b8277be3aa5c0c7b4ed3f7"
 dependencies = [
  "rayon",
 ]
@@ -465,7 +465,7 @@ dependencies = [
 [[package]]
 name = "egglog-reports"
 version = "2.0.0"
-source = "git+https://github.com/saulshanabrook/egg-smol.git?branch=codex%2Fsplit-scheduler-can-stop-report#ebba7bb902bdc1b0f377b6bb22c06ac305912674"
+source = "git+https://github.com/egraphs-good/egglog?rev=15eec00#15eec00c5a8eed0d88b8277be3aa5c0c7b4ed3f7"
 dependencies = [
  "clap",
  "hashbrown 0.16.0",
@@ -479,7 +479,7 @@ dependencies = [
 [[package]]
 name = "egglog-union-find"
 version = "2.0.0"
-source = "git+https://github.com/saulshanabrook/egg-smol.git?branch=codex%2Fsplit-scheduler-can-stop-report#ebba7bb902bdc1b0f377b6bb22c06ac305912674"
+source = "git+https://github.com/egraphs-good/egglog?rev=15eec00#15eec00c5a8eed0d88b8277be3aa5c0c7b4ed3f7"
 dependencies = [
  "crossbeam",
  "egglog-concurrency",

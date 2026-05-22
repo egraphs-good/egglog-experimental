@@ -239,6 +239,83 @@ fn test_multi_extract_with_set_cost() {
     assert!(!output.contains("Mul"));
 }
 
+#[test]
+fn test_keep_best_basic() {
+    let mut egraph = egglog_experimental::new_experimental_egraph();
+
+    egraph
+        .parse_and_run_program(
+            None,
+            r#"
+        (datatype Math (Num i64) (Add Math Math))
+        (relation Target (Math))
+
+        ; put two nodes in the same eclass
+        (union (Num 2) (Add (Num 1) (Num 1)))
+
+        ; record what we care about
+        (Target (Num 2))
+        "#,
+        )
+        .unwrap();
+
+    // Before keep-best: both Num and Add tables have entries, Target has 1 row.
+    assert_eq!(egraph.get_size("Num"), 2);
+    assert_eq!(egraph.get_size("Add"), 1);
+    assert_eq!(egraph.get_size("Target"), 1);
+
+    // Run keep-best on the Target relation.
+    egraph
+        .parse_and_run_program(None, r#"(keep-best "Target")"#)
+        .unwrap();
+
+    // After keep-best: Target still has exactly 1 row,
+    // and it contains a constructor term that can be extracted.
+    assert_eq!(egraph.get_size("Target"), 1);
+    assert_eq!(egraph.get_size("Num"), 1);
+
+    let result = egraph
+        .parse_and_run_program(None, "(print-function Target 100)")
+        .unwrap();
+    let output = result[0].to_string();
+    assert!(output.contains("Num") && !output.contains("Add"));
+}
+
+#[test]
+fn test_keep_best_clears_other_tables() {
+    let mut egraph = egglog_experimental::new_experimental_egraph();
+
+    egraph
+        .parse_and_run_program(
+            None,
+            r#"
+        (datatype Math (Num i64) (Add Math Math))
+        (relation Target (Math))
+        (Num 42)
+        (Add (Num 1) (Num 2))
+        (Target (Num 42))
+        "#,
+        )
+        .unwrap();
+
+    let before_num = egraph.get_size("Num");
+    let before_add = egraph.get_size("Add");
+    assert!(before_num >= 3); // Num 42, Num 1, Num 2
+    assert_eq!(before_add, 1);
+    assert_eq!(egraph.get_size("Target"), 1);
+
+    egraph
+        .parse_and_run_program(None, r#"(keep-best "Target")"#)
+        .unwrap();
+
+    // After keep-best, Add table (not referenced by Target) should be empty.
+    // The Num table entry for 42 should be re-inserted (it's reachable via Target).
+    // Num 1 and Num 2 are not reachable from Target, so they should be gone.
+    assert_eq!(egraph.get_size("Add"), 0);
+    assert_eq!(egraph.get_size("Target"), 1);
+    assert_eq!(egraph.get_size("Num"), 1); // only Num 42 is kept
+}
+
 fn add_copy_backoff_program(egraph: &mut egglog::EGraph) {
     egraph
         .parse_and_run_program(
@@ -318,4 +395,62 @@ fn test_saturate_continues_until_scheduler_can_stop_after_no_progress_ban() {
         report.updated,
         "the eventual copy applications should be reported as database progress"
     );
+}
+
+#[test]
+fn test_schedule_call_prim() {
+    let mut egraph = egglog_experimental::new_experimental_egraph();
+
+    egraph
+        .parse_and_run_program(
+            None,
+            r#"
+        (datatype Math (Num i64) (Add Math Math))
+        (relation Target (Math))
+        (union (Num 2) (Add (Num 1) (Num 1)))
+        (Target (Num 2))
+        "#,
+        )
+        .unwrap();
+
+    // call-prim inside a run-schedule: evaluate a primitive expression
+    egraph
+        .parse_and_run_program(
+            None,
+            r#"
+        (run-schedule
+          (call-prim (get-size!)))
+        "#,
+        )
+        .unwrap();
+}
+
+#[test]
+fn test_schedule_user_defined_command() {
+    let mut egraph = egglog_experimental::new_experimental_egraph();
+
+    egraph
+        .parse_and_run_program(
+            None,
+            r#"
+        (datatype Math (Num i64) (Add Math Math))
+        (relation Target (Math))
+        (union (Num 2) (Add (Num 1) (Num 1)))
+        (Target (Num 2))
+        "#,
+        )
+        .unwrap();
+
+    // keep-best as a step inside run-schedule
+    egraph
+        .parse_and_run_program(
+            None,
+            r#"
+        (run-schedule
+          (keep-best "Target"))
+        "#,
+        )
+        .unwrap();
+
+    assert_eq!(egraph.get_size("Target"), 1);
 }
