@@ -265,7 +265,7 @@ fn only_run_report(outputs: &[CommandOutput]) -> &egglog_reports::RunReport {
 }
 
 #[test]
-fn test_backoff_run_schedule_should_not_report_progress_without_egraph_updates() {
+fn test_backoff_run_schedule_should_stay_unsaturated_while_only_banned_work_remains() {
     let mut egraph = egglog_experimental::new_experimental_egraph();
     add_copy_backoff_program(&mut egraph);
 
@@ -283,12 +283,8 @@ fn test_backoff_run_schedule_should_not_report_progress_without_egraph_updates()
     let report = only_run_report(&outputs);
     assert_eq!(egraph.get_size("S"), 0);
     assert!(
-        !report.updated,
-        "banning work in the scheduler is not database progress"
-    );
-    assert!(
-        !report.can_stop,
-        "the scheduler still has deferred work after the ban"
+        report.updated,
+        "banning work should keep the run unsaturated while deferred work remains"
     );
 }
 
@@ -317,5 +313,36 @@ fn test_saturate_continues_until_scheduler_can_stop_after_no_progress_ban() {
     assert!(
         report.updated,
         "the eventual copy applications should be reported as database progress"
+    );
+}
+
+#[test]
+fn test_backoff_scheduler_does_not_match_subsumed_rows() {
+    let mut egraph = egglog_experimental::new_experimental_egraph();
+
+    let outputs = egraph
+        .parse_and_run_program(
+            None,
+            r#"
+        (ruleset copy)
+        (relation R (i64))
+        (relation S (i64))
+        (R 0)
+        (R 1)
+        (subsume (R 0))
+        (subsume (R 1))
+        (rule ((R x)) ((S x)) :ruleset copy :name "copy")
+        (run-schedule
+          (let-scheduler bo (back-off :match-limit 100 :ban-length 3))
+          (run-with bo copy))
+        "#,
+        )
+        .unwrap();
+
+    let report = only_run_report(&outputs);
+    assert_eq!(egraph.get_size("S"), 0);
+    assert!(
+        !report.updated,
+        "subsumed rows should not be returned to custom scheduler matches"
     );
 }
