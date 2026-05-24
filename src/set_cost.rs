@@ -221,7 +221,7 @@ impl UserDefinedCommand for CustomExtract {
         &self,
         egraph: &mut EGraph,
         args: &[Expr],
-    ) -> Result<Option<CommandOutput>, egglog::Error> {
+    ) -> Result<Vec<CommandOutput>, egglog::Error> {
         assert!(args.len() <= 2);
         let (sort, value) = egraph.eval_expr(&args[0])?;
         let n = args.get(1).map(|arg| egraph.eval_expr(arg)).transpose()?;
@@ -252,7 +252,7 @@ impl UserDefinedCommand for CustomExtract {
                 if log_enabled!(log::Level::Info) {
                     log::info!("extracted with cost {cost}: {}", termdag.to_string(term));
                 }
-                Ok(Some(CommandOutput::ExtractBest(termdag, cost, term)))
+                Ok(vec![CommandOutput::ExtractBest(termdag, cost, term)])
             } else {
                 Err(Error::ExtractError(
                     "Unable to find any valid extraction (likely due to subsume or delete)"
@@ -269,7 +269,7 @@ impl UserDefinedCommand for CustomExtract {
                 .map(|e| e.1)
                 .collect();
             log::info!("extracted variants:");
-            Ok(Some(CommandOutput::ExtractVariants(termdag, terms)))
+            Ok(vec![CommandOutput::ExtractVariants(termdag, terms)])
         }
     }
 }

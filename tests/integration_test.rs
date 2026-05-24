@@ -398,7 +398,7 @@ fn test_saturate_continues_until_scheduler_can_stop_after_no_progress_ban() {
 }
 
 #[test]
-fn test_schedule_call_prim() {
+fn test_schedule_expr_eval() {
     let mut egraph = egglog_experimental::new_experimental_egraph();
 
     egraph
@@ -413,13 +413,13 @@ fn test_schedule_call_prim() {
         )
         .unwrap();
 
-    // call-prim inside a run-schedule: evaluate a primitive expression
+    // Direct expression evaluation as a schedule step (supersedes call-prim)
     egraph
         .parse_and_run_program(
             None,
             r#"
         (run-schedule
-          (call-prim (get-size!)))
+          (get-size!))
         "#,
         )
         .unwrap();
@@ -453,4 +453,168 @@ fn test_schedule_user_defined_command() {
         .unwrap();
 
     assert_eq!(egraph.get_size("Target"), 1);
+}
+
+#[test]
+fn test_schedule_repeat_push_pop_print_size() {
+    use egglog::CommandOutput;
+    let mut egraph = egglog_experimental::new_experimental_egraph();
+
+    // Commutativity and both directions of associativity for Add.
+    egraph
+        .parse_and_run_program(
+            None,
+            r#"
+        (datatype Math (Num i64) (Add Math Math))
+        (ruleset math-rules)
+        (rewrite (Add a b) (Add b a) :ruleset math-rules)
+        (rewrite (Add (Add a b) c) (Add a (Add b c)) :ruleset math-rules)
+        (rewrite (Add a (Add b c)) (Add (Add a b) c) :ruleset math-rules)
+        "#,
+        )
+        .unwrap();
+
+    // Each of 3 outer iterations:
+    //   1. push the current (fact-free) state
+    //   2. insert a sum-1-to-5 addition chain as a schedule action
+    //   3. repeat 5 times: run math-rules one step, then print-size
+    //   4. pop back to the fact-free state
+    //
+    // print-size fires inside the inner repeat, so each outer iteration
+    // emits 5 PrintAllFunctionsSize outputs — 15 total.
+    let outputs = egraph
+        .parse_and_run_program(
+            None,
+            r#"
+        (run-schedule
+          (repeat 3
+            (push)
+            (Add (Add (Add (Add (Num 1) (Num 2)) (Num 3)) (Num 4)) (Num 5))
+            (repeat 5
+              (run math-rules)
+              (print-size))
+            (pop)))
+        "#,
+        )
+        .unwrap();
+
+    // 3 outer iterations × 5 inner steps = 15 PrintAllFunctionsSize outputs,
+    // followed by a single RunSchedule.
+    let print_size_outputs: Vec<_> = outputs
+        .iter()
+        .filter(|o| matches!(o, CommandOutput::PrintAllFunctionsSize(_)))
+        .collect();
+    assert_eq!(
+        print_size_outputs.len(),
+        15,
+        "expected 3 × 5 = 15 print-size outputs, got {}",
+        print_size_outputs.len()
+    );
+
+    let add_sizes: Vec<usize> = print_size_outputs
+        .into_iter()
+        .map(|o| match o {
+            CommandOutput::PrintAllFunctionsSize(v) => {
+                let add = v.iter().find(|(n, _)| n == "Add").map(|(_, s)| *s).unwrap();
+                let num = v.iter().find(|(n, _)| n == "Num").map(|(_, s)| *s).unwrap();
+                // Num is always 5 (one per distinct literal, shared via e-class).
+                assert_eq!(num, 5, "Num size should stay at 5");
+                add
+            }
+            _ => unreachable!(),
+        })
+        .collect();
+
+    // Expected Add sizes after each of the 5 rule steps, measured within a
+    // single outer iteration (the push/pop makes all three groups identical).
+    let expected = [14, 50, 137, 182, 180];
+    for group in 0..3 {
+        for step in 0..5 {
+            assert_eq!(
+                add_sizes[group * 5 + step],
+                expected[step],
+                "outer iteration {group}, inner step {step}: unexpected Add size"
+            );
+        }
+    }
+
+    // The last output is always the RunSchedule report.
+    assert!(
+        matches!(outputs.last().unwrap(), CommandOutput::RunSchedule(_)),
+        "last output must be RunSchedule"
+    );
+
+    // After the repeat the pop has unwound all facts — the e-graph is back to
+    // the state it had after defining the datatype (no concrete tuples).
+    assert_eq!(egraph.get_size("Add"), 0);
+    assert_eq!(egraph.get_size("Num"), 0);
+}
+
+#[test]
+fn test_schedule_commands_and_actions() {
+    use egglog::CommandOutput;
+    let mut egraph = egglog_experimental::new_experimental_egraph();
+
+    egraph
+        .parse_and_run_program(
+            None,
+            r#"
+        (datatype Math (Num i64) (Add Math Math))
+        (relation Target (Math))
+        (union (Num 2) (Add (Num 1) (Num 1)))
+        (Target (Num 2))
+        "#,
+        )
+        .unwrap();
+
+    // print-size inside run-schedule returns a CommandOutput::PrintFunctionSize
+    let outputs = egraph
+        .parse_and_run_program(
+            None,
+            r#"
+        (run-schedule
+          (print-size Target))
+        "#,
+        )
+        .unwrap();
+
+    // outputs should be: [PrintFunctionSize(...), RunSchedule(report)]
+    assert!(outputs.len() >= 2, "expected at least 2 outputs, got {}", outputs.len());
+    assert!(matches!(outputs[0], CommandOutput::PrintFunctionSize(_)));
+    assert!(matches!(outputs.last().unwrap(), CommandOutput::RunSchedule(_)));
+
+    // extract inside run-schedule
+    let outputs = egraph
+        .parse_and_run_program(
+            None,
+            r#"
+        (run-schedule
+          (extract (Num 2) 0))
+        "#,
+        )
+        .unwrap();
+    assert!(outputs.iter().any(|o| matches!(o, CommandOutput::ExtractBest(..))));
+
+    // union as a schedule step
+    egraph
+        .parse_and_run_program(
+            None,
+            r#"
+        (run-schedule
+          (union (Num 1) (Num 2)))
+        "#,
+        )
+        .unwrap();
+
+    // push/pop as schedule steps
+    egraph
+        .parse_and_run_program(
+            None,
+            r#"
+        (run-schedule
+          (push)
+          (pop))
+        "#,
+        )
+        .unwrap();
 }

@@ -56,7 +56,7 @@ impl<
     CM: CostModel<C> + Clone + Send + Sync + 'static,
 > UserDefinedCommand for MultiExtract<C, CM>
 {
-    fn update(&self, egraph: &mut EGraph, args: &[Expr]) -> Result<Option<CommandOutput>, Error> {
+    fn update(&self, egraph: &mut EGraph, args: &[Expr]) -> Result<Vec<CommandOutput>, Error> {
         assert!(args.len() >= 2);
 
         let (variants_sort, variants_value) = egraph.eval_expr(&args[0])?;
@@ -105,8 +105,8 @@ impl<
             );
         }
 
-        Ok(Some(CommandOutput::UserDefined(std::sync::Arc::from(
+        Ok(vec![CommandOutput::UserDefined(std::sync::Arc::from(
             MultiExtractOutput { termdag, terms },
-        ))))
+        ))])
     }
 }

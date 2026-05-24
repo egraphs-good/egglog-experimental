@@ -19,7 +19,7 @@ use egglog::{
 pub struct KeepBestCommand;
 
 impl UserDefinedCommand for KeepBestCommand {
-    fn update(&self, egraph: &mut EGraph, args: &[Expr]) -> Result<Option<CommandOutput>, Error> {
+    fn update(&self, egraph: &mut EGraph, args: &[Expr]) -> Result<Vec<CommandOutput>, Error> {
         // Step 1: evaluate each argument to a table name string.
         let table_names: Vec<String> = args
             .iter()
@@ -73,7 +73,7 @@ impl UserDefinedCommand for KeepBestCommand {
             }
         });
 
-        Ok(None)
+        Ok(vec![])
     }
 }
 

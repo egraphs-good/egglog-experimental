@@ -2,7 +2,7 @@ use std::{collections::HashMap, sync::Mutex};
 
 use egglog::{
     CommandOutput, UserDefinedCommand,
-    ast::{Command, Expr, Fact, Literal, ParseError},
+    ast::{Action, Change, Command, Expr, Fact, Literal, ParseError, PrintFunctionMode},
     prelude::run_ruleset,
     scheduler::{Scheduler, SchedulerId},
 };
@@ -44,7 +44,11 @@ impl ScheduleState {
     // - the same condition may be compiled and type checked multiple times
     // - the logging information may show that multiple schedules are run, but they
     //   are actually the same schedule.
-    fn run(&mut self, egraph: &mut egglog::EGraph, arg: &Expr) -> Result<RunReport, egglog::Error> {
+    fn run(
+        &mut self,
+        egraph: &mut egglog::EGraph,
+        arg: &Expr,
+    ) -> Result<(Vec<CommandOutput>, RunReport), egglog::Error> {
         let err = || {
             Err(egglog::Error::ParseError(ParseError(
                 arg.span(),
@@ -56,7 +60,7 @@ impl ScheduleState {
             let output = run_ruleset(egraph, ruleset.as_str())?;
             assert!(output.len() == 1);
             if let CommandOutput::RunSchedule(report) = &output[0] {
-                return Ok(report.clone());
+                return Ok((vec![], report.clone()));
             }
             panic!("Expected a RunSchedule, got {:?}", output[0]);
         }
@@ -68,11 +72,18 @@ impl ScheduleState {
         macro_rules! new_scope {
             ($f:expr) => {{
                 let curr_scope = self.schedulers.len();
-                let res: Result<RunReport, egglog::Error> = $f();
+                let res: Result<(Vec<CommandOutput>, RunReport), egglog::Error> = $f();
                 self.schedulers.truncate(curr_scope);
                 res
             }};
         }
+
+        // Run a single Command via run_program and return (outputs, empty RunReport).
+        let run_cmd =
+            |egraph: &mut egglog::EGraph, cmd: Command| -> Result<(Vec<CommandOutput>, RunReport), egglog::Error> {
+                let outputs = egraph.run_program(vec![cmd])?;
+                Ok((outputs, RunReport::default()))
+            };
 
         match head.as_str() {
             "let-scheduler" => match exprs.as_slice() {
@@ -87,7 +98,7 @@ impl ScheduleState {
                         (scheduler_libs.lock().unwrap().get(scheduler_name).unwrap())(egraph, args);
                     let id = egraph.add_scheduler(scheduler);
                     self.schedulers.push((name.clone(), id));
-                    Ok(RunReport::default())
+                    Ok((vec![], RunReport::default()))
                 }
                 _ => err(),
             },
@@ -128,89 +139,206 @@ impl ScheduleState {
                         .run_program(vec![Command::Check(span, vec![Fact::Fact(until)])])
                         .is_ok()
                     {
-                        return Ok(RunReport::default());
+                        return Ok((vec![], RunReport::default()));
                     }
                 }
 
-                if let Some(scheduler) = scheduler {
-                    egraph.step_rules_with_scheduler(scheduler, ruleset)
+                let report = if let Some(scheduler) = scheduler {
+                    egraph.step_rules_with_scheduler(scheduler, ruleset)?
                 } else {
-                    // Running the ruleset
-                    egraph.step_rules(ruleset)
-                }
+                    egraph.step_rules(ruleset)?
+                };
+                Ok((vec![], report))
             }
             "saturate" => {
+                let mut all_outputs: Vec<CommandOutput> = vec![];
                 let mut report = RunReport::default();
                 loop {
-                    let iter_report = new_scope!(|| {
+                    let (iter_outputs, iter_report) = new_scope!(|| {
+                        let mut iter_outputs: Vec<CommandOutput> = vec![];
                         let mut iter_report = RunReport::default();
                         for expr in exprs {
-                            let res = self.run(egraph, expr)?;
-                            iter_report.union(res);
+                            let (step_outputs, step_report) = self.run(egraph, expr)?;
+                            iter_outputs.extend(step_outputs);
+                            iter_report.union(step_report);
                         }
-                        Ok(iter_report)
+                        Ok((iter_outputs, iter_report))
                     })?;
                     let should_stop = iter_report.can_stop;
+                    all_outputs.extend(iter_outputs);
                     report.union(iter_report);
                     if should_stop {
                         break;
                     }
                 }
-                Ok(report)
+                Ok((all_outputs, report))
             }
             "seq" => {
                 new_scope!(|| {
+                    let mut all_outputs: Vec<CommandOutput> = vec![];
                     let mut report = RunReport::default();
                     for expr in exprs {
-                        // Recursively run each expression in the sequence
-                        let res = self.run(egraph, expr)?;
-                        report.union(res);
+                        let (step_outputs, step_report) = self.run(egraph, expr)?;
+                        all_outputs.extend(step_outputs);
+                        report.union(step_report);
                     }
-                    Ok(report)
+                    Ok((all_outputs, report))
                 })
             }
-            "repeat" => {
-                match exprs.as_slice() {
-                    [Expr::Lit(_span, Literal::Int(n)), rest @ ..] => {
-                        let mut report = RunReport::default();
-                        for _ in 0..*n {
-                            let sub_report = new_scope!(|| {
-                                let mut report = RunReport::default();
-                                // Recursively run the rest of the expressions
-                                for expr in rest {
-                                    let res = self.run(egraph, expr)?;
-                                    report.union(res);
-                                }
-                                Ok(report)
-                            })?;
-                            report.union(sub_report);
-                        }
-                        Ok(report)
+            "repeat" => match exprs.as_slice() {
+                [Expr::Lit(_span, Literal::Int(n)), rest @ ..] => {
+                    let mut all_outputs: Vec<CommandOutput> = vec![];
+                    let mut report = RunReport::default();
+                    for _ in 0..*n {
+                        let (iter_outputs, iter_report) = new_scope!(|| {
+                            let mut iter_outputs: Vec<CommandOutput> = vec![];
+                            let mut iter_report = RunReport::default();
+                            for expr in rest {
+                                let (step_outputs, step_report) = self.run(egraph, expr)?;
+                                iter_outputs.extend(step_outputs);
+                                iter_report.union(step_report);
+                            }
+                            Ok((iter_outputs, iter_report))
+                        })?;
+                        all_outputs.extend(iter_outputs);
+                        report.union(iter_report);
                     }
-                    _ => err(),
+                    Ok((all_outputs, report))
                 }
-            }
-            "call-prim" => match exprs.as_slice() {
-                [inner] => {
-                    egraph.eval_expr(inner)?;
-                    Ok(RunReport::default())
+                _ => err(),
+            },
+            // print-size: (print-size) or (print-size FuncName)
+            "print-size" => match exprs.as_slice() {
+                [] => run_cmd(egraph, Command::PrintSize(span.clone(), None)),
+                [Expr::Var(_, name)] => {
+                    run_cmd(egraph, Command::PrintSize(span.clone(), Some(name.clone())))
                 }
+                _ => err(),
+            },
+            // print-function: (print-function FuncName) or (print-function FuncName n)
+            "print-function" => match exprs.as_slice() {
+                [Expr::Var(_, name)] => run_cmd(
+                    egraph,
+                    Command::PrintFunction(
+                        span.clone(),
+                        name.clone(),
+                        None,
+                        None,
+                        PrintFunctionMode::Default,
+                    ),
+                ),
+                [Expr::Var(_, name), Expr::Lit(_, Literal::Int(n))] => run_cmd(
+                    egraph,
+                    Command::PrintFunction(
+                        span.clone(),
+                        name.clone(),
+                        Some(*n as usize),
+                        None,
+                        PrintFunctionMode::Default,
+                    ),
+                ),
+                _ => err(),
+            },
+            // extract: (extract expr) or (extract expr n)
+            "extract" => match exprs.as_slice() {
+                [expr] => run_cmd(
+                    egraph,
+                    Command::Extract(
+                        span.clone(),
+                        expr.clone(),
+                        Expr::Lit(span.clone(), Literal::Int(0)),
+                    ),
+                ),
+                [expr, n] => run_cmd(
+                    egraph,
+                    Command::Extract(span.clone(), expr.clone(), n.clone()),
+                ),
+                _ => err(),
+            },
+            // push: (push) or (push n)
+            "push" => match exprs.as_slice() {
+                [] => run_cmd(egraph, Command::Push(1)),
+                [Expr::Lit(_, Literal::Int(n))] => run_cmd(egraph, Command::Push(*n as usize)),
+                _ => err(),
+            },
+            // pop: (pop) or (pop n)
+            "pop" => match exprs.as_slice() {
+                [] => run_cmd(egraph, Command::Pop(span.clone(), 1)),
+                [Expr::Lit(_, Literal::Int(n))] => {
+                    run_cmd(egraph, Command::Pop(span.clone(), *n as usize))
+                }
+                _ => err(),
+            },
+            // Non-let actions
+            "union" => match exprs.as_slice() {
+                [a, b] => run_cmd(
+                    egraph,
+                    Command::Action(Action::Union(span.clone(), a.clone(), b.clone())),
+                ),
+                _ => err(),
+            },
+            "set" => match exprs.as_slice() {
+                [Expr::Call(_, f, args), rhs] => run_cmd(
+                    egraph,
+                    Command::Action(Action::Set(
+                        span.clone(),
+                        f.clone(),
+                        args.clone(),
+                        rhs.clone(),
+                    )),
+                ),
+                _ => err(),
+            },
+            "delete" => match exprs.as_slice() {
+                [Expr::Call(_, f, args)] => run_cmd(
+                    egraph,
+                    Command::Action(Action::Change(
+                        span.clone(),
+                        Change::Delete,
+                        f.clone(),
+                        args.clone(),
+                    )),
+                ),
+                _ => err(),
+            },
+            "subsume" => match exprs.as_slice() {
+                [Expr::Call(_, f, args)] => run_cmd(
+                    egraph,
+                    Command::Action(Action::Change(
+                        span.clone(),
+                        Change::Subsume,
+                        f.clone(),
+                        args.clone(),
+                    )),
+                ),
+                _ => err(),
+            },
+            "panic" => match exprs.as_slice() {
+                [Expr::Lit(_, Literal::String(msg))] => run_cmd(
+                    egraph,
+                    Command::Action(Action::Panic(span.clone(), msg.clone())),
+                ),
                 _ => err(),
             },
             _ => {
                 if egraph.has_command(head) {
-                    let output = egraph.run_user_defined_command(head, exprs)?;
-                    let report = if let Some(CommandOutput::RunSchedule(r)) = output {
-                        r
-                    } else {
-                        RunReport::default()
-                    };
-                    Ok(report)
+                    let cmd_outputs = egraph.run_user_defined_command(head, exprs)?;
+                    let mut report = RunReport::default();
+                    let mut outputs = Vec::new();
+                    for output in cmd_outputs {
+                        if let CommandOutput::RunSchedule(r) = output {
+                            report.union(r);
+                        } else {
+                            outputs.push(output);
+                        }
+                    }
+                    Ok((outputs, report))
                 } else {
-                    Err(egglog::Error::ParseError(ParseError(
-                        span.clone(),
-                        format!("Invalid schedule step: {head}"),
-                    )))
+                    // General expression evaluation (supersedes call-prim)
+                    run_cmd(
+                        egraph,
+                        Command::Action(Action::Expr(span.clone(), arg.clone())),
+                    )
                 }
             }
         }
@@ -222,13 +350,17 @@ impl UserDefinedCommand for RunExtendedSchedule {
         &self,
         egraph: &mut egglog::EGraph,
         args: &[Expr],
-    ) -> Result<Option<CommandOutput>, egglog::Error> {
+    ) -> Result<Vec<CommandOutput>, egglog::Error> {
         let mut schedule = ScheduleState::new();
         let mut report = RunReport::default();
+        let mut outputs: Vec<CommandOutput> = Vec::new();
         for arg in args {
-            report.union(schedule.run(egraph, arg)?);
+            let (step_outputs, step_report) = schedule.run(egraph, arg)?;
+            outputs.extend(step_outputs);
+            report.union(step_report);
         }
-        Ok(Some(CommandOutput::RunSchedule(report)))
+        outputs.push(CommandOutput::RunSchedule(report));
+        Ok(outputs)
     }
 }
 
