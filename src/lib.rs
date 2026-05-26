@@ -20,10 +20,9 @@
 //!   Body variables are positional (`_0`, `_1`, ...), and a partial primitive
 //!   body result propagates as primitive failure. The registered primitive uses
 //!   the minimum capability needed by its body (`pure`, `read`, `write`, or
-//!   `full`). Bodies may call built-in or previously registered primitives, but
-//!   they may not call or capture table-backed functions, nor accept or return
-//!   function-container sorts, because those reads are hidden from seminaive
-//!   rule dependency analysis.
+//!   `full`). Bodies may call built-in or previously registered primitives and
+//!   table-backed functions; applying those primitives is allowed only in a
+//!   compatible runtime context.
 //!
 //! Each bullet links to a runnable demo so you can explore the feature quickly.
 //! The rest of this crate exposes the Rust APIs and helpers that back these extensions.

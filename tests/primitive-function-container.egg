@@ -1,0 +1,8 @@
+(sort IntToInt (UnstableFn (i64) i64))
+(function f (i64) i64 :no-merge)
+
+(primitive apply-fn (IntToInt i64) i64 (unstable-app _0 _1))
+
+(set (f 1) 9)
+(let $f (unstable-fn "f"))
+(check (= (apply-fn $f 1) 9))

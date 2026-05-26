@@ -1,13 +1,12 @@
-use egglog::ast::{Expr, Literal};
+use egglog::ast::{Expr, FunctionSubtype, Literal};
 use egglog::constraint::SimpleTypeConstraint;
 use egglog::prelude::Span;
-use egglog::sort::{FunctionContainer, literal_sort};
+use egglog::sort::literal_sort;
 use egglog::{
     ArcSort, CommandOutput, Context, Core, EGraph, Error, FullPrim, FullState, Primitive, PurePrim,
     PureState, ReadPrim, ReadState, ResolvedCall, ResolvedExpr, TypeError, UserDefinedCommand,
     Value, WritePrim, WriteState,
 };
-use std::any::TypeId;
 
 pub struct RegisterPrimitive;
 
@@ -24,7 +23,6 @@ impl UserDefinedCommand for RegisterPrimitive {
         ensure_name_available(egraph, &name, &name_span)?;
 
         let input_sort_names = decode_input_sort_names(&args[1])?;
-        validate_positional_vars(&args[3], input_sort_names.len())?;
 
         let input_sorts = input_sort_names
             .iter()
@@ -32,28 +30,13 @@ impl UserDefinedCommand for RegisterPrimitive {
             .collect::<Result<Vec<_>, _>>()?;
         let (output_span, output_name) = decode_atom(&args[2], "output sort")?;
         let output_sort = resolve_sort(egraph, &output_name, &output_span)?;
-        for sort in &input_sorts {
-            reject_function_container_sort(
-                sort,
-                &args[1].span(),
-                "input",
-                "function-container inputs can carry table-backed functions whose reads are hidden from seminaive scheduling",
-            )?;
-        }
-        reject_function_container_sort(
-            &output_sort,
-            &output_span,
-            "output",
-            "function-container outputs can later carry table-backed functions whose reads are hidden from seminaive scheduling",
-        )?;
 
         let bindings: Vec<_> = input_sorts
             .iter()
             .enumerate()
             .map(|(index, sort)| (format!("_{index}"), args[3].span(), sort.clone()))
             .collect();
-        let (body, capability) = typecheck_body(egraph, &args[3], &bindings, output_sort.clone())?;
-        validate_resolved_body(&body)?;
+        let (body, context) = typecheck_body(egraph, &args[3], &bindings, output_sort.clone())?;
         // The core output-context typecheck constrains overload resolution, but
         // currently still accepts some literal/container mismatches.
         // Keep this explicit check for the final declared primitive output sort.
@@ -69,15 +52,16 @@ impl UserDefinedCommand for RegisterPrimitive {
 
         let primitive = DefinedPrimitive {
             name,
+            input_vars: bindings.iter().map(|(name, _, _)| name.clone()).collect(),
             input: input_sorts,
             output: output_sort,
             body,
         };
-        match capability {
-            PrimitiveCapability::Pure => egraph.add_pure_primitive(primitive, None),
-            PrimitiveCapability::Read => egraph.add_read_primitive(primitive, None),
-            PrimitiveCapability::Write => egraph.add_write_primitive(primitive, None),
-            PrimitiveCapability::Full => egraph.add_full_primitive(primitive, None),
+        match context {
+            Context::Pure => egraph.add_pure_primitive(primitive, None),
+            Context::Read => egraph.add_read_primitive(primitive, None),
+            Context::Write => egraph.add_write_primitive(primitive, None),
+            Context::Full => egraph.add_full_primitive(primitive, None),
         }
         Ok(None)
     }
@@ -86,6 +70,7 @@ impl UserDefinedCommand for RegisterPrimitive {
 #[derive(Clone)]
 struct DefinedPrimitive {
     name: String,
+    input_vars: Vec<String>,
     input: Vec<ArcSort>,
     output: ArcSort,
     body: ResolvedExpr,
@@ -105,44 +90,40 @@ impl Primitive for DefinedPrimitive {
 
 impl PurePrim for DefinedPrimitive {
     fn apply<'a, 'db>(&self, mut state: PureState<'a, 'db>, args: &[Value]) -> Option<Value> {
-        eval_resolved_expr(&mut state, &self.body, args)
+        self.eval(&mut state, args)
     }
 }
 
 impl ReadPrim for DefinedPrimitive {
     fn apply<'a, 'db>(&self, mut state: ReadState<'a, 'db>, args: &[Value]) -> Option<Value> {
-        eval_resolved_expr(&mut state, &self.body, args)
+        self.eval(&mut state, args)
     }
 }
 
 impl WritePrim for DefinedPrimitive {
     fn apply<'a, 'db>(&self, mut state: WriteState<'a, 'db>, args: &[Value]) -> Option<Value> {
-        eval_resolved_expr(&mut state, &self.body, args)
+        self.eval(&mut state, args)
     }
 }
 
 impl FullPrim for DefinedPrimitive {
     fn apply<'a, 'db>(&self, mut state: FullState<'a, 'db>, args: &[Value]) -> Option<Value> {
-        eval_resolved_expr(&mut state, &self.body, args)
+        self.eval(&mut state, args)
     }
 }
 
-#[derive(Clone, Copy)]
-enum PrimitiveCapability {
-    Pure,
-    Read,
-    Write,
-    Full,
-}
-
-impl PrimitiveCapability {
-    fn context(self) -> Context {
-        match self {
-            Self::Pure => Context::Pure,
-            Self::Read => Context::Read,
-            Self::Write => Context::Write,
-            Self::Full => Context::Full,
-        }
+impl DefinedPrimitive {
+    fn eval<'a, 'db>(&self, state: &mut impl Core<'a, 'db>, args: &[Value]) -> Option<Value>
+    where
+        'db: 'a,
+    {
+        let bindings: Vec<_> = self
+            .input_vars
+            .iter()
+            .map(String::as_str)
+            .zip(args.iter().copied())
+            .collect();
+        state.eval_resolved_expr(&self.body, &bindings)
     }
 }
 
@@ -183,38 +164,6 @@ fn decode_input_sort_names(expr: &Expr) -> Result<Vec<(Span, String)>, Error> {
     }
 }
 
-fn validate_positional_vars(body: &Expr, arity: usize) -> Result<(), Error> {
-    let mut failure = None;
-    body.visit_vars(&mut |span, name| {
-        if failure.is_some() {
-            return;
-        }
-        let Some(index) = parse_positional_index(name) else {
-            failure = Some(backend_error(
-                span.clone(),
-                format!(
-                    "primitive body variables must be positional (_0, _1, ...), found `{name}`"
-                ),
-            ));
-            return;
-        };
-        if index >= arity {
-            failure = Some(backend_error(
-                span.clone(),
-                format!("primitive body variable `{name}` is out of range for arity {arity}"),
-            ));
-        }
-    });
-    match failure {
-        Some(err) => Err(err),
-        None => Ok(()),
-    }
-}
-
-fn parse_positional_index(name: &str) -> Option<usize> {
-    name.strip_prefix('_')?.parse().ok()
-}
-
 fn ensure_name_available(egraph: &mut EGraph, name: &str, span: &Span) -> Result<(), Error> {
     if egraph.get_sort_by_name(name).is_some() {
         return Err(TypeError::SortAlreadyBound(name.to_owned(), span.clone()).into());
@@ -235,141 +184,28 @@ fn resolve_sort(egraph: &EGraph, name: &str, span: &Span) -> Result<ArcSort, Err
         .ok_or_else(|| TypeError::UndefinedSort(name.to_owned(), span.clone()).into())
 }
 
-fn reject_function_container_sort(
-    sort: &ArcSort,
-    span: &Span,
-    role: &str,
-    reason: &str,
-) -> Result<(), Error> {
-    if sort_contains_function_container(sort) {
-        Err(backend_error(
-            span.clone(),
-            format!(
-                "primitive {role} sort `{}` is not seminaive-safe: {reason}",
-                sort.name()
-            ),
-        ))
-    } else {
-        Ok(())
-    }
-}
-
-fn sort_contains_function_container(sort: &ArcSort) -> bool {
-    sort.value_type() == Some(TypeId::of::<FunctionContainer>())
-        || (sort.is_container_sort()
-            && sort
-                .inner_sorts()
-                .iter()
-                .any(sort_contains_function_container))
-}
-
 fn typecheck_body(
     egraph: &mut EGraph,
     body: &Expr,
     bindings: &[(String, Span, ArcSort)],
     output_sort: ArcSort,
-) -> Result<(ResolvedExpr, PrimitiveCapability), TypeError> {
+) -> Result<(ResolvedExpr, Context), TypeError> {
     let mut last_error = None;
-    for capability in [
-        PrimitiveCapability::Pure,
-        PrimitiveCapability::Read,
-        PrimitiveCapability::Write,
-        PrimitiveCapability::Full,
-    ] {
+    for context in [Context::Pure, Context::Read, Context::Write, Context::Full] {
         match egraph.typecheck_expr_with_bindings_and_output(
             body,
             bindings,
             output_sort.clone(),
-            capability.context(),
+            context,
         ) {
-            Ok(resolved) => return Ok((resolved, capability)),
+            Ok(resolved) if required_context(&resolved).is_allowed_in(context) => {
+                return Ok((resolved, context));
+            }
+            Ok(_) => {}
             Err(err) => last_error = Some(err),
         }
     }
     Err(last_error.expect("primitive body typechecking always tries at least one context"))
-}
-
-fn validate_resolved_body(expr: &ResolvedExpr) -> Result<(), Error> {
-    match expr {
-        ResolvedExpr::Lit(_, _) => Ok(()),
-        ResolvedExpr::Var(span, resolved_var) => {
-            if parse_positional_index(&resolved_var.name).is_some() {
-                Ok(())
-            } else {
-                Err(backend_error(
-                    span.clone(),
-                    format!(
-                        "primitive body variables must be positional (_0, _1, ...), found `{}`",
-                        resolved_var.name
-                    ),
-                ))
-            }
-        }
-        ResolvedExpr::Call(_, ResolvedCall::Primitive(primitive), children) => {
-            children.iter().try_for_each(validate_resolved_body)?;
-            for sort in primitive.input() {
-                if sort_contains_function_container(sort) {
-                    return Err(backend_error(
-                        expr.span(),
-                        format!(
-                            "primitive body call to `{}` is not seminaive-safe: function-container arguments can carry table-backed functions whose reads are hidden from rule dependency analysis",
-                            primitive.name()
-                        ),
-                    ));
-                }
-            }
-            if sort_contains_function_container(primitive.output()) {
-                return Err(backend_error(
-                    expr.span(),
-                    format!(
-                        "primitive body call to `{}` is not seminaive-safe: primitive bodies may not produce function-container values",
-                        primitive.name()
-                    ),
-                ));
-            }
-            Ok(())
-        }
-        ResolvedExpr::Call(span, ResolvedCall::Func(func), _) => Err(backend_error(
-            span.clone(),
-            format!(
-                "primitive body call to table-backed function `{}` is not seminaive-safe: rule dependency analysis cannot see reads performed inside primitive bodies",
-                func.name
-            ),
-        )),
-    }
-}
-
-fn eval_resolved_expr<'a, 'db>(
-    state: &mut impl Core<'a, 'db>,
-    expr: &ResolvedExpr,
-    args: &[Value],
-) -> Option<Value>
-where
-    'db: 'a,
-{
-    match expr {
-        ResolvedExpr::Lit(_, literal) => Some(match literal {
-            Literal::Int(x) => state.base_values().get::<i64>(*x),
-            Literal::Float(x) => state.base_values().get::<egglog::sort::F>(x.into()),
-            Literal::String(x) => state
-                .base_values()
-                .get::<egglog::sort::S>(egglog::sort::S::new(x.clone())),
-            Literal::Bool(x) => state.base_values().get::<bool>(*x),
-            Literal::Unit => state.base_values().get::<()>(()),
-        }),
-        ResolvedExpr::Var(_, resolved_var) => {
-            let index = parse_positional_index(&resolved_var.name)?;
-            args.get(index).copied()
-        }
-        ResolvedExpr::Call(_, ResolvedCall::Primitive(primitive), children) => {
-            let values = children
-                .iter()
-                .map(|child| eval_resolved_expr(state, child, args))
-                .collect::<Option<Vec<_>>>()?;
-            state.apply_primitive(primitive, &values)
-        }
-        ResolvedExpr::Call(_, ResolvedCall::Func(_), _) => None,
-    }
 }
 
 fn resolved_expr_output_sort(expr: &ResolvedExpr) -> ArcSort {
@@ -377,6 +213,54 @@ fn resolved_expr_output_sort(expr: &ResolvedExpr) -> ArcSort {
         ResolvedExpr::Lit(_, literal) => literal_sort(literal),
         ResolvedExpr::Var(_, resolved_var) => resolved_var.sort.clone(),
         ResolvedExpr::Call(_, resolved_call, _) => resolved_call.output().clone(),
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RequiredContext {
+    Pure,
+    Read,
+    Write,
+    Full,
+}
+
+impl RequiredContext {
+    fn combine(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::Full, _) | (_, Self::Full) => Self::Full,
+            (Self::Read, Self::Write) | (Self::Write, Self::Read) => Self::Full,
+            (Self::Read, _) | (_, Self::Read) => Self::Read,
+            (Self::Write, _) | (_, Self::Write) => Self::Write,
+            (Self::Pure, Self::Pure) => Self::Pure,
+        }
+    }
+
+    fn is_allowed_in(self, context: Context) -> bool {
+        match self {
+            Self::Pure => true,
+            Self::Read => matches!(context, Context::Read | Context::Full),
+            Self::Write => matches!(context, Context::Write | Context::Full),
+            Self::Full => matches!(context, Context::Full),
+        }
+    }
+}
+
+fn required_context(expr: &ResolvedExpr) -> RequiredContext {
+    match expr {
+        ResolvedExpr::Lit(_, _) | ResolvedExpr::Var(_, _) => RequiredContext::Pure,
+        ResolvedExpr::Call(_, resolved_call, children) => {
+            let call_context = match resolved_call {
+                ResolvedCall::Primitive(_) => RequiredContext::Pure,
+                ResolvedCall::Func(func) => match func.subtype {
+                    FunctionSubtype::Constructor => RequiredContext::Write,
+                    FunctionSubtype::Custom => RequiredContext::Read,
+                },
+            };
+            children
+                .iter()
+                .map(required_context)
+                .fold(call_context, RequiredContext::combine)
+        }
     }
 }
 
