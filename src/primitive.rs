@@ -54,6 +54,9 @@ impl UserDefinedCommand for RegisterPrimitive {
             .collect();
         let (body, capability) = typecheck_body(egraph, &args[3], &bindings, output_sort.clone())?;
         validate_resolved_body(&body)?;
+        // The core output-context typecheck constrains overload resolution, but
+        // currently still accepts some literal/container mismatches.
+        // Keep this explicit check for the final declared primitive output sort.
         let body_output = resolved_expr_output_sort(&body);
         if body_output.name() != output_sort.name() {
             return Err(TypeError::Mismatch {
