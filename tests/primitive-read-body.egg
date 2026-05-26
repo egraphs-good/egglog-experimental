@@ -1,0 +1,7 @@
+(datatype Foo (MkFoo i64))
+
+(primitive foo-size () i64 (get-size! "MkFoo"))
+(check (= (foo-size) 0))
+
+(MkFoo 1)
+(check (= (foo-size) 1))

@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use egglog::{
+    CommandOutput,
     ast::{Expr, Literal},
     prelude::{RustSpan, Span},
 };
@@ -236,4 +237,191 @@ fn test_multi_extract_with_set_cost() {
     assert!(output.contains("(Add (Num 5) (Num 5))"));
     assert!(output.contains("(Add (Num 3) (Num 3))"));
     assert!(!output.contains("Mul"));
+}
+
+#[test]
+fn test_extract_missing_expression_returns_error_instead_of_panicking() {
+    let mut egraph = egglog_experimental::new_experimental_egraph();
+
+    let err = egraph.parse_and_run_program(None, "(extract)").unwrap_err();
+
+    assert!(
+        err.to_string()
+            .contains("extract expects an expression and optional variant count")
+    );
+}
+
+#[test]
+fn test_extract_extra_arguments_return_error_instead_of_panicking() {
+    let mut egraph = egglog_experimental::new_experimental_egraph();
+
+    let err = egraph
+        .parse_and_run_program(None, "(extract 0 1 2)")
+        .unwrap_err();
+
+    assert!(
+        err.to_string()
+            .contains("extract expects at most two arguments")
+    );
+}
+
+#[test]
+fn test_extract_negative_variants_returns_error_instead_of_panicking() {
+    let mut egraph = egglog_experimental::new_experimental_egraph();
+
+    egraph
+        .parse_and_run_program(None, "(datatype E (Num i64))")
+        .unwrap();
+
+    let err = egraph
+        .parse_and_run_program(None, "(extract (Num 1) -1)")
+        .unwrap_err();
+
+    assert!(err.to_string().contains("negative number of variants"));
+}
+
+#[test]
+fn test_extract_zero_variants_preserves_best_extract_behavior() {
+    let mut egraph = egglog_experimental::new_experimental_egraph();
+
+    let result = egraph
+        .parse_and_run_program(
+            None,
+            "
+        (with-dynamic-cost
+            (datatype E (Add E E :cost 10) (Num i64 :cost 1))
+        )
+        (union (Num 2) (Add (Num 1) (Num 1)))
+        (extract (Num 2) 0)",
+        )
+        .unwrap();
+
+    assert_eq!(result.len(), 1);
+    assert_eq!(result[0].to_string(), "(Num 2)\n");
+}
+
+#[test]
+fn test_multi_extract_bad_arity_returns_error_instead_of_panicking() {
+    for program in ["(multi-extract)", "(multi-extract 1)"] {
+        let mut egraph = egglog_experimental::new_experimental_egraph();
+
+        let err = egraph.parse_and_run_program(None, program).unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("multi-extract expects at least a variant count and one expression"),
+            "unexpected error for {program}: {err}"
+        );
+    }
+}
+
+fn add_copy_backoff_program(egraph: &mut egglog::EGraph) {
+    egraph
+        .parse_and_run_program(
+            None,
+            r#"
+        (ruleset copy)
+        (relation R (i64))
+        (relation S (i64))
+        (R 0)
+        (R 1)
+        (R 2)
+        (R 3)
+        (rule ((R x)) ((S x)) :ruleset copy :name "copy")
+        "#,
+        )
+        .unwrap();
+}
+
+fn only_run_report(outputs: &[CommandOutput]) -> &egglog_reports::RunReport {
+    match outputs {
+        [CommandOutput::RunSchedule(report)] => report,
+        other => panic!("expected one RunSchedule output, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_multi_extract_negative_variants_returns_error_instead_of_panicking() {
+    let mut egraph = egglog_experimental::new_experimental_egraph();
+
+    egraph
+        .parse_and_run_program(None, "(datatype E (Num i64))")
+        .unwrap();
+
+    let err = egraph
+        .parse_and_run_program(None, "(multi-extract -1 (Num 1))")
+        .unwrap_err();
+
+    assert!(err.to_string().contains("negative number of variants"));
+}
+
+#[test]
+fn test_multi_extract_zero_variants_returns_error_instead_of_extracting() {
+    let mut egraph = egglog_experimental::new_experimental_egraph();
+
+    egraph
+        .parse_and_run_program(None, "(datatype E (Num i64))")
+        .unwrap();
+
+    let err = egraph
+        .parse_and_run_program(None, "(multi-extract 0 (Num 1))")
+        .unwrap_err();
+
+    assert!(err.to_string().contains("positive number of variants"));
+}
+
+#[test]
+fn test_backoff_run_schedule_should_not_report_progress_without_egraph_updates() {
+    let mut egraph = egglog_experimental::new_experimental_egraph();
+    add_copy_backoff_program(&mut egraph);
+
+    let outputs = egraph
+        .parse_and_run_program(
+            None,
+            r#"
+        (run-schedule
+          (let-scheduler bo (back-off :match-limit 1 :ban-length 3))
+          (run-with bo copy))
+        "#,
+        )
+        .unwrap();
+
+    let report = only_run_report(&outputs);
+    assert_eq!(egraph.get_size("S"), 0);
+    assert!(
+        !report.updated,
+        "banning work in the scheduler is not database progress"
+    );
+    assert!(
+        !report.can_stop,
+        "the scheduler still has deferred work after the ban"
+    );
+}
+
+#[test]
+fn test_saturate_continues_until_scheduler_can_stop_after_no_progress_ban() {
+    let mut egraph = egglog_experimental::new_experimental_egraph();
+    add_copy_backoff_program(&mut egraph);
+
+    let outputs = egraph
+        .parse_and_run_program(
+            None,
+            r#"
+        (run-schedule
+          (let-scheduler bo (back-off :match-limit 1 :ban-length 3))
+          (saturate (run-with bo copy)))
+        "#,
+        )
+        .unwrap();
+
+    let report = only_run_report(&outputs);
+    assert_eq!(
+        egraph.get_size("S"),
+        4,
+        "saturate should keep running while the scheduler reports deferred work"
+    );
+    assert!(
+        report.updated,
+        "the eventual copy applications should be reported as database progress"
+    );
 }

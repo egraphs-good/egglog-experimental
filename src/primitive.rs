@@ -3,8 +3,9 @@ use egglog::constraint::SimpleTypeConstraint;
 use egglog::prelude::Span;
 use egglog::sort::{FunctionContainer, literal_sort};
 use egglog::{
-    ArcSort, CommandOutput, Core, EGraph, Error, Primitive, PurePrim, PureState, ResolvedCall,
-    ResolvedExpr, SpecializedPrimitive, TypeError, UserDefinedCommand, Value,
+    ArcSort, CommandOutput, Context, Core, EGraph, Error, FullPrim, FullState, Primitive, PurePrim,
+    PureState, ReadPrim, ReadState, ResolvedCall, ResolvedExpr, TypeError, UserDefinedCommand,
+    Value, WritePrim, WriteState,
 };
 use std::any::TypeId;
 
@@ -51,14 +52,9 @@ impl UserDefinedCommand for RegisterPrimitive {
             .enumerate()
             .map(|(index, sort)| (format!("_{index}"), args[3].span(), sort.clone()))
             .collect();
-        let resolved_body = egraph.typecheck_expr_with_bindings_and_output(
-            &args[3],
-            &bindings,
-            output_sort.clone(),
-        )?;
-        let body = compile_resolved_body(&resolved_body)?;
-
-        let body_output = resolved_expr_output_sort(&resolved_body);
+        let (body, capability) = typecheck_body(egraph, &args[3], &bindings, output_sort.clone())?;
+        validate_resolved_body(&body)?;
+        let body_output = resolved_expr_output_sort(&body);
         if body_output.name() != output_sort.name() {
             return Err(TypeError::Mismatch {
                 expr: args[3].clone(),
@@ -68,15 +64,18 @@ impl UserDefinedCommand for RegisterPrimitive {
             .into());
         }
 
-        egraph.add_pure_primitive(
-            DefinedPrimitive {
-                name,
-                input: input_sorts,
-                output: output_sort,
-                body,
-            },
-            None,
-        );
+        let primitive = DefinedPrimitive {
+            name,
+            input: input_sorts,
+            output: output_sort,
+            body,
+        };
+        match capability {
+            PrimitiveCapability::Pure => egraph.add_pure_primitive(primitive, None),
+            PrimitiveCapability::Read => egraph.add_read_primitive(primitive, None),
+            PrimitiveCapability::Write => egraph.add_write_primitive(primitive, None),
+            PrimitiveCapability::Full => egraph.add_full_primitive(primitive, None),
+        }
         Ok(None)
     }
 }
@@ -86,7 +85,7 @@ struct DefinedPrimitive {
     name: String,
     input: Vec<ArcSort>,
     output: ArcSort,
-    body: CompiledExpr,
+    body: ResolvedExpr,
 }
 
 impl Primitive for DefinedPrimitive {
@@ -103,15 +102,45 @@ impl Primitive for DefinedPrimitive {
 
 impl PurePrim for DefinedPrimitive {
     fn apply<'a, 'db>(&self, mut state: PureState<'a, 'db>, args: &[Value]) -> Option<Value> {
-        eval_compiled_expr(&mut state, &self.body, args)
+        eval_resolved_expr(&mut state, &self.body, args)
     }
 }
 
-#[derive(Clone)]
-enum CompiledExpr {
-    Lit(Literal),
-    Arg(usize),
-    Primitive(SpecializedPrimitive, Vec<CompiledExpr>),
+impl ReadPrim for DefinedPrimitive {
+    fn apply<'a, 'db>(&self, mut state: ReadState<'a, 'db>, args: &[Value]) -> Option<Value> {
+        eval_resolved_expr(&mut state, &self.body, args)
+    }
+}
+
+impl WritePrim for DefinedPrimitive {
+    fn apply<'a, 'db>(&self, mut state: WriteState<'a, 'db>, args: &[Value]) -> Option<Value> {
+        eval_resolved_expr(&mut state, &self.body, args)
+    }
+}
+
+impl FullPrim for DefinedPrimitive {
+    fn apply<'a, 'db>(&self, mut state: FullState<'a, 'db>, args: &[Value]) -> Option<Value> {
+        eval_resolved_expr(&mut state, &self.body, args)
+    }
+}
+
+#[derive(Clone, Copy)]
+enum PrimitiveCapability {
+    Pure,
+    Read,
+    Write,
+    Full,
+}
+
+impl PrimitiveCapability {
+    fn context(self) -> Context {
+        match self {
+            Self::Pure => Context::Pure,
+            Self::Read => Context::Read,
+            Self::Write => Context::Write,
+            Self::Full => Context::Full,
+        }
+    }
 }
 
 fn decode_atom(expr: &Expr, position: &str) -> Result<(Span, String), Error> {
@@ -231,26 +260,50 @@ fn sort_contains_function_container(sort: &ArcSort) -> bool {
                 .any(sort_contains_function_container))
 }
 
-fn compile_resolved_body(expr: &ResolvedExpr) -> Result<CompiledExpr, Error> {
+fn typecheck_body(
+    egraph: &mut EGraph,
+    body: &Expr,
+    bindings: &[(String, Span, ArcSort)],
+    output_sort: ArcSort,
+) -> Result<(ResolvedExpr, PrimitiveCapability), TypeError> {
+    let mut last_error = None;
+    for capability in [
+        PrimitiveCapability::Pure,
+        PrimitiveCapability::Read,
+        PrimitiveCapability::Write,
+        PrimitiveCapability::Full,
+    ] {
+        match egraph.typecheck_expr_with_bindings_and_output(
+            body,
+            bindings,
+            output_sort.clone(),
+            capability.context(),
+        ) {
+            Ok(resolved) => return Ok((resolved, capability)),
+            Err(err) => last_error = Some(err),
+        }
+    }
+    Err(last_error.expect("primitive body typechecking always tries at least one context"))
+}
+
+fn validate_resolved_body(expr: &ResolvedExpr) -> Result<(), Error> {
     match expr {
-        ResolvedExpr::Lit(_, literal) => Ok(CompiledExpr::Lit(literal.clone())),
+        ResolvedExpr::Lit(_, _) => Ok(()),
         ResolvedExpr::Var(span, resolved_var) => {
-            let Some(index) = parse_positional_index(&resolved_var.name) else {
-                return Err(backend_error(
+            if parse_positional_index(&resolved_var.name).is_some() {
+                Ok(())
+            } else {
+                Err(backend_error(
                     span.clone(),
                     format!(
                         "primitive body variables must be positional (_0, _1, ...), found `{}`",
                         resolved_var.name
                     ),
-                ));
-            };
-            Ok(CompiledExpr::Arg(index))
+                ))
+            }
         }
         ResolvedExpr::Call(_, ResolvedCall::Primitive(primitive), children) => {
-            let compiled_children = children
-                .iter()
-                .map(compile_resolved_body)
-                .collect::<Result<Vec<_>, _>>()?;
+            children.iter().try_for_each(validate_resolved_body)?;
             for sort in primitive.input() {
                 if sort_contains_function_container(sort) {
                     return Err(backend_error(
@@ -271,10 +324,7 @@ fn compile_resolved_body(expr: &ResolvedExpr) -> Result<CompiledExpr, Error> {
                     ),
                 ));
             }
-            Ok(CompiledExpr::Primitive(
-                primitive.clone(),
-                compiled_children,
-            ))
+            Ok(())
         }
         ResolvedExpr::Call(span, ResolvedCall::Func(func), _) => Err(backend_error(
             span.clone(),
@@ -286,16 +336,16 @@ fn compile_resolved_body(expr: &ResolvedExpr) -> Result<CompiledExpr, Error> {
     }
 }
 
-fn eval_compiled_expr<'a, 'db>(
+fn eval_resolved_expr<'a, 'db>(
     state: &mut impl Core<'a, 'db>,
-    expr: &CompiledExpr,
+    expr: &ResolvedExpr,
     args: &[Value],
 ) -> Option<Value>
 where
     'db: 'a,
 {
     match expr {
-        CompiledExpr::Lit(literal) => Some(match literal {
+        ResolvedExpr::Lit(_, literal) => Some(match literal {
             Literal::Int(x) => state.base_values().get::<i64>(*x),
             Literal::Float(x) => state.base_values().get::<egglog::sort::F>(x.into()),
             Literal::String(x) => state
@@ -304,14 +354,18 @@ where
             Literal::Bool(x) => state.base_values().get::<bool>(*x),
             Literal::Unit => state.base_values().get::<()>(()),
         }),
-        CompiledExpr::Arg(index) => args.get(*index).copied(),
-        CompiledExpr::Primitive(primitive, children) => {
+        ResolvedExpr::Var(_, resolved_var) => {
+            let index = parse_positional_index(&resolved_var.name)?;
+            args.get(index).copied()
+        }
+        ResolvedExpr::Call(_, ResolvedCall::Primitive(primitive), children) => {
             let values = children
                 .iter()
-                .map(|child| eval_compiled_expr(state, child, args))
+                .map(|child| eval_resolved_expr(state, child, args))
                 .collect::<Option<Vec<_>>>()?;
             state.apply_primitive(primitive, &values)
         }
+        ResolvedExpr::Call(_, ResolvedCall::Func(_), _) => None,
     }
 }
 
