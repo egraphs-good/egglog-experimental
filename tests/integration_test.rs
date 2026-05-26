@@ -312,6 +312,9 @@ fn test_multi_extract_bad_arity_returns_error_instead_of_panicking() {
                 .contains("multi-extract expects at least a variant count and one expression"),
             "unexpected error for {program}: {err}"
         );
+    }
+}
+
 fn add_copy_backoff_program(egraph: &mut egglog::EGraph) {
     egraph
         .parse_and_run_program(
@@ -365,6 +368,9 @@ fn test_multi_extract_zero_variants_returns_error_instead_of_extracting() {
         .unwrap_err();
 
     assert!(err.to_string().contains("positive number of variants"));
+}
+
+#[test]
 fn test_backoff_run_schedule_should_not_report_progress_without_egraph_updates() {
     let mut egraph = egglog_experimental::new_experimental_egraph();
     add_copy_backoff_program(&mut egraph);

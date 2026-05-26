@@ -11,7 +11,7 @@ use egglog::{
     CommandOutput, EGraph, Error, TermDag, TermId, TypeError, UserDefinedCommand,
     ast::{Expr, ParseError},
     extract::{Cost, CostModel, Extractor},
-    prelude::{RustSpan, Span},
+    prelude::{RustSpan, Span, span},
 };
 use log::log_enabled;
 use std::{fmt::Debug, marker::PhantomData};
@@ -60,13 +60,7 @@ impl<
 {
     fn update(&self, egraph: &mut EGraph, args: &[Expr]) -> Result<Option<CommandOutput>, Error> {
         if args.len() < 2 {
-            let span = args.first().map(Expr::span).unwrap_or_else(|| {
-                Span::Rust(std::sync::Arc::new(RustSpan {
-                    file: "egglog-experimental",
-                    line: 0,
-                    column: 0,
-                }))
-            });
+            let span = args.first().map(Expr::span).unwrap_or_else(|| span!());
             return Err(Error::ParseError(ParseError(
                 span,
                 "multi-extract expects at least a variant count and one expression".into(),

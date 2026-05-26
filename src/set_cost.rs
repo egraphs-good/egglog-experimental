@@ -5,6 +5,7 @@ use egglog::{
     CommandOutput, EGraph, Error, TermDag, TermId, TypeError, UserDefinedCommand,
     ast::*,
     extract::{CostModel, DefaultCost, Extractor, TreeAdditiveCostModel},
+    span,
     util::FreshGen,
 };
 use log::log_enabled;
@@ -225,11 +226,7 @@ impl UserDefinedCommand for CustomExtract {
         match args {
             [] => {
                 return Err(Error::ParseError(ParseError(
-                    Span::Rust(Arc::new(RustSpan {
-                        file: "egglog-experimental",
-                        line: 0,
-                        column: 0,
-                    })),
+                    span!(),
                     "extract expects an expression and optional variant count".into(),
                 )));
             }
@@ -272,8 +269,7 @@ impl UserDefinedCommand for CustomExtract {
             egraph,
             DynamicCostModel,
         );
-        // Preserve egglog's existing convention: omitted or zero variant count
-        // means best extraction. Positive counts request multiple variants.
+        // Omitted or zero variant count means best extraction.
         if n == 0 {
             if let Some((cost, term)) = extractor.extract_best(egraph, &mut termdag, value) {
                 if log_enabled!(log::Level::Info) {
