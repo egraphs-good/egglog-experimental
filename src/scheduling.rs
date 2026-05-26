@@ -15,9 +15,7 @@ pub trait SchedulerGen {
     fn new_scheduler(&self, egraph: &egglog::EGraph, args: &[Expr]) -> Box<dyn Scheduler>;
 }
 
-type SchedulerBuilder = Box<dyn Fn(&egglog::EGraph, &[Expr]) -> Box<dyn Scheduler> + Send + Sync>;
-
-type FallibleSchedulerBuilder = Box<
+type SchedulerBuilder = Box<
     dyn Fn(
             &egglog::EGraph,
             &egglog::ast::Span,
@@ -27,53 +25,26 @@ type FallibleSchedulerBuilder = Box<
         + Sync,
 >;
 
-enum SchedulerBuilderEntry {
-    Infallible(SchedulerBuilder),
-    Fallible(FallibleSchedulerBuilder),
-}
-
 struct ScheduleState {
     schedulers: Vec<(String, SchedulerId)>,
 }
 
 lazy_static! {
-    static ref scheduler_libs: Mutex<HashMap<String, SchedulerBuilderEntry>> = {
+    static ref scheduler_libs: Mutex<HashMap<String, SchedulerBuilder>> = {
         Mutex::new(HashMap::from_iter([(
             "back-off".into(),
-            SchedulerBuilderEntry::Fallible(Box::new(schedulers::new_back_off_scheduler)),
+            Box::new(schedulers::new_back_off_scheduler) as SchedulerBuilder,
         )]))
     };
 }
 
 pub fn add_scheduler_builder(name: String, builder: SchedulerBuilder) {
-    scheduler_libs
-        .lock()
-        .unwrap()
-        .insert(name, SchedulerBuilderEntry::Infallible(builder));
+    scheduler_libs.lock().unwrap().insert(name, builder);
 }
 
 impl ScheduleState {
     fn new() -> Self {
         Self { schedulers: vec![] }
-    }
-
-    fn build_scheduler(
-        egraph: &egglog::EGraph,
-        span: &egglog::ast::Span,
-        scheduler_name: &str,
-        args: &[Expr],
-    ) -> Result<Box<dyn Scheduler>, egglog::Error> {
-        let libs = scheduler_libs.lock().unwrap();
-        let Some(builder) = libs.get(scheduler_name) else {
-            return Err(egglog::Error::ParseError(ParseError(
-                span.clone(),
-                format!("Unknown scheduler: {scheduler_name}"),
-            )));
-        };
-        match builder {
-            SchedulerBuilderEntry::Infallible(builder) => Ok(builder(egraph, args)),
-            SchedulerBuilderEntry::Fallible(builder) => builder(egraph, span, args),
-        }
     }
 
     // Current limitation: because it relies on the publicly available Rust APIs to access
@@ -119,7 +90,16 @@ impl ScheduleState {
                             format!("Scheduler {name} already exists"),
                         )));
                     }
-                    let scheduler = Self::build_scheduler(egraph, span, scheduler_name, args)?;
+                    let scheduler = {
+                        let libs = scheduler_libs.lock().unwrap();
+                        let Some(builder) = libs.get(scheduler_name) else {
+                            return Err(egglog::Error::ParseError(ParseError(
+                                span.clone(),
+                                format!("Unknown scheduler: {scheduler_name}"),
+                            )));
+                        };
+                        builder(egraph, span, args)?
+                    };
                     let id = egraph.add_scheduler(scheduler);
                     self.schedulers.push((name.clone(), id));
                     Ok(RunReport::default())
@@ -301,10 +281,11 @@ mod schedulers {
 
     use crate::parse_tags;
 
-    fn parse_back_off_config(
+    pub(super) fn new_back_off_scheduler(
+        _egraph: &egglog::EGraph,
         span: &egglog::ast::Span,
         args: &[Expr],
-    ) -> Result<(usize, usize), egglog::Error> {
+    ) -> Result<Box<dyn Scheduler>, egglog::Error> {
         let tags = parse_tags(span, args)?;
         let default_match_limit = tags
             .get(":match-limit")
@@ -336,15 +317,6 @@ mod schedulers {
             })
             .transpose()?
             .unwrap_or(5);
-        Ok((default_match_limit, default_ban_length))
-    }
-
-    pub(super) fn new_back_off_scheduler(
-        _egraph: &egglog::EGraph,
-        span: &egglog::ast::Span,
-        args: &[Expr],
-    ) -> Result<Box<dyn Scheduler>, egglog::Error> {
-        let (default_match_limit, default_ban_length) = parse_back_off_config(span, args)?;
         Ok(Box::new(BackOffScheduler {
             default_match_limit,
             default_ban_length,
