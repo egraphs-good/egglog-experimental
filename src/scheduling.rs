@@ -65,7 +65,10 @@ impl ScheduleState {
             if let [CommandOutput::RunSchedule(report)] = output.as_slice() {
                 return Ok(report.clone());
             }
-            return err();
+            return Err(egglog::Error::ParseError(ParseError(
+                arg.span(),
+                format!("Expected ruleset {ruleset} to produce one RunSchedule output"),
+            )));
         }
 
         let Expr::Call(span, head, exprs) = arg else {
@@ -135,7 +138,12 @@ impl ScheduleState {
                     None => ("", exprs),
                     Some(Expr::Var(_span, v)) if *v == ":until" => ("", exprs),
                     Some(Expr::Var(_span, ruleset)) => (ruleset.as_str(), &exprs[1..]),
-                    _ => return err(),
+                    Some(expr) => {
+                        return Err(egglog::Error::ParseError(ParseError(
+                            expr.span(),
+                            "Expected ruleset name or :until clause in run schedule".into(),
+                        )));
+                    }
                 };
 
                 let until = match rest {

@@ -247,7 +247,10 @@ fn test_invalid_run_schedule_returns_error_instead_of_panicking() {
         .parse_and_run_program(None, "(run-schedule (run 1))")
         .unwrap_err();
 
-    assert!(err.to_string().contains("Invalid schedule"));
+    assert!(
+        err.to_string()
+            .contains("Expected ruleset name or :until clause")
+    );
 }
 
 #[test]
