@@ -22,6 +22,9 @@ impl UserDefinedCommand for RegisterPrimitive {
         ensure_name_available(egraph, &name, &name_span)?;
 
         let input_sort_names = decode_input_sort_names(&args[1])?;
+        let input_var_names: Vec<_> = (0..input_sort_names.len())
+            .map(|index| format!("_{index}"))
+            .collect();
 
         let input_sorts = input_sort_names
             .iter()
@@ -30,9 +33,6 @@ impl UserDefinedCommand for RegisterPrimitive {
         let (output_span, output_name) = decode_atom(&args[2], "output sort")?;
         let output_sort = resolve_sort(egraph, &output_name, &output_span)?;
 
-        let input_var_names: Vec<_> = (0..input_sorts.len())
-            .map(|index| format!("_{index}"))
-            .collect();
         let bindings: Vec<_> = input_var_names
             .iter()
             .zip(&input_sorts)
