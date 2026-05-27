@@ -1,7 +1,6 @@
 use egglog::ast::{Expr, FunctionSubtype, Literal};
 use egglog::constraint::SimpleTypeConstraint;
 use egglog::prelude::Span;
-use egglog::sort::literal_sort;
 use egglog::{
     ArcSort, CommandOutput, Context, Core, EGraph, Error, FullPrim, FullState, Primitive, PurePrim,
     PureState, ReadPrim, ReadState, ResolvedCall, ResolvedExpr, TypeError, UserDefinedCommand,
@@ -31,28 +30,41 @@ impl UserDefinedCommand for RegisterPrimitive {
         let (output_span, output_name) = decode_atom(&args[2], "output sort")?;
         let output_sort = resolve_sort(egraph, &output_name, &output_span)?;
 
-        let bindings: Vec<_> = input_sorts
-            .iter()
-            .enumerate()
-            .map(|(index, sort)| (format!("_{index}"), args[3].span(), sort.clone()))
+        let input_var_names: Vec<_> = (0..input_sorts.len())
+            .map(|index| format!("_{index}"))
             .collect();
-        let (body, context) = typecheck_body(egraph, &args[3], &bindings, output_sort.clone())?;
-        // The core output-context typecheck constrains overload resolution, but
-        // currently still accepts some literal/container mismatches.
-        // Keep this explicit check for the final declared primitive output sort.
-        let body_output = resolved_expr_output_sort(&body);
-        if body_output.name() != output_sort.name() {
-            return Err(TypeError::Mismatch {
-                expr: args[3].clone(),
-                expected: output_sort,
-                actual: body_output,
+        let bindings: Vec<_> = input_var_names
+            .iter()
+            .zip(&input_sorts)
+            .map(|(name, sort)| (name.clone(), args[3].span(), sort.clone()))
+            .collect();
+
+        let mut last_error = None;
+        let mut typechecked_body = None;
+        for context in [Context::Pure, Context::Read, Context::Write, Context::Full] {
+            match egraph.typecheck_expr_with_bindings_and_output(
+                &args[3],
+                &bindings,
+                output_sort.clone(),
+                context,
+            ) {
+                Ok(resolved) if required_context(&resolved).is_allowed_in(context) => {
+                    typechecked_body = Some((resolved, context));
+                    break;
+                }
+                Ok(_) => {}
+                Err(err) => last_error = Some(err),
             }
-            .into());
         }
+        let Some((body, context)) = typechecked_body else {
+            return Err(last_error
+                .expect("primitive body typechecking always tries at least one context")
+                .into());
+        };
 
         let primitive = DefinedPrimitive {
             name,
-            input_vars: bindings.iter().map(|(name, _, _)| name.clone()).collect(),
+            input_vars: input_var_names,
             input: input_sorts,
             output: output_sort,
             body,
@@ -182,38 +194,6 @@ fn resolve_sort(egraph: &EGraph, name: &str, span: &Span) -> Result<ArcSort, Err
         .get_sort_by_name(name)
         .cloned()
         .ok_or_else(|| TypeError::UndefinedSort(name.to_owned(), span.clone()).into())
-}
-
-fn typecheck_body(
-    egraph: &mut EGraph,
-    body: &Expr,
-    bindings: &[(String, Span, ArcSort)],
-    output_sort: ArcSort,
-) -> Result<(ResolvedExpr, Context), TypeError> {
-    let mut last_error = None;
-    for context in [Context::Pure, Context::Read, Context::Write, Context::Full] {
-        match egraph.typecheck_expr_with_bindings_and_output(
-            body,
-            bindings,
-            output_sort.clone(),
-            context,
-        ) {
-            Ok(resolved) if required_context(&resolved).is_allowed_in(context) => {
-                return Ok((resolved, context));
-            }
-            Ok(_) => {}
-            Err(err) => last_error = Some(err),
-        }
-    }
-    Err(last_error.expect("primitive body typechecking always tries at least one context"))
-}
-
-fn resolved_expr_output_sort(expr: &ResolvedExpr) -> ArcSort {
-    match expr {
-        ResolvedExpr::Lit(_, literal) => literal_sort(literal),
-        ResolvedExpr::Var(_, resolved_var) => resolved_var.sort.clone(),
-        ResolvedExpr::Call(_, resolved_call, _) => resolved_call.output().clone(),
-    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
