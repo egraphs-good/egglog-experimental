@@ -37,6 +37,8 @@ mod multi_extract;
 pub use multi_extract::*;
 mod size;
 pub use size::*;
+mod stats;
+pub use stats::*;
 
 // Sugar modules using parse-time macros
 mod sugar;
@@ -70,6 +72,9 @@ pub fn new_experimental_egraph() -> EGraph {
             "multi-extract".into(),
             Arc::new(MultiExtract::new(DynamicCostModel)),
         )
+        .unwrap();
+    egraph
+        .add_command("egraph-detailed-stats".into(), Arc::new(EgraphDetailedStats))
         .unwrap();
     egraph
 }
