@@ -9,10 +9,8 @@
 
 use egglog::{
     ArcSort, CommandOutput, EGraph, Error, TermDag, TermId, TypeError, UserDefinedCommand, Value,
-    Write,
     ast::Expr,
     extract::{Extractor, TreeAdditiveCostModel},
-    prelude::{RustSpan, Span},
     sort::S,
 };
 
@@ -51,7 +49,7 @@ impl UserDefinedCommand for KeepBestCommand {
         egraph.with_full_state(|mut state| {
             for (name, _, keys) in &all_keys {
                 for key in keys {
-                    state.remove(name, key);
+                    egglog::Write::remove(&mut state, name, key);
                 }
             }
         });
@@ -69,7 +67,7 @@ impl UserDefinedCommand for KeepBestCommand {
 
         egraph.with_full_state(|mut state| {
             for (table_name, values) in &rows_to_insert {
-                state.insert(table_name, values.iter().copied());
+                egglog::Write::insert(&mut state, table_name, values.iter().copied());
             }
         });
 
@@ -91,7 +89,16 @@ fn collect_and_extract(
     for table_name in table_names {
         let func = egraph
             .get_function(table_name)
-            .ok_or_else(|| TypeError::UnboundFunction(table_name.clone(), egglog::span!()))?;
+            .ok_or_else(|| {
+                TypeError::UnboundFunction(
+                    table_name.clone(),
+                    egglog::prelude::Span::Rust(std::sync::Arc::new(egglog::prelude::RustSpan {
+                        file: file!(),
+                        line: line!(),
+                        column: column!(),
+                    })),
+                )
+            })?;
 
         let all_sorts: Vec<ArcSort> = func
             .schema()
@@ -145,7 +152,14 @@ fn eval_terms(
     term_ids
         .iter()
         .map(|tid| {
-            let expr = termdag.term_to_expr(tid, egglog::span!());
+            let expr = termdag.term_to_expr(
+                tid,
+                egglog::prelude::Span::Rust(std::sync::Arc::new(egglog::prelude::RustSpan {
+                    file: file!(),
+                    line: line!(),
+                    column: column!(),
+                })),
+            );
             let (_, val) = egraph.eval_expr(&expr)?;
             Ok(val)
         })
