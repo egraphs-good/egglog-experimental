@@ -50,7 +50,15 @@ impl UserDefinedCommand for RegisterPrimitive {
                 output_sort.clone(),
                 context,
             ) {
-                Ok(resolved) if required_context(egraph, &resolved).is_allowed_in(context) => {
+                Ok(resolved)
+                    if matches!(
+                        (required_context(egraph, &resolved), context),
+                        (Context::Pure, _)
+                            | (Context::Read, Context::Read | Context::Full)
+                            | (Context::Write, Context::Write | Context::Full)
+                            | (Context::Full, Context::Full)
+                    ) =>
+                {
                     typechecked_body = Some((resolved, context));
                     break;
                 }
@@ -206,102 +214,74 @@ fn resolve_sort(egraph: &EGraph, name: &str, span: &Span) -> Result<ArcSort, Err
         .ok_or_else(|| TypeError::UndefinedSort(name.to_owned(), span.clone()).into())
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum RequiredContext {
-    Pure,
-    Read,
-    Write,
-    Full,
-}
-
-impl RequiredContext {
-    fn combine(self, other: Self) -> Self {
-        match (self, other) {
-            (Self::Full, _) | (_, Self::Full) => Self::Full,
-            (Self::Read, Self::Write) | (Self::Write, Self::Read) => Self::Full,
-            (Self::Read, _) | (_, Self::Read) => Self::Read,
-            (Self::Write, _) | (_, Self::Write) => Self::Write,
-            (Self::Pure, Self::Pure) => Self::Pure,
-        }
-    }
-
-    fn is_allowed_in(self, context: Context) -> bool {
-        match self {
-            Self::Pure => true,
-            Self::Read => matches!(context, Context::Read | Context::Full),
-            Self::Write => matches!(context, Context::Write | Context::Full),
-            Self::Full => matches!(context, Context::Full),
-        }
-    }
-}
-
-fn required_context(egraph: &mut EGraph, expr: &ResolvedExpr) -> RequiredContext {
+fn required_context(egraph: &mut EGraph, expr: &ResolvedExpr) -> Context {
     match expr {
-        ResolvedExpr::Lit(_, _) | ResolvedExpr::Var(_, _) => RequiredContext::Pure,
+        ResolvedExpr::Lit(_, _) | ResolvedExpr::Var(_, _) => Context::Pure,
         ResolvedExpr::Call(_, resolved_call, children) => {
             let call_context = match resolved_call {
                 ResolvedCall::Primitive(primitive) if primitive.name() == "unstable-fn" => {
-                    unstable_fn_target_context(egraph, primitive, children)
+                    match children.first() {
+                        Some(ResolvedExpr::Lit(_, Literal::String(name))) => {
+                            let type_info = egraph.type_info();
+                            if let Some(func) = type_info.get_func_type(name) {
+                                match func.subtype {
+                                    FunctionSubtype::Constructor => Context::Write,
+                                    FunctionSubtype::Custom => Context::Read,
+                                }
+                            } else if let Ok(fn_sort) = Arc::downcast::<FunctionSort>(
+                                primitive.output().clone().as_arc_any(),
+                            ) {
+                                let types: Vec<_> = primitive
+                                    .input()
+                                    .iter()
+                                    .skip(1)
+                                    .cloned()
+                                    .chain(fn_sort.inputs().iter().cloned())
+                                    .chain(std::iter::once(fn_sort.output()))
+                                    .collect();
+
+                                let can_run_in = |context| {
+                                    type_info.get_prims(name).into_iter().flatten().any(|p| {
+                                        p.accept(&types, type_info)
+                                            && p.is_valid_in_context(context)
+                                    })
+                                };
+                                if can_run_in(Context::Pure) {
+                                    Context::Pure
+                                } else if can_run_in(Context::Read) && !can_run_in(Context::Write) {
+                                    Context::Read
+                                } else if can_run_in(Context::Write) && !can_run_in(Context::Read) {
+                                    Context::Write
+                                } else {
+                                    Context::Full
+                                }
+                            } else {
+                                Context::Full
+                            }
+                        }
+                        _ => Context::Full,
+                    }
                 }
-                ResolvedCall::Primitive(_) => RequiredContext::Pure,
+                ResolvedCall::Primitive(_) => Context::Pure,
                 ResolvedCall::Func(func) => match func.subtype {
-                    FunctionSubtype::Constructor => RequiredContext::Write,
-                    FunctionSubtype::Custom => RequiredContext::Read,
+                    FunctionSubtype::Constructor => Context::Write,
+                    FunctionSubtype::Custom => Context::Read,
                 },
             };
             let mut context = call_context;
             for child in children {
-                context = context.combine(required_context(egraph, child));
+                context = match (context, required_context(egraph, child)) {
+                    (Context::Full, _) | (_, Context::Full) => Context::Full,
+                    (Context::Read, Context::Write) | (Context::Write, Context::Read) => {
+                        Context::Full
+                    }
+                    (Context::Read, _) | (_, Context::Read) => Context::Read,
+                    (Context::Write, _) | (_, Context::Write) => Context::Write,
+                    (Context::Pure, Context::Pure) => Context::Pure,
+                };
             }
             context
         }
-    }
-}
-
-fn unstable_fn_target_context(
-    egraph: &mut EGraph,
-    primitive: &egglog::SpecializedPrimitive,
-    children: &[ResolvedExpr],
-) -> RequiredContext {
-    let Some(ResolvedExpr::Lit(_, Literal::String(name))) = children.first() else {
-        return RequiredContext::Full;
-    };
-
-    let type_info = egraph.type_info();
-    if let Some(func) = type_info.get_func_type(name) {
-        return match func.subtype {
-            FunctionSubtype::Constructor => RequiredContext::Write,
-            FunctionSubtype::Custom => RequiredContext::Read,
-        };
-    }
-
-    let Ok(fn_sort) = Arc::downcast::<FunctionSort>(primitive.output().clone().as_arc_any()) else {
-        return RequiredContext::Full;
-    };
-    let types: Vec<_> = primitive
-        .input()
-        .iter()
-        .skip(1)
-        .cloned()
-        .chain(fn_sort.inputs().iter().cloned())
-        .chain(std::iter::once(fn_sort.output()))
-        .collect();
-
-    let can_run_in = |context| {
-        type_info
-            .get_prims(name)
-            .into_iter()
-            .flatten()
-            .any(|p| p.accept(&types, type_info) && p.is_valid_in_context(context))
-    };
-    if can_run_in(Context::Pure) {
-        RequiredContext::Pure
-    } else if can_run_in(Context::Read) && !can_run_in(Context::Write) {
-        RequiredContext::Read
-    } else if can_run_in(Context::Write) && !can_run_in(Context::Read) {
-        RequiredContext::Write
-    } else {
-        RequiredContext::Full
     }
 }
 
