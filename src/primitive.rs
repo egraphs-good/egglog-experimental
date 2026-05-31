@@ -1,13 +1,15 @@
 use egglog::ast::{Expr, FunctionSubtype, Literal};
 use egglog::constraint::SimpleTypeConstraint;
 use egglog::prelude::Span;
+use egglog::sort::FunctionSort;
 use egglog::{
-    ArcSort, CommandOutput, Context, Core, EGraph, Error, FullPrim, FullState,
-    PreparedResolvedExpr, Primitive, PurePrim, PureState, ReadPrim, ReadState, ResolvedCall,
-    ResolvedExpr, TypeError, UserDefinedCommand, Value, WritePrim, WriteState,
+    ArcSort, CommandOutput, Context, Core, EGraph, Error, FullPrim, FullState, Primitive, PurePrim,
+    PureState, ReadPrim, ReadState, ResolvedCall, ResolvedExpr, TypeError, UserDefinedCommand,
+    Value, WritePrim, WriteState,
 };
+use std::sync::Arc;
 
-pub struct RegisterPrimitive;
+pub(crate) struct RegisterPrimitive;
 
 impl UserDefinedCommand for RegisterPrimitive {
     fn update(&self, egraph: &mut EGraph, args: &[Expr]) -> Result<Option<CommandOutput>, Error> {
@@ -48,7 +50,7 @@ impl UserDefinedCommand for RegisterPrimitive {
                 output_sort.clone(),
                 context,
             ) {
-                Ok(resolved) if required_context(&resolved).is_allowed_in(context) => {
+                Ok(resolved) if required_context(egraph, &resolved).is_allowed_in(context) => {
                     typechecked_body = Some((resolved, context));
                     break;
                 }
@@ -62,12 +64,14 @@ impl UserDefinedCommand for RegisterPrimitive {
                 .into());
         };
 
+        let (body, hidden_bindings) = egraph.prepare_unstable_fn_targets_for_eval(&body)?;
         let primitive = DefinedPrimitive {
             name,
             input_vars: input_var_names,
             input: input_sorts,
             output: output_sort,
-            body: egraph.prepare_resolved_expr_for_eval(&body)?,
+            body,
+            hidden_bindings,
         };
         match context {
             Context::Pure => egraph.add_pure_primitive(primitive, None),
@@ -85,7 +89,8 @@ struct DefinedPrimitive {
     input_vars: Vec<String>,
     input: Vec<ArcSort>,
     output: ArcSort,
-    body: PreparedResolvedExpr,
+    body: ResolvedExpr,
+    hidden_bindings: Vec<(String, Value)>,
 }
 
 impl Primitive for DefinedPrimitive {
@@ -129,13 +134,18 @@ impl DefinedPrimitive {
     where
         'db: 'a,
     {
-        let bindings: Vec<_> = self
-            .input_vars
+        let mut bindings: Vec<_> = self
+            .hidden_bindings
             .iter()
-            .map(String::as_str)
-            .zip(args.iter().copied())
+            .map(|(name, value)| (name.as_str(), *value))
             .collect();
-        self.body.eval(state, &bindings)
+        bindings.extend(
+            self.input_vars
+                .iter()
+                .map(String::as_str)
+                .zip(args.iter().copied()),
+        );
+        state.eval_resolved_expr(&self.body, &bindings)
     }
 }
 
@@ -225,22 +235,73 @@ impl RequiredContext {
     }
 }
 
-fn required_context(expr: &ResolvedExpr) -> RequiredContext {
+fn required_context(egraph: &mut EGraph, expr: &ResolvedExpr) -> RequiredContext {
     match expr {
         ResolvedExpr::Lit(_, _) | ResolvedExpr::Var(_, _) => RequiredContext::Pure,
         ResolvedExpr::Call(_, resolved_call, children) => {
             let call_context = match resolved_call {
+                ResolvedCall::Primitive(primitive) if primitive.name() == "unstable-fn" => {
+                    unstable_fn_target_context(egraph, primitive, children)
+                }
                 ResolvedCall::Primitive(_) => RequiredContext::Pure,
                 ResolvedCall::Func(func) => match func.subtype {
                     FunctionSubtype::Constructor => RequiredContext::Write,
                     FunctionSubtype::Custom => RequiredContext::Read,
                 },
             };
-            children
-                .iter()
-                .map(required_context)
-                .fold(call_context, RequiredContext::combine)
+            let mut context = call_context;
+            for child in children {
+                context = context.combine(required_context(egraph, child));
+            }
+            context
         }
+    }
+}
+
+fn unstable_fn_target_context(
+    egraph: &mut EGraph,
+    primitive: &egglog::SpecializedPrimitive,
+    children: &[ResolvedExpr],
+) -> RequiredContext {
+    let Some(ResolvedExpr::Lit(_, Literal::String(name))) = children.first() else {
+        return RequiredContext::Full;
+    };
+
+    let type_info = egraph.type_info();
+    if let Some(func) = type_info.get_func_type(name) {
+        return match func.subtype {
+            FunctionSubtype::Constructor => RequiredContext::Write,
+            FunctionSubtype::Custom => RequiredContext::Read,
+        };
+    }
+
+    let Ok(fn_sort) = Arc::downcast::<FunctionSort>(primitive.output().clone().as_arc_any()) else {
+        return RequiredContext::Full;
+    };
+    let types: Vec<_> = primitive
+        .input()
+        .iter()
+        .skip(1)
+        .cloned()
+        .chain(fn_sort.inputs().iter().cloned())
+        .chain(std::iter::once(fn_sort.output()))
+        .collect();
+
+    let can_run_in = |context| {
+        type_info
+            .get_prims(name)
+            .into_iter()
+            .flatten()
+            .any(|p| p.accept(&types, type_info) && p.is_valid_in_context(context))
+    };
+    if can_run_in(Context::Pure) {
+        RequiredContext::Pure
+    } else if can_run_in(Context::Read) && !can_run_in(Context::Write) {
+        RequiredContext::Read
+    } else if can_run_in(Context::Write) && !can_run_in(Context::Read) {
+        RequiredContext::Write
+    } else {
+        RequiredContext::Full
     }
 }
 
