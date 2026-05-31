@@ -2,9 +2,9 @@ use egglog::ast::{Expr, FunctionSubtype, Literal};
 use egglog::constraint::SimpleTypeConstraint;
 use egglog::prelude::Span;
 use egglog::{
-    ArcSort, CommandOutput, Context, Core, EGraph, Error, FullPrim, FullState, Primitive, PurePrim,
-    PureState, ReadPrim, ReadState, ResolvedCall, ResolvedExpr, TypeError, UserDefinedCommand,
-    Value, WritePrim, WriteState,
+    ArcSort, CommandOutput, Context, Core, EGraph, Error, FullPrim, FullState,
+    PreparedResolvedExpr, Primitive, PurePrim, PureState, ReadPrim, ReadState, ResolvedCall,
+    ResolvedExpr, TypeError, UserDefinedCommand, Value, WritePrim, WriteState,
 };
 
 pub struct RegisterPrimitive;
@@ -67,7 +67,7 @@ impl UserDefinedCommand for RegisterPrimitive {
             input_vars: input_var_names,
             input: input_sorts,
             output: output_sort,
-            body,
+            body: egraph.prepare_resolved_expr_for_eval(&body)?,
         };
         match context {
             Context::Pure => egraph.add_pure_primitive(primitive, None),
@@ -85,7 +85,7 @@ struct DefinedPrimitive {
     input_vars: Vec<String>,
     input: Vec<ArcSort>,
     output: ArcSort,
-    body: ResolvedExpr,
+    body: PreparedResolvedExpr,
 }
 
 impl Primitive for DefinedPrimitive {
@@ -135,7 +135,7 @@ impl DefinedPrimitive {
             .map(String::as_str)
             .zip(args.iter().copied())
             .collect();
-        state.eval_resolved_expr(&self.body, &bindings)
+        self.body.eval(state, &bindings)
     }
 }
 
