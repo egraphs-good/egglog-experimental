@@ -579,9 +579,16 @@ fn test_schedule_commands_and_actions() {
         .unwrap();
 
     // outputs should be: [PrintFunctionSize(...), RunSchedule(report)]
-    assert!(outputs.len() >= 2, "expected at least 2 outputs, got {}", outputs.len());
+    assert!(
+        outputs.len() >= 2,
+        "expected at least 2 outputs, got {}",
+        outputs.len()
+    );
     assert!(matches!(outputs[0], CommandOutput::PrintFunctionSize(_)));
-    assert!(matches!(outputs.last().unwrap(), CommandOutput::RunSchedule(_)));
+    assert!(matches!(
+        outputs.last().unwrap(),
+        CommandOutput::RunSchedule(_)
+    ));
 
     // extract inside run-schedule
     let outputs = egraph
@@ -593,7 +600,11 @@ fn test_schedule_commands_and_actions() {
         "#,
         )
         .unwrap();
-    assert!(outputs.iter().any(|o| matches!(o, CommandOutput::ExtractBest(..))));
+    assert!(
+        outputs
+            .iter()
+            .any(|o| matches!(o, CommandOutput::ExtractBest(..)))
+    );
 
     // union as a schedule step
     egraph

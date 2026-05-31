@@ -79,11 +79,12 @@ impl ScheduleState {
         }
 
         // Run a single Command via run_program and return (outputs, empty RunReport).
-        let run_cmd =
-            |egraph: &mut egglog::EGraph, cmd: Command| -> Result<(Vec<CommandOutput>, RunReport), egglog::Error> {
-                let outputs = egraph.run_program(vec![cmd])?;
-                Ok((outputs, RunReport::default()))
-            };
+        let run_cmd = |egraph: &mut egglog::EGraph,
+                       cmd: Command|
+         -> Result<(Vec<CommandOutput>, RunReport), egglog::Error> {
+            let outputs = egraph.run_program(vec![cmd])?;
+            Ok((outputs, RunReport::default()))
+        };
 
         match head.as_str() {
             "let-scheduler" => match exprs.as_slice() {
