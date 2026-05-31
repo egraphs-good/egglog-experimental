@@ -1,13 +1,13 @@
 use egglog_ast::span::Span;
+use log::log_enabled;
 use std::sync::Arc;
 
 use egglog::{
-    CommandOutput, EGraph, Error, TermDag, TermId, TypeError, UserDefinedCommand,
+    CommandOutput, EGraph, TermDag, TermId, UserDefinedCommand,
     ast::*,
     extract::{CostModel, DefaultCost, Extractor, TreeAdditiveCostModel},
     util::FreshGen,
 };
-use log::log_enabled;
 
 pub fn add_set_cost(egraph: &mut EGraph) {
     egraph
@@ -222,54 +222,58 @@ impl UserDefinedCommand for CustomExtract {
         egraph: &mut EGraph,
         args: &[Expr],
     ) -> Result<Vec<CommandOutput>, egglog::Error> {
-        assert!(args.len() <= 2);
-        let (sort, value) = egraph.eval_expr(&args[0])?;
-        let n = args.get(1).map(|arg| egraph.eval_expr(arg)).transpose()?;
-        let n = if let Some(nv) = n {
-            // TODO: egglog does not yet support u64
-            if nv.0.name() != "i64" {
+        extract_with_cost_model(egraph, args, DynamicCostModel)
+    }
+}
+
+/// Run an `(extract expr)` or `(extract expr n)` using the given cost model.
+/// Parses args, evaluates n if present, and dispatches to extract-best or extract-variants.
+pub(crate) fn extract_with_cost_model<CM>(
+    egraph: &mut egglog::EGraph,
+    args: &[Expr],
+    cost_model: CM,
+) -> Result<Vec<CommandOutput>, egglog::Error>
+where
+    CM: CostModel<DefaultCost> + Clone + 'static,
+{
+    let (expr, variants) = match args {
+        [expr] => (expr, 0usize),
+        [expr, n_expr] => {
+            let (n_sort, n_val) = egraph.eval_expr(n_expr)?;
+            if n_sort.name() != "i64" {
                 let i64sort = egraph.get_arcsort_by(|s| s.name() == "i64");
-                return Err(Error::TypeError(TypeError::Mismatch {
-                    expr: args[1].clone(),
+                return Err(egglog::Error::TypeError(egglog::TypeError::Mismatch {
+                    expr: n_expr.clone(),
                     expected: i64sort,
-                    actual: nv.0,
+                    actual: n_sort,
                 }));
             }
-            egraph.value_to_base::<i64>(nv.1)
-        } else {
-            0
-        };
-
-        let mut termdag = TermDag::default();
-
-        let extractor = Extractor::compute_costs_from_rootsorts(
-            Some(vec![sort.clone()]),
-            egraph,
-            DynamicCostModel,
-        );
-        if n == 0 {
-            if let Some((cost, term)) = extractor.extract_best(egraph, &mut termdag, value) {
-                if log_enabled!(log::Level::Info) {
-                    log::info!("extracted with cost {cost}: {}", termdag.to_string(term));
-                }
-                Ok(vec![CommandOutput::ExtractBest(termdag, cost, term)])
-            } else {
-                Err(Error::ExtractError(
-                    "Unable to find any valid extraction (likely due to subsume or delete)"
-                        .to_string(),
-                ))
-            }
-        } else {
-            if n < 0 {
-                panic!("Cannot extract negative number of variants");
-            }
-            let terms: Vec<TermId> = extractor
-                .extract_variants(egraph, &mut termdag, value, n as usize)
-                .iter()
-                .map(|e| e.1)
-                .collect();
-            log::info!("extracted variants:");
-            Ok(vec![CommandOutput::ExtractVariants(termdag, terms)])
+            let n = egraph.value_to_base::<i64>(n_val);
+            assert!(n >= 0, "Cannot extract negative number of variants");
+            (expr, n as usize)
         }
+        _ => panic!("extract takes 1 or 2 arguments"),
+    };
+    let (sort, value) = egraph.eval_expr(expr)?;
+    let extractor = Extractor::compute_costs_from_rootsorts(Some(vec![sort]), egraph, cost_model);
+    let mut termdag = TermDag::default();
+    if variants == 0 {
+        if let Some((cost, term)) = extractor.extract_best(egraph, &mut termdag, value) {
+            if log_enabled!(log::Level::Info) {
+                log::info!("extracted with cost {cost}: {}", termdag.to_string(term));
+            }
+            Ok(vec![CommandOutput::ExtractBest(termdag, cost, term)])
+        } else {
+            Err(egglog::Error::ExtractError(
+                "Unable to find any valid extraction (likely due to subsume or delete)".to_string(),
+            ))
+        }
+    } else {
+        let terms: Vec<TermId> = extractor
+            .extract_variants(egraph, &mut termdag, value, variants)
+            .iter()
+            .map(|e| e.1)
+            .collect();
+        Ok(vec![CommandOutput::ExtractVariants(termdag, terms)])
     }
 }

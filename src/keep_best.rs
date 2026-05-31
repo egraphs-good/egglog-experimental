@@ -12,6 +12,7 @@ use egglog::{
     ast::Expr,
     extract::{Extractor, TreeAdditiveCostModel},
     sort::S,
+    span,
 };
 
 pub struct KeepBestCommand;
@@ -77,16 +78,7 @@ fn collect_and_extract(
     for table_name in table_names {
         let func = egraph
             .get_function(table_name)
-            .ok_or_else(|| {
-                TypeError::UnboundFunction(
-                    table_name.clone(),
-                    egglog::prelude::Span::Rust(std::sync::Arc::new(egglog::prelude::RustSpan {
-                        file: file!(),
-                        line: line!(),
-                        column: column!(),
-                    })),
-                )
-            })?;
+            .ok_or_else(|| TypeError::UnboundFunction(table_name.clone(), span!()))?;
 
         let all_sorts: Vec<ArcSort> = func
             .schema()

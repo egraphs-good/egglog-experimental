@@ -1,15 +1,45 @@
-use std::{collections::HashMap, sync::Mutex};
+use std::{collections::HashMap, marker::PhantomData, sync::Mutex};
 
 use egglog::{
     CommandOutput, UserDefinedCommand,
     ast::{Action, Change, Command, Expr, Fact, Literal, ParseError, PrintFunctionMode},
+    extract::{CostModel, DefaultCost, TreeAdditiveCostModel},
     prelude::run_ruleset,
     scheduler::{Scheduler, SchedulerId},
 };
 use egglog_reports::RunReport;
 use lazy_static::lazy_static;
 
-pub struct RunExtendedSchedule;
+use crate::extract_with_cost_model;
+
+pub struct RunExtendedSchedule<CM = TreeAdditiveCostModel>
+where
+    CM: CostModel<DefaultCost> + Clone + Send + Sync + 'static,
+{
+    cost_model: CM,
+    _cost: PhantomData<DefaultCost>,
+}
+
+impl Default for RunExtendedSchedule<TreeAdditiveCostModel> {
+    fn default() -> Self {
+        RunExtendedSchedule {
+            cost_model: TreeAdditiveCostModel::default(),
+            _cost: PhantomData,
+        }
+    }
+}
+
+impl<CM> RunExtendedSchedule<CM>
+where
+    CM: CostModel<DefaultCost> + Clone + Send + Sync + 'static,
+{
+    pub fn new(cost_model: CM) -> Self {
+        RunExtendedSchedule {
+            cost_model,
+            _cost: PhantomData,
+        }
+    }
+}
 
 pub trait SchedulerGen {
     fn new_scheduler(&self, egraph: &egglog::EGraph, args: &[Expr]) -> Box<dyn Scheduler>;
@@ -17,8 +47,9 @@ pub trait SchedulerGen {
 
 type SchedulerBuilder = Box<dyn Fn(&egglog::EGraph, &[Expr]) -> Box<dyn Scheduler> + Send + Sync>;
 
-struct ScheduleState {
+struct ScheduleState<CM: CostModel<DefaultCost> + Clone + 'static> {
     schedulers: Vec<(String, SchedulerId)>,
+    cost_model: CM,
 }
 
 lazy_static! {
@@ -34,9 +65,12 @@ pub fn add_scheduler_builder(name: String, builder: SchedulerBuilder) {
     scheduler_libs.lock().unwrap().insert(name, builder);
 }
 
-impl ScheduleState {
-    fn new() -> Self {
-        Self { schedulers: vec![] }
+impl<CM: CostModel<DefaultCost> + Clone + 'static> ScheduleState<CM> {
+    fn new(cost_model: CM) -> Self {
+        Self {
+            schedulers: vec![],
+            cost_model,
+        }
     }
 
     // Current limitation: because it relies on the publicly available Rust APIs to access
@@ -241,21 +275,11 @@ impl ScheduleState {
                 _ => err(),
             },
             // extract: (extract expr) or (extract expr n)
-            "extract" => match exprs.as_slice() {
-                [expr] => run_cmd(
-                    egraph,
-                    Command::Extract(
-                        span.clone(),
-                        expr.clone(),
-                        Expr::Lit(span.clone(), Literal::Int(0)),
-                    ),
-                ),
-                [expr, n] => run_cmd(
-                    egraph,
-                    Command::Extract(span.clone(), expr.clone(), n.clone()),
-                ),
-                _ => err(),
-            },
+            "extract" if matches!(exprs.len(), 1 | 2) => {
+                let outputs = extract_with_cost_model(egraph, exprs, self.cost_model.clone())?;
+                Ok((outputs, RunReport::default()))
+            }
+            "extract" => err(),
             // push: (push) or (push n)
             "push" => match exprs.as_slice() {
                 [] => run_cmd(egraph, Command::Push(1)),
@@ -346,13 +370,16 @@ impl ScheduleState {
     }
 }
 
-impl UserDefinedCommand for RunExtendedSchedule {
+impl<CM> UserDefinedCommand for RunExtendedSchedule<CM>
+where
+    CM: CostModel<DefaultCost> + Clone + Send + Sync + 'static,
+{
     fn update(
         &self,
         egraph: &mut egglog::EGraph,
         args: &[Expr],
     ) -> Result<Vec<CommandOutput>, egglog::Error> {
-        let mut schedule = ScheduleState::new();
+        let mut schedule = ScheduleState::new(self.cost_model.clone());
         let mut report = RunReport::default();
         let mut outputs: Vec<CommandOutput> = Vec::new();
         for arg in args {
