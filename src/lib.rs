@@ -22,7 +22,8 @@
 //!   the minimum capability needed by its body (`pure`, `read`, `write`, or
 //!   `full`). Bodies may call built-in or previously registered primitives and
 //!   table-backed functions; applying those primitives is allowed only in a
-//!   compatible runtime context.
+//!   compatible runtime context. Global references are not supported in primitive
+//!   bodies; pass captured values as explicit primitive inputs instead.
 //!
 //! Each bullet links to a runnable demo so you can explore the feature quickly.
 //! The rest of this crate exposes the Rust APIs and helpers that back these extensions.

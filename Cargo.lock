@@ -330,7 +330,7 @@ checksum = "d0881ea181b1df73ff77ffaaf9c7544ecc11e82fba9b5f27b262a3c73a332555"
 [[package]]
 name = "egglog"
 version = "2.0.0"
-source = "git+https://github.com/saulshanabrook/egg-smol.git?branch=codex%2Fsplit-primitive-body-runtime-apis#cf4fe23e104c263e07b771f4a314cf0dac8be1c8"
+source = "git+https://github.com/saulshanabrook/egg-smol.git?branch=codex%2Fsplit-primitive-body-runtime-apis#efee229927810e0212afd33c883eff0cc9aa4d3e"
 dependencies = [
  "chrono",
  "clap",
@@ -362,7 +362,7 @@ dependencies = [
 [[package]]
 name = "egglog-add-primitive"
 version = "2.0.0"
-source = "git+https://github.com/saulshanabrook/egg-smol.git?branch=codex%2Fsplit-primitive-body-runtime-apis#cf4fe23e104c263e07b771f4a314cf0dac8be1c8"
+source = "git+https://github.com/saulshanabrook/egg-smol.git?branch=codex%2Fsplit-primitive-body-runtime-apis#efee229927810e0212afd33c883eff0cc9aa4d3e"
 dependencies = [
  "quote",
  "syn 2.0.108",
@@ -371,7 +371,7 @@ dependencies = [
 [[package]]
 name = "egglog-ast"
 version = "2.0.0"
-source = "git+https://github.com/saulshanabrook/egg-smol.git?branch=codex%2Fsplit-primitive-body-runtime-apis#cf4fe23e104c263e07b771f4a314cf0dac8be1c8"
+source = "git+https://github.com/saulshanabrook/egg-smol.git?branch=codex%2Fsplit-primitive-body-runtime-apis#efee229927810e0212afd33c883eff0cc9aa4d3e"
 dependencies = [
  "ordered-float",
 ]
@@ -379,7 +379,7 @@ dependencies = [
 [[package]]
 name = "egglog-bridge"
 version = "2.0.0"
-source = "git+https://github.com/saulshanabrook/egg-smol.git?branch=codex%2Fsplit-primitive-body-runtime-apis#cf4fe23e104c263e07b771f4a314cf0dac8be1c8"
+source = "git+https://github.com/saulshanabrook/egg-smol.git?branch=codex%2Fsplit-primitive-body-runtime-apis#efee229927810e0212afd33c883eff0cc9aa4d3e"
 dependencies = [
  "anyhow",
  "dyn-clone",
@@ -402,7 +402,7 @@ dependencies = [
 [[package]]
 name = "egglog-concurrency"
 version = "2.0.0"
-source = "git+https://github.com/saulshanabrook/egg-smol.git?branch=codex%2Fsplit-primitive-body-runtime-apis#cf4fe23e104c263e07b771f4a314cf0dac8be1c8"
+source = "git+https://github.com/saulshanabrook/egg-smol.git?branch=codex%2Fsplit-primitive-body-runtime-apis#efee229927810e0212afd33c883eff0cc9aa4d3e"
 dependencies = [
  "arc-swap",
  "bumpalo",
@@ -414,7 +414,7 @@ dependencies = [
 [[package]]
 name = "egglog-core-relations"
 version = "2.0.0"
-source = "git+https://github.com/saulshanabrook/egg-smol.git?branch=codex%2Fsplit-primitive-body-runtime-apis#cf4fe23e104c263e07b771f4a314cf0dac8be1c8"
+source = "git+https://github.com/saulshanabrook/egg-smol.git?branch=codex%2Fsplit-primitive-body-runtime-apis#efee229927810e0212afd33c883eff0cc9aa4d3e"
 dependencies = [
  "anyhow",
  "bumpalo",
@@ -457,7 +457,7 @@ dependencies = [
 [[package]]
 name = "egglog-numeric-id"
 version = "2.0.0"
-source = "git+https://github.com/saulshanabrook/egg-smol.git?branch=codex%2Fsplit-primitive-body-runtime-apis#cf4fe23e104c263e07b771f4a314cf0dac8be1c8"
+source = "git+https://github.com/saulshanabrook/egg-smol.git?branch=codex%2Fsplit-primitive-body-runtime-apis#efee229927810e0212afd33c883eff0cc9aa4d3e"
 dependencies = [
  "rayon",
 ]
@@ -465,7 +465,7 @@ dependencies = [
 [[package]]
 name = "egglog-reports"
 version = "2.0.0"
-source = "git+https://github.com/saulshanabrook/egg-smol.git?branch=codex%2Fsplit-primitive-body-runtime-apis#cf4fe23e104c263e07b771f4a314cf0dac8be1c8"
+source = "git+https://github.com/saulshanabrook/egg-smol.git?branch=codex%2Fsplit-primitive-body-runtime-apis#efee229927810e0212afd33c883eff0cc9aa4d3e"
 dependencies = [
  "clap",
  "hashbrown 0.16.0",
@@ -479,7 +479,7 @@ dependencies = [
 [[package]]
 name = "egglog-union-find"
 version = "2.0.0"
-source = "git+https://github.com/saulshanabrook/egg-smol.git?branch=codex%2Fsplit-primitive-body-runtime-apis#cf4fe23e104c263e07b771f4a314cf0dac8be1c8"
+source = "git+https://github.com/saulshanabrook/egg-smol.git?branch=codex%2Fsplit-primitive-body-runtime-apis#efee229927810e0212afd33c883eff0cc9aa4d3e"
 dependencies = [
  "crossbeam",
  "egglog-concurrency",

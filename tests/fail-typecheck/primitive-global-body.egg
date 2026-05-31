@@ -1,0 +1,3 @@
+(let $offset 1)
+
+(primitive add-offset i64 i64 (+ _0 $offset))
