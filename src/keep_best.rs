@@ -31,28 +31,16 @@ impl UserDefinedCommand for KeepBestCommand {
         // term for every column value.
         let extracted = collect_and_extract(egraph, &table_names)?;
 
-        // Step 3: collect all input keys for every function, then clear all
-        // tables in one batched with_full_state call.
+        // Step 3: clear every function in the e-graph in bulk.
+        //
+        // `clear_function` drops the entire row buffer for a table in
+        // O(1)-in-row-count time and bumps the table's generation so cached
+        // indexes/subsets are lazily rebuilt. That's strictly faster than
+        // staging a `remove` per row, which is what we used to do here.
         let all_funcs: Vec<String> = egraph.get_function_names();
-        let all_keys: Vec<(String, usize, Vec<Vec<Value>>)> = all_funcs
-            .iter()
-            .map(|name| {
-                let n_inputs = egraph.get_function(name).unwrap().schema().input.len();
-                let mut keys: Vec<Vec<Value>> = Vec::new();
-                egraph.function_for_each(name, |row| {
-                    keys.push(row.vals[..n_inputs].to_vec());
-                })?;
-                Ok((name.clone(), n_inputs, keys))
-            })
-            .collect::<Result<_, Error>>()?;
-
-        egraph.with_full_state(|mut state| {
-            for (name, _, keys) in &all_keys {
-                for key in keys {
-                    egglog::Write::remove(&mut state, name, key);
-                }
-            }
-        });
+        for name in &all_funcs {
+            egraph.clear_function(name)?;
+        }
 
         // Step 4: re-insert the optimal tuples. Evaluate each extracted term
         // via eval_expr so that constructor sub-terms are re-created bottom-up,
