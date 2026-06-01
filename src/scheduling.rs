@@ -1,45 +1,15 @@
-use std::{collections::HashMap, marker::PhantomData, sync::Mutex};
+use std::{collections::HashMap, sync::Mutex};
 
 use egglog::{
     CommandOutput, UserDefinedCommand,
-    ast::{Action, Change, Command, Expr, Fact, Literal, ParseError, PrintFunctionMode},
-    extract::{CostModel, DefaultCost, TreeAdditiveCostModel},
+    ast::{Command, Expr, Fact, Literal, ParseError},
     prelude::run_ruleset,
     scheduler::{Scheduler, SchedulerId},
 };
 use egglog_reports::RunReport;
 use lazy_static::lazy_static;
 
-use crate::extract_with_cost_model;
-
-pub struct RunExtendedSchedule<CM = TreeAdditiveCostModel>
-where
-    CM: CostModel<DefaultCost> + Clone + Send + Sync + 'static,
-{
-    cost_model: CM,
-    _cost: PhantomData<DefaultCost>,
-}
-
-impl Default for RunExtendedSchedule<TreeAdditiveCostModel> {
-    fn default() -> Self {
-        RunExtendedSchedule {
-            cost_model: TreeAdditiveCostModel::default(),
-            _cost: PhantomData,
-        }
-    }
-}
-
-impl<CM> RunExtendedSchedule<CM>
-where
-    CM: CostModel<DefaultCost> + Clone + Send + Sync + 'static,
-{
-    pub fn new(cost_model: CM) -> Self {
-        RunExtendedSchedule {
-            cost_model,
-            _cost: PhantomData,
-        }
-    }
-}
+pub struct RunExtendedSchedule;
 
 pub trait SchedulerGen {
     fn new_scheduler(&self, egraph: &egglog::EGraph, args: &[Expr]) -> Box<dyn Scheduler>;
@@ -47,9 +17,8 @@ pub trait SchedulerGen {
 
 type SchedulerBuilder = Box<dyn Fn(&egglog::EGraph, &[Expr]) -> Box<dyn Scheduler> + Send + Sync>;
 
-struct ScheduleState<CM: CostModel<DefaultCost> + Clone + 'static> {
+struct ScheduleState {
     schedulers: Vec<(String, SchedulerId)>,
-    cost_model: CM,
 }
 
 lazy_static! {
@@ -65,12 +34,9 @@ pub fn add_scheduler_builder(name: String, builder: SchedulerBuilder) {
     scheduler_libs.lock().unwrap().insert(name, builder);
 }
 
-impl<CM: CostModel<DefaultCost> + Clone + 'static> ScheduleState<CM> {
-    fn new(cost_model: CM) -> Self {
-        Self {
-            schedulers: vec![],
-            cost_model,
-        }
+impl ScheduleState {
+    fn new() -> Self {
+        Self { schedulers: vec![] }
     }
 
     // Current limitation: because it relies on the publicly available Rust APIs to access
@@ -111,14 +77,6 @@ impl<CM: CostModel<DefaultCost> + Clone + 'static> ScheduleState<CM> {
                 res
             }};
         }
-
-        // Run a single Command via run_program and return (outputs, empty RunReport).
-        let run_cmd = |egraph: &mut egglog::EGraph,
-                       cmd: Command|
-         -> Result<(Vec<CommandOutput>, RunReport), egglog::Error> {
-            let outputs = egraph.run_program(vec![cmd])?;
-            Ok((outputs, RunReport::default()))
-        };
 
         match head.as_str() {
             "let-scheduler" => match exprs.as_slice() {
@@ -242,144 +200,47 @@ impl<CM: CostModel<DefaultCost> + Clone + 'static> ScheduleState<CM> {
                 }
                 _ => err(),
             },
-            // print-size: (print-size) or (print-size FuncName)
-            "print-size" => match exprs.as_slice() {
-                [] => run_cmd(egraph, Command::PrintSize(span.clone(), None)),
-                [Expr::Var(_, name)] => {
-                    run_cmd(egraph, Command::PrintSize(span.clone(), Some(name.clone())))
-                }
-                _ => err(),
-            },
-            // print-function: (print-function FuncName) or (print-function FuncName n)
-            "print-function" => match exprs.as_slice() {
-                [Expr::Var(_, name)] => run_cmd(
-                    egraph,
-                    Command::PrintFunction(
-                        span.clone(),
-                        name.clone(),
-                        None,
-                        None,
-                        PrintFunctionMode::Default,
-                    ),
-                ),
-                [Expr::Var(_, name), Expr::Lit(_, Literal::Int(n))] => run_cmd(
-                    egraph,
-                    Command::PrintFunction(
-                        span.clone(),
-                        name.clone(),
-                        Some(*n as usize),
-                        None,
-                        PrintFunctionMode::Default,
-                    ),
-                ),
-                _ => err(),
-            },
-            // extract: (extract expr) or (extract expr n)
-            "extract" if matches!(exprs.len(), 1 | 2) => {
-                let outputs = extract_with_cost_model(egraph, exprs, self.cost_model.clone())?;
-                Ok((outputs, RunReport::default()))
-            }
-            "extract" => err(),
-            // push: (push) or (push n)
-            "push" => match exprs.as_slice() {
-                [] => run_cmd(egraph, Command::Push(1)),
-                [Expr::Lit(_, Literal::Int(n))] => run_cmd(egraph, Command::Push(*n as usize)),
-                _ => err(),
-            },
-            // pop: (pop) or (pop n)
-            "pop" => match exprs.as_slice() {
-                [] => run_cmd(egraph, Command::Pop(span.clone(), 1)),
-                [Expr::Lit(_, Literal::Int(n))] => {
-                    run_cmd(egraph, Command::Pop(span.clone(), *n as usize))
-                }
-                _ => err(),
-            },
-            // Non-let actions
-            "union" => match exprs.as_slice() {
-                [a, b] => run_cmd(
-                    egraph,
-                    Command::Action(Action::Union(span.clone(), a.clone(), b.clone())),
-                ),
-                _ => err(),
-            },
-            "set" => match exprs.as_slice() {
-                [Expr::Call(_, f, args), rhs] => run_cmd(
-                    egraph,
-                    Command::Action(Action::Set(
-                        span.clone(),
-                        f.clone(),
-                        args.clone(),
-                        rhs.clone(),
-                    )),
-                ),
-                _ => err(),
-            },
-            "delete" => match exprs.as_slice() {
-                [Expr::Call(_, f, args)] => run_cmd(
-                    egraph,
-                    Command::Action(Action::Change(
-                        span.clone(),
-                        Change::Delete,
-                        f.clone(),
-                        args.clone(),
-                    )),
-                ),
-                _ => err(),
-            },
-            "subsume" => match exprs.as_slice() {
-                [Expr::Call(_, f, args)] => run_cmd(
-                    egraph,
-                    Command::Action(Action::Change(
-                        span.clone(),
-                        Change::Subsume,
-                        f.clone(),
-                        args.clone(),
-                    )),
-                ),
-                _ => err(),
-            },
-            "panic" => match exprs.as_slice() {
-                [Expr::Lit(_, Literal::String(msg))] => run_cmd(
-                    egraph,
-                    Command::Action(Action::Panic(span.clone(), msg.clone())),
-                ),
-                _ => err(),
-            },
-            _ => {
-                if egraph.has_command(head) {
-                    let cmd_outputs = egraph.run_user_defined_command(head, exprs)?;
-                    let mut report = RunReport::default();
-                    let mut outputs = Vec::new();
-                    for output in cmd_outputs {
-                        if let CommandOutput::RunSchedule(r) = output {
-                            report.union(r);
-                        } else {
-                            outputs.push(output);
-                        }
+            // Allowlisted commands forwarded via parse roundtrip.
+            // User-defined commands are also allowed (run-schedule, multi-extract, keep-best, ...).
+            // Anything else (rule declarations, let bindings, function definitions, ...) is rejected.
+            _ if matches!(
+                head.as_str(),
+                "print-size"
+                    | "print-function"
+                    | "extract"
+                    | "push"
+                    | "pop"
+                    | "union"
+                    | "set"
+                    | "delete"
+                    | "subsume"
+                    | "panic"
+            ) || egraph.has_command(head) =>
+            {
+                let outputs = egraph.parse_and_run_program(None, &format!("{}", arg))?;
+                let mut report = RunReport::default();
+                let mut cmd_outputs = Vec::new();
+                for output in outputs {
+                    if let CommandOutput::RunSchedule(r) = output {
+                        report.union(r);
+                    } else {
+                        cmd_outputs.push(output);
                     }
-                    Ok((outputs, report))
-                } else {
-                    // General expression evaluation (supersedes call-prim)
-                    run_cmd(
-                        egraph,
-                        Command::Action(Action::Expr(span.clone(), arg.clone())),
-                    )
                 }
+                Ok((cmd_outputs, report))
             }
+            _ => err(),
         }
     }
 }
 
-impl<CM> UserDefinedCommand for RunExtendedSchedule<CM>
-where
-    CM: CostModel<DefaultCost> + Clone + Send + Sync + 'static,
-{
+impl UserDefinedCommand for RunExtendedSchedule {
     fn update(
         &self,
         egraph: &mut egglog::EGraph,
         args: &[Expr],
     ) -> Result<Vec<CommandOutput>, egglog::Error> {
-        let mut schedule = ScheduleState::new(self.cost_model.clone());
+        let mut schedule = ScheduleState::new();
         let mut report = RunReport::default();
         let mut outputs: Vec<CommandOutput> = Vec::new();
         for arg in args {
