@@ -234,11 +234,44 @@ impl UserDefinedCommand for RunExtendedSchedule {
         egraph: &mut egglog::EGraph,
         args: &[Expr],
     ) -> Result<Option<CommandOutput>, egglog::Error> {
+        let split = args
+            .iter()
+            .position(|e| matches!(e, Expr::Var(_, s) if s.starts_with(':')))
+            .unwrap_or(args.len());
+        let (scheds, opts) = args.split_at(split);
+        let size_limit = match opts {
+            [] => None,
+            [Expr::Var(_, kw), Expr::Lit(_, Literal::Int(n))] if kw == ":size-limit" && *n >= 0 => {
+                Some(*n as usize)
+            }
+            _ => {
+                return Err(egglog::Error::ParseError(ParseError(
+                    opts[0].span(),
+                    "could not parse run-schedule options (expected `:size-limit N`)".into(),
+                )));
+            }
+        };
+        if let Some(limit) = size_limit {
+            egglog::set_action_row_cap(limit);
+        }
+
         let mut schedule = ScheduleState::new();
         let mut report = RunReport::default();
-        for arg in args {
-            report.union(schedule.run(egraph, arg)?);
+        let mut result = Ok(());
+        for arg in scheds {
+            match schedule.run(egraph, arg) {
+                Ok(r) => report.union(r),
+                Err(e) => {
+                    result = Err(e);
+                    break;
+                }
+            }
         }
+
+        if size_limit.is_some() {
+            egglog::set_action_row_cap(usize::MAX);
+        }
+        result?;
         Ok(Some(CommandOutput::RunSchedule(report)))
     }
 }
