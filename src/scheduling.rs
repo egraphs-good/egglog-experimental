@@ -15,7 +15,15 @@ pub trait SchedulerGen {
     fn new_scheduler(&self, egraph: &egglog::EGraph, args: &[Expr]) -> Box<dyn Scheduler>;
 }
 
-type SchedulerBuilder = Box<dyn Fn(&egglog::EGraph, &[Expr]) -> Box<dyn Scheduler> + Send + Sync>;
+type SchedulerBuilder = Box<
+    dyn Fn(
+            &egglog::EGraph,
+            &egglog::ast::Span,
+            &[Expr],
+        ) -> Result<Box<dyn Scheduler>, egglog::Error>
+        + Send
+        + Sync,
+>;
 
 struct ScheduleState {
     schedulers: Vec<(String, SchedulerId)>,
@@ -58,11 +66,13 @@ impl ScheduleState {
 
         if let Expr::Var(_, ruleset) = arg {
             let output = run_ruleset(egraph, ruleset.as_str())?;
-            assert!(output.len() == 1);
-            if let CommandOutput::RunSchedule(report) = &output[0] {
+            if let [CommandOutput::RunSchedule(report)] = output.as_slice() {
                 return Ok((vec![], report.clone()));
             }
-            panic!("Expected a RunSchedule, got {:?}", output[0]);
+            return Err(egglog::Error::ParseError(ParseError(
+                arg.span(),
+                format!("Expected ruleset {ruleset} to produce one RunSchedule output"),
+            )));
         }
 
         let Expr::Call(span, head, exprs) = arg else {
@@ -87,8 +97,16 @@ impl ScheduleState {
                             format!("Scheduler {name} already exists"),
                         )));
                     }
-                    let scheduler =
-                        (scheduler_libs.lock().unwrap().get(scheduler_name).unwrap())(egraph, args);
+                    let scheduler = {
+                        let libs = scheduler_libs.lock().unwrap();
+                        let Some(builder) = libs.get(scheduler_name) else {
+                            return Err(egglog::Error::ParseError(ParseError(
+                                span.clone(),
+                                format!("Unknown scheduler: {scheduler_name}"),
+                            )));
+                        };
+                        builder(egraph, span, args)?
+                    };
                     let id = egraph.add_scheduler(scheduler);
                     self.schedulers.push((name.clone(), id));
                     Ok((vec![], RunReport::default()))
@@ -98,17 +116,24 @@ impl ScheduleState {
             "run" | "run-with" => {
                 let mut scheduler = None;
                 let exprs: &[egglog::ast::Expr] = if head.as_str() == "run-with" {
-                    let Expr::Var(_, ref scheduler_name) = exprs[0] else {
+                    let Some((Expr::Var(scheduler_span, scheduler_name), rest)) =
+                        exprs.split_first()
+                    else {
                         return err();
                     };
                     scheduler = Some(
                         self.schedulers
                             .iter()
                             .rfind(|(n, _)| n == scheduler_name)
-                            .unwrap()
-                            .1,
+                            .map(|(_, id)| *id)
+                            .ok_or_else(|| {
+                                egglog::Error::ParseError(ParseError(
+                                    scheduler_span.clone(),
+                                    format!("Unknown scheduler: {scheduler_name}"),
+                                ))
+                            })?,
                     );
-                    &exprs[1..]
+                    rest
                 } else {
                     &exprs[..]
                 };
@@ -117,7 +142,12 @@ impl ScheduleState {
                     None => ("", exprs),
                     Some(Expr::Var(_span, v)) if *v == ":until" => ("", exprs),
                     Some(Expr::Var(_span, ruleset)) => (ruleset.as_str(), &exprs[1..]),
-                    _ => unreachable!(),
+                    Some(expr) => {
+                        return Err(egglog::Error::ParseError(ParseError(
+                            expr.span(),
+                            "Expected ruleset name or :until clause in run schedule".into(),
+                        )));
+                    }
                 };
 
                 let until = match rest {
@@ -253,22 +283,39 @@ impl UserDefinedCommand for RunExtendedSchedule {
     }
 }
 
-pub(crate) fn parse_tags(args: &[Expr]) -> HashMap<String, Literal> {
+pub(crate) fn parse_tags(
+    span: &egglog::ast::Span,
+    args: &[Expr],
+) -> Result<HashMap<String, Literal>, egglog::Error> {
+    if !args.len().is_multiple_of(2) {
+        return Err(egglog::Error::ParseError(ParseError(
+            span.clone(),
+            "Scheduler tags must be key/value pairs".into(),
+        )));
+    }
     let mut tags = HashMap::new();
-    assert!(args.len().is_multiple_of(2));
     for arg in args.chunks(2) {
-        let Expr::Var(_, ref tag_name) = arg[0] else {
-            panic!("Invalid tag name: {:?}", arg[0]);
+        let Expr::Var(ref tag_span, ref tag_name) = arg[0] else {
+            return Err(egglog::Error::ParseError(ParseError(
+                arg[0].span(),
+                "Invalid scheduler tag name".into(),
+            )));
         };
         let Expr::Lit(_, lit) = &arg[1] else {
-            panic!("Invalid tag value: {:?}", arg[1]);
+            return Err(egglog::Error::ParseError(ParseError(
+                arg[1].span(),
+                format!("Invalid value for scheduler tag {tag_name}"),
+            )));
         };
-        if tags.contains_key(&tag_name.to_string()) {
-            panic!("Tag name already exists: {:?}", tag_name);
+        if tags.contains_key(tag_name) {
+            return Err(egglog::Error::ParseError(ParseError(
+                tag_span.clone(),
+                format!("Scheduler tag {tag_name} already exists"),
+            )));
         }
         tags.insert(tag_name.to_string(), lit.clone());
     }
-    tags
+    Ok(tags)
 }
 
 mod schedulers {
@@ -284,32 +331,45 @@ mod schedulers {
 
     pub(super) fn new_back_off_scheduler(
         _egraph: &egglog::EGraph,
+        span: &egglog::ast::Span,
         args: &[Expr],
-    ) -> Box<dyn Scheduler> {
-        let tags = parse_tags(args);
+    ) -> Result<Box<dyn Scheduler>, egglog::Error> {
+        let tags = parse_tags(span, args)?;
         let default_match_limit = tags
             .get(":match-limit")
-            .map(|lit| {
-                let Literal::Int(n) = lit else {
-                    panic!("Invalid match limit: {:?}", lit);
-                };
-                *n as usize
+            .map(|lit| match lit {
+                Literal::Int(n) if *n >= 0 => Ok(*n as usize),
+                Literal::Int(_) => Err(egglog::Error::ParseError(egglog::ast::ParseError(
+                    span.clone(),
+                    "Scheduler :match-limit must be non-negative".into(),
+                ))),
+                _ => Err(egglog::Error::ParseError(egglog::ast::ParseError(
+                    span.clone(),
+                    "Scheduler :match-limit must be an integer".into(),
+                ))),
             })
+            .transpose()?
             .unwrap_or(1000);
         let default_ban_length = tags
             .get(":ban-length")
-            .map(|lit| {
-                let Literal::Int(n) = lit else {
-                    panic!("Invalid ban length: {:?}", lit);
-                };
-                *n as usize
+            .map(|lit| match lit {
+                Literal::Int(n) if *n >= 0 => Ok(*n as usize),
+                Literal::Int(_) => Err(egglog::Error::ParseError(egglog::ast::ParseError(
+                    span.clone(),
+                    "Scheduler :ban-length must be non-negative".into(),
+                ))),
+                _ => Err(egglog::Error::ParseError(egglog::ast::ParseError(
+                    span.clone(),
+                    "Scheduler :ban-length must be an integer".into(),
+                ))),
             })
+            .transpose()?
             .unwrap_or(5);
-        Box::new(BackOffScheduler {
+        Ok(Box::new(BackOffScheduler {
             default_match_limit,
             default_ban_length,
             stats: HashMap::new(),
-        })
+        }))
     }
 
     #[derive(Debug, Clone)]
