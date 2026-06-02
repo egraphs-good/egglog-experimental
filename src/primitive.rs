@@ -12,7 +12,7 @@ use std::sync::Arc;
 pub(crate) struct RegisterPrimitive;
 
 impl UserDefinedCommand for RegisterPrimitive {
-    fn update(&self, egraph: &mut EGraph, args: &[Expr]) -> Result<Option<CommandOutput>, Error> {
+    fn update(&self, egraph: &mut EGraph, args: &[Expr]) -> Result<Vec<CommandOutput>, Error> {
         if args.len() != 4 {
             return Err(backend_error(
                 args.first().map(Expr::span).unwrap_or_else(|| Span::Panic),
@@ -87,7 +87,7 @@ impl UserDefinedCommand for RegisterPrimitive {
             Context::Write => egraph.add_write_primitive(primitive, None),
             Context::Full => egraph.add_full_primitive(primitive, None),
         }
-        Ok(None)
+        Ok(vec![])
     }
 }
 

@@ -233,13 +233,13 @@ impl UserDefinedCommand for RunExtendedSchedule {
         &self,
         egraph: &mut egglog::EGraph,
         args: &[Expr],
-    ) -> Result<Option<CommandOutput>, egglog::Error> {
+    ) -> Result<Vec<CommandOutput>, egglog::Error> {
         let mut schedule = ScheduleState::new();
         let mut report = RunReport::default();
         for arg in args {
             report.union(schedule.run(egraph, arg)?);
         }
-        Ok(Some(CommandOutput::RunSchedule(report)))
+        Ok(vec![CommandOutput::RunSchedule(report)])
     }
 }
 

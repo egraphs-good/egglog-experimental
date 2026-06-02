@@ -1,4 +1,4 @@
-use egglog_ast::span::{RustSpan, Span};
+use egglog_ast::span::Span;
 use std::sync::Arc;
 
 use egglog::{
@@ -222,7 +222,7 @@ impl UserDefinedCommand for CustomExtract {
         &self,
         egraph: &mut EGraph,
         args: &[Expr],
-    ) -> Result<Option<CommandOutput>, egglog::Error> {
+    ) -> Result<Vec<CommandOutput>, egglog::Error> {
         match args {
             [] => {
                 return Err(Error::ParseError(ParseError(
@@ -275,7 +275,7 @@ impl UserDefinedCommand for CustomExtract {
                 if log_enabled!(log::Level::Info) {
                     log::info!("extracted with cost {cost}: {}", termdag.to_string(term));
                 }
-                Ok(Some(CommandOutput::ExtractBest(termdag, cost, term)))
+                Ok(vec![CommandOutput::ExtractBest(termdag, cost, term)])
             } else {
                 Err(Error::ExtractError(
                     "Unable to find any valid extraction (likely due to subsume or delete)"
@@ -289,7 +289,7 @@ impl UserDefinedCommand for CustomExtract {
                 .map(|e| e.1)
                 .collect();
             log::info!("extracted variants:");
-            Ok(Some(CommandOutput::ExtractVariants(termdag, terms)))
+            Ok(vec![CommandOutput::ExtractVariants(termdag, terms)])
         }
     }
 }

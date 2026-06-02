@@ -20,16 +20,17 @@
 //!   Body variables are positional (`_0`, `_1`, ...), and a partial primitive
 //!   body result propagates as primitive failure. The registered primitive uses
 //!   the minimum capability needed by its body (`pure`, `read`, `write`, or
-//!   `full`). Bodies may call built-in or previously registered primitives and
-//!   table-backed functions; applying those primitives is allowed only in a
-//!   compatible runtime context. Global references are not supported in primitive
-//!   bodies; pass captured values as explicit primitive inputs instead.
+//!   `full`). Bodies may call built-in or previously registered primitives,
+//!   table-backed functions, and globals; applying those primitives is allowed
+//!   only in a compatible runtime context. A global reference makes the defined
+//!   primitive read-capable because globals lower to zero-argument function
+//!   lookups.
 //!
 //! Each bullet links to a runnable demo so you can explore the feature quickly.
 //! The rest of this crate exposes the Rust APIs and helpers that back these extensions.
 //!
 use egglog::ast::Parser;
-use egglog::prelude::{RustSpan, Span, add_base_sort};
+use egglog::prelude::add_base_sort;
 pub use egglog::*;
 use std::sync::Arc;
 
