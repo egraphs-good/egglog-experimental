@@ -1,7 +1,7 @@
-use std::{collections::HashSet, convert::TryFrom};
+use std::convert::TryFrom;
 
 use egglog::{
-    ExecutionState, Primitive, Value,
+    Core, Primitive, Read, ReadPrim, ReadState, Value,
     constraint::{AllEqualTypeConstraint, TypeConstraint},
     prelude::BaseSort,
     prelude::{I64Sort, Span, StringSort},
@@ -23,34 +23,25 @@ impl Primitive for GetSizePrimitive {
             .with_all_arguments_sort(StringSort.to_arcsort())
             .into_box()
     }
+}
 
-    fn apply(&self, exec_state: &mut ExecutionState, args: &[Value]) -> Option<Value> {
-        let filters: Option<HashSet<String>> = if args.is_empty() {
-            None
-        } else {
-            Some(
-                args.iter()
-                    .map(|value| exec_state.base_values().unwrap::<S>(*value).0)
-                    .collect::<HashSet<_>>(),
-            )
+impl ReadPrim for GetSizePrimitive {
+    fn apply<'a, 'db>(&self, state: ReadState<'a, 'db>, args: &[Value]) -> Option<Value> {
+        let size: usize = match args {
+            [] => state
+                .table_sizes()
+                .into_iter()
+                .filter_map(|(name, size)| {
+                    (!name.starts_with(INTERNAL_SYMBOL_PREFIX)).then_some(size)
+                })
+                .sum(),
+            tables => tables
+                .iter()
+                .map(|value| state.base_values().unwrap::<S>(*value).0)
+                .filter_map(|name| state.table_size(&name))
+                .sum(),
         };
-
-        let total_size: usize = exec_state
-            .table_ids()
-            .filter_map(|table_id| {
-                let name = exec_state.table_name(table_id)?;
-                if name.starts_with(INTERNAL_SYMBOL_PREFIX) {
-                    return None;
-                }
-                if let Some(filter) = &filters
-                    && !filter.contains(name)
-                {
-                    return None;
-                }
-                Some(exec_state.get_table(table_id).len())
-            })
-            .sum();
-        let total_size = i64::try_from(total_size).ok()?;
-        Some(exec_state.base_values().get::<i64>(total_size))
+        let size = i64::try_from(size).ok()?;
+        Some(state.base_values().get::<i64>(size))
     }
 }

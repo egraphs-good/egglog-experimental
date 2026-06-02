@@ -309,34 +309,25 @@ pub fn print_table_stats(egraph: &EGraph, sym: Option<&str>) -> Result<Vec<Table
     let mut results: Vec<TableStats> = Vec::new();
     if let Some(sym) = sym {
         let func = egraph
-            .functions_iter()
-            .map(|(_, f)| f)
-            .find(|f| f.term_constructor() == Some(sym))
-            .or_else(|| egraph.get_function(sym))
+            .get_function(sym)
             .ok_or_else(|| TypeError::UnboundFunction(sym.to_owned(), Span::Panic))?;
-        if func.is_hidden() || func.is_let_binding() {
+        if func.is_let_binding() {
             return Err(Error::BackendError(format!(
-                "print-table-stats: function `{sym}` is hidden or a let-binding and cannot be reported"
+                "print-table-stats: function `{sym}` is a let-binding and cannot be reported"
             )));
         }
-        let actual_name = func.name().to_owned();
-        let display_name = func
-            .term_constructor()
-            .map(str::to_owned)
-            .unwrap_or_else(|| actual_name.clone());
-        let mut stats = compute_table_stats(egraph, &actual_name)?;
-        stats.name = display_name;
+        let mut stats = compute_table_stats(egraph, func.name())?;
+        stats.name = func.name().to_owned();
         results.push(stats);
     } else {
         let mut names: Vec<(String, String)> = egraph
-            .functions_iter()
-            .filter(|(_, f)| !f.is_hidden() && !f.is_let_binding())
-            .map(|(sym, f)| {
-                let display_name = f
-                    .term_constructor()
-                    .map(str::to_owned)
-                    .unwrap_or_else(|| sym.clone());
-                (display_name, sym.clone())
+            .get_function_names()
+            .into_iter()
+            .filter_map(|name| {
+                egraph
+                    .get_function(&name)
+                    .filter(|f| !f.is_let_binding())
+                    .map(|_| (name.clone(), name))
             })
             .collect();
         names.sort_by(|a, b| a.0.cmp(&b.0));
