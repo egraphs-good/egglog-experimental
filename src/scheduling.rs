@@ -1,3 +1,54 @@
+//! The `run-schedule` command: an extended scheduling language for egglog.                           
+//!                                                                                                   
+//! `run-schedule` takes one or more *schedule expressions* and runs them in                          
+//! order against the e-graph, returning the combined [`RunReport`] (plus any                         
+//! per-command outputs such as `print-size` results). It is registered as a                          
+//! user-defined command by [`new_experimental_egraph`](crate::new_experimental_egraph)               
+//! and is the experimental counterpart to core egglog's built-in `run-schedule`.                     
+//!                                                                                                   
+//! # Schedule expressions                                                                            
+//!                                                                                                   
+//! A schedule expression is one of:                                                                  
+//!                                                                                                   
+//! - **`ruleset`** — a bare ruleset name (a [`Var`](egglog::ast::Expr::Var)),                        
+//!   e.g. `my-rules`. Runs one step of that ruleset.                                                 
+//! - **`(run [ruleset] [:until cond])`** — run one step of `ruleset` (or the                         
+//!   empty/default ruleset if omitted). With `:until cond`, the step is skipped                      
+//!   once `cond` already holds (`cond` is checked as a [`Check`](egglog::ast::Command::Check)).      
+//! - **`(run-with scheduler [ruleset] [:until cond])`** — like `run`, but drives                     
+//!   the ruleset with a named scheduler previously bound by `let-scheduler`.                         
+//! - **`(let-scheduler name (scheduler-kind args...))`** — bind `name` to a fresh                    
+//!   scheduler instance (e.g. `(back-off :match-limit 1000 :ban-length 5)`).                         
+//!   The binding is scoped to the enclosing `seq`/`saturate`/`repeat` block.                         
+//! - **`(seq step...)`** — run each step once, in order.                                             
+//! - **`(saturate step...)`** — repeatedly run the body until it makes no further                    
+//!   progress (the accumulated report's `can_stop` is set).                                          
+//! - **`(repeat n step...)`** — run the body `n` times.                                              
+//! - **`(eval expr...)`** — evaluate each `expr` in the full read/write                              
+//!   (FullState) context and add the resulting terms to the e-graph, the                             
+//!   schedule-step analogue of a top-level expression like `(Add (Num 1) (Num 2))`.                  
+//!   Because evaluation has full database access, the expressions may also call                      
+//!   reading primitives such as `(get-size!)` that are not admissible from an                        
+//!   ordinary action context.                                                                        
+//! - **A forwarded command** — a fixed allowlist of side-effecting commands                          
+//!   (`print-size`, `print-function`, `extract`, `push`, `pop`, `union`, `set`,                      
+//!   `delete`, `subsume`, `panic`) and any registered user-defined command                           
+//!   (e.g. `keep-best`, `multi-extract`, or a nested `run-schedule`). These are                      
+//!   forwarded by re-parsing the s-expression through                                                
+//!   [`parse_and_run_program`](egglog::EGraph::parse_and_run_program); any other                     
+//!   head (rule declarations, `let` bindings, function definitions, …) is rejected.                  
+//!                                                                                                   
+//! # Example                                                                                         
+//!                                                                                                   
+//! ```text                                                                                           
+//! (run-schedule                                                                                     
+//!   (repeat 3                                                                                       
+//!     (push)                                                                                        
+//!     (eval (Add (Num 1) (Num 2)))   ; add a term to the e-graph                                    
+//!     (saturate (run math-rules))    ; rewrite to fixpoint                                          
+//!     (keep-best "Target")           ; compact to best representatives                              
+//!     (pop)))                                                                                       
+//! ```                       
 use std::{collections::HashMap, sync::Mutex};
 
 use egglog::{
@@ -9,6 +60,9 @@ use egglog::{
 use egglog_reports::RunReport;
 use lazy_static::lazy_static;
 
+/// The `run-schedule` user-defined command.                                                          
+///                                                                                                   
+/// See the [module-level documentation](self) for the full schedule language.  
 pub struct RunExtendedSchedule;
 
 pub trait SchedulerGen {
@@ -230,6 +284,18 @@ impl ScheduleState {
                 }
                 _ => err(),
             },
+            // (eval <expr> ...): evaluate each expression and add the resulting
+            // terms to the e-graph — the schedule-step analogue of a top-level
+            // expression such as `(Add (Num 1) (Num 2))`. Evaluation happens in
+            // the full read/write (FullState) context, so the expressions may
+            // also call reading primitives like `(get-size!)` that are not
+            // admissible from an ordinary action context.
+            "eval" => {
+                for expr in exprs {
+                    egraph.eval_expr(expr)?;
+                }
+                Ok((vec![], RunReport::default()))
+            }
             // Allowlisted commands forwarded via parse roundtrip.
             // User-defined commands are also allowed (run-schedule, multi-extract, keep-best, ...).
             // Anything else (rule declarations, let bindings, function definitions, ...) is rejected.

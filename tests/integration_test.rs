@@ -314,6 +314,9 @@ fn test_keep_best_clears_other_tables() {
     assert_eq!(egraph.get_size("Add"), 0);
     assert_eq!(egraph.get_size("Target"), 1);
     assert_eq!(egraph.get_size("Num"), 1); // only Num 42 is kept
+}
+
+#[test]
 fn test_extract_missing_expression_returns_error_instead_of_panicking() {
     let mut egraph = egglog_experimental::new_experimental_egraph();
 
@@ -623,16 +626,36 @@ fn test_schedule_expr_eval() {
         )
         .unwrap();
 
-    // Direct expression evaluation as a schedule step (supersedes call-prim)
+    // `(eval <expr>)` evaluates an expression as a schedule step in the full
+    // read/write (FullState) context. Here it calls the `get-size!` reading
+    // primitive, which is only admissible because of that full context.
     egraph
         .parse_and_run_program(
             None,
             r#"
         (run-schedule
-          (get-size!))
+          (eval (get-size!)))
         "#,
         )
         .unwrap();
+
+    // `(eval <expr>)` also adds constructor terms to the e-graph, just like a
+    // top-level expression would.
+    let before = egraph.get_size("Add");
+    egraph
+              .parse_and_run_program(
+                  None,
+                  r#"                                                                                      
+              (run-schedule                                                                                
+                (eval (Add (Num 3) (Num 4))))                                                              
+              "#,
+              )
+              .unwrap();
+    assert_eq!(
+        egraph.get_size("Add"),
+        before + 1,
+        "(eval ...) should add the new Add term to the e-graph"
+    );
 }
 
 #[test]
@@ -686,7 +709,7 @@ fn test_schedule_repeat_push_pop_print_size() {
 
     // Each of 3 outer iterations:
     //   1. push the current (fact-free) state
-    //   2. insert a sum-1-to-5 addition chain as a schedule action
+    //   2. eval a sum-1-to-5 addition chain to add it to the e-graph
     //   3. repeat 5 times: run math-rules one step, then print-size
     //   4. pop back to the fact-free state
     //
@@ -699,7 +722,7 @@ fn test_schedule_repeat_push_pop_print_size() {
         (run-schedule
           (repeat 3
             (push)
-            (Add (Add (Add (Add (Num 1) (Num 2)) (Num 3)) (Num 4)) (Num 5))
+            (eval (Add (Add (Add (Add (Num 1) (Num 2)) (Num 3)) (Num 4)) (Num 5)))
             (repeat 5
               (run math-rules)
               (print-size))

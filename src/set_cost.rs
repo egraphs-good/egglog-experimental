@@ -1,7 +1,4 @@
-use egglog_ast::span::Span;
-use log::log_enabled;
-use std::sync::Arc;
-
+use crate::Error;
 use egglog::{
     CommandOutput, EGraph, TermDag, TermId, UserDefinedCommand,
     ast::*,
@@ -9,6 +6,9 @@ use egglog::{
     span,
     util::FreshGen,
 };
+use egglog_ast::span::Span;
+use log::log_enabled;
+use std::sync::Arc;
 
 pub fn add_set_cost(egraph: &mut EGraph) {
     egraph
@@ -245,9 +245,9 @@ impl UserDefinedCommand for CustomExtract {
             if nv.0.name() != "i64" {
                 let i64sort = egraph.get_arcsort_by(|s| s.name() == "i64");
                 return Err(egglog::Error::TypeError(egglog::TypeError::Mismatch {
-                    expr: n_expr.clone(),
+                    expr: args[1].clone(),
                     expected: i64sort,
-                    actual: n_sort,
+                    actual: nv.0,
                 }));
             }
             egraph.value_to_base::<i64>(nv.1)
@@ -282,7 +282,6 @@ impl UserDefinedCommand for CustomExtract {
                         .to_string(),
                 ))
             }
-            Ok(vec![CommandOutput::ExtractBest(termdag, cost, term)])
         } else {
             let terms: Vec<TermId> = extractor
                 .extract_variants(egraph, &mut termdag, value, n as usize)
@@ -292,12 +291,5 @@ impl UserDefinedCommand for CustomExtract {
             log::info!("extracted variants:");
             Ok(vec![CommandOutput::ExtractVariants(termdag, terms)])
         }
-    } else {
-        let terms: Vec<TermId> = extractor
-            .extract_variants(egraph, &mut termdag, value, variants)
-            .iter()
-            .map(|e| e.1)
-            .collect();
-        Ok(vec![CommandOutput::ExtractVariants(termdag, terms)])
     }
 }

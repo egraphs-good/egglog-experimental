@@ -11,7 +11,7 @@ use egglog::{
     CommandOutput, EGraph, Error, TermDag, TermId, TypeError, UserDefinedCommand,
     ast::{Expr, ParseError},
     extract::{Cost, CostModel, Extractor},
-    prelude::{RustSpan, Span, span},
+    prelude::span,
 };
 use log::log_enabled;
 use std::{fmt::Debug, marker::PhantomData};
