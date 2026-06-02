@@ -3,13 +3,18 @@ use std::{collections::HashMap, sync::Mutex};
 use egglog::{
     CommandOutput, UserDefinedCommand,
     ast::{Command, Expr, Fact, Literal, ParseError},
-    prelude::run_ruleset,
+    prelude::{RustSpan, Span, run_ruleset},
     scheduler::{Scheduler, SchedulerId},
+    span,
 };
 use egglog_reports::RunReport;
 use lazy_static::lazy_static;
 
+type PermanentSchedulerState = HashMap<String, SchedulerId>;
+
 pub struct RunExtendedSchedule;
+
+pub struct LetSchedulerCommand;
 
 pub trait SchedulerGen {
     fn new_scheduler(&self, egraph: &egglog::EGraph, args: &[Expr]) -> Box<dyn Scheduler>;
@@ -37,6 +42,33 @@ pub fn add_scheduler_builder(name: String, builder: SchedulerBuilder) {
 impl ScheduleState {
     fn new() -> Self {
         Self { schedulers: vec![] }
+    }
+
+    fn lookup_scheduler(
+        &self,
+        egraph: &egglog::EGraph,
+        span: &egglog::ast::Span,
+        name: &str,
+    ) -> Result<SchedulerId, egglog::Error> {
+        if let Some(id) = self
+            .schedulers
+            .iter()
+            .rfind(|(n, _)| n == name)
+            .map(|(_, id)| *id)
+        {
+            return Ok(id);
+        }
+
+        match egraph
+            .extension_state::<PermanentSchedulerState>()
+            .and_then(|state| state.get(name).copied())
+        {
+            Some(id) => Ok(id),
+            None => Err(egglog::Error::ParseError(ParseError(
+                span.clone(),
+                format!("Unknown scheduler: {name}"),
+            ))),
+        }
     }
 
     // Current limitation: because it relies on the publicly available Rust APIs to access
@@ -94,17 +126,14 @@ impl ScheduleState {
             "run" | "run-with" => {
                 let mut scheduler = None;
                 let exprs: &[egglog::ast::Expr] = if head.as_str() == "run-with" {
-                    let Expr::Var(_, ref scheduler_name) = exprs[0] else {
+                    let Some((Expr::Var(scheduler_span, scheduler_name), rest)) =
+                        exprs.split_first()
+                    else {
                         return err();
                     };
-                    scheduler = Some(
-                        self.schedulers
-                            .iter()
-                            .rfind(|(n, _)| n == scheduler_name)
-                            .unwrap()
-                            .1,
-                    );
-                    &exprs[1..]
+                    scheduler =
+                        Some(self.lookup_scheduler(egraph, scheduler_span, scheduler_name)?);
+                    rest
                 } else {
                     &exprs[..]
                 };
@@ -209,6 +238,52 @@ impl UserDefinedCommand for RunExtendedSchedule {
             report.union(schedule.run(egraph, arg)?);
         }
         Ok(Some(CommandOutput::RunSchedule(report)))
+    }
+}
+
+impl UserDefinedCommand for LetSchedulerCommand {
+    fn update(
+        &self,
+        egraph: &mut egglog::EGraph,
+        args: &[Expr],
+    ) -> Result<Option<CommandOutput>, egglog::Error> {
+        match args {
+            [
+                Expr::Var(span, name),
+                Expr::Call(_, scheduler_name, scheduler_args),
+            ] => {
+                if egraph
+                    .extension_state::<PermanentSchedulerState>()
+                    .and_then(|state| state.get(name).copied())
+                    .is_some()
+                {
+                    return Err(egglog::Error::ParseError(ParseError(
+                        span.clone(),
+                        format!("Scheduler {name} already exists"),
+                    )));
+                }
+
+                let scheduler = {
+                    let libs = scheduler_libs.lock().unwrap();
+                    let Some(builder) = libs.get(scheduler_name) else {
+                        return Err(egglog::Error::ParseError(ParseError(
+                            span.clone(),
+                            format!("Unknown scheduler: {scheduler_name}"),
+                        )));
+                    };
+                    builder(egraph, scheduler_args)
+                };
+                let id = egraph.add_scheduler(scheduler);
+                egraph
+                    .extension_state_or_default::<PermanentSchedulerState>()
+                    .insert(name.clone(), id);
+                Ok(None)
+            }
+            invalid => Err(egglog::Error::ParseError(ParseError(
+                invalid.first().map_or_else(|| span!(), Expr::span),
+                "Invalid let-scheduler command".into(),
+            ))),
+        }
     }
 }
 

@@ -12,7 +12,8 @@
 //! - [Rationals support](https://egraphs-good.github.io/egglog-demo/?example=rational)
 //!   (see [`rational`] for the exposed primitives)
 //! - [Dynamic cost models with `set-cost`](https://egraphs-good.github.io/egglog-demo/?example=05-cost-model-and-extraction)
-//! - [Custom schedulers via `run-with`](https://egraphs-good.github.io/egglog-demo/?example=math-backoff)
+//! - [Custom schedulers via `run-with`](https://egraphs-good.github.io/egglog-demo/?example=math-backoff),
+//!   including top-level `(let-scheduler name ...)` bindings stored on the e-graph
 //! - [`(get-size!)` primitive](https://github.com/egraphs-good/egglog-experimental/blob/main/tests/web-demo/node-limit.egg)
 //!   for inspecting total tuple counts or counts for specific tables
 //! - [Multi-extraction](https://github.com/egraphs-good/egglog-experimental/blob/main/tests/web-demo/multi-extract.egg)
@@ -63,6 +64,9 @@ pub fn new_experimental_egraph() -> EGraph {
     // scheduler support
     egraph
         .add_command("run-schedule".into(), Arc::new(RunExtendedSchedule))
+        .unwrap();
+    egraph
+        .add_command("let-scheduler".into(), Arc::new(LetSchedulerCommand))
         .unwrap();
 
     egraph
