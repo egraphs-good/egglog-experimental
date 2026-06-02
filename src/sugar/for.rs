@@ -43,6 +43,7 @@ impl Macro<Vec<Command>> for For {
             name: rulename,
             ruleset: ruleset.clone(),
             naive: false,
+            no_decomp: false,
         };
 
         Ok(vec![

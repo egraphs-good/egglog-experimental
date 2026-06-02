@@ -3,7 +3,7 @@ use std::{collections::HashMap, sync::Mutex};
 use egglog::{
     CommandOutput, UserDefinedCommand,
     ast::{Command, Expr, Fact, Literal, ParseError},
-    prelude::{RustSpan, Span, run_ruleset},
+    prelude::{Span, run_ruleset},
     scheduler::{Scheduler, SchedulerId},
     span,
 };
@@ -20,7 +20,15 @@ pub trait SchedulerGen {
     fn new_scheduler(&self, egraph: &egglog::EGraph, args: &[Expr]) -> Box<dyn Scheduler>;
 }
 
-type SchedulerBuilder = Box<dyn Fn(&egglog::EGraph, &[Expr]) -> Box<dyn Scheduler> + Send + Sync>;
+type SchedulerBuilder = Box<
+    dyn Fn(
+            &egglog::EGraph,
+            &egglog::ast::Span,
+            &[Expr],
+        ) -> Result<Box<dyn Scheduler>, egglog::Error>
+        + Send
+        + Sync,
+>;
 
 struct ScheduleState {
     schedulers: Vec<(String, SchedulerId)>,
@@ -47,7 +55,7 @@ fn build_scheduler(
 ) -> Result<Box<dyn Scheduler>, egglog::Error> {
     let libs = scheduler_libs.lock().unwrap();
     match libs.get(name) {
-        Some(builder) => Ok(builder(egraph, args)),
+        Some(builder) => builder(egraph, span, args),
         None => Err(egglog::Error::ParseError(ParseError(
             span.clone(),
             format!("Unknown scheduler: {name}"),
@@ -102,11 +110,13 @@ impl ScheduleState {
 
         if let Expr::Var(_, ruleset) = arg {
             let output = run_ruleset(egraph, ruleset.as_str())?;
-            assert!(output.len() == 1);
-            if let CommandOutput::RunSchedule(report) = &output[0] {
+            if let [CommandOutput::RunSchedule(report)] = output.as_slice() {
                 return Ok(report.clone());
             }
-            panic!("Expected a RunSchedule, got {:?}", output[0]);
+            return Err(egglog::Error::ParseError(ParseError(
+                arg.span(),
+                format!("Expected ruleset {ruleset} to produce one RunSchedule output"),
+            )));
         }
 
         let Expr::Call(span, head, exprs) = arg else {
@@ -160,7 +170,12 @@ impl ScheduleState {
                     None => ("", exprs),
                     Some(Expr::Var(_span, v)) if *v == ":until" => ("", exprs),
                     Some(Expr::Var(_span, ruleset)) => (ruleset.as_str(), &exprs[1..]),
-                    _ => unreachable!(),
+                    Some(expr) => {
+                        return Err(egglog::Error::ParseError(ParseError(
+                            expr.span(),
+                            "Expected ruleset name or :until clause in run schedule".into(),
+                        )));
+                    }
                 };
 
                 let until = match rest {
@@ -197,10 +212,11 @@ impl ScheduleState {
                         }
                         Ok(iter_report)
                     })?;
-                    if !iter_report.updated {
+                    let should_stop = iter_report.can_stop;
+                    report.union(iter_report);
+                    if should_stop {
                         break;
                     }
-                    report.union(iter_report);
                 }
                 Ok(report)
             }
@@ -249,13 +265,13 @@ impl UserDefinedCommand for RunExtendedSchedule {
         &self,
         egraph: &mut egglog::EGraph,
         args: &[Expr],
-    ) -> Result<Option<CommandOutput>, egglog::Error> {
+    ) -> Result<Vec<CommandOutput>, egglog::Error> {
         let mut schedule = ScheduleState::new();
         let mut report = RunReport::default();
         for arg in args {
             report.union(schedule.run(egraph, arg)?);
         }
-        Ok(Some(CommandOutput::RunSchedule(report)))
+        Ok(vec![CommandOutput::RunSchedule(report)])
     }
 }
 
@@ -264,7 +280,7 @@ impl UserDefinedCommand for LetSchedulerCommand {
         &self,
         egraph: &mut egglog::EGraph,
         args: &[Expr],
-    ) -> Result<Option<CommandOutput>, egglog::Error> {
+    ) -> Result<Vec<CommandOutput>, egglog::Error> {
         match args {
             [
                 Expr::Var(span, name),
@@ -287,7 +303,7 @@ impl UserDefinedCommand for LetSchedulerCommand {
                 egraph
                     .extension_state_or_default::<PermanentSchedulerState>()
                     .insert(name.clone(), id);
-                Ok(None)
+                Ok(vec![])
             }
             invalid => Err(egglog::Error::ParseError(ParseError(
                 invalid.first().map_or_else(|| span!(), Expr::span),
@@ -297,22 +313,39 @@ impl UserDefinedCommand for LetSchedulerCommand {
     }
 }
 
-pub(crate) fn parse_tags(args: &[Expr]) -> HashMap<String, Literal> {
+pub(crate) fn parse_tags(
+    span: &egglog::ast::Span,
+    args: &[Expr],
+) -> Result<HashMap<String, Literal>, egglog::Error> {
+    if !args.len().is_multiple_of(2) {
+        return Err(egglog::Error::ParseError(ParseError(
+            span.clone(),
+            "Scheduler tags must be key/value pairs".into(),
+        )));
+    }
     let mut tags = HashMap::new();
-    assert!(args.len().is_multiple_of(2));
     for arg in args.chunks(2) {
-        let Expr::Var(_, ref tag_name) = arg[0] else {
-            panic!("Invalid tag name: {:?}", arg[0]);
+        let Expr::Var(ref tag_span, ref tag_name) = arg[0] else {
+            return Err(egglog::Error::ParseError(ParseError(
+                arg[0].span(),
+                "Invalid scheduler tag name".into(),
+            )));
         };
         let Expr::Lit(_, lit) = &arg[1] else {
-            panic!("Invalid tag value: {:?}", arg[1]);
+            return Err(egglog::Error::ParseError(ParseError(
+                arg[1].span(),
+                format!("Invalid value for scheduler tag {tag_name}"),
+            )));
         };
-        if tags.contains_key(&tag_name.to_string()) {
-            panic!("Tag name already exists: {:?}", tag_name);
+        if tags.contains_key(tag_name) {
+            return Err(egglog::Error::ParseError(ParseError(
+                tag_span.clone(),
+                format!("Scheduler tag {tag_name} already exists"),
+            )));
         }
         tags.insert(tag_name.to_string(), lit.clone());
     }
-    tags
+    Ok(tags)
 }
 
 mod schedulers {
@@ -328,32 +361,45 @@ mod schedulers {
 
     pub(super) fn new_back_off_scheduler(
         _egraph: &egglog::EGraph,
+        span: &egglog::ast::Span,
         args: &[Expr],
-    ) -> Box<dyn Scheduler> {
-        let tags = parse_tags(args);
+    ) -> Result<Box<dyn Scheduler>, egglog::Error> {
+        let tags = parse_tags(span, args)?;
         let default_match_limit = tags
             .get(":match-limit")
-            .map(|lit| {
-                let Literal::Int(n) = lit else {
-                    panic!("Invalid match limit: {:?}", lit);
-                };
-                *n as usize
+            .map(|lit| match lit {
+                Literal::Int(n) if *n >= 0 => Ok(*n as usize),
+                Literal::Int(_) => Err(egglog::Error::ParseError(egglog::ast::ParseError(
+                    span.clone(),
+                    "Scheduler :match-limit must be non-negative".into(),
+                ))),
+                _ => Err(egglog::Error::ParseError(egglog::ast::ParseError(
+                    span.clone(),
+                    "Scheduler :match-limit must be an integer".into(),
+                ))),
             })
+            .transpose()?
             .unwrap_or(1000);
         let default_ban_length = tags
             .get(":ban-length")
-            .map(|lit| {
-                let Literal::Int(n) = lit else {
-                    panic!("Invalid ban length: {:?}", lit);
-                };
-                *n as usize
+            .map(|lit| match lit {
+                Literal::Int(n) if *n >= 0 => Ok(*n as usize),
+                Literal::Int(_) => Err(egglog::Error::ParseError(egglog::ast::ParseError(
+                    span.clone(),
+                    "Scheduler :ban-length must be non-negative".into(),
+                ))),
+                _ => Err(egglog::Error::ParseError(egglog::ast::ParseError(
+                    span.clone(),
+                    "Scheduler :ban-length must be an integer".into(),
+                ))),
             })
+            .transpose()?
             .unwrap_or(5);
-        Box::new(BackOffScheduler {
+        Ok(Box::new(BackOffScheduler {
             default_match_limit,
             default_ban_length,
             stats: HashMap::new(),
-        })
+        }))
     }
 
     #[derive(Debug, Clone)]

@@ -22,7 +22,7 @@
 //! The rest of this crate exposes the Rust APIs and helpers that back these extensions.
 //!
 use egglog::ast::Parser;
-use egglog::prelude::{RustSpan, Span, add_base_sort};
+use egglog::prelude::add_base_sort;
 pub use egglog::*;
 use std::sync::Arc;
 

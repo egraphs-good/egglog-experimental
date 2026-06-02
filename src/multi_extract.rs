@@ -4,12 +4,14 @@
 //! The syntax for multi-extraction is `(multi-extract n t1 ... tm)`,
 //! where n must be a positive i64.
 //! This command will extract n lowest-cost variants of each of the m terms.
-//! `(multi-extract 1 t)` is equivalent to `(extract t)`.
+//! `(multi-extract 1 t)` is equivalent to `(extract t)`. Unlike
+//! `(extract t 0)`, `(multi-extract 0 t)` is rejected.
 
 use egglog::{
     CommandOutput, EGraph, Error, TermDag, TermId, TypeError, UserDefinedCommand,
-    ast::Expr,
+    ast::{Expr, ParseError},
     extract::{Cost, CostModel, Extractor},
+    prelude::span,
 };
 use log::log_enabled;
 use std::{fmt::Debug, marker::PhantomData};
@@ -56,8 +58,14 @@ impl<
     CM: CostModel<C> + Clone + Send + Sync + 'static,
 > UserDefinedCommand for MultiExtract<C, CM>
 {
-    fn update(&self, egraph: &mut EGraph, args: &[Expr]) -> Result<Option<CommandOutput>, Error> {
-        assert!(args.len() >= 2);
+    fn update(&self, egraph: &mut EGraph, args: &[Expr]) -> Result<Vec<CommandOutput>, Error> {
+        if args.len() < 2 {
+            let span = args.first().map(Expr::span).unwrap_or_else(|| span!());
+            return Err(Error::ParseError(ParseError(
+                span,
+                "multi-extract expects at least a variant count and one expression".into(),
+            )));
+        }
 
         let (variants_sort, variants_value) = egraph.eval_expr(&args[0])?;
         if variants_sort.name() != "i64" {
@@ -70,7 +78,16 @@ impl<
 
         let n: i64 = egraph.value_to_base(variants_value);
         if n < 0 {
-            panic!("Cannot extract negative number of variants");
+            return Err(Error::ParseError(ParseError(
+                args[0].span(),
+                "Cannot extract negative number of variants".into(),
+            )));
+        }
+        if n == 0 {
+            return Err(Error::ParseError(ParseError(
+                args[0].span(),
+                "multi-extract requires a positive number of variants".into(),
+            )));
         }
 
         let (sorts, values): (Vec<_>, Vec<_>) = args[1..]
@@ -105,8 +122,8 @@ impl<
             );
         }
 
-        Ok(Some(CommandOutput::UserDefined(std::sync::Arc::from(
+        Ok(vec![CommandOutput::UserDefined(std::sync::Arc::from(
             MultiExtractOutput { termdag, terms },
-        ))))
+        ))])
     }
 }
