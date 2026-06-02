@@ -68,33 +68,6 @@ impl ScheduleState {
         Self { schedulers: vec![] }
     }
 
-    fn lookup_scheduler(
-        &self,
-        egraph: &egglog::EGraph,
-        span: &egglog::ast::Span,
-        name: &str,
-    ) -> Result<SchedulerId, egglog::Error> {
-        if let Some(id) = self
-            .schedulers
-            .iter()
-            .rfind(|(n, _)| n == name)
-            .map(|(_, id)| *id)
-        {
-            return Ok(id);
-        }
-
-        match egraph
-            .extension_state::<PermanentSchedulerState>()
-            .and_then(|state| state.get(name).copied())
-        {
-            Some(id) => Ok(id),
-            None => Err(egglog::Error::ParseError(ParseError(
-                span.clone(),
-                format!("Unknown scheduler: {name}"),
-            ))),
-        }
-    }
-
     // Current limitation: because it relies on the publicly available Rust APIs to access
     // the egraph, it has to split the same schedule into multiple runs. This means
     // - the same condition may be compiled and type checked multiple times
@@ -159,8 +132,23 @@ impl ScheduleState {
                     else {
                         return err();
                     };
-                    scheduler =
-                        Some(self.lookup_scheduler(egraph, scheduler_span, scheduler_name)?);
+                    scheduler = Some(
+                        self.schedulers
+                            .iter()
+                            .rfind(|(name, _)| name == scheduler_name)
+                            .map(|(_, id)| *id)
+                            .or_else(|| {
+                                egraph
+                                    .extension_state::<PermanentSchedulerState>()
+                                    .and_then(|state| state.get(scheduler_name).copied())
+                            })
+                            .ok_or_else(|| {
+                                egglog::Error::ParseError(ParseError(
+                                    scheduler_span.clone(),
+                                    format!("Unknown scheduler: {scheduler_name}"),
+                                ))
+                            })?,
+                    );
                     rest
                 } else {
                     &exprs[..]
