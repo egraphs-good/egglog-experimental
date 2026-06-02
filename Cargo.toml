@@ -17,9 +17,10 @@ default = ["bin"]
 bin = ["egglog/bin"]
 
 [dependencies]
-egglog = { git = "https://github.com/saulshanabrook/egg-smol.git", rev = "399c70586bd4e1da9e526cbbce834f37245bbd60", default-features = false }
-egglog-ast = { git = "https://github.com/saulshanabrook/egg-smol.git", rev = "399c70586bd4e1da9e526cbbce834f37245bbd60", default-features = false }
-egglog-reports = { git = "https://github.com/saulshanabrook/egg-smol.git", rev = "399c70586bd4e1da9e526cbbce834f37245bbd60", default-features = false }
+# Temporary pin to the egglog extension-state PR until it lands.
+egglog = { git = "https://github.com/egraphs-good/egglog.git", rev = "42bc6c43d99c6deb44e3c2cafc1a9f1436c25ff5", default-features = false }
+egglog-ast = { git = "https://github.com/egraphs-good/egglog.git", rev = "42bc6c43d99c6deb44e3c2cafc1a9f1436c25ff5", default-features = false }
+egglog-reports = { git = "https://github.com/egraphs-good/egglog.git", rev = "42bc6c43d99c6deb44e3c2cafc1a9f1436c25ff5", default-features = false }
 
 num = "0.4.3"
 lazy_static = "1.4"

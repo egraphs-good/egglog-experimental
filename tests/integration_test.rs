@@ -362,6 +362,30 @@ fn test_top_level_let_scheduler_redeclaration_returns_error() {
 }
 
 #[test]
+fn test_let_scheduler_unknown_scheduler_returns_error() {
+    let mut egraph = new_copy_egraph();
+    let err = egraph
+        .parse_and_run_program(None, "(let-scheduler bo (missing-scheduler))")
+        .unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("Unknown scheduler: missing-scheduler")
+    );
+
+    let mut egraph = new_copy_egraph();
+    let err = egraph
+        .parse_and_run_program(
+            None,
+            "(run-schedule (let-scheduler bo (missing-scheduler)))",
+        )
+        .unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("Unknown scheduler: missing-scheduler")
+    );
+}
+
+#[test]
 fn test_top_level_let_scheduler_invalidates_after_push_pop() {
     let mut egraph = new_copy_egraph();
 

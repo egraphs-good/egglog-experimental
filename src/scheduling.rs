@@ -39,6 +39,22 @@ pub fn add_scheduler_builder(name: String, builder: SchedulerBuilder) {
     scheduler_libs.lock().unwrap().insert(name, builder);
 }
 
+fn build_scheduler(
+    egraph: &egglog::EGraph,
+    span: &Span,
+    name: &str,
+    args: &[Expr],
+) -> Result<Box<dyn Scheduler>, egglog::Error> {
+    let libs = scheduler_libs.lock().unwrap();
+    match libs.get(name) {
+        Some(builder) => Ok(builder(egraph, args)),
+        None => Err(egglog::Error::ParseError(ParseError(
+            span.clone(),
+            format!("Unknown scheduler: {name}"),
+        ))),
+    }
+}
+
 impl ScheduleState {
     fn new() -> Self {
         Self { schedulers: vec![] }
@@ -108,15 +124,17 @@ impl ScheduleState {
 
         match head.as_str() {
             "let-scheduler" => match exprs.as_slice() {
-                [Expr::Var(_, name), Expr::Call(_, scheduler_name, args)] => {
+                [
+                    Expr::Var(_, name),
+                    Expr::Call(scheduler_span, scheduler_name, args),
+                ] => {
                     if self.schedulers.iter().any(|(n, _)| n == name) {
                         return Err(egglog::Error::ParseError(ParseError(
                             span.clone(),
                             format!("Scheduler {name} already exists"),
                         )));
                     }
-                    let scheduler =
-                        (scheduler_libs.lock().unwrap().get(scheduler_name).unwrap())(egraph, args);
+                    let scheduler = build_scheduler(egraph, scheduler_span, scheduler_name, args)?;
                     let id = egraph.add_scheduler(scheduler);
                     self.schedulers.push((name.clone(), id));
                     Ok(RunReport::default())
@@ -250,7 +268,7 @@ impl UserDefinedCommand for LetSchedulerCommand {
         match args {
             [
                 Expr::Var(span, name),
-                Expr::Call(_, scheduler_name, scheduler_args),
+                Expr::Call(scheduler_span, scheduler_name, scheduler_args),
             ] => {
                 if egraph
                     .extension_state::<PermanentSchedulerState>()
@@ -263,16 +281,8 @@ impl UserDefinedCommand for LetSchedulerCommand {
                     )));
                 }
 
-                let scheduler = {
-                    let libs = scheduler_libs.lock().unwrap();
-                    let Some(builder) = libs.get(scheduler_name) else {
-                        return Err(egglog::Error::ParseError(ParseError(
-                            span.clone(),
-                            format!("Unknown scheduler: {scheduler_name}"),
-                        )));
-                    };
-                    builder(egraph, scheduler_args)
-                };
+                let scheduler =
+                    build_scheduler(egraph, scheduler_span, scheduler_name, scheduler_args)?;
                 let id = egraph.add_scheduler(scheduler);
                 egraph
                     .extension_state_or_default::<PermanentSchedulerState>()
