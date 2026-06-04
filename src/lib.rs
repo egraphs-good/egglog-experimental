@@ -13,6 +13,8 @@
 //!   (see [`rational`] for the exposed primitives)
 //! - [Dynamic cost models with `set-cost`](https://egraphs-good.github.io/egglog-demo/?example=05-cost-model-and-extraction)
 //! - [Custom schedulers via `run-with`](https://egraphs-good.github.io/egglog-demo/?example=math-backoff)
+//! - An extended `run-schedule` command (see [`scheduling`]) with `seq`,                             
+//!   `saturate`, `repeat`, `eval`, and forwarded commands            
 //! - [`(get-size!)` primitive](https://github.com/egraphs-good/egglog-experimental/blob/main/tests/web-demo/node-limit.egg)
 //!   for inspecting total tuple counts or counts for specific tables
 //! - [Multi-extraction](https://github.com/egraphs-good/egglog-experimental/blob/main/tests/web-demo/multi-extract.egg)
@@ -21,13 +23,13 @@
 //! The rest of this crate exposes the Rust APIs and helpers that back these extensions.
 //!
 use egglog::ast::Parser;
-use egglog::prelude::{RustSpan, Span, add_base_sort};
+use egglog::prelude::add_base_sort;
 pub use egglog::*;
 use std::sync::Arc;
 
 pub mod rational;
 pub use rational::*;
-mod scheduling;
+pub mod scheduling;
 pub use scheduling::*;
 mod fresh_macro;
 
@@ -43,6 +45,9 @@ pub use table_stats::*;
 // Sugar modules using parse-time macros
 mod sugar;
 pub use sugar::*;
+
+mod keep_best;
+pub use keep_best::KeepBestCommand;
 
 pub fn new_experimental_egraph() -> EGraph {
     let mut egraph = EGraph::default();
@@ -72,6 +77,10 @@ pub fn new_experimental_egraph() -> EGraph {
             "multi-extract".into(),
             Arc::new(MultiExtract::new(DynamicCostModel)),
         )
+        .unwrap();
+
+    egraph
+        .add_command("keep-best".into(), Arc::new(KeepBestCommand))
         .unwrap();
 
     // Per-column statistics for function tables.

@@ -341,7 +341,7 @@ pub fn print_table_stats(egraph: &EGraph, sym: Option<&str>) -> Result<Vec<Table
 }
 
 impl UserDefinedCommand for PrintTableStatsCommand {
-    fn update(&self, egraph: &mut EGraph, args: &[Expr]) -> Result<Option<CommandOutput>, Error> {
+    fn update(&self, egraph: &mut EGraph, args: &[Expr]) -> Result<Vec<CommandOutput>, Error> {
         let name: Option<String> = match args {
             [] => None,
             [arg] => match arg {
@@ -361,8 +361,8 @@ impl UserDefinedCommand for PrintTableStatsCommand {
             }
         };
         let stats = print_table_stats(egraph, name.as_deref())?;
-        Ok(Some(CommandOutput::UserDefined(Arc::new(
+        Ok(vec![CommandOutput::UserDefined(Arc::new(
             TableStatsOutput { stats },
-        ))))
+        ))])
     }
 }

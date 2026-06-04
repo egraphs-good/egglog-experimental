@@ -1,14 +1,14 @@
-use egglog_ast::span::{RustSpan, Span};
-use std::sync::Arc;
-
+use crate::Error;
 use egglog::{
-    CommandOutput, EGraph, Error, TermDag, TermId, TypeError, UserDefinedCommand,
+    CommandOutput, EGraph, TermDag, TermId, UserDefinedCommand,
     ast::*,
     extract::{CostModel, DefaultCost, Extractor, TreeAdditiveCostModel},
     span,
     util::FreshGen,
 };
+use egglog_ast::span::Span;
 use log::log_enabled;
+use std::sync::Arc;
 
 pub fn add_set_cost(egraph: &mut EGraph) {
     egraph
@@ -222,7 +222,7 @@ impl UserDefinedCommand for CustomExtract {
         &self,
         egraph: &mut EGraph,
         args: &[Expr],
-    ) -> Result<Option<CommandOutput>, egglog::Error> {
+    ) -> Result<Vec<CommandOutput>, egglog::Error> {
         match args {
             [] => {
                 return Err(Error::ParseError(ParseError(
@@ -244,7 +244,7 @@ impl UserDefinedCommand for CustomExtract {
             // TODO: egglog does not yet support u64
             if nv.0.name() != "i64" {
                 let i64sort = egraph.get_arcsort_by(|s| s.name() == "i64");
-                return Err(Error::TypeError(TypeError::Mismatch {
+                return Err(egglog::Error::TypeError(egglog::TypeError::Mismatch {
                     expr: args[1].clone(),
                     expected: i64sort,
                     actual: nv.0,
@@ -275,7 +275,7 @@ impl UserDefinedCommand for CustomExtract {
                 if log_enabled!(log::Level::Info) {
                     log::info!("extracted with cost {cost}: {}", termdag.to_string(term));
                 }
-                Ok(Some(CommandOutput::ExtractBest(termdag, cost, term)))
+                Ok(vec![CommandOutput::ExtractBest(termdag, cost, term)])
             } else {
                 Err(Error::ExtractError(
                     "Unable to find any valid extraction (likely due to subsume or delete)"
@@ -289,7 +289,7 @@ impl UserDefinedCommand for CustomExtract {
                 .map(|e| e.1)
                 .collect();
             log::info!("extracted variants:");
-            Ok(Some(CommandOutput::ExtractVariants(termdag, terms)))
+            Ok(vec![CommandOutput::ExtractVariants(termdag, terms)])
         }
     }
 }

@@ -11,7 +11,7 @@ use egglog::{
     CommandOutput, EGraph, Error, TermDag, TermId, TypeError, UserDefinedCommand,
     ast::{Expr, ParseError},
     extract::{Cost, CostModel, Extractor},
-    prelude::{RustSpan, Span, span},
+    prelude::span,
 };
 use log::log_enabled;
 use std::{fmt::Debug, marker::PhantomData};
@@ -58,7 +58,7 @@ impl<
     CM: CostModel<C> + Clone + Send + Sync + 'static,
 > UserDefinedCommand for MultiExtract<C, CM>
 {
-    fn update(&self, egraph: &mut EGraph, args: &[Expr]) -> Result<Option<CommandOutput>, Error> {
+    fn update(&self, egraph: &mut EGraph, args: &[Expr]) -> Result<Vec<CommandOutput>, Error> {
         if args.len() < 2 {
             let span = args.first().map(Expr::span).unwrap_or_else(|| span!());
             return Err(Error::ParseError(ParseError(
@@ -122,8 +122,8 @@ impl<
             );
         }
 
-        Ok(Some(CommandOutput::UserDefined(std::sync::Arc::from(
+        Ok(vec![CommandOutput::UserDefined(std::sync::Arc::from(
             MultiExtractOutput { termdag, terms },
-        ))))
+        ))])
     }
 }
