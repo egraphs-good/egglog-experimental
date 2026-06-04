@@ -177,12 +177,15 @@ impl ScheduleState {
                         for expr in exprs {
                             let res = self.run(egraph, expr)?;
                             iter_report.union(res);
+                            if egglog::size_cap_hit() {
+                                break;
+                            }
                         }
                         Ok(iter_report)
                     })?;
                     let should_stop = iter_report.can_stop;
                     report.union(iter_report);
-                    if should_stop {
+                    if should_stop || egglog::size_cap_hit() {
                         break;
                     }
                 }
@@ -195,6 +198,9 @@ impl ScheduleState {
                         // Recursively run each expression in the sequence
                         let res = self.run(egraph, expr)?;
                         report.union(res);
+                        if egglog::size_cap_hit() {
+                            break;
+                        }
                     }
                     Ok(report)
                 })
@@ -210,10 +216,16 @@ impl ScheduleState {
                                 for expr in rest {
                                     let res = self.run(egraph, expr)?;
                                     report.union(res);
+                                    if egglog::size_cap_hit() {
+                                        break;
+                                    }
                                 }
                                 Ok(report)
                             })?;
                             report.union(sub_report);
+                            if egglog::size_cap_hit() {
+                                break;
+                            }
                         }
                         Ok(report)
                     }
@@ -253,6 +265,7 @@ impl UserDefinedCommand for RunExtendedSchedule {
         };
         if let Some(limit) = size_limit {
             egglog::set_action_row_cap(limit);
+            egglog::sync_size_estimate(egraph.num_tuples());
         }
 
         let mut schedule = ScheduleState::new();
@@ -265,6 +278,9 @@ impl UserDefinedCommand for RunExtendedSchedule {
                     result = Err(e);
                     break;
                 }
+            }
+            if egglog::size_cap_hit() {
+                break;
             }
         }
 
