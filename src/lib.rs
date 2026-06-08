@@ -14,6 +14,8 @@
 //! - [Dynamic cost models with `set-cost`](https://egraphs-good.github.io/egglog-demo/?example=05-cost-model-and-extraction)
 //! - [Custom schedulers via `run-with`](https://egraphs-good.github.io/egglog-demo/?example=math-backoff),
 //!   including top-level `(let-scheduler name ...)` bindings stored on the e-graph
+//! - An extended `run-schedule` command (see [`scheduling`]) with `seq`,
+//!   `saturate`, `repeat`, `eval`, and forwarded commands
 //! - [`(get-size!)` primitive](https://github.com/egraphs-good/egglog-experimental/blob/main/tests/web-demo/node-limit.egg)
 //!   for inspecting total tuple counts or counts for specific tables
 //! - [Multi-extraction](https://github.com/egraphs-good/egglog-experimental/blob/main/tests/web-demo/multi-extract.egg)
@@ -28,7 +30,7 @@ use std::sync::Arc;
 
 pub mod rational;
 pub use rational::*;
-mod scheduling;
+pub mod scheduling;
 pub use scheduling::*;
 mod fresh_macro;
 
@@ -38,10 +40,15 @@ mod multi_extract;
 pub use multi_extract::*;
 mod size;
 pub use size::*;
+mod table_stats;
+pub use table_stats::*;
 
 // Sugar modules using parse-time macros
 mod sugar;
 pub use sugar::*;
+
+mod keep_best;
+pub use keep_best::KeepBestCommand;
 
 pub fn new_experimental_egraph() -> EGraph {
     let mut egraph = EGraph::default();
@@ -74,6 +81,15 @@ pub fn new_experimental_egraph() -> EGraph {
             "multi-extract".into(),
             Arc::new(MultiExtract::new(DynamicCostModel)),
         )
+        .unwrap();
+
+    egraph
+        .add_command("keep-best".into(), Arc::new(KeepBestCommand))
+        .unwrap();
+
+    // Per-column statistics for function tables.
+    egraph
+        .add_command("print-table-stats".into(), Arc::new(PrintTableStatsCommand))
         .unwrap();
     egraph
 }

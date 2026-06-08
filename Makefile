@@ -1,6 +1,6 @@
 WWW=${PWD}/target/www/
 
-all: test nits docs
+all: test fixnits nits docs
 
 test:
 	cargo nextest run --release
@@ -12,6 +12,12 @@ nits:
 	cargo clippy --tests -- -D warnings
 	@rustup component add rustfmt
 	cargo fmt --check
+
+fixnits:
+	@rustup component add rustfmt
+	cargo fmt
+	@rustup component add rustfmt
+	cargo clippy --fix --tests --workspace --allow-dirty
 
 docs:
 	mkdir -p ${WWW}

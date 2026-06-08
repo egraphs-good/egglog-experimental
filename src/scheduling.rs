@@ -1,3 +1,54 @@
+//! The `run-schedule` command: an extended scheduling language for egglog.
+//!
+//! `run-schedule` takes one or more *schedule expressions* and runs them in
+//! order against the e-graph, returning the combined [`RunReport`] (plus any
+//! per-command outputs such as `print-size` results). It is registered as a
+//! user-defined command by [`new_experimental_egraph`](crate::new_experimental_egraph)
+//! and is the experimental counterpart to core egglog's built-in `run-schedule`.
+//!
+//! # Schedule expressions
+//!
+//! A schedule expression is one of:
+//!
+//! - **`ruleset`** — a bare ruleset name (a [`Var`](egglog::ast::Expr::Var)),
+//!   e.g. `my-rules`. Runs one step of that ruleset.
+//! - **`(run [ruleset] [:until cond])`** — run one step of `ruleset` (or the
+//!   empty/default ruleset if omitted). With `:until cond`, the step is skipped
+//!   once `cond` already holds (`cond` is checked as a [`Check`](egglog::ast::Command::Check)).
+//! - **`(run-with scheduler [ruleset] [:until cond])`** — like `run`, but drives
+//!   the ruleset with a named scheduler previously bound by `let-scheduler`.
+//! - **`(let-scheduler name (scheduler-kind args...))`** — bind `name` to a fresh
+//!   scheduler instance (e.g. `(back-off :match-limit 1000 :ban-length 5)`).
+//!   The binding is scoped to the enclosing `seq`/`saturate`/`repeat` block.
+//! - **`(seq step...)`** — run each step once, in order.
+//! - **`(saturate step...)`** — repeatedly run the body until it makes no further
+//!   progress (the accumulated report's `can_stop` is set).
+//! - **`(repeat n step...)`** — run the body `n` times.
+//! - **`(eval expr...)`** — evaluate each `expr` in the full read/write
+//!   (FullState) context and add the resulting terms to the e-graph, the
+//!   schedule-step analogue of a top-level expression like `(Add (Num 1) (Num 2))`.
+//!   Because evaluation has full database access, the expressions may also call
+//!   reading primitives such as `(get-size!)` that are not admissible from an
+//!   ordinary action context.
+//! - **A forwarded command** — a fixed allowlist of side-effecting commands
+//!   (`print-size`, `print-function`, `extract`, `push`, `pop`, `union`, `set`,
+//!   `delete`, `subsume`, `panic`) and any registered user-defined command
+//!   (e.g. `keep-best`, `multi-extract`, or a nested `run-schedule`). These are
+//!   forwarded by re-parsing the s-expression through
+//!   [`parse_and_run_program`](egglog::EGraph::parse_and_run_program); any other
+//!   head (rule declarations, `let` bindings, function definitions, …) is rejected.
+//!
+//! # Example
+//!
+//! ```text
+//! (run-schedule
+//!   (repeat 3
+//!     (push)
+//!     (eval (Add (Num 1) (Num 2)))   ; add a term to the e-graph
+//!     (saturate (run math-rules))    ; rewrite to fixpoint
+//!     (keep-best "Target")           ; compact to best representatives
+//!     (pop)))
+//! ```
 use std::{collections::HashMap, sync::Mutex};
 
 use egglog::{
@@ -12,6 +63,9 @@ use lazy_static::lazy_static;
 
 type PermanentSchedulerState = HashMap<String, SchedulerId>;
 
+/// The `run-schedule` user-defined command.
+///
+/// See the [module-level documentation](self) for the full schedule language.
 pub struct RunExtendedSchedule;
 
 pub struct LetSchedulerCommand;
@@ -73,7 +127,11 @@ impl ScheduleState {
     // - the same condition may be compiled and type checked multiple times
     // - the logging information may show that multiple schedules are run, but they
     //   are actually the same schedule.
-    fn run(&mut self, egraph: &mut egglog::EGraph, arg: &Expr) -> Result<RunReport, egglog::Error> {
+    fn run(
+        &mut self,
+        egraph: &mut egglog::EGraph,
+        arg: &Expr,
+    ) -> Result<(Vec<CommandOutput>, RunReport), egglog::Error> {
         let err = || {
             Err(egglog::Error::ParseError(ParseError(
                 arg.span(),
@@ -84,7 +142,7 @@ impl ScheduleState {
         if let Expr::Var(_, ruleset) = arg {
             let output = run_ruleset(egraph, ruleset.as_str())?;
             if let [CommandOutput::RunSchedule(report)] = output.as_slice() {
-                return Ok(report.clone());
+                return Ok((vec![], report.clone()));
             }
             return Err(egglog::Error::ParseError(ParseError(
                 arg.span(),
@@ -99,7 +157,7 @@ impl ScheduleState {
         macro_rules! new_scope {
             ($f:expr) => {{
                 let curr_scope = self.schedulers.len();
-                let res: Result<RunReport, egglog::Error> = $f();
+                let res: Result<(Vec<CommandOutput>, RunReport), egglog::Error> = $f();
                 self.schedulers.truncate(curr_scope);
                 res
             }};
@@ -120,7 +178,7 @@ impl ScheduleState {
                     let scheduler = build_scheduler(egraph, scheduler_span, scheduler_name, args)?;
                     let id = egraph.add_scheduler(scheduler);
                     self.schedulers.push((name.clone(), id));
-                    Ok(RunReport::default())
+                    Ok((vec![], RunReport::default()))
                 }
                 _ => err(),
             },
@@ -135,7 +193,7 @@ impl ScheduleState {
                     scheduler = Some(
                         self.schedulers
                             .iter()
-                            .rfind(|(name, _)| name == scheduler_name)
+                            .rfind(|(n, _)| n == scheduler_name)
                             .map(|(_, id)| *id)
                             .or_else(|| {
                                 egraph
@@ -178,72 +236,116 @@ impl ScheduleState {
                         .run_program(vec![Command::Check(span, vec![Fact::Fact(until)])])
                         .is_ok()
                     {
-                        return Ok(RunReport::default());
+                        return Ok((vec![], RunReport::default()));
                     }
                 }
 
-                if let Some(scheduler) = scheduler {
-                    egraph.step_rules_with_scheduler(scheduler, ruleset)
+                let report = if let Some(scheduler) = scheduler {
+                    egraph.step_rules_with_scheduler(scheduler, ruleset)?
                 } else {
-                    // Running the ruleset
-                    egraph.step_rules(ruleset)
-                }
+                    egraph.step_rules(ruleset)?
+                };
+                Ok((vec![], report))
             }
             "saturate" => {
+                let mut all_outputs: Vec<CommandOutput> = vec![];
                 let mut report = RunReport::default();
                 loop {
-                    let iter_report = new_scope!(|| {
+                    let (iter_outputs, iter_report) = new_scope!(|| {
+                        let mut iter_outputs: Vec<CommandOutput> = vec![];
                         let mut iter_report = RunReport::default();
                         for expr in exprs {
-                            let res = self.run(egraph, expr)?;
-                            iter_report.union(res);
+                            let (step_outputs, step_report) = self.run(egraph, expr)?;
+                            iter_outputs.extend(step_outputs);
+                            iter_report.union(step_report);
                         }
-                        Ok(iter_report)
+                        Ok((iter_outputs, iter_report))
                     })?;
                     let should_stop = iter_report.can_stop;
+                    all_outputs.extend(iter_outputs);
                     report.union(iter_report);
                     if should_stop {
                         break;
                     }
                 }
-                Ok(report)
+                Ok((all_outputs, report))
             }
             "seq" => {
                 new_scope!(|| {
+                    let mut all_outputs: Vec<CommandOutput> = vec![];
                     let mut report = RunReport::default();
                     for expr in exprs {
-                        // Recursively run each expression in the sequence
-                        let res = self.run(egraph, expr)?;
-                        report.union(res);
+                        let (step_outputs, step_report) = self.run(egraph, expr)?;
+                        all_outputs.extend(step_outputs);
+                        report.union(step_report);
                     }
-                    Ok(report)
+                    Ok((all_outputs, report))
                 })
             }
-            "repeat" => {
-                match exprs.as_slice() {
-                    [Expr::Lit(_span, Literal::Int(n)), rest @ ..] => {
-                        let mut report = RunReport::default();
-                        for _ in 0..*n {
-                            let sub_report = new_scope!(|| {
-                                let mut report = RunReport::default();
-                                // Recursively run the rest of the expressions
-                                for expr in rest {
-                                    let res = self.run(egraph, expr)?;
-                                    report.union(res);
-                                }
-                                Ok(report)
-                            })?;
-                            report.union(sub_report);
-                        }
-                        Ok(report)
+            "repeat" => match exprs.as_slice() {
+                [Expr::Lit(_span, Literal::Int(n)), rest @ ..] => {
+                    let mut all_outputs: Vec<CommandOutput> = vec![];
+                    let mut report = RunReport::default();
+                    for _ in 0..*n {
+                        let (iter_outputs, iter_report) = new_scope!(|| {
+                            let mut iter_outputs: Vec<CommandOutput> = vec![];
+                            let mut iter_report = RunReport::default();
+                            for expr in rest {
+                                let (step_outputs, step_report) = self.run(egraph, expr)?;
+                                iter_outputs.extend(step_outputs);
+                                iter_report.union(step_report);
+                            }
+                            Ok((iter_outputs, iter_report))
+                        })?;
+                        all_outputs.extend(iter_outputs);
+                        report.union(iter_report);
                     }
-                    _ => err(),
+                    Ok((all_outputs, report))
                 }
+                _ => err(),
+            },
+            // (eval <expr> ...): evaluate each expression and add the resulting
+            // terms to the e-graph — the schedule-step analogue of a top-level
+            // expression such as `(Add (Num 1) (Num 2))`. Evaluation happens in
+            // the full read/write (FullState) context, so the expressions may
+            // also call reading primitives like `(get-size!)` that are not
+            // admissible from an ordinary action context.
+            "eval" => {
+                for expr in exprs {
+                    egraph.eval_expr(expr)?;
+                }
+                Ok((vec![], RunReport::default()))
             }
-            _ => Err(egglog::Error::ParseError(ParseError(
-                span.clone(),
-                "Invalid schedule".into(),
-            ))),
+            // Allowlisted commands forwarded via parse roundtrip.
+            // User-defined commands are also allowed (run-schedule, multi-extract, keep-best, ...).
+            // Anything else (rule declarations, let bindings, function definitions, ...) is rejected.
+            _ if matches!(
+                head.as_str(),
+                "print-size"
+                    | "print-function"
+                    | "extract"
+                    | "push"
+                    | "pop"
+                    | "union"
+                    | "set"
+                    | "delete"
+                    | "subsume"
+                    | "panic"
+            ) || egraph.has_command(head) =>
+            {
+                let outputs = egraph.parse_and_run_program(None, &format!("{}", arg))?;
+                let mut report = RunReport::default();
+                let mut cmd_outputs = Vec::new();
+                for output in outputs {
+                    if let CommandOutput::RunSchedule(r) = output {
+                        report.union(r);
+                    } else {
+                        cmd_outputs.push(output);
+                    }
+                }
+                Ok((cmd_outputs, report))
+            }
+            _ => err(),
         }
     }
 }
@@ -256,10 +358,14 @@ impl UserDefinedCommand for RunExtendedSchedule {
     ) -> Result<Vec<CommandOutput>, egglog::Error> {
         let mut schedule = ScheduleState::new();
         let mut report = RunReport::default();
+        let mut outputs: Vec<CommandOutput> = Vec::new();
         for arg in args {
-            report.union(schedule.run(egraph, arg)?);
+            let (step_outputs, step_report) = schedule.run(egraph, arg)?;
+            outputs.extend(step_outputs);
+            report.union(step_report);
         }
-        Ok(vec![CommandOutput::RunSchedule(report)])
+        outputs.push(CommandOutput::RunSchedule(report));
+        Ok(outputs)
     }
 }
 
