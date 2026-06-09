@@ -1,69 +1,74 @@
-//! The `run-schedule` command: an extended scheduling language for egglog.                           
-//!                                                                                                   
-//! `run-schedule` takes one or more *schedule expressions* and runs them in                          
-//! order against the e-graph, returning the combined [`RunReport`] (plus any                         
-//! per-command outputs such as `print-size` results). It is registered as a                          
-//! user-defined command by [`new_experimental_egraph`](crate::new_experimental_egraph)               
-//! and is the experimental counterpart to core egglog's built-in `run-schedule`.                     
-//!                                                                                                   
-//! # Schedule expressions                                                                            
-//!                                                                                                   
-//! A schedule expression is one of:                                                                  
-//!                                                                                                   
-//! - **`ruleset`** — a bare ruleset name (a [`Var`](egglog::ast::Expr::Var)),                        
-//!   e.g. `my-rules`. Runs one step of that ruleset.                                                 
-//! - **`(run [ruleset] [:until cond])`** — run one step of `ruleset` (or the                         
-//!   empty/default ruleset if omitted). With `:until cond`, the step is skipped                      
-//!   once `cond` already holds (`cond` is checked as a [`Check`](egglog::ast::Command::Check)).      
-//! - **`(run-with scheduler [ruleset] [:until cond])`** — like `run`, but drives                     
-//!   the ruleset with a named scheduler previously bound by `let-scheduler`.                         
-//! - **`(let-scheduler name (scheduler-kind args...))`** — bind `name` to a fresh                    
-//!   scheduler instance (e.g. `(back-off :match-limit 1000 :ban-length 5)`).                         
-//!   The binding is scoped to the enclosing `seq`/`saturate`/`repeat` block.                         
-//! - **`(seq step...)`** — run each step once, in order.                                             
-//! - **`(saturate step...)`** — repeatedly run the body until it makes no further                    
-//!   progress (the accumulated report's `can_stop` is set).                                          
-//! - **`(repeat n step...)`** — run the body `n` times.                                              
-//! - **`(eval expr...)`** — evaluate each `expr` in the full read/write                              
-//!   (FullState) context and add the resulting terms to the e-graph, the                             
-//!   schedule-step analogue of a top-level expression like `(Add (Num 1) (Num 2))`.                  
-//!   Because evaluation has full database access, the expressions may also call                      
-//!   reading primitives such as `(get-size!)` that are not admissible from an                        
-//!   ordinary action context.                                                                        
-//! - **A forwarded command** — a fixed allowlist of side-effecting commands                          
-//!   (`print-size`, `print-function`, `extract`, `push`, `pop`, `union`, `set`,                      
-//!   `delete`, `subsume`, `panic`) and any registered user-defined command                           
-//!   (e.g. `keep-best`, `multi-extract`, or a nested `run-schedule`). These are                      
-//!   forwarded by re-parsing the s-expression through                                                
-//!   [`parse_and_run_program`](egglog::EGraph::parse_and_run_program); any other                     
-//!   head (rule declarations, `let` bindings, function definitions, …) is rejected.                  
-//!                                                                                                   
-//! # Example                                                                                         
-//!                                                                                                   
-//! ```text                                                                                           
-//! (run-schedule                                                                                     
-//!   (repeat 3                                                                                       
-//!     (push)                                                                                        
-//!     (eval (Add (Num 1) (Num 2)))   ; add a term to the e-graph                                    
-//!     (saturate (run math-rules))    ; rewrite to fixpoint                                          
-//!     (keep-best "Target")           ; compact to best representatives                              
-//!     (pop)))                                                                                       
-//! ```                       
+//! The `run-schedule` command: an extended scheduling language for egglog.
+//!
+//! `run-schedule` takes one or more *schedule expressions* and runs them in
+//! order against the e-graph, returning the combined [`RunReport`] (plus any
+//! per-command outputs such as `print-size` results). It is registered as a
+//! user-defined command by [`new_experimental_egraph`](crate::new_experimental_egraph)
+//! and is the experimental counterpart to core egglog's built-in `run-schedule`.
+//!
+//! # Schedule expressions
+//!
+//! A schedule expression is one of:
+//!
+//! - **`ruleset`** — a bare ruleset name (a [`Var`](egglog::ast::Expr::Var)),
+//!   e.g. `my-rules`. Runs one step of that ruleset.
+//! - **`(run [ruleset] [:until cond])`** — run one step of `ruleset` (or the
+//!   empty/default ruleset if omitted). With `:until cond`, the step is skipped
+//!   once `cond` already holds (`cond` is checked as a [`Check`](egglog::ast::Command::Check)).
+//! - **`(run-with scheduler [ruleset] [:until cond])`** — like `run`, but drives
+//!   the ruleset with a named scheduler previously bound by `let-scheduler`.
+//! - **`(let-scheduler name (scheduler-kind args...))`** — bind `name` to a fresh
+//!   scheduler instance (e.g. `(back-off :match-limit 1000 :ban-length 5)`).
+//!   The binding is scoped to the enclosing `seq`/`saturate`/`repeat` block.
+//! - **`(seq step...)`** — run each step once, in order.
+//! - **`(saturate step...)`** — repeatedly run the body until it makes no further
+//!   progress (the accumulated report's `can_stop` is set).
+//! - **`(repeat n step...)`** — run the body `n` times.
+//! - **`(eval expr...)`** — evaluate each `expr` in the full read/write
+//!   (FullState) context and add the resulting terms to the e-graph, the
+//!   schedule-step analogue of a top-level expression like `(Add (Num 1) (Num 2))`.
+//!   Because evaluation has full database access, the expressions may also call
+//!   reading primitives such as `(get-size!)` that are not admissible from an
+//!   ordinary action context.
+//! - **A forwarded command** — a fixed allowlist of side-effecting commands
+//!   (`print-size`, `print-function`, `extract`, `push`, `pop`, `union`, `set`,
+//!   `delete`, `subsume`, `panic`) and any registered user-defined command
+//!   (e.g. `keep-best`, `multi-extract`, or a nested `run-schedule`). These are
+//!   forwarded by re-parsing the s-expression through
+//!   [`parse_and_run_program`](egglog::EGraph::parse_and_run_program); any other
+//!   head (rule declarations, `let` bindings, function definitions, …) is rejected.
+//!
+//! # Example
+//!
+//! ```text
+//! (run-schedule
+//!   (repeat 3
+//!     (push)
+//!     (eval (Add (Num 1) (Num 2)))   ; add a term to the e-graph
+//!     (saturate (run math-rules))    ; rewrite to fixpoint
+//!     (keep-best "Target")           ; compact to best representatives
+//!     (pop)))
+//! ```
 use std::{collections::HashMap, sync::Mutex};
 
 use egglog::{
     CommandOutput, UserDefinedCommand,
     ast::{Command, Expr, Fact, Literal, ParseError},
-    prelude::run_ruleset,
+    prelude::{Span, run_ruleset},
     scheduler::{Scheduler, SchedulerId},
+    span,
 };
 use egglog_reports::RunReport;
 use lazy_static::lazy_static;
 
-/// The `run-schedule` user-defined command.                                                          
-///                                                                                                   
-/// See the [module-level documentation](self) for the full schedule language.  
+type PermanentSchedulerState = HashMap<String, SchedulerId>;
+
+/// The `run-schedule` user-defined command.
+///
+/// See the [module-level documentation](self) for the full schedule language.
 pub struct RunExtendedSchedule;
+
+pub struct LetSchedulerCommand;
 
 pub trait SchedulerGen {
     fn new_scheduler(&self, egraph: &egglog::EGraph, args: &[Expr]) -> Box<dyn Scheduler>;
@@ -94,6 +99,22 @@ lazy_static! {
 
 pub fn add_scheduler_builder(name: String, builder: SchedulerBuilder) {
     scheduler_libs.lock().unwrap().insert(name, builder);
+}
+
+fn build_scheduler(
+    egraph: &egglog::EGraph,
+    span: &Span,
+    name: &str,
+    args: &[Expr],
+) -> Result<Box<dyn Scheduler>, egglog::Error> {
+    let libs = scheduler_libs.lock().unwrap();
+    match libs.get(name) {
+        Some(builder) => builder(egraph, span, args),
+        None => Err(egglog::Error::ParseError(ParseError(
+            span.clone(),
+            format!("Unknown scheduler: {name}"),
+        ))),
+    }
 }
 
 impl ScheduleState {
@@ -144,23 +165,17 @@ impl ScheduleState {
 
         match head.as_str() {
             "let-scheduler" => match exprs.as_slice() {
-                [Expr::Var(_, name), Expr::Call(_, scheduler_name, args)] => {
+                [
+                    Expr::Var(_, name),
+                    Expr::Call(scheduler_span, scheduler_name, args),
+                ] => {
                     if self.schedulers.iter().any(|(n, _)| n == name) {
                         return Err(egglog::Error::ParseError(ParseError(
                             span.clone(),
                             format!("Scheduler {name} already exists"),
                         )));
                     }
-                    let scheduler = {
-                        let libs = scheduler_libs.lock().unwrap();
-                        let Some(builder) = libs.get(scheduler_name) else {
-                            return Err(egglog::Error::ParseError(ParseError(
-                                span.clone(),
-                                format!("Unknown scheduler: {scheduler_name}"),
-                            )));
-                        };
-                        builder(egraph, span, args)?
-                    };
+                    let scheduler = build_scheduler(egraph, scheduler_span, scheduler_name, args)?;
                     let id = egraph.add_scheduler(scheduler);
                     self.schedulers.push((name.clone(), id));
                     Ok((vec![], RunReport::default()))
@@ -180,6 +195,11 @@ impl ScheduleState {
                             .iter()
                             .rfind(|(n, _)| n == scheduler_name)
                             .map(|(_, id)| *id)
+                            .or_else(|| {
+                                egraph
+                                    .extension_state::<PermanentSchedulerState>()
+                                    .and_then(|state| state.get(scheduler_name).copied())
+                            })
                             .ok_or_else(|| {
                                 egglog::Error::ParseError(ParseError(
                                     scheduler_span.clone(),
@@ -346,6 +366,44 @@ impl UserDefinedCommand for RunExtendedSchedule {
         }
         outputs.push(CommandOutput::RunSchedule(report));
         Ok(outputs)
+    }
+}
+
+impl UserDefinedCommand for LetSchedulerCommand {
+    fn update(
+        &self,
+        egraph: &mut egglog::EGraph,
+        args: &[Expr],
+    ) -> Result<Vec<CommandOutput>, egglog::Error> {
+        match args {
+            [
+                Expr::Var(span, name),
+                Expr::Call(scheduler_span, scheduler_name, scheduler_args),
+            ] => {
+                if egraph
+                    .extension_state::<PermanentSchedulerState>()
+                    .and_then(|state| state.get(name).copied())
+                    .is_some()
+                {
+                    return Err(egglog::Error::ParseError(ParseError(
+                        span.clone(),
+                        format!("Scheduler {name} already exists"),
+                    )));
+                }
+
+                let scheduler =
+                    build_scheduler(egraph, scheduler_span, scheduler_name, scheduler_args)?;
+                let id = egraph.add_scheduler(scheduler);
+                egraph
+                    .extension_state_or_default::<PermanentSchedulerState>()
+                    .insert(name.clone(), id);
+                Ok(vec![])
+            }
+            invalid => Err(egglog::Error::ParseError(ParseError(
+                invalid.first().map_or_else(|| span!(), Expr::span),
+                "Invalid let-scheduler command".into(),
+            ))),
+        }
     }
 }
 

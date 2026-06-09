@@ -4,7 +4,54 @@ use egglog::{
     CommandOutput,
     ast::{Expr, Literal},
     prelude::{RustSpan, Span},
+    span,
 };
+
+fn eval_get_size(egraph: &mut egglog::EGraph, names: &[&str]) -> i64 {
+    let span = span!();
+    let expr = Expr::Call(
+        span.clone(),
+        "get-size!".into(),
+        names
+            .iter()
+            .map(|name| Expr::Lit(span.clone(), Literal::String((*name).into())))
+            .collect(),
+    );
+    let (_, value) = egraph.eval_expr(&expr).unwrap();
+    egraph.value_to_base::<i64>(value)
+}
+
+fn new_copy_egraph() -> egglog::EGraph {
+    let mut egraph = egglog_experimental::new_experimental_egraph();
+    egraph
+        .parse_and_run_program(
+            None,
+            r#"
+        (ruleset copy)
+        (relation R (i64))
+        (relation S (i64))
+        (R 0)
+        (rule ((R x)) ((S x)) :ruleset copy :name "copy")
+        "#,
+        )
+        .unwrap();
+    egraph
+}
+
+fn let_backoff(egraph: &mut egglog::EGraph) {
+    egraph
+        .parse_and_run_program(
+            None,
+            "(let-scheduler bo (back-off :match-limit 2 :ban-length 2))",
+        )
+        .unwrap();
+}
+
+fn run_bo_copy(egraph: &mut egglog::EGraph) {
+    egraph
+        .parse_and_run_program(None, "(run-schedule (run-with bo copy))")
+        .unwrap();
+}
 
 #[test]
 fn test_extract() {
@@ -389,6 +436,140 @@ fn test_keep_best_clears_other_tables() {
 }
 
 #[test]
+fn test_top_level_let_scheduler_persists_on_the_egraph() {
+    let mut egraph = egglog_experimental::new_experimental_egraph();
+
+    egraph
+        .parse_and_run_program(
+            None,
+            r#"
+        (ruleset copy)
+        (ruleset grow)
+        (relation R (i64))
+        (relation S (i64))
+        (relation Seed ())
+        (R 0)
+        (R 1)
+        (R 2)
+        (Seed)
+        (rule ((R x)) ((S x)) :ruleset copy :name "copy")
+        (rule ((Seed)) ((R 3)) :ruleset grow :name "grow")
+        "#,
+        )
+        .unwrap();
+
+    let_backoff(&mut egraph);
+
+    egraph
+        .parse_and_run_program(
+            None,
+            r#"
+        (run-schedule
+          (seq
+            (run-with bo copy)
+            (run grow)
+            (run-with bo copy)))
+        "#,
+        )
+        .unwrap();
+
+    assert_eq!(
+        eval_get_size(&mut egraph, &["S"]),
+        3,
+        "ordinary back-off should replay the queued copy backlog and should not depend on fresh rematching"
+    );
+}
+
+#[test]
+fn test_top_level_let_scheduler_survives_egraph_clone() {
+    let mut original = new_copy_egraph();
+    let_backoff(&mut original);
+
+    let mut cloned = original.clone();
+    run_bo_copy(&mut cloned);
+    run_bo_copy(&mut original);
+
+    assert_eq!(eval_get_size(&mut cloned, &["S"]), 1);
+    assert_eq!(eval_get_size(&mut original, &["S"]), 1);
+}
+
+#[test]
+fn test_top_level_let_scheduler_redeclaration_returns_error() {
+    let mut egraph = new_copy_egraph();
+    let_backoff(&mut egraph);
+
+    let err = egraph
+        .parse_and_run_program(
+            None,
+            "(let-scheduler bo (back-off :match-limit 10 :ban-length 1))",
+        )
+        .unwrap_err();
+
+    assert!(err.to_string().contains("Scheduler bo already exists"));
+
+    run_bo_copy(&mut egraph);
+    assert_eq!(eval_get_size(&mut egraph, &["S"]), 1);
+}
+
+#[test]
+fn test_let_scheduler_unknown_scheduler_returns_error() {
+    let mut egraph = new_copy_egraph();
+    let err = egraph
+        .parse_and_run_program(None, "(let-scheduler bo (missing-scheduler))")
+        .unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("Unknown scheduler: missing-scheduler")
+    );
+
+    let mut egraph = new_copy_egraph();
+    let err = egraph
+        .parse_and_run_program(
+            None,
+            "(run-schedule (let-scheduler bo (missing-scheduler)))",
+        )
+        .unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("Unknown scheduler: missing-scheduler")
+    );
+}
+
+#[test]
+fn test_top_level_let_scheduler_invalidates_after_push_pop() {
+    let mut egraph = new_copy_egraph();
+
+    for _ in 0..2 {
+        egraph.parse_and_run_program(None, "(push)").unwrap();
+        let_backoff(&mut egraph);
+        run_bo_copy(&mut egraph);
+        assert_eq!(eval_get_size(&mut egraph, &["S"]), 1);
+        egraph.parse_and_run_program(None, "(pop)").unwrap();
+        assert_eq!(eval_get_size(&mut egraph, &["S"]), 0);
+
+        let err = egraph
+            .parse_and_run_program(None, "(run-schedule (run-with bo copy))")
+            .unwrap_err();
+        assert!(err.to_string().contains("Unknown scheduler: bo"));
+    }
+}
+
+#[test]
+fn test_top_level_let_scheduler_survives_pop_when_declared_before_push() {
+    let mut egraph = new_copy_egraph();
+    let_backoff(&mut egraph);
+    egraph.parse_and_run_program(None, "(push)").unwrap();
+    run_bo_copy(&mut egraph);
+    assert_eq!(eval_get_size(&mut egraph, &["S"]), 1);
+
+    egraph.parse_and_run_program(None, "(pop)").unwrap();
+    assert_eq!(eval_get_size(&mut egraph, &["S"]), 0);
+
+    run_bo_copy(&mut egraph);
+    assert_eq!(eval_get_size(&mut egraph, &["S"]), 1);
+}
+
+#[test]
 fn test_extract_missing_expression_returns_error_instead_of_panicking() {
     let mut egraph = egglog_experimental::new_experimental_egraph();
 
@@ -715,14 +896,14 @@ fn test_schedule_expr_eval() {
     // top-level expression would.
     let before = egraph.get_size("Add");
     egraph
-              .parse_and_run_program(
-                  None,
-                  r#"                                                                                      
-              (run-schedule                                                                                
-                (eval (Add (Num 3) (Num 4))))                                                              
+        .parse_and_run_program(
+            None,
+            r#"
+              (run-schedule
+                (eval (Add (Num 3) (Num 4))))
               "#,
-              )
-              .unwrap();
+        )
+        .unwrap();
     assert_eq!(
         egraph.get_size("Add"),
         before + 1,
