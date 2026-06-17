@@ -1,14 +1,14 @@
-use egglog_ast::span::Span;
-use std::sync::Arc;
-
+use crate::Error;
 use egglog::{
-    CommandOutput, EGraph, Error, TermDag, TermId, TypeError, UserDefinedCommand,
+    CommandOutput, EGraph, TermDag, TermId, UserDefinedCommand,
     ast::*,
     extract::{CostModel, DefaultCost, Extractor, TreeAdditiveCostModel},
     span,
     util::FreshGen,
 };
+use egglog_ast::span::Span;
 use log::log_enabled;
+use std::sync::Arc;
 
 pub fn add_set_cost(egraph: &mut EGraph) {
     egraph
@@ -244,7 +244,7 @@ impl UserDefinedCommand for CustomExtract {
             // TODO: egglog does not yet support u64
             if nv.0.name() != "i64" {
                 let i64sort = egraph.get_arcsort_by(|s| s.name() == "i64");
-                return Err(Error::TypeError(TypeError::Mismatch {
+                return Err(egglog::Error::TypeError(egglog::TypeError::Mismatch {
                     expr: args[1].clone(),
                     expected: i64sort,
                     actual: nv.0,
