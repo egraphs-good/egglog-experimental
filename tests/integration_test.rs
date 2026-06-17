@@ -864,6 +864,58 @@ fn test_saturate_continues_until_scheduler_can_stop_after_no_progress_ban() {
 }
 
 #[test]
+fn test_backoff_drops_held_matches_subsumed_by_analysis() {
+    let mut egraph = egglog_experimental::new_experimental_egraph();
+
+    egraph
+        .parse_and_run_program(
+            None,
+            r#"
+        (ruleset analysis)
+        (ruleset copy)
+        (datatype Math
+          (Add Math Math)
+          (Num i64))
+        (relation Hit (Math))
+        (let expr1 (Add (Num 0) (Num 1)))
+        (let expr2 (Add (Num 0) (Num 2)))
+        (rewrite (Add (Num 0) x) x :subsume :ruleset analysis)
+        (rule ((= e (Add (Num 0) x))) ((Hit e)) :ruleset copy :name "copy-add")
+        (let-scheduler bo (back-off :match-limit 1 :ban-length 1))
+        "#,
+        )
+        .unwrap();
+
+    let first_outputs = egraph
+        .parse_and_run_program(None, "(run-schedule (run-with bo copy))")
+        .unwrap();
+    let first_report = only_run_report(&first_outputs);
+    assert_eq!(egraph.get_size("Hit"), 0);
+    assert!(
+        !first_report.updated,
+        "back-off should hold the over-limit matches without running actions"
+    );
+
+    egraph
+        .parse_and_run_program(None, "(run-schedule (run analysis))")
+        .unwrap();
+
+    let second_outputs = egraph
+        .parse_and_run_program(None, "(run-schedule (run-with bo copy))")
+        .unwrap();
+    let second_report = only_run_report(&second_outputs);
+    assert_eq!(
+        egraph.get_size("Hit"),
+        0,
+        "held scheduler keys whose body witnesses were subsumed must not fire"
+    );
+    assert!(
+        !second_report.updated,
+        "discarding stale scheduler keys is not user-visible progress"
+    );
+}
+
+#[test]
 fn test_schedule_expr_eval() {
     let mut egraph = egglog_experimental::new_experimental_egraph();
 
