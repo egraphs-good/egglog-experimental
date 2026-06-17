@@ -19,6 +19,15 @@
 //! - [`(get-size!)` primitive](https://github.com/egraphs-good/egglog-experimental/blob/main/tests/web-demo/node-limit.egg)
 //!   for inspecting total tuple counts or counts for specific tables
 //! - [Multi-extraction](https://github.com/egraphs-good/egglog-experimental/blob/main/tests/web-demo/multi-extract.egg)
+//! - Body-defined primitives with `(primitive name (InputSort*) OutputSort body)`.
+//!   Body variables are positional (`_0`, `_1`, ...), and a partial primitive
+//!   body result propagates as primitive failure. The registered primitive uses
+//!   the minimum capability needed by its body (`pure`, `read`, `write`, or
+//!   `full`). Bodies may call built-in or previously registered primitives,
+//!   table-backed functions, and globals; applying those primitives is allowed
+//!   only in a compatible runtime context. A global reference makes the defined
+//!   primitive read-capable because globals lower to zero-argument function
+//!   lookups.
 //!
 //! Each bullet links to a runnable demo so you can explore the feature quickly.
 //! The rest of this crate exposes the Rust APIs and helpers that back these extensions.
@@ -40,6 +49,7 @@ mod multi_extract;
 pub use multi_extract::*;
 mod size;
 pub use size::*;
+mod primitive;
 mod table_stats;
 pub use table_stats::*;
 
@@ -90,6 +100,9 @@ pub fn new_experimental_egraph() -> EGraph {
     // Per-column statistics for function tables.
     egraph
         .add_command("print-table-stats".into(), Arc::new(PrintTableStatsCommand))
+        .unwrap();
+    egraph
+        .add_command("primitive".into(), Arc::new(primitive::RegisterPrimitive))
         .unwrap();
     egraph
 }

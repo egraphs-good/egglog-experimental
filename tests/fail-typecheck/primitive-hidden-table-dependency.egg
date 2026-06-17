@@ -1,0 +1,14 @@
+;; Regression for a seminaive hidden dependency: this used to compile a call to
+;; f inside via-f, so the rule depended only on via-f and missed later writes to f.
+(function f (i64) i64 :no-merge)
+(relation seed (i64))
+(relation out (i64))
+
+(primitive via-f (i64) i64 (f _0))
+
+(rule ((seed x)) ((out (via-f x))))
+(seed 1)
+(run 1)
+(set (f 1) 9)
+(run 1)
+(check (out 9))

@@ -1,0 +1,7 @@
+(datatype Foo (MkFoo i64))
+
+(primitive make-foo (i64) Foo (MkFoo _0))
+
+(check (= (get-size! "MkFoo") 0))
+(let foo (make-foo 7))
+(check (= (get-size! "MkFoo") 1))

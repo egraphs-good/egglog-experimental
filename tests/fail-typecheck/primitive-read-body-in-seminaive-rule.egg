@@ -1,0 +1,7 @@
+(datatype Foo (MkFoo i64))
+(relation R (i64))
+
+(primitive foo-size () i64 (get-size! "MkFoo"))
+
+(R 0)
+(rule ((R x) (= n (foo-size))) ((R n)))

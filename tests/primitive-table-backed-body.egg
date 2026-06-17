@@ -1,0 +1,11 @@
+(function f (i64) i64 :no-merge)
+(relation out (i64))
+
+(primitive via-f (i64) i64 (f _0))
+
+(set (f 1) 9)
+(check (= (via-f 1) 9))
+
+(rule ((= x (via-f 1))) ((out x)) :naive)
+(run 1)
+(check (out 9))

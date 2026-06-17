@@ -1,0 +1,2 @@
+(sort Math)
+(primitive bad (i64) Math _0)

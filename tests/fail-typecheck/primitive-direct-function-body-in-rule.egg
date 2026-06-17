@@ -1,0 +1,6 @@
+(sort IntToInt (UnstableFn (i64) i64))
+(function f (i64) i64 :no-merge)
+(relation R (i64))
+
+(primitive apply-direct-fn (i64) i64 (unstable-app (unstable-fn "f") _0))
+(rule ((R x) (= y (apply-direct-fn x))) ((R y)))

@@ -1,0 +1,2 @@
+(sort IntToInt (UnstableFn (i64) i64))
+(primitive bad (i64) i64 (unstable-app (unstable-fn "missing") _0))

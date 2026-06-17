@@ -1,0 +1,6 @@
+(let $offset 1)
+(relation Out (i64))
+
+(primitive add-offset i64 i64 (+ _0 $offset))
+
+(rule ((= x (add-offset 4))) ((Out x)))
