@@ -10,7 +10,7 @@
 use egglog::{
     CommandOutput, EGraph, Error, TermDag, TermId, TypeError, UserDefinedCommand,
     ast::{Expr, ParseError},
-    extract::{Cost, CostModel, Extractor},
+    extract::{Cost, TreeCostModel},
     prelude::span,
 };
 use log::log_enabled;
@@ -36,13 +36,15 @@ impl std::fmt::Display for MultiExtractOutput {
     }
 }
 
-pub struct MultiExtract<C: Cost + Ord + Eq + Clone + Debug + Send + Sync, CM: CostModel<C> + Clone>
-{
+pub struct MultiExtract<
+    C: Cost + Ord + Eq + Clone + Debug + Send + Sync,
+    CM: TreeCostModel<C> + Clone,
+> {
     cost_model: CM,
     _cost_t: PhantomData<C>,
 }
 
-impl<C: Cost + Ord + Eq + Clone + Debug + Send + Sync, CM: CostModel<C> + Clone>
+impl<C: Cost + Ord + Eq + Clone + Debug + Send + Sync, CM: TreeCostModel<C> + Clone>
     MultiExtract<C, CM>
 {
     pub fn new(cost_model: CM) -> Self {
@@ -55,7 +57,7 @@ impl<C: Cost + Ord + Eq + Clone + Debug + Send + Sync, CM: CostModel<C> + Clone>
 
 impl<
     C: Cost + Ord + Eq + Clone + Debug + Send + Sync,
-    CM: CostModel<C> + Clone + Send + Sync + 'static,
+    CM: TreeCostModel<C> + Clone + Send + Sync + 'static,
 > UserDefinedCommand for MultiExtract<C, CM>
 {
     fn update(&self, egraph: &mut EGraph, args: &[Expr]) -> Result<Vec<CommandOutput>, Error> {
@@ -90,28 +92,17 @@ impl<
             )));
         }
 
-        let (sorts, values): (Vec<_>, Vec<_>) = args[1..]
+        let roots: Vec<_> = args[1..]
             .iter()
             .map(|arg| egraph.eval_expr(arg))
             .collect::<Result<_, _>>()?;
 
-        let mut termdag = TermDag::default();
-        let extractor = Extractor::compute_costs_from_rootsorts(
-            Some(sorts.clone()),
-            egraph,
-            self.cost_model.clone(),
-        );
+        let extracted = egraph.extract_variants(roots, n as usize, self.cost_model.clone())?;
 
-        let terms: Vec<Vec<_>> = values
+        let terms: Vec<Vec<_>> = extracted
+            .variants
             .into_iter()
-            .zip(sorts)
-            .map(|(value, sort)| {
-                extractor
-                    .extract_variants_with_sort(egraph, &mut termdag, value, n as usize, sort)
-                    .into_iter()
-                    .map(|e| e.1)
-                    .collect()
-            })
+            .map(|variants| variants.into_iter().map(|variant| variant.term).collect())
             .collect();
 
         if log_enabled!(log::Level::Info) {
@@ -123,7 +114,10 @@ impl<
         }
 
         Ok(vec![CommandOutput::UserDefined(std::sync::Arc::from(
-            MultiExtractOutput { termdag, terms },
+            MultiExtractOutput {
+                termdag: extracted.termdag,
+                terms,
+            },
         ))])
     }
 }

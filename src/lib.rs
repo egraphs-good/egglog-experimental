@@ -12,6 +12,8 @@
 //! - [Rationals support](https://egraphs-good.github.io/egglog-demo/?example=rational)
 //!   (see [`rational`] for the exposed primitives)
 //! - [Dynamic cost models with `set-cost`](https://egraphs-good.github.io/egglog-demo/?example=05-cost-model-and-extraction)
+//! - Greedy DAG extraction with `(extract <expr> :extractor greedy-dag)`,
+//!   which uses dynamic costs but charges shared subterms once
 //! - [Custom schedulers via `run-with`](https://egraphs-good.github.io/egglog-demo/?example=math-backoff),
 //!   including top-level `(let-scheduler name ...)` bindings stored on the e-graph
 //! - An extended `run-schedule` command (see [`scheduling`]) with `seq`,

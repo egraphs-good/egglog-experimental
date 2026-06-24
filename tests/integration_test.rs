@@ -53,6 +53,26 @@ fn run_bo_copy(egraph: &mut egglog::EGraph) {
         .unwrap();
 }
 
+const DYNAMIC_DAG_FIXTURE: &str = "
+(with-dynamic-cost
+    (datatype E
+        (Pair E E :cost 1)
+        (Wide E :cost 1)
+        (Leaf i64 :cost 1))
+)
+
+(let shared (Wide (Leaf 0)))
+(let daggy (Pair shared shared))
+(let treeish (Pair (Leaf 1) (Leaf 2)))
+(union daggy treeish)
+";
+
+fn run_dynamic_dag(commands: &str) -> Vec<CommandOutput> {
+    egglog_experimental::new_experimental_egraph()
+        .parse_and_run_program(None, &format!("{DYNAMIC_DAG_FIXTURE}\n{commands}"))
+        .unwrap()
+}
+
 #[test]
 fn test_extract() {
     let mut egraph = egglog_experimental::new_experimental_egraph();
@@ -95,6 +115,101 @@ fn test_extract() {
     assert_eq!(result[2].to_string(), "(Add (Num 1) (Num 1))\n");
     assert_eq!(result[3].to_string(), "(Add (Num 1) (Num 1))\n");
     assert_eq!(result[4].to_string(), "(Sub (Num 5) (Num 3))\n");
+}
+
+#[test]
+fn test_extract_rejects_explicit_tree_extractor() {
+    let mut egraph = egglog_experimental::new_experimental_egraph();
+
+    let err = egraph
+        .parse_and_run_program(
+            None,
+            "
+        (with-dynamic-cost
+            (datatype E (Leaf i64))
+        )
+        (let leaf (Leaf 0))
+        (extract leaf :extractor tree)",
+        )
+        .unwrap_err();
+
+    assert!(
+        err.to_string()
+            .contains("omit :extractor to use the default tree extractor"),
+        "unexpected error: {err}"
+    );
+}
+
+#[test]
+fn test_greedy_dag_extract_prefers_shared_subterms() {
+    let result = run_dynamic_dag(
+        "
+        (extract daggy)
+        (extract daggy :extractor greedy-dag)",
+    );
+
+    assert_eq!(result.len(), 2);
+    assert_eq!(result[0].to_string(), "(Pair (Leaf 1) (Leaf 2))\n");
+    assert_eq!(
+        result[1].to_string(),
+        "(Pair (Wide (Leaf 0)) (Wide (Leaf 0)))\n"
+    );
+
+    let CommandOutput::ExtractBest(_, tree_cost, _) = result[0].clone() else {
+        panic!("expected tree extract output");
+    };
+    let CommandOutput::ExtractBest(_, dag_cost, _) = result[1].clone() else {
+        panic!("expected greedy-dag extract output");
+    };
+    assert_eq!(tree_cost, 5);
+    assert_eq!(dag_cost, 4);
+}
+
+#[test]
+fn test_greedy_dag_extract_respects_set_cost() {
+    let result = run_dynamic_dag(
+        "
+        (extract daggy :extractor greedy-dag)
+        (set-cost (Wide (Leaf 0)) 10)
+        (extract daggy :extractor greedy-dag)",
+    );
+
+    assert_eq!(result.len(), 2);
+    assert_eq!(
+        result[0].to_string(),
+        "(Pair (Wide (Leaf 0)) (Wide (Leaf 0)))\n"
+    );
+    assert_eq!(result[1].to_string(), "(Pair (Leaf 1) (Leaf 2))\n");
+}
+
+#[test]
+fn test_greedy_dag_extract_avoids_cycle_from_python_issue_387() {
+    let mut egraph = egglog_experimental::new_experimental_egraph();
+
+    let result = egraph
+        .parse_and_run_program(
+            None,
+            "
+        (sort S)
+        (constructor S0 (S) S)
+        (constructor S3 (S S) S)
+        (constructor S5 (S) S)
+        (constructor S6 () S)
+
+        (let b (S6))
+        (let c (S0 b))
+        (let x (S0 (S3 (S5 b) b)))
+        (let y (S0 (S0 (S0 c))))
+
+        (union x y)
+
+        (let victim (S0 x))
+        (extract victim :extractor greedy-dag)",
+        )
+        .unwrap();
+
+    assert_eq!(result.len(), 1);
+    assert!(matches!(result[0], CommandOutput::ExtractBest(..)));
 }
 
 #[test]
@@ -589,10 +704,7 @@ fn test_extract_extra_arguments_return_error_instead_of_panicking() {
         .parse_and_run_program(None, "(extract 0 1 2)")
         .unwrap_err();
 
-    assert!(
-        err.to_string()
-            .contains("extract expects at most two arguments")
-    );
+    assert!(err.to_string().contains("expected :extractor"));
 }
 
 #[test]
@@ -628,6 +740,16 @@ fn test_extract_zero_variants_preserves_best_extract_behavior() {
 
     assert_eq!(result.len(), 1);
     assert_eq!(result[0].to_string(), "(Num 2)\n");
+}
+
+#[test]
+fn test_greedy_dag_extract_variants_rank_root_alternatives() {
+    let result = run_dynamic_dag("(extract daggy 2 :extractor greedy-dag)");
+
+    assert_eq!(
+        result[0].to_string(),
+        "(\n   (Pair (Wide (Leaf 0)) (Wide (Leaf 0)))\n   (Pair (Leaf 1) (Leaf 2))\n)\n"
+    );
 }
 
 #[test]

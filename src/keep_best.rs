@@ -8,11 +8,8 @@
 //! Each argument must evaluate to a `String` that names an existing function.
 
 use egglog::{
-    ArcSort, CommandOutput, EGraph, Error, TermDag, TermId, TypeError, UserDefinedCommand, Value,
-    ast::Expr,
-    extract::{Extractor, TreeAdditiveCostModel},
-    sort::S,
-    span,
+    ArcSort, CommandOutput, EGraph, Error, RawValues, TermDag, TermId, TypeError,
+    UserDefinedCommand, Value, Write, ast::Expr, extract::TreeAdditiveCostModel, sort::S, span,
 };
 
 pub struct KeepBestCommand;
@@ -43,28 +40,47 @@ impl UserDefinedCommand for KeepBestCommand {
             egraph.clear_function(name)?;
         }
 
-        // Step 4: re-insert the optimal tuples. Evaluate each extracted term
-        // via eval_expr so that constructor sub-terms are re-created bottom-up,
-        // then stage all target-table inserts in one with_full_state call.
-        let mut rows_to_insert: Vec<(String, Vec<Value>)> = Vec::new();
-        for (table_name, extracted_rows, termdag) in &extracted {
+        // Step 4: re-insert the optimal tuples. Evaluate each extracted term via eval_expr so
+        // that constructor sub-terms are re-created bottom-up, then stage all writes in one
+        // update.
+        let mut rows_to_insert: Vec<(String, TableKind, Vec<Value>)> = Vec::new();
+        for (table_name, kind, extracted_rows, termdag) in &extracted {
             for term_ids in extracted_rows {
                 let values = eval_terms(egraph, termdag, term_ids)?;
-                rows_to_insert.push((table_name.clone(), values));
+                rows_to_insert.push((table_name.clone(), *kind, values));
             }
         }
 
-        egraph.with_full_state(|mut state| {
-            for (table_name, values) in &rows_to_insert {
-                egglog::Write::insert(&mut state, table_name, values.iter().copied());
+        egraph.update(|mut state| {
+            for (table_name, kind, values) in rows_to_insert {
+                let Some((output, inputs)) = values.split_last() else {
+                    return Err(Error::ExtractError(format!(
+                        "keep-best: empty row for table {table_name}"
+                    )));
+                };
+                match kind {
+                    TableKind::Function => {
+                        state.set(&table_name, RawValues(inputs.to_vec()), *output)?;
+                    }
+                    TableKind::Constructor => {
+                        state.add(&table_name, RawValues(inputs.to_vec()))?;
+                    }
+                }
             }
-        });
+            Ok(())
+        })?;
 
         Ok(vec![])
     }
 }
 
-type ExtractedTable = (String, Vec<Vec<TermId>>, TermDag);
+#[derive(Clone, Copy)]
+enum TableKind {
+    Function,
+    Constructor,
+}
+
+type ExtractedTable = (String, TableKind, Vec<Vec<TermId>>, TermDag);
 
 /// For each table, collect all rows and extract the best term for each value.
 /// Returns `(table_name, rows, termdag)` triples where each row is a list of
@@ -89,34 +105,53 @@ fn collect_and_extract(
             .collect();
 
         let mut raw_rows: Vec<Vec<Value>> = Vec::new();
-        egraph.function_for_each(table_name, |row| {
-            raw_rows.push(row.vals.to_vec());
-        })?;
+        let kind = if egraph
+            .function_entries(table_name, |entry| {
+                let mut row = entry.inputs.to_vec();
+                row.push(entry.output);
+                raw_rows.push(row);
+            })
+            .is_ok()
+        {
+            TableKind::Function
+        } else {
+            egraph.constructor_enodes(table_name, |enode| {
+                let mut row = enode.children.to_vec();
+                row.push(enode.eclass);
+                raw_rows.push(row);
+            })?;
+            TableKind::Constructor
+        };
 
-        let extractor = Extractor::compute_costs_from_rootsorts(
-            Some(all_sorts.clone()),
-            egraph,
-            TreeAdditiveCostModel::default(),
-        );
-        let mut termdag = TermDag::default();
+        let roots = raw_rows
+            .iter()
+            .flat_map(|row_vals| {
+                row_vals
+                    .iter()
+                    .zip(all_sorts.iter())
+                    .map(|(val, sort)| (sort.clone(), *val))
+            })
+            .collect();
+        let extracted = egraph
+            .extract_best(roots, TreeAdditiveCostModel::default())
+            .map_err(|_| {
+                Error::ExtractError(format!(
+                    "keep-best: could not extract value in table {table_name}"
+                ))
+            })?;
+        let termdag = extracted.termdag;
+        let mut terms = extracted.terms.into_iter().map(|root| root.term);
         let mut extracted_rows: Vec<Vec<TermId>> = Vec::new();
 
         for row_vals in &raw_rows {
             let mut term_ids = Vec::new();
-            for (val, sort) in row_vals.iter().zip(all_sorts.iter()) {
-                let (_, tid) = extractor
-                    .extract_best_with_sort(egraph, &mut termdag, *val, sort.clone())
-                    .ok_or_else(|| {
-                        Error::ExtractError(format!(
-                            "keep-best: could not extract value in table {table_name}"
-                        ))
-                    })?;
-                term_ids.push(tid);
+            for _ in row_vals {
+                term_ids.push(terms.next().expect("one term per extracted table cell"));
             }
             extracted_rows.push(term_ids);
         }
 
-        result.push((table_name.clone(), extracted_rows, termdag));
+        result.push((table_name.clone(), kind, extracted_rows, termdag));
     }
 
     Ok(result)

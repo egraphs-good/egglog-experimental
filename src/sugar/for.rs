@@ -1,4 +1,5 @@
 use egglog::{ast::*, util::FreshGen};
+use egglog_ast::generic_ast::RuleEvalMode;
 use egglog_ast::span::Span;
 
 pub struct For;
@@ -42,8 +43,9 @@ impl Macro<Vec<Command>> for For {
             body: query,
             name: rulename,
             ruleset: ruleset.clone(),
-            naive: false,
+            eval_mode: RuleEvalMode::Seminaive,
             no_decomp: false,
+            include_subsumed: false,
         };
 
         Ok(vec![
