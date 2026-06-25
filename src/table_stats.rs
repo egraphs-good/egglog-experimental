@@ -1,6 +1,6 @@
-//! `(print-table-stats <table>?)` — per-column statistics for function tables.
+//! `(print-table-stats <table>?)` — per-column statistics for tables.
 //!
-//! For each function table, this command reports:
+//! For each table, this command reports:
 //! 1. The number of distinct values in every column (including the output column).
 //! 2. For every ordered pair of distinct columns `(source, target)`, the
 //!    min / 25th percentile / median / mean / 75th percentile / max of the
@@ -10,9 +10,9 @@
 //!    `(output -> combined inputs)` — i.e. for each output value, the number
 //!    of distinct input tuples that produce it.
 //!
-//! Without arguments, every non-hidden, non-let-binding function is reported
-//! (alphabetically). With one argument (an unquoted function name) only that
-//! function is reported.
+//! Without arguments, every non-hidden, non-let-binding table is reported
+//! (alphabetically). With one argument (an unquoted table name) only that
+//! table is reported.
 
 use egglog::{
     CommandOutput, EGraph, Error, TypeError, UserDefinedCommand, Value, ast::Expr, prelude::Span,
@@ -60,7 +60,7 @@ pub struct PairOutDegree {
     pub stats: OutDegreeStats,
 }
 
-/// Per-column statistics for a single function table.
+/// Per-column statistics for a single table.
 #[derive(Clone, Debug)]
 pub struct TableStats {
     /// The display name of the function table.
@@ -208,7 +208,7 @@ impl Display for TableStatsOutput {
     }
 }
 
-/// Compute per-column statistics for a single function table identified by
+/// Compute per-column statistics for a single table identified by
 /// its internal name.
 fn compute_table_stats(egraph: &EGraph, func_name: &str) -> Result<TableStats, Error> {
     let func = egraph
@@ -234,14 +234,8 @@ fn compute_table_stats(egraph: &EGraph, func_name: &str) -> Result<TableStats, E
     }
     let mut output_to_inputs_map: HashMap<Value, HashSet<Vec<Value>>> = HashMap::default();
 
-    egraph.function_entries(func_name, |row| {
+    let mut visit_row = |vals: Vec<Value>| {
         size += 1;
-        let vals: Vec<Value> = row
-            .inputs
-            .iter()
-            .copied()
-            .chain(std::iter::once(row.output))
-            .collect();
         debug_assert_eq!(vals.len(), n_cols);
         for (i, v) in vals.iter().enumerate() {
             distinct[i].insert(*v);
@@ -265,7 +259,31 @@ fn compute_table_stats(egraph: &EGraph, func_name: &str) -> Result<TableStats, E
                 .or_default()
                 .insert(inputs);
         }
-    })?;
+    };
+
+    if egraph
+        .function_entries(func_name, |row| {
+            visit_row(
+                row.inputs
+                    .iter()
+                    .copied()
+                    .chain(std::iter::once(row.output))
+                    .collect(),
+            );
+        })
+        .is_err()
+    {
+        egraph.constructor_enodes(func_name, |enode| {
+            visit_row(
+                enode
+                    .children
+                    .iter()
+                    .copied()
+                    .chain(std::iter::once(enode.eclass))
+                    .collect(),
+            );
+        })?;
+    }
 
     let distinct_counts: Vec<usize> = distinct.iter().map(|s| s.len()).collect();
 
@@ -307,8 +325,8 @@ fn compute_table_stats(egraph: &EGraph, func_name: &str) -> Result<TableStats, E
     })
 }
 
-/// Compute per-column statistics for the given function table, or for every
-/// non-hidden, non-let-binding function when `sym` is `None`.
+/// Compute per-column statistics for the given table, or for every
+/// non-hidden, non-let-binding table when `sym` is `None`.
 pub fn print_table_stats(egraph: &EGraph, sym: Option<&str>) -> Result<Vec<TableStats>, Error> {
     let mut results: Vec<TableStats> = Vec::new();
     if let Some(sym) = sym {

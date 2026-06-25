@@ -1,4 +1,4 @@
-use crate::Error;
+use crate::{Error, extractor_option::parse_extractor_keyword};
 use egglog::{
     ArcSort, CommandOutput, EGraph, Enode, RawValues, Read, TermId, UserDefinedCommand, Value,
     ast::*,
@@ -217,30 +217,6 @@ impl DagCostModel<DefaultCost> for DynamicCostModel {
 }
 
 struct CustomExtract;
-
-fn parse_use_greedy_dag(arg: &Expr) -> Result<bool, Error> {
-    match arg {
-        Expr::Var(_, name) if name == "greedy-dag" => Ok(true),
-        Expr::Var(_, name) => Err(Error::ParseError(ParseError(
-            arg.span(),
-            format!("unknown extractor: {name}; omit :extractor to use the default tree extractor"),
-        ))),
-        _ => Err(Error::ParseError(ParseError(
-            arg.span(),
-            "extractor name must be a symbol".into(),
-        ))),
-    }
-}
-
-fn parse_extractor_keyword(keyword: &Expr, extractor: &Expr) -> Result<bool, Error> {
-    match keyword {
-        Expr::Var(_, keyword) if keyword == ":extractor" => parse_use_greedy_dag(extractor),
-        _ => Err(Error::ParseError(ParseError(
-            keyword.span(),
-            "expected :extractor".into(),
-        ))),
-    }
-}
 
 impl UserDefinedCommand for CustomExtract {
     fn update(

@@ -45,6 +45,7 @@ pub mod scheduling;
 pub use scheduling::*;
 mod fresh_macro;
 
+mod extractor_option;
 mod set_cost;
 pub use set_cost::*;
 mod multi_extract;

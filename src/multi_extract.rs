@@ -3,14 +3,17 @@
 //! reducing the overhead of creating an extractor for each term.
 //! The syntax for multi-extraction is `(multi-extract n t1 ... tm)`,
 //! where n must be a positive i64.
+//! Use `(multi-extract n t1 ... tm :extractor greedy-dag)` to charge shared
+//! subterms once when ranking each expression's variants.
 //! This command will extract n lowest-cost variants of each of the m terms.
 //! `(multi-extract 1 t)` is equivalent to `(extract t)`. Unlike
 //! `(extract t 0)`, `(multi-extract 0 t)` is rejected.
 
+use crate::extractor_option::split_trailing_extractor;
 use egglog::{
     CommandOutput, EGraph, Error, TermDag, TermId, TypeError, UserDefinedCommand,
     ast::{Expr, ParseError},
-    extract::{Cost, TreeCostModel},
+    extract::{Cost, DagCostModel},
     prelude::span,
 };
 use log::log_enabled;
@@ -38,13 +41,13 @@ impl std::fmt::Display for MultiExtractOutput {
 
 pub struct MultiExtract<
     C: Cost + Ord + Eq + Clone + Debug + Send + Sync,
-    CM: TreeCostModel<C> + Clone,
+    CM: DagCostModel<C> + Clone,
 > {
     cost_model: CM,
     _cost_t: PhantomData<C>,
 }
 
-impl<C: Cost + Ord + Eq + Clone + Debug + Send + Sync, CM: TreeCostModel<C> + Clone>
+impl<C: Cost + Ord + Eq + Clone + Debug + Send + Sync, CM: DagCostModel<C> + Clone>
     MultiExtract<C, CM>
 {
     pub fn new(cost_model: CM) -> Self {
@@ -57,10 +60,12 @@ impl<C: Cost + Ord + Eq + Clone + Debug + Send + Sync, CM: TreeCostModel<C> + Cl
 
 impl<
     C: Cost + Ord + Eq + Clone + Debug + Send + Sync,
-    CM: TreeCostModel<C> + Clone + Send + Sync + 'static,
+    CM: DagCostModel<C> + Clone + Send + Sync + 'static,
 > UserDefinedCommand for MultiExtract<C, CM>
 {
     fn update(&self, egraph: &mut EGraph, args: &[Expr]) -> Result<Vec<CommandOutput>, Error> {
+        let (args, use_greedy_dag) = split_trailing_extractor(args)?;
+
         if args.len() < 2 {
             let span = args.first().map(Expr::span).unwrap_or_else(|| span!());
             return Err(Error::ParseError(ParseError(
@@ -97,7 +102,11 @@ impl<
             .map(|arg| egraph.eval_expr(arg))
             .collect::<Result<_, _>>()?;
 
-        let extracted = egraph.extract_variants(roots, n as usize, self.cost_model.clone())?;
+        let extracted = if use_greedy_dag {
+            egraph.extract_variants_greedy_dag(roots, n as usize, self.cost_model.clone())
+        } else {
+            egraph.extract_variants(roots, n as usize, self.cost_model.clone())
+        }?;
 
         let terms: Vec<Vec<_>> = extracted
             .variants

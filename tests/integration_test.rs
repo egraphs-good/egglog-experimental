@@ -474,6 +474,22 @@ fn test_multi_extract_with_set_cost() {
 }
 
 #[test]
+fn test_multi_extract_accepts_greedy_dag_extractor() {
+    let result = run_dynamic_dag("(multi-extract 1 daggy :extractor greedy-dag)");
+
+    assert_eq!(result.len(), 1);
+    let output = result[0].to_string();
+    assert!(
+        output.contains("(Pair (Wide (Leaf 0)) (Wide (Leaf 0)))"),
+        "expected shared DAG extraction: {output}"
+    );
+    assert!(
+        !output.contains("(Pair (Leaf 1) (Leaf 2))"),
+        "expected greedy DAG to prefer the shared term: {output}"
+    );
+}
+
+#[test]
 fn test_keep_best_basic() {
     let mut egraph = egglog_experimental::new_experimental_egraph();
 
@@ -513,6 +529,39 @@ fn test_keep_best_basic() {
         .unwrap();
     let output = result[0].to_string();
     assert!(output.contains("Num") && !output.contains("Add"));
+}
+
+#[test]
+fn test_keep_best_accepts_greedy_dag_extractor() {
+    let mut egraph = egglog_experimental::new_experimental_egraph();
+
+    egraph
+        .parse_and_run_program(
+            None,
+            &format!(
+                "{DYNAMIC_DAG_FIXTURE}
+        (relation Target (E))
+        (Target daggy)"
+            ),
+        )
+        .unwrap();
+
+    egraph
+        .parse_and_run_program(None, r#"(keep-best "Target" :extractor greedy-dag)"#)
+        .unwrap();
+
+    let result = egraph
+        .parse_and_run_program(None, "(print-function Target 10)")
+        .unwrap();
+    let output = result[0].to_string();
+    assert!(
+        output.contains("(Pair (Wide (Leaf 0)) (Wide (Leaf 0)))"),
+        "expected shared DAG extraction: {output}"
+    );
+    assert!(
+        !output.contains("(Pair (Leaf 1) (Leaf 2))"),
+        "expected keep-best to retain the greedy DAG representative: {output}"
+    );
 }
 
 #[test]
