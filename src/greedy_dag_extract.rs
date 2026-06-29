@@ -157,6 +157,7 @@ pub fn extract_variants_tree<C: Cost, M: DagCostModel<C> + 'static>(
 /// total, so cost comparison does not require subtraction or inspecting
 /// the cost type.
 type PaidDagCosts<C> = AggregatedSparseSecondaryMap<DagCostKey, C>;
+type ChildDagCosts<C> = (Vec<Arc<PaidDagCosts<C>>>, Vec<C>);
 
 /// Keyed on sort and value, since the same value of different sorts can have different extractions
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -467,7 +468,7 @@ impl<C: Cost + Ord + Eq + Clone + Debug> GreedyDagExtractor<C> {
         egraph: &EGraph,
         children: impl IntoIterator<Item = (Value, &'a ArcSort)>,
         reject_reachable_key: Option<InternId<DagCostKey>>,
-    ) -> Option<(Vec<Arc<PaidDagCosts<C>>>, Vec<C>)> {
+    ) -> Option<ChildDagCosts<C>> {
         let mut child_cost_sets = Vec::new();
         let mut child_costs = Vec::new();
 
