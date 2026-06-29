@@ -46,6 +46,9 @@ pub use scheduling::*;
 mod fresh_macro;
 
 mod extractor_option;
+mod greedy_dag_extract;
+mod secondary_map;
+pub use greedy_dag_extract::DagCostModel;
 mod set_cost;
 pub use set_cost::*;
 mod multi_extract;

@@ -7,7 +7,10 @@
 //!
 //! Each argument must evaluate to a `String` that names an existing function.
 
-use crate::extractor_option::split_trailing_extractor;
+use crate::{
+    extractor_option::split_trailing_extractor,
+    greedy_dag_extract::{extract_best_greedy_dag, extract_best_tree},
+};
 use egglog::{
     ArcSort, CommandOutput, EGraph, Error, RawValues, TermDag, TermId, TypeError,
     UserDefinedCommand, Value, Write, ast::Expr, extract::TreeAdditiveCostModel, sort::S, span,
@@ -137,9 +140,9 @@ fn collect_and_extract(
             })
             .collect();
         let extracted = if use_greedy_dag {
-            egraph.extract_best_greedy_dag(roots, TreeAdditiveCostModel::default())
+            extract_best_greedy_dag(egraph, roots, TreeAdditiveCostModel::default())
         } else {
-            egraph.extract_best(roots, TreeAdditiveCostModel::default())
+            extract_best_tree(egraph, roots, TreeAdditiveCostModel::default())
         }
         .map_err(|_| {
             Error::ExtractError(format!(

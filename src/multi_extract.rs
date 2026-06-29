@@ -9,15 +9,18 @@
 //! `(multi-extract 1 t)` is equivalent to `(extract t)`. Unlike
 //! `(extract t 0)`, `(multi-extract 0 t)` is rejected.
 
-use crate::extractor_option::split_trailing_extractor;
+use crate::{
+    extractor_option::split_trailing_extractor,
+    greedy_dag_extract::{DagCostModel, extract_variants_greedy_dag, extract_variants_tree},
+};
 use egglog::{
     CommandOutput, EGraph, Error, TermDag, TermId, TypeError, UserDefinedCommand,
     ast::{Expr, ParseError},
-    extract::{Cost, DagCostModel},
+    extract::{Cost, TreeCostModel},
     prelude::span,
 };
 use log::log_enabled;
-use std::{fmt::Debug, marker::PhantomData};
+use std::marker::PhantomData;
 
 #[derive(Debug)]
 pub struct MultiExtractOutput {
@@ -39,17 +42,12 @@ impl std::fmt::Display for MultiExtractOutput {
     }
 }
 
-pub struct MultiExtract<
-    C: Cost + Ord + Eq + Clone + Debug + Send + Sync,
-    CM: DagCostModel<C> + Clone,
-> {
+pub struct MultiExtract<C: Cost + Send + Sync, CM: TreeCostModel<C> + DagCostModel<C> + Clone> {
     cost_model: CM,
     _cost_t: PhantomData<C>,
 }
 
-impl<C: Cost + Ord + Eq + Clone + Debug + Send + Sync, CM: DagCostModel<C> + Clone>
-    MultiExtract<C, CM>
-{
+impl<C: Cost + Send + Sync, CM: TreeCostModel<C> + DagCostModel<C> + Clone> MultiExtract<C, CM> {
     pub fn new(cost_model: CM) -> Self {
         MultiExtract {
             cost_model,
@@ -58,10 +56,8 @@ impl<C: Cost + Ord + Eq + Clone + Debug + Send + Sync, CM: DagCostModel<C> + Clo
     }
 }
 
-impl<
-    C: Cost + Ord + Eq + Clone + Debug + Send + Sync,
-    CM: DagCostModel<C> + Clone + Send + Sync + 'static,
-> UserDefinedCommand for MultiExtract<C, CM>
+impl<C: Cost + Send + Sync, CM: TreeCostModel<C> + DagCostModel<C> + Clone + Send + Sync + 'static>
+    UserDefinedCommand for MultiExtract<C, CM>
 {
     fn update(&self, egraph: &mut EGraph, args: &[Expr]) -> Result<Vec<CommandOutput>, Error> {
         let (args, use_greedy_dag) = split_trailing_extractor(args)?;
@@ -103,9 +99,9 @@ impl<
             .collect::<Result<_, _>>()?;
 
         let extracted = if use_greedy_dag {
-            egraph.extract_variants_greedy_dag(roots, n as usize, self.cost_model.clone())
+            extract_variants_greedy_dag(egraph, roots, n as usize, self.cost_model.clone())
         } else {
-            egraph.extract_variants(roots, n as usize, self.cost_model.clone())
+            extract_variants_tree(egraph, roots, n as usize, self.cost_model.clone())
         }?;
 
         let terms: Vec<Vec<_>> = extracted

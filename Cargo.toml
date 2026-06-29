@@ -24,6 +24,8 @@ egglog-reports = { git = "https://github.com/saulshanabrook/egg-smol.git", branc
 num = "0.4.3"
 lazy_static = "1.4"
 log = "0.4"
+fixedbitset = "0.5.7"
+hashbrown = "0.16.0"
 
 [dev-dependencies]
 glob = "0.3.1"

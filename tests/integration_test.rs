@@ -213,6 +213,40 @@ fn test_greedy_dag_extract_avoids_cycle_from_python_issue_387() {
 }
 
 #[test]
+fn test_greedy_dag_multi_extract_avoids_combined_root_cycle() {
+    let mut egraph = egglog_experimental::new_experimental_egraph();
+
+    let result = egraph
+        .parse_and_run_program(
+            None,
+            "
+        (sort S)
+        (constructor S0 (S) S)
+        (constructor S3 (S S) S)
+        (constructor S5 (S) S)
+        (constructor S6 () S)
+
+        (let b (S6))
+        (let c (S0 b))
+        (let x (S0 (S3 (S5 b) b)))
+        (let y (S0 (S0 (S0 c))))
+
+        (union x y)
+
+        (let victim (S0 x))
+        (multi-extract 1 victim x :extractor greedy-dag)",
+        )
+        .unwrap();
+
+    assert_eq!(result.len(), 1);
+    let output = result[0].to_string();
+    assert!(
+        output.contains("S0") || output.contains("S6"),
+        "combined greedy-DAG extraction should return finite terms, got {output}"
+    );
+}
+
+#[test]
 fn test_get_size_primitive() {
     let mut egraph = egglog_experimental::new_experimental_egraph();
 
