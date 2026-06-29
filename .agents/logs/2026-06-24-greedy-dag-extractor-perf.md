@@ -145,9 +145,9 @@
 ## Experiment 6: tree extractor ratio-of-means CI
 
 - Status: complete
-- Question: using the `../egglog_repro` percent-change algorithm, is the remaining tree extractor before/after difference plausibly zero?
+- Question: using the `<egglog-repro-worktree>` percent-change algorithm, is the remaining tree extractor before/after difference plausibly zero?
 - Algorithm source:
-  - `../egglog_repro/scripts/compute_timing_percent_change.mjs`.
+  - `<egglog-repro-worktree>/scripts/compute_timing_percent_change.mjs`.
   - Uses ratio of execution-time means, sample variance with `n - 1`, Welch degrees of freedom, interpolated 95% t critical value, and a Fieller-style CI for the ratio of means.
   - Percent columns are `(ratio - 1) * 100`.
 - Input samples:
@@ -156,8 +156,8 @@
   - CSV input was written temporarily to `.tmp/tree_extract_codspeed_means.csv` and then removed after recording the results here.
 - Exact commands:
   - `env CODSPEED_PROFILER_ENABLED=false codspeed run -m walltime -- cargo codspeed run -m walltime --bench ci_benchmarking extract-vec-bench`
-  - `node ../egglog_repro/scripts/compute_timing_mean_ci.mjs .tmp/tree_extract_codspeed_means.csv .tmp/tree_extract_mean_ci.csv`
-  - `node ../egglog_repro/scripts/compute_timing_percent_change.mjs .tmp/tree_extract_codspeed_means.csv .tmp/tree_extract_percent_change.csv`
+  - `node <egglog-repro-worktree>/scripts/compute_timing_mean_ci.mjs .tmp/tree_extract_codspeed_means.csv .tmp/tree_extract_mean_ci.csv`
+  - `node <egglog-repro-worktree>/scripts/compute_timing_percent_change.mjs .tmp/tree_extract_codspeed_means.csv .tmp/tree_extract_percent_change.csv`
 - Observed samples:
   - upstream-main means: `10.595`, `11.361`, `10.897`, `10.403`, `10.512` ms.
   - PR means: `11.440`, `11.118`, `11.445`, `11.391`, `11.304` ms.
@@ -220,11 +220,11 @@
 - Question: does the default tree `extract-vec-bench.egg` slowdown reproduce when running a release-built egglog harness directly, without Divan benchmark discovery and proof-support setup?
 - Hypothesis: if the slowdown is only from Divan argument discovery, direct `parse_and_run_program` timing should be near zero-change; if the default command path itself regressed, the direct harness should still show a slowdown.
 - Harness:
-  - Extended `../egglog_repro/scripts/run_benchmark_matrix.mjs` so a commit entry can use `{ "path": "<core-worktree>" }` as a local path dependency.
+  - Extended `<egglog-repro-worktree>/scripts/run_benchmark_matrix.mjs` so a commit entry can use `{ "path": "<core-worktree>" }` as a local path dependency.
   - The local path cache key includes the checkout HEAD, tracked diff, and untracked file contents.
   - Increased generated-harness timing precision from milliseconds to microseconds of seconds because this case is only about 15 ms.
 - Exact config:
-  - `../egglog_repro/.tmp/egg-smol-extract-vec-working-tree.json`
+  - `<egglog-repro-worktree>/<tmp>/egg-smol-extract-vec-working-tree.json`
   - Baseline: `upstream/main` commit `5294cdc66a7b90a9a1480cb2d930f2ee5785c8dd`.
   - Candidate: local `<core-worktree>` path dependency, fingerprint `e1ba95e10ae3`.
   - File: `<core-worktree>/tests/extract-vec-bench.egg`.
@@ -232,9 +232,9 @@
 - Exact command:
   - `node scripts/run_benchmark_matrix.mjs --config .tmp/egg-smol-extract-vec-working-tree.json --no-render`
 - Outputs:
-  - `../egglog_repro/.tmp/egg-smol-extract-vec-working-tree_raw.csv`
-  - `../egglog_repro/.tmp/egg-smol-extract-vec-working-tree_mean_ci.csv`
-  - `../egglog_repro/.tmp/egg-smol-extract-vec-working-tree_percent_change.csv`
+  - `<egglog-repro-worktree>/<tmp>/egg-smol-extract-vec-working-tree_raw.csv`
+  - `<egglog-repro-worktree>/<tmp>/egg-smol-extract-vec-working-tree_mean_ci.csv`
+  - `<egglog-repro-worktree>/<tmp>/egg-smol-extract-vec-working-tree_percent_change.csv`
 - Observed result:
   - Upstream-main samples: mean `14.0957 ms`, sample standard deviation `0.6296 ms`, min `13.499 ms`, max `15.578 ms`.
   - Working-tree samples: mean `15.42795 ms`, sample standard deviation `0.6439 ms`, min `14.681 ms`, max `17.076 ms`.
@@ -243,8 +243,8 @@
   - Tuple counts matched: both variants produced `1248` tuples in every run.
 - Order-effect check:
   - Ran a second matrix with the commit order reversed and `top_n = 1` only to force a fresh timing cache key; the generated harness ignores `top_n`, so the measured work is unchanged.
-  - Config: `../egglog_repro/.tmp/egg-smol-extract-vec-working-tree-reversed.json`.
-  - Output: `../egglog_repro/.tmp/egg-smol-extract-vec-working-tree-reversed_percent_change.csv`.
+  - Config: `<egglog-repro-worktree>/<tmp>/egg-smol-extract-vec-working-tree-reversed.json`.
+  - Output: `<egglog-repro-worktree>/<tmp>/egg-smol-extract-vec-working-tree-reversed_percent_change.csv`.
   - Working-tree-first samples: working tree mean `15.9057 ms`, upstream-main mean `14.20295 ms`.
   - In that reversed baseline view, upstream-main is `-10.705281754339623%` relative to the working tree, with Fieller 95% CI `-17.444700174312587%` to `-2.9374176527587226%`.
   - This reversed run had one working-tree outlier (`26.741 ms`), but it still supports the same direction: upstream-main is faster than the working tree on this direct CLI harness.
@@ -261,8 +261,8 @@
   - H2: parse/typecheck/run outside extraction is slower.
   - H3: the single-run direct slowdown is a one-shot process or code-layout artifact that disappears when the same process repeats the workload.
 - Probe 1: repeated direct timing.
-  - Added `inner_repeats` support to `../egglog_repro/scripts/run_benchmark_matrix.mjs`; generated harnesses loop over a fresh `EGraph::default()` and `parse_and_run_program` for the same input, then report per-iteration time.
-  - Config: `../egglog_repro/.tmp/egg-smol-extract-vec-inner-repeats.json`.
+  - Added `inner_repeats` support to `<egglog-repro-worktree>/scripts/run_benchmark_matrix.mjs`; generated harnesses loop over a fresh `EGraph::default()` and `parse_and_run_program` for the same input, then report per-iteration time.
+  - Config: `<egglog-repro-worktree>/<tmp>/egg-smol-extract-vec-inner-repeats.json`.
   - Command: `node scripts/run_benchmark_matrix.mjs --config .tmp/egg-smol-extract-vec-inner-repeats.json --no-render`.
   - Runs: 5 process-level samples per variant, `inner_repeats = 100`, serial.
   - Before fix: upstream-main mean `15.4892 ms`; working tree mean `19.501 ms`.
@@ -288,7 +288,7 @@
   - `cargo test --test files extract_vec_bench`
   - `cargo test --test files greedy_dag_vec_extract`
   - `cargo test --test files proof_support_snapshot`
-  - In `../egglog_repro`: `node --check scripts/run_benchmark_matrix.mjs`, `cargo fmt --check`, `cargo check --quiet --features latest_main`.
+  - In `<egglog-repro-worktree>`: `node --check scripts/run_benchmark_matrix.mjs`, `cargo fmt --check`, `cargo check --quiet --features latest_main`.
 - Decision:
   - H1 is confirmed. The slowdown came from using greedy-DAG's value-level backwards producer traversal in the default tree extractor setup.
   - Keep the tree setup fix. It removes the measured slowdown while leaving greedy-DAG's value-reachable setup intact.
@@ -316,7 +316,7 @@
   - `cargo test --test files greedy_dag_vec_extract`
   - `cargo codspeed build -m walltime --bench ci_benchmarking`
   - `env CODSPEED_PROFILER_ENABLED=false codspeed run -m walltime -- cargo codspeed run -m walltime --bench ci_benchmarking greedy-dag-vec-extract`
-  - `codspeed samply record --save-only --presymbolicate -o <tmp>/egg-smol-greedy-dag-reserve-once-profile.json.gz -- ../egglog_repro/.egglog_repro_cache/builds/799279f743b0c7e4/target/release/bench <core-worktree>/tests/greedy-dag-vec-extract.egg 0 1 100`
+  - `codspeed samply record --save-only --presymbolicate -o <tmp>/egg-smol-greedy-dag-reserve-once-profile.json.gz -- <egglog-repro-worktree>/<cache>/builds/799279f743b0c7e4/target/release/bench <core-worktree>/tests/greedy-dag-vec-extract.egg 0 1 100`
 - Observed result:
   - Staged allocation run: best `44.66 ms`, report `6a395ed0fa4fbf27dcacfa8b`.
   - Confirmation run was noisy but stayed in the improved best-time range: best `45.93 ms`, report `6a395edb0090450daf1fb0af`.
@@ -340,7 +340,7 @@
   - `cargo codspeed build -m walltime --bench ci_benchmarking`
   - `env CODSPEED_PROFILER_ENABLED=false codspeed run -m walltime -- cargo codspeed run -m walltime --bench ci_benchmarking greedy-dag-vec-extract`
   - `env CODSPEED_PROFILER_ENABLED=false codspeed run -m walltime -- cargo codspeed run -m walltime --bench ci_benchmarking extract-vec-bench`
-  - `codspeed samply record --save-only --presymbolicate -o <tmp>/egg-smol-greedy-dag-bitset-profile.json.gz -- ../egglog_repro/.egglog_repro_cache/builds/799279f743b0c7e4/target/release/bench <core-worktree>/tests/greedy-dag-vec-extract.egg 0 1 150`
+  - `codspeed samply record --save-only --presymbolicate -o <tmp>/egg-smol-greedy-dag-bitset-profile.json.gz -- <egglog-repro-worktree>/<cache>/builds/799279f743b0c7e4/target/release/bench <core-worktree>/tests/greedy-dag-vec-extract.egg 0 1 150`
 - Observed result:
   - First bitset run: best `20.17 ms`, relative stddev `2.81%`, report `6a396006836494ceadaff62a`.
   - Confirmation run: best `19.97 ms`, relative stddev `2.03%`, report `6a396013c93a1577f817bfb1`.
@@ -434,7 +434,7 @@
   - `cargo test --test files greedy_dag_vec_extract`
   - `cargo codspeed build -m walltime --bench ci_benchmarking`
   - `env CODSPEED_PROFILER_ENABLED=false codspeed run -m walltime -- cargo codspeed run -m walltime --bench ci_benchmarking greedy-dag-vec-extract`
-  - `codspeed samply record --save-only --presymbolicate -o <tmp>/egg-smol-greedy-dag-worklist-profile.json.gz -- ../egglog_repro/.egglog_repro_cache/builds/799279f743b0c7e4/target/release/bench <core-worktree>/tests/greedy-dag-vec-extract.egg 0 1 200`
+  - `codspeed samply record --save-only --presymbolicate -o <tmp>/egg-smol-greedy-dag-worklist-profile.json.gz -- <egglog-repro-worktree>/<cache>/builds/799279f743b0c7e4/target/release/bench <core-worktree>/tests/greedy-dag-vec-extract.egg 0 1 200`
 - Observed result:
   - First run: best `14.16 ms`, relative stddev `0.97%`, report `6a397e0b4edabacae4cbe29a`.
   - Confirmation run: best `14.18 ms`, report `6a397e174edabacae4cbe29d`.
