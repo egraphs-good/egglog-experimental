@@ -217,10 +217,17 @@ impl DagCostModel<DefaultCost> for DynamicCostModel {
                 .read(|state| state.lookup(&name, RawValues(enode.children.to_vec())))
                 .ok()
                 .flatten()
-                .map(|c| {
+                .and_then(|c| {
                     let cost = egraph.value_to_base::<i64>(c);
-                    assert!(cost >= 0);
-                    cost as DefaultCost
+                    if cost >= 0 {
+                        Some(cost as DefaultCost)
+                    } else {
+                        log::warn!(
+                            "Ignoring negative dynamic extraction cost {cost} for {}",
+                            func.name()
+                        );
+                        None
+                    }
                 })
                 .unwrap_or_else(default_cost)
         } else {

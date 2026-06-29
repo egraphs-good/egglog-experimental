@@ -803,6 +803,10 @@ impl<C: Cost + Ord + Eq + Clone + Debug> GreedyDagExtractor<C> {
         nvariants: usize,
         sort: ArcSort,
     ) -> Vec<ExtractedTerm<C>> {
+        if nvariants == 0 {
+            return vec![];
+        }
+
         if sort.is_eq_sort() {
             let mut root_variants: Vec<(C, ProducerRowId)> = Vec::new();
 

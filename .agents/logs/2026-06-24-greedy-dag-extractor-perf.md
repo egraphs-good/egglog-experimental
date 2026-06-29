@@ -116,7 +116,7 @@
 - Status: complete
 - Smallest repro: `extract-vec-bench`.
 - Question: did the PR regress the default tree extractor on the copied workload?
-- Before-PR source: detached worktree at fetched `upstream/main` commit `5294cdc66a7b90a9a1480cb2d930f2ee5785c8dd`, path `/private/tmp/egg-smol-tree-before-pr-codex`.
+- Before-PR source: detached worktree at fetched `upstream/main` commit `5294cdc66a7b90a9a1480cb2d930f2ee5785c8dd`, path `<upstream-main-worktree>`.
 - Initial observation:
   - Upstream-main tree run: best `10.50 ms`, report `6a394dbad11d3576c6021599`.
   - PR tree run before this experiment: best `63.22 ms`, report `6a394d6f0090450daf1fae96`.
@@ -185,8 +185,8 @@
   - H2: high-sample PR profiles should show extra samples in non-extraction stacks.
   - H3: high-sample profiles should have no stable hot-path difference.
 - Exact probes:
-  - `codspeed samply record --save-only --presymbolicate -o /private/tmp/tree-old-high-profile.json.gz -- /private/tmp/egg-smol-tree-before-pr-codex/target/release/deps/ci_benchmarking-51041ae6619f6d69 extract-vec-bench --sample-count 200`
-  - `codspeed samply record --save-only --presymbolicate -o /private/tmp/tree-pr-high-profile.json.gz -- /Users/saul/p/egg-smol/target/release/deps/ci_benchmarking-51041ae6619f6d69 extract-vec-bench --sample-count 200`
+  - `codspeed samply record --save-only --presymbolicate -o <tmp>/tree-old-high-profile.json.gz -- <upstream-main-worktree>/target/release/deps/ci_benchmarking-51041ae6619f6d69 extract-vec-bench --sample-count 200`
+  - `codspeed samply record --save-only --presymbolicate -o <tmp>/tree-pr-high-profile.json.gz -- <core-worktree>/target/release/deps/ci_benchmarking-51041ae6619f6d69 extract-vec-bench --sample-count 200`
 - Observed result:
   - High-sample profiles captured 385 upstream-main main-thread samples and 390 PR main-thread samples.
   - Extraction is not the source of the remaining gap: upstream-main had 3 `extract` category samples (0.78%), while the PR had 4 (1.03%).
@@ -204,7 +204,7 @@
 - Hypothesis: the direct `samply` command profiles the whole `ci_benchmarking` process, including eager Divan benchmark argument construction, before the filtered `extract-vec-bench` body runs.
 - Confirming prediction: most resolve/typecheck samples should be under `bench_cases_proof_testing` / `file_supports_proofs`, not under `run_example` / `parse_and_run_program` for the selected benchmark.
 - Exact probe:
-  - Re-aggregated the same `/private/tmp/tree-old-high-profile.json.gz` and `/private/tmp/tree-pr-high-profile.json.gz` profiles by stack ancestry.
+  - Re-aggregated the same `<tmp>/tree-old-high-profile.json.gz` and `<tmp>/tree-pr-high-profile.json.gz` profiles by stack ancestry.
 - Observed result:
   - Upstream-main: `file_supports_proofs` accounted for 327 / 385 main-thread samples (84.94%); resolve/typecheck under `file_supports_proofs` accounted for 312 samples (81.04%).
   - PR: `file_supports_proofs` accounted for 340 / 390 main-thread samples (87.18%); resolve/typecheck under `file_supports_proofs` accounted for 329 samples (84.36%).
@@ -220,14 +220,14 @@
 - Question: does the default tree `extract-vec-bench.egg` slowdown reproduce when running a release-built egglog harness directly, without Divan benchmark discovery and proof-support setup?
 - Hypothesis: if the slowdown is only from Divan argument discovery, direct `parse_and_run_program` timing should be near zero-change; if the default command path itself regressed, the direct harness should still show a slowdown.
 - Harness:
-  - Extended `../egglog_repro/scripts/run_benchmark_matrix.mjs` so a commit entry can use `{ "path": "/Users/saul/p/egg-smol" }` as a local path dependency.
+  - Extended `../egglog_repro/scripts/run_benchmark_matrix.mjs` so a commit entry can use `{ "path": "<core-worktree>" }` as a local path dependency.
   - The local path cache key includes the checkout HEAD, tracked diff, and untracked file contents.
   - Increased generated-harness timing precision from milliseconds to microseconds of seconds because this case is only about 15 ms.
 - Exact config:
   - `../egglog_repro/.tmp/egg-smol-extract-vec-working-tree.json`
   - Baseline: `upstream/main` commit `5294cdc66a7b90a9a1480cb2d930f2ee5785c8dd`.
-  - Candidate: local `/Users/saul/p/egg-smol` path dependency, fingerprint `e1ba95e10ae3`.
-  - File: `/Users/saul/p/egg-smol/tests/extract-vec-bench.egg`.
+  - Candidate: local `<core-worktree>` path dependency, fingerprint `e1ba95e10ae3`.
+  - File: `<core-worktree>/tests/extract-vec-bench.egg`.
   - Runs: 20; query decomposition on; concurrency off / 1 thread; timeout 30 s; no rendering.
 - Exact command:
   - `node scripts/run_benchmark_matrix.mjs --config .tmp/egg-smol-extract-vec-working-tree.json --no-render`
@@ -268,9 +268,9 @@
   - Before fix: upstream-main mean `15.4892 ms`; working tree mean `19.501 ms`.
   - Before-fix percent change: `+25.900627534023712%`, Fieller 95% CI `+10.377495720796471%` to `+41.77089432208214%`.
 - Probe 2: direct repeated profiles.
-  - Upstream profile: `/private/tmp/egg-smol-repeat-upstream-profile.json.gz`.
-  - Working-tree before-fix profile: `/private/tmp/egg-smol-repeat-working-profile.json.gz`.
-  - Exact profile shape: `codspeed samply record --save-only --presymbolicate ... bench /Users/saul/p/egg-smol/tests/extract-vec-bench.egg 0 1 300`.
+  - Upstream profile: `<tmp>/egg-smol-repeat-upstream-profile.json.gz`.
+  - Working-tree before-fix profile: `<tmp>/egg-smol-repeat-working-profile.json.gz`.
+  - Exact profile shape: `codspeed samply record --save-only --presymbolicate ... bench <core-worktree>/tests/extract-vec-bench.egg 0 1 300`.
   - Upstream profile had 4042 main-thread samples; working-tree profile had 4381.
   - The extra samples were in default tree extraction setup: before-fix working tree had `collect_reachable_extraction_nodes` at 276 samples (6.30%), `ReachableExtractionBuilder::discover_node` at 272 samples (6.21%), and `egglog_bridge::EGraph::for_each_matching_col` at 167 samples (3.81%). Upstream had no value-level producer walk.
   - Upstream's tree setup was the old sort/function setup path, `Extractor<C>::compute_costs_from_rootsorts` at 838 samples (20.73%); before-fix working tree used `Extractor<C>::prepare` at 1104 samples (25.20%), which included the new value-level reachability pass.
@@ -282,7 +282,7 @@
   - Repeated direct timing: upstream-main mean `15.4892 ms`; working tree mean `15.4856 ms`.
   - Repeated direct percent change: `-0.023242000878032076%`, Fieller 95% CI `-3.755251061039011%` to `+3.936191713576398%`.
   - Original single-iteration direct matrix also recovered: upstream-main mean `14.41925 ms`; working tree mean `14.37045 ms`; percent change `-0.338436465142089%`, Fieller 95% CI `-2.061673809714537%` to `+1.4165313296456983%`.
-  - Fixed working-tree profile: `/private/tmp/egg-smol-repeat-working-fixed-profile.json.gz`; stack shape no longer contains `collect_reachable_extraction_nodes`, `ReachableExtractionBuilder::discover_node`, or `for_each_matching_col` under default tree setup. The profiled fixed run itself was noisy, so use it only for stack-shape confirmation.
+  - Fixed working-tree profile: `<tmp>/egg-smol-repeat-working-fixed-profile.json.gz`; stack shape no longer contains `collect_reachable_extraction_nodes`, `ReachableExtractionBuilder::discover_node`, or `for_each_matching_col` under default tree setup. The profiled fixed run itself was noisy, so use it only for stack-shape confirmation.
 - Validation:
   - `cargo fmt --check`
   - `cargo test --test files extract_vec_bench`
@@ -316,7 +316,7 @@
   - `cargo test --test files greedy_dag_vec_extract`
   - `cargo codspeed build -m walltime --bench ci_benchmarking`
   - `env CODSPEED_PROFILER_ENABLED=false codspeed run -m walltime -- cargo codspeed run -m walltime --bench ci_benchmarking greedy-dag-vec-extract`
-  - `codspeed samply record --save-only --presymbolicate -o /private/tmp/egg-smol-greedy-dag-reserve-once-profile.json.gz -- ../egglog_repro/.egglog_repro_cache/builds/799279f743b0c7e4/target/release/bench /Users/saul/p/egg-smol/tests/greedy-dag-vec-extract.egg 0 1 100`
+  - `codspeed samply record --save-only --presymbolicate -o <tmp>/egg-smol-greedy-dag-reserve-once-profile.json.gz -- ../egglog_repro/.egglog_repro_cache/builds/799279f743b0c7e4/target/release/bench <core-worktree>/tests/greedy-dag-vec-extract.egg 0 1 100`
 - Observed result:
   - Staged allocation run: best `44.66 ms`, report `6a395ed0fa4fbf27dcacfa8b`.
   - Confirmation run was noisy but stayed in the improved best-time range: best `45.93 ms`, report `6a395edb0090450daf1fb0af`.
@@ -340,7 +340,7 @@
   - `cargo codspeed build -m walltime --bench ci_benchmarking`
   - `env CODSPEED_PROFILER_ENABLED=false codspeed run -m walltime -- cargo codspeed run -m walltime --bench ci_benchmarking greedy-dag-vec-extract`
   - `env CODSPEED_PROFILER_ENABLED=false codspeed run -m walltime -- cargo codspeed run -m walltime --bench ci_benchmarking extract-vec-bench`
-  - `codspeed samply record --save-only --presymbolicate -o /private/tmp/egg-smol-greedy-dag-bitset-profile.json.gz -- ../egglog_repro/.egglog_repro_cache/builds/799279f743b0c7e4/target/release/bench /Users/saul/p/egg-smol/tests/greedy-dag-vec-extract.egg 0 1 150`
+  - `codspeed samply record --save-only --presymbolicate -o <tmp>/egg-smol-greedy-dag-bitset-profile.json.gz -- ../egglog_repro/.egglog_repro_cache/builds/799279f743b0c7e4/target/release/bench <core-worktree>/tests/greedy-dag-vec-extract.egg 0 1 150`
 - Observed result:
   - First bitset run: best `20.17 ms`, relative stddev `2.81%`, report `6a396006836494ceadaff62a`.
   - Confirmation run: best `19.97 ms`, relative stddev `2.03%`, report `6a396013c93a1577f817bfb1`.
@@ -434,7 +434,7 @@
   - `cargo test --test files greedy_dag_vec_extract`
   - `cargo codspeed build -m walltime --bench ci_benchmarking`
   - `env CODSPEED_PROFILER_ENABLED=false codspeed run -m walltime -- cargo codspeed run -m walltime --bench ci_benchmarking greedy-dag-vec-extract`
-  - `codspeed samply record --save-only --presymbolicate -o /private/tmp/egg-smol-greedy-dag-worklist-profile.json.gz -- ../egglog_repro/.egglog_repro_cache/builds/799279f743b0c7e4/target/release/bench /Users/saul/p/egg-smol/tests/greedy-dag-vec-extract.egg 0 1 200`
+  - `codspeed samply record --save-only --presymbolicate -o <tmp>/egg-smol-greedy-dag-worklist-profile.json.gz -- ../egglog_repro/.egglog_repro_cache/builds/799279f743b0c7e4/target/release/bench <core-worktree>/tests/greedy-dag-vec-extract.egg 0 1 200`
 - Observed result:
   - First run: best `14.16 ms`, relative stddev `0.97%`, report `6a397e0b4edabacae4cbe29a`.
   - Confirmation run: best `14.18 ms`, report `6a397e174edabacae4cbe29d`.
@@ -618,7 +618,7 @@
 
 ## Diff-reduction pass
 
-- Status: in progress
+- Status: complete
 - Goal: reduce `src/extract.rs` review surface and remove performance-only abstractions unless CodSpeed still justifies them.
 - Cleanup changes kept so far:
   - Inlined single-use greedy-DAG helpers (`empty_cost_set`, `merge_cost_set`) and the debug fixed-point assertion.
@@ -951,7 +951,7 @@
 - Input:
   - Source: <https://github.com/ajpal/poach/blob/1de0e5bf540130ea1e1520bf006907f33590a286/infra/nightly-resources/test-files/herbie-math-taylor/taylor7.egg>.
   - Downloaded raw file to
-    `/private/tmp/egg-smol-taylor7-bench.cQNVez/taylor7.egg`.
+    `<tmp-taylor-bench>/taylor7.egg`.
   - The pinned file does not run unchanged on either clean upstream or the PR
     binary because it uses `(set (constN) ...)` on zero-argument constructors.
     The compatibility input rewrites those 10,548 setup actions to
@@ -960,11 +960,11 @@
     to add `:extractor greedy-dag`.
 - Binaries:
   - Clean upstream/main worktree at `e4a65359`, copied to
-    `/private/tmp/egg-smol-taylor7-bench.cQNVez/bin/egglog-upstream-main`.
+    `<tmp-taylor-bench>/bin/egglog-upstream-main`.
   - Current dirty PR worktree at `e4a65359`, copied to
-    `/private/tmp/egg-smol-taylor7-bench.cQNVez/bin/egglog-current`.
+    `<tmp-taylor-bench>/bin/egglog-current`.
 - Exact command:
-  - `hyperfine --warmup 1 --runs 3 --export-json /private/tmp/egg-smol-taylor7-bench.cQNVez/hyperfine-taylor7-current-vs-upstream.json --command-name 'upstream tree' '/private/tmp/egg-smol-taylor7-bench.cQNVez/bin/egglog-upstream-main /private/tmp/egg-smol-taylor7-bench.cQNVez/taylor7-compat.egg > /dev/null 2> /dev/null' --command-name 'current tree' '/private/tmp/egg-smol-taylor7-bench.cQNVez/bin/egglog-current /private/tmp/egg-smol-taylor7-bench.cQNVez/taylor7-compat.egg > /dev/null 2> /dev/null' --command-name 'current greedy-dag' '/private/tmp/egg-smol-taylor7-bench.cQNVez/bin/egglog-current /private/tmp/egg-smol-taylor7-bench.cQNVez/taylor7-compat-greedy-dag.egg > /dev/null 2> /dev/null'`
+  - `hyperfine --warmup 1 --runs 3 --export-json <tmp-taylor-bench>/hyperfine-taylor7-current-vs-upstream.json --command-name 'upstream tree' '<tmp-taylor-bench>/bin/egglog-upstream-main <tmp-taylor-bench>/taylor7-compat.egg > /dev/null 2> /dev/null' --command-name 'current tree' '<tmp-taylor-bench>/bin/egglog-current <tmp-taylor-bench>/taylor7-compat.egg > /dev/null 2> /dev/null' --command-name 'current greedy-dag' '<tmp-taylor-bench>/bin/egglog-current <tmp-taylor-bench>/taylor7-compat-greedy-dag.egg > /dev/null 2> /dev/null'`
 - Observed result:
   - Upstream tree: `26.516 s ± 0.072 s`.
   - Current tree: `27.293 s ± 0.109 s`.
@@ -987,7 +987,7 @@
   input?
 - Input:
   - Original checked-in file copied to
-    `/private/tmp/egg-smol-taylor7-bench.cQNVez/taylor51.egg`.
+    `<tmp-taylor-bench>/taylor51.egg`.
   - Greedy-DAG variant mechanically rewrites all 324 final extract commands to
     add `:extractor greedy-dag`.
   - Unlike Taylor 7, this file needed no `(set (constN) ...)` compatibility
@@ -996,7 +996,7 @@
   - Reused the preserved `egglog-upstream-main` and `egglog-current` release
     binaries from Experiment 33.
 - Exact command:
-  - `hyperfine --warmup 3 --runs 10 --export-json /private/tmp/egg-smol-taylor7-bench.cQNVez/hyperfine-taylor51-current-vs-upstream.json --command-name 'upstream tree' '/private/tmp/egg-smol-taylor7-bench.cQNVez/bin/egglog-upstream-main /private/tmp/egg-smol-taylor7-bench.cQNVez/taylor51.egg > /dev/null 2> /dev/null' --command-name 'current tree' '/private/tmp/egg-smol-taylor7-bench.cQNVez/bin/egglog-current /private/tmp/egg-smol-taylor7-bench.cQNVez/taylor51.egg > /dev/null 2> /dev/null' --command-name 'current greedy-dag' '/private/tmp/egg-smol-taylor7-bench.cQNVez/bin/egglog-current /private/tmp/egg-smol-taylor7-bench.cQNVez/taylor51-greedy-dag.egg > /dev/null 2> /dev/null'`
+  - `hyperfine --warmup 3 --runs 10 --export-json <tmp-taylor-bench>/hyperfine-taylor51-current-vs-upstream.json --command-name 'upstream tree' '<tmp-taylor-bench>/bin/egglog-upstream-main <tmp-taylor-bench>/taylor51.egg > /dev/null 2> /dev/null' --command-name 'current tree' '<tmp-taylor-bench>/bin/egglog-current <tmp-taylor-bench>/taylor51.egg > /dev/null 2> /dev/null' --command-name 'current greedy-dag' '<tmp-taylor-bench>/bin/egglog-current <tmp-taylor-bench>/taylor51-greedy-dag.egg > /dev/null 2> /dev/null'`
 - Observed result:
   - Upstream tree: `740.6 ms ± 3.2 ms`.
   - Current tree: `759.5 ms ± 1.5 ms`.
@@ -1073,12 +1073,12 @@
 - Binaries:
   - Reused preserved upstream/current binaries from Experiments 33-35.
   - Built current sort-reverted release binary and copied it to
-    `/private/tmp/egg-smol-taylor7-bench.cQNVez/bin/egglog-current-sort-api-reverted`.
+    `<tmp-taylor-bench>/bin/egglog-current-sort-api-reverted`.
 - Exact commands:
   - `cargo build --release --bin egglog`
-  - `cp target/release/egglog /private/tmp/egg-smol-taylor7-bench.cQNVez/bin/egglog-current-sort-api-reverted`
-  - `hyperfine --warmup 2 --runs 10 --export-json /private/tmp/egg-smol-taylor7-bench.cQNVez/hyperfine-taylor51-sort-api-reverted.json '/private/tmp/egg-smol-taylor7-bench.cQNVez/bin/egglog-upstream-main /private/tmp/egg-smol-taylor7-bench.cQNVez/taylor51.egg' '/private/tmp/egg-smol-taylor7-bench.cQNVez/bin/egglog-current /private/tmp/egg-smol-taylor7-bench.cQNVez/taylor51.egg' '/private/tmp/egg-smol-taylor7-bench.cQNVez/bin/egglog-current-sort-api-reverted /private/tmp/egg-smol-taylor7-bench.cQNVez/taylor51.egg' '/private/tmp/egg-smol-taylor7-bench.cQNVez/bin/egglog-current-sort-api-reverted /private/tmp/egg-smol-taylor7-bench.cQNVez/taylor51-greedy-dag.egg'`
-  - `hyperfine --runs 1 --export-json /private/tmp/egg-smol-taylor7-bench.cQNVez/hyperfine-taylor7-sort-api-reverted-smoke.json '/private/tmp/egg-smol-taylor7-bench.cQNVez/bin/egglog-upstream-main /private/tmp/egg-smol-taylor7-bench.cQNVez/taylor7-compat.egg' '/private/tmp/egg-smol-taylor7-bench.cQNVez/bin/egglog-current /private/tmp/egg-smol-taylor7-bench.cQNVez/taylor7-compat.egg' '/private/tmp/egg-smol-taylor7-bench.cQNVez/bin/egglog-current-sort-api-reverted /private/tmp/egg-smol-taylor7-bench.cQNVez/taylor7-compat.egg' '/private/tmp/egg-smol-taylor7-bench.cQNVez/bin/egglog-current-sort-api-reverted /private/tmp/egg-smol-taylor7-bench.cQNVez/taylor7-compat-greedy-dag.egg'`
+  - `cp target/release/egglog <tmp-taylor-bench>/bin/egglog-current-sort-api-reverted`
+  - `hyperfine --warmup 2 --runs 10 --export-json <tmp-taylor-bench>/hyperfine-taylor51-sort-api-reverted.json '<tmp-taylor-bench>/bin/egglog-upstream-main <tmp-taylor-bench>/taylor51.egg' '<tmp-taylor-bench>/bin/egglog-current <tmp-taylor-bench>/taylor51.egg' '<tmp-taylor-bench>/bin/egglog-current-sort-api-reverted <tmp-taylor-bench>/taylor51.egg' '<tmp-taylor-bench>/bin/egglog-current-sort-api-reverted <tmp-taylor-bench>/taylor51-greedy-dag.egg'`
+  - `hyperfine --runs 1 --export-json <tmp-taylor-bench>/hyperfine-taylor7-sort-api-reverted-smoke.json '<tmp-taylor-bench>/bin/egglog-upstream-main <tmp-taylor-bench>/taylor7-compat.egg' '<tmp-taylor-bench>/bin/egglog-current <tmp-taylor-bench>/taylor7-compat.egg' '<tmp-taylor-bench>/bin/egglog-current-sort-api-reverted <tmp-taylor-bench>/taylor7-compat.egg' '<tmp-taylor-bench>/bin/egglog-current-sort-api-reverted <tmp-taylor-bench>/taylor7-compat-greedy-dag.egg'`
 - Observed result:
   - Taylor 51 upstream tree: `751.3 ms ± 10.3 ms`.
   - Taylor 51 old current tree: `797.7 ms ± 50.9 ms`.

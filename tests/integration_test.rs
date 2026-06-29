@@ -803,6 +803,44 @@ fn test_extract_zero_variants_preserves_best_extract_behavior() {
 }
 
 #[test]
+fn test_greedy_dag_extract_variants_zero_primitive_returns_empty() {
+    let mut egraph = egglog_experimental::new_experimental_egraph();
+    let expr = egraph.parser.get_expr_from_string(None, "1").unwrap();
+    let (sort, value) = egraph.eval_expr(&expr).unwrap();
+
+    let extracted = egglog_experimental::extract_variants_greedy_dag(
+        &egraph,
+        vec![(sort, value)],
+        0,
+        egglog::extract::TreeAdditiveCostModel::default(),
+    )
+    .unwrap();
+
+    assert_eq!(extracted.variants.len(), 1);
+    assert!(extracted.variants[0].is_empty());
+}
+
+#[test]
+fn test_negative_dynamic_cost_falls_back_instead_of_panicking() {
+    let mut egraph = egglog_experimental::new_experimental_egraph();
+
+    let result = egraph
+        .parse_and_run_program(
+            None,
+            r#"
+        (with-dynamic-cost
+          (datatype E (Num i64)))
+        (set-cost (Num 1) -1)
+        (extract (Num 1))
+        "#,
+        )
+        .unwrap();
+
+    assert_eq!(result.len(), 1);
+    assert_eq!(result[0].to_string(), "(Num 1)\n");
+}
+
+#[test]
 fn test_greedy_dag_extract_variants_rank_root_alternatives() {
     let result = run_dynamic_dag("(extract daggy 2 :extractor greedy-dag)");
 

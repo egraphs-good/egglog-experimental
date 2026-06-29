@@ -122,6 +122,9 @@ fn collect_and_extract(
             TableKind::Function
         } else {
             egraph.constructor_enodes(table_name, |enode| {
+                if enode.subsumed {
+                    return;
+                }
                 let mut row = enode.children.to_vec();
                 row.push(enode.eclass);
                 raw_rows.push(row);
