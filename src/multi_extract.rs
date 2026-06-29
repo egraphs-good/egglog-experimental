@@ -10,7 +10,7 @@
 //! `(extract t 0)`, `(multi-extract 0 t)` is rejected.
 
 use crate::greedy_dag_extract::{
-    DagCostModel, extract_variants_greedy_dag, extract_variants_tree, split_trailing_extractor,
+    DagCostModel, TreeCostModelFromDag, extract_variants_greedy_dag, split_trailing_extractor,
 };
 use egglog::{
     CommandOutput, EGraph, Error, TermDag, TermId, TypeError, UserDefinedCommand,
@@ -100,7 +100,11 @@ impl<C: Cost + Send + Sync, CM: DagCostModel<C> + Clone + Send + Sync + 'static>
         let extracted = if use_greedy_dag {
             extract_variants_greedy_dag(egraph, roots, n as usize, self.cost_model.clone())
         } else {
-            extract_variants_tree(egraph, roots, n as usize, self.cost_model.clone())
+            egraph.extract_variants(
+                roots,
+                n as usize,
+                TreeCostModelFromDag(self.cost_model.clone()),
+            )
         }?;
 
         let terms: Vec<Vec<_>> = extracted

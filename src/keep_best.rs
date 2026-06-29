@@ -7,12 +7,13 @@
 //!
 //! Each argument must evaluate to a `String` that names an existing function.
 
+use crate::DynamicCostModel;
 use crate::greedy_dag_extract::{
-    extract_best_greedy_dag, extract_best_tree, split_trailing_extractor,
+    TreeCostModelFromDag, extract_best_greedy_dag, split_trailing_extractor,
 };
 use egglog::{
     ArcSort, CommandOutput, EGraph, Error, RawValues, TermDag, TermId, TypeError,
-    UserDefinedCommand, Value, Write, ast::Expr, extract::TreeAdditiveCostModel, sort::S, span,
+    UserDefinedCommand, Value, Write, ast::Expr, sort::S, span,
 };
 
 pub struct KeepBestCommand;
@@ -142,9 +143,9 @@ fn collect_and_extract(
             })
             .collect();
         let extracted = if use_greedy_dag {
-            extract_best_greedy_dag(egraph, roots, TreeAdditiveCostModel::default())
+            extract_best_greedy_dag(egraph, roots, DynamicCostModel)
         } else {
-            extract_best_tree(egraph, roots, TreeAdditiveCostModel::default())
+            egraph.extract_best(roots, TreeCostModelFromDag(DynamicCostModel))
         }
         .map_err(|_| {
             Error::ExtractError(format!(

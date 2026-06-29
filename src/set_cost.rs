@@ -1,8 +1,8 @@
 use crate::{
     Error,
     greedy_dag_extract::{
-        DagCostModel, extract_best_greedy_dag, extract_best_tree, extract_variants_greedy_dag,
-        extract_variants_tree, parse_extractor_keyword,
+        DagCostModel, TreeCostModelFromDag, extract_best_greedy_dag, extract_variants_greedy_dag,
+        parse_extractor_keyword,
     },
 };
 use egglog::{
@@ -301,7 +301,7 @@ impl UserDefinedCommand for CustomExtract {
             let extracted = if use_greedy_dag {
                 extract_best_greedy_dag(egraph, roots, DynamicCostModel)?
             } else {
-                extract_best_tree(egraph, roots, DynamicCostModel)?
+                egraph.extract_best(roots, TreeCostModelFromDag(DynamicCostModel))?
             };
             let root = extracted
                 .terms
@@ -327,7 +327,11 @@ impl UserDefinedCommand for CustomExtract {
             let extracted = if use_greedy_dag {
                 extract_variants_greedy_dag(egraph, roots, n as usize, DynamicCostModel)?
             } else {
-                extract_variants_tree(egraph, roots, n as usize, DynamicCostModel)?
+                egraph.extract_variants(
+                    roots,
+                    n as usize,
+                    TreeCostModelFromDag(DynamicCostModel),
+                )?
             };
             let terms: Vec<TermId> = extracted
                 .variants

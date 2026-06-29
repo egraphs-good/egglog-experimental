@@ -47,7 +47,9 @@ mod fresh_macro;
 
 mod greedy_dag_extract;
 mod secondary_map;
-pub use greedy_dag_extract::{DagCostModel, extract_best_greedy_dag, extract_variants_greedy_dag};
+pub use greedy_dag_extract::{
+    DagCostModel, TreeCostModelFromDag, extract_best_greedy_dag, extract_variants_greedy_dag,
+};
 mod set_cost;
 pub use set_cost::*;
 mod multi_extract;

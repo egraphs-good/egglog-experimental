@@ -49,10 +49,13 @@ pub trait DagCostModel<C: Cost>: BaseCostModel<C> {
     }
 }
 
-// `TreeCostModel` lives in core egglog, so Rust's orphan rules do not let this
-// crate blanket-implement it for every `M: DagCostModel`. Use a local adapter
-// when the tree extractor should derive total costs from marginal DAG costs.
-struct TreeCostModelFromDag<M>(M);
+/// Adapts a [`DagCostModel`] so it can be used with core tree extraction.
+///
+/// `TreeCostModel` lives in core egglog, so Rust's orphan rules do not let this
+/// crate blanket-implement it for every `M: DagCostModel`. This adapter derives
+/// tree total costs by combining a node's marginal DAG cost with its child
+/// total costs.
+pub struct TreeCostModelFromDag<M>(pub M);
 
 impl<C: Cost, M: DagCostModel<C>> BaseCostModel<C> for TreeCostModelFromDag<M> {
     fn base_value_cost(&self, egraph: &EGraph, sort: &ArcSort, value: Value) -> C {
@@ -143,23 +146,6 @@ fn parse_use_greedy_dag(arg: &Expr) -> Result<bool, Error> {
     }
 }
 
-pub fn extract_best_tree<C: Cost, M: DagCostModel<C> + 'static>(
-    egraph: &EGraph,
-    roots: Vec<(ArcSort, Value)>,
-    cost_model: M,
-) -> Result<ExtractedTerms<C>, Error> {
-    egraph.extract_best(roots, TreeCostModelFromDag(cost_model))
-}
-
-pub fn extract_variants_tree<C: Cost, M: DagCostModel<C> + 'static>(
-    egraph: &EGraph,
-    roots: Vec<(ArcSort, Value)>,
-    nvariants: usize,
-    cost_model: M,
-) -> Result<ExtractedTermVariants<C>, Error> {
-    egraph.extract_variants(roots, nvariants, TreeCostModelFromDag(cost_model))
-}
-
 // Greedy-DAG extraction.
 //
 // This is a root-aware adaptation of extraction-gym's `faster-greedy-dag`:
@@ -192,6 +178,13 @@ pub fn extract_variants_tree<C: Cost, M: DagCostModel<C> + 'static>(
 /// total, so cost comparison does not require subtraction or inspecting
 /// the cost type.
 type PaidDagCosts<C> = AggregatedSparseSecondaryMap<DagCostKey, C>;
+
+/// Cost information for the already-selected child DAGs of one candidate node.
+///
+/// The first vector stores each child's once-paid dependency set, which is
+/// unioned to score sharing for the candidate DAG. The second vector stores the
+/// corresponding child total costs, which are passed to the user cost model for
+/// context when computing this node's marginal cost.
 type ChildDagCosts<C> = (Vec<Arc<PaidDagCosts<C>>>, Vec<C>);
 
 /// Keyed on sort and value, since the same value of different sorts can have different extractions

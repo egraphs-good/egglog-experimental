@@ -543,6 +543,43 @@ fn test_keep_best_basic() {
 }
 
 #[test]
+fn test_keep_best_respects_set_cost() {
+    let mut egraph = egglog_experimental::new_experimental_egraph();
+
+    egraph
+        .parse_and_run_program(
+            None,
+            r#"
+        (with-dynamic-cost
+          (datatype Math (Num i64) (Add Math Math)))
+        (relation Target (Math))
+
+        (union (Num 2) (Add (Num 1) (Num 1)))
+        (set-cost (Num 2) 100)
+        (Target (Num 2))
+        "#,
+        )
+        .unwrap();
+
+    egraph
+        .parse_and_run_program(None, r#"(keep-best "Target")"#)
+        .unwrap();
+
+    let result = egraph
+        .parse_and_run_program(None, "(print-function Target 100)")
+        .unwrap();
+    let output = result[0].to_string();
+    assert!(
+        output.contains("(Add (Num 1) (Num 1))"),
+        "expected dynamic cost model to prefer Add: {output}"
+    );
+    assert!(
+        !output.contains("(Num 2)"),
+        "expected high-cost Num representative to be removed: {output}"
+    );
+}
+
+#[test]
 fn test_keep_best_accepts_greedy_dag_extractor() {
     let mut egraph = egglog_experimental::new_experimental_egraph();
 
