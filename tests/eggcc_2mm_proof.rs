@@ -1,11 +1,15 @@
 use std::path::Path;
 use std::process::Command;
 
-fn run_fixture_with_proofs(fixture_name: &str) -> String {
+fn read_fixture(fixture_name: &str) -> (std::path::PathBuf, String) {
     let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
     let fixture = manifest_dir.join("tests/fixtures").join(fixture_name);
     let program = std::fs::read_to_string(&fixture).expect("read eggcc 2mm fixture");
+    (fixture, program)
+}
 
+fn run_fixture_with_proofs(fixture_name: &str) -> String {
+    let (fixture, program) = read_fixture(fixture_name);
     let output = Command::new(env!("CARGO_BIN_EXE_egglog-experimental"))
         .arg("--proofs")
         .arg(&fixture)
@@ -24,8 +28,8 @@ fn run_fixture_with_proofs(fixture_name: &str) -> String {
 }
 
 #[test]
-fn eggcc_2mm_container_helpers_run_with_proofs() {
-    let program = run_fixture_with_proofs("eggcc-2mm-container-helpers.egg");
+fn eggcc_2mm_full_export_uses_container_helpers() {
+    let (_fixture, program) = read_fixture("eggcc-2mm-pass1-merge-old.egg");
 
     for required in [
         "pair-min-by-second-i64",
@@ -42,12 +46,6 @@ fn eggcc_2mm_container_helpers_run_with_proofs() {
             "fixture should exercise {required}"
         );
     }
-}
-
-#[test]
-#[ignore = "full eggcc proof canary is too slow for default debug-profile CI"]
-fn eggcc_2mm_full_export_runs_with_proofs() {
-    let program = run_fixture_with_proofs("eggcc-2mm-pass1-merge-old.egg");
 
     assert!(
         !program.contains(":no-merge"),
@@ -57,4 +55,10 @@ fn eggcc_2mm_full_export_runs_with_proofs() {
         program.contains(":merge old"),
         "full eggcc export should pin former no-merge functions to :merge old"
     );
+}
+
+#[test]
+#[ignore = "full eggcc proof canary is too slow for default debug-profile CI"]
+fn eggcc_2mm_full_export_runs_with_proofs() {
+    run_fixture_with_proofs("eggcc-2mm-pass1-merge-old.egg");
 }
