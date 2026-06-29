@@ -9,9 +9,7 @@ use crate::{
 use egglog::{
     ArcSort, CommandOutput, EGraph, Enode, RawValues, Read, TermId, UserDefinedCommand, Value,
     ast::*,
-    extract::{
-        BaseCostModel, CommutativeMonoid, DefaultCost, TreeAdditiveCostModel, TreeCostModel,
-    },
+    extract::{BaseCostModel, DefaultCost, TreeAdditiveCostModel},
     span,
     util::FreshGen,
 };
@@ -191,45 +189,9 @@ fn map_fallible<T>(
 #[derive(Clone)]
 pub struct DynamicCostModel;
 
-fn dynamic_enode_cost(egraph: &EGraph, func: &egglog::Function, enode: &Enode<'_>) -> DefaultCost {
-    let name = get_cost_table_name(func.name());
-    if egraph.get_function(&name).is_some() {
-        egraph
-            .read(|state| state.lookup(&name, RawValues(enode.children.to_vec())))
-            .ok()
-            .flatten()
-            .map(|c| {
-                let cost = egraph.value_to_base::<i64>(c);
-                assert!(cost >= 0);
-                cost as DefaultCost
-            })
-            .unwrap_or_else(|| {
-                TreeCostModel::total_enode_cost(&TreeAdditiveCostModel {}, egraph, func, enode, &[])
-            })
-    } else {
-        TreeCostModel::total_enode_cost(&TreeAdditiveCostModel {}, egraph, func, enode, &[])
-    }
-}
-
 impl BaseCostModel<DefaultCost> for DynamicCostModel {
     fn base_value_cost(&self, egraph: &EGraph, sort: &ArcSort, value: Value) -> DefaultCost {
         BaseCostModel::base_value_cost(&TreeAdditiveCostModel {}, egraph, sort, value)
-    }
-}
-
-impl TreeCostModel<DefaultCost> for DynamicCostModel {
-    fn total_enode_cost(
-        &self,
-        egraph: &EGraph,
-        func: &egglog::Function,
-        enode: &Enode<'_>,
-        child_costs: &[DefaultCost],
-    ) -> DefaultCost {
-        child_costs
-            .iter()
-            .fold(dynamic_enode_cost(egraph, func, enode), |cost, child| {
-                cost.combine(child)
-            })
     }
 }
 
@@ -241,7 +203,30 @@ impl DagCostModel<DefaultCost> for DynamicCostModel {
         enode: &Enode<'_>,
         _child_costs: &[DefaultCost],
     ) -> DefaultCost {
-        dynamic_enode_cost(egraph, func, enode)
+        let default_cost = || {
+            DagCostModel::marginal_enode_cost(
+                &TreeAdditiveCostModel::default(),
+                egraph,
+                func,
+                enode,
+                &[],
+            )
+        };
+        let name = get_cost_table_name(func.name());
+        if egraph.get_function(&name).is_some() {
+            egraph
+                .read(|state| state.lookup(&name, RawValues(enode.children.to_vec())))
+                .ok()
+                .flatten()
+                .map(|c| {
+                    let cost = egraph.value_to_base::<i64>(c);
+                    assert!(cost >= 0);
+                    cost as DefaultCost
+                })
+                .unwrap_or_else(default_cost)
+        } else {
+            default_cost()
+        }
     }
 }
 

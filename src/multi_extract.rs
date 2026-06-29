@@ -16,7 +16,7 @@ use crate::{
 use egglog::{
     CommandOutput, EGraph, Error, TermDag, TermId, TypeError, UserDefinedCommand,
     ast::{Expr, ParseError},
-    extract::{Cost, TreeCostModel},
+    extract::Cost,
     prelude::span,
 };
 use log::log_enabled;
@@ -42,12 +42,12 @@ impl std::fmt::Display for MultiExtractOutput {
     }
 }
 
-pub struct MultiExtract<C: Cost + Send + Sync, CM: TreeCostModel<C> + DagCostModel<C> + Clone> {
+pub struct MultiExtract<C: Cost + Send + Sync, CM: DagCostModel<C> + Clone> {
     cost_model: CM,
     _cost_t: PhantomData<C>,
 }
 
-impl<C: Cost + Send + Sync, CM: TreeCostModel<C> + DagCostModel<C> + Clone> MultiExtract<C, CM> {
+impl<C: Cost + Send + Sync, CM: DagCostModel<C> + Clone> MultiExtract<C, CM> {
     pub fn new(cost_model: CM) -> Self {
         MultiExtract {
             cost_model,
@@ -56,8 +56,8 @@ impl<C: Cost + Send + Sync, CM: TreeCostModel<C> + DagCostModel<C> + Clone> Mult
     }
 }
 
-impl<C: Cost + Send + Sync, CM: TreeCostModel<C> + DagCostModel<C> + Clone + Send + Sync + 'static>
-    UserDefinedCommand for MultiExtract<C, CM>
+impl<C: Cost + Send + Sync, CM: DagCostModel<C> + Clone + Send + Sync + 'static> UserDefinedCommand
+    for MultiExtract<C, CM>
 {
     fn update(&self, egraph: &mut EGraph, args: &[Expr]) -> Result<Vec<CommandOutput>, Error> {
         let (args, use_greedy_dag) = split_trailing_extractor(args)?;

@@ -48,6 +48,46 @@ pub trait DagCostModel<C: Cost>: BaseCostModel<C> {
     }
 }
 
+// `TreeCostModel` lives in core egglog, so Rust's orphan rules do not let this
+// crate blanket-implement it for every `M: DagCostModel`. Use a local adapter
+// when the tree extractor should derive total costs from marginal DAG costs.
+struct TreeCostModelFromDag<M>(M);
+
+impl<C: Cost, M: DagCostModel<C>> BaseCostModel<C> for TreeCostModelFromDag<M> {
+    fn base_value_cost(&self, egraph: &EGraph, sort: &ArcSort, value: Value) -> C {
+        self.0.base_value_cost(egraph, sort, value)
+    }
+}
+
+impl<C: Cost, M: DagCostModel<C>> TreeCostModel<C> for TreeCostModelFromDag<M> {
+    fn total_enode_cost(
+        &self,
+        egraph: &EGraph,
+        func: &Function,
+        enode: &Enode<'_>,
+        child_costs: &[C],
+    ) -> C {
+        child_costs.iter().fold(
+            self.0.marginal_enode_cost(egraph, func, enode, child_costs),
+            |cost, child| cost.combine(child),
+        )
+    }
+
+    fn total_container_cost(
+        &self,
+        egraph: &EGraph,
+        sort: &ArcSort,
+        value: Value,
+        element_costs: &[C],
+    ) -> C {
+        element_costs.iter().fold(
+            self.0
+                .marginal_container_cost(egraph, sort, value, element_costs),
+            |cost, child| cost.combine(child),
+        )
+    }
+}
+
 impl DagCostModel<DefaultCost> for TreeAdditiveCostModel {
     fn marginal_enode_cost(
         &self,
@@ -68,21 +108,21 @@ fn canonicalize_value(egraph: &EGraph, sort: &ArcSort, value: Value) -> Value {
     }
 }
 
-pub fn extract_best_tree<C: Cost, M: TreeCostModel<C> + 'static>(
+pub fn extract_best_tree<C: Cost, M: DagCostModel<C> + 'static>(
     egraph: &EGraph,
     roots: Vec<(ArcSort, Value)>,
     cost_model: M,
 ) -> Result<ExtractedTerms<C>, Error> {
-    egraph.extract_best(roots, cost_model)
+    egraph.extract_best(roots, TreeCostModelFromDag(cost_model))
 }
 
-pub fn extract_variants_tree<C: Cost, M: TreeCostModel<C> + 'static>(
+pub fn extract_variants_tree<C: Cost, M: DagCostModel<C> + 'static>(
     egraph: &EGraph,
     roots: Vec<(ArcSort, Value)>,
     nvariants: usize,
     cost_model: M,
 ) -> Result<ExtractedTermVariants<C>, Error> {
-    egraph.extract_variants(roots, nvariants, cost_model)
+    egraph.extract_variants(roots, nvariants, TreeCostModelFromDag(cost_model))
 }
 
 // Greedy-DAG extraction.
