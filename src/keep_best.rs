@@ -149,13 +149,17 @@ fn collect_and_extract(
             ))
         })?;
         let termdag = extracted.termdag;
-        let mut terms = extracted.terms.into_iter().map(|root| root.term);
+        let extract_error = format!("keep-best: could not extract value in table {table_name}");
+        let mut terms = extracted.terms.into_iter().map(move |root| {
+            root.ok_or_else(|| Error::ExtractError(extract_error.clone()))
+                .map(|root| root.term)
+        });
         let mut extracted_rows: Vec<Vec<TermId>> = Vec::new();
 
         for row_vals in &raw_rows {
             let mut term_ids = Vec::new();
             for _ in row_vals {
-                term_ids.push(terms.next().expect("one term per extracted table cell"));
+                term_ids.push(terms.next().expect("one term per extracted table cell")?);
             }
             extracted_rows.push(term_ids);
         }

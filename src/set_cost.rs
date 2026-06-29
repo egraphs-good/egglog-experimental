@@ -300,7 +300,10 @@ impl UserDefinedCommand for CustomExtract {
                 .terms
                 .into_iter()
                 .next()
-                .expect("one root was requested");
+                .expect("one root was requested")
+                .ok_or_else(|| {
+                    Error::ExtractError("Unable to find any valid extraction".to_string())
+                })?;
             if log_enabled!(log::Level::Info) {
                 log::info!(
                     "extracted with cost {}: {}",

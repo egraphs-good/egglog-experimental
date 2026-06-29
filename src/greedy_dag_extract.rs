@@ -415,7 +415,7 @@ impl ReachableExtractionBuilder {
             let mut rows = Vec::new();
             egraph
                 .read(|rs| {
-                    rs.constructor_enodes_for_eclass(&func_name, value, |enode| {
+                    rs.enodes_for_eclass(&func_name, value, |enode| {
                         if !enode.subsumed {
                             rows.push(enode.children.to_vec());
                         }
@@ -868,17 +868,8 @@ pub fn extract_best_greedy_dag<C: Cost + Ord + Eq + Clone + Debug, M: DagCostMod
     let mut termdag = TermDag::default();
     let extracted_roots = roots
         .into_iter()
-        .map(|(sort, value)| {
-            let sort_name = sort.name().to_owned();
-            extractor
-                .extract_best_with_sort(egraph, &mut termdag, value, sort)
-                .ok_or_else(|| {
-                    Error::ExtractError(format!(
-                        "Unable to find any valid greedy-DAG extraction for sort {sort_name}"
-                    ))
-                })
-        })
-        .collect::<Result<Vec<_>, _>>()?;
+        .map(|(sort, value)| extractor.extract_best_with_sort(egraph, &mut termdag, value, sort))
+        .collect();
 
     Ok(ExtractedTerms {
         termdag,
