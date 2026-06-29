@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
 use egglog::{
-    ArcSort, CommandOutput, Error, TermDag, TermId, Value,
+    CommandOutput, Error, TermDag, TermId,
     ast::{Command, Expr, sanitize_internal_names},
     prelude::Span,
     span,
@@ -228,19 +228,13 @@ fn validate_extracted_term(
             "extracted term sort should match root expression sort: root {root:?}, extracted {extracted_expr}"
         )));
     }
-    if canonical(egraph, &root_sort, root_value)
-        != canonical(egraph, &extracted_sort, extracted_value)
-    {
+    if root_value != extracted_value {
         return Err(Error::ExtractError(format!(
             "extracted term should be equal to root expression: root {root:?}, extracted {extracted_expr}"
         )));
     }
 
     Ok(())
-}
-
-fn canonical(egraph: &EGraph, sort: &ArcSort, value: Value) -> Value {
-    egraph.canonical_value(sort, value)
 }
 
 fn generate_tests(glob: &str) -> Vec<Trial> {

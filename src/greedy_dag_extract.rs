@@ -2,7 +2,7 @@ use crate::secondary_map::{
     AggregatedSparseSecondaryMap, InternId, Interner, InternerBuilder, SecondaryMap, SecondarySet,
 };
 use egglog::{
-    ArcSort, EGraph, Enode, Error, Function, TermDag, TermId, Value,
+    ArcSort, EGraph, Enode, Error, Function, Read, TermDag, TermId, Value,
     ast::{Expr, ParseError},
     extract::{
         BaseCostModel, Cost, DefaultCost, ExtractedTerm, ExtractedTermVariants, ExtractedTerms,
@@ -140,14 +140,6 @@ fn parse_use_greedy_dag(arg: &Expr) -> Result<bool, Error> {
             arg.span(),
             "extractor name must be a symbol".into(),
         ))),
-    }
-}
-
-fn canonicalize_value(egraph: &EGraph, sort: &ArcSort, value: Value) -> Value {
-    if sort.is_eq_sort() {
-        egraph.canonical_value(sort, value)
-    } else {
-        value
     }
 }
 
@@ -385,13 +377,11 @@ impl ReachableExtractionBuilder {
                 self.intern_nested_eq_dependencies(egraph, &child_sort, child_value, dependencies);
             }
         } else if sort.is_eq_sort() {
-            let value = canonicalize_value(egraph, sort, value);
             dependencies.insert(self.intern_key(sort.name(), value));
         }
     }
 
     fn discover_node(&mut self, egraph: &EGraph, sort: &ArcSort, value: Value) {
-        let value = canonicalize_value(egraph, sort, value);
         let sort_name = sort.name().to_owned();
         let key = self.intern_key(&sort_name, value);
 
@@ -410,38 +400,57 @@ impl ReachableExtractionBuilder {
             return;
         }
 
-        for constructor_enode in egraph.constructor_enodes_for_eclass(sort, value, false) {
-            if constructor_enode.subsumed {
-                continue;
-            }
-            let func_name = constructor_enode.function;
-            let children = constructor_enode.children;
-            let func = egraph.get_function(&func_name).unwrap();
-            // Child `(sort, value)` dependencies from matching rows. Discover
-            // them after recording this row so recursive discovery cannot
-            // invalidate the dependency ids we just interned.
-            let mut discovered_child_values = Vec::new();
-            let mut dependencies = HashSet::default();
-            for (child_value, child_sort) in children.iter().zip(func.schema().input.iter()) {
-                self.intern_nested_eq_dependencies(
-                    egraph,
-                    child_sort,
-                    *child_value,
-                    &mut dependencies,
-                );
-                discovered_child_values.push((child_sort.clone(), *child_value));
-            }
-            self.producer_rows.push(
-                GreedyDagProducerRow {
-                    func_name,
-                    children,
-                    eclass: value,
-                },
-                dependencies,
-            );
+        let constructors: Vec<_> = egraph
+            .functions_iter()
+            .filter(|(_, func)| {
+                func.is_constructor()
+                    && !func.is_hidden()
+                    && !func.is_unextractable()
+                    && func.schema().output.name() == sort_name
+            })
+            .map(|(func_name, func)| (func_name.clone(), func.schema().input.clone()))
+            .collect();
 
-            for (child_sort, child_value) in discovered_child_values {
-                self.discover_node(egraph, &child_sort, child_value);
+        for (func_name, input_sorts) in constructors {
+            let mut rows = Vec::new();
+            egraph
+                .read(|rs| {
+                    rs.constructor_enodes_for_eclass(&func_name, value, |enode| {
+                        if !enode.subsumed {
+                            rows.push(enode.children.to_vec());
+                        }
+                    })
+                })
+                .expect("constructor name came from the egraph");
+
+            for children in rows {
+                // Child `(sort, value)` dependencies from matching rows.
+                // Discover them after recording this row so recursive
+                // discovery cannot invalidate the dependency ids we just
+                // interned.
+                let mut discovered_child_values = Vec::new();
+                let mut dependencies = HashSet::default();
+                for (child_value, child_sort) in children.iter().zip(input_sorts.iter()) {
+                    self.intern_nested_eq_dependencies(
+                        egraph,
+                        child_sort,
+                        *child_value,
+                        &mut dependencies,
+                    );
+                    discovered_child_values.push((child_sort.clone(), *child_value));
+                }
+                self.producer_rows.push(
+                    GreedyDagProducerRow {
+                        func_name: func_name.clone(),
+                        children,
+                        eclass: value,
+                    },
+                    dependencies,
+                );
+
+                for (child_sort, child_value) in discovered_child_values {
+                    self.discover_node(egraph, &child_sort, child_value);
+                }
             }
         }
     }
@@ -562,7 +571,6 @@ impl<C: Cost + Ord + Eq + Clone + Debug> GreedyDagExtractor<C> {
                 container_self_cost,
             ))
         } else if sort.is_eq_sort() {
-            let value = canonicalize_value(egraph, sort, value);
             let key = self.reachable_cost_key(sort, value)?;
             self.best_producers
                 .get(key)
@@ -737,7 +745,6 @@ impl<C: Cost + Ord + Eq + Clone + Debug> GreedyDagExtractor<C> {
         sort: &ArcSort,
         cache: &mut HashMap<(Value, String), TermId>,
     ) -> TermId {
-        let value = canonicalize_value(egraph, sort, value);
         let key = (value, sort.name().to_owned());
         if let Some(term) = cache.get(&key) {
             return *term;
@@ -774,16 +781,9 @@ impl<C: Cost + Ord + Eq + Clone + Debug> GreedyDagExtractor<C> {
         value: Value,
         sort: ArcSort,
     ) -> Option<ExtractedTerm<C>> {
-        let canonical_value = canonicalize_value(egraph, &sort, value);
-        let best_cost = self.compute_cost_node(egraph, canonical_value, &sort)?;
+        let best_cost = self.compute_cost_node(egraph, value, &sort)?;
         let mut cache = Default::default();
-        let term = self.reconstruct_termdag_node_helper(
-            egraph,
-            termdag,
-            canonical_value,
-            &sort,
-            &mut cache,
-        );
+        let term = self.reconstruct_termdag_node_helper(egraph, termdag, value, &sort, &mut cache);
         Some(ExtractedTerm {
             cost: best_cost.total().clone(),
             term,
@@ -804,7 +804,6 @@ impl<C: Cost + Ord + Eq + Clone + Debug> GreedyDagExtractor<C> {
         sort: ArcSort,
     ) -> Vec<ExtractedTerm<C>> {
         if sort.is_eq_sort() {
-            let canonical_value = canonicalize_value(egraph, &sort, value);
             let mut root_variants: Vec<(C, ProducerRowId)> = Vec::new();
 
             for (producer_row_id, producer_row) in self.producer_rows.iter() {
@@ -813,7 +812,7 @@ impl<C: Cost + Ord + Eq + Clone + Debug> GreedyDagExtractor<C> {
                 if sort.name() != target_sort.name() {
                     continue;
                 }
-                if producer_row.eclass != canonical_value {
+                if producer_row.eclass != value {
                     continue;
                 }
                 let enode = Enode {
@@ -822,7 +821,7 @@ impl<C: Cost + Ord + Eq + Clone + Debug> GreedyDagExtractor<C> {
                     subsumed: false,
                 };
                 if let Some(cost_set) =
-                    self.compute_cost_hyperedge(egraph, func, &enode, target_sort, canonical_value)
+                    self.compute_cost_hyperedge(egraph, func, &enode, target_sort, value)
                 {
                     root_variants.push((cost_set.total().clone(), producer_row_id));
                 }
