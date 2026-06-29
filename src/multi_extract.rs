@@ -9,9 +9,8 @@
 //! `(multi-extract 1 t)` is equivalent to `(extract t)`. Unlike
 //! `(extract t 0)`, `(multi-extract 0 t)` is rejected.
 
-use crate::{
-    extractor_option::split_trailing_extractor,
-    greedy_dag_extract::{DagCostModel, extract_variants_greedy_dag, extract_variants_tree},
+use crate::greedy_dag_extract::{
+    DagCostModel, extract_variants_greedy_dag, extract_variants_tree, split_trailing_extractor,
 };
 use egglog::{
     CommandOutput, EGraph, Error, TermDag, TermId, TypeError, UserDefinedCommand,

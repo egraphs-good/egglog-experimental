@@ -7,9 +7,8 @@
 //!
 //! Each argument must evaluate to a `String` that names an existing function.
 
-use crate::{
-    extractor_option::split_trailing_extractor,
-    greedy_dag_extract::{extract_best_greedy_dag, extract_best_tree},
+use crate::greedy_dag_extract::{
+    extract_best_greedy_dag, extract_best_tree, split_trailing_extractor,
 };
 use egglog::{
     ArcSort, CommandOutput, EGraph, Error, RawValues, TermDag, TermId, TypeError,

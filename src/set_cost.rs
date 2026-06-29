@@ -1,9 +1,8 @@
 use crate::{
     Error,
-    extractor_option::parse_extractor_keyword,
     greedy_dag_extract::{
         DagCostModel, extract_best_greedy_dag, extract_best_tree, extract_variants_greedy_dag,
-        extract_variants_tree,
+        extract_variants_tree, parse_extractor_keyword,
     },
 };
 use egglog::{
