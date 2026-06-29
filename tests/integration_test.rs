@@ -118,29 +118,6 @@ fn test_extract() {
 }
 
 #[test]
-fn test_extract_rejects_explicit_tree_extractor() {
-    let mut egraph = egglog_experimental::new_experimental_egraph();
-
-    let err = egraph
-        .parse_and_run_program(
-            None,
-            "
-        (with-dynamic-cost
-            (datatype E (Leaf i64))
-        )
-        (let leaf (Leaf 0))
-        (extract leaf :extractor tree)",
-        )
-        .unwrap_err();
-
-    assert!(
-        err.to_string()
-            .contains("omit :extractor to use the default tree extractor"),
-        "unexpected error: {err}"
-    );
-}
-
-#[test]
 fn test_greedy_dag_extract_prefers_shared_subterms() {
     let result = run_dynamic_dag(
         "

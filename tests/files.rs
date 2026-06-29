@@ -142,6 +142,12 @@ fn run_program_with_extract_checks(
         outputs.extend(command_outputs);
 
         if !has_extractor {
+            // Run a paired greedy-DAG extraction at the same program point as
+            // every ordinary `(extract ...)` in the file corpus. Running
+            // command-by-command matters for scoped programs: an extraction
+            // inside `push`/`pop` must be checked before that scope is popped.
+            // The paired output is also returned so the file tests exercise
+            // normal rendering for both extractors.
             let mut dag_args = args;
             dag_args.push(Expr::Var(span.clone(), ":extractor".to_owned()));
             dag_args.push(Expr::Var(span.clone(), "greedy-dag".to_owned()));
