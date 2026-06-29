@@ -17,9 +17,9 @@ default = ["bin"]
 bin = ["egglog/bin"]
 
 [dependencies]
-egglog = { git = "https://github.com/oflatt/egglog-duckdb.git", branch = "oflatt-container-proofs", default-features = false }
-egglog-ast = { git = "https://github.com/oflatt/egglog-duckdb.git", branch = "oflatt-container-proofs", default-features = false }
-egglog-reports = { git = "https://github.com/oflatt/egglog-duckdb.git", branch = "oflatt-container-proofs", default-features = false }
+egglog = { git = "https://github.com/egraphs-good/egglog.git", branch = "codex/pr927-plus-pr930-eggcc-proof", default-features = false }
+egglog-ast = { git = "https://github.com/egraphs-good/egglog.git", branch = "codex/pr927-plus-pr930-eggcc-proof", default-features = false }
+egglog-reports = { git = "https://github.com/egraphs-good/egglog.git", branch = "codex/pr927-plus-pr930-eggcc-proof", default-features = false }
 
 num = "0.4.3"
 lazy_static = "1.4"
