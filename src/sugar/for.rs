@@ -44,6 +44,7 @@ impl Macro<Vec<Command>> for For {
             ruleset: ruleset.clone(),
             naive: false,
             no_decomp: false,
+            include_subsumed: false,
         };
 
         Ok(vec![

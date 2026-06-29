@@ -52,6 +52,12 @@ pub use size::*;
 mod primitive;
 mod table_stats;
 pub use table_stats::*;
+mod maybe;
+pub use maybe::*;
+mod either;
+pub use either::*;
+mod container_primitives;
+pub use container_primitives::*;
 
 // Sugar modules using parse-time macros
 mod sugar;
@@ -61,6 +67,14 @@ mod keep_best;
 pub use keep_best::KeepBestCommand;
 
 pub fn new_experimental_egraph() -> EGraph {
+    new_experimental_egraph_with_options(true)
+}
+
+pub fn new_experimental_egraph_for_proofs() -> EGraph {
+    new_experimental_egraph_with_options(false)
+}
+
+fn new_experimental_egraph_with_options(extended_run_schedule: bool) -> EGraph {
     let mut egraph = EGraph::default();
 
     // Set up the parser with experimental parse-time macros
@@ -72,6 +86,15 @@ pub fn new_experimental_egraph() -> EGraph {
     // Support for set cost
     add_set_cost(&mut egraph);
     egraph.add_read_primitive(GetSizePrimitive, None);
+    egraph
+        .type_info()
+        .add_presort::<MaybeSort>(span!())
+        .unwrap();
+    egraph
+        .type_info()
+        .add_presort::<EitherSort>(span!())
+        .unwrap();
+    add_container_primitives(&mut egraph);
 
     // unstable-fresh! macro
     egraph
@@ -79,9 +102,11 @@ pub fn new_experimental_egraph() -> EGraph {
         .register(Arc::new(fresh_macro::FreshMacro::new()));
 
     // scheduler support
-    egraph
-        .add_command("run-schedule".into(), Arc::new(RunExtendedSchedule))
-        .unwrap();
+    if extended_run_schedule {
+        egraph
+            .add_command("run-schedule".into(), Arc::new(RunExtendedSchedule))
+            .unwrap();
+    }
     egraph
         .add_command("let-scheduler".into(), Arc::new(LetSchedulerCommand))
         .unwrap();

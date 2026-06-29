@@ -114,8 +114,16 @@ fn generate_tests(glob: &str) -> Vec<Trial> {
     let mut push_trial = |run: Run| trials.push(run.into_trial());
 
     for entry in glob::glob(glob).unwrap() {
+        let path = entry.unwrap();
+        if path
+            .components()
+            .any(|component| component.as_os_str() == "fixtures")
+        {
+            continue;
+        }
+
         let run = Run {
-            path: entry.unwrap().clone(),
+            path: path.clone(),
             desugar: false,
         };
         // let should_fail = run.should_fail();
