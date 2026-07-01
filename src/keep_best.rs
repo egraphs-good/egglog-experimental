@@ -8,7 +8,8 @@
 //! Each argument must evaluate to a `String` that names an existing function.
 
 use egglog::{
-    ArcSort, CommandOutput, EGraph, Error, TermDag, TermId, TypeError, UserDefinedCommand, Value,
+    ArcSort, CommandOutput, EGraph, Error, RawValues, TermDag, TermId, TypeError,
+    UserDefinedCommand, Value, Write,
     ast::Expr,
     extract::{Extractor, TreeAdditiveCostModel},
     sort::S,
@@ -45,7 +46,7 @@ impl UserDefinedCommand for KeepBestCommand {
 
         // Step 4: re-insert the optimal tuples. Evaluate each extracted term
         // via eval_expr so that constructor sub-terms are re-created bottom-up,
-        // then stage all target-table inserts in one with_full_state call.
+        // then stage all target-table writes in one update call.
         let mut rows_to_insert: Vec<(String, Vec<Value>)> = Vec::new();
         for (table_name, extracted_rows, termdag) in &extracted {
             for term_ids in extracted_rows {
@@ -54,11 +55,23 @@ impl UserDefinedCommand for KeepBestCommand {
             }
         }
 
-        egraph.with_full_state(|mut state| {
+        egraph.update(|mut state| {
             for (table_name, values) in &rows_to_insert {
-                egglog::Write::insert(&mut state, table_name, values.iter().copied());
+                let (output, inputs) = values.split_last().ok_or_else(|| {
+                    Error::BackendError(format!(
+                        "keep-best: extracted row for table {table_name} had no output column"
+                    ))
+                })?;
+                if let Err(err) = state.set(table_name, RawValues(inputs.to_vec()), *output) {
+                    if is_constructor_subtype_error(&err) {
+                        state.add(table_name, RawValues(inputs.to_vec()))?;
+                    } else {
+                        return Err(err);
+                    }
+                }
             }
-        });
+            Ok(())
+        })?;
 
         Ok(vec![])
     }
@@ -88,10 +101,7 @@ fn collect_and_extract(
             .cloned()
             .collect();
 
-        let mut raw_rows: Vec<Vec<Value>> = Vec::new();
-        egraph.function_for_each(table_name, |row| {
-            raw_rows.push(row.vals.to_vec());
-        })?;
+        let raw_rows = table_rows(egraph, table_name)?;
 
         let extractor = Extractor::compute_costs_from_rootsorts(
             Some(all_sorts.clone()),
@@ -120,6 +130,35 @@ fn collect_and_extract(
     }
 
     Ok(result)
+}
+
+fn table_rows(egraph: &EGraph, table_name: &str) -> Result<Vec<Vec<Value>>, Error> {
+    let mut raw_rows = Vec::new();
+    match egraph.function_entries(table_name, |entry| {
+        let mut vals = entry.inputs.to_vec();
+        vals.push(entry.output);
+        raw_rows.push(vals);
+    }) {
+        Ok(()) => Ok(raw_rows),
+        Err(err) if is_constructor_subtype_error(&err) => {
+            raw_rows.clear();
+            egraph.constructor_enodes(table_name, |enode| {
+                let mut vals = enode.children.to_vec();
+                vals.push(enode.eclass);
+                raw_rows.push(vals);
+            })?;
+            Ok(raw_rows)
+        }
+        Err(err) => Err(err),
+    }
+}
+
+fn is_constructor_subtype_error(error: &Error) -> bool {
+    if let Error::ApiError(egglog::ApiError::WrongSubtype { actual, .. }) = error {
+        *actual == "constructor"
+    } else {
+        false
+    }
 }
 
 /// Evaluate a list of `TermId`s from `termdag` using `eval_expr`, returning

@@ -15,8 +15,7 @@
 //! function is reported.
 
 use egglog::{
-    CommandOutput, EGraph, Error, FunctionRow, TypeError, UserDefinedCommand, Value, ast::Expr,
-    prelude::Span,
+    CommandOutput, EGraph, Error, TypeError, UserDefinedCommand, Value, ast::Expr, prelude::Span,
 };
 use egglog_ast::generic_ast::GenericExpr;
 use std::{
@@ -235,9 +234,8 @@ fn compute_table_stats(egraph: &EGraph, func_name: &str) -> Result<TableStats, E
     }
     let mut output_to_inputs_map: HashMap<Value, HashSet<Vec<Value>>> = HashMap::default();
 
-    egraph.function_for_each(func_name, |row: FunctionRow<'_>| {
+    for vals in table_rows(egraph, func_name)? {
         size += 1;
-        let vals = row.vals;
         debug_assert_eq!(vals.len(), n_cols);
         for (i, v) in vals.iter().enumerate() {
             distinct[i].insert(*v);
@@ -261,7 +259,7 @@ fn compute_table_stats(egraph: &EGraph, func_name: &str) -> Result<TableStats, E
                 .or_default()
                 .insert(inputs);
         }
-    })?;
+    }
 
     let distinct_counts: Vec<usize> = distinct.iter().map(|s| s.len()).collect();
 
@@ -301,6 +299,35 @@ fn compute_table_stats(egraph: &EGraph, func_name: &str) -> Result<TableStats, E
         distinct_counts,
         out_degrees,
     })
+}
+
+fn table_rows(egraph: &EGraph, table_name: &str) -> Result<Vec<Vec<Value>>, Error> {
+    let mut raw_rows = Vec::new();
+    match egraph.function_entries(table_name, |entry| {
+        let mut vals = entry.inputs.to_vec();
+        vals.push(entry.output);
+        raw_rows.push(vals);
+    }) {
+        Ok(()) => Ok(raw_rows),
+        Err(err) if is_constructor_subtype_error(&err) => {
+            raw_rows.clear();
+            egraph.constructor_enodes(table_name, |enode| {
+                let mut vals = enode.children.to_vec();
+                vals.push(enode.eclass);
+                raw_rows.push(vals);
+            })?;
+            Ok(raw_rows)
+        }
+        Err(err) => Err(err),
+    }
+}
+
+fn is_constructor_subtype_error(error: &Error) -> bool {
+    if let Error::ApiError(egglog::ApiError::WrongSubtype { actual, .. }) = error {
+        *actual == "constructor"
+    } else {
+        false
+    }
 }
 
 /// Compute per-column statistics for the given function table, or for every
