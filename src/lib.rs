@@ -19,6 +19,12 @@
 //! - [`(get-size!)` primitive](https://github.com/egraphs-good/egglog-experimental/blob/main/tests/web-demo/node-limit.egg)
 //!   for inspecting total tuple counts or counts for specific tables
 //! - [Multi-extraction](https://github.com/egraphs-good/egglog-experimental/blob/main/tests/web-demo/multi-extract.egg)
+//! - Named arguments for declarations. `constructor`, `function`, `relation`,
+//!   `datatype`, and `datatype*` may name their fields, e.g.
+//!   `(constructor MyCar (:color Color :numwheel i64) Vehicle)`. Call sites can
+//!   then pass arguments by name in any order, mix leading positional arguments
+//!   with trailing named ones, and use a trailing `...` to bind every
+//!   unspecified field to a fresh variable (see [`named_args`]).
 //! - Body-defined primitives with `(primitive name (InputSort*) OutputSort body)`.
 //!   Body variables are positional (`_0`, `_1`, ...), and a partial primitive
 //!   body result propagates as primitive failure. The registered primitive uses
@@ -50,6 +56,8 @@ pub use multi_extract::*;
 mod size;
 pub use size::*;
 mod primitive;
+pub mod named_args;
+pub use named_args::*;
 mod table_stats;
 pub use table_stats::*;
 
@@ -112,5 +120,11 @@ pub fn experimental_parser() -> Parser {
     let mut parser = Parser::default();
     parser.add_command_macro(Arc::new(sugar::For));
     parser.add_command_macro(Arc::new(sugar::WithRuleset));
+    // Named arguments for declarations, e.g.
+    //   (constructor MyCar (:color Color :numwheel i64) Vehicle)
+    // These shadow the built-in declaration commands and register per-name
+    // expression macros so call sites can pass args by name, reorder them, and
+    // fill the rest with fresh variables using a trailing `...`.
+    named_args::register_named_args(&mut parser);
     parser
 }

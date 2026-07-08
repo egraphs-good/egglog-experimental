@@ -1,0 +1,7 @@
+; `...` must be the final argument.
+(sort Color)
+(sort Vehicle)
+(constructor Red () Color)
+(constructor MyCar (:color Color :numwheel i64) Vehicle)
+
+(rule ((MyCar ... :color c)) ())
