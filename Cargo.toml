@@ -17,9 +17,9 @@ default = ["bin"]
 bin = ["egglog/bin"]
 
 [dependencies]
-egglog = { git = "https://github.com/egraphs-good/egglog.git", rev = "857237af22cc490cf274b636580f859323e0d3f7", default-features = false }
-egglog-ast = { git = "https://github.com/egraphs-good/egglog.git", rev = "857237af22cc490cf274b636580f859323e0d3f7", default-features = false }
-egglog-reports = { git = "https://github.com/egraphs-good/egglog.git", rev = "857237af22cc490cf274b636580f859323e0d3f7", default-features = false }
+egglog = { git = "https://github.com/egraphs-good/egglog.git", rev = "15eb57a5406ca62d9dfbfc6eb9b10afee173cc12", default-features = false }
+egglog-ast = { git = "https://github.com/egraphs-good/egglog.git", rev = "15eb57a5406ca62d9dfbfc6eb9b10afee173cc12", default-features = false }
+egglog-reports = { git = "https://github.com/egraphs-good/egglog.git", rev = "15eb57a5406ca62d9dfbfc6eb9b10afee173cc12", default-features = false }
 
 num = "0.4.3"
 lazy_static = "1.4"
@@ -32,7 +32,3 @@ libtest-mimic = "0.8.1"
 
 # Local dev against the forked egglog (quasiquote `:#field` keyword-splice etc.)
 # not yet pushed. Remove and bump the `rev` above once egglog is pushed.
-[patch."https://github.com/egraphs-good/egglog.git"]
-egglog = { path = "../egglog-quote" }
-egglog-ast = { path = "../egglog-quote/egglog-ast" }
-egglog-reports = { path = "../egglog-quote/egglog-reports" }
