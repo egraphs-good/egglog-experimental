@@ -1,0 +1,4 @@
+; A declaration must name either all of its fields or none of them.
+(sort Color)
+(sort Vehicle)
+(constructor Bad (:color Color i64) Vehicle)

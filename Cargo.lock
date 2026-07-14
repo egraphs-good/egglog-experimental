@@ -330,7 +330,7 @@ checksum = "d0881ea181b1df73ff77ffaaf9c7544ecc11e82fba9b5f27b262a3c73a332555"
 [[package]]
 name = "egglog"
 version = "2.0.0"
-source = "git+https://github.com/egraphs-good/egglog.git?rev=5294cdc66a7b90a9a1480cb2d930f2ee5785c8dd#5294cdc66a7b90a9a1480cb2d930f2ee5785c8dd"
+source = "git+https://github.com/egraphs-good/egglog.git?rev=857237af22cc490cf274b636580f859323e0d3f7#857237af22cc490cf274b636580f859323e0d3f7"
 dependencies = [
  "chrono",
  "clap",
@@ -341,6 +341,7 @@ dependencies = [
  "egglog-bridge",
  "egglog-core-relations",
  "egglog-numeric-id",
+ "egglog-quote",
  "egglog-reports",
  "egraph-serialize",
  "enum-map",
@@ -362,7 +363,7 @@ dependencies = [
 [[package]]
 name = "egglog-add-primitive"
 version = "2.0.0"
-source = "git+https://github.com/egraphs-good/egglog.git?rev=5294cdc66a7b90a9a1480cb2d930f2ee5785c8dd#5294cdc66a7b90a9a1480cb2d930f2ee5785c8dd"
+source = "git+https://github.com/egraphs-good/egglog.git?rev=857237af22cc490cf274b636580f859323e0d3f7#857237af22cc490cf274b636580f859323e0d3f7"
 dependencies = [
  "quote",
  "syn 2.0.108",
@@ -371,7 +372,7 @@ dependencies = [
 [[package]]
 name = "egglog-ast"
 version = "2.0.0"
-source = "git+https://github.com/egraphs-good/egglog.git?rev=5294cdc66a7b90a9a1480cb2d930f2ee5785c8dd#5294cdc66a7b90a9a1480cb2d930f2ee5785c8dd"
+source = "git+https://github.com/egraphs-good/egglog.git?rev=857237af22cc490cf274b636580f859323e0d3f7#857237af22cc490cf274b636580f859323e0d3f7"
 dependencies = [
  "ordered-float",
 ]
@@ -379,7 +380,7 @@ dependencies = [
 [[package]]
 name = "egglog-bridge"
 version = "2.0.0"
-source = "git+https://github.com/egraphs-good/egglog.git?rev=5294cdc66a7b90a9a1480cb2d930f2ee5785c8dd#5294cdc66a7b90a9a1480cb2d930f2ee5785c8dd"
+source = "git+https://github.com/egraphs-good/egglog.git?rev=857237af22cc490cf274b636580f859323e0d3f7#857237af22cc490cf274b636580f859323e0d3f7"
 dependencies = [
  "anyhow",
  "dyn-clone",
@@ -402,7 +403,7 @@ dependencies = [
 [[package]]
 name = "egglog-concurrency"
 version = "2.0.0"
-source = "git+https://github.com/egraphs-good/egglog.git?rev=5294cdc66a7b90a9a1480cb2d930f2ee5785c8dd#5294cdc66a7b90a9a1480cb2d930f2ee5785c8dd"
+source = "git+https://github.com/egraphs-good/egglog.git?rev=857237af22cc490cf274b636580f859323e0d3f7#857237af22cc490cf274b636580f859323e0d3f7"
 dependencies = [
  "arc-swap",
  "bumpalo",
@@ -414,7 +415,7 @@ dependencies = [
 [[package]]
 name = "egglog-core-relations"
 version = "2.0.0"
-source = "git+https://github.com/egraphs-good/egglog.git?rev=5294cdc66a7b90a9a1480cb2d930f2ee5785c8dd#5294cdc66a7b90a9a1480cb2d930f2ee5785c8dd"
+source = "git+https://github.com/egraphs-good/egglog.git?rev=857237af22cc490cf274b636580f859323e0d3f7#857237af22cc490cf274b636580f859323e0d3f7"
 dependencies = [
  "anyhow",
  "bumpalo",
@@ -457,15 +458,24 @@ dependencies = [
 [[package]]
 name = "egglog-numeric-id"
 version = "2.0.0"
-source = "git+https://github.com/egraphs-good/egglog.git?rev=5294cdc66a7b90a9a1480cb2d930f2ee5785c8dd#5294cdc66a7b90a9a1480cb2d930f2ee5785c8dd"
+source = "git+https://github.com/egraphs-good/egglog.git?rev=857237af22cc490cf274b636580f859323e0d3f7#857237af22cc490cf274b636580f859323e0d3f7"
 dependencies = [
  "rayon",
 ]
 
 [[package]]
+name = "egglog-quote"
+version = "2.0.0"
+source = "git+https://github.com/egraphs-good/egglog.git?rev=857237af22cc490cf274b636580f859323e0d3f7#857237af22cc490cf274b636580f859323e0d3f7"
+dependencies = [
+ "proc-macro2",
+ "quote",
+]
+
+[[package]]
 name = "egglog-reports"
 version = "2.0.0"
-source = "git+https://github.com/egraphs-good/egglog.git?rev=5294cdc66a7b90a9a1480cb2d930f2ee5785c8dd#5294cdc66a7b90a9a1480cb2d930f2ee5785c8dd"
+source = "git+https://github.com/egraphs-good/egglog.git?rev=857237af22cc490cf274b636580f859323e0d3f7#857237af22cc490cf274b636580f859323e0d3f7"
 dependencies = [
  "clap",
  "hashbrown 0.16.0",
@@ -479,7 +489,7 @@ dependencies = [
 [[package]]
 name = "egglog-union-find"
 version = "2.0.0"
-source = "git+https://github.com/egraphs-good/egglog.git?rev=5294cdc66a7b90a9a1480cb2d930f2ee5785c8dd#5294cdc66a7b90a9a1480cb2d930f2ee5785c8dd"
+source = "git+https://github.com/egraphs-good/egglog.git?rev=857237af22cc490cf274b636580f859323e0d3f7#857237af22cc490cf274b636580f859323e0d3f7"
 dependencies = [
  "crossbeam",
  "egglog-concurrency",
