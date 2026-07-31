@@ -14,9 +14,9 @@
 //! (alphabetically). With one argument (an unquoted function name) only that
 //! function is reported.
 
+use crate::table_rows::for_each_row;
 use egglog::{
-    CommandOutput, EGraph, Error, FunctionRow, TypeError, UserDefinedCommand, Value, ast::Expr,
-    prelude::Span,
+    CommandOutput, EGraph, Error, TypeError, UserDefinedCommand, Value, ast::Expr, prelude::Span,
 };
 use egglog_ast::generic_ast::GenericExpr;
 use std::{
@@ -235,9 +235,8 @@ fn compute_table_stats(egraph: &EGraph, func_name: &str) -> Result<TableStats, E
     }
     let mut output_to_inputs_map: HashMap<Value, HashSet<Vec<Value>>> = HashMap::default();
 
-    egraph.function_for_each(func_name, |row: FunctionRow<'_>| {
+    for_each_row(egraph, func_name, |vals| {
         size += 1;
-        let vals = row.vals;
         debug_assert_eq!(vals.len(), n_cols);
         for (i, v) in vals.iter().enumerate() {
             distinct[i].insert(*v);

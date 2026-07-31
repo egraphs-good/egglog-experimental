@@ -7,8 +7,10 @@
 //!
 //! Each argument must evaluate to a `String` that names an existing function.
 
+use crate::table_rows::{for_each_row, is_constructor};
 use egglog::{
-    ArcSort, CommandOutput, EGraph, Error, TermDag, TermId, TypeError, UserDefinedCommand, Value,
+    ArcSort, CommandOutput, EGraph, Error, RawValues, TermDag, TermId, TypeError,
+    UserDefinedCommand, Value, Write,
     ast::Expr,
     extract::{Extractor, TreeAdditiveCostModel},
     sort::S,
@@ -45,20 +47,33 @@ impl UserDefinedCommand for KeepBestCommand {
 
         // Step 4: re-insert the optimal tuples. Evaluate each extracted term
         // via eval_expr so that constructor sub-terms are re-created bottom-up,
-        // then stage all target-table inserts in one with_full_state call.
-        let mut rows_to_insert: Vec<(String, Vec<Value>)> = Vec::new();
+        // then stage all target-table inserts in one `update` call.
+        let mut rows_to_insert: Vec<(String, bool, Vec<Value>)> = Vec::new();
         for (table_name, extracted_rows, termdag) in &extracted {
+            let constructor = is_constructor(egraph, table_name)?;
             for term_ids in extracted_rows {
                 let values = eval_terms(egraph, termdag, term_ids)?;
-                rows_to_insert.push((table_name.clone(), values));
+                rows_to_insert.push((table_name.clone(), constructor, values));
             }
         }
 
-        egraph.with_full_state(|mut state| {
-            for (table_name, values) in &rows_to_insert {
-                egglog::Write::insert(&mut state, table_name, values.iter().copied());
+        egraph.update(|mut state| {
+            for (table_name, constructor, values) in &rows_to_insert {
+                let (output, inputs) = values
+                    .split_last()
+                    .expect("extracted row has at least an output column");
+                if *constructor {
+                    // `add` mints (or finds) the eclass for these inputs; the
+                    // union pins it to the eclass the extracted output term
+                    // evaluated to, which is what the raw row insert used to do.
+                    let eclass = state.add(table_name, RawValues(inputs.to_vec()))?;
+                    state.union(eclass, *output)?;
+                } else {
+                    state.set(table_name, RawValues(inputs.to_vec()), *output)?;
+                }
             }
-        });
+            Ok(())
+        })?;
 
         Ok(vec![])
     }
@@ -89,8 +104,8 @@ fn collect_and_extract(
             .collect();
 
         let mut raw_rows: Vec<Vec<Value>> = Vec::new();
-        egraph.function_for_each(table_name, |row| {
-            raw_rows.push(row.vals.to_vec());
+        for_each_row(egraph, table_name, |vals| {
+            raw_rows.push(vals.to_vec());
         })?;
 
         let extractor = Extractor::compute_costs_from_rootsorts(
