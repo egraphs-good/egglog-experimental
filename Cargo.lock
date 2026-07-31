@@ -330,7 +330,7 @@ checksum = "d0881ea181b1df73ff77ffaaf9c7544ecc11e82fba9b5f27b262a3c73a332555"
 [[package]]
 name = "egglog"
 version = "2.0.0"
-source = "git+https://github.com/egraphs-good/egglog.git?rev=5294cdc66a7b90a9a1480cb2d930f2ee5785c8dd#5294cdc66a7b90a9a1480cb2d930f2ee5785c8dd"
+source = "git+https://github.com/egraphs-good/egglog.git?rev=53b9721b9706741edff2b7c1e379fc37137184d9#53b9721b9706741edff2b7c1e379fc37137184d9"
 dependencies = [
  "chrono",
  "clap",
@@ -352,9 +352,9 @@ dependencies = [
  "mimalloc",
  "num",
  "ordered-float",
- "rayon",
  "rustc-hash",
  "serde_json",
+ "smallvec",
  "thiserror",
  "web-time",
 ]
@@ -362,7 +362,7 @@ dependencies = [
 [[package]]
 name = "egglog-add-primitive"
 version = "2.0.0"
-source = "git+https://github.com/egraphs-good/egglog.git?rev=5294cdc66a7b90a9a1480cb2d930f2ee5785c8dd#5294cdc66a7b90a9a1480cb2d930f2ee5785c8dd"
+source = "git+https://github.com/egraphs-good/egglog.git?rev=53b9721b9706741edff2b7c1e379fc37137184d9#53b9721b9706741edff2b7c1e379fc37137184d9"
 dependencies = [
  "quote",
  "syn 2.0.108",
@@ -371,7 +371,7 @@ dependencies = [
 [[package]]
 name = "egglog-ast"
 version = "2.0.0"
-source = "git+https://github.com/egraphs-good/egglog.git?rev=5294cdc66a7b90a9a1480cb2d930f2ee5785c8dd#5294cdc66a7b90a9a1480cb2d930f2ee5785c8dd"
+source = "git+https://github.com/egraphs-good/egglog.git?rev=53b9721b9706741edff2b7c1e379fc37137184d9#53b9721b9706741edff2b7c1e379fc37137184d9"
 dependencies = [
  "ordered-float",
 ]
@@ -379,10 +379,11 @@ dependencies = [
 [[package]]
 name = "egglog-bridge"
 version = "2.0.0"
-source = "git+https://github.com/egraphs-good/egglog.git?rev=5294cdc66a7b90a9a1480cb2d930f2ee5785c8dd#5294cdc66a7b90a9a1480cb2d930f2ee5785c8dd"
+source = "git+https://github.com/egraphs-good/egglog.git?rev=53b9721b9706741edff2b7c1e379fc37137184d9#53b9721b9706741edff2b7c1e379fc37137184d9"
 dependencies = [
  "anyhow",
  "dyn-clone",
+ "egglog-concurrency",
  "egglog-core-relations",
  "egglog-numeric-id",
  "egglog-reports",
@@ -393,7 +394,6 @@ dependencies = [
  "num-rational",
  "once_cell",
  "ordered-float",
- "rayon",
  "smallvec",
  "thiserror",
  "web-time",
@@ -402,19 +402,19 @@ dependencies = [
 [[package]]
 name = "egglog-concurrency"
 version = "2.0.0"
-source = "git+https://github.com/egraphs-good/egglog.git?rev=5294cdc66a7b90a9a1480cb2d930f2ee5785c8dd#5294cdc66a7b90a9a1480cb2d930f2ee5785c8dd"
+source = "git+https://github.com/egraphs-good/egglog.git?rev=53b9721b9706741edff2b7c1e379fc37137184d9#53b9721b9706741edff2b7c1e379fc37137184d9"
 dependencies = [
  "arc-swap",
  "bumpalo",
+ "crossbeam",
  "egglog-numeric-id",
- "rayon",
  "smallvec",
 ]
 
 [[package]]
 name = "egglog-core-relations"
 version = "2.0.0"
-source = "git+https://github.com/egraphs-good/egglog.git?rev=5294cdc66a7b90a9a1480cb2d930f2ee5785c8dd#5294cdc66a7b90a9a1480cb2d930f2ee5785c8dd"
+source = "git+https://github.com/egraphs-good/egglog.git?rev=53b9721b9706741edff2b7c1e379fc37137184d9#53b9721b9706741edff2b7c1e379fc37137184d9"
 dependencies = [
  "anyhow",
  "bumpalo",
@@ -433,7 +433,6 @@ dependencies = [
  "num",
  "once_cell",
  "rand 0.9.2",
- "rayon",
  "rustc-hash",
  "smallvec",
  "thiserror",
@@ -457,15 +456,12 @@ dependencies = [
 [[package]]
 name = "egglog-numeric-id"
 version = "2.0.0"
-source = "git+https://github.com/egraphs-good/egglog.git?rev=5294cdc66a7b90a9a1480cb2d930f2ee5785c8dd#5294cdc66a7b90a9a1480cb2d930f2ee5785c8dd"
-dependencies = [
- "rayon",
-]
+source = "git+https://github.com/egraphs-good/egglog.git?rev=53b9721b9706741edff2b7c1e379fc37137184d9#53b9721b9706741edff2b7c1e379fc37137184d9"
 
 [[package]]
 name = "egglog-reports"
 version = "2.0.0"
-source = "git+https://github.com/egraphs-good/egglog.git?rev=5294cdc66a7b90a9a1480cb2d930f2ee5785c8dd#5294cdc66a7b90a9a1480cb2d930f2ee5785c8dd"
+source = "git+https://github.com/egraphs-good/egglog.git?rev=53b9721b9706741edff2b7c1e379fc37137184d9#53b9721b9706741edff2b7c1e379fc37137184d9"
 dependencies = [
  "clap",
  "hashbrown 0.16.0",
@@ -479,7 +475,7 @@ dependencies = [
 [[package]]
 name = "egglog-union-find"
 version = "2.0.0"
-source = "git+https://github.com/egraphs-good/egglog.git?rev=5294cdc66a7b90a9a1480cb2d930f2ee5785c8dd#5294cdc66a7b90a9a1480cb2d930f2ee5785c8dd"
+source = "git+https://github.com/egraphs-good/egglog.git?rev=53b9721b9706741edff2b7c1e379fc37137184d9#53b9721b9706741edff2b7c1e379fc37137184d9"
 dependencies = [
  "crossbeam",
  "egglog-concurrency",
@@ -499,12 +495,6 @@ dependencies = [
  "serde",
  "serde_json",
 ]
-
-[[package]]
-name = "either"
-version = "1.15.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "48c757948c5ede0e46177b7add2e67155f70e33c07fea8284df6576da70b3719"
 
 [[package]]
 name = "enum-map"
@@ -1082,26 +1072,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6f97cdb2a36ed4183de61b2f824cc45c9f1037f28afe0a322e9fff4c108b5aaa"
 dependencies = [
  "rand_core 0.6.4",
-]
-
-[[package]]
-name = "rayon"
-version = "1.11.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "368f01d005bf8fd9b1206fb6fa653e6c4a81ceb1466406b81792d87c5677a58f"
-dependencies = [
- "either",
- "rayon-core",
-]
-
-[[package]]
-name = "rayon-core"
-version = "1.13.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "22e18b0f0062d30d4230b2e85ff77fdfe4326feb054b9783a3460d8435c8ab91"
-dependencies = [
- "crossbeam-deque",
- "crossbeam-utils",
 ]
 
 [[package]]
