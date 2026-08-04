@@ -436,6 +436,93 @@ fn test_keep_best_clears_other_tables() {
 }
 
 #[test]
+fn test_keep_best_function_table() {
+    let mut egraph = egglog_experimental::new_experimental_egraph();
+
+    egraph
+        .parse_and_run_program(
+            None,
+            r#"
+        (datatype Math (Num i64) (Add Math Math))
+        (function Best (Math) i64 :no-merge)
+
+        ; two nodes in one eclass, so extraction has to pick the cheaper term
+        (union (Num 2) (Add (Num 1) (Num 1)))
+
+        (set (Best (Num 2)) 7)
+        "#,
+        )
+        .unwrap();
+
+    assert_eq!(egraph.get_size("Best"), 1);
+    assert_eq!(egraph.get_size("Add"), 1);
+
+    // A `function` table re-inserts via `set`, unlike the constructor and
+    // relation cases above, and carries a non-eq-sort output column.
+    egraph
+        .parse_and_run_program(None, r#"(keep-best "Best")"#)
+        .unwrap();
+
+    assert_eq!(egraph.get_size("Best"), 1);
+    assert_eq!(egraph.get_size("Add"), 0);
+
+    // The key comes back as the cheapest term for its eclass, and the output
+    // column survives the round trip.
+    let result = egraph
+        .parse_and_run_program(None, "(print-function Best 100)")
+        .unwrap();
+    let output = result[0].to_string();
+    assert!(output.contains("(Num 2)"), "unexpected output: {output}");
+    assert!(output.contains("7"), "unexpected output: {output}");
+    assert!(!output.contains("Add"), "unexpected output: {output}");
+}
+
+#[test]
+fn test_keep_best_mixed_function_and_relation() {
+    let mut egraph = egglog_experimental::new_experimental_egraph();
+
+    egraph
+        .parse_and_run_program(
+            None,
+            r#"
+        (datatype Math (Num i64) (Add Math Math))
+        (relation Target (Math))
+        (function Best (Math) i64 :no-merge)
+
+        (union (Num 2) (Add (Num 1) (Num 1)))
+        (union (Num 3) (Add (Num 1) (Num 2)))
+
+        (Target (Num 3))
+        (set (Best (Num 2)) 7)
+        "#,
+        )
+        .unwrap();
+
+    // One keep-best call spanning both subtypes, so each table has to be
+    // dispatched independently on the way back in.
+    egraph
+        .parse_and_run_program(None, r#"(keep-best "Target" "Best")"#)
+        .unwrap();
+
+    assert_eq!(egraph.get_size("Target"), 1);
+    assert_eq!(egraph.get_size("Best"), 1);
+    assert_eq!(egraph.get_size("Add"), 0);
+
+    let target = egraph
+        .parse_and_run_program(None, "(print-function Target 100)")
+        .unwrap()[0]
+        .to_string();
+    assert!(target.contains("(Num 3)"), "unexpected output: {target}");
+
+    let best = egraph
+        .parse_and_run_program(None, "(print-function Best 100)")
+        .unwrap()[0]
+        .to_string();
+    assert!(best.contains("(Num 2)"), "unexpected output: {best}");
+    assert!(best.contains("7"), "unexpected output: {best}");
+}
+
+#[test]
 fn test_top_level_let_scheduler_persists_on_the_egraph() {
     let mut egraph = egglog_experimental::new_experimental_egraph();
 

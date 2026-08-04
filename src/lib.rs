@@ -50,6 +50,7 @@ pub use multi_extract::*;
 mod size;
 pub use size::*;
 mod primitive;
+mod table_rows;
 mod table_stats;
 pub use table_stats::*;
 
