@@ -19,6 +19,8 @@
 //! - [`(get-size!)` primitive](https://github.com/egraphs-good/egglog-experimental/blob/main/tests/web-demo/node-limit.egg)
 //!   for inspecting total tuple counts or counts for specific tables
 //! - [Multi-extraction](https://github.com/egraphs-good/egglog-experimental/blob/main/tests/web-demo/multi-extract.egg)
+//! - [`unstable-subst`](subst): substitution over the sub-e-graph reachable
+//!   from a root, driven by a `Map` from an eq-sort to itself
 //! - Body-defined primitives with `(primitive name (InputSort*) OutputSort body)`.
 //!   Body variables are positional (`_0`, `_1`, ...), and a partial primitive
 //!   body result propagates as primitive failure. The registered primitive uses
@@ -60,6 +62,9 @@ pub use sugar::*;
 
 mod keep_best;
 pub use keep_best::KeepBestCommand;
+
+mod subst;
+pub use subst::{SUBST, Subst, subst, substitute};
 
 pub fn new_experimental_egraph() -> EGraph {
     let mut egraph = EGraph::default();
@@ -105,6 +110,9 @@ pub fn new_experimental_egraph() -> EGraph {
     egraph
         .add_command("primitive".into(), Arc::new(primitive::RegisterPrimitive))
         .unwrap();
+
+    // Substitution over a reachable sub-e-graph.
+    egraph.add_full_primitive(Subst, None);
     egraph
 }
 
