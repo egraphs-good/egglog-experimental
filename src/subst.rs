@@ -37,25 +37,23 @@
 
 use std::any::TypeId;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::sync::Arc;
 
 use egglog::api::RawValues;
 use egglog::ast::Span;
 use egglog::constraint::{self, Constraint, ImpossibleConstraint, TypeConstraint};
 use egglog::sort::MapContainer;
 use egglog::{
-    ArcSort, Atom, AtomTerm, Core, EGraph, Error, FullPrim, FullState, Primitive, Read, TypeInfo,
-    Value, Write,
+    ArcSort, Atom, AtomTerm, Core, EGraph, Error, FullPrim, FullState, FuncType, Primitive, Read,
+    TypeInfo, Value, Write,
 };
 
 /// The name of the primitive, as written in an egglog program.
 pub const SUBST: &str = "unstable-subst";
 
-/// A constructor the walk can follow. Resolved from the state's table schemas
-/// at the start of each call, since an e-graph gains constructors over time.
-struct Constructor<'a> {
-    name: String,
-    inputs: &'a [ArcSort],
-}
+/// A constructor the walk can follow. Resolved from the e-graph's signatures at
+/// the start of each call, since an e-graph gains constructors over time.
+type Constructor = Arc<FuncType>;
 
 /// What a column of a given sort holds, as far as the walk cares.
 enum Kind {
@@ -104,7 +102,7 @@ struct Snapshot {
 }
 
 struct Walk<'a> {
-    ctors: Vec<Constructor<'a>>,
+    ctors: Vec<Constructor>,
     /// Indices into `ctors`, by output sort name.
     by_output: HashMap<String, Vec<usize>>,
     map: &'a BTreeMap<Value, Value>,
@@ -122,7 +120,7 @@ struct Walk<'a> {
 /// The constructors with an eq-sort output, which are the rows that make up the
 /// term structure. Function tables are analyses over that structure, and
 /// globals lower to function tables, so both stay out of the walk.
-fn constructors<'a, 'db: 'a>(state: &FullState<'a, 'db>) -> Vec<Constructor<'a>> {
+fn constructors(state: &FullState<'_, '_>) -> Vec<Constructor> {
     let names: Vec<String> = state
         .table_sizes()
         .into_iter()
@@ -133,11 +131,8 @@ fn constructors<'a, 'db: 'a>(state: &FullState<'a, 'db>) -> Vec<Constructor<'a>>
         .filter_map(|name| {
             // `constructor_schema` rejects the function tables, which is also
             // what keeps globals out: they lower to function tables.
-            let schema = state.constructor_schema(&name).ok()?;
-            schema.output.is_eq_sort().then_some(Constructor {
-                name,
-                inputs: &schema.input,
-            })
+            let func_type = state.constructor_schema(&name).ok()?;
+            func_type.output.is_eq_sort().then_some(func_type)
         })
         .collect()
 }
@@ -159,13 +154,10 @@ pub fn substitute(
     let ctors = constructors(state);
     let mut by_output: HashMap<String, Vec<usize>> = HashMap::new();
     for (index, ctor) in ctors.iter().enumerate() {
-        let output = state
-            .constructor_schema(&ctor.name)
-            .expect("the constructor was just resolved")
-            .output
-            .name()
-            .to_owned();
-        by_output.entry(output).or_default().push(index);
+        by_output
+            .entry(ctor.output.name().to_owned())
+            .or_default()
+            .push(index);
     }
 
     let mut walk = Walk {
@@ -223,8 +215,8 @@ impl Walk<'_> {
 
             let mut deps = Vec::new();
             for node in &nodes {
-                let inputs = self.ctors[node.ctor].inputs;
-                for (child, child_sort) in node.children.iter().zip(inputs) {
+                let ctor = self.ctors[node.ctor].clone();
+                for (child, child_sort) in node.children.iter().zip(&ctor.input) {
                     match kind_of(child_sort) {
                         Kind::Eclass => {
                             deps.push(*child);
@@ -410,9 +402,9 @@ impl Walk<'_> {
     /// The substituted children of `node`, or `None` if some child's copy does
     /// not exist yet.
     fn copied_args(&mut self, state: &mut FullState<'_, '_>, node: &ENode) -> Option<Vec<Value>> {
-        let inputs = self.ctors[node.ctor].inputs;
+        let ctor = self.ctors[node.ctor].clone();
         let mut args = Vec::with_capacity(node.children.len());
-        for (child, child_sort) in node.children.iter().zip(inputs) {
+        for (child, child_sort) in node.children.iter().zip(&ctor.input) {
             let image = match kind_of(child_sort) {
                 Kind::Eclass => self.eclass_image(*child)?,
                 Kind::Container(type_id) => self.container_image(state, *child, type_id)?,
