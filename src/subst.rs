@@ -39,7 +39,7 @@ use std::any::TypeId;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 
 use egglog::api::RawValues;
-use egglog::ast::{FunctionSubtype, Span};
+use egglog::ast::Span;
 use egglog::constraint::{self, Constraint, ImpossibleConstraint, TypeConstraint};
 use egglog::sort::MapContainer;
 use egglog::{
@@ -131,10 +131,9 @@ fn constructors<'a, 'db: 'a>(state: &FullState<'a, 'db>) -> Vec<Constructor<'a>>
     names
         .into_iter()
         .filter_map(|name| {
-            if state.table_subtype(&name)? != FunctionSubtype::Constructor {
-                return None;
-            }
-            let schema = state.table_schema(&name)?;
+            // `constructor_schema` rejects the function tables, which is also
+            // what keeps globals out: they lower to function tables.
+            let schema = state.constructor_schema(&name).ok()?;
             schema.output.is_eq_sort().then_some(Constructor {
                 name,
                 inputs: &schema.input,
@@ -161,7 +160,7 @@ pub fn substitute(
     let mut by_output: HashMap<String, Vec<usize>> = HashMap::new();
     for (index, ctor) in ctors.iter().enumerate() {
         let output = state
-            .table_schema(&ctor.name)
+            .constructor_schema(&ctor.name)
             .expect("the constructor was just resolved")
             .output
             .name()
