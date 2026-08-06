@@ -17,12 +17,13 @@ default = ["bin"]
 bin = ["egglog/bin"]
 
 [dependencies]
-# Local override while the egglog side of `unstable-subst` (Read::enodes_for_eclass,
-# Read::table_schema / table_subtype, Core::rebuild_container) is unmerged. Revert to
-# the git rev once it lands upstream.
-egglog = { path = "/home/oflatt/egglog-subst/.claude/worktrees/subst-primitive", default-features = false }
-egglog-ast = { path = "/home/oflatt/egglog-subst/.claude/worktrees/subst-primitive/egglog-ast", default-features = false }
-egglog-reports = { path = "/home/oflatt/egglog-subst/.claude/worktrees/subst-primitive/egglog-reports", default-features = false }
+# Points at egraphs-good/egglog#986, which adds the e-graph introspection
+# `unstable-subst` is built on (Read::enodes_for_eclass, Read::table_schema /
+# table_subtype, Core::rebuild_container). Move back to an egraphs-good rev once
+# that PR merges.
+egglog = { git = "https://github.com/oflatt-claude/egglog.git", rev = "1118c51a327c3ef99a97e60122c43b08f513ccb1", default-features = false }
+egglog-ast = { git = "https://github.com/oflatt-claude/egglog.git", rev = "1118c51a327c3ef99a97e60122c43b08f513ccb1", default-features = false }
+egglog-reports = { git = "https://github.com/oflatt-claude/egglog.git", rev = "1118c51a327c3ef99a97e60122c43b08f513ccb1", default-features = false }
 
 num = "0.4.3"
 lazy_static = "1.4"
