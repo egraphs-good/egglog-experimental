@@ -21,9 +21,9 @@ bin = ["egglog/bin"]
 # `unstable-subst` is built on (Read::enodes_for_eclass, Read::table_schema /
 # table_subtype, Core::rebuild_container). Move back to an egraphs-good rev once
 # that PR merges.
-egglog = { git = "https://github.com/oflatt-claude/egglog.git", rev = "765e83281a1922e22dbbc1d35d2cadc9bbfd1463", default-features = false }
-egglog-ast = { git = "https://github.com/oflatt-claude/egglog.git", rev = "765e83281a1922e22dbbc1d35d2cadc9bbfd1463", default-features = false }
-egglog-reports = { git = "https://github.com/oflatt-claude/egglog.git", rev = "765e83281a1922e22dbbc1d35d2cadc9bbfd1463", default-features = false }
+egglog = { git = "https://github.com/oflatt-claude/egglog.git", rev = "f910d36243a2937724db4c10349dff0d68fbaa84", default-features = false }
+egglog-ast = { git = "https://github.com/oflatt-claude/egglog.git", rev = "f910d36243a2937724db4c10349dff0d68fbaa84", default-features = false }
+egglog-reports = { git = "https://github.com/oflatt-claude/egglog.git", rev = "f910d36243a2937724db4c10349dff0d68fbaa84", default-features = false }
 
 num = "0.4.3"
 lazy_static = "1.4"

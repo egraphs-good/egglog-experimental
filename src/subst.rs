@@ -37,7 +37,6 @@
 
 use std::any::TypeId;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
-use std::sync::Arc;
 
 use egglog::api::RawValues;
 use egglog::ast::Span;
@@ -53,7 +52,7 @@ pub const SUBST: &str = "unstable-subst";
 
 /// A constructor the walk can follow. Resolved from the e-graph's signatures at
 /// the start of each call, since an e-graph gains constructors over time.
-type Constructor = Arc<FuncType>;
+type Constructor<'a> = &'a FuncType;
 
 /// What a column of a given sort holds, as far as the walk cares.
 enum Kind {
@@ -102,7 +101,7 @@ struct Snapshot {
 }
 
 struct Walk<'a> {
-    ctors: Vec<Constructor>,
+    ctors: Vec<Constructor<'a>>,
     /// Indices into `ctors`, by output sort name.
     by_output: HashMap<String, Vec<usize>>,
     map: &'a BTreeMap<Value, Value>,
@@ -120,7 +119,7 @@ struct Walk<'a> {
 /// The constructors with an eq-sort output, which are the rows that make up the
 /// term structure. Function tables are analyses over that structure, and
 /// globals lower to function tables, so both stay out of the walk.
-fn constructors(state: &FullState<'_, '_>) -> Vec<Constructor> {
+fn constructors<'db>(state: &FullState<'_, 'db>) -> Vec<Constructor<'db>> {
     let names: Vec<String> = state
         .table_sizes()
         .into_iter()
@@ -139,8 +138,8 @@ fn constructors(state: &FullState<'_, '_>) -> Vec<Constructor> {
 
 /// Substitute `map` through the sub-e-graph reachable from `root`, returning
 /// the root of the copy. See the module docs for the semantics.
-pub fn substitute(
-    state: &mut FullState<'_, '_>,
+pub fn substitute<'db>(
+    state: &mut FullState<'_, 'db>,
     root: Value,
     map: &BTreeMap<Value, Value>,
 ) -> Result<Value, Error> {
@@ -215,7 +214,7 @@ impl Walk<'_> {
 
             let mut deps = Vec::new();
             for node in &nodes {
-                let ctor = self.ctors[node.ctor].clone();
+                let ctor = self.ctors[node.ctor];
                 for (child, child_sort) in node.children.iter().zip(&ctor.input) {
                     match kind_of(child_sort) {
                         Kind::Eclass => {
@@ -402,7 +401,7 @@ impl Walk<'_> {
     /// The substituted children of `node`, or `None` if some child's copy does
     /// not exist yet.
     fn copied_args(&mut self, state: &mut FullState<'_, '_>, node: &ENode) -> Option<Vec<Value>> {
-        let ctor = self.ctors[node.ctor].clone();
+        let ctor = self.ctors[node.ctor];
         let mut args = Vec::with_capacity(node.children.len());
         for (child, child_sort) in node.children.iter().zip(&ctor.input) {
             let image = match kind_of(child_sort) {
