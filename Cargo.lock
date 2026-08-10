@@ -330,7 +330,7 @@ checksum = "d0881ea181b1df73ff77ffaaf9c7544ecc11e82fba9b5f27b262a3c73a332555"
 [[package]]
 name = "egglog"
 version = "2.0.0"
-source = "git+https://github.com/saulshanabrook/egg-smol.git?branch=codex%2Fgreedy-dag-extractor#4ea17eb02ca485bbcd105b750c1532e00eddf30c"
+source = "git+https://github.com/saulshanabrook/egg-smol.git?branch=codex%2Fgreedy-dag-extractor#7bb03e15db4c77458223db0fca126a60af6a1fbb"
 dependencies = [
  "chrono",
  "clap",
@@ -363,7 +363,7 @@ dependencies = [
 [[package]]
 name = "egglog-add-primitive"
 version = "2.0.0"
-source = "git+https://github.com/saulshanabrook/egg-smol.git?branch=codex%2Fgreedy-dag-extractor#4ea17eb02ca485bbcd105b750c1532e00eddf30c"
+source = "git+https://github.com/saulshanabrook/egg-smol.git?branch=codex%2Fgreedy-dag-extractor#7bb03e15db4c77458223db0fca126a60af6a1fbb"
 dependencies = [
  "quote",
  "syn 2.0.108",
@@ -372,7 +372,7 @@ dependencies = [
 [[package]]
 name = "egglog-ast"
 version = "2.0.0"
-source = "git+https://github.com/saulshanabrook/egg-smol.git?branch=codex%2Fgreedy-dag-extractor#4ea17eb02ca485bbcd105b750c1532e00eddf30c"
+source = "git+https://github.com/saulshanabrook/egg-smol.git?branch=codex%2Fgreedy-dag-extractor#7bb03e15db4c77458223db0fca126a60af6a1fbb"
 dependencies = [
  "ordered-float",
 ]
@@ -380,7 +380,7 @@ dependencies = [
 [[package]]
 name = "egglog-bridge"
 version = "2.0.0"
-source = "git+https://github.com/saulshanabrook/egg-smol.git?branch=codex%2Fgreedy-dag-extractor#4ea17eb02ca485bbcd105b750c1532e00eddf30c"
+source = "git+https://github.com/saulshanabrook/egg-smol.git?branch=codex%2Fgreedy-dag-extractor#7bb03e15db4c77458223db0fca126a60af6a1fbb"
 dependencies = [
  "anyhow",
  "dyn-clone",
@@ -403,7 +403,7 @@ dependencies = [
 [[package]]
 name = "egglog-concurrency"
 version = "2.0.0"
-source = "git+https://github.com/saulshanabrook/egg-smol.git?branch=codex%2Fgreedy-dag-extractor#4ea17eb02ca485bbcd105b750c1532e00eddf30c"
+source = "git+https://github.com/saulshanabrook/egg-smol.git?branch=codex%2Fgreedy-dag-extractor#7bb03e15db4c77458223db0fca126a60af6a1fbb"
 dependencies = [
  "arc-swap",
  "bumpalo",
@@ -415,7 +415,7 @@ dependencies = [
 [[package]]
 name = "egglog-core-relations"
 version = "2.0.0"
-source = "git+https://github.com/saulshanabrook/egg-smol.git?branch=codex%2Fgreedy-dag-extractor#4ea17eb02ca485bbcd105b750c1532e00eddf30c"
+source = "git+https://github.com/saulshanabrook/egg-smol.git?branch=codex%2Fgreedy-dag-extractor#7bb03e15db4c77458223db0fca126a60af6a1fbb"
 dependencies = [
  "anyhow",
  "bumpalo",
@@ -460,7 +460,7 @@ dependencies = [
 [[package]]
 name = "egglog-numeric-id"
 version = "2.0.0"
-source = "git+https://github.com/saulshanabrook/egg-smol.git?branch=codex%2Fgreedy-dag-extractor#4ea17eb02ca485bbcd105b750c1532e00eddf30c"
+source = "git+https://github.com/saulshanabrook/egg-smol.git?branch=codex%2Fgreedy-dag-extractor#7bb03e15db4c77458223db0fca126a60af6a1fbb"
 dependencies = [
  "rayon",
 ]
@@ -468,7 +468,7 @@ dependencies = [
 [[package]]
 name = "egglog-reports"
 version = "2.0.0"
-source = "git+https://github.com/saulshanabrook/egg-smol.git?branch=codex%2Fgreedy-dag-extractor#4ea17eb02ca485bbcd105b750c1532e00eddf30c"
+source = "git+https://github.com/saulshanabrook/egg-smol.git?branch=codex%2Fgreedy-dag-extractor#7bb03e15db4c77458223db0fca126a60af6a1fbb"
 dependencies = [
  "clap",
  "hashbrown 0.16.0",
@@ -482,7 +482,7 @@ dependencies = [
 [[package]]
 name = "egglog-union-find"
 version = "2.0.0"
-source = "git+https://github.com/saulshanabrook/egg-smol.git?branch=codex%2Fgreedy-dag-extractor#4ea17eb02ca485bbcd105b750c1532e00eddf30c"
+source = "git+https://github.com/saulshanabrook/egg-smol.git?branch=codex%2Fgreedy-dag-extractor#7bb03e15db4c77458223db0fca126a60af6a1fbb"
 dependencies = [
  "crossbeam",
  "egglog-concurrency",
@@ -505,9 +505,9 @@ dependencies = [
 
 [[package]]
 name = "either"
-version = "1.15.0"
+version = "1.17.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "48c757948c5ede0e46177b7add2e67155f70e33c07fea8284df6576da70b3719"
+checksum = "9e5e8f6c15a24b9a3ee5efec809ccd006d3b30e8b3bb63c39af737c7f87daa1d"
 
 [[package]]
 name = "enum-map"
@@ -1089,9 +1089,9 @@ dependencies = [
 
 [[package]]
 name = "rayon"
-version = "1.11.0"
+version = "1.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "368f01d005bf8fd9b1206fb6fa653e6c4a81ceb1466406b81792d87c5677a58f"
+checksum = "fb39b166781f92d482534ef4b4b1b2568f42613b53e5b6c160e24cfbfa30926d"
 dependencies = [
  "either",
  "rayon-core",

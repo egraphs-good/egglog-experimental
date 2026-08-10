@@ -11,6 +11,7 @@ use crate::DynamicCostModel;
 use crate::greedy_dag_extract::{
     TreeCostModelFromDag, extract_best_greedy_dag, split_trailing_extractor,
 };
+use crate::table_rows::{for_each_row, is_constructor};
 use egglog::{
     ArcSort, CommandOutput, EGraph, Error, RawValues, TermDag, TermId, TypeError,
     UserDefinedCommand, Value, Write, ast::Expr, sort::S, span,
@@ -46,31 +47,31 @@ impl UserDefinedCommand for KeepBestCommand {
             egraph.clear_function(name)?;
         }
 
-        // Step 4: re-insert the optimal tuples. Evaluate each extracted term via eval_expr so
-        // that constructor sub-terms are re-created bottom-up, then stage all writes in one
-        // update.
-        let mut rows_to_insert: Vec<(String, TableKind, Vec<Value>)> = Vec::new();
-        for (table_name, kind, extracted_rows, termdag) in &extracted {
+        // Step 4: re-insert the optimal tuples. Evaluate each extracted term
+        // via eval_expr so that constructor sub-terms are re-created bottom-up,
+        // then stage all target-table inserts in one `update` call.
+        let mut rows_to_insert: Vec<(String, bool, Vec<Value>)> = Vec::new();
+        for (table_name, extracted_rows, termdag) in &extracted {
+            let constructor = is_constructor(egraph, table_name)?;
             for term_ids in extracted_rows {
                 let values = eval_terms(egraph, termdag, term_ids)?;
-                rows_to_insert.push((table_name.clone(), *kind, values));
+                rows_to_insert.push((table_name.clone(), constructor, values));
             }
         }
 
         egraph.update(|mut state| {
-            for (table_name, kind, values) in rows_to_insert {
-                let Some((output, inputs)) = values.split_last() else {
-                    return Err(Error::ExtractError(format!(
-                        "keep-best: empty row for table {table_name}"
-                    )));
-                };
-                match kind {
-                    TableKind::Function => {
-                        state.set(&table_name, RawValues(inputs.to_vec()), *output)?;
-                    }
-                    TableKind::Constructor => {
-                        state.add(&table_name, RawValues(inputs.to_vec()))?;
-                    }
+            for (table_name, constructor, values) in &rows_to_insert {
+                let (output, inputs) = values
+                    .split_last()
+                    .expect("extracted row has at least an output column");
+                if *constructor {
+                    // `add` mints (or finds) the eclass for these inputs; the
+                    // union pins it to the eclass the extracted output term
+                    // evaluated to, which is what the raw row insert used to do.
+                    let eclass = state.add(table_name, RawValues(inputs.to_vec()))?;
+                    state.union(eclass, *output)?;
+                } else {
+                    state.set(table_name, RawValues(inputs.to_vec()), *output)?;
                 }
             }
             Ok(())
@@ -80,13 +81,7 @@ impl UserDefinedCommand for KeepBestCommand {
     }
 }
 
-#[derive(Clone, Copy)]
-enum TableKind {
-    Function,
-    Constructor,
-}
-
-type ExtractedTable = (String, TableKind, Vec<Vec<TermId>>, TermDag);
+type ExtractedTable = (String, Vec<Vec<TermId>>, TermDag);
 
 /// For each table, collect all rows and extract the best term for each value.
 /// Returns `(table_name, rows, termdag)` triples where each row is a list of
@@ -112,26 +107,9 @@ fn collect_and_extract(
             .collect();
 
         let mut raw_rows: Vec<Vec<Value>> = Vec::new();
-        let kind = if egraph
-            .function_entries(table_name, |entry| {
-                let mut row = entry.inputs.to_vec();
-                row.push(entry.output);
-                raw_rows.push(row);
-            })
-            .is_ok()
-        {
-            TableKind::Function
-        } else {
-            egraph.constructor_enodes(table_name, |enode| {
-                if enode.subsumed {
-                    return;
-                }
-                let mut row = enode.children.to_vec();
-                row.push(enode.eclass);
-                raw_rows.push(row);
-            })?;
-            TableKind::Constructor
-        };
+        for_each_row(egraph, table_name, |vals| {
+            raw_rows.push(vals.to_vec());
+        })?;
 
         let roots = raw_rows
             .iter()
@@ -168,7 +146,7 @@ fn collect_and_extract(
             extracted_rows.push(term_ids);
         }
 
-        result.push((table_name.clone(), kind, extracted_rows, termdag));
+        result.push((table_name.clone(), extracted_rows, termdag));
     }
 
     Ok(result)

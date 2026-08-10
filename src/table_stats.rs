@@ -14,6 +14,7 @@
 //! (alphabetically). With one argument (an unquoted table name) only that
 //! table is reported.
 
+use crate::table_rows::for_each_row;
 use egglog::{
     CommandOutput, EGraph, Error, TypeError, UserDefinedCommand, Value, ast::Expr, prelude::Span,
 };
@@ -234,7 +235,7 @@ fn compute_table_stats(egraph: &EGraph, func_name: &str) -> Result<TableStats, E
     }
     let mut output_to_inputs_map: HashMap<Value, HashSet<Vec<Value>>> = HashMap::default();
 
-    let mut visit_row = |vals: Vec<Value>| {
+    for_each_row(egraph, func_name, |vals| {
         size += 1;
         debug_assert_eq!(vals.len(), n_cols);
         for (i, v) in vals.iter().enumerate() {
@@ -259,31 +260,7 @@ fn compute_table_stats(egraph: &EGraph, func_name: &str) -> Result<TableStats, E
                 .or_default()
                 .insert(inputs);
         }
-    };
-
-    if egraph
-        .function_entries(func_name, |row| {
-            visit_row(
-                row.inputs
-                    .iter()
-                    .copied()
-                    .chain(std::iter::once(row.output))
-                    .collect(),
-            );
-        })
-        .is_err()
-    {
-        egraph.constructor_enodes(func_name, |enode| {
-            visit_row(
-                enode
-                    .children
-                    .iter()
-                    .copied()
-                    .chain(std::iter::once(enode.eclass))
-                    .collect(),
-            );
-        })?;
-    }
+    })?;
 
     let distinct_counts: Vec<usize> = distinct.iter().map(|s| s.len()).collect();
 

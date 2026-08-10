@@ -16,7 +16,7 @@
 //! <https://docs.rs/slotmap/latest/slotmap/struct.SparseSecondaryMap.html> and
 //! <https://doc.rust-lang.org/beta/nightly-rustc/rustc_index/vec/struct.IndexVec.html>.
 
-use egglog::extract::CommutativeMonoid;
+use egglog::extract::Cost;
 use fixedbitset::FixedBitSet;
 use hashbrown::{Equivalent, HashMap};
 use std::borrow::Borrow;
@@ -160,7 +160,7 @@ impl<K> Interner<K> {
     /// The capacity is for expected present entries, not for the full interned
     /// universe. The membership bitset is sized from the frozen universe.
     #[inline]
-    pub(super) fn aggregated_map_with_capacity<V: CommutativeMonoid>(
+    pub(super) fn aggregated_map_with_capacity<V: Cost>(
         &self,
         entries_capacity: usize,
     ) -> AggregatedSparseSecondaryMap<K, V> {
@@ -374,12 +374,12 @@ impl<K, V> SparseSecondaryMap<K, V> {
 /// each id can be inserted once, membership tests are constant-time, iteration
 /// visits only present entries, and the commutative-monoid total is cached on
 /// insert.
-pub(super) struct AggregatedSparseSecondaryMap<K, V: CommutativeMonoid> {
+pub(super) struct AggregatedSparseSecondaryMap<K, V: Cost> {
     entries: SparseSecondaryMap<K, V>,
     total: V,
 }
 
-impl<K, V: CommutativeMonoid> Clone for AggregatedSparseSecondaryMap<K, V> {
+impl<K, V: Cost> Clone for AggregatedSparseSecondaryMap<K, V> {
     fn clone(&self) -> Self {
         Self {
             entries: self.entries.clone(),
@@ -390,7 +390,7 @@ impl<K, V: CommutativeMonoid> Clone for AggregatedSparseSecondaryMap<K, V> {
 
 impl<K, V> fmt::Debug for AggregatedSparseSecondaryMap<K, V>
 where
-    V: CommutativeMonoid + fmt::Debug,
+    V: Cost,
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("AggregatedSparseSecondaryMap")
@@ -400,7 +400,7 @@ where
     }
 }
 
-impl<K, V: CommutativeMonoid> AggregatedSparseSecondaryMap<K, V> {
+impl<K, V: Cost> AggregatedSparseSecondaryMap<K, V> {
     fn with_capacity(interner: &Interner<K>, entries_capacity: usize) -> Self {
         Self {
             entries: SparseSecondaryMap::with_capacity(interner, entries_capacity),

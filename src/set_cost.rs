@@ -190,7 +190,7 @@ pub struct DynamicCostModel;
 
 impl BaseCostModel<DefaultCost> for DynamicCostModel {
     fn base_value_cost(&self, egraph: &EGraph, sort: &ArcSort, value: Value) -> DefaultCost {
-        BaseCostModel::base_value_cost(&TreeAdditiveCostModel {}, egraph, sort, value)
+        BaseCostModel::base_value_cost(&TreeAdditiveCostModel::default(), egraph, sort, value)
     }
 }
 
