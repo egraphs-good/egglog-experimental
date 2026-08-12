@@ -459,9 +459,12 @@ impl Walk<'_> {
         let image = if remap.is_empty() {
             container
         } else {
-            state.rebuild_container(type_id, container, &|value| {
-                remap.get(&value).copied().unwrap_or(value)
-            })
+            // The sort this value came from said it is a container of this type.
+            state
+                .map_container(type_id, container, &|value| {
+                    remap.get(&value).copied().unwrap_or(value)
+                })
+                .unwrap_or(container)
         };
         self.container_images.insert(container, image);
         Some(image)
