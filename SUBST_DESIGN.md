@@ -81,9 +81,10 @@ Consequences worth stating out loud:
   that e-node's insert names the copy, and the cyclic e-node then unions into
   it. `x = {Var "x", Add x (Num 0)}` qualifies and works. A cycle in which every
   e-node points back into the cycle has no such starting point, and naming its
-  copy would mean inventing an e-class id — so it returns
-  `Error::SubstError` (`egglog_experimental::subst`) or panics with that reason (the
-  primitive) rather than producing a partial copy.
+  copy would mean inventing an e-class id — so it reports that
+  (`egglog_experimental::subst` returns an error naming the e-class; the
+  primitive panics, since a primitive cannot return one) rather than producing
+  a partial copy.
 * **Subsumed e-nodes are skipped** — they are excluded from extraction, so
   resurrecting them un-subsumed in a copy would be wrong.
 * Registered by `new_experimental_egraph`, so a plain `EGraph::default` does not
@@ -131,14 +132,13 @@ after which the whole primitive is ordinary out-of-tree code.
   from <https://github.com/egraphs-good/egglog/pull/934> (still open), together
   with the `core-relations` `ExecutionState::for_each_matching_col` and
   `egglog-bridge` `TableAction::for_each_output_value` it rests on.
-* `Read::table_schema` / `Read::table_subtype` — a table's declared column sorts
-  and subtype, from inside a primitive body. `EGraph::functions_iter` already
-  exposes this from `&EGraph`, but a primitive only sees the state wrapper, and
-  those carried no sort information at all. Backed by a `FunctionSchemas` map
-  the e-graph shares with the wrappers exactly as it already shares
-  `ActionRegistry`, snapshot/restored across `push`/`pop` so a popped table
-  stops resolving.
-* `Core::rebuild_container` — remap a container value's contents and intern the
+* `Read::constructor_schema` / `Read::function_schema` / `Read::table_subtype` —
+  a table's declared signature and subtype, from inside a primitive body.
+  `EGraph::functions_iter` already exposes this from `&EGraph`, but a primitive
+  only sees the state wrapper, and those carried no sort information at all.
+  The e-graph passes its `&TypeInfo` into each execution as an
+  `ExternalContext`, so the borrow lasts exactly that operation.
+* `Core::map_container` — map a container value's contents and intern the
   result, over the existing `ContainerValues::rebuild_val_with`. Out-of-tree
   code cannot go through `Core::register_container`, which needs to name the
   container's Rust type.
@@ -163,12 +163,12 @@ so a `Map` sort can be identified without downcasting to `MapSort` (whose
   after every command) and in a `:naive` rule head. Term-encoding mode, where
   canonicalization goes through a per-sort union-find table rather than the
   backend's, is untested.
-* Proof mode is unsupported: the copied rows carry no justification.
-  `egglog_experimental::subst` errors out (`ProofsIncompatibleApi`, from
-  `EGraph::update`), and the primitive is
-  registered without a proof validator, so `program_supports_proofs` already
-  excludes any program using it from the proof-checking test runs. A program
-  that enables proofs *and* calls the primitive is not caught.
+* Proof mode is unsupported: the copied rows carry no justification. This is
+  rejected rather than silently wrong — `egglog_experimental::subst` errors with
+  `ProofsIncompatibleApi` (from `EGraph::update`), and the primitive is
+  registered without a proof validator, so a program that uses it under
+  `--proofs` or `--term-encoding` is refused with "primitive operation lacks a
+  validator function".
 * Tests live in `tests/subst.rs` rather than a `tests/*.egg` file, so they skip
   the `files` harness's desugar / term-encoding / multi-thread variants.
 * A failing substitution reaches an egglog program as the generic

@@ -80,7 +80,14 @@ enum Kind {
 fn kind_of(sort: &ArcSort) -> Kind {
     if sort.is_eq_sort() {
         Kind::Eclass
-    } else if sort.is_eq_container_sort() {
+    } else if sort.is_container_sort() {
+        // Deliberately not `is_eq_container_sort`, which answers from the
+        // sort's declared element sorts. For an `unstable-fn` value those are
+        // the arguments still to be applied, not the ones it captured — a
+        // `(UnstableFn () Math)` holding an e-class reports no eq-sort
+        // elements. Walking every container and asking the value what it holds
+        // costs an `inner_values` call on containers that turn out to have no
+        // e-classes inside, and cannot miss one.
         Kind::Container(
             sort.value_type()
                 .expect("a container sort has a value type"),
@@ -362,6 +369,7 @@ impl Walk<'_> {
                 .iter()
                 .map(|node| self.ctors[node.ctor].name.as_str())
                 .collect();
+            ctors.sort_unstable();
             ctors.dedup();
             return Err(error(format!(
                 "no order copies e-class {eclass:?}: its remaining e-nodes ({}) all refer to \
@@ -473,12 +481,13 @@ impl Walk<'_> {
         let image = if remap.is_empty() {
             container
         } else {
-            // The sort this value came from said it is a container of this type.
-            state
-                .map_container(type_id, container, &|value| {
-                    remap.get(&value).copied().unwrap_or(value)
-                })
-                .unwrap_or(container)
+            let mapped = state.map_container(type_id, container, &|value| {
+                remap.get(&value).copied().unwrap_or(value)
+            });
+            // `collect` already read this value's contents through the same
+            // sort, so it is a container of this type.
+            debug_assert!(mapped.is_some(), "{container:?} is not a {type_id:?}");
+            mapped.unwrap_or(container)
         };
         self.container_images.insert(container, image);
         Some(image)

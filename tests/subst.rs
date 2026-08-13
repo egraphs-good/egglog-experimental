@@ -180,6 +180,25 @@ fn a_replacement_built_in_the_same_action_is_fine() {
     );
 }
 
+/// An `unstable-fn` value captures e-classes, and those get substituted like
+/// any other container's contents. The sort reports its element sorts as the
+/// arguments *still to be applied*, which for a nullary one is nothing at all,
+/// so classifying containers by that would skip these silently.
+#[test]
+fn substitutes_inside_a_captured_function_value() {
+    egraph(
+        r#"
+(sort Thunk (UnstableFn () Math))
+(constructor Delay (Thunk) Math)
+(let $x (Var "x"))
+(let $e (Delay (unstable-fn "Add" $x (Num 1))))
+(let $copy (unstable-subst $e (map-insert (map-empty) $x (Num 5))))
+(check (= $copy (Delay (unstable-fn "Add" (Num 5) (Num 1)))))
+(fail (check (= $copy $e)))
+"#,
+    );
+}
+
 /// A cyclic e-class is copied as long as one of its e-nodes has all its
 /// children outside the cycle: that e-node's `lookup_or_insert` names the copy,
 /// and the cyclic e-node then unions into it. No e-class id is invented.
