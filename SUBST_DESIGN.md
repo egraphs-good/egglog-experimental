@@ -65,11 +65,14 @@ Consequences worth stating out loud:
   `x * 0` result above would come back as a bare `(Mul (Num 5) (Num 0))` not
   known to equal `0`. A running rule set would re-derive that; a one-shot
   substitution would not.
-* **Only committed rows are visible.** The walk reads tables, and an action's
-  writes are staged until the action finishes, so a term built in the same
-  action comes back unsubstituted. Terms from earlier commands and earlier rule
-  iterations are fine — which is what the `:naive` beta-reduction shape needs —
-  but `(unstable-subst (Mul x y) m)` in one action does not work.
+* **`root` must already exist.** The walk reads tables, and an action's writes
+  stay staged until the action finishes. A root the enclosing action just built
+  has no rows yet, so the walk finds nothing under it and returns it *unchanged
+  and without an error* — `(unstable-subst (Mul x y) m)`, building its own
+  argument, silently does nothing. Pass a root the rule's query bound, or one
+  from an earlier command; that is what the `:naive` beta-reduction shape does.
+  Replacements are exempt: a map's values are spliced into the copy without
+  being walked, so those can be built in the same action.
 * **No e-class id is ever invented.** Every copied e-node goes in through
   `lookup_or_insert`, exactly as `(Add a b)` in an action does, so egglog names
   the copy. The consequence is the cycle rule below.

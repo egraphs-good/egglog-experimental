@@ -17,13 +17,9 @@ default = ["bin"]
 bin = ["egglog/bin"]
 
 [dependencies]
-# Points at egraphs-good/egglog#986, which adds the e-graph introspection
-# `unstable-subst` is built on (Read::enodes_for_eclass, Read::table_schema /
-# table_subtype, Core::rebuild_container). Move back to an egraphs-good rev once
-# that PR merges.
-egglog = { git = "https://github.com/oflatt-claude/egglog.git", rev = "53f4fe588fc22f2ca6a9762a4c019cb6deec195d", default-features = false }
-egglog-ast = { git = "https://github.com/oflatt-claude/egglog.git", rev = "53f4fe588fc22f2ca6a9762a4c019cb6deec195d", default-features = false }
-egglog-reports = { git = "https://github.com/oflatt-claude/egglog.git", rev = "53f4fe588fc22f2ca6a9762a4c019cb6deec195d", default-features = false }
+egglog = { git = "https://github.com/egraphs-good/egglog.git", rev = "c2c0f1510a3633b768fb3d30ad284b211290e4b2", default-features = false }
+egglog-ast = { git = "https://github.com/egraphs-good/egglog.git", rev = "c2c0f1510a3633b768fb3d30ad284b211290e4b2", default-features = false }
+egglog-reports = { git = "https://github.com/egraphs-good/egglog.git", rev = "c2c0f1510a3633b768fb3d30ad284b211290e4b2", default-features = false }
 
 num = "0.4.3"
 lazy_static = "1.4"

@@ -13,7 +13,22 @@
 //! Unaffected e-classes are shared with the original rather than copied, so
 //! substituting an empty map returns `root` itself and writes nothing.
 //!
-//! Three properties are worth knowing before relying on this:
+//! # Warning: `root` must already exist
+//!
+//! Pass a root the rule's query bound, or one from an earlier command — not a
+//! term the enclosing action just built.
+//!
+//! The walk reads committed table contents, and an action's writes stay staged
+//! until it finishes. A root this action built has no rows yet, so the walk
+//! finds no e-nodes under it, nothing is affected, and it comes back
+//! **unchanged and without an error**. `(unstable-subst (Mul x y) m)`, building
+//! its own argument, silently does nothing. The same applies to any term under
+//! the root that the action just built: it is not there to be substituted.
+//!
+//! Replacements are not affected — a map's values are spliced into the copy
+//! without being walked, so those can be built in the same action.
+//!
+//! # Other properties worth knowing
 //!
 //! - The region's equations are substituted along with its terms. Copying an
 //!   e-class copies every one of its e-nodes, so `t1 = t2` in the original
@@ -23,9 +38,6 @@
 //!   classes (anything a rewrite rule derived) and wrong for a ground `union`
 //!   pinning one of them down, so only substitute classes that behave like
 //!   universally quantified variables.
-//! - The walk reads committed table contents, so a term the enclosing action
-//!   has only just staged is not visible to it and comes back unsubstituted.
-//!   Terms from earlier commands, and from earlier rule iterations, are fine.
 //! - The snapshot comes from live table contents, so this is a `Context::Full`
 //!   primitive: top-level actions and `:naive` rule heads only.
 //!
@@ -50,8 +62,7 @@ use egglog::{
 /// The name of the primitive, as written in an egglog program.
 pub const SUBST: &str = "unstable-subst";
 
-/// A constructor the walk can follow. Resolved from the e-graph's signatures at
-/// the start of each call, since an e-graph gains constructors over time.
+/// A constructor the walk can follow.
 type Constructor<'a> = &'a FuncType;
 
 /// What a column of a given sort holds, as far as the walk cares.
@@ -112,13 +123,12 @@ struct Walk<'a> {
     /// The copy of each affected e-class that has been named so far.
     images: HashMap<Value, Value>,
     container_images: HashMap<Value, Value>,
-    /// The e-class leaves of a container value, flattened through nesting.
+    /// Memo for [`Walk::container_leaves`].
     container_leaves: HashMap<Value, Vec<(ArcSort, Value)>>,
 }
 
-/// The constructors with an eq-sort output, which are the rows that make up the
-/// term structure. Function tables are analyses over that structure, and
-/// globals lower to function tables, so both stay out of the walk.
+/// The constructors with an eq-sort output: the rows that make up the term
+/// structure. Resolved per call, since an e-graph gains constructors over time.
 fn constructors<'db>(state: &FullState<'_, 'db>) -> Vec<Constructor<'db>> {
     let names: Vec<String> = state
         .table_sizes()
@@ -138,6 +148,10 @@ fn constructors<'db>(state: &FullState<'_, 'db>) -> Vec<Constructor<'db>> {
 
 /// Substitute `map` through the sub-e-graph reachable from `root`, returning
 /// the root of the copy. See the module docs for the semantics.
+///
+/// `root` must be an e-class that already has rows: one the query bound, or
+/// one from an earlier command. A root the enclosing action just built is not
+/// in the tables yet and comes back unchanged, with no error.
 pub fn substitute<'db>(
     state: &mut FullState<'_, 'db>,
     root: Value,
@@ -483,6 +497,8 @@ fn error(message: String) -> Error {
 /// `root` are copied with each key e-class replaced by its mapped value;
 /// e-classes the substitution does not affect are shared with the original
 /// rather than copied.
+///
+/// `root` must be an e-class that already has rows — see the module docs.
 ///
 /// Errors if the substituted region contains a cycle in which every e-node
 /// refers back into the cycle, since naming that copy would require an e-class

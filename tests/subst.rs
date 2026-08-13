@@ -151,8 +151,8 @@ fn a_ground_equation_about_a_key_is_substituted_too() {
 
 /// A row an action has only just staged is not in the tables the walk reads,
 /// so a term built in the same action is invisible to it and comes back
-/// unsubstituted. Terms from earlier commands, and from earlier rule
-/// iterations, are fine.
+/// unsubstituted — with no error. Terms from earlier commands, and from
+/// earlier rule iterations, are fine.
 #[test]
 fn does_not_see_terms_built_in_the_same_action() {
     let mut eg = egraph(
@@ -163,6 +163,21 @@ fn does_not_see_terms_built_in_the_same_action() {
 "#,
     );
     assert_eq!(global(&mut eg, "copy"), global(&mut eg, "unsubstituted"));
+}
+
+/// The staging limit is about the region being walked, not the replacements:
+/// a map's values are spliced into the copy without being walked, so building
+/// one in the same action is fine.
+#[test]
+fn a_replacement_built_in_the_same_action_is_fine() {
+    egraph(
+        r#"
+(let $x (Var "x"))
+(let $e (Add $x (Num 1)))
+(let $copy (unstable-subst $e (map-insert (map-empty) $x (Mul (Num 2) (Num 3)))))
+(check (= $copy (Add (Mul (Num 2) (Num 3)) (Num 1))))
+"#,
+    );
 }
 
 /// A cyclic e-class is copied as long as one of its e-nodes has all its
@@ -409,7 +424,7 @@ fn the_rust_api_substitutes() {
 
 #[test]
 fn a_popped_constructor_is_not_walked() {
-    let mut eg = egraph(
+    egraph(
         r#"
 (let $x (Var "x"))
 (push)
@@ -421,5 +436,4 @@ fn a_popped_constructor_is_not_walked() {
 (check (= $copy (Add (Num 2) (Num 1))))
 "#,
     );
-    let _ = &mut eg;
 }
