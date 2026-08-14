@@ -165,6 +165,31 @@ fn does_not_see_terms_built_in_the_same_action() {
     assert_eq!(global(&mut eg, "copy"), global(&mut eg, "unsubstituted"));
 }
 
+/// A key e-class is replaced whole, never walked into, so the other e-nodes in
+/// it do not get copied alongside the replacement. With `{Lit 1, Var "x"}` in
+/// one class and `x |-> 2`, the copy holds `2` and nothing asserts `1 = 2`.
+///
+/// Contrast `a_ground_equation_about_a_key_is_substituted_too`, where the class
+/// is affected but *not* a key: there every e-node is copied.
+#[test]
+fn a_key_eclass_is_replaced_whole() {
+    egraph(
+        r#"
+(let $x (Var "x"))
+(let $one (Num 1))
+(union $x $one)
+(let $e (Add $x (Num 3)))
+(let $copy (unstable-subst $e (map-insert (map-empty) $x (Num 2))))
+(check (= $copy (Add (Num 2) (Num 3))))
+;; the other e-node of the key class is not dragged along
+(fail (check (= (Num 1) (Num 2))))
+;; and the original class is untouched
+(check (= (Num 1) (Var "x")))
+(fail (check (= $copy $e)))
+"#,
+    );
+}
+
 /// The staging limit is about the region being walked, not the replacements:
 /// a map's values are spliced into the copy without being walked, so building
 /// one in the same action is fine.
