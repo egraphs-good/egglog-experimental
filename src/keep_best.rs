@@ -95,11 +95,11 @@ fn collect_and_extract(
             .get_function(table_name)
             .ok_or_else(|| TypeError::UnboundFunction(table_name.clone(), span!()))?;
 
-        let all_sorts: Vec<ArcSort> = func
-            .schema()
+        let func_type = func.func_type();
+        let all_sorts: Vec<ArcSort> = func_type
             .input
             .iter()
-            .chain(std::iter::once(&func.schema().output))
+            .chain(std::iter::once(&func_type.output))
             .cloned()
             .collect();
 
