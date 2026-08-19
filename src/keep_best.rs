@@ -17,6 +17,11 @@ use egglog::{
     span,
 };
 
+/// User-defined command implementing `(keep-best "table"...)`.
+///
+/// For every row in the named tables, the command extracts the best term for
+/// each value. It then **clears every function in the e-graph** and reinserts
+/// only the extracted rows from the named tables.
 pub struct KeepBestCommand;
 
 impl UserDefinedCommand for KeepBestCommand {

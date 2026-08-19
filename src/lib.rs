@@ -1,23 +1,49 @@
+#![warn(missing_docs)]
 //! # egglog-experimental
 //!
-//! This crate layers several experimental features on top of the core
-//! [`egglog`](https://github.com/egraphs-good/egglog) language and runtime.
-//! It can serve as a standard library when building equality
-//! saturation workflows in Rust.
+//! Experimental extensions to the [`egglog`] language and runtime.
 //!
-//! ## Implemented extensions
+//! Start with [`new_experimental_egraph`] to get an e-graph with every
+//! extension registered:
 //!
-//! - Language and values: exact rationals, one-shot `for` rules, grouped
-//!   `with-ruleset` declarations, body-defined primitives, and fresh values in
-//!   rule actions.
-//! - Scheduling and extraction: extended schedules, named back-off schedulers,
-//!   dynamic costs, multi-extraction, and `keep-best` compaction.
-//! - Inspection: table-size queries and per-table column and out-degree
+//! ```
+//! use egglog_experimental::new_experimental_egraph;
+//!
+//! let mut egraph = new_experimental_egraph();
+//! egraph.parse_and_run_program(
+//!     None,
+//!     "(datatype Math (Num i64)) (extract (Num 1))",
+//! )?;
+//! # Ok::<(), egglog_experimental::Error>(())
+//! ```
+//!
+//! ## Language and values
+//!
+//! - [`RationalSort`] adds exact `Rational` values and numeric primitives.
+//! - [`For`] implements `(for (fact...) (action...))`, a rule that runs once
+//!   over the current matches.
+//! - [`WithRuleset`] groups rules and rewrites with
+//!   `(with-ruleset name command...)`.
+//! - `(primitive name (InputSort...) OutputSort body)` defines a primitive in
+//!   egglog. Body arguments are named `_0`, `_1`, and so on; calls to existing
+//!   primitives, functions, and globals determine the required access mode.
+//! - `(unstable-fresh! Sort [:cost N] [:unextractable])` creates a fresh value
+//!   for each match of a rule action.
+//!
+//! ## Scheduling and extraction
+//!
+//! - [`scheduling`] documents the extended `run-schedule` language and named
+//!   schedulers.
+//! - [`DynamicCostModel`] supports runtime costs declared with
+//!   `with-dynamic-cost` and changed with `set-cost`.
+//! - [`MultiExtract`] implements `(multi-extract n term...)`.
+//! - [`KeepBestCommand`] compacts selected tables to their best terms.
+//!
+//! ## Inspection
+//!
+//! - [`GetSizePrimitive`] implements `(get-size! "table"...)`.
+//! - [`PrintTableStatsCommand`] reports table cardinality and out-degree
 //!   statistics.
-//!
-//! The [feature guide](https://github.com/egraphs-good/egglog-experimental#features)
-//! gives concise syntax and runnable examples. This crate's modules document
-//! the Rust APIs behind the extensions.
 //!
 use egglog::ast::Parser;
 use egglog::prelude::add_base_sort;
@@ -48,7 +74,11 @@ pub use sugar::*;
 mod keep_best;
 pub use keep_best::KeepBestCommand;
 
-/// Creates an [`EGraph`] with every egglog-experimental extension registered.
+/// Creates a default [`EGraph`] with every experimental extension registered.
+///
+/// This is the recommended entry point for running egglog programs that use
+/// this crate. Use [`experimental_parser`] instead when only the parse-time
+/// `for` and `with-ruleset` macros are needed.
 pub fn new_experimental_egraph() -> EGraph {
     let mut egraph = EGraph::default();
 

@@ -18,8 +18,9 @@
 //! - **`(run-with scheduler [ruleset] [:until cond])`** — like `run`, but drives
 //!   the ruleset with a named scheduler previously bound by `let-scheduler`.
 //! - **`(let-scheduler name (scheduler-kind args...))`** — bind `name` to a fresh
-//!   scheduler instance (e.g. `(back-off :match-limit 1000 :ban-length 5)`).
-//!   The binding is scoped to the enclosing `seq`/`saturate`/`repeat` block.
+//!   scheduler instance (e.g. `(back-off :match-limit 1000 :ban-length 5)`). A
+//!   binding inside `run-schedule` is scoped to its enclosing block; a top-level
+//!   binding persists on the e-graph.
 //! - **`(seq step...)`** — run each step once, in order.
 //! - **`(saturate step...)`** — repeatedly run the body until it makes no further
 //!   progress (the accumulated report's `can_stop` is set).
@@ -68,9 +69,21 @@ type PermanentSchedulerState = HashMap<String, SchedulerId>;
 /// See the [module-level documentation](self) for the full schedule language.
 pub struct RunExtendedSchedule;
 
+/// User-defined command implementing
+/// `(let-scheduler name (scheduler-kind args...))`.
+///
+/// A top-level binding persists on the e-graph and can be used by later
+/// `run-schedule` commands. See the [module documentation](self) for scoped
+/// bindings inside a schedule.
 pub struct LetSchedulerCommand;
 
+/// Factory interface for constructing a scheduler from parsed egglog
+/// arguments.
+///
+/// Scheduler registration uses [`add_scheduler_builder`], which accepts the
+/// equivalent closure directly.
 pub trait SchedulerGen {
+    /// Creates a fresh scheduler for `egraph` from `args`.
     fn new_scheduler(&self, egraph: &egglog::EGraph, args: &[Expr]) -> Box<dyn Scheduler>;
 }
 
@@ -97,6 +110,11 @@ lazy_static! {
     };
 }
 
+/// Registers a scheduler constructor for use by `let-scheduler`.
+///
+/// The builder receives the current e-graph, the scheduler expression's source
+/// span, and its unevaluated arguments. Registration is process-global;
+/// registering the same name again replaces the previous builder.
 pub fn add_scheduler_builder(name: String, builder: SchedulerBuilder) {
     scheduler_libs.lock().unwrap().insert(name, builder);
 }

@@ -83,10 +83,14 @@ pub struct TableStats {
 /// S-expression so it composes with the rest of egglog's output format.
 #[derive(Debug)]
 pub struct TableStatsOutput {
+    /// Statistics in the same order they are rendered.
     pub stats: Vec<TableStats>,
 }
 
 /// User-defined command implementing `(print-table-stats <name>?)`.
+///
+/// With no argument it reports every visible function table. One unquoted
+/// function name limits the report to that table.
 pub struct PrintTableStatsCommand;
 
 impl OutDegreeStats {
