@@ -525,7 +525,10 @@
 
 - Exact producer-dependency worklist through containers: tried in Experiment 20 and kept. This was the largest remaining win.
 - Materialize cost sets only for winning candidates: tried in Experiment 19 and rejected. The measured change was below noise while adding mutable scratch state and a second candidate-cost path.
-- Lower-bound rejection: not implemented in this generic extractor. It is only safe under nonnegative monotone cost assumptions, but the current `DagCostModel<C>` remains generic over signed/custom costs.
+- Lower-bound rejection: not implemented in this generic extractor. It is only
+  safe when combining another marginal cannot reduce a cost. The current
+  `CombinableCost` laws require monotonicity but do not require the identity to
+  be a lower bound, so custom costs may still violate that stronger assumption.
 - Deterministic complete relaxation: kept as a design constraint for Experiment 20. The producer table changes scheduling and storage, while still evaluating the same reachable producer rows with the same `compute_cost_hyperedge` logic.
 - Tiny exact oracle / ILP quality checks: deferred. Useful for a future quality-focused extractor suite, but not necessary to validate these behavior-preserving scheduling/data-structure changes.
 - Quality-changing boosted/pruned extractors: deferred to separate extractor modes. They should not be hidden behind `:extractor greedy-dag` because quality tradeoffs need explicit user control.
@@ -1120,3 +1123,37 @@
 - Decision:
   - Keep the checked-in greedy-DAG Taylor copy and use these numbers in the PR
     performance section.
+
+## Experiment 38: core cost-trait refactor canary
+
+- Status: complete
+- Date: 2026-08-19
+- Question: does moving the marginal/combinable cost interfaces into core and
+  removing selected child costs from greedy-DAG marginal callbacks regress tree
+  or greedy-DAG extraction?
+- Baseline:
+  - `egglog-experimental` commit
+    `df3a870dd6a7c14c7f857ff54157314032dde1e8`.
+  - Core egglog commit
+    `38c3aebd14084d481fb0ba1f37065dbf93ebddf7`, before the uncommitted cost-trait
+    refactor.
+- Candidate:
+  - The same two commits plus the paired uncommitted core and experimental
+    cost-trait changes.
+- Input:
+  - Tree: checked-in `tests/taylor51.egg`.
+  - Greedy DAG: the historical checked-in `tests/greedy-dag-taylor.egg` from
+    before the extractor moved to `egglog-experimental`.
+- Exact command shape:
+  - Build both `egglog-experimental` binaries in release mode, patching each to
+    the corresponding core checkout.
+  - `hyperfine --warmup 2 --runs 10 <baseline/current tree and greedy-DAG commands>`.
+- Observed result:
+  - Baseline tree: `1.038 s +/- 0.025 s`.
+  - Candidate tree: `1.024 s +/- 0.015 s`.
+  - Baseline greedy DAG: `227.4 ms +/- 4.4 ms`.
+  - Candidate greedy DAG: `225.4 ms +/- 4.7 ms`.
+  - Candidate greedy DAG was `4.54 +/- 0.12` times faster than candidate tree.
+- Decision:
+  - Keep the trait refactor. Neither extractor regressed in this canary; both
+    candidate means were slightly lower than their exact-revision baselines.

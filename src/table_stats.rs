@@ -215,7 +215,7 @@ fn compute_table_stats(egraph: &EGraph, func_name: &str) -> Result<TableStats, E
     let func = egraph
         .get_function(func_name)
         .ok_or_else(|| TypeError::UnboundFunction(func_name.to_owned(), Span::Panic))?;
-    let schema = func.schema();
+    let schema = func.func_type();
     let mut column_types: Vec<String> = schema.input.iter().map(|s| s.name().to_owned()).collect();
     column_types.push(schema.output.name().to_owned());
     let n_cols = column_types.len();

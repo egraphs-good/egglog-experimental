@@ -1,3 +1,13 @@
+//! Greedy DAG extraction over intrinsic marginal costs.
+//!
+//! The extractor takes a [`CombinableCost`] and a [`MarginalCostModel`]. It
+//! tracks the reachable `(sort, value)` dependencies for each candidate and
+//! charges each dependency's marginal cost once, even when the returned
+//! [`TermDag`] shares it. Marginal costs may inspect egraph values and analyses,
+//! but they are independent of selected child extraction costs; objectives that
+//! depend on those costs belong in core's [`egglog::extract::FoldCostModel`] or
+//! [`egglog::extract::TotalCostModel`].
+
 use crate::secondary_map::{
     AggregatedSparseSecondaryMap, InternId, Interner, InternerBuilder, SecondaryMap, SecondarySet,
 };
@@ -5,104 +15,12 @@ use egglog::{
     ArcSort, EGraph, Enode, Error, Function, Read, TermDag, TermId, Value,
     ast::{Expr, ParseError},
     extract::{
-        BaseCostModel, Cost, DefaultCost, ExtractedTerm, ExtractedTermVariants, ExtractedTerms,
-        TreeAdditiveCostModel, TreeCostModel,
+        CombinableCost, ExtractedTerm, ExtractedTermVariants, ExtractedTerms, MarginalCostModel,
     },
 };
 use std::collections::VecDeque;
 use std::collections::{HashMap, HashSet};
-use std::fmt::Debug;
 use std::sync::Arc;
-
-/// An interface for DAG extraction cost models.
-///
-/// DAG extraction charges each selected `(sort, value)` dependency once, so it
-/// requires marginal costs for adding a single unique node.
-pub trait DagCostModel<C: Cost>: BaseCostModel<C> {
-    /// The marginal cost of adding this e-node, not including child costs.
-    ///
-    /// `child_costs` gives the selected child DAG costs for context.
-    fn marginal_enode_cost(
-        &self,
-        egraph: &EGraph,
-        func: &Function,
-        enode: &Enode<'_>,
-        child_costs: &[C],
-    ) -> C;
-
-    /// The marginal cost of adding this container value, not including elements.
-    ///
-    /// The default is the identity cost, matching the default total container
-    /// cost of just combining the elements.
-    fn marginal_container_cost(
-        &self,
-        egraph: &EGraph,
-        sort: &ArcSort,
-        value: Value,
-        element_costs: &[C],
-    ) -> C {
-        let _egraph = egraph;
-        let _sort = sort;
-        let _value = value;
-        let _element_costs = element_costs;
-        C::identity()
-    }
-}
-
-/// Adapts a [`DagCostModel`] so it can be used with core tree extraction.
-///
-/// `TreeCostModel` lives in core egglog, so Rust's orphan rules do not let this
-/// crate blanket-implement it for every `M: DagCostModel`. This adapter derives
-/// tree total costs by combining a node's marginal DAG cost with its child
-/// total costs.
-pub struct TreeCostModelFromDag<M>(pub M);
-
-impl<C: Cost, M: DagCostModel<C>> BaseCostModel<C> for TreeCostModelFromDag<M> {
-    fn base_value_cost(&self, egraph: &EGraph, sort: &ArcSort, value: Value) -> C {
-        self.0.base_value_cost(egraph, sort, value)
-    }
-}
-
-impl<C: Cost, M: DagCostModel<C>> TreeCostModel<C> for TreeCostModelFromDag<M> {
-    fn total_enode_cost(
-        &self,
-        egraph: &EGraph,
-        func: &Function,
-        enode: &Enode<'_>,
-        child_costs: &[C],
-    ) -> C {
-        child_costs.iter().fold(
-            self.0.marginal_enode_cost(egraph, func, enode, child_costs),
-            |cost, child| cost.combine(child),
-        )
-    }
-
-    fn total_container_cost(
-        &self,
-        egraph: &EGraph,
-        sort: &ArcSort,
-        value: Value,
-        element_costs: &[C],
-    ) -> C {
-        element_costs.iter().fold(
-            self.0
-                .marginal_container_cost(egraph, sort, value, element_costs),
-            |cost, child| cost.combine(child),
-        )
-    }
-}
-
-impl DagCostModel<DefaultCost> for TreeAdditiveCostModel {
-    fn marginal_enode_cost(
-        &self,
-        egraph: &EGraph,
-        func: &Function,
-        enode: &Enode<'_>,
-        _child_costs: &[DefaultCost],
-    ) -> DefaultCost {
-        TreeCostModel::total_enode_cost(self, egraph, func, enode, &[])
-    }
-}
 
 pub(crate) fn parse_extractor_keyword(keyword: &Expr, extractor: &Expr) -> Result<bool, Error> {
     match keyword {
@@ -178,14 +96,6 @@ fn parse_use_greedy_dag(arg: &Expr) -> Result<bool, Error> {
 /// total, so cost comparison does not require subtraction or inspecting
 /// the cost type.
 type PaidDagCosts<C> = AggregatedSparseSecondaryMap<DagCostKey, C>;
-
-/// Cost information for the already-selected child DAGs of one candidate node.
-///
-/// The first vector stores each child's once-paid dependency set, which is
-/// unioned to score sharing for the candidate DAG. The second vector stores the
-/// corresponding child total costs, which are passed to the user cost model for
-/// context when computing this node's marginal cost.
-type ChildDagCosts<C> = (Vec<Arc<PaidDagCosts<C>>>, Vec<C>);
 
 /// Keyed on sort and value, since the same value of different sorts can have different extractions
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -300,7 +210,7 @@ impl ProducerRowsBuilder {
 /// Cost and producer row are stored together because they are a single
 /// invariant: reconstruction is valid exactly when a value has a chosen
 /// producer row with the corresponding once-paid DAG cost set.
-struct BestProducer<C: Cost + Ord + Eq + Clone + Debug> {
+struct BestProducer<C: CombinableCost> {
     costs: Arc<PaidDagCosts<C>>,
     producer_row: ProducerRowId,
 }
@@ -312,7 +222,7 @@ struct BestProducer<C: Cost + Ord + Eq + Clone + Debug> {
 /// eq-sort value while charging each selected `(sort, value)` dependency at
 /// most once. This is not globally optimal, but it is much cheaper than an
 /// exact DAG extractor and avoids the optimal-substructure assumption required
-/// by encoding DAG sharing inside a normal [`TreeCostModel`].
+/// by encoding DAG sharing inside a normal `TotalCostModel`.
 ///
 /// Multiple requested roots share this single producer choice for any reachable
 /// `(sort, value)`. That keeps reconstruction simple and makes sharing explicit
@@ -320,8 +230,8 @@ struct BestProducer<C: Cost + Ord + Eq + Clone + Debug> {
 /// extractors that need different subterms for the same e-class under different
 /// roots. See extraction-gym's discussion of that limitation:
 /// https://github.com/egraphs-good/extraction-gym/issues/36.
-pub struct GreedyDagExtractor<C: Cost + Ord + Eq + Clone + Debug> {
-    cost_model: Box<dyn DagCostModel<C>>,
+pub struct GreedyDagExtractor<C: CombinableCost> {
+    cost_model: Box<dyn MarginalCostModel<C>>,
 
     /// Sort-name interner used only to build compact [`DagCostKey`]s.
     sort_ids: Interner<String>,
@@ -399,9 +309,9 @@ impl ReachableExtractionBuilder {
                 func.is_constructor()
                     && !func.is_hidden()
                     && !func.is_unextractable()
-                    && func.schema().output.name() == sort_name
+                    && func.func_type().output.name() == sort_name
             })
-            .map(|(func_name, func)| (func_name.clone(), func.schema().input.clone()))
+            .map(|(func_name, func)| (func_name.clone(), func.func_type().input.clone()))
             .collect();
 
         for (func_name, input_sorts) in constructors {
@@ -449,11 +359,11 @@ impl ReachableExtractionBuilder {
     }
 }
 
-impl<C: Cost + Ord + Eq + Clone + Debug> GreedyDagExtractor<C> {
+impl<C: CombinableCost> GreedyDagExtractor<C> {
     fn prepare(
         egraph: &EGraph,
         roots: &[(ArcSort, Value)],
-        cost_model: impl DagCostModel<C> + 'static,
+        cost_model: impl MarginalCostModel<C> + 'static,
     ) -> Self {
         // Build the root-local problem: collect extractable functions, intern
         // reachable `(sort, value)` dependencies, and record producer rows with
@@ -513,20 +423,18 @@ impl<C: Cost + Ord + Eq + Clone + Debug> GreedyDagExtractor<C> {
         egraph: &EGraph,
         children: impl IntoIterator<Item = (Value, &'a ArcSort)>,
         reject_reachable_key: Option<InternId<DagCostKey>>,
-    ) -> Option<ChildDagCosts<C>> {
+    ) -> Option<Vec<Arc<PaidDagCosts<C>>>> {
         let mut child_cost_sets = Vec::new();
-        let mut child_costs = Vec::new();
 
         for (value, sort) in children {
             let child_cost_set = self.compute_cost_node(egraph, value, sort)?;
             if reject_reachable_key.is_some_and(|key| child_cost_set.contains(key)) {
                 return None;
             }
-            child_costs.push(child_cost_set.total().clone());
             child_cost_sets.push(child_cost_set);
         }
 
-        Some((child_cost_sets, child_costs))
+        Some(child_cost_sets)
     }
 
     fn add_marginal_cost(
@@ -552,12 +460,9 @@ impl<C: Cost + Ord + Eq + Clone + Debug> GreedyDagExtractor<C> {
             let children = elements
                 .iter()
                 .map(|(child_sort, child_value)| (*child_value, child_sort));
-            let (child_cost_sets, child_costs) =
-                self.compute_child_dag_costs(egraph, children, None)?;
+            let child_cost_sets = self.compute_child_dag_costs(egraph, children, None)?;
 
-            let container_self_cost =
-                self.cost_model
-                    .marginal_container_cost(egraph, sort, value, &child_costs);
+            let container_self_cost = self.cost_model.marginal_container_cost(egraph, sort, value);
             Some(self.add_marginal_cost(
                 &child_cost_sets,
                 self.reachable_cost_key(sort, value)?,
@@ -590,14 +495,11 @@ impl<C: Cost + Ord + Eq + Clone + Debug> GreedyDagExtractor<C> {
         let children = enode
             .children
             .iter()
-            .zip(func.schema().input.iter())
+            .zip(func.func_type().input.iter())
             .map(|(value, sort)| (*value, sort));
-        let (child_cost_sets, child_costs) =
-            self.compute_child_dag_costs(egraph, children, Some(target_key))?;
+        let child_cost_sets = self.compute_child_dag_costs(egraph, children, Some(target_key))?;
 
-        let node_cost = self
-            .cost_model
-            .marginal_enode_cost(egraph, func, enode, &child_costs);
+        let node_cost = self.cost_model.marginal_enode_cost(egraph, func, enode);
         Some(self.add_marginal_cost(&child_cost_sets, target_key, node_cost))
     }
 
@@ -623,7 +525,7 @@ impl<C: Cost + Ord + Eq + Clone + Debug> GreedyDagExtractor<C> {
         let Some((new_cost_set, target_key)) = ({
             let producer_row = self.producer_rows.get(producer_row_id);
             let func = egraph.get_function(&producer_row.func_name).unwrap();
-            let target_sort = &func.schema().output;
+            let target_sort = &func.func_type().output;
             let target = producer_row.eclass;
             let Some(target_key) = self.reachable_cost_key(target_sort, target) else {
                 return false;
@@ -723,7 +625,11 @@ impl<C: Cost + Ord + Eq + Clone + Debug> GreedyDagExtractor<C> {
     ) -> TermId {
         let func = egraph.get_function(&producer_row.func_name).unwrap();
         let mut ch_terms: Vec<TermId> = Vec::new();
-        for (value, sort) in producer_row.children.iter().zip(func.schema().input.iter()) {
+        for (value, sort) in producer_row
+            .children
+            .iter()
+            .zip(func.func_type().input.iter())
+        {
             ch_terms
                 .push(self.reconstruct_termdag_node_helper(egraph, termdag, *value, sort, cache));
         }
@@ -805,7 +711,7 @@ impl<C: Cost + Ord + Eq + Clone + Debug> GreedyDagExtractor<C> {
 
             for (producer_row_id, producer_row) in self.producer_rows.iter() {
                 let func = egraph.get_function(&producer_row.func_name).unwrap();
-                let target_sort = &func.schema().output;
+                let target_sort = &func.func_type().output;
                 if sort.name() != target_sort.name() {
                     continue;
                 }
@@ -852,11 +758,11 @@ impl<C: Cost + Ord + Eq + Clone + Debug> GreedyDagExtractor<C> {
 
 /// Extract the best greedy-DAG term for each requested `(sort, value)` root.
 ///
-/// Shared subterms are charged once according to the DAG cost model. When
+/// Shared subterms are charged once according to the marginal cost model. When
 /// multiple roots reach the same `(sort, value)`, this greedy extractor uses
 /// one shared producer choice for that value rather than choosing root-specific
 /// alternatives.
-pub fn extract_best_greedy_dag<C: Cost + Ord + Eq + Clone + Debug, M: DagCostModel<C> + 'static>(
+pub fn extract_best_greedy_dag<C: CombinableCost, M: MarginalCostModel<C> + 'static>(
     egraph: &EGraph,
     roots: Vec<(ArcSort, Value)>,
     cost_model: M,
@@ -875,10 +781,7 @@ pub fn extract_best_greedy_dag<C: Cost + Ord + Eq + Clone + Debug, M: DagCostMod
 }
 
 /// Extract up to `nvariants` greedy-DAG root variants for each requested root.
-pub fn extract_variants_greedy_dag<
-    C: Cost + Ord + Eq + Clone + Debug,
-    M: DagCostModel<C> + 'static,
->(
+pub fn extract_variants_greedy_dag<C: CombinableCost, M: MarginalCostModel<C> + 'static>(
     egraph: &EGraph,
     roots: Vec<(ArcSort, Value)>,
     nvariants: usize,

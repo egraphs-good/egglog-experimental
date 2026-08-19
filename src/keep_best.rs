@@ -8,9 +8,7 @@
 //! Each argument must evaluate to a `String` that names an existing function.
 
 use crate::DynamicCostModel;
-use crate::greedy_dag_extract::{
-    TreeCostModelFromDag, extract_best_greedy_dag, split_trailing_extractor,
-};
+use crate::greedy_dag_extract::{extract_best_greedy_dag, split_trailing_extractor};
 use crate::table_rows::{for_each_row, is_constructor};
 use egglog::{
     ArcSort, CommandOutput, EGraph, Error, RawValues, TermDag, TermId, TypeError,
@@ -99,10 +97,10 @@ fn collect_and_extract(
             .ok_or_else(|| TypeError::UnboundFunction(table_name.clone(), span!()))?;
 
         let all_sorts: Vec<ArcSort> = func
-            .schema()
+            .func_type()
             .input
             .iter()
-            .chain(std::iter::once(&func.schema().output))
+            .chain(std::iter::once(&func.func_type().output))
             .cloned()
             .collect();
 
@@ -123,7 +121,7 @@ fn collect_and_extract(
         let extracted = if use_greedy_dag {
             extract_best_greedy_dag(egraph, roots, DynamicCostModel)
         } else {
-            egraph.extract_best(roots, TreeCostModelFromDag(DynamicCostModel))
+            egraph.extract_best(roots, DynamicCostModel)
         }
         .map_err(|_| {
             Error::ExtractError(format!(

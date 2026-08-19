@@ -1,14 +1,13 @@
 use crate::{
     Error,
     greedy_dag_extract::{
-        DagCostModel, TreeCostModelFromDag, extract_best_greedy_dag, extract_variants_greedy_dag,
-        parse_extractor_keyword,
+        extract_best_greedy_dag, extract_variants_greedy_dag, parse_extractor_keyword,
     },
 };
 use egglog::{
     ArcSort, CommandOutput, EGraph, Enode, RawValues, Read, TermId, UserDefinedCommand, Value,
     ast::*,
-    extract::{BaseCostModel, DefaultCost, TreeAdditiveCostModel},
+    extract::{AdditiveCostModel, BaseCostModel, DefaultCost, FoldCostModel, MarginalCostModel},
     span,
     util::FreshGen,
 };
@@ -190,25 +189,23 @@ pub struct DynamicCostModel;
 
 impl BaseCostModel<DefaultCost> for DynamicCostModel {
     fn base_value_cost(&self, egraph: &EGraph, sort: &ArcSort, value: Value) -> DefaultCost {
-        BaseCostModel::base_value_cost(&TreeAdditiveCostModel::default(), egraph, sort, value)
+        BaseCostModel::base_value_cost(&AdditiveCostModel::default(), egraph, sort, value)
     }
 }
 
-impl DagCostModel<DefaultCost> for DynamicCostModel {
+impl MarginalCostModel<DefaultCost> for DynamicCostModel {
     fn marginal_enode_cost(
         &self,
         egraph: &EGraph,
         func: &egglog::Function,
         enode: &Enode<'_>,
-        _child_costs: &[DefaultCost],
     ) -> DefaultCost {
         let default_cost = || {
-            DagCostModel::marginal_enode_cost(
-                &TreeAdditiveCostModel::default(),
+            MarginalCostModel::marginal_enode_cost(
+                &AdditiveCostModel::default(),
                 egraph,
                 func,
                 enode,
-                &[],
             )
         };
         let name = get_cost_table_name(func.name());
@@ -235,6 +232,8 @@ impl DagCostModel<DefaultCost> for DynamicCostModel {
         }
     }
 }
+
+impl FoldCostModel<DefaultCost> for DynamicCostModel {}
 
 struct CustomExtract;
 
@@ -301,7 +300,7 @@ impl UserDefinedCommand for CustomExtract {
             let extracted = if use_greedy_dag {
                 extract_best_greedy_dag(egraph, roots, DynamicCostModel)?
             } else {
-                egraph.extract_best(roots, TreeCostModelFromDag(DynamicCostModel))?
+                egraph.extract_best(roots, DynamicCostModel)?
             };
             let root = extracted
                 .terms
@@ -327,11 +326,7 @@ impl UserDefinedCommand for CustomExtract {
             let extracted = if use_greedy_dag {
                 extract_variants_greedy_dag(egraph, roots, n as usize, DynamicCostModel)?
             } else {
-                egraph.extract_variants(
-                    roots,
-                    n as usize,
-                    TreeCostModelFromDag(DynamicCostModel),
-                )?
+                egraph.extract_variants(roots, n as usize, DynamicCostModel)?
             };
             let terms: Vec<TermId> = extracted
                 .variants

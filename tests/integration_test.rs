@@ -936,7 +936,7 @@ fn test_greedy_dag_extract_variants_zero_primitive_returns_empty() {
         &egraph,
         vec![(sort, value)],
         0,
-        egglog::extract::TreeAdditiveCostModel::default(),
+        egglog::extract::AdditiveCostModel::default(),
     )
     .unwrap();
 
