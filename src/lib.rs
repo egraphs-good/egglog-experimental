@@ -7,30 +7,17 @@
 //!
 //! ## Implemented extensions
 //!
-//! - [`for`-loops](https://egraphs-good.github.io/egglog-demo/?example=for)
-//! - [`with-ruleset`](https://egraphs-good.github.io/egglog-demo/?example=with-ruleset)
-//! - [Rationals support](https://egraphs-good.github.io/egglog-demo/?example=rational)
-//!   (see [`rational`] for the exposed primitives)
-//! - [Dynamic cost models with `set-cost`](https://egraphs-good.github.io/egglog-demo/?example=05-cost-model-and-extraction)
-//! - [Custom schedulers via `run-with`](https://egraphs-good.github.io/egglog-demo/?example=math-backoff),
-//!   including top-level `(let-scheduler name ...)` bindings stored on the e-graph
-//! - An extended `run-schedule` command (see [`scheduling`]) with `seq`,
-//!   `saturate`, `repeat`, `eval`, and forwarded commands
-//! - [`(get-size!)` primitive](https://github.com/egraphs-good/egglog-experimental/blob/main/tests/web-demo/node-limit.egg)
-//!   for inspecting total tuple counts or counts for specific tables
-//! - [Multi-extraction](https://github.com/egraphs-good/egglog-experimental/blob/main/tests/web-demo/multi-extract.egg)
-//! - Body-defined primitives with `(primitive name (InputSort*) OutputSort body)`.
-//!   Body variables are positional (`_0`, `_1`, ...), and a partial primitive
-//!   body result propagates as primitive failure. The registered primitive uses
-//!   the minimum capability needed by its body (`pure`, `read`, `write`, or
-//!   `full`). Bodies may call built-in or previously registered primitives,
-//!   table-backed functions, and globals; applying those primitives is allowed
-//!   only in a compatible runtime context. A global reference makes the defined
-//!   primitive read-capable because globals lower to zero-argument function
-//!   lookups.
+//! - Language and values: exact rationals, one-shot `for` rules, grouped
+//!   `with-ruleset` declarations, body-defined primitives, and fresh values in
+//!   rule actions.
+//! - Scheduling and extraction: extended schedules, named back-off schedulers,
+//!   dynamic costs, multi-extraction, and `keep-best` compaction.
+//! - Inspection: table-size queries and per-table column and out-degree
+//!   statistics.
 //!
-//! Each bullet links to a runnable demo so you can explore the feature quickly.
-//! The rest of this crate exposes the Rust APIs and helpers that back these extensions.
+//! The [feature guide](https://github.com/egraphs-good/egglog-experimental#features)
+//! gives concise syntax and runnable examples. This crate's modules document
+//! the Rust APIs behind the extensions.
 //!
 use egglog::ast::Parser;
 use egglog::prelude::add_base_sort;
@@ -61,6 +48,7 @@ pub use sugar::*;
 mod keep_best;
 pub use keep_best::KeepBestCommand;
 
+/// Creates an [`EGraph`] with every egglog-experimental extension registered.
 pub fn new_experimental_egraph() -> EGraph {
     let mut egraph = EGraph::default();
 
@@ -108,7 +96,9 @@ pub fn new_experimental_egraph() -> EGraph {
     egraph
 }
 
-// Create a parser with experimental macros
+/// Creates a parser with the `for` and `with-ruleset` parse-time macros.
+///
+/// Use [`new_experimental_egraph`] to register all runtime extensions as well.
 pub fn experimental_parser() -> Parser {
     let mut parser = Parser::default();
     parser.add_command_macro(Arc::new(sugar::For));
