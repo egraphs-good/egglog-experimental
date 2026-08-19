@@ -5,7 +5,7 @@ it needs lives in `egglog` (see "What egglog had to expose" below).
 
 ## What it does
 
-```
+```text
 (unstable-subst root map) : (R, Map<K, K>) -> R
 ```
 

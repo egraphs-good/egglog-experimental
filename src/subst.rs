@@ -325,58 +325,134 @@ impl Walk<'_> {
     /// once its children have copies, and a cycle in the copied region needs
     /// one e-node whose children all lie outside it to get started. A cycle
     /// with no such e-node is reported instead.
-    fn build(&mut self, state: &mut FullState<'_, '_>, root: Value) -> Result<Value, Error> {
-        // Children before parents, so the acyclic case finishes in one sweep.
-        let order = self.postorder(root);
-        let mut pending: Vec<(Value, Vec<ENode>)> = order
-            .into_iter()
-            .map(|eclass| {
-                let nodes = self.snapshot.nodes.remove(&eclass).unwrap_or_default();
-                (eclass, nodes)
-            })
-            .collect();
+    /// The e-classes a copy of `node` needs to exist first, direct children and
+    /// container leaves alike.
+    fn node_deps(&self, node: &ENode) -> Vec<Value> {
+        let ctor = self.ctors[node.ctor];
+        let mut deps = Vec::new();
+        for (child, child_sort) in node.children.iter().zip(&ctor.input) {
+            match kind_of(child_sort) {
+                Kind::Eclass => deps.push(*child),
+                Kind::Container(_) => deps.extend(
+                    self.container_leaves
+                        .get(child)
+                        .into_iter()
+                        .flatten()
+                        .map(|(_, leaf)| *leaf),
+                ),
+                Kind::Opaque => {}
+            }
+        }
+        deps
+    }
 
+    /// Whether a copied row can already name `dep`: it is replaced outright, it
+    /// is shared with the original, or its own copy has been accounted for.
+    fn resolved(&self, dep: Value, copyable: &HashSet<Value>) -> bool {
+        self.map.contains_key(&dep) || !self.affected.contains(&dep) || copyable.contains(&dep)
+    }
+
+    /// Decide, without writing anything, whether the region can be copied at
+    /// all, and in what order its e-classes can be named.
+    ///
+    /// Doing this before the first write is what keeps a failure from leaving a
+    /// partial copy behind: egglog flushes an action's staged writes even when
+    /// it ends in an error, so a sweep that discovered an ungrounded cycle only
+    /// after copying its way up to it could not take those rows back.
+    fn plan(&self, root: Value) -> Result<Vec<Value>, Error> {
+        let region = self.postorder(root);
+        let mut copyable: HashSet<Value> = HashSet::new();
+        let mut order: Vec<Value> = Vec::with_capacity(region.len());
+
+        // Least fixpoint of "has an e-node whose children all resolve". A class
+        // joins `order` when it becomes nameable, so the order is one the
+        // copies can actually be built in.
         loop {
             let mut progress = false;
-            for (eclass, nodes) in pending.iter_mut() {
-                let mut blocked = Vec::new();
-                for node in std::mem::take(nodes) {
-                    let Some(args) = self.copied_args(state, &node) else {
-                        blocked.push(node);
-                        continue;
-                    };
-                    let copy = state.add(&self.ctors[node.ctor].name, RawValues(args))?;
-                    match self.images.get(eclass) {
-                        // The first e-node copied names the class; the rest are
-                        // further ways to say the same one.
-                        None => {
-                            self.images.insert(*eclass, copy);
-                        }
-                        Some(image) if *image != copy => state.union(copy, *image)?,
-                        Some(_) => {}
-                    }
+            for eclass in &region {
+                if copyable.contains(eclass) {
+                    continue;
+                }
+                let nameable = self.snapshot.nodes[eclass].iter().any(|node| {
+                    self.node_deps(node)
+                        .iter()
+                        .all(|dep| self.resolved(*dep, &copyable))
+                });
+                if nameable {
+                    copyable.insert(*eclass);
+                    order.push(*eclass);
                     progress = true;
                 }
-                *nodes = blocked;
             }
             if !progress {
                 break;
             }
         }
 
-        if let Some((eclass, blocked)) = pending.iter().find(|(_, nodes)| !nodes.is_empty()) {
-            let mut ctors: Vec<&str> = blocked
+        // Every e-node has to be copyable, not just one per class: a class can
+        // be nameable while another of its e-nodes still points into a cycle.
+        for eclass in &region {
+            let mut blocked: Vec<&str> = self.snapshot.nodes[eclass]
                 .iter()
+                .filter(|node| {
+                    !self
+                        .node_deps(node)
+                        .iter()
+                        .all(|dep| self.resolved(*dep, &copyable))
+                })
                 .map(|node| self.ctors[node.ctor].name.as_str())
                 .collect();
-            ctors.sort_unstable();
-            ctors.dedup();
-            return Err(error(format!(
-                "no order copies e-class {eclass:?}: its remaining e-nodes ({}) all refer to \
-                 copies that do not exist yet. Every cycle in the substituted region needs at \
-                 least one e-node whose children all lie outside it.",
-                ctors.join(", "),
-            )));
+            if !blocked.is_empty() {
+                blocked.sort_unstable();
+                blocked.dedup();
+                return Err(error(format!(
+                    "no order copies e-class {eclass:?}: its e-nodes ({}) refer to copies that \
+                     nothing can produce. Every cycle in the substituted region needs at least \
+                     one e-node whose children all lie outside it.",
+                    blocked.join(", "),
+                )));
+            }
+        }
+        Ok(order)
+    }
+
+    /// Copy the affected e-classes and return the root's image.
+    ///
+    /// Every copied e-node goes in through `lookup_or_insert`, so egglog names
+    /// the copy's e-class — nothing here invents an id. [`Walk::plan`] has
+    /// already established that every e-node in the region can be copied, and
+    /// in what order, so this writes without having to discover blockage.
+    fn build(&mut self, state: &mut FullState<'_, '_>, root: Value) -> Result<Value, Error> {
+        let order = self.plan(root)?;
+
+        // Name each class from the first of its e-nodes that can be built. Its
+        // other e-nodes may name classes further along, so they wait.
+        let mut leftovers: Vec<(Value, ENode)> = Vec::new();
+        for eclass in order {
+            let mut named = false;
+            for node in self.snapshot.nodes.remove(&eclass).unwrap_or_default() {
+                if !named && let Some(args) = self.copied_args(state, &node) {
+                    let copy = state.add(&self.ctors[node.ctor].name, RawValues(args))?;
+                    self.images.insert(eclass, copy);
+                    named = true;
+                    continue;
+                }
+                leftovers.push((eclass, node));
+            }
+            debug_assert!(named, "plan said {eclass:?} was nameable");
+        }
+
+        // Every class has an image now, so the rest go in as further ways to
+        // say the class they came from.
+        for (eclass, node) in leftovers {
+            let args = self
+                .copied_args(state, &node)
+                .expect("plan said every e-node was copyable");
+            let copy = state.add(&self.ctors[node.ctor].name, RawValues(args))?;
+            let image = self.images[&eclass];
+            if copy != image {
+                state.union(copy, image)?;
+            }
         }
 
         self.images
@@ -537,11 +613,25 @@ impl Primitive for Subst {
 }
 
 impl FullPrim for Subst {
+    /// Returns `None` only for a substitution this cannot perform — today just
+    /// an ungrounded cycle — having first raised a primitive panic, so the
+    /// program stops rather than continuing with a missing value. The shapes
+    /// the typechecker already rules out panic instead, since reaching them
+    /// means a bug here rather than a program egglog should have rejected.
     fn apply<'a, 'db>(&self, mut state: FullState<'a, 'db>, args: &[Value]) -> Option<Value> {
-        let [root, map] = args else { return None };
+        let [root, map] = args else {
+            panic!(
+                "{SUBST} takes a root and a map; the typechecker admitted {} arguments",
+                args.len()
+            )
+        };
         // Cloned out so the container registry is not still borrowed when the
         // walk starts interning new containers.
-        let entries = state.value_to_container::<MapContainer>(*map)?.data.clone();
+        let entries = state
+            .value_to_container::<MapContainer>(*map)
+            .unwrap_or_else(|| panic!("{SUBST}'s type constraint admits only `Map` values"))
+            .data
+            .clone();
         match substitute(&mut state, *root, &entries) {
             Ok(image) => Some(image),
             Err(err) => {

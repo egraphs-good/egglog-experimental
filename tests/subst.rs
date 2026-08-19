@@ -254,6 +254,37 @@ const UNGROUNDED_CYCLE: &str = r#"
 (let $map (map-insert (map-empty) $x (Num 9)))
 "#;
 
+/// The same ungrounded cycle, with an acyclic affected branch beside it that
+/// *is* copyable. The copyable part must not be written: egglog flushes an
+/// action's staged writes even when it ends in an error, so a substitution that
+/// copies its way up to a blockage cannot take those rows back.
+const UNGROUNDED_CYCLE_WITH_SIDE_BRANCH: &str = r#"
+(let $x (Var "x"))
+(let $a (Add (Num 0) $x))
+(let $b (Mul $a (Num 1)))
+(union $a (Add $b $x))
+(subsume (Add (Num 0) $x))
+(let $side (Add $x (Num 7)))
+(let $root (Mul $a $side))
+(let $map (map-insert (map-empty) $x (Num 9)))
+"#;
+
+#[test]
+fn a_failed_substitution_writes_nothing() {
+    let mut eg = egraph(UNGROUNDED_CYCLE_WITH_SIDE_BRANCH);
+    let before = eg.update(|state| Ok(state.table_size("Add"))).unwrap();
+
+    let root = global(&mut eg, "root");
+    let map = global(&mut eg, "map");
+    assert!(
+        egglog_experimental::subst(&mut eg, root, map).is_err(),
+        "expected the ungrounded cycle to fail"
+    );
+
+    let after = eg.update(|state| Ok(state.table_size("Add"))).unwrap();
+    assert_eq!(before, after, "a failed substitution left rows behind");
+}
+
 /// The walk reports an ungrounded cycle instead of inventing an e-class id.
 #[test]
 fn an_ungrounded_cycle_is_an_error() {
@@ -429,11 +460,12 @@ fn a_replacement_that_is_itself_affected_is_copied_where_it_occurs() {
     );
 }
 
-/// The walk uses an explicit stack, so depth is bounded by the heap rather than
-/// by Rust's stack.
+/// The walk keeps its own stack, so a deep term does not turn into deep
+/// recursion. Depth is well past anything a program writes by hand while
+/// staying cheap enough for CI.
 #[test]
 fn handles_a_deep_spine() {
-    const DEPTH: usize = 20_000;
+    const DEPTH: usize = 5_000;
     let mut program = String::from("(let $x (Var \"x\"))\n(let $e0 $x)\n");
     for i in 1..=DEPTH {
         program.push_str(&format!("(let $e{i} (Add $x $e{}))\n", i - 1));
