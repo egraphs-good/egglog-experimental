@@ -19,7 +19,7 @@ cargo install --path=egglog-experimental
 To use it in a Rust project, you can add it as a dependency in a `Cargo.toml` file.
 
 ```
-egglog-experimental = "1.0"
+egglog-experimental = "3.0"
 ```
 
 ## Documentation
