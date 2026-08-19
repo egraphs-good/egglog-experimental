@@ -1,9 +1,8 @@
 use std::path::PathBuf;
 
 use egglog::{
-    CommandOutput, Error, TermDag, TermId,
+    CommandOutput, Error,
     ast::{Command, Expr, sanitize_internal_names},
-    prelude::Span,
     span,
 };
 use egglog_experimental::*;
@@ -131,73 +130,142 @@ fn run_program_with_extract_checks(
 
     for command in program {
         let extract = extract_command_parts(&command);
+        // Validate from the same pre-command state without letting test
+        // instrumentation mutate the program's real e-graph.
+        let mut validation_egraph = extract.as_ref().map(|_| egraph.clone());
         let command_outputs = egraph.run_program(vec![command])?;
 
-        let Some((span, args, root, has_extractor)) = extract else {
+        let Some(extract) = extract else {
             outputs.extend(command_outputs);
             continue;
         };
 
-        validate_extract_outputs(egraph, &command_outputs, &root)?;
+        validate_extract_outputs(
+            validation_egraph.as_mut().unwrap(),
+            &extract,
+            &command_outputs,
+        )?;
         outputs.extend(command_outputs);
-
-        if !has_extractor {
-            // Run a paired greedy-DAG extraction at the same program point as
-            // every ordinary `(extract ...)` in the file corpus. Running
-            // command-by-command matters for scoped programs: an extraction
-            // inside `push`/`pop` must be checked before that scope is popped.
-            // The paired output is also returned so the file tests exercise
-            // normal rendering for both extractors.
-            let mut dag_args = args;
-            dag_args.push(Expr::Var(span.clone(), ":extractor".to_owned()));
-            dag_args.push(Expr::Var(span.clone(), "greedy-dag".to_owned()));
-            let dag_outputs = egraph.run_program(vec![Command::UserDefined(
-                span,
-                "extract".to_owned(),
-                dag_args,
-            )])?;
-            validate_extract_outputs(egraph, &dag_outputs, &root)?;
-            outputs.extend(dag_outputs);
-        }
     }
 
     Ok(outputs)
 }
 
-fn extract_command_parts(command: &Command) -> Option<(Span, Vec<Expr>, Expr, bool)> {
+struct ExtractCheck {
+    root: Expr,
+    variants: Option<Expr>,
+    use_greedy_dag: bool,
+}
+
+fn extract_command_parts(command: &Command) -> Option<ExtractCheck> {
     match command {
-        Command::UserDefined(span, name, args) if name == "extract" => args.first().map(|root| {
-            (
-                span.clone(),
-                args.clone(),
-                root.clone(),
-                extract_args_have_extractor(args),
-            )
-        }),
+        Command::UserDefined(_, name, args) if name == "extract" => {
+            let use_greedy_dag = args
+                .iter()
+                .any(|arg| matches!(arg, Expr::Var(_, keyword) if keyword == ":extractor"));
+            let positional = if use_greedy_dag {
+                args.get(..args.len().checked_sub(2)?)?
+            } else {
+                args
+            };
+            match positional {
+                [root] => Some(ExtractCheck {
+                    root: root.clone(),
+                    variants: None,
+                    use_greedy_dag,
+                }),
+                [root, variants] => Some(ExtractCheck {
+                    root: root.clone(),
+                    variants: Some(variants.clone()),
+                    use_greedy_dag,
+                }),
+                _ => None,
+            }
+        }
         _ => None,
     }
 }
 
-fn extract_args_have_extractor(args: &[Expr]) -> bool {
-    args.iter()
-        .any(|arg| matches!(arg, Expr::Var(_, keyword) if keyword == ":extractor"))
-}
-
 fn validate_extract_outputs(
     egraph: &mut EGraph,
-    outputs: &[CommandOutput],
-    root: &Expr,
+    extract: &ExtractCheck,
+    requested_outputs: &[CommandOutput],
 ) -> Result<(), Error> {
+    // Evaluate the potentially stateful root exactly once, then invoke the
+    // opposite extractor directly so both algorithms see that same value.
+    let (root_sort, root_value) = egraph.eval_expr(&extract.root)?;
+    let nvariants = if let Some(variants) = &extract.variants {
+        let (_, value) = egraph.eval_expr(variants)?;
+        usize::try_from(egraph.value_to_base::<i64>(value)).map_err(|_| {
+            Error::ExtractError("extract variant count must be nonnegative".to_owned())
+        })?
+    } else {
+        0
+    };
+
+    let requested_exprs = extracted_exprs(requested_outputs)?;
+    let roots = vec![(root_sort.clone(), root_value)];
+    let paired_exprs = if nvariants == 0 {
+        let extracted = if extract.use_greedy_dag {
+            egraph.extract_best(roots, DynamicCostModel)?
+        } else {
+            extract_best_greedy_dag(egraph, roots, DynamicCostModel)?
+        };
+        let root = extracted
+            .terms
+            .into_iter()
+            .next()
+            .expect("one root was requested")
+            .ok_or_else(|| Error::ExtractError("paired extractor returned no term".to_owned()))?;
+        vec![extracted.termdag.term_to_expr(&root.term, span!())]
+    } else {
+        let extracted = if extract.use_greedy_dag {
+            egraph.extract_variants(roots, nvariants, DynamicCostModel)?
+        } else {
+            extract_variants_greedy_dag(egraph, roots, nvariants, DynamicCostModel)?
+        };
+        let variants = extracted
+            .variants
+            .into_iter()
+            .next()
+            .expect("one root was requested");
+        variants
+            .into_iter()
+            .map(|variant| extracted.termdag.term_to_expr(&variant.term, span!()))
+            .collect()
+    };
+
+    if requested_exprs.is_empty() != paired_exprs.is_empty() {
+        return Err(Error::ExtractError(
+            "only one extractor returned variants for the requested root".to_owned(),
+        ));
+    }
+
+    for extracted_expr in requested_exprs.iter().chain(&paired_exprs) {
+        let (extracted_sort, extracted_value) = egraph.eval_expr(extracted_expr)?;
+        if root_sort.name() != extracted_sort.name() || root_value != extracted_value {
+            return Err(Error::ExtractError(format!(
+                "extractor returned a term unequal to the requested root: root {:?}, extracted {extracted_expr:?}",
+                extract.root
+            )));
+        }
+    }
+
+    Ok(())
+}
+
+fn extracted_exprs(outputs: &[CommandOutput]) -> Result<Vec<Expr>, Error> {
     let mut saw_extract = false;
+    let mut extracted = Vec::new();
     for output in outputs {
         match output {
             CommandOutput::ExtractBest(termdag, _cost, term) => {
-                validate_extracted_term(egraph, root, termdag, *term)?;
+                extracted.push(termdag.term_to_expr(term, span!()));
                 saw_extract = true;
             }
             CommandOutput::ExtractVariants(termdag, terms) => {
                 for term in terms {
-                    validate_extracted_term(egraph, root, termdag, *term)?;
+                    extracted.push(termdag.term_to_expr(term, span!()));
                 }
                 saw_extract = true;
             }
@@ -205,36 +273,12 @@ fn validate_extract_outputs(
         }
     }
     if saw_extract {
-        Ok(())
+        Ok(extracted)
     } else {
         Err(Error::ExtractError(
             "extract command should produce an extract output".to_owned(),
         ))
     }
-}
-
-fn validate_extracted_term(
-    egraph: &mut EGraph,
-    root: &Expr,
-    termdag: &TermDag,
-    term: TermId,
-) -> Result<(), Error> {
-    let (root_sort, root_value) = egraph.eval_expr(root)?;
-    let extracted_expr = termdag.term_to_expr(&term, span!());
-    let (extracted_sort, extracted_value) = egraph.eval_expr(&extracted_expr)?;
-
-    if root_sort.name() != extracted_sort.name() {
-        return Err(Error::ExtractError(format!(
-            "extracted term sort should match root expression sort: root {root:?}, extracted {extracted_expr}"
-        )));
-    }
-    if root_value != extracted_value {
-        return Err(Error::ExtractError(format!(
-            "extracted term should be equal to root expression: root {root:?}, extracted {extracted_expr}"
-        )));
-    }
-
-    Ok(())
 }
 
 fn generate_tests(glob: &str) -> Vec<Trial> {

@@ -1,9 +1,9 @@
 //! Implementation of the `keep-best` command.
 //!
 //! `(keep-best "table1" "table2" ... [:extractor greedy-dag])` extracts the
-//! optimal representative term for every entry in each named table, clears the
-//! entire e-graph, and re-inserts only those optimal tuples. This "compacts"
-//! the e-graph to the best solutions found so far.
+//! best representative found by the selected extractor for every entry in each
+//! named table, clears the entire e-graph, and re-inserts only those tuples.
+//! This "compacts" the e-graph to the best solutions found so far.
 //!
 //! Each argument must evaluate to a `String` that names an existing function.
 
@@ -30,7 +30,7 @@ impl UserDefinedCommand for KeepBestCommand {
             })
             .collect::<Result<_, Error>>()?;
 
-        // Step 2: for each table, collect all rows and extract the optimal
+        // Step 2: for each table, collect all rows and extract the best
         // term for every column value.
         let extracted = collect_and_extract(egraph, &table_names, use_greedy_dag)?;
 
@@ -45,7 +45,7 @@ impl UserDefinedCommand for KeepBestCommand {
             egraph.clear_function(name)?;
         }
 
-        // Step 4: re-insert the optimal tuples. Evaluate each extracted term
+        // Step 4: re-insert the selected tuples. Evaluate each extracted term
         // via eval_expr so that constructor sub-terms are re-created bottom-up,
         // then stage all target-table inserts in one `update` call.
         let mut rows_to_insert: Vec<(String, bool, Vec<Value>)> = Vec::new();

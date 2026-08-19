@@ -1,0 +1,2 @@
+(datatype E (Num i64))
+(extract (Num (get-size! "Num")))

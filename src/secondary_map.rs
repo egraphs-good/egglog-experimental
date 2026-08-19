@@ -42,20 +42,6 @@ pub(super) struct InternId<K> {
     _key: PhantomData<fn() -> K>,
 }
 
-impl<K> InternId<K> {
-    fn new(index: usize) -> Self {
-        Self {
-            index,
-            _key: PhantomData,
-        }
-    }
-
-    #[inline]
-    fn index(self) -> usize {
-        self.index
-    }
-}
-
 impl<K> Clone for InternId<K> {
     fn clone(&self) -> Self {
         *self
@@ -121,7 +107,10 @@ impl<K: Eq + Hash> InternerBuilder<K> {
             return *id;
         }
 
-        let id = InternId::new(self.ids.len());
+        let id = InternId {
+            index: self.ids.len(),
+            _key: PhantomData,
+        };
         self.ids.insert(key, id);
         id
     }
@@ -160,11 +149,17 @@ impl<K> Interner<K> {
     /// The capacity is for expected present entries, not for the full interned
     /// universe. The membership bitset is sized from the frozen universe.
     #[inline]
-    pub(super) fn aggregated_map_with_capacity<V: CombinableCost>(
+    fn aggregated_map_with_capacity<V: CombinableCost>(
         &self,
         entries_capacity: usize,
     ) -> AggregatedSparseSecondaryMap<K, V> {
-        AggregatedSparseSecondaryMap::with_capacity(self, entries_capacity)
+        AggregatedSparseSecondaryMap {
+            entries: SparseSecondaryMap {
+                entries: Vec::with_capacity(entries_capacity.min(self.len())),
+                present: self.secondary_set(),
+            },
+            total: V::identity(),
+        }
     }
 
     /// Creates a dense secondary map for this frozen id-space.
@@ -173,7 +168,12 @@ impl<K> Interner<K> {
     /// than avoiding empty slots.
     #[inline]
     pub(super) fn secondary_map<V>(&self) -> SecondaryMap<K, V> {
-        SecondaryMap::with_len(self.len())
+        let mut values = Vec::with_capacity(self.len());
+        values.resize_with(self.len(), || None);
+        SecondaryMap {
+            values,
+            _key: PhantomData,
+        }
     }
 
     /// Creates a dense secondary set for this frozen id-space.
@@ -182,7 +182,10 @@ impl<K> Interner<K> {
     /// instead of hash lookups.
     #[inline]
     pub(super) fn secondary_set(&self) -> SecondarySet<K> {
-        SecondarySet::with_len(self.len())
+        SecondarySet {
+            present: FixedBitSet::with_capacity(self.len()),
+            _key: PhantomData,
+        }
     }
 }
 
@@ -220,27 +223,12 @@ impl<K> Clone for SecondarySet<K> {
     }
 }
 
-impl<K> fmt::Debug for SecondarySet<K> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("SecondarySet")
-            .field("present", &self.present)
-            .finish()
-    }
-}
-
 impl<K> SecondarySet<K> {
-    fn with_len(len: usize) -> Self {
-        Self {
-            present: FixedBitSet::with_capacity(len),
-            _key: PhantomData,
-        }
-    }
-
     /// Returns whether `id` is present.
     #[inline]
-    pub(super) fn contains(&self, id: InternId<K>) -> bool {
-        debug_assert!(id.index() < self.present.len());
-        self.present.contains(id.index())
+    fn contains(&self, id: InternId<K>) -> bool {
+        debug_assert!(id.index < self.present.len());
+        self.present.contains(id.index)
     }
 
     /// Inserts `id` and returns whether it was absent.
@@ -249,7 +237,7 @@ impl<K> SecondarySet<K> {
         if self.contains(id) {
             false
         } else {
-            self.present.insert(id.index());
+            self.present.insert(id.index);
             true
         }
     }
@@ -257,8 +245,8 @@ impl<K> SecondarySet<K> {
     /// Removes `id` from the set.
     #[inline]
     pub(super) fn remove(&mut self, id: InternId<K>) {
-        debug_assert!(id.index() < self.present.len());
-        self.present.set(id.index(), false);
+        debug_assert!(id.index < self.present.len());
+        self.present.set(id.index, false);
     }
 }
 
@@ -275,27 +263,18 @@ pub(super) struct SecondaryMap<K, V> {
 }
 
 impl<K, V> SecondaryMap<K, V> {
-    fn with_len(len: usize) -> Self {
-        let mut values = Vec::with_capacity(len);
-        values.resize_with(len, || None);
-        Self {
-            values,
-            _key: PhantomData,
-        }
-    }
-
     /// Returns the payload for `id`, if one has been inserted.
     #[inline]
     pub(super) fn get(&self, id: InternId<K>) -> Option<&V> {
-        debug_assert!(id.index() < self.values.len());
-        self.values.get(id.index()).and_then(Option::as_ref)
+        debug_assert!(id.index < self.values.len());
+        self.values.get(id.index).and_then(Option::as_ref)
     }
 
     /// Inserts or replaces the payload for `id`.
     #[inline]
     pub(super) fn insert(&mut self, id: InternId<K>, value: V) -> Option<V> {
-        debug_assert!(id.index() < self.values.len());
-        self.values[id.index()].replace(value)
+        debug_assert!(id.index < self.values.len());
+        self.values[id.index].replace(value)
     }
 }
 
@@ -303,8 +282,12 @@ impl<K, V> SecondaryMap<K, V> {
 ///
 /// This stores only present id/payload pairs while using a dense bitset for
 /// membership checks. It is useful when each candidate touches a small subset
-/// of a larger interned universe and still needs sparse iteration.
-pub(super) struct SparseSecondaryMap<K, V> {
+/// of a larger interned universe and still needs sparse iteration. Each map
+/// uses one membership bit per interned key; this root-local memory tradeoff is
+/// deliberate because replacing the bitset with linear membership checks made
+/// the greedy-DAG benchmark roughly 65-70% slower (see
+/// `.agents/logs/2026-06-24-greedy-dag-extractor-perf.md`).
+struct SparseSecondaryMap<K, V> {
     entries: Vec<(InternId<K>, V)>,
     present: SecondarySet<K>,
 }
@@ -318,51 +301,13 @@ impl<K, V: Clone> Clone for SparseSecondaryMap<K, V> {
     }
 }
 
-impl<K, V: fmt::Debug> fmt::Debug for SparseSecondaryMap<K, V> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("SparseSecondaryMap")
-            .field("entries", &self.entries)
-            .field("present", &self.present)
-            .finish()
-    }
-}
-
 impl<K, V> SparseSecondaryMap<K, V> {
-    fn with_capacity(interner: &Interner<K>, entries_capacity: usize) -> Self {
-        Self {
-            entries: Vec::with_capacity(entries_capacity),
-            present: interner.secondary_set(),
-        }
-    }
-
-    /// Returns whether `id` already has a payload in this secondary map.
-    #[inline]
-    pub(super) fn contains(&self, id: InternId<K>) -> bool {
-        self.present.contains(id)
-    }
-
     /// Inserts `value` for `id`, which must not already be present.
     #[inline]
     fn insert_new(&mut self, id: InternId<K>, value: V) {
         debug_assert!(!self.present.contains(id));
         self.present.insert(id);
         self.entries.push((id, value));
-    }
-
-    #[inline]
-    fn reserve_entries(&mut self, additional: usize) {
-        self.entries.reserve(additional);
-    }
-
-    #[inline]
-    fn entries(&self) -> &[(InternId<K>, V)] {
-        &self.entries
-    }
-
-    /// Returns the number of present id/payload pairs.
-    #[inline]
-    pub(super) fn len(&self) -> usize {
-        self.entries.len()
     }
 }
 
@@ -388,30 +333,12 @@ impl<K, V: CombinableCost> Clone for AggregatedSparseSecondaryMap<K, V> {
     }
 }
 
-impl<K, V> fmt::Debug for AggregatedSparseSecondaryMap<K, V>
-where
-    V: CombinableCost + fmt::Debug,
-{
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("AggregatedSparseSecondaryMap")
-            .field("entries", &self.entries)
-            .field("total", &self.total)
-            .finish()
-    }
-}
-
 impl<K, V: CombinableCost> AggregatedSparseSecondaryMap<K, V> {
-    fn with_capacity(interner: &Interner<K>, entries_capacity: usize) -> Self {
-        Self {
-            entries: SparseSecondaryMap::with_capacity(interner, entries_capacity),
-            total: V::identity(),
-        }
-    }
-
     /// Unions several sparse secondary maps by cloning the largest input first.
     ///
     /// This is the efficient merge operation used by greedy-DAG candidate
-    /// construction. It follows extraction-gym's `faster-greedy-dag` strategy:
+    /// construction. It follows
+    /// [extraction-gym's `faster-greedy-dag` strategy](https://github.com/egraphs-good/extraction-gym/blob/903ba0f818b50608fe20ae9e0f03c35cb27bc50a/src/extract/faster_greedy_dag.rs#L57-L62):
     /// start from the largest child set, then insert missing ids from smaller
     /// sets, so the largest set is not replayed entry by entry. Duplicate ids
     /// are counted once.
@@ -439,19 +366,23 @@ impl<K, V: CombinableCost> AggregatedSparseSecondaryMap<K, V> {
                 biggest = Some((idx, len));
             }
         }
+        let entries_capacity = entries_capacity.min(interner.len());
 
         let Some((biggest_idx, _)) = biggest else {
-            return Self::with_capacity(interner, entries_capacity);
+            return interner.aggregated_map_with_capacity(entries_capacity);
         };
 
         let biggest: &AggregatedSparseSecondaryMap<K, V> = maps[biggest_idx].borrow();
         let mut merged = biggest.clone();
-        merged.reserve_entries(entries_capacity.saturating_sub(merged.len()));
+        merged
+            .entries
+            .entries
+            .reserve(entries_capacity.saturating_sub(merged.len()));
 
         for (idx, map) in maps.iter().enumerate() {
             if idx != biggest_idx {
                 let map: &AggregatedSparseSecondaryMap<K, V> = map.borrow();
-                for (id, value) in map.entries() {
+                for (id, value) in &map.entries.entries {
                     merged.insert_if_absent(*id, value.clone());
                 }
             }
@@ -463,7 +394,7 @@ impl<K, V: CombinableCost> AggregatedSparseSecondaryMap<K, V> {
     /// Returns whether `id` already has a payload in this secondary map.
     #[inline]
     pub(super) fn contains(&self, id: InternId<K>) -> bool {
-        self.entries.contains(id)
+        self.entries.present.contains(id)
     }
 
     /// Inserts `value` for `id` if the id is not already present.
@@ -473,26 +404,16 @@ impl<K, V: CombinableCost> AggregatedSparseSecondaryMap<K, V> {
     /// cached aggregate without requiring subtraction.
     #[inline]
     pub(super) fn insert_if_absent(&mut self, id: InternId<K>, value: V) {
-        if !self.entries.contains(id) {
+        if !self.entries.present.contains(id) {
             self.total = self.total.clone().combine(&value);
             self.entries.insert_new(id, value);
         }
     }
 
-    #[inline]
-    fn reserve_entries(&mut self, additional: usize) {
-        self.entries.reserve_entries(additional);
-    }
-
-    #[inline]
-    fn entries(&self) -> &[(InternId<K>, V)] {
-        self.entries.entries()
-    }
-
     /// Returns the number of present id/payload pairs.
     #[inline]
-    pub(super) fn len(&self) -> usize {
-        self.entries.len()
+    fn len(&self) -> usize {
+        self.entries.entries.len()
     }
 
     /// Returns the cached aggregate of all present payloads.
@@ -571,12 +492,12 @@ mod tests {
         assert!(map.contains(a));
         assert!(map.contains(b));
         assert_eq!(map.len(), 2);
-        assert_eq!(map.entries(), &[(a, 4), (b, 3)]);
+        assert_eq!(map.entries.entries, [(a, 4), (b, 3)]);
         assert_eq!(*map.total(), 7);
     }
 
     #[test]
-    fn cloned_maps_keep_membership_and_can_reserve_more_entries() {
+    fn cloned_maps_keep_membership() {
         let mut builder = InternerBuilder::<&'static str>::default();
         let a = builder.intern("a");
         let b = builder.intern("b");
@@ -586,11 +507,10 @@ mod tests {
 
         map.insert_if_absent(a, 1);
         let mut cloned = map.clone();
-        cloned.reserve_entries(1);
         cloned.insert_if_absent(b, 2);
 
-        assert_eq!(map.entries(), &[(a, 1)]);
-        assert_eq!(cloned.entries(), &[(a, 1), (b, 2)]);
+        assert_eq!(map.entries.entries, [(a, 1)]);
+        assert_eq!(cloned.entries.entries, [(a, 1), (b, 2)]);
         assert_eq!(*cloned.total(), 3);
     }
 
@@ -620,7 +540,7 @@ mod tests {
         assert!(union.contains(b));
         assert!(union.contains(c));
         assert!(union.contains(d));
-        assert_eq!(union.entries(), &[(a, 1), (b, 2), (c, 3), (d, 4)]);
+        assert_eq!(union.entries.entries, [(a, 1), (b, 2), (c, 3), (d, 4)]);
         assert_eq!(*union.total(), 10);
     }
 }

@@ -564,7 +564,7 @@
   - Source: local profiling and allocation experiment.
   - Local validation: Experiment 12 showed precomputing final candidate entry capacity reduced resize/rehash cost.
 
-- Avoiding subtraction and preserving arbitrary `Cost` implementations.
+- Avoiding subtraction and preserving arbitrary lawful `CombinableCost` implementations.
   - Source: egglog API design constraint. The extractor maintains cached totals and unions newly seen entries, rather than deriving marginal deltas by subtracting shared child totals.
   - Local rationale: Experiment 13 records the complexity target: DAG scoring still visits selected entries, but the representation makes that union cheaper without assuming numeric subtraction.
 
@@ -1157,3 +1157,232 @@
 - Decision:
   - Keep the trait refactor. Neither extractor regressed in this canary; both
     candidate means were slightly lower than their exact-revision baselines.
+
+## Experiment 39: immutable candidate snapshots
+
+- Status: accepted
+- Date: 2026-08-19
+- Question: can each cached greedy-DAG score retain the exact producer choices
+  it was scored against without slowing the established vector workload?
+- Correctness issue:
+  - The committed implementation cached a parent's paid-cost set but followed
+    each child's latest global producer during reconstruction. A later child
+    improvement could therefore make the returned term disagree with its
+    reported cost or introduce a cycle into an older parent candidate.
+- Baseline:
+  - `egglog-experimental` commit
+    `5bdf212976aecc18cbba659ce6d2afac769178a7` in a detached worktree.
+- Candidate:
+  - The same commit plus the uncommitted immutable-candidate changes; diff
+    fingerprint excluding `rust-toolchain.toml`:
+    `02e1b81b8656f4c0ae530e6c5b62102971d9b379ed24c92dc10176aa0b3879b6`.
+- Input:
+  - A temporary copy of core's `tests/extract-vec-bench.egg` with its final
+    extract command changed to `:extractor greedy-dag`.
+- Validation before timing:
+  - Both release binaries exited successfully on the input.
+  - A temporary inspection binary reported `cost=1488 nodes=1509 root=1508`
+    for both implementations.
+  - `cargo test --offline --test integration_test greedy_dag`: 9 passed.
+  - `cargo test --release --offline --test integration_test greedy_dag`: 9
+    passed. The release run caught and fixed a root-producer insertion that had
+    accidentally been placed inside `debug_assert!`.
+- Exact command:
+  - `hyperfine --warmup 5 --runs 30 --export-json /tmp/pr55-snapshot-perf.json '<baseline-bin> /tmp/greedy-dag-extract-vec.egg >/dev/null' '<candidate-bin> /tmp/greedy-dag-extract-vec.egg >/dev/null'`
+- Observed result:
+  - Baseline: `157.0 ms +/- 44.7 ms` (median `137.8 ms`).
+  - Candidate: `151.7 ms +/- 32.3 ms` (median `140.3 ms`).
+  - Hyperfine ratio: candidate `1.04 +/- 0.37` times faster. The variance is
+    too large to claim a speedup, but it provides no evidence of a regression.
+- Rejected intermediate:
+  - Rejecting every disagreement between child producer snapshots made this
+    workload unextractable. The accepted implementation instead combines
+    closed child plans, keeps one producer on overlaps, and exactly rescores
+    the resulting reachable plan only when a disagreement occurs.
+- Decision:
+  - Keep immutable candidate snapshots and conflict-only exact rescoring. They
+    restore agreement between reported cost and reconstruction with no measured
+    regression on this canary.
+
+## Experiment 40: final immutable-snapshot timing and peak RSS
+
+- Status: accepted
+- Date: 2026-08-19
+- Question: after the review-driven traversal and data-structure cleanup, does
+  the final candidate retain Experiment 39's timing while keeping the memory
+  cost of immutable producer snapshots bounded on the vector canary?
+- Baseline:
+  - `egglog-experimental` commit
+    `5bdf212976aecc18cbba659ce6d2afac769178a7` in a detached worktree.
+- Candidate fingerprints:
+  - Worktree diff excluding `rust-toolchain.toml`:
+    `2d97abd445687d22719c36fa3f3a4b3bbd466cd16cb63137ad0f47a56098c309`.
+  - `src/greedy_dag_extract.rs` blob:
+    `ce550854ad6039dd4956225097d76fda8e27562a`.
+  - `src/secondary_map.rs` blob:
+    `a6b39fcd7585d7fca3142d7f0cda85cd03ef4f87`.
+- Input:
+  - The Experiment 39 temporary greedy-DAG copy of core's
+    `tests/extract-vec-bench.egg`.
+- Validation before timing:
+  - Both release binaries exited successfully on the input.
+  - Core integration tests: 58 passed.
+  - Experimental release integration tests: 54 passed.
+  - Both worktrees passed `cargo clippy --offline --all-targets -- -D warnings`.
+- Timing command:
+  - `hyperfine --warmup 5 --runs 30 --export-json /tmp/pr55-final-reverse.json '<candidate-bin> /tmp/greedy-dag-extract-vec.egg >/dev/null' '<baseline-bin> /tmp/greedy-dag-extract-vec.egg >/dev/null'`
+- Timing result:
+  - Candidate: `141.5 ms +/- 17.2 ms` (median `141.5 ms`).
+  - Baseline: `147.2 ms +/- 24.3 ms` (median `142.8 ms`).
+  - Hyperfine ratio: candidate `1.04 +/- 0.21` times faster. This does not
+    establish a speedup, but it provides no evidence of a regression.
+- Peak-RSS method:
+  - Twelve paired runs, alternating candidate/baseline order, measured with
+    `/usr/bin/time -lp`; medians are reported because one baseline sample was
+    an external high outlier.
+- Peak-RSS result:
+  - Candidate median: `917,454,848` bytes.
+  - Baseline median: `910,442,496` bytes.
+  - Difference: `7,012,352` bytes (`0.77%`).
+- Decision:
+  - Keep the final representation. Immutable snapshots fix a correctness bug
+    without a measured timing regression; the observed sub-1% peak-RSS increase
+    is the explicit memory cost on this canary.
+
+## Experiment 41: conflict-reconciled cycle detection
+
+- Status: accepted
+- Date: 2026-08-19
+- Question: does deferring cycle rejection until conflicting child snapshots
+  can be reconciled regress the established vector canary?
+- Correctness issue:
+  - A child snapshot could reach the candidate root only through a producer
+    choice that loses during conflict reconciliation. Rejecting that candidate
+    before reconciliation omitted a finite root variant.
+- Baseline:
+  - `egglog-experimental` commit
+    `5bdf212976aecc18cbba659ce6d2afac769178a7` in the detached worktree used by
+    Experiments 39-40.
+- Candidate fingerprints before adding this ledger entry:
+  - Worktree diff excluding `rust-toolchain.toml`:
+    `42dc1a41707555af112a531903ba380ae7904cb5496c9d2698e8907428f9a10e`.
+  - `src/greedy_dag_extract.rs` blob:
+    `0d5b54ec13831963fb4609c5b67bb383591b4371`.
+  - `src/secondary_map.rs` blob:
+    `a6b39fcd7585d7fca3142d7f0cda85cd03ef4f87`.
+- Input:
+  - The temporary greedy-DAG copy of core's `tests/extract-vec-bench.egg` used
+    by Experiments 39-40.
+- Validation before timing:
+  - The conflict/cycle regression passed in debug and release builds.
+  - All 54 experimental release integration tests passed.
+  - Both worktrees passed `cargo clippy --all-targets -- -D warnings`.
+- Exact timing command:
+  - `hyperfine --warmup 5 --runs 30 --export-json /tmp/pr55-cycle-reconciliation.json --command-name current '<candidate-bin> /tmp/greedy-dag-extract-vec.egg >/dev/null' --command-name baseline '<baseline-bin> /tmp/greedy-dag-extract-vec.egg >/dev/null'`
+- Observed result:
+  - Candidate: `207.7 ms +/- 41.0 ms` (median `202.7 ms`).
+  - Baseline: `225.6 ms +/- 51.7 ms` (median `216.9 ms`).
+  - Hyperfine ratio: candidate `1.09 +/- 0.33` times faster. Variance is too
+    high to claim a speedup, but this run provides no evidence of a regression.
+- Decision:
+  - Keep the corrected cycle ordering. Exact rescoring is still limited to
+    producer conflicts, and the established canary shows no measured timing
+    regression.
+
+## Experiment 42: borrowed cost models and zero-variant fast path
+
+- Status: accepted
+- Date: 2026-08-19
+- Question: does making the private extractor generic over its marginal cost
+  model, so public APIs accept borrowed models, regress the established vector
+  canary?
+- Baseline:
+  - `egglog-experimental` commit
+    `5bdf212976aecc18cbba659ce6d2afac769178a7` in the detached worktree used by
+    Experiments 39-41.
+- Candidate fingerprints before adding this ledger entry:
+  - Worktree diff excluding `rust-toolchain.toml`:
+    `4f96ba6a4f7ca2c4394ed0ebc825d2c4db28f937844812d2b364407e0cee52e4`.
+  - `src/greedy_dag_extract.rs` blob:
+    `4676d81731e97db18b5f979344e665300d77f9d2`.
+  - `src/secondary_map.rs` blob:
+    `a6b39fcd7585d7fca3142d7f0cda85cd03ef4f87`.
+- Input:
+  - The temporary greedy-DAG copy of core's `tests/extract-vec-bench.egg` used
+    by Experiments 39-41.
+- Validation before timing:
+  - A borrowed counting model verifies that zero-variant extraction invokes no
+    cost callbacks.
+  - All 58 core integration tests and all 54 experimental release integration
+    tests passed.
+  - Both worktrees passed `cargo clippy --all-targets -- -D warnings`.
+- Exact timing command:
+  - `hyperfine --warmup 5 --runs 30 --export-json /tmp/pr55-generic-model.json --command-name current '<candidate-bin> /tmp/greedy-dag-extract-vec.egg >/dev/null' --command-name baseline '<baseline-bin> /tmp/greedy-dag-extract-vec.egg >/dev/null'`
+- Observed result:
+  - Candidate: `196.4 ms +/- 10.4 ms` (median `193.9 ms`).
+  - Baseline: `207.0 ms +/- 24.7 ms` (median `201.6 ms`).
+  - Hyperfine ratio: candidate `1.05 +/- 0.14` times faster. This does not
+    establish a speedup, but it provides no evidence of a regression.
+- Decision:
+  - Keep the generic model field and zero-variant fast path. They remove an
+    unnecessary `'static` API constraint and avoid analysis when no result is
+    requested without adding measured cost to the normal extraction path.
+
+## Experiment 43: current Taylor 51 tree versus greedy DAG
+
+- Status: complete
+- Date: 2026-08-19
+- Question: after the immutable-candidate and API-review changes, how does the
+  current greedy-DAG extractor compare with tree extraction on Taylor 51?
+- Candidate fingerprints before adding this ledger entry:
+  - Experimental worktree diff excluding `rust-toolchain.toml`:
+    `11c6f09e38fd924fbcfbcb032ee8721f070c1c5f21700bd6a7daf7476aa48f67`.
+  - Core worktree diff excluding `rust-toolchain.toml`:
+    `8a4527f28b620972bc47ef03eefeb1cb051ca8abb26e76ada2d6a1ee03ae0710`.
+  - Experimental release binary SHA-256:
+    `44b08896913bb01f9c9ca0c07f7b7aeb16b241d8fa36962f31ed2c38577bc2c8`.
+- Input:
+  - Tree: core's checked-in `tests/taylor51.egg`.
+  - Greedy DAG: a temporary copy with only the 324 extraction commands changed
+    to append `:extractor greedy-dag`.
+- Validation before timing:
+  - Both inputs completed successfully with the same release binary.
+- Exact command:
+  - `hyperfine --warmup 3 --runs 10 --command-name 'taylor51 tree' '<binary> <core>/tests/taylor51.egg >/dev/null' --command-name 'taylor51 greedy-dag' '<binary> /tmp/greedy-dag-taylor-current.egg >/dev/null'`
+- Observed result:
+  - Tree: `984.7 ms +/- 7.1 ms`.
+  - Greedy DAG: `199.6 ms +/- 5.2 ms`.
+  - Hyperfine ratio: greedy DAG was `4.93 +/- 0.13` times faster.
+- Decision:
+  - Keep the current implementation. The post-review algorithm retains the
+    large Taylor advantage previously observed, while Experiments 39-42 cover
+    its correctness-oriented changes against the established vector canary.
+
+## Experiment 44: Taylor 51 after the core 3.0.0 base update
+
+- Status: complete
+- Date: 2026-08-19
+- Question: does updating the experimental lockfile to the final reviewed core
+  branch head after its 3.0.0 release-base merge change the Taylor comparison?
+- Candidate fingerprints before adding this ledger entry:
+  - Core commit: `5c42f40d0f72da0138e91c7e0aa093caf57ec36d`.
+  - Experimental worktree diff excluding `rust-toolchain.toml`:
+    `2296eee1d551685815d9e01269a5dbb8206e7a24f4078b63c380fe5a6277daca`.
+  - Experimental release binary SHA-256:
+    `2a7ce1279113b2a9941979d3d4162f4b513989f8e8f02ad1b48f36f8d9265441`.
+- Input and command:
+  - Same tree input, 324-command greedy-DAG transformation, and
+    `hyperfine --warmup 3 --runs 10` command shape as Experiment 43.
+- Validation before timing:
+  - Core integration tests passed 58/58.
+  - Experimental greedy-DAG release tests passed 11/11.
+  - Experimental release file corpus passed 40/40.
+  - Experimental release all-target Clippy passed with warnings denied.
+- Observed result:
+  - Tree: `1.024 s +/- 0.013 s`.
+  - Greedy DAG: `204.3 ms +/- 2.4 ms`.
+  - Hyperfine ratio: greedy DAG was `5.01 +/- 0.08` times faster.
+- Decision:
+  - Keep the implementation and report these post-base-update numbers in the
+    PR description. The small shift from Experiment 43 is within the range
+    expected from a fresh binary and does not change the conclusion.

@@ -1,6 +1,6 @@
-//! `(print-table-stats <table>?)` — per-column statistics for tables.
+//! `(print-table-stats <table>?)` — per-column statistics for function tables.
 //!
-//! For each table, this command reports:
+//! For each function table, this command reports:
 //! 1. The number of distinct values in every column (including the output column).
 //! 2. For every ordered pair of distinct columns `(source, target)`, the
 //!    min / 25th percentile / median / mean / 75th percentile / max of the
@@ -10,9 +10,9 @@
 //!    `(output -> combined inputs)` — i.e. for each output value, the number
 //!    of distinct input tuples that produce it.
 //!
-//! Without arguments, every non-hidden, non-let-binding table is reported
-//! (alphabetically). With one argument (an unquoted table name) only that
-//! table is reported.
+//! Without arguments, every non-hidden, non-let-binding function is reported
+//! (alphabetically). With one argument (an unquoted function name) only that
+//! function is reported.
 
 use crate::table_rows::for_each_row;
 use egglog::{
@@ -61,7 +61,7 @@ pub struct PairOutDegree {
     pub stats: OutDegreeStats,
 }
 
-/// Per-column statistics for a single table.
+/// Per-column statistics for a single function table.
 #[derive(Clone, Debug)]
 pub struct TableStats {
     /// The display name of the function table.
@@ -209,7 +209,7 @@ impl Display for TableStatsOutput {
     }
 }
 
-/// Compute per-column statistics for a single table identified by
+/// Compute per-column statistics for a single function table identified by
 /// its internal name.
 fn compute_table_stats(egraph: &EGraph, func_name: &str) -> Result<TableStats, Error> {
     let func = egraph
@@ -302,8 +302,8 @@ fn compute_table_stats(egraph: &EGraph, func_name: &str) -> Result<TableStats, E
     })
 }
 
-/// Compute per-column statistics for the given table, or for every
-/// non-hidden, non-let-binding table when `sym` is `None`.
+/// Compute per-column statistics for the given function table, or for every
+/// non-hidden, non-let-binding function when `sym` is `None`.
 pub fn print_table_stats(egraph: &EGraph, sym: Option<&str>) -> Result<Vec<TableStats>, Error> {
     let mut results: Vec<TableStats> = Vec::new();
     if let Some(sym) = sym {

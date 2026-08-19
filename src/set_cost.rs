@@ -1,7 +1,7 @@
 use crate::{
     Error,
     greedy_dag_extract::{
-        extract_best_greedy_dag, extract_variants_greedy_dag, parse_extractor_keyword,
+        extract_best_greedy_dag, extract_variants_greedy_dag, split_trailing_extractor,
     },
 };
 use egglog::{
@@ -243,23 +243,16 @@ impl UserDefinedCommand for CustomExtract {
         egraph: &mut EGraph,
         args: &[Expr],
     ) -> Result<Vec<CommandOutput>, egglog::Error> {
-        let (expr, variants, use_greedy_dag) = match args {
+        let (args, use_greedy_dag) = split_trailing_extractor(args)?;
+        let (expr, variants) = match args {
             [] => {
                 return Err(Error::ParseError(ParseError(
                     span!(),
                     "extract expects an expression and optional variant count".into(),
                 )));
             }
-            [expr] => (expr, None, false),
-            [expr, variants] => (expr, Some(variants), false),
-            [expr, keyword, extractor] => {
-                (expr, None, parse_extractor_keyword(keyword, extractor)?)
-            }
-            [expr, variants, keyword, extractor] => (
-                expr,
-                Some(variants),
-                parse_extractor_keyword(keyword, extractor)?,
-            ),
+            [expr] => (expr, None),
+            [expr, variants] => (expr, Some(variants)),
             [_, _, extra, ..] => {
                 return Err(Error::ParseError(ParseError(
                     extra.span(),

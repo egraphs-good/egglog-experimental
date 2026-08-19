@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{cell::Cell, rc::Rc, sync::Arc};
 
 use egglog::{
     CommandOutput,
@@ -6,6 +6,71 @@ use egglog::{
     prelude::{RustSpan, Span},
     span,
 };
+
+// Deliberately non-Send: MultiExtract stores the model, not extracted costs.
+type TreeOnlyCost = Rc<u64>;
+
+#[derive(Clone)]
+struct TreeOnlyCostModel;
+
+struct BorrowedCountingMarginalCostModel<'a>(&'a Cell<usize>);
+
+impl egglog::extract::BaseCostModel<usize> for BorrowedCountingMarginalCostModel<'_> {
+    fn base_value_cost(
+        &self,
+        _egraph: &egglog::EGraph,
+        _sort: &egglog::ArcSort,
+        _value: egglog::Value,
+    ) -> usize {
+        self.0.set(self.0.get() + 1);
+        1
+    }
+}
+
+impl egglog::extract::MarginalCostModel<usize> for BorrowedCountingMarginalCostModel<'_> {
+    fn marginal_enode_cost(
+        &self,
+        _egraph: &egglog::EGraph,
+        _func: &egglog::Function,
+        _enode: &egglog::Enode<'_>,
+    ) -> usize {
+        self.0.set(self.0.get() + 1);
+        1
+    }
+}
+
+impl egglog::extract::BaseCostModel<TreeOnlyCost> for TreeOnlyCostModel {
+    fn base_value_cost(
+        &self,
+        _egraph: &egglog::EGraph,
+        _sort: &egglog::ArcSort,
+        _value: egglog::Value,
+    ) -> TreeOnlyCost {
+        Rc::new(1)
+    }
+}
+
+impl egglog::extract::TotalCostModel<TreeOnlyCost> for TreeOnlyCostModel {
+    fn total_enode_cost(
+        &self,
+        _egraph: &egglog::EGraph,
+        _func: &egglog::Function,
+        _enode: &egglog::Enode<'_>,
+        child_costs: &[TreeOnlyCost],
+    ) -> TreeOnlyCost {
+        Rc::new(1 + child_costs.iter().map(|cost| **cost).sum::<u64>())
+    }
+
+    fn total_container_cost(
+        &self,
+        _egraph: &egglog::EGraph,
+        _sort: &egglog::ArcSort,
+        _value: egglog::Value,
+        element_costs: &[TreeOnlyCost],
+    ) -> TreeOnlyCost {
+        Rc::new(element_costs.iter().map(|cost| **cost).sum())
+    }
+}
 
 fn eval_get_size(egraph: &mut egglog::EGraph, names: &[&str]) -> i64 {
     let span = span!();
@@ -65,6 +130,21 @@ const DYNAMIC_DAG_FIXTURE: &str = "
 (let daggy (Pair shared shared))
 (let treeish (Pair (Leaf 1) (Leaf 2)))
 (union daggy treeish)
+";
+
+const CYCLIC_DAG_FIXTURE: &str = "
+(sort S)
+(constructor S0 (S) S)
+(constructor S3 (S S) S)
+(constructor S5 (S) S)
+(constructor S6 () S)
+
+(let b (S6))
+(let c (S0 b))
+(let x (S0 (S3 (S5 b) b)))
+(let y (S0 (S0 (S0 c))))
+(union x y)
+(let victim (S0 x))
 ";
 
 fn run_dynamic_dag(commands: &str) -> Vec<CommandOutput> {
@@ -143,6 +223,174 @@ fn test_greedy_dag_extract_prefers_shared_subterms() {
 }
 
 #[test]
+fn test_greedy_dag_cost_and_term_use_the_same_producer_snapshot() {
+    let mut egraph = egglog_experimental::new_experimental_egraph();
+    egraph
+        .parse_and_run_program(
+            None,
+            r#"
+            (with-dynamic-cost
+              (datatype E
+                (X :cost 10)
+                (D :cost 4)
+                (C E :cost 1)
+                (Bx E :cost 1)
+                (Bc E :cost 1)
+                (A E E :cost 1)
+                (Alt :cost 15)))
+            (let $x (X))
+            (let $d (D))
+            (let $c (C $d))
+            (let $b-old (Bx $x))
+            (let $b-new (Bc $c))
+            (union $b-old $b-new)
+            (let $a (A $b-old $x))
+            (union $a (Alt))
+            "#,
+        )
+        .unwrap();
+
+    let root_expr = egraph.parser.get_expr_from_string(None, "$a").unwrap();
+    let (sort, value) = egraph.eval_expr(&root_expr).unwrap();
+    let extracted = egglog_experimental::extract_best_greedy_dag(
+        &egraph,
+        vec![(sort.clone(), value)],
+        egglog_experimental::DynamicCostModel,
+    )
+    .unwrap();
+    let root = extracted.terms[0].as_ref().unwrap();
+    let term = extracted.termdag.to_string(root.term);
+
+    assert_eq!(root.cost, 12);
+    assert_eq!(term, "(A (Bx (X)) (X))");
+    let roundtrip = egraph.parser.get_expr_from_string(None, &term).unwrap();
+    let (roundtrip_sort, roundtrip_value) = egraph.eval_expr(&roundtrip).unwrap();
+    assert_eq!(roundtrip_sort.name(), sort.name());
+    assert_eq!(roundtrip_value, value);
+
+    let variants = egglog_experimental::extract_variants_greedy_dag(
+        &egraph,
+        vec![(sort, value)],
+        1,
+        egglog_experimental::DynamicCostModel,
+    )
+    .unwrap();
+    assert_eq!(variants.variants[0][0].cost, 12);
+    assert_eq!(
+        variants.termdag.to_string(variants.variants[0][0].term),
+        term
+    );
+}
+
+#[test]
+fn test_greedy_dag_reconciles_conflicting_child_snapshots() {
+    let mut egraph = egglog_experimental::new_experimental_egraph();
+    egraph
+        .parse_and_run_program(
+            None,
+            r#"
+            (with-dynamic-cost
+              (datatype E
+                (A :cost 5)
+                (PAlt :cost 0)
+                (OldOnly :cost 1)
+                (UOnly :cost 1)
+                (UOnly2 :cost 0)
+                (C :cost 1)
+                (B E :cost 1)
+                (XOld E E E :cost 2)
+                (XNew E :cost 1)
+                (U E E E E E :cost 1)
+                (V E E :cost 1)
+                (P E E :cost 1)))
+            (let $a (A))
+            (let $p-alt (PAlt))
+            (let $old-only (OldOnly))
+            (let $u-only (UOnly))
+            (let $u-only-2 (UOnly2))
+            (let $c (C))
+            (let $b (B $c))
+            (let $x-old (XOld $p-alt $a $old-only))
+            (let $x-new (XNew $b))
+            (union $x-old $x-new)
+            (let $u (U $x-old $b $c $u-only $u-only-2))
+            (let $v (V $x-old $a))
+            (let $p (P $u $v))
+            (union $p $p-alt)
+            "#,
+        )
+        .unwrap();
+
+    let roots: Vec<_> = ["$p", "$u", "$v"]
+        .into_iter()
+        .map(|root| {
+            let expr = egraph.parser.get_expr_from_string(None, root).unwrap();
+            egraph.eval_expr(&expr).unwrap()
+        })
+        .collect();
+    let extracted = egglog_experimental::extract_best_greedy_dag(
+        &egraph,
+        roots.clone(),
+        egglog_experimental::DynamicCostModel,
+    )
+    .unwrap();
+    let terms: Vec<_> = extracted
+        .terms
+        .iter()
+        .map(|root| {
+            let root = root.as_ref().unwrap();
+            (root.cost, extracted.termdag.to_string(root.term))
+        })
+        .collect();
+
+    assert_eq!(
+        terms,
+        [
+            (0, "(PAlt)".to_owned(),),
+            (
+                5,
+                "(U (XNew (B (C))) (B (C)) (C) (UOnly) (UOnly2))".to_owned(),
+            ),
+            (9, "(V (XOld (PAlt) (A) (OldOnly)) (A))".to_owned()),
+        ]
+    );
+    for ((expected_sort, expected_value), (_, term)) in roots.iter().zip(&terms) {
+        let expr = egraph.parser.get_expr_from_string(None, term).unwrap();
+        let (actual_sort, actual_value) = egraph.eval_expr(&expr).unwrap();
+        assert_eq!(actual_sort.name(), expected_sort.name());
+        assert_eq!(actual_value, *expected_value);
+    }
+
+    // The losing XOld snapshot reaches the root through PAlt, but the larger
+    // sibling snapshot selects XNew. Reconciliation removes that apparent
+    // cycle, so the finite P producer must remain available as a variant.
+    let root_expr = egraph.parser.get_expr_from_string(None, "$p").unwrap();
+    let root = egraph.eval_expr(&root_expr).unwrap();
+    let variants = egglog_experimental::extract_variants_greedy_dag(
+        &egraph,
+        vec![root],
+        2,
+        egglog_experimental::DynamicCostModel,
+    )
+    .unwrap();
+    let extracted_variants: Vec<_> = variants.variants[0]
+        .iter()
+        .map(|variant| (variant.cost, variants.termdag.to_string(variant.term)))
+        .collect();
+    assert_eq!(
+        extracted_variants,
+        [
+            (0, "(PAlt)".to_owned()),
+            (
+                12,
+                "(P (U (XNew (B (C))) (B (C)) (C) (UOnly) (UOnly2)) (V (XNew (B (C))) (A)))"
+                    .to_owned(),
+            ),
+        ]
+    );
+}
+
+#[test]
 fn test_greedy_dag_extract_respects_set_cost() {
     let result = run_dynamic_dag(
         "
@@ -166,22 +414,7 @@ fn test_greedy_dag_extract_avoids_cycle_from_python_issue_387() {
     let result = egraph
         .parse_and_run_program(
             None,
-            "
-        (sort S)
-        (constructor S0 (S) S)
-        (constructor S3 (S S) S)
-        (constructor S5 (S) S)
-        (constructor S6 () S)
-
-        (let b (S6))
-        (let c (S0 b))
-        (let x (S0 (S3 (S5 b) b)))
-        (let y (S0 (S0 (S0 c))))
-
-        (union x y)
-
-        (let victim (S0 x))
-        (extract victim :extractor greedy-dag)",
+            &format!("{CYCLIC_DAG_FIXTURE}\n(extract victim :extractor greedy-dag)"),
         )
         .unwrap();
 
@@ -196,30 +429,24 @@ fn test_greedy_dag_multi_extract_avoids_combined_root_cycle() {
     let result = egraph
         .parse_and_run_program(
             None,
-            "
-        (sort S)
-        (constructor S0 (S) S)
-        (constructor S3 (S S) S)
-        (constructor S5 (S) S)
-        (constructor S6 () S)
-
-        (let b (S6))
-        (let c (S0 b))
-        (let x (S0 (S3 (S5 b) b)))
-        (let y (S0 (S0 (S0 c))))
-
-        (union x y)
-
-        (let victim (S0 x))
-        (multi-extract 1 victim x :extractor greedy-dag)",
+            &format!("{CYCLIC_DAG_FIXTURE}\n(multi-extract 1 victim x :extractor greedy-dag)"),
         )
         .unwrap();
 
     assert_eq!(result.len(), 1);
     let output = result[0].to_string();
-    assert!(
-        output.contains("S0") || output.contains("S6"),
-        "combined greedy-DAG extraction should return finite terms, got {output}"
+    assert_eq!(
+        output.lines().filter(|line| *line == "   (").count(),
+        2,
+        "multi-extract should preserve both requested roots: {output}"
+    );
+    assert_eq!(
+        output
+            .lines()
+            .filter(|line| line.starts_with("      "))
+            .count(),
+        2,
+        "multi-extract should return one finite term per root: {output}"
     );
 }
 
@@ -497,6 +724,35 @@ fn test_multi_extract_accepts_greedy_dag_extractor() {
     assert!(
         !output.contains("(Pair (Leaf 1) (Leaf 2))"),
         "expected greedy DAG to prefer the shared term: {output}"
+    );
+}
+
+#[test]
+fn test_multi_extract_accepts_tree_only_cost_model() {
+    let mut egraph = egglog_experimental::new_experimental_egraph();
+    egraph
+        .add_command(
+            "tree-multi-extract".to_owned(),
+            Arc::new(egglog_experimental::MultiExtract::new(TreeOnlyCostModel)),
+        )
+        .unwrap();
+
+    let result = egraph
+        .parse_and_run_program(
+            None,
+            "(datatype E (Num i64)) (tree-multi-extract 1 (Num 1))",
+        )
+        .unwrap();
+
+    assert_eq!(result.len(), 1);
+    assert!(result[0].to_string().contains("(Num 1)"));
+
+    let err = egraph
+        .parse_and_run_program(None, "(tree-multi-extract 1 (Num 1) :extractor greedy-dag)")
+        .unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("does not support greedy-DAG extraction")
     );
 }
 
@@ -888,7 +1144,9 @@ fn test_extract_extra_arguments_return_error_instead_of_panicking() {
         .parse_and_run_program(None, "(extract 0 1 2)")
         .unwrap_err();
 
-    assert!(err.to_string().contains("expected :extractor"));
+    assert!(err.to_string().contains(
+        "extract expects an expression, optional variant count, and optional :extractor"
+    ));
 }
 
 #[test]
@@ -927,21 +1185,65 @@ fn test_extract_zero_variants_preserves_best_extract_behavior() {
 }
 
 #[test]
-fn test_greedy_dag_extract_variants_zero_primitive_returns_empty() {
+fn test_greedy_dag_extract_zero_variants_returns_empty_for_all_root_kinds() {
     let mut egraph = egglog_experimental::new_experimental_egraph();
-    let expr = egraph.parser.get_expr_from_string(None, "1").unwrap();
-    let (sort, value) = egraph.eval_expr(&expr).unwrap();
+    egraph
+        .parse_and_run_program(None, "(datatype E (Num i64)) (sort IntVec (Vec i64))")
+        .unwrap();
+    let roots = ["1", "(vec-of 1)", "(Num 1)"]
+        .into_iter()
+        .map(|source| {
+            let expr = egraph.parser.get_expr_from_string(None, source).unwrap();
+            egraph.eval_expr(&expr).unwrap()
+        })
+        .collect();
 
+    let calls = Cell::new(0);
     let extracted = egglog_experimental::extract_variants_greedy_dag(
         &egraph,
-        vec![(sort, value)],
+        roots,
         0,
-        egglog::extract::AdditiveCostModel::default(),
+        BorrowedCountingMarginalCostModel(&calls),
     )
     .unwrap();
 
-    assert_eq!(extracted.variants.len(), 1);
-    assert!(extracted.variants[0].is_empty());
+    assert_eq!(extracted.variants.len(), 3);
+    assert!(extracted.variants.iter().all(Vec::is_empty));
+    assert_eq!(calls.get(), 0);
+}
+
+#[test]
+fn test_greedy_dag_tracks_eq_dependencies_nested_in_containers() {
+    let mut egraph = egglog_experimental::new_experimental_egraph();
+    egraph
+        .parse_and_run_program(
+            None,
+            "(datatype* (E (Leaf) (List VecE)) (sort VecE (Vec E)))",
+        )
+        .unwrap();
+    let expr = egraph
+        .parser
+        .get_expr_from_string(None, "(List (vec-of (Leaf)))")
+        .unwrap();
+    let (sort, value) = egraph.eval_expr(&expr).unwrap();
+
+    // Discovery records the List producer before Leaf. Reaching List therefore
+    // requires the reverse worklist index to include the E value inside VecE.
+    let calls = Cell::new(0);
+    let extracted = egglog_experimental::extract_best_greedy_dag(
+        &egraph,
+        vec![(sort, value)],
+        BorrowedCountingMarginalCostModel(&calls),
+    )
+    .unwrap();
+    let root = extracted.terms[0].as_ref().unwrap();
+
+    assert_eq!(root.cost, 2);
+    assert_eq!(
+        extracted.termdag.to_string(root.term),
+        "(List (vec-of (Leaf)))"
+    );
+    assert!(calls.get() > 0);
 }
 
 #[test]
