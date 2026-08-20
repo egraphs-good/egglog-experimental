@@ -1,4 +1,6 @@
-//! Tests for the `unstable-subst` primitive.
+//! Tests for `unstable-subst` that need Rust: e-class identity, table sizes,
+//! error variants, and the `subst` entry point. The language-level semantics
+//! are in `tests/subst-basics.egg`.
 
 use egglog::prelude::exprs::var;
 use egglog::prelude::*;
@@ -25,33 +27,6 @@ fn egraph(program: &str) -> EGraph {
 /// rather than terms.
 fn global(eg: &mut EGraph, name: &str) -> Value {
     eg.eval_expr(&var(&format!("${name}"))).unwrap().1
-}
-
-#[test]
-fn replaces_a_variable_everywhere_it_occurs() {
-    egraph(
-        r#"
-(let $x (Var "x"))
-(let $y (Var "y"))
-(let $e (Add $x (Mul $x (Num 2))))
-(let $copy (unstable-subst $e (map-insert (map-empty) $x $y)))
-(check (= $copy (Add $y (Mul $y (Num 2)))))
-(fail (check (= $copy $e)))
-"#,
-    );
-}
-
-#[test]
-fn substitutes_several_keys_at_once() {
-    egraph(
-        r#"
-(let $x (Var "x"))
-(let $y (Var "y"))
-(let $e (Add $x $y))
-(let $copy (unstable-subst $e (map-insert (map-insert (map-empty) $x $y) $y $x)))
-(check (= $copy (Add $y $x)))
-"#,
-    );
 }
 
 #[test]
@@ -110,45 +85,6 @@ fn unaffected_subterms_are_shared_not_copied() {
     assert_ne!(global(&mut eg, "e"), global(&mut eg, "copy"));
 }
 
-/// Copying an e-class copies every one of its e-nodes, so an equation between
-/// two reachable terms is carried over to the copy. For an equation a rewrite
-/// rule derived — one that holds for every value of the substituted class —
-/// that is exactly right: `x * 0 = 0` stays `5 * 0 = 0`. The untouched `(Num 0)`
-/// e-node copies to itself, which is what merges the copy back into that class.
-#[test]
-fn an_equation_that_holds_for_every_value_survives_substitution() {
-    egraph(
-        r#"
-(rewrite (Mul a (Num 0)) (Num 0))
-(let $x (Var "x"))
-(let $e (Mul $x (Num 0)))
-(run 1)
-(check (= $e (Num 0)))
-(let $copy (unstable-subst $e (map-insert (map-empty) $x (Num 5))))
-(check (= $copy (Mul (Num 5) (Num 0))))
-(check (= $copy (Num 0)))
-"#,
-    );
-}
-
-/// The same mechanism is unsound on a *ground* equation, which holds only for
-/// the class it pins down: `(union (Add x (Num 1)) (Num 5))` says `x = 4`, and
-/// substituting `x := 9` into it asserts `9 + 1 = 5`. Only substitute classes
-/// that behave like universally quantified variables.
-#[test]
-fn a_ground_equation_about_a_key_is_substituted_too() {
-    egraph(
-        r#"
-(let $x (Var "x"))
-(let $e (Add $x (Num 1)))
-(union $e (Num 5))
-(let $copy (unstable-subst $e (map-insert (map-empty) $x (Num 9))))
-(check (= $copy (Add (Num 9) (Num 1))))
-(check (= $copy (Num 5)))
-"#,
-    );
-}
-
 /// A row an action has only just staged is not in the tables the walk reads,
 /// so a term built in the same action is invisible to it and comes back
 /// unsubstituted — with no error. Terms from earlier commands, and from
@@ -163,83 +99,6 @@ fn does_not_see_terms_built_in_the_same_action() {
 "#,
     );
     assert_eq!(global(&mut eg, "copy"), global(&mut eg, "unsubstituted"));
-}
-
-/// A key e-class is replaced whole, never walked into, so the other e-nodes in
-/// it do not get copied alongside the replacement. With `{Lit 1, Var "x"}` in
-/// one class and `x |-> 2`, the copy holds `2` and nothing asserts `1 = 2`.
-///
-/// Contrast `a_ground_equation_about_a_key_is_substituted_too`, where the class
-/// is affected but *not* a key: there every e-node is copied.
-#[test]
-fn a_key_eclass_is_replaced_whole() {
-    egraph(
-        r#"
-(let $x (Var "x"))
-(let $one (Num 1))
-(union $x $one)
-(let $e (Add $x (Num 3)))
-(let $copy (unstable-subst $e (map-insert (map-empty) $x (Num 2))))
-(check (= $copy (Add (Num 2) (Num 3))))
-;; the other e-node of the key class is not dragged along
-(fail (check (= (Num 1) (Num 2))))
-;; and the original class is untouched
-(check (= (Num 1) (Var "x")))
-(fail (check (= $copy $e)))
-"#,
-    );
-}
-
-/// The staging limit is about the region being walked, not the replacements:
-/// a map's values are spliced into the copy without being walked, so building
-/// one in the same action is fine.
-#[test]
-fn a_replacement_built_in_the_same_action_is_fine() {
-    egraph(
-        r#"
-(let $x (Var "x"))
-(let $e (Add $x (Num 1)))
-(let $copy (unstable-subst $e (map-insert (map-empty) $x (Mul (Num 2) (Num 3)))))
-(check (= $copy (Add (Mul (Num 2) (Num 3)) (Num 1))))
-"#,
-    );
-}
-
-/// An `unstable-fn` value captures e-classes, and those get substituted like
-/// any other container's contents. The sort reports its element sorts as the
-/// arguments *still to be applied*, which for a nullary one is nothing at all,
-/// so classifying containers by that would skip these silently.
-#[test]
-fn substitutes_inside_a_captured_function_value() {
-    egraph(
-        r#"
-(sort Thunk (UnstableFn () Math))
-(constructor Delay (Thunk) Math)
-(let $x (Var "x"))
-(let $e (Delay (unstable-fn "Add" $x (Num 1))))
-(let $copy (unstable-subst $e (map-insert (map-empty) $x (Num 5))))
-(check (= $copy (Delay (unstable-fn "Add" (Num 5) (Num 1)))))
-(fail (check (= $copy $e)))
-"#,
-    );
-}
-
-/// A cyclic e-class is copied as long as one of its e-nodes has all its
-/// children outside the cycle: that e-node's `lookup_or_insert` names the copy,
-/// and the cyclic e-node then unions into it. No e-class id is invented.
-#[test]
-fn a_grounded_cyclic_eclass_is_copied() {
-    egraph(
-        r#"
-(let $x (Var "x"))
-(let $loop (Add $x (Num 0)))
-;; $loop now holds a grounded e-node and one referring to its own class.
-(union $loop (Add $loop (Num 0)))
-(let $copy (unstable-subst $loop (map-insert (map-empty) $x (Num 7))))
-(check (= $copy (Add (Num 7) (Num 0))))
-(check (= $copy (Add $copy (Num 0))))
-"#,
-    );
 }
 
 /// `$a = {Add (Num 0) x, Add $b x}` with `$b = Mul $a (Num 1)`: affected through
@@ -316,53 +175,6 @@ fn an_ungrounded_cycle_panics_from_egglog() {
     );
 }
 
-/// The root's sort is free: it need not be the map's key sort, because a
-/// substitution reaches through every sort in the term structure.
-#[test]
-fn the_root_may_be_a_different_sort_than_the_keys() {
-    egraph(
-        r#"
-(datatype MathList (Nil) (Cons Math MathList))
-(let $x (Var "x"))
-(let $list (Cons $x (Cons (Num 1) (Nil))))
-(let $copy (unstable-subst $list (map-insert (map-empty) $x (Num 8))))
-(check (= $copy (Cons (Num 8) (Cons (Num 1) (Nil)))))
-"#,
-    );
-}
-
-/// E-classes reached only through a container child are substituted too, and
-/// the container is rebuilt around the replacements.
-#[test]
-fn substitutes_inside_container_children() {
-    egraph(
-        r#"
-(sort MathVec (Vec Math))
-(constructor Sum (MathVec) Math)
-(let $x (Var "x"))
-(let $e (Sum (vec-of $x (Num 1))))
-(let $copy (unstable-subst $e (map-insert (map-empty) $x (Num 4))))
-(check (= $copy (Sum (vec-of (Num 4) (Num 1)))))
-"#,
-    );
-}
-
-/// Container children with no e-classes inside are never walked into, so a
-/// substitution leaves them alone.
-#[test]
-fn leaves_containers_without_eclasses_alone() {
-    egraph(
-        r#"
-(sort Ints (Vec i64))
-(constructor Tagged (Math Ints) Math)
-(let $x (Var "x"))
-(let $e (Tagged $x (vec-of 1 2)))
-(let $copy (unstable-subst $e (map-insert (map-empty) $x (Num 5))))
-(check (= $copy (Tagged (Num 5) (vec-of 1 2))))
-"#,
-    );
-}
-
 /// Subsumed e-nodes are excluded from extraction, so a copy must not bring
 /// them back un-subsumed.
 #[test]
@@ -381,22 +193,6 @@ fn skips_subsumed_enodes() {
     // The one `Mul` row is the subsumed original; no copy was made.
     let muls = eg.update(|fs| Ok(fs.table_size("Mul"))).unwrap();
     assert_eq!(muls, Some(1));
-}
-
-#[test]
-fn runs_in_a_naive_rule_head() {
-    egraph(
-        r#"
-(constructor Beta (Math Math Math) Math)
-(rule ((= $lhs (Beta body from to)))
-      ((union $lhs (unstable-subst body (map-insert (map-empty) from to))))
-      :naive)
-(let $x (Var "x"))
-(let $b (Beta (Add $x $x) $x (Num 3)))
-(run 1)
-(check (= $b (Add (Num 3) (Num 3))))
-"#,
-    );
 }
 
 /// Reads of live tables in a seminaive rule head would not re-fire when the
@@ -443,23 +239,6 @@ fn rejects_a_map_between_different_sorts() {
     );
 }
 
-/// Substitution is simultaneous, and a key's replacement is not itself
-/// substituted — but a *reachable* class that happens to be a replacement is
-/// still copied where it occurs on its own.
-#[test]
-fn a_replacement_that_is_itself_affected_is_copied_where_it_occurs() {
-    egraph(
-        r#"
-(let $x (Var "x"))
-(let $y (Add $x (Num 1)))
-(let $e (Mul $x $y))
-(let $copy (unstable-subst $e (map-insert (map-empty) $x $y)))
-;; x |-> y, and y itself becomes (Add y 1) where it occurs as a child.
-(check (= $copy (Mul $y (Add $y (Num 1)))))
-"#,
-    );
-}
-
 /// The walk keeps its own stack, so a deep term does not turn into deep
 /// recursion. Depth is well past anything a program writes by hand while
 /// staying cheap enough for CI.
@@ -496,20 +275,4 @@ fn the_rust_api_substitutes() {
     let map = global(&mut eg, "map");
     let copy = egglog_experimental::subst(&mut eg, root, map).unwrap();
     assert_eq!(copy, global(&mut eg, "expected"));
-}
-
-#[test]
-fn a_popped_constructor_is_not_walked() {
-    egraph(
-        r#"
-(let $x (Var "x"))
-(push)
-(constructor Neg (Math) Math)
-(let $inner (Neg $x))
-(pop)
-(let $e (Add $x (Num 1)))
-(let $copy (unstable-subst $e (map-insert (map-empty) $x (Num 2))))
-(check (= $copy (Add (Num 2) (Num 1))))
-"#,
-    );
 }

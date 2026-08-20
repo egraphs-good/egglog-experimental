@@ -222,7 +222,7 @@ impl Walk<'_> {
             let mut nodes = Vec::new();
             for index in candidates {
                 let mut rows = Vec::new();
-                state.enodes_for_eclass(&self.ctors[index].name, value, |enode| {
+                state.constructor_enodes_for_eclass(&self.ctors[index].name, value, |enode| {
                     if !enode.subsumed {
                         rows.push(enode.children.to_vec());
                     }

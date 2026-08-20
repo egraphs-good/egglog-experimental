@@ -57,7 +57,7 @@ Consequences worth stating out loud:
   `x := 9` copies the untouched `(Num 5)` unchanged, merges, and thereby asserts
   `9 + 1 = 5`. So only substitute classes that behave like universally
   quantified variables — being singleton is neither necessary nor sufficient.
-  (`tests/subst.rs` pins both directions.)
+  (`tests/subst-basics.egg` pins both directions.)
 
   Copying every e-node rather than only the ones that change is deliberate.
   Copying only the changed e-nodes would never merge back into the original
@@ -127,11 +127,14 @@ how deeply the program's sorts nest containers.
 Nothing substitution-specific: three general pieces of e-graph introspection,
 after which the whole primitive is ordinary out-of-tree code.
 
-* `Read::enodes_for_eclass` — indexed lookup of the constructor rows whose
-  output column is a given e-class, instead of scanning the table. Cherry-picked
-  from <https://github.com/egraphs-good/egglog/pull/934> (still open), together
-  with the `core-relations` `ExecutionState::for_each_matching_col` and
-  `egglog-bridge` `TableAction::for_each_output_value` it rests on.
+* `Read::constructor_enodes_for_eclass` — indexed lookup of the constructor rows
+  whose output column is a given e-class, instead of scanning the table.
+  Cherry-picked from <https://github.com/egraphs-good/egglog/pull/934> (still
+  open), together with the `core-relations`
+  `ExecutionState::for_each_matching_col` and `egglog-bridge`
+  `TableAction::for_each_output_value` it rests on. The walk keeps an index from
+  sort to constructors and probes one table at a time, so it does not use
+  `Read::eclass_enodes`, which spans every constructor at once.
 * `Read::constructor_schema` / `Read::function_schema` / `Read::table_subtype` —
   a table's declared signature and subtype, from inside a primitive body.
   `EGraph::functions_iter` already exposes this from `&EGraph`, but a primitive
@@ -169,8 +172,12 @@ so a `Map` sort can be identified without downcasting to `MapSort` (whose
   registered without a proof validator, so a program that uses it under
   `--proofs` or `--term-encoding` is refused with "primitive operation lacks a
   validator function".
-* Tests live in `tests/subst.rs` rather than a `tests/*.egg` file, so they skip
-  the `files` harness's desugar / term-encoding / multi-thread variants.
+* The semantics are pinned by `tests/subst-basics.egg`, one case per push/pop
+  scope, and `tests/unstable-subst.egg` demonstrates beta reduction.
+  `tests/subst.rs` keeps what `check` cannot see: e-class identity, table sizes,
+  error variants, and the `subst` entry point. This repository's `files` harness
+  runs each `.egg` file once, without egglog's desugar / term-encoding /
+  multi-thread variants.
 * A failing substitution reaches an egglog program as the generic
   "primitive panicked", with the reason in the log. Registering a custom panic
   message needs `egglog_bridge::EGraph::new_panic`, and egglog exposes no

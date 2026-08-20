@@ -17,9 +17,12 @@ default = ["bin"]
 bin = ["egglog/bin"]
 
 [dependencies]
-egglog = { git = "https://github.com/egraphs-good/egglog.git", rev = "c2c0f1510a3633b768fb3d30ad284b211290e4b2", default-features = false }
-egglog-ast = { git = "https://github.com/egraphs-good/egglog.git", rev = "c2c0f1510a3633b768fb3d30ad284b211290e4b2", default-features = false }
-egglog-reports = { git = "https://github.com/egraphs-good/egglog.git", rev = "c2c0f1510a3633b768fb3d30ad284b211290e4b2", default-features = false }
+# TODO: re-pin to egraphs-good/egglog once https://github.com/egraphs-good/egglog/pull/1003
+# lands. `unstable-subst` needs the `pop` fix on that branch; without it, walking the
+# tables after a `pop` hands the backend a table id it no longer has.
+egglog = { git = "https://github.com/oflatt-claude/egglog.git", rev = "67d32a5f3dd77498aa2e4159bae8bdeadded7464", default-features = false }
+egglog-ast = { git = "https://github.com/oflatt-claude/egglog.git", rev = "67d32a5f3dd77498aa2e4159bae8bdeadded7464", default-features = false }
+egglog-reports = { git = "https://github.com/oflatt-claude/egglog.git", rev = "67d32a5f3dd77498aa2e4159bae8bdeadded7464", default-features = false }
 
 num = "0.4.3"
 lazy_static = "1.4"
