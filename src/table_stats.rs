@@ -83,10 +83,14 @@ pub struct TableStats {
 /// S-expression so it composes with the rest of egglog's output format.
 #[derive(Debug)]
 pub struct TableStatsOutput {
+    /// Statistics in the same order they are rendered.
     pub stats: Vec<TableStats>,
 }
 
 /// User-defined command implementing `(print-table-stats <name>?)`.
+///
+/// With no argument it reports every visible function table. One unquoted
+/// function name limits the report to that table.
 pub struct PrintTableStatsCommand;
 
 impl OutDegreeStats {
@@ -215,11 +219,15 @@ fn compute_table_stats(egraph: &EGraph, func_name: &str) -> Result<TableStats, E
     let func = egraph
         .get_function(func_name)
         .ok_or_else(|| TypeError::UnboundFunction(func_name.to_owned(), Span::Panic))?;
-    let schema = func.schema();
-    let mut column_types: Vec<String> = schema.input.iter().map(|s| s.name().to_owned()).collect();
-    column_types.push(schema.output.name().to_owned());
+    let func_type = func.func_type();
+    let mut column_types: Vec<String> = func_type
+        .input
+        .iter()
+        .map(|s| s.name().to_owned())
+        .collect();
+    column_types.push(func_type.output.name().to_owned());
     let n_cols = column_types.len();
-    let n_inputs = schema.input.len();
+    let n_inputs = func_type.input.len();
     let output_col = n_cols - 1;
     let track_combined = n_inputs >= 2;
 

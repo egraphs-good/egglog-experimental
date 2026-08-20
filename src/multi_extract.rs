@@ -1,11 +1,8 @@
-//! An implementation of multi-extraction for egraphs.
-//! Adds support for extracting multiple terms with a single command,
-//! reducing the overhead of creating an extractor for each term.
-//! The syntax for multi-extraction is `(multi-extract n t1 ... tm)`,
-//! where n must be a positive i64.
-//! This command will extract n lowest-cost variants of each of the m terms.
-//! `(multi-extract 1 t)` is equivalent to `(extract t)`. Unlike
-//! `(extract t 0)`, `(multi-extract 0 t)` is rejected.
+//! Extract multiple terms or variants with one extractor pass.
+//!
+//! `(multi-extract n term...)` prints the `n` lowest-cost variants of every
+//! term. `n` must be a positive `i64`; `(multi-extract 1 term)` is equivalent
+//! to best extraction.
 
 use egglog::{
     CommandOutput, EGraph, Error, TermDag, TermId, TypeError, UserDefinedCommand,
@@ -16,6 +13,7 @@ use egglog::{
 use log::log_enabled;
 use std::{fmt::Debug, marker::PhantomData};
 
+/// Displayable output produced by [`MultiExtract`].
 #[derive(Debug)]
 pub struct MultiExtractOutput {
     termdag: TermDag,
@@ -36,6 +34,11 @@ impl std::fmt::Display for MultiExtractOutput {
     }
 }
 
+/// User-defined command implementing `(multi-extract n term...)` with a
+/// caller-provided cost model.
+///
+/// The positive `i64` value `n` is the number of variants returned for each
+/// term. All terms share one extractor computation.
 pub struct MultiExtract<C: Cost + Ord + Eq + Clone + Debug + Send + Sync, CM: CostModel<C> + Clone>
 {
     cost_model: CM,
@@ -45,6 +48,7 @@ pub struct MultiExtract<C: Cost + Ord + Eq + Clone + Debug + Send + Sync, CM: Co
 impl<C: Cost + Ord + Eq + Clone + Debug + Send + Sync, CM: CostModel<C> + Clone>
     MultiExtract<C, CM>
 {
+    /// Creates a multi-extraction command that uses `cost_model`.
     pub fn new(cost_model: CM) -> Self {
         MultiExtract {
             cost_model,

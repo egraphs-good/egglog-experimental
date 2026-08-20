@@ -1,6 +1,6 @@
 [package]
 name = "egglog-experimental"
-version = "0.1.0"
+version = "3.0.0"
 edition = "2024"
 description = "Experimental extensions to the egglog language."
 repository = "https://github.com/egraphs-good/egglog-experimental"
@@ -17,9 +17,9 @@ default = ["bin"]
 bin = ["egglog/bin"]
 
 [dependencies]
-egglog = { git = "https://github.com/egraphs-good/egglog.git", rev = "53b9721b9706741edff2b7c1e379fc37137184d9", default-features = false }
-egglog-ast = { git = "https://github.com/egraphs-good/egglog.git", rev = "53b9721b9706741edff2b7c1e379fc37137184d9", default-features = false }
-egglog-reports = { git = "https://github.com/egraphs-good/egglog.git", rev = "53b9721b9706741edff2b7c1e379fc37137184d9", default-features = false }
+egglog = { version = "3.0.0", git = "https://github.com/egraphs-good/egglog.git", rev = "8879605cafad303db25787406163a7e5bc845f5d", default-features = false }
+egglog-ast = { version = "3.0.0", git = "https://github.com/egraphs-good/egglog.git", rev = "8879605cafad303db25787406163a7e5bc845f5d", default-features = false }
+egglog-reports = { version = "3.0.0", git = "https://github.com/egraphs-good/egglog.git", rev = "8879605cafad303db25787406163a7e5bc845f5d", default-features = false }
 
 num = "0.4.3"
 lazy_static = "1.4"

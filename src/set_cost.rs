@@ -1,3 +1,19 @@
+//! Runtime-configurable extraction costs.
+//!
+//! Wrap datatype or constructor declarations in `with-dynamic-cost` to create
+//! a cost table for each extractable constructor. `set-cost` updates a node's
+//! cost, and the replacement `extract` command reads those costs:
+//!
+//! ```text
+//! (with-dynamic-cost
+//!   (datatype Math (Num i64) (Add Math Math)))
+//! (set-cost (Num 1) 100)
+//! (extract (Num 1))
+//! ```
+//!
+//! Nodes without an assigned dynamic cost retain their normal tree-additive
+//! cost. Costs must be non-negative.
+
 use crate::Error;
 use egglog::{
     CommandOutput, EGraph, RawValues, Read, TermDag, TermId, UserDefinedCommand,
@@ -10,6 +26,11 @@ use egglog_ast::span::Span;
 use log::log_enabled;
 use std::sync::Arc;
 
+/// Registers `with-dynamic-cost`, `set-cost`, and the dynamic-cost `extract`
+/// command on an e-graph.
+///
+/// [`new_experimental_egraph`](crate::new_experimental_egraph) calls this
+/// automatically.
 pub fn add_set_cost(egraph: &mut EGraph) {
     egraph
         .parser
@@ -177,8 +198,11 @@ fn map_fallible<T>(
         .collect::<Result<_, _>>()
 }
 
-/// The cost model that handles dynamic costs. Use this cost model if you use the `with-dynamic-cost` / `set-cost`
-/// extensions in your egglog program
+/// An extraction cost model that reads costs assigned by `set-cost`.
+///
+/// It falls back to [`TreeAdditiveCostModel`] for constructors without an
+/// assigned dynamic cost. Use this model for custom extractors that should
+/// agree with this crate's replacement `extract` command.
 #[derive(Clone)]
 pub struct DynamicCostModel;
 
