@@ -29,6 +29,9 @@
 //!   primitives, functions, and globals determine the required access mode.
 //! - `(unstable-fresh! Sort [:cost N] [:unextractable])` creates a fresh value
 //!   for each match of a rule action.
+//! - [`Subst`] implements `(unstable-subst root map)`, which copies the
+//!   sub-e-graph reachable from `root` with each key e-class replaced by its
+//!   mapped value.
 //!
 //! ## Scheduling and extraction
 //!
@@ -73,6 +76,9 @@ pub use sugar::*;
 
 mod keep_best;
 pub use keep_best::KeepBestCommand;
+
+mod subst;
+pub use subst::{SUBST, Subst, subst, substitute};
 
 /// Creates a default [`EGraph`] with every experimental extension registered.
 ///
@@ -123,6 +129,9 @@ pub fn new_experimental_egraph() -> EGraph {
     egraph
         .add_command("primitive".into(), Arc::new(primitive::RegisterPrimitive))
         .unwrap();
+
+    // Substitution over a reachable sub-e-graph.
+    egraph.add_full_primitive(Subst, None);
     egraph
 }
 

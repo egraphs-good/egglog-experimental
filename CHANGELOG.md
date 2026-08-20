@@ -4,6 +4,12 @@ This file records notable user-facing changes to egglog-experimental.
 
 ## [Unreleased]
 
+### Added
+
+- `(unstable-subst root map)`, which copies the sub-e-graph reachable from
+  `root` with each key e-class replaced by its mapped value, and returns the
+  copied root. Available in top-level actions and `:naive` rule heads.
+
 ## [3.0.0] - 2026-08-20
 
 This is the first crates.io release of egglog-experimental. Its major version
