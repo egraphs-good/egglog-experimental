@@ -4,7 +4,7 @@ This file records notable user-facing changes to egglog-experimental.
 
 ## [Unreleased]
 
-## [3.0.0] - 2026-08-19
+## [3.0.0] - 2026-08-20
 
 This is the first crates.io release of egglog-experimental. Its major version
 matches egglog 3, with which it is compatible.
