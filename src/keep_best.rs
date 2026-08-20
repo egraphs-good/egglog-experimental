@@ -123,9 +123,9 @@ fn collect_and_extract(
         } else {
             egraph.extract_best(roots, DynamicCostModel)
         }
-        .map_err(|_| {
+        .map_err(|err| {
             Error::ExtractError(format!(
-                "keep-best: could not extract value in table {table_name}"
+                "keep-best: could not extract value in table {table_name}: {err}"
             ))
         })?;
         let termdag = extracted.termdag;

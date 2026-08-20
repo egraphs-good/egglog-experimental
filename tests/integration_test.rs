@@ -434,19 +434,9 @@ fn test_greedy_dag_multi_extract_avoids_combined_root_cycle() {
         .unwrap();
 
     assert_eq!(result.len(), 1);
-    let output = result[0].to_string();
     assert_eq!(
-        output.lines().filter(|line| *line == "   (").count(),
-        2,
-        "multi-extract should preserve both requested roots: {output}"
-    );
-    assert_eq!(
-        output
-            .lines()
-            .filter(|line| line.starts_with("      "))
-            .count(),
-        2,
-        "multi-extract should return one finite term per root: {output}"
+        result[0].to_string(),
+        "(\n   (\n      (S0 (S0 (S3 (S5 (S6)) (S6))))\n   )\n   (\n      (S0 (S3 (S5 (S6)) (S6)))\n   )\n)\n"
     );
 }
 

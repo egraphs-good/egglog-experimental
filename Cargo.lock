@@ -330,7 +330,7 @@ checksum = "d0881ea181b1df73ff77ffaaf9c7544ecc11e82fba9b5f27b262a3c73a332555"
 [[package]]
 name = "egglog"
 version = "3.0.0"
-source = "git+https://github.com/saulshanabrook/egg-smol.git?branch=codex%2Fgreedy-dag-extractor#5c42f40d0f72da0138e91c7e0aa093caf57ec36d"
+source = "git+https://github.com/saulshanabrook/egg-smol.git?branch=codex%2Fgreedy-dag-extractor#a78ba6ad39e70c293c903b3cbd76b65308934a6c"
 dependencies = [
  "chrono",
  "clap",
@@ -362,7 +362,7 @@ dependencies = [
 [[package]]
 name = "egglog-add-primitive"
 version = "3.0.0"
-source = "git+https://github.com/saulshanabrook/egg-smol.git?branch=codex%2Fgreedy-dag-extractor#5c42f40d0f72da0138e91c7e0aa093caf57ec36d"
+source = "git+https://github.com/saulshanabrook/egg-smol.git?branch=codex%2Fgreedy-dag-extractor#a78ba6ad39e70c293c903b3cbd76b65308934a6c"
 dependencies = [
  "quote",
  "syn 2.0.108",
@@ -371,7 +371,7 @@ dependencies = [
 [[package]]
 name = "egglog-ast"
 version = "3.0.0"
-source = "git+https://github.com/saulshanabrook/egg-smol.git?branch=codex%2Fgreedy-dag-extractor#5c42f40d0f72da0138e91c7e0aa093caf57ec36d"
+source = "git+https://github.com/saulshanabrook/egg-smol.git?branch=codex%2Fgreedy-dag-extractor#a78ba6ad39e70c293c903b3cbd76b65308934a6c"
 dependencies = [
  "ordered-float",
 ]
@@ -379,7 +379,7 @@ dependencies = [
 [[package]]
 name = "egglog-bridge"
 version = "3.0.0"
-source = "git+https://github.com/saulshanabrook/egg-smol.git?branch=codex%2Fgreedy-dag-extractor#5c42f40d0f72da0138e91c7e0aa093caf57ec36d"
+source = "git+https://github.com/saulshanabrook/egg-smol.git?branch=codex%2Fgreedy-dag-extractor#a78ba6ad39e70c293c903b3cbd76b65308934a6c"
 dependencies = [
  "anyhow",
  "dyn-clone",
@@ -402,7 +402,7 @@ dependencies = [
 [[package]]
 name = "egglog-concurrency"
 version = "3.0.0"
-source = "git+https://github.com/saulshanabrook/egg-smol.git?branch=codex%2Fgreedy-dag-extractor#5c42f40d0f72da0138e91c7e0aa093caf57ec36d"
+source = "git+https://github.com/saulshanabrook/egg-smol.git?branch=codex%2Fgreedy-dag-extractor#a78ba6ad39e70c293c903b3cbd76b65308934a6c"
 dependencies = [
  "arc-swap",
  "bumpalo",
@@ -414,7 +414,7 @@ dependencies = [
 [[package]]
 name = "egglog-core-relations"
 version = "3.0.0"
-source = "git+https://github.com/saulshanabrook/egg-smol.git?branch=codex%2Fgreedy-dag-extractor#5c42f40d0f72da0138e91c7e0aa093caf57ec36d"
+source = "git+https://github.com/saulshanabrook/egg-smol.git?branch=codex%2Fgreedy-dag-extractor#a78ba6ad39e70c293c903b3cbd76b65308934a6c"
 dependencies = [
  "anyhow",
  "bumpalo",
@@ -458,12 +458,12 @@ dependencies = [
 [[package]]
 name = "egglog-numeric-id"
 version = "3.0.0"
-source = "git+https://github.com/saulshanabrook/egg-smol.git?branch=codex%2Fgreedy-dag-extractor#5c42f40d0f72da0138e91c7e0aa093caf57ec36d"
+source = "git+https://github.com/saulshanabrook/egg-smol.git?branch=codex%2Fgreedy-dag-extractor#a78ba6ad39e70c293c903b3cbd76b65308934a6c"
 
 [[package]]
 name = "egglog-reports"
 version = "3.0.0"
-source = "git+https://github.com/saulshanabrook/egg-smol.git?branch=codex%2Fgreedy-dag-extractor#5c42f40d0f72da0138e91c7e0aa093caf57ec36d"
+source = "git+https://github.com/saulshanabrook/egg-smol.git?branch=codex%2Fgreedy-dag-extractor#a78ba6ad39e70c293c903b3cbd76b65308934a6c"
 dependencies = [
  "clap",
  "hashbrown 0.16.0",
@@ -477,7 +477,7 @@ dependencies = [
 [[package]]
 name = "egglog-union-find"
 version = "3.0.0"
-source = "git+https://github.com/saulshanabrook/egg-smol.git?branch=codex%2Fgreedy-dag-extractor#5c42f40d0f72da0138e91c7e0aa093caf57ec36d"
+source = "git+https://github.com/saulshanabrook/egg-smol.git?branch=codex%2Fgreedy-dag-extractor#a78ba6ad39e70c293c903b3cbd76b65308934a6c"
 dependencies = [
  "crossbeam",
  "egglog-concurrency",

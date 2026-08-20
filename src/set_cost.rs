@@ -219,7 +219,7 @@ impl MarginalCostModel<DefaultCost> for DynamicCostModel {
                     if cost >= 0 {
                         Some(cost as DefaultCost)
                     } else {
-                        log::warn!(
+                        log::debug!(
                             "Ignoring negative dynamic extraction cost {cost} for {}",
                             func.name()
                         );
