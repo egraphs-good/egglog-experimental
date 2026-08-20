@@ -1,3 +1,10 @@
+//! Inspect e-graph table sizes from an egglog expression.
+//!
+//! `(get-size!)` returns the sum of all non-internal table sizes.
+//! `(get-size! "A" "B")` returns the sum for the named tables. The primitive
+//! is read-capable, so it can also be used in extended schedule guards and
+//! `eval` steps.
+
 use std::convert::TryFrom;
 
 use egglog::{
@@ -9,6 +16,10 @@ use egglog::{
     util::INTERNAL_SYMBOL_PREFIX,
 };
 
+/// Read primitive implementing `(get-size! "table"...)`.
+///
+/// With no arguments it sums all non-internal tables. String arguments limit
+/// the sum to the named tables.
 #[derive(Clone)]
 pub struct GetSizePrimitive;
 

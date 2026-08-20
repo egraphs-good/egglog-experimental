@@ -17,6 +17,11 @@ use egglog::{
     span,
 };
 
+/// User-defined command implementing `(keep-best "table"...)`.
+///
+/// For every row in the named tables, the command extracts the best term for
+/// each value. It then **clears every function in the e-graph** and reinserts
+/// only the extracted rows from the named tables.
 pub struct KeepBestCommand;
 
 impl UserDefinedCommand for KeepBestCommand {
@@ -95,11 +100,11 @@ fn collect_and_extract(
             .get_function(table_name)
             .ok_or_else(|| TypeError::UnboundFunction(table_name.clone(), span!()))?;
 
-        let all_sorts: Vec<ArcSort> = func
-            .func_type()
+        let func_type = func.func_type();
+        let all_sorts: Vec<ArcSort> = func_type
             .input
             .iter()
-            .chain(std::iter::once(&func.func_type().output))
+            .chain(std::iter::once(&func_type.output))
             .cloned()
             .collect();
 
