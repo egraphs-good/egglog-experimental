@@ -1,0 +1,5 @@
+(sort IntMap (Map i64 i64))
+(sort IntBinary (UnstableFn (i64 i64) i64))
+
+; A Map fold callback must accept accumulator, key, and value.
+(map-fold-kv (unstable-fn "+") 0 (map-empty))

@@ -38,6 +38,73 @@ fn new_copy_egraph() -> egglog::EGraph {
     egraph
 }
 
+#[test]
+fn invalid_higher_order_calls_report_the_unresolved_primitive() {
+    let cases = [
+        (
+            r#"
+            (sort IntMap (Map i64 i64))
+            (sort IntBinary (UnstableFn (i64 i64) i64))
+            (map-fold-kv (unstable-fn "+") 0 (map-empty))
+            "#,
+            "Failed to infer a type for: @map-fold-kv",
+        ),
+        (
+            r#"
+            (sort MaybeInt (Maybe i64))
+            (sort IntToInt (UnstableFn (i64) i64))
+            (unstable-catch (unstable-fn "+" 1))
+            "#,
+            "Failed to infer a type for: @unstable-catch",
+        ),
+        (
+            r#"
+            (sort MaybeInt (Maybe i64))
+            (sort MaybeString (Maybe String))
+            (let ambiguous (maybe-none))
+            "#,
+            "Failed to infer a type for: @maybe-none",
+        ),
+    ];
+
+    for (program, expected) in cases {
+        let mut egraph = egglog_experimental::new_experimental_egraph();
+        let error = egraph.parse_and_run_program(None, program).unwrap_err();
+        assert!(
+            error.to_string().contains(expected),
+            "unexpected diagnostic: {error}"
+        );
+    }
+}
+
+#[test]
+fn f64_is_finite_rejects_nan_and_infinities() {
+    let mut egraph = egglog_experimental::new_experimental_egraph();
+    egraph
+        .parse_and_run_program(
+            None,
+            r#"
+            (check (f64-is-finite 1.0))
+            (fail (check (f64-is-finite NaN)))
+            (fail (check (f64-is-finite inf)))
+            (fail (check (f64-is-finite -inf)))
+            "#,
+        )
+        .unwrap();
+}
+
+#[test]
+fn f64_is_finite_supports_proof_mode() {
+    let mut egraph = egglog_experimental::new_experimental_egraph();
+    let resolved = egraph
+        .resolve_program(None, "(check (f64-is-finite 1.0))")
+        .unwrap();
+    assert!(egglog::program_supports_proofs(
+        &resolved,
+        egraph.type_info()
+    ));
+}
+
 fn let_backoff(egraph: &mut egglog::EGraph) {
     egraph
         .parse_and_run_program(

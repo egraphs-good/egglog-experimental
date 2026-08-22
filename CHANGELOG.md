@@ -4,6 +4,19 @@ This file records notable user-facing changes to egglog-experimental.
 
 ## [Unreleased]
 
+### Added
+
+- A `Maybe[T]` sort with construction, partial unwrapping, defaulting,
+  undefined-result capture, and higher-order branching. When more than one
+  nominal `Maybe` alias is compatible, `maybe-none` requires type context.
+- `map-fold-kv` for folding Map entries in opaque, EGraph-local stored `Value`
+  order. Callbacks should be order-insensitive; an undefined callback makes the
+  whole fold undefined.
+- `f64-is-finite`, a predicate for guarding computations that may produce NaN
+  or infinite values.
+
+`Maybe` operations and `map-fold-kv` are not currently supported in proof mode.
+
 ## [3.0.0] - 2026-08-20
 
 This is the first crates.io release of egglog-experimental. Its major version

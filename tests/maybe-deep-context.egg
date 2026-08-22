@@ -1,0 +1,9 @@
+; A nested expected type can resolve none through more than one surrounding
+; constructor even when another Maybe alias sorts first by name.
+(sort A (Maybe i64))
+(sort Z (Maybe i64))
+(sort ZZ (Maybe Z))
+(sort ZZZ (Maybe ZZ))
+(relation consume-deep-maybe (ZZZ))
+
+(consume-deep-maybe (maybe-some (maybe-some (maybe-none))))
