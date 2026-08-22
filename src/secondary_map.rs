@@ -16,7 +16,7 @@
 //! <https://docs.rs/slotmap/latest/slotmap/struct.SparseSecondaryMap.html> and
 //! <https://doc.rust-lang.org/beta/nightly-rustc/rustc_index/vec/struct.IndexVec.html>.
 
-use egglog::extract::CombinableCost;
+use egglog::extract::MonoidCost;
 use fixedbitset::FixedBitSet;
 use hashbrown::{Equivalent, HashMap};
 use std::borrow::Borrow;
@@ -149,7 +149,7 @@ impl<K> Interner<K> {
     /// The capacity is for expected present entries, not for the full interned
     /// universe. The membership bitset is sized from the frozen universe.
     #[inline]
-    fn aggregated_map_with_capacity<V: CombinableCost>(
+    fn aggregated_map_with_capacity<V: MonoidCost>(
         &self,
         entries_capacity: usize,
     ) -> AggregatedSparseSecondaryMap<K, V> {
@@ -319,12 +319,12 @@ impl<K, V> SparseSecondaryMap<K, V> {
 /// each id can be inserted once, membership tests are constant-time, iteration
 /// visits only present entries, and the commutative-monoid total is cached on
 /// insert.
-pub(super) struct AggregatedSparseSecondaryMap<K, V: CombinableCost> {
+pub(super) struct AggregatedSparseSecondaryMap<K, V: MonoidCost> {
     entries: SparseSecondaryMap<K, V>,
     total: V,
 }
 
-impl<K, V: CombinableCost> Clone for AggregatedSparseSecondaryMap<K, V> {
+impl<K, V: MonoidCost> Clone for AggregatedSparseSecondaryMap<K, V> {
     fn clone(&self) -> Self {
         Self {
             entries: self.entries.clone(),
@@ -333,7 +333,7 @@ impl<K, V: CombinableCost> Clone for AggregatedSparseSecondaryMap<K, V> {
     }
 }
 
-impl<K, V: CombinableCost> AggregatedSparseSecondaryMap<K, V> {
+impl<K, V: MonoidCost> AggregatedSparseSecondaryMap<K, V> {
     /// Unions several sparse secondary maps by cloning the largest input first.
     ///
     /// This is the efficient merge operation used by greedy-DAG candidate

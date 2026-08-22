@@ -1386,3 +1386,62 @@
   - Keep the implementation and report these post-base-update numbers in the
     PR description. The small shift from Experiment 43 is within the range
     expected from a fresh binary and does not change the conclusion.
+
+## Experiment 45: cache cost-model callbacks during greedy-DAG preparation
+
+- Status: accepted
+- Date: 2026-08-22
+- Question: does evaluating each reachable producer, primitive, and container
+  cost once during preparation preserve the default model's performance while
+  preventing fixed-point revisits, variant rescoring, and multiple roots from
+  repeating custom cost-model callbacks?
+- Baseline:
+  - Experimental commit
+    `38894aa2589ba6f80cf8de3aac05b7b25e4384bb`, built from its locked core
+    dependency at `a78ba6ad39e70c293c903b3cbd76b65308934a6c`.
+  - Release binary SHA-256:
+    `1a6819f571512ddd55d92168f4b6f2a176f277193e5b253046e1cebff4ae60a3`.
+- Candidate:
+  - Core commit `8f41101a5f214f806f588a4391d633467e10df95`.
+  - Experimental worktree diff fingerprint, excluding the local
+    `rust-toolchain.toml` change:
+    `fa2ea72bcc34183c18b6a54d5775d3b1573574ed`.
+  - Release binary SHA-256:
+    `6c668c6b7703765af9d68dc58ac8fdc1ceb47d88e7066843e5258ea4cf707623`.
+- Input:
+  - Tree: core's checked-in `tests/taylor51.egg`.
+  - Greedy DAG: a temporary copy with only the 324 extraction commands changed
+    to append `:extractor greedy-dag`.
+- Correctness validation:
+  - A borrowed counting model checks a nested producer/container case and
+    observes exactly three callbacks: two producer rows and one container.
+  - A variants test requests two variants for each of two identical roots and
+    observes exactly four callbacks total: two producer rows and two primitive
+    values. Variant rescoring and the second root therefore reuse the prepared
+    cost snapshot.
+  - The producer-conflict regression requests both best terms and variants. In
+    each extraction, its twelve reachable producer rows cause exactly twelve
+    callbacks even though reconciling the child snapshots triggers exact
+    rescoring.
+  - A non-additive `MaxCost` model verifies that paid-set aggregation uses the
+    public monoid operation: combining marginal costs 3 and 2 produces 3, not
+    the additive result 5.
+  - The experimental release file corpus passed 40/40.
+- Exact timing command:
+  - `hyperfine --warmup 5 --runs 30 --export-json /tmp/pr55-cost-cache-taylor51.json --command-name 'baseline greedy-dag' '<baseline-bin> /tmp/greedy-dag-taylor-current.egg >/dev/null' --command-name 'cached greedy-dag' '<candidate-bin> /tmp/greedy-dag-taylor-current.egg >/dev/null' --command-name 'current tree' '<candidate-bin> <core>/tests/taylor51.egg >/dev/null'`
+- Observed result:
+  - Baseline greedy DAG: `207.4 ms +/- 3.4 ms`.
+  - Cached greedy DAG: `206.9 ms +/- 2.8 ms`.
+  - Current tree: `1.039 s +/- 0.014 s`.
+  - The candidate/baseline mean change is `-0.23%`; the Fieller-style 95%
+    confidence interval is `[-0.98%, +0.53%]`, computed with
+    `egglog_repro/scripts/compute_timing_percent_change.mjs` from all 30 process
+    samples. The timing artifacts are
+    `/tmp/pr55-cost-cache-taylor51.json` and
+    `/tmp/pr55-cost-cache-percent-change.csv`.
+  - Cached greedy DAG is `5.02 +/- 0.10` times faster than current tree on this
+    workload.
+- Decision:
+  - Keep one-time callback evaluation. It makes custom stateful or expensive
+    models predictable, exact callback-count tests cover the behavior, and the
+    default cheap model shows no measurable regression.

@@ -13,33 +13,88 @@ type TreeOnlyCost = Rc<u64>;
 #[derive(Clone)]
 struct TreeOnlyCostModel;
 
-struct BorrowedCountingMarginalCostModel<'a>(&'a Cell<usize>);
+struct CountingDagCostModel<'a, M>(&'a Cell<usize>, M);
 
-impl egglog::extract::BaseCostModel<usize> for BorrowedCountingMarginalCostModel<'_> {
+impl<C, M> egglog::extract::DagCostModel<C> for CountingDagCostModel<'_, M>
+where
+    C: egglog::extract::MonoidCost,
+    M: egglog::extract::DagCostModel<C>,
+{
+    fn base_value_cost(
+        &self,
+        egraph: &egglog::EGraph,
+        sort: &egglog::ArcSort,
+        value: egglog::Value,
+    ) -> C {
+        self.0.set(self.0.get() + 1);
+        self.1.base_value_cost(egraph, sort, value)
+    }
+
+    fn enode_cost(
+        &self,
+        egraph: &egglog::EGraph,
+        func: &egglog::Function,
+        enode: &egglog::Enode<'_>,
+    ) -> C {
+        self.0.set(self.0.get() + 1);
+        self.1.enode_cost(egraph, func, enode)
+    }
+
+    fn container_cost(
+        &self,
+        egraph: &egglog::EGraph,
+        sort: &egglog::ArcSort,
+        value: egglog::Value,
+    ) -> C {
+        self.0.set(self.0.get() + 1);
+        self.1.container_cost(egraph, sort, value)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct MaxCost(u64);
+
+impl egglog::extract::MonoidCost for MaxCost {
+    fn identity() -> Self {
+        Self(0)
+    }
+
+    fn combine(self, other: &Self) -> Self {
+        std::cmp::max(self, *other)
+    }
+}
+
+struct MaxCostModel;
+
+impl egglog::extract::DagCostModel<MaxCost> for MaxCostModel {
     fn base_value_cost(
         &self,
         _egraph: &egglog::EGraph,
         _sort: &egglog::ArcSort,
         _value: egglog::Value,
-    ) -> usize {
-        self.0.set(self.0.get() + 1);
-        1
+    ) -> MaxCost {
+        MaxCost(1)
     }
-}
 
-impl egglog::extract::MarginalCostModel<usize> for BorrowedCountingMarginalCostModel<'_> {
-    fn marginal_enode_cost(
+    fn enode_cost(
         &self,
         _egraph: &egglog::EGraph,
-        _func: &egglog::Function,
+        func: &egglog::Function,
         _enode: &egglog::Enode<'_>,
-    ) -> usize {
-        self.0.set(self.0.get() + 1);
-        1
+    ) -> MaxCost {
+        MaxCost(match func.name() {
+            "Cheap" => 2,
+            "Pair" => 3,
+            "Expensive" => 5,
+            name => panic!("unexpected constructor {name}"),
+        })
     }
 }
 
-impl egglog::extract::BaseCostModel<TreeOnlyCost> for TreeOnlyCostModel {
+impl egglog::extract::TreeCostModel<TreeOnlyCost> for TreeOnlyCostModel {
+    type EnodeCost = ();
+    type ContainerCost = ();
+
     fn base_value_cost(
         &self,
         _egraph: &egglog::EGraph,
@@ -48,26 +103,27 @@ impl egglog::extract::BaseCostModel<TreeOnlyCost> for TreeOnlyCostModel {
     ) -> TreeOnlyCost {
         Rc::new(1)
     }
-}
-
-impl egglog::extract::TotalCostModel<TreeOnlyCost> for TreeOnlyCostModel {
-    fn total_enode_cost(
+    fn enode_cost(
         &self,
         _egraph: &egglog::EGraph,
         _func: &egglog::Function,
         _enode: &egglog::Enode<'_>,
-        child_costs: &[TreeOnlyCost],
-    ) -> TreeOnlyCost {
-        Rc::new(1 + child_costs.iter().map(|cost| **cost).sum::<u64>())
+    ) {
     }
 
-    fn total_container_cost(
+    fn container_cost(
         &self,
         _egraph: &egglog::EGraph,
         _sort: &egglog::ArcSort,
         _value: egglog::Value,
-        element_costs: &[TreeOnlyCost],
-    ) -> TreeOnlyCost {
+    ) {
+    }
+
+    fn fold_enode_cost(&self, (): (), child_costs: &[TreeOnlyCost]) -> TreeOnlyCost {
+        Rc::new(1 + child_costs.iter().map(|cost| **cost).sum::<u64>())
+    }
+
+    fn fold_container_cost(&self, (): (), element_costs: &[TreeOnlyCost]) -> TreeOnlyCost {
         Rc::new(element_costs.iter().map(|cost| **cost).sum())
     }
 }
@@ -328,10 +384,11 @@ fn test_greedy_dag_reconciles_conflicting_child_snapshots() {
             egraph.eval_expr(&expr).unwrap()
         })
         .collect();
+    let best_calls = Cell::new(0);
     let extracted = egglog_experimental::extract_best_greedy_dag(
         &egraph,
         roots.clone(),
-        egglog_experimental::DynamicCostModel,
+        CountingDagCostModel(&best_calls, egglog_experimental::DynamicCostModel),
     )
     .unwrap();
     let terms: Vec<_> = extracted
@@ -360,17 +417,21 @@ fn test_greedy_dag_reconciles_conflicting_child_snapshots() {
         assert_eq!(actual_sort.name(), expected_sort.name());
         assert_eq!(actual_value, *expected_value);
     }
+    // Twelve reachable constructor rows are costed during preparation. Exact
+    // conflict rescoring reuses those costs instead of calling the model again.
+    assert_eq!(best_calls.get(), 12);
 
     // The losing XOld snapshot reaches the root through PAlt, but the larger
     // sibling snapshot selects XNew. Reconciliation removes that apparent
     // cycle, so the finite P producer must remain available as a variant.
     let root_expr = egraph.parser.get_expr_from_string(None, "$p").unwrap();
     let root = egraph.eval_expr(&root_expr).unwrap();
+    let variant_calls = Cell::new(0);
     let variants = egglog_experimental::extract_variants_greedy_dag(
         &egraph,
         vec![root],
         2,
-        egglog_experimental::DynamicCostModel,
+        CountingDagCostModel(&variant_calls, egglog_experimental::DynamicCostModel),
     )
     .unwrap();
     let extracted_variants: Vec<_> = variants.variants[0]
@@ -388,6 +449,7 @@ fn test_greedy_dag_reconciles_conflicting_child_snapshots() {
             ),
         ]
     );
+    assert_eq!(variant_calls.get(), 12);
 }
 
 #[test]
@@ -1193,7 +1255,7 @@ fn test_greedy_dag_extract_zero_variants_returns_empty_for_all_root_kinds() {
         &egraph,
         roots,
         0,
-        BorrowedCountingMarginalCostModel(&calls),
+        CountingDagCostModel(&calls, egglog::extract::AdditiveCostModel::default()),
     )
     .unwrap();
 
@@ -1223,7 +1285,7 @@ fn test_greedy_dag_tracks_eq_dependencies_nested_in_containers() {
     let extracted = egglog_experimental::extract_best_greedy_dag(
         &egraph,
         vec![(sort, value)],
-        BorrowedCountingMarginalCostModel(&calls),
+        CountingDagCostModel(&calls, egglog::extract::AdditiveCostModel::default()),
     )
     .unwrap();
     let root = extracted.terms[0].as_ref().unwrap();
@@ -1233,7 +1295,66 @@ fn test_greedy_dag_tracks_eq_dependencies_nested_in_containers() {
         extracted.termdag.to_string(root.term),
         "(List (vec-of (Leaf)))"
     );
-    assert!(calls.get() > 0);
+    assert_eq!(calls.get(), 3);
+}
+
+#[test]
+fn test_greedy_dag_accepts_non_additive_monoid_cost() {
+    let mut egraph = egglog_experimental::new_experimental_egraph();
+    egraph
+        .parse_and_run_program(
+            None,
+            "(datatype E (Cheap) (Expensive) (Pair E E))
+             (let $child (Cheap))
+             (union $child (Expensive))
+             (let $root (Pair $child $child))",
+        )
+        .unwrap();
+    let root_expr = egraph.parser.get_expr_from_string(None, "$root").unwrap();
+    let root = egraph.eval_expr(&root_expr).unwrap();
+
+    let extracted =
+        egglog_experimental::extract_best_greedy_dag(&egraph, vec![root], MaxCostModel).unwrap();
+    let root = extracted.terms[0].as_ref().unwrap();
+
+    // `max` combines the Pair cost (3) and Cheap cost (2); addition would be 5.
+    assert_eq!(root.cost, MaxCost(3));
+    assert_eq!(
+        extracted.termdag.to_string(root.term),
+        "(Pair (Cheap) (Cheap))"
+    );
+}
+
+#[test]
+fn test_greedy_dag_costs_each_reachable_node_once_for_variants() {
+    let mut egraph = egglog_experimental::new_experimental_egraph();
+    egraph
+        .parse_and_run_program(
+            None,
+            "(datatype E (Leaf i64))
+             (let $root (Leaf 1))
+             (union $root (Leaf 2))",
+        )
+        .unwrap();
+    let root_expr = egraph.parser.get_expr_from_string(None, "$root").unwrap();
+    let root = egraph.eval_expr(&root_expr).unwrap();
+
+    let calls = Cell::new(0);
+    let extracted = egglog_experimental::extract_variants_greedy_dag(
+        &egraph,
+        vec![root.clone(), root],
+        2,
+        CountingDagCostModel(&calls, egglog::extract::AdditiveCostModel::default()),
+    )
+    .unwrap();
+
+    assert_eq!(
+        extracted.variants.iter().map(Vec::len).collect::<Vec<_>>(),
+        [2, 2]
+    );
+    // Two producer rows and their two primitive children are each costed once,
+    // including during variant rescoring and debug fixed-point validation.
+    assert_eq!(calls.get(), 4);
 }
 
 #[test]

@@ -1,3 +1,19 @@
+//! Runtime-configurable extraction costs.
+//!
+//! Wrap datatype or constructor declarations in `with-dynamic-cost` to create
+//! a cost table for each extractable constructor. `set-cost` updates a node's
+//! cost, and the replacement `extract` command reads those costs:
+//!
+//! ```text
+//! (with-dynamic-cost
+//!   (datatype Math (Num i64) (Add Math Math)))
+//! (set-cost (Num 1) 100)
+//! (extract (Num 1))
+//! ```
+//!
+//! Nodes without an assigned dynamic cost retain their normal tree-additive
+//! cost. Negative assignments are ignored and also fall back to that cost.
+
 use crate::{
     Error,
     greedy_dag_extract::{
@@ -7,7 +23,7 @@ use crate::{
 use egglog::{
     ArcSort, CommandOutput, EGraph, Enode, RawValues, Read, TermId, UserDefinedCommand, Value,
     ast::*,
-    extract::{AdditiveCostModel, BaseCostModel, DefaultCost, FoldCostModel, MarginalCostModel},
+    extract::{AdditiveCostModel, DagCostModel, DefaultCost, MonoidCost, TreeCostModel},
     span,
     util::FreshGen,
 };
@@ -15,6 +31,11 @@ use egglog_ast::span::Span;
 use log::log_enabled;
 use std::sync::Arc;
 
+/// Registers `with-dynamic-cost`, `set-cost`, and the dynamic-cost `extract`
+/// command on an e-graph.
+///
+/// [`new_experimental_egraph`](crate::new_experimental_egraph) calls this
+/// automatically.
 pub fn add_set_cost(egraph: &mut EGraph) {
     egraph
         .parser
@@ -182,32 +203,27 @@ fn map_fallible<T>(
         .collect::<Result<_, _>>()
 }
 
-/// The cost model that handles dynamic costs. Use this cost model if you use the `with-dynamic-cost` / `set-cost`
-/// extensions in your egglog program
+/// An extraction cost model that reads costs assigned by `set-cost`.
+///
+/// It falls back to [`AdditiveCostModel`] for constructors without an
+/// assigned dynamic cost. Use this model for custom extractors that should
+/// agree with this crate's replacement `extract` command.
 #[derive(Clone)]
 pub struct DynamicCostModel;
 
-impl BaseCostModel<DefaultCost> for DynamicCostModel {
+impl DagCostModel<DefaultCost> for DynamicCostModel {
     fn base_value_cost(&self, egraph: &EGraph, sort: &ArcSort, value: Value) -> DefaultCost {
-        BaseCostModel::base_value_cost(&AdditiveCostModel::default(), egraph, sort, value)
+        DagCostModel::base_value_cost(&AdditiveCostModel::default(), egraph, sort, value)
     }
-}
 
-impl MarginalCostModel<DefaultCost> for DynamicCostModel {
-    fn marginal_enode_cost(
+    fn enode_cost(
         &self,
         egraph: &EGraph,
         func: &egglog::Function,
         enode: &Enode<'_>,
     ) -> DefaultCost {
-        let default_cost = || {
-            MarginalCostModel::marginal_enode_cost(
-                &AdditiveCostModel::default(),
-                egraph,
-                func,
-                enode,
-            )
-        };
+        let default_cost =
+            || DagCostModel::enode_cost(&AdditiveCostModel::default(), egraph, func, enode);
         let name = get_cost_table_name(func.name());
         if egraph.get_function(&name).is_some() {
             egraph
@@ -233,7 +249,43 @@ impl MarginalCostModel<DefaultCost> for DynamicCostModel {
     }
 }
 
-impl FoldCostModel<DefaultCost> for DynamicCostModel {}
+impl TreeCostModel<DefaultCost> for DynamicCostModel {
+    type EnodeCost = DefaultCost;
+    type ContainerCost = DefaultCost;
+
+    fn base_value_cost(&self, egraph: &EGraph, sort: &ArcSort, value: Value) -> DefaultCost {
+        DagCostModel::base_value_cost(self, egraph, sort, value)
+    }
+
+    fn enode_cost(
+        &self,
+        egraph: &EGraph,
+        func: &egglog::Function,
+        enode: &Enode<'_>,
+    ) -> DefaultCost {
+        DagCostModel::enode_cost(self, egraph, func, enode)
+    }
+
+    fn container_cost(&self, egraph: &EGraph, sort: &ArcSort, value: Value) -> DefaultCost {
+        DagCostModel::container_cost(self, egraph, sort, value)
+    }
+
+    fn fold_enode_cost(&self, enode_cost: DefaultCost, child_costs: &[DefaultCost]) -> DefaultCost {
+        child_costs
+            .iter()
+            .fold(enode_cost, |cost, child| cost.combine(child))
+    }
+
+    fn fold_container_cost(
+        &self,
+        container_cost: DefaultCost,
+        element_costs: &[DefaultCost],
+    ) -> DefaultCost {
+        element_costs
+            .iter()
+            .fold(container_cost, |cost, element| cost.combine(element))
+    }
+}
 
 struct CustomExtract;
 
@@ -293,7 +345,7 @@ impl UserDefinedCommand for CustomExtract {
             let extracted = if use_greedy_dag {
                 extract_best_greedy_dag(egraph, roots, DynamicCostModel)?
             } else {
-                egraph.extract_best(roots, DynamicCostModel)?
+                egraph.extract_best_with_cost_model(roots, DynamicCostModel)?
             };
             let root = extracted
                 .terms
@@ -319,7 +371,7 @@ impl UserDefinedCommand for CustomExtract {
             let extracted = if use_greedy_dag {
                 extract_variants_greedy_dag(egraph, roots, n as usize, DynamicCostModel)?
             } else {
-                egraph.extract_variants(roots, n as usize, DynamicCostModel)?
+                egraph.extract_variants_with_cost_model(roots, n as usize, DynamicCostModel)?
             };
             let terms: Vec<TermId> = extracted
                 .variants

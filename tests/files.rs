@@ -207,7 +207,7 @@ fn validate_extract_outputs(
     let roots = vec![(root_sort.clone(), root_value)];
     let paired_exprs = if nvariants == 0 {
         let extracted = if extract.use_greedy_dag {
-            egraph.extract_best(roots, DynamicCostModel)?
+            egraph.extract_best_with_cost_model(roots, DynamicCostModel)?
         } else {
             extract_best_greedy_dag(egraph, roots, DynamicCostModel)?
         };
@@ -220,7 +220,7 @@ fn validate_extract_outputs(
         vec![extracted.termdag.term_to_expr(&root.term, span!())]
     } else {
         let extracted = if extract.use_greedy_dag {
-            egraph.extract_variants(roots, nvariants, DynamicCostModel)?
+            egraph.extract_variants_with_cost_model(roots, nvariants, DynamicCostModel)?
         } else {
             extract_variants_greedy_dag(egraph, roots, nvariants, DynamicCostModel)?
         };

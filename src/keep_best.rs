@@ -15,6 +15,11 @@ use egglog::{
     UserDefinedCommand, Value, Write, ast::Expr, sort::S, span,
 };
 
+/// User-defined command implementing `(keep-best "table"...)`.
+///
+/// For every row in the named tables, the command extracts the best term for
+/// each value. It then **clears every function in the e-graph** and reinserts
+/// only the extracted rows from the named tables.
 pub struct KeepBestCommand;
 
 impl UserDefinedCommand for KeepBestCommand {
@@ -96,11 +101,11 @@ fn collect_and_extract(
             .get_function(table_name)
             .ok_or_else(|| TypeError::UnboundFunction(table_name.clone(), span!()))?;
 
-        let all_sorts: Vec<ArcSort> = func
-            .func_type()
+        let func_type = func.func_type();
+        let all_sorts: Vec<ArcSort> = func_type
             .input
             .iter()
-            .chain(std::iter::once(&func.func_type().output))
+            .chain(std::iter::once(&func_type.output))
             .cloned()
             .collect();
 
@@ -121,7 +126,7 @@ fn collect_and_extract(
         let extracted = if use_greedy_dag {
             extract_best_greedy_dag(egraph, roots, DynamicCostModel)
         } else {
-            egraph.extract_best(roots, DynamicCostModel)
+            egraph.extract_best_with_cost_model(roots, DynamicCostModel)
         }
         .map_err(|err| {
             Error::ExtractError(format!(
