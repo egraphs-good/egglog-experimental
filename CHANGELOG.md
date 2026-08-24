@@ -4,6 +4,18 @@ This file records notable user-facing changes to egglog-experimental.
 
 ## [Unreleased]
 
+### Added
+
+- `:node-limit` and `:eager-apply` options for the `back-off` scheduler:
+  `:node-limit N` keeps the e-graph within `N` e-nodes while choosing matches;
+  with `:eager-apply`, each rule's chosen matches are applied before the next
+  rule is consulted, so the limit is checked against the live e-graph size.
+- The `(get-node-size!)` primitive: the e-node count of the e-graph (rows of
+  eq-sort tables), the same measure `:node-limit` uses.
+- A `:dag` option for `multi-extract` that let-binds subterms shared across
+  the extracted variants instead of expanding every variant to a tree, plus
+  the underlying `dag_print` printing functions.
+
 ## [3.0.0] - 2026-08-20
 
 This is the first crates.io release of egglog-experimental. Its major version
