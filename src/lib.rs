@@ -91,6 +91,7 @@ pub fn new_experimental_egraph() -> EGraph {
     // Support for set cost
     add_set_cost(&mut egraph);
     egraph.add_read_primitive(GetSizePrimitive, None);
+    egraph.add_read_primitive(GetNodeSizePrimitive, None);
 
     // unstable-fresh! macro
     egraph

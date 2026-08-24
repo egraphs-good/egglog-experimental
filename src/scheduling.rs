@@ -465,11 +465,51 @@ mod schedulers {
 
     use egglog::{
         ast::{Expr, Literal},
-        scheduler::{Matches, Scheduler},
+        scheduler::{Matches, Scheduler, SchedulerContext},
     };
     use log::{debug, info};
 
     use crate::parse_tags;
+
+    /// Initial estimate for how many e-nodes one fired match adds, before any
+    /// growth has been observed. Recalibrated each iteration.
+    const GROWTH_PER_MATCH_INIT: f64 = 2.0;
+    /// Clamp bounds for the observed growth rate, so a merge-heavy iteration
+    /// (which can shrink the e-graph) or one wildly-fanning rule cannot push
+    /// the estimate to a degenerate value.
+    const GROWTH_PER_MATCH_MIN: f64 = 0.1;
+    const GROWTH_PER_MATCH_MAX: f64 = 64.0;
+    /// When converting the node budget into a match budget, never assume a
+    /// match adds less than one node, even if the observed (dedup-heavy)
+    /// growth rate is lower: under-estimating growth is what overshoots the
+    /// limit.
+    const GROWTH_PER_MATCH_BUDGET_FLOOR: f64 = 1.0;
+    /// Approve at most 1/BUDGET_SAFETY of the remaining node budget per
+    /// iteration, so a mis-estimated growth rate overshoots by at most
+    /// `remaining * (actual/estimate / BUDGET_SAFETY - 1)`. The residual
+    /// matches are held (not re-queried), so approaching the limit
+    /// geometrically over a few extra iterations is cheap.
+    const BUDGET_SAFETY: f64 = 2.0;
+
+    fn parse_usize_tag(
+        tags: &HashMap<String, Literal>,
+        tag: &str,
+        span: &egglog::ast::Span,
+    ) -> Result<Option<usize>, egglog::Error> {
+        tags.get(tag)
+            .map(|lit| match lit {
+                Literal::Int(n) if *n >= 0 => Ok(*n as usize),
+                Literal::Int(_) => Err(egglog::Error::ParseError(egglog::ast::ParseError(
+                    span.clone(),
+                    format!("Scheduler {tag} must be non-negative"),
+                ))),
+                _ => Err(egglog::Error::ParseError(egglog::ast::ParseError(
+                    span.clone(),
+                    format!("Scheduler {tag} must be an integer"),
+                ))),
+            })
+            .transpose()
+    }
 
     pub(super) fn new_back_off_scheduler(
         _egraph: &egglog::EGraph,
@@ -477,40 +517,19 @@ mod schedulers {
         args: &[Expr],
     ) -> Result<Box<dyn Scheduler>, egglog::Error> {
         let tags = parse_tags(span, args)?;
-        let default_match_limit = tags
-            .get(":match-limit")
-            .map(|lit| match lit {
-                Literal::Int(n) if *n >= 0 => Ok(*n as usize),
-                Literal::Int(_) => Err(egglog::Error::ParseError(egglog::ast::ParseError(
-                    span.clone(),
-                    "Scheduler :match-limit must be non-negative".into(),
-                ))),
-                _ => Err(egglog::Error::ParseError(egglog::ast::ParseError(
-                    span.clone(),
-                    "Scheduler :match-limit must be an integer".into(),
-                ))),
-            })
-            .transpose()?
-            .unwrap_or(1000);
-        let default_ban_length = tags
-            .get(":ban-length")
-            .map(|lit| match lit {
-                Literal::Int(n) if *n >= 0 => Ok(*n as usize),
-                Literal::Int(_) => Err(egglog::Error::ParseError(egglog::ast::ParseError(
-                    span.clone(),
-                    "Scheduler :ban-length must be non-negative".into(),
-                ))),
-                _ => Err(egglog::Error::ParseError(egglog::ast::ParseError(
-                    span.clone(),
-                    "Scheduler :ban-length must be an integer".into(),
-                ))),
-            })
-            .transpose()?
-            .unwrap_or(5);
+        let default_match_limit = parse_usize_tag(&tags, ":match-limit", span)?.unwrap_or(1000);
+        let default_ban_length = parse_usize_tag(&tags, ":ban-length", span)?.unwrap_or(5);
+        let node_limit = parse_usize_tag(&tags, ":node-limit", span)?;
         Ok(Box::new(BackOffScheduler {
             default_match_limit,
             default_ban_length,
+            node_limit,
             stats: HashMap::new(),
+            growth_per_match: HashMap::new(),
+            nodes_at_iteration_start: 0,
+            approved_this_iteration: 0,
+            current_ruleset: String::new(),
+            last_seen_iteration: None,
         }))
     }
 
@@ -518,7 +537,32 @@ mod schedulers {
     pub struct BackOffScheduler {
         default_match_limit: usize,
         default_ban_length: usize,
+        /// Upper bound on the number of e-nodes (`EGraph::num_nodes`). When
+        /// set, matches are only approved while the projected e-graph size
+        /// stays below the limit; rules consulted after the budget runs out
+        /// are delayed instead of applied.
+        node_limit: Option<usize>,
         stats: HashMap<String, RuleStats>,
+        /// Estimated e-nodes added per approved match, keyed by ruleset (the
+        /// same scheduler can drive rulesets with very different growth, e.g.
+        /// rewrites versus constant folding, whose matches only union). Jumps
+        /// up immediately when growth is under-estimated and decays slowly
+        /// (EMA) when over-estimated: under-estimates are what overshoot the
+        /// node limit. Only maintained when `node_limit` is set.
+        growth_per_match: HashMap<String, f64>,
+        /// `num_nodes()` reading taken at the start of the current iteration.
+        /// Sizes reported through the context only change between iterations,
+        /// so within an iteration the projected size is this reading plus
+        /// the estimated growth of the matches approved so far.
+        nodes_at_iteration_start: usize,
+        /// Matches approved so far in the current iteration, across all rules.
+        approved_this_iteration: usize,
+        /// The ruleset the current iteration is running, i.e. the one the
+        /// approved matches (and the growth observed at the next iteration
+        /// boundary) belong to.
+        current_ruleset: String,
+        /// Which iteration the fields above refer to.
+        last_seen_iteration: Option<usize>,
     }
 
     #[derive(Debug, Clone)]
@@ -542,10 +586,74 @@ mod schedulers {
                 iteration: 0,
             })
         }
+
+        /// On the first call of a new iteration, re-read the e-graph size and
+        /// recalibrate the growth-per-match estimate of the ruleset that ran
+        /// in the previous iteration from the growth its approved matches
+        /// actually caused.
+        fn refresh_iteration(&mut self, ctx: &SchedulerContext, ruleset: &str) {
+            if self.node_limit.is_none() || self.last_seen_iteration == Some(ctx.iteration) {
+                return;
+            }
+            let nodes = ctx.egraph.num_nodes();
+            if self.last_seen_iteration.is_some() && self.approved_this_iteration > 0 {
+                let grew = nodes.saturating_sub(self.nodes_at_iteration_start);
+                let observed = (grew as f64 / self.approved_this_iteration as f64)
+                    .clamp(GROWTH_PER_MATCH_MIN, GROWTH_PER_MATCH_MAX);
+                let growth = self
+                    .growth_per_match
+                    .entry(self.current_ruleset.clone())
+                    .or_insert(GROWTH_PER_MATCH_INIT);
+                // Jump up immediately, decay slowly: an under-estimate is
+                // what overshoots the node limit.
+                *growth = if observed > *growth {
+                    observed
+                } else {
+                    0.5 * *growth + 0.5 * observed
+                };
+                debug!(
+                    "Recalibrated growth per match of {} to {:.3} ({} nodes / {} matches)",
+                    self.current_ruleset, growth, grew, self.approved_this_iteration,
+                );
+            }
+            self.nodes_at_iteration_start = nodes;
+            self.approved_this_iteration = 0;
+            self.current_ruleset = ruleset.to_owned();
+            self.last_seen_iteration = Some(ctx.iteration);
+        }
+
+        /// How many more matches fit in the node budget, given the projected
+        /// e-graph size after the matches already approved this iteration.
+        fn match_budget(&self, node_limit: usize) -> usize {
+            let growth = self
+                .growth_per_match
+                .get(&self.current_ruleset)
+                .copied()
+                .unwrap_or(GROWTH_PER_MATCH_INIT)
+                .max(GROWTH_PER_MATCH_BUDGET_FLOOR);
+            let projected = self.nodes_at_iteration_start as f64
+                + growth * self.approved_this_iteration as f64;
+            let remaining = node_limit as f64 - projected;
+            if remaining <= 0.0 {
+                0
+            } else {
+                (remaining / (BUDGET_SAFETY * growth)) as usize
+            }
+        }
     }
 
     impl Scheduler for BackOffScheduler {
-        fn can_stop(&mut self, rules: &[&str], _ruleset: &str) -> bool {
+        fn can_stop(&mut self, ctx: &SchedulerContext, rules: &[&str], _ruleset: &str) -> bool {
+            // At the node limit, further iterations cannot make progress:
+            // every rule would be delayed. Report saturation even though
+            // banned rules may be pending.
+            if let Some(node_limit) = self.node_limit {
+                let nodes = ctx.egraph.num_nodes();
+                if nodes >= node_limit {
+                    info!("Node limit reached ({nodes} >= {node_limit}); stopping");
+                    return true;
+                }
+            }
             let stats = &mut self.stats;
             let n_stats = stats.len();
 
@@ -601,40 +709,79 @@ mod schedulers {
             result
         }
 
-        fn filter_matches(&mut self, rule: &str, _ruleset: &str, matches: &mut Matches) -> bool {
-            let stats = self.get_stats(rule.to_owned());
-            stats.iteration += 1;
+        fn filter_matches(
+            &mut self,
+            ctx: &SchedulerContext,
+            rule: &str,
+            ruleset: &str,
+            matches: &mut Matches,
+        ) -> bool {
+            self.refresh_iteration(ctx, ruleset);
 
-            if stats.iteration < stats.banned_until {
-                debug!(
-                    "Skipping {} ({}-{}), banned until {}...",
-                    rule, stats.times_applied, stats.times_banned, stats.banned_until,
-                );
-                return false;
+            let total_len: usize = matches.match_size();
+            {
+                let stats = self.get_stats(rule.to_owned());
+                stats.iteration += 1;
+
+                if stats.iteration < stats.banned_until {
+                    debug!(
+                        "Skipping {} ({}-{}), banned until {}...",
+                        rule, stats.times_applied, stats.times_banned, stats.banned_until,
+                    );
+                    return false;
+                }
+
+                let threshold = stats
+                    .match_limit
+                    .checked_shl(stats.times_banned as u32)
+                    .unwrap();
+                if total_len > threshold {
+                    let ban_length = stats.ban_length << stats.times_banned;
+                    stats.times_banned += 1;
+                    stats.banned_until = stats.iteration + ban_length;
+                    info!(
+                        "Banning {} ({}-{}) for {} iters: {} < {}",
+                        rule,
+                        stats.times_applied,
+                        stats.times_banned,
+                        ban_length,
+                        threshold,
+                        total_len,
+                    );
+                    return false;
+                }
             }
 
-            let threshold = stats
-                .match_limit
-                .checked_shl(stats.times_banned as u32)
-                .unwrap();
-            let total_len: usize = matches.match_size();
-            if total_len > threshold {
-                let ban_length = stats.ban_length << stats.times_banned;
-                stats.times_banned += 1;
-                stats.banned_until = stats.iteration + ban_length;
-                info!(
-                    "Banning {} ({}-{}) for {} iters: {} < {}",
-                    rule, stats.times_applied, stats.times_banned, ban_length, threshold, total_len,
-                );
-                false
-            } else {
-                stats.times_applied += 1;
-                debug!(
-                    "Choosing all matches for {} ({}-{})",
-                    rule, stats.times_applied, stats.times_banned
-                );
+            let Some(node_limit) = self.node_limit else {
+                self.get_stats(rule.to_owned()).times_applied += 1;
+                debug!("Choosing all matches for {}", rule);
+                matches.choose_all();
+                return true;
+            };
+
+            let budget = self.match_budget(node_limit);
+            if budget == 0 {
+                debug!("Delaying {}: node budget exhausted", rule);
+                return false;
+            }
+            if total_len <= budget {
+                self.approved_this_iteration += total_len;
+                self.get_stats(rule.to_owned()).times_applied += 1;
+                debug!("Choosing all matches for {}", rule);
                 matches.choose_all();
                 true
+            } else {
+                for idx in 0..budget {
+                    matches.choose(idx);
+                }
+                self.approved_this_iteration += budget;
+                self.get_stats(rule.to_owned()).times_applied += 1;
+                info!(
+                    "Partially applying {}: {}/{} matches within node budget",
+                    rule, budget, total_len,
+                );
+                // The residual matches stay pending; do not re-run the query.
+                false
             }
         }
     }

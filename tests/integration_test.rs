@@ -1202,3 +1202,69 @@ fn test_schedule_commands_and_actions() {
         )
         .unwrap();
 }
+
+#[test]
+fn test_backoff_node_limit() {
+    let mut egraph = egglog_experimental::new_experimental_egraph();
+
+    // "count" grows one Num per iteration; "pair" is quadratic in the number
+    // of Nums. Without a node limit this saturates at 201 Nums and ~40k Adds.
+    egraph
+        .parse_and_run_program(
+            None,
+            r#"
+        (ruleset explode)
+        (datatype Math (Num i64) (Add Math Math))
+        (Num 0)
+        (rule ((= e (Num i)) (< i 200)) ((Num (+ i 1))) :ruleset explode :name "count")
+        (rule ((= a (Num x)) (= b (Num y))) ((Add a b)) :ruleset explode :name "pair")
+        (run-schedule
+          (let-scheduler bo (back-off :node-limit 500))
+          (saturate (run-with bo explode)))
+        "#,
+        )
+        .unwrap();
+
+    let nodes = egraph.num_nodes();
+    // Every match in this workload adds exactly one e-node, so the growth
+    // estimate converges from above and the limit is never overshot.
+    assert!(nodes <= 500, "node limit overshot: {nodes}");
+    // The scheduler stopped because of the limit, not because the workload
+    // saturated early.
+    assert!(nodes >= 450, "stopped too early: {nodes}");
+
+    // (get-node-size!) agrees with EGraph::num_nodes and, since this program
+    // has no analysis tables, with (get-size!).
+    let span = span!();
+    let expr = Expr::Call(span.clone(), "get-node-size!".into(), vec![]);
+    let (_, value) = egraph.eval_expr(&expr).unwrap();
+    assert_eq!(egraph.value_to_base::<i64>(value), nodes as i64);
+    assert_eq!(eval_get_size(&mut egraph, &[]), nodes as i64);
+}
+
+#[test]
+fn test_get_node_size_excludes_analysis_tables() {
+    let mut egraph = egglog_experimental::new_experimental_egraph();
+    egraph
+        .parse_and_run_program(
+            None,
+            r#"
+        (datatype Math (Num i64))
+        (function depth (Math) i64 :no-merge)
+        (Num 0)
+        (Num 1)
+        (set (depth (Num 0)) 0)
+        "#,
+        )
+        .unwrap();
+
+    let span = span!();
+    let expr = Expr::Call(span.clone(), "get-node-size!".into(), vec![]);
+    let (_, value) = egraph.eval_expr(&expr).unwrap();
+    // Two Num nodes; the depth analysis row is excluded.
+    assert_eq!(egraph.value_to_base::<i64>(value), 2);
+    // ... but included by (get-size!).
+    assert_eq!(eval_get_size(&mut egraph, &[]), 3);
+    assert_eq!(egraph.num_nodes(), 2);
+    assert_eq!(egraph.total_size(), 3);
+}
