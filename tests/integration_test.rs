@@ -1298,3 +1298,39 @@ fn test_backoff_node_limit_eager_apply() {
         "unexpected final size: {nodes}"
     );
 }
+
+#[test]
+fn test_multi_extract_dag() {
+    let mut egraph = egglog_experimental::new_experimental_egraph();
+    let outputs = egraph
+        .parse_and_run_program(
+            None,
+            r#"
+        (datatype Math (Num i64) (Add Math Math) (Neg Math))
+        (let a (Add (Num 1) (Num 2)))
+        (let b (Neg (Add (Num 1) (Num 2))))
+        (multi-extract 1 :dag a b)
+        "#,
+        )
+        .unwrap();
+    let printed = outputs.last().unwrap().to_string();
+    let tokens: Vec<&str> = printed.split_whitespace().collect();
+    // The shared (Add (Num 1) (Num 2)) is bound once; leaves stay inline.
+    assert_eq!(
+        tokens.join(" "),
+        "(let ( (?t0 (Add (Num 1) (Num 2))) ) ( ( ?t0 ) ( (Neg ?t0) ) ))"
+    );
+
+    // :dag output must expand to exactly the non-dag output.
+    let plain = egraph
+        .parse_and_run_program(None, "(multi-extract 1 a b)")
+        .unwrap()
+        .last()
+        .unwrap()
+        .to_string();
+    let plain_tokens: Vec<&str> = plain.split_whitespace().collect();
+    assert_eq!(
+        plain_tokens.join(" "),
+        "( ( (Add (Num 1) (Num 2)) ) ( (Neg (Add (Num 1) (Num 2))) ) )"
+    );
+}

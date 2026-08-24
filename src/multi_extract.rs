@@ -1,8 +1,13 @@
 //! Extract multiple terms or variants with one extractor pass.
 //!
-//! `(multi-extract n term...)` prints the `n` lowest-cost variants of every
-//! term. `n` must be a positive `i64`; `(multi-extract 1 term)` is equivalent
-//! to best extraction.
+//! `(multi-extract n [:dag] term...)` prints the `n` lowest-cost variants of
+//! every term. `n` must be a positive `i64`; `(multi-extract 1 term)` is
+//! equivalent to best extraction.
+//!
+//! With `:dag`, the output is one
+//! `(let ((name def) ...) ((variant ...) ...))` s-expression in which
+//! subterms shared across all variants of all terms are let-bound once (see
+//! [`crate::dag_print`]), instead of every variant being expanded to a tree.
 
 use egglog::{
     CommandOutput, EGraph, Error, TermDag, TermId, TypeError, UserDefinedCommand,
@@ -18,19 +23,40 @@ use std::{fmt::Debug, marker::PhantomData};
 pub struct MultiExtractOutput {
     termdag: TermDag,
     terms: Vec<Vec<TermId>>,
+    dag: bool,
 }
 
 impl std::fmt::Display for MultiExtractOutput {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        writeln!(f, "(")?;
-        for variants in &self.terms {
-            writeln!(f, "   (")?;
-            for expr in variants {
-                writeln!(f, "      {}", self.termdag.to_string(*expr))?;
+        if self.dag {
+            let roots: Vec<TermId> = self.terms.iter().flatten().copied().collect();
+            let (bindings, rendered) = crate::render_terms_with_shared_lets(&self.termdag, &roots);
+            writeln!(f, "(let (")?;
+            for (name, def) in &bindings {
+                writeln!(f, "   ({name} {def})")?;
             }
-            writeln!(f, "   )")?;
+            writeln!(f, " )")?;
+            writeln!(f, " (")?;
+            let mut next = rendered.iter();
+            for variants in &self.terms {
+                writeln!(f, "   (")?;
+                for _ in variants {
+                    writeln!(f, "      {}", next.next().unwrap())?;
+                }
+                writeln!(f, "   )")?;
+            }
+            writeln!(f, " ))")
+        } else {
+            writeln!(f, "(")?;
+            for variants in &self.terms {
+                writeln!(f, "   (")?;
+                for expr in variants {
+                    writeln!(f, "      {}", self.termdag.to_string(*expr))?;
+                }
+                writeln!(f, "   )")?;
+            }
+            writeln!(f, ")")
         }
-        writeln!(f, ")")
     }
 }
 
@@ -63,6 +89,20 @@ impl<
 > UserDefinedCommand for MultiExtract<C, CM>
 {
     fn update(&self, egraph: &mut EGraph, args: &[Expr]) -> Result<Vec<CommandOutput>, Error> {
+        // `:dag` may appear anywhere among the arguments.
+        let mut dag = false;
+        let args: Vec<Expr> = args
+            .iter()
+            .filter(|arg| match arg {
+                Expr::Var(_, v) if v == ":dag" => {
+                    dag = true;
+                    false
+                }
+                _ => true,
+            })
+            .cloned()
+            .collect();
+        let args = args.as_slice();
         if args.len() < 2 {
             let span = args.first().map(Expr::span).unwrap_or_else(|| span!());
             return Err(Error::ParseError(ParseError(
@@ -127,7 +167,11 @@ impl<
         }
 
         Ok(vec![CommandOutput::UserDefined(std::sync::Arc::from(
-            MultiExtractOutput { termdag, terms },
+            MultiExtractOutput {
+                termdag,
+                terms,
+                dag,
+            },
         ))])
     }
 }

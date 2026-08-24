@@ -60,6 +60,8 @@ mod set_cost;
 pub use set_cost::*;
 mod multi_extract;
 pub use multi_extract::*;
+mod dag_print;
+pub use dag_print::*;
 mod size;
 pub use size::*;
 mod primitive;
