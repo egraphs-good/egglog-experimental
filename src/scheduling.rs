@@ -520,10 +520,12 @@ mod schedulers {
         let default_match_limit = parse_usize_tag(&tags, ":match-limit", span)?.unwrap_or(1000);
         let default_ban_length = parse_usize_tag(&tags, ":ban-length", span)?.unwrap_or(5);
         let node_limit = parse_usize_tag(&tags, ":node-limit", span)?;
+        let eager_apply = parse_usize_tag(&tags, ":eager-apply", span)?.is_some_and(|n| n != 0);
         Ok(Box::new(BackOffScheduler {
             default_match_limit,
             default_ban_length,
             node_limit,
+            eager_apply,
             stats: HashMap::new(),
             growth_per_match: HashMap::new(),
             nodes_at_iteration_start: 0,
@@ -542,6 +544,12 @@ mod schedulers {
         /// stays below the limit; rules consulted after the budget runs out
         /// are delayed instead of applied.
         node_limit: Option<usize>,
+        /// Apply each rule's chosen matches before the next rule is
+        /// consulted (`Scheduler::apply_immediately`). Sizes observed through
+        /// the context are then up to date within an iteration, so the
+        /// node-limit check reads them directly instead of projecting from a
+        /// growth estimate.
+        eager_apply: bool,
         stats: HashMap<String, RuleStats>,
         /// Estimated e-nodes added per approved match, keyed by ruleset (the
         /// same scheduler can drive rulesets with very different growth, e.g.
@@ -592,7 +600,10 @@ mod schedulers {
         /// in the previous iteration from the growth its approved matches
         /// actually caused.
         fn refresh_iteration(&mut self, ctx: &SchedulerContext, ruleset: &str) {
-            if self.node_limit.is_none() || self.last_seen_iteration == Some(ctx.iteration) {
+            if self.node_limit.is_none()
+                || self.eager_apply
+                || self.last_seen_iteration == Some(ctx.iteration)
+            {
                 return;
             }
             let nodes = ctx.egraph.num_nodes();
@@ -631,8 +642,8 @@ mod schedulers {
                 .copied()
                 .unwrap_or(GROWTH_PER_MATCH_INIT)
                 .max(GROWTH_PER_MATCH_BUDGET_FLOOR);
-            let projected = self.nodes_at_iteration_start as f64
-                + growth * self.approved_this_iteration as f64;
+            let projected =
+                self.nodes_at_iteration_start as f64 + growth * self.approved_this_iteration as f64;
             let remaining = node_limit as f64 - projected;
             if remaining <= 0.0 {
                 0
@@ -643,6 +654,10 @@ mod schedulers {
     }
 
     impl Scheduler for BackOffScheduler {
+        fn apply_immediately(&self) -> bool {
+            self.eager_apply
+        }
+
         fn can_stop(&mut self, ctx: &SchedulerContext, rules: &[&str], _ruleset: &str) -> bool {
             // At the node limit, further iterations cannot make progress:
             // every rule would be delayed. Report saturation even though
@@ -758,6 +773,20 @@ mod schedulers {
                 matches.choose_all();
                 return true;
             };
+
+            if self.eager_apply {
+                // Chosen matches are applied before the next rule is
+                // consulted, so the size below is up to date: check it
+                // directly instead of projecting from a growth estimate.
+                if ctx.egraph.num_nodes() >= node_limit {
+                    debug!("Delaying {}: at node limit", rule);
+                    return false;
+                }
+                self.get_stats(rule.to_owned()).times_applied += 1;
+                debug!("Choosing all matches for {}", rule);
+                matches.choose_all();
+                return true;
+            }
 
             let budget = self.match_budget(node_limit);
             if budget == 0 {

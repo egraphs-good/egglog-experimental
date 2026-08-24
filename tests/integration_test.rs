@@ -1268,3 +1268,33 @@ fn test_get_node_size_excludes_analysis_tables() {
     assert_eq!(egraph.num_nodes(), 2);
     assert_eq!(egraph.total_size(), 3);
 }
+
+#[test]
+fn test_backoff_node_limit_eager_apply() {
+    let mut egraph = egglog_experimental::new_experimental_egraph();
+
+    // Same workload as test_backoff_node_limit, but with :eager-apply the
+    // scheduler checks the live size before each rule instead of projecting
+    // from a growth estimate. Overshoot is bounded by one rule's match set.
+    egraph
+        .parse_and_run_program(
+            None,
+            r#"
+        (ruleset explode)
+        (datatype Math (Num i64) (Add Math Math))
+        (Num 0)
+        (rule ((= e (Num i)) (< i 200)) ((Num (+ i 1))) :ruleset explode :name "count")
+        (rule ((= a (Num x)) (= b (Num y))) ((Add a b)) :ruleset explode :name "pair")
+        (run-schedule
+          (let-scheduler bo (back-off :node-limit 500 :eager-apply 1))
+          (saturate (run-with bo explode)))
+        "#,
+        )
+        .unwrap();
+
+    let nodes = egraph.num_nodes();
+    assert!(
+        (450..=600).contains(&nodes),
+        "unexpected final size: {nodes}"
+    );
+}
