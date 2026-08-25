@@ -5,8 +5,9 @@
 //! differ near the root, and different roots share leaves and common
 //! subexpressions — so expanding every term to a tree can blow the printed
 //! size up by orders of magnitude relative to the underlying [`TermDag`].
-//! The functions here print a set of terms against a single sequence of let
-//! bindings instead:
+//! [`render_terms_with_shared_lets`] renders a set of terms against a single
+//! sequence of let bindings instead (the `(let ...)` s-expression around them
+//! is assembled by the caller, e.g. `multi-extract :dag`):
 //!
 //! - a binding is introduced only for an `App` term that is referenced two or
 //!   more times across all printed terms; everything else is inlined, so
@@ -90,22 +91,6 @@ pub fn render_terms_with_shared_lets(
     (bindings, rendered_roots)
 }
 
-/// Render `roots` as a single `(let ((name def) ...) (root ...))`
-/// s-expression (the binding list is empty when nothing is shared).
-pub fn termdag_to_dag_string(termdag: &TermDag, roots: &[TermId]) -> String {
-    let (bindings, rendered) = render_terms_with_shared_lets(termdag, roots);
-    let mut out = String::from("(let (");
-    for (name, def) in &bindings {
-        write!(out, "\n   ({name} {def})").unwrap();
-    }
-    out.push_str(")\n (");
-    for root in &rendered {
-        write!(out, "\n   {root}").unwrap();
-    }
-    out.push_str("))");
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -151,14 +136,5 @@ mod tests {
         let (bindings, rendered) = render_terms_with_shared_lets(&td, &[double]);
         assert_eq!(bindings, vec![("?t0".into(), "(Num 1)".into())]);
         assert_eq!(rendered, vec!["(Add ?t0 ?t0)".to_string()]);
-    }
-
-    #[test]
-    fn let_string_shape() {
-        let (td, add, neg) = dag();
-        assert_eq!(
-            termdag_to_dag_string(&td, &[add, neg]),
-            "(let (\n   (?t0 (Add (Num 1) (Num 2))))\n (\n   ?t0\n   (Neg ?t0)))"
-        );
     }
 }
