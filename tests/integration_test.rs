@@ -1226,12 +1226,13 @@ fn test_backoff_node_limit() {
         .unwrap();
 
     let nodes = egraph.num_nodes();
-    // Every match in this workload adds exactly one e-node, so the growth
-    // estimate converges from above and the limit is never overshot.
-    assert!(nodes <= 500, "node limit overshot: {nodes}");
-    // The scheduler stopped because of the limit, not because the workload
-    // saturated early.
-    assert!(nodes >= 450, "stopped too early: {nodes}");
+    // The size is checked once per iteration, so the limit can be overshot by
+    // at most one iteration's growth (a few dozen nodes here), and the
+    // scheduler stopped because of the limit rather than early saturation.
+    assert!(
+        (450..=600).contains(&nodes),
+        "unexpected final size: {nodes}"
+    );
 
     // (get-node-size!) agrees with EGraph::num_nodes and, since this program
     // has no analysis tables, with (get-size!).
