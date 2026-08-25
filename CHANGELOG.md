@@ -13,7 +13,8 @@ This file records notable user-facing changes to egglog-experimental.
   is consulted, so the check sees the live size and the limit is overshot by
   at most one rule's matches.
 - The `(get-node-size!)` primitive: the e-node count of the e-graph (rows of
-  eq-sort tables), the same measure `:node-limit` uses.
+  constructor tables, excluding `relation`s and functions to base sorts), the
+  same measure `:node-limit` uses.
 - A `:dag` option for `multi-extract` that let-binds subterms shared across
   the extracted variants instead of expanding every variant to a tree, plus
   the underlying `dag_print` printing functions.

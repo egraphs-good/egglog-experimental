@@ -59,10 +59,10 @@ impl ReadPrim for GetSizePrimitive {
 }
 
 /// `(get-node-size!)`: the number of e-nodes in the e-graph — the total row
-/// count of tables whose output is an eq-sort. Unlike `(get-size!)`, this
-/// excludes analysis tables (functions to base-sort values), so it matches the
-/// node count of a traditional e-graph. Same measure as
-/// `egglog::EGraph::num_nodes`.
+/// count of tables whose output is a unionable eq-sort (constructors). Unlike
+/// `(get-size!)`, this excludes analysis tables (functions to base-sort values
+/// and `relation`s), so it matches the node count of a traditional e-graph.
+/// Same measure as `egglog::EGraph::num_nodes`.
 #[derive(Clone)]
 pub struct GetNodeSizePrimitive;
 
