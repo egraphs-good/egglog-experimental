@@ -1540,3 +1540,27 @@
   - Keep the flattened representation. Both workloads are performance-neutral,
     while the implementation loses one type, nested field access, and roughly
     30 lines without changing the bitset/vector algorithm.
+
+## Experiment 50: final upstream-main Taylor 51 comparison
+
+- Status: complete
+- Candidate:
+  - Experimental commit `4c5e7922e7689fa7bc1b7e7fe0615634846ac336`.
+  - Upstream egglog commit
+    `e264c37a3332453eb0b6486c82c8766dd1af17df`.
+  - Release binary SHA-256:
+    `6f7e70684a365f6d66ed41f611cd7d867151068d7552bc6e2b61ce0dc9b2dfaf`.
+- Input:
+  - Tree: upstream commit's checked-in `tests/taylor51.egg`.
+  - Greedy DAG: a byte-identical temporary copy except that its 324 extraction
+    commands append `:extractor greedy-dag`.
+- Exact command:
+  - `hyperfine --warmup 5 --runs 20 --export-json /tmp/egglog-greedy-dag-cleanup.p6QKX2/final-tree-vs-dag.json --command-name tree '<candidate> <upstream>/tests/taylor51.egg >/dev/null' --command-name 'greedy DAG' '<candidate> /tmp/egglog-greedy-dag-cleanup.p6QKX2/greedy-variants.egg >/dev/null'`
+- Observed result:
+  - Tree: `1.026 s +/- 0.012 s`.
+  - Greedy DAG: `207.8 ms +/- 2.2 ms`.
+  - Hyperfine ratio: greedy DAG was `4.93 +/- 0.08` times faster.
+- Decision:
+  - Keep the final implementation. The cleanup retains the established
+    roughly 5x Taylor speed advantage while removing command integration and
+    secondary-map layering.
