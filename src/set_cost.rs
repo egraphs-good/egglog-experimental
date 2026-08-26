@@ -12,7 +12,7 @@
 //! ```
 //!
 //! Nodes without an assigned dynamic cost retain their normal tree-additive
-//! cost. Negative assignments are ignored and also fall back to that cost.
+//! cost. Costs must be non-negative.
 
 use crate::{
     Error,
@@ -23,7 +23,7 @@ use crate::{
 use egglog::{
     ArcSort, CommandOutput, EGraph, Enode, RawValues, Read, TermId, UserDefinedCommand, Value,
     ast::*,
-    extract::{AdditiveCostModel, DagCostModel, DefaultCost, MonoidCost, TreeCostModel},
+    extract::{DEFAULT_COST_MODEL, DagCostModel, DefaultCost, TreeCostModelFromDag},
     span,
     util::FreshGen,
 };
@@ -205,15 +205,16 @@ fn map_fallible<T>(
 
 /// An extraction cost model that reads costs assigned by `set-cost`.
 ///
-/// It falls back to [`AdditiveCostModel`] for constructors without an
-/// assigned dynamic cost. Use this model for custom extractors that should
-/// agree with this crate's replacement `extract` command.
+/// It falls back to the marginal costs used by [`DEFAULT_COST_MODEL`] for
+/// constructors without an assigned dynamic cost. Use this model for custom
+/// extractors that should agree with this crate's replacement `extract`
+/// command.
 #[derive(Clone)]
 pub struct DynamicCostModel;
 
 impl DagCostModel<DefaultCost> for DynamicCostModel {
     fn base_value_cost(&self, egraph: &EGraph, sort: &ArcSort, value: Value) -> DefaultCost {
-        DagCostModel::base_value_cost(&AdditiveCostModel::default(), egraph, sort, value)
+        DagCostModel::base_value_cost(&DEFAULT_COST_MODEL.0, egraph, sort, value)
     }
 
     fn enode_cost(
@@ -222,68 +223,22 @@ impl DagCostModel<DefaultCost> for DynamicCostModel {
         func: &egglog::Function,
         enode: &Enode<'_>,
     ) -> DefaultCost {
-        let default_cost =
-            || DagCostModel::enode_cost(&AdditiveCostModel::default(), egraph, func, enode);
+        let default_cost = || DagCostModel::enode_cost(&DEFAULT_COST_MODEL.0, egraph, func, enode);
         let name = get_cost_table_name(func.name());
         if egraph.get_function(&name).is_some() {
             egraph
                 .read(|state| state.lookup(&name, RawValues(enode.children.to_vec())))
                 .ok()
                 .flatten()
-                .and_then(|c| {
+                .map(|c| {
                     let cost = egraph.value_to_base::<i64>(c);
-                    if cost >= 0 {
-                        Some(cost as DefaultCost)
-                    } else {
-                        log::debug!(
-                            "Ignoring negative dynamic extraction cost {cost} for {}",
-                            func.name()
-                        );
-                        None
-                    }
+                    assert!(cost >= 0);
+                    cost as DefaultCost
                 })
                 .unwrap_or_else(default_cost)
         } else {
             default_cost()
         }
-    }
-}
-
-impl TreeCostModel<DefaultCost> for DynamicCostModel {
-    type EnodeCost = DefaultCost;
-    type ContainerCost = DefaultCost;
-
-    fn base_value_cost(&self, egraph: &EGraph, sort: &ArcSort, value: Value) -> DefaultCost {
-        DagCostModel::base_value_cost(self, egraph, sort, value)
-    }
-
-    fn enode_cost(
-        &self,
-        egraph: &EGraph,
-        func: &egglog::Function,
-        enode: &Enode<'_>,
-    ) -> DefaultCost {
-        DagCostModel::enode_cost(self, egraph, func, enode)
-    }
-
-    fn container_cost(&self, egraph: &EGraph, sort: &ArcSort, value: Value) -> DefaultCost {
-        DagCostModel::container_cost(self, egraph, sort, value)
-    }
-
-    fn fold_enode_cost(&self, enode_cost: DefaultCost, child_costs: &[DefaultCost]) -> DefaultCost {
-        child_costs
-            .iter()
-            .fold(enode_cost, |cost, child| cost.combine(child))
-    }
-
-    fn fold_container_cost(
-        &self,
-        container_cost: DefaultCost,
-        element_costs: &[DefaultCost],
-    ) -> DefaultCost {
-        element_costs
-            .iter()
-            .fold(container_cost, |cost, element| cost.combine(element))
     }
 }
 
@@ -345,7 +300,8 @@ impl UserDefinedCommand for CustomExtract {
             let extracted = if use_greedy_dag {
                 extract_best_greedy_dag(egraph, roots, DynamicCostModel)?
             } else {
-                egraph.extract_best_with_cost_model(roots, DynamicCostModel)?
+                egraph
+                    .extract_best_with_cost_model(roots, TreeCostModelFromDag(DynamicCostModel))?
             };
             let root = extracted
                 .terms
@@ -371,7 +327,11 @@ impl UserDefinedCommand for CustomExtract {
             let extracted = if use_greedy_dag {
                 extract_variants_greedy_dag(egraph, roots, n as usize, DynamicCostModel)?
             } else {
-                egraph.extract_variants_with_cost_model(roots, n as usize, DynamicCostModel)?
+                egraph.extract_variants_with_cost_model(
+                    roots,
+                    n as usize,
+                    TreeCostModelFromDag(DynamicCostModel),
+                )?
             };
             let terms: Vec<TermId> = extracted
                 .variants

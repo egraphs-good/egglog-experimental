@@ -12,7 +12,7 @@ use crate::greedy_dag_extract::{extract_best_greedy_dag, split_trailing_extracto
 use crate::table_rows::{for_each_row, is_constructor};
 use egglog::{
     ArcSort, CommandOutput, EGraph, Error, RawValues, TermDag, TermId, TypeError,
-    UserDefinedCommand, Value, Write, ast::Expr, sort::S, span,
+    UserDefinedCommand, Value, Write, ast::Expr, extract::TreeCostModelFromDag, sort::S, span,
 };
 
 /// User-defined command implementing `(keep-best "table"...)`.
@@ -126,7 +126,7 @@ fn collect_and_extract(
         let extracted = if use_greedy_dag {
             extract_best_greedy_dag(egraph, roots, DynamicCostModel)
         } else {
-            egraph.extract_best_with_cost_model(roots, DynamicCostModel)
+            egraph.extract_best_with_cost_model(roots, TreeCostModelFromDag(DynamicCostModel))
         }
         .map_err(|err| {
             Error::ExtractError(format!(

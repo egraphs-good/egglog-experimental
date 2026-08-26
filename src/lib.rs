@@ -115,7 +115,7 @@ pub fn new_experimental_egraph() -> EGraph {
     egraph
         .add_command(
             "multi-extract".into(),
-            Arc::new(MultiExtract::with_greedy_dag(DynamicCostModel)),
+            Arc::new(MultiExtract::new(DynamicCostModel)),
         )
         .unwrap();
 

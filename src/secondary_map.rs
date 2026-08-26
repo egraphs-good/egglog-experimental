@@ -154,10 +154,8 @@ impl<K> Interner<K> {
         entries_capacity: usize,
     ) -> AggregatedSparseSecondaryMap<K, V> {
         AggregatedSparseSecondaryMap {
-            entries: SparseSecondaryMap {
-                entries: Vec::with_capacity(entries_capacity.min(self.len())),
-                present: self.secondary_set(),
-            },
+            entries: Vec::with_capacity(entries_capacity.min(self.len())),
+            present: self.secondary_set(),
             total: V::identity(),
         }
     }
@@ -278,49 +276,19 @@ impl<K, V> SecondaryMap<K, V> {
     }
 }
 
-/// Sparse secondary map over a fixed dense id-space.
-///
-/// This stores only present id/payload pairs while using a dense bitset for
-/// membership checks. It is useful when each candidate touches a small subset
-/// of a larger interned universe and still needs sparse iteration. Each map
-/// uses one membership bit per interned key; this root-local memory tradeoff is
-/// deliberate because replacing the bitset with linear membership checks made
-/// the greedy-DAG benchmark roughly 65-70% slower (see
-/// `.agents/logs/2026-06-24-greedy-dag-extractor-perf.md`).
-struct SparseSecondaryMap<K, V> {
-    entries: Vec<(InternId<K>, V)>,
-    present: SecondarySet<K>,
-}
-
-impl<K, V: Clone> Clone for SparseSecondaryMap<K, V> {
-    fn clone(&self) -> Self {
-        Self {
-            entries: self.entries.clone(),
-            present: self.present.clone(),
-        }
-    }
-}
-
-impl<K, V> SparseSecondaryMap<K, V> {
-    /// Inserts `value` for `id`, which must not already be present.
-    #[inline]
-    fn insert_new(&mut self, id: InternId<K>, value: V) {
-        debug_assert!(!self.present.contains(id));
-        self.present.insert(id);
-        self.entries.push((id, value));
-    }
-}
-
 /// Sparse secondary map over a fixed dense id-space with a cached aggregate.
 ///
 /// Construct this through [`Interner::aggregated_map_with_capacity`] so the
 /// interner that allocated the ids also sizes the membership structure. This
 /// behaves like a sparse insertion-ordered map from interned ids to payloads:
 /// each id can be inserted once, membership tests are constant-time, iteration
-/// visits only present entries, and the commutative-monoid total is cached on
-/// insert.
+/// visits only present entries, and the monoid total is cached on insert. Each
+/// map uses one membership bit per interned key; replacing the bitset with
+/// linear entry scans made the greedy-DAG benchmark roughly 65-70% slower (see
+/// `.agents/logs/2026-06-24-greedy-dag-extractor-perf.md`).
 pub(super) struct AggregatedSparseSecondaryMap<K, V: MonoidCost> {
-    entries: SparseSecondaryMap<K, V>,
+    entries: Vec<(InternId<K>, V)>,
+    present: SecondarySet<K>,
     total: V,
 }
 
@@ -328,6 +296,7 @@ impl<K, V: MonoidCost> Clone for AggregatedSparseSecondaryMap<K, V> {
     fn clone(&self) -> Self {
         Self {
             entries: self.entries.clone(),
+            present: self.present.clone(),
             total: self.total.clone(),
         }
     }
@@ -376,13 +345,12 @@ impl<K, V: MonoidCost> AggregatedSparseSecondaryMap<K, V> {
         let mut merged = biggest.clone();
         merged
             .entries
-            .entries
             .reserve(entries_capacity.saturating_sub(merged.len()));
 
         for (idx, map) in maps.iter().enumerate() {
             if idx != biggest_idx {
                 let map: &AggregatedSparseSecondaryMap<K, V> = map.borrow();
-                for (id, value) in &map.entries.entries {
+                for (id, value) in &map.entries {
                     merged.insert_if_absent(*id, value.clone());
                 }
             }
@@ -394,7 +362,7 @@ impl<K, V: MonoidCost> AggregatedSparseSecondaryMap<K, V> {
     /// Returns whether `id` already has a payload in this secondary map.
     #[inline]
     pub(super) fn contains(&self, id: InternId<K>) -> bool {
-        self.entries.present.contains(id)
+        self.present.contains(id)
     }
 
     /// Inserts `value` for `id` if the id is not already present.
@@ -404,16 +372,16 @@ impl<K, V: MonoidCost> AggregatedSparseSecondaryMap<K, V> {
     /// cached aggregate without requiring subtraction.
     #[inline]
     pub(super) fn insert_if_absent(&mut self, id: InternId<K>, value: V) {
-        if !self.entries.present.contains(id) {
+        if self.present.insert(id) {
             self.total = self.total.clone().combine(&value);
-            self.entries.insert_new(id, value);
+            self.entries.push((id, value));
         }
     }
 
     /// Returns the number of present id/payload pairs.
     #[inline]
     fn len(&self) -> usize {
-        self.entries.entries.len()
+        self.entries.len()
     }
 
     /// Returns the cached aggregate of all present payloads.
@@ -492,7 +460,7 @@ mod tests {
         assert!(map.contains(a));
         assert!(map.contains(b));
         assert_eq!(map.len(), 2);
-        assert_eq!(map.entries.entries, [(a, 4), (b, 3)]);
+        assert_eq!(map.entries, [(a, 4), (b, 3)]);
         assert_eq!(*map.total(), 7);
     }
 
@@ -509,8 +477,8 @@ mod tests {
         let mut cloned = map.clone();
         cloned.insert_if_absent(b, 2);
 
-        assert_eq!(map.entries.entries, [(a, 1)]);
-        assert_eq!(cloned.entries.entries, [(a, 1), (b, 2)]);
+        assert_eq!(map.entries, [(a, 1)]);
+        assert_eq!(cloned.entries, [(a, 1), (b, 2)]);
         assert_eq!(*cloned.total(), 3);
     }
 
@@ -540,7 +508,7 @@ mod tests {
         assert!(union.contains(b));
         assert!(union.contains(c));
         assert!(union.contains(d));
-        assert_eq!(union.entries.entries, [(a, 1), (b, 2), (c, 3), (d, 4)]);
+        assert_eq!(union.entries, [(a, 1), (b, 2), (c, 3), (d, 4)]);
         assert_eq!(*union.total(), 10);
     }
 }

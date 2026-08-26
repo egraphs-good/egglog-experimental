@@ -1445,3 +1445,98 @@
   - Keep one-time callback evaluation. It makes custom stateful or expensive
     models predictable, exact callback-count tests cover the behavior, and the
     default cheap model shows no measurable regression.
+
+## Experiment 46: upstream-main pin and command cost-model cleanup
+
+- Status: complete
+- Question: after the core extraction API merged upstream, can experimental
+  use that revision while removing `MultiExtract`'s optional function pointer
+  and `DynamicCostModel`'s duplicate tree-model implementation without
+  regressing greedy-DAG extraction?
+- Change:
+  - Pinned the egglog crates to upstream commit
+    `e264c37a3332453eb0b6486c82c8766dd1af17df`, which contains merged egglog
+    PR 934.
+  - Made `MultiExtract` require a `DagCostModel` and construct greedy-DAG
+    extraction directly when requested.
+  - Adapted that same model to tree extraction with `TreeCostModelFromDag`.
+  - Kept only the `DagCostModel` implementation on `DynamicCostModel` and used
+    the marginal model inside `DEFAULT_COST_MODEL` for fallback costs.
+- Validation:
+  - `cargo test --release` passed: 6 unit, 40 file, 55 integration, 8 fresh,
+    and 1 doc test.
+  - The pre-cleanup and cleaned binaries produced byte-identical output on the
+    copied vector best-extraction workload and the 324-extract Taylor variants
+    workload.
+  - Hyperfine, before the machine became noisy:
+    - vector best: old `109.1 ms +/- 6.7 ms`, cleaned
+      `103.1 ms +/- 7.5 ms` (30 runs each);
+    - Taylor variants: old `204.4 ms +/- 4.8 ms`, cleaned
+      `201.9 ms +/- 2.2 ms` (20 runs each).
+- Decision:
+  - Keep the cleanup. It removes the optional function pointer, one constructor,
+    the tree-only command specialization, and the duplicate tree callbacks,
+    with no behavioral-output or timing regression.
+
+## Experiment 47: always build the producer target index
+
+- Status: rejected
+- Question: can `ProducerRows::by_target` stop being optional, removing the
+  `index_targets` parameter and variant-only construction branches?
+- Hypothesis: the extra hash insertion per discovered producer row may be cheap
+  enough that the simpler always-built index is neutral for best extraction.
+- Method:
+  - Preserved release binaries with and without the change.
+  - Warmed each binary 10 times, then ran 60 alternating A/B and B/A pairs on
+    the vector best-extraction workload.
+  - Computed each pair's relative change and a 95% normal confidence interval
+    from the sample standard deviation of those paired changes.
+- Observed result:
+  - Optional target index: `131.383 ms +/- 11.074 ms`.
+  - Always-built target index: `134.104 ms +/- 13.150 ms`.
+  - Paired change: `+2.32%` (95% CI `+0.11%` to `+4.53%`).
+- Decision:
+  - Reject and restore variant-only target indexing. The `Option` and boolean
+    prevent a small measured regression on the common best-extraction path.
+
+## Experiment 48: remove producer-plan capacity reservation
+
+- Status: rejected
+- Question: can candidate-plan merging rely on `HashMap` growth instead of
+  computing and reserving an upper bound from all child plans?
+- Method:
+  - Compared preserved release binaries with and without the reserve.
+  - Best workload: 10 warmups and 60 alternating pairs.
+  - Variants workload: 5 warmups and 30 alternating pairs.
+  - Used the same paired relative-change CI calculation as Experiment 47.
+- Observed result:
+  - Best extraction: `-0.83%` without the reserve (95% CI `-4.43%` to
+    `+2.76%`), which is inconclusive.
+  - Variants extraction: `+2.72%` without the reserve (95% CI `+0.90%` to
+    `+4.54%`), a measured regression.
+- Decision:
+  - Restore the reservation. Variant ranking repeatedly merges producer plans,
+    and avoiding map growth justifies the small capacity calculation.
+
+## Experiment 49: flatten the private sparse-map wrapper
+
+- Status: complete
+- Question: does `SparseSecondaryMap` need to remain a separate private type
+  when its only owner is `AggregatedSparseSecondaryMap`?
+- Change:
+  - Moved the sparse entry vector and membership bitset directly onto
+    `AggregatedSparseSecondaryMap`.
+  - Removed the one-use wrapper and its clone/insert implementations.
+  - Used `SecondarySet::insert`'s boolean result directly, avoiding a duplicate
+    membership check on successful insertion.
+- Method:
+  - Best workload: 8 warmups and 50 alternating pairs.
+  - Variants workload: 5 warmups and 30 alternating pairs.
+  - Used the same paired relative-change CI calculation as Experiment 47.
+- Observed result:
+  - Best extraction: `-1.20%` (95% CI `-2.69%` to `+0.28%`).
+  - Variants extraction: `-0.88%` (95% CI `-3.41%` to `+1.65%`).
+- Decision:
+  - Keep the flattened representation. Both workloads are performance-neutral,
+    while the implementation loses one type, nested field access, and roughly
+    30 lines without changing the bitset/vector algorithm.

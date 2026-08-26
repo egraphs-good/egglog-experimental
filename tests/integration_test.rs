@@ -1,4 +1,4 @@
-use std::{cell::Cell, rc::Rc, sync::Arc};
+use std::{cell::Cell, sync::Arc};
 
 use egglog::{
     CommandOutput,
@@ -6,12 +6,6 @@ use egglog::{
     prelude::{RustSpan, Span},
     span,
 };
-
-// Deliberately non-Send: MultiExtract stores the model, not extracted costs.
-type TreeOnlyCost = Rc<u64>;
-
-#[derive(Clone)]
-struct TreeOnlyCostModel;
 
 struct CountingDagCostModel<'a, M>(&'a Cell<usize>, M);
 
@@ -88,43 +82,6 @@ impl egglog::extract::DagCostModel<MaxCost> for MaxCostModel {
             "Expensive" => 5,
             name => panic!("unexpected constructor {name}"),
         })
-    }
-}
-
-impl egglog::extract::TreeCostModel<TreeOnlyCost> for TreeOnlyCostModel {
-    type EnodeCost = ();
-    type ContainerCost = ();
-
-    fn base_value_cost(
-        &self,
-        _egraph: &egglog::EGraph,
-        _sort: &egglog::ArcSort,
-        _value: egglog::Value,
-    ) -> TreeOnlyCost {
-        Rc::new(1)
-    }
-    fn enode_cost(
-        &self,
-        _egraph: &egglog::EGraph,
-        _func: &egglog::Function,
-        _enode: &egglog::Enode<'_>,
-    ) {
-    }
-
-    fn container_cost(
-        &self,
-        _egraph: &egglog::EGraph,
-        _sort: &egglog::ArcSort,
-        _value: egglog::Value,
-    ) {
-    }
-
-    fn fold_enode_cost(&self, (): (), child_costs: &[TreeOnlyCost]) -> TreeOnlyCost {
-        Rc::new(1 + child_costs.iter().map(|cost| **cost).sum::<u64>())
-    }
-
-    fn fold_container_cost(&self, (): (), element_costs: &[TreeOnlyCost]) -> TreeOnlyCost {
-        Rc::new(element_costs.iter().map(|cost| **cost).sum())
     }
 }
 
@@ -780,35 +737,6 @@ fn test_multi_extract_accepts_greedy_dag_extractor() {
 }
 
 #[test]
-fn test_multi_extract_accepts_tree_only_cost_model() {
-    let mut egraph = egglog_experimental::new_experimental_egraph();
-    egraph
-        .add_command(
-            "tree-multi-extract".to_owned(),
-            Arc::new(egglog_experimental::MultiExtract::new(TreeOnlyCostModel)),
-        )
-        .unwrap();
-
-    let result = egraph
-        .parse_and_run_program(
-            None,
-            "(datatype E (Num i64)) (tree-multi-extract 1 (Num 1))",
-        )
-        .unwrap();
-
-    assert_eq!(result.len(), 1);
-    assert!(result[0].to_string().contains("(Num 1)"));
-
-    let err = egraph
-        .parse_and_run_program(None, "(tree-multi-extract 1 (Num 1) :extractor greedy-dag)")
-        .unwrap_err();
-    assert!(
-        err.to_string()
-            .contains("does not support greedy-DAG extraction")
-    );
-}
-
-#[test]
 fn test_keep_best_basic() {
     let mut egraph = egglog_experimental::new_experimental_egraph();
 
@@ -1355,26 +1283,6 @@ fn test_greedy_dag_costs_each_reachable_node_once_for_variants() {
     // Two producer rows and their two primitive children are each costed once,
     // including during variant rescoring and debug fixed-point validation.
     assert_eq!(calls.get(), 4);
-}
-
-#[test]
-fn test_negative_dynamic_cost_falls_back_instead_of_panicking() {
-    let mut egraph = egglog_experimental::new_experimental_egraph();
-
-    let result = egraph
-        .parse_and_run_program(
-            None,
-            r#"
-        (with-dynamic-cost
-          (datatype E (Num i64)))
-        (set-cost (Num 1) -1)
-        (extract (Num 1))
-        "#,
-        )
-        .unwrap();
-
-    assert_eq!(result.len(), 1);
-    assert_eq!(result[0].to_string(), "(Num 1)\n");
 }
 
 #[test]

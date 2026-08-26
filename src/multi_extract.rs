@@ -9,12 +9,13 @@
 
 use crate::greedy_dag_extract::{extract_variants_greedy_dag, split_trailing_extractor};
 use egglog::{
-    ArcSort, CommandOutput, EGraph, Error, TermDag, TermId, TypeError, UserDefinedCommand, Value,
+    CommandOutput, EGraph, Error, TermDag, TermId, TypeError, UserDefinedCommand,
     ast::{Expr, ParseError},
-    extract::{Cost, DagCostModel, ExtractedTermVariants, MonoidCost, TreeCostModel},
+    extract::{DagCostModel, MonoidCost, TreeCostModelFromDag},
     prelude::span,
 };
 use log::log_enabled;
+use std::marker::PhantomData;
 
 /// Displayable output produced by [`MultiExtract`].
 #[derive(Debug)]
@@ -37,43 +38,31 @@ impl std::fmt::Display for MultiExtractOutput {
     }
 }
 
-type GreedyDagExtractFn<C, CM> =
-    fn(&EGraph, Vec<(ArcSort, Value)>, usize, CM) -> Result<ExtractedTermVariants<C>, Error>;
-
 /// User-defined command implementing `(multi-extract n term...)` with a
-/// caller-provided tree cost model.
+/// caller-provided marginal cost model.
 ///
 /// The positive `i64` value `n` is the number of variants returned for each
-/// term. All terms share one extractor computation. [`MultiExtract::new`]
-/// supports tree extraction, while [`MultiExtract::with_greedy_dag`] also
-/// accepts `:extractor greedy-dag` when the model also implements
-/// [`DagCostModel`].
-pub struct MultiExtract<C: Cost, CM: TreeCostModel<C> + Clone> {
+/// term. All terms share one extractor computation. Tree extraction adapts the
+/// model with [`TreeCostModelFromDag`]; `:extractor greedy-dag` uses its
+/// marginal costs directly.
+pub struct MultiExtract<C: MonoidCost, CM: DagCostModel<C> + Clone> {
     cost_model: CM,
-    greedy_dag_extract: Option<GreedyDagExtractFn<C, CM>>,
+    // Extracted costs are temporary, so this marker should not impose their
+    // ownership or auto-trait properties on the registered command.
+    _cost: PhantomData<fn() -> C>,
 }
 
-impl<C: Cost, CM: TreeCostModel<C> + Clone> MultiExtract<C, CM> {
-    /// Creates a tree-only multi-extract command for `cost_model`.
+impl<C: MonoidCost, CM: DagCostModel<C> + Clone> MultiExtract<C, CM> {
+    /// Creates a multi-extract command for `cost_model`.
     pub fn new(cost_model: CM) -> Self {
         MultiExtract {
             cost_model,
-            greedy_dag_extract: None,
+            _cost: PhantomData,
         }
     }
 }
 
-impl<C: MonoidCost, CM: DagCostModel<C> + TreeCostModel<C> + Clone> MultiExtract<C, CM> {
-    /// Creates a multi-extract command that also accepts `:extractor greedy-dag`.
-    pub fn with_greedy_dag(cost_model: CM) -> Self {
-        Self {
-            cost_model,
-            greedy_dag_extract: Some(extract_variants_greedy_dag::<C, CM>),
-        }
-    }
-}
-
-impl<C: Cost, CM: TreeCostModel<C> + Clone + Send + Sync + 'static> UserDefinedCommand
+impl<C: MonoidCost, CM: DagCostModel<C> + Clone + Send + Sync + 'static> UserDefinedCommand
     for MultiExtract<C, CM>
 {
     fn update(&self, egraph: &mut EGraph, args: &[Expr]) -> Result<Vec<CommandOutput>, Error> {
@@ -116,15 +105,13 @@ impl<C: Cost, CM: TreeCostModel<C> + Clone + Send + Sync + 'static> UserDefinedC
             .collect::<Result<_, _>>()?;
 
         let extracted = if use_greedy_dag {
-            let extract = self.greedy_dag_extract.ok_or_else(|| {
-                Error::ExtractError(
-                    "this multi-extract cost model does not support greedy-DAG extraction"
-                        .to_owned(),
-                )
-            })?;
-            extract(egraph, roots, n as usize, self.cost_model.clone())
+            extract_variants_greedy_dag(egraph, roots, n as usize, self.cost_model.clone())
         } else {
-            egraph.extract_variants_with_cost_model(roots, n as usize, self.cost_model.clone())
+            egraph.extract_variants_with_cost_model(
+                roots,
+                n as usize,
+                TreeCostModelFromDag(self.cost_model.clone()),
+            )
         }?;
 
         let terms: Vec<Vec<_>> = extracted
