@@ -507,6 +507,7 @@ mod schedulers {
             node_limit,
             eager_apply,
             stats: HashMap::new(),
+            cached_nodes: None,
         }))
     }
 
@@ -525,6 +526,11 @@ mod schedulers {
         /// live size within an iteration.
         eager_apply: bool,
         stats: HashMap<String, RuleStats>,
+        /// `num_nodes()` as of `(iteration, value)`. Counting is O(#tables),
+        /// and with eager application it is consulted once per rule; the
+        /// size only changes when a rule's matches are applied, so the
+        /// reading is reused until then (and dropped at iteration boundaries).
+        cached_nodes: Option<(usize, usize)>,
     }
 
     #[derive(Debug, Clone)]
@@ -659,7 +665,14 @@ mod schedulers {
             // With eager application this is the live size; otherwise it is
             // the size at the start of the iteration.
             if let Some(node_limit) = node_limit {
-                let nodes = ctx.egraph.num_nodes();
+                let nodes = match self.cached_nodes {
+                    Some((iteration, nodes)) if iteration == ctx.iteration => nodes,
+                    _ => {
+                        let nodes = ctx.egraph.num_nodes();
+                        self.cached_nodes = Some((ctx.iteration, nodes));
+                        nodes
+                    }
+                };
                 if nodes >= node_limit {
                     debug!(
                         "Delaying {}: at node limit ({} >= {})",
@@ -669,12 +682,18 @@ mod schedulers {
                 }
             }
 
+            // Re-borrow: the node-limit check above needed `self`.
+            let stats = self.stats.get_mut(rule).unwrap();
             stats.times_applied += 1;
             debug!(
                 "Choosing all matches for {} ({}-{})",
                 rule, stats.times_applied, stats.times_banned
             );
             matches.choose_all();
+            if total_len > 0 {
+                // Applying these matches changes the size.
+                self.cached_nodes = None;
+            }
             true
         }
     }
