@@ -91,6 +91,11 @@ Discovery starts from every requested `(sort, value)` root and uses an explicit
 worklist, so deeply nested constructor chains do not consume the Rust call
 stack.
 
+The first reachable value of an eq sort scans the e-graph's functions for
+visible, extractable constructors that produce that sort. Their names and input
+sorts are cached as one shared immutable list. Later values of the same sort
+reuse that list, while constructors for unrelated sorts are never cloned.
+
 For an eq-sort value, discovery finds every visible, extractable, non-subsumed
 normal constructor row that produces the value. It records the row and then
 schedules its children. Containers are expanded structurally. Any eq-sort
@@ -279,6 +284,9 @@ Focused integration tests cover the semantic boundaries:
   variants and repeated roots reuse the frozen marginal-cost snapshot.
 - `test_greedy_dag_extract_zero_variants_returns_empty_for_all_root_kinds`
   verifies the zero-work fast path.
+- `test_greedy_dag_discovery_handles_deep_constructor_chains` runs a 20,000-node
+  unextractable chain in a child process and verifies that discovery returns an
+  extraction error instead of overflowing the process stack.
 
 The file-test harness also runs the opposite extractor for every recognized
 `extract` command from an equivalent cloned e-graph state. It converts each
@@ -306,15 +314,17 @@ but are not general performance guarantees.
 | Reserve the merged producer-plan capacity | Removing the reserve regressed variant extraction by 2.72% (95% CI +0.90% to +4.54%); the best-extraction result was inconclusive. |
 | Use `hashbrown::HashMap` in hot maps | A complete replacement with `std::collections::HashMap` regressed Taylor 51 by 1.90% across 120 alternating pairs (95% CI +1.04% to +2.76%). The experiment did not isolate the hasher from other implementation details. |
 | Keep the sparse entries, membership bitset, and aggregate in one type | Flattening a one-use nested wrapper removed roughly 30 lines and was performance-neutral on best and variant workloads. |
+| Share constructor metadata once per encountered output sort | Against the original iterative discovery at commit `e3e4dd8`, the final implementation reduced Taylor 51 greedy-DAG time from 198.7-199.8 ms to 144.6-144.8 ms in two 20-run command orders, a 1.37-1.38x speedup. |
+| Build constructor lists lazily and keep discovery iterative | Compared with eager all-sort indexing and recursive discovery, the final implementation reduced repeated primitive and shallow-eq extraction time by 9-12%. Taylor was about 1-2% slower, while a 20,000-node unextractable chain returned the intended error instead of aborting with stack overflow. |
 
-The final Taylor 51 comparison used experimental commit `4c5e7922` with egglog
+The final Taylor 51 comparison used experimental commit `dc45b6b` with egglog
 commit `e264c37a`, `hyperfine --warmup 5 --runs 20`, and redirected stdout. The
-same release binary ran the original tree workload in `1.026 s +/- 0.012 s` and
-a copy with its 324 extraction commands changed to `:extractor greedy-dag` in
-`207.8 ms +/- 2.2 ms`. Greedy DAG was `4.93 +/- 0.08` times faster on this
-particular workload. This is a whole-program comparison of two extractors that
-may select different terms, not a general claim that greedy DAG extraction is
-faster than tree extraction.
+same release binary ran the original tree workload in `985.6 ms +/- 10.7 ms`
+and a copy with its 324 extraction commands changed to
+`:extractor greedy-dag` in `144.6 ms +/- 2.3 ms`. Greedy DAG was
+`6.82 +/- 0.13` times faster on this particular workload. This is a
+whole-program comparison of two extractors that may select different terms,
+not a general claim that greedy DAG extraction is faster than tree extraction.
 
 ## Alternatives Tried
 
@@ -331,6 +341,11 @@ Several plausible simplifications or optimizations were measured and rejected:
   slower.
 - Building the variant target index eagerly and replacing `hashbrown` with the
   standard `HashMap` both made best extraction measurably slower.
+- Eagerly indexing constructors for every sort avoided a per-sort scan but made
+  repeated primitive and shallow-eq extraction slower than lazy indexing.
+- Storing each cached constructor's input sorts in another `Arc` instead of a
+  `Vec` was neutral in 20-run comparisons in both command orders, so the simpler
+  `Vec` representation remains.
 
 Quality-changing pruning, parallel heuristics, and initialized exact solving
 are intentionally deferred to separate extractor modes. They should not be
