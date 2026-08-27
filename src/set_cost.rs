@@ -28,7 +28,6 @@ use egglog::{
     util::FreshGen,
 };
 use egglog_ast::span::Span;
-use log::log_enabled;
 use std::sync::Arc;
 
 /// Registers `with-dynamic-cost`, `set-cost`, and the dynamic-cost `extract`
@@ -311,14 +310,11 @@ impl UserDefinedCommand for CustomExtract {
                 .ok_or_else(|| {
                     Error::ExtractError("Unable to find any valid extraction".to_string())
                 })?;
-            // Avoid rendering the extracted term when this log target is disabled.
-            if log_enabled!(log::Level::Info) {
-                log::info!(
-                    "extracted with cost {}: {}",
-                    root.cost,
-                    extracted.termdag.to_string(root.term)
-                );
-            }
+            log::info!(
+                "extracted with cost {}: {}",
+                root.cost,
+                extracted.termdag.to_string(root.term)
+            );
             Ok(vec![CommandOutput::ExtractBest(
                 extracted.termdag,
                 root.cost,
