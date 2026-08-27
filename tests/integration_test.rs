@@ -1252,9 +1252,12 @@ fn test_get_node_size_excludes_analysis_tables() {
             r#"
         (datatype Math (Num i64))
         (function depth (Math) i64 :no-merge)
+        (relation seen (Math))
         (Num 0)
         (Num 1)
         (set (depth (Num 0)) 0)
+        (seen (Num 0))
+        (seen (Num 1))
         "#,
         )
         .unwrap();
@@ -1262,12 +1265,13 @@ fn test_get_node_size_excludes_analysis_tables() {
     let span = span!();
     let expr = Expr::Call(span.clone(), "get-node-size!".into(), vec![]);
     let (_, value) = egraph.eval_expr(&expr).unwrap();
-    // Two Num nodes; the depth analysis row is excluded.
+    // Two Num nodes; the depth analysis row and the two relation rows (a
+    // constructor over a non-unionable sort) are excluded.
     assert_eq!(egraph.value_to_base::<i64>(value), 2);
     // ... but included by (get-size!).
-    assert_eq!(eval_get_size(&mut egraph, &[]), 3);
+    assert_eq!(eval_get_size(&mut egraph, &[]), 5);
     assert_eq!(egraph.num_nodes(), 2);
-    assert_eq!(egraph.total_size(), 3);
+    assert_eq!(egraph.total_size(), 5);
 }
 
 #[test]
