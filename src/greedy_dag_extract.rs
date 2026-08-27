@@ -19,35 +19,37 @@ use hashbrown::{HashMap, hash_map::Entry};
 use std::collections::{HashSet, VecDeque};
 use std::sync::Arc;
 
+/// `:extractor` is an ordinary identifier, so user-defined commands receive it
+/// as a plain [`Expr::Var`] positional argument like any other name. Only the
+/// trailing `:extractor <symbol>` pair is read as the selector, so a value that
+/// happens to be named `:extractor` elsewhere in the argument list, or a
+/// non-symbol final argument, stays positional.
+///
+/// A trailing `<symbol> <symbol>` pair remains ambiguous and resolves to the
+/// selector, which also keeps a misspelled extractor name an error rather than
+/// silently positional. Removing that last case needs a surface form ordinary
+/// `Expr::Var` parsing cannot produce.
 pub(crate) fn split_trailing_extractor(args: &[Expr]) -> Result<(&[Expr], bool), Error> {
-    let Some(idx) = args
-        .iter()
-        .position(|arg| matches!(arg, Expr::Var(_, keyword) if keyword == ":extractor"))
-    else {
+    let Some([keyword, extractor]) = args.last_chunk::<2>() else {
         return Ok((args, false));
     };
 
-    if idx + 2 != args.len() {
+    if !matches!(keyword, Expr::Var(_, keyword) if keyword == ":extractor") {
+        return Ok((args, false));
+    }
+
+    let Expr::Var(_, name) = extractor else {
+        return Ok((args, false));
+    };
+
+    if name != "greedy-dag" {
         return Err(Error::ParseError(ParseError(
-            args[idx].span(),
-            "expected trailing :extractor <name>".into(),
+            extractor.span(),
+            format!("unknown extractor: {name}; omit :extractor to use the default tree extractor"),
         )));
     }
 
-    let extractor = &args[idx + 1];
-    let use_greedy_dag = match extractor {
-        Expr::Var(_, name) if name == "greedy-dag" => Ok(true),
-        Expr::Var(_, name) => Err(Error::ParseError(ParseError(
-            extractor.span(),
-            format!("unknown extractor: {name}; omit :extractor to use the default tree extractor"),
-        ))),
-        _ => Err(Error::ParseError(ParseError(
-            extractor.span(),
-            "extractor name must be a symbol".into(),
-        ))),
-    }?;
-
-    Ok((&args[..idx], use_greedy_dag))
+    Ok((&args[..args.len() - 2], true))
 }
 
 // Greedy-DAG extraction.
@@ -634,6 +636,14 @@ impl<C: MonoidCost> GreedyDagExtractor<C> {
     }
 
     /// Recompute the exact paid closure for a reconciled producer plan.
+    ///
+    /// The cache lives for one call and is intentionally not hoisted across
+    /// calls. Results are keyed by `(sort, value)` but decided by this call's
+    /// `producer_choices`, which `candidate_from_children` rebuilds per call
+    /// from `best_candidates` snapshots that keep changing until the fixed
+    /// point converges. Two calls in one run can therefore resolve the same key
+    /// to different producer rows, so a shared cache would score a plan against
+    /// choices it did not make.
     fn rescore_producer_plan(
         &self,
         egraph: &EGraph,

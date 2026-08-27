@@ -161,11 +161,12 @@ struct ExtractCheck {
 fn extract_command_parts(command: &Command) -> Option<ExtractCheck> {
     match command {
         Command::UserDefined(_, name, args) if name == "extract" => {
-            let use_greedy_dag = args
-                .iter()
-                .any(|arg| matches!(arg, Expr::Var(_, keyword) if keyword == ":extractor"));
+            let use_greedy_dag = matches!(
+                args.last_chunk::<2>(),
+                Some([Expr::Var(_, keyword), Expr::Var(..)]) if keyword == ":extractor"
+            );
             let positional = if use_greedy_dag {
-                args.get(..args.len().checked_sub(2)?)?
+                args.get(..args.len() - 2)?
             } else {
                 args
             };

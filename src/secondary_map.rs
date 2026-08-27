@@ -11,9 +11,17 @@
 //! monoid aggregate. `slotmap` provides generational deletion safety we do not
 //! need and its `SparseSecondaryMap` is `HashMap`-backed; `rustc_index` and
 //! `index_vec` cover dense typed indexing, but not sparse associated payloads
-//! with an aggregate. See:
+//! with an aggregate. `indexmap::IndexSet` (already in the tree, via core's
+//! `TermDag`) does cover the interner half, and swapping it in measures the
+//! same on the Taylor greedy-DAG canary. It is not used because it would
+//! replace only that half: the id-indexed structures here are the point.
+//! `SecondaryMap` indexes a `Vec` directly and `SecondarySet` a bitset, both
+//! without hashing at all, and `AggregatedSparseSecondaryMap` maintains a
+//! running monoid total on insert so cost comparison never re-sums or
+//! subtracts. See:
 //! <https://docs.rs/lasso/latest/lasso/trait.IntoReader.html>,
-//! <https://docs.rs/slotmap/latest/slotmap/struct.SparseSecondaryMap.html> and
+//! <https://docs.rs/slotmap/latest/slotmap/struct.SparseSecondaryMap.html>,
+//! <https://docs.rs/indexmap/latest/indexmap/set/struct.IndexSet.html> and
 //! <https://doc.rust-lang.org/beta/nightly-rustc/rustc_index/vec/struct.IndexVec.html>.
 
 use egglog::extract::MonoidCost;
