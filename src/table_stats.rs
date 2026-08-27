@@ -333,7 +333,7 @@ pub fn print_table_stats(egraph: &EGraph, sym: Option<&str>) -> Result<Vec<Table
             .filter_map(|name| {
                 egraph
                     .get_function(&name)
-                    .filter(|f| !f.is_hidden() && !f.is_let_binding())
+                    .filter(|f| !f.is_let_binding())
                     .map(|_| (name.clone(), name))
             })
             .collect();

@@ -311,6 +311,7 @@ impl UserDefinedCommand for CustomExtract {
                 .ok_or_else(|| {
                     Error::ExtractError("Unable to find any valid extraction".to_string())
                 })?;
+            // Avoid rendering the extracted term when this log target is disabled.
             if log_enabled!(log::Level::Info) {
                 log::info!(
                     "extracted with cost {}: {}",
@@ -341,7 +342,6 @@ impl UserDefinedCommand for CustomExtract {
                 .into_iter()
                 .map(|variant| variant.term)
                 .collect();
-            log::info!("extracted variants:");
             Ok(vec![CommandOutput::ExtractVariants(
                 extracted.termdag,
                 terms,
