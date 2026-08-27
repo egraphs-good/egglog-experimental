@@ -1,4 +1,4 @@
-use std::{cell::Cell, sync::Arc};
+use std::{cell::Cell, fmt::Write as _, fs, process::Command, sync::Arc};
 
 use egglog::{
     CommandOutput,
@@ -1842,5 +1842,39 @@ fn test_unknown_trailing_extractor_is_still_rejected() {
     assert!(
         err.to_string().contains("unknown extractor: greedy-dg"),
         "unexpected error: {err}"
+    );
+}
+
+#[test]
+fn test_greedy_dag_discovery_handles_deep_constructor_chains() {
+    const DEPTH: usize = 20_000;
+
+    // The unextractable leaf prevents reconstruction, isolating the discovery
+    // traversal. Run the CLI as a child process so a stack-overflow regression
+    // is reported as a test failure instead of aborting this test process.
+    let mut program = String::from(
+        "(sort E)\n(constructor Bottom () E :unextractable)\n(constructor Next (E) E)\n(let $x0 (Bottom))\n",
+    );
+    for depth in 1..DEPTH {
+        writeln!(program, "(let $x{depth} (Next $x{}))", depth - 1).unwrap();
+    }
+    writeln!(program, "(extract $x{} :extractor greedy-dag)", DEPTH - 1).unwrap();
+
+    let path = std::env::temp_dir().join(format!(
+        "egglog-greedy-dag-deep-discovery-{}.egg",
+        std::process::id()
+    ));
+    fs::write(&path, program).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_egglog-experimental"))
+        .arg(&path)
+        .output()
+        .unwrap();
+    fs::remove_file(path).unwrap();
+
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert_eq!(output.status.code(), Some(1), "unexpected status: {stderr}");
+    assert!(
+        stderr.contains("Unable to find any valid extraction"),
+        "unexpected error: {stderr}"
     );
 }
