@@ -73,8 +73,8 @@ pub(crate) fn split_trailing_extractor(args: &[Expr]) -> Result<(&[Expr], bool),
 // View tables with `term_constructor` are proof/term-encoding internals; skipping
 // them avoids stabilizing their special row layout for custom extractors.
 //
-// `.agents/logs/2026-06-24-greedy-dag-extractor-perf.md` records the local
-// profiling data behind the representation choices below.
+// `docs/greedy-dag-extractor.md` describes the algorithm, invariants, measured
+// representation choices, and alternatives that were considered.
 
 /// Once-paid dependency costs for one potential extracted DAG.
 ///

@@ -284,8 +284,9 @@ impl<K, V> SecondaryMap<K, V> {
 /// each id can be inserted once, membership tests are constant-time, iteration
 /// visits only present entries, and the monoid total is cached on insert. Each
 /// map uses one membership bit per interned key; replacing the bitset with
-/// linear entry scans made the greedy-DAG benchmark roughly 65-70% slower (see
-/// `.agents/logs/2026-06-24-greedy-dag-extractor-perf.md`).
+/// linear entry scans made the greedy-DAG benchmark roughly 65-70% slower. The
+/// measurements and alternatives are documented in
+/// `docs/greedy-dag-extractor.md`.
 pub(super) struct AggregatedSparseSecondaryMap<K, V: MonoidCost> {
     entries: Vec<(InternId<K>, V)>,
     present: SecondarySet<K>,
