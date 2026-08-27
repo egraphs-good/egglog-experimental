@@ -76,6 +76,9 @@ pub(crate) fn split_trailing_extractor(args: &[Expr]) -> Result<(&[Expr], bool),
 // `.agents/logs/2026-06-24-greedy-dag-extractor-perf.md` records the local
 // profiling data behind the representation choices below.
 
+/// A constructor's name and its input sorts.
+type Constructor = (String, Vec<ArcSort>);
+
 /// Once-paid dependency costs for one potential extracted DAG.
 ///
 /// The keys are reachable `(sort, value)` dependencies and the values are their
@@ -288,26 +291,9 @@ struct ReachableExtractionBuilder {
     structural_nodes: HashMap<InternId<DagCostKey>, (ArcSort, Value)>,
     /// Deduplication set for reachable eq-sort values.
     seen_eq_values: HashSet<InternId<DagCostKey>>,
-}
-
-/// One pending step in root-reachable producer discovery.
-///
-/// Producer-row tasks let the iterative traversal preserve the old recursive
-/// depth-first ordering: record a row, discover all of its children, then move
-/// to the next row. Producer ids break equal-cost ties, so this order is part
-/// of extraction's deterministic behavior.
-enum DiscoveryTask {
-    Node {
-        sort: ArcSort,
-        value: Value,
-    },
-    ProducerRows {
-        func_name: String,
-        input_sorts: Vec<ArcSort>,
-        rows: Vec<Vec<Value>>,
-        eclass: Value,
-        target: InternId<DagCostKey>,
-    },
+    /// Constructors by output sort name, in `functions_iter()` order, computed
+    /// once from the whole e-graph before traversal starts.
+    constructors_by_sort: HashMap<String, Arc<[Constructor]>>,
 }
 
 impl ReachableExtractionBuilder {
@@ -342,125 +328,66 @@ impl ReachableExtractionBuilder {
     }
 
     fn discover_node(&mut self, egraph: &EGraph, sort: &ArcSort, value: Value) {
-        let mut pending = vec![DiscoveryTask::Node {
-            sort: sort.clone(),
-            value,
-        }];
+        let key = self.intern_key(sort.name(), value);
 
-        while let Some(task) = pending.pop() {
-            match task {
-                DiscoveryTask::Node { sort, value } => {
-                    let sort_name = sort.name().to_owned();
-                    let key = self.intern_key(&sort_name, value);
+        if !sort.is_eq_sort() {
+            self.structural_nodes
+                .entry(key)
+                .or_insert_with(|| (sort.clone(), value));
+        }
 
-                    if !sort.is_eq_sort() {
-                        self.structural_nodes
-                            .entry(key)
-                            .or_insert_with(|| (sort.clone(), value));
-                    }
+        if sort.is_container_sort() {
+            for (child_sort, child_value) in egraph.container_inner_values(sort, value) {
+                self.discover_node(egraph, &child_sort, child_value);
+            }
+            return;
+        }
 
-                    if sort.is_container_sort() {
-                        for (child_sort, child_value) in egraph
-                            .container_inner_values(&sort, value)
-                            .into_iter()
-                            .rev()
-                        {
-                            pending.push(DiscoveryTask::Node {
-                                sort: child_sort,
-                                value: child_value,
-                            });
+        if !sort.is_eq_sort() || !self.seen_eq_values.insert(key) {
+            return;
+        }
+
+        let Some(constructors) = self.constructors_by_sort.get(sort.name()).cloned() else {
+            return;
+        };
+
+        for (func_name, input_sorts) in constructors.iter() {
+            let mut rows = Vec::new();
+            egraph
+                .read(|rs| {
+                    rs.constructor_enodes_for_eclass(func_name, value, |enode| {
+                        if !enode.subsumed {
+                            rows.push(enode.children.to_vec());
                         }
-                        continue;
-                    }
+                    })
+                })
+                .expect("constructor name came from the egraph");
 
-                    if !sort.is_eq_sort() || !self.seen_eq_values.insert(key) {
-                        continue;
-                    }
-
-                    let constructors: Vec<_> = egraph
-                        .functions_iter()
-                        .filter(|(_, func)| {
-                            func.func_type().subtype == FunctionSubtype::Constructor
-                                && !func.is_hidden()
-                                && !func.is_unextractable()
-                                && func.func_type().output.name() == sort_name
-                        })
-                        .map(|(func_name, func)| {
-                            (func_name.clone(), func.func_type().input.clone())
-                        })
-                        .collect();
-
-                    let mut producer_tasks = Vec::new();
-                    for (func_name, input_sorts) in constructors {
-                        let mut rows = Vec::new();
-                        egraph
-                            .read(|rs| {
-                                rs.constructor_enodes_for_eclass(&func_name, value, |enode| {
-                                    if !enode.subsumed {
-                                        rows.push(enode.children.to_vec());
-                                    }
-                                })
-                            })
-                            .expect("constructor name came from the egraph");
-
-                        rows.reverse();
-                        if !rows.is_empty() {
-                            producer_tasks.push(DiscoveryTask::ProducerRows {
-                                func_name,
-                                input_sorts,
-                                rows,
-                                eclass: value,
-                                target: key,
-                            });
-                        }
-                    }
-                    pending.extend(producer_tasks.into_iter().rev());
-                }
-                DiscoveryTask::ProducerRows {
-                    func_name,
-                    input_sorts,
-                    mut rows,
-                    eclass,
-                    target,
-                } => {
-                    let children = rows.pop().unwrap();
-                    let mut child_nodes = Vec::with_capacity(children.len());
-                    let mut dependencies = HashSet::default();
-                    for (child_value, child_sort) in children.iter().zip(input_sorts.iter()) {
-                        self.intern_nested_eq_dependencies(
-                            egraph,
-                            child_sort,
-                            *child_value,
-                            &mut dependencies,
-                        );
-                        child_nodes.push((child_sort.clone(), *child_value));
-                    }
-                    self.producer_rows.push(
-                        GreedyDagProducerRow {
-                            func_name: func_name.clone(),
-                            children,
-                            eclass,
-                            cost: (),
-                        },
-                        target,
-                        dependencies,
+            for children in rows {
+                let mut child_nodes = Vec::with_capacity(children.len());
+                let mut dependencies = HashSet::default();
+                for (child_value, child_sort) in children.iter().zip(input_sorts.iter()) {
+                    self.intern_nested_eq_dependencies(
+                        egraph,
+                        child_sort,
+                        *child_value,
+                        &mut dependencies,
                     );
+                    child_nodes.push((child_sort.clone(), *child_value));
+                }
+                self.producer_rows.push(
+                    GreedyDagProducerRow {
+                        func_name: func_name.clone(),
+                        children,
+                        eclass: value,
+                        cost: (),
+                    },
+                    key,
+                    dependencies,
+                );
 
-                    if !rows.is_empty() {
-                        pending.push(DiscoveryTask::ProducerRows {
-                            func_name,
-                            input_sorts,
-                            rows,
-                            eclass,
-                            target,
-                        });
-                    }
-                    for (child_sort, child_value) in child_nodes.into_iter().rev() {
-                        pending.push(DiscoveryTask::Node {
-                            sort: child_sort,
-                            value: child_value,
-                        });
-                    }
+                for (child_sort, child_value) in child_nodes {
+                    self.discover_node(egraph, &child_sort, child_value);
                 }
             }
         }
@@ -477,6 +404,19 @@ impl<C: MonoidCost> GreedyDagExtractor<C> {
         // Build the root-local problem: collect extractable functions, intern
         // reachable `(sort, value)` dependencies, and record producer rows with
         // their reverse dependency edges.
+        let mut constructors_by_sort: HashMap<String, Vec<Constructor>> = HashMap::default();
+        for (func_name, func) in egraph.functions_iter() {
+            if func.func_type().subtype == FunctionSubtype::Constructor
+                && !func.is_hidden()
+                && !func.is_unextractable()
+            {
+                constructors_by_sort
+                    .entry(func.func_type().output.name().to_owned())
+                    .or_default()
+                    .push((func_name.clone(), func.func_type().input.clone()));
+            }
+        }
+
         let mut builder = ReachableExtractionBuilder {
             sort_ids: Default::default(),
             key_ids: Default::default(),
@@ -486,6 +426,10 @@ impl<C: MonoidCost> GreedyDagExtractor<C> {
             },
             structural_nodes: Default::default(),
             seen_eq_values: Default::default(),
+            constructors_by_sort: constructors_by_sort
+                .into_iter()
+                .map(|(sort, funcs)| (sort, funcs.into()))
+                .collect(),
         };
 
         for (sort, value) in roots {
