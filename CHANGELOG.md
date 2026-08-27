@@ -6,12 +6,10 @@ This file records notable user-facing changes to egglog-experimental.
 
 ### Added
 
-- `:node-limit` and `:eager-apply` options for the `back-off` scheduler:
-  `:node-limit N` stops applying matches once the e-graph reaches `N` e-nodes,
-  checked against the size at the start of each iteration; with
-  `:eager-apply`, each rule's chosen matches are applied before the next rule
-  is consulted, so the check sees the live size and the limit is overshot by
-  at most one rule's matches.
+- A `:node-limit N` option for the `back-off` scheduler: it stops applying
+  matches once the e-graph reaches `N` e-nodes. egglog applies each rule's
+  chosen matches before the next rule is consulted, so the check sees the
+  live size and the limit is overshot by at most one rule's matches.
 - The `(get-node-size!)` primitive: the e-node count of the e-graph (rows of
   constructor tables, excluding `relation`s and functions to base sorts), the
   same measure `:node-limit` uses.

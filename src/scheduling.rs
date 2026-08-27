@@ -500,12 +500,10 @@ mod schedulers {
         let default_match_limit = parse_usize_tag(&tags, ":match-limit", span)?.unwrap_or(1000);
         let default_ban_length = parse_usize_tag(&tags, ":ban-length", span)?.unwrap_or(5);
         let node_limit = parse_usize_tag(&tags, ":node-limit", span)?;
-        let eager_apply = parse_usize_tag(&tags, ":eager-apply", span)?.is_some_and(|n| n != 0);
         Ok(Box::new(BackOffScheduler {
             default_match_limit,
             default_ban_length,
             node_limit,
-            eager_apply,
             stats: HashMap::new(),
             cached_nodes: None,
         }))
@@ -516,20 +514,16 @@ mod schedulers {
         default_match_limit: usize,
         default_ban_length: usize,
         /// Upper bound on the number of e-nodes (`EGraph::num_nodes`). Once
-        /// the e-graph reaches it, rules are delayed instead of applied.
-        /// Without `eager_apply` the size is only current at the start of
-        /// each iteration, so the limit can be overshot by one iteration's
-        /// growth; with it, by one rule's.
+        /// the e-graph reaches it, rules are delayed instead of applied. The
+        /// runner applies each rule's chosen matches before consulting the
+        /// next rule, so the check sees the live size and the limit can be
+        /// overshot by at most one rule's matches.
         node_limit: Option<usize>,
-        /// Apply each rule's chosen matches before the next rule is consulted
-        /// (`Scheduler::apply_immediately`), so the node-limit check sees the
-        /// live size within an iteration.
-        eager_apply: bool,
         stats: HashMap<String, RuleStats>,
-        /// `num_nodes()` as of `(iteration, value)`. Counting is O(#tables),
-        /// and with eager application it is consulted once per rule; the
-        /// size only changes when a rule's matches are applied, so the
-        /// reading is reused until then (and dropped at iteration boundaries).
+        /// `num_nodes()` as of `(iteration, value)`. Counting is O(#tables)
+        /// and it is consulted once per rule; the size only changes when a
+        /// rule's matches are applied, so the reading is reused until then
+        /// (and dropped at iteration boundaries).
         cached_nodes: Option<(usize, usize)>,
     }
 
@@ -557,10 +551,6 @@ mod schedulers {
     }
 
     impl Scheduler for BackOffScheduler {
-        fn apply_immediately(&self) -> bool {
-            self.eager_apply
-        }
-
         fn can_stop(&mut self, ctx: &SchedulerContext, rules: &[&str], _ruleset: &str) -> bool {
             // At the node limit, further iterations cannot make progress:
             // every rule would be delayed. Report saturation even though
@@ -662,8 +652,8 @@ mod schedulers {
                 return false;
             }
 
-            // With eager application this is the live size; otherwise it is
-            // the size at the start of the iteration.
+            // Live size: earlier rules' matches in this iteration are already
+            // applied (an upper bound until the end-of-iteration rebuild).
             if let Some(node_limit) = node_limit {
                 let nodes = match self.cached_nodes {
                     Some((iteration, nodes)) if iteration == ctx.iteration => nodes,
