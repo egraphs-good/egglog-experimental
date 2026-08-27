@@ -1780,3 +1780,67 @@ fn test_schedule_commands_and_actions() {
         )
         .unwrap();
 }
+
+#[test]
+fn test_extractor_keyword_does_not_shadow_a_value_named_extractor() {
+    // `:extractor` is a legal identifier, so a value may be bound to it.
+    let mut egraph = egglog_experimental::new_experimental_egraph();
+    let result = egraph
+        .parse_and_run_program(
+            None,
+            r#"
+            (relation table1 (i64))
+            (relation table2 (i64))
+            (table1 1)
+            (table2 2)
+            (let :extractor "table1")
+            (keep-best :extractor "table2")"#,
+        )
+        .expect("a table name bound to `:extractor` is positional, not the selector");
+    assert!(result.is_empty(), "unexpected output: {result:?}");
+}
+
+#[test]
+fn test_extractor_keyword_does_not_shadow_a_term_named_extractor() {
+    let result =
+        run_dynamic_dag("(let :extractor (Leaf 1))\n(multi-extract 1 :extractor (Leaf 2))");
+    assert_eq!(result.len(), 1);
+}
+
+/// A trailing `<symbol> <symbol>` pair is genuinely ambiguous: it is
+/// indistinguishable from the selector without changing the surface syntax.
+/// The selector wins, so a value named `:extractor` cannot be the
+/// second-to-last argument when the last one is also a bare symbol.
+#[test]
+fn test_extractor_keyword_wins_against_a_trailing_symbol_pair() {
+    let err = egglog_experimental::new_experimental_egraph()
+        .parse_and_run_program(
+            None,
+            &format!("{DYNAMIC_DAG_FIXTURE}\n(let :extractor (Leaf 1))\n(multi-extract 1 :extractor daggy)"),
+        )
+        .expect_err("documented limitation");
+    assert!(
+        err.to_string().contains("unknown extractor: daggy"),
+        "unexpected error: {err}"
+    );
+}
+
+#[test]
+fn test_extractor_keyword_does_not_shadow_a_variant_count_named_extractor() {
+    let result = run_dynamic_dag("(let :extractor 2)\n(extract daggy :extractor)");
+    assert_eq!(result.len(), 1);
+}
+
+#[test]
+fn test_unknown_trailing_extractor_is_still_rejected() {
+    let err = egglog_experimental::new_experimental_egraph()
+        .parse_and_run_program(
+            None,
+            &format!("{DYNAMIC_DAG_FIXTURE}\n(extract daggy :extractor greedy-dg)"),
+        )
+        .expect_err("a misspelled extractor name must not be treated as positional");
+    assert!(
+        err.to_string().contains("unknown extractor: greedy-dg"),
+        "unexpected error: {err}"
+    );
+}
