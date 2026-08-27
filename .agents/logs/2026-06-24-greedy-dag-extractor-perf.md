@@ -1564,3 +1564,50 @@
   - Keep the final implementation. The cleanup retains the established
     roughly 5x Taylor speed advantage while removing command integration and
     secondary-map layering.
+
+## Experiment 51: replace `hashbrown` with the standard `HashMap`
+
+- Status: rejected
+- Date: 2026-08-27
+- Question: can the extractor remove its direct `hashbrown` dependency and use
+  `std::collections::HashMap` without slowing greedy-DAG extraction?
+- Change:
+  - Replaced the ordinary maps and `Entry` API with their standard-library
+    equivalents.
+  - Replaced `hashbrown::Equivalent` interner lookups with the standard
+    `K: Borrow<Q>` lookup contract.
+  - Removed the direct dependency from `Cargo.toml` and `Cargo.lock`.
+- Baseline:
+  - Experimental commit `467b60e44cd3e25c4fc0d6815885807c3bd89c31`.
+  - Release binary SHA-256:
+    `922b5e7355fbe327a7637dcb1a65b5320f880b64645b12fe7a3eb252acce54dc`.
+- Candidate:
+  - Baseline plus the standard-map change, with diff fingerprint
+    `8e024e643f5a892973795c3e9d2cacca247053bd08e39e453996453a7b9f445f`.
+  - Release binary SHA-256:
+    `a7f198dab5553657c7e0212996738e791b70f7a123d4232976f08434f6d8585f`.
+- Input:
+  - A generated copy of core's `tests/taylor51.egg` whose 324 extraction
+    commands append `:extractor greedy-dag`.
+- Validation before timing:
+  - The candidate passed `cargo check --release` and completed the input.
+- Method:
+  - Preserved both release binaries, warmed each ten times, then ran two
+    independent batches of 60 pairs. Each batch alternated baseline/candidate
+    and candidate/baseline order.
+  - Timed each process with `process.hrtime.bigint()`, computed each pair's
+    candidate-over-baseline percentage change, and used the sample standard
+    deviation to form a normal 95% confidence interval.
+- Observed result:
+  - Batch 1: baseline `203.28 ms`, candidate `206.90 ms`; paired change `+2.07%`
+    (95% CI `+0.76%` to `+3.39%`).
+  - Batch 2: baseline `201.36 ms`, candidate `204.59 ms`; paired change `+1.73%`
+    (95% CI `+0.62%` to `+2.84%`).
+  - Across all 120 pairs, the paired change was `+1.90%` (95% CI `+1.04%` to
+    `+2.76%`).
+- Decision:
+  - Restore `hashbrown`. The standard library supports every required API, but
+    the complete replacement causes a small reproducible regression on this
+    extraction-heavy workload. `hashbrown` 0.16's default hasher differs from
+    `std::collections::HashMap`, but this experiment does not isolate whether
+    the hasher or another implementation detail accounts for the difference.
