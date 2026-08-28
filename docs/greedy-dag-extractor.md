@@ -92,15 +92,20 @@ worklist, so deeply nested constructor chains do not consume the Rust call
 stack.
 
 The first reachable value of an eq sort scans the e-graph's functions for
-visible, extractable constructors that produce that sort. Their names and input
-sorts are cached as one shared immutable list. Later values of the same sort
-reuse that list, while constructors for unrelated sorts are never cloned.
+visible, extractable constructors that produce that sort. Borrowed `Function`
+metadata is cached as one shared immutable list. Later values of the same sort
+reuse that list without cloning function names and sort vectors or repeating
+function lookups. The extractor immutably borrows the e-graph for the lifetime
+of this metadata.
 
 For an eq-sort value, discovery finds every visible, extractable, non-subsumed
-normal constructor row that produces the value. It records the row and then
-schedules its children. Containers are expanded structurally. Any eq-sort
-values nested inside containers are recorded as dependencies of the enclosing
-producer row, not only as independently reachable nodes.
+normal constructor row that produces the value. One `ReadState` is held for the
+complete discovery pass, avoiding repeated read-state setup while traversing
+many roots. It records each row and then schedules its children. Containers are
+expanded structurally. Any eq-sort values nested inside containers are recorded
+as dependencies of the enclosing producer row, not only as independently
+reachable nodes. Cost-model callbacks run after the read state is released,
+because a custom model may read the e-graph itself.
 
 Discovery deliberately excludes hidden functions, unextractable functions,
 subsumed rows, and proof or term-encoding view tables. The latter have a
@@ -163,7 +168,7 @@ choices conflict, the candidate is cyclic and is rejected. When child snapshots
 select different producers for the same e-class, simply unioning their costs
 would make the score disagree with reconstruction. The implementation instead
 chooses one closed producer plan, installs the candidate's root producer, and
-rescans that exact plan to:
+rescans that exact plan with an explicit enter/exit worklist to:
 
 - remove dependencies reachable only through losing choices;
 - recompute the once-paid cost closure;
@@ -225,9 +230,10 @@ order.
 
 ### Producer rows and indexes
 
-Backend row callbacks borrow their data, but propagation must revisit rows after
-discovery. `ProducerRows` therefore owns a compact arena of reachable rows and
-uses typed `ProducerRowId`s to refer to it.
+Backend row callbacks borrow child values, but propagation must revisit rows
+after discovery. `ProducerRows` therefore owns each reachable row's child values
+and marginal cost in a compact arena and uses typed `ProducerRowId`s to refer to
+it. Constructor metadata remains borrowed from the immutably held e-graph.
 
 The always-built dependency index supports fixed-point propagation. The target
 index is built only for variants because best extraction never reads it, and
@@ -314,7 +320,7 @@ but are not general performance guarantees.
 | Reserve the merged producer-plan capacity | Removing the reserve regressed variant extraction by 2.72% (95% CI +0.90% to +4.54%); the best-extraction result was inconclusive. |
 | Use `hashbrown::HashMap` in hot maps | A complete replacement with `std::collections::HashMap` regressed Taylor 51 by 1.90% across 120 alternating pairs (95% CI +1.04% to +2.76%). The experiment did not isolate the hasher from other implementation details. |
 | Keep the sparse entries, membership bitset, and aggregate in one type | Flattening a one-use nested wrapper removed roughly 30 lines and was performance-neutral on best and variant workloads. |
-| Share constructor metadata once per encountered output sort | Against the original iterative discovery at commit `e3e4dd8`, the final implementation reduced Taylor 51 greedy-DAG time from 198.7-199.8 ms to 144.6-144.8 ms in two 20-run command orders, a 1.37-1.38x speedup. |
+| Borrow constructor metadata, hold one read state across discovery, and use iterative exact rescoring | This removes cloned function metadata, repeated lookups/read-state setup, and recursive rescore state. Against `f95d6fd`, three 20-run Taylor 51 comparisons measured 143.5-148.6 ms before and 114.2-118.7 ms after, a 1.25-1.26x speedup. The vector canary was statistically neutral and both outputs were byte-identical. |
 | Build constructor lists lazily and keep discovery iterative | Compared with eager all-sort indexing and recursive discovery, the final implementation reduced repeated primitive and shallow-eq extraction time by 9-12%. Taylor was about 1-2% slower, while a 20,000-node unextractable chain returned the intended error instead of aborting with stack overflow. |
 
 The final Taylor 51 comparison used experimental commit `dc45b6b` with egglog
@@ -344,8 +350,41 @@ Several plausible simplifications or optimizations were measured and rejected:
 - Eagerly indexing constructors for every sort avoided a per-sort scan but made
   repeated primitive and shallow-eq extraction slower than lazy indexing.
 - Storing each cached constructor's input sorts in another `Arc` instead of a
-  `Vec` was neutral in 20-run comparisons in both command orders, so the simpler
-  `Vec` representation remains.
+  `Vec` was neutral. The later borrowed-metadata implementation made both owned
+  representations unnecessary.
+
+### One global producer choice per e-class
+
+An extraction-gym-style global `e-class -> producer row` map remains a possible
+separate heuristic, but it is not a behavior-preserving replacement for the
+per-candidate plans in `greedy-dag`. Exact recosting after selection would make
+the reported cost honest, but it cannot repair choices made using an earlier
+sub-DAG.
+
+The producer-snapshot regression test gives a small example. The globally
+cheapest representative of `B` is `Bc(C(D))`, with cost 6, while `Bx(X)` costs
+11 in isolation. Under `A(B, X)`, however, `Bx(X)` shares `X`, so the complete
+root costs 12. Reusing the global `B` choice makes that root cost 17. Reranking
+the root after exact recosting would choose `Alt` at cost 15, which is finite and
+honestly scored but still misses the available cost-12 DAG.
+
+Dropping root-specific choices and agreement between best and one-variant
+extraction would permit that quality change, but it would not by itself make a
+global map safe. `MonoidCost` permits signed costs and does not require every
+marginal cost to be at least `identity`. A three-class construction with
+marginal costs -5, -2, and 3 can accept each update against an acyclic prior map
+yet finish with the global choices `0 -> 2 -> 1 -> 0`. A global-map extractor
+must therefore either restrict its cost domain, detect and fail or fall back
+after final selection, or retain enough candidate-local state to avoid the
+cycle. The last option recreates much of the current snapshot machinery.
+
+This design could be revisited as an explicitly weaker extractor mode: define
+one representative for all roots, exactly recost and cycle-check the final
+selection, and document that finite extraction and root-specific quality are
+not guaranteed. It should not silently change the current `greedy-dag`
+contract. The representation and cycle risks are also discussed in
+[extraction-gym issue 28](https://github.com/egraphs-good/extraction-gym/issues/28)
+and [issue 36](https://github.com/egraphs-good/extraction-gym/issues/36).
 
 Quality-changing pruning, parallel heuristics, and initialized exact solving
 are intentionally deferred to separate extractor modes. They should not be

@@ -157,7 +157,7 @@ impl<K> Interner<K> {
     /// The capacity is for expected present entries, not for the full interned
     /// universe. The membership bitset is sized from the frozen universe.
     #[inline]
-    fn aggregated_map_with_capacity<V: MonoidCost>(
+    pub(super) fn aggregated_map_with_capacity<V: MonoidCost>(
         &self,
         entries_capacity: usize,
     ) -> AggregatedSparseSecondaryMap<K, V> {

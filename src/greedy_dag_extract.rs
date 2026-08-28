@@ -11,7 +11,7 @@ use crate::secondary_map::{
     AggregatedSparseSecondaryMap, InternId, Interner, InternerBuilder, SecondaryMap, SecondarySet,
 };
 use egglog::{
-    ArcSort, EGraph, Enode, Error, Read, TermDag, TermId, Value,
+    ArcSort, EGraph, Enode, Error, Function, Read, ReadState, TermDag, TermId, Value,
     ast::{Expr, FunctionSubtype, ParseError},
     extract::{DagCostModel, ExtractedTerm, ExtractedTermVariants, ExtractedTerms, MonoidCost},
 };
@@ -78,8 +78,12 @@ pub(crate) fn split_trailing_extractor(args: &[Expr]) -> Result<(&[Expr], bool),
 // `docs/greedy-dag-extractor.md` describes the algorithm, invariants, measured
 // representation choices, and alternatives that were considered.
 
-/// A constructor's name and its input sorts.
-type Constructor = (String, Vec<ArcSort>);
+/// Borrowed metadata for one extractable constructor.
+///
+/// The prepared extractor immutably borrows the e-graph, so producer rows can
+/// retain `Function` metadata without cloning names and sort vectors or looking
+/// functions up again during scoring and reconstruction.
+type Constructor<'egraph> = &'egraph Function;
 
 /// Once-paid dependency costs for one potential extracted DAG.
 ///
@@ -120,14 +124,16 @@ struct DagCostKey {
 /// records every reachable row whose output is a value that may be extracted.
 /// The worklist uses a reverse dependency index to revisit producer rows when a
 /// child dependency becomes cheaper.
-struct GreedyDagProducerRow<C> {
+struct GreedyDagProducerRow<'egraph, C> {
     /// Constructor function for this row.
-    func_name: String,
+    func: &'egraph Function,
     /// Owned child values. Backend row callbacks are borrowed, but the greedy
     /// DAG fixed point revisits producer rows after root discovery.
     children: Vec<Value>,
     /// Canonical e-class produced by this constructor row.
     eclass: Value,
+    /// Interned `(sort, value)` produced by this row.
+    target: InternId<DagCostKey>,
     /// Marginal enode cost computed once while freezing the reachable problem.
     cost: C,
 }
@@ -139,13 +145,6 @@ struct GreedyDagProducerRow<C> {
 /// rows that can produce one such dependency.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 struct ProducerRowId(usize);
-
-/// Mutable state for exact rescoring of one reconciled producer plan.
-struct ProducerPlanScoringState<C: MonoidCost> {
-    used_choices: ProducerPlan,
-    cache: HashMap<InternId<DagCostKey>, Arc<PaidDagCosts<C>>>,
-    visiting: SecondarySet<DagCostKey>,
-}
 
 /// Mutable state shared by one term reconstruction traversal.
 struct TermReconstructionState<'a, C: MonoidCost> {
@@ -165,31 +164,30 @@ struct TermReconstructionState<'a, C: MonoidCost> {
 /// built only for variant extraction because best extraction never reads it;
 /// an alternating paired benchmark found eagerly indexing every row made best
 /// extraction about 2.3% slower.
-struct ProducerRows<C> {
-    rows: Vec<GreedyDagProducerRow<C>>,
+struct ProducerRows<'egraph, C> {
+    rows: Vec<GreedyDagProducerRow<'egraph, C>>,
     by_dependency: SecondaryMap<DagCostKey, Vec<ProducerRowId>>,
     by_target: Option<SecondaryMap<DagCostKey, Vec<ProducerRowId>>>,
 }
 
 #[derive(Default)]
-struct ProducerRowsBuilder {
-    rows: Vec<GreedyDagProducerRow<()>>,
+struct ProducerRowsBuilder<'egraph> {
+    rows: Vec<GreedyDagProducerRow<'egraph, ()>>,
     by_dependency: HashMap<InternId<DagCostKey>, Vec<ProducerRowId>>,
     by_target: Option<HashMap<InternId<DagCostKey>, Vec<ProducerRowId>>>,
 }
 
-impl ProducerRowsBuilder {
+impl<'egraph> ProducerRowsBuilder<'egraph> {
     fn push(
         &mut self,
-        row: GreedyDagProducerRow<()>,
-        target: InternId<DagCostKey>,
+        row: GreedyDagProducerRow<'egraph, ()>,
         dependencies: impl IntoIterator<Item = InternId<DagCostKey>>,
     ) {
         let row_id = ProducerRowId(self.rows.len());
-        self.rows.push(row);
         if let Some(by_target) = &mut self.by_target {
-            by_target.entry(target).or_default().push(row_id);
+            by_target.entry(row.target).or_default().push(row_id);
         }
+        self.rows.push(row);
         for dependency in dependencies {
             self.by_dependency
                 .entry(dependency)
@@ -200,18 +198,18 @@ impl ProducerRowsBuilder {
 
     fn freeze<C: MonoidCost, M: DagCostModel<C>>(
         self,
-        egraph: &EGraph,
+        egraph: &'egraph EGraph,
         cost_model: &M,
         key_ids: &Interner<DagCostKey>,
-    ) -> ProducerRows<C> {
+    ) -> ProducerRows<'egraph, C> {
         let mut by_dependency = key_ids.secondary_map();
         for (key, producer_row_ids) in self.by_dependency {
             by_dependency.insert(key, producer_row_ids);
         }
-        let by_target = self.by_target.map(|rows| {
+        let by_target = self.by_target.map(|rows_by_target| {
             let mut by_target = key_ids.secondary_map();
-            for (key, producer_row_ids) in rows {
-                by_target.insert(key, producer_row_ids);
+            for (target, producer_row_ids) in rows_by_target {
+                by_target.insert(target, producer_row_ids);
             }
             by_target
         });
@@ -219,20 +217,18 @@ impl ProducerRowsBuilder {
             .rows
             .into_iter()
             .map(|row| {
-                let func = egraph
-                    .get_function(&row.func_name)
-                    .expect("producer constructor came from the egraph");
                 let enode = Enode {
-                    name: func.name(),
+                    name: row.func.name(),
                     children: &row.children,
                     eclass: row.eclass,
                     subsumed: false,
                 };
-                let cost = cost_model.enode_cost(egraph, func, &enode);
+                let cost = cost_model.enode_cost(egraph, row.func, &enode);
                 GreedyDagProducerRow {
-                    func_name: row.func_name,
+                    func: row.func,
                     children: row.children,
                     eclass: row.eclass,
+                    target: row.target,
                     cost,
                 }
             })
@@ -263,14 +259,16 @@ impl ProducerRowsBuilder {
 /// Preparation evaluates the cost model once per reachable producer row and
 /// once per distinct primitive or container value. Fixed-point propagation,
 /// variant ranking, and conflict rescoring reuse that frozen cost snapshot.
-struct GreedyDagExtractor<C: MonoidCost> {
+struct GreedyDagExtractor<'egraph, C: MonoidCost> {
+    egraph: &'egraph EGraph,
+
     /// Sort-name interner used only to build compact [`DagCostKey`]s.
     sort_ids: Interner<String>,
     /// Dense id-space for every reachable dependency that can be charged once.
     key_ids: Interner<DagCostKey>,
 
     /// Reachable producer rows and the reverse index used by the worklist.
-    producer_rows: ProducerRows<C>,
+    producer_rows: ProducerRows<'egraph, C>,
 
     /// Cached marginal costs for reachable primitive and container values.
     structural_costs: SecondaryMap<DagCostKey, C>,
@@ -282,43 +280,43 @@ struct GreedyDagExtractor<C: MonoidCost> {
     best_candidates: SecondaryMap<DagCostKey, Arc<DagCandidate<C>>>,
 }
 
-struct ReachableExtractionBuilder {
+struct ReachableExtractionBuilder<'egraph> {
+    egraph: &'egraph EGraph,
+
     /// Growable sort-name interner used while discovering reachable values.
     sort_ids: InternerBuilder<String>,
     /// Growable id-space for reachable `(sort, value)` dependencies.
     key_ids: InternerBuilder<DagCostKey>,
     /// Reachable producer rows and their reverse dependency index.
-    producer_rows: ProducerRowsBuilder,
+    producer_rows: ProducerRowsBuilder<'egraph>,
     /// Unique reachable primitive and container values to cost after discovery.
     structural_nodes: HashMap<InternId<DagCostKey>, (ArcSort, Value)>,
     /// Deduplication set for reachable eq-sort values.
     seen_eq_values: HashSet<InternId<DagCostKey>>,
     /// Constructors by encountered output sort name, in `functions_iter()`
     /// order. Lists are built lazily and shared across values of the same sort.
-    constructors_by_sort: HashMap<String, Arc<[Constructor]>>,
+    constructors_by_sort: HashMap<String, Arc<[Constructor<'egraph>]>>,
 }
 
 /// One pending step in root-reachable producer discovery.
 ///
-/// Producer-row tasks let the iterative traversal preserve recursive
-/// depth-first ordering: record a row, discover all of its children, then move
-/// to the next row. Producer IDs break equal-cost ties, so this order is part
-/// of extraction's deterministic behavior.
-enum DiscoveryTask {
+/// Producer-row tasks preserve recursive depth-first ordering: after recording
+/// a row they put its children above the remaining rows on the LIFO worklist.
+/// Producer IDs break equal-cost ties, so this order is deterministic.
+enum DiscoveryTask<'egraph> {
     Node {
         sort: ArcSort,
         value: Value,
     },
-    ProducerRows {
-        func_name: String,
-        input_sorts: Vec<ArcSort>,
-        rows: Vec<Vec<Value>>,
+    ProducerRow {
+        func: &'egraph Function,
+        children: Vec<Value>,
         eclass: Value,
         target: InternId<DagCostKey>,
     },
 }
 
-impl ReachableExtractionBuilder {
+impl<'egraph> ReachableExtractionBuilder<'egraph> {
     fn intern_key(&mut self, sort_name: &str, value: Value) -> InternId<DagCostKey> {
         let sort_id = self
             .sort_ids
@@ -327,15 +325,15 @@ impl ReachableExtractionBuilder {
         self.key_ids.intern(DagCostKey { sort_id, value })
     }
 
-    fn constructors_for_sort(&mut self, egraph: &EGraph, sort_name: &str) -> Arc<[Constructor]> {
+    fn constructors_for_sort(&mut self, sort_name: &str) -> Arc<[Constructor<'egraph>]> {
         if let Some(constructors) = self.constructors_by_sort.get(sort_name) {
             return constructors.clone();
         }
 
-        // Sharing one immutable list per encountered sort avoids cloning names
-        // and input sorts for every reachable value. Building lists lazily also
-        // avoids scanning and cloning unrelated constructors for shallow roots.
-        let constructors: Arc<[Constructor]> = egraph
+        // Sharing one immutable list per encountered sort avoids rescanning
+        // unrelated constructors for every reachable value.
+        let constructors: Arc<[Constructor<'egraph>]> = self
+            .egraph
             .functions_iter()
             .filter(|(_, func)| {
                 func.func_type().subtype == FunctionSubtype::Constructor
@@ -343,7 +341,7 @@ impl ReachableExtractionBuilder {
                     && !func.is_unextractable()
                     && func.func_type().output.name() == sort_name
             })
-            .map(|(func_name, func)| (func_name.clone(), func.func_type().input.clone()))
+            .map(|(_, func)| func)
             .collect::<Vec<_>>()
             .into();
         self.constructors_by_sort
@@ -353,7 +351,6 @@ impl ReachableExtractionBuilder {
 
     fn intern_nested_eq_dependencies(
         &mut self,
-        egraph: &EGraph,
         sort: &ArcSort,
         value: Value,
         dependencies: &mut HashSet<InternId<DagCostKey>>,
@@ -362,7 +359,7 @@ impl ReachableExtractionBuilder {
         while let Some((sort, value)) = pending.pop() {
             if sort.is_container_sort() {
                 pending.extend(
-                    egraph
+                    self.egraph
                         .container_inner_values(&sort, value)
                         .into_iter()
                         .rev(),
@@ -373,7 +370,7 @@ impl ReachableExtractionBuilder {
         }
     }
 
-    fn discover_node(&mut self, egraph: &EGraph, sort: &ArcSort, value: Value) {
+    fn discover_node(&mut self, read_state: &ReadState<'_, '_>, sort: &ArcSort, value: Value) {
         // Keep discovery iterative: unlike the later traversals, discovery can
         // reach a deep unextractable chain that never enters reconstruction or
         // rescoring. The task frames preserve the recursive DFS tie-break order.
@@ -395,7 +392,8 @@ impl ReachableExtractionBuilder {
                     }
 
                     if sort.is_container_sort() {
-                        for (child_sort, child_value) in egraph
+                        for (child_sort, child_value) in self
+                            .egraph
                             .container_inner_values(&sort, value)
                             .into_iter()
                             .rev()
@@ -412,46 +410,36 @@ impl ReachableExtractionBuilder {
                         continue;
                     }
 
-                    let constructors = self.constructors_for_sort(egraph, &sort_name);
+                    let constructors = self.constructors_for_sort(&sort_name);
                     let mut producer_tasks = Vec::new();
-                    for (func_name, input_sorts) in constructors.iter() {
-                        let mut rows = Vec::new();
-                        egraph
-                            .read(|rs| {
-                                rs.constructor_enodes_for_eclass(func_name, value, |enode| {
-                                    if !enode.subsumed {
-                                        rows.push(enode.children.to_vec());
-                                    }
-                                })
+                    for &func in constructors.iter() {
+                        read_state
+                            .constructor_enodes_for_eclass(func.name(), value, |enode| {
+                                if !enode.subsumed {
+                                    producer_tasks.push(DiscoveryTask::ProducerRow {
+                                        func,
+                                        children: enode.children.to_vec(),
+                                        eclass: value,
+                                        target: key,
+                                    });
+                                }
                             })
                             .expect("constructor name came from the egraph");
-
-                        rows.reverse();
-                        if !rows.is_empty() {
-                            producer_tasks.push(DiscoveryTask::ProducerRows {
-                                func_name: func_name.clone(),
-                                input_sorts: input_sorts.clone(),
-                                rows,
-                                eclass: value,
-                                target: key,
-                            });
-                        }
                     }
                     pending.extend(producer_tasks.into_iter().rev());
                 }
-                DiscoveryTask::ProducerRows {
-                    func_name,
-                    input_sorts,
-                    mut rows,
+                DiscoveryTask::ProducerRow {
+                    func,
+                    children,
                     eclass,
                     target,
                 } => {
-                    let children = rows.pop().unwrap();
                     let mut child_nodes = Vec::with_capacity(children.len());
                     let mut dependencies = HashSet::default();
-                    for (child_value, child_sort) in children.iter().zip(input_sorts.iter()) {
+                    for (child_value, child_sort) in
+                        children.iter().zip(func.func_type().input.iter())
+                    {
                         self.intern_nested_eq_dependencies(
-                            egraph,
                             child_sort,
                             *child_value,
                             &mut dependencies,
@@ -460,24 +448,15 @@ impl ReachableExtractionBuilder {
                     }
                     self.producer_rows.push(
                         GreedyDagProducerRow {
-                            func_name: func_name.clone(),
+                            func,
                             children,
                             eclass,
+                            target,
                             cost: (),
                         },
-                        target,
                         dependencies,
                     );
 
-                    if !rows.is_empty() {
-                        pending.push(DiscoveryTask::ProducerRows {
-                            func_name,
-                            input_sorts,
-                            rows,
-                            eclass,
-                            target,
-                        });
-                    }
                     for (child_sort, child_value) in child_nodes.into_iter().rev() {
                         pending.push(DiscoveryTask::Node {
                             sort: child_sort,
@@ -490,9 +469,9 @@ impl ReachableExtractionBuilder {
     }
 }
 
-impl<C: MonoidCost> GreedyDagExtractor<C> {
+impl<'egraph, C: MonoidCost> GreedyDagExtractor<'egraph, C> {
     fn prepare<M: DagCostModel<C>>(
-        egraph: &EGraph,
+        egraph: &'egraph EGraph,
         roots: &[(ArcSort, Value)],
         cost_model: M,
         index_targets: bool,
@@ -501,6 +480,7 @@ impl<C: MonoidCost> GreedyDagExtractor<C> {
         // reachable `(sort, value)` dependencies, and record producer rows with
         // their reverse dependency edges.
         let mut builder = ReachableExtractionBuilder {
+            egraph,
             sort_ids: Default::default(),
             key_ids: Default::default(),
             producer_rows: ProducerRowsBuilder {
@@ -512,9 +492,15 @@ impl<C: MonoidCost> GreedyDagExtractor<C> {
             constructors_by_sort: Default::default(),
         };
 
-        for (sort, value) in roots {
-            builder.discover_node(egraph, sort, *value);
-        }
+        // Keep one read guard for the complete discovery pass. Reacquiring it
+        // for every reachable node was measurable on extraction-heavy programs.
+        // Cost callbacks run only after this closure because custom models may
+        // read the e-graph themselves.
+        egraph.read(|read_state| {
+            for (sort, value) in roots {
+                builder.discover_node(&read_state, sort, *value);
+            }
+        });
 
         // Discovery is complete, so freeze the interned id spaces before
         // constructing secondary maps. From here on, greedy-DAG propagation can
@@ -546,6 +532,7 @@ impl<C: MonoidCost> GreedyDagExtractor<C> {
         // Run the greedy fixed point over the reachable producer rows and keep
         // the resulting best producer choice for each reachable eq-sort value.
         let mut extractor = Self {
+            egraph,
             sort_ids,
             key_ids,
             producer_rows,
@@ -553,7 +540,7 @@ impl<C: MonoidCost> GreedyDagExtractor<C> {
             best_candidates,
         };
 
-        extractor.greedy_dag(egraph);
+        extractor.greedy_dag();
         extractor
     }
 
@@ -577,7 +564,6 @@ impl<C: MonoidCost> GreedyDagExtractor<C> {
     /// resulting score describes the snapshot used for reconstruction.
     fn candidate_from_children(
         &self,
-        egraph: &EGraph,
         value: Value,
         sort: &ArcSort,
         child_candidates: &[Arc<DagCandidate<C>>],
@@ -640,7 +626,7 @@ impl<C: MonoidCost> GreedyDagExtractor<C> {
 
         if conflict {
             return self
-                .rescore_producer_plan(egraph, value, sort, &producer_choices)
+                .rescore_producer_plan(value, sort, &producer_choices)
                 .map(Arc::new);
         }
 
@@ -659,137 +645,100 @@ impl<C: MonoidCost> GreedyDagExtractor<C> {
 
     /// Recompute the exact paid closure for a reconciled producer plan.
     ///
-    /// The cache lives for one call and is intentionally not hoisted across
-    /// calls. Results are keyed by `(sort, value)` but decided by this call's
-    /// `producer_choices`, which `candidate_from_children` rebuilds per call
-    /// from `best_candidates` snapshots that keep changing until the fixed
-    /// point converges. Two calls in one run can therefore resolve the same key
-    /// to different producer rows, so a shared cache would score a plan against
-    /// choices it did not make.
+    /// Rescoring traverses the fixed plan once, rejecting cycles and collecting
+    /// each reachable dependency's marginal cost. The traversal state is local
+    /// because separate calls can choose different producers for the same key.
     fn rescore_producer_plan(
         &self,
-        egraph: &EGraph,
         value: Value,
         sort: &ArcSort,
         producer_choices: &ProducerPlan,
     ) -> Option<DagCandidate<C>> {
-        let mut state = ProducerPlanScoringState {
-            used_choices: HashMap::default(),
-            cache: HashMap::default(),
-            visiting: self.key_ids.secondary_set(),
-        };
-        let paid_costs =
-            self.rescore_producer_plan_node(egraph, value, sort, producer_choices, &mut state)?;
+        enum Task {
+            Enter(ArcSort, Value),
+            Exit(InternId<DagCostKey>, Option<ProducerRowId>),
+        }
 
-        let ProducerPlanScoringState {
-            used_choices,
-            cache,
-            ..
-        } = state;
-        drop(cache);
-        let paid_costs = Arc::try_unwrap(paid_costs).unwrap_or_else(|costs| costs.as_ref().clone());
+        let mut tasks = vec![Task::Enter(sort.clone(), value)];
+        let mut visiting = self.key_ids.secondary_set();
+        let mut used_choices = HashMap::default();
+        let mut paid_costs = self.key_ids.aggregated_map_with_capacity(0);
+
+        while let Some(task) = tasks.pop() {
+            match task {
+                Task::Enter(sort, value) => {
+                    let key = self.reachable_cost_key(&sort, value)?;
+                    if paid_costs.contains(key) {
+                        continue;
+                    }
+                    if !visiting.insert(key) {
+                        return None;
+                    }
+
+                    let (producer_row_id, children) = if sort.is_container_sort() {
+                        (None, self.egraph.container_inner_values(&sort, value))
+                    } else if sort.is_eq_sort() {
+                        let producer_row_id = *producer_choices.get(&key)?;
+                        let producer_row = &self.producer_rows.rows[producer_row_id.0];
+                        let func = producer_row.func;
+                        debug_assert!(producer_row.target == key);
+                        (
+                            Some(producer_row_id),
+                            func.func_type()
+                                .input
+                                .iter()
+                                .cloned()
+                                .zip(producer_row.children.iter().copied())
+                                .collect(),
+                        )
+                    } else {
+                        (None, Vec::new())
+                    };
+
+                    tasks.push(Task::Exit(key, producer_row_id));
+                    tasks.extend(
+                        children
+                            .into_iter()
+                            .rev()
+                            .map(|(sort, value)| Task::Enter(sort, value)),
+                    );
+                }
+                Task::Exit(key, producer_row_id) => {
+                    visiting.remove(key);
+                    let marginal_cost = if let Some(producer_row_id) = producer_row_id {
+                        used_choices.insert(key, producer_row_id);
+                        self.producer_rows.rows[producer_row_id.0].cost.clone()
+                    } else {
+                        self.structural_costs.get(key)?.clone()
+                    };
+                    paid_costs.insert_if_absent(key, marginal_cost);
+                }
+            }
+        }
+
         Some(DagCandidate {
             paid_costs,
             producer_choices: used_choices,
         })
     }
 
-    fn rescore_producer_plan_node(
-        &self,
-        egraph: &EGraph,
-        value: Value,
-        sort: &ArcSort,
-        producer_choices: &ProducerPlan,
-        state: &mut ProducerPlanScoringState<C>,
-    ) -> Option<Arc<PaidDagCosts<C>>> {
-        let key = self.reachable_cost_key(sort, value)?;
-        if let Some(costs) = state.cache.get(&key) {
-            return Some(costs.clone());
-        }
-        if !state.visiting.insert(key) {
-            return None;
-        }
-
-        let (child_costs, marginal_cost) = if sort.is_container_sort() {
-            let mut child_costs = Vec::new();
-            for (child_sort, child_value) in egraph.container_inner_values(sort, value) {
-                child_costs.push(self.rescore_producer_plan_node(
-                    egraph,
-                    child_value,
-                    &child_sort,
-                    producer_choices,
-                    state,
-                )?);
-            }
-            (child_costs, self.structural_costs.get(key)?.clone())
-        } else if sort.is_eq_sort() {
-            let producer_row_id = *producer_choices.get(&key)?;
-            let producer_row = &self.producer_rows.rows[producer_row_id.0];
-            let func = egraph.get_function(&producer_row.func_name)?;
-            if producer_row.eclass != value || func.func_type().output.name() != sort.name() {
-                return None;
-            }
-            state.used_choices.insert(key, producer_row_id);
-
-            let mut child_costs = Vec::new();
-            for (child_value, child_sort) in producer_row
-                .children
-                .iter()
-                .zip(func.func_type().input.iter())
-            {
-                child_costs.push(self.rescore_producer_plan_node(
-                    egraph,
-                    *child_value,
-                    child_sort,
-                    producer_choices,
-                    state,
-                )?);
-            }
-            (child_costs, producer_row.cost.clone())
-        } else {
-            (Vec::new(), self.structural_costs.get(key)?.clone())
-        };
-
-        let mut paid_costs = PaidDagCosts::union_by_cloning_largest(&self.key_ids, &child_costs, 1);
-        paid_costs.insert_if_absent(key, marginal_cost);
-        let paid_costs = Arc::new(paid_costs);
-        state.visiting.remove(key);
-        state.cache.insert(key, paid_costs.clone());
-        Some(paid_costs)
-    }
-
-    fn compute_cost_node(
-        &self,
-        egraph: &EGraph,
-        value: Value,
-        sort: &ArcSort,
-    ) -> Option<Arc<DagCandidate<C>>> {
+    fn compute_cost_node(&self, value: Value, sort: &ArcSort) -> Option<Arc<DagCandidate<C>>> {
         if sort.is_container_sort() {
             let key = self.reachable_cost_key(sort, value)?;
-            let elements = egraph.container_inner_values(sort, value);
+            let elements = self.egraph.container_inner_values(sort, value);
             let child_candidates = elements
                 .iter()
-                .map(|(child_sort, child_value)| {
-                    self.compute_cost_node(egraph, *child_value, child_sort)
-                })
+                .map(|(child_sort, child_value)| self.compute_cost_node(*child_value, child_sort))
                 .collect::<Option<Vec<_>>>()?;
 
             let container_self_cost = self.structural_costs.get(key)?.clone();
-            self.candidate_from_children(
-                egraph,
-                value,
-                sort,
-                &child_candidates,
-                container_self_cost,
-                None,
-            )
+            self.candidate_from_children(value, sort, &child_candidates, container_self_cost, None)
         } else if sort.is_eq_sort() {
             let key = self.reachable_cost_key(sort, value)?;
             self.best_candidates.get(key).cloned()
         } else {
             let key = self.reachable_cost_key(sort, value)?;
             self.candidate_from_children(
-                egraph,
                 value,
                 sort,
                 &[],
@@ -801,20 +750,18 @@ impl<C: MonoidCost> GreedyDagExtractor<C> {
 
     fn compute_cost_hyperedge(
         &self,
-        egraph: &EGraph,
         producer_row_id: ProducerRowId,
     ) -> Option<Arc<DagCandidate<C>>> {
         let producer_row = &self.producer_rows.rows[producer_row_id.0];
-        let func = egraph.get_function(&producer_row.func_name)?;
+        let func = producer_row.func;
         let child_candidates = producer_row
             .children
             .iter()
             .zip(func.func_type().input.iter())
-            .map(|(value, sort)| self.compute_cost_node(egraph, *value, sort))
+            .map(|(value, sort)| self.compute_cost_node(*value, sort))
             .collect::<Option<Vec<_>>>()?;
 
         self.candidate_from_children(
-            egraph,
             producer_row.eclass,
             &func.func_type().output,
             &child_candidates,
@@ -823,36 +770,15 @@ impl<C: MonoidCost> GreedyDagExtractor<C> {
         )
     }
 
-    /// Enqueue a changed dependency once until it is processed.
-    fn enqueue_if_absent(
-        pending: &mut VecDeque<InternId<DagCostKey>>,
-        pending_set: &mut SecondarySet<DagCostKey>,
-        key: InternId<DagCostKey>,
-    ) {
-        if pending_set.insert(key) {
-            pending.push_back(key);
-        }
-    }
-
     /// Recompute one producer row and update its target if it improves.
     fn update_from_producer_row(
         &mut self,
-        egraph: &EGraph,
         producer_row_id: ProducerRowId,
         pending: &mut VecDeque<InternId<DagCostKey>>,
         pending_set: &mut SecondarySet<DagCostKey>,
     ) -> bool {
-        let Some((new_candidate, target_key)) = ({
-            let producer_row = &self.producer_rows.rows[producer_row_id.0];
-            let func = egraph.get_function(&producer_row.func_name).unwrap();
-            let target_sort = &func.func_type().output;
-            let target = producer_row.eclass;
-            let Some(target_key) = self.reachable_cost_key(target_sort, target) else {
-                return false;
-            };
-            self.compute_cost_hyperedge(egraph, producer_row_id)
-                .map(|candidate| (candidate, target_key))
-        }) else {
+        let target_key = self.producer_rows.rows[producer_row_id.0].target;
+        let Some(new_candidate) = self.compute_cost_hyperedge(producer_row_id) else {
             return false;
         };
 
@@ -863,7 +789,9 @@ impl<C: MonoidCost> GreedyDagExtractor<C> {
 
         if should_update {
             self.best_candidates.insert(target_key, new_candidate);
-            Self::enqueue_if_absent(pending, pending_set, target_key);
+            if pending_set.insert(target_key) {
+                pending.push_back(target_key);
+            }
         }
 
         should_update
@@ -877,13 +805,12 @@ impl<C: MonoidCost> GreedyDagExtractor<C> {
     /// rows that mention changed dependencies, which avoids repeatedly scanning
     /// unrelated backend rows. Debug builds finish with a full pass to assert
     /// that the reverse dependency index did not miss any improving row.
-    fn greedy_dag(&mut self, egraph: &EGraph) {
+    fn greedy_dag(&mut self) {
         let mut pending = VecDeque::new();
         let mut pending_set = self.key_ids.secondary_set();
 
         for producer_row_id in 0..self.producer_rows.rows.len() {
             self.update_from_producer_row(
-                egraph,
                 ProducerRowId(producer_row_id),
                 &mut pending,
                 &mut pending_set,
@@ -896,12 +823,7 @@ impl<C: MonoidCost> GreedyDagExtractor<C> {
                 continue;
             };
             for producer_row_id in producer_row_ids {
-                self.update_from_producer_row(
-                    egraph,
-                    producer_row_id,
-                    &mut pending,
-                    &mut pending_set,
-                );
+                self.update_from_producer_row(producer_row_id, &mut pending, &mut pending_set);
             }
         }
 
@@ -912,7 +834,6 @@ impl<C: MonoidCost> GreedyDagExtractor<C> {
             for producer_row_id in 0..self.producer_rows.rows.len() {
                 assert!(
                     !self.update_from_producer_row(
-                        egraph,
                         ProducerRowId(producer_row_id),
                         &mut pending,
                         &mut pending_set
@@ -923,28 +844,8 @@ impl<C: MonoidCost> GreedyDagExtractor<C> {
         }
     }
 
-    /// Reconstruct the term rooted at a producer row, reusing the caller's cache.
-    fn reconstruct_producer_row(
-        &self,
-        egraph: &EGraph,
-        producer_row: &GreedyDagProducerRow<C>,
-        state: &mut TermReconstructionState<'_, C>,
-    ) -> Option<TermId> {
-        let func = egraph.get_function(&producer_row.func_name).unwrap();
-        let mut ch_terms: Vec<TermId> = Vec::new();
-        for (value, sort) in producer_row
-            .children
-            .iter()
-            .zip(func.func_type().input.iter())
-        {
-            ch_terms.push(self.reconstruct_termdag_node_helper(egraph, *value, sort, state)?);
-        }
-        Some(state.termdag.app(func.name().to_owned(), ch_terms))
-    }
-
     fn reconstruct_termdag_node_helper(
         &self,
-        egraph: &EGraph,
         value: Value,
         sort: &ArcSort,
         state: &mut TermReconstructionState<'_, C>,
@@ -958,18 +859,30 @@ impl<C: MonoidCost> GreedyDagExtractor<C> {
         }
 
         let term = if sort.is_container_sort() {
-            let elements = egraph.container_inner_values(sort, value);
+            let elements = self.egraph.container_inner_values(sort, value);
             let mut ch_terms: Vec<TermId> = Vec::new();
             for ch in elements.iter() {
-                ch_terms.push(self.reconstruct_termdag_node_helper(egraph, ch.1, &ch.0, state)?);
+                ch_terms.push(self.reconstruct_termdag_node_helper(ch.1, &ch.0, state)?);
             }
-            egraph.reconstruct_container_value(sort, value, state.termdag, ch_terms)
+            self.egraph
+                .reconstruct_container_value(sort, value, state.termdag, ch_terms)
         } else if sort.is_eq_sort() {
             let producer_row_id = state.candidate.producer_choices.get(&key)?;
             let producer_row = &self.producer_rows.rows[producer_row_id.0];
-            self.reconstruct_producer_row(egraph, producer_row, state)?
+            let mut child_terms = Vec::with_capacity(producer_row.children.len());
+            for (child, child_sort) in producer_row
+                .children
+                .iter()
+                .zip(producer_row.func.func_type().input.iter())
+            {
+                child_terms.push(self.reconstruct_termdag_node_helper(*child, child_sort, state)?);
+            }
+            state
+                .termdag
+                .app(producer_row.func.name().to_owned(), child_terms)
         } else {
-            egraph.reconstruct_base_value(sort, value, state.termdag)
+            self.egraph
+                .reconstruct_base_value(sort, value, state.termdag)
         };
 
         state.visiting.remove(key);
@@ -980,19 +893,18 @@ impl<C: MonoidCost> GreedyDagExtractor<C> {
     /// Extract the best greedy-DAG term of a value from a given sort.
     fn extract_best_with_sort(
         &self,
-        egraph: &EGraph,
         termdag: &mut TermDag,
         value: Value,
         sort: ArcSort,
     ) -> Option<ExtractedTerm<C>> {
-        let candidate = self.compute_cost_node(egraph, value, &sort)?;
+        let candidate = self.compute_cost_node(value, &sort)?;
         let mut state = TermReconstructionState {
             termdag,
             candidate: &candidate,
             cache: Default::default(),
             visiting: self.key_ids.secondary_set(),
         };
-        let term = self.reconstruct_termdag_node_helper(egraph, value, &sort, &mut state)?;
+        let term = self.reconstruct_termdag_node_helper(value, &sort, &mut state)?;
         Some(ExtractedTerm {
             cost: candidate.paid_costs.total().clone(),
             term,
@@ -1007,7 +919,6 @@ impl<C: MonoidCost> GreedyDagExtractor<C> {
     /// plan is rescored. This is not a full k-best DAG extractor.
     fn extract_variants_with_sort(
         &self,
-        egraph: &EGraph,
         termdag: &mut TermDag,
         value: Value,
         nvariants: usize,
@@ -1033,21 +944,12 @@ impl<C: MonoidCost> GreedyDagExtractor<C> {
                 return vec![];
             };
             for &producer_row_id in producer_row_ids {
-                let producer_row = &self.producer_rows.rows[producer_row_id.0];
-                let func = egraph.get_function(&producer_row.func_name).unwrap();
-                let target_sort = &func.func_type().output;
-                if sort.name() != target_sort.name() {
-                    continue;
-                }
-                if producer_row.eclass != value {
-                    continue;
-                }
                 let candidate = best_candidate
                     .filter(|candidate| {
                         candidate.producer_choices.get(&target_key) == Some(&producer_row_id)
                     })
                     .cloned()
-                    .or_else(|| self.compute_cost_hyperedge(egraph, producer_row_id));
+                    .or_else(|| self.compute_cost_hyperedge(producer_row_id));
                 if let Some(candidate) = candidate {
                     root_variants.push((producer_row_id, candidate));
                 }
@@ -1068,9 +970,7 @@ impl<C: MonoidCost> GreedyDagExtractor<C> {
                     cache: Default::default(),
                     visiting: self.key_ids.secondary_set(),
                 };
-                if let Some(term) =
-                    self.reconstruct_termdag_node_helper(egraph, value, &sort, &mut state)
-                {
+                if let Some(term) = self.reconstruct_termdag_node_helper(value, &sort, &mut state) {
                     res.push(ExtractedTerm {
                         cost: candidate.paid_costs.total().clone(),
                         term,
@@ -1083,7 +983,7 @@ impl<C: MonoidCost> GreedyDagExtractor<C> {
             log::warn!(
                 "extracting multiple greedy-DAG variants for containers or primitives is not implemented, returning a single variant."
             );
-            if let Some(res) = self.extract_best_with_sort(egraph, termdag, value, sort) {
+            if let Some(res) = self.extract_best_with_sort(termdag, value, sort) {
                 vec![res]
             } else {
                 vec![]
@@ -1117,7 +1017,7 @@ pub fn extract_best_greedy_dag<C: MonoidCost, M: DagCostModel<C>>(
     let mut termdag = TermDag::default();
     let extracted_roots = roots
         .into_iter()
-        .map(|(sort, value)| extractor.extract_best_with_sort(egraph, &mut termdag, value, sort))
+        .map(|(sort, value)| extractor.extract_best_with_sort(&mut termdag, value, sort))
         .collect();
 
     Ok(ExtractedTerms {
@@ -1158,7 +1058,7 @@ pub fn extract_variants_greedy_dag<C: MonoidCost, M: DagCostModel<C>>(
     let variants = roots
         .into_iter()
         .map(|(sort, value)| {
-            extractor.extract_variants_with_sort(egraph, &mut termdag, value, nvariants, sort)
+            extractor.extract_variants_with_sort(&mut termdag, value, nvariants, sort)
         })
         .collect();
 
