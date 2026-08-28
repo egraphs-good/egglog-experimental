@@ -6,8 +6,8 @@
 //!
 //! With `:dag`, the output is one
 //! `(let ((name def) ...) ((variant ...) ...))` s-expression in which
-//! subterms shared across all variants of all terms are let-bound once (see
-//! [`crate::dag_print`]), instead of every variant being expanded to a tree.
+//! subterms shared across all variants of all terms are let-bound once, instead
+//! of every variant being expanded to a tree.
 
 use egglog::{
     CommandOutput, EGraph, Error, TermDag, TermId, TypeError, UserDefinedCommand,
@@ -30,7 +30,8 @@ impl std::fmt::Display for MultiExtractOutput {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         if self.dag {
             let roots: Vec<TermId> = self.terms.iter().flatten().copied().collect();
-            let (bindings, rendered) = crate::render_terms_with_shared_lets(&self.termdag, &roots);
+            let (bindings, rendered) =
+                crate::dag_print::render_terms_with_shared_lets(&self.termdag, &roots);
             writeln!(f, "(let (")?;
             for (name, def) in &bindings {
                 writeln!(f, "   ({name} {def})")?;
@@ -60,7 +61,7 @@ impl std::fmt::Display for MultiExtractOutput {
     }
 }
 
-/// User-defined command implementing `(multi-extract n term...)` with a
+/// User-defined command implementing `(multi-extract n [:dag] term...)` with a
 /// caller-provided cost model.
 ///
 /// The positive `i64` value `n` is the number of variants returned for each
@@ -89,32 +90,27 @@ impl<
 > UserDefinedCommand for MultiExtract<C, CM>
 {
     fn update(&self, egraph: &mut EGraph, args: &[Expr]) -> Result<Vec<CommandOutput>, Error> {
-        // `:dag` may appear anywhere among the arguments.
-        let mut dag = false;
-        let args: Vec<Expr> = args
-            .iter()
-            .filter(|arg| match arg {
-                Expr::Var(_, v) if v == ":dag" => {
-                    dag = true;
-                    false
-                }
-                _ => true,
-            })
-            .cloned()
-            .collect();
-        let args = args.as_slice();
-        if args.len() < 2 {
-            let span = args.first().map(Expr::span).unwrap_or_else(|| span!());
+        let Some((variants_expr, mut terms)) = args.split_first() else {
             return Err(Error::ParseError(ParseError(
-                span,
+                span!(),
+                "multi-extract expects at least a variant count and one expression".into(),
+            )));
+        };
+        let dag = matches!(terms.first(), Some(Expr::Var(_, option)) if option == ":dag");
+        if dag {
+            terms = &terms[1..];
+        }
+        if terms.is_empty() {
+            return Err(Error::ParseError(ParseError(
+                variants_expr.span(),
                 "multi-extract expects at least a variant count and one expression".into(),
             )));
         }
 
-        let (variants_sort, variants_value) = egraph.eval_expr(&args[0])?;
+        let (variants_sort, variants_value) = egraph.eval_expr(variants_expr)?;
         if variants_sort.name() != "i64" {
             return Err(Error::TypeError(TypeError::Mismatch {
-                expr: args[0].clone(),
+                expr: variants_expr.clone(),
                 expected: egraph.get_arcsort_by(|s| s.name() == "i64"),
                 actual: variants_sort,
             }));
@@ -123,18 +119,18 @@ impl<
         let n: i64 = egraph.value_to_base(variants_value);
         if n < 0 {
             return Err(Error::ParseError(ParseError(
-                args[0].span(),
+                variants_expr.span(),
                 "Cannot extract negative number of variants".into(),
             )));
         }
         if n == 0 {
             return Err(Error::ParseError(ParseError(
-                args[0].span(),
+                variants_expr.span(),
                 "multi-extract requires a positive number of variants".into(),
             )));
         }
 
-        let (sorts, values): (Vec<_>, Vec<_>) = args[1..]
+        let (sorts, values): (Vec<_>, Vec<_>) = terms
             .iter()
             .map(|arg| egraph.eval_expr(arg))
             .collect::<Result<_, _>>()?;

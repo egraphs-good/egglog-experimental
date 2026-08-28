@@ -36,12 +36,13 @@
 //!   schedulers.
 //! - [`DynamicCostModel`] supports runtime costs declared with
 //!   `with-dynamic-cost` and changed with `set-cost`.
-//! - [`MultiExtract`] implements `(multi-extract n term...)`.
+//! - [`MultiExtract`] implements `(multi-extract n [:dag] term...)`.
 //! - [`KeepBestCommand`] compacts selected tables to their best terms.
 //!
 //! ## Inspection
 //!
 //! - [`GetSizePrimitive`] implements `(get-size! "table"...)`.
+//! - [`GetNodeSizePrimitive`] implements `(get-node-size!)`.
 //! - [`PrintTableStatsCommand`] reports table cardinality and out-degree
 //!   statistics.
 //!
@@ -61,7 +62,6 @@ pub use set_cost::*;
 mod multi_extract;
 pub use multi_extract::*;
 mod dag_print;
-pub use dag_print::*;
 mod size;
 pub use size::*;
 mod primitive;
