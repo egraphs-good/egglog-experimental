@@ -1,5 +1,5 @@
 ;; `unstable-subst` copies the sub-e-graph reachable from a root, replacing each
-;; key e-class with its mapped value, and hands back the copied root. The
+;; source e-class with its paired target, and hands back the copied root. The
 ;; motivating use is beta reduction: substituting an argument into a lambda body.
 
 (datatype Expr
@@ -9,15 +9,13 @@
   (Lam String Expr)
   (App Expr Expr))
 
-(sort Subst (Map Expr Expr))
-
 ;; (App (Lam x body) arg)  ==>  body[x := arg]
 ;;
 ;; `:naive` because substitution reads the database to walk `body`, which an
 ;; ordinary seminaive rule head may not do. `body` comes from the query, so it
 ;; already has rows for the walk to find — a term built in this action would not.
 (rule ((= redex (App (Lam x body) arg)))
-      ((union redex (unstable-subst body (map-insert (map-empty) (Var x) arg))))
+      ((union redex (unstable-subst body (Var x) arg)))
       :naive)
 
 ;; (\x. x + 1) 5  ==>  5 + 1

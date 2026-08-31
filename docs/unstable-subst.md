@@ -1,187 +1,158 @@
 # `unstable-subst`: a substitution primitive
 
-Status: exploration. Lives in `egglog-experimental`; the e-graph introspection
-it needs lives in `egglog` (see "What egglog had to expose" below).
+Status: exploration. Lives in `egglog-experimental`; the general e-graph
+introspection it uses lives in `egglog` (see "What egglog had to expose").
 
-## What it does
+## Interface
 
 ```text
-(unstable-subst root map) : (R, Map<K, K>) -> R
+(unstable-subst root from1 to1 ... fromN toN)
+    : R × (K1 × K1) × ... × (KN × KN) → R
 ```
 
-`root` is an e-class of any eq-sort `R`; `map` is a `Map` whose key and value
-sorts are the same eq-sort `K`. The primitive walks the sub-e-graph reachable
-from `root`, copies the part of it that the substitution actually touches while
-replacing every occurrence of a key e-class with its mapped value, and returns
-the e-class of the copied root.
+Here `N >= 0`. `root` is an e-class of any eq-sort `R`. Within each pair,
+`fromI` and `toI` must share one eq-sort `KI`; different pairs may use different
+eq-sorts. A final unpaired `from` is rejected during typechecking.
 
-Reachability follows **constructor** rows only (the term structure), never
-`function` rows (those are analyses over the structure, not part of it).
-Container-valued children (`Vec`, `Map`, `Set`, ...) are followed into and
-rebuilt with substituted contents.
+The pairs form one simultaneous substitution. For example,
+`(unstable-subst root x y y x)` swaps `x` and `y`; it does not substitute
+`x := y` and then `y := x`. A replacement is spliced in as supplied and is not
+itself traversed. Repeating the same source e-class is an error rather than
+silently choosing one replacement; duplicates are rejected before subgraph
+traversal or copy writes, even when they name the same replacement. With no pairs,
+`(unstable-subst root)` returns the exact root value and writes nothing.
 
-## Semantics
+The primitive walks the sub-e-graph reachable from `root`, copies only the part
+affected by the substitution, and returns the copied root. Reachability follows
+constructor rows (term structure), not `function` rows (analyses over that
+structure). It also follows e-classes inside containers such as `Vec`, `Map`,
+and `Set`, rebuilding affected containers around their substituted contents.
 
-Let `σ` be the resulting map on values.
+## Semantics and safety
 
-* An e-class is **affected** if it is a key of `map`, or if one of its e-nodes
-  has an affected child (least fixpoint over the reachable subgraph).
-  Container values are affected if any of their contents are.
-* `σ(v) = map[v]` for keys, `σ(v) = v` for unaffected `v`.
-* For an affected non-key e-class `e`, every e-node `f(c1..cn) -> e` in the
-  snapshot is copied as `f(σ(c1)..σ(cn))`; all the copies are unioned together
-  and `σ(e)` is that class. Copying every e-node, not just the ones that change,
-  is what carries the region's equations over to the copy — see below.
-* The return value is `σ(root)`.
+Let `σ` map each source e-class to its paired replacement.
 
-Consequences worth stating out loud:
+* A reachable e-class is **affected** if it is a source or if one of its
+  e-nodes, including through a container child, refers to an affected e-class.
+* `σ(v)` is the paired replacement for a source, the original `v` for an
+  unaffected value, and the rebuilt value for an affected container.
+* For an affected non-source e-class `e`, every non-subsumed e-node
+  `f(c1..cn) -> e` in the snapshot is copied as `f(σ(c1)..σ(cn))`. Those
+  copies are unioned, and their class is `σ(e)`.
+* The result is `σ(root)`. If no source is reachable, the original root is
+  returned and nothing is copied.
 
-* **Nothing is copied when nothing changes.** An unaffected sub-e-graph is
-  shared with the original, so `(unstable-subst e (map-empty))` is exactly `e`
-  and allocates nothing.
-* **The region's equations are substituted too, not just its terms.** An
-  e-class is a set of terms known equal, so copying it copies every one of its
-  e-nodes: if the e-graph knows `t1 = t2` and both are reachable, the copy
-  asserts `σ(t1) = σ(t2)`. An e-node with no substituted children copies to
-  itself, so `lookup_or_insert` finds the original row and the copy merges back
-  into the original class.
+Copying every e-node carries the region's equations into the copy. If the
+original e-class contains both `t1` and `t2`, the copy asserts
+`σ(t1) = σ(t2)`. This is sound only when substitution preserves a derivation
+of that equality, including every premise on which it depends. The primitive
+does not inspect provenance or prove that condition for the caller.
 
-  That is what you want when the equations come from rewrite rules, which hold
-  for every value of the substituted classes. With
-  `(rewrite (Mul a (Num 0)) (Num 0))`, the class of `(Mul x (Num 0))` also holds
-  `(Num 0)`; substituting `x := 5` merges the copy back into that class and
-  returns it, and `5 * 0` really is `0`.
+For example, an equality such as `a * 0 = 0` derived by an unconditional
+rewrite is preserved by substituting for `a`. A ground union such as
+`x + 1 = 5` is not preserved by arbitrarily replacing `x`: copying it under
+`x := 9` would assert `9 + 1 = 5`. Equations from conditional or
+analysis-dependent rules are likewise not generally safe, because substitution
+can invalidate the condition or analysis fact that justified them. Being a
+singleton e-class is neither necessary nor sufficient; what matters is whether
+the copied derivations remain valid.
 
-  It is wrong when the e-graph holds a **ground** equation pinning a substituted
-  class down. `(union (Add x (Num 1)) (Num 5))` asserts `x = 4`; substituting
-  `x := 9` copies the untouched `(Num 5)` unchanged, merges, and thereby asserts
-  `9 + 1 = 5`. So only substitute classes that behave like universally
-  quantified variables — being singleton is neither necessary nor sufficient.
-  (`tests/subst-basics.egg` pins both directions.)
+## Operational constraints
 
-  Copying every e-node rather than only the ones that change is deliberate.
-  Copying only the changed e-nodes would never merge back into the original
-  class, but it would also drop the region's equations from the copy: the
-  `x * 0` result above would come back as a bare `(Mul (Num 5) (Num 0))` not
-  known to equal `0`. A running rule set would re-derive that; a one-shot
-  substitution would not.
-* **`root` must already exist.** The walk reads tables, and an action's writes
-  stay staged until the action finishes. A root the enclosing action just built
-  has no rows yet, so the walk finds nothing under it and returns it *unchanged
-  and without an error* — `(unstable-subst (Mul x y) m)`, building its own
-  argument, silently does nothing. Pass a root the rule's query bound, or one
-  from an earlier command; that is what the `:naive` beta-reduction shape does.
-  Replacements are exempt: a map's values are spliced into the copy without
-  being walked, so those can be built in the same action.
-* **No e-class id is ever invented.** Every copied e-node goes in through
-  `lookup_or_insert`, exactly as `(Add a b)` in an action does, so egglog names
-  the copy. The consequence is the cycle rule below.
-* **Grounded cycles are copied; ungrounded ones error.** A cyclic e-class can
-  only be copied if one of its e-nodes has all its children outside the cycle:
-  that e-node's insert names the copy, and the cyclic e-node then unions into
-  it. `x = {Var "x", Add x (Num 0)}` qualifies and works. A cycle in which every
-  e-node points back into the cycle has no such starting point, and naming its
-  copy would mean inventing an e-class id — so it reports that
-  (`egglog_experimental::subst` returns an error naming the e-class; the
-  primitive panics, since a primitive cannot return one) rather than producing
-  a partial copy.
-* **Subsumed e-nodes are skipped** — they are excluded from extraction, so
-  resurrecting them un-subsumed in a copy would be wrong.
-* Registered by `new_experimental_egraph`, so a plain `EGraph::default` does not
-  have it.
-* The snapshot is taken from live table contents, so `unstable-subst` is only
-  available where reads *and* writes are legal: top-level actions (`let`,
-  `eval`, action-mode `run-schedule`) and the head of a `:naive` rule. This is
-  the `Context::Full` capability, enforced by the typechecker. It is not
-  available in an ordinary seminaive rule head, because a rule that read live
-  state would not re-fire when the state it read grows.
+* **If traversal is required, `root` must already have committed rows.** An
+  action's writes are staged until the action finishes. A root built by that
+  same action is therefore invisible to the walk and returns unchanged, without
+  an error. A root that is itself a source instead returns its paired target
+  directly and needs no rows. Otherwise, pass a root bound by the rule query or
+  created by an earlier command. Replacements may be built in the current
+  action because they are spliced in rather than walked.
+* **No e-class id is invented.** Every copied e-node is inserted through the
+  ordinary constructor path. A cycle is copyable only if some e-node can first
+  name each copied class. If every e-node in a cycle depends on an as-yet
+  unnamed copy, substitution reports an ungrounded-cycle error before writing.
+* **Subsumed e-nodes are skipped.** They are excluded from extraction and must
+  not be resurrected as ordinary rows in a copy.
+* **Live reads require `Context::Full`.** The primitive is available in
+  top-level actions and `:naive` rule heads, not ordinary seminaive rule heads,
+  which would not re-fire when the live state they read grows.
+* It is registered by `new_experimental_egraph`; `EGraph::default` does not
+  include it.
 
 ## Implementation
 
-Three passes over the reachable subgraph. The two that walk e-classes use an
-explicit stack, so term depth is bounded by the heap rather than by Rust's
-stack; only the descent into nested containers recurses, and that is bounded by
-how deeply the program's sorts nest containers.
+Substitution separates all copyability decisions from mutation: one read-only
+phase followed by two write passes.
 
-1. **Collect** — DFS from `root` gathering, per reachable e-class, its e-nodes
-   (table name + child values), and per reachable container value, its
-   contents. The root's sort is not known at runtime (the primitive is shared
-   across all call sites), so the walk probes every eq-sorted constructor for
-   the root e-class and then uses the matched constructor's declared input
-   sorts for everything below it. E-class ids come from one global counter, so
-   probing the wrong sort's table simply finds nothing.
-2. **Mark** — worklist propagation from the map keys up the parent relation
-   built in pass 1.
-3. **Build** — a sweep over the affected e-classes in postorder, copying every
-   e-node whose children already have copies (`lookup_or_insert` per e-node;
-   the first copy of a class names it, later ones union into it). One sweep
-   finishes the acyclic case; the sweep repeats while it makes progress, which
-   is what lets a grounded cycle close. Anything still uncopied when progress
-   stops is an ungrounded cycle and is reported. Containers are rebuilt through
-   `ContainerValues::rebuild_val_with` with a remap table, and nothing is
-   interned until every value inside the container resolves, so a blocked
-   container leaves no half-substituted copy behind.
+1. **Collect and preflight, read-only.** Build a snapshot of reachable
+   constructor rows and container contents, mark the affected region, and
+   compute an order in which every copied e-class can be named. If no such
+   order exists, report the ungrounded cycle before substitution writes a copy.
+   Values built as arguments to the primitive have already been staged by the
+   enclosing action, so this guarantee does not roll those argument writes back.
+2. **Name copied classes.** In the computed order, insert one ready e-node per
+   affected non-source e-class to obtain its image.
+3. **Complete their equations.** With every image named, insert the remaining
+   e-nodes and union each result into the image of its original class.
+
+Container rebuilding waits until every e-class inside has an image, so an
+ungrounded cycle cannot leave a half-substituted container behind. E-class
+traversal uses explicit stacks; only descent through nested container values
+recurses, bounded by the program's container-sort nesting.
+
+### Cost
+
+Collection uses indexed output lookups rather than whole-table scans, but its
+cost is not proportional only to returned rows. When a traversal is needed, it
+scans table-size metadata and asks for the schema of every nonempty table to
+catalog the current nonempty constructors. Let `C` be the number with an eq-sort
+output, `C_s` the number outputting sort `s`, and `R_s` the reached non-root
+e-classes of sort `s`. Collection then makes exactly
+`C + sum_s(R_s * C_s)` indexed row probes: the root's sort is unknown, while
+every child's sort is known. Each probe uses that table's cached output-column
+index; there is no cross-table e-class index.
+
+After those probes, snapshot construction and affected marking are linear in
+the reached e-classes, returned rows, dependency edges, and container contents.
+The copyability fixpoint can rescan the affected snapshot while it finds a
+naming order, so its worst case is superlinear (quadratic when progress reveals
+only one of linearly many classes per scan). Apart from backend insertion and
+union costs, the two write passes process each planned e-node at most twice.
+Snapshot memory is proportional to the reached e-classes, rows, edges, and
+container contents; there is no configured snapshot-size bound.
 
 ### What egglog had to expose
 
-Nothing substitution-specific: three general pieces of e-graph introspection,
-after which the whole primitive is ordinary out-of-tree code.
+Nothing substitution-specific: a small set of general e-graph operations makes
+the primitive implementable out of tree.
 
-* `Read::constructor_enodes_for_eclass` — indexed lookup of the constructor rows
-  whose output column is a given e-class, instead of scanning the table.
-  Cherry-picked from <https://github.com/egraphs-good/egglog/pull/934> (still
-  open), together with the `core-relations`
-  `ExecutionState::for_each_matching_col` and `egglog-bridge`
-  `TableAction::for_each_output_value` it rests on. The walk keeps an index from
-  sort to constructors and probes one table at a time, so it does not use
-  `Read::eclass_enodes`, which spans every constructor at once.
-* `Read::constructor_schema` / `Read::function_schema` / `Read::table_subtype` —
-  a table's declared signature and subtype, from inside a primitive body.
-  `EGraph::functions_iter` already exposes this from `&EGraph`, but a primitive
-  only sees the state wrapper, and those carried no sort information at all.
-  The e-graph passes its `&TypeInfo` into each execution as an
-  `ExternalContext`, so the borrow lasts exactly that operation.
-* `Core::map_container` — map a container value's contents and intern the
-  result, over the existing `ContainerValues::rebuild_val_with`. Out-of-tree
-  code cannot go through `Core::register_container`, which needs to name the
-  container's Rust type.
+* `Read::constructor_enodes_for_eclass` performs an indexed lookup of
+  constructor rows whose output is one e-class. The lookup was developed in
+  [PR #934](https://github.com/egraphs-good/egglog/pull/934), cherry-picked
+  upstream in [PR #986](https://github.com/egraphs-good/egglog/pull/986), and
+  renamed to the pinned method by
+  [PR #1003](https://github.com/egraphs-good/egglog/pull/1003). The Cargo
+  dependency pins that earliest suitable official upstream merge.
+* `Read::constructor_schema`, together with `Read::table_sizes`, lets a
+  primitive enumerate the current nonempty constructors and group them by
+  output sort. The e-graph supplies its `TypeInfo` as an `ExternalContext` for
+  the duration of the operation.
+* `Core::map_container` rebuilds and interns a container value through the
+  existing `ContainerValues::rebuild_val_with` machinery.
 
-Two things it did **not** need to expose, worth recording because they were the
-expected blockers: `TypeInfo::get_arcsorts_by` is already public, so the type
-constraint can enumerate the declared `Map` and eq-sorts itself; and a sort's
-kind is recoverable from the public `Sort::value_type` and `Sort::inner_sorts`,
-so a `Map` sort can be identified without downcasting to `MapSort` (whose
-`ContainerSort` impl sits behind a private wrapper type).
+## Known limitations
 
-### Known limitations
-
-* `R` and `K` must be eq-sorts, and the map's key and value sorts must be
-  identical: a substitution that replaced a `K`-sorted child with a value of a
-  different sort would produce an ill-typed row.
-* A cycle in the substituted region with no grounded e-node is rejected rather
-  than copied, as described above.
-* No bound on snapshot size — a root that reaches the whole e-graph copies as
-  much of it as the substitution affects.
-* Values are assumed canonical, which holds at the top level (egglog rebuilds
-  after every command) and in a `:naive` rule head. Term-encoding mode, where
-  canonicalization goes through a per-sort union-find table rather than the
-  backend's, is untested.
-* Proof mode is unsupported: the copied rows carry no justification. This is
-  rejected rather than silently wrong — `egglog_experimental::subst` errors with
-  `ProofsIncompatibleApi` (from `EGraph::update`), and the primitive is
-  registered without a proof validator, so a program that uses it under
-  `--proofs` or `--term-encoding` is refused with "primitive operation lacks a
-  validator function".
-* The semantics are pinned by `tests/subst-basics.egg`, one case per push/pop
-  scope, and `tests/unstable-subst.egg` demonstrates beta reduction.
-  `tests/subst.rs` keeps what `check` cannot see: e-class identity, table sizes,
-  error variants, and the `subst` entry point. This repository's `files` harness
-  runs each `.egg` file once, without egglog's desugar / term-encoding /
-  multi-thread variants.
-* A failing substitution reaches an egglog program as the generic
-  "primitive panicked", with the reason in the log. Registering a custom panic
-  message needs `egglog_bridge::EGraph::new_panic`, and egglog exposes no
-  accessor for its backend; a `Write::panic_with(message)` would fix it.
-* The constructor list is rebuilt from the table schemas on every call, which is
-  O(tables) per substitution. Fine at the scale of a typical program, and it is
-  what keeps the primitive correct as an e-graph gains constructors.
+* Values are assumed canonical. That holds after top-level rebuilds and in a
+  `:naive` rule head, the supported contexts.
+* A custom `ContainerValue` must invoke its rebuild callback only for
+  eq-sort or eq-container fields, as egglog's built-in containers do. The
+  callback carries raw values rather than their sorts, so presenting an opaque
+  base field whose raw id collides with an e-class id could remap that field.
+* Proof mode is unsupported because copied rows carry no justification. The
+  primitive has no proof validator, so proof or term-encoding execution is
+  refused rather than silently producing an invalid proof.
+* A primitive-level failure reaches an egglog program as a generic primitive
+  panic, with the specific reason in the log.
+* `tests/subst-basics.egg` pins language semantics,
+  `tests/unstable-subst.egg` demonstrates beta reduction, and `tests/subst.rs`
+  covers e-class identity, table sizes, and failure behavior. The file harness
+  does not add egglog's desugar, term-encoding, or multi-thread variants.

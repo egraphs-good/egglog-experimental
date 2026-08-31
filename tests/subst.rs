@@ -1,10 +1,10 @@
 //! Tests for `unstable-subst` that need Rust: e-class identity, table sizes,
-//! error variants, and the `subst` entry point. The language-level semantics
-//! are in `tests/subst-basics.egg`.
+//! error variants, and failure atomicity. The language-level semantics are in
+//! `tests/subst-basics.egg`.
 
 use egglog::prelude::exprs::var;
 use egglog::prelude::*;
-use egglog::{EGraph, Error, Value};
+use egglog::{EGraph, Error};
 use egglog_experimental::new_experimental_egraph;
 
 const MATH: &str = r#"
@@ -13,7 +13,6 @@ const MATH: &str = r#"
   (Var String)
   (Add Math Math)
   (Mul Math Math))
-(sort MathToMath (Map Math Math))
 "#;
 
 fn egraph(program: &str) -> EGraph {
@@ -23,33 +22,33 @@ fn egraph(program: &str) -> EGraph {
     eg
 }
 
-/// The value of a global, for the assertions that need to compare e-classes
-/// rather than terms.
-fn global(eg: &mut EGraph, name: &str) -> Value {
-    eg.eval_expr(&var(&format!("${name}"))).unwrap().1
-}
-
 #[test]
 fn substituting_a_missing_key_returns_the_root_itself() {
     let mut eg = egraph(
         r#"
 (let $x (Var "x"))
 (let $e (Add $x (Num 1)))
-(let $copy (unstable-subst $e (map-insert (map-empty) (Var "absent") (Num 0))))
+(let $copy (unstable-subst $e (Var "absent") (Num 0)))
 "#,
     );
-    assert_eq!(global(&mut eg, "e"), global(&mut eg, "copy"));
+    assert_eq!(
+        eg.eval_expr(&var("$e")).unwrap().1,
+        eg.eval_expr(&var("$copy")).unwrap().1
+    );
 }
 
 #[test]
-fn an_empty_map_returns_the_root_itself() {
+fn no_replacements_returns_the_root_itself() {
     let mut eg = egraph(
         r#"
 (let $e (Add (Var "x") (Num 1)))
-(let $copy (unstable-subst $e (map-empty)))
+(let $copy (unstable-subst $e))
 "#,
     );
-    assert_eq!(global(&mut eg, "e"), global(&mut eg, "copy"));
+    assert_eq!(
+        eg.eval_expr(&var("$e")).unwrap().1,
+        eg.eval_expr(&var("$copy")).unwrap().1
+    );
 }
 
 #[test]
@@ -58,10 +57,13 @@ fn substituting_the_root_returns_its_replacement() {
         r#"
 (let $x (Var "x"))
 (let $y (Var "y"))
-(let $copy (unstable-subst $x (map-insert (map-empty) $x $y)))
+(let $copy (unstable-subst $x $x $y))
 "#,
     );
-    assert_eq!(global(&mut eg, "y"), global(&mut eg, "copy"));
+    assert_eq!(
+        eg.eval_expr(&var("$y")).unwrap().1,
+        eg.eval_expr(&var("$copy")).unwrap().1
+    );
 }
 
 /// Only the spine above a substituted class is copied; e-classes the
@@ -73,7 +75,7 @@ fn unaffected_subterms_are_shared_not_copied() {
 (let $x (Var "x"))
 (let $untouched (Mul (Num 3) (Num 4)))
 (let $e (Add $x $untouched))
-(let $copy (unstable-subst $e (map-insert (map-empty) $x (Num 7))))
+(let $copy (unstable-subst $e $x (Num 7)))
 (check (= $copy (Add (Num 7) $untouched)))
 "#,
     );
@@ -82,23 +84,36 @@ fn unaffected_subterms_are_shared_not_copied() {
     assert_eq!(adds, Some(2));
     let muls = eg.update(|fs| Ok(fs.table_size("Mul"))).unwrap();
     assert_eq!(muls, Some(1));
-    assert_ne!(global(&mut eg, "e"), global(&mut eg, "copy"));
+    assert_ne!(
+        eg.eval_expr(&var("$e")).unwrap().1,
+        eg.eval_expr(&var("$copy")).unwrap().1
+    );
 }
 
-/// A row an action has only just staged is not in the tables the walk reads,
-/// so a term built in the same action is invisible to it and comes back
-/// unsubstituted — with no error. Terms from earlier commands, and from
-/// earlier rule iterations, are fine.
+/// A row an action has only just staged is not in the tables the walk reads, so
+/// a term built in the same action is invisible when traversal is needed and
+/// comes back unsubstituted — with no error. A root that is itself a source is
+/// replaced without a walk. Terms from earlier commands and rule iterations
+/// are visible.
 #[test]
 fn does_not_see_terms_built_in_the_same_action() {
     let mut eg = egraph(
         r#"
 (let $x (Var "x"))
-(let $copy (unstable-subst (Mul $x (Num 5)) (map-insert (map-empty) $x (Num 9))))
+(let $nine (Num 9))
+(let $copy (unstable-subst (Mul $x (Num 5)) $x (Num 9)))
 (let $unsubstituted (Mul $x (Num 5)))
+(let $direct (unstable-subst (Mul $x (Num 6)) (Mul $x (Num 6)) $nine))
 "#,
     );
-    assert_eq!(global(&mut eg, "copy"), global(&mut eg, "unsubstituted"));
+    assert_eq!(
+        eg.eval_expr(&var("$copy")).unwrap().1,
+        eg.eval_expr(&var("$unsubstituted")).unwrap().1
+    );
+    assert_eq!(
+        eg.eval_expr(&var("$direct")).unwrap().1,
+        eg.eval_expr(&var("$nine")).unwrap().1
+    );
 }
 
 /// `$a = {Add (Num 0) x, Add $b x}` with `$b = Mul $a (Num 1)`: affected through
@@ -110,7 +125,7 @@ const UNGROUNDED_CYCLE: &str = r#"
 (let $b (Mul $a (Num 1)))
 (union $a (Add $b $x))
 (subsume (Add (Num 0) $x))
-(let $map (map-insert (map-empty) $x (Num 9)))
+(let $replacement (Num 9))
 "#;
 
 /// The same ungrounded cycle, with an acyclic affected branch beside it that
@@ -125,37 +140,23 @@ const UNGROUNDED_CYCLE_WITH_SIDE_BRANCH: &str = r#"
 (subsume (Add (Num 0) $x))
 (let $side (Add $x (Num 7)))
 (let $root (Mul $a $side))
-(let $map (map-insert (map-empty) $x (Num 9)))
+(let $replacement (Num 9))
 "#;
 
 #[test]
-fn a_failed_substitution_writes_nothing() {
+fn a_failed_substitution_writes_no_constructor_copies() {
     let mut eg = egraph(UNGROUNDED_CYCLE_WITH_SIDE_BRANCH);
     let before = eg.update(|state| Ok(state.table_size("Add"))).unwrap();
-
-    let root = global(&mut eg, "root");
-    let map = global(&mut eg, "map");
+    let err = eg
+        .parse_and_run_program(None, "(let $copy (unstable-subst $root $x $replacement))")
+        .unwrap_err();
     assert!(
-        egglog_experimental::subst(&mut eg, root, map).is_err(),
-        "expected the ungrounded cycle to fail"
+        err.to_string().contains("panicked"),
+        "expected a primitive panic, got {err}"
     );
 
     let after = eg.update(|state| Ok(state.table_size("Add"))).unwrap();
-    assert_eq!(before, after, "a failed substitution left rows behind");
-}
-
-/// The walk reports an ungrounded cycle instead of inventing an e-class id.
-#[test]
-fn an_ungrounded_cycle_is_an_error() {
-    let mut eg = egraph(UNGROUNDED_CYCLE);
-    let root = global(&mut eg, "a");
-    let map = global(&mut eg, "map");
-    let err = egglog_experimental::subst(&mut eg, root, map).unwrap_err();
-    let message = err.to_string();
-    assert!(
-        message.contains("unstable-subst") && message.contains("no order copies e-class"),
-        "expected an ungrounded-cycle error, got {message}"
-    );
+    assert_eq!(before, after, "a failed substitution wrote an Add copy");
 }
 
 /// A primitive cannot return an `Error`, and registering a custom panic message
@@ -166,7 +167,7 @@ fn an_ungrounded_cycle_is_an_error() {
 fn an_ungrounded_cycle_panics_from_egglog() {
     let mut eg = egraph(UNGROUNDED_CYCLE);
     let err = eg
-        .parse_and_run_program(None, "(let $copy (unstable-subst $a $map))")
+        .parse_and_run_program(None, "(let $copy (unstable-subst $a $x $replacement))")
         .unwrap_err();
     let message = err.to_string();
     assert!(
@@ -186,7 +187,7 @@ fn skips_subsumed_enodes() {
 (let $drop (Mul $x (Num 1)))
 (union $keep $drop)
 (subsume (Mul $x (Num 1)))
-(let $copy (unstable-subst $keep (map-insert (map-empty) $x (Num 6))))
+(let $copy (unstable-subst $keep $x (Num 6)))
 (check (= $copy (Add (Num 6) (Num 1))))
 "#,
     );
@@ -207,7 +208,7 @@ fn rejected_in_a_seminaive_rule_head() {
             r#"
 (constructor Beta (Math Math Math) Math)
 (rule ((= $lhs (Beta body from to)))
-      ((union $lhs (unstable-subst body (map-insert (map-empty) from to)))))
+      ((union $lhs (unstable-subst body from to))))
 "#,
         )
         .unwrap_err();
@@ -217,19 +218,21 @@ fn rejected_in_a_seminaive_rule_head() {
     );
 }
 
-/// A map from one sort to another cannot be a substitution: the replacement
-/// would not typecheck in the column it is written to.
+/// A source and target of distinct eq-sorts cannot form one pair: the target
+/// would not typecheck in the column where the source occurred. Separate pairs
+/// may still use separate eq-sorts.
 #[test]
-fn rejects_a_map_between_different_sorts() {
+fn rejects_a_pair_between_distinct_eq_sorts() {
     let mut eg = new_experimental_egraph();
     eg.parse_and_run_program(None, MATH).unwrap();
     let err = eg
         .parse_and_run_program(
             None,
             r#"
-(sort MathToInt (Map Math i64))
+(datatype Ty (TVar String) (IntTy))
 (let $x (Var "x"))
-(let $copy (unstable-subst $x (map-insert (map-empty) $x 3)))
+(let $a (TVar "a"))
+(let $copy (unstable-subst $x $x $a))
 "#,
         )
         .unwrap_err();
@@ -237,6 +240,70 @@ fn rejects_a_map_between_different_sorts() {
         matches!(err, Error::TypeError(_) | Error::TypeErrors(_)),
         "expected a type error, got {err}"
     );
+}
+
+#[test]
+fn rejects_non_eq_roots_and_pairs() {
+    let mut eg = new_experimental_egraph();
+    eg.parse_and_run_program(None, MATH).unwrap();
+    for program in [
+        "(let $copy (unstable-subst 1))",
+        r#"
+(let $x (Var "x"))
+(let $copy (unstable-subst $x 1 2))
+"#,
+    ] {
+        let err = eg.parse_and_run_program(None, program).unwrap_err();
+        assert!(
+            matches!(err, Error::TypeError(_) | Error::TypeErrors(_)),
+            "expected a type error, got {err}"
+        );
+    }
+}
+
+#[test]
+fn rejects_an_unpaired_source() {
+    let mut eg = new_experimental_egraph();
+    eg.parse_and_run_program(None, MATH).unwrap();
+    let err = eg
+        .parse_and_run_program(
+            None,
+            r#"
+(let $x (Var "x"))
+(let $copy (unstable-subst $x $x))
+"#,
+        )
+        .unwrap_err();
+    assert!(
+        matches!(err, Error::TypeError(_) | Error::TypeErrors(_)),
+        "expected a type error, got {err}"
+    );
+}
+
+#[test]
+fn rejects_duplicate_sources() {
+    let mut eg = egraph(
+        r#"
+(let $x (Var "x"))
+(let $alias (Var "alias"))
+(union $x $alias)
+(let $e (Add $x (Num 1)))
+(let $replacement (Num 2))
+"#,
+    );
+    let before = eg.update(|state| Ok(state.table_size("Add"))).unwrap();
+    let err = eg
+        .parse_and_run_program(
+            None,
+            "(let $copy (unstable-subst $e $x $replacement $alias $replacement))",
+        )
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("panicked"),
+        "expected a primitive panic, got {err}"
+    );
+    let after = eg.update(|state| Ok(state.table_size("Add"))).unwrap();
+    assert_eq!(before, after, "a duplicate source wrote an Add copy");
 }
 
 /// The walk keeps its own stack, so a deep term does not turn into deep
@@ -252,27 +319,10 @@ fn handles_a_deep_spine() {
     let mut eg = egraph(&program);
     eg.parse_and_run_program(
         None,
-        &format!("(let $copy (unstable-subst $e{DEPTH} (map-insert (map-empty) $x (Num 0))))"),
+        &format!("(let $copy (unstable-subst $e{DEPTH} $x (Num 0)))"),
     )
     .unwrap();
     // Every one of the spine's `Add`s mentions `x`, so all of them are copied.
     let adds = eg.update(|fs| Ok(fs.table_size("Add"))).unwrap();
     assert_eq!(adds, Some(2 * DEPTH));
-}
-
-/// The Rust-level entry point, which takes the map as a container value.
-#[test]
-fn the_rust_api_substitutes() {
-    let mut eg = egraph(
-        r#"
-(let $x (Var "x"))
-(let $e (Add $x (Num 1)))
-(let $map (map-insert (map-empty) $x (Num 2)))
-(let $expected (Add (Num 2) (Num 1)))
-"#,
-    );
-    let root = global(&mut eg, "e");
-    let map = global(&mut eg, "map");
-    let copy = egglog_experimental::subst(&mut eg, root, map).unwrap();
-    assert_eq!(copy, global(&mut eg, "expected"));
 }

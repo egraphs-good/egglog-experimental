@@ -1,51 +1,11 @@
-//! Substitution over a reachable sub-e-graph: the `unstable-subst` primitive.
+//! Implementation of `(unstable-subst root from1 to1 ...)`.
 //!
-//! `(unstable-subst root map)` takes an e-class `root` of any eq-sort and a
-//! `Map` whose key and value sorts are the same eq-sort. It walks the
-//! constructor rows reachable from `root`, copies the part of that sub-e-graph
-//! the substitution actually touches while replacing each key e-class with its
-//! mapped value, and returns the e-class of the copied root.
-//!
-//! The walk follows constructor rows only — `function` rows are analyses over
-//! the term structure, not part of it — and reaches through container-valued
-//! children, rebuilding them with substituted contents.
-//!
-//! Unaffected e-classes are shared with the original rather than copied, so
-//! substituting an empty map returns `root` itself and writes nothing.
-//!
-//! # Warning: `root` must already exist
-//!
-//! Pass a root the rule's query bound, or one from an earlier command — not a
-//! term the enclosing action just built.
-//!
-//! The walk reads committed table contents, and an action's writes stay staged
-//! until it finishes. A root this action built has no rows yet, so the walk
-//! finds no e-nodes under it, nothing is affected, and it comes back
-//! **unchanged and without an error**. `(unstable-subst (Mul x y) m)`, building
-//! its own argument, silently does nothing. The same applies to any term under
-//! the root that the action just built: it is not there to be substituted.
-//!
-//! Replacements are not affected — a map's values are spliced into the copy
-//! without being walked, so those can be built in the same action.
-//!
-//! # Other properties worth knowing
-//!
-//! - The region's equations are substituted along with its terms. Copying an
-//!   e-class copies every one of its e-nodes, so `t1 = t2` in the original
-//!   becomes `σ(t1) = σ(t2)` in the copy — and an e-node with no substituted
-//!   children copies to itself, merging the copy back into the original class.
-//!   That is correct for equations that hold for every value of the substituted
-//!   classes (anything a rewrite rule derived) and wrong for a ground `union`
-//!   pinning one of them down, so only substitute classes that behave like
-//!   universally quantified variables.
-//! - The snapshot comes from live table contents, so this is a `Context::Full`
-//!   primitive: top-level actions and `:naive` rule heads only.
-//!
-//! Copies are named by `lookup_or_insert`, the same way `(Add a b)` in an
-//! action is, so no e-class id is ever invented here. A cyclic e-class can
-//! therefore only be copied if it has an e-node whose children all lie outside
-//! the cycle to name it first — `x = {Var "x", Add x (Num 0)}` does, and works.
-//! A cycle with no such e-node is an error rather than a silent partial copy.
+//! Source/target pairs may use different eq-sorts and are applied
+//! simultaneously while copying the affected constructor subgraph. The root
+//! must have committed rows when traversal is needed; copied equations are
+//! sound only when substitution preserves their derivations and premises. See
+//! `docs/unstable-subst.md` for the complete interface, safety boundary,
+//! algorithm, and cost model.
 
 use std::any::TypeId;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
@@ -53,14 +13,12 @@ use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use egglog::api::RawValues;
 use egglog::ast::Span;
 use egglog::constraint::{self, Constraint, ImpossibleConstraint, TypeConstraint};
-use egglog::sort::MapContainer;
 use egglog::{
-    ArcSort, Atom, AtomTerm, Core, EGraph, Error, FullPrim, FullState, FuncType, Primitive, Read,
-    TypeInfo, Value, Write,
+    ArcSort, Atom, AtomTerm, Core, Error, FullPrim, FullState, FuncType, Primitive, Read, TypeInfo,
+    Value, Write,
 };
 
-/// The name of the primitive, as written in an egglog program.
-pub const SUBST: &str = "unstable-subst";
+const SUBST: &str = "unstable-subst";
 
 /// A constructor the walk can follow.
 type Constructor<'a> = &'a FuncType;
@@ -140,6 +98,7 @@ fn constructors<'db>(state: &FullState<'_, 'db>) -> Vec<Constructor<'db>> {
     let names: Vec<String> = state
         .table_sizes()
         .into_iter()
+        .filter(|&(_, size)| size != 0)
         .map(|(name, _)| name.to_owned())
         .collect();
     names
@@ -156,10 +115,11 @@ fn constructors<'db>(state: &FullState<'_, 'db>) -> Vec<Constructor<'db>> {
 /// Substitute `map` through the sub-e-graph reachable from `root`, returning
 /// the root of the copy. See the module docs for the semantics.
 ///
-/// `root` must be an e-class that already has rows: one the query bound, or
-/// one from an earlier command. A root the enclosing action just built is not
-/// in the tables yet and comes back unchanged, with no error.
-pub fn substitute<'db>(
+/// When traversal is needed, `root` must be an e-class that already has rows:
+/// one the query bound, or one from an earlier command. A root the enclosing
+/// action just built is not in the tables yet and comes back unchanged, with
+/// no error. A root that is itself a source returns its target without a walk.
+fn substitute<'db>(
     state: &mut FullState<'_, 'db>,
     root: Value,
     map: &BTreeMap<Value, Value>,
@@ -317,16 +277,8 @@ impl Walk<'_> {
         }
     }
 
-    /// Copy the affected e-classes and return the root's image.
-    ///
-    /// Every copied e-node goes in through `lookup_or_insert`, so egglog names
-    /// the copy's e-class — nothing here invents an id. That is why this is a
-    /// sweep rather than a single postorder pass: an e-node can only be copied
-    /// once its children have copies, and a cycle in the copied region needs
-    /// one e-node whose children all lie outside it to get started. A cycle
-    /// with no such e-node is reported instead.
-    /// The e-classes a copy of `node` needs to exist first, direct children and
-    /// container leaves alike.
+    /// The e-classes a copy of `node` needs to resolve first, including leaves
+    /// reached through containers.
     fn node_deps(&self, node: &ENode) -> Vec<Value> {
         let ctor = self.ctors[node.ctor];
         let mut deps = Vec::new();
@@ -357,8 +309,8 @@ impl Walk<'_> {
     ///
     /// Doing this before the first write is what keeps a failure from leaving a
     /// partial copy behind: egglog flushes an action's staged writes even when
-    /// it ends in an error, so a sweep that discovered an ungrounded cycle only
-    /// after copying its way up to it could not take those rows back.
+    /// it ends in an error, so a write pass that discovered an ungrounded cycle
+    /// only after copying its way up to it could not take those rows back.
     fn plan(&self, root: Value) -> Result<Vec<Value>, Error> {
         let region = self.postorder(root);
         let mut copyable: HashSet<Value> = HashSet::new();
@@ -479,7 +431,10 @@ impl Walk<'_> {
                     }
                     stack.push(Frame::Exit(eclass));
                     for dep in self.snapshot.deps.get(&eclass).into_iter().flatten() {
-                        if self.needs_copy(*dep) && !seen.contains(dep) {
+                        if self.affected.contains(dep)
+                            && !self.map.contains_key(dep)
+                            && !seen.contains(dep)
+                        {
                             stack.push(Frame::Enter(*dep));
                         }
                     }
@@ -488,12 +443,6 @@ impl Walk<'_> {
             }
         }
         order
-    }
-
-    /// Whether this e-class gets a copy: affected, and not a key (a key is
-    /// replaced outright rather than copied).
-    fn needs_copy(&self, eclass: Value) -> bool {
-        self.affected.contains(&eclass) && !self.map.contains_key(&eclass)
     }
 
     /// The substituted children of `node`, or `None` if some child's copy does
@@ -562,8 +511,7 @@ impl Walk<'_> {
             });
             // `collect` already read this value's contents through the same
             // sort, so it is a container of this type.
-            debug_assert!(mapped.is_some(), "{container:?} is not a {type_id:?}");
-            mapped.unwrap_or(container)
+            mapped.expect("collect read this value as the same container type")
         };
         self.container_images.insert(container, image);
         Some(image)
@@ -574,31 +522,14 @@ fn error(message: String) -> Error {
     Error::BackendError(format!("{SUBST}: {message}"))
 }
 
-/// Substitute through the sub-e-graph reachable from `root`, returning the
-/// e-class of the copy. The top-level form of the [`SUBST`] primitive.
+/// The full-context `(unstable-subst root from1 to1 ...)` primitive.
 ///
-/// `map` must be a `Map` container value whose key and value sorts are the same
-/// eq-sort; `root` may be of any eq-sort. Constructor rows reachable from
-/// `root` are copied with each key e-class replaced by its mapped value;
-/// e-classes the substitution does not affect are shared with the original
-/// rather than copied.
+/// [`new_experimental_egraph`](crate::new_experimental_egraph) registers it by
+/// default. Callers must ensure that substitution preserves the derivation and
+/// every premise of each copied equation; see the [guide] for the full semantic
+/// safety boundary.
 ///
-/// `root` must be an e-class that already has rows — see the module docs.
-///
-/// Errors if the substituted region contains a cycle in which every e-node
-/// refers back into the cycle, since naming that copy would require an e-class
-/// id no row produces.
-pub fn subst(egraph: &mut EGraph, root: Value, map: Value) -> Result<Value, Error> {
-    egraph.update(|mut state| {
-        let entries = match state.value_to_container::<MapContainer>(map) {
-            Some(entries) => entries.data.clone(),
-            None => return Err(error(format!("{map:?} is not a Map container value"))),
-        };
-        substitute(&mut state, root, &entries)
-    })
-}
-
-/// The `unstable-subst` primitive.
+/// [guide]: https://github.com/egraphs-good/egglog-experimental/blob/main/docs/unstable-subst.md
 #[derive(Clone)]
 pub struct Subst;
 
@@ -613,25 +544,32 @@ impl Primitive for Subst {
 }
 
 impl FullPrim for Subst {
-    /// Returns `None` only for a substitution this cannot perform — today just
-    /// an ungrounded cycle — having first raised a primitive panic, so the
-    /// program stops rather than continuing with a missing value. The shapes
-    /// the typechecker already rules out panic instead, since reaching them
-    /// means a bug here rather than a program egglog should have rejected.
+    /// Returns `None` only after raising a primitive panic, so the program
+    /// stops rather than continuing with a missing value. Shapes the
+    /// typechecker rules out panic directly, since reaching one means a bug
+    /// here rather than a program egglog should have admitted.
     fn apply<'a, 'db>(&self, mut state: FullState<'a, 'db>, args: &[Value]) -> Option<Value> {
-        let [root, map] = args else {
+        let Some((root, flat_pairs)) = args.split_first() else {
             panic!(
-                "{SUBST} takes a root and a map; the typechecker admitted {} arguments",
-                args.len()
+                "{SUBST} takes a root followed by source/target pairs; \
+                 the typechecker admitted no arguments"
             )
         };
-        // Cloned out so the container registry is not still borrowed when the
-        // walk starts interning new containers.
-        let entries = state
-            .value_to_container::<MapContainer>(*map)
-            .unwrap_or_else(|| panic!("{SUBST}'s type constraint admits only `Map` values"))
-            .data
-            .clone();
+        let mut pairs = flat_pairs.chunks_exact(2);
+        if !pairs.remainder().is_empty() {
+            panic!(
+                "{SUBST} takes source/target pairs; the typechecker admitted {} arguments",
+                args.len()
+            )
+        }
+        let mut entries = BTreeMap::new();
+        for pair in &mut pairs {
+            if entries.insert(pair[0], pair[1]).is_some() {
+                log::error!("{SUBST}: source {:?} appears more than once", pair[0]);
+                state.panic();
+                return None;
+            }
+        }
         match substitute(&mut state, *root, &entries) {
             Ok(image) => Some(image),
             Err(err) => {
@@ -647,13 +585,7 @@ impl FullPrim for Subst {
     }
 }
 
-/// `(unstable-subst root map) : (R, Map<K, K>) -> R` for any eq-sort `R`.
-///
-/// `R` is free rather than pinned to `K` because a substitution reaches through
-/// every sort in the term structure, so a root of one sort can perfectly well
-/// be rewritten by a map over another. `K` must be an eq-sort mapping to
-/// itself: replacing a `K`-sorted child with a value of another sort would
-/// produce an ill-typed row.
+/// `(unstable-subst root from1 to1 ...) : (R, K1, K1, ...) -> R`.
 struct SubstTypeConstraint {
     span: Span,
 }
@@ -664,7 +596,9 @@ impl TypeConstraint for SubstTypeConstraint {
         arguments: &[AtomTerm],
         typeinfo: &TypeInfo,
     ) -> Vec<Box<dyn Constraint<AtomTerm, ArcSort>>> {
-        let [root, map, out] = arguments else {
+        // `arguments` includes the output term, so valid calls have an even
+        // length: root, zero or more source/target pairs, output.
+        if arguments.len() < 2 || !arguments.len().is_multiple_of(2) {
             return vec![constraint::impossible(
                 ImpossibleConstraint::ArityMismatch {
                     atom: Atom {
@@ -672,48 +606,33 @@ impl TypeConstraint for SubstTypeConstraint {
                         head: SUBST.to_owned(),
                         args: arguments.to_vec(),
                     },
-                    expected: 3,
+                    expected: arguments.len() + 1,
                 },
             )];
-        };
+        }
 
-        let mut cs: Vec<Box<dyn Constraint<AtomTerm, ArcSort>>> =
-            vec![constraint::eq(root.clone(), out.clone())];
-
-        // One instantiation per declared sort that could stand in each
-        // position; `xor` defers until the surrounding program pins it down.
-        //
-        // A `Map` sort is identified by the Rust type its values intern
-        // under, since the `ContainerSort` impl behind an `ArcSort` is
-        // wrapped in a private type that out-of-tree code cannot downcast to.
-        let mut map_sorts: Vec<ArcSort> = typeinfo.get_arcsorts_by(|sort| {
-            sort.value_type() == Some(TypeId::of::<MapContainer>())
-                && match sort.inner_sorts().as_slice() {
-                    [key, value] => key.is_eq_sort() && key.name() == value.name(),
-                    _ => false,
-                }
-        });
-        map_sorts.sort_by_key(|sort| sort.name().to_owned());
-        cs.push(constraint::xor(
-            map_sorts
-                .into_iter()
-                .map(|sort| constraint::assign(map.clone(), sort))
-                .collect(),
-        ));
+        let (out, inputs) = arguments.split_last().expect("checked two arguments");
+        let (root, flat_pairs) = inputs.split_first().expect("checked for a root");
+        let mut cs: Vec<Box<dyn Constraint<AtomTerm, ArcSort>>> = Vec::new();
 
         let mut eq_sorts = typeinfo.get_arcsorts_by(|sort| sort.is_eq_sort());
         eq_sorts.sort_by_key(|sort| sort.name().to_owned());
+        cs.push(constraint::eq(root.clone(), out.clone()));
         cs.push(constraint::xor(
             eq_sorts
-                .into_iter()
-                .map(|sort| {
-                    constraint::and(vec![
-                        constraint::assign(root.clone(), sort.clone()),
-                        constraint::assign(out.clone(), sort),
-                    ])
-                })
+                .iter()
+                .map(|sort| constraint::assign(root.clone(), sort.clone()))
                 .collect(),
         ));
+        for pair in flat_pairs.chunks_exact(2) {
+            cs.push(constraint::eq(pair[0].clone(), pair[1].clone()));
+            cs.push(constraint::xor(
+                eq_sorts
+                    .iter()
+                    .map(|sort| constraint::assign(pair[0].clone(), sort.clone()))
+                    .collect(),
+            ));
+        }
 
         cs
     }

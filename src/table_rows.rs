@@ -6,8 +6,7 @@
 //! helper dispatches on the subtype and hands the callback the whole row —
 //! inputs followed by the output (or eclass) column.
 
-use egglog::ast::FunctionSubtype;
-use egglog::{EGraph, Error, Read, Value};
+use egglog::{ApiError, EGraph, Error, Value};
 
 /// Call `f` once per row of `name`, with every column in schema order.
 pub(crate) fn for_each_row(
@@ -34,8 +33,15 @@ pub(crate) fn for_each_row(
 }
 
 /// Whether `name` is a constructor (or relation) table rather than a
-/// `function` table. Unknown tables report `false`; the scan that follows
-/// reports the missing table.
+/// `function` table.
+///
+/// egglog exposes no subtype accessor on [`egglog::Function`], so probe with a
+/// constructor scan that stops before reading a row and read the answer off the
+/// subtype check, which runs before any iteration.
 pub(crate) fn is_constructor(egraph: &EGraph, name: &str) -> Result<bool, Error> {
-    Ok(egraph.read(|state| state.table_subtype(name)) == Some(FunctionSubtype::Constructor))
+    match egraph.constructor_enodes_while(name, |_| false) {
+        Ok(()) => Ok(true),
+        Err(Error::ApiError(ApiError::WrongSubtype { .. })) => Ok(false),
+        Err(err) => Err(err),
+    }
 }

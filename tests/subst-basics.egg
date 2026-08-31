@@ -7,14 +7,13 @@
   (Var String)
   (Add Math Math)
   (Mul Math Math))
-(sort MathToMath (Map Math Math))
 
 ;; Every occurrence of a key is replaced.
 (push)
 (let $x (Var "x"))
 (let $y (Var "y"))
 (let $e (Add $x (Mul $x (Num 2))))
-(let $copy (unstable-subst $e (map-insert (map-empty) $x $y)))
+(let $copy (unstable-subst $e $x $y))
 (check (= $copy (Add $y (Mul $y (Num 2)))))
 (fail (check (= $copy $e)))
 (pop)
@@ -24,34 +23,42 @@
 (let $x (Var "x"))
 (let $y (Var "y"))
 (let $e (Add $x $y))
-(let $copy (unstable-subst $e (map-insert (map-insert (map-empty) $x $y) $y $x)))
+(let $copy (unstable-subst $e $x $y $y $x))
 (check (= $copy (Add $y $x)))
 (pop)
 
-;; Copying an e-class copies all of its e-nodes, so an equation that holds for
-;; every value of the substituted class survives: `x * 0 = 0` stays `5 * 0 = 0`.
+;; Copying an e-class copies all of its e-nodes. This is sound when the
+;; derivation's premises are preserved by substitution: an unconditional
+;; `x * 0 = 0` stays `5 * 0 = 0`.
 (push)
 (rewrite (Mul a (Num 0)) (Num 0))
 (let $x (Var "x"))
 (let $e (Mul $x (Num 0)))
 (run 1)
 (check (= $e (Num 0)))
-(let $copy (unstable-subst $e (map-insert (map-empty) $x (Num 5))))
+(let $copy (unstable-subst $e $x (Num 5)))
 (check (= $copy (Mul (Num 5) (Num 0))))
 (check (= $copy (Num 0)))
 (pop)
 
-;; The same mechanism is unsound on a *ground* equation, which holds only for
-;; the class it pins down: `x + 1 = 5` says `x = 4`, so substituting `x := 9`
-;; asserts `9 + 1 = 5`. Only substitute classes that behave like universally
-;; quantified variables.
+;; The same mechanism is unsound when a derivation's premise is not preserved.
+;; `Special x` proves `x * 0 = 0`, but substituting `x := y` also copies that
+;; equation even though `Special y` is false. Callers must establish the
+;; stronger, premise-preservation condition; merely deriving an equation from
+;; a rule is not enough.
 (push)
+(relation Special (Math))
+(rule ((Special a)) ((union (Mul a (Num 0)) (Num 0))))
 (let $x (Var "x"))
-(let $e (Add $x (Num 1)))
-(union $e (Num 5))
-(let $copy (unstable-subst $e (map-insert (map-empty) $x (Num 9))))
-(check (= $copy (Add (Num 9) (Num 1))))
-(check (= $copy (Num 5)))
+(let $y (Var "y"))
+(Special $x)
+(run 1)
+(let $e (Mul $x (Num 0)))
+(check (= $e (Num 0)))
+(fail (check (Special $y)))
+(let $copy (unstable-subst $e $x $y))
+(check (= $copy (Mul $y (Num 0))))
+(check (= $copy (Num 0)))
 (pop)
 
 ;; A key e-class is replaced whole, never walked into, so the other e-nodes in
@@ -62,7 +69,7 @@
 (let $one (Num 1))
 (union $x $one)
 (let $e (Add $x (Num 3)))
-(let $copy (unstable-subst $e (map-insert (map-empty) $x (Num 2))))
+(let $copy (unstable-subst $e $x (Num 2)))
 (check (= $copy (Add (Num 2) (Num 3))))
 (fail (check (= (Num 1) (Num 2))))
 (check (= (Num 1) (Var "x")))
@@ -74,7 +81,7 @@
 (push)
 (let $x (Var "x"))
 (let $e (Add $x (Num 1)))
-(let $copy (unstable-subst $e (map-insert (map-empty) $x (Mul (Num 2) (Num 3)))))
+(let $copy (unstable-subst $e $x (Mul (Num 2) (Num 3))))
 (check (= $copy (Add (Mul (Num 2) (Num 3)) (Num 1))))
 (pop)
 
@@ -86,7 +93,7 @@
 (constructor Delay (Thunk) Math)
 (let $x (Var "x"))
 (let $e (Delay (unstable-fn "Add" $x (Num 1))))
-(let $copy (unstable-subst $e (map-insert (map-empty) $x (Num 5))))
+(let $copy (unstable-subst $e $x (Num 5)))
 (check (= $copy (Delay (unstable-fn "Add" (Num 5) (Num 1)))))
 (fail (check (= $copy $e)))
 (pop)
@@ -98,19 +105,32 @@
 (let $x (Var "x"))
 (let $loop (Add $x (Num 0)))
 (union $loop (Add $loop (Num 0)))
-(let $copy (unstable-subst $loop (map-insert (map-empty) $x (Num 7))))
+(let $copy (unstable-subst $loop $x (Num 7)))
 (check (= $copy (Add (Num 7) (Num 0))))
 (check (= $copy (Add $copy (Num 0))))
 (pop)
 
-;; The root's sort is free: it need not be the map's key sort, because a
-;; substitution reaches through every sort in the term structure.
+;; The root's sort is independent of every substitution pair because the walk
+;; reaches through every sort in the term structure.
 (push)
 (datatype MathList (Nil) (Cons Math MathList))
 (let $x (Var "x"))
 (let $list (Cons $x (Cons (Num 1) (Nil))))
-(let $copy (unstable-subst $list (map-insert (map-empty) $x (Num 8))))
+(let $copy (unstable-subst $list $x (Num 8)))
 (check (= $copy (Cons (Num 8) (Cons (Num 1) (Nil)))))
+(pop)
+
+;; Each source/target pair may have its own eq-sort. This is needed for a
+;; function body whose parameters have different sorts: both substitutions
+;; happen in one simultaneous traversal.
+(push)
+(datatype Ty (TVar String) (IntTy))
+(datatype TypedExpr (Ann Math Ty))
+(let $x (Var "x"))
+(let $a (TVar "a"))
+(let $body (Ann $x $a))
+(let $copy (unstable-subst $body $x (Num 4) $a (IntTy)))
+(check (= $copy (Ann (Num 4) (IntTy))))
 (pop)
 
 ;; E-classes reached only through a container child are substituted, and the
@@ -120,7 +140,7 @@
 (constructor Sum (MathVec) Math)
 (let $x (Var "x"))
 (let $e (Sum (vec-of $x (Num 1))))
-(let $copy (unstable-subst $e (map-insert (map-empty) $x (Num 4))))
+(let $copy (unstable-subst $e $x (Num 4)))
 (check (= $copy (Sum (vec-of (Num 4) (Num 1)))))
 (pop)
 
@@ -130,7 +150,7 @@
 (constructor Tagged (Math Ints) Math)
 (let $x (Var "x"))
 (let $e (Tagged $x (vec-of 1 2)))
-(let $copy (unstable-subst $e (map-insert (map-empty) $x (Num 5))))
+(let $copy (unstable-subst $e $x (Num 5)))
 (check (= $copy (Tagged (Num 5) (vec-of 1 2))))
 (pop)
 
@@ -140,7 +160,7 @@
 (let $x (Var "x"))
 (let $y (Add $x (Num 1)))
 (let $e (Mul $x $y))
-(let $copy (unstable-subst $e (map-insert (map-empty) $x $y)))
+(let $copy (unstable-subst $e $x $y))
 (check (= $copy (Mul $y (Add $y (Num 1)))))
 (pop)
 
@@ -149,7 +169,7 @@
 (push)
 (constructor Beta (Math Math Math) Math)
 (rule ((= lhs (Beta body from to)))
-      ((union lhs (unstable-subst body (map-insert (map-empty) from to))))
+      ((union lhs (unstable-subst body from to)))
       :naive)
 (let $x (Var "x"))
 (let $b (Beta (Add $x $x) $x (Num 3)))
@@ -166,6 +186,6 @@
 (let $inner (Neg $x))
 (pop)
 (let $e (Add $x (Num 1)))
-(let $copy (unstable-subst $e (map-insert (map-empty) $x (Num 2))))
+(let $copy (unstable-subst $e $x (Num 2)))
 (check (= $copy (Add (Num 2) (Num 1))))
 (pop)
