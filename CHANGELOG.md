@@ -10,7 +10,7 @@ This file records notable user-facing changes to egglog-experimental.
   reaches this soft threshold, further rules are delayed. Each check sees
   earlier rule actions, but one rule may add any number of nodes and the
   deferred rebuild may change the count again.
-- The `(get-node-size!)` primitive: the visible constructor-row count of an
+- The `(get-node-size!)` primitive: the visible e-node count of an
   ordinary experimental e-graph, excluding relations, analysis functions,
   global aliases, hidden declarations, and internal-prefixed implementation
   tables. This is the same measure `:node-limit` uses there.

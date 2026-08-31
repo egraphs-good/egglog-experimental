@@ -4,7 +4,7 @@
 //! `(get-size! "A" "B")` returns the sum for the named tables. The primitive
 //! is read-capable, so it can also be used in extended schedule guards and
 //! `eval` steps.
-//! `(get-node-size!)` returns the visible constructor-node count.
+//! `(get-node-size!)` returns the visible e-node count.
 
 use std::convert::TryFrom;
 
