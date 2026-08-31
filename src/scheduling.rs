@@ -18,7 +18,7 @@
 //! - **`(run-with scheduler [ruleset] [:until cond])`** — like `run`, but drives
 //!   the ruleset with a named scheduler previously bound by `let-scheduler`.
 //! - **`(let-scheduler name (scheduler-kind args...))`** — bind `name` to a fresh
-//!   scheduler instance (e.g. `(back-off :match-limit 1000 :node-limit 5000)`). A
+//!   scheduler instance (e.g. `(back-off :match-limit 1000 :ban-length 5 :node-limit 5000)`). A
 //!   binding inside `run-schedule` is scoped to its enclosing block; a top-level
 //!   binding persists on the e-graph.
 //! - **`(seq step...)`** — run each step once, in order.

@@ -59,7 +59,7 @@ impl ReadPrim for GetSizePrimitive {
     }
 }
 
-/// `(get-node-size!)`: the row count of visible constructor tables whose
+/// `(get-node-size!)`: the number of e-nodes in visible constructor tables whose
 /// output is a unionable eq-sort.
 ///
 /// Unlike `(get-size!)`, it excludes relations, analysis functions, global

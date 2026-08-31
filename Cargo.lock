@@ -332,7 +332,7 @@ checksum = "d0881ea181b1df73ff77ffaaf9c7544ecc11e82fba9b5f27b262a3c73a332555"
 [[package]]
 name = "egglog"
 version = "3.0.0"
-source = "git+https://github.com/saulshanabrook/egg-smol.git?rev=ea9f1fa9b39cf330fc96ea553386a0c6802b07a6#ea9f1fa9b39cf330fc96ea553386a0c6802b07a6"
+source = "git+https://github.com/saulshanabrook/egg-smol.git?rev=c96c0e6a7ef60d102ab482a141b2996e0cddbc2f#c96c0e6a7ef60d102ab482a141b2996e0cddbc2f"
 dependencies = [
  "chrono",
  "clap",
@@ -364,7 +364,7 @@ dependencies = [
 [[package]]
 name = "egglog-add-primitive"
 version = "3.0.0"
-source = "git+https://github.com/saulshanabrook/egg-smol.git?rev=ea9f1fa9b39cf330fc96ea553386a0c6802b07a6#ea9f1fa9b39cf330fc96ea553386a0c6802b07a6"
+source = "git+https://github.com/saulshanabrook/egg-smol.git?rev=c96c0e6a7ef60d102ab482a141b2996e0cddbc2f#c96c0e6a7ef60d102ab482a141b2996e0cddbc2f"
 dependencies = [
  "quote",
  "syn 2.0.119",
@@ -373,7 +373,7 @@ dependencies = [
 [[package]]
 name = "egglog-ast"
 version = "3.0.0"
-source = "git+https://github.com/saulshanabrook/egg-smol.git?rev=ea9f1fa9b39cf330fc96ea553386a0c6802b07a6#ea9f1fa9b39cf330fc96ea553386a0c6802b07a6"
+source = "git+https://github.com/saulshanabrook/egg-smol.git?rev=c96c0e6a7ef60d102ab482a141b2996e0cddbc2f#c96c0e6a7ef60d102ab482a141b2996e0cddbc2f"
 dependencies = [
  "ordered-float",
 ]
@@ -381,7 +381,7 @@ dependencies = [
 [[package]]
 name = "egglog-bridge"
 version = "3.0.0"
-source = "git+https://github.com/saulshanabrook/egg-smol.git?rev=ea9f1fa9b39cf330fc96ea553386a0c6802b07a6#ea9f1fa9b39cf330fc96ea553386a0c6802b07a6"
+source = "git+https://github.com/saulshanabrook/egg-smol.git?rev=c96c0e6a7ef60d102ab482a141b2996e0cddbc2f#c96c0e6a7ef60d102ab482a141b2996e0cddbc2f"
 dependencies = [
  "anyhow",
  "dyn-clone",
@@ -404,7 +404,7 @@ dependencies = [
 [[package]]
 name = "egglog-concurrency"
 version = "3.0.0"
-source = "git+https://github.com/saulshanabrook/egg-smol.git?rev=ea9f1fa9b39cf330fc96ea553386a0c6802b07a6#ea9f1fa9b39cf330fc96ea553386a0c6802b07a6"
+source = "git+https://github.com/saulshanabrook/egg-smol.git?rev=c96c0e6a7ef60d102ab482a141b2996e0cddbc2f#c96c0e6a7ef60d102ab482a141b2996e0cddbc2f"
 dependencies = [
  "arc-swap",
  "bumpalo",
@@ -416,7 +416,7 @@ dependencies = [
 [[package]]
 name = "egglog-core-relations"
 version = "3.0.0"
-source = "git+https://github.com/saulshanabrook/egg-smol.git?rev=ea9f1fa9b39cf330fc96ea553386a0c6802b07a6#ea9f1fa9b39cf330fc96ea553386a0c6802b07a6"
+source = "git+https://github.com/saulshanabrook/egg-smol.git?rev=c96c0e6a7ef60d102ab482a141b2996e0cddbc2f#c96c0e6a7ef60d102ab482a141b2996e0cddbc2f"
 dependencies = [
  "anyhow",
  "bumpalo",
@@ -458,12 +458,12 @@ dependencies = [
 [[package]]
 name = "egglog-numeric-id"
 version = "3.0.0"
-source = "git+https://github.com/saulshanabrook/egg-smol.git?rev=ea9f1fa9b39cf330fc96ea553386a0c6802b07a6#ea9f1fa9b39cf330fc96ea553386a0c6802b07a6"
+source = "git+https://github.com/saulshanabrook/egg-smol.git?rev=c96c0e6a7ef60d102ab482a141b2996e0cddbc2f#c96c0e6a7ef60d102ab482a141b2996e0cddbc2f"
 
 [[package]]
 name = "egglog-reports"
 version = "3.0.0"
-source = "git+https://github.com/saulshanabrook/egg-smol.git?rev=ea9f1fa9b39cf330fc96ea553386a0c6802b07a6#ea9f1fa9b39cf330fc96ea553386a0c6802b07a6"
+source = "git+https://github.com/saulshanabrook/egg-smol.git?rev=c96c0e6a7ef60d102ab482a141b2996e0cddbc2f#c96c0e6a7ef60d102ab482a141b2996e0cddbc2f"
 dependencies = [
  "clap",
  "hashbrown 0.16.1",
@@ -477,7 +477,7 @@ dependencies = [
 [[package]]
 name = "egglog-union-find"
 version = "3.0.0"
-source = "git+https://github.com/saulshanabrook/egg-smol.git?rev=ea9f1fa9b39cf330fc96ea553386a0c6802b07a6#ea9f1fa9b39cf330fc96ea553386a0c6802b07a6"
+source = "git+https://github.com/saulshanabrook/egg-smol.git?rev=c96c0e6a7ef60d102ab482a141b2996e0cddbc2f#c96c0e6a7ef60d102ab482a141b2996e0cddbc2f"
 dependencies = [
  "crossbeam",
  "egglog-concurrency",
