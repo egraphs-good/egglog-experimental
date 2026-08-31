@@ -4,6 +4,16 @@ This file records notable user-facing changes to egglog-experimental.
 
 ## [Unreleased]
 
+### Added
+
+- Greedy DAG extraction for `extract`, `multi-extract`, and `keep-best` via
+  `:extractor greedy-dag`.
+
+### Changed
+
+- `keep-best` now honors dynamic costs assigned by `set-cost` in both tree and
+  greedy-DAG extraction modes.
+
 ## [3.0.0] - 2026-08-20
 
 This is the first crates.io release of egglog-experimental. Its major version
