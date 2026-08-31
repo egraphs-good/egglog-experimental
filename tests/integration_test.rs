@@ -1845,23 +1845,21 @@ fn test_unknown_trailing_extractor_is_still_rejected() {
     );
 }
 
-#[test]
-fn test_greedy_dag_discovery_handles_deep_constructor_chains() {
-    const DEPTH: usize = 20_000;
-
-    // The unextractable leaf prevents reconstruction, isolating the discovery
-    // traversal. Run the CLI as a child process so a stack-overflow regression
-    // is reported as a test failure instead of aborting this test process.
-    let mut program = String::from(
-        "(sort E)\n(constructor Bottom () E :unextractable)\n(constructor Next (E) E)\n(let $x0 (Bottom))\n",
+fn run_deep_greedy_dag_chain(
+    depth: usize,
+    bottom_options: &str,
+    label: &str,
+) -> std::process::Output {
+    let mut program = format!(
+        "(sort E)\n(constructor Bottom () E {bottom_options})\n(constructor Next (E) E)\n(let $x0 (Bottom))\n"
     );
-    for depth in 1..DEPTH {
+    for depth in 1..depth {
         writeln!(program, "(let $x{depth} (Next $x{}))", depth - 1).unwrap();
     }
-    writeln!(program, "(extract $x{} :extractor greedy-dag)", DEPTH - 1).unwrap();
+    writeln!(program, "(extract $x{} :extractor greedy-dag)", depth - 1).unwrap();
 
     let path = std::env::temp_dir().join(format!(
-        "egglog-greedy-dag-deep-discovery-{}.egg",
+        "egglog-greedy-dag-deep-{label}-{}.egg",
         std::process::id()
     ));
     fs::write(&path, program).unwrap();
@@ -1870,11 +1868,26 @@ fn test_greedy_dag_discovery_handles_deep_constructor_chains() {
         .output()
         .unwrap();
     fs::remove_file(path).unwrap();
+    output
+}
 
+#[test]
+fn test_greedy_dag_discovery_handles_deep_constructor_chains() {
+    // The unextractable leaf prevents reconstruction, isolating the discovery
+    // traversal. Run the CLI as a child process so a stack-overflow regression
+    // is reported as a test failure instead of aborting this test process.
+    let output = run_deep_greedy_dag_chain(20_000, ":unextractable", "discovery");
     let stderr = String::from_utf8(output.stderr).unwrap();
     assert_eq!(output.status.code(), Some(1), "unexpected status: {stderr}");
     assert!(
         stderr.contains("Unable to find any valid extraction"),
         "unexpected error: {stderr}"
     );
+}
+
+#[test]
+fn test_greedy_dag_reconstruction_handles_deep_constructor_chains() {
+    let output = run_deep_greedy_dag_chain(10_000, "", "reconstruction");
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(output.status.success(), "unexpected status: {stderr}");
 }

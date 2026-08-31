@@ -87,9 +87,10 @@ The implementation has five stages.
 
 ### 1. Discover the root-reachable problem
 
-Discovery starts from every requested `(sort, value)` root and uses an explicit
-worklist, so deeply nested constructor chains do not consume the Rust call
-stack.
+Discovery starts from every requested `(sort, value)` root and recursively
+visits its producer rows and children in depth-first order. The recursion is
+guarded by [`stacker`](https://github.com/rust-lang/stacker), including paths
+that end at unextractable values before reaching scoring or reconstruction.
 
 The first reachable value of an eq sort scans the e-graph's functions for
 visible, extractable constructors that produce that sort. Borrowed `Function`
@@ -181,9 +182,13 @@ other greedy DAG representations in
 
 ### 5. Reconstruct terms and variants
 
-Reconstruction follows the selected producer snapshot, using a per-result memo
-and visiting set. Repeated dependencies become shared `TermId`s in a single
-`TermDag`; a visiting-set hit is treated as an extraction cycle.
+Reconstruction follows the selected producer snapshot recursively, using a
+per-result memo and visiting set. Repeated dependencies become shared `TermId`s
+in a single `TermDag`; a visiting-set hit is treated as an extraction cycle.
+Each recursive entry lets `stacker` check stack headroom and allocate another
+stack segment when needed. On targets that `stacker` does not support, its
+documented behavior is to compile as a no-op rather than provide this
+stack-safety guarantee.
 
 Best extraction reconstructs the fixed-point winner for each requested root.
 Variant extraction evaluates only producer rows indexed under the requested
@@ -293,6 +298,9 @@ Focused integration tests cover the semantic boundaries:
 - `test_greedy_dag_discovery_handles_deep_constructor_chains` runs a 20,000-node
   unextractable chain in a child process and verifies that discovery returns an
   extraction error instead of overflowing the process stack.
+- `test_greedy_dag_reconstruction_handles_deep_constructor_chains` extracts a
+  10,000-node constructor chain and verifies that reconstruction completes
+  without overflowing the process stack.
 
 The file-test harness also runs the opposite extractor for every recognized
 `extract` command from an equivalent cloned e-graph state. It converts each
@@ -321,21 +329,30 @@ but are not general performance guarantees.
 | Use `hashbrown::HashMap` in hot maps | A complete replacement with `std::collections::HashMap` regressed Taylor 51 by 1.90% across 120 alternating pairs (95% CI +1.04% to +2.76%). The experiment did not isolate the hasher from other implementation details. |
 | Keep the sparse entries, membership bitset, and aggregate in one type | Flattening a one-use nested wrapper removed roughly 30 lines and was performance-neutral on best and variant workloads. |
 | Borrow constructor metadata, hold one read state across discovery, and use iterative exact rescoring | This removes cloned function metadata, repeated lookups/read-state setup, and recursive rescore state. Against `f95d6fd`, three 20-run Taylor 51 comparisons measured 143.5-148.6 ms before and 114.2-118.7 ms after, a 1.25-1.26x speedup. The vector canary was statistically neutral and both outputs were byte-identical. |
-| Build constructor lists lazily and keep discovery iterative | Compared with eager all-sort indexing and recursive discovery, the final implementation reduced repeated primitive and shallow-eq extraction time by 9-12%. Taylor was about 1-2% slower, while a 20,000-node unextractable chain returned the intended error instead of aborting with stack overflow. |
+| Build constructor lists lazily | Eagerly indexing constructors for every sort made repeated primitive and shallow-eq extraction slower; root discovery therefore builds one shared list only for each sort it reaches. |
+| Guard naturally recursive traversals with `stacker` | Replacing the explicit scoring/reconstruction fallback and discovery worklist removed about 255 source lines. The exact final binary versus the explicit-stack binary measured `120.21 ms` versus `121.05 ms` on Taylor 51 across 160 alternating pairs: the mean ratio improved by 0.70%, and paired changes averaged -0.65% (95% CI -1.10% to -0.19%). Checking headroom at every recursion point was also 1.13% faster than checking every 64 levels on Taylor (95% CI -1.94% to -0.33%); the vector canary changed by -1.04% (95% CI -2.26% to +0.19%). The tradeoff is four added lockfile packages, native stack switching through `psm`, and no stack growth on unsupported targets. The 20,000-node discovery and 10,000-node reconstruction tests cover both deep paths. |
 
-The final Taylor 51 comparison used experimental commit `dc45b6b` with egglog
-commit `e264c37a`, `hyperfine --warmup 5 --runs 20`, and redirected stdout. The
-same release binary ran the original tree workload in `985.6 ms +/- 10.7 ms`
-and a copy with its 324 extraction commands changed to
-`:extractor greedy-dag` in `144.6 ms +/- 2.3 ms`. Greedy DAG was
-`6.82 +/- 0.13` times faster on this particular workload. This is a
-whole-program comparison of two extractors that may select different terms,
-not a general claim that greedy DAG extraction is faster than tree extraction.
+On the current implementation, `hyperfine --warmup 5 --runs 20` with redirected
+stdout measured the original Taylor 51 tree workload at `1.018 s +/- 0.021 s`
+and the same workload with its 324 extraction commands using
+`:extractor greedy-dag` at `122.5 ms +/- 2.7 ms`. The same release binary was
+used for both, and greedy DAG was `8.31 +/- 0.25` times faster on this workload.
+This is a whole-program comparison of extractors that may select different
+terms, not a general claim that greedy DAG extraction is faster than tree
+extraction.
 
 ## Alternatives Tried
 
 Several plausible simplifications or optimizations were measured and rejected:
 
+- Marking the recursive functions with the `recursive` crate passed the deep
+  reconstruction test and removed the explicit traversal, but added six
+  transitive packages and regressed Taylor 51 by 1.91% across 40 alternating
+  pairs (95% CI +1.29% to +2.54%).
+- Rewriting conflict-only exact rescoring recursively with `stacker` was
+  performance-neutral on the vector canary (-0.19%, 95% CI -2.43% to +2.05%)
+  but removed only two lines while adding another traversal-state type. The
+  explicit enter/exit traversal remains smaller conceptually.
 - Returning owned candidates to reduce `Arc` traffic produced noisy results and
   no clear improvement over the bitset baseline.
 - Replacing the pending queue's keys with dense IDs did not beat the simpler

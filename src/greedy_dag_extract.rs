@@ -154,6 +154,17 @@ struct TermReconstructionState<'a, C: MonoidCost> {
     visiting: SecondarySet<DagCostKey>,
 }
 
+// These traversals are naturally recursive, which keeps their invariants local
+// and substantially smaller than explicit task stacks. Stacker grows the stack
+// only near the red zone. On unsupported targets it is a no-op:
+// https://github.com/rust-lang/stacker#platform-support.
+// Checking at every recursive entry was 1.13% faster than threading a depth
+// counter and checking every 64 levels on Taylor 51. The sizes follow rustc's
+// established stacker configuration:
+// https://github.com/rust-lang/rust/blob/1.90.0/compiler/rustc_data_structures/src/stack.rs#L1-L14.
+const STACK_RED_ZONE: usize = 100 * 1024;
+const STACK_SEGMENT_SIZE: usize = 1024 * 1024;
+
 /// Producer rows plus indexes by dependency and produced target.
 ///
 /// The rows form a small extraction-local arena because backend callbacks
@@ -298,24 +309,6 @@ struct ReachableExtractionBuilder<'egraph> {
     constructors_by_sort: HashMap<String, Arc<[Constructor<'egraph>]>>,
 }
 
-/// One pending step in root-reachable producer discovery.
-///
-/// Producer-row tasks preserve recursive depth-first ordering: after recording
-/// a row they put its children above the remaining rows on the LIFO worklist.
-/// Producer IDs break equal-cost ties, so this order is deterministic.
-enum DiscoveryTask<'egraph> {
-    Node {
-        sort: ArcSort,
-        value: Value,
-    },
-    ProducerRow {
-        func: &'egraph Function,
-        children: Vec<Value>,
-        eclass: Value,
-        target: InternId<DagCostKey>,
-    },
-}
-
 impl<'egraph> ReachableExtractionBuilder<'egraph> {
     fn intern_key(&mut self, sort_name: &str, value: Value) -> InternId<DagCostKey> {
         let sort_id = self
@@ -371,101 +364,67 @@ impl<'egraph> ReachableExtractionBuilder<'egraph> {
     }
 
     fn discover_node(&mut self, read_state: &ReadState<'_, '_>, sort: &ArcSort, value: Value) {
-        // Keep discovery iterative: unlike the later traversals, discovery can
-        // reach a deep unextractable chain that never enters reconstruction or
-        // rescoring. The task frames preserve the recursive DFS tie-break order.
-        let mut pending = vec![DiscoveryTask::Node {
-            sort: sort.clone(),
-            value,
-        }];
+        // Discovery can follow unextractable paths that never reach later
+        // scoring or reconstruction, so protect recursion at this entry point.
+        stacker::maybe_grow(STACK_RED_ZONE, STACK_SEGMENT_SIZE, || {
+            let sort_name = sort.name().to_owned();
+            let key = self.intern_key(&sort_name, value);
+            if !sort.is_eq_sort() {
+                self.structural_nodes
+                    .entry(key)
+                    .or_insert_with(|| (sort.clone(), value));
+            }
 
-        while let Some(task) = pending.pop() {
-            match task {
-                DiscoveryTask::Node { sort, value } => {
-                    let sort_name = sort.name().to_owned();
-                    let key = self.intern_key(&sort_name, value);
-
-                    if !sort.is_eq_sort() {
-                        self.structural_nodes
-                            .entry(key)
-                            .or_insert_with(|| (sort.clone(), value));
-                    }
-
-                    if sort.is_container_sort() {
-                        for (child_sort, child_value) in self
-                            .egraph
-                            .container_inner_values(&sort, value)
-                            .into_iter()
-                            .rev()
-                        {
-                            pending.push(DiscoveryTask::Node {
-                                sort: child_sort,
-                                value: child_value,
-                            });
-                        }
-                        continue;
-                    }
-
-                    if !sort.is_eq_sort() || !self.seen_eq_values.insert(key) {
-                        continue;
-                    }
-
-                    let constructors = self.constructors_for_sort(&sort_name);
-                    let mut producer_tasks = Vec::new();
-                    for &func in constructors.iter() {
-                        read_state
-                            .constructor_enodes_for_eclass(func.name(), value, |enode| {
-                                if !enode.subsumed {
-                                    producer_tasks.push(DiscoveryTask::ProducerRow {
-                                        func,
-                                        children: enode.children.to_vec(),
-                                        eclass: value,
-                                        target: key,
-                                    });
-                                }
-                            })
-                            .expect("constructor name came from the egraph");
-                    }
-                    pending.extend(producer_tasks.into_iter().rev());
+            if sort.is_container_sort() {
+                for (child_sort, child_value) in self.egraph.container_inner_values(sort, value) {
+                    self.discover_node(read_state, &child_sort, child_value);
                 }
-                DiscoveryTask::ProducerRow {
-                    func,
-                    children,
-                    eclass,
-                    target,
-                } => {
-                    let mut child_nodes = Vec::with_capacity(children.len());
-                    let mut dependencies = HashSet::default();
-                    for (child_value, child_sort) in
-                        children.iter().zip(func.func_type().input.iter())
-                    {
-                        self.intern_nested_eq_dependencies(
-                            child_sort,
-                            *child_value,
-                            &mut dependencies,
-                        );
-                        child_nodes.push((child_sort.clone(), *child_value));
-                    }
-                    self.producer_rows.push(
-                        GreedyDagProducerRow {
-                            func,
-                            children,
-                            eclass,
-                            target,
-                            cost: (),
-                        },
-                        dependencies,
-                    );
+                return;
+            }
+            if !sort.is_eq_sort() || !self.seen_eq_values.insert(key) {
+                return;
+            }
 
-                    for (child_sort, child_value) in child_nodes.into_iter().rev() {
-                        pending.push(DiscoveryTask::Node {
-                            sort: child_sort,
-                            value: child_value,
-                        });
-                    }
+            let constructors = self.constructors_for_sort(&sort_name);
+            let mut producer_rows = Vec::new();
+            for &func in constructors.iter() {
+                read_state
+                    .constructor_enodes_for_eclass(func.name(), value, |enode| {
+                        if !enode.subsumed {
+                            producer_rows.push((func, enode.children.to_vec()));
+                        }
+                    })
+                    .expect("constructor name came from the egraph");
+            }
+
+            for (func, children) in producer_rows {
+                let child_nodes: Vec<_> = func
+                    .func_type()
+                    .input
+                    .iter()
+                    .cloned()
+                    .zip(children.iter().copied())
+                    .collect();
+                let mut dependencies = HashSet::default();
+                for (child_value, child_sort) in children.iter().zip(func.func_type().input.iter())
+                {
+                    self.intern_nested_eq_dependencies(child_sort, *child_value, &mut dependencies);
+                }
+                self.producer_rows.push(
+                    GreedyDagProducerRow {
+                        func,
+                        children,
+                        eclass: value,
+                        target: key,
+                        cost: (),
+                    },
+                    dependencies,
+                );
+                for (child_sort, child_value) in child_nodes {
+                    self.discover_node(read_state, &child_sort, child_value);
                 }
             }
-        }
+        })
     }
 }
 
@@ -723,29 +682,39 @@ impl<'egraph, C: MonoidCost> GreedyDagExtractor<'egraph, C> {
     }
 
     fn compute_cost_node(&self, value: Value, sort: &ArcSort) -> Option<Arc<DagCandidate<C>>> {
-        if sort.is_container_sort() {
-            let key = self.reachable_cost_key(sort, value)?;
-            let elements = self.egraph.container_inner_values(sort, value);
-            let child_candidates = elements
-                .iter()
-                .map(|(child_sort, child_value)| self.compute_cost_node(*child_value, child_sort))
-                .collect::<Option<Vec<_>>>()?;
+        stacker::maybe_grow(STACK_RED_ZONE, STACK_SEGMENT_SIZE, || {
+            if sort.is_container_sort() {
+                let key = self.reachable_cost_key(sort, value)?;
+                let elements = self.egraph.container_inner_values(sort, value);
+                let child_candidates = elements
+                    .iter()
+                    .map(|(child_sort, child_value)| {
+                        self.compute_cost_node(*child_value, child_sort)
+                    })
+                    .collect::<Option<Vec<_>>>()?;
 
-            let container_self_cost = self.structural_costs.get(key)?.clone();
-            self.candidate_from_children(value, sort, &child_candidates, container_self_cost, None)
-        } else if sort.is_eq_sort() {
-            let key = self.reachable_cost_key(sort, value)?;
-            self.best_candidates.get(key).cloned()
-        } else {
-            let key = self.reachable_cost_key(sort, value)?;
-            self.candidate_from_children(
-                value,
-                sort,
-                &[],
-                self.structural_costs.get(key)?.clone(),
-                None,
-            )
-        }
+                let container_self_cost = self.structural_costs.get(key)?.clone();
+                self.candidate_from_children(
+                    value,
+                    sort,
+                    &child_candidates,
+                    container_self_cost,
+                    None,
+                )
+            } else if sort.is_eq_sort() {
+                let key = self.reachable_cost_key(sort, value)?;
+                self.best_candidates.get(key).cloned()
+            } else {
+                let key = self.reachable_cost_key(sort, value)?;
+                self.candidate_from_children(
+                    value,
+                    sort,
+                    &[],
+                    self.structural_costs.get(key)?.clone(),
+                    None,
+                )
+            }
+        })
     }
 
     fn compute_cost_hyperedge(
@@ -844,50 +813,54 @@ impl<'egraph, C: MonoidCost> GreedyDagExtractor<'egraph, C> {
         }
     }
 
+    /// Reconstruct one selected producer plan into the shared term DAG.
     fn reconstruct_termdag_node_helper(
         &self,
         value: Value,
         sort: &ArcSort,
         state: &mut TermReconstructionState<'_, C>,
     ) -> Option<TermId> {
-        let key = self.reachable_cost_key(sort, value)?;
-        if let Some(term) = state.cache.get(&key) {
-            return Some(*term);
-        }
-        if !state.visiting.insert(key) {
-            return None;
-        }
-
-        let term = if sort.is_container_sort() {
-            let elements = self.egraph.container_inner_values(sort, value);
-            let mut ch_terms: Vec<TermId> = Vec::new();
-            for ch in elements.iter() {
-                ch_terms.push(self.reconstruct_termdag_node_helper(ch.1, &ch.0, state)?);
+        stacker::maybe_grow(STACK_RED_ZONE, STACK_SEGMENT_SIZE, || {
+            let key = self.reachable_cost_key(sort, value)?;
+            if let Some(term) = state.cache.get(&key) {
+                return Some(*term);
             }
-            self.egraph
-                .reconstruct_container_value(sort, value, state.termdag, ch_terms)
-        } else if sort.is_eq_sort() {
-            let producer_row_id = state.candidate.producer_choices.get(&key)?;
-            let producer_row = &self.producer_rows.rows[producer_row_id.0];
-            let mut child_terms = Vec::with_capacity(producer_row.children.len());
-            for (child, child_sort) in producer_row
-                .children
-                .iter()
-                .zip(producer_row.func.func_type().input.iter())
-            {
-                child_terms.push(self.reconstruct_termdag_node_helper(*child, child_sort, state)?);
+            if !state.visiting.insert(key) {
+                return None;
             }
-            state
-                .termdag
-                .app(producer_row.func.name().to_owned(), child_terms)
-        } else {
-            self.egraph
-                .reconstruct_base_value(sort, value, state.termdag)
-        };
 
-        state.visiting.remove(key);
-        state.cache.insert(key, term);
-        Some(term)
+            let term = if sort.is_container_sort() {
+                let elements = self.egraph.container_inner_values(sort, value);
+                let mut ch_terms: Vec<TermId> = Vec::new();
+                for ch in elements.iter() {
+                    ch_terms.push(self.reconstruct_termdag_node_helper(ch.1, &ch.0, state)?);
+                }
+                self.egraph
+                    .reconstruct_container_value(sort, value, state.termdag, ch_terms)
+            } else if sort.is_eq_sort() {
+                let producer_row_id = state.candidate.producer_choices.get(&key)?;
+                let producer_row = &self.producer_rows.rows[producer_row_id.0];
+                let mut child_terms = Vec::with_capacity(producer_row.children.len());
+                for (child, child_sort) in producer_row
+                    .children
+                    .iter()
+                    .zip(producer_row.func.func_type().input.iter())
+                {
+                    child_terms
+                        .push(self.reconstruct_termdag_node_helper(*child, child_sort, state)?);
+                }
+                state
+                    .termdag
+                    .app(producer_row.func.name().to_owned(), child_terms)
+            } else {
+                self.egraph
+                    .reconstruct_base_value(sort, value, state.termdag)
+            };
+
+            state.visiting.remove(key);
+            state.cache.insert(key, term);
+            Some(term)
+        })
     }
 
     /// Extract the best greedy-DAG term of a value from a given sort.
