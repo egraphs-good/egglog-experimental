@@ -1,4 +1,5 @@
 use egglog::{ast::*, util::FreshGen};
+use egglog_ast::generic_ast::RuleEvalMode;
 use egglog_ast::span::Span;
 
 /// Parse-time macro for applying actions once to all current query matches.

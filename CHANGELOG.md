@@ -14,8 +14,15 @@ This file records notable user-facing changes to egglog-experimental.
   whole fold undefined.
 - `f64-is-finite`, a predicate for guarding computations that may produce NaN
   or infinite values.
+- Greedy DAG extraction for `extract`, `multi-extract`, and `keep-best` via
+  `:extractor greedy-dag`.
 
 `Maybe` operations and `map-fold-kv` are not currently supported in proof mode.
+
+### Changed
+
+- `keep-best` now honors dynamic costs assigned by `set-cost` in both tree and
+  greedy-DAG extraction modes.
 
 ## [3.0.0] - 2026-08-20
 
