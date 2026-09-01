@@ -7,17 +7,20 @@
 //! subterms once within each ranked variant. Greedy-DAG extraction is a
 //! heuristic rather than a globally optimal k-best extractor.
 
-use crate::greedy_dag_extract::{extract_variants_greedy_dag, split_trailing_extractor};
+use crate::greedy_dag_extract::{extract_variants_greedy_dag_by_root, split_trailing_extractor};
 use egglog::{
     CommandOutput, EGraph, Error, TermDag, TermId, TypeError, UserDefinedCommand,
     ast::{Expr, ParseError},
-    extract::{DagCostModel, MonoidCost, TreeCostModelFromDag},
+    extract::{DagCostModel, MonoidCost, TreeCostModelFromDag, TreeExtractor},
     prelude::span,
 };
 use log::log_enabled;
 use std::marker::PhantomData;
 
-/// Displayable output produced by [`MultiExtract`].
+/// Legacy aggregate output previously produced by [`MultiExtract`].
+///
+/// `multi-extract` now returns one standard [`CommandOutput::ExtractVariants`]
+/// for each requested root. This type remains public for source compatibility.
 #[derive(Debug)]
 pub struct MultiExtractOutput {
     termdag: TermDag,
@@ -42,9 +45,11 @@ impl std::fmt::Display for MultiExtractOutput {
 /// caller-provided marginal cost model.
 ///
 /// The positive `i64` value `n` is the number of variants returned for each
-/// term. All terms share one extractor computation. Tree extraction adapts the
-/// model with [`TreeCostModelFromDag`]; `:extractor greedy-dag` uses its
-/// marginal costs directly.
+/// term. All terms share one extractor computation, but each root is
+/// reconstructed into its own [`TermDag`] and returned as a standard
+/// [`CommandOutput::ExtractVariants`]. Tree extraction adapts the model with
+/// [`TreeCostModelFromDag`]; `:extractor greedy-dag` uses its marginal costs
+/// directly.
 pub struct MultiExtract<C: MonoidCost, CM: DagCostModel<C> + Clone> {
     cost_model: CM,
     // Extracted costs are temporary, so this marker should not impose their
@@ -104,35 +109,45 @@ impl<C: MonoidCost, CM: DagCostModel<C> + Clone + Send + Sync + 'static> UserDef
             .map(|arg| egraph.eval_expr(arg))
             .collect::<Result<_, _>>()?;
 
+        let root_count = roots.len();
         let extracted = if use_greedy_dag {
-            extract_variants_greedy_dag(egraph, roots, n as usize, self.cost_model.clone())
+            extract_variants_greedy_dag_by_root(egraph, roots, n as usize, self.cost_model.clone())?
         } else {
-            egraph.extract_variants_with_cost_model(
-                roots,
-                n as usize,
+            let root_sorts = roots.iter().map(|(sort, _)| sort.clone()).collect();
+            let extractor = TreeExtractor::compute_costs_from_rootsorts(
+                Some(root_sorts),
+                egraph,
                 TreeCostModelFromDag(self.cost_model.clone()),
-            )
-        }?;
+            );
+            roots
+                .into_iter()
+                .map(|(sort, value)| {
+                    let mut termdag = TermDag::default();
+                    let variants =
+                        extractor.extract_variants_with_sort(&mut termdag, value, n as usize, sort);
+                    (termdag, variants)
+                })
+                .collect()
+        };
 
-        let terms: Vec<Vec<_>> = extracted
-            .variants
+        let outputs = extracted
             .into_iter()
-            .map(|variants| variants.into_iter().map(|variant| variant.term).collect())
+            .map(|(termdag, variants)| {
+                CommandOutput::ExtractVariants(
+                    termdag,
+                    variants.into_iter().map(|variant| variant.term).collect(),
+                )
+            })
             .collect();
 
         if log_enabled!(log::Level::Info) {
             log::info!(
                 "extracted up to {} variants for each of {} expressions",
                 n,
-                terms.len()
+                root_count
             );
         }
 
-        Ok(vec![CommandOutput::UserDefined(std::sync::Arc::from(
-            MultiExtractOutput {
-                termdag: extracted.termdag,
-                terms,
-            },
-        ))])
+        Ok(outputs)
     }
 }

@@ -12,7 +12,11 @@ use crate::greedy_dag_extract::{extract_best_greedy_dag, split_trailing_extracto
 use crate::table_rows::{for_each_row, is_constructor};
 use egglog::{
     ArcSort, CommandOutput, EGraph, Error, RawValues, TermDag, TermId, TypeError,
-    UserDefinedCommand, Value, Write, ast::Expr, extract::TreeCostModelFromDag, sort::S, span,
+    UserDefinedCommand, Value, Write,
+    ast::{Expr, ParseError},
+    extract::TreeCostModelFromDag,
+    sort::S,
+    span,
 };
 
 /// User-defined command implementing `(keep-best "table"...)`.
@@ -25,6 +29,13 @@ pub struct KeepBestCommand;
 impl UserDefinedCommand for KeepBestCommand {
     fn update(&self, egraph: &mut EGraph, args: &[Expr]) -> Result<Vec<CommandOutput>, Error> {
         let (args, use_greedy_dag) = split_trailing_extractor(args)?;
+
+        if args.is_empty() {
+            return Err(Error::ParseError(ParseError(
+                span!(),
+                "keep-best expects at least one table name".into(),
+            )));
+        }
 
         // Step 1: evaluate each argument to a table name string.
         let table_names: Vec<String> = args

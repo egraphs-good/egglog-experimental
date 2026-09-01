@@ -21,8 +21,12 @@ This file records notable user-facing changes to egglog-experimental.
 
 ### Changed
 
+- `multi-extract` now returns one standard `CommandOutput::ExtractVariants`
+  per requested root, in input order. Unextractable roots produce an empty
+  variants output.
 - `keep-best` now honors dynamic costs assigned by `set-cost` in both tree and
   greedy-DAG extraction modes.
+- `keep-best` rejects calls without a target table before mutating the e-graph.
 
 ## [3.0.0] - 2026-08-20
 
