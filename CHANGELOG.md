@@ -6,10 +6,9 @@ This file records notable user-facing changes to egglog-experimental.
 
 ### Added
 
-- `(unstable-subst root from1 to1 ...)`, which simultaneously replaces
-  e-classes while copying the sub-e-graph reachable from `root`. Each pair may
-  use a different eq-sort, supporting bodies with heterogeneous parameters.
-  Available in top-level actions and `:naive` rule heads.
+- `(unstable-subst root map)`, which copies the sub-e-graph reachable from
+  `root` with each key e-class replaced by its mapped value, and returns the
+  copied root. Available in top-level actions and `:naive` rule heads.
 
 ## [3.0.0] - 2026-08-20
 

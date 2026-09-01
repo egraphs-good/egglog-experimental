@@ -6,21 +6,19 @@ introspection it uses lives in `egglog` (see "What egglog had to expose").
 ## Interface
 
 ```text
-(unstable-subst root from1 to1 ... fromN toN)
-    : R × (K1 × K1) × ... × (KN × KN) → R
+(unstable-subst root map) : R × Map<K, K> → R
 ```
 
-Here `N >= 0`. `root` is an e-class of any eq-sort `R`. Within each pair,
-`fromI` and `toI` must share one eq-sort `KI`; different pairs may use different
-eq-sorts. A final unpaired `from` is rejected during typechecking.
+`root` is an e-class of any eq-sort `R`. `map` has one eq-sort `K` for both
+keys and values; `R` and `K` may differ because traversal can reach `K`-sorted
+children beneath an `R`-sorted root. Exactly one map is accepted, so a single
+call cannot substitute keys of several different sorts.
 
-The pairs form one simultaneous substitution. For example,
-`(unstable-subst root x y y x)` swaps `x` and `y`; it does not substitute
-`x := y` and then `y := x`. A replacement is spliced in as supplied and is not
-itself traversed. Repeating the same source e-class is an error rather than
-silently choosing one replacement; duplicates are rejected before subgraph
-traversal or copy writes, even when they name the same replacement. With no pairs,
-`(unstable-subst root)` returns the exact root value and writes nothing.
+The entries form one simultaneous substitution. For example, a map containing
+`x -> y` and `y -> x` swaps `x` and `y`; it does not substitute `x := y` and
+then `y := x`. A mapped value is spliced in as supplied and is not itself
+traversed. With an empty map, the primitive returns the exact root value and
+writes nothing.
 
 The primitive walks the sub-e-graph reachable from `root`, copies only the part
 affected by the substitution, and returns the copied root. Reachability follows
@@ -30,16 +28,16 @@ and `Set`, rebuilding affected containers around their substituted contents.
 
 ## Semantics and safety
 
-Let `σ` map each source e-class to its paired replacement.
+Let `σ` map each key e-class to its mapped value.
 
-* A reachable e-class is **affected** if it is a source or if one of its
+* A reachable e-class is **affected** if it is a key or if one of its
   e-nodes, including through a container child, refers to an affected e-class.
-* `σ(v)` is the paired replacement for a source, the original `v` for an
+* `σ(v)` is the mapped value for a key, the original `v` for an
   unaffected value, and the rebuilt value for an affected container.
-* For an affected non-source e-class `e`, every non-subsumed e-node
+* For an affected non-key e-class `e`, every non-subsumed e-node
   `f(c1..cn) -> e` in the snapshot is copied as `f(σ(c1)..σ(cn))`. Those
   copies are unioned, and their class is `σ(e)`.
-* The result is `σ(root)`. If no source is reachable, the original root is
+* The result is `σ(root)`. If no key is reachable, the original root is
   returned and nothing is copied.
 
 Copying every e-node carries the region's equations into the copy. If the
@@ -62,7 +60,7 @@ the copied derivations remain valid.
 * **If traversal is required, `root` must already have committed rows.** An
   action's writes are staged until the action finishes. A root built by that
   same action is therefore invisible to the walk and returns unchanged, without
-  an error. A root that is itself a source instead returns its paired target
+  an error. A root that is itself a key instead returns its mapped value
   directly and needs no rows. Otherwise, pass a root bound by the rule query or
   created by an earlier command. Replacements may be built in the current
   action because they are spliced in rather than walked.
@@ -90,7 +88,7 @@ phase followed by two write passes.
    Values built as arguments to the primitive have already been staged by the
    enclosing action, so this guarantee does not roll those argument writes back.
 2. **Name copied classes.** In the computed order, insert one ready e-node per
-   affected non-source e-class to obtain its image.
+   affected non-key e-class to obtain its image.
 3. **Complete their equations.** With every image named, insert the remaining
    e-nodes and union each result into the image of its original class.
 

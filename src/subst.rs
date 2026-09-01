@@ -1,9 +1,9 @@
-//! Implementation of `(unstable-subst root from1 to1 ...)`.
+//! Implementation of `(unstable-subst root map)`.
 //!
-//! Source/target pairs may use different eq-sorts and are applied
-//! simultaneously while copying the affected constructor subgraph. The root
-//! must have committed rows when traversal is needed; copied equations are
-//! sound only when substitution preserves their derivations and premises. See
+//! The map's keys and values share one eq-sort and are applied simultaneously
+//! while copying the affected constructor subgraph. The root must have
+//! committed rows when traversal is needed; copied equations are sound only
+//! when substitution preserves their derivations and premises. See
 //! `docs/unstable-subst.md` for the complete interface, safety boundary,
 //! algorithm, and cost model.
 
@@ -13,6 +13,7 @@ use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use egglog::api::RawValues;
 use egglog::ast::Span;
 use egglog::constraint::{self, Constraint, ImpossibleConstraint, TypeConstraint};
+use egglog::sort::MapContainer;
 use egglog::{
     ArcSort, Atom, AtomTerm, Core, Error, FullPrim, FullState, FuncType, Primitive, Read, TypeInfo,
     Value, Write,
@@ -118,7 +119,7 @@ fn constructors<'db>(state: &FullState<'_, 'db>) -> Vec<Constructor<'db>> {
 /// When traversal is needed, `root` must be an e-class that already has rows:
 /// one the query bound, or one from an earlier command. A root the enclosing
 /// action just built is not in the tables yet and comes back unchanged, with
-/// no error. A root that is itself a source returns its target without a walk.
+/// no error. A root that is itself a key returns its mapped value without a walk.
 fn substitute<'db>(
     state: &mut FullState<'_, 'db>,
     root: Value,
@@ -522,7 +523,7 @@ fn error(message: String) -> Error {
     Error::BackendError(format!("{SUBST}: {message}"))
 }
 
-/// The full-context `(unstable-subst root from1 to1 ...)` primitive.
+/// The full-context `(unstable-subst root map)` primitive.
 ///
 /// [`new_experimental_egraph`](crate::new_experimental_egraph) registers it by
 /// default. Callers must ensure that substitution preserves the derivation and
@@ -549,27 +550,19 @@ impl FullPrim for Subst {
     /// typechecker rules out panic directly, since reaching one means a bug
     /// here rather than a program egglog should have admitted.
     fn apply<'a, 'db>(&self, mut state: FullState<'a, 'db>, args: &[Value]) -> Option<Value> {
-        let Some((root, flat_pairs)) = args.split_first() else {
+        let [root, map] = args else {
             panic!(
-                "{SUBST} takes a root followed by source/target pairs; \
-                 the typechecker admitted no arguments"
-            )
-        };
-        let mut pairs = flat_pairs.chunks_exact(2);
-        if !pairs.remainder().is_empty() {
-            panic!(
-                "{SUBST} takes source/target pairs; the typechecker admitted {} arguments",
+                "{SUBST} takes a root and a map; the typechecker admitted {} arguments",
                 args.len()
             )
-        }
-        let mut entries = BTreeMap::new();
-        for pair in &mut pairs {
-            if entries.insert(pair[0], pair[1]).is_some() {
-                log::error!("{SUBST}: source {:?} appears more than once", pair[0]);
-                state.panic();
-                return None;
-            }
-        }
+        };
+        // Cloned out so the container registry is not still borrowed when the
+        // walk starts interning new containers.
+        let entries = state
+            .value_to_container::<MapContainer>(*map)
+            .unwrap_or_else(|| panic!("{SUBST}'s type constraint admits only `Map` values"))
+            .data
+            .clone();
         match substitute(&mut state, *root, &entries) {
             Ok(image) => Some(image),
             Err(err) => {
@@ -585,7 +578,13 @@ impl FullPrim for Subst {
     }
 }
 
-/// `(unstable-subst root from1 to1 ...) : (R, K1, K1, ...) -> R`.
+/// `(unstable-subst root map) : (R, Map<K, K>) -> R` for any eq-sort `R`.
+///
+/// `R` is free rather than pinned to `K` because a substitution reaches through
+/// every sort in the term structure, so a root of one sort can perfectly well
+/// be rewritten by a map over another. `K` must be an eq-sort mapping to
+/// itself: replacing a `K`-sorted child with a value of another sort would
+/// produce an ill-typed row.
 struct SubstTypeConstraint {
     span: Span,
 }
@@ -596,9 +595,7 @@ impl TypeConstraint for SubstTypeConstraint {
         arguments: &[AtomTerm],
         typeinfo: &TypeInfo,
     ) -> Vec<Box<dyn Constraint<AtomTerm, ArcSort>>> {
-        // `arguments` includes the output term, so valid calls have an even
-        // length: root, zero or more source/target pairs, output.
-        if arguments.len() < 2 || !arguments.len().is_multiple_of(2) {
+        let [root, map, out] = arguments else {
             return vec![constraint::impossible(
                 ImpossibleConstraint::ArityMismatch {
                     atom: Atom {
@@ -606,33 +603,48 @@ impl TypeConstraint for SubstTypeConstraint {
                         head: SUBST.to_owned(),
                         args: arguments.to_vec(),
                     },
-                    expected: arguments.len() + 1,
+                    expected: 3,
                 },
             )];
-        }
+        };
 
-        let (out, inputs) = arguments.split_last().expect("checked two arguments");
-        let (root, flat_pairs) = inputs.split_first().expect("checked for a root");
-        let mut cs: Vec<Box<dyn Constraint<AtomTerm, ArcSort>>> = Vec::new();
+        let mut cs: Vec<Box<dyn Constraint<AtomTerm, ArcSort>>> =
+            vec![constraint::eq(root.clone(), out.clone())];
+
+        // One instantiation per declared sort that could stand in each
+        // position; `xor` defers until the surrounding program pins it down.
+        //
+        // A `Map` sort is identified by the Rust type its values intern
+        // under, since the `ContainerSort` impl behind an `ArcSort` is
+        // wrapped in a private type that out-of-tree code cannot downcast to.
+        let mut map_sorts: Vec<ArcSort> = typeinfo.get_arcsorts_by(|sort| {
+            sort.value_type() == Some(TypeId::of::<MapContainer>())
+                && match sort.inner_sorts().as_slice() {
+                    [key, value] => key.is_eq_sort() && key.name() == value.name(),
+                    _ => false,
+                }
+        });
+        map_sorts.sort_by_key(|sort| sort.name().to_owned());
+        cs.push(constraint::xor(
+            map_sorts
+                .into_iter()
+                .map(|sort| constraint::assign(map.clone(), sort))
+                .collect(),
+        ));
 
         let mut eq_sorts = typeinfo.get_arcsorts_by(|sort| sort.is_eq_sort());
         eq_sorts.sort_by_key(|sort| sort.name().to_owned());
-        cs.push(constraint::eq(root.clone(), out.clone()));
         cs.push(constraint::xor(
             eq_sorts
-                .iter()
-                .map(|sort| constraint::assign(root.clone(), sort.clone()))
+                .into_iter()
+                .map(|sort| {
+                    constraint::and(vec![
+                        constraint::assign(root.clone(), sort.clone()),
+                        constraint::assign(out.clone(), sort),
+                    ])
+                })
                 .collect(),
         ));
-        for pair in flat_pairs.chunks_exact(2) {
-            cs.push(constraint::eq(pair[0].clone(), pair[1].clone()));
-            cs.push(constraint::xor(
-                eq_sorts
-                    .iter()
-                    .map(|sort| constraint::assign(pair[0].clone(), sort.clone()))
-                    .collect(),
-            ));
-        }
 
         cs
     }
