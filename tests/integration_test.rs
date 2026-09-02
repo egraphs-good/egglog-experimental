@@ -519,14 +519,11 @@ fn test_greedy_dag_multi_extract_avoids_combined_root_cycle() {
         )
         .unwrap();
 
-    assert_eq!(result.len(), 2);
-    assert!(matches!(result[0], CommandOutput::ExtractVariants(..)));
-    assert!(matches!(result[1], CommandOutput::ExtractVariants(..)));
+    assert!(matches!(result.as_slice(), [CommandOutput::UserDefined(_)]));
     assert_eq!(
         result[0].to_string(),
-        "(\n   (S0 (S0 (S3 (S5 (S6)) (S6))))\n)\n"
+        "(\n   (\n      (S0 (S0 (S3 (S5 (S6)) (S6))))\n   )\n   (\n      (S0 (S3 (S5 (S6)) (S6)))\n   )\n)\n"
     );
-    assert_eq!(result[1].to_string(), "(\n   (S0 (S3 (S5 (S6)) (S6)))\n)\n");
 }
 
 #[test]
@@ -629,48 +626,57 @@ fn test_extract_set_cost_decls() {
 
 #[test]
 fn test_multi_extract_two_variants_two_terms() {
-    let mut egraph = egglog_experimental::new_experimental_egraph();
+    for extractor in ["", " :extractor greedy-dag"] {
+        let mut egraph = egglog_experimental::new_experimental_egraph();
+        let result = egraph
+            .parse_and_run_program(
+                None,
+                &format!(
+                    "
+                    (with-dynamic-cost
+                        (datatype E (Add E E) (Mul E E) (Num i64))
+                    )
 
-    let result = egraph
-        .parse_and_run_program(
-            None,
-            "
-        (with-dynamic-cost
-            (datatype E (Add E E) (Mul E E) (Num i64))
-        )
+                    (union (Num 2) (Add (Num 1) (Num 1)))
+                    (union (Num 2) (Mul (Num 1) (Num 2)))
 
-        (union (Num 2) (Add (Num 1) (Num 1)))
-        (union (Num 2) (Mul (Num 1) (Num 2)))
+                    (union (Num 4) (Add (Num 2) (Num 2)))
+                    (union (Num 4) (Mul (Num 2) (Num 2)))
 
-        (union (Num 4) (Add (Num 2) (Num 2)))
-        (union (Num 4) (Mul (Num 2) (Num 2)))
+                    (multi-extract 2 (Num 2) (Num 4){extractor})"
+                ),
+            )
+            .unwrap();
 
-        (multi-extract 2 (Num 2) (Num 4))",
-        )
-        .unwrap();
+        let [CommandOutput::UserDefined(output)] = result.as_slice() else {
+            panic!("expected one aggregate user-defined output, got {result:?}");
+        };
+        let output = output
+            .as_ref()
+            .as_any()
+            .downcast_ref::<egglog_experimental::MultiExtractOutput>()
+            .expect("user-defined output should retain its concrete multi-extract type");
+        let terms: Vec<Vec<_>> = output
+            .terms
+            .iter()
+            .map(|variants| {
+                variants
+                    .iter()
+                    .map(|term| output.termdag.to_string(*term))
+                    .collect()
+            })
+            .collect();
 
-    let [
-        CommandOutput::ExtractVariants(first_dag, first_terms),
-        CommandOutput::ExtractVariants(second_dag, second_terms),
-    ] = result.as_slice()
-    else {
-        panic!("expected one ExtractVariants output per root, got {result:?}");
-    };
-    let first_terms: Vec<_> = first_terms
-        .iter()
-        .map(|term| first_dag.to_string(*term))
-        .collect();
-    let second_terms: Vec<_> = second_terms
-        .iter()
-        .map(|term| second_dag.to_string(*term))
-        .collect();
-    assert!(first_terms.iter().any(|term| term == "(Num 2)"));
-    assert!(!first_terms.iter().any(|term| term == "(Num 4)"));
-    assert!(second_terms.iter().any(|term| term == "(Num 4)"));
+        assert_eq!(terms.iter().map(Vec::len).collect::<Vec<_>>(), [2, 2]);
+        assert_eq!(terms[0][0], "(Num 2)");
+        assert!(terms[0][1] == "(Add (Num 1) (Num 1))" || terms[0][1] == "(Mul (Num 1) (Num 2))");
+        assert_eq!(terms[1][0], "(Num 4)");
+        assert!(terms[1][1] == "(Add (Num 2) (Num 2))" || terms[1][1] == "(Mul (Num 2) (Num 2))");
+    }
 }
 
 #[test]
-fn test_multi_extract_returns_ordered_standard_outputs_including_empty() {
+fn test_multi_extract_returns_one_ordered_aggregate_including_empty_groups() {
     for extractor in ["", " :extractor greedy-dag"] {
         let mut egraph = egglog_experimental::new_experimental_egraph();
         let result = egraph
@@ -687,22 +693,22 @@ fn test_multi_extract_returns_ordered_standard_outputs_including_empty() {
             )
             .unwrap();
 
-        let [
-            CommandOutput::ExtractVariants(visible_dag, visible_terms),
-            CommandOutput::ExtractVariants(integer_dag, integer_terms),
-            CommandOutput::ExtractVariants(hidden_dag, hidden_terms),
-        ] = result.as_slice()
-        else {
-            panic!("expected one ordered ExtractVariants output per root, got {result:?}");
+        let [CommandOutput::UserDefined(output)] = result.as_slice() else {
+            panic!("expected one aggregate user-defined output, got {result:?}");
         };
-        assert_eq!(visible_terms.len(), 1);
-        assert_eq!(visible_dag.to_string(visible_terms[0]), "(visible)");
-        assert_eq!(visible_dag.size(), 1);
-        assert_eq!(integer_terms.len(), 1);
-        assert_eq!(integer_dag.to_string(integer_terms[0]), "42");
-        assert_eq!(integer_dag.size(), 1);
-        assert!(hidden_terms.is_empty());
-        assert_eq!(hidden_dag.size(), 0);
+        let output = output
+            .as_ref()
+            .as_any()
+            .downcast_ref::<egglog_experimental::MultiExtractOutput>()
+            .expect("user-defined output should retain its concrete multi-extract type");
+
+        assert_eq!(
+            output.terms.iter().map(Vec::len).collect::<Vec<_>>(),
+            [1, 1, 0]
+        );
+        assert_eq!(output.termdag.to_string(output.terms[0][0]), "(visible)");
+        assert_eq!(output.termdag.to_string(output.terms[1][0]), "42");
+        assert_eq!(output.termdag.size(), 2);
     }
 }
 
@@ -832,11 +838,8 @@ fn test_multi_extract_with_set_cost() {
         )
         .unwrap();
 
-    assert_eq!(result.len(), 2);
-    let output = result
-        .iter()
-        .map(CommandOutput::to_string)
-        .collect::<String>();
+    assert!(matches!(result.as_slice(), [CommandOutput::UserDefined(_)]));
+    let output = result[0].to_string();
     assert!(output.contains("(Add (Num 5) (Num 5))"));
     assert!(output.contains("(Add (Num 3) (Num 3))"));
     assert!(!output.contains("Mul"));
@@ -1752,7 +1755,7 @@ fn test_schedule_user_defined_command() {
 }
 
 #[test]
-fn test_schedule_preserves_one_multi_extract_output_per_root() {
+fn test_schedule_preserves_aggregate_multi_extract_output() {
     let mut egraph = egglog_experimental::new_experimental_egraph();
     let outputs = egraph
         .parse_and_run_program(
@@ -1765,10 +1768,9 @@ fn test_schedule_preserves_one_multi_extract_output_per_root() {
         )
         .unwrap();
 
-    assert_eq!(outputs.len(), 3);
-    assert!(matches!(outputs[0], CommandOutput::ExtractVariants(..)));
-    assert!(matches!(outputs[1], CommandOutput::ExtractVariants(..)));
-    assert!(matches!(outputs[2], CommandOutput::RunSchedule(..)));
+    assert_eq!(outputs.len(), 2);
+    assert!(matches!(outputs[0], CommandOutput::UserDefined(_)));
+    assert!(matches!(outputs[1], CommandOutput::RunSchedule(..)));
 }
 
 #[test]
@@ -1969,9 +1971,10 @@ fn test_extractor_keyword_does_not_shadow_a_value_named_extractor() {
 fn test_extractor_keyword_does_not_shadow_a_term_named_extractor() {
     let result =
         run_dynamic_dag("(let :extractor (Leaf 1))\n(multi-extract 1 :extractor (Leaf 2))");
-    assert_eq!(result.len(), 2);
-    assert!(result[0].to_string().contains("(Leaf 1)"));
-    assert!(result[1].to_string().contains("(Leaf 2)"));
+    assert!(matches!(result.as_slice(), [CommandOutput::UserDefined(_)]));
+    let output = result[0].to_string();
+    assert!(output.contains("(Leaf 1)"));
+    assert!(output.contains("(Leaf 2)"));
 }
 
 /// A trailing `<symbol> <symbol>` pair is genuinely ambiguous: it is

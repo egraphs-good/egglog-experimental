@@ -7,24 +7,31 @@
 //! subterms once within each ranked variant. Greedy-DAG extraction is a
 //! heuristic rather than a globally optimal k-best extractor.
 
-use crate::greedy_dag_extract::{extract_variants_greedy_dag_by_root, split_trailing_extractor};
+use crate::greedy_dag_extract::{extract_variants_greedy_dag, split_trailing_extractor};
 use egglog::{
     CommandOutput, EGraph, Error, TermDag, TermId, TypeError, UserDefinedCommand,
     ast::{Expr, ParseError},
-    extract::{DagCostModel, MonoidCost, TreeCostModelFromDag, TreeExtractor},
+    extract::{DagCostModel, MonoidCost, TreeCostModelFromDag},
     prelude::span,
 };
 use log::log_enabled;
 use std::marker::PhantomData;
 
-/// Legacy aggregate output previously produced by [`MultiExtract`].
+/// Aggregate output produced by [`MultiExtract`].
 ///
-/// `multi-extract` now returns one standard [`CommandOutput::ExtractVariants`]
-/// for each requested root. This type remains public for source compatibility.
+/// Every term ID indexes the shared [`MultiExtractOutput::termdag`]. The outer
+/// [`MultiExtractOutput::terms`] vector follows requested-root order, including
+/// an empty vector for any root without a finite extraction.
+/// When wrapped in [`CommandOutput::UserDefined`], consumers can downcast the
+/// contained user-defined output to this concrete type.
 #[derive(Debug)]
 pub struct MultiExtractOutput {
-    termdag: TermDag,
-    terms: Vec<Vec<TermId>>,
+    /// Shared term storage for every requested root and variant.
+    pub termdag: TermDag,
+    /// Term IDs grouped by requested root, in request order.
+    ///
+    /// A root without a finite extraction has an empty inner vector.
+    pub terms: Vec<Vec<TermId>>,
 }
 
 impl std::fmt::Display for MultiExtractOutput {
@@ -45,9 +52,8 @@ impl std::fmt::Display for MultiExtractOutput {
 /// caller-provided marginal cost model.
 ///
 /// The positive `i64` value `n` is the number of variants returned for each
-/// term. All terms share one extractor computation, but each root is
-/// reconstructed into its own [`TermDag`] and returned as a standard
-/// [`CommandOutput::ExtractVariants`]. Tree extraction adapts the model with
+/// term. All terms share one extractor computation and one aggregate
+/// [`MultiExtractOutput`]. Tree extraction adapts the model with
 /// [`TreeCostModelFromDag`]; `:extractor greedy-dag` uses its marginal costs
 /// directly.
 pub struct MultiExtract<C: MonoidCost, CM: DagCostModel<C> + Clone> {
@@ -109,45 +115,35 @@ impl<C: MonoidCost, CM: DagCostModel<C> + Clone + Send + Sync + 'static> UserDef
             .map(|arg| egraph.eval_expr(arg))
             .collect::<Result<_, _>>()?;
 
-        let root_count = roots.len();
         let extracted = if use_greedy_dag {
-            extract_variants_greedy_dag_by_root(egraph, roots, n as usize, self.cost_model.clone())?
+            extract_variants_greedy_dag(egraph, roots, n as usize, self.cost_model.clone())
         } else {
-            let root_sorts = roots.iter().map(|(sort, _)| sort.clone()).collect();
-            let extractor = TreeExtractor::compute_costs_from_rootsorts(
-                Some(root_sorts),
-                egraph,
+            egraph.extract_variants_with_cost_model(
+                roots,
+                n as usize,
                 TreeCostModelFromDag(self.cost_model.clone()),
-            );
-            roots
-                .into_iter()
-                .map(|(sort, value)| {
-                    let mut termdag = TermDag::default();
-                    let variants =
-                        extractor.extract_variants_with_sort(&mut termdag, value, n as usize, sort);
-                    (termdag, variants)
-                })
-                .collect()
-        };
+            )
+        }?;
 
-        let outputs = extracted
+        let terms: Vec<Vec<_>> = extracted
+            .variants
             .into_iter()
-            .map(|(termdag, variants)| {
-                CommandOutput::ExtractVariants(
-                    termdag,
-                    variants.into_iter().map(|variant| variant.term).collect(),
-                )
-            })
+            .map(|variants| variants.into_iter().map(|variant| variant.term).collect())
             .collect();
 
         if log_enabled!(log::Level::Info) {
             log::info!(
                 "extracted up to {} variants for each of {} expressions",
                 n,
-                root_count
+                terms.len()
             );
         }
 
-        Ok(outputs)
+        Ok(vec![CommandOutput::UserDefined(std::sync::Arc::from(
+            MultiExtractOutput {
+                termdag: extracted.termdag,
+                terms,
+            },
+        ))])
     }
 }

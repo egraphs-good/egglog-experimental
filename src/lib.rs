@@ -68,7 +68,9 @@
 //!   schedulers.
 //! - [`DynamicCostModel`] supports runtime costs declared with
 //!   `with-dynamic-cost` and changed with `set-cost`.
-//! - [`MultiExtract`] implements `(multi-extract n term...)`.
+//! - [`MultiExtract`] implements `(multi-extract n term...)`, returning one
+//!   [`MultiExtractOutput`] whose public fields expose shared term storage and
+//!   ordered per-root variant IDs.
 //! - [`KeepBestCommand`] compacts selected tables to their best terms.
 //! - `:extractor greedy-dag` enables heuristic DAG-cost extraction for
 //!   `extract`, `multi-extract`, and `keep-best`. Within each independently

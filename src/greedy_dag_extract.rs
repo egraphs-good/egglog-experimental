@@ -1037,29 +1037,3 @@ pub fn extract_variants_greedy_dag<C: MonoidCost, M: DagCostModel<C>>(
 
     Ok(ExtractedTermVariants { termdag, variants })
 }
-
-/// Variants for one requested root, reconstructed into independent storage.
-pub(crate) type ExtractedRootVariants<C> = (TermDag, Vec<ExtractedTerm<C>>);
-
-/// Extract greedy-DAG variants into one [`TermDag`] per requested root.
-///
-/// Preparation is shared across every root, while reconstruction storage is
-/// kept separate so callers can return each root as an independent output
-/// without cloning a combined term DAG.
-pub(crate) fn extract_variants_greedy_dag_by_root<C: MonoidCost, M: DagCostModel<C>>(
-    egraph: &EGraph,
-    roots: Vec<(ArcSort, Value)>,
-    nvariants: usize,
-    cost_model: M,
-) -> Result<Vec<ExtractedRootVariants<C>>, Error> {
-    let extractor = GreedyDagExtractor::prepare(egraph, &roots, cost_model, true);
-    Ok(roots
-        .into_iter()
-        .map(|(sort, value)| {
-            let mut termdag = TermDag::default();
-            let variants =
-                extractor.extract_variants_with_sort(&mut termdag, value, nvariants, sort);
-            (termdag, variants)
-        })
-        .collect())
-}

@@ -67,16 +67,15 @@ costs.
 Each returned root or variant has its own complete producer-choice snapshot.
 That snapshot determines both its reported cost and its reconstructed term.
 Separate roots may therefore use different representatives for a shared
-e-class. In the Rust batch API, their terms share storage in the returned
-`TermDag`, but the extractor does not minimize the union of all requested roots
-as one joint DAG.
+e-class. Their terms share storage in the returned `TermDag`, but the extractor
+does not minimize the union of all requested roots as one joint DAG.
 
-The language-level `multi-extract` command returns one standard
-`CommandOutput::ExtractVariants` for each requested root, in request order.
-Roots without a finite extraction still produce an output with an empty
-variant list. Cost preparation is shared across all roots, then each root is
-reconstructed into a fresh `TermDag`; the Rust batch extraction functions keep
-their shared-`TermDag` result representation.
+The language-level `multi-extract` command preserves this batch representation.
+It returns one `CommandOutput::UserDefined` containing a `MultiExtractOutput`.
+Its public `termdag` field stores all returned terms, while its public `terms`
+field groups their IDs by requested root in request order. A root without a
+finite extraction retains an empty group. Consumers can safely downcast the
+user-defined output to `MultiExtractOutput` to access these fields.
 
 This choice avoids the non-local representation problem described in
 [extraction-gym issue 36](https://github.com/egraphs-good/extraction-gym/issues/36):
