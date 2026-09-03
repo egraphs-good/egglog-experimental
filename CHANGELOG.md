@@ -45,6 +45,8 @@ This file records notable user-facing changes to egglog-experimental.
   user-defined command output. Unextractable roots retain an empty group.
 - The `back-off` scheduler now rejects unknown option tags instead of silently
   ignoring misspellings or removed options.
+- `keep-best` now honors dynamic costs assigned by `set-cost` in both tree and
+  greedy-DAG extraction modes.
 - `keep-best` rejects calls without a target table before mutating the e-graph.
 
 ## [3.0.0] - 2026-08-20

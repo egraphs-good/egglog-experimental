@@ -35,6 +35,6 @@ libtest-mimic = "0.8.1"
 
 # User-defined output downcasting, pending egglog#1008.
 [patch."https://github.com/egraphs-good/egglog.git"]
-egglog = { git = "https://github.com/saulshanabrook/egg-smol.git", rev = "c1031cb8eaaaa81df3880d06fa9b49cf45b05a31" }
-egglog-ast = { git = "https://github.com/saulshanabrook/egg-smol.git", rev = "c1031cb8eaaaa81df3880d06fa9b49cf45b05a31" }
-egglog-reports = { git = "https://github.com/saulshanabrook/egg-smol.git", rev = "c1031cb8eaaaa81df3880d06fa9b49cf45b05a31" }
+egglog = { git = "https://github.com/saulshanabrook/egg-smol.git", rev = "181a647685d2e35a99906448e9c10f0555130589" }
+egglog-ast = { git = "https://github.com/saulshanabrook/egg-smol.git", rev = "181a647685d2e35a99906448e9c10f0555130589" }
+egglog-reports = { git = "https://github.com/saulshanabrook/egg-smol.git", rev = "181a647685d2e35a99906448e9c10f0555130589" }
