@@ -1,4 +1,11 @@
-use std::{cell::Cell, fmt::Write as _, fs, process::Command, sync::Arc};
+use std::{
+    cell::Cell,
+    fmt::Write as _,
+    fs,
+    panic::{AssertUnwindSafe, catch_unwind},
+    process::Command,
+    sync::Arc,
+};
 
 use egglog::{
     CommandOutput,
@@ -169,6 +176,111 @@ fn f64_is_finite_rejects_nan_and_infinities() {
             "#,
         )
         .unwrap();
+}
+
+#[test]
+fn rational_primitives_cover_their_exact_domain() {
+    let mut egraph = egglog_experimental::new_experimental_egraph();
+    egraph
+        .parse_and_run_program(
+            None,
+            r#"
+            ; Construction canonicalizes signs and common factors.
+            (check (= (rational 2 -4) (rational -1 2)))
+            (check (= (numer (rational 6 -9)) -2))
+            (check (= (denom (rational 6 -9)) 3))
+
+            (check (= (neg (rational -3 2)) (rational 3 2)))
+            (check (= (abs (rational -3 2)) (rational 3 2)))
+            (check (= (floor (rational -9223372036854775808 1))
+                      (rational -9223372036854775808 1)))
+            (check (= (ceil (rational 9223372036854775807 1))
+                      (rational 9223372036854775807 1)))
+            (check (= (floor (rational -9223372036854775807 3))
+                      (rational -3074457345618258603 1)))
+            (check (= (ceil (rational 9223372036854775807 2))
+                      (rational 4611686018427387904 1)))
+            (check (= (round (rational -3 2)) (rational -2 1)))
+            (check (= (round (rational 3 2)) (rational 2 1)))
+            (check (= (round (rational -9223372036854775808 1))
+                      (rational -9223372036854775808 1)))
+            (check (= (round (rational 9223372036854775807 1))
+                      (rational 9223372036854775807 1)))
+            (check (= (min (rational -9223372036854775808 1)
+                           (rational 9223372036854775807 1))
+                      (rational -9223372036854775808 1)))
+            (check (= (max (rational -9223372036854775808 1)
+                           (rational 9223372036854775807 1))
+                      (rational 9223372036854775807 1)))
+            (check (< (rational -9223372036854775808 1)
+                      (rational 9223372036854775807 1)))
+            (check (> (rational 9223372036854775807 1)
+                      (rational -9223372036854775808 1)))
+            (check (<= (rational -9223372036854775808 1)
+                       (rational -9223372036854775808 1)))
+            (check (>= (rational 9223372036854775807 1)
+                       (rational 9223372036854775807 1)))
+            (check (= (+ (rational 9223372036854775807 2)
+                         (rational 9223372036854775807 2))
+                      (rational 9223372036854775807 1)))
+            (check (= (- (rational 9223372036854775807 2)
+                         (rational -9223372036854775807 2))
+                      (rational 9223372036854775807 1)))
+            (check (= (* (rational 2 3) (rational 3 4))
+                      (rational 1 2)))
+            (check (= (/ (rational 2 3) (rational 4 5))
+                      (rational 5 6)))
+
+            (check (= (pow (rational 2 3) (rational 3 1)) (rational 8 27)))
+            (check (= (log (rational 1 1)) (rational 0 1)))
+            (check (= (sqrt (rational 0 1)) (rational 0 1)))
+            (check (= (sqrt (rational 4 9)) (rational 2 3)))
+            (check (= (cbrt (rational 0 1)) (rational 0 1)))
+            (check (= (cbrt (rational 8 27)) (rational 2 3)))
+            (check (= (cbrt (rational -8 27)) (rational -2 3)))
+            (check (= (cbrt (rational -9223372036854775808 1))
+                      (rational -2097152 1)))
+            (check (= (to-f64 (rational 1 2)) 0.5))
+            "#,
+        )
+        .unwrap();
+}
+
+fn assert_rational_expr_undefined(expr: &str) {
+    let result = catch_unwind(AssertUnwindSafe(|| {
+        let mut egraph = egglog_experimental::new_experimental_egraph();
+        egraph.parse_and_run_program(None, &format!("(let result {expr})"))
+    }));
+    let Ok(result) = result else {
+        panic!("undefined Rational expression panicked: {expr}");
+    };
+    assert!(result.is_err(), "Rational expression was defined: {expr}");
+}
+
+#[test]
+fn rational_partial_primitives_are_undefined_without_panicking() {
+    for expr in [
+        "(rational 1 0)",
+        "(rational 1 -9223372036854775808)",
+        "(rational -9223372036854775808 -1)",
+        "(neg (rational -9223372036854775808 1))",
+        "(abs (rational -9223372036854775808 1))",
+        "(+ (rational 9223372036854775807 1) (rational 1 1))",
+        "(- (rational -9223372036854775808 1) (rational 1 1))",
+        "(* (rational 9223372036854775807 1) (rational 2 1))",
+        "(/ (rational -9223372036854775808 1) (rational -1 1))",
+        "(pow (rational 0 1) (rational 0 1))",
+        "(pow (rational 0 1) (rational 1 2))",
+        "(pow (rational 4 1) (rational 1 2))",
+        "(pow (rational 2 1) (rational -1 1))",
+        "(pow (rational 9223372036854775807 1) (rational 2 1))",
+        "(log (rational 2 1))",
+        "(sqrt (rational 2 1))",
+        "(sqrt (rational -1 1))",
+        "(cbrt (rational 2 1))",
+    ] {
+        assert_rational_expr_undefined(expr);
+    }
 }
 
 #[test]
@@ -620,6 +732,44 @@ fn test_extract_set_cost_decls() {
             (set-cost (Num2 2) 1000)
             (set-cost (Mul (Num 2) (Num 2)) 1000)
             (set-cost (Sub2 (Num2 2) (Num2 2)) 1000)",
+        )
+        .unwrap();
+}
+
+#[test]
+fn test_set_cost_rejects_negative_computed_values_without_panicking() {
+    let mut egraph = egglog_experimental::new_experimental_egraph();
+    egraph
+        .parse_and_run_program(
+            None,
+            r#"
+            (with-dynamic-cost (datatype E (Num i64)))
+            (set-cost (Num 1) (+ 1 1))
+            (extract (Num 1))
+            "#,
+        )
+        .unwrap();
+
+    let error = egraph
+        .parse_and_run_program(None, "(set-cost (Num 2) (- 0 1))")
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("@validate-dynamic-cost"),
+        "unexpected error: {error}"
+    );
+
+    egraph
+        .parse_and_run_program(
+            None,
+            r#"
+            (fail (check (= (cost_table_Num 2) -1)))
+            (extract (Num 2))
+
+            ; Direct cost-table writes are outside set-cost's validated
+            ; protocol, but extraction must still remain panic-free.
+            (set (cost_table_Num 3) -1)
+            (extract (Num 3))
+            "#,
         )
         .unwrap();
 }

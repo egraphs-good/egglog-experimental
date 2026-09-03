@@ -2,7 +2,8 @@
 //!
 //! `(keep-best "table1" "table2" ... [:extractor greedy-dag])` extracts the
 //! best representative found by the selected extractor for every entry in each
-//! named table, clears the entire e-graph, and re-inserts only those tuples.
+//! named table and then clears all existing rows. It rebuilds the selected
+//! tuples along with any constructor rows needed by their extracted values.
 //! This "compacts" the e-graph to the best solutions found so far.
 //!
 //! Each argument must evaluate to a `String` that names an existing function.
@@ -22,8 +23,9 @@ use egglog::{
 /// User-defined command implementing `(keep-best "table"...)`.
 ///
 /// For every row in the named tables, the command extracts the best term for
-/// each value. It then **clears every function in the e-graph** and reinserts
-/// only the extracted rows from the named tables.
+/// each value. It then **clears every function in the e-graph** and rebuilds
+/// the extracted rows from the named tables, including any constructor rows
+/// needed to represent their values.
 pub struct KeepBestCommand;
 
 impl UserDefinedCommand for KeepBestCommand {
