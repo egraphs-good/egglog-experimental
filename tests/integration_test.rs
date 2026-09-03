@@ -862,6 +862,19 @@ fn test_multi_extract_accepts_greedy_dag_extractor() {
 }
 
 #[test]
+fn test_multi_extract_dag_accepts_greedy_dag_extractor() {
+    let result = run_dynamic_dag("(multi-extract 1 :dag daggy :extractor greedy-dag)");
+
+    assert_eq!(result.len(), 1);
+    let output = result[0].to_string();
+    let tokens: Vec<&str> = output.split_whitespace().collect();
+    assert_eq!(
+        tokens.join(" "),
+        "(let ( (?t0 (Wide (Leaf 0))) ) ( ( (Pair ?t0 ?t0) ) ))"
+    );
+}
+
+#[test]
 fn test_keep_best_basic() {
     let mut egraph = egglog_experimental::new_experimental_egraph();
 
@@ -1536,8 +1549,24 @@ fn test_invalid_scheduler_config_returns_error_instead_of_panicking() {
 }
 
 #[test]
+fn test_unknown_backoff_tag_returns_error() {
+    for tag in [":node-limt", ":eager-apply"] {
+        let mut egraph = egglog_experimental::new_experimental_egraph();
+        let err = egraph
+            .parse_and_run_program(
+                None,
+                &format!("(run-schedule (let-scheduler bo (back-off {tag} 10)))"),
+            )
+            .unwrap_err();
+
+        assert!(err.to_string().contains("Unknown back-off scheduler tag"));
+        assert!(err.to_string().contains(tag));
+    }
+}
+
+#[test]
 fn test_negative_scheduler_config_returns_error_instead_of_panicking() {
-    for tag in [":match-limit", ":ban-length"] {
+    for tag in [":match-limit", ":ban-length", ":node-limit"] {
         let mut egraph = egglog_experimental::new_experimental_egraph();
         let err = egraph
             .parse_and_run_program(
@@ -1552,7 +1581,11 @@ fn test_negative_scheduler_config_returns_error_instead_of_panicking() {
 
 #[test]
 fn test_multi_extract_bad_arity_returns_error_instead_of_panicking() {
-    for program in ["(multi-extract)", "(multi-extract 1)"] {
+    for program in [
+        "(multi-extract)",
+        "(multi-extract 1)",
+        "(multi-extract 1 :dag)",
+    ] {
         let mut egraph = egglog_experimental::new_experimental_egraph();
 
         let err = egraph.parse_and_run_program(None, program).unwrap_err();
@@ -1560,6 +1593,23 @@ fn test_multi_extract_bad_arity_returns_error_instead_of_panicking() {
         assert!(
             err.to_string()
                 .contains("multi-extract expects at least a variant count and one expression"),
+            "unexpected error for {program}: {err}"
+        );
+    }
+}
+
+#[test]
+fn test_multi_extract_dag_only_in_documented_position() {
+    for program in ["(multi-extract 1 a :dag)", "(multi-extract 1 :dag :dag a)"] {
+        let mut egraph = egglog_experimental::new_experimental_egraph();
+        let err = egraph
+            .parse_and_run_program(
+                None,
+                &format!("(datatype Math (Num i64)) (let a (Num 1)) {program}"),
+            )
+            .unwrap_err();
+        assert!(
+            err.to_string().contains(":dag"),
             "unexpected error for {program}: {err}"
         );
     }
@@ -1946,6 +1996,138 @@ fn test_schedule_commands_and_actions() {
         "#,
         )
         .unwrap();
+}
+
+#[test]
+fn test_backoff_node_limit() {
+    let mut egraph = egglog_experimental::new_experimental_egraph();
+
+    // "count" grows one Num per iteration; "pair" is quadratic in the number
+    // of Nums. Without a node limit this saturates at 201 Nums and ~40k Adds.
+    egraph
+        .parse_and_run_program(
+            None,
+            r#"
+        (ruleset explode)
+        (datatype Math (Num i64) (Add Math Math))
+        (Num 0)
+        (rule ((= e (Num i)) (< i 200)) ((Num (+ i 1))) :ruleset explode :name "count")
+        (rule ((= a (Num x)) (= b (Num y))) ((Add a b)) :ruleset explode :name "pair")
+        (run-schedule
+          (let-scheduler bo (back-off :node-limit 500))
+          (saturate (run-with bo explode)))
+        "#,
+        )
+        .unwrap();
+
+    let nodes = egraph.num_nodes();
+    // This program has no node-producing merge callbacks: it reaches the soft
+    // threshold and remains within the expected final rule batch.
+    assert!(
+        (500..=600).contains(&nodes),
+        "unexpected final size: {nodes}"
+    );
+
+    // (get-node-size!) agrees with EGraph::num_nodes and, since this program
+    // has no analysis tables, with (get-size!).
+    let span = span!();
+    let expr = Expr::Call(span.clone(), "get-node-size!".into(), vec![]);
+    let (_, value) = egraph.eval_expr(&expr).unwrap();
+    assert_eq!(egraph.value_to_base::<i64>(value), nodes as i64);
+    assert_eq!(eval_get_size(&mut egraph, &[]), nodes as i64);
+}
+
+#[test]
+fn test_get_node_size_excludes_analysis_tables() {
+    let mut egraph = egglog_experimental::new_experimental_egraph();
+    egraph
+        .parse_and_run_program(
+            None,
+            r#"
+        (datatype Math (Num i64))
+        (function depth (Math) i64 :no-merge)
+        (relation seen (Math))
+        (Num 0)
+        (Num 1)
+        (set (depth (Num 0)) 0)
+        (seen (Num 0))
+        (seen (Num 1))
+        "#,
+        )
+        .unwrap();
+
+    let span = span!();
+    let expr = Expr::Call(span.clone(), "get-node-size!".into(), vec![]);
+    let (_, value) = egraph.eval_expr(&expr).unwrap();
+    // Two Num nodes; the depth analysis row and the two relation rows (a
+    // constructor over a non-unionable sort) are excluded.
+    assert_eq!(egraph.value_to_base::<i64>(value), 2);
+    // ... but included by (get-size!).
+    assert_eq!(eval_get_size(&mut egraph, &[]), 5);
+    assert_eq!(egraph.num_nodes(), 2);
+}
+
+#[test]
+fn test_get_node_size_excludes_custom_let_and_hidden_tables() {
+    let mut egraph = egglog_experimental::new_experimental_egraph();
+    egraph
+        .parse_and_run_program(
+            None,
+            r#"
+        (sort S)
+        (constructor C () S)
+        (constructor Hidden () S :internal-hidden)
+        (function analysis () S :merge old)
+        (relation seen ())
+        (C)
+        (Hidden)
+        (set (analysis) (C))
+        (let root (C))
+        (seen)
+        "#,
+        )
+        .unwrap();
+
+    let expr = Expr::Call(span!(), "get-node-size!".into(), vec![]);
+    let (_, value) = egraph.eval_expr(&expr).unwrap();
+    assert_eq!(egraph.value_to_base::<i64>(value), 1);
+    assert_eq!(egraph.num_nodes(), 1);
+}
+
+#[test]
+fn test_multi_extract_dag() {
+    let mut egraph = egglog_experimental::new_experimental_egraph();
+    let outputs = egraph
+        .parse_and_run_program(
+            None,
+            r#"
+        (datatype Math (Num i64) (Add Math Math) (Neg Math))
+        (let a (Add (Num 1) (Num 2)))
+        (let b (Neg (Add (Num 1) (Num 2))))
+        (multi-extract 1 :dag a b)
+        "#,
+        )
+        .unwrap();
+    let printed = outputs.last().unwrap().to_string();
+    let tokens: Vec<&str> = printed.split_whitespace().collect();
+    // The shared (Add (Num 1) (Num 2)) is bound once; leaves stay inline.
+    assert_eq!(
+        tokens.join(" "),
+        "(let ( (?t0 (Add (Num 1) (Num 2))) ) ( ( ?t0 ) ( (Neg ?t0) ) ))"
+    );
+
+    // :dag output must expand to exactly the non-dag output.
+    let plain = egraph
+        .parse_and_run_program(None, "(multi-extract 1 a b)")
+        .unwrap()
+        .last()
+        .unwrap()
+        .to_string();
+    let plain_tokens: Vec<&str> = plain.split_whitespace().collect();
+    assert_eq!(
+        plain_tokens.join(" "),
+        "( ( (Add (Num 1) (Num 2)) ) ( (Neg (Add (Num 1) (Num 2))) ) )"
+    );
 }
 
 #[test]

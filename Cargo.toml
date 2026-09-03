@@ -17,9 +17,9 @@ default = ["bin"]
 bin = ["egglog/bin"]
 
 [dependencies]
-egglog = { version = "3.0.0", git = "https://github.com/egraphs-good/egglog.git", rev = "e264c37a3332453eb0b6486c82c8766dd1af17df", default-features = false }
-egglog-ast = { version = "3.0.0", git = "https://github.com/egraphs-good/egglog.git", rev = "e264c37a3332453eb0b6486c82c8766dd1af17df", default-features = false }
-egglog-reports = { version = "3.0.0", git = "https://github.com/egraphs-good/egglog.git", rev = "e264c37a3332453eb0b6486c82c8766dd1af17df", default-features = false }
+egglog = { version = "3.0.0", git = "https://github.com/egraphs-good/egglog.git", rev = "d61ba050231778fcc8d053d4fc9dbc8d9ae1f779", default-features = false }
+egglog-ast = { version = "3.0.0", git = "https://github.com/egraphs-good/egglog.git", rev = "d61ba050231778fcc8d053d4fc9dbc8d9ae1f779", default-features = false }
+egglog-reports = { version = "3.0.0", git = "https://github.com/egraphs-good/egglog.git", rev = "d61ba050231778fcc8d053d4fc9dbc8d9ae1f779", default-features = false }
 
 num = "0.4.3"
 lazy_static = "1.4"
@@ -35,6 +35,6 @@ libtest-mimic = "0.8.1"
 
 # User-defined output downcasting, pending egglog#1008.
 [patch."https://github.com/egraphs-good/egglog.git"]
-egglog = { git = "https://github.com/saulshanabrook/egg-smol.git", rev = "ee58d8a537cec77e07595b1f0b577eee617f34b6" }
-egglog-ast = { git = "https://github.com/saulshanabrook/egg-smol.git", rev = "ee58d8a537cec77e07595b1f0b577eee617f34b6" }
-egglog-reports = { git = "https://github.com/saulshanabrook/egg-smol.git", rev = "ee58d8a537cec77e07595b1f0b577eee617f34b6" }
+egglog = { git = "https://github.com/saulshanabrook/egg-smol.git", rev = "c1031cb8eaaaa81df3880d06fa9b49cf45b05a31" }
+egglog-ast = { git = "https://github.com/saulshanabrook/egg-smol.git", rev = "c1031cb8eaaaa81df3880d06fa9b49cf45b05a31" }
+egglog-reports = { git = "https://github.com/saulshanabrook/egg-smol.git", rev = "c1031cb8eaaaa81df3880d06fa9b49cf45b05a31" }

@@ -68,9 +68,9 @@
 //!   schedulers.
 //! - [`DynamicCostModel`] supports runtime costs declared with
 //!   `with-dynamic-cost` and changed with `set-cost`.
-//! - [`MultiExtract`] implements `(multi-extract n term...)`, returning one
-//!   [`MultiExtractOutput`] whose public fields expose shared term storage and
-//!   ordered per-root variant IDs.
+//! - [`MultiExtract`] implements `(multi-extract n [:dag] term...)`, returning
+//!   one [`MultiExtractOutput`] whose public fields expose shared term storage
+//!   and ordered per-root variant IDs.
 //! - [`KeepBestCommand`] compacts selected tables to their best terms.
 //! - `:extractor greedy-dag` enables heuristic DAG-cost extraction for
 //!   `extract`, `multi-extract`, and `keep-best`. Within each independently
@@ -80,6 +80,7 @@
 //! ## Inspection
 //!
 //! - [`GetSizePrimitive`] implements `(get-size! "table"...)`.
+//! - [`GetNodeSizePrimitive`] implements `(get-node-size!)`.
 //! - [`PrintTableStatsCommand`] reports table cardinality and out-degree
 //!   statistics.
 //!
@@ -102,6 +103,7 @@ mod set_cost;
 pub use set_cost::*;
 mod multi_extract;
 pub use multi_extract::*;
+mod dag_print;
 mod size;
 pub use size::*;
 mod map_fold;
@@ -136,6 +138,7 @@ pub fn new_experimental_egraph() -> EGraph {
     // Support for set cost
     add_set_cost(&mut egraph);
     egraph.add_read_primitive(GetSizePrimitive, None);
+    egraph.add_read_primitive(GetNodeSizePrimitive, None);
 
     // unstable-fresh! macro
     egraph

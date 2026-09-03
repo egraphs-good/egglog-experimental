@@ -1,8 +1,14 @@
 //! Extract multiple terms or variants with one extractor pass.
 //!
-//! `(multi-extract n term...)` prints the `n` lowest-cost variants of every
-//! term. `n` must be a positive `i64`; `(multi-extract 1 term)` is equivalent
-//! to best extraction.
+//! `(multi-extract n [:dag] term... [:extractor greedy-dag])` prints the `n`
+//! lowest-cost variants of every term. `n` must be a positive `i64`;
+//! `(multi-extract 1 term)` is equivalent to best extraction.
+//!
+//! With `:dag`, the output is one
+//! `(let ((name def) ...) ((variant ...) ...))` s-expression in which subterms
+//! shared across all variants of all terms are let-bound once, instead of every
+//! variant being expanded to a tree.
+//!
 //! Use `(multi-extract n term... :extractor greedy-dag)` to charge shared
 //! subterms once within each ranked variant. Greedy-DAG extraction is a
 //! heuristic rather than a globally optimal k-best extractor.
@@ -32,23 +38,46 @@ pub struct MultiExtractOutput {
     ///
     /// A root without a finite extraction has an empty inner vector.
     pub terms: Vec<Vec<TermId>>,
+    dag: bool,
 }
 
 impl std::fmt::Display for MultiExtractOutput {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        writeln!(f, "(")?;
-        for variants in &self.terms {
-            writeln!(f, "   (")?;
-            for expr in variants {
-                writeln!(f, "      {}", self.termdag.to_string(*expr))?;
+        if self.dag {
+            let roots: Vec<TermId> = self.terms.iter().flatten().copied().collect();
+            let (bindings, rendered) =
+                crate::dag_print::render_terms_with_shared_lets(&self.termdag, &roots);
+            writeln!(f, "(let (")?;
+            for (name, def) in &bindings {
+                writeln!(f, "   ({name} {def})")?;
             }
-            writeln!(f, "   )")?;
+            writeln!(f, " )")?;
+            writeln!(f, " (")?;
+            let mut next = rendered.iter();
+            for variants in &self.terms {
+                writeln!(f, "   (")?;
+                for _ in variants {
+                    writeln!(f, "      {}", next.next().unwrap())?;
+                }
+                writeln!(f, "   )")?;
+            }
+            writeln!(f, " ))")
+        } else {
+            writeln!(f, "(")?;
+            for variants in &self.terms {
+                writeln!(f, "   (")?;
+                for expr in variants {
+                    writeln!(f, "      {}", self.termdag.to_string(*expr))?;
+                }
+                writeln!(f, "   )")?;
+            }
+            writeln!(f, ")")
         }
-        writeln!(f, ")")
     }
 }
 
-/// User-defined command implementing `(multi-extract n term...)` with a
+/// User-defined command implementing
+/// `(multi-extract n [:dag] term... [:extractor greedy-dag])` with a
 /// caller-provided marginal cost model.
 ///
 /// The positive `i64` value `n` is the number of variants returned for each
@@ -79,18 +108,27 @@ impl<C: MonoidCost, CM: DagCostModel<C> + Clone + Send + Sync + 'static> UserDef
     fn update(&self, egraph: &mut EGraph, args: &[Expr]) -> Result<Vec<CommandOutput>, Error> {
         let (args, use_greedy_dag) = split_trailing_extractor(args)?;
 
-        if args.len() < 2 {
-            let span = args.first().map(Expr::span).unwrap_or_else(|| span!());
+        let Some((variants_expr, mut terms)) = args.split_first() else {
             return Err(Error::ParseError(ParseError(
-                span,
+                span!(),
+                "multi-extract expects at least a variant count and one expression".into(),
+            )));
+        };
+        let dag = matches!(terms.first(), Some(Expr::Var(_, option)) if option == ":dag");
+        if dag {
+            terms = &terms[1..];
+        }
+        if terms.is_empty() {
+            return Err(Error::ParseError(ParseError(
+                variants_expr.span(),
                 "multi-extract expects at least a variant count and one expression".into(),
             )));
         }
 
-        let (variants_sort, variants_value) = egraph.eval_expr(&args[0])?;
+        let (variants_sort, variants_value) = egraph.eval_expr(variants_expr)?;
         if variants_sort.name() != "i64" {
             return Err(Error::TypeError(TypeError::Mismatch {
-                expr: args[0].clone(),
+                expr: variants_expr.clone(),
                 expected: egraph.get_arcsort_by(|s| s.name() == "i64"),
                 actual: variants_sort,
             }));
@@ -99,18 +137,18 @@ impl<C: MonoidCost, CM: DagCostModel<C> + Clone + Send + Sync + 'static> UserDef
         let n: i64 = egraph.value_to_base(variants_value);
         if n < 0 {
             return Err(Error::ParseError(ParseError(
-                args[0].span(),
+                variants_expr.span(),
                 "Cannot extract negative number of variants".into(),
             )));
         }
         if n == 0 {
             return Err(Error::ParseError(ParseError(
-                args[0].span(),
+                variants_expr.span(),
                 "multi-extract requires a positive number of variants".into(),
             )));
         }
 
-        let roots: Vec<_> = args[1..]
+        let roots: Vec<_> = terms
             .iter()
             .map(|arg| egraph.eval_expr(arg))
             .collect::<Result<_, _>>()?;
@@ -143,6 +181,7 @@ impl<C: MonoidCost, CM: DagCostModel<C> + Clone + Send + Sync + 'static> UserDef
             MultiExtractOutput {
                 termdag: extracted.termdag,
                 terms,
+                dag,
             },
         ))])
     }
