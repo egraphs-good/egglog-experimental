@@ -1,9 +1,10 @@
-//! Inspect e-graph table sizes from an egglog expression.
+//! Inspect e-graph table and e-node counts from egglog expressions.
 //!
 //! `(get-size!)` returns the sum of all non-internal table sizes.
 //! `(get-size! "A" "B")` returns the sum for the named tables. The primitive
 //! is read-capable, so it can also be used in extended schedule guards and
 //! `eval` steps.
+//! `(get-node-size!)` returns the visible e-node count.
 
 use std::convert::TryFrom;
 
@@ -58,12 +59,13 @@ impl ReadPrim for GetSizePrimitive {
     }
 }
 
-/// `(get-node-size!)`: the number of e-nodes in the e-graph — the total row
-/// count of tables whose output is a unionable eq-sort (constructors). Unlike
-/// `(get-size!)`, this excludes analysis tables (functions to base-sort values
-/// and `relation`s, which desugar to constructors over a fresh non-unionable
-/// sort), so it matches the node count of a traditional e-graph. Same measure
-/// as `egglog::EGraph::num_nodes`.
+/// `(get-node-size!)`: the number of e-nodes in visible constructor tables whose
+/// output is a unionable eq-sort.
+///
+/// Unlike `(get-size!)`, it excludes relations, analysis functions, global
+/// aliases, hidden declarations, and internal-prefixed implementation tables.
+/// On an ordinary experimental e-graph, this is the same measure as the
+/// back-off scheduler's `:node-limit`.
 #[derive(Clone)]
 pub struct GetNodeSizePrimitive;
 
@@ -89,14 +91,14 @@ impl ReadPrim for GetNodeSizePrimitive {
             .table_sizes()
             .into_iter()
             .filter_map(|(name, size)| {
-                if name.starts_with(INTERNAL_SYMBOL_PREFIX) {
+                if name.starts_with(INTERNAL_SYMBOL_PREFIX)
+                    || state.is_table_hidden(name)?
+                    || state.table_subtype(name)? != FunctionSubtype::Constructor
+                {
                     return None;
                 }
-                let func_type = match state.table_subtype(name)? {
-                    FunctionSubtype::Constructor => state.constructor_schema(name).ok()?,
-                    FunctionSubtype::Custom => state.function_schema(name).ok()?,
-                };
-                state.is_sort_unionable(&func_type.output)?.then_some(size)
+                let output = &state.constructor_schema(name).ok()?.output;
+                state.is_sort_unionable(output)?.then_some(size)
             })
             .sum();
         let size = i64::try_from(size).ok()?;

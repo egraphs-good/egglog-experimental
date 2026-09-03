@@ -74,6 +74,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
 
 [[package]]
+name = "ar_archive_writer"
+version = "0.5.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "73cd58deff2140a0a8eae87e417bd01db68a33e148aa93d1e8cd837e55e312b6"
+dependencies = [
+ "object",
+]
+
+[[package]]
 name = "arc-swap"
 version = "1.9.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -332,7 +341,7 @@ checksum = "d0881ea181b1df73ff77ffaaf9c7544ecc11e82fba9b5f27b262a3c73a332555"
 [[package]]
 name = "egglog"
 version = "3.0.0"
-source = "git+https://github.com/egraphs-good/egglog.git?rev=924b5cd0f203542a097a800239100633d3c0f2b4#924b5cd0f203542a097a800239100633d3c0f2b4"
+source = "git+https://github.com/egraphs-good/egglog.git?rev=d61ba050231778fcc8d053d4fc9dbc8d9ae1f779#d61ba050231778fcc8d053d4fc9dbc8d9ae1f779"
 dependencies = [
  "chrono",
  "clap",
@@ -364,7 +373,7 @@ dependencies = [
 [[package]]
 name = "egglog-add-primitive"
 version = "3.0.0"
-source = "git+https://github.com/egraphs-good/egglog.git?rev=924b5cd0f203542a097a800239100633d3c0f2b4#924b5cd0f203542a097a800239100633d3c0f2b4"
+source = "git+https://github.com/egraphs-good/egglog.git?rev=d61ba050231778fcc8d053d4fc9dbc8d9ae1f779#d61ba050231778fcc8d053d4fc9dbc8d9ae1f779"
 dependencies = [
  "quote",
  "syn 2.0.119",
@@ -373,7 +382,7 @@ dependencies = [
 [[package]]
 name = "egglog-ast"
 version = "3.0.0"
-source = "git+https://github.com/egraphs-good/egglog.git?rev=924b5cd0f203542a097a800239100633d3c0f2b4#924b5cd0f203542a097a800239100633d3c0f2b4"
+source = "git+https://github.com/egraphs-good/egglog.git?rev=d61ba050231778fcc8d053d4fc9dbc8d9ae1f779#d61ba050231778fcc8d053d4fc9dbc8d9ae1f779"
 dependencies = [
  "ordered-float",
 ]
@@ -381,7 +390,7 @@ dependencies = [
 [[package]]
 name = "egglog-bridge"
 version = "3.0.0"
-source = "git+https://github.com/egraphs-good/egglog.git?rev=924b5cd0f203542a097a800239100633d3c0f2b4#924b5cd0f203542a097a800239100633d3c0f2b4"
+source = "git+https://github.com/egraphs-good/egglog.git?rev=d61ba050231778fcc8d053d4fc9dbc8d9ae1f779#d61ba050231778fcc8d053d4fc9dbc8d9ae1f779"
 dependencies = [
  "anyhow",
  "dyn-clone",
@@ -404,7 +413,7 @@ dependencies = [
 [[package]]
 name = "egglog-concurrency"
 version = "3.0.0"
-source = "git+https://github.com/egraphs-good/egglog.git?rev=924b5cd0f203542a097a800239100633d3c0f2b4#924b5cd0f203542a097a800239100633d3c0f2b4"
+source = "git+https://github.com/egraphs-good/egglog.git?rev=d61ba050231778fcc8d053d4fc9dbc8d9ae1f779#d61ba050231778fcc8d053d4fc9dbc8d9ae1f779"
 dependencies = [
  "arc-swap",
  "bumpalo",
@@ -416,7 +425,7 @@ dependencies = [
 [[package]]
 name = "egglog-core-relations"
 version = "3.0.0"
-source = "git+https://github.com/egraphs-good/egglog.git?rev=924b5cd0f203542a097a800239100633d3c0f2b4#924b5cd0f203542a097a800239100633d3c0f2b4"
+source = "git+https://github.com/egraphs-good/egglog.git?rev=d61ba050231778fcc8d053d4fc9dbc8d9ae1f779#d61ba050231778fcc8d053d4fc9dbc8d9ae1f779"
 dependencies = [
  "anyhow",
  "bumpalo",
@@ -448,22 +457,25 @@ dependencies = [
  "egglog",
  "egglog-ast",
  "egglog-reports",
+ "fixedbitset",
  "glob",
+ "hashbrown 0.16.1",
  "lazy_static",
  "libtest-mimic",
  "log",
  "num",
+ "stacker",
 ]
 
 [[package]]
 name = "egglog-numeric-id"
 version = "3.0.0"
-source = "git+https://github.com/egraphs-good/egglog.git?rev=924b5cd0f203542a097a800239100633d3c0f2b4#924b5cd0f203542a097a800239100633d3c0f2b4"
+source = "git+https://github.com/egraphs-good/egglog.git?rev=d61ba050231778fcc8d053d4fc9dbc8d9ae1f779#d61ba050231778fcc8d053d4fc9dbc8d9ae1f779"
 
 [[package]]
 name = "egglog-reports"
 version = "3.0.0"
-source = "git+https://github.com/egraphs-good/egglog.git?rev=924b5cd0f203542a097a800239100633d3c0f2b4#924b5cd0f203542a097a800239100633d3c0f2b4"
+source = "git+https://github.com/egraphs-good/egglog.git?rev=d61ba050231778fcc8d053d4fc9dbc8d9ae1f779#d61ba050231778fcc8d053d4fc9dbc8d9ae1f779"
 dependencies = [
  "clap",
  "hashbrown 0.16.1",
@@ -477,7 +489,7 @@ dependencies = [
 [[package]]
 name = "egglog-union-find"
 version = "3.0.0"
-source = "git+https://github.com/egraphs-good/egglog.git?rev=924b5cd0f203542a097a800239100633d3c0f2b4#924b5cd0f203542a097a800239100633d3c0f2b4"
+source = "git+https://github.com/egraphs-good/egglog.git?rev=d61ba050231778fcc8d053d4fc9dbc8d9ae1f779#d61ba050231778fcc8d053d4fc9dbc8d9ae1f779"
 dependencies = [
  "crossbeam",
  "egglog-concurrency",
@@ -936,6 +948,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "object"
+version = "0.39.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2e5a6c098c7a3b6547378093f5cc30bc54fd361ce711e05293a5cc589562739b"
+dependencies = [
+ "memchr",
+]
+
+[[package]]
 name = "once_cell"
 version = "1.21.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1050,6 +1071,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "985e7ec9bb745e6ce6535b544d84d6cd6f7ad8bd711c398938ae983b91a766d9"
 dependencies = [
  "unicode-ident",
+]
+
+[[package]]
+name = "psm"
+version = "0.1.32"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4dcd034599e63b970727f70d79e02d62390a4a84f7c6b827c27c46d5ac3fa622"
+dependencies = [
+ "ar_archive_writer",
+ "cc",
 ]
 
 [[package]]
@@ -1276,6 +1307,19 @@ name = "smallvec"
 version = "1.15.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8ed6a63f02c8539c91a8685a86f4099661ba3da017932f6ebbea6de3f0fa7c90"
+
+[[package]]
+name = "stacker"
+version = "0.1.25"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "707f49d46706bacf8a2b00d51dace3f9de527c13eec3778f570c411f89e69967"
+dependencies = [
+ "cc",
+ "cfg-if",
+ "libc",
+ "psm",
+ "windows-sys",
+]
 
 [[package]]
 name = "strsim"

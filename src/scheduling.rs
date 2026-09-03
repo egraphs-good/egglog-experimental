@@ -18,7 +18,7 @@
 //! - **`(run-with scheduler [ruleset] [:until cond])`** — like `run`, but drives
 //!   the ruleset with a named scheduler previously bound by `let-scheduler`.
 //! - **`(let-scheduler name (scheduler-kind args...))`** — bind `name` to a fresh
-//!   scheduler instance (e.g. `(back-off :match-limit 1000 :ban-length 5)`). A
+//!   scheduler instance (e.g. `(back-off :match-limit 1000 :ban-length 5 :node-limit 5000)`). A
 //!   binding inside `run-schedule` is scoped to its enclosing block; a top-level
 //!   binding persists on the e-graph.
 //! - **`(seq step...)`** — run each step once, in order.
@@ -478,11 +478,18 @@ mod schedulers {
     ) -> Result<Option<usize>, egglog::Error> {
         tags.get(tag)
             .map(|lit| match lit {
-                Literal::Int(n) if *n >= 0 => Ok(*n as usize),
-                Literal::Int(_) => Err(egglog::Error::ParseError(egglog::ast::ParseError(
-                    span.clone(),
-                    format!("Scheduler {tag} must be non-negative"),
-                ))),
+                Literal::Int(n) if *n < 0 => {
+                    Err(egglog::Error::ParseError(egglog::ast::ParseError(
+                        span.clone(),
+                        format!("Scheduler {tag} must be non-negative"),
+                    )))
+                }
+                Literal::Int(n) => usize::try_from(*n).map_err(|_| {
+                    egglog::Error::ParseError(egglog::ast::ParseError(
+                        span.clone(),
+                        format!("Scheduler {tag} is too large for this platform"),
+                    ))
+                }),
                 _ => Err(egglog::Error::ParseError(egglog::ast::ParseError(
                     span.clone(),
                     format!("Scheduler {tag} must be an integer"),
@@ -497,6 +504,15 @@ mod schedulers {
         args: &[Expr],
     ) -> Result<Box<dyn Scheduler>, egglog::Error> {
         let tags = parse_tags(span, args)?;
+        if let Some(tag) = tags
+            .keys()
+            .find(|tag| !matches!(tag.as_str(), ":match-limit" | ":ban-length" | ":node-limit"))
+        {
+            return Err(egglog::Error::ParseError(egglog::ast::ParseError(
+                span.clone(),
+                format!("Unknown back-off scheduler tag {tag}"),
+            )));
+        }
         let default_match_limit = parse_usize_tag(&tags, ":match-limit", span)?.unwrap_or(1000);
         let default_ban_length = parse_usize_tag(&tags, ":ban-length", span)?.unwrap_or(5);
         let node_limit = parse_usize_tag(&tags, ":node-limit", span)?;
@@ -505,7 +521,6 @@ mod schedulers {
             default_ban_length,
             node_limit,
             stats: HashMap::new(),
-            cached_nodes: None,
         }))
     }
 
@@ -513,18 +528,12 @@ mod schedulers {
     pub struct BackOffScheduler {
         default_match_limit: usize,
         default_ban_length: usize,
-        /// Upper bound on the number of e-nodes (`EGraph::num_nodes`). Once
-        /// the e-graph reaches it, rules are delayed instead of applied. The
-        /// runner applies each rule's chosen matches before consulting the
-        /// next rule, so the check sees the live size and the limit can be
-        /// overshot by at most one rule's matches.
+        /// Soft threshold for the number of e-nodes. Once an observed count
+        /// reaches it, rules are delayed instead of applied. A selected rule
+        /// may insert any number of nodes, and the deferred rebuild may change
+        /// the count again.
         node_limit: Option<usize>,
         stats: HashMap<String, RuleStats>,
-        /// `num_nodes()` as of `(iteration, value)`. Counting is O(#tables)
-        /// and it is consulted once per rule; the size only changes when a
-        /// rule's matches are applied, so the reading is reused until then
-        /// (and dropped at iteration boundaries).
-        cached_nodes: Option<(usize, usize)>,
     }
 
     #[derive(Debug, Clone)]
@@ -551,12 +560,12 @@ mod schedulers {
     }
 
     impl Scheduler for BackOffScheduler {
-        fn can_stop(&mut self, ctx: &SchedulerContext, rules: &[&str], _ruleset: &str) -> bool {
+        fn can_stop(&mut self, ctx: &SchedulerContext<'_>, rules: &[&str], _ruleset: &str) -> bool {
             // At the node limit, further iterations cannot make progress:
             // every rule would be delayed. Report saturation even though
             // banned rules may be pending.
             if let Some(node_limit) = self.node_limit {
-                let nodes = ctx.egraph.num_nodes();
+                let nodes = ctx.num_nodes();
                 if nodes >= node_limit {
                     info!("Node limit reached ({nodes} >= {node_limit}); stopping");
                     return true;
@@ -619,7 +628,7 @@ mod schedulers {
 
         fn filter_matches(
             &mut self,
-            ctx: &SchedulerContext,
+            ctx: &SchedulerContext<'_>,
             rule: &str,
             _ruleset: &str,
             matches: &mut Matches,
@@ -652,17 +661,10 @@ mod schedulers {
                 return false;
             }
 
-            // Live size: earlier rules' matches in this iteration are already
-            // applied (an upper bound until the end-of-iteration rebuild).
+            // Earlier rule actions are visible here. Rebuilding may later move
+            // the count in either direction.
             if let Some(node_limit) = node_limit {
-                let nodes = match self.cached_nodes {
-                    Some((iteration, nodes)) if iteration == ctx.iteration => nodes,
-                    _ => {
-                        let nodes = ctx.egraph.num_nodes();
-                        self.cached_nodes = Some((ctx.iteration, nodes));
-                        nodes
-                    }
-                };
+                let nodes = ctx.num_nodes();
                 if nodes >= node_limit {
                     debug!(
                         "Delaying {}: at node limit ({} >= {})",
@@ -672,18 +674,12 @@ mod schedulers {
                 }
             }
 
-            // Re-borrow: the node-limit check above needed `self`.
-            let stats = self.stats.get_mut(rule).unwrap();
             stats.times_applied += 1;
             debug!(
                 "Choosing all matches for {} ({}-{})",
                 rule, stats.times_applied, stats.times_banned
             );
             matches.choose_all();
-            if total_len > 0 {
-                // Applying these matches changes the size.
-                self.cached_nodes = None;
-            }
             true
         }
     }
