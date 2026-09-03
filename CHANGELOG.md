@@ -16,11 +16,15 @@ This file records notable user-facing changes to egglog-experimental.
   tables. This is the same measure `:node-limit` uses there.
 - A `:dag` option for `multi-extract` that let-binds subterms shared across
   the extracted variants instead of expanding every variant to a tree.
+- Greedy DAG extraction for `extract`, `multi-extract`, and `keep-best` via
+  `:extractor greedy-dag`.
 
 ### Changed
 
 - The `back-off` scheduler now rejects unknown option tags instead of silently
   ignoring misspellings or removed options.
+- `keep-best` now honors dynamic costs assigned by `set-cost` in both tree and
+  greedy-DAG extraction modes.
 
 ## [3.0.0] - 2026-08-20
 

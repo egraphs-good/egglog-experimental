@@ -1,22 +1,27 @@
 //! Extract multiple terms or variants with one extractor pass.
 //!
-//! `(multi-extract n [:dag] term...)` prints the `n` lowest-cost variants of
-//! every term. `n` must be a positive `i64`; `(multi-extract 1 term)` is
-//! equivalent to best extraction.
+//! `(multi-extract n [:dag] term... [:extractor greedy-dag])` prints the `n`
+//! lowest-cost variants of every term. `n` must be a positive `i64`;
+//! `(multi-extract 1 term)` is equivalent to best extraction.
 //!
 //! With `:dag`, the output is one
-//! `(let ((name def) ...) ((variant ...) ...))` s-expression in which
-//! subterms shared across all variants of all terms are let-bound once, instead
-//! of every variant being expanded to a tree.
+//! `(let ((name def) ...) ((variant ...) ...))` s-expression in which subterms
+//! shared across all variants of all terms are let-bound once, instead of every
+//! variant being expanded to a tree.
+//!
+//! Use `(multi-extract n term... :extractor greedy-dag)` to charge shared
+//! subterms once within each ranked variant. Greedy-DAG extraction is a
+//! heuristic rather than a globally optimal k-best extractor.
 
+use crate::greedy_dag_extract::{extract_variants_greedy_dag, split_trailing_extractor};
 use egglog::{
     CommandOutput, EGraph, Error, TermDag, TermId, TypeError, UserDefinedCommand,
     ast::{Expr, ParseError},
-    extract::{Cost, CostModel, Extractor},
+    extract::{DagCostModel, MonoidCost, TreeCostModelFromDag},
     prelude::span,
 };
 use log::log_enabled;
-use std::{fmt::Debug, marker::PhantomData};
+use std::marker::PhantomData;
 
 /// Displayable output produced by [`MultiExtract`].
 #[derive(Debug)]
@@ -61,35 +66,37 @@ impl std::fmt::Display for MultiExtractOutput {
     }
 }
 
-/// User-defined command implementing `(multi-extract n [:dag] term...)` with a
-/// caller-provided cost model.
+/// User-defined command implementing
+/// `(multi-extract n [:dag] term... [:extractor greedy-dag])` with a
+/// caller-provided marginal cost model.
 ///
 /// The positive `i64` value `n` is the number of variants returned for each
-/// term. All terms share one extractor computation.
-pub struct MultiExtract<C: Cost + Ord + Eq + Clone + Debug + Send + Sync, CM: CostModel<C> + Clone>
-{
+/// term. All terms share one extractor computation. Tree extraction adapts the
+/// model with [`TreeCostModelFromDag`]; `:extractor greedy-dag` uses its
+/// marginal costs directly.
+pub struct MultiExtract<C: MonoidCost, CM: DagCostModel<C> + Clone> {
     cost_model: CM,
-    _cost_t: PhantomData<C>,
+    // Extracted costs are temporary, so this marker should not impose their
+    // ownership or auto-trait properties on the registered command.
+    _cost: PhantomData<fn() -> C>,
 }
 
-impl<C: Cost + Ord + Eq + Clone + Debug + Send + Sync, CM: CostModel<C> + Clone>
-    MultiExtract<C, CM>
-{
-    /// Creates a multi-extraction command that uses `cost_model`.
+impl<C: MonoidCost, CM: DagCostModel<C> + Clone> MultiExtract<C, CM> {
+    /// Creates a multi-extract command for `cost_model`.
     pub fn new(cost_model: CM) -> Self {
         MultiExtract {
             cost_model,
-            _cost_t: PhantomData,
+            _cost: PhantomData,
         }
     }
 }
 
-impl<
-    C: Cost + Ord + Eq + Clone + Debug + Send + Sync,
-    CM: CostModel<C> + Clone + Send + Sync + 'static,
-> UserDefinedCommand for MultiExtract<C, CM>
+impl<C: MonoidCost, CM: DagCostModel<C> + Clone + Send + Sync + 'static> UserDefinedCommand
+    for MultiExtract<C, CM>
 {
     fn update(&self, egraph: &mut EGraph, args: &[Expr]) -> Result<Vec<CommandOutput>, Error> {
+        let (args, use_greedy_dag) = split_trailing_extractor(args)?;
+
         let Some((variants_expr, mut terms)) = args.split_first() else {
             return Err(Error::ParseError(ParseError(
                 span!(),
@@ -130,33 +137,30 @@ impl<
             )));
         }
 
-        let (sorts, values): (Vec<_>, Vec<_>) = terms
+        let roots: Vec<_> = terms
             .iter()
             .map(|arg| egraph.eval_expr(arg))
             .collect::<Result<_, _>>()?;
 
-        let mut termdag = TermDag::default();
-        let extractor = Extractor::compute_costs_from_rootsorts(
-            Some(sorts.clone()),
-            egraph,
-            self.cost_model.clone(),
-        );
+        let extracted = if use_greedy_dag {
+            extract_variants_greedy_dag(egraph, roots, n as usize, self.cost_model.clone())
+        } else {
+            egraph.extract_variants_with_cost_model(
+                roots,
+                n as usize,
+                TreeCostModelFromDag(self.cost_model.clone()),
+            )
+        }?;
 
-        let terms: Vec<Vec<_>> = values
+        let terms: Vec<Vec<_>> = extracted
+            .variants
             .into_iter()
-            .zip(sorts)
-            .map(|(value, sort)| {
-                extractor
-                    .extract_variants_with_sort(egraph, &mut termdag, value, n as usize, sort)
-                    .into_iter()
-                    .map(|e| e.1)
-                    .collect()
-            })
+            .map(|variants| variants.into_iter().map(|variant| variant.term).collect())
             .collect();
 
         if log_enabled!(log::Level::Info) {
             log::info!(
-                "extracted {} variants for each of {} expressions",
+                "extracted up to {} variants for each of {} expressions",
                 n,
                 terms.len()
             );
@@ -164,7 +168,7 @@ impl<
 
         Ok(vec![CommandOutput::UserDefined(std::sync::Arc::from(
             MultiExtractOutput {
-                termdag,
+                termdag: extracted.termdag,
                 terms,
                 dag,
             },

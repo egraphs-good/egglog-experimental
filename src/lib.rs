@@ -38,6 +38,10 @@
 //!   `with-dynamic-cost` and changed with `set-cost`.
 //! - [`MultiExtract`] implements `(multi-extract n [:dag] term...)`.
 //! - [`KeepBestCommand`] compacts selected tables to their best terms.
+//! - `:extractor greedy-dag` enables heuristic DAG-cost extraction for
+//!   `extract`, `multi-extract`, and `keep-best`. Within each independently
+//!   costed root or variant, it charges shared subterms once. It does not
+//!   support proof/term-encoding view tables.
 //!
 //! ## Inspection
 //!
@@ -57,6 +61,9 @@ pub mod scheduling;
 pub use scheduling::*;
 mod fresh_macro;
 
+mod greedy_dag_extract;
+mod secondary_map;
+pub use greedy_dag_extract::{extract_best_greedy_dag, extract_variants_greedy_dag};
 mod set_cost;
 pub use set_cost::*;
 mod multi_extract;
