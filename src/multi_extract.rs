@@ -23,11 +23,21 @@ use egglog::{
 use log::log_enabled;
 use std::marker::PhantomData;
 
-/// Displayable output produced by [`MultiExtract`].
+/// Aggregate output produced by [`MultiExtract`].
+///
+/// Every term ID indexes the shared [`MultiExtractOutput::termdag`]. The outer
+/// [`MultiExtractOutput::terms`] vector follows requested-root order, including
+/// an empty vector for any root without a finite extraction.
+/// When wrapped in [`CommandOutput::UserDefined`], consumers can downcast the
+/// contained user-defined output to this concrete type.
 #[derive(Debug)]
 pub struct MultiExtractOutput {
-    termdag: TermDag,
-    terms: Vec<Vec<TermId>>,
+    /// Shared term storage for every requested root and variant.
+    pub termdag: TermDag,
+    /// Term IDs grouped by requested root, in request order.
+    ///
+    /// A root without a finite extraction has an empty inner vector.
+    pub terms: Vec<Vec<TermId>>,
     dag: bool,
 }
 
@@ -71,9 +81,10 @@ impl std::fmt::Display for MultiExtractOutput {
 /// caller-provided marginal cost model.
 ///
 /// The positive `i64` value `n` is the number of variants returned for each
-/// term. All terms share one extractor computation. Tree extraction adapts the
-/// model with [`TreeCostModelFromDag`]; `:extractor greedy-dag` uses its
-/// marginal costs directly.
+/// term. All terms share one extractor computation and one aggregate
+/// [`MultiExtractOutput`]. Tree extraction adapts the model with
+/// [`TreeCostModelFromDag`]; `:extractor greedy-dag` uses its marginal costs
+/// directly.
 pub struct MultiExtract<C: MonoidCost, CM: DagCostModel<C> + Clone> {
     cost_model: CM,
     // Extracted costs are temporary, so this marker should not impose their

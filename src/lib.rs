@@ -30,13 +30,47 @@
 //! - `(unstable-fresh! Sort [:cost N] [:unextractable])` creates a fresh value
 //!   for each match of a rule action.
 //!
+//! ## Generic containers and callbacks
+//!
+//! `(sort Name (Maybe T))` declares an optional `T`. The language primitives
+//! are `maybe-none`, `maybe-some`, partial `maybe-unwrap`, and
+//! `maybe-unwrap-or`. Because `maybe-none` has no value from which to infer its
+//! nominal sort, surrounding context must select its type when multiple
+//! compatible `Maybe` aliases are in scope:
+//!
+//! ```text
+//! (sort MaybeInt (Maybe i64))
+//! (check (= (maybe-unwrap-or (maybe-none) 0) 0))
+//! ```
+//!
+//! `(unstable-catch thunk)` calls a zero-argument `UnstableFn` and returns
+//! `maybe-some` for a defined result or `maybe-none` when the call is
+//! undefined. `(unstable-maybe-match value on-some default)` applies the unary
+//! `on-some` function only when `value` is present; an undefined selected
+//! callback makes the match undefined.
+//!
+//! `(map-fold-kv callback initial map)` invokes `callback` as
+//! `(accumulator, key, value) -> accumulator` for each stored entry. Traversal
+//! follows opaque, e-graph-local `Value` order rather than a semantic key
+//! ordering, so callbacks should be order-insensitive. An undefined callback
+//! makes the whole fold undefined.
+//!
+//! `(f64-is-finite value)` is defined exactly when the built-in `f64` value is
+//! neither infinite nor NaN. It can guard rewrites that would otherwise
+//! materialize non-finite numeric results.
+//!
+//! `Maybe` operations, `unstable-catch`, `unstable-maybe-match`, and
+//! `map-fold-kv` do not currently support proof mode.
+//!
 //! ## Scheduling and extraction
 //!
 //! - [`scheduling`] documents the extended `run-schedule` language and named
 //!   schedulers.
 //! - [`DynamicCostModel`] supports runtime costs declared with
 //!   `with-dynamic-cost` and changed with `set-cost`.
-//! - [`MultiExtract`] implements `(multi-extract n [:dag] term...)`.
+//! - [`MultiExtract`] implements `(multi-extract n [:dag] term...)`, returning
+//!   one [`MultiExtractOutput`] whose public fields expose shared term storage
+//!   and ordered per-root variant IDs.
 //! - [`KeepBestCommand`] compacts selected tables to their best terms.
 //! - `:extractor greedy-dag` enables heuristic DAG-cost extraction for
 //!   `extract`, `multi-extract`, and `keep-best`. Within each independently
@@ -59,6 +93,7 @@ pub mod rational;
 pub use rational::*;
 pub mod scheduling;
 pub use scheduling::*;
+mod f64;
 mod fresh_macro;
 
 mod greedy_dag_extract;
@@ -71,9 +106,12 @@ pub use multi_extract::*;
 mod dag_print;
 mod size;
 pub use size::*;
+mod map_fold;
+mod maybe;
 mod primitive;
 mod table_rows;
 mod table_stats;
+mod type_constraints;
 pub use table_stats::*;
 
 // Sugar modules using parse-time macros
@@ -133,6 +171,9 @@ pub fn new_experimental_egraph() -> EGraph {
     egraph
         .add_command("primitive".into(), Arc::new(primitive::RegisterPrimitive))
         .unwrap();
+    maybe::add_maybe(&mut egraph);
+    egraph.add_pure_primitive(map_fold::MapFoldKv, None);
+    f64::add_f64_primitives(&mut egraph);
     egraph
 }
 

@@ -1,0 +1,5 @@
+(sort MaybeInt (Maybe i64))
+(sort IntToInt (UnstableFn (i64) i64))
+
+; Catch only accepts a zero-argument function value.
+(unstable-catch (unstable-fn "+" 1))

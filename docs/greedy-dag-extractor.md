@@ -70,6 +70,13 @@ Separate roots may therefore use different representatives for a shared
 e-class. Their terms share storage in the returned `TermDag`, but the extractor
 does not minimize the union of all requested roots as one joint DAG.
 
+The language-level `multi-extract` command preserves this batch representation.
+It returns one `CommandOutput::UserDefined` containing a `MultiExtractOutput`.
+Its public `termdag` field stores all returned terms, while its public `terms`
+field groups their IDs by requested root in request order. A root without a
+finite extraction retains an empty group. Consumers can safely downcast the
+user-defined output to `MultiExtractOutput` to access these fields.
+
 This choice avoids the non-local representation problem described in
 [extraction-gym issue 36](https://github.com/egraphs-good/extraction-gym/issues/36):
 one globally selected node per e-class is not always sufficient for several

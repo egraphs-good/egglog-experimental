@@ -1,0 +1,55 @@
+(sort IntMap (Map i64 i64))
+(sort StringIntMap (Map String i64))
+(sort IntSet (Set i64))
+(sort IntFold (UnstableFn (i64 i64 i64) i64))
+(sort IntSetFold (UnstableFn (IntSet i64 i64) IntSet))
+(sort StringIntFold (UnstableFn (String String i64) String))
+
+(primitive add-key-value (i64 i64 i64) i64 (+ _0 (+ _1 _2)))
+(primitive add-scaled-key-value (i64 i64 i64 i64) i64 (+ _1 (* _0 (+ _2 _3))))
+(primitive append-key (i64 i64 i64) i64 (+ (* _0 10) _1))
+(primitive collect-key (IntSet i64 i64) IntSet (set-insert _0 _1))
+(primitive divide-by-value (i64 i64 i64) i64 (/ _0 _2))
+(primitive append-string-key-value (String String i64) String (+ _0 _1 (to-string _2)))
+
+(let $ints (map-insert (map-insert (map-empty) 2 20) 1 10))
+
+(let $ints-reversed (map-insert (map-insert (map-empty) 1 10) 2 20))
+
+(function empty-ints () IntMap :no-merge)
+(set (empty-ints) (map-empty))
+
+(let $zero-value-ints (map-insert (map-empty) 3 0))
+
+(sort OtherIntMap (Map i64 i64))
+(function other-ints () OtherIntMap :no-merge)
+(set (other-ints) (map-insert (map-insert (map-empty) 2 20) 1 10))
+
+(let $string-ints (map-insert (map-empty) "key" 4))
+
+(check (= (map-fold-kv (unstable-fn "add-key-value") 0 $ints) 33))
+(check (= (map-fold-kv (unstable-fn "add-key-value") 0 (other-ints)) 33))
+(check (= (map-fold-kv (unstable-fn "add-key-value") 7 (empty-ints)) 7))
+
+; Prefix partial application captures the scale before the accumulator/key/value arguments.
+(check (= (map-fold-kv (unstable-fn "add-scaled-key-value" 2) 1 $ints) 67))
+
+; Container accumulators are supported.
+(check (=
+  (map-fold-kv (unstable-fn "collect-key") (set-empty) $ints)
+  (set-of 1 2)))
+
+; Heterogeneous keys and values reach the callback as accumulator, key, value.
+(check (=
+  (map-fold-kv (unstable-fn "append-string-key-value") "" $string-ints)
+  "key4"))
+
+; Traversal follows opaque EGraph-local Value order, not insertion order. For
+; these unboxed positive i64 keys, reversing insertion leaves that order alone.
+; Callbacks should be order-insensitive across EGraphs.
+(check (=
+  (map-fold-kv (unstable-fn "append-key") 0 $ints)
+  (map-fold-kv (unstable-fn "append-key") 0 $ints-reversed)))
+
+; An undefined callback makes the entire fold undefined.
+(fail (map-fold-kv (unstable-fn "divide-by-value") 1 $zero-value-ints))

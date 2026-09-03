@@ -1,0 +1,42 @@
+(datatype Math
+  (Num i64))
+
+(sort MaybeInt (Maybe i64))
+(sort MaybeMath (Maybe Math))
+(sort MaybeMaybeInt (Maybe MaybeInt))
+(sort IntThunk (UnstableFn () i64))
+(sort IntToInt (UnstableFn (i64) i64))
+(sort MaybeIntToMaybeInt (UnstableFn (MaybeInt) MaybeInt))
+
+(primitive identity-maybe MaybeInt MaybeInt _0)
+
+(check (= (maybe-some 1) (maybe-some 1)))
+(check (= (maybe-unwrap (maybe-some 1)) 1))
+(check (= (maybe-unwrap-or (maybe-none) 2) 2))
+(check (= (maybe-unwrap-or (maybe-some 7) 2) 7))
+(fail (maybe-unwrap (identity-maybe (maybe-none))))
+
+; Maybe values rebuild their equality-sort contents.
+(let $a (Num 1))
+(let $b (Num 2))
+(let $maybe-a (maybe-some $a))
+(let $maybe-b (maybe-some $b))
+(union $a $b)
+(run 1)
+(check (= $maybe-a $maybe-b))
+
+; Catch turns a defined or undefined zero-argument exact callback into Maybe.
+(check (= (unstable-catch (unstable-fn "+" 1 2)) (maybe-some 3)))
+(check (= (unstable-catch (unstable-fn "/" 1 0)) (maybe-none)))
+(check (= (unstable-catch (unstable-fn "maybe-unwrap" (maybe-some 4))) (maybe-some 4)))
+(check (= (unstable-catch (unstable-fn "maybe-unwrap" (maybe-none))) (maybe-none)))
+
+; Match evaluates only the some branch and propagates an undefined callback.
+(check (= (unstable-maybe-match (maybe-some 2) (unstable-fn "+" 1) 0) 3))
+(check (= (unstable-maybe-match (maybe-none) (unstable-fn "/" 1) 7) 7))
+(fail (unstable-maybe-match (maybe-some 0) (unstable-fn "/" 1) 7))
+
+; Nested Maybe output exercises container-valued overload resolution.
+(check (=
+  (unstable-maybe-match (maybe-some (maybe-some 9)) (unstable-fn "identity-maybe") (maybe-none))
+  (maybe-some 9)))
