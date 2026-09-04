@@ -1,7 +1,7 @@
 # `unstable-subst`: a substitution primitive
 
 Status: exploration. Lives in `egglog-experimental`; the general e-graph
-introspection it uses lives in `egglog` (see "What egglog had to expose").
+operations it uses live in `egglog` (see "Upstream egglog requirements").
 
 ## Interface
 
@@ -34,11 +34,16 @@ Let `σ` map each key e-class to its mapped value.
   e-nodes, including through a container child, refers to an affected e-class.
 * `σ(v)` is the mapped value for a key, the original `v` for an
   unaffected value, and the rebuilt value for an affected container.
-* For an affected non-key e-class `e`, every non-subsumed e-node
-  `f(c1..cn) -> e` in the snapshot is copied as `f(σ(c1)..σ(cn))`. Those
+* For an affected non-key e-class `e`, every e-node `f(c1..cn) -> e` in the
+  snapshot, including subsumed rows, is copied as `f(σ(c1)..σ(cn))`. Those
   copies are unioned, and their class is `σ(e)`.
 * The result is `σ(root)`. If no key is reachable, the original root is
   returned and nothing is copied.
+* A new target inherits its source row's status. Copying a live row does not
+  revive an existing subsumed target. Copying a subsumed row subsumes its
+  target, so subsumption wins whether the collision is with a committed row,
+  another row from this action, or a row that becomes equal only during
+  congruence closure.
 
 Copying every e-node carries the region's equations into the copy. If the
 original e-class contains both `t1` and `t2`, the copy asserts
@@ -65,11 +70,14 @@ the copied derivations remain valid.
   created by an earlier command. Replacements may be built in the current
   action because they are spliced in rather than walked.
 * **No e-class id is invented.** Every copied e-node is inserted through the
-  ordinary constructor path. A cycle is copyable only if some e-node can first
-  name each copied class. If every e-node in a cycle depends on an as-yet
-  unnamed copy, substitution reports an ungrounded-cycle error before writing.
-* **Subsumed e-nodes are skipped.** They are excluded from extraction and must
-  not be resurrected as ordinary rows in a copy.
+  ordinary constructor path. An affected cycle is copyable only if some e-node,
+  including a subsumed one, can begin naming its copied classes. If every
+  e-node in the affected cycle depends on an as-yet unnamed copy, substitution
+  reports an ungrounded-cycle error before writing. An unaffected cycle is
+  shared unchanged and therefore needs no grounding row.
+* **Subsumed e-nodes remain subsumed when copied.** They participate in
+  reachability, equations, and cycle grounding without becoming visible to
+  ordinary rule matching.
 * **Live reads require `Context::Full`.** The primitive is available in
   top-level actions and `:naive` rule heads, not ordinary seminaive rule heads,
   which would not re-fire when the live state they read grows.
@@ -82,22 +90,24 @@ Substitution separates all copyability decisions from mutation: one read-only
 phase followed by two write passes.
 
 1. **Collect and preflight, read-only.** Build a snapshot of reachable
-   constructor rows and container contents, mark the affected region, and
-   compute an order in which every copied e-class can be named. If no such
-   order exists, report the ungrounded cycle before substitution writes a copy.
-   Values built as arguments to the primitive have already been staged by the
-   enclosing action, so this guarantee does not roll those argument writes back.
+   constructor rows, their subsumption status, and container contents; mark the
+   affected region; and compute an order in which every copied e-class can be
+   named. If no such order exists, report the ungrounded cycle before
+   substitution writes a copy. Values built as arguments to the primitive have
+   already been staged by the enclosing action, so this guarantee does not roll
+   those argument writes back.
 2. **Name copied classes.** In the computed order, insert one ready e-node per
-   affected non-key e-class to obtain its image.
+   affected non-key e-class to obtain its image, applying the status rule above.
 3. **Complete their equations.** With every image named, insert the remaining
-   e-nodes and union each result into the image of its original class.
+   e-nodes with the same status rule and union each result into the image of its
+   original class.
 
 Container rebuilding waits until every e-class inside has an image, so an
 ungrounded cycle cannot leave a half-substituted container behind. E-class
 traversal uses explicit stacks; only descent through nested container values
 recurses, bounded by the program's container-sort nesting.
 
-### Cost
+### Analytical cost
 
 Collection uses indexed output lookups rather than whole-table scans, but its
 cost is not proportional only to returned rows. When a traversal is needed, it
@@ -111,31 +121,39 @@ index; there is no cross-table e-class index.
 
 After those probes, snapshot construction and affected marking are linear in
 the reached e-classes, returned rows, dependency edges, and container contents.
-The copyability fixpoint can rescan the affected snapshot while it finds a
-naming order, so its worst case is superlinear (quadratic when progress reveals
-only one of linearly many classes per scan). Apart from backend insertion and
-union costs, the two write passes process each planned e-node at most twice.
-Snapshot memory is proportional to the reached e-classes, rows, edges, and
-container contents; there is no configured snapshot-size bound.
+For `V` affected classes, `N` affected e-nodes, and `E` dependency occurrences,
+copy planning uses per-node unresolved counts, reverse waiters, and an ordered
+ready set in `O(N + E + V log V)` time and `O(V + N + E)` memory. The ordering
+matches the previous deterministic left-to-right fixpoint without repeatedly
+rescanning the affected snapshot. Apart from backend insertion and union costs,
+the two write passes process each planned e-node at most twice. Total snapshot
+memory is proportional to the reached e-classes, rows, edges, and container
+contents; there is no configured snapshot-size bound. These are analytical
+bounds, not benchmark measurements.
 
-### What egglog had to expose
+### Upstream egglog requirements
 
 Nothing substitution-specific: a small set of general e-graph operations makes
 the primitive implementable out of tree.
 
 * `Read::constructor_enodes_for_eclass` performs an indexed lookup of
-  constructor rows whose output is one e-class. The lookup was developed in
-  [PR #934](https://github.com/egraphs-good/egglog/pull/934), cherry-picked
-  upstream in [PR #986](https://github.com/egraphs-good/egglog/pull/986), and
-  renamed to the pinned method by
-  [PR #1003](https://github.com/egraphs-good/egglog/pull/1003). The Cargo
-  dependency pins that earliest suitable official upstream merge.
+  constructor rows, including their status, whose output is one e-class. The
+  lookup was developed in [PR #934](https://github.com/egraphs-good/egglog/pull/934),
+  cherry-picked upstream in
+  [PR #986](https://github.com/egraphs-good/egglog/pull/986), and renamed by
+  [PR #1003](https://github.com/egraphs-good/egglog/pull/1003).
 * `Read::constructor_schema`, together with `Read::table_sizes`, lets a
   primitive enumerate the current nonempty constructors and group them by
   output sort. The e-graph supplies its `TypeInfo` as an `ExternalContext` for
   the duration of the operation.
 * `Core::map_container` rebuilds and interns a container value through the
   existing `ContainerValues::rebuild_val_with` machinery.
+* `Write::subsume` can target a row inserted earlier in the same action. The
+  prediction-aware implementation is proposed in
+  [egglog PR #1010](https://github.com/egraphs-good/egglog/pull/1010), whose
+  head commit `9e7481ff` is currently pinned here. It also makes direct
+  rule-action and `FullState` subsumption of a missing row create that row as
+  subsumed. No substitution-specific upstream API is added.
 
 ## Known limitations
 
@@ -152,5 +170,6 @@ the primitive implementable out of tree.
   panic, with the specific reason in the log.
 * `tests/subst-basics.egg` pins language semantics,
   `tests/unstable-subst.egg` demonstrates beta reduction, and `tests/subst.rs`
-  covers e-class identity, table sizes, and failure behavior. The file harness
-  does not add egglog's desugar, term-encoding, or multi-thread variants.
+  covers e-class identity, row status and collisions, cycles, table sizes, and
+  failure behavior. The file harness does not add egglog's desugar,
+  term-encoding, or multi-thread variants.

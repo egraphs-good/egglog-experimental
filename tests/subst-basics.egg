@@ -5,6 +5,7 @@
 (datatype Math
   (Num i64)
   (Var String)
+  (Wrap Math)
   (Add Math Math)
   (Mul Math Math))
 (sort MathToMath (Map Math Math))
@@ -113,6 +114,23 @@
 (let $copy (unstable-subst $loop (map-insert (map-empty) $x (Num 7))))
 (check (= $copy (Add (Num 7) (Num 0))))
 (check (= $copy (Add $copy (Num 0))))
+(pop)
+
+;; A subsumed row still grounds a cyclic e-class and is copied without becoming
+;; visible to an ordinary rule head. This is the shape reported by Luminal.
+(push)
+(relation saw-wrap (Math))
+(rule ((= e (Wrap x))) ((saw-wrap x)))
+(let $v (Var "v"))
+(let $w (Var "w"))
+(let $a (Wrap $v))
+(union $a (Add $a $v))
+(subsume (Wrap $v))
+(let $sigma (map-insert (map-empty) $v $w))
+(let $img (unstable-subst $a $sigma))
+(run 1)
+(check (= $img (Add $img $w)))
+(fail (check (saw-wrap $w)))
 (pop)
 
 ;; The root's sort is independent of the map's key/value sort because the walk

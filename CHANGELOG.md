@@ -6,9 +6,11 @@ This file records notable user-facing changes to egglog-experimental.
 
 ### Added
 
-- `(unstable-subst root map)`, which copies the sub-e-graph reachable from
-  `root` with each key e-class replaced by its mapped value, and returns the
-  copied root. Available in top-level actions and `:naive` rule heads.
+- `(unstable-subst root map)`, which copies the affected portion of the
+  constructor sub-e-graph reachable from `root` with each key e-class replaced
+  by its mapped value, preserving subsumed rows and making subsumption dominant
+  on copy collisions. Available in top-level actions and `:naive` rule heads;
+  anchorless affected cycles fail before copy writes.
 
 ## [3.0.0] - 2026-08-20
 

@@ -10,11 +10,7 @@
 use crate::table_rows::{for_each_row, is_constructor};
 use egglog::{
     ArcSort, CommandOutput, EGraph, Error, RawValues, TermDag, TermId, TypeError,
-    UserDefinedCommand, Value, Write,
-    ast::Expr,
-    extract::{Extractor, TreeAdditiveCostModel},
-    sort::S,
-    span,
+    UserDefinedCommand, Value, Write, ast::Expr, sort::S, span,
 };
 
 /// User-defined command implementing `(keep-best "table"...)`.
@@ -113,25 +109,32 @@ fn collect_and_extract(
             raw_rows.push(vals.to_vec());
         })?;
 
-        let extractor = Extractor::compute_costs_from_rootsorts(
-            Some(all_sorts.clone()),
-            egraph,
-            TreeAdditiveCostModel::default(),
-        );
-        let mut termdag = TermDag::default();
+        let roots = raw_rows
+            .iter()
+            .flat_map(|row_vals| {
+                row_vals
+                    .iter()
+                    .zip(all_sorts.iter())
+                    .map(|(value, sort)| (sort.clone(), *value))
+            })
+            .collect();
+        let extracted = egraph.extract_best(roots)?;
+        let termdag = extracted.termdag;
+        let mut terms = extracted.terms.into_iter();
         let mut extracted_rows: Vec<Vec<TermId>> = Vec::new();
 
         for row_vals in &raw_rows {
             let mut term_ids = Vec::new();
-            for (val, sort) in row_vals.iter().zip(all_sorts.iter()) {
-                let (_, tid) = extractor
-                    .extract_best_with_sort(egraph, &mut termdag, *val, sort.clone())
+            for _ in row_vals {
+                let term = terms
+                    .next()
+                    .expect("one extraction result per table cell")
                     .ok_or_else(|| {
                         Error::ExtractError(format!(
                             "keep-best: could not extract value in table {table_name}"
                         ))
                     })?;
-                term_ids.push(tid);
+                term_ids.push(term.term);
             }
             extracted_rows.push(term_ids);
         }

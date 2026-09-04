@@ -465,7 +465,7 @@ mod schedulers {
 
     use egglog::{
         ast::{Expr, Literal},
-        scheduler::{Matches, Scheduler},
+        scheduler::{Matches, Scheduler, SchedulerContext},
     };
     use log::{debug, info};
 
@@ -545,7 +545,12 @@ mod schedulers {
     }
 
     impl Scheduler for BackOffScheduler {
-        fn can_stop(&mut self, rules: &[&str], _ruleset: &str) -> bool {
+        fn can_stop(
+            &mut self,
+            _ctx: &SchedulerContext<'_>,
+            rules: &[&str],
+            _ruleset: &str,
+        ) -> bool {
             let stats = &mut self.stats;
             let n_stats = stats.len();
 
@@ -601,7 +606,13 @@ mod schedulers {
             result
         }
 
-        fn filter_matches(&mut self, rule: &str, _ruleset: &str, matches: &mut Matches) -> bool {
+        fn filter_matches(
+            &mut self,
+            _ctx: &SchedulerContext<'_>,
+            rule: &str,
+            _ruleset: &str,
+            matches: &mut Matches,
+        ) -> bool {
             let stats = self.get_stats(rule.to_owned());
             stats.iteration += 1;
 

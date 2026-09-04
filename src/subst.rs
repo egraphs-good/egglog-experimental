@@ -3,12 +3,13 @@
 //! The map's keys and values share one eq-sort and are applied simultaneously
 //! while copying the affected constructor subgraph. The root must have
 //! committed rows when traversal is needed; copied equations are sound only
-//! when substitution preserves their derivations and premises. See
-//! `docs/unstable-subst.md` for the complete interface, safety boundary,
-//! algorithm, and cost model.
+//! when substitution preserves their derivations and premises. Subsumed rows
+//! participate without becoming live, and affected cycles need a grounding
+//! row. See `docs/unstable-subst.md` for the complete interface, safety
+//! boundary, algorithm, and cost model.
 
 use std::any::TypeId;
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 
 use egglog::api::RawValues;
 use egglog::ast::Span;
@@ -61,13 +62,14 @@ fn kind_of(sort: &ArcSort) -> Kind {
 struct ENode {
     ctor: usize,
     children: Vec<Value>,
+    subsumed: bool,
 }
 
 /// The reachable sub-e-graph.
 #[derive(Default)]
 struct Snapshot {
-    /// E-nodes of each reachable e-class. Subsumed rows are left out: they are
-    /// excluded from extraction, so a copy must not resurrect them.
+    /// E-nodes of each reachable e-class, including subsumed rows so they can
+    /// participate in structure without being resurrected as live rows.
     nodes: HashMap<Value, Vec<ENode>>,
     /// Contents of each reachable container value, with the [`TypeId`] to
     /// rebuild it under.
@@ -184,13 +186,12 @@ impl Walk<'_> {
             for index in candidates {
                 let mut rows = Vec::new();
                 state.constructor_enodes_for_eclass(&self.ctors[index].name, value, |enode| {
-                    if !enode.subsumed {
-                        rows.push(enode.children.to_vec());
-                    }
+                    rows.push((enode.children.to_vec(), enode.subsumed));
                 })?;
-                nodes.extend(rows.into_iter().map(|children| ENode {
+                nodes.extend(rows.into_iter().map(|(children, subsumed)| ENode {
                     ctor: index,
                     children,
+                    subsumed,
                 }));
             }
 
@@ -314,31 +315,58 @@ impl Walk<'_> {
     /// only after copying its way up to it could not take those rows back.
     fn plan(&self, root: Value) -> Result<Vec<Value>, Error> {
         let region = self.postorder(root);
+        let ranks: HashMap<Value, usize> = region
+            .iter()
+            .enumerate()
+            .map(|(rank, eclass)| (*eclass, rank))
+            .collect();
         let mut copyable: HashSet<Value> = HashSet::new();
         let mut order: Vec<Value> = Vec::with_capacity(region.len());
 
-        // Least fixpoint of "has an e-node whose children all resolve". A class
-        // joins `order` when it becomes nameable, so the order is one the
-        // copies can actually be built in.
-        loop {
-            let mut progress = false;
-            for eclass in &region {
-                if copyable.contains(eclass) {
-                    continue;
-                }
-                let nameable = self.snapshot.nodes[eclass].iter().any(|node| {
-                    self.node_deps(node)
-                        .iter()
-                        .all(|dep| self.resolved(*dep, &copyable))
-                });
-                if nameable {
-                    copyable.insert(*eclass);
-                    order.push(*eclass);
-                    progress = true;
+        // Count each unresolved dependency once per e-node occurrence and
+        // notify just the nodes waiting on a class when its copy becomes
+        // nameable. `(sweep, rank)` preserves the old left-to-right fixpoint's
+        // deterministic allocation order without rescanning the whole region.
+        let mut waiters = vec![Vec::new(); region.len()];
+        let mut owners = Vec::new();
+        let mut pending = Vec::new();
+        for (owner_rank, eclass) in region.iter().enumerate() {
+            for node in &self.snapshot.nodes[eclass] {
+                let node_index = pending.len();
+                owners.push(owner_rank);
+                pending.push(0usize);
+                for dep in self.node_deps(node) {
+                    if self.affected.contains(&dep) && !self.map.contains_key(&dep) {
+                        let dep_rank = ranks[&dep];
+                        pending[node_index] += 1;
+                        waiters[dep_rank].push(node_index);
+                    }
                 }
             }
-            if !progress {
-                break;
+        }
+
+        let mut scheduled = vec![false; region.len()];
+        let mut ready = BTreeSet::new();
+        for (&remaining, &owner_rank) in pending.iter().zip(&owners) {
+            if remaining == 0 && !scheduled[owner_rank] {
+                scheduled[owner_rank] = true;
+                ready.insert((0usize, owner_rank));
+            }
+        }
+        while let Some((sweep, resolved_rank)) = ready.pop_first() {
+            let eclass = region[resolved_rank];
+            copyable.insert(eclass);
+            order.push(eclass);
+            for &node_index in &waiters[resolved_rank] {
+                pending[node_index] -= 1;
+                if pending[node_index] == 0 {
+                    let owner_rank = owners[node_index];
+                    if !scheduled[owner_rank] {
+                        scheduled[owner_rank] = true;
+                        let owner_sweep = sweep + usize::from(owner_rank <= resolved_rank);
+                        ready.insert((owner_sweep, owner_rank));
+                    }
+                }
             }
         }
 
@@ -384,8 +412,7 @@ impl Walk<'_> {
         for eclass in order {
             let mut named = false;
             for node in self.snapshot.nodes.remove(&eclass).unwrap_or_default() {
-                if !named && let Some(args) = self.copied_args(state, &node) {
-                    let copy = state.add(&self.ctors[node.ctor].name, RawValues(args))?;
+                if !named && let Some(copy) = self.copy_node(state, &node)? {
                     self.images.insert(eclass, copy);
                     named = true;
                     continue;
@@ -398,10 +425,9 @@ impl Walk<'_> {
         // Every class has an image now, so the rest go in as further ways to
         // say the class they came from.
         for (eclass, node) in leftovers {
-            let args = self
-                .copied_args(state, &node)
+            let copy = self
+                .copy_node(state, &node)?
                 .expect("plan said every e-node was copyable");
-            let copy = state.add(&self.ctors[node.ctor].name, RawValues(args))?;
             let image = self.images[&eclass];
             if copy != image {
                 state.union(copy, image)?;
@@ -412,6 +438,27 @@ impl Walk<'_> {
             .get(&root)
             .copied()
             .ok_or_else(|| error(format!("the root e-class {root:?} was not copied")))
+    }
+
+    /// Materialize one copied row once all of its inputs have images.
+    /// Subsumption is monotone and therefore wins every collision.
+    fn copy_node(
+        &mut self,
+        state: &mut FullState<'_, '_>,
+        node: &ENode,
+    ) -> Result<Option<Value>, Error> {
+        let Some(args) = self.copied_args(state, node) else {
+            return Ok(None);
+        };
+        let name = &self.ctors[node.ctor].name;
+        let copy = if node.subsumed {
+            let copy = state.add(name, RawValues(args.clone()))?;
+            state.subsume(name, RawValues(args))?;
+            copy
+        } else {
+            state.add(name, RawValues(args))?
+        };
+        Ok(Some(copy))
     }
 
     /// The affected e-classes that need copying, children before parents.
