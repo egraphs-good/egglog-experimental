@@ -31,14 +31,6 @@ This file records notable user-facing changes to egglog-experimental.
 
 ### Changed
 
-- `Rational` construction and arithmetic now remain undefined instead of
-  panicking when a normalized i64 result cannot be represented. Powers require
-  nonnegative integer exponents; `log` is cleanly undefined except at one; and
-  square and cube roots succeed only for exact rational roots, including zero
-  and negative exact cube roots.
-- `set-cost` now rejects negative computed costs when they are written instead
-  of panicking during later extraction. Invalid negative rows written directly
-  to the underlying cost-table protocol fall back to the default cost.
 - `MultiExtractOutput`, the single aggregate output returned by `multi-extract`,
   now publicly exposes its shared `TermDag` as `termdag` and its ordered
   per-root term IDs as `terms`. Consumers can recover it by downcasting the

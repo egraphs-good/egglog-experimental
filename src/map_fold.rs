@@ -1,3 +1,9 @@
+//! Higher-order folding over map entries.
+//!
+//! `map-fold-kv` threads an accumulator through a callback for every key-value
+//! pair in a map. Iteration follows opaque, e-graph-local value order, so
+//! callbacks should be order-insensitive.
+
 use std::any::TypeId;
 
 use egglog::constraint::{Constraint, TypeConstraint};

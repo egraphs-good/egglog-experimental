@@ -1,3 +1,9 @@
+//! An optional-value container and control-flow primitives.
+//!
+//! `Maybe[T]` stores either no value or one value of `T`. This module provides
+//! construction, partial unwrapping, defaulting, undefined-result capture, and
+//! higher-order branching over those values.
+
 use std::any::TypeId;
 
 use egglog::ast::Expr;

@@ -12,9 +12,7 @@
 //! ```
 //!
 //! Nodes without an assigned dynamic cost retain their normal tree-additive
-//! cost. Costs must be non-negative; `set-cost` validates computed values when
-//! they are written. Invalid values written directly to the underlying cost
-//! table are ignored by extraction.
+//! cost. Costs must be non-negative.
 
 use crate::{
     Error,
@@ -24,7 +22,6 @@ use crate::{
 };
 use egglog::{
     ArcSort, CommandOutput, EGraph, Enode, RawValues, Read, TermId, UserDefinedCommand, Value,
-    add_primitive,
     ast::*,
     extract::{DEFAULT_COST_MODEL, DagCostModel, DefaultCost, TreeCostModelFromDag},
     span,
@@ -33,17 +30,12 @@ use egglog::{
 use egglog_ast::span::Span;
 use std::sync::Arc;
 
-const VALIDATE_COST_PRIMITIVE: &str = "@validate-dynamic-cost";
-
 /// Registers `with-dynamic-cost`, `set-cost`, and the dynamic-cost `extract`
 /// command on an e-graph.
 ///
 /// [`new_experimental_egraph`](crate::new_experimental_egraph) calls this
 /// automatically.
 pub fn add_set_cost(egraph: &mut EGraph) {
-    add_primitive!(egraph, "@validate-dynamic-cost" = |cost: i64| -?> i64 {
-        (cost >= 0).then_some(cost)
-    });
     egraph
         .parser
         .add_command_macro(Arc::new(SetCostDeclarations));
@@ -72,11 +64,6 @@ impl Macro<Vec<Action>> for SetCost {
                 let cost_table_name = get_cost_table_name(&func);
                 let args = map_fallible(args, parser, Parser::parse_expr)?;
                 let value = parser.parse_expr(value)?;
-                let value = Expr::Call(
-                    value.span().clone(),
-                    VALIDATE_COST_PRIMITIVE.into(),
-                    vec![value],
-                );
 
                 let vs = (0..args.len())
                     .map(|_| parser.symbol_gen.fresh("set_cost_var"))
@@ -242,7 +229,11 @@ impl DagCostModel<DefaultCost> for DynamicCostModel {
                 .read(|state| state.lookup(&name, RawValues(enode.children.to_vec())))
                 .ok()
                 .flatten()
-                .and_then(|c| DefaultCost::try_from(egraph.value_to_base::<i64>(c)).ok())
+                .map(|c| {
+                    let cost = egraph.value_to_base::<i64>(c);
+                    assert!(cost >= 0);
+                    cost as DefaultCost
+                })
                 .unwrap_or_else(default_cost)
         } else {
             default_cost()
