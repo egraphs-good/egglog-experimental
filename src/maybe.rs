@@ -207,6 +207,8 @@ impl TypeConstraint for MaybeNoneTypeConstraint {
     }
 }
 
+/// `(unstable-catch thunk)` evaluates a zero-argument `UnstableFn`, returning
+/// `maybe-some` when the application is defined and `maybe-none` otherwise.
 #[derive(Clone, Copy)]
 struct Catch {
     do_rebuild: bool,

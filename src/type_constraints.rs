@@ -14,6 +14,11 @@ use egglog::{ArcSort, Atom, AtomTerm};
 
 /// Resolves a primitive call against a deterministic list of complete
 /// input-plus-result signatures.
+///
+/// Unlike `constraint::xor` over exact assignment branches, this propagates
+/// positions shared by every currently compatible signature while several
+/// alternatives remain. That shared propagation lets interacting overloaded
+/// calls converge without selecting an arbitrary nominal alias.
 #[derive(Clone)]
 struct ExactSignatures {
     /// Input terms followed by the primitive's result term.
