@@ -117,23 +117,25 @@ fn new_copy_egraph() -> egglog::EGraph {
 }
 
 #[test]
-fn invalid_higher_order_calls_report_the_unresolved_primitive() {
+fn invalid_higher_order_calls_report_type_errors() {
     let cases = [
         (
             r#"
             (sort IntMap (Map i64 i64))
             (sort IntBinary (UnstableFn (i64 i64) i64))
-            (map-fold-kv (unstable-fn "+") 0 (map-empty))
+            (relation int-result (i64))
+            (int-result (map-fold-kv (unstable-fn "+") 0 (map-empty)))
             "#,
-            "Failed to infer a type for: @map-fold-kv",
+            "All alternative definitions considered failed",
         ),
         (
             r#"
             (sort MaybeInt (Maybe i64))
             (sort IntToInt (UnstableFn (i64) i64))
-            (unstable-catch (unstable-fn "+" 1))
+            (relation maybe-result (MaybeInt))
+            (maybe-result (unstable-catch (unstable-fn "+" 1)))
             "#,
-            "Failed to infer a type for: @unstable-catch",
+            "All alternative definitions considered failed",
         ),
         (
             r#"
