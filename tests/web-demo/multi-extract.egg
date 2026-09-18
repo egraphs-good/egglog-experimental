@@ -1,4 +1,5 @@
-; (multi-extract n t1 ... tm) extracts n lowest-cost variants of each term.
+; (multi-extract n t1 ... tm) returns one aggregate containing n lowest-cost
+; variants of each term, grouped in input order.
 
 (datatype Math (Add Math Math) (Mul Math Math) (Num i64))
 
@@ -16,4 +17,3 @@
 
 ; Extract 1 variant of a single term
 (multi-extract 1 x)
-

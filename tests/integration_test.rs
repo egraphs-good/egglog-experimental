@@ -116,6 +116,75 @@ fn new_copy_egraph() -> egglog::EGraph {
     egraph
 }
 
+#[test]
+fn invalid_higher_order_calls_report_type_errors() {
+    let cases = [
+        (
+            r#"
+            (sort IntMap (Map i64 i64))
+            (sort IntBinary (UnstableFn (i64 i64) i64))
+            (relation int-result (i64))
+            (int-result (map-fold-kv (unstable-fn "+") 0 (map-empty)))
+            "#,
+            "All alternative definitions considered failed",
+        ),
+        (
+            r#"
+            (sort MaybeInt (Maybe i64))
+            (sort IntToInt (UnstableFn (i64) i64))
+            (relation maybe-result (MaybeInt))
+            (maybe-result (unstable-catch (unstable-fn "+" 1)))
+            "#,
+            "All alternative definitions considered failed",
+        ),
+        (
+            r#"
+            (sort MaybeInt (Maybe i64))
+            (sort MaybeString (Maybe String))
+            (let ambiguous (maybe-none))
+            "#,
+            "Failed to infer a type for: @maybe-none",
+        ),
+    ];
+
+    for (program, expected) in cases {
+        let mut egraph = egglog_experimental::new_experimental_egraph();
+        let error = egraph.parse_and_run_program(None, program).unwrap_err();
+        assert!(
+            error.to_string().contains(expected),
+            "unexpected diagnostic: {error}"
+        );
+    }
+}
+
+#[test]
+fn f64_is_finite_rejects_nan_and_infinities() {
+    let mut egraph = egglog_experimental::new_experimental_egraph();
+    egraph
+        .parse_and_run_program(
+            None,
+            r#"
+            (check (f64-is-finite 1.0))
+            (fail (check (f64-is-finite NaN)))
+            (fail (check (f64-is-finite inf)))
+            (fail (check (f64-is-finite -inf)))
+            "#,
+        )
+        .unwrap();
+}
+
+#[test]
+fn f64_is_finite_supports_proof_mode() {
+    let mut egraph = egglog_experimental::new_experimental_egraph();
+    let resolved = egraph
+        .resolve_program(None, "(check (f64-is-finite 1.0))")
+        .unwrap();
+    assert!(egglog::program_supports_proofs(
+        &resolved,
+        egraph.type_info()
+    ));
+}
+
 fn let_backoff(egraph: &mut egglog::EGraph) {
     egraph
         .parse_and_run_program(
@@ -452,7 +521,7 @@ fn test_greedy_dag_multi_extract_avoids_combined_root_cycle() {
         )
         .unwrap();
 
-    assert_eq!(result.len(), 1);
+    assert!(matches!(result.as_slice(), [CommandOutput::UserDefined(_)]));
     assert_eq!(
         result[0].to_string(),
         "(\n   (\n      (S0 (S0 (S3 (S5 (S6)) (S6))))\n   )\n   (\n      (S0 (S3 (S5 (S6)) (S6)))\n   )\n)\n"
@@ -559,32 +628,90 @@ fn test_extract_set_cost_decls() {
 
 #[test]
 fn test_multi_extract_two_variants_two_terms() {
-    let mut egraph = egglog_experimental::new_experimental_egraph();
+    for extractor in ["", " :extractor greedy-dag"] {
+        let mut egraph = egglog_experimental::new_experimental_egraph();
+        let result = egraph
+            .parse_and_run_program(
+                None,
+                &format!(
+                    "
+                    (with-dynamic-cost
+                        (datatype E (Add E E) (Mul E E) (Num i64))
+                    )
 
-    let result = egraph
-        .parse_and_run_program(
-            None,
-            "
-        (with-dynamic-cost
-            (datatype E (Add E E) (Mul E E) (Num i64))
-        )
+                    (union (Num 2) (Add (Num 1) (Num 1)))
+                    (union (Num 2) (Mul (Num 1) (Num 2)))
 
-        (union (Num 2) (Add (Num 1) (Num 1)))
-        (union (Num 2) (Mul (Num 1) (Num 2)))
+                    (union (Num 4) (Add (Num 2) (Num 2)))
+                    (union (Num 4) (Mul (Num 2) (Num 2)))
 
-        (union (Num 4) (Add (Num 2) (Num 2)))
-        (union (Num 4) (Mul (Num 2) (Num 2)))
+                    (multi-extract 2 (Num 2) (Num 4){extractor})"
+                ),
+            )
+            .unwrap();
 
-        (multi-extract 2 (Num 2) (Num 4))",
-        )
-        .unwrap();
+        let [CommandOutput::UserDefined(output)] = result.as_slice() else {
+            panic!("expected one aggregate user-defined output, got {result:?}");
+        };
+        let output = output
+            .as_ref()
+            .as_any()
+            .downcast_ref::<egglog_experimental::MultiExtractOutput>()
+            .expect("user-defined output should retain its concrete multi-extract type");
+        let terms: Vec<Vec<_>> = output
+            .terms
+            .iter()
+            .map(|variants| {
+                variants
+                    .iter()
+                    .map(|term| output.termdag.to_string(*term))
+                    .collect()
+            })
+            .collect();
 
-    assert_eq!(result.len(), 1);
-    let output = result[0].to_string();
-    assert!(output.contains("(Num 2)"));
-    assert!(output.contains("(Add (Num 1) (Num 1))") || output.contains("(Mul (Num 1) (Num 2))"));
-    assert!(output.contains("(Num 4)"));
-    assert!(output.contains("(Add (Num 2) (Num 2))") || output.contains("(Mul (Num 2) (Num 2))"));
+        assert_eq!(terms.iter().map(Vec::len).collect::<Vec<_>>(), [2, 2]);
+        assert_eq!(terms[0][0], "(Num 2)");
+        assert!(terms[0][1] == "(Add (Num 1) (Num 1))" || terms[0][1] == "(Mul (Num 1) (Num 2))");
+        assert_eq!(terms[1][0], "(Num 4)");
+        assert!(terms[1][1] == "(Add (Num 2) (Num 2))" || terms[1][1] == "(Mul (Num 2) (Num 2))");
+    }
+}
+
+#[test]
+fn test_multi_extract_returns_one_ordered_aggregate_including_empty_groups() {
+    for extractor in ["", " :extractor greedy-dag"] {
+        let mut egraph = egglog_experimental::new_experimental_egraph();
+        let result = egraph
+            .parse_and_run_program(
+                None,
+                &format!(
+                    r#"
+                    (datatype Math)
+                    (constructor visible () Math)
+                    (constructor hidden () Math :unextractable)
+                    (multi-extract 1 (visible) 42 (hidden){extractor})
+                    "#
+                ),
+            )
+            .unwrap();
+
+        let [CommandOutput::UserDefined(output)] = result.as_slice() else {
+            panic!("expected one aggregate user-defined output, got {result:?}");
+        };
+        let output = output
+            .as_ref()
+            .as_any()
+            .downcast_ref::<egglog_experimental::MultiExtractOutput>()
+            .expect("user-defined output should retain its concrete multi-extract type");
+
+        assert_eq!(
+            output.terms.iter().map(Vec::len).collect::<Vec<_>>(),
+            [1, 1, 0]
+        );
+        assert_eq!(output.termdag.to_string(output.terms[0][0]), "(visible)");
+        assert_eq!(output.termdag.to_string(output.terms[1][0]), "42");
+        assert_eq!(output.termdag.size(), 2);
+    }
 }
 
 #[test]
@@ -713,7 +840,7 @@ fn test_multi_extract_with_set_cost() {
         )
         .unwrap();
 
-    assert_eq!(result.len(), 1);
+    assert!(matches!(result.as_slice(), [CommandOutput::UserDefined(_)]));
     let output = result[0].to_string();
     assert!(output.contains("(Add (Num 5) (Num 5))"));
     assert!(output.contains("(Add (Num 3) (Num 3))"));
@@ -789,6 +916,29 @@ fn test_keep_best_basic() {
         .unwrap();
     let output = result[0].to_string();
     assert!(output.contains("Num") && !output.contains("Add"));
+}
+
+#[test]
+fn test_keep_best_without_targets_fails_before_mutation() {
+    for command in ["(keep-best)", "(keep-best :extractor greedy-dag)"] {
+        let mut egraph = egglog_experimental::new_experimental_egraph();
+        egraph
+            .parse_and_run_program(None, "(relation R (i64)) (R 1)")
+            .unwrap();
+
+        let err = egraph.parse_and_run_program(None, command).unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("keep-best expects at least one table name"),
+            "unexpected error for {command}: {err}"
+        );
+        assert_eq!(
+            egraph.get_size("R"),
+            1,
+            "{command} mutated the e-graph before failing"
+        );
+    }
 }
 
 #[test]
@@ -1657,6 +1807,25 @@ fn test_schedule_user_defined_command() {
 }
 
 #[test]
+fn test_schedule_preserves_aggregate_multi_extract_output() {
+    let mut egraph = egglog_experimental::new_experimental_egraph();
+    let outputs = egraph
+        .parse_and_run_program(
+            None,
+            r#"
+            (datatype Math (Num i64))
+            (run-schedule
+              (multi-extract 1 (Num 1) 2))
+            "#,
+        )
+        .unwrap();
+
+    assert_eq!(outputs.len(), 2);
+    assert!(matches!(outputs[0], CommandOutput::UserDefined(_)));
+    assert!(matches!(outputs[1], CommandOutput::RunSchedule(..)));
+}
+
+#[test]
 fn test_schedule_repeat_push_pop_print_size() {
     use egglog::CommandOutput;
     let mut egraph = egglog_experimental::new_experimental_egraph();
@@ -1986,7 +2155,10 @@ fn test_extractor_keyword_does_not_shadow_a_value_named_extractor() {
 fn test_extractor_keyword_does_not_shadow_a_term_named_extractor() {
     let result =
         run_dynamic_dag("(let :extractor (Leaf 1))\n(multi-extract 1 :extractor (Leaf 2))");
-    assert_eq!(result.len(), 1);
+    assert!(matches!(result.as_slice(), [CommandOutput::UserDefined(_)]));
+    let output = result[0].to_string();
+    assert!(output.contains("(Leaf 1)"));
+    assert!(output.contains("(Leaf 2)"));
 }
 
 /// A trailing `<symbol> <symbol>` pair is genuinely ambiguous: it is
