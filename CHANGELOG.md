@@ -41,6 +41,11 @@ This file records notable user-facing changes to egglog-experimental.
   greedy-DAG extraction modes.
 - `keep-best` rejects calls without a target table before mutating the e-graph.
 
+### Fixed
+
+- Subsuming a constructor row created earlier in the same rule or in
+  `EGraph::update` now works through the updated egglog dependency.
+
 ## [3.0.0] - 2026-08-20
 
 This is the first crates.io release of egglog-experimental. Its major version
