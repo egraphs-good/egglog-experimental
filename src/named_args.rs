@@ -91,16 +91,23 @@ impl Macro<Expr> for NamedCallMacro {
                 Sexp::Atom(a, key_span) if a.starts_with(':') => {
                     seen_named = true;
                     let key = &a[1..];
-                    let pos = self.arg_names.iter().position(|p| p == key).ok_or_else(|| {
-                        ParseError(
-                            key_span.clone(),
-                            format!("`{}` has no argument named `{key}`", self.name),
-                        )
-                    })?;
+                    let pos = self
+                        .arg_names
+                        .iter()
+                        .position(|p| p == key)
+                        .ok_or_else(|| {
+                            ParseError(
+                                key_span.clone(),
+                                format!("`{}` has no argument named `{key}`", self.name),
+                            )
+                        })?;
                     if slots[pos].is_some() {
                         return error(
                             key_span.clone(),
-                            &format!("argument `{key}` of `{}` specified more than once", self.name),
+                            &format!(
+                                "argument `{key}` of `{}` specified more than once",
+                                self.name
+                            ),
                         );
                     }
                     i += 1;
@@ -307,7 +314,9 @@ fn process_variant(parser: &mut Parser, sexp: &Sexp) -> Result<Variant, ParseErr
             _ => {
                 return error(
                     tail[i].span(),
-                    &format!("expected `:name` or an option but found `{key}`; name either all fields or none"),
+                    &format!(
+                        "expected `:name` or an option but found `{key}`; name either all fields or none"
+                    ),
                 );
             }
         }
@@ -354,6 +363,7 @@ pub struct NamedChange {
 }
 
 impl NamedChange {
+    /// The macro for `(delete (<table> <args>*))`.
     pub fn delete() -> Self {
         Self {
             keyword: "delete",
@@ -361,6 +371,7 @@ impl NamedChange {
         }
     }
 
+    /// The macro for `(subsume (<table> <args>*))`.
     pub fn subsume() -> Self {
         Self {
             keyword: "subsume",
