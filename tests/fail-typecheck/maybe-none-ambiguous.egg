@@ -1,0 +1,6 @@
+(sort MaybeInt (Maybe i64))
+(sort MaybeString (Maybe String))
+
+; A zero-argument none needs surrounding type context. It must not select an
+; arbitrary nominal Maybe alias based on declaration or sort-name order.
+(let ambiguous (maybe-none))

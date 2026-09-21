@@ -1,24 +1,44 @@
 //! Implementation of the `keep-best` command.
 //!
-//! `(keep-best "table1" "table2" ...)` extracts the optimal representative
-//! term for every entry in each named table, clears the entire e-graph, and
-//! re-inserts only those optimal tuples.  This "compacts" the e-graph to the
-//! best solutions found so far.
+//! `(keep-best "table1" "table2" ... [:extractor greedy-dag])` extracts the
+//! best representative found by the selected extractor for every entry in each
+//! named table and then clears all existing rows. It rebuilds the selected
+//! tuples along with any constructor rows needed by their extracted values.
+//! This "compacts" the e-graph to the best solutions found so far.
 //!
 //! Each argument must evaluate to a `String` that names an existing function.
 
+use crate::DynamicCostModel;
+use crate::greedy_dag_extract::{extract_best_greedy_dag, split_trailing_extractor};
+use crate::table_rows::{for_each_row, is_constructor};
 use egglog::{
-    ArcSort, CommandOutput, EGraph, Error, TermDag, TermId, TypeError, UserDefinedCommand, Value,
-    ast::Expr,
-    extract::{Extractor, TreeAdditiveCostModel},
+    ArcSort, CommandOutput, EGraph, Error, RawValues, TermDag, TermId, TypeError,
+    UserDefinedCommand, Value, Write,
+    ast::{Expr, ParseError},
+    extract::TreeCostModelFromDag,
     sort::S,
     span,
 };
 
+/// User-defined command implementing `(keep-best "table"...)`.
+///
+/// For every row in the named tables, the command extracts the best term for
+/// each value. It then **clears every function in the e-graph** and rebuilds
+/// the extracted rows from the named tables, including any constructor rows
+/// needed to represent their values.
 pub struct KeepBestCommand;
 
 impl UserDefinedCommand for KeepBestCommand {
     fn update(&self, egraph: &mut EGraph, args: &[Expr]) -> Result<Vec<CommandOutput>, Error> {
+        let (args, use_greedy_dag) = split_trailing_extractor(args)?;
+
+        if args.is_empty() {
+            return Err(Error::ParseError(ParseError(
+                span!(),
+                "keep-best expects at least one table name".into(),
+            )));
+        }
+
         // Step 1: evaluate each argument to a table name string.
         let table_names: Vec<String> = args
             .iter()
@@ -28,9 +48,9 @@ impl UserDefinedCommand for KeepBestCommand {
             })
             .collect::<Result<_, Error>>()?;
 
-        // Step 2: for each table, collect all rows and extract the optimal
+        // Step 2: for each table, collect all rows and extract the best
         // term for every column value.
-        let extracted = collect_and_extract(egraph, &table_names)?;
+        let extracted = collect_and_extract(egraph, &table_names, use_greedy_dag)?;
 
         // Step 3: clear every function in the e-graph in bulk.
         //
@@ -43,22 +63,35 @@ impl UserDefinedCommand for KeepBestCommand {
             egraph.clear_function(name)?;
         }
 
-        // Step 4: re-insert the optimal tuples. Evaluate each extracted term
+        // Step 4: re-insert the selected tuples. Evaluate each extracted term
         // via eval_expr so that constructor sub-terms are re-created bottom-up,
-        // then stage all target-table inserts in one with_full_state call.
-        let mut rows_to_insert: Vec<(String, Vec<Value>)> = Vec::new();
+        // then stage all target-table inserts in one `update` call.
+        let mut rows_to_insert: Vec<(String, bool, Vec<Value>)> = Vec::new();
         for (table_name, extracted_rows, termdag) in &extracted {
+            let constructor = is_constructor(egraph, table_name)?;
             for term_ids in extracted_rows {
                 let values = eval_terms(egraph, termdag, term_ids)?;
-                rows_to_insert.push((table_name.clone(), values));
+                rows_to_insert.push((table_name.clone(), constructor, values));
             }
         }
 
-        egraph.with_full_state(|mut state| {
-            for (table_name, values) in &rows_to_insert {
-                egglog::Write::insert(&mut state, table_name, values.iter().copied());
+        egraph.update(|mut state| {
+            for (table_name, constructor, values) in &rows_to_insert {
+                let (output, inputs) = values
+                    .split_last()
+                    .expect("extracted row has at least an output column");
+                if *constructor {
+                    // `add` mints (or finds) the eclass for these inputs; the
+                    // union pins it to the eclass the extracted output term
+                    // evaluated to, which is what the raw row insert used to do.
+                    let eclass = state.add(table_name, RawValues(inputs.to_vec()))?;
+                    state.union(eclass, *output)?;
+                } else {
+                    state.set(table_name, RawValues(inputs.to_vec()), *output)?;
+                }
             }
-        });
+            Ok(())
+        })?;
 
         Ok(vec![])
     }
@@ -72,6 +105,7 @@ type ExtractedTable = (String, Vec<Vec<TermId>>, TermDag);
 fn collect_and_extract(
     egraph: &EGraph,
     table_names: &[String],
+    use_greedy_dag: bool,
 ) -> Result<Vec<ExtractedTable>, Error> {
     let mut result = Vec::new();
 
@@ -80,38 +114,50 @@ fn collect_and_extract(
             .get_function(table_name)
             .ok_or_else(|| TypeError::UnboundFunction(table_name.clone(), span!()))?;
 
-        let all_sorts: Vec<ArcSort> = func
-            .schema()
+        let func_type = func.func_type();
+        let all_sorts: Vec<ArcSort> = func_type
             .input
             .iter()
-            .chain(std::iter::once(&func.schema().output))
+            .chain(std::iter::once(&func_type.output))
             .cloned()
             .collect();
 
         let mut raw_rows: Vec<Vec<Value>> = Vec::new();
-        egraph.function_for_each(table_name, |row| {
-            raw_rows.push(row.vals.to_vec());
+        for_each_row(egraph, table_name, |vals| {
+            raw_rows.push(vals.to_vec());
         })?;
 
-        let extractor = Extractor::compute_costs_from_rootsorts(
-            Some(all_sorts.clone()),
-            egraph,
-            TreeAdditiveCostModel::default(),
-        );
-        let mut termdag = TermDag::default();
+        let roots = raw_rows
+            .iter()
+            .flat_map(|row_vals| {
+                row_vals
+                    .iter()
+                    .zip(all_sorts.iter())
+                    .map(|(val, sort)| (sort.clone(), *val))
+            })
+            .collect();
+        let extracted = if use_greedy_dag {
+            extract_best_greedy_dag(egraph, roots, DynamicCostModel)
+        } else {
+            egraph.extract_best_with_cost_model(roots, TreeCostModelFromDag(DynamicCostModel))
+        }
+        .map_err(|err| {
+            Error::ExtractError(format!(
+                "keep-best: could not extract value in table {table_name}: {err}"
+            ))
+        })?;
+        let termdag = extracted.termdag;
+        let extract_error = format!("keep-best: could not extract value in table {table_name}");
+        let mut terms = extracted.terms.into_iter().map(move |root| {
+            root.ok_or_else(|| Error::ExtractError(extract_error.clone()))
+                .map(|root| root.term)
+        });
         let mut extracted_rows: Vec<Vec<TermId>> = Vec::new();
 
         for row_vals in &raw_rows {
             let mut term_ids = Vec::new();
-            for (val, sort) in row_vals.iter().zip(all_sorts.iter()) {
-                let (_, tid) = extractor
-                    .extract_best_with_sort(egraph, &mut termdag, *val, sort.clone())
-                    .ok_or_else(|| {
-                        Error::ExtractError(format!(
-                            "keep-best: could not extract value in table {table_name}"
-                        ))
-                    })?;
-                term_ids.push(tid);
+            for _ in row_vals {
+                term_ids.push(terms.next().expect("one term per extracted table cell")?);
             }
             extracted_rows.push(term_ids);
         }

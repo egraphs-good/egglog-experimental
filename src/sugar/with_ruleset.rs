@@ -1,6 +1,16 @@
 use egglog::ast::*;
 use egglog_ast::span::Span;
 
+/// Parse-time macro for assigning several rules or rewrites to one ruleset.
+///
+/// ```text
+/// (with-ruleset simplify
+///   (rewrite (Add x (Num 0)) x)
+///   (birewrite (Add x y) (Add y x)))
+/// ```
+///
+/// The body accepts `rule`, `rewrite`, and `birewrite` declarations that do
+/// not already name a ruleset.
 pub struct WithRuleset;
 
 impl Macro<Vec<Command>> for WithRuleset {

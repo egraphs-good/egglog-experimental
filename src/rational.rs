@@ -1,14 +1,32 @@
+//! Exact rational numbers for egglog programs.
+//!
+//! [`RationalSort`] registers the `Rational` sort and these overloaded
+//! primitives:
+//!
+//! - `(rational numerator denominator)` constructs a value; the denominator
+//!   must be nonzero.
+//! - `+`, `-`, `*`, `/`, `min`, `max`, `neg`, and `abs` perform arithmetic.
+//! - `<`, `>`, `<=`, and `>=` compare values.
+//! - `floor`, `ceil`, `round`, `numer`, `denom`, and `to-f64` inspect or
+//!   convert values.
+//! - `pow` and `sqrt` return a result only when it is exactly representable.
+//!   `log` and `cbrt` currently support only the value one.
+//!
+//! [`new_experimental_egraph`] registers this sort automatically.
+
 use egglog::prelude::BaseSort;
 use egglog::sort::{BaseValues, Boxed, F, OrderedFloat};
 use num::integer::Roots;
 use num::rational::Rational64;
 use num::traits::{CheckedAdd, CheckedDiv, CheckedMul, CheckedSub, One, Signed, ToPrimitive, Zero};
 
+/// Rust representation of an egglog `Rational` value.
 pub type R = Boxed<Rational64>;
 use crate::ast::Literal;
 
 use super::*;
 
+/// The egglog `Rational` base sort and its primitive operations.
 #[derive(Debug)]
 pub struct RationalSort;
 

@@ -19,10 +19,10 @@ cargo install --path=egglog-experimental
 To use it in a Rust project, you can add it as a dependency in a `Cargo.toml` file.
 
 ```
-egglog-experimental = "1.0"
+egglog-experimental = "3.0"
 ```
 
 ## Documentation
 
 Check out the crate documentation (built locally) for the current list of implemented extensions, API details, and demo links.
-We plan to do a release on crates.io with the release of egglog 2.0.
+Releases are coordinated with compatible releases of egglog.

@@ -1,6 +1,16 @@
 use egglog::{ast::*, util::FreshGen};
+use egglog_ast::generic_ast::RuleEvalMode;
 use egglog_ast::span::Span;
 
+/// Parse-time macro for applying actions once to all current query matches.
+///
+/// ```text
+/// (for ((source x))
+///      ((destination x)))
+/// ```
+///
+/// The macro creates a temporary ruleset containing one rule and runs that
+/// ruleset for one iteration.
 pub struct For;
 
 impl Macro<Vec<Command>> for For {
@@ -42,8 +52,9 @@ impl Macro<Vec<Command>> for For {
             body: query,
             name: rulename,
             ruleset: ruleset.clone(),
-            naive: false,
+            eval_mode: RuleEvalMode::Seminaive,
             no_decomp: false,
+            include_subsumed: false,
         };
 
         Ok(vec![

@@ -18,8 +18,9 @@
 //! - **`(run-with scheduler [ruleset] [:until cond])`** — like `run`, but drives
 //!   the ruleset with a named scheduler previously bound by `let-scheduler`.
 //! - **`(let-scheduler name (scheduler-kind args...))`** — bind `name` to a fresh
-//!   scheduler instance (e.g. `(back-off :match-limit 1000 :ban-length 5)`).
-//!   The binding is scoped to the enclosing `seq`/`saturate`/`repeat` block.
+//!   scheduler instance (e.g. `(back-off :match-limit 1000 :ban-length 5 :node-limit 5000)`). A
+//!   binding inside `run-schedule` is scoped to its enclosing block; a top-level
+//!   binding persists on the e-graph.
 //! - **`(seq step...)`** — run each step once, in order.
 //! - **`(saturate step...)`** — repeatedly run the body until it makes no further
 //!   progress (the accumulated report's `can_stop` is set).
@@ -68,9 +69,21 @@ type PermanentSchedulerState = HashMap<String, SchedulerId>;
 /// See the [module-level documentation](self) for the full schedule language.
 pub struct RunExtendedSchedule;
 
+/// User-defined command implementing
+/// `(let-scheduler name (scheduler-kind args...))`.
+///
+/// A top-level binding persists on the e-graph and can be used by later
+/// `run-schedule` commands. See the [module documentation](self) for scoped
+/// bindings inside a schedule.
 pub struct LetSchedulerCommand;
 
+/// Factory interface for constructing a scheduler from parsed egglog
+/// arguments.
+///
+/// Scheduler registration uses [`add_scheduler_builder`], which accepts the
+/// equivalent closure directly.
 pub trait SchedulerGen {
+    /// Creates a fresh scheduler for `egraph` from `args`.
     fn new_scheduler(&self, egraph: &egglog::EGraph, args: &[Expr]) -> Box<dyn Scheduler>;
 }
 
@@ -97,6 +110,11 @@ lazy_static! {
     };
 }
 
+/// Registers a scheduler constructor for use by `let-scheduler`.
+///
+/// The builder receives the current e-graph, the scheduler expression's source
+/// span, and its unevaluated arguments. Registration is process-global;
+/// registering the same name again replaces the previous builder.
 pub fn add_scheduler_builder(name: String, builder: SchedulerBuilder) {
     scheduler_libs.lock().unwrap().insert(name, builder);
 }
@@ -447,11 +465,38 @@ mod schedulers {
 
     use egglog::{
         ast::{Expr, Literal},
-        scheduler::{Matches, Scheduler},
+        scheduler::{Matches, Scheduler, SchedulerContext},
     };
     use log::{debug, info};
 
     use crate::parse_tags;
+
+    fn parse_usize_tag(
+        tags: &HashMap<String, Literal>,
+        tag: &str,
+        span: &egglog::ast::Span,
+    ) -> Result<Option<usize>, egglog::Error> {
+        tags.get(tag)
+            .map(|lit| match lit {
+                Literal::Int(n) if *n < 0 => {
+                    Err(egglog::Error::ParseError(egglog::ast::ParseError(
+                        span.clone(),
+                        format!("Scheduler {tag} must be non-negative"),
+                    )))
+                }
+                Literal::Int(n) => usize::try_from(*n).map_err(|_| {
+                    egglog::Error::ParseError(egglog::ast::ParseError(
+                        span.clone(),
+                        format!("Scheduler {tag} is too large for this platform"),
+                    ))
+                }),
+                _ => Err(egglog::Error::ParseError(egglog::ast::ParseError(
+                    span.clone(),
+                    format!("Scheduler {tag} must be an integer"),
+                ))),
+            })
+            .transpose()
+    }
 
     pub(super) fn new_back_off_scheduler(
         _egraph: &egglog::EGraph,
@@ -459,39 +504,22 @@ mod schedulers {
         args: &[Expr],
     ) -> Result<Box<dyn Scheduler>, egglog::Error> {
         let tags = parse_tags(span, args)?;
-        let default_match_limit = tags
-            .get(":match-limit")
-            .map(|lit| match lit {
-                Literal::Int(n) if *n >= 0 => Ok(*n as usize),
-                Literal::Int(_) => Err(egglog::Error::ParseError(egglog::ast::ParseError(
-                    span.clone(),
-                    "Scheduler :match-limit must be non-negative".into(),
-                ))),
-                _ => Err(egglog::Error::ParseError(egglog::ast::ParseError(
-                    span.clone(),
-                    "Scheduler :match-limit must be an integer".into(),
-                ))),
-            })
-            .transpose()?
-            .unwrap_or(1000);
-        let default_ban_length = tags
-            .get(":ban-length")
-            .map(|lit| match lit {
-                Literal::Int(n) if *n >= 0 => Ok(*n as usize),
-                Literal::Int(_) => Err(egglog::Error::ParseError(egglog::ast::ParseError(
-                    span.clone(),
-                    "Scheduler :ban-length must be non-negative".into(),
-                ))),
-                _ => Err(egglog::Error::ParseError(egglog::ast::ParseError(
-                    span.clone(),
-                    "Scheduler :ban-length must be an integer".into(),
-                ))),
-            })
-            .transpose()?
-            .unwrap_or(5);
+        if let Some(tag) = tags
+            .keys()
+            .find(|tag| !matches!(tag.as_str(), ":match-limit" | ":ban-length" | ":node-limit"))
+        {
+            return Err(egglog::Error::ParseError(egglog::ast::ParseError(
+                span.clone(),
+                format!("Unknown back-off scheduler tag {tag}"),
+            )));
+        }
+        let default_match_limit = parse_usize_tag(&tags, ":match-limit", span)?.unwrap_or(1000);
+        let default_ban_length = parse_usize_tag(&tags, ":ban-length", span)?.unwrap_or(5);
+        let node_limit = parse_usize_tag(&tags, ":node-limit", span)?;
         Ok(Box::new(BackOffScheduler {
             default_match_limit,
             default_ban_length,
+            node_limit,
             stats: HashMap::new(),
         }))
     }
@@ -500,6 +528,11 @@ mod schedulers {
     pub struct BackOffScheduler {
         default_match_limit: usize,
         default_ban_length: usize,
+        /// Soft threshold for the number of e-nodes. Once an observed count
+        /// reaches it, rules are delayed instead of applied. A selected rule
+        /// may insert any number of nodes, and the deferred rebuild may change
+        /// the count again.
+        node_limit: Option<usize>,
         stats: HashMap<String, RuleStats>,
     }
 
@@ -527,7 +560,17 @@ mod schedulers {
     }
 
     impl Scheduler for BackOffScheduler {
-        fn can_stop(&mut self, rules: &[&str], _ruleset: &str) -> bool {
+        fn can_stop(&mut self, ctx: &SchedulerContext<'_>, rules: &[&str], _ruleset: &str) -> bool {
+            // At the node limit, further iterations cannot make progress:
+            // every rule would be delayed. Report saturation even though
+            // banned rules may be pending.
+            if let Some(node_limit) = self.node_limit {
+                let nodes = ctx.num_nodes();
+                if nodes >= node_limit {
+                    info!("Node limit reached ({nodes} >= {node_limit}); stopping");
+                    return true;
+                }
+            }
             let stats = &mut self.stats;
             let n_stats = stats.len();
 
@@ -583,7 +626,15 @@ mod schedulers {
             result
         }
 
-        fn filter_matches(&mut self, rule: &str, _ruleset: &str, matches: &mut Matches) -> bool {
+        fn filter_matches(
+            &mut self,
+            ctx: &SchedulerContext<'_>,
+            rule: &str,
+            _ruleset: &str,
+            matches: &mut Matches,
+        ) -> bool {
+            let node_limit = self.node_limit;
+            let total_len: usize = matches.match_size();
             let stats = self.get_stats(rule.to_owned());
             stats.iteration += 1;
 
@@ -599,7 +650,6 @@ mod schedulers {
                 .match_limit
                 .checked_shl(stats.times_banned as u32)
                 .unwrap();
-            let total_len: usize = matches.match_size();
             if total_len > threshold {
                 let ban_length = stats.ban_length << stats.times_banned;
                 stats.times_banned += 1;
@@ -608,16 +658,29 @@ mod schedulers {
                     "Banning {} ({}-{}) for {} iters: {} < {}",
                     rule, stats.times_applied, stats.times_banned, ban_length, threshold, total_len,
                 );
-                false
-            } else {
-                stats.times_applied += 1;
-                debug!(
-                    "Choosing all matches for {} ({}-{})",
-                    rule, stats.times_applied, stats.times_banned
-                );
-                matches.choose_all();
-                true
+                return false;
             }
+
+            // Earlier rule actions are visible here. Rebuilding may later move
+            // the count in either direction.
+            if let Some(node_limit) = node_limit {
+                let nodes = ctx.num_nodes();
+                if nodes >= node_limit {
+                    debug!(
+                        "Delaying {}: at node limit ({} >= {})",
+                        rule, nodes, node_limit
+                    );
+                    return false;
+                }
+            }
+
+            stats.times_applied += 1;
+            debug!(
+                "Choosing all matches for {} ({}-{})",
+                rule, stats.times_applied, stats.times_banned
+            );
+            matches.choose_all();
+            true
         }
     }
 }
