@@ -2,7 +2,8 @@
 //!
 //! `(keep-best "table1" "table2" ... [:extractor greedy-dag])` extracts the
 //! best representative found by the selected extractor for every entry in each
-//! named table, clears the entire e-graph, and re-inserts only those tuples.
+//! named table and then clears all existing rows. It rebuilds the selected
+//! tuples along with any constructor rows needed by their extracted values.
 //! This "compacts" the e-graph to the best solutions found so far.
 //!
 //! Each argument must evaluate to a `String` that names an existing function.
@@ -12,19 +13,31 @@ use crate::greedy_dag_extract::{extract_best_greedy_dag, split_trailing_extracto
 use crate::table_rows::{for_each_row, is_constructor};
 use egglog::{
     ArcSort, CommandOutput, EGraph, Error, RawValues, TermDag, TermId, TypeError,
-    UserDefinedCommand, Value, Write, ast::Expr, extract::TreeCostModelFromDag, sort::S, span,
+    UserDefinedCommand, Value, Write,
+    ast::{Expr, ParseError},
+    extract::TreeCostModelFromDag,
+    sort::S,
+    span,
 };
 
 /// User-defined command implementing `(keep-best "table"...)`.
 ///
 /// For every row in the named tables, the command extracts the best term for
-/// each value. It then **clears every function in the e-graph** and reinserts
-/// only the extracted rows from the named tables.
+/// each value. It then **clears every function in the e-graph** and rebuilds
+/// the extracted rows from the named tables, including any constructor rows
+/// needed to represent their values.
 pub struct KeepBestCommand;
 
 impl UserDefinedCommand for KeepBestCommand {
     fn update(&self, egraph: &mut EGraph, args: &[Expr]) -> Result<Vec<CommandOutput>, Error> {
         let (args, use_greedy_dag) = split_trailing_extractor(args)?;
+
+        if args.is_empty() {
+            return Err(Error::ParseError(ParseError(
+                span!(),
+                "keep-best expects at least one table name".into(),
+            )));
+        }
 
         // Step 1: evaluate each argument to a table name string.
         let table_names: Vec<String> = args

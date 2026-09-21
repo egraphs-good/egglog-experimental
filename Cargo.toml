@@ -17,9 +17,9 @@ default = ["bin"]
 bin = ["egglog/bin"]
 
 [dependencies]
-egglog = { version = "3.0.0", git = "https://github.com/egraphs-good/egglog.git", rev = "a07403c05fd5727d55ebf254013b3dd361bd67f6", default-features = false }
-egglog-ast = { version = "3.0.0", git = "https://github.com/egraphs-good/egglog.git", rev = "a07403c05fd5727d55ebf254013b3dd361bd67f6", default-features = false }
-egglog-reports = { version = "3.0.0", git = "https://github.com/egraphs-good/egglog.git", rev = "a07403c05fd5727d55ebf254013b3dd361bd67f6", default-features = false }
+egglog = { version = "3.0.0", git = "https://github.com/egraphs-good/egglog.git", rev = "90635860397ce710f8c0a4eeb04154a8ebc3ac05", default-features = false }
+egglog-ast = { version = "3.0.0", git = "https://github.com/egraphs-good/egglog.git", rev = "90635860397ce710f8c0a4eeb04154a8ebc3ac05", default-features = false }
+egglog-reports = { version = "3.0.0", git = "https://github.com/egraphs-good/egglog.git", rev = "90635860397ce710f8c0a4eeb04154a8ebc3ac05", default-features = false }
 
 num = "0.4.3"
 lazy_static = "1.4"

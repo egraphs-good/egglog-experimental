@@ -149,11 +149,11 @@ the primitive implementable out of tree.
 * `Core::map_container` rebuilds and interns a container value through the
   existing `ContainerValues::rebuild_val_with` machinery.
 * `Write::subsume` can target a row inserted earlier in the same action. The
-  prediction-aware implementation is proposed in
-  [egglog PR #1010](https://github.com/egraphs-good/egglog/pull/1010), whose
-  head commit `a07403c0` is currently pinned here. It also makes direct
-  rule-action and `FullState` subsumption of a missing row create that row as
-  subsumed. No substitution-specific upstream API is added.
+  prediction-aware implementation landed upstream in
+  [egglog PR #1010](https://github.com/egraphs-good/egglog/pull/1010) and is
+  part of the pinned `9063586` egglog. It also makes direct rule-action and
+  `FullState` subsumption of a missing row create that row as subsumed. No
+  substitution-specific upstream API is added.
 
 ## Known limitations
 
