@@ -1,0 +1,12 @@
+; Named calls must see declarations that an earlier `(include ...)` pulled in.
+; Registering field names while parsing was too early: egglog parses the whole
+; program before running any of it, so the include had not been read yet.
+
+(include "tests/named-args-included-defs.egg")
+
+(Included :x 1 :y 2)
+(relation Saw (i64))
+(rule ((Included :x x ...)) ((Saw x)))
+(run 1)
+(check (Saw 1))
+(check (Included :y 2 :x 1))
