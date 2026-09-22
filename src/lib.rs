@@ -32,6 +32,12 @@
 //! - [`Subst`] implements `(unstable-subst root map)`, which copies the affected
 //!   portion of the constructor sub-e-graph reachable from `root` with each key
 //!   e-class replaced by its mapped value.
+//! - Named arguments let `constructor`, `function`, `relation`, `datatype`, and
+//!   `datatype*` name their fields, e.g.
+//!   `(constructor MyCar (:color Color :numwheel i64) Vehicle)`. Call sites can
+//!   then pass arguments by name in any order, mix leading positional arguments
+//!   with trailing named ones, and use a trailing `...` to bind every
+//!   unspecified field to a fresh variable (see [`named_args`]).
 //!
 //! ## Generic containers and callbacks
 //!
@@ -111,8 +117,10 @@ mod size;
 pub use size::*;
 mod map_fold;
 mod maybe;
+pub mod named_args;
 mod primitive;
 mod table_rows;
+pub use named_args::*;
 mod table_stats;
 mod type_constraints;
 pub use table_stats::*;
@@ -137,6 +145,11 @@ pub fn new_experimental_egraph() -> EGraph {
 
     // Set up the parser with experimental parse-time macros
     egraph.parser = experimental_parser();
+
+    // Named arguments for declarations, e.g.
+    //   (constructor MyCar (:color Color :numwheel i64) Vehicle)
+    // Registered first so later macros only ever see positional calls.
+    named_args::register_named_args(&mut egraph);
 
     // Rational support
     add_base_sort(&mut egraph, RationalSort, span!()).unwrap();

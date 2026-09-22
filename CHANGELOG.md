@@ -6,6 +6,12 @@ This file records notable user-facing changes to egglog-experimental.
 
 ### Added
 
+- Named arguments for declarations: `constructor`, `function`, `relation`,
+  `datatype`, and `datatype*` may name their fields, e.g.
+  `(constructor MyCar (:color Color :numwheel i64) Vehicle)`. Call sites can
+  then pass arguments by name in any order, mix leading positional arguments
+  with trailing named ones, and end with `...` to bind every unspecified field
+  to a fresh variable.
 - A `Maybe[T]` sort with construction, partial unwrapping, defaulting,
   undefined-result capture, and higher-order branching. When more than one
   nominal `Maybe` alias is compatible, `maybe-none` requires type context.

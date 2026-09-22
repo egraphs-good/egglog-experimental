@@ -1,0 +1,7 @@
+; Omitting a field without a trailing `...` is an error.
+(sort Color)
+(sort Vehicle)
+(constructor Red () Color)
+(constructor MyCar (:color Color :numwheel i64) Vehicle)
+
+(let bad (MyCar :color (Red)))

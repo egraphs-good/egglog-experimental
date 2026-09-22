@@ -1,0 +1,64 @@
+; Named arguments for declarations.
+;
+; A declaration may name its fields with `:name Sort` pairs. Call sites can then
+; pass arguments by name in any order, mix leading positional args with trailing
+; named ones, and end with `...` to bind every unspecified field to a fresh
+; variable.
+
+(sort Color)
+(sort Vehicle)
+(constructor Red () Color)
+(constructor MyCar (:color Color :numwheel i64) Vehicle)
+
+; Build with named args (any order) and positionally; both agree.
+(let c1 (MyCar :numwheel 4 :color (Red)))
+(let c2 (MyCar (Red) 4))
+(run 0)
+(check (= c1 c2))
+
+; Query with named arg + `...` (numwheel bound to a fresh var).
+(relation UsesColor (Color))
+(rule ((MyCar :color c ...)) ((UsesColor c)))
+
+; Query with a leading positional arg + `...`.
+(relation HasCar (Vehicle))
+(rule ((MyCar c ...)) ((HasCar (MyCar c 4))))
+
+; Query with all fields named and reordered.
+(relation Wheels (i64))
+(rule ((MyCar :numwheel w :color c)) ((Wheels w)))
+
+(run 3)
+(check (UsesColor (Red)))
+(check (Wheels 4))
+
+; Named args on a function, including in `set`.
+(function score (:a i64 :b i64) i64 :no-merge)
+(set (score :b 2 :a 1) 100)
+(run 0)
+(check (= (score 1 2) 100))
+(check (= (score :a 1 :b 2) 100))
+
+; Named args on a relation.
+(relation edge (:from i64 :to i64))
+(edge :from 1 :to 2)
+(edge 3 4)
+(run 0)
+(check (edge 1 2))
+(check (edge :to 4 :from 3))
+
+; Named args on a datatype variant.
+(datatype Expr
+  (Lit i64)
+  (Add :lhs Expr :rhs Expr))
+(let e (Add :rhs (Lit 2) :lhs (Lit 1)))
+(run 0)
+(check (= e (Add (Lit 1) (Lit 2))))
+
+; Named args on a datatype* variant, with `...` in a query.
+(datatype* (Group (Bar :x i64 :y i64)))
+(let b (Bar :x 5 :y 6))
+(relation SawX (i64))
+(rule ((Bar :x x ...)) ((SawX x)))
+(run 1)
+(check (SawX 5))

@@ -1,0 +1,7 @@
+; Referencing a field name the constructor does not have is an error.
+(sort Color)
+(sort Vehicle)
+(constructor Red () Color)
+(constructor MyCar (:color Color :numwheel i64) Vehicle)
+
+(rule ((MyCar :bogus c ...)) ())
