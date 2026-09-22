@@ -1,0 +1,9 @@
+error[E0521]: borrowed data escapes outside of closure
+ --> tests/typed_ui/borrowed_binder_escape.rs:6:9
+  |
+4 |     let mut escaped = None;
+  |         ----------- `escaped` declared here, outside of the closure body
+5 |     let _ = ruleset(|value: &I64| {
+  |                      ----- `value` is a reference that is only valid in the closure body
+6 |         escaped = Some(value);
+  |         ^^^^^^^^^^^^^^^^^^^^^ `value` escapes the closure body here

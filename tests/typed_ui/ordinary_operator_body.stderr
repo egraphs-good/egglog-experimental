@@ -1,0 +1,5 @@
+error[E0600]: cannot apply unary operator `-` to type `&Num`
+  --> tests/typed_ui/ordinary_operator_body.rs:11:13
+   |
+11 |     let _ = -&value;
+   |             ^^^^^^^ cannot apply unary operator `-`

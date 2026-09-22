@@ -1,0 +1,16 @@
+error[E0277]: the trait bound `fn(_) -> Num {make::<_>}: SelectCall<_>` is not satisfied
+ --> tests/typed_ui/generic_selector.rs:9:68
+  |
+9 |     let _: Result<Option<(I64,)>, TypedError> = get_args(&make(1), make);
+  |                                                 --------           ^^^^ the trait `SelectCall<_>` is not implemented for fn item `fn(_) -> Num {make::<_>}`
+  |                                                 |
+  |                                                 required by a bound introduced by this call
+  |
+note: required by a bound in `egglog_experimental::typed::get_args`
+ --> src/typed/selector.rs
+  |
+  | pub fn get_args<N, F, A>(node: &N, selector: F) -> Result<Option<A>, TypedError>
+  |        -------- required by a bound in this function
+...
+  |     F: SelectCall<A, Root = N>,
+  |        ^^^^^^^^^^^^^^^^^^^^^^^ required by this bound in `get_args`

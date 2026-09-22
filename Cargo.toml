@@ -8,18 +8,30 @@ keywords = ["e-graphs", "egglog", "datalog", "compiler", "equality"]
 license = "MIT"
 readme = "README.md"
 
+[workspace]
+members = ["typed-macros"]
+resolver = "3"
+
 [[test]]
 harness = false
 name = "files"
 
+[[bin]]
+name = "egglog-experimental"
+path = "src/main.rs"
+required-features = ["bin"]
+
 [features]
 default = ["bin"]
 bin = ["egglog/bin"]
+typed = ["dep:egglog-experimental-typed-macros"]
+serde = ["egglog/serde"]
+graphviz = ["egglog/graphviz"]
 
 [dependencies]
-egglog = { version = "3.0.0", git = "https://github.com/egraphs-good/egglog.git", rev = "e264c37a3332453eb0b6486c82c8766dd1af17df", default-features = false }
-egglog-ast = { version = "3.0.0", git = "https://github.com/egraphs-good/egglog.git", rev = "e264c37a3332453eb0b6486c82c8766dd1af17df", default-features = false }
-egglog-reports = { version = "3.0.0", git = "https://github.com/egraphs-good/egglog.git", rev = "e264c37a3332453eb0b6486c82c8766dd1af17df", default-features = false }
+egglog = { version = "3.0.0", git = "https://github.com/saulshanabrook/egg-smol", rev = "b061d1f41398747fb39f6e186a682e8e2d758ceb", default-features = false }
+egglog-ast = { version = "3.0.0", git = "https://github.com/saulshanabrook/egg-smol", rev = "b061d1f41398747fb39f6e186a682e8e2d758ceb", default-features = false }
+egglog-reports = { version = "3.0.0", git = "https://github.com/saulshanabrook/egg-smol", rev = "b061d1f41398747fb39f6e186a682e8e2d758ceb", default-features = false }
 
 num = "0.4.3"
 lazy_static = "1.4"
@@ -27,7 +39,193 @@ log = "0.4"
 fixedbitset = "0.5.7"
 # Greedy-DAG's hot maps were 1.90% faster than std on the Taylor 51 canary.
 hashbrown = "0.16.0"
+egglog-experimental-typed-macros = { path = "typed-macros", version = "3.0.0", optional = true }
 
 [dev-dependencies]
 glob = "0.3.1"
 libtest-mimic = "0.8.1"
+trybuild = "1"
+
+[[example]]
+name = "typed_antiunify"
+required-features = ["typed"]
+
+[[example]]
+name = "typed_bignum"
+required-features = ["typed"]
+
+[[example]]
+name = "typed_birewrite"
+required-features = ["typed"]
+
+[[example]]
+name = "typed_bool"
+required-features = ["typed"]
+
+[[example]]
+name = "typed_datatypes"
+required-features = ["typed"]
+
+[[example]]
+name = "typed_eqsat_basic"
+required-features = ["typed"]
+
+[[example]]
+name = "typed_eqsolve"
+required-features = ["typed"]
+
+[[example]]
+name = "typed_fibonacci"
+required-features = ["typed"]
+
+[[example]]
+name = "typed_freeze"
+required-features = ["typed"]
+
+[[example]]
+name = "typed_knapsack"
+required-features = ["typed"]
+
+[[example]]
+name = "typed_levenshtein_distance"
+required-features = ["typed"]
+
+[[example]]
+name = "typed_list"
+required-features = ["typed"]
+
+[[example]]
+name = "typed_naturals"
+required-features = ["typed"]
+
+[[example]]
+name = "typed_path"
+required-features = ["typed"]
+
+[[example]]
+name = "typed_path_union"
+required-features = ["typed"]
+
+[[example]]
+name = "typed_pathproof"
+required-features = ["typed"]
+
+[[example]]
+name = "typed_points_to"
+required-features = ["typed"]
+
+[[example]]
+name = "typed_push_pop"
+required-features = ["typed"]
+
+[[example]]
+name = "typed_schedule_demo"
+required-features = ["typed"]
+
+[[example]]
+name = "typed_set"
+required-features = ["typed"]
+
+[[example]]
+name = "typed_subsume"
+required-features = ["typed"]
+
+[[example]]
+name = "typed_towers_of_hanoi"
+required-features = ["typed"]
+
+[[example]]
+name = "typed_tutorial_analysis"
+required-features = ["typed"]
+
+[[example]]
+name = "typed_tutorial_basics"
+required-features = ["typed"]
+
+[[example]]
+name = "typed_tutorial_datalog"
+required-features = ["typed"]
+
+[[example]]
+name = "typed_tutorial_extraction"
+required-features = ["typed"]
+
+[[example]]
+name = "typed_tutorial_scheduling"
+required-features = ["typed"]
+
+[[example]]
+name = "typed_unify"
+required-features = ["typed"]
+
+[[example]]
+name = "typed_array"
+required-features = ["typed"]
+
+[[example]]
+name = "typed_bdd"
+required-features = ["typed"]
+
+[[example]]
+name = "typed_combinators"
+required-features = ["typed"]
+
+[[example]]
+name = "typed_cyk"
+required-features = ["typed"]
+
+[[example]]
+name = "typed_fusion"
+required-features = ["typed"]
+
+[[example]]
+name = "typed_herbie"
+required-features = ["typed"]
+
+[[example]]
+name = "typed_herbie_tutorial"
+required-features = ["typed"]
+
+[[example]]
+name = "typed_lambda"
+required-features = ["typed"]
+
+[[example]]
+name = "typed_math"
+required-features = ["typed"]
+
+[[example]]
+name = "typed_matrix"
+required-features = ["typed"]
+
+[[example]]
+name = "typed_multiset"
+required-features = ["typed"]
+
+[[example]]
+name = "typed_ndarrays"
+required-features = ["typed"]
+
+[[example]]
+name = "typed_prims"
+required-features = ["typed"]
+
+[[example]]
+name = "typed_resolution"
+required-features = ["typed"]
+
+[[example]]
+name = "typed_rw_analysis"
+required-features = ["typed"]
+
+[[example]]
+name = "typed_typecheck"
+required-features = ["typed"]
+
+[[example]]
+name = "typed_typeinfer"
+required-features = ["typed"]
+
+[[example]]
+name = "typed_unification_points_to"
+required-features = ["typed"]

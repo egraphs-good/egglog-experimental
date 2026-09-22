@@ -1,0 +1,20 @@
+error[E0277]: the trait bound `egglog_experimental::typed::builtins::Unit: From<egglog_experimental::typed::Relation>` is not satisfied
+ --> tests/typed_ui/relation_not_expression.rs:9:10
+  |
+9 |     Make(Seen(1));
+  |     ---- ^^^^^^^ the trait `From<egglog_experimental::typed::Relation>` is not implemented for `egglog_experimental::typed::builtins::Unit`
+  |     |
+  |     required by a bound introduced by this call
+  |
+  = help: the following other types implement trait `From<T>`:
+            `egglog_experimental::typed::builtins::Unit` implements `From<&egglog_experimental::typed::builtins::Unit>`
+            `egglog_experimental::typed::builtins::Unit` implements `From<()>`
+  = note: required for `egglog_experimental::typed::Relation` to implement `Into<egglog_experimental::typed::builtins::Unit>`
+note: required by a bound in `Make`
+ --> tests/typed_ui/relation_not_expression.rs:6:1
+  |
+6 | #[constructor]
+  | ^^^^^^^^^^^^^^ required by this bound in `Make`
+7 | pub fn Make(value: eg::Unit) -> A;
+  |        ---- required by a bound in this function
+  = note: this error originates in the attribute macro `constructor` (in Nightly builds, run with -Z macro-backtrace for more info)

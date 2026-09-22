@@ -1,0 +1,25 @@
+error: only self or &self receivers are supported
+ --> tests/typed_ui/declarations_unsupported.rs:7:16
+  |
+7 |     fn mutable(&mut self) -> egglog_experimental::typed::builtins::I64;
+  |                ^^^^^^^^^
+
+error[E0053]: method `row` has an incompatible type for trait
+  --> tests/typed_ui/declarations_unsupported.rs:12:1
+   |
+12 | #[declarations]
+   | ^^^^^^^^^^^^^^^ expected `()`, found `egglog_experimental::typed::Relation`
+   |
+note: type in trait
+  --> tests/typed_ui/declarations_unsupported.rs:10:18
+   |
+10 |     fn row(&self);
+   |                  ^
+   = note: expected signature `fn(&Num) -> ()`
+              found signature `fn(&Num) -> egglog_experimental::typed::Relation`
+   = note: this error originates in the attribute macro `declarations` (in Nightly builds, run with -Z macro-backtrace for more info)
+help: change the output type to match the trait
+   |
+12 - #[declarations]
+12 + ()
+   |

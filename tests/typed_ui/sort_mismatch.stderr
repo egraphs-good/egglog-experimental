@@ -1,0 +1,7 @@
+error[E0308]: mismatched types
+ --> tests/typed_ui/sort_mismatch.rs:9:16
+  |
+9 |     let _: B = Make(1);
+  |            -   ^^^^^^^ expected `B`, found `A`
+  |            |
+  |            expected due to this

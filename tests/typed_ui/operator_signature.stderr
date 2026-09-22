@@ -1,0 +1,95 @@
+error: symbolic operator Output must be an owned sort wrapper
+  --> tests/typed_ui/operator_signature.rs:24:5
+   |
+24 |     fn neg(self) -> Self::Output;
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+error[E0407]: method `add` is not a member of trait `__EgglogSignature0`
+  --> tests/typed_ui/operator_signature.rs:38:1
+   |
+38 | #[declarations]
+   | ^^^^^^^^^^^^^^^ not a member of trait `__EgglogSignature0`
+   |
+   = note: this error originates in the attribute macro `declarations` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+error[E0407]: method `add` is not a member of trait `std::ops::Sub`
+  --> tests/typed_ui/operator_signature.rs:38:1
+   |
+38 | #[declarations]
+   | ^^^^^^^^^^^^^^^ not a member of trait `std::ops::Sub`
+   |
+   = note: this error originates in the attribute macro `declarations` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+error[E0053]: method `add` has an incompatible type for trait
+ --> tests/typed_ui/operator_signature.rs:8:23
+  |
+8 |     fn add(self, rhs: &Num) -> Num;
+  |                       ^^^^ expected `I64`, found `&Num`
+  |
+note: type in trait
+ --> tests/typed_ui/operator_signature.rs:4:1
+  |
+4 | #[declarations]
+  | ^^^^^^^^^^^^^^^
+  = note: expected signature `fn(Num, egglog_experimental::typed::builtins::I64) -> Num`
+             found signature `fn(Num, &Num) -> Num`
+  = note: this error originates in the attribute macro `declarations` (in Nightly builds, run with -Z macro-backtrace for more info)
+help: change the parameter type to match the trait
+  |
+8 -     fn add(self, rhs: &Num) -> Num;
+8 +     fn add(self, rhs: egglog_experimental::typed::builtins::I64) -> Num;
+  |
+
+error[E0053]: method `neg` has an incompatible type for trait
+  --> tests/typed_ui/operator_signature.rs:14:21
+   |
+14 |     fn neg(self) -> I64;
+   |                     ^^^ expected `Num`, found `I64`
+   |
+   = note: expected signature `fn(Num) -> Num`
+              found signature `fn(Num) -> egglog_experimental::typed::builtins::I64`
+help: change the output type to match the trait
+   |
+14 -     fn neg(self) -> I64;
+14 +     fn neg(self) -> Num;
+   |
+
+error[E0053]: method `mul` has an incompatible type for trait
+  --> tests/typed_ui/operator_signature.rs:33:32
+   |
+33 |     fn mul(self, rhs: Self) -> I64;
+   |                                ^^^ expected `WrongOutput`, found `I64`
+   |
+note: type in trait
+  --> tests/typed_ui/operator_signature.rs:29:1
+   |
+29 | #[declarations]
+   | ^^^^^^^^^^^^^^^
+   = note: expected signature `fn(WrongOutput, WrongOutput) -> WrongOutput`
+              found signature `fn(WrongOutput, WrongOutput) -> egglog_experimental::typed::builtins::I64`
+   = note: this error originates in the attribute macro `declarations` (in Nightly builds, run with -Z macro-backtrace for more info)
+help: change the output type to match the trait
+   |
+33 -     fn mul(self, rhs: Self) -> I64;
+33 +     fn mul(self, rhs: Self) -> WrongOutput;
+   |
+
+error[E0046]: not all trait items implemented, missing: `sub`
+  --> tests/typed_ui/operator_signature.rs:38:1
+   |
+38 | #[declarations]
+   | ^^^^^^^^^^^^^^^
+   | |
+   | missing `sub` in implementation
+   | `sub` from trait
+   |
+   = note: this error originates in the attribute macro `declarations` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+error[E0046]: not all trait items implemented, missing: `sub`
+  --> tests/typed_ui/operator_signature.rs:38:1
+   |
+38 | #[declarations]
+   | ^^^^^^^^^^^^^^^ missing `sub` in implementation
+   |
+   = note: this error originates in the attribute macro `declarations` (in Nightly builds, run with -Z macro-backtrace for more info)
+   = help: implement the missing item: `fn sub(self, _: __EgglogRhs0) -> <Self as Sub<__EgglogRhs0>>::Output { todo!() }`

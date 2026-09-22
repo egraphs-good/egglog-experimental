@@ -1,0 +1,13 @@
+error[E0560]: struct `PairArgs` has no field named `missing`
+  --> tests/typed_named_args_ui/fresh_fields.rs:15:9
+   |
+15 |         missing: 1.into(),
+   |         ^^^^^^^ `PairArgs` does not have this field
+   |
+   = note: available fields are: `left`, `right`
+
+error[E0308]: mismatched types
+  --> tests/typed_named_args_ui/fresh_fields.rs:11:15
+   |
+11 |         left: egg::String::from("wrong sort"),
+   |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ expected `I64`, found `String`

@@ -1,0 +1,111 @@
+error[E0277]: the trait bound `egglog_experimental::typed::Fact: IntoActions<Direct>` is not satisfied
+ --> tests/typed_ui/register_non_actions.rs:4:20
+  |
+4 |     graph.register(eq(egg::I64::from(1), 1));
+  |           -------- ^^^^^^^^^^^^^^^^^^^^^^^^ the trait `ValueInput` is not implemented for `egglog_experimental::typed::Fact`
+  |           |
+  |           required by a bound introduced by this call
+  |
+  = help: the following other types implement trait `ValueInput`:
+            &S
+            egglog_experimental::typed::builtins::BigInt
+            egglog_experimental::typed::builtins::BigRat
+            egglog_experimental::typed::builtins::Bool
+            egglog_experimental::typed::builtins::F64
+            egglog_experimental::typed::builtins::I64
+            egglog_experimental::typed::builtins::Map<K, V>
+            egglog_experimental::typed::builtins::MultiSet<S>
+          and $N others
+  = note: required for `egglog_experimental::typed::Fact` to implement `IntoActions<Direct>`
+note: required by a bound in `egglog_experimental::typed::EGraph::register`
+ --> src/typed/session.rs
+  |
+  |     pub fn register<T, M>(&mut self, items: T) -> Result<(), TypedError>
+  |            -------- required by a bound in this associated function
+  |     where
+  |         T: IntoActions<M>,
+  |            ^^^^^^^^^^^^^^ required by this bound in `EGraph::register`
+
+error[E0277]: the trait bound `egglog_experimental::typed::Rule: IntoActions<Direct>` is not satisfied
+ --> tests/typed_ui/register_non_actions.rs:5:20
+  |
+5 |     graph.register(rule((), ()));
+  |           -------- ^^^^^^^^^^^^ the trait `ValueInput` is not implemented for `egglog_experimental::typed::Rule`
+  |           |
+  |           required by a bound introduced by this call
+  |
+  = help: the following other types implement trait `ValueInput`:
+            &S
+            egglog_experimental::typed::builtins::BigInt
+            egglog_experimental::typed::builtins::BigRat
+            egglog_experimental::typed::builtins::Bool
+            egglog_experimental::typed::builtins::F64
+            egglog_experimental::typed::builtins::I64
+            egglog_experimental::typed::builtins::Map<K, V>
+            egglog_experimental::typed::builtins::MultiSet<S>
+          and $N others
+  = note: required for `egglog_experimental::typed::Rule` to implement `IntoActions<Direct>`
+note: required by a bound in `egglog_experimental::typed::EGraph::register`
+ --> src/typed/session.rs
+  |
+  |     pub fn register<T, M>(&mut self, items: T) -> Result<(), TypedError>
+  |            -------- required by a bound in this associated function
+  |     where
+  |         T: IntoActions<M>,
+  |            ^^^^^^^^^^^^^^ required by this bound in `EGraph::register`
+
+error[E0277]: the trait bound `Ruleset: IntoActions<Direct>` is not satisfied
+ --> tests/typed_ui/register_non_actions.rs:6:20
+  |
+6 |     graph.register(ruleset(()));
+  |           -------- ^^^^^^^^^^^ the trait `ValueInput` is not implemented for `Ruleset`
+  |           |
+  |           required by a bound introduced by this call
+  |
+  = help: the following other types implement trait `ValueInput`:
+            &S
+            egglog_experimental::typed::builtins::BigInt
+            egglog_experimental::typed::builtins::BigRat
+            egglog_experimental::typed::builtins::Bool
+            egglog_experimental::typed::builtins::F64
+            egglog_experimental::typed::builtins::I64
+            egglog_experimental::typed::builtins::Map<K, V>
+            egglog_experimental::typed::builtins::MultiSet<S>
+          and $N others
+  = note: required for `Ruleset` to implement `IntoActions<Direct>`
+note: required by a bound in `egglog_experimental::typed::EGraph::register`
+ --> src/typed/session.rs
+  |
+  |     pub fn register<T, M>(&mut self, items: T) -> Result<(), TypedError>
+  |            -------- required by a bound in this associated function
+  |     where
+  |         T: IntoActions<M>,
+  |            ^^^^^^^^^^^^^^ required by this bound in `EGraph::register`
+
+error[E0277]: the trait bound `Schedule: IntoActions<Direct>` is not satisfied
+ --> tests/typed_ui/register_non_actions.rs:7:20
+  |
+7 |     graph.register(ruleset(()).repeat(1));
+  |           -------- ^^^^^^^^^^^^^^^^^^^^^ the trait `ValueInput` is not implemented for `Schedule`
+  |           |
+  |           required by a bound introduced by this call
+  |
+  = help: the following other types implement trait `ValueInput`:
+            &S
+            egglog_experimental::typed::builtins::BigInt
+            egglog_experimental::typed::builtins::BigRat
+            egglog_experimental::typed::builtins::Bool
+            egglog_experimental::typed::builtins::F64
+            egglog_experimental::typed::builtins::I64
+            egglog_experimental::typed::builtins::Map<K, V>
+            egglog_experimental::typed::builtins::MultiSet<S>
+          and $N others
+  = note: required for `Schedule` to implement `IntoActions<Direct>`
+note: required by a bound in `egglog_experimental::typed::EGraph::register`
+ --> src/typed/session.rs
+  |
+  |     pub fn register<T, M>(&mut self, items: T) -> Result<(), TypedError>
+  |            -------- required by a bound in this associated function
+  |     where
+  |         T: IntoActions<M>,
+  |            ^^^^^^^^^^^^^^ required by this bound in `EGraph::register`

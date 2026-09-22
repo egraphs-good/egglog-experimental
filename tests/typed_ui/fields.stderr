@@ -1,0 +1,5 @@
+error[E0422]: cannot find struct, variant or union type `MakeArgs` in this scope
+ --> tests/typed_ui/fields.rs:8:13
+  |
+8 |     let _ = MakeArgs { wrong: 1.into() };
+  |             ^^^^^^^^ not found in this scope

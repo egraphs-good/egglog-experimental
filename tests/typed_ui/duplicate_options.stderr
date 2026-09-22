@@ -1,0 +1,53 @@
+error: duplicate declaration option `name`
+ --> tests/typed_ui/duplicate_options.rs:3:24
+  |
+3 | #[sort(name = "first", name = "second")]
+  |                        ^^^^^^^^^^^^^^^
+
+error: duplicate declaration option `name`
+ --> tests/typed_ui/duplicate_options.rs:9:31
+  |
+9 | #[constructor(name = "first", name = "second")]
+  |                               ^^^^^^^^^^^^^^^
+
+error: duplicate declaration option `cost`
+  --> tests/typed_ui/duplicate_options.rs:12:25
+   |
+12 | #[constructor(cost = 1, cost = 2)]
+   |                         ^^^^^^^^
+
+error: duplicate declaration option `unextractable`
+  --> tests/typed_ui/duplicate_options.rs:15:30
+   |
+15 | #[constructor(unextractable, unextractable)]
+   |                              ^^^^^^^^^^^^^
+
+error: duplicate declaration option `name`
+  --> tests/typed_ui/duplicate_options.rs:18:38
+   |
+18 | #[function(no_merge, name = "first", name = "second")]
+   |                                      ^^^^^^^^^^^^^^^
+
+error: duplicate declaration option `name`
+  --> tests/typed_ui/duplicate_options.rs:21:28
+   |
+21 | #[relation(name = "first", name = "second")]
+   |                            ^^^^^^^^^^^^^^^
+
+error: duplicate declaration option `name`
+  --> tests/typed_ui/duplicate_options.rs:26:35
+   |
+26 |     #[constructor(name = "first", name = "second")]
+   |                                   ^^^^^^^^^^^^^^^
+
+error: one callable declaration attribute is allowed per method
+  --> tests/typed_ui/duplicate_options.rs:33:5
+   |
+33 |     #[constructor(cost = 2)]
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^
+
+error: duplicate declaration option `unextractable`
+  --> tests/typed_ui/duplicate_options.rs:39:34
+   |
+39 |     #[constructor(unextractable, unextractable)]
+   |                                  ^^^^^^^^^^^^^

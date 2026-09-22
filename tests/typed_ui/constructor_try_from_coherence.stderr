@@ -1,0 +1,43 @@
+error[E0119]: conflicting implementations of trait `TryFrom<&Num>` for type `egglog_experimental::typed::builtins::I64`
+ --> tests/typed_ui/constructor_try_from_coherence.rs:4:1
+  |
+4 | #[declarations]
+  | ^^^^^^^^^^^^^^^
+  | |
+  | first implementation here
+  | conflicting implementation for `egglog_experimental::typed::builtins::I64`
+  |
+  = note: this error originates in the attribute macro `declarations` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+error[E0119]: conflicting implementations of trait `TryFrom<Num>` for type `egglog_experimental::typed::builtins::I64`
+ --> tests/typed_ui/constructor_try_from_coherence.rs:4:1
+  |
+4 | #[declarations]
+  | ^^^^^^^^^^^^^^^
+  | |
+  | first implementation here
+  | conflicting implementation for `egglog_experimental::typed::builtins::I64`
+  |
+  = note: this error originates in the attribute macro `declarations` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+error[E0119]: conflicting implementations of trait `TryFrom<&Alias>` for type `egglog_experimental::typed::builtins::I64`
+  --> tests/typed_ui/constructor_try_from_coherence.rs:14:1
+   |
+14 | #[constructor(try_from(Integer))]
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^---
+   | |
+   | first implementation here
+   | conflicting implementation for `egglog_experimental::typed::builtins::I64`
+   |
+   = note: this error originates in the attribute macro `constructor` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+error[E0119]: conflicting implementations of trait `TryFrom<Alias>` for type `egglog_experimental::typed::builtins::I64`
+  --> tests/typed_ui/constructor_try_from_coherence.rs:14:1
+   |
+14 | #[constructor(try_from(Integer))]
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^---
+   | |
+   | first implementation here
+   | conflicting implementation for `egglog_experimental::typed::builtins::I64`
+   |
+   = note: this error originates in the attribute macro `constructor` (in Nightly builds, run with -Z macro-backtrace for more info)

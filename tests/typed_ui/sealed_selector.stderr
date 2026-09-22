@@ -1,0 +1,74 @@
+error[E0277]: the trait bound `UncheckedArguments: typed::selector::sealed::Arguments` is not satisfied
+ --> tests/typed_ui/sealed_selector.rs:6:23
+  |
+6 | impl SelectedArgs for UncheckedArguments {
+  |                       ^^^^^^^^^^^^^^^^^^ unsatisfied trait bound
+  |
+help: the trait `typed::selector::sealed::Arguments` is not implemented for `UncheckedArguments`
+ --> tests/typed_ui/sealed_selector.rs:5:1
+  |
+5 | struct UncheckedArguments;
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^
+  = help: the following other types implement trait `typed::selector::sealed::Arguments`:
+            ()
+            (A0, A1)
+            (A0, A1, A2)
+            (A0, A1, A2, A3)
+            (A0, A1, A2, A3, A4)
+            (A0, A1, A2, A3, A4, A5)
+            (A0, A1, A2, A3, A4, A5, A6)
+            (A0, A1, A2, A3, A4, A5, A6, A7)
+          and $N others
+note: required by a bound in `SelectedArgs`
+ --> src/typed/selector.rs
+  |
+  | pub trait SelectedArgs: sealed::Arguments + Sized {
+  |                         ^^^^^^^^^^^^^^^^^ required by this bound in `SelectedArgs`
+  = note: `SelectedArgs` is a "sealed trait", because to implement it you also need to implement `egglog_experimental::typed::selector::sealed::Arguments`, which is not accessible; this is usually done to force you to use one of the provided types that already implement it
+  = help: the following types implement the trait:
+            ()
+            (A0,)
+            (A0, A1)
+            (A0, A1, A2)
+            (A0, A1, A2, A3)
+            (A0, A1, A2, A3, A4)
+            (A0, A1, A2, A3, A4, A5)
+            (A0, A1, A2, A3, A4, A5, A6)
+          and $N others
+
+error[E0046]: not all trait items implemented, missing: `select`
+  --> tests/typed_ui/sealed_selector.rs:13:1
+   |
+13 | impl SelectCall<()> for UncheckedSelector {
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ missing `select` in implementation
+   |
+   = help: implement the missing item: `fn select(self) -> Result<typed::selector::Selection, TypedError> { todo!() }`
+
+error[E0277]: the trait bound `UncheckedSelector: typed::selector::sealed::Selector<()>` is not satisfied
+  --> tests/typed_ui/sealed_selector.rs:13:25
+   |
+13 | impl SelectCall<()> for UncheckedSelector {
+   |                         ^^^^^^^^^^^^^^^^^ unsatisfied trait bound
+   |
+help: the trait `FnOnce()` is not implemented for `UncheckedSelector`
+  --> tests/typed_ui/sealed_selector.rs:12:1
+   |
+12 | struct UncheckedSelector;
+   | ^^^^^^^^^^^^^^^^^^^^^^^^
+   = note: required for `UncheckedSelector` to implement `typed::selector::sealed::Selector<()>`
+note: required by a bound in `SelectCall`
+  --> src/typed/selector.rs
+   |
+   | pub trait SelectCall<A>: sealed::Selector<A> {
+   |                          ^^^^^^^^^^^^^^^^^^^ required by this bound in `SelectCall`
+   = note: `SelectCall` is a "sealed trait", because to implement it you also need to implement `egglog_experimental::typed::selector::sealed::Selector`, which is not accessible; this is usually done to force you to use one of the provided types that already implement it
+   = help: the following types implement the trait:
+             F
+             F
+             F
+             F
+             F
+             F
+             F
+             F
+           and $N others

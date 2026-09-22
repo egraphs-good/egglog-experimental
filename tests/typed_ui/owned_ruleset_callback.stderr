@@ -1,0 +1,22 @@
+error[E0277]: the trait bound `{closure@$DIR/tests/typed_ui/owned_ruleset_callback.rs:4:21: 4:33}: IntoRules<_>` is not satisfied
+ --> tests/typed_ui/owned_ruleset_callback.rs:4:21
+  |
+4 |     let _ = ruleset(|value: I64| rule(eq(value, 1), ()));
+  |             ------- ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ unsatisfied trait bound
+  |             |
+  |             required by a bound introduced by this call
+  |
+  = help: the trait `IntoRules<_>` is not implemented for closure `{closure@$DIR/tests/typed_ui/owned_ruleset_callback.rs:4:21: 4:33}`
+note: required by a bound in `egglog_experimental::typed::ruleset`
+ --> src/typed/rule.rs
+  |
+  | pub fn ruleset<T, M>(input: T) -> Ruleset
+  |        ------- required by a bound in this function
+  | where
+  |     T: IntoRules<M>,
+  |        ^^^^^^^^^^^^ required by this bound in `ruleset`
+help: use parentheses to call this closure
+  |
+4 -     let _ = ruleset(|value: I64| rule(eq(value, 1), ()));
+4 +     let _ = ruleset((|value: I64| rule(eq(value, 1), ()))(/* egglog_experimental::typed::builtins::I64 */));
+  |

@@ -1,0 +1,35 @@
+error[E0277]: the trait bound `bool: From<egglog_experimental::typed::builtins::I64>` is not satisfied
+ --> tests/typed_ui/constructor_try_from_route.rs:4:1
+  |
+4 | #[constructor(try_from(bool))]
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ the trait `From<egglog_experimental::typed::builtins::I64>` is not implemented for `bool`
+  |
+  = help: the following other types implement trait `TryFrom<T>`:
+            `bool` implements `TryFrom<&Num>`
+            `bool` implements `TryFrom<&egglog_experimental::typed::builtins::Bool>`
+            `bool` implements `TryFrom<Num>`
+            `bool` implements `TryFrom<egglog_experimental::typed::builtins::Bool>`
+  = note: required for `egglog_experimental::typed::builtins::I64` to implement `Into<bool>`
+  = note: required for `bool` to implement `TryFrom<egglog_experimental::typed::builtins::I64>`
+  = note: this error originates in the attribute macro `constructor` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+error[E0277]: the trait bound `std::vec::Vec<i64>: From<egglog_experimental::typed::builtins::Vec<egglog_experimental::typed::builtins::I64>>` is not satisfied
+ --> tests/typed_ui/constructor_try_from_route.rs:8:1
+  |
+8 | #[constructor(try_from(Vec<i64>))]
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ unsatisfied trait bound
+  |
+  = help: the trait `From<egglog_experimental::typed::builtins::Vec<egglog_experimental::typed::builtins::I64>>` is not implemented for `std::vec::Vec<i64>`
+  = help: the following other types implement trait `From<T>`:
+            `std::vec::Vec<T, A>` implements `From<BinaryHeap<T, A>>`
+            `std::vec::Vec<T, A>` implements `From<Box<[T], A>>`
+            `std::vec::Vec<T, A>` implements `From<VecDeque<T, A>>`
+            `std::vec::Vec<T>` implements `From<&[T; N]>`
+            `std::vec::Vec<T>` implements `From<&[T]>`
+            `std::vec::Vec<T>` implements `From<&mut [T; N]>`
+            `std::vec::Vec<T>` implements `From<&mut [T]>`
+            `std::vec::Vec<T>` implements `From<Cow<'_, [T]>>`
+          and $N others
+  = note: required for `egglog_experimental::typed::builtins::Vec<egglog_experimental::typed::builtins::I64>` to implement `Into<std::vec::Vec<i64>>`
+  = note: required for `std::vec::Vec<i64>` to implement `TryFrom<egglog_experimental::typed::builtins::Vec<egglog_experimental::typed::builtins::I64>>`
+  = note: this error originates in the attribute macro `constructor` (in Nightly builds, run with -Z macro-backtrace for more info)

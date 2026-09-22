@@ -1,0 +1,18 @@
+error[E0053]: method `read` has an incompatible type for trait
+  --> tests/typed_ui/trait_signature.rs:10:27
+   |
+10 |     fn read(&self, value: &I64) -> I64;
+   |                           ^^^^ expected `I64`, found `&I64`
+   |
+note: type in trait
+  --> tests/typed_ui/trait_signature.rs:5:27
+   |
+ 5 |     fn read(&self, value: I64) -> I64;
+   |                           ^^^
+   = note: expected signature `fn(&Num, egglog_experimental::typed::builtins::I64) -> egglog_experimental::typed::builtins::I64`
+              found signature `fn(&Num, &egglog_experimental::typed::builtins::I64) -> egglog_experimental::typed::builtins::I64`
+help: change the parameter type to match the trait
+   |
+10 -     fn read(&self, value: &I64) -> I64;
+10 +     fn read(&self, value: egglog_experimental::typed::builtins::I64) -> I64;
+   |

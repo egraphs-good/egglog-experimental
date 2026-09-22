@@ -1,0 +1,21 @@
+error[E0119]: conflicting implementations of trait `Add<_>` for type `Num`
+  --> tests/typed_ui/operator_overlap.rs:15:1
+   |
+ 8 | #[declarations]
+   | --------------- first implementation here
+...
+15 | #[declarations]
+   | ^^^^^^^^^^^^^^^ conflicting implementation for `Num`
+   |
+   = note: this error originates in the attribute macro `declarations` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+error[E0119]: conflicting implementations of trait `Add<_>` for type `&Num`
+  --> tests/typed_ui/operator_overlap.rs:15:1
+   |
+ 8 | #[declarations]
+   | --------------- first implementation here
+...
+15 | #[declarations]
+   | ^^^^^^^^^^^^^^^ conflicting implementation for `&Num`
+   |
+   = note: this error originates in the attribute macro `declarations` (in Nightly builds, run with -Z macro-backtrace for more info)

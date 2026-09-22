@@ -1,0 +1,55 @@
+error: functions require no_merge or merge = builder
+  --> tests/typed_ui/declaration_defaults.rs:11:8
+   |
+11 |     fn missing_policy(value: I64) -> Num;
+   |        ^^^^^^^^^^^^^^
+
+error: symbolic outputs must be owned sort wrappers
+  --> tests/typed_ui/declaration_defaults.rs:15:39
+   |
+15 |     fn borrowed_output(value: I64) -> &Num;
+   |                                       ^^^^
+
+error: declarations must be monomorphic fixed-arity safe functions
+  --> tests/typed_ui/declaration_defaults.rs:19:5
+   |
+19 |     async fn asynchronous(value: I64) -> Num;
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+error: declarations must be monomorphic fixed-arity safe functions
+  --> tests/typed_ui/declaration_defaults.rs:23:5
+   |
+23 |     const fn constant(value: I64) -> Num;
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+error: declarations must be monomorphic fixed-arity safe functions
+  --> tests/typed_ui/declaration_defaults.rs:27:5
+   |
+27 |     unsafe fn unsafe_stub(value: I64) -> Num;
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+error: declarations must be monomorphic fixed-arity safe functions
+  --> tests/typed_ui/declaration_defaults.rs:31:5
+   |
+31 |     fn generic<T>(value: T) -> Num;
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+error: symbolic declarations must be bodyless
+  --> tests/typed_ui/declaration_defaults.rs:36:5
+   |
+36 |     fn annotated_body(value: I64) -> Num { unreachable!() }
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+error[E0277]: the trait bound `egglog_experimental::typed::builtins::I64: EqualitySort` is not satisfied
+ --> tests/typed_ui/declaration_defaults.rs:6:40
+  |
+6 |     fn primitive_output(value: I64) -> I64;
+  |                                        ^^^ the trait `EqualitySort` is not implemented for `egglog_experimental::typed::builtins::I64`
+  |
+  = help: the trait `EqualitySort` is implemented for `Num`
+note: required by a bound in `assert_equality`
+ --> tests/typed_ui/declaration_defaults.rs:4:1
+  |
+4 | #[declarations]
+  | ^^^^^^^^^^^^^^^ required by this bound in `assert_equality`
+  = note: this error originates in the attribute macro `declarations` (in Nightly builds, run with -Z macro-backtrace for more info)

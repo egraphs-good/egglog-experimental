@@ -1,0 +1,9 @@
+error: lifetime may not live long enough
+ --> tests/typed_ui/frozen_native_handle_escape.rs:5:9
+  |
+4 |     let _escaped = native::with_frozen(&core, &[], FreezeLimits::default(), |snapshot, _| {
+  |                                                                              --------   - return type of closure is Result<FrozenValue<'2>, TypedError>
+  |                                                                              |
+  |                                                                              has type `&'1 FrozenEGraph`
+5 |         Ok(snapshot.eclasses().next().unwrap().value())
+  |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ returning this value requires that `'1` must outlive `'2`

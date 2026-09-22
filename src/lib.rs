@@ -1,4 +1,5 @@
 #![warn(missing_docs)]
+#![cfg_attr(feature = "typed", recursion_limit = "256")]
 //! # egglog-experimental
 //!
 //! Experimental extensions to the [`egglog`] language and runtime.
@@ -49,10 +50,16 @@
 //! - [`PrintTableStatsCommand`] reports table cardinality and out-degree
 //!   statistics.
 //!
+#[cfg(test)]
+extern crate self as egglog_experimental;
+
 use egglog::ast::Parser;
 use egglog::prelude::add_base_sort;
 pub use egglog::*;
 use std::sync::Arc;
+
+#[cfg(feature = "typed")]
+pub mod typed;
 
 pub mod rational;
 pub use rational::*;

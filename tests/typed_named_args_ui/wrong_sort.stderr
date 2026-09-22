@@ -1,0 +1,5 @@
+error[E0308]: mismatched types
+  --> tests/typed_named_args_ui/wrong_sort.rs:13:16
+   |
+13 |         value: String::from("wrong"),
+   |                ^^^^^^^^^^^^^^^^^^^^^ expected `I64`, found `String`

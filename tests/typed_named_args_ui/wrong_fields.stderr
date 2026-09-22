@@ -1,0 +1,7 @@
+error[E0560]: struct `LeafArgs` has no field named `missing`
+ --> tests/typed_named_args_ui/wrong_fields.rs:9:24
+  |
+9 |     let _ = LeafArgs { missing: 1.into() };
+  |                        ^^^^^^^ `LeafArgs` does not have this field
+  |
+  = note: available fields are: `value`

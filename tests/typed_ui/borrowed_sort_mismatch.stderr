@@ -1,0 +1,20 @@
+error[E0277]: the trait bound `egglog_experimental::typed::builtins::I64: From<&egglog_experimental::typed::builtins::String>` is not satisfied
+ --> tests/typed_ui/borrowed_sort_mismatch.rs:9:25
+  |
+9 |     let _ = eq(&number, &text);
+  |             --          ^^^^^ the trait `From<&egglog_experimental::typed::builtins::String>` is not implemented for `egglog_experimental::typed::builtins::I64`
+  |             |
+  |             required by a bound introduced by this call
+  |
+  = help: the following other types implement trait `From<T>`:
+            `egglog_experimental::typed::builtins::I64` implements `From<&egglog_experimental::typed::builtins::I64>`
+            `egglog_experimental::typed::builtins::I64` implements `From<&i32>`
+            `egglog_experimental::typed::builtins::I64` implements `From<&i64>`
+            `egglog_experimental::typed::builtins::I64` implements `From<i32>`
+            `egglog_experimental::typed::builtins::I64` implements `From<i64>`
+  = note: required for `&egglog_experimental::typed::builtins::String` to implement `Into<egglog_experimental::typed::builtins::I64>`
+note: required by a bound in `egglog_experimental::typed::eq`
+ --> src/typed/rule.rs
+  |
+  | pub fn eq<I: ValueInput>(lhs: I, rhs: impl Into<I::Owned>) -> Fact {
+  |                                            ^^^^^^^^^^^^^^ required by this bound in `eq`

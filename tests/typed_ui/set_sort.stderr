@@ -1,0 +1,20 @@
+error[E0277]: the trait bound `egglog_experimental::typed::builtins::I64: From<egglog_experimental::typed::builtins::String>` is not satisfied
+ --> tests/typed_ui/set_sort.rs:8:28
+  |
+8 |     let _ = set(weight(1), String::from("wrong"));
+  |             ---            ^^^^^^^^^^^^^^^^^^^^^ the trait `From<egglog_experimental::typed::builtins::String>` is not implemented for `egglog_experimental::typed::builtins::I64`
+  |             |
+  |             required by a bound introduced by this call
+  |
+  = help: the following other types implement trait `From<T>`:
+            `egglog_experimental::typed::builtins::I64` implements `From<&egglog_experimental::typed::builtins::I64>`
+            `egglog_experimental::typed::builtins::I64` implements `From<&i32>`
+            `egglog_experimental::typed::builtins::I64` implements `From<&i64>`
+            `egglog_experimental::typed::builtins::I64` implements `From<i32>`
+            `egglog_experimental::typed::builtins::I64` implements `From<i64>`
+  = note: required for `egglog_experimental::typed::builtins::String` to implement `Into<egglog_experimental::typed::builtins::I64>`
+note: required by a bound in `egglog_experimental::typed::set`
+ --> src/typed/rule.rs
+  |
+  | pub fn set<I: ValueInput>(call: I, value: impl Into<I::Owned>) -> Action {
+  |                                                ^^^^^^^^^^^^^^ required by this bound in `set`

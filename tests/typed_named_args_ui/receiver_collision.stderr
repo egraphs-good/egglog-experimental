@@ -1,0 +1,7 @@
+error: named argument records reserve `receiver` for the method receiver
+ --> tests/typed_named_args_ui/receiver_collision.rs:5:1
+  |
+5 | #[declarations]
+  | ^^^^^^^^^^^^^^^
+  |
+  = note: this error originates in the attribute macro `declarations` (in Nightly builds, run with -Z macro-backtrace for more info)

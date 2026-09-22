@@ -332,7 +332,7 @@ checksum = "d0881ea181b1df73ff77ffaaf9c7544ecc11e82fba9b5f27b262a3c73a332555"
 [[package]]
 name = "egglog"
 version = "3.0.0"
-source = "git+https://github.com/egraphs-good/egglog.git?rev=e264c37a3332453eb0b6486c82c8766dd1af17df#e264c37a3332453eb0b6486c82c8766dd1af17df"
+source = "git+https://github.com/saulshanabrook/egg-smol?rev=b061d1f41398747fb39f6e186a682e8e2d758ceb#b061d1f41398747fb39f6e186a682e8e2d758ceb"
 dependencies = [
  "chrono",
  "clap",
@@ -364,7 +364,7 @@ dependencies = [
 [[package]]
 name = "egglog-add-primitive"
 version = "3.0.0"
-source = "git+https://github.com/egraphs-good/egglog.git?rev=e264c37a3332453eb0b6486c82c8766dd1af17df#e264c37a3332453eb0b6486c82c8766dd1af17df"
+source = "git+https://github.com/saulshanabrook/egg-smol?rev=b061d1f41398747fb39f6e186a682e8e2d758ceb#b061d1f41398747fb39f6e186a682e8e2d758ceb"
 dependencies = [
  "quote",
  "syn 2.0.119",
@@ -373,7 +373,7 @@ dependencies = [
 [[package]]
 name = "egglog-ast"
 version = "3.0.0"
-source = "git+https://github.com/egraphs-good/egglog.git?rev=e264c37a3332453eb0b6486c82c8766dd1af17df#e264c37a3332453eb0b6486c82c8766dd1af17df"
+source = "git+https://github.com/saulshanabrook/egg-smol?rev=b061d1f41398747fb39f6e186a682e8e2d758ceb#b061d1f41398747fb39f6e186a682e8e2d758ceb"
 dependencies = [
  "ordered-float",
 ]
@@ -381,7 +381,7 @@ dependencies = [
 [[package]]
 name = "egglog-bridge"
 version = "3.0.0"
-source = "git+https://github.com/egraphs-good/egglog.git?rev=e264c37a3332453eb0b6486c82c8766dd1af17df#e264c37a3332453eb0b6486c82c8766dd1af17df"
+source = "git+https://github.com/saulshanabrook/egg-smol?rev=b061d1f41398747fb39f6e186a682e8e2d758ceb#b061d1f41398747fb39f6e186a682e8e2d758ceb"
 dependencies = [
  "anyhow",
  "dyn-clone",
@@ -404,7 +404,7 @@ dependencies = [
 [[package]]
 name = "egglog-concurrency"
 version = "3.0.0"
-source = "git+https://github.com/egraphs-good/egglog.git?rev=e264c37a3332453eb0b6486c82c8766dd1af17df#e264c37a3332453eb0b6486c82c8766dd1af17df"
+source = "git+https://github.com/saulshanabrook/egg-smol?rev=b061d1f41398747fb39f6e186a682e8e2d758ceb#b061d1f41398747fb39f6e186a682e8e2d758ceb"
 dependencies = [
  "arc-swap",
  "bumpalo",
@@ -416,7 +416,7 @@ dependencies = [
 [[package]]
 name = "egglog-core-relations"
 version = "3.0.0"
-source = "git+https://github.com/egraphs-good/egglog.git?rev=e264c37a3332453eb0b6486c82c8766dd1af17df#e264c37a3332453eb0b6486c82c8766dd1af17df"
+source = "git+https://github.com/saulshanabrook/egg-smol?rev=b061d1f41398747fb39f6e186a682e8e2d758ceb#b061d1f41398747fb39f6e186a682e8e2d758ceb"
 dependencies = [
  "anyhow",
  "bumpalo",
@@ -447,6 +447,7 @@ version = "3.0.0"
 dependencies = [
  "egglog",
  "egglog-ast",
+ "egglog-experimental-typed-macros",
  "egglog-reports",
  "fixedbitset",
  "glob",
@@ -455,17 +456,27 @@ dependencies = [
  "libtest-mimic",
  "log",
  "num",
+ "trybuild",
+]
+
+[[package]]
+name = "egglog-experimental-typed-macros"
+version = "3.0.0"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
 ]
 
 [[package]]
 name = "egglog-numeric-id"
 version = "3.0.0"
-source = "git+https://github.com/egraphs-good/egglog.git?rev=e264c37a3332453eb0b6486c82c8766dd1af17df#e264c37a3332453eb0b6486c82c8766dd1af17df"
+source = "git+https://github.com/saulshanabrook/egg-smol?rev=b061d1f41398747fb39f6e186a682e8e2d758ceb#b061d1f41398747fb39f6e186a682e8e2d758ceb"
 
 [[package]]
 name = "egglog-reports"
 version = "3.0.0"
-source = "git+https://github.com/egraphs-good/egglog.git?rev=e264c37a3332453eb0b6486c82c8766dd1af17df#e264c37a3332453eb0b6486c82c8766dd1af17df"
+source = "git+https://github.com/saulshanabrook/egg-smol?rev=b061d1f41398747fb39f6e186a682e8e2d758ceb#b061d1f41398747fb39f6e186a682e8e2d758ceb"
 dependencies = [
  "clap",
  "hashbrown 0.16.1",
@@ -479,7 +490,7 @@ dependencies = [
 [[package]]
 name = "egglog-union-find"
 version = "3.0.0"
-source = "git+https://github.com/egraphs-good/egglog.git?rev=e264c37a3332453eb0b6486c82c8766dd1af17df#e264c37a3332453eb0b6486c82c8766dd1af17df"
+source = "git+https://github.com/saulshanabrook/egg-smol?rev=b061d1f41398747fb39f6e186a682e8e2d758ceb#b061d1f41398747fb39f6e186a682e8e2d758ceb"
 dependencies = [
  "crossbeam",
  "egglog-concurrency",
@@ -1252,6 +1263,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "serde_spanned"
+version = "1.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6662b5879511e06e8999a8a235d848113e942c9124f211511b16466ee2995f26"
+dependencies = [
+ "serde_core",
+]
+
+[[package]]
 name = "shlex"
 version = "2.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1319,6 +1339,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "target-tuple"
+version = "1.0.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "876fef147edbcbddc8ac5cbbba92c7b86519e314e86638596c09673b2ed01e7f"
+
+[[package]]
 name = "tempfile"
 version = "3.27.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1329,6 +1355,15 @@ dependencies = [
  "once_cell",
  "rustix",
  "windows-sys",
+]
+
+[[package]]
+name = "termcolor"
+version = "1.4.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "06794f8f6c5c898b3275aebefa6b8a1cb24cd2c6c79397ab15774837a0bc5755"
+dependencies = [
+ "winapi-util",
 ]
 
 [[package]]
@@ -1349,6 +1384,60 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 3.0.3",
+]
+
+[[package]]
+name = "toml"
+version = "1.1.5+spec-1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "12c0ba9680044b4ce98d391a62094047eada0d64860b80166c39f4a6b5640785"
+dependencies = [
+ "indexmap",
+ "serde_core",
+ "serde_spanned",
+ "toml_datetime",
+ "toml_parser",
+ "toml_writer",
+ "winnow",
+]
+
+[[package]]
+name = "toml_datetime"
+version = "1.1.1+spec-1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3165f65f62e28e0115a00b2ebdd37eb6f3b641855f9d636d3cd4103767159ad7"
+dependencies = [
+ "serde_core",
+]
+
+[[package]]
+name = "toml_parser"
+version = "1.1.3+spec-1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1d38ac1cf9b95face32296c0a3ede1fdc270627c9d9c02a7274dd6d960dc4d56"
+dependencies = [
+ "winnow",
+]
+
+[[package]]
+name = "toml_writer"
+version = "1.1.2+spec-1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7d56353a2a665ad0f41a421187180aab746c8c325620617ad883a99a1cbe66d2"
+
+[[package]]
+name = "trybuild"
+version = "1.0.121"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c0cabaa10be1917331a313866bd94526343e03c77bcf69144b62b072ad35d47c"
+dependencies = [
+ "glob",
+ "serde",
+ "serde_derive",
+ "serde_json",
+ "target-tuple",
+ "termcolor",
+ "toml",
 ]
 
 [[package]]
@@ -1446,6 +1535,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "winapi-util"
+version = "0.1.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
+dependencies = [
+ "windows-sys",
+]
+
+[[package]]
 name = "windows-link"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1459,6 +1557,12 @@ checksum = "ae137229bcbd6cdf0f7b80a31df61766145077ddf49416a728b02cb3921ff3fc"
 dependencies = [
  "windows-link",
 ]
+
+[[package]]
+name = "winnow"
+version = "1.0.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "23b97319f7b8343df12cc98938e5c3eb436064524c8d2b4e30a1d3a36eecdf81"
 
 [[package]]
 name = "wit-bindgen"
