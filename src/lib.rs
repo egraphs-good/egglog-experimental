@@ -29,6 +29,9 @@
 //!   primitives, functions, and globals determine the required access mode.
 //! - `(unstable-fresh! Sort [:cost N] [:unextractable])` creates a fresh value
 //!   for each match of a rule action.
+//! - [`Subst`] implements `(unstable-subst root map)`, which copies the affected
+//!   portion of the constructor sub-e-graph reachable from `root` with each key
+//!   e-class replaced by its mapped value.
 //! - Named arguments let `constructor`, `function`, `relation`, `datatype`, and
 //!   `datatype*` name their fields, e.g.
 //!   `(constructor MyCar (:color Color :numwheel i64) Vehicle)`. Call sites can
@@ -129,6 +132,9 @@ pub use sugar::*;
 mod keep_best;
 pub use keep_best::KeepBestCommand;
 
+mod subst;
+pub use subst::Subst;
+
 /// Creates a default [`EGraph`] with every experimental extension registered.
 ///
 /// This is the recommended entry point for running egglog programs that use
@@ -187,6 +193,9 @@ pub fn new_experimental_egraph() -> EGraph {
     maybe::add_maybe(&mut egraph);
     egraph.add_pure_primitive(map_fold::MapFoldKv, None);
     f64::add_f64_primitives(&mut egraph);
+
+    // Substitution over a reachable sub-e-graph.
+    egraph.add_full_primitive(Subst, None);
     egraph
 }
 
