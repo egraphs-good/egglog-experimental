@@ -1,0 +1,37 @@
+;; `unstable-subst` copies the sub-e-graph reachable from a root, replacing each
+;; key e-class with its mapped value, and hands back the copied root. The
+;; motivating use is beta reduction: substituting an argument into a lambda body.
+
+(datatype Expr
+  (Num i64)
+  (Var String)
+  (Add Expr Expr)
+  (Lam String Expr)
+  (App Expr Expr))
+
+(sort Subst (Map Expr Expr))
+
+;; (App (Lam x body) arg)  ==>  body[x := arg]
+;;
+;; `:naive` because substitution reads the database to walk `body`, which an
+;; ordinary seminaive rule head may not do. `body` comes from the query, so it
+;; already has rows for the walk to find — a term built in this action would not.
+(rule ((= redex (App (Lam x body) arg)))
+      ((union redex (unstable-subst body (map-insert (map-empty) (Var x) arg))))
+      :naive)
+
+;; (\x. x + 1) 5  ==>  5 + 1
+(let $inc (Lam "x" (Add (Var "x") (Num 1))))
+(let $applied (App $inc (Num 5)))
+(run 1)
+(check (= $applied (Add (Num 5) (Num 1))))
+
+;; The lambda itself is untouched: substitution copies, it does not rewrite in
+;; place.
+(check (= $inc (Lam "x" (Add (Var "x") (Num 1)))))
+
+;; Nested application reduces too, one redex per iteration.
+(let $twice (Lam "y" (Add (Var "y") (Var "y"))))
+(let $nested (App $twice (App $inc (Num 2))))
+(run 3)
+(check (= $nested (Add (Add (Num 2) (Num 1)) (Add (Num 2) (Num 1)))))
