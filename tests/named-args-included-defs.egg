@@ -1,0 +1,2 @@
+; Declarations included by named-args-include.egg. Also valid on its own.
+(relation Included (:x i64 :y i64))

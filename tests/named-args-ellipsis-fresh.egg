@@ -1,0 +1,22 @@
+; Each `...` must bind its own fresh variables. Deriving them from the field
+; names let the second fresh variable for `x` collide with the first for `x1`,
+; which silently joined two independent rows together and made this check fail.
+
+(relation R (:x i64 :x1 i64))
+(relation Hit ())
+
+(R 1 2)
+(rule ((R ...) (R ...)) ((Hit)))
+(run 1)
+(check (Hit))
+
+; The same shape, but across two rows that share no field value: the two `...`
+; patterns must not be constrained to match the same row.
+(relation S (:a i64 :a1 i64))
+(relation Pair (i64 i64))
+(S 1 2)
+(S 3 4)
+(rule ((S a ...) (S b ...)) ((Pair a b)))
+(run 1)
+(check (Pair 1 3))
+(check (Pair 3 1))

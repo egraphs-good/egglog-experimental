@@ -1,0 +1,23 @@
+; Field names must follow declaration scope and redeclaration. A named
+; declaration inside a `(push)`/`(pop)` must not keep rewriting calls to a name
+; that has since been redeclared positionally with a different arity.
+
+(push)
+(relation R (:x i64))
+(R :x 1)
+(pop)
+
+(relation R (i64 i64))
+(R 1 2)
+(run 0)
+(check (R 1 2))
+
+; Redeclaration at the same arity also replaces the field names.
+(push)
+(relation S (:a i64))
+(S :a 1)
+(pop)
+(relation S (:b i64))
+(S :b 2)
+(run 0)
+(check (S 2))

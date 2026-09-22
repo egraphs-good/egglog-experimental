@@ -20,599 +20,475 @@
 //! (rule ((MyCar :numwheel w :color c)) ((Use c)))  ; any order
 //! ```
 //!
-//! Implementation strategy: the declaration commands (`constructor`, `function`,
-//! `relation`, `datatype`, `datatype*`) are registered as parser command macros
-//! that shadow the built-ins. When a declaration names its fields, we emit the
-//! ordinary positional command *and* register a per-name expression macro
-//! (`NamedCallMacro`) on the parser. Because facts and actions both flow
-//! through `Parser::parse_expr`, that single expression macro rewrites named/
-//! `...` call syntax into positional `Expr::Call`s in queries, actions, and
-//! nested positions alike. No changes to the core `egglog` crate are required.
+//! # Implementation strategy
+//!
+//! Everything happens in one [`CommandMacro`]. `:name` and `...` already parse
+//! as ordinary variables, and a declaration's `:name Sort` pairs already parse
+//! as a longer sort list, so no parse-time macro is needed: a declaration
+//! command arrives with its field names still in the sort list, and a named
+//! call arrives as an ordinary [`Expr::Call`] whose arguments include
+//! `Expr::Var(":color")` and `Expr::Var("...")`.
+//!
+//! Running as a command macro rather than at parse time is what makes scoping
+//! correct. egglog parses a whole program before running any of it, so a
+//! parse-time macro sees declarations in *source* order; command macros run in
+//! *execution* order, after every preceding command has taken effect. That is
+//! what lets a call see declarations from a file that an earlier `(include ...)`
+//! pulled in, and what lets `(push)`/`(pop)` and redeclaration work: field names
+//! are recorded per `(name, arity)`, and each call site resolves against the
+//! arity the e-graph currently has for that name.
+//!
+//! The recorded names outlive a `(pop)`, since the registry is not itself
+//! scoped, but they can never be *applied* out of scope: a stale entry is only
+//! reachable through an arity that the live type information still reports.
 
-use egglog::ast::*;
-use egglog::util::FreshGen;
-use std::sync::Arc;
+use egglog::ast::{
+    Action, Command, Expr, GenericActions as Actions, ParseError, Span, Subdatatypes, Variant,
+};
+use egglog::util::{FreshGen, SymbolGen};
+use egglog::{CommandMacro, EGraph, Error, TypeInfo};
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 
-/// True for the tokens that act as markers in a call: the `...` ellipsis and
-/// any `:name` keyword. Such tokens can never be a plain argument value.
-fn is_marker(sexp: &Sexp) -> bool {
-    matches!(sexp, Sexp::Atom(a, _) if a == "..." || a.starts_with(':'))
+/// Add named-argument support to an e-graph.
+///
+/// Each call installs a registry of its own, so separate e-graphs never share
+/// field names.
+pub fn register_named_args(egraph: &mut EGraph) {
+    egraph
+        .command_macros_mut()
+        .register(Arc::new(NamedArgs::default()));
 }
 
-/// Register the named-argument macros on a parser: the declaration command
-/// macros (`constructor`, `function`, `relation`, `datatype`, `datatype*`) plus
-/// the `set`/`delete`/`subsume` action macros. Use this to add named-argument
-/// support to a plain `egglog` parser without pulling in the rest of
-/// egglog-experimental (e.g. `egraph.parser` on a bare `egglog::EGraph`).
-pub fn register_named_args(parser: &mut Parser) {
-    parser.add_command_macro(Arc::new(NamedConstructor));
-    parser.add_command_macro(Arc::new(NamedFunction));
-    parser.add_command_macro(Arc::new(NamedRelation));
-    parser.add_command_macro(Arc::new(NamedDatatype));
-    parser.add_command_macro(Arc::new(NamedDatatypes));
-    parser.add_action_macro(Arc::new(NamedSet));
-    parser.add_action_macro(Arc::new(NamedChange::delete()));
-    parser.add_action_macro(Arc::new(NamedChange::subsume()));
+/// Field names of every declaration seen so far.
+#[derive(Default)]
+struct Declarations {
+    /// Field names per `(name, arity)`. A positional declaration records
+    /// `None`, so redeclaring a name at the same arity stops the old field
+    /// names from being applied.
+    by_arity: HashMap<(String, usize), Option<Vec<String>>>,
+    /// The arity of the most recent declaration of each name. Only used when
+    /// the type information does not know the name, which is the case in
+    /// desugaring mode, where declarations are not run.
+    latest_arity: HashMap<String, usize>,
 }
 
-/// Expression macro registered for each constructor/function/relation/variant
-/// declared with named fields. Rewrites a call using named args, leading
-/// positional args, and an optional trailing `...` into a positional
-/// `Expr::Call`.
-struct NamedCallMacro {
-    /// The declared name (constructor/function/relation/variant).
-    name: String,
-    /// Field names in declaration order.
-    arg_names: Vec<String>,
+/// The command macro implementing named arguments.
+#[derive(Default)]
+struct NamedArgs {
+    declarations: Mutex<Declarations>,
 }
 
-impl Macro<Expr> for NamedCallMacro {
-    fn name(&self) -> &str {
-        &self.name
+impl CommandMacro for NamedArgs {
+    fn transform(
+        &self,
+        command: Command,
+        symbol_gen: &mut SymbolGen,
+        type_info: &TypeInfo,
+    ) -> Result<Vec<Command>, Error> {
+        let command = self.declare(command)?;
+        Ok(vec![self.expand_calls(command, symbol_gen, type_info)?])
+    }
+}
+
+impl NamedArgs {
+    /// Record the field names of a declaration and strip them from its sort
+    /// list, leaving an ordinary positional declaration.
+    fn declare(&self, command: Command) -> Result<Command, Error> {
+        Ok(match command {
+            Command::Constructor {
+                span,
+                name,
+                mut schema,
+                cost,
+                unextractable,
+                hidden,
+                let_binding,
+                term_constructor,
+            } => {
+                let (names, input) = split_fields(&schema.input, &span)?;
+                self.record(&name, names, input.len());
+                schema.input = input;
+                Command::Constructor {
+                    span,
+                    name,
+                    schema,
+                    cost,
+                    unextractable,
+                    hidden,
+                    let_binding,
+                    term_constructor,
+                }
+            }
+            Command::Function {
+                span,
+                name,
+                mut schema,
+                merge,
+                hidden,
+                let_binding,
+                term_constructor,
+                unextractable,
+            } => {
+                let (names, input) = split_fields(&schema.input, &span)?;
+                self.record(&name, names, input.len());
+                schema.input = input;
+                Command::Function {
+                    span,
+                    name,
+                    schema,
+                    merge,
+                    hidden,
+                    let_binding,
+                    term_constructor,
+                    unextractable,
+                }
+            }
+            Command::Relation { span, name, inputs } => {
+                let (names, inputs) = split_fields(&inputs, &span)?;
+                self.record(&name, names, inputs.len());
+                Command::Relation { span, name, inputs }
+            }
+            Command::Datatype {
+                span,
+                name,
+                variants,
+            } => Command::Datatype {
+                span,
+                name,
+                variants: self.declare_variants(variants)?,
+            },
+            Command::Datatypes { span, datatypes } => {
+                let mut declared = Vec::with_capacity(datatypes.len());
+                for (sub_span, name, subdatatypes) in datatypes {
+                    let subdatatypes = match subdatatypes {
+                        Subdatatypes::Variants(variants) => {
+                            Subdatatypes::Variants(self.declare_variants(variants)?)
+                        }
+                        new_sort => new_sort,
+                    };
+                    declared.push((sub_span, name, subdatatypes));
+                }
+                Command::Datatypes {
+                    span,
+                    datatypes: declared,
+                }
+            }
+            other => other,
+        })
     }
 
-    fn parse(&self, args: &[Sexp], span: Span, parser: &mut Parser) -> Result<Expr, ParseError> {
-        let arity = self.arg_names.len();
-        let mut slots: Vec<Option<Expr>> = (0..arity).map(|_| None).collect();
+    fn declare_variants(&self, variants: Vec<Variant>) -> Result<Vec<Variant>, Error> {
+        variants
+            .into_iter()
+            .map(|mut variant| {
+                let (names, types) = split_fields(&variant.types, &variant.span)?;
+                self.record(&variant.name, names, types.len());
+                variant.types = types;
+                Ok(variant)
+            })
+            .collect()
+    }
+
+    fn record(&self, name: &str, names: Option<Vec<String>>, arity: usize) {
+        let mut declarations = self.declarations.lock().unwrap();
+        declarations
+            .by_arity
+            .insert((name.to_string(), arity), names);
+        declarations.latest_arity.insert(name.to_string(), arity);
+    }
+
+    /// Rewrite every named call in `command` into a positional one.
+    fn expand_calls(
+        &self,
+        command: Command,
+        symbol_gen: &mut SymbolGen,
+        type_info: &TypeInfo,
+    ) -> Result<Command, Error> {
+        // `set`, `delete`, and `subsume` keep the table name beside its
+        // arguments instead of as a call, so `visit_exprs` never offers them as
+        // one. Rebuild them into a call, expand that, and take it apart again.
+        let command = self.expand_table_actions(command, symbol_gen, type_info)?;
+
+        let mut failure = None;
+        let expanded = command.visit_exprs(&mut |expr| match self
+            .expand_call(&expr, symbol_gen, type_info)
+        {
+            Ok(Some(expanded)) => expanded,
+            Ok(None) => expr,
+            Err(error) => {
+                failure.get_or_insert(error);
+                expr
+            }
+        });
+        match failure {
+            Some(error) => Err(Error::ParseError(error)),
+            None => Ok(expanded),
+        }
+    }
+
+    fn expand_table_actions(
+        &self,
+        command: Command,
+        symbol_gen: &mut SymbolGen,
+        type_info: &TypeInfo,
+    ) -> Result<Command, Error> {
+        Ok(match command {
+            Command::Action(action) => {
+                Command::Action(self.expand_table_action(action, symbol_gen, type_info)?)
+            }
+            Command::Rule { mut rule } => {
+                rule.head = Actions(
+                    rule.head
+                        .0
+                        .into_iter()
+                        .map(|action| self.expand_table_action(action, symbol_gen, type_info))
+                        .collect::<Result<_, _>>()?,
+                );
+                Command::Rule { rule }
+            }
+            Command::Fail(span, command) => Command::Fail(
+                span,
+                Box::new(self.expand_table_actions(*command, symbol_gen, type_info)?),
+            ),
+            other => other,
+        })
+    }
+
+    fn expand_table_action(
+        &self,
+        action: Action,
+        symbol_gen: &mut SymbolGen,
+        type_info: &TypeInfo,
+    ) -> Result<Action, Error> {
+        Ok(match action {
+            Action::Set(span, table, args, value) => {
+                let args = self.expand_table_args(&span, &table, args, symbol_gen, type_info)?;
+                Action::Set(span, table, args, value)
+            }
+            Action::Change(span, change, table, args) => {
+                let args = self.expand_table_args(&span, &table, args, symbol_gen, type_info)?;
+                Action::Change(span, change, table, args)
+            }
+            other => other,
+        })
+    }
+
+    fn expand_table_args(
+        &self,
+        span: &Span,
+        table: &str,
+        args: Vec<Expr>,
+        symbol_gen: &mut SymbolGen,
+        type_info: &TypeInfo,
+    ) -> Result<Vec<Expr>, Error> {
+        let call = Expr::Call(span.clone(), table.to_string(), args);
+        match self.expand_call(&call, symbol_gen, type_info) {
+            Ok(Some(Expr::Call(_, _, expanded))) => Ok(expanded),
+            Ok(_) => match call {
+                Expr::Call(_, _, args) => Ok(args),
+                _ => unreachable!("built as a call just above"),
+            },
+            Err(error) => Err(Error::ParseError(error)),
+        }
+    }
+
+    /// Rewrite one call, or return `None` to leave it alone.
+    fn expand_call(
+        &self,
+        expr: &Expr,
+        symbol_gen: &mut SymbolGen,
+        type_info: &TypeInfo,
+    ) -> Result<Option<Expr>, ParseError> {
+        let Expr::Call(span, name, args) = expr else {
+            return Ok(None);
+        };
+
+        // Resolve against the arity the e-graph currently has for this name, so
+        // a declaration that has been popped or replaced cannot be applied.
+        let declarations = self.declarations.lock().unwrap();
+        let arity = type_info
+            .get_func_type(name)
+            .map(|func| func.input.len())
+            .or_else(|| declarations.latest_arity.get(name).copied());
+        let Some(arity) = arity else {
+            // Nothing is declared under this name; let type checking report it.
+            return Ok(None);
+        };
+        let field_names = match declarations.by_arity.get(&(name.clone(), arity)) {
+            Some(Some(field_names)) => field_names.clone(),
+            Some(None) | None => {
+                drop(declarations);
+                // Declared without field names. Marker syntax cannot work here,
+                // and reporting that beats leaving `:color` to fail later as an
+                // unbound symbol.
+                return match args.iter().find_map(marker) {
+                    Some(found) => error(
+                        span.clone(),
+                        &format!(
+                            "`{name}` was not declared with named fields, so `{found}` cannot be used here"
+                        ),
+                    ),
+                    None => Ok(None),
+                };
+            }
+        };
+        drop(declarations);
+
+        if !args.iter().any(|arg| marker(arg).is_some()) && args.len() == arity {
+            // An ordinary positional call, which needs no rewriting.
+            return Ok(None);
+        }
+
+        let mut slots: Vec<Option<Expr>> = vec![None; arity];
         let mut has_ellipsis = false;
         let mut seen_named = false;
-        let mut next_positional = 0usize;
+        let mut next_positional = 0;
 
         let mut i = 0;
         while i < args.len() {
             if has_ellipsis {
                 return error(args[i].span(), "`...` must be the last argument");
             }
-            match &args[i] {
-                Sexp::Atom(a, _) if a == "..." => {
+            match marker(&args[i]) {
+                Some("...") => {
                     has_ellipsis = true;
                     i += 1;
                 }
-                Sexp::Atom(a, key_span) if a.starts_with(':') => {
+                Some(key) => {
                     seen_named = true;
-                    let key = &a[1..];
-                    let pos = self
-                        .arg_names
-                        .iter()
-                        .position(|p| p == key)
-                        .ok_or_else(|| {
-                            ParseError(
-                                key_span.clone(),
-                                format!("`{}` has no argument named `{key}`", self.name),
-                            )
-                        })?;
-                    if slots[pos].is_some() {
+                    let key = &key[1..];
+                    let position = field_names.iter().position(|field| field == key);
+                    let Some(position) = position else {
                         return error(
-                            key_span.clone(),
-                            &format!(
-                                "argument `{key}` of `{}` specified more than once",
-                                self.name
-                            ),
+                            args[i].span(),
+                            &format!("`{name}` has no argument named `{key}`"),
+                        );
+                    };
+                    if slots[position].is_some() {
+                        return error(
+                            args[i].span(),
+                            &format!("argument `{key}` of `{name}` specified more than once"),
                         );
                     }
                     i += 1;
-                    let Some(value_sexp) = args.get(i) else {
-                        return error(key_span.clone(), &format!("`:{key}` requires a value"));
+                    let Some(value) = args.get(i) else {
+                        return error(args[i - 1].span(), &format!("`:{key}` requires a value"));
                     };
-                    if is_marker(value_sexp) {
-                        return error(value_sexp.span(), &format!("expected a value for `:{key}`"));
+                    if let Some(found) = marker(value) {
+                        return error(
+                            value.span(),
+                            &format!("expected a value for `:{key}` but found `{found}`"),
+                        );
                     }
-                    slots[pos] = Some(parser.parse_expr(value_sexp)?);
+                    slots[position] = Some(value.clone());
                     i += 1;
                 }
-                other => {
+                None => {
                     if seen_named {
                         return error(
-                            other.span(),
+                            args[i].span(),
                             "positional arguments must come before named arguments",
                         );
                     }
                     if next_positional >= arity {
                         return error(
-                            other.span(),
-                            &format!(
-                                "`{}` takes {arity} argument(s) but was given more",
-                                self.name
-                            ),
+                            args[i].span(),
+                            &format!("`{name}` takes {arity} argument(s) but was given more"),
                         );
                     }
-                    slots[next_positional] = Some(parser.parse_expr(other)?);
+                    slots[next_positional] = Some(args[i].clone());
                     next_positional += 1;
                     i += 1;
                 }
             }
         }
 
-        let mut final_args = Vec::with_capacity(arity);
+        let mut expanded = Vec::with_capacity(arity);
         let mut missing = Vec::new();
-        for (idx, slot) in slots.into_iter().enumerate() {
+        for (index, slot) in slots.into_iter().enumerate() {
             match slot {
-                Some(expr) => final_args.push(expr),
+                Some(arg) => expanded.push(arg),
+                // A fixed hint keeps these names unique among themselves; a
+                // field-name hint could collide with another field's name.
                 None if has_ellipsis => {
-                    let fresh = parser.symbol_gen.fresh(self.arg_names[idx].as_str());
-                    final_args.push(Expr::Var(span.clone(), fresh));
+                    expanded.push(Expr::Var(span.clone(), symbol_gen.fresh("_")))
                 }
-                None => missing.push(self.arg_names[idx].clone()),
+                None => missing.push(field_names[index].clone()),
             }
         }
 
         if !missing.is_empty() {
             return error(
-                span,
+                span.clone(),
                 &format!(
-                    "`{}` is missing argument(s): {} (add `...` to bind the rest to fresh variables)",
-                    self.name,
+                    "`{name}` is missing argument(s): {} (add `...` to bind the rest to fresh variables)",
                     missing.join(", ")
                 ),
             );
         }
 
-        Ok(Expr::Call(span, self.name.clone(), final_args))
+        Ok(Some(Expr::Call(span.clone(), name.clone(), expanded)))
     }
 }
 
-fn error<T>(span: Span, message: &str) -> Result<T, ParseError> {
-    Err(ParseError(span, message.to_string()))
-}
-
-/// Parse a table-lookup call through `parse_expr` (so named-argument expression
-/// macros fire) and destructure it into `(function, args)`. This is what lets
-/// `set`/`delete`/`subsume` accept named arguments; the built-ins split the
-/// head and arguments by hand and would otherwise bypass the macro.
-fn parse_table_call(parser: &mut Parser, sexp: &Sexp) -> Result<(String, Vec<Expr>), ParseError> {
-    match parser.parse_expr(sexp)? {
-        Expr::Call(_, func, args) => Ok((func, args)),
-        other => error(
-            other.span(),
-            "expected a table lookup of the form (<table> <args>*)",
-        ),
+/// The `...` ellipsis and `:name` keywords parse as variables, but can never be
+/// a plain argument value.
+fn marker(expr: &Expr) -> Option<&str> {
+    match expr {
+        Expr::Var(_, name) if name == "..." || name.starts_with(':') => Some(name),
+        _ => None,
     }
 }
 
-fn register_named_call(parser: &mut Parser, name: &str, arg_names: Vec<String>) {
-    parser.add_expr_macro(Arc::new(NamedCallMacro {
-        name: name.to_string(),
-        arg_names,
-    }));
-}
-
-/// Split a schema input list into optional field names and the list of sort
-/// names. Returns `Some(names)` when the schema is named (`(:a T :b U)`), or
-/// `None` when it is positional (`(T U)`). Declarations must name either all
-/// fields or none.
-fn parse_schema_list(input: &Sexp) -> Result<(Option<Vec<String>>, Vec<String>), ParseError> {
-    let items = input.expect_list("input sorts")?;
-
-    let named = matches!(items.first(), Some(Sexp::Atom(a, _)) if a.starts_with(':'));
-    if !named {
-        let mut sorts = Vec::with_capacity(items.len());
+/// Split a declaration's sort list into field names and sorts. Returns
+/// `Some(names)` when the declaration is named (`(:a T :b U)`), or `None` when
+/// it is positional (`(T U)`). A declaration must name either all fields or
+/// none, which is what makes the two forms distinguishable.
+fn split_fields(
+    items: &[String],
+    span: &Span,
+) -> Result<(Option<Vec<String>>, Vec<String>), Error> {
+    let bad = |message: String| Err(Error::ParseError(ParseError(span.clone(), message)));
+    if !items.first().is_some_and(|item| item.starts_with(':')) {
         for item in items {
-            let sort = item.expect_atom("input sort")?;
-            if sort.starts_with(':') {
-                return error(
-                    item.span(),
-                    &format!("unexpected named argument `{sort}`; name either all fields or none"),
-                );
+            if item.starts_with(':') {
+                return bad(format!(
+                    "unexpected named argument `{item}`; name either all fields or none"
+                ));
             }
-            sorts.push(sort);
         }
-        return Ok((None, sorts));
+        return Ok((None, items.to_vec()));
     }
 
     let mut names = Vec::new();
     let mut sorts = Vec::new();
     let mut i = 0;
     while i < items.len() {
-        let key = items[i].expect_atom("argument name")?;
+        let key = &items[i];
         if !key.starts_with(':') {
-            return error(
-                items[i].span(),
-                &format!("expected `:name` but found `{key}`; name either all fields or none"),
-            );
+            return bad(format!(
+                "expected `:name` but found `{key}`; name either all fields or none"
+            ));
         }
         let name = key[1..].to_string();
-        let key_span = items[i].span();
         i += 1;
-        let Some(sort_sexp) = items.get(i) else {
-            return error(key_span, &format!("argument `{name}` is missing its sort"));
+        let Some(sort) = items.get(i) else {
+            return bad(format!("argument `{name}` is missing its sort"));
         };
-        let sort = sort_sexp.expect_atom("argument sort")?;
         if sort.starts_with(':') {
-            return error(
-                sort_sexp.span(),
-                &format!("expected a sort for `{name}` but found `{sort}`"),
-            );
+            return bad(format!("expected a sort for `{name}` but found `{sort}`"));
         }
         if names.contains(&name) {
-            return error(key_span, &format!("duplicate argument name `{name}`"));
+            return bad(format!("duplicate argument name `{name}`"));
         }
         names.push(name);
-        sorts.push(sort);
+        sorts.push(sort.clone());
         i += 1;
     }
     Ok((Some(names), sorts))
 }
 
-/// Parse a single datatype variant, registering a `NamedCallMacro` when the
-/// variant names its fields. Positional variants are delegated to the built-in
-/// parser. Because `:cost` and `:unextractable` share the variant's flat
-/// argument list, they are always treated as options, so those two words cannot
-/// be used as field names in a variant.
-fn process_variant(parser: &mut Parser, sexp: &Sexp) -> Result<Variant, ParseError> {
-    let (head, tail, span) = sexp.expect_call("datatype variant")?;
-
-    let is_named = matches!(
-        tail.first(),
-        Some(Sexp::Atom(a, _)) if a.starts_with(':') && a != ":cost" && a != ":unextractable"
-    );
-    if !is_named {
-        return parser.variant(sexp);
-    }
-
-    let mut names = Vec::new();
-    let mut types = Vec::new();
-    let mut cost = None;
-    let mut unextractable = false;
-
-    let mut i = 0;
-    while i < tail.len() {
-        let key = tail[i].expect_atom("argument name or option")?;
-        match key.as_str() {
-            ":unextractable" => {
-                unextractable = true;
-                i += 1;
-            }
-            ":cost" => {
-                i += 1;
-                let Some(c) = tail.get(i) else {
-                    return error(span.clone(), ":cost requires a value");
-                };
-                cost = Some(c.expect_uint("cost")?);
-                i += 1;
-            }
-            k if k.starts_with(':') => {
-                let name = k[1..].to_string();
-                let key_span = tail[i].span();
-                i += 1;
-                let Some(sort_sexp) = tail.get(i) else {
-                    return error(key_span, &format!("argument `{name}` is missing its sort"));
-                };
-                let sort = sort_sexp.expect_atom("argument sort")?;
-                if sort.starts_with(':') {
-                    return error(
-                        sort_sexp.span(),
-                        &format!("expected a sort for `{name}` but found `{sort}`"),
-                    );
-                }
-                if names.contains(&name) {
-                    return error(key_span, &format!("duplicate argument name `{name}`"));
-                }
-                names.push(name);
-                types.push(sort);
-                i += 1;
-            }
-            _ => {
-                return error(
-                    tail[i].span(),
-                    &format!(
-                        "expected `:name` or an option but found `{key}`; name either all fields or none"
-                    ),
-                );
-            }
-        }
-    }
-
-    register_named_call(parser, &head, names);
-    Ok(Variant {
-        span,
-        name: head,
-        types,
-        cost,
-        unextractable,
-    })
-}
-
-/// `(set (<table> <args>*) <expr>)` routed through `parse_expr` for named args.
-pub struct NamedSet;
-
-impl Macro<Vec<Action>> for NamedSet {
-    fn name(&self) -> &str {
-        "set"
-    }
-
-    fn parse(
-        &self,
-        tail: &[Sexp],
-        span: Span,
-        parser: &mut Parser,
-    ) -> Result<Vec<Action>, ParseError> {
-        let [call, value] = tail else {
-            return error(span, "usage: (set (<table name> <expr>*) <expr>)");
-        };
-        let (func, args) = parse_table_call(parser, call)?;
-        let value = parser.parse_expr(value)?;
-        Ok(vec![Action::Set(span, func, args, value)])
-    }
-}
-
-/// `(delete (<table> <args>*))` / `(subsume (<table> <args>*))` routed through
-/// `parse_expr` for named args.
-pub struct NamedChange {
-    keyword: &'static str,
-    change: Change,
-}
-
-impl NamedChange {
-    /// The macro for `(delete (<table> <args>*))`.
-    pub fn delete() -> Self {
-        Self {
-            keyword: "delete",
-            change: Change::Delete,
-        }
-    }
-
-    /// The macro for `(subsume (<table> <args>*))`.
-    pub fn subsume() -> Self {
-        Self {
-            keyword: "subsume",
-            change: Change::Subsume,
-        }
-    }
-}
-
-impl Macro<Vec<Action>> for NamedChange {
-    fn name(&self) -> &str {
-        self.keyword
-    }
-
-    fn parse(
-        &self,
-        tail: &[Sexp],
-        span: Span,
-        parser: &mut Parser,
-    ) -> Result<Vec<Action>, ParseError> {
-        let [call] = tail else {
-            return error(span, "usage: (<change> (<table name> <expr>*))");
-        };
-        let (func, args) = parse_table_call(parser, call)?;
-        Ok(vec![Action::Change(span, self.change, func, args)])
-    }
-}
-
-/// `(constructor <name> (<schema>) <output> <options>*)` with named-field support.
-pub struct NamedConstructor;
-
-impl Macro<Vec<Command>> for NamedConstructor {
-    fn name(&self) -> &str {
-        "constructor"
-    }
-
-    fn parse(
-        &self,
-        tail: &[Sexp],
-        span: Span,
-        parser: &mut Parser,
-    ) -> Result<Vec<Command>, ParseError> {
-        let [name, inputs, output, rest @ ..] = tail else {
-            return error(
-                span,
-                "usage: (constructor <name> (<input sort>*) <output sort> <options>*)",
-            );
-        };
-        let name = name.expect_atom("constructor name")?;
-        let (names_opt, input) = parse_schema_list(inputs)?;
-        let output = output.expect_atom("output sort")?;
-
-        let mut cost = None;
-        let mut unextractable = false;
-        let mut hidden = false;
-        let mut let_binding = false;
-        for (key, val) in parser.parse_options(rest)? {
-            match (key, val) {
-                (":unextractable", []) => unextractable = true,
-                (":internal-hidden", []) => hidden = true,
-                (":internal-let", []) => let_binding = true,
-                (":cost", [c]) => cost = Some(c.expect_uint("cost")?),
-                _ => return error(span.clone(), "could not parse constructor options"),
-            }
-        }
-
-        if let Some(arg_names) = names_opt {
-            register_named_call(parser, &name, arg_names);
-        }
-
-        Ok(vec![Command::Constructor {
-            span,
-            name,
-            schema: Schema { input, output },
-            cost,
-            unextractable,
-            hidden,
-            let_binding,
-            term_constructor: None,
-        }])
-    }
-}
-
-/// `(function <name> (<schema>) <output> <options>*)` with named-field support.
-pub struct NamedFunction;
-
-impl Macro<Vec<Command>> for NamedFunction {
-    fn name(&self) -> &str {
-        "function"
-    }
-
-    fn parse(
-        &self,
-        tail: &[Sexp],
-        span: Span,
-        parser: &mut Parser,
-    ) -> Result<Vec<Command>, ParseError> {
-        let [name, inputs, output, rest @ ..] = tail else {
-            return error(
-                span,
-                "usage: (function <name> (<input sort>*) <output sort> <options>*)",
-            );
-        };
-        let name = name.expect_atom("function name")?;
-        let (names_opt, input) = parse_schema_list(inputs)?;
-        let output = output.expect_atom("output sort")?;
-
-        let mut merge = None;
-        let mut hidden = false;
-        let mut let_binding = false;
-        let mut term_constructor = None;
-        let mut unextractable = false;
-        for (key, val) in parser.parse_options(rest)? {
-            match (key, val) {
-                (":no-merge", []) => {
-                    if merge.is_some() {
-                        return error(span.clone(), "conflicting merge options");
-                    }
-                    merge = Some(None);
-                }
-                (":merge", [e]) => {
-                    if merge.is_some() {
-                        return error(span.clone(), "conflicting merge options");
-                    }
-                    merge = Some(Some(parser.parse_expr(e)?));
-                }
-                (":internal-hidden", []) => hidden = true,
-                (":internal-let", []) => let_binding = true,
-                (":unextractable", []) => unextractable = true,
-                (":internal-term-constructor", [tc]) => {
-                    term_constructor = Some(tc.expect_atom("term constructor name")?)
-                }
-                _ => return error(span.clone(), "could not parse function options"),
-            }
-        }
-        let Some(merge) = merge else {
-            return error(span, "functions are required to specify merge behaviour");
-        };
-
-        if let Some(arg_names) = names_opt {
-            register_named_call(parser, &name, arg_names);
-        }
-
-        Ok(vec![Command::Function {
-            span,
-            name,
-            schema: Schema { input, output },
-            merge,
-            hidden,
-            let_binding,
-            term_constructor,
-            unextractable,
-        }])
-    }
-}
-
-/// `(relation <name> (<schema>))` with named-field support.
-pub struct NamedRelation;
-
-impl Macro<Vec<Command>> for NamedRelation {
-    fn name(&self) -> &str {
-        "relation"
-    }
-
-    fn parse(
-        &self,
-        tail: &[Sexp],
-        span: Span,
-        parser: &mut Parser,
-    ) -> Result<Vec<Command>, ParseError> {
-        let [name, inputs] = tail else {
-            return error(span, "usage: (relation <name> (<input sort>*))");
-        };
-        let name = name.expect_atom("relation name")?;
-        let (names_opt, inputs) = parse_schema_list(inputs)?;
-
-        if let Some(arg_names) = names_opt {
-            register_named_call(parser, &name, arg_names);
-        }
-
-        Ok(vec![Command::Relation { span, name, inputs }])
-    }
-}
-
-/// `(datatype <name> <variant>*)` with named-field support per variant.
-pub struct NamedDatatype;
-
-impl Macro<Vec<Command>> for NamedDatatype {
-    fn name(&self) -> &str {
-        "datatype"
-    }
-
-    fn parse(
-        &self,
-        tail: &[Sexp],
-        span: Span,
-        parser: &mut Parser,
-    ) -> Result<Vec<Command>, ParseError> {
-        let [name, variants @ ..] = tail else {
-            return error(span, "usage: (datatype <name> <variant>*)");
-        };
-        let name = name.expect_atom("sort name")?;
-        let mut parsed = Vec::with_capacity(variants.len());
-        for variant in variants {
-            parsed.push(process_variant(parser, variant)?);
-        }
-        Ok(vec![Command::Datatype {
-            span,
-            name,
-            variants: parsed,
-        }])
-    }
-}
-
-/// `(datatype* <datatype>*)` with named-field support per variant.
-pub struct NamedDatatypes;
-
-impl Macro<Vec<Command>> for NamedDatatypes {
-    fn name(&self) -> &str {
-        "datatype*"
-    }
-
-    fn parse(
-        &self,
-        tail: &[Sexp],
-        span: Span,
-        parser: &mut Parser,
-    ) -> Result<Vec<Command>, ParseError> {
-        let mut datatypes = Vec::with_capacity(tail.len());
-        for sub in tail {
-            let (head, subtail, sub_span) = sub.expect_call("datatype")?;
-            if head == "sort" {
-                // Container-sort declaration: reuse the built-in parser verbatim.
-                datatypes.push(parser.rec_datatype(sub)?);
-            } else {
-                let mut variants = Vec::with_capacity(subtail.len());
-                for variant in subtail {
-                    variants.push(process_variant(parser, variant)?);
-                }
-                datatypes.push((sub_span, head, Subdatatypes::Variants(variants)));
-            }
-        }
-        Ok(vec![Command::Datatypes { span, datatypes }])
-    }
+fn error<T>(span: Span, message: &str) -> Result<T, ParseError> {
+    Err(ParseError(span, message.to_string()))
 }

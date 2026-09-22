@@ -140,6 +140,11 @@ pub fn new_experimental_egraph() -> EGraph {
     // Set up the parser with experimental parse-time macros
     egraph.parser = experimental_parser();
 
+    // Named arguments for declarations, e.g.
+    //   (constructor MyCar (:color Color :numwheel i64) Vehicle)
+    // Registered first so later macros only ever see positional calls.
+    named_args::register_named_args(&mut egraph);
+
     // Rational support
     add_base_sort(&mut egraph, RationalSort, span!()).unwrap();
 
@@ -192,11 +197,5 @@ pub fn experimental_parser() -> Parser {
     let mut parser = Parser::default();
     parser.add_command_macro(Arc::new(sugar::For));
     parser.add_command_macro(Arc::new(sugar::WithRuleset));
-    // Named arguments for declarations, e.g.
-    //   (constructor MyCar (:color Color :numwheel i64) Vehicle)
-    // These shadow the built-in declaration commands and register per-name
-    // expression macros so call sites can pass args by name, reorder them, and
-    // fill the rest with fresh variables using a trailing `...`.
-    named_args::register_named_args(&mut parser);
     parser
 }
