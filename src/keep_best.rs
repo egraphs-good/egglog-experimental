@@ -181,7 +181,7 @@ fn eval_terms(
             let expr = termdag.term_to_expr(
                 tid,
                 egglog::prelude::Span::Rust(std::sync::Arc::new(egglog::prelude::RustSpan {
-                    file: file!(),
+                    file: file!().into(),
                     line: line!(),
                     column: column!(),
                 })),
