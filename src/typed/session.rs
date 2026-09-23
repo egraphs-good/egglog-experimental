@@ -1,8 +1,9 @@
 use super::{
-    Action, DefaultCost, EgglogValue, Fact, FreezeLimits, RunReport, Schedule, SortRef, TypedError,
+    DefaultCost, EgglogValue, Fact, FreezeLimits, RunReport, Schedule, TypedError,
     decl::{CallKind, SortKind},
     expr::{Expr, NodeKind, ValueInput},
     lower::{Commit, Installed, Planner},
+    program::IntoDefinitions,
     rule::{IntoActions, IntoFacts},
 };
 use egglog::{Term, ast::Command, prelude::Read};
@@ -282,17 +283,44 @@ impl EGraph {
     /// Creates a destination through [`crate::new_experimental_egraph`].
     pub fn new(options: EGraphOptions) -> Self {
         let mut core = crate::new_experimental_egraph();
-        let state = core.extension_state_or_default::<Installed>();
-        for name in [
-            "i64", "f64", "bool", "String", "Unit", "BigInt", "BigRat", "Rational",
-        ] {
-            state.sorts.insert(name.into(), SortRef::builtin(name));
-        }
+        core.extension_state_or_default::<Installed>();
         Self { core, options }
     }
     /// Consumes this wrapper and permanently ends typed lifecycle tracking.
     pub fn into_raw(self) -> egglog::EGraph {
         self.core
+    }
+    /// Records the actual native commands submitted while `operation` runs.
+    /// Returns both its result (including a returned error) and the command record.
+    /// Nested recordings are rejected without discarding the outer record.
+    ///
+    /// The record retains failed commands and popped scopes. A failed check is a
+    /// failed native command even though [`Self::check`] returns `Ok(false)`.
+    /// Preflight errors submit no commands. Extraction records its materialization
+    /// commands, but not the direct native extractor or result decoding; `freeze`,
+    /// `stats`, and `num_tuples` are also observations without commands.
+    ///
+    /// Recording an existing graph produces a fragment requiring its prior state.
+    /// Even on a fresh graph, the record is an attempted program, not a snapshot
+    /// or a guarantee that replay proceeds past previously failed commands.
+    pub fn record<R>(
+        &mut self,
+        operation: impl FnOnce(&mut Self) -> R,
+    ) -> Result<(R, egglog::program::CommandRecord), TypedError> {
+        if !self.core.try_start_recording() {
+            return Err(TypedError::Invalid(
+                "a typed recording is already active".into(),
+            ));
+        }
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| operation(self)));
+        let record = self
+            .core
+            .stop_recording()
+            .expect("typed recording remains active");
+        match result {
+            Ok(result) => Ok((result, record)),
+            Err(payload) => std::panic::resume_unwind(payload),
+        }
     }
     fn ensure_healthy(&self) -> Result<(), TypedError> {
         if self
@@ -312,17 +340,28 @@ impl EGraph {
     /// Pushes native data and typed installation state together.
     pub fn push(&mut self) -> Result<(), TypedError> {
         self.ensure_healthy()?;
-        self.core.push();
-        Ok(())
+        let program = egglog::program::Program::new(vec![Command::Push(1)])?;
+        self.core
+            .run_shared_program(program)
+            .map(|_| ())
+            .map_err(|source| TypedError::Core {
+                source,
+                command: 0,
+                completed: 0,
+            })
     }
     /// Restores the most recent native scope, including capture identities and health.
     /// Fresh-name counters are intentionally not restored.
     pub fn pop(&mut self) -> Result<(), TypedError> {
-        self.core.pop().map_err(|source| TypedError::Core {
-            source,
-            command: 0,
-            completed: 0,
-        })
+        let program = egglog::program::Program::new(vec![Command::Pop(super::origin(), 1)])?;
+        self.core
+            .run_shared_program(program)
+            .map(|_| ())
+            .map_err(|source| TypedError::Core {
+                source,
+                command: 0,
+                completed: 0,
+            })
     }
     fn execute(
         &mut self,
@@ -335,10 +374,15 @@ impl EGraph {
                 "emitted command limit exceeded".into(),
             ));
         }
+        let (commands, commits): (Vec<_>, Vec<_>) = commands.into_iter().unzip();
+        let program = egglog::program::Program::new(commands)?;
         let mut output = vec![];
         self.core.parser.symbol_gen = symbol_gen;
-        for (index, (command, commit)) in commands.into_iter().enumerate() {
-            match self.core.run_program(vec![command]) {
+        for (index, (command, commit)) in program.commands.into_iter().zip(commits).enumerate() {
+            match self.core.run_shared_program(egglog::program::Program {
+                format: program.format,
+                commands: vec![command],
+            }) {
                 Ok(values) => {
                     commit.apply(self.core.extension_state_or_default::<Installed>());
                     output.extend(values);
@@ -355,6 +399,29 @@ impl EGraph {
             }
         }
         Ok((output, true))
+    }
+    /// Installs sorts, selected callables, rules, or rulesets without evaluating
+    /// expressions or running rules. Accepts nested tuples and collections.
+    ///
+    /// Use `S::sort_ref()` for a sort and [`super::Definition::callable`] for an
+    /// ordinary callable selector. Dependencies install in first-use order;
+    /// compatible definitions and shared rule occurrences install only once.
+    /// Installation state follows `push`/`pop`, just like implicit installation.
+    pub fn install<T, M>(&mut self, definitions: T) -> Result<(), TypedError>
+    where
+        T: IntoDefinitions<M>,
+    {
+        self.ensure_healthy()?;
+        let definitions = definitions.into_definitions();
+        let mut planner = Planner::new(&mut self.core, self.options.lowering_limits.clone());
+        planner.install(&definitions)?;
+        let Planner {
+            commands,
+            symbol_gen,
+            ..
+        } = planner;
+        self.execute(commands, symbol_gen, false)?;
+        Ok(())
     }
     /// Materializes expressions and executes actions in caller order.
     ///
@@ -376,14 +443,7 @@ impl EGraph {
         self.ensure_healthy()?;
         let actions = items.into_actions();
         let mut planner = Planner::new(&mut self.core, self.options.lowering_limits.clone());
-        planner.collect(
-            actions.iter().flat_map(Action::expressions).cloned(),
-            actions.iter().filter_map(|a| match a {
-                Action::Set(f, ..) | Action::Change(_, f, _) => Some(f.clone()),
-                _ => None,
-            }),
-        )?;
-        planner.top_actions(&actions)?;
+        planner.register(&actions)?;
         let Planner {
             commands,
             symbol_gen,

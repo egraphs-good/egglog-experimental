@@ -5,7 +5,8 @@ and Python `433542b4e7e5a4263566b166d849856a7e20aa5e`. It includes the 40 public
 core web demos, the 12 Python package gallery scripts, and the seven Python
 tutorials. It does not include the complete core regression suite or external
 compiler exercise projects. The admitted portions map to 45 Rust ports; the
-46th example demonstrates typed frozen traversal and table observation.
+46th example demonstrates typed frozen traversal and table observation, and
+the 47th exports a complete shared program for cross-frontend execution.
 
 Every listed Rust file is independently runnable with
 `cargo run --no-default-features --features typed --example typed_NAME`.
@@ -31,7 +32,9 @@ their expected results rather than maintaining parallel arrays. Explicit constru
 for query-field binding, callable selection, ambiguous conversions, and symbolic
 left operands. The tables below own the exact source coverage and exclusions.
 Declarations use their default qualified Rust names, not aliases retaining old
-descriptor spellings. Simple merge policies are written directly in attributes;
+descriptor spellings. The `typed_program_export` interchange example explicitly
+names its sort and constructors to give other frontends stable shared identities.
+Simple merge policies are written directly in attributes;
 costs, extractability, and explicit duplicate-output policies are preserved.
 Application sorts use `#[sort]` and `#[declarations] impl` only. Bodyless
 constructors and relations need no redundant attribute. Unary constructors opt
@@ -160,6 +163,7 @@ occurrence identity when those rules are inserted at their source positions.
 | `docs/tutorials/tut_4_scheduling.py` | `typed_tutorial_scheduling` | Lines 1–198 |
 | `docs/tutorials/tut_5_extraction.py` | `typed_tutorial_extraction` | Lines 1–99 |
 | Typed Rust RFC | `typed_freeze` | Exact rootless snapshots, retained typed captures, selected nodes, scalar decoding, typed table rows, duplicate roots and cyclic traversal |
+| Shared program interchange | `typed_program_export` | Offline declarations, captured addition, folding schedule, and equality assertion exported as versioned JSON |
 
 ## Explicit deferred portions
 

@@ -2,6 +2,7 @@ use super::{
     Action, CallableRef, Fact, Ruleset, Schedule, SortRef, TypedError,
     decl::{CallKind, CallableDef, SortKind},
     expr::{Expr, Identity, NodeKind, VariableKey},
+    program::{Definition, DefinitionKind},
     rule::{RuleData, ScheduleNode},
     session::LoweringLimits,
 };
@@ -13,7 +14,7 @@ use std::{
     sync::Arc,
 };
 
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub(crate) struct Installed {
     pub poisoned: bool,
     pub sorts: HashMap<Arc<str>, SortRef>,
@@ -22,6 +23,25 @@ pub(crate) struct Installed {
     pub globals: HashMap<String, SortRef>,
     pub rules: HashMap<Identity<RuleData>, String>,
     pub groups: HashMap<Vec<Identity<RuleData>>, String>,
+}
+
+impl Default for Installed {
+    fn default() -> Self {
+        Self {
+            poisoned: false,
+            sorts: [
+                "i64", "f64", "bool", "String", "Unit", "BigInt", "BigRat", "Rational",
+            ]
+            .into_iter()
+            .map(|name| (name.into(), SortRef::builtin(name)))
+            .collect(),
+            declarations: HashMap::new(),
+            captures: HashMap::new(),
+            globals: HashMap::new(),
+            rules: HashMap::new(),
+            groups: HashMap::new(),
+        }
+    }
 }
 
 pub(crate) enum Commit {
@@ -115,6 +135,32 @@ impl<'a> Planner<'a> {
         }
         self.commands.push((command, commit));
         Ok(())
+    }
+    pub fn install(&mut self, definitions: &[Definition]) -> Result<(), TypedError> {
+        for definition in definitions {
+            match &definition.0 {
+                DefinitionKind::Sort(sort) => {
+                    self.sort(sort)?;
+                }
+                DefinitionKind::Callable(callable) => self.collect([], [callable.clone()])?,
+                DefinitionKind::Ruleset(rules) => {
+                    self.group(rules)?;
+                }
+            }
+        }
+        Ok(())
+    }
+    pub fn register(&mut self, actions: &[Action]) -> Result<(), TypedError> {
+        self.collect(
+            actions.iter().flat_map(Action::expressions).cloned(),
+            actions.iter().filter_map(|action| match action {
+                Action::Set(callable, ..) | Action::Change(_, callable, _) => {
+                    Some(callable.clone())
+                }
+                _ => None,
+            }),
+        )?;
+        self.top_actions(actions)
     }
     fn sort(&mut self, sort: &SortRef) -> Result<String, TypedError> {
         self.symbol_gen.reserve(sort.name());

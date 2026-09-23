@@ -81,6 +81,29 @@ schedule: submit it with `egraph.run(&theory)?`, or saturate it with
 `&schedule` on repeated submissions; sharing preserves its rule occurrences and
 incremental cursors.
 
+To install definitions without running rules or creating rows, use
+`egraph.install((Math::sort_ref(), Definition::callable(selector)?, &theory))?`.
+The selector identifies an ordinary declared callable using fresh borrowed
+arguments. `register` continues to mean immediate materialization/actions.
+
+`ProgramBuilder` provides the same installation and lowering operations offline
+and produces the shared `egglog::program::Program` for JSON interchange. Its
+`to_egglog()` output is diagnostic; `to_replayable_egglog()` checks whether the
+text preserves command fields and literal bits. `egraph.record(|graph| ...)?`
+returns the callback result and core's attempted-command record, including
+failures and scope changes. Direct observations and native extraction results
+are not command entries. See the [export and recording contract](docs/typed-rust-api-rfc.md#explicit-installation-export-and-recording).
+
+Export the standalone addition/folding example without running Egglog:
+
+```sh
+cargo run --no-default-features --features typed --example typed_program_export > program.json
+```
+
+The JSON includes declarations, a captured `2 + 3` expression, the folding
+schedule, and an assertion that the result equals `5`. Core or another frontend
+can deserialize this same `Program` and submit it through `run_shared_program`.
+
 Fixed theories use a declaration attribute instead of handwritten lazy wrappers:
 
 ```rust,ignore

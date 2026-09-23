@@ -766,7 +766,7 @@ fn callable(
                 static #definition: ::std::sync::OnceLock<::egglog_experimental::typed::__private::CallableDef>=::std::sync::OnceLock::new();
                 #definition.get_or_init(|| {
                     #constraint
-                    let #span=::egglog_experimental::typed::__private::Span::Rust(::std::sync::Arc::new(::egglog_experimental::typed::__private::RustSpan{file:file!(),line:line!(),column:column!()}));let _=&#span;
+                    let #span=::egglog_experimental::typed::__private::Span::Rust(::std::sync::Arc::new(::egglog_experimental::typed::__private::RustSpan{file:file!().into(),line:line!(),column:column!()}));let _=&#span;
                     ::egglog_experimental::typed::__private::CallableDef{callable:Self::#reference(),inputs:vec![#(<#types as ::egglog_experimental::typed::EgglogValue>::sort_ref()),*],output:<#output as ::egglog_experimental::typed::EgglogValue>::sort_ref(),merge:#merge,cost:#cost,unextractable:#unextractable}
                 })
             }

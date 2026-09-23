@@ -29,9 +29,9 @@ serde = ["egglog/serde"]
 graphviz = ["egglog/graphviz"]
 
 [dependencies]
-egglog = { version = "3.0.0", git = "https://github.com/saulshanabrook/egg-smol", rev = "b061d1f41398747fb39f6e186a682e8e2d758ceb", default-features = false }
-egglog-ast = { version = "3.0.0", git = "https://github.com/saulshanabrook/egg-smol", rev = "b061d1f41398747fb39f6e186a682e8e2d758ceb", default-features = false }
-egglog-reports = { version = "3.0.0", git = "https://github.com/saulshanabrook/egg-smol", rev = "b061d1f41398747fb39f6e186a682e8e2d758ceb", default-features = false }
+egglog = { version = "3.0.0", git = "https://github.com/saulshanabrook/egg-smol", rev = "c743cf5b96be0f53c11ac9ed749aafb20cedb218", default-features = false }
+egglog-ast = { version = "3.0.0", git = "https://github.com/saulshanabrook/egg-smol", rev = "c743cf5b96be0f53c11ac9ed749aafb20cedb218", default-features = false }
+egglog-reports = { version = "3.0.0", git = "https://github.com/saulshanabrook/egg-smol", rev = "c743cf5b96be0f53c11ac9ed749aafb20cedb218", default-features = false }
 
 num = "0.4.3"
 lazy_static = "1.4"
@@ -45,6 +45,10 @@ egglog-experimental-typed-macros = { path = "typed-macros", version = "3.0.0", o
 glob = "0.3.1"
 libtest-mimic = "0.8.1"
 trybuild = "1"
+
+[[example]]
+name = "typed_program_export"
+required-features = ["typed"]
 
 [[example]]
 name = "typed_antiunify"

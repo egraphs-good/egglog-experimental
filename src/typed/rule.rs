@@ -491,6 +491,9 @@ impl Ruleset {
     /// Spans retain Rust authoring locations. This is not canonical equivalence:
     /// aliases or first-use order can change the AST without changing semantics.
     /// Native `Display` is useful for inspection, not lossless source serialization.
+    /// For the shared serializable format, use [`super::ProgramBuilder::install`]
+    /// and [`super::ProgramBuilder::finish`]. The resulting core program provides
+    /// JSON serialization, diagnostic `to_egglog`, and checked `to_replayable_egglog`.
     ///
     /// ```
     /// use egglog_experimental::typed::{builtins::I64, prelude::*};

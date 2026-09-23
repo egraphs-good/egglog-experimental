@@ -27,6 +27,7 @@ mod decl;
 mod expr;
 mod freeze;
 mod lower;
+mod program;
 mod rule;
 mod selector;
 mod session;
@@ -41,6 +42,7 @@ pub use egglog_experimental_typed_macros::{
 pub use egglog_reports::RunReport;
 pub use expr::{EgglogValue, EqualitySort, let_, var};
 pub use freeze::*;
+pub use program::{Definition, IntoDefinitions, ProgramBuilder};
 pub use rule::*;
 pub use selector::{CallRoot, SelectCall, SelectedArgs, get_args};
 pub use session::*;
@@ -48,11 +50,11 @@ pub use session::*;
 /// Imports the typed authoring and execution vocabulary.
 pub mod prelude {
     pub use super::{
-        Action, DecodeError, EGraph, EGraphOptions, EgglogValue, EqualitySort, Fact, FreezeLimits,
-        FrozenEGraph, LoweringLimits, Relation, Rule, Ruleset, RunReport, Schedule, SortRef,
-        TableRow, TableSnapshot, TypedError, birewrite, constructor, declarations, delete, eq,
-        function, get_args, let_, ne, panic, relation, rewrite, rule, ruleset, sequence, set, sort,
-        subsume, union, var,
+        Action, DecodeError, Definition, EGraph, EGraphOptions, EgglogValue, EqualitySort, Fact,
+        FreezeLimits, FrozenEGraph, LoweringLimits, ProgramBuilder, Relation, Rule, Ruleset,
+        RunReport, Schedule, SortRef, TableRow, TableSnapshot, TypedError, birewrite, constructor,
+        declarations, delete, eq, function, get_args, let_, ne, panic, relation, rewrite, rule,
+        ruleset, sequence, set, sort, subsume, union, var,
     };
 }
 
@@ -127,6 +129,17 @@ impl std::error::Error for TypedError {
     }
 }
 
+impl From<egglog::program::ProgramError> for TypedError {
+    fn from(error: egglog::program::ProgramError) -> Self {
+        match error {
+            egglog::program::ProgramError::Limit(reason) => {
+                Self::LoweringLimit(format!("shared program exceeds {reason}"))
+            }
+            error => Self::Invalid(format!("invalid shared program: {error}")),
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 /// Explicit decoding failed for a portable expression or observed scalar/container.
 pub struct DecodeError(#[doc = "Explanation of the unsupported or mismatched value."] pub String);
@@ -146,7 +159,7 @@ impl From<DecodeError> for TypedError {
 pub(crate) fn origin() -> egglog::ast::Span {
     let caller = std::panic::Location::caller();
     egglog::ast::Span::Rust(std::sync::Arc::new(egglog::ast::RustSpan {
-        file: caller.file(),
+        file: caller.file().into(),
         line: caller.line(),
         column: caller.column(),
     }))

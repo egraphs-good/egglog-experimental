@@ -2,7 +2,7 @@
 
 Status: implemented; under review
 
-Updated: 2026-09-22
+Updated: 2026-09-23
 
 Home: `egglog-experimental`; first consumer: Luminal's CPU ReferenceRuntime path
 
@@ -16,17 +16,18 @@ API specification.
 ## Direction
 
 Build typed Rust authoring values in `egglog_experimental::typed`. Lower them
-to existing `egglog::ast::Command` values and submit them through
-`EGraph::run_program`. Core keeps its macro expansion, desugaring,
-typechecking, global lowering, rule compiler, and executor. The initial
-implementation uses the existing core pin without parsing generated Egglog
-source. This is a concrete reuse decision, not a prohibition on core changes
-when they make the design simpler or more faithful.
+to existing `egglog::ast::Command` values in the shared, versioned
+`egglog::program::Program` representation. `EGraph::run_shared_program` validates
+that structure and uses core's existing macro expansion, desugaring,
+typechecking, global lowering, rule compiler, and executor. Execution does not
+parse generated Egglog source. This is a serializable command-tree boundary;
+a resolved typed IR and direct linker remain future work.
 
 The public design keeps named sorts, ordinary functions/methods/operators,
 reusable query variables, immutable rulesets/schedules, typed inspection, and
-execution methods with exact results. There are no public callable descriptors;
-explicitly named argument records are opt-in for high-arity calls. Ordinary Rust
+execution methods with exact results. Ordinary calls need no callable descriptors;
+`Definition::callable` selects a declaration only for explicit installation.
+Explicitly named argument records are opt-in for high-arity calls. Ordinary Rust
 constructs and combines these values at runtime; declaration macros produce
 ordinary Rust functions.
 A shared `Arc` expression graph already is a DAG.
@@ -43,9 +44,11 @@ operation requires it.
 The first acceptance result is a working Luminal PR migrating
 `Graph::build_search_space::<ReferenceRuntime>` through search, shared LLIR
 reconstruction, and execution. It must handle the complete core catalog
-installed by that path, runtime-generated rules, and every output. Python
-integration, complete GPU authoring migration, replay, and joint DAG-cost
-optimization are later work. Observation uses one rootless `freeze()` snapshot
+installed by that path, runtime-generated rules, and every output. Shared program
+serialization now provides a common core boundary for language frontends; it
+does not reconstruct Rust wrappers or their declaration-source identities.
+Complete GPU authoring migration and joint DAG-cost optimization remain separate
+work. Observation uses one rootless `freeze()` snapshot
 with exact scalar/container values and cyclic e-class traversal. Typed and native
 producers use the same native snapshot builder, not a serialization bridge.
 
@@ -241,8 +244,9 @@ impls/methods, mutable or typed receivers, and incompatible host signatures are
 diagnosed rather than translated into another calling convention. Existing
 generic builtin implementations remain ordinary Rust.
 
-Generated declaration tokens, resolvers, and metadata stay private. The current
-surface has no public descriptor value, `.call`, or `.project`. `get_args`
+Generated declaration tokens, resolvers, and metadata stay private.
+`Definition::callable(selector)` is an optional installation description; normal
+calls have no `.call` or `.project` indirection. `get_args`
 supports tuple inspection, and `args = Name` opts into a named record derived
 from the same declaration. A match-like macro remains deferred. Rust parameter
 names serve IDE hints, documentation and opted-in record fields;
@@ -844,9 +848,10 @@ merge-function installation dependencies, including a self-read by a merge,
 are rejected: the pinned runtime resolves a merge's callees before installing
 the new function.
 
-This separates the future Python boundary cleanly: an owned collection of
-nominal definitions could feed the same private flat representation. No Python
-adapter, runtime schema factory, or stable wire format is part of this work.
+The shared core program records the lowered nominal declarations and commands,
+without serializing Rust resolver pointers, allocation identities, or `TypeId`.
+Its versioned JSON format and Rust-generated schema are language independent.
+A runtime factory for typed Rust declaration wrappers is not provided.
 
 ## DAG-to-AST lowering
 
@@ -1038,8 +1043,8 @@ iterative closing alone is not evidence of end-to-end safety.
 ### Native execution with scope-aware bookkeeping
 
 The typed `EGraph` privately owns the existing core EGraph. All declaration,
-rule, action, and schedule execution uses constructed AST commands through
-`run_program`; observation and result decoding may use core's existing
+rule, action, and schedule execution uses shared programs containing constructed
+AST commands through `run_shared_program`; observation and result decoding use core's existing
 public read/extraction APIs. There is no typed direct linker or replacement
 executor. The wrapper does not offer mutable raw access; a consuming
 `into_raw` ends typed bookkeeping.
@@ -1058,8 +1063,9 @@ Submission has these steps:
    so frozen values cannot be hidden under another authored expression.
 2. Check pending and installed native names and prepare dependency order. Declare equality sorts first,
    then dependent applied sorts and callables; install rules/groups as needed.
-3. Commit the planned name generator after all wrapper checks, then submit
-   emitted commands in order through `run_program(vec![command])`.
+3. Validate the shared program and commit the planned name generator after all
+   wrapper checks, then submit emitted commands in order through
+   `run_shared_program`, one command per confirmed-prefix boundary.
    Publish each installation entry only after its command succeeds.
 4. Decode that method's expected result; discard temporary evaluation maps.
 
@@ -1119,10 +1125,15 @@ commands with verbatim nominal declaration names, without executing or natively
 typechecking them. Their formatted text
 is not a lossless source serialization contract.
 
+`ProgramBuilder` supplies the supported offline export route. It preserves the
+same dependency order, captures, rule occurrences, and scope rules as successful
+live submissions, and finishes as the core `Program`, not a second wire format.
+
 | Initial method | Success value | Meaning |
 | --- | --- | --- |
 | `EGraph::new(options)` | `EGraph` directly | Infallible destination construction |
 | `EGraph::default()` | `EGraph` directly | Construction with default options |
+| `install(definitions)` | `()` | Install sorts, selected callables, rules, or rulesets and their dependencies without evaluating expressions or running rules |
 | `register(items)` | `()` | Ordered immediate materialization/actions |
 | `run(schedule)` / `run(&schedule)` | `RunReport` | Install reachable immutable rules and execute an owned or borrowed native schedule |
 | `stats()` | `RunReport` | Native report data, with diagnostic rule/group labels |
@@ -1132,6 +1143,7 @@ is not a lossless source serialization contract.
 | `extract_many(&roots)` | `Vec<S>` | Best tree for each ordered owned or borrowed root, including duplicates |
 | `freeze()` | `FrozenEGraph` | Owned snapshot of supported installed data, with e-class traversal and no selected roots |
 | `push()`, `pop()` | `()` | Native scope operation with typed installation state |
+| `record(operation)` | `(R, CommandRecord)` | Run a Rust callback returning `R` and retain the native commands it submitted, including failures and scope changes |
 
 All fallible methods return `Result<Success, TypedError>`. Both `stats` and
 `freeze` take `&self`. `stats` clones the native cumulative report directly,
@@ -1141,6 +1153,66 @@ evaluate take `&mut self`. `freeze` uses `EGraphOptions::freeze_limits`; frozen
 traversal and expression lookup borrow only the snapshot.
 The error records the source origin, failing emitted command, confirmed prefix,
 and underlying core error where available; it is not a receipt/root ledger.
+
+### Explicit installation, export, and recording
+
+`egraph.install((Num::sort_ref(), Definition::callable(|x: &Num| cost(x))?, &rules))?`
+installs only the selected definitions and their reachable dependencies. The
+selector runs ordinary Rust to build one direct symbolic call; it does not
+evaluate Egglog arguments. It must use each fresh argument exactly once in
+declaration order. Primitive operations are not installable declarations.
+Installing a sort does not install its unrelated constructors. Installing a
+ruleset does not execute a schedule, create dummy rows, or require `repeat(0)`.
+Repeated compatible installation retains existing rule occurrences and cursors.
+`register` continues to accept only expressions, relation rows, and actions.
+
+For offline export, use `ProgramBuilder::default()` or `new(limits)`. Its
+`install`, `register`, `run`, and `check` methods select the intended meaning of
+objects: definitions install, expressions/actions materialize, schedules run,
+and facts assert a query. `push` and `pop` restore planned installations and
+captures while retaining fresh counters. Each lowering failure leaves the
+builder unchanged. `finish()` validates and returns `egglog::program::Program`.
+The builder assumes earlier commands succeed; its `check` is an assertion that
+stops runtime execution when false, unlike the live method's boolean observation.
+Native typechecking and execution can still reject an exported program.
+
+The standalone `typed_program_export` example prints the complete JSON program
+for folding `2 + 3` and checking equality with `5`:
+
+```sh
+cargo run --no-default-features --features typed --example typed_program_export > program.json
+```
+
+The shared program provides `to_json`/`from_json`, a Rust-generated schema, and
+`parse` for Egglog source. `to_egglog()` is diagnostic source formatting;
+`to_replayable_egglog()` checks that parsing preserves fields and literal bits
+apart from spans, and returns an error otherwise. Qualified operator names,
+unrepresentable identifiers, special float payloads, and internal metadata may
+require JSON. The checked printer's parser policy remains part of its contract;
+diagnostic text is not automatically a portable executable file.
+
+Execute imported programs in the core graph with `run_shared_program`. The
+typed wrapper deliberately has no arbitrary-program import method: native
+declarations alone cannot reconstruct macro definition sources, authored capture
+initializers, or rule occurrence identities used by typed installation tracking.
+This boundary does not serialize snapshots, host extensions, or external files.
+
+`let (result, record) = graph.record(|graph| { /* typed operations */ })?` returns
+the callback's value even when that value is an error. The record comes from
+core's command recorder and retains each attempted command and its outcome;
+popping a scope does not erase history. A false live `check` has a failed native
+`Check` entry even though its typed result is `Ok(false)`. A preflight rejection
+submits no commands. A failing command may have internal partial effects, and
+the unexecuted suffix is not recorded. Nested recordings are rejected; Rust
+unwinding stops recording before resuming the panic.
+
+The recorded commands include actual `Push`/`Pop` and the materialization prefix
+of extraction. Native `extract_best` and result decoding, `freeze`, `stats`, and
+`num_tuples` are direct observations with no command entries. Recording does not
+invent an `Extract` command for them. A recording started on an existing graph
+is a fragment requiring prior state. `record.program()` returns attempted
+commands, including failures; it is not a successful-state snapshot or a promise
+that replay continues after false checks or other failed commands.
 
 Registration and rule RHSs share the same documentation-hidden `IntoActions<M>`
 adapters; the mode is inferred and is not part of ordinary call syntax. Both

@@ -51,7 +51,9 @@ pub trait EgglogValue:
     + Sync
     + 'static
 {
-    #[doc(hidden)]
+    /// Describes this exact sort for explicit installation with [`super::EGraph::install`]
+    /// or [`super::ProgramBuilder::install`]. Installing a sort does not install
+    /// its unrelated constructors or materialize any values.
     fn sort_ref() -> SortRef;
     #[doc(hidden)]
     fn expression(&self) -> &Expr;

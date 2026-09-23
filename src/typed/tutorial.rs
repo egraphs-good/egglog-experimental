@@ -1,6 +1,6 @@
 //! # Learn the typed Rust API
 //!
-//! These six lessons are an entry point into the full 46-example corpus. Each
+//! These six lessons are an entry point into the full 47-example corpus. Each
 //! lesson's complete program is the standalone Cargo example also executed by
 //! the `typed_examples` integration tests. Run one using, for example,
 //! `cargo run --no-default-features --features typed --example typed_tutorial_basics`.
@@ -46,7 +46,9 @@
 //! group for diagnostic inspection without executing it.
 //! `register(items)` accepts precisely the same expression, relation, and action
 //! inputs as a rule's RHS, including nested borrowed tuples and collections.
-//! Query facts belong in `check`; submit rules and rulesets through a schedule.
+//! Query facts belong in `check`; execute rules and rulesets through a schedule.
+//! Use `install((Num::sort_ref(), Definition::callable(selector)?, &rules))` to
+//! install selected definitions without constructing values or running rules.
 //! Declare a named `#[sort]` struct, then methods and standard operators with
 //! `#[declarations]`. A bodyless method with an equality-sort output declares a
 //! constructor; one without a return type declares a relation. Primitive outputs
@@ -87,6 +89,48 @@
 //! Submit a temporary directly, as in `egraph.run(group.saturate())?`, or borrow
 //! a reusable schedule with `egraph.run(&schedule)?`. These forms do not create
 //! new rule occurrences or reset their incremental cursors.
+//!
+//! ## Export programs and record a session
+//!
+//! [`super::ProgramBuilder`] lowers objects without creating an EGraph. Use
+//! `install` for sorts, selected callables, rules, and rulesets; `register` for
+//! expressions and actions; `run` for schedules; and `check` for facts. It retains
+//! dependencies, captures, rule occurrences, and pushed scopes between calls.
+//! Its `check` emits an assertion, so a false result stops runtime execution.
+//! `finish` returns the shared [`egglog::program::Program`], which supports JSON
+//! serialization and a Rust-generated schema. Execute it through a core graph's
+//! `run_shared_program`; importing arbitrary programs back into the typed wrapper
+//! is not supported because its macro/capture/occurrence tracking would be missing.
+//!
+//! `program.to_egglog()` gives diagnostic Egglog source.
+//! `program.to_replayable_egglog()` additionally verifies source representability
+//! and fails if names, metadata, or literal bits cannot round-trip. Use JSON for
+//! exact interchange; neither source export nor JSON is an e-graph snapshot.
+//!
+//! ```rust
+//! use egglog_experimental::typed::{builtins::I64, prelude::*};
+//! #[relation]
+//! fn seen(value: I64);
+//! let mut graph = EGraph::default();
+//! let (result, record) = graph.record(|graph| {
+//!     graph.install(Definition::callable(|value: &I64| seen(value))?)?;
+//!     graph.register(seen(3))?;
+//!     graph.check(seen(3))
+//! })?;
+//! assert!(result?);
+//! let json = record.program()?.to_json()?;
+//! # let _ = json;
+//! # Ok::<(), Box<dyn std::error::Error>>(())
+//! ```
+//!
+//! The record retains native command outcomes, including failures and popped
+//! scopes. Preflight failures submit no commands; false checks are failed native
+//! commands despite returning `Ok(false)`. Extraction records materialization,
+//! but its direct native extraction and decoding have no command entry. Neither
+//! do `stats`, `num_tuples`, or `freeze`. An existing graph's recording requires
+//! its earlier state, and failed commands prevent ordinary replay from reaching
+//! later entries. Recording does not promise a complete execution trace or a
+//! successful-state snapshot.
 //!
 //! ## Partial patterns and matched field updates
 //!

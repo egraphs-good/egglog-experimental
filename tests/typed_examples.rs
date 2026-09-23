@@ -76,4 +76,5 @@ example_tests!(
         "../examples/typed_tutorial_extraction.rs"
     ),
     (freeze, "../examples/typed_freeze.rs"),
+    (program_export, "../examples/typed_program_export.rs"),
 );
