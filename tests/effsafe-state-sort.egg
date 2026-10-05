@@ -1,0 +1,31 @@
+;; The state as a sort of its own. Values are a separate pure sort that can
+;; read from a state; only `World` e-classes are effectful.
+
+(datatype*
+  (World
+    (Init)
+    (Tick World)
+    (Emit Value World))
+  (Value
+    (Lit i64)
+    (Plus Value Value)
+    (Clock World)))          ; reads the time from a world, pure
+
+(relation Live (World))
+(rule ((= w (Init))) ((Live w)))
+(rule ((= w (Tick p))) ((Live w)))
+(rule ((= w (Emit v p))) ((Live w)))
+
+(rewrite (Plus (Lit a) (Lit b)) (Lit (+ a b)))
+
+(let $w0 (Init))
+(let $w1 (Tick $w0))
+;; two ways to get here: tick twice, or emit nothing and tick twice
+(let $w2 (Tick $w1))
+(let $w2b (Tick (Emit (Lit 0) $w1)))
+(union $w2 $w2b)
+;; emit the clock reading of the state we are in
+(let $w3 (Emit (Plus (Clock $w2) (Lit 1)) $w2))
+(run 5)
+;; The cheaper chain (no Emit of 0) is chosen, and Clock reads that same chain.
+(effsafe-extract Live $w3)

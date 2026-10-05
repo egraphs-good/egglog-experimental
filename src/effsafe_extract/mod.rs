@@ -146,7 +146,7 @@ pub fn extract_effsafe(
         region_costs,
         &root_classes,
         StatewalkOptions::default(),
-    );
+    )?;
     let t_regions = t1.elapsed();
     if log::log_enabled!(log::Level::Debug) {
         let enodes: usize = g.classes.iter().map(|c| c.enodes.len()).sum();

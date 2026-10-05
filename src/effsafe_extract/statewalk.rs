@@ -16,6 +16,7 @@
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, VecDeque};
 
+use egglog::Error;
 use rand_mt::Mt64;
 use rustc_hash::FxHashMap;
 
@@ -108,7 +109,7 @@ struct Region {
 }
 
 impl Region {
-    fn new(g: &EGraph, root: EClassId, opts: StatewalkOptions) -> (Self, Vec<u32>) {
+    fn new(g: &EGraph, root: EClassId, opts: StatewalkOptions) -> Result<(Self, Vec<u32>), Error> {
         debug_assert!(super::checks::has_single_arg(g));
         let arg = g
             .class_ids()
@@ -120,7 +121,13 @@ impl Region {
                     .position(|n| g.state_child(n).is_none())
                     .map(|n| (c, n))
             })
-            .expect("region has no entry e-node");
+            .ok_or_else(|| {
+                Error::ExtractError(format!(
+                    "the region rooted at {} has no entry: no effectful e-node without an \
+                     effectful child (a region needs its own argument or initial state)",
+                    describe_class(g, root)
+                ))
+            })?;
 
         let n = g.len();
         let mut parents_pure = vec![Vec::new(); n];
@@ -289,8 +296,18 @@ impl Region {
             satellite_of,
             satellite_count,
         };
-        (region, counts)
+        Ok((region, counts))
     }
+}
+
+/// `root` by the constructors of its e-nodes, for error messages.
+pub(super) fn describe_class(g: &EGraph, class: EClassId) -> String {
+    let ops: Vec<&str> = g.classes[class]
+        .enodes
+        .iter()
+        .filter_map(|n| g.op_name(n))
+        .collect();
+    format!("an e-class with {ops:?}")
 }
 
 /// The DP's mutable state: the versioned extractable sets and counters, and
@@ -397,8 +414,8 @@ pub fn statewalk_dp(
     root: EClassId,
     costs: &[Vec<Cost>],
     opts: StatewalkOptions,
-) -> Statewalk {
-    let (region, counts) = Region::new(g, root, opts);
+) -> Result<Statewalk, Error> {
+    let (region, counts) = Region::new(g, root, opts)?;
     let n_compressed = region.compressed.iter().flatten().count();
 
     let mut versions = Versions {
@@ -506,14 +523,22 @@ pub fn statewalk_dp(
         }
     }
 
+    let Some(best) = best else {
+        return Err(Error::ExtractError(format!(
+            "no effect-safe extraction for the region rooted at {}: no chain of effectful \
+             e-nodes from the root to the entry makes every pure term it needs extractable \
+             (does a pure term read a state from outside this region?)",
+            describe_class(g, root)
+        )));
+    };
     let mut statewalk = Statewalk::new();
-    let mut cur = Some(best.expect("no statewalk reaches the root"));
+    let mut cur = Some(best);
     while let Some(id) = cur {
         statewalk.push((states[id].class, states[id].pick));
         cur = states[id].prev;
     }
     debug_assert!(super::checks::is_valid_statewalk(g, root, &statewalk));
-    statewalk
+    Ok(statewalk)
 }
 
 /// Linearize a region along a statewalk: every effectful e-class keeps only its
@@ -589,9 +614,9 @@ pub fn extract_region(
     root: EClassId,
     costs: &[Vec<Cost>],
     opts: StatewalkOptions,
-) -> Extraction {
+) -> Result<Extraction, Error> {
     let t0 = std::time::Instant::now();
-    let statewalk = statewalk_dp(g, root, costs, opts);
+    let statewalk = statewalk_dp(g, root, costs, opts)?;
     if log::log_enabled!(log::Level::Debug) {
         log::debug!(
             "effsafe dp={:.2}ms walk_len={}",
@@ -624,5 +649,5 @@ pub fn extract_region(
         );
     }
     debug_assert!(super::checks::is_effect_safe(g, root, &extraction));
-    extraction
+    Ok(extraction)
 }

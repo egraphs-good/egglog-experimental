@@ -1,0 +1,19 @@
+;; A subregion may only use the state of its own region. Here the loop body
+;; reads a value computed from the *outer* state instead of its own Arg, so
+;; no effect-safe extraction exists.
+(datatype Expr
+  (Arg)
+  (Num i64)
+  (Read Expr)                ; pure read of a state
+  (Print Expr Expr)
+  (Loop Expr Expr :regions (1)))
+(relation Effectful (Expr))
+(rule ((= e (Arg))) ((Effectful e)))
+(rule ((= e (Print v s))) ((Effectful e)))
+(rule ((= e (Loop i b))) ((Effectful e)))
+(let $s0 (Arg))
+(let $s1 (Print (Num 1) $s0))
+;; the body prints a read of the outer state s1 rather than of its own Arg
+(let $l (Loop $s1 (Print (Read $s1) (Arg))))
+(run 2)
+(effsafe-extract Effectful $l)

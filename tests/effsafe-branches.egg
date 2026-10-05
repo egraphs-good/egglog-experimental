@@ -1,0 +1,31 @@
+;; Branch regions: a value computed inside both branches of an If can also be
+;; hoisted in front of it. The If's branches are subregions (:regions (2 3)),
+;; each starting from its own state.
+
+(datatype Expr
+  (Arg)
+  (Num i64)
+  (Mul Expr Expr)
+  (Print Expr Expr)
+  (If Expr Expr Expr Expr :regions (2 3)))   ; pred inputs then else
+(relation Effectful (Expr))
+(rule ((= e (Arg))) ((Effectful e)))
+(rule ((= e (Print v s))) ((Effectful e)))
+(rule ((= e (If p i t els))) ((Effectful e)))
+
+(with-dynamic-cost (constructor Expensive (i64) Expr))
+
+(let $s0 (Arg))
+;; both branches print the same expensive value, computed from their own state
+(let $then (Print (Expensive 7) (Arg)))
+(let $else (Print (Mul (Expensive 7) (Num 1)) (Arg)))
+(let $if (If (Num 1) $s0 $then $else))
+;; the else branch's product simplifies to the same value
+(rewrite (Mul x (Num 1)) x)
+(run 5)
+(effsafe-extract Effectful $if)
+
+;; make the expensive value pricey: the branches still each need it (they are
+;; separate regions with separate states), so the extraction is unchanged.
+(set-cost (Expensive 7) 100)
+(effsafe-extract Effectful $if)

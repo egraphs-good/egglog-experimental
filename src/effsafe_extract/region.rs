@@ -6,6 +6,8 @@
 //! the results are stitched together by placing subregions below the e-nodes
 //! that use them.
 
+use egglog::Error;
+
 use super::cost::{Cost, RegionCostModel};
 use super::egraph::{
     EClass, EClassId, EGraph, EGraphMapping, ENode, ExtractedNode, Extraction, ExtractionId,
@@ -20,16 +22,16 @@ pub fn extract_all(
     region_costs: &dyn RegionCostModel,
     function_roots: &[EClassId],
     opts: StatewalkOptions,
-) -> Vec<Extraction> {
+) -> Result<Vec<Extraction>, Error> {
     let mut regions = Regions::new(g, egraph, region_costs, function_roots, opts);
     function_roots
         .iter()
         .map(|&root| {
             regions.placed.fill(None);
             let mut extraction = Vec::new();
-            regions.place(root, &mut extraction);
+            regions.place(root, &mut extraction)?;
             debug_assert!(super::checks::is_effect_safe(g, root, &extraction));
-            extraction
+            Ok(extraction)
         })
         .collect()
 }
@@ -111,15 +113,15 @@ impl<'g> Regions<'g> {
 
     /// Append the extraction of the region rooted at `root` to `out`, placing
     /// its subregions first. Returns the position of the root.
-    fn place(&mut self, root: EClassId, out: &mut Extraction) -> ExtractionId {
+    fn place(&mut self, root: EClassId, out: &mut Extraction) -> Result<ExtractionId, Error> {
         let g = self.g;
         let rid = self.region_of[root].expect("not a region root");
         if let Some(id) = self.placed[rid] {
-            return id;
+            return Ok(id);
         }
         if self.cache[rid].is_none() {
             let t0 = std::time::Instant::now();
-            let (region, region_root, to_g) = self.build_region(root);
+            let (region, region_root, to_g) = self.build_region(root)?;
             let t_build = t0.elapsed();
             let tc = std::time::Instant::now();
             let costs = project_statewalk_costs(&to_g, &self.costs);
@@ -130,7 +132,7 @@ impl<'g> Regions<'g> {
                 );
             }
             let t1 = std::time::Instant::now();
-            let extraction = extract_region(&region, region_root, &costs, self.opts);
+            let extraction = extract_region(&region, region_root, &costs, self.opts)?;
             let t_extract = t1.elapsed();
             if log::log_enabled!(log::Level::Debug) {
                 log::debug!(
@@ -148,7 +150,7 @@ impl<'g> Regions<'g> {
         let mut subregions = Vec::new();
         for en in &region {
             for child in g.region_children(g.enode(en.class, en.node)) {
-                subregions.push(self.place(child, out));
+                subregions.push(self.place(child, out)?);
             }
         }
         let base = out.len();
@@ -176,7 +178,7 @@ impl<'g> Regions<'g> {
             });
         }
         self.placed[rid] = Some(out.len() - 1);
-        out.len() - 1
+        Ok(out.len() - 1)
     }
 
     /// The region e-graph rooted at `root`: the effectful spine reached through
@@ -184,7 +186,7 @@ impl<'g> Regions<'g> {
     /// (effectful children at `:regions` positions) are dropped from e-nodes,
     /// and e-nodes with children outside the region are dropped entirely. Returns the (pruned) region, its root, and
     /// the mapping back into `g`.
-    fn build_region(&mut self, root: EClassId) -> (EGraph, EClassId, EGraphMapping) {
+    fn build_region(&mut self, root: EClassId) -> Result<(EGraph, EClassId, EGraphMapping), Error> {
         let g = self.g;
         let marks = &mut self.marks;
         marks.clear();
@@ -259,7 +261,14 @@ impl<'g> Regions<'g> {
         debug_assert!(super::checks::is_wellformed(&region, true, false));
 
         let (pruned, region_to_pruned) = region.prune_unextractable(Some(0));
-        let pruned_root = region_to_pruned.class(0);
+        let Some(pruned_root) = region_to_pruned.classes[0] else {
+            return Err(Error::ExtractError(format!(
+                "no effect-safe extraction for the region rooted at {}: every term of the \
+                 root uses a state from outside the region (a subregion may only use its \
+                 own entry and the e-nodes on its own statewalk)",
+                super::statewalk::describe_class(g, root)
+            )));
+        };
         let pruned_to_g = region_to_pruned.inverse(&pruned).then(&to_g);
         debug_assert!(super::checks::is_valid_mapping(
             &pruned_to_g,
@@ -270,7 +279,7 @@ impl<'g> Regions<'g> {
             false,
             false
         ));
-        (pruned, pruned_root, pruned_to_g)
+        Ok((pruned, pruned_root, pruned_to_g))
     }
 }
 
