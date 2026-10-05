@@ -169,11 +169,9 @@ impl EGraph {
         }
     }
 
-    /// Drop e-nodes that cannot be part of any finite term and e-classes that
-    /// are unreachable from `root` (every e-class is kept when `root` is `None`).
-    /// Returns the pruned e-graph and the mapping from this e-graph into it.
-    pub fn prune_unextractable(&self, root: Option<EClassId>) -> (EGraph, EGraphMapping) {
-        // An e-node is extractable once all its children are; an e-class once one of its e-nodes is.
+    /// Which e-classes have a finite term: an e-node is extractable once all
+    /// its children are, and an e-class once one of its e-nodes is.
+    pub fn extractable_classes(&self) -> Vec<bool> {
         let parents = self.parents();
         let mut remaining = self.child_counts();
         let mut extractable = vec![false; self.len()];
@@ -193,6 +191,15 @@ impl EGraph {
                 }
             }
         }
+        extractable
+    }
+
+    /// Drop e-nodes that cannot be part of any finite term and e-classes that
+    /// are unreachable from `root` (every e-class is kept when `root` is `None`).
+    /// Returns the pruned e-graph and the mapping from this e-graph into it.
+    pub fn prune_unextractable(&self, root: Option<EClassId>) -> (EGraph, EGraphMapping) {
+        let extractable = self.extractable_classes();
+        let mut queue = VecDeque::new();
 
         // Reachability from the root through extractable e-nodes.
         let mut reachable = vec![root.is_none(); self.len()];

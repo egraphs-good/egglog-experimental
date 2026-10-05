@@ -145,7 +145,7 @@ impl<'e> Builder<'e> {
             let out_sort = self.sort_id(&ty.output);
             let mut rows: Vec<(Value, Vec<Value>, Cost)> = Vec::new();
             self.egraph.constructor_enodes(&name, |enode| {
-                if !enode.subsumed {
+                if !enode.subsumed || self.config.include_subsumed {
                     let cost = self.cost_model.enode_cost(self.egraph, func, &enode);
                     rows.push((enode.eclass, enode.children.to_vec(), cost));
                 }
@@ -353,9 +353,77 @@ pub fn build(
         .iter()
         .map(|&r| {
             mapping.classes[r].ok_or_else(|| {
-                Error::ExtractError("extraction root has no finite term".to_string())
+                Error::ExtractError(format!(
+                    "extraction root has no finite term: {}",
+                    explain_unextractable(&builder.g, r)
+                ))
             })
         })
         .collect::<Result<Vec<_>, _>>()?;
     Ok((pruned, roots))
+}
+
+/// Why e-class `class` has no finite term: summarize the e-classes without a
+/// finite term by sort, and list the ones with no extractable e-node at all,
+/// which are the usual culprits (a sort whose only constructors are
+/// `:unextractable`, or one that should be a placeholder).
+fn explain_unextractable(g: &EGraph, class: EClassId) -> String {
+    let extractable = g.extractable_classes();
+    let root_ops: Vec<&str> = g.classes[class]
+        .enodes
+        .iter()
+        .filter_map(|n| g.op_name(n))
+        .collect();
+    let mut by_sort: Vec<(String, usize)> = Vec::new();
+    let mut empty: Vec<String> = Vec::new();
+    for c in g.class_ids().filter(|&c| !extractable[c]) {
+        let sort = g.sorts[g.classes[c].sort].name().to_string();
+        match by_sort.iter_mut().find(|(s, _)| *s == sort) {
+            Some((_, n)) => *n += 1,
+            None => by_sort.push((sort.clone(), 1)),
+        }
+        if g.classes[c].enodes.is_empty() && empty.len() < 8 {
+            empty.push(sort);
+        }
+    }
+    let mut details = String::new();
+    if std::env::var_os("EFFSAFE_DEBUG").is_some() {
+        let boring = ["Get", "Bop", "Uop", "Top", "Concat", "Single"];
+        for c in g
+            .class_ids()
+            .filter(|&c| !extractable[c])
+            .filter(|&c| {
+                std::env::var("EFFSAFE_DEBUG").as_deref() == Ok("all")
+                    || g.classes[c]
+                        .enodes
+                        .iter()
+                        .any(|n| !boring.contains(&g.op_name(n).unwrap_or("<leaf>")))
+            })
+            .take(200)
+        {
+            details.push_str(&format!(
+                "\n  class {c} ({}):",
+                g.sorts[g.classes[c].sort].name()
+            ));
+            for n in &g.classes[c].enodes {
+                let op = g.op_name(n).unwrap_or("<leaf>");
+                let kids: Vec<String> = n
+                    .children
+                    .iter()
+                    .map(|&k| {
+                        format!(
+                            "{}#{k}{}",
+                            g.sorts[g.classes[k].sort].name(),
+                            if extractable[k] { "" } else { "!" }
+                        )
+                    })
+                    .collect();
+                details.push_str(&format!("\n    {op} {kids:?}"));
+            }
+        }
+    }
+    format!(
+        "root e-class (e-nodes {root_ops:?}); e-classes without a finite term by sort: {by_sort:?}; \
+         e-classes with no extractable e-node (unextractable constructors only): {empty:?}{details}"
+    )
 }

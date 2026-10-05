@@ -39,6 +39,10 @@ pub struct EffsafeConfig {
     pub regions: HashMap<String, Vec<usize>>,
     /// Sort name to the term that stands in for every value of that sort.
     pub placeholders: HashMap<String, Expr>,
+    /// Extract from subsumed e-nodes too. egglog's own extractors skip them;
+    /// a program whose rules subsume e-nodes for reasons other than
+    /// extraction can opt back in with a trailing `:include-subsumed`.
+    pub include_subsumed: bool,
 }
 
 /// Shared, per-e-graph annotation state.
@@ -99,6 +103,14 @@ pub fn extract_effsafe(
         .map(|e| to_term::extraction_to_term(&g, egraph, &placeholders, e, &mut termdag))
         .collect();
     Ok(EffsafeExtractOutput { termdag, terms })
+}
+
+/// Split a trailing `:include-subsumed` flag off a command's arguments.
+fn split_include_subsumed(args: &[Expr]) -> (&[Expr], bool) {
+    match args.split_last() {
+        Some((Expr::Var(_, flag), rest)) if flag == ":include-subsumed" => (rest, true),
+        _ => (args, false),
+    }
 }
 
 fn usage(span: Span, msg: &str) -> Error {
@@ -196,10 +208,11 @@ pub struct EffsafeExtract<CM> {
 
 impl<CM: DagCostModel<Cost> + Send + Sync + 'static> UserDefinedCommand for EffsafeExtract<CM> {
     fn update(&self, egraph: &mut EGraph, args: &[Expr]) -> Result<Vec<CommandOutput>, Error> {
+        let (args, include_subsumed) = split_include_subsumed(args);
         let [relation, exprs @ ..] = args else {
             return Err(usage(
                 span!(),
-                "usage: (effsafe-extract <effectful-relation> <expr>...)",
+                "usage: (effsafe-extract <effectful-relation> <expr>... [:include-subsumed])",
             ));
         };
         if exprs.is_empty() {
@@ -213,7 +226,8 @@ impl<CM: DagCostModel<Cost> + Send + Sync + 'static> UserDefinedCommand for Effs
             .iter()
             .map(|e| egraph.eval_expr(e))
             .collect::<Result<Vec<_>, _>>()?;
-        let config = self.config.lock().unwrap().clone();
+        let mut config = self.config.lock().unwrap().clone();
+        config.include_subsumed |= include_subsumed;
         let output = extract_effsafe(
             egraph,
             &relation,
@@ -236,15 +250,17 @@ pub struct EffsafeExtractAll<CM> {
 
 impl<CM: DagCostModel<Cost> + Send + Sync + 'static> UserDefinedCommand for EffsafeExtractAll<CM> {
     fn update(&self, egraph: &mut EGraph, args: &[Expr]) -> Result<Vec<CommandOutput>, Error> {
+        let (args, include_subsumed) = split_include_subsumed(args);
         let [relation, constructor] = args else {
             return Err(usage(
                 span!(),
-                "usage: (effsafe-extract-all <effectful-relation> <constructor>)",
+                "usage: (effsafe-extract-all <effectful-relation> <constructor> [:include-subsumed])",
             ));
         };
         let relation = expect_name(relation, "relation")?;
         let constructor = expect_name(constructor, "constructor")?;
-        let config = self.config.lock().unwrap().clone();
+        let mut config = self.config.lock().unwrap().clone();
+        config.include_subsumed |= include_subsumed;
         let output = extract_effsafe(
             egraph,
             &relation,

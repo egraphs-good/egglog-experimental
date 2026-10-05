@@ -42,6 +42,7 @@
 (effsafe-extract Effectful $i)
 (effsafe-extract Effectful $p3 $i)
 (effsafe-extract-all Effectful Func)
+(effsafe-extract-all Effectful Func :include-subsumed)
 
 ;; Regions can also be declared without the annotation.
 (datatype Expr2 (Arg2) (Num2 i64) (Print2 Expr2 Expr2) (If2 Expr2 Expr2 Expr2 Expr2))

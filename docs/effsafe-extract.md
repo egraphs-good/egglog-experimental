@@ -152,6 +152,16 @@ From Rust, `extract_effsafe` runs the same extraction with an explicit
 `EffsafeConfig`, and `new_experimental_egraph_with_effsafe` registers the
 commands with custom cost models.
 
+## Subsumed e-nodes
+
+Like egglog's other extractors, `effsafe-extract` skips subsumed e-nodes.
+A program whose rules subsume e-nodes for other reasons (to stop rewrites
+from firing again, say) can include them with a trailing `:include-subsumed`:
+
+```lisp
+(effsafe-extract-all Effectful Func :include-subsumed)
+```
+
 ## Limitations
 
 - Pure e-nodes must not use effectful e-nodes that are not on their region's
