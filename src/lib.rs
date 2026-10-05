@@ -133,8 +133,8 @@ pub use subst::Subst;
 
 pub mod effsafe_extract;
 pub use effsafe_extract::{
-    EffsafeConfig, EffsafeExtractOutput, RegionCostModel, SumRegions, add_effsafe_extract,
-    extract_effsafe,
+    EffsafeConfig, EffsafeExtractOutput, EffsafeState, RegionCostModel, SumRegions,
+    add_effsafe_extract, effsafe_state, extract_effsafe, set_effsafe_cost_models,
 };
 
 /// Creates a default [`EGraph`] with every experimental extension registered.
@@ -143,21 +143,6 @@ pub use effsafe_extract::{
 /// this crate. Use [`experimental_parser`] instead when only the parse-time
 /// `for` and `with-ruleset` macros are needed.
 pub fn new_experimental_egraph() -> EGraph {
-    new_experimental_egraph_with_effsafe(DynamicCostModel, Arc::new(SumRegions))
-}
-
-/// Like [`new_experimental_egraph`], but effect-safe extraction prices e-nodes
-/// with `cost_model` and folds subregion costs with `region_costs`.
-///
-/// Use this when embedding egglog in a compiler whose cost heuristics are not
-/// expressible as `:cost` annotations.
-pub fn new_experimental_egraph_with_effsafe<CM>(
-    cost_model: CM,
-    region_costs: Arc<dyn RegionCostModel>,
-) -> EGraph
-where
-    CM: egglog::extract::DagCostModel<egglog::extract::DefaultCost> + Clone + Send + Sync + 'static,
-{
     let mut egraph = EGraph::default();
 
     // Set up the parser with experimental parse-time macros
@@ -210,7 +195,7 @@ where
     egraph.add_full_primitive(Subst, None);
 
     // Effect-safe extraction with :regions annotations.
-    add_effsafe_extract(&mut egraph, cost_model, region_costs);
+    add_effsafe_extract(&mut egraph);
     egraph
 }
 

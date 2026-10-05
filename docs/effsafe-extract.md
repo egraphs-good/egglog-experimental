@@ -136,8 +136,12 @@ impl RegionCostModel for MyRegions {
         }
     }
 }
-let egraph = new_experimental_egraph_with_effsafe(DynamicCostModel, Arc::new(MyRegions));
+let mut egraph = new_experimental_egraph();
+set_effsafe_cost_models(&mut egraph, DynamicCostModel, MyRegions);
 ```
+
+The annotations and cost models live in the e-graph's extension state
+(`EffsafeState`), so they are cloned and snapshotted with it.
 
 Costs are `u64`s with saturating arithmetic.
 
@@ -158,8 +162,8 @@ extracted e-class) through `CommandOutput::UserDefined`; the CLI prints the
 terms.
 
 From Rust, `extract_effsafe` runs the same extraction with an explicit
-`EffsafeConfig`, and `new_experimental_egraph_with_effsafe` registers the
-commands with custom cost models.
+`EffsafeConfig`, and `set_effsafe_cost_models` installs custom cost models
+on an e-graph.
 
 ## Subsumed e-nodes
 

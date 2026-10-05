@@ -21,7 +21,7 @@ mod statewalk;
 mod to_term;
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use egglog::ast::{Command, Expr, Literal, Macro, ParseError, Parser, Sexp};
 use egglog::extract::DagCostModel;
@@ -47,8 +47,59 @@ pub struct EffsafeConfig {
     pub include_subsumed: bool,
 }
 
-/// Shared, per-e-graph annotation state.
-pub type SharedEffsafeConfig = Arc<Mutex<EffsafeConfig>>;
+/// Everything effect-safe extraction keeps on an e-graph: the annotations and
+/// the cost models. Stored as egglog extension state, so it is cloned and
+/// snapshotted with the e-graph. Change the models with
+/// [`set_effsafe_cost_models`].
+#[derive(Clone)]
+pub struct EffsafeState {
+    /// Annotations from `:regions`, `effsafe-regions` and `effsafe-placeholder`.
+    pub config: EffsafeConfig,
+    /// Prices e-nodes, base values and containers.
+    pub cost_model: Arc<dyn DagCostModel<Cost> + Send + Sync>,
+    /// Folds subregion costs into their parent e-node's cost.
+    pub region_costs: Arc<dyn RegionCostModel>,
+}
+
+impl Default for EffsafeState {
+    fn default() -> Self {
+        EffsafeState {
+            config: EffsafeConfig::default(),
+            cost_model: Arc::new(crate::DynamicCostModel),
+            region_costs: Arc::new(SumRegions),
+        }
+    }
+}
+
+impl std::fmt::Debug for EffsafeState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EffsafeState")
+            .field("config", &self.config)
+            .finish_non_exhaustive()
+    }
+}
+
+/// The effect-safe extraction state of `egraph`, created with the default
+/// cost models if the e-graph has none yet.
+pub fn effsafe_state(egraph: &mut EGraph) -> &mut EffsafeState {
+    egraph.extension_state_or_default::<EffsafeState>()
+}
+
+/// Use `cost_model` and `region_costs` for effect-safe extraction on `egraph`.
+///
+/// The default is the dynamic cost model (`:cost` and `set-cost`) with
+/// subregion costs summed. A compiler embedding egglog can supply heuristics
+/// that are not expressible as annotations, such as charging only the more
+/// expensive branch of a conditional.
+pub fn set_effsafe_cost_models(
+    egraph: &mut EGraph,
+    cost_model: impl DagCostModel<Cost> + Send + Sync + 'static,
+    region_costs: impl RegionCostModel + 'static,
+) {
+    let state = effsafe_state(egraph);
+    state.cost_model = Arc::new(cost_model);
+    state.region_costs = Arc::new(region_costs);
+}
 
 /// Output of `effsafe-extract` and `effsafe-extract-all`: one term per root.
 #[derive(Debug)]
@@ -146,9 +197,7 @@ fn expect_name(expr: &Expr, what: &str) -> Result<String, Error> {
 
 /// `(effsafe-regions <constructor> <position>...)`: the arguments of
 /// `constructor` at these zero-based positions start subregions.
-pub struct EffsafeRegions {
-    config: SharedEffsafeConfig,
-}
+pub struct EffsafeRegions;
 
 impl UserDefinedCommand for EffsafeRegions {
     fn update(&self, egraph: &mut EGraph, args: &[Expr]) -> Result<Vec<CommandOutput>, Error> {
@@ -184,16 +233,14 @@ impl UserDefinedCommand for EffsafeRegions {
         }
         parsed.sort_unstable();
         parsed.dedup();
-        self.config.lock().unwrap().regions.insert(name, parsed);
+        effsafe_state(egraph).config.regions.insert(name, parsed);
         Ok(vec![])
     }
 }
 
 /// `(effsafe-placeholder <sort> <expr>)`: extraction does not descend into
 /// values of `sort`; every such child becomes `expr` in the output.
-pub struct EffsafePlaceholder {
-    config: SharedEffsafeConfig,
-}
+pub struct EffsafePlaceholder;
 
 impl UserDefinedCommand for EffsafePlaceholder {
     fn update(&self, egraph: &mut EGraph, args: &[Expr]) -> Result<Vec<CommandOutput>, Error> {
@@ -207,9 +254,8 @@ impl UserDefinedCommand for EffsafePlaceholder {
                 &format!("{sort} is not a declared sort"),
             ));
         }
-        self.config
-            .lock()
-            .unwrap()
+        effsafe_state(egraph)
+            .config
             .placeholders
             .insert(sort, expr.clone());
         Ok(vec![])
@@ -217,13 +263,9 @@ impl UserDefinedCommand for EffsafePlaceholder {
 }
 
 /// `(effsafe-extract <effectful-relation> <expr>...)`.
-pub struct EffsafeExtract<CM> {
-    config: SharedEffsafeConfig,
-    cost_model: CM,
-    region_costs: Arc<dyn RegionCostModel>,
-}
+pub struct EffsafeExtract;
 
-impl<CM: DagCostModel<Cost> + Send + Sync + 'static> UserDefinedCommand for EffsafeExtract<CM> {
+impl UserDefinedCommand for EffsafeExtract {
     fn update(&self, egraph: &mut EGraph, args: &[Expr]) -> Result<Vec<CommandOutput>, Error> {
         let (args, include_subsumed) = split_include_subsumed(args);
         let [relation, exprs @ ..] = args else {
@@ -243,15 +285,15 @@ impl<CM: DagCostModel<Cost> + Send + Sync + 'static> UserDefinedCommand for Effs
             .iter()
             .map(|e| egraph.eval_expr(e))
             .collect::<Result<Vec<_>, _>>()?;
-        let mut config = self.config.lock().unwrap().clone();
-        config.include_subsumed |= include_subsumed;
+        let mut state = effsafe_state(egraph).clone();
+        state.config.include_subsumed |= include_subsumed;
         let output = extract_effsafe(
             egraph,
             &relation,
             &Roots::Values(values),
-            &config,
-            &self.cost_model,
-            self.region_costs.as_ref(),
+            &state.config,
+            state.cost_model.as_ref(),
+            state.region_costs.as_ref(),
         )?;
         Ok(vec![CommandOutput::UserDefined(Arc::new(output))])
     }
@@ -259,13 +301,9 @@ impl<CM: DagCostModel<Cost> + Send + Sync + 'static> UserDefinedCommand for Effs
 
 /// `(effsafe-extract-all <effectful-relation> <constructor>)`: extract every
 /// e-class holding an e-node of `constructor`.
-pub struct EffsafeExtractAll<CM> {
-    config: SharedEffsafeConfig,
-    cost_model: CM,
-    region_costs: Arc<dyn RegionCostModel>,
-}
+pub struct EffsafeExtractAll;
 
-impl<CM: DagCostModel<Cost> + Send + Sync + 'static> UserDefinedCommand for EffsafeExtractAll<CM> {
+impl UserDefinedCommand for EffsafeExtractAll {
     fn update(&self, egraph: &mut EGraph, args: &[Expr]) -> Result<Vec<CommandOutput>, Error> {
         let (args, include_subsumed) = split_include_subsumed(args);
         let [relation, constructor] = args else {
@@ -276,15 +314,15 @@ impl<CM: DagCostModel<Cost> + Send + Sync + 'static> UserDefinedCommand for Effs
         };
         let relation = expect_name(relation, "relation")?;
         let constructor = expect_name(constructor, "constructor")?;
-        let mut config = self.config.lock().unwrap().clone();
-        config.include_subsumed |= include_subsumed;
+        let mut state = effsafe_state(egraph).clone();
+        state.config.include_subsumed |= include_subsumed;
         let output = extract_effsafe(
             egraph,
             &relation,
             &Roots::Constructor(&constructor),
-            &config,
-            &self.cost_model,
-            self.region_costs.as_ref(),
+            &state.config,
+            state.cost_model.as_ref(),
+            state.region_costs.as_ref(),
         )?;
         Ok(vec![CommandOutput::UserDefined(Arc::new(output))])
     }
@@ -400,62 +438,23 @@ impl Macro<Vec<Command>> for RegionsAnnotation {
     }
 }
 
-/// Register effect-safe extraction on an e-graph with the given cost models,
-/// and return the annotation state the commands share.
-///
-/// `cost_model` prices e-nodes (for the egglog frontend this is
-/// [`crate::DynamicCostModel`], so `:cost` and `set-cost` apply);
-/// `region_costs` folds subregion costs ([`SumRegions`] by default).
-pub fn add_effsafe_extract<CM>(
-    egraph: &mut EGraph,
-    cost_model: CM,
-    region_costs: Arc<dyn RegionCostModel>,
-) -> SharedEffsafeConfig
-where
-    CM: DagCostModel<Cost> + Clone + Send + Sync + 'static,
-{
-    let config: SharedEffsafeConfig = Arc::default();
+/// Register effect-safe extraction on an e-graph: the `:regions` annotation
+/// and the `effsafe-*` commands. Cost models default to the dynamic cost
+/// model with summed subregions; see [`set_effsafe_cost_models`].
+pub fn add_effsafe_extract(egraph: &mut EGraph) {
     egraph.parser.add_command_macro(Arc::new(RegionsAnnotation {
         head: "constructor",
     }));
     egraph
         .parser
         .add_command_macro(Arc::new(RegionsAnnotation { head: "datatype" }));
-    egraph
-        .add_command(
-            "effsafe-regions".into(),
-            Arc::new(EffsafeRegions {
-                config: config.clone(),
-            }),
-        )
-        .unwrap();
-    egraph
-        .add_command(
-            "effsafe-placeholder".into(),
-            Arc::new(EffsafePlaceholder {
-                config: config.clone(),
-            }),
-        )
-        .unwrap();
-    egraph
-        .add_command(
-            "effsafe-extract".into(),
-            Arc::new(EffsafeExtract {
-                config: config.clone(),
-                cost_model: cost_model.clone(),
-                region_costs: region_costs.clone(),
-            }),
-        )
-        .unwrap();
-    egraph
-        .add_command(
-            "effsafe-extract-all".into(),
-            Arc::new(EffsafeExtractAll {
-                config: config.clone(),
-                cost_model,
-                region_costs,
-            }),
-        )
-        .unwrap();
-    config
+    let commands: [(&str, Arc<dyn UserDefinedCommand>); 4] = [
+        ("effsafe-regions", Arc::new(EffsafeRegions)),
+        ("effsafe-placeholder", Arc::new(EffsafePlaceholder)),
+        ("effsafe-extract", Arc::new(EffsafeExtract)),
+        ("effsafe-extract-all", Arc::new(EffsafeExtractAll)),
+    ];
+    for (name, command) in commands {
+        egraph.add_command(name.into(), command).unwrap();
+    }
 }
