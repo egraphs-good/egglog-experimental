@@ -1,0 +1,37 @@
+;; `:regions` composes with `with-dynamic-cost` and works inside `datatype*`.
+
+(with-dynamic-cost
+  (datatype* (Expr
+               (Arg)
+               (Num i64)
+               (Add Expr Expr)
+               (Print Expr Expr)
+               (Call String Stmts Expr :regions (1))
+               (Loop Expr Expr :regions (1)))
+             (Stmts
+               (Nil)
+               (Cons Expr Stmts :regions (0))))
+  (constructor If (Expr Expr Expr Expr) Expr :regions (2 3)))
+(rule ((= e (Arg))) ((set-effectful e)))
+(rule ((= e (Print v s))) ((set-effectful e)))
+(rule ((= e (If p s t els))) ((set-effectful e)))
+(rule ((= e (Loop s b))) ((set-effectful e)))
+(rule ((= e (Call n args s))) ((set-effectful e)))
+(rule ((= e (Cons x rest))) ((set-effectful e)))
+(rule ((= e (Nil))) ((set-effectful e)))
+
+(let $s0 (Arg))
+(let $p1 (Print (Num 1) $s0))
+(let $p2 (Print (Add (Num 1) (Num 0)) $s0))
+(union $p1 $p2)
+;; dynamic costs steer the choice: make (Num 1) expensive
+(set-cost (Num 1) 100)
+(let $body (Print (Num 7) (Arg)))
+(let $l (Loop $p1 $body))
+(let $i (If (Num 0) $l $body (Print (Num 8) (Arg))))
+;; a call whose argument list is a chain of regions
+(let $c (Call "f" (Cons (Print (Num 2) (Arg)) (Cons (Print (Num 3) (Arg)) (Nil))) $i))
+(run 5)
+(extract $p1 :extractor effsafe)
+(extract $i :extractor effsafe)
+(extract $c :extractor effsafe)

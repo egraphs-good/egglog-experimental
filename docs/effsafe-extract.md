@@ -223,8 +223,6 @@ from firing again, say) can include them with `:include-subsumed`:
 - Pure e-nodes must not use effectful e-nodes that are not on their region's
   statewalk; the language's rewrites must preserve this (it holds for
   languages in which the state is linear).
-- `:regions` is accepted on `constructor` and on `datatype` variants, not yet
-  inside `datatype*`.
 - A container holding two states is an error, like any e-node with two
   effectful children.
 - Roots must be marked with `set-effectful`. Extracting a pure root is a plain

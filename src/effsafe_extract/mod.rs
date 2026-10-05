@@ -462,6 +462,29 @@ fn regions_command(span: Span, constructor: &str, positions: &[i64]) -> Command 
     Command::UserDefined(span, "effsafe-regions".to_string(), args)
 }
 
+/// Strip `:regions` from the variant lists in `items[skip..]`, collecting an
+/// `effsafe-regions` command for each annotated variant.
+fn strip_variants(
+    items: &[Sexp],
+    skip: usize,
+    region_commands: &mut Vec<Command>,
+) -> Result<Vec<Sexp>, ParseError> {
+    let mut rest = Vec::with_capacity(items.len());
+    for (i, item) in items.iter().enumerate() {
+        match item {
+            Sexp::List(variant, vspan) if i >= skip => {
+                let (stripped, positions) = strip_regions(variant)?;
+                if let (Some(positions), Some(Sexp::Atom(name, _))) = (positions, variant.first()) {
+                    region_commands.push(regions_command(vspan.clone(), name, &positions));
+                }
+                rest.push(Sexp::List(stripped, vspan.clone()));
+            }
+            other => rest.push(clone_sexp(other)),
+        }
+    }
+    Ok(rest)
+}
+
 impl Macro<Vec<Command>> for RegionsAnnotation {
     fn name(&self) -> &str {
         self.head
@@ -482,23 +505,19 @@ impl Macro<Vec<Command>> for RegionsAnnotation {
                 }
                 rest
             }
-            _ => {
+            "datatype" => {
                 // (datatype Name (Variant Sort... :regions (...))...)
+                strip_variants(args, 1, &mut region_commands)?
+            }
+            _ => {
+                // (datatype* (Name (Variant ...)...) (sort Name (Container ...))...)
                 let mut rest = Vec::with_capacity(args.len());
-                for (i, arg) in args.iter().enumerate() {
+                for arg in args {
                     match arg {
-                        Sexp::List(variant, vspan) if i > 0 => {
-                            let (items, positions) = strip_regions(variant)?;
-                            if let (Some(positions), Some(Sexp::Atom(name, _))) =
-                                (positions, variant.first())
-                            {
-                                region_commands.push(regions_command(
-                                    vspan.clone(),
-                                    name,
-                                    &positions,
-                                ));
-                            }
-                            rest.push(Sexp::List(items, vspan.clone()));
+                        Sexp::List(items, dspan) if !matches!(items.first(), Some(Sexp::Atom(head, _)) if head == "sort") =>
+                        {
+                            let items = strip_variants(items, 1, &mut region_commands)?;
+                            rest.push(Sexp::List(items, dspan.clone()));
                         }
                         other => rest.push(clone_sexp(other)),
                     }
@@ -529,6 +548,9 @@ pub fn add_effsafe_extract(egraph: &mut EGraph) {
     egraph
         .parser
         .add_command_macro(Arc::new(RegionsAnnotation { head: "datatype" }));
+    egraph
+        .parser
+        .add_command_macro(Arc::new(RegionsAnnotation { head: "datatype*" }));
     let commands: [(&str, Arc<dyn UserDefinedCommand>); 2] = [
         ("effsafe-regions", Arc::new(EffsafeRegions)),
         ("print-function", Arc::new(PrintFunction)),

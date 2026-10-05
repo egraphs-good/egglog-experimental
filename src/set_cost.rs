@@ -106,12 +106,29 @@ impl Macro<Vec<Command>> for SetCostDeclarations {
         span: Span,
         parser: &mut Parser,
     ) -> Result<Vec<Command>, ParseError> {
-        let decls = map_fallible(decls, parser, Parser::parse_command)?
-            .into_iter()
-            .flatten()
-            .collect::<Vec<_>>();
+        // Each argument must expand to a datatype or constructor declaration.
+        // Other macros (`:regions`, say) may expand a declaration into extra
+        // commands; those pass through unchanged.
+        let mut expanded: Vec<Command> = vec![];
+        for decl in decls {
+            let commands = parser.parse_command(decl)?;
+            if !commands.iter().any(|c| {
+                matches!(
+                    c,
+                    Command::Datatype { .. }
+                        | Command::Datatypes { .. }
+                        | Command::Constructor { .. }
+                )
+            }) {
+                return Err(ParseError(
+                    span,
+                    "Expect a datatype declaration".to_string(),
+                ));
+            }
+            expanded.extend(commands);
+        }
         let mut cost_table_commands = vec![];
-        for decl in decls.iter() {
+        for decl in expanded.iter() {
             match decl {
                 Command::Datatype { variants, .. } => {
                     let commands = generate_cost_table_commands_from_variants(variants);
@@ -152,15 +169,10 @@ impl Macro<Vec<Command>> for SetCostDeclarations {
                         });
                     }
                 }
-                _ => {
-                    return Err(ParseError(
-                        span,
-                        "Expect a datatype declaration".to_string(),
-                    ));
-                }
+                _ => {}
             }
         }
-        let mut commands = decls;
+        let mut commands = expanded;
         commands.extend(cost_table_commands);
         Ok(commands)
     }
