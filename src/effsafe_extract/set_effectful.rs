@@ -151,7 +151,12 @@ fn sort_of(
         Expr::Call(_, head, _) => type_info
             .get_func_type(head)
             .map(|f| f.output.name().to_string()),
-        Expr::Lit(..) => None,
+        Expr::Lit(..) => {
+            return Err(Error::ParseError(ParseError(
+                expr.span(),
+                format!("set-effectful: {expr} is a literal, not an eq sort expression"),
+            )));
+        }
     };
     let Some(sort) = sort else {
         return Err(Error::ParseError(ParseError(

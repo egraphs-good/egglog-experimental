@@ -29,27 +29,56 @@ use std::sync::Arc;
 /// selector, which also keeps a misspelled extractor name an error rather than
 /// silently positional. Removing that last case needs a surface form ordinary
 /// `Expr::Var` parsing cannot produce.
-pub(crate) fn split_trailing_extractor(args: &[Expr]) -> Result<(&[Expr], bool), Error> {
+/// Which extractor a command's trailing `:extractor <name>` selects.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Extractor {
+    /// egglog's default tree extractor.
+    Tree,
+    /// `:extractor greedy-dag`.
+    GreedyDag,
+    /// `:extractor effsafe`: effect-safe extraction (see `effsafe_extract`).
+    Effsafe,
+}
+
+pub(crate) fn split_trailing_extractor(args: &[Expr]) -> Result<(&[Expr], Extractor), Error> {
     let Some([keyword, extractor]) = args.last_chunk::<2>() else {
-        return Ok((args, false));
+        return Ok((args, Extractor::Tree));
     };
 
     if !matches!(keyword, Expr::Var(_, keyword) if keyword == ":extractor") {
-        return Ok((args, false));
+        return Ok((args, Extractor::Tree));
     }
 
     let Expr::Var(_, name) = extractor else {
-        return Ok((args, false));
+        return Ok((args, Extractor::Tree));
     };
 
-    if name != "greedy-dag" {
-        return Err(Error::ParseError(ParseError(
-            extractor.span(),
-            format!("unknown extractor: {name}; omit :extractor to use the default tree extractor"),
-        )));
-    }
+    let extractor = match name.as_str() {
+        "greedy-dag" => Extractor::GreedyDag,
+        "effsafe" => Extractor::Effsafe,
+        _ => {
+            return Err(Error::ParseError(ParseError(
+                extractor.span(),
+                format!(
+                    "unknown extractor: {name}; use greedy-dag or effsafe, or omit :extractor for the default tree extractor"
+                ),
+            )));
+        }
+    };
+    Ok((&args[..args.len() - 2], extractor))
+}
 
-    Ok((&args[..args.len() - 2], true))
+/// Reject `:extractor effsafe` on commands that only know tree and greedy-DAG
+/// extraction, and return whether greedy-DAG was chosen.
+pub(crate) fn greedy_dag_or_tree(extractor: Extractor, command: &str) -> Result<bool, Error> {
+    match extractor {
+        Extractor::Tree => Ok(false),
+        Extractor::GreedyDag => Ok(true),
+        Extractor::Effsafe => Err(Error::ParseError(ParseError(
+            egglog::span!(),
+            format!("{command} does not support :extractor effsafe; use extract or print-function"),
+        ))),
+    }
 }
 
 // Greedy-DAG extraction.

@@ -15,4 +15,4 @@
 ;; the body prints a read of the outer state s1 rather than of its own Arg
 (let $l (Loop $s1 (Print (Read $s1) (Arg))))
 (run 2)
-(extract $l :effsafe)
+(extract $l :extractor effsafe)

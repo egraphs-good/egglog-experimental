@@ -37,12 +37,12 @@
 
 (run 10)
 
-(extract $p3 :effsafe)
-(extract $i :effsafe)
-(extract $p3 :effsafe)
-(extract $i :effsafe)
-(print-function Func :effsafe)
-(print-function Func :effsafe :include-subsumed)
+(extract $p3 :extractor effsafe)
+(extract $i :extractor effsafe)
+(extract $p3 :extractor effsafe)
+(extract $i :extractor effsafe)
+(print-function Func :extractor effsafe)
+(print-function Func :extractor effsafe :include-subsumed)
 
 ;; Regions can also be declared without the annotation.
 (datatype Expr2 (Arg2) (Num2 i64) (Print2 Expr2 Expr2) (If2 Expr2 Expr2 Expr2 Expr2))
@@ -52,4 +52,4 @@
 (rule ((= e (If2 p s t els))) ((set-effectful e)))
 (let $j (If2 (Num2 0) (Arg2) (Print2 (Num2 1) (Arg2)) (Arg2)))
 (run 5)
-(extract $j :effsafe)
+(extract $j :extractor effsafe)

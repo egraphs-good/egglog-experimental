@@ -27,4 +27,4 @@
 (let $w3 (Emit (Plus (Clock $w2) (Lit 1)) $w2))
 (run 5)
 ;; The cheaper chain (no Emit of 0) is chosen, and Clock reads that same chain.
-(extract $w3 :effsafe)
+(extract $w3 :extractor effsafe)

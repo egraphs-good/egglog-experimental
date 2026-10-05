@@ -20,4 +20,4 @@
 (let $body (Cons (Assign "a" 1) (Cons (Assign "a" 2) (Cons (Print 2) (Nil)))))
 (let $f (Fn "main" $body))
 (run 5)
-(print-function Fn :effsafe)
+(print-function Fn :extractor effsafe)

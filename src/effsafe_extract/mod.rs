@@ -1,4 +1,5 @@
-//! Effect-safe extraction: `(extract e :effsafe)`, `(print-function Ctor :effsafe)`,
+//! Effect-safe extraction: `(extract e :extractor effsafe)`,
+//! `(print-function Ctor :extractor effsafe)`,
 //! `(set-effectful e)`, `effsafe-regions`, `effsafe-placeholder`, and the
 //! `:regions` annotation on `constructor` and `datatype` declarations.
 //!
@@ -187,42 +188,23 @@ pub fn extract_effsafe(
     })
 }
 
-/// Trailing options shared by `extract` and `print-function`: `:effsafe`
-/// selects effect-safe extraction and `:include-subsumed` lets it extract from
-/// subsumed e-nodes. Returns the remaining arguments.
-pub(crate) struct EffsafeOptions {
-    pub effsafe: bool,
-    pub include_subsumed: bool,
-}
-
-pub(crate) fn split_effsafe_options(mut args: &[Expr]) -> (&[Expr], EffsafeOptions) {
-    let mut options = EffsafeOptions {
-        effsafe: false,
-        include_subsumed: false,
-    };
-    loop {
-        match args {
-            [rest @ .., Expr::Var(_, flag)] if flag == ":include-subsumed" => {
-                options.include_subsumed = true;
-                args = rest;
-            }
-            [rest @ .., Expr::Var(_, flag)] if flag == ":effsafe" => {
-                options.effsafe = true;
-                args = rest;
-            }
-            _ => return (args, options),
-        }
+/// Split a trailing `:include-subsumed` flag, which lets effect-safe
+/// extraction extract from subsumed e-nodes, off a command's arguments.
+pub(crate) fn split_include_subsumed(args: &[Expr]) -> (&[Expr], bool) {
+    match args {
+        [rest @ .., Expr::Var(_, flag)] if flag == ":include-subsumed" => (rest, true),
+        _ => (args, false),
     }
 }
 
 /// Run effect-safe extraction for a command, with the e-graph's models.
 pub(crate) fn extract_with_options(
     egraph: &mut EGraph,
-    options: &EffsafeOptions,
+    include_subsumed: bool,
     roots: &Roots,
 ) -> Result<EffsafeExtractOutput, Error> {
     let mut state = effsafe_state(egraph).clone();
-    state.config.include_subsumed |= options.include_subsumed;
+    state.config.include_subsumed |= include_subsumed;
     extract_effsafe(
         egraph,
         roots,
@@ -313,24 +295,25 @@ impl UserDefinedCommand for EffsafePlaceholder {
     }
 }
 
-/// `print-function` with an `:effsafe` option: prints the effect-safe
+/// `print-function` with `:extractor effsafe`: prints the effect-safe
 /// extraction of every e-class holding an e-node of the table. Without the
 /// option it is egglog's `print-function`.
 pub struct PrintFunction;
 
 impl UserDefinedCommand for PrintFunction {
     fn update(&self, egraph: &mut EGraph, args: &[Expr]) -> Result<Vec<CommandOutput>, Error> {
-        let (args, options) = split_effsafe_options(args);
+        let (args, include_subsumed) = split_include_subsumed(args);
         let [name, rest @ ..] = args else {
             return Err(usage(
                 span!(),
-                "usage: (print-function <table> [n] [:file \"f\"] [:mode csv|default] [:effsafe] [:include-subsumed])",
+                "usage: (print-function <table> [n] [:file \"f\"] [:mode csv|default] [:extractor effsafe] [:include-subsumed])",
             ));
         };
         let name = expect_name(name, "table")?;
         let mut rows: Option<usize> = None;
         let mut file: Option<String> = None;
         let mut mode = PrintFunctionMode::Default;
+        let mut effsafe = false;
         let mut rest = rest;
         if let [Expr::Lit(_, Literal::Int(n)), tail @ ..] = rest {
             rows =
@@ -344,11 +327,12 @@ impl UserDefinedCommand for PrintFunction {
                 (":file", Expr::Lit(_, Literal::String(f))) => file = Some(f.clone()),
                 (":mode", Expr::Var(_, m)) if m == "csv" => mode = PrintFunctionMode::CSV,
                 (":mode", Expr::Var(_, m)) if m == "default" => mode = PrintFunctionMode::Default,
+                (":extractor", Expr::Var(_, e)) if e == "effsafe" => effsafe = true,
                 _ => {
                     return Err(usage(
                         span.clone(),
                         "unknown option to print-function; supported: `:mode csv|default`, \
-                         `:file \"<filename>\"`, `:effsafe`, `:include-subsumed`",
+                         `:file \"<filename>\"`, `:extractor effsafe`, `:include-subsumed`",
                     ));
                 }
             }
@@ -366,7 +350,7 @@ impl UserDefinedCommand for PrintFunction {
             })
             .transpose()?;
 
-        if !options.effsafe {
+        if !effsafe {
             return Ok(egraph
                 .print_function(&name, rows, file, span!(), mode)?
                 .into_iter()
@@ -378,7 +362,7 @@ impl UserDefinedCommand for PrintFunction {
                 &format!("{name} is not a declared table"),
             ));
         };
-        let output = extract_with_options(egraph, &options, &Roots::Constructor(&name))?;
+        let output = extract_with_options(egraph, include_subsumed, &Roots::Constructor(&name))?;
         let mut terms: Vec<(TermId, TermId)> = output.terms.iter().map(|&t| (t, t)).collect();
         if let Some(n) = rows {
             terms.truncate(n);
@@ -505,7 +489,7 @@ impl Macro<Vec<Command>> for RegionsAnnotation {
 
 /// Register effect-safe extraction on an e-graph: the `:regions` annotation,
 /// `set-effectful`, `effsafe-regions`, `effsafe-placeholder`, and
-/// `print-function` with its `:effsafe` option. The `:effsafe` option of
+/// `print-function` with `:extractor effsafe`. The `:extractor effsafe` of
 /// `extract` lives in the dynamic-cost `extract` command (`set_cost.rs`).
 /// Cost models default to the dynamic cost model with summed subregions; see
 /// [`set_effsafe_cost_models`].

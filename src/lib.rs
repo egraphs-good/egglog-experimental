@@ -75,8 +75,8 @@
 //!   one [`MultiExtractOutput`] whose public fields expose shared term storage
 //!   and ordered per-root variant IDs.
 //! - [`KeepBestCommand`] compacts selected tables to their best terms.
-//! - [`effsafe_extract`] adds `(extract term :effsafe)` and
-//!   `(print-function Ctor :effsafe)`: effect-safe extraction for languages
+//! - [`effsafe_extract`] adds `(extract term :extractor effsafe)` and
+//!   `(print-function Ctor :extractor effsafe)`: effect-safe extraction for languages
 //!   that thread a state through their terms. `(set-effectful e)` marks the
 //!   effectful e-classes and `:regions` annotations on constructors mark
 //!   subregions (see `docs/effsafe-extract.md`).

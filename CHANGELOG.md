@@ -8,8 +8,8 @@ This file records notable user-facing changes to egglog-experimental.
 
 - Effect-safe extraction for languages that thread a state through their
   terms (statewalk DP, Flatt et al., OOPSLA 2026,
-  <https://doi.org/10.1145/3839530>), ported from eggcc: `(extract e :effsafe)`
-  and `(print-function Ctor :effsafe)`. `(set-effectful e)` marks effectful
+  <https://doi.org/10.1145/3839530>), ported from eggcc: `(extract e :extractor effsafe)`
+  and `(print-function Ctor :extractor effsafe)`. `(set-effectful e)` marks effectful
   e-classes in a generated relation per sort; the `:regions` option on
   `constructor` and `datatype` variants (or `effsafe-regions`) marks the
   arguments that start subregions; `effsafe-placeholder` skips a sort. Costs

@@ -16,4 +16,4 @@
 (let $s1 (Print (Num 1) $s0))
 (let $c (Call "f" (vec-of (Read $s1) (Num 2) $s1)))
 (run 3)
-(extract $c :effsafe)
+(extract $c :extractor effsafe)

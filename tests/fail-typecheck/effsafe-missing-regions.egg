@@ -11,4 +11,4 @@
 (let $s0 (Arg))
 (let $i (If (Num 1) $s0 (Print (Num 2) $s0) (Print (Num 3) $s0)))
 (run 5)
-(extract $i :effsafe)
+(extract $i :extractor effsafe)

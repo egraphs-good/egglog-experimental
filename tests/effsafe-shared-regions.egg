@@ -19,4 +19,4 @@
 (let $f (Fn "f" (Loop (Arg) $body)))
 (let $g (Fn "g" (Call "f" (Loop (Print (Num 0) (Arg)) $body))))
 (run 3)
-(print-function Fn :effsafe)
+(print-function Fn :extractor effsafe)

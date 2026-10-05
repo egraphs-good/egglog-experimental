@@ -150,20 +150,20 @@ Costs are `u64`s with saturating arithmetic.
 ## Commands
 
 ```lisp
-(extract <expr> :effsafe [:include-subsumed])
-(print-function <constructor> [n] :effsafe [:include-subsumed])
+(extract <expr> :extractor effsafe [:include-subsumed])
+(print-function <constructor> [n] :extractor effsafe [:include-subsumed])
 (set-effectful <expr>)
 (effsafe-regions <constructor> <position>...)
 (effsafe-placeholder <sort> <expr>)
 ```
 
-`extract ... :effsafe` extracts the expression's e-class, which must be
+`extract ... :extractor effsafe` extracts the expression's e-class, which must be
 effectful, and reports it like any `extract` (the cost is the sum of the
 marginal costs of the e-nodes in the extracted DAG). `print-function ...
-:effsafe` extracts every e-class that holds an e-node of the constructor, in
+:extractor effsafe` extracts every e-class that holds an e-node of the constructor, in
 e-class order, sharing regions between them, and prints one term per
-e-class. Variants (`extract e n`) and `:extractor` are not supported with
-`:effsafe`.
+e-class. Variants (`extract e n`), `multi-extract` and `keep-best` do not support
+`:extractor effsafe`.
 
 From Rust, `extract_effsafe` runs the same extraction with an explicit
 `EffsafeConfig`, and `set_effsafe_cost_models` installs custom cost models
@@ -178,7 +178,7 @@ A program whose rules subsume e-nodes for other reasons (to stop rewrites
 from firing again, say) can include them with `:include-subsumed`:
 
 ```lisp
-(print-function Func :effsafe :include-subsumed)
+(print-function Func :extractor effsafe :include-subsumed)
 ```
 
 ## Limitations
@@ -191,4 +191,4 @@ from firing again, say) can include them with `:include-subsumed`:
 - A container holding two states is an error, like any e-node with two
   effectful children.
 - Roots must be marked with `set-effectful`. Extracting a pure root is a plain
-  tree extraction, which `extract` without `:effsafe` already provides.
+  tree extraction, which `extract` without `:extractor effsafe` already provides.

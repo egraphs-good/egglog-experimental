@@ -17,7 +17,7 @@
 use crate::{
     Error,
     greedy_dag_extract::{
-        extract_best_greedy_dag, extract_variants_greedy_dag, split_trailing_extractor,
+        Extractor, extract_best_greedy_dag, extract_variants_greedy_dag, split_trailing_extractor,
     },
 };
 use egglog::{
@@ -249,14 +249,9 @@ impl UserDefinedCommand for CustomExtract {
         egraph: &mut EGraph,
         args: &[Expr],
     ) -> Result<Vec<CommandOutput>, egglog::Error> {
-        let (args, effsafe) = crate::effsafe_extract::split_effsafe_options(args);
-        let (args, use_greedy_dag) = split_trailing_extractor(args)?;
-        if effsafe.effsafe && use_greedy_dag {
-            return Err(Error::ParseError(ParseError(
-                span!(),
-                ":effsafe and :extractor cannot be combined".into(),
-            )));
-        }
+        let (args, include_subsumed) = crate::effsafe_extract::split_include_subsumed(args);
+        let (args, extractor) = split_trailing_extractor(args)?;
+        let use_greedy_dag = extractor == Extractor::GreedyDag;
         let (expr, variants) = match args {
             [] => {
                 return Err(Error::ParseError(ParseError(
@@ -301,7 +296,7 @@ impl UserDefinedCommand for CustomExtract {
 
         let roots = vec![(sort, value)];
 
-        if effsafe.effsafe {
+        if extractor == Extractor::Effsafe {
             if n != 0 {
                 return Err(Error::ParseError(ParseError(
                     variants.unwrap().span(),
@@ -310,7 +305,7 @@ impl UserDefinedCommand for CustomExtract {
             }
             let output = crate::effsafe_extract::extract_with_options(
                 egraph,
-                &effsafe,
+                include_subsumed,
                 &crate::effsafe_extract::Roots::Values(roots),
             )?;
             let term = output.terms[0];

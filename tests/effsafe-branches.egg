@@ -22,9 +22,9 @@
 ;; the else branch's product simplifies to the same value
 (rewrite (Mul x (Num 1)) x)
 (run 5)
-(extract $if :effsafe)
+(extract $if :extractor effsafe)
 
 ;; make the expensive value pricey: the branches still each need it (they are
 ;; separate regions with separate states), so the extraction is unchanged.
 (set-cost (Expensive 7) 100)
-(extract $if :effsafe)
+(extract $if :extractor effsafe)

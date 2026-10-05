@@ -13,7 +13,9 @@
 //! subterms once within each ranked variant. Greedy-DAG extraction is a
 //! heuristic rather than a globally optimal k-best extractor.
 
-use crate::greedy_dag_extract::{extract_variants_greedy_dag, split_trailing_extractor};
+use crate::greedy_dag_extract::{
+    extract_variants_greedy_dag, greedy_dag_or_tree, split_trailing_extractor,
+};
 use egglog::{
     CommandOutput, EGraph, Error, TermDag, TermId, TypeError, UserDefinedCommand,
     ast::{Expr, ParseError},
@@ -106,7 +108,8 @@ impl<C: MonoidCost, CM: DagCostModel<C> + Clone + Send + Sync + 'static> UserDef
     for MultiExtract<C, CM>
 {
     fn update(&self, egraph: &mut EGraph, args: &[Expr]) -> Result<Vec<CommandOutput>, Error> {
-        let (args, use_greedy_dag) = split_trailing_extractor(args)?;
+        let (args, extractor) = split_trailing_extractor(args)?;
+        let use_greedy_dag = greedy_dag_or_tree(extractor, "multi-extract")?;
 
         let Some((variants_expr, mut terms)) = args.split_first() else {
             return Err(Error::ParseError(ParseError(
