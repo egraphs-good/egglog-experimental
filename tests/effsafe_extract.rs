@@ -1,8 +1,8 @@
-//! Effect-safe extraction (`effsafe-extract`): the extracted terms are checked
+//! Effect-safe extraction (`extract :effsafe`): the extracted terms are checked
 //! against expected strings, which the `.egg` file harness cannot do.
 
 use egglog::CommandOutput;
-use egglog_experimental::{EffsafeExtractOutput, new_experimental_egraph};
+use egglog_experimental::new_experimental_egraph;
 
 /// A small effectful language: `Print` and `Arg` carry the state, `Read`
 /// is a pure value that depends on a state, `If` and `Loop` have subregions.
@@ -16,12 +16,11 @@ const LANG: &str = r#"
   (If Expr Expr Expr Expr :regions (2 3))
   (Loop Expr Expr :regions (1)))
 (constructor Func (String Expr) Expr)
-(relation Effectful (Expr))
-(rule ((= e (Arg))) ((Effectful e)))
-(rule ((= e (Print v s))) ((Effectful e)))
-(rule ((= e (If p s t els))) ((Effectful e)))
-(rule ((= e (Loop s b))) ((Effectful e)))
-(rule ((= e (Func n b))) ((Effectful e)))
+(rule ((= e (Arg))) ((set-effectful e)))
+(rule ((= e (Print v s))) ((set-effectful e)))
+(rule ((= e (If p s t els))) ((set-effectful e)))
+(rule ((= e (Loop s b))) ((set-effectful e)))
+(rule ((= e (Func n b))) ((set-effectful e)))
 "#;
 
 /// Run `program` after the language prelude and return the terms of every
@@ -34,16 +33,10 @@ fn extract(program: &str) -> Vec<Vec<String>> {
     outputs
         .iter()
         .filter_map(|output| match output {
-            CommandOutput::UserDefined(out) => out
-                .as_ref()
-                .as_any()
-                .downcast_ref::<EffsafeExtractOutput>()
-                .map(|out| {
-                    out.terms
-                        .iter()
-                        .map(|&t| out.termdag.to_string(t))
-                        .collect()
-                }),
+            CommandOutput::ExtractBest(termdag, _, term) => Some(vec![termdag.to_string(*term)]),
+            CommandOutput::PrintFunction(_, termdag, terms, _) => {
+                Some(terms.iter().map(|(t, _)| termdag.to_string(*t)).collect())
+            }
             _ => None,
         })
         .collect()
@@ -75,7 +68,7 @@ fn picks_one_state_chain() {
         (union $p1 $p2)
         (let $p3 (Print (Add (Num 2) (Num 3)) $p1))
         (run 5)
-        (effsafe-extract Effectful $p3)
+        (extract $p3 )
         "#,
     );
     assert_eq!(term, "(Print (Add (Num 2) (Num 3)) (Print (Num 1) (Arg)))");
@@ -96,7 +89,7 @@ fn reads_use_the_chosen_state() {
         (union $s1 $s1b)
         (let $root (Print (Add (Read $s1) (Read $s1)) $s1))
         (run 5)
-        (effsafe-extract Effectful $root)
+        (extract $root )
         "#,
     );
     // The cheaper (Num 2) print is chosen, and both Reads refer to it.
@@ -115,7 +108,7 @@ fn nested_regions() {
         (let $branch (If (Num 0) $s0 (Print (Num 2) $inner) (Arg)))
         (let $outer (Loop $s0 $branch))
         (run 5)
-        (effsafe-extract Effectful $outer)
+        (extract $outer )
         "#,
     );
     assert_eq!(
@@ -132,7 +125,7 @@ fn subregion_shared_by_two_roots_is_extracted_once() {
         (let $f (Func "f" (Loop (Arg) $body)))
         (let $g (Func "g" (Print (Num 9) (Loop (Arg) $body))))
         (run 5)
-        (effsafe-extract-all Effectful Func)
+        (print-function Func )
         "#,
     );
     assert_eq!(terms.len(), 1);
@@ -157,7 +150,8 @@ fn multiple_roots_in_one_call() {
         (let $a (Print (Num 1) $s0))
         (let $b (Print (Num 2) $a))
         (run 5)
-        (effsafe-extract Effectful $a $b)
+        (extract $a )
+        (extract $b )
         "#,
     );
     assert_eq!(
@@ -182,7 +176,7 @@ fn dynamic_costs_steer_the_choice() {
         (union $p $q)
         (set-cost (Big 7) 1000)
         (run 5)
-        (effsafe-extract Effectful $p)
+        (extract $p )
         "#,
     );
     assert_eq!(term, "(Print (Add (Num 3) (Num 4)) (Arg))");
@@ -198,7 +192,7 @@ fn placeholders_replace_a_sort() {
         (let $l (Loop $s0 (Print (Leaf (InLoop (Arg))) (Arg))))
         (effsafe-placeholder Ctx (NoCtx))
         (run 5)
-        (effsafe-extract Effectful $l)
+        (extract $l )
         "#,
     );
     assert_eq!(term, "(Loop (Arg) (Print (Leaf (NoCtx)) (Arg)))");
@@ -213,7 +207,7 @@ fn containers_are_extracted_element_by_element() {
         (let $s0 (Arg))
         (let $p (Print (Many (vec-of (Num 1) (Add (Num 2) (Num 3)))) $s0))
         (run 5)
-        (effsafe-extract Effectful $p)
+        (extract $p )
         "#,
     );
     assert_eq!(
@@ -231,14 +225,14 @@ fn containers_carry_the_state() {
         r#"
         (sort Exprs (Vec Expr))
         (constructor Call (String Exprs) Expr)
-        (rule ((= e (Call n args))) ((Effectful e)))
+        (rule ((= e (Call n args))) ((set-effectful e)))
         (let $s0 (Arg))
         (let $s1 (Print (Num 1) $s0))
         (let $s1b (Print (Add (Num 0) (Num 1)) $s0))
         (union $s1 $s1b)
         (let $c (Call "f" (vec-of (Read $s1) $s1)))
         (run 5)
-        (effsafe-extract Effectful $c)
+        (extract $c )
         "#,
     );
     assert_eq!(
@@ -256,24 +250,22 @@ fn subsumed_nodes_are_skipped_unless_included() {
         (run 5)
         (subsume (Print (Num 1) $s0))
     "#;
-    let err = extract_error(&format!("{program}\n(effsafe-extract Effectful $p)"));
+    let err = extract_error(&format!("{program}\n(extract $p )"));
     assert!(
         err.contains("no extractable e-nodes") || err.contains("no finite term"),
         "unexpected error: {err}"
     );
-    let term = extract_one(&format!(
-        "{program}\n(effsafe-extract Effectful $p :include-subsumed)"
-    ));
+    let term = extract_one(&format!("{program}\n(extract $p  :include-subsumed)"));
     assert_eq!(term, "(Print (Num 1) (Arg))");
 }
 
 #[test]
 fn errors_are_reported() {
-    let err = extract_error("(let $n (Num 1)) (run 1) (effsafe-extract Effectful $n)");
+    let err = extract_error("(let $n (Num 1)) (run 1) (extract $n )");
     assert!(err.contains("not effectful"), "unexpected error: {err}");
 
-    let err = extract_error("(let $s (Arg)) (run 1) (effsafe-extract Missing $s)");
-    assert!(err.contains("not declared"), "unexpected error: {err}");
+    let err = extract_error("(set-effectful 1)");
+    assert!(err.contains("not an eq sort"), "unexpected error: {err}");
 
     let err = extract_error("(effsafe-regions Print 5)");
     assert!(err.contains("out of range"), "unexpected error: {err}");
@@ -281,10 +273,10 @@ fn errors_are_reported() {
     let err = extract_error(
         r#"
         (constructor Both (Expr Expr) Expr)
-        (rule ((= e (Both a b))) ((Effectful e)))
+        (rule ((= e (Both a b))) ((set-effectful e)))
         (let $b (Both (Arg) (Arg)))
         (run 2)
-        (effsafe-extract Effectful $b)
+        (extract $b )
         "#,
     );
     assert!(err.contains("marked as regions"), "unexpected error: {err}");

@@ -167,37 +167,33 @@ impl<'e> Builder<'e> {
         Ok(())
     }
 
-    /// Mark the e-classes in the effectful relation.
-    fn mark_effectful(&mut self, relation: &str) -> Result<(), Error> {
-        let Some(func) = self.egraph.get_function(relation) else {
-            return Err(Error::ExtractError(format!(
-                "effectful relation {relation} is not declared"
-            )));
-        };
-        let ty = func.func_type();
-        let [sort] = &ty.input[..] else {
-            return Err(Error::ExtractError(format!(
-                "effectful relation {relation} must take exactly one argument"
-            )));
-        };
-        if !sort.is_eq_sort() {
-            return Err(Error::ExtractError(format!(
-                "effectful relation {relation} must range over an eq sort"
-            )));
-        }
-        let sort_id = self.sort_id(sort);
-        let mut values = Vec::new();
-        match ty.subtype {
-            FunctionSubtype::Constructor => self
-                .egraph
-                .constructor_enodes(relation, |enode| values.push(enode.children[0]))?,
-            FunctionSubtype::Custom => self
-                .egraph
-                .function_entries(relation, |entry| values.push(entry.inputs[0]))?,
-        }
-        for value in values {
-            if let Some(&class) = self.class_ids.get(&(sort_id, value)) {
-                self.g.classes[class].is_effectful = true;
+    /// Mark the e-classes recorded by `set-effectful`: every row of every
+    /// generated `effsafe_effectful_<Sort>` relation.
+    fn mark_effectful(&mut self) -> Result<(), Error> {
+        let relations: Vec<(String, ArcSort, FunctionSubtype)> = self
+            .egraph
+            .functions_iter()
+            .filter(|(name, _)| super::set_effectful::effectful_relation_sort(name).is_some())
+            .filter_map(|(name, func)| match &func.func_type().input[..] {
+                [sort] => Some((name.clone(), sort.clone(), func.func_type().subtype)),
+                _ => None,
+            })
+            .collect();
+        for (relation, sort, subtype) in relations {
+            let sort_id = self.sort_id(&sort);
+            let mut values = Vec::new();
+            match subtype {
+                FunctionSubtype::Constructor => self
+                    .egraph
+                    .constructor_enodes(&relation, |enode| values.push(enode.children[0]))?,
+                FunctionSubtype::Custom => self
+                    .egraph
+                    .function_entries(&relation, |entry| values.push(entry.inputs[0]))?,
+            }
+            for value in values {
+                if let Some(&class) = self.class_ids.get(&(sort_id, value)) {
+                    self.g.classes[class].is_effectful = true;
+                }
             }
         }
         self.mark_effectful_containers();
@@ -309,7 +305,7 @@ impl<'e> Builder<'e> {
                     .collect();
                 return Err(Error::ExtractError(format!(
                     "extraction root is not effectful (e-class with {names:?}); \
-                     effsafe-extract roots must be in the effectful relation"
+                     roots must be marked with set-effectful"
                 )));
             }
         }
@@ -368,7 +364,6 @@ pub fn build(
     egraph: &egglog::EGraph,
     config: &EffsafeConfig,
     cost_model: &dyn DagCostModel<Cost>,
-    effectful: &str,
     roots: &Roots,
 ) -> Result<(TermGraph, Vec<EClassId>), Error> {
     let mut builder = Builder {
@@ -381,7 +376,7 @@ pub fn build(
         placeholder_classes: FxIndexMap::default(),
     };
     builder.collect()?;
-    builder.mark_effectful(effectful)?;
+    builder.mark_effectful()?;
     let roots = builder.resolve_roots(roots)?;
     builder.validate(&roots)?;
     let roots = builder.restrict_to_reachable(&roots);

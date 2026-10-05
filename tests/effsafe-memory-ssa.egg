@@ -12,10 +12,9 @@
   (Load Expr Expr)           ; (Load ptr mem) -> value, pure
   (Ret Expr Expr))           ; (Ret value mem) -> mem
 
-(relation Effectful (Expr))
-(rule ((= e (Mem))) ((Effectful e)))
-(rule ((= e (Store p v m))) ((Effectful e)))
-(rule ((= e (Ret v m))) ((Effectful e)))
+(rule ((= e (Mem))) ((set-effectful e)))
+(rule ((= e (Store p v m))) ((set-effectful e)))
+(rule ((= e (Ret v m))) ((set-effectful e)))
 
 ;; store-to-load forwarding
 (rewrite (Load p (Store p v m)) v)
@@ -31,9 +30,9 @@
 (run 10)
 (check (= $x (Num 1)))
 ;; Both loads are forwarded; the stores stay because the final memory depends on them.
-(effsafe-extract Effectful $m3)
+(extract $m3 :effsafe)
 
 ;; A load the rewrites cannot forward (unknown pointer) must read the chosen state.
 (let $m4 (Ret (Load (Ptr "z") $m2) $m2))
 (run 5)
-(effsafe-extract Effectful $m4)
+(extract $m4 :effsafe)

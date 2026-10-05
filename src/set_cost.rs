@@ -249,7 +249,14 @@ impl UserDefinedCommand for CustomExtract {
         egraph: &mut EGraph,
         args: &[Expr],
     ) -> Result<Vec<CommandOutput>, egglog::Error> {
+        let (args, effsafe) = crate::effsafe_extract::split_effsafe_options(args);
         let (args, use_greedy_dag) = split_trailing_extractor(args)?;
+        if effsafe.effsafe && use_greedy_dag {
+            return Err(Error::ParseError(ParseError(
+                span!(),
+                ":effsafe and :extractor cannot be combined".into(),
+            )));
+        }
         let (expr, variants) = match args {
             [] => {
                 return Err(Error::ParseError(ParseError(
@@ -293,6 +300,27 @@ impl UserDefinedCommand for CustomExtract {
         }
 
         let roots = vec![(sort, value)];
+
+        if effsafe.effsafe {
+            if n != 0 {
+                return Err(Error::ParseError(ParseError(
+                    variants.unwrap().span(),
+                    "effect-safe extraction does not support variants".into(),
+                )));
+            }
+            let output = crate::effsafe_extract::extract_with_options(
+                egraph,
+                &effsafe,
+                &crate::effsafe_extract::Roots::Values(roots),
+            )?;
+            let term = output.terms[0];
+            let cost = output.costs[0];
+            log::info!(
+                "extracted effect-safely with cost {cost}: {}",
+                output.termdag.to_string(term)
+            );
+            return Ok(vec![CommandOutput::ExtractBest(output.termdag, cost, term)]);
+        }
 
         // Omitted or zero variant count means best extraction.
         if n == 0 {

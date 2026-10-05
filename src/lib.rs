@@ -75,10 +75,11 @@
 //!   one [`MultiExtractOutput`] whose public fields expose shared term storage
 //!   and ordered per-root variant IDs.
 //! - [`KeepBestCommand`] compacts selected tables to their best terms.
-//! - [`effsafe_extract`] implements `(effsafe-extract rel term...)` and
-//!   `(effsafe-extract-all rel constructor)`: effect-safe extraction for
-//!   languages that thread a state through their terms, configured with
-//!   `:regions` annotations on constructors (see `docs/effsafe-extract.md`).
+//! - [`effsafe_extract`] adds `(extract term :effsafe)` and
+//!   `(print-function Ctor :effsafe)`: effect-safe extraction for languages
+//!   that thread a state through their terms. `(set-effectful e)` marks the
+//!   effectful e-classes and `:regions` annotations on constructors mark
+//!   subregions (see `docs/effsafe-extract.md`).
 //! - `:extractor greedy-dag` enables heuristic DAG-cost extraction for
 //!   `extract`, `multi-extract`, and `keep-best`. Within each independently
 //!   costed root or variant, it charges shared subterms once. It does not

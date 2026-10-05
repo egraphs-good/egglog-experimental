@@ -10,10 +10,9 @@
   (Cons Stmt Block))
 (constructor Fn (String Block) Block)
 
-(relation Effectful (Block))
-(rule ((= b (Nil))) ((Effectful b)))
-(rule ((= b (Cons s r))) ((Effectful b)))
-(rule ((= b (Fn n body))) ((Effectful b)))
+(rule ((= b (Nil))) ((set-effectful b)))
+(rule ((= b (Cons s r))) ((set-effectful b)))
+(rule ((= b (Fn n body))) ((set-effectful b)))
 
 ;; a dead assignment followed by a re-assignment can be dropped
 (rewrite (Cons (Assign x v) (Cons (Assign x w) rest)) (Cons (Assign x w) rest))
@@ -21,4 +20,4 @@
 (let $body (Cons (Assign "a" 1) (Cons (Assign "a" 2) (Cons (Print 2) (Nil)))))
 (let $f (Fn "main" $body))
 (run 5)
-(effsafe-extract-all Effectful Fn)
+(print-function Fn :effsafe)

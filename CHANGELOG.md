@@ -6,14 +6,15 @@ This file records notable user-facing changes to egglog-experimental.
 
 ### Added
 
-- `effsafe-extract` and `effsafe-extract-all`: effect-safe extraction for
-  languages that thread a state through their terms (statewalk DP, Flatt et
-  al., OOPSLA 2026, <https://doi.org/10.1145/3839530>), ported from eggcc. Effectful e-classes are given by a relation; the
-  `:regions` option on `constructor` and `datatype` variants (or
-  `effsafe-regions`) marks the arguments that start subregions;
-  `effsafe-placeholder` skips a sort. Costs come from the dynamic cost model
-  plus a `RegionCostModel` hook for subregion costs. See
-  `docs/effsafe-extract.md`.
+- Effect-safe extraction for languages that thread a state through their
+  terms (statewalk DP, Flatt et al., OOPSLA 2026,
+  <https://doi.org/10.1145/3839530>), ported from eggcc: `(extract e :effsafe)`
+  and `(print-function Ctor :effsafe)`. `(set-effectful e)` marks effectful
+  e-classes in a generated relation per sort; the `:regions` option on
+  `constructor` and `datatype` variants (or `effsafe-regions`) marks the
+  arguments that start subregions; `effsafe-placeholder` skips a sort. Costs
+  come from the dynamic cost model plus a `RegionCostModel` hook for
+  subregion costs. See `docs/effsafe-extract.md`.
 - A `Maybe[T]` sort with construction, partial unwrapping, defaulting,
   undefined-result capture, and higher-order branching. When more than one
   nominal `Maybe` alias is compatible, `maybe-none` requires type context.

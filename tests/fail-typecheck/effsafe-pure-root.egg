@@ -1,9 +1,8 @@
-;; Roots must be effectful; a pure root is a plain tree extraction, which
-;; `extract` already provides.
+;; Roots must be marked with set-effectful; a pure root is a plain tree
+;; extraction, which `extract` without :effsafe already provides.
 (datatype Expr (Arg) (Num i64) (Print Expr Expr))
-(relation Effectful (Expr))
-(rule ((= e (Arg))) ((Effectful e)))
-(rule ((= e (Print v s))) ((Effectful e)))
+(rule ((= e (Arg))) ((set-effectful e)))
+(rule ((= e (Print v s))) ((set-effectful e)))
 (let $n (Num 1))
 (run 1)
-(effsafe-extract Effectful $n)
+(extract $n :effsafe)

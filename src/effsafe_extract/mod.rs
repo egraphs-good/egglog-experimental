@@ -1,11 +1,11 @@
-//! Effect-safe extraction: `effsafe-extract`, `effsafe-extract-all`,
-//! `effsafe-regions`, `effsafe-placeholder`, and the `:regions` annotation on
-//! `constructor` and `datatype` declarations.
+//! Effect-safe extraction: `(extract e :effsafe)`, `(print-function Ctor :effsafe)`,
+//! `(set-effectful e)`, `effsafe-regions`, `effsafe-placeholder`, and the
+//! `:regions` annotation on `constructor` and `datatype` declarations.
 //!
 //! This is the *statewalk DP* of Flatt et al., "Efficient Extraction for
 //! Effectful E-graphs" (OOPSLA 2026, <https://doi.org/10.1145/3839530>).
 //! See `docs/effsafe-extract.md` for the language-level description. In short:
-//! the program marks effectful e-classes in a relation, annotates which
+//! the program marks effectful e-classes with `set-effectful`, annotates which
 //! constructor arguments start subregions, and the extractor chooses one
 //! effectful e-node per e-class along each region's *statewalk* such that the
 //! pure terms those e-nodes need are extractable from the chosen state.
@@ -16,6 +16,7 @@ mod cost;
 mod greedy;
 mod persistent;
 mod region;
+mod set_effectful;
 mod statewalk;
 mod term_graph;
 mod to_term;
@@ -23,7 +24,7 @@ mod to_term;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use egglog::ast::{Command, Expr, Literal, Macro, ParseError, Parser, Sexp};
+use egglog::ast::{Command, Expr, Literal, Macro, ParseError, Parser, PrintFunctionMode, Sexp};
 use egglog::extract::DagCostModel;
 use egglog::{CommandOutput, EGraph, Error, TermDag, TermId, UserDefinedCommand, span};
 use egglog_ast::span::Span;
@@ -31,6 +32,7 @@ use rustc_hash::FxHashMap;
 
 pub use build::Roots;
 pub use cost::{Cost, RegionCostModel, SumRegions};
+pub use set_effectful::{SetEffectful, effectful_relation};
 pub use statewalk::StatewalkOptions;
 
 /// The language's effect annotations, collected from `:regions` and
@@ -101,13 +103,16 @@ pub fn set_effsafe_cost_models(
     state.region_costs = Arc::new(region_costs);
 }
 
-/// Output of `effsafe-extract` and `effsafe-extract-all`: one term per root.
+/// Result of an effect-safe extraction: one term per root.
 #[derive(Debug)]
 pub struct EffsafeExtractOutput {
     /// Term storage shared by every root.
     pub termdag: TermDag,
-    /// Root terms, in request order (or e-class order for `effsafe-extract-all`).
+    /// Root terms, in request order (or e-class order for a whole constructor).
     pub terms: Vec<TermId>,
+    /// Per root, the sum of the marginal costs of the distinct e-nodes in its
+    /// extracted DAG (subregion folds are not included).
+    pub costs: Vec<Cost>,
 }
 
 impl std::fmt::Display for EffsafeExtractOutput {
@@ -123,21 +128,18 @@ impl std::fmt::Display for EffsafeExtractOutput {
     }
 }
 
-/// Extract `roots` effect-safely.
-///
-/// `effectful` names the relation holding the effectful e-classes.
-/// `cost_model` gives each e-node's marginal cost; `region_costs` folds the
-/// costs of an e-node's subregions into its own.
+/// Extract `roots` effect-safely. Effectful e-classes are those marked with
+/// `set-effectful`. `cost_model` gives each e-node's marginal cost;
+/// `region_costs` folds the costs of an e-node's subregions into its own.
 pub fn extract_effsafe(
     egraph: &EGraph,
-    effectful: &str,
     roots: &Roots,
     config: &EffsafeConfig,
     cost_model: &dyn DagCostModel<Cost>,
     region_costs: &dyn RegionCostModel,
 ) -> Result<EffsafeExtractOutput, Error> {
     let t0 = std::time::Instant::now();
-    let (g, root_classes) = build::build(egraph, config, cost_model, effectful, roots)?;
+    let (g, root_classes) = build::build(egraph, config, cost_model, roots)?;
     let t_build = t0.elapsed();
     let t1 = std::time::Instant::now();
     let extractions = region::extract_all(
@@ -170,15 +172,64 @@ pub fn extract_effsafe(
         .iter()
         .map(|e| to_term::extraction_to_term(&g, egraph, &placeholders, e, &mut termdag))
         .collect();
-    Ok(EffsafeExtractOutput { termdag, terms })
+    let costs = extractions
+        .iter()
+        .map(|e| {
+            e.iter().fold(0, |acc: Cost, en| {
+                acc.saturating_add(g.enode(en.class, en.node).cost)
+            })
+        })
+        .collect();
+    Ok(EffsafeExtractOutput {
+        termdag,
+        terms,
+        costs,
+    })
 }
 
-/// Split a trailing `:include-subsumed` flag off a command's arguments.
-fn split_include_subsumed(args: &[Expr]) -> (&[Expr], bool) {
-    match args.split_last() {
-        Some((Expr::Var(_, flag), rest)) if flag == ":include-subsumed" => (rest, true),
-        _ => (args, false),
+/// Trailing options shared by `extract` and `print-function`: `:effsafe`
+/// selects effect-safe extraction and `:include-subsumed` lets it extract from
+/// subsumed e-nodes. Returns the remaining arguments.
+pub(crate) struct EffsafeOptions {
+    pub effsafe: bool,
+    pub include_subsumed: bool,
+}
+
+pub(crate) fn split_effsafe_options(mut args: &[Expr]) -> (&[Expr], EffsafeOptions) {
+    let mut options = EffsafeOptions {
+        effsafe: false,
+        include_subsumed: false,
+    };
+    loop {
+        match args {
+            [rest @ .., Expr::Var(_, flag)] if flag == ":include-subsumed" => {
+                options.include_subsumed = true;
+                args = rest;
+            }
+            [rest @ .., Expr::Var(_, flag)] if flag == ":effsafe" => {
+                options.effsafe = true;
+                args = rest;
+            }
+            _ => return (args, options),
+        }
     }
+}
+
+/// Run effect-safe extraction for a command, with the e-graph's models.
+pub(crate) fn extract_with_options(
+    egraph: &mut EGraph,
+    options: &EffsafeOptions,
+    roots: &Roots,
+) -> Result<EffsafeExtractOutput, Error> {
+    let mut state = effsafe_state(egraph).clone();
+    state.config.include_subsumed |= options.include_subsumed;
+    extract_effsafe(
+        egraph,
+        roots,
+        &state.config,
+        state.cost_model.as_ref(),
+        state.region_costs.as_ref(),
+    )
 }
 
 fn usage(span: Span, msg: &str) -> Error {
@@ -262,69 +313,83 @@ impl UserDefinedCommand for EffsafePlaceholder {
     }
 }
 
-/// `(effsafe-extract <effectful-relation> <expr>...)`.
-pub struct EffsafeExtract;
+/// `print-function` with an `:effsafe` option: prints the effect-safe
+/// extraction of every e-class holding an e-node of the table. Without the
+/// option it is egglog's `print-function`.
+pub struct PrintFunction;
 
-impl UserDefinedCommand for EffsafeExtract {
+impl UserDefinedCommand for PrintFunction {
     fn update(&self, egraph: &mut EGraph, args: &[Expr]) -> Result<Vec<CommandOutput>, Error> {
-        let (args, include_subsumed) = split_include_subsumed(args);
-        let [relation, exprs @ ..] = args else {
+        let (args, options) = split_effsafe_options(args);
+        let [name, rest @ ..] = args else {
             return Err(usage(
                 span!(),
-                "usage: (effsafe-extract <effectful-relation> <expr>... [:include-subsumed])",
+                "usage: (print-function <table> [n] [:file \"f\"] [:mode csv|default] [:effsafe] [:include-subsumed])",
             ));
         };
-        if exprs.is_empty() {
-            return Err(usage(
-                relation.span(),
-                "effsafe-extract needs at least one expression",
-            ));
+        let name = expect_name(name, "table")?;
+        let mut rows: Option<usize> = None;
+        let mut file: Option<String> = None;
+        let mut mode = PrintFunctionMode::Default;
+        let mut rest = rest;
+        if let [Expr::Lit(_, Literal::Int(n)), tail @ ..] = rest {
+            rows =
+                Some(usize::try_from(*n).map_err(|_| {
+                    usage(rest[0].span(), "the number of rows must be non-negative")
+                })?);
+            rest = tail;
         }
-        let relation = expect_name(relation, "relation")?;
-        let values = exprs
-            .iter()
-            .map(|e| egraph.eval_expr(e))
-            .collect::<Result<Vec<_>, _>>()?;
-        let mut state = effsafe_state(egraph).clone();
-        state.config.include_subsumed |= include_subsumed;
-        let output = extract_effsafe(
-            egraph,
-            &relation,
-            &Roots::Values(values),
-            &state.config,
-            state.cost_model.as_ref(),
-            state.region_costs.as_ref(),
-        )?;
-        Ok(vec![CommandOutput::UserDefined(Arc::new(output))])
-    }
-}
+        while let [Expr::Var(span, option), value, tail @ ..] = rest {
+            match (option.as_str(), value) {
+                (":file", Expr::Lit(_, Literal::String(f))) => file = Some(f.clone()),
+                (":mode", Expr::Var(_, m)) if m == "csv" => mode = PrintFunctionMode::CSV,
+                (":mode", Expr::Var(_, m)) if m == "default" => mode = PrintFunctionMode::Default,
+                _ => {
+                    return Err(usage(
+                        span.clone(),
+                        "unknown option to print-function; supported: `:mode csv|default`, \
+                         `:file \"<filename>\"`, `:effsafe`, `:include-subsumed`",
+                    ));
+                }
+            }
+            rest = tail;
+        }
+        if let [extra, ..] = rest {
+            return Err(usage(extra.span(), "unexpected argument to print-function"));
+        }
+        let file = file
+            .map(|f| {
+                let path = std::path::PathBuf::from(&f);
+                std::fs::File::create(&path)
+                    .map(|file| (file, path.clone()))
+                    .map_err(|e| Error::IoError(path, e, span!()))
+            })
+            .transpose()?;
 
-/// `(effsafe-extract-all <effectful-relation> <constructor>)`: extract every
-/// e-class holding an e-node of `constructor`.
-pub struct EffsafeExtractAll;
-
-impl UserDefinedCommand for EffsafeExtractAll {
-    fn update(&self, egraph: &mut EGraph, args: &[Expr]) -> Result<Vec<CommandOutput>, Error> {
-        let (args, include_subsumed) = split_include_subsumed(args);
-        let [relation, constructor] = args else {
+        if !options.effsafe {
+            return Ok(egraph
+                .print_function(&name, rows, file, span!(), mode)?
+                .into_iter()
+                .collect());
+        }
+        let Some(function) = egraph.get_function(&name).cloned() else {
             return Err(usage(
-                span!(),
-                "usage: (effsafe-extract-all <effectful-relation> <constructor> [:include-subsumed])",
+                args[0].span(),
+                &format!("{name} is not a declared table"),
             ));
         };
-        let relation = expect_name(relation, "relation")?;
-        let constructor = expect_name(constructor, "constructor")?;
-        let mut state = effsafe_state(egraph).clone();
-        state.config.include_subsumed |= include_subsumed;
-        let output = extract_effsafe(
-            egraph,
-            &relation,
-            &Roots::Constructor(&constructor),
-            &state.config,
-            state.cost_model.as_ref(),
-            state.region_costs.as_ref(),
-        )?;
-        Ok(vec![CommandOutput::UserDefined(Arc::new(output))])
+        let output = extract_with_options(egraph, &options, &Roots::Constructor(&name))?;
+        let mut terms: Vec<(TermId, TermId)> = output.terms.iter().map(|&t| (t, t)).collect();
+        if let Some(n) = rows {
+            terms.truncate(n);
+        }
+        let result = CommandOutput::PrintFunction(function, output.termdag, terms, mode);
+        if let Some((mut file, path)) = file {
+            use std::io::Write;
+            write!(file, "{result}").map_err(|e| Error::IoError(path, e, span!()))?;
+            return Ok(vec![]);
+        }
+        Ok(vec![result])
     }
 }
 
@@ -438,9 +503,12 @@ impl Macro<Vec<Command>> for RegionsAnnotation {
     }
 }
 
-/// Register effect-safe extraction on an e-graph: the `:regions` annotation
-/// and the `effsafe-*` commands. Cost models default to the dynamic cost
-/// model with summed subregions; see [`set_effsafe_cost_models`].
+/// Register effect-safe extraction on an e-graph: the `:regions` annotation,
+/// `set-effectful`, `effsafe-regions`, `effsafe-placeholder`, and
+/// `print-function` with its `:effsafe` option. The `:effsafe` option of
+/// `extract` lives in the dynamic-cost `extract` command (`set_cost.rs`).
+/// Cost models default to the dynamic cost model with summed subregions; see
+/// [`set_effsafe_cost_models`].
 pub fn add_effsafe_extract(egraph: &mut EGraph) {
     egraph.parser.add_command_macro(Arc::new(RegionsAnnotation {
         head: "constructor",
@@ -448,13 +516,13 @@ pub fn add_effsafe_extract(egraph: &mut EGraph) {
     egraph
         .parser
         .add_command_macro(Arc::new(RegionsAnnotation { head: "datatype" }));
-    let commands: [(&str, Arc<dyn UserDefinedCommand>); 4] = [
+    let commands: [(&str, Arc<dyn UserDefinedCommand>); 3] = [
         ("effsafe-regions", Arc::new(EffsafeRegions)),
         ("effsafe-placeholder", Arc::new(EffsafePlaceholder)),
-        ("effsafe-extract", Arc::new(EffsafeExtract)),
-        ("effsafe-extract-all", Arc::new(EffsafeExtractAll)),
+        ("print-function", Arc::new(PrintFunction)),
     ];
     for (name, command) in commands {
         egraph.add_command(name.into(), command).unwrap();
     }
+    egraph.command_macros_mut().register(Arc::new(SetEffectful));
 }

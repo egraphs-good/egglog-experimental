@@ -45,19 +45,21 @@ not enough; the extractor needs a global view of which state each term uses.
 
 Three things tell the extractor about the language.
 
-### The effectful relation
+### `set-effectful`
 
-A unary relation marks the e-classes whose terms carry the state. The program
-populates it with ordinary rules:
+`(set-effectful e)` marks the e-class of `e` as carrying the state. It is an
+action, so rules can use it:
 
 ```lisp
-(relation Effectful (Expr))
-(rule ((= e (Print v s))) ((Effectful e)))
+(rule ((= e (Print v s))) ((set-effectful e)))
 ```
 
 Effectfulness is a property of e-classes, not constructors: in eggcc an `If`
-is effectful only when its type contains the state. The relation is passed to
-the extraction commands by name, so a program can keep several.
+is effectful only when its type contains the state. Like `set-cost`,
+`set-effectful` stores its facts in a generated relation per sort
+(`effsafe_effectful_<Sort>`), declared the first time a sort is marked; the
+extractor reads them all. A container (`Vec`, `Set`, ...) holding an
+effectful element is effectful without being marked.
 
 ### `:regions`
 
@@ -148,31 +150,35 @@ Costs are `u64`s with saturating arithmetic.
 ## Commands
 
 ```lisp
-(effsafe-extract <effectful-relation> <expr>...)
-(effsafe-extract-all <effectful-relation> <constructor>)
+(extract <expr> :effsafe [:include-subsumed])
+(print-function <constructor> [n] :effsafe [:include-subsumed])
+(set-effectful <expr>)
 (effsafe-regions <constructor> <position>...)
 (effsafe-placeholder <sort> <expr>)
 ```
 
-`effsafe-extract` extracts each expression's e-class; the roots must be
-effectful. `effsafe-extract-all` extracts every e-class that holds an e-node
-of the given constructor, in e-class order, sharing regions between them.
-Both return an `EffsafeExtractOutput` (a `TermDag` and one root term per
-extracted e-class) through `CommandOutput::UserDefined`; the CLI prints the
-terms.
+`extract ... :effsafe` extracts the expression's e-class, which must be
+effectful, and reports it like any `extract` (the cost is the sum of the
+marginal costs of the e-nodes in the extracted DAG). `print-function ...
+:effsafe` extracts every e-class that holds an e-node of the constructor, in
+e-class order, sharing regions between them, and prints one term per
+e-class. Variants (`extract e n`) and `:extractor` are not supported with
+`:effsafe`.
 
 From Rust, `extract_effsafe` runs the same extraction with an explicit
 `EffsafeConfig`, and `set_effsafe_cost_models` installs custom cost models
-on an e-graph.
+on an e-graph. Programmatic callers read the terms from the
+`CommandOutput::ExtractBest` or `CommandOutput::PrintFunction` the commands
+return.
 
 ## Subsumed e-nodes
 
-Like egglog's other extractors, `effsafe-extract` skips subsumed e-nodes.
+Like egglog's other extractors, effect-safe extraction skips subsumed e-nodes.
 A program whose rules subsume e-nodes for other reasons (to stop rewrites
-from firing again, say) can include them with a trailing `:include-subsumed`:
+from firing again, say) can include them with `:include-subsumed`:
 
 ```lisp
-(effsafe-extract-all Effectful Func :include-subsumed)
+(print-function Func :effsafe :include-subsumed)
 ```
 
 ## Limitations
@@ -182,9 +188,7 @@ from firing again, say) can include them with a trailing `:include-subsumed`:
   languages in which the state is linear).
 - `:regions` is accepted on `constructor` and on `datatype` variants, not yet
   inside `datatype*`.
-- Containers are extracted element by element. A container holding an
-  effectful element is effectful itself and the statewalk runs through it,
-  so a state can be passed inside a `Vec`; a container holding two states is
-  an error, like any e-node with two effectful children.
-- Roots must be effectful. Extracting a pure root is a plain tree extraction,
-  which `extract` already provides.
+- A container holding two states is an error, like any e-node with two
+  effectful children.
+- Roots must be marked with `set-effectful`. Extracting a pure root is a plain
+  tree extraction, which `extract` without `:effsafe` already provides.
