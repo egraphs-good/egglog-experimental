@@ -13,11 +13,11 @@
 mod build;
 mod checks;
 mod cost;
-mod egraph;
 mod greedy;
 mod persistent;
 mod region;
 mod statewalk;
+mod term_graph;
 mod to_term;
 
 use std::collections::HashMap;
@@ -160,7 +160,7 @@ pub fn extract_effsafe(
         );
     }
     let mut termdag = TermDag::default();
-    let mut placeholders: FxHashMap<egraph::SortId, TermId> = FxHashMap::default();
+    let mut placeholders: FxHashMap<term_graph::SortId, TermId> = FxHashMap::default();
     for (sort_id, sort) in g.sorts.iter().enumerate() {
         if let Some(expr) = config.placeholders.get(sort.name()) {
             placeholders.insert(sort_id, termdag.expr_to_term(expr));

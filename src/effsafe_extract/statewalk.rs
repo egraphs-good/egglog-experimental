@@ -21,9 +21,9 @@ use rand_mt::Mt64;
 use rustc_hash::FxHashMap;
 
 use super::cost::Cost;
-use super::egraph::{EClass, EClassId, EGraph, EGraphMapping, ENodeId, Extraction};
 use super::greedy::statewalk_greedy_extraction;
 use super::persistent::{Id as VersionId, PersistentBitSet, PersistentCounters};
+use super::term_graph::{EClass, EClassId, EGraphMapping, ENodeId, Extraction, TermGraph};
 
 /// The chosen effectful e-nodes of a region, from the root down to the entry.
 pub type Statewalk = Vec<(EClassId, ENodeId)>;
@@ -109,7 +109,11 @@ struct Region {
 }
 
 impl Region {
-    fn new(g: &EGraph, root: EClassId, opts: StatewalkOptions) -> Result<(Self, Vec<u32>), Error> {
+    fn new(
+        g: &TermGraph,
+        root: EClassId,
+        opts: StatewalkOptions,
+    ) -> Result<(Self, Vec<u32>), Error> {
         debug_assert!(super::checks::has_single_arg(g));
         let arg = g
             .class_ids()
@@ -301,7 +305,7 @@ impl Region {
 }
 
 /// `root` by the constructors of its e-nodes, for error messages.
-pub(super) fn describe_class(g: &EGraph, class: EClassId) -> String {
+pub(super) fn describe_class(g: &TermGraph, class: EClassId) -> String {
     let ops: Vec<&str> = g.classes[class]
         .enodes
         .iter()
@@ -410,7 +414,7 @@ impl Versions {
 /// The cheapest statewalk of the region `g` from `root` down to its entry.
 /// `costs[c][n]` is the statewalk cost of effectful e-node `(c, n)`.
 pub fn statewalk_dp(
-    g: &EGraph,
+    g: &TermGraph,
     root: EClassId,
     costs: &[Vec<Cost>],
     opts: StatewalkOptions,
@@ -545,7 +549,7 @@ pub fn statewalk_dp(
 /// chosen e-node, whose effectful child is redirected to the next e-class on the
 /// walk. An e-class visited more than once gets a fresh copy per visit.
 /// Returns the linearized e-graph and the mapping back into `g`.
-pub fn linearize(g: &EGraph, statewalk: &Statewalk) -> (EGraph, EGraphMapping) {
+pub fn linearize(g: &TermGraph, statewalk: &Statewalk) -> (TermGraph, EGraphMapping) {
     let mut lin = g.empty_like();
     lin.classes = g
         .classes
@@ -610,7 +614,7 @@ pub fn linearize(g: &EGraph, statewalk: &Statewalk) -> (EGraph, EGraphMapping) {
 /// Extract `root` from the region `g`: find the cheapest statewalk, linearize
 /// along it, and greedily extract the pure terms it needs.
 pub fn extract_region(
-    g: &EGraph,
+    g: &TermGraph,
     root: EClassId,
     costs: &[Vec<Cost>],
     opts: StatewalkOptions,

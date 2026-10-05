@@ -3,12 +3,12 @@
 
 use std::collections::VecDeque;
 
-use super::egraph::{EClassId, EGraph, EGraphMapping, Extraction, ExtractionId};
 use super::statewalk::Statewalk;
+use super::term_graph::{EClassId, EGraphMapping, Extraction, ExtractionId, TermGraph};
 
 /// Every e-node's children are in range and (unless `allow_subregion_children`)
 /// at most one child is effectful. Empty e-classes are allowed only if `allow_empty`.
-pub fn is_wellformed(g: &EGraph, allow_empty: bool, allow_subregion_children: bool) -> bool {
+pub fn is_wellformed(g: &TermGraph, allow_empty: bool, allow_subregion_children: bool) -> bool {
     let mut ok = true;
     for c in g.class_ids() {
         let class = &g.classes[c];
@@ -38,8 +38,8 @@ pub fn is_wellformed(g: &EGraph, allow_empty: bool, allow_subregion_children: bo
 /// `mapping` is a valid mapping from `source` into `target`.
 pub fn is_valid_mapping(
     mapping: &EGraphMapping,
-    source: &EGraph,
-    target: &EGraph,
+    source: &TermGraph,
+    target: &TermGraph,
     partial: bool,
     injective: bool,
     surjective: bool,
@@ -124,7 +124,7 @@ pub fn is_valid_mapping(
 }
 
 /// A region has exactly one entry: one effectful e-node with no effectful children.
-pub fn has_single_arg(g: &EGraph) -> bool {
+pub fn has_single_arg(g: &TermGraph) -> bool {
     let args: Vec<EClassId> = g
         .class_ids()
         .filter(|&c| g.is_effectful(c))
@@ -151,7 +151,7 @@ pub fn has_single_arg(g: &EGraph) -> bool {
 
 /// `statewalk` runs from `root` down to a leaf, each step through the
 /// effectful child of the previous e-node.
-pub fn is_valid_statewalk(g: &EGraph, root: EClassId, statewalk: &Statewalk) -> bool {
+pub fn is_valid_statewalk(g: &TermGraph, root: EClassId, statewalk: &Statewalk) -> bool {
     if statewalk.first().map(|s| s.0) != Some(root) {
         eprintln!("Error: statewalk does not start at the root");
         return false;
@@ -188,7 +188,7 @@ pub fn is_valid_statewalk(g: &EGraph, root: EClassId, statewalk: &Statewalk) -> 
 
 /// `extraction` is a well-formed term DAG over `g` with `root` last: every
 /// node is in range, has the right children, and only refers to earlier nodes.
-pub fn is_valid_extraction(g: &EGraph, root: EClassId, extraction: &Extraction) -> bool {
+pub fn is_valid_extraction(g: &TermGraph, root: EClassId, extraction: &Extraction) -> bool {
     if extraction.last().map(|en| en.class) != Some(root) {
         eprintln!("Error: the last node of the extraction is not the root");
         return false;
@@ -219,7 +219,7 @@ pub fn is_valid_extraction(g: &EGraph, root: EClassId, extraction: &Extraction) 
 
 /// `extraction` is effect safe: within each region, pure nodes only use
 /// effectful nodes on that region's statewalk.
-pub fn is_effect_safe(g: &EGraph, root: EClassId, extraction: &Extraction) -> bool {
+pub fn is_effect_safe(g: &TermGraph, root: EClassId, extraction: &Extraction) -> bool {
     if !is_valid_extraction(g, root, extraction) {
         return false;
     }
@@ -228,7 +228,7 @@ pub fn is_effect_safe(g: &EGraph, root: EClassId, extraction: &Extraction) -> bo
 }
 
 fn is_effect_safe_region(
-    g: &EGraph,
+    g: &TermGraph,
     root: ExtractionId,
     extraction: &Extraction,
     checked: &mut [bool],

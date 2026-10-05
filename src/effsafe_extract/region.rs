@@ -9,15 +9,15 @@
 use egglog::Error;
 
 use super::cost::{Cost, RegionCostModel};
-use super::egraph::{
-    EClass, EClassId, EGraph, EGraphMapping, ENode, ExtractedNode, Extraction, ExtractionId,
-};
 use super::greedy::{project_statewalk_costs, statewalk_costs};
 use super::statewalk::{StatewalkOptions, extract_region};
+use super::term_graph::{
+    EClass, EClassId, EGraphMapping, ENode, ExtractedNode, Extraction, ExtractionId, TermGraph,
+};
 
 /// Extract every function root of `g`.
 pub fn extract_all(
-    g: &EGraph,
+    g: &TermGraph,
     egraph: &egglog::EGraph,
     region_costs: &dyn RegionCostModel,
     function_roots: &[EClassId],
@@ -67,7 +67,7 @@ impl Marks {
 }
 
 struct Regions<'g> {
-    g: &'g EGraph,
+    g: &'g TermGraph,
     opts: StatewalkOptions,
     costs: Vec<Vec<Cost>>,
     /// Region number of each region root.
@@ -81,7 +81,7 @@ struct Regions<'g> {
 
 impl<'g> Regions<'g> {
     fn new(
-        g: &'g EGraph,
+        g: &'g TermGraph,
         egraph: &egglog::EGraph,
         region_costs: &dyn RegionCostModel,
         function_roots: &[EClassId],
@@ -186,7 +186,10 @@ impl<'g> Regions<'g> {
     /// (effectful children at `:regions` positions) are dropped from e-nodes,
     /// and e-nodes with children outside the region are dropped entirely. Returns the (pruned) region, its root, and
     /// the mapping back into `g`.
-    fn build_region(&mut self, root: EClassId) -> Result<(EGraph, EClassId, EGraphMapping), Error> {
+    fn build_region(
+        &mut self,
+        root: EClassId,
+    ) -> Result<(TermGraph, EClassId, EGraphMapping), Error> {
         let g = self.g;
         let marks = &mut self.marks;
         marks.clear();
@@ -285,7 +288,7 @@ impl<'g> Regions<'g> {
 
 /// Function roots first, then every effectful e-class at a `:regions`
 /// position of some effectful e-node. Each e-class appears once.
-fn region_roots(g: &EGraph, function_roots: &[EClassId]) -> Vec<EClassId> {
+fn region_roots(g: &TermGraph, function_roots: &[EClassId]) -> Vec<EClassId> {
     let mut is_root = vec![false; g.len()];
     let mut roots = Vec::new();
     let mut add = |c: EClassId, roots: &mut Vec<EClassId>| {

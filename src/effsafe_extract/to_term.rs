@@ -3,12 +3,12 @@
 use egglog::{TermDag, TermId};
 use rustc_hash::FxHashMap;
 
-use super::egraph::{EGraph, Extraction, NodeKind, SortId};
+use super::term_graph::{Extraction, NodeKind, SortId, TermGraph};
 
 /// Build the term for `extraction`, whose nodes are in topological order with
 /// the root last. `placeholders` gives the term for each placeholder sort.
 pub fn extraction_to_term(
-    g: &EGraph,
+    g: &TermGraph,
     egraph: &egglog::EGraph,
     placeholders: &FxHashMap<SortId, TermId>,
     extraction: &Extraction,

@@ -17,7 +17,7 @@ use rustc_hash::FxHasher;
 
 use super::EffsafeConfig;
 use super::cost::Cost;
-use super::egraph::{EClass, EClassId, EGraph, ENode, NodeKind, OpInfo, SortId};
+use super::term_graph::{EClass, EClassId, ENode, NodeKind, OpInfo, SortId, TermGraph};
 
 type FxIndexMap<K, V> = IndexMap<K, V, BuildHasherDefault<FxHasher>>;
 
@@ -36,7 +36,7 @@ struct Builder<'e> {
     egraph: &'e egglog::EGraph,
     config: &'e EffsafeConfig,
     cost_model: &'e dyn DagCostModel<Cost>,
-    g: EGraph,
+    g: TermGraph,
     sort_ids: FxIndexMap<String, SortId>,
     class_ids: FxIndexMap<ClassKey, EClassId>,
     /// The single e-class standing in for each placeholder sort.
@@ -370,12 +370,12 @@ pub fn build(
     cost_model: &dyn DagCostModel<Cost>,
     effectful: &str,
     roots: &Roots,
-) -> Result<(EGraph, Vec<EClassId>), Error> {
+) -> Result<(TermGraph, Vec<EClassId>), Error> {
     let mut builder = Builder {
         egraph,
         config,
         cost_model,
-        g: EGraph::default(),
+        g: TermGraph::default(),
         sort_ids: FxIndexMap::default(),
         class_ids: FxIndexMap::default(),
         placeholder_classes: FxIndexMap::default(),
@@ -404,7 +404,7 @@ pub fn build(
 /// finite term by sort, and list the ones with no extractable e-node at all,
 /// which are the usual culprits (a sort whose only constructors are
 /// `:unextractable`, or one that should be a placeholder).
-fn explain_unextractable(g: &EGraph, class: EClassId) -> String {
+fn explain_unextractable(g: &TermGraph, class: EClassId) -> String {
     let extractable = g.extractable_classes();
     let root_ops: Vec<&str> = g.classes[class]
         .enodes

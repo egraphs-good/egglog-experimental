@@ -12,8 +12,8 @@ use indexmap::IndexMap;
 use rustc_hash::FxHasher;
 
 use super::cost::{Cost, INFINITE, RegionCostModel};
-use super::egraph::{
-    EClassId, EGraph, EGraphMapping, ENode, ENodeId, ExtractedNode, Extraction, ExtractionId,
+use super::term_graph::{
+    EClassId, EGraphMapping, ENode, ENodeId, ExtractedNode, Extraction, ExtractionId, TermGraph,
 };
 
 type FxIndexMap<K, V> = IndexMap<K, V, BuildHasherDefault<FxHasher>>;
@@ -93,7 +93,7 @@ impl Ord for BagCost {
 /// Dijkstra-style state shared by the greedy passes: the best known cost and
 /// pick per e-class, and a work heap ordered by cost (ties: larger id first).
 struct Greedy<'g> {
-    g: &'g EGraph,
+    g: &'g TermGraph,
     parents: Vec<Vec<(EClassId, ENodeId)>>,
     /// Children of each e-node whose e-class has not been settled yet.
     remaining: Vec<Vec<usize>>,
@@ -103,7 +103,7 @@ struct Greedy<'g> {
 }
 
 impl<'g> Greedy<'g> {
-    fn new(g: &'g EGraph) -> Self {
+    fn new(g: &'g TermGraph) -> Self {
         let mut greedy = Greedy {
             g,
             parents: g.parents(),
@@ -163,7 +163,7 @@ impl<'g> Greedy<'g> {
 /// `:regions` positions are folded by `regions`; the rest are bag costs.
 /// Stops early once `root` is settled.
 pub fn greedy_costs(
-    g: &EGraph,
+    g: &TermGraph,
     egraph: &egglog::EGraph,
     regions: &dyn RegionCostModel,
     root: Option<EClassId>,
@@ -204,7 +204,7 @@ pub fn greedy_costs(
 
 /// Estimated cost of every e-class.
 pub fn estimate_class_costs(
-    g: &EGraph,
+    g: &TermGraph,
     egraph: &egglog::EGraph,
     regions: &dyn RegionCostModel,
 ) -> Vec<Cost> {
@@ -215,7 +215,7 @@ pub fn estimate_class_costs(
 /// estimated cost of its pure children, and the folded cost of its regions
 /// (effectful children on the statewalk are paid for by the rest of the walk).
 fn statewalk_enode_cost(
-    g: &EGraph,
+    g: &TermGraph,
     egraph: &egglog::EGraph,
     regions: &dyn RegionCostModel,
     class_cost: &[Cost],
@@ -238,7 +238,7 @@ fn statewalk_enode_cost(
 
 /// Statewalk costs for every effectful e-node (pure e-classes get an empty row).
 pub fn statewalk_costs(
-    g: &EGraph,
+    g: &TermGraph,
     egraph: &egglog::EGraph,
     regions: &dyn RegionCostModel,
 ) -> Vec<Vec<Cost>> {
@@ -286,7 +286,7 @@ pub fn project_statewalk_costs(mapping: &EGraphMapping, costs: &[Vec<Cost>]) -> 
 /// settled, the whole term below it is emitted and its e-classes become free
 /// for everyone else to reuse (their cost drops to zero), which is what makes
 /// the shared statewalk pay for pure subterms only once.
-pub fn statewalk_greedy_extraction(g: &EGraph, root: EClassId) -> Extraction {
+pub fn statewalk_greedy_extraction(g: &TermGraph, root: EClassId) -> Extraction {
     let mut greedy = Greedy::new(g);
     let mut extraction: Extraction = Vec::new();
     let mut extracted: Vec<Option<ExtractionId>> = vec![None; g.len()];

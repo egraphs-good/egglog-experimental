@@ -15,9 +15,9 @@ pub type EClassId = usize;
 pub type ENodeId = usize;
 /// Position of an e-node inside an [`Extraction`].
 pub type ExtractionId = usize;
-/// Index into [`EGraph::ops`].
+/// Index into [`TermGraph::ops`].
 pub type OpId = usize;
-/// Index into [`EGraph::sorts`].
+/// Index into [`TermGraph::sorts`].
 pub type SortId = usize;
 
 /// A constructor the e-graph uses, with its `:regions` annotation.
@@ -62,13 +62,13 @@ pub struct EClass {
 }
 
 #[derive(Clone, Debug, Default)]
-pub struct EGraph {
+pub struct TermGraph {
     pub classes: Vec<EClass>,
     pub ops: Vec<OpInfo>,
     pub sorts: Vec<egglog::ArcSort>,
 }
 
-impl EGraph {
+impl TermGraph {
     pub fn len(&self) -> usize {
         self.classes.len()
     }
@@ -161,8 +161,8 @@ impl EGraph {
     }
 
     /// An e-graph with the same ops and sorts but no e-classes.
-    pub fn empty_like(&self) -> EGraph {
-        EGraph {
+    pub fn empty_like(&self) -> TermGraph {
+        TermGraph {
             classes: Vec::new(),
             ops: self.ops.clone(),
             sorts: self.sorts.clone(),
@@ -197,7 +197,7 @@ impl EGraph {
     /// Drop e-nodes that cannot be part of any finite term and e-classes that
     /// are unreachable from `root` (every e-class is kept when `root` is `None`).
     /// Returns the pruned e-graph and the mapping from this e-graph into it.
-    pub fn prune_unextractable(&self, root: Option<EClassId>) -> (EGraph, EGraphMapping) {
+    pub fn prune_unextractable(&self, root: Option<EClassId>) -> (TermGraph, EGraphMapping) {
         let extractable = self.extractable_classes();
         let mut queue = VecDeque::new();
 
@@ -281,7 +281,7 @@ pub struct EGraphMapping {
 
 impl EGraphMapping {
     /// A mapping with the shape of `source` that maps nothing yet.
-    pub fn unmapped(source: &EGraph) -> Self {
+    pub fn unmapped(source: &TermGraph) -> Self {
         EGraphMapping {
             classes: vec![None; source.len()],
             enodes: source
@@ -301,7 +301,7 @@ impl EGraphMapping {
     }
 
     /// The inverse mapping, from `target` back into the source.
-    pub fn inverse(&self, target: &EGraph) -> EGraphMapping {
+    pub fn inverse(&self, target: &TermGraph) -> EGraphMapping {
         let mut inv = EGraphMapping::unmapped(target);
         for (c, &mapped) in self.classes.iter().enumerate() {
             if let Some(tc) = mapped {
