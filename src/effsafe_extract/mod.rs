@@ -2,6 +2,8 @@
 //! `effsafe-regions`, `effsafe-placeholder`, and the `:regions` annotation on
 //! `constructor` and `datatype` declarations.
 //!
+//! This is the *statewalk DP* of Flatt et al., "Efficient Extraction for
+//! Effectful E-graphs" (OOPSLA 2026, <https://doi.org/10.1145/3839530>).
 //! See `docs/effsafe-extract.md` for the language-level description. In short:
 //! the program marks effectful e-classes in a relation, annotates which
 //! constructor arguments start subregions, and the extractor chooses one
@@ -83,7 +85,10 @@ pub fn extract_effsafe(
     cost_model: &dyn DagCostModel<Cost>,
     region_costs: &dyn RegionCostModel,
 ) -> Result<EffsafeExtractOutput, Error> {
+    let t0 = std::time::Instant::now();
     let (g, root_classes) = build::build(egraph, config, cost_model, effectful, roots)?;
+    let t_build = t0.elapsed();
+    let t1 = std::time::Instant::now();
     let extractions = region::extract_all(
         &g,
         egraph,
@@ -91,6 +96,18 @@ pub fn extract_effsafe(
         &root_classes,
         StatewalkOptions::default(),
     );
+    let t_regions = t1.elapsed();
+    if log::log_enabled!(log::Level::Debug) {
+        let enodes: usize = g.classes.iter().map(|c| c.enodes.len()).sum();
+        log::debug!(
+            "effsafe build={:.1}ms regions={:.1}ms classes={} enodes={} roots={}",
+            t_build.as_secs_f64() * 1e3,
+            t_regions.as_secs_f64() * 1e3,
+            g.len(),
+            enodes,
+            root_classes.len()
+        );
+    }
     let mut termdag = TermDag::default();
     let mut placeholders: FxHashMap<egraph::SortId, TermId> = FxHashMap::default();
     for (sort_id, sort) in g.sorts.iter().enumerate() {

@@ -7,8 +7,8 @@ This file records notable user-facing changes to egglog-experimental.
 ### Added
 
 - `effsafe-extract` and `effsafe-extract-all`: effect-safe extraction for
-  languages that thread a state through their terms, ported from eggcc's
-  tiger extractor. Effectful e-classes are given by a relation; the
+  languages that thread a state through their terms (statewalk DP, Flatt et
+  al., OOPSLA 2026, <https://doi.org/10.1145/3839530>), ported from eggcc. Effectful e-classes are given by a relation; the
   `:regions` option on `constructor` and `datatype` variants (or
   `effsafe-regions`) marks the arguments that start subregions;
   `effsafe-placeholder` skips a sort. Costs come from the dynamic cost model

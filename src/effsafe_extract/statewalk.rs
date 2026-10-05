@@ -1,4 +1,5 @@
-//! The statewalk dynamic program.
+//! The statewalk dynamic program (Section 6 of Flatt et al., "Efficient
+//! Extraction for Effectful E-graphs", OOPSLA 2026).
 //!
 //! A *region* is an e-graph in which effectful e-classes form a chain from the
 //! region's root down to its *entry*, an effectful e-node with no effectful
@@ -589,15 +590,39 @@ pub fn extract_region(
     costs: &[Vec<Cost>],
     opts: StatewalkOptions,
 ) -> Extraction {
+    let t0 = std::time::Instant::now();
     let statewalk = statewalk_dp(g, root, costs, opts);
+    if log::log_enabled!(log::Level::Debug) {
+        log::debug!(
+            "effsafe dp={:.2}ms walk_len={}",
+            t0.elapsed().as_secs_f64() * 1e3,
+            statewalk.len()
+        );
+    }
+    let t1 = std::time::Instant::now();
     let (lin, lin_to_g) = linearize(g, &statewalk);
+    let t_lin = t1.elapsed();
     // The root keeps its id in the linearized e-graph.
+    let t2 = std::time::Instant::now();
     let (pruned, lin_to_pruned) = lin.prune_unextractable(Some(root));
+    let t_prune = t2.elapsed();
+    let t3 = std::time::Instant::now();
     let extraction = statewalk_greedy_extraction(&pruned, lin_to_pruned.class(root));
+    let t_greedy = t3.elapsed();
+    let t4 = std::time::Instant::now();
     let extraction = lin_to_pruned
         .inverse(&pruned)
         .then(&lin_to_g)
         .apply(&extraction);
+    if log::log_enabled!(log::Level::Debug) {
+        log::debug!(
+            "effsafe linearize={:.2}ms prune={:.2}ms greedy={:.2}ms map={:.2}ms",
+            t_lin.as_secs_f64() * 1e3,
+            t_prune.as_secs_f64() * 1e3,
+            t_greedy.as_secs_f64() * 1e3,
+            t4.elapsed().as_secs_f64() * 1e3
+        );
+    }
     debug_assert!(super::checks::is_effect_safe(g, root, &extraction));
     extraction
 }

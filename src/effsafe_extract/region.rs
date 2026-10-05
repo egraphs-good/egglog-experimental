@@ -85,7 +85,15 @@ impl<'g> Regions<'g> {
         function_roots: &[EClassId],
         opts: StatewalkOptions,
     ) -> Self {
+        let t0 = std::time::Instant::now();
         let roots = region_roots(g, function_roots);
+        let costs = statewalk_costs(g, egraph, region_costs);
+        if log::log_enabled!(log::Level::Debug) {
+            log::debug!(
+                "effsafe statewalk_costs(global greedy)={:.2}ms",
+                t0.elapsed().as_secs_f64() * 1e3
+            );
+        }
         let mut region_of = vec![None; g.len()];
         for (i, &root) in roots.iter().enumerate() {
             region_of[root] = Some(i);
@@ -93,7 +101,7 @@ impl<'g> Regions<'g> {
         Regions {
             g,
             opts,
-            costs: statewalk_costs(g, egraph, region_costs),
+            costs,
             region_of,
             cache: vec![None; roots.len()],
             placed: vec![None; roots.len()],
@@ -110,9 +118,28 @@ impl<'g> Regions<'g> {
             return id;
         }
         if self.cache[rid].is_none() {
+            let t0 = std::time::Instant::now();
             let (region, region_root, to_g) = self.build_region(root);
+            let t_build = t0.elapsed();
+            let tc = std::time::Instant::now();
             let costs = project_statewalk_costs(&to_g, &self.costs);
+            if log::log_enabled!(log::Level::Debug) {
+                log::debug!(
+                    "effsafe project_costs={:.2}ms",
+                    tc.elapsed().as_secs_f64() * 1e3
+                );
+            }
+            let t1 = std::time::Instant::now();
             let extraction = extract_region(&region, region_root, &costs, self.opts);
+            let t_extract = t1.elapsed();
+            if log::log_enabled!(log::Level::Debug) {
+                log::debug!(
+                    "effsafe region classes={} build={:.2}ms extract={:.2}ms",
+                    region.len(),
+                    t_build.as_secs_f64() * 1e3,
+                    t_extract.as_secs_f64() * 1e3
+                );
+            }
             self.cache[rid] = Some(to_g.apply(&extraction));
         }
         let region = self.cache[rid].clone().unwrap();

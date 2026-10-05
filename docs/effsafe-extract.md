@@ -6,9 +6,18 @@ heap) through their expressions, and whose e-graphs therefore contain terms
 that are individually valid but cannot be combined: two e-nodes that both
 consume the same state cannot both appear in one program.
 
-The extractor was developed for the [eggcc](https://github.com/egraphs-good/eggcc)
-compiler, where it is known as *tiger*. The algorithm is described in detail in
-the paper's artifact; this document covers the interface.
+The algorithm is *statewalk DP* from
+
+> Oliver Flatt, Anjali Pal, Yihong Zhang, Ryan Tjoa, Kirsten Graham, Alex
+> Fischman, Chandrakana Nandi, Eli Rosenthal, Zachary Tatlock, and Haobin Ni.
+> 2026. *Efficient Extraction for Effectful E-graphs.* Proc. ACM Program. Lang.
+> 10, OOPSLA2, Article 398. <https://doi.org/10.1145/3839530>
+
+which defines effect-safe extraction (Section 4), shows that finding any
+effect-safe extraction is NP-complete (Section 5), and gives the dynamic
+program, tractable in *statewalk width* (Section 6). It was developed for the
+[eggcc](https://github.com/egraphs-good/eggcc) compiler, where it is known as
+*tiger*. This document covers the interface; see the paper for the algorithm.
 
 ## The problem
 
@@ -88,7 +97,7 @@ and to emit a fixed term for every child of that sort instead:
 
 ## Regions
 
-A *region* is the part of the e-graph reachable from an effectful root
+Regions follow Section 7.1 of the paper. A *region* is the part of the e-graph reachable from an effectful root
 through state children and pure children, but not through subregions. Every
 region has exactly one *entry*: an effectful e-node with no effectful children
 (a function argument, say). Within a region, the extractor:
