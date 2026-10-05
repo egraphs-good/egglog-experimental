@@ -134,8 +134,8 @@ pub use subst::Subst;
 
 pub mod effsafe_extract;
 pub use effsafe_extract::{
-    EffsafeConfig, EffsafeExtractOutput, EffsafeState, RegionCostModel, SumRegions,
-    add_effsafe_extract, effsafe_state, extract_effsafe, set_effsafe_cost_models,
+    EffsafeConfig, EffsafeExtractOutput, EffsafeState, RegionBoundary, add_effsafe_extract,
+    effsafe_state, extract_effsafe, set_effsafe_cost_models,
 };
 
 /// Creates a default [`EGraph`] with every experimental extension registered.

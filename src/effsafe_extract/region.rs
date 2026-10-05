@@ -1,37 +1,63 @@
 //! Splitting the e-graph into regions and extracting them one at a time.
 //!
-//! A region root is a `Function` body or any effectful e-class that appears as
-//! a *second* effectful child of an e-node (the body of an `If` branch or a
-//! `DoWhile`, say). Each region is extracted on its own by the statewalk DP;
+//! A region root is an extraction root or any effectful e-class at a
+//! `:regions` position of an effectful e-node (the body of an `If` branch or
+//! a `DoWhile`, say). Each region is extracted on its own by the statewalk DP;
 //! the results are stitched together by placing subregions below the e-nodes
 //! that use them.
+//!
+//! Region choices can conflict: a region's cheapest extraction may use a
+//! subregion that in turn (transitively) uses the region itself, or a
+//! subregion may have no effect-safe extraction at all. When placing a
+//! subregion fails, the e-nodes that chose it are forbidden in the enclosing
+//! region, which is extracted again without them.
 
 use egglog::Error;
+use rustc_hash::FxHashSet;
 
-use super::cost::{Cost, RegionCostModel};
-use super::greedy::{project_statewalk_costs, statewalk_costs};
-use super::statewalk::{StatewalkOptions, extract_region};
+use super::cost::{Cost, RegionBoundary};
+use super::greedy::{
+    effective_cost, estimate_class_costs, project_statewalk_costs, statewalk_costs,
+};
+use super::statewalk::{StatewalkOptions, describe_class, extract_region};
 use super::term_graph::{
-    EClass, EClassId, EGraphMapping, ENode, ExtractedNode, Extraction, ExtractionId, TermGraph,
+    EClass, EClassId, EGraphMapping, ENodeId, ExtractedNode, Extraction, ExtractionId, TermGraph,
 };
 
-/// Extract every function root of `g`.
+/// An extraction together with the region each of its nodes belongs to.
+pub struct PlacedExtraction {
+    pub extraction: Extraction,
+    /// Region index (into the regions' numbering) of each node.
+    pub region_of_node: Vec<usize>,
+}
+
+/// Extract every root of `g`.
 pub fn extract_all(
     g: &TermGraph,
-    egraph: &egglog::EGraph,
-    region_costs: &dyn RegionCostModel,
-    function_roots: &[EClassId],
+    boundary: &dyn RegionBoundary,
+    roots: &[EClassId],
     opts: StatewalkOptions,
-) -> Result<Vec<Extraction>, Error> {
-    let mut regions = Regions::new(g, egraph, region_costs, function_roots, opts);
-    function_roots
+) -> Result<Vec<PlacedExtraction>, Error> {
+    let mut regions = Regions::new(g, boundary, roots, opts);
+    roots
         .iter()
         .map(|&root| {
             regions.placed.fill(None);
-            let mut extraction = Vec::new();
-            regions.place(root, &mut extraction)?;
-            debug_assert!(super::checks::is_effect_safe(g, root, &extraction));
-            Ok(extraction)
+            let mut out = PlacedExtraction {
+                extraction: Vec::new(),
+                region_of_node: Vec::new(),
+            };
+            regions.place(root, &mut out).map_err(|err| match err {
+                PlaceError::Other(err) => err,
+                PlaceError::Cycle(class) => Error::ExtractError(format!(
+                    "no effect-safe extraction for {}: every choice leads back into the \
+                     region rooted at {}, which is being extracted",
+                    describe_class(g, root),
+                    describe_class(g, class)
+                )),
+            })?;
+            debug_assert!(super::checks::is_effect_safe(g, root, &out.extraction));
+            Ok(out)
         })
         .collect()
 }
@@ -66,14 +92,36 @@ impl Marks {
     }
 }
 
+/// Why a region could not be placed.
+enum PlaceError {
+    /// The region is already being placed higher up the stack; its root is given.
+    Cycle(EClassId),
+    Other(Error),
+}
+
+impl From<Error> for PlaceError {
+    fn from(err: Error) -> Self {
+        PlaceError::Other(err)
+    }
+}
+
 struct Regions<'g> {
     g: &'g TermGraph,
+    boundary: &'g dyn RegionBoundary,
     opts: StatewalkOptions,
+    /// Estimated cost of every e-class (global greedy).
+    class_cost: Vec<Cost>,
+    /// Statewalk cost of every effectful e-node.
     costs: Vec<Vec<Cost>>,
     /// Region number of each region root.
     region_of: Vec<Option<usize>>,
     /// Extraction of each region, over `g`, computed on demand.
     cache: Vec<Option<Extraction>>,
+    /// E-nodes of `g` excluded from each region, because the subregion they
+    /// chose could not be placed below it.
+    forbidden: Vec<FxHashSet<(EClassId, ENodeId)>>,
+    /// Regions currently being placed (on the recursion stack).
+    placing: Vec<bool>,
     /// Where each region was placed in the extraction being built.
     placed: Vec<Option<ExtractionId>>,
     marks: Marks,
@@ -82,14 +130,14 @@ struct Regions<'g> {
 impl<'g> Regions<'g> {
     fn new(
         g: &'g TermGraph,
-        egraph: &egglog::EGraph,
-        region_costs: &dyn RegionCostModel,
-        function_roots: &[EClassId],
+        boundary: &'g dyn RegionBoundary,
+        roots: &[EClassId],
         opts: StatewalkOptions,
     ) -> Self {
         let t0 = std::time::Instant::now();
-        let roots = region_roots(g, function_roots);
-        let costs = statewalk_costs(g, egraph, region_costs);
+        let region_roots = region_roots(g, roots);
+        let class_cost = estimate_class_costs(g, boundary);
+        let costs = statewalk_costs(g, boundary, &class_cost);
         if log::log_enabled!(log::Level::Debug) {
             log::debug!(
                 "effsafe statewalk_costs(global greedy)={:.2}ms",
@@ -97,100 +145,163 @@ impl<'g> Regions<'g> {
             );
         }
         let mut region_of = vec![None; g.len()];
-        for (i, &root) in roots.iter().enumerate() {
+        for (i, &root) in region_roots.iter().enumerate() {
             region_of[root] = Some(i);
         }
         Regions {
             g,
+            boundary,
             opts,
+            class_cost,
             costs,
             region_of,
-            cache: vec![None; roots.len()],
-            placed: vec![None; roots.len()],
+            cache: vec![None; region_roots.len()],
+            forbidden: vec![FxHashSet::default(); region_roots.len()],
+            placing: vec![false; region_roots.len()],
+            placed: vec![None; region_roots.len()],
             marks: Marks::new(g.len()),
         }
     }
 
     /// Append the extraction of the region rooted at `root` to `out`, placing
     /// its subregions first. Returns the position of the root.
-    fn place(&mut self, root: EClassId, out: &mut Extraction) -> Result<ExtractionId, Error> {
-        let g = self.g;
+    fn place(
+        &mut self,
+        root: EClassId,
+        out: &mut PlacedExtraction,
+    ) -> Result<ExtractionId, PlaceError> {
         let rid = self.region_of[root].expect("not a region root");
         if let Some(id) = self.placed[rid] {
             return Ok(id);
         }
-        if self.cache[rid].is_none() {
-            let t0 = std::time::Instant::now();
-            let (region, region_root, to_g) = self.build_region(root)?;
-            let t_build = t0.elapsed();
-            let tc = std::time::Instant::now();
-            let costs = project_statewalk_costs(&to_g, &self.costs);
-            if log::log_enabled!(log::Level::Debug) {
-                log::debug!(
-                    "effsafe project_costs={:.2}ms",
-                    tc.elapsed().as_secs_f64() * 1e3
-                );
-            }
-            let t1 = std::time::Instant::now();
-            let extraction = extract_region(&region, region_root, &costs, self.opts)?;
-            let t_extract = t1.elapsed();
-            if log::log_enabled!(log::Level::Debug) {
-                log::debug!(
-                    "effsafe region classes={} build={:.2}ms extract={:.2}ms",
-                    region.len(),
-                    t_build.as_secs_f64() * 1e3,
-                    t_extract.as_secs_f64() * 1e3
-                );
-            }
-            self.cache[rid] = Some(to_g.apply(&extraction));
+        if self.placing[rid] {
+            return Err(PlaceError::Cycle(root));
         }
-        let region = self.cache[rid].clone().unwrap();
+        self.placing[rid] = true;
+        let result = self.place_inner(root, rid, out);
+        self.placing[rid] = false;
+        result
+    }
 
-        // Subregions hang off the effectful children at `:regions` positions.
-        let mut subregions = Vec::new();
-        for en in &region {
-            for child in g.region_children(g.enode(en.class, en.node)) {
-                subregions.push(self.place(child, out)?);
+    fn place_inner(
+        &mut self,
+        root: EClassId,
+        rid: usize,
+        out: &mut PlacedExtraction,
+    ) -> Result<ExtractionId, PlaceError> {
+        let g = self.g;
+        loop {
+            if self.cache[rid].is_none() {
+                self.cache[rid] = Some(self.extract_cached(root, rid)?);
             }
-        }
-        let base = out.len();
-        let mut subregions = subregions.into_iter();
-        for en in &region {
-            let enode = g.enode(en.class, en.node);
-            let positions = g.region_positions(enode);
-            let mut inner = en.children.iter();
-            let children = enode
-                .children
-                .iter()
-                .enumerate()
-                .map(|(i, &child)| {
-                    if positions.contains(&i) && g.is_effectful(child) {
-                        subregions.next().expect("subregion was placed")
-                    } else {
-                        base + inner.next().expect("region extraction has the child")
+            let region = self.cache[rid].clone().unwrap();
+
+            // Place the subregions first. If one cannot be placed, forbid the
+            // e-nodes of this region that chose it and extract the region again.
+            let checkpoint = (out.extraction.len(), self.placed.clone());
+            let mut subregions = Vec::new();
+            let mut failed: Option<(EClassId, PlaceError)> = None;
+            'nodes: for en in &region {
+                for child in g.region_children(g.enode(en.class, en.node)) {
+                    match self.place(child, out) {
+                        Ok(id) => subregions.push(id),
+                        Err(err) => {
+                            failed = Some((child, err));
+                            break 'nodes;
+                        }
                     }
-                })
-                .collect();
-            out.push(ExtractedNode {
-                class: en.class,
-                node: en.node,
-                children,
-            });
+                }
+            }
+            if let Some((child, err)) = failed {
+                out.extraction.truncate(checkpoint.0);
+                out.region_of_node.truncate(checkpoint.0);
+                self.placed = checkpoint.1;
+                let culprits: Vec<(EClassId, ENodeId)> = region
+                    .iter()
+                    .filter(|en| {
+                        g.region_children(g.enode(en.class, en.node))
+                            .any(|c| c == child)
+                    })
+                    .map(|en| (en.class, en.node))
+                    .collect();
+                if culprits.is_empty() {
+                    return Err(err);
+                }
+                log::debug!(
+                    "effsafe region {}: subregion {} cannot be placed; forbidding {} e-node(s) and retrying",
+                    describe_class(g, root),
+                    describe_class(g, child),
+                    culprits.len()
+                );
+                self.forbidden[rid].extend(culprits);
+                self.cache[rid] = None;
+                continue;
+            }
+
+            let base = out.extraction.len();
+            let mut subregions = subregions.into_iter();
+            for en in &region {
+                let enode = g.enode(en.class, en.node);
+                let mut inner = en.children.iter();
+                let children = enode
+                    .children
+                    .iter()
+                    .enumerate()
+                    .map(|(i, &child)| {
+                        if enode.regions.contains(&i) && g.is_effectful(child) {
+                            subregions.next().expect("subregion was placed")
+                        } else {
+                            base + inner.next().expect("region extraction has the child")
+                        }
+                    })
+                    .collect();
+                out.extraction.push(ExtractedNode {
+                    class: en.class,
+                    node: en.node,
+                    children,
+                });
+                out.region_of_node.push(rid);
+            }
+            self.placed[rid] = Some(out.extraction.len() - 1);
+            return Ok(out.extraction.len() - 1);
         }
-        self.placed[rid] = Some(out.len() - 1);
-        Ok(out.len() - 1)
+    }
+
+    /// Extract the region rooted at `root` (over `g`), honouring its forbidden e-nodes.
+    fn extract_cached(&mut self, root: EClassId, rid: usize) -> Result<Extraction, Error> {
+        let t0 = std::time::Instant::now();
+        let (region, region_root, to_g) = self.build_region(root, rid)?;
+        let t_build = t0.elapsed();
+        let costs = project_statewalk_costs(&to_g, &self.costs);
+        let t1 = std::time::Instant::now();
+        let extraction = extract_region(&region, region_root, &costs, self.opts)?;
+        if log::log_enabled!(log::Level::Debug) {
+            log::debug!(
+                "effsafe region classes={} build={:.2}ms extract={:.2}ms",
+                region.len(),
+                t_build.as_secs_f64() * 1e3,
+                t1.elapsed().as_secs_f64() * 1e3
+            );
+        }
+        Ok(to_g.apply(&extraction))
     }
 
     /// The region e-graph rooted at `root`: the effectful spine reached through
     /// state children, plus the pure e-classes it uses. Subregion children
     /// (effectful children at `:regions` positions) are dropped from e-nodes,
-    /// and e-nodes with children outside the region are dropped entirely. Returns the (pruned) region, its root, and
+    /// whose cost becomes the boundary fold of the subregions' estimated costs,
+    /// and e-nodes with children outside the region, or forbidden for this
+    /// region, are dropped entirely. Returns the (pruned) region, its root, and
     /// the mapping back into `g`.
     fn build_region(
         &mut self,
         root: EClassId,
+        rid: usize,
     ) -> Result<(TermGraph, EClassId, EGraphMapping), Error> {
         let g = self.g;
+        let boundary = self.boundary;
+        let class_cost = &self.class_cost;
+        let forbidden = &self.forbidden[rid];
         let marks = &mut self.marks;
         marks.clear();
         let mut members = vec![root];
@@ -227,14 +338,16 @@ impl<'g> Regions<'g> {
         };
         for &m in &members {
             let class = &g.classes[m];
-            let mut enodes: Vec<ENode> = Vec::new();
+            let mut enodes = Vec::new();
             let mut node_map = Vec::new();
             for (n, enode) in class.enodes.iter().enumerate() {
-                let positions = g.region_positions(enode);
+                if forbidden.contains(&(m, n)) {
+                    continue;
+                }
                 let mut children = Vec::with_capacity(enode.children.len());
                 let mut inside = true;
                 for (i, &child) in enode.children.iter().enumerate() {
-                    if positions.contains(&i) && g.is_effectful(child) {
+                    if enode.regions.contains(&i) && g.is_effectful(child) {
                         continue;
                     }
                     match marks.get(child) {
@@ -247,11 +360,8 @@ impl<'g> Regions<'g> {
                 }
                 if inside {
                     node_map.push(Some(n));
-                    enodes.push(ENode {
-                        kind: enode.kind.clone(),
-                        cost: enode.cost,
-                        children,
-                    });
+                    let cost = effective_cost(g, boundary, enode, |c| class_cost[c]);
+                    enodes.push(enode.without_regions(cost, children));
                 }
             }
             region.classes.push(EClass {
@@ -269,7 +379,7 @@ impl<'g> Regions<'g> {
                 "no effect-safe extraction for the region rooted at {}: every term of the \
                  root uses a state from outside the region (a subregion may only use its \
                  own entry and the e-nodes on its own statewalk)",
-                super::statewalk::describe_class(g, root)
+                describe_class(g, root)
             )));
         };
         let pruned_to_g = region_to_pruned.inverse(&pruned).then(&to_g);
@@ -286,26 +396,26 @@ impl<'g> Regions<'g> {
     }
 }
 
-/// Function roots first, then every effectful e-class at a `:regions`
+/// Extraction roots first, then every effectful e-class at a `:regions`
 /// position of some effectful e-node. Each e-class appears once.
-fn region_roots(g: &TermGraph, function_roots: &[EClassId]) -> Vec<EClassId> {
+fn region_roots(g: &TermGraph, roots: &[EClassId]) -> Vec<EClassId> {
     let mut is_root = vec![false; g.len()];
-    let mut roots = Vec::new();
-    let mut add = |c: EClassId, roots: &mut Vec<EClassId>| {
+    let mut out = Vec::new();
+    let mut add = |c: EClassId, out: &mut Vec<EClassId>| {
         if !is_root[c] {
             is_root[c] = true;
-            roots.push(c);
+            out.push(c);
         }
     };
-    for &root in function_roots {
-        add(root, &mut roots);
+    for &root in roots {
+        add(root, &mut out);
     }
     for c in g.class_ids().filter(|&c| g.is_effectful(c)) {
         for enode in &g.classes[c].enodes {
             for child in g.region_children(enode) {
-                add(child, &mut roots);
+                add(child, &mut out);
             }
         }
     }
-    roots
+    out
 }

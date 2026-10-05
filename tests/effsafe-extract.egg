@@ -44,9 +44,9 @@
 (print-function Func :extractor effsafe)
 (print-function Func :extractor effsafe :include-subsumed)
 
-;; Regions can also be declared without the annotation.
-(datatype Expr2 (Arg2) (Num2 i64) (Print2 Expr2 Expr2) (If2 Expr2 Expr2 Expr2 Expr2))
-(effsafe-regions If2 2 3)
+;; `:regions` works on `constructor` declarations too.
+(datatype Expr2 (Arg2) (Num2 i64) (Print2 Expr2 Expr2))
+(constructor If2 (Expr2 Expr2 Expr2 Expr2) Expr2 :regions (2 3))
 (rule ((= e (Arg2))) ((set-effectful e)))
 (rule ((= e (Print2 v s))) ((set-effectful e)))
 (rule ((= e (If2 p s t els))) ((set-effectful e)))

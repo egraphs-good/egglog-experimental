@@ -96,40 +96,53 @@ fn rewrite_rule(
     }
     let mut declared: Vec<String> = Vec::new();
     let mut commands: Vec<Command> = Vec::new();
-    let mut error: Option<Error> = None;
-    let head = rule.head.clone().visit_exprs(&mut |expr| {
-        if error.is_some() {
-            return expr;
-        }
-        let Expr::Call(span, head, args) = &expr else {
-            return expr;
-        };
-        if head != SET_EFFECTFUL {
-            return expr;
-        }
-        let [arg] = &args[..] else {
-            error = Some(usage(span.clone()));
-            return expr;
-        };
-        match sort_of(arg, &vars, type_info) {
-            Ok(sort) => {
-                commands.extend(declare_if_needed(
-                    &sort,
-                    span.clone(),
-                    type_info,
-                    &mut declared,
-                ));
-                Expr::Call(span.clone(), effectful_relation(&sort), args.clone())
+    // Actions run in order and a `let` binds a variable for the actions after
+    // it, so rewrite one action at a time and record each binding's sort.
+    let mut new_actions = Vec::with_capacity(rule.head.len());
+    for action in rule.head.iter() {
+        let mut error: Option<Error> = None;
+        let rewritten = action.clone().visit_exprs(&mut |expr| {
+            if error.is_some() {
+                return expr;
             }
-            Err(err) => {
-                error = Some(err);
-                expr
+            let Expr::Call(span, head, args) = &expr else {
+                return expr;
+            };
+            if head != SET_EFFECTFUL {
+                return expr;
             }
+            let [arg] = &args[..] else {
+                error = Some(usage(span.clone()));
+                return expr;
+            };
+            match sort_of(arg, &vars, type_info) {
+                Ok(sort) => {
+                    commands.extend(declare_if_needed(
+                        &sort,
+                        span.clone(),
+                        type_info,
+                        &mut declared,
+                    ));
+                    Expr::Call(span.clone(), effectful_relation(&sort), args.clone())
+                }
+                Err(err) => {
+                    error = Some(err);
+                    expr
+                }
+            }
+        });
+        if let Some(err) = error {
+            return Err(err);
         }
-    });
-    if let Some(err) = error {
-        return Err(err);
+        if let Action::Let(_, var, expr) = action
+            && let Ok(sort) = sort_of(expr, &vars, type_info)
+        {
+            vars.insert(var.clone(), sort);
+        }
+        new_actions.push(rewritten);
     }
+    let mut head = rule.head.clone();
+    head.0 = new_actions;
     commands.push(Command::Rule {
         rule: Rule { head, ..rule },
     });

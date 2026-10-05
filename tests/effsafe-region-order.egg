@@ -1,0 +1,25 @@
+;; Subregions may sit at any argument position: here the loop body comes
+;; before the state and the If's branches come before its predicate and state.
+
+(datatype Expr
+  (Arg)
+  (Num i64)
+  (Add Expr Expr)
+  (Print Expr Expr)
+  (Loop Expr Expr :regions (0))              ; body, inputs
+  (If Expr Expr Expr Expr :regions (0 1)))   ; then, else, pred, inputs
+(rule ((= e (Arg))) ((set-effectful e)))
+(rule ((= e (Print v s))) ((set-effectful e)))
+(rule ((= e (Loop b s))) ((set-effectful e)))
+(rule ((= e (If t els p s))) ((set-effectful e)))
+
+(let $s0 (Arg))
+(let $p1 (Print (Num 1) $s0))
+(let $p2 (Print (Add (Num 1) (Num 0)) $s0))
+(union $p1 $p2)
+(let $body (Print (Num 7) (Arg)))
+(let $l (Loop $body $p1))
+(let $i (If (Print (Num 2) (Arg)) $body (Num 0) $l))
+(run 5)
+(extract $l :extractor effsafe)
+(extract $i :extractor effsafe)

@@ -76,26 +76,31 @@ positions that start subregions:
   (Loop Expr Expr :regions (1)))            ; inputs, body
 ```
 
-The same declaration can be made separately, for example when the datatype is
-declared in another file:
-
-```lisp
-(effsafe-regions If 2 3)
-```
+The annotation lowers to the command `(effsafe-regions If 2 3)`, which
+programs can also write directly if the declaration cannot be changed.
 
 An effectful e-node with two effectful children outside its `:regions`
-positions is an error.
+positions has no single state input. Such e-nodes are skipped (the extraction
+fails with a message naming them only if a root has no other term).
 
-### `effsafe-placeholder`
+### Placeholders (Rust only)
 
 Some sorts should not be extracted at all. eggcc attaches a *context* to every
 leaf that refers back to the region the leaf is in, which makes the terms
-cyclic. `effsafe-placeholder` tells the extractor not to descend into a sort
-and to emit a fixed term for every child of that sort instead:
+cyclic. An embedder can name a constructor of such a sort that stands in for
+every value of it, in `EffsafeConfig::placeholders`:
 
-```lisp
-(effsafe-placeholder Assumption (NoContext))
+```rust
+effsafe_state(&mut egraph)
+    .config
+    .placeholders
+    .insert("Assumption".into(), Expr::Call(span!(), "NoContext".into(), vec![]));
 ```
+
+The extractor does not descend into the sort and emits the placeholder for
+every child of that sort instead; the replacement must be a constructor
+application of the sort. There is no egglog command for this, because the
+extracted term is then no longer a member of the requested e-class.
 
 ## Regions
 
@@ -116,31 +121,58 @@ them. A subregion used from several places is extracted once.
 
 ## Costs
 
-E-node costs come from a `DagCostModel`: in the egglog frontend this is the
-dynamic cost model, so `:cost` annotations and `set-cost` apply. Base values
-and containers are priced by the same model.
+Costs are a DAG within each region and a tree across region boundaries, using
+egglog's two cost model traits:
 
-The cost of an e-node is its own cost, plus the cost of its non-region
-children, plus whatever its subregions add. The last part is decided by a
-`RegionCostModel`. The default, `SumRegions`, adds the subregions' costs. A
-compiler can implement the trait to express heuristics such as charging only
-the more expensive branch of a conditional or weighting a loop body by an
-iteration estimate:
+| Where | Trait | Role |
+| --- | --- | --- |
+| Within a region | `DagCostModel` | Marginal e-node, base value and container costs; a pure e-class shared within a region is charged once. |
+| At a region boundary | `TreeCostModel` | Combines the costs of an e-node's subregions with its own: sum, branch weighting, loop multiplication, ... |
+
+In the egglog frontend the `DagCostModel` is the dynamic cost model, so
+`:cost` annotations and `set-cost` apply, and the boundary model is
+`TreeCostModelFromDag` of the same model, which adds the subregions' costs to
+the e-node's own cost.
+
+The boundary model sees only e-nodes with `:regions` children. Its
+`enode_cost` annotation is computed once per e-node, and `fold_enode_cost`
+receives the subregions' costs in their argument positions and `0` for every
+other child. The result (including the e-node's own cost) is the e-node's
+effective marginal cost in the enclosing region, whose DAG then charges the
+predicate, state and other ordinary children, preserving sharing. A subregion
+used from several e-nodes is extracted and placed once but charged at every
+use, as a tree would.
+
+A compiler embedding egglog installs its own models with
+`set_effsafe_cost_models`. eggcc, for instance, charges both branches of an
+`If` (the cheaper one at a quarter) and multiplies a loop body by an iteration
+estimate:
 
 ```rust
-struct MyRegions;
-impl RegionCostModel for MyRegions {
-    fn fold_regions(&self, _: &EGraph, constructor: &str, costs: &[Cost]) -> Cost {
-        match constructor {
-            "If" => costs.iter().copied().max().unwrap_or(0),
-            "Loop" => costs[0].saturating_mul(100),
-            _ => costs.iter().sum(),
+struct Heuristics;
+impl TreeCostModel<DefaultCost> for Heuristics {
+    type EnodeCost = (String, DefaultCost);     // constructor name, own cost
+    type ContainerCost = DefaultCost;
+    fn enode_cost(&self, egraph: &EGraph, func: &Function, enode: &Enode<'_>) -> Self::EnodeCost {
+        (func.name().to_string(), DagCostModel::enode_cost(&MyNodeCosts, egraph, func, enode))
+    }
+    fn fold_enode_cost(&self, (name, own): Self::EnodeCost, child_costs: &[DefaultCost]) -> DefaultCost {
+        match (name.as_str(), child_costs) {
+            ("If", &[_, _, then, els]) => own + then.max(els) + then.min(els) / 4,
+            ("Loop", &[_, body]) => own + body.saturating_mul(100),
+            _ => child_costs.iter().fold(own, |acc, c| acc.saturating_add(*c)),
         }
     }
+    // base_value_cost, container_cost, fold_container_cost as usual
 }
 let mut egraph = new_experimental_egraph();
-set_effsafe_cost_models(&mut egraph, DynamicCostModel, MyRegions);
+set_effsafe_cost_models(&mut egraph, MyNodeCosts, Heuristics);
 ```
+
+The reported cost of an extraction is the extracted program's cost under the
+same models: for the example above, an `If` of cost 1 whose branches cost 10
+each reports `1 + 10 + 10 = 21` (plus its predicate and state) even though the
+two branches are the same shared region.
 
 The annotations and cost models live in the e-graph's extension state
 (`EffsafeState`), so they are cloned and snapshotted with it.
@@ -153,21 +185,23 @@ Costs are `u64`s with saturating arithmetic.
 (extract <expr> :extractor effsafe [:include-subsumed])
 (print-function <constructor> [n] :extractor effsafe [:include-subsumed])
 (set-effectful <expr>)
-(effsafe-regions <constructor> <position>...)
-(effsafe-placeholder <sort> <expr>)
+(effsafe-regions <constructor> <position>...)   ; what :regions lowers to
 ```
 
 `extract ... :extractor effsafe` extracts the expression's e-class, which must be
-effectful, and reports it like any `extract` (the cost is the sum of the
-marginal costs of the e-nodes in the extracted DAG). `print-function ...
+effectful, and reports it like any `extract` (see Costs for what the cost
+means). `print-function ...
 :extractor effsafe` extracts every e-class that holds an e-node of the constructor, in
 e-class order, sharing regions between them, and prints one term per
 e-class. Variants (`extract e n`), `multi-extract` and `keep-best` do not support
 `:extractor effsafe`.
 
+`:include-subsumed` is an error with the other extractors.
+
 From Rust, `extract_effsafe` runs the same extraction with an explicit
-`EffsafeConfig`, and `set_effsafe_cost_models` installs custom cost models
-on an e-graph. Programmatic callers read the terms from the
+`EffsafeConfig`, `effsafe_state` gives access to the configuration stored on
+an e-graph (placeholders included), and `set_effsafe_cost_models` installs
+custom cost models. Programmatic callers read the terms from the
 `CommandOutput::ExtractBest` or `CommandOutput::PrintFunction` the commands
 return.
 

@@ -9,7 +9,7 @@ use std::collections::VecDeque;
 
 use egglog::Value;
 
-use super::cost::Cost;
+use super::cost::{Annotation, Cost};
 
 pub type EClassId = usize;
 pub type ENodeId = usize;
@@ -20,12 +20,10 @@ pub type OpId = usize;
 /// Index into [`TermGraph::sorts`].
 pub type SortId = usize;
 
-/// A constructor the e-graph uses, with its `:regions` annotation.
+/// A constructor the e-graph uses.
 #[derive(Clone, Debug)]
 pub struct OpInfo {
     pub name: String,
-    /// Child positions that start subregions, sorted.
-    pub regions: Vec<usize>,
 }
 
 #[derive(Clone, Debug)]
@@ -40,17 +38,57 @@ pub enum NodeKind {
     Placeholder,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct ENode {
     pub kind: NodeKind,
     /// Marginal cost of this e-node, not counting its children.
     pub cost: Cost,
     pub children: Vec<EClassId>,
+    /// Positions in `children` that start subregions (from `:regions`), sorted.
+    /// Empty inside a region graph, where subregion children are removed.
+    pub regions: Vec<usize>,
+    /// The boundary cost model's annotation, present when `regions` is not empty.
+    pub boundary: Option<Annotation>,
+}
+
+impl std::fmt::Debug for ENode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ENode")
+            .field("kind", &self.kind)
+            .field("cost", &self.cost)
+            .field("children", &self.children)
+            .field("regions", &self.regions)
+            .finish_non_exhaustive()
+    }
 }
 
 impl ENode {
     pub fn is_leaf(&self) -> bool {
         self.children.is_empty()
+    }
+
+    /// A copy of this e-node with marginal cost `cost` (normally the boundary
+    /// fold of its subregions' costs) and `children`, which must correspond
+    /// position by position to the non-region children of `self`.
+    pub fn without_regions(&self, cost: Cost, children: Vec<EClassId>) -> ENode {
+        ENode {
+            kind: self.kind.clone(),
+            cost,
+            children,
+            regions: Vec::new(),
+            boundary: None,
+        }
+    }
+
+    /// A copy of this e-node with the same shape and `children` renumbered.
+    pub fn with_children(&self, children: Vec<EClassId>) -> ENode {
+        ENode {
+            kind: self.kind.clone(),
+            cost: self.cost,
+            children,
+            regions: self.regions.clone(),
+            boundary: self.boundary.clone(),
+        }
     }
 }
 
@@ -101,11 +139,8 @@ impl TermGraph {
     }
 
     /// Child positions of `enode` that start subregions.
-    pub fn region_positions(&self, enode: &ENode) -> &[usize] {
-        match enode.kind {
-            NodeKind::Op(op) => &self.ops[op].regions,
-            _ => &[],
-        }
+    pub fn region_positions<'a>(&self, enode: &'a ENode) -> &'a [usize] {
+        &enode.regions
     }
 
     /// The children of `enode` with their position, split into
@@ -242,11 +277,7 @@ impl TermGraph {
                 if let Some(children) = children {
                     let class = &mut pruned.classes[target];
                     mapping.enodes[c][n] = Some(class.enodes.len());
-                    class.enodes.push(ENode {
-                        kind: enode.kind.clone(),
-                        cost: enode.cost,
-                        children,
-                    });
+                    class.enodes.push(enode.with_children(children));
                 }
             }
         }

@@ -252,6 +252,12 @@ impl UserDefinedCommand for CustomExtract {
         let (args, include_subsumed) = crate::effsafe_extract::split_include_subsumed(args);
         let (args, extractor) = split_trailing_extractor(args)?;
         let use_greedy_dag = extractor == Extractor::GreedyDag;
+        if include_subsumed && extractor != Extractor::Effsafe {
+            return Err(Error::ParseError(ParseError(
+                span!(),
+                ":include-subsumed is only supported with :extractor effsafe".into(),
+            )));
+        }
         let (expr, variants) = match args {
             [] => {
                 return Err(Error::ParseError(ParseError(

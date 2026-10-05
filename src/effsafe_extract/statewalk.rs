@@ -191,11 +191,11 @@ impl Region {
                 counts.extend_from_slice(&child_count[c]);
             }
         }
-        // The counters are two bits wide and store (children - 1).
+        // The counters store (children - 1): a decrement that finds zero means
+        // the last child just became extractable.
         for count in &mut counts {
             debug_assert!(*count > 0);
             *count -= 1;
-            debug_assert!(*count <= 3);
         }
 
         // Random hash contributions; mt19937_64 with its default seed, like the C++.
@@ -476,7 +476,7 @@ pub fn statewalk_dp(
             {
                 continue;
             }
-            let new_cost = cost + costs[v][vn];
+            let new_cost = cost.saturating_add(costs[v][vn]);
             if best.is_some_and(|b| states[b].cost <= new_cost) {
                 continue;
             }

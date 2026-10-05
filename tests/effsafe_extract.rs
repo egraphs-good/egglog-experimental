@@ -1,8 +1,12 @@
 //! Effect-safe extraction (`extract :extractor effsafe`): the extracted terms are checked
 //! against expected strings, which the `.egg` file harness cannot do.
 
-use egglog::CommandOutput;
-use egglog_experimental::new_experimental_egraph;
+use egglog::ast::Expr;
+use egglog::extract::{DefaultCost, TreeCostModel};
+use egglog::{ArcSort, CommandOutput, EGraph, Enode, Function, Value, span};
+use egglog_experimental::{
+    DynamicCostModel, effsafe_state, new_experimental_egraph, set_effsafe_cost_models,
+};
 
 /// A small effectful language: `Print` and `Arg` carry the state, `Read`
 /// is a pure value that depends on a state, `If` and `Loop` have subregions.
@@ -23,13 +27,17 @@ const LANG: &str = r#"
 (rule ((= e (Func n b))) ((set-effectful e)))
 "#;
 
-/// Run `program` after the language prelude and return the terms of every
-/// effsafe extraction, as strings.
-fn extract(program: &str) -> Vec<Vec<String>> {
+/// Run `program` after the language prelude on an e-graph prepared by
+/// `setup` and return the outputs.
+fn run(program: &str, setup: impl FnOnce(&mut EGraph)) -> Vec<CommandOutput> {
     let mut egraph = new_experimental_egraph();
-    let outputs = egraph
+    setup(&mut egraph);
+    egraph
         .parse_and_run_program(None, &format!("{LANG}\n{program}"))
-        .unwrap_or_else(|err| panic!("program failed: {err}"));
+        .unwrap_or_else(|err| panic!("program failed: {err}"))
+}
+
+fn terms_of(outputs: &[CommandOutput]) -> Vec<Vec<String>> {
     outputs
         .iter()
         .filter_map(|output| match output {
@@ -42,6 +50,33 @@ fn extract(program: &str) -> Vec<Vec<String>> {
         .collect()
 }
 
+/// Run `program` after the language prelude and return the terms of every
+/// effsafe extraction, as strings.
+fn extract(program: &str) -> Vec<Vec<String>> {
+    terms_of(&run(program, |_| ()))
+}
+
+/// Like [`extract_one`] but on an e-graph prepared by `setup`.
+fn extract_one_with(program: &str, setup: impl FnOnce(&mut EGraph)) -> String {
+    let mut all = terms_of(&run(program, setup));
+    assert_eq!(all.len(), 1, "expected one extraction");
+    let mut terms = all.pop().unwrap();
+    assert_eq!(terms.len(), 1, "expected one root");
+    terms.pop().unwrap()
+}
+
+/// The term and reported cost of the single `extract` in `program`.
+fn extract_with_cost(program: &str) -> (String, DefaultCost) {
+    let outputs = run(program, |_| ());
+    let mut found = outputs.iter().filter_map(|output| match output {
+        CommandOutput::ExtractBest(termdag, cost, term) => Some((termdag.to_string(*term), *cost)),
+        _ => None,
+    });
+    let result = found.next().expect("an extraction");
+    assert!(found.next().is_none(), "expected one extraction");
+    result
+}
+
 fn extract_one(program: &str) -> String {
     let mut all = extract(program);
     assert_eq!(all.len(), 1, "expected one extraction");
@@ -51,10 +86,71 @@ fn extract_one(program: &str) -> String {
 }
 
 fn extract_error(program: &str) -> String {
+    extract_error_with(program, |_| ())
+}
+
+fn extract_error_with(program: &str, setup: impl FnOnce(&mut EGraph)) -> String {
     let mut egraph = new_experimental_egraph();
+    setup(&mut egraph);
     match egraph.parse_and_run_program(None, &format!("{LANG}\n{program}")) {
         Ok(_) => panic!("program should have failed"),
         Err(err) => err.to_string(),
+    }
+}
+
+/// Stands in for every value of sort `sort`; see `EffsafeConfig::placeholders`.
+fn placeholder(sort: &str, head: &str) -> impl FnOnce(&mut EGraph) {
+    let (sort, head) = (sort.to_string(), head.to_string());
+    move |egraph: &mut EGraph| {
+        effsafe_state(egraph)
+            .config
+            .placeholders
+            .insert(sort, Expr::Call(span!(), head, vec![]));
+    }
+}
+
+/// A boundary cost model that does not charge `Loop` bodies at all, so that a
+/// loop whose body leads back to the loop itself looks cheapest.
+struct FreeLoops;
+
+impl TreeCostModel<DefaultCost> for FreeLoops {
+    type EnodeCost = (String, DefaultCost);
+    type ContainerCost = DefaultCost;
+
+    fn base_value_cost(&self, _: &EGraph, _: &ArcSort, _: Value) -> DefaultCost {
+        1
+    }
+
+    fn enode_cost(&self, egraph: &EGraph, func: &Function, enode: &Enode<'_>) -> Self::EnodeCost {
+        use egglog::extract::DagCostModel;
+        (
+            func.name().to_string(),
+            DynamicCostModel.enode_cost(egraph, func, enode),
+        )
+    }
+
+    fn container_cost(&self, _: &EGraph, _: &ArcSort, _: Value) -> DefaultCost {
+        1
+    }
+
+    fn fold_enode_cost(
+        &self,
+        (name, own): Self::EnodeCost,
+        child_costs: &[DefaultCost],
+    ) -> DefaultCost {
+        if name == "Loop" {
+            own
+        } else {
+            child_costs
+                .iter()
+                .fold(own, |acc, c| acc.saturating_add(*c))
+        }
+    }
+
+    fn fold_container_cost(&self, own: DefaultCost, element_costs: &[DefaultCost]) -> DefaultCost {
+        element_costs
+            .iter()
+            .fold(own, |acc, c| acc.saturating_add(*c))
     }
 }
 
@@ -184,18 +280,131 @@ fn dynamic_costs_steer_the_choice() {
 
 #[test]
 fn placeholders_replace_a_sort() {
-    let term = extract_one(
-        r#"
+    // Placeholders are a Rust-side hook: the embedder names a constructor of
+    // the sort that stands in for every value of it.
+    let program = r#"
         (datatype Ctx (InLoop Expr) (NoCtx))
         (constructor Leaf (Ctx) Expr)
         (let $s0 (Arg))
         (let $l (Loop $s0 (Print (Leaf (InLoop (Arg))) (Arg))))
-        (effsafe-placeholder Ctx (NoCtx))
         (run 5)
         (extract $l :extractor effsafe)
+    "#;
+    let term = extract_one_with(program, placeholder("Ctx", "NoCtx"));
+    assert_eq!(term, "(Loop (Arg) (Print (Leaf (NoCtx)) (Arg)))");
+
+    // The replacement is checked: it must be a constructor of the sort.
+    let err = extract_error_with(program, placeholder("Ctx", "Num"));
+    assert!(
+        err.contains("not a constructor application of that sort"),
+        "unexpected error: {err}"
+    );
+    let err = extract_error_with(program, placeholder("Ctx", "Missing"));
+    assert!(
+        err.contains("not a constructor application of that sort"),
+        "unexpected error: {err}"
+    );
+}
+
+#[test]
+fn cyclic_region_choices_are_avoided() {
+    // The loop's body is the loop's own e-class. Under FreeLoops the loop
+    // looks cheaper than the alternative, but placing its body leads back to
+    // the region being extracted, so the extractor falls back to Expensive.
+    let term = extract_one_with(
+        r#"
+        (constructor Expensive (Expr Expr) Expr :cost 100)
+        (rule ((= e (Expensive v s))) ((set-effectful e)))
+        (let $s0 (Arg))
+        (let $r (Expensive (Num 1) $s0))
+        (union $r (Loop $s0 $r))
+        (run 5)
+        (extract $r :extractor effsafe)
+        "#,
+        |egraph| set_effsafe_cost_models(egraph, DynamicCostModel, FreeLoops),
+    );
+    assert_eq!(term, "(Expensive (Num 1) (Arg))");
+
+    // With no alternative at all the cycle is reported, not overflowed.
+    let err = extract_error_with(
+        r#"
+        (let $s0 (Arg))
+        (let $r (Print (Num 1) $s0))
+        (union $r (Loop $s0 $r))
+        (run 5)
+        (subsume (Print (Num 1) $s0))
+        (extract $r :extractor effsafe)
+        "#,
+        |egraph| set_effsafe_cost_models(egraph, DynamicCostModel, FreeLoops),
+    );
+    assert!(
+        err.contains("leads back into") || err.contains("no finite term"),
+        "unexpected error: {err}"
+    );
+}
+
+#[test]
+fn reported_cost_charges_each_region_occurrence() {
+    // Both branches are the same region (cost 9 + 1 = 10). It is placed once
+    // but charged once per occurrence: If 1 + 10 + 10 = 21, plus the
+    // predicate (Num 1 + literal 1) and the state (1) in the enclosing
+    // region: 24.
+    let (term, cost) = extract_with_cost(
+        r#"
+        (constructor Big (Expr) Expr :cost 9)
+        (rule ((= e (Big s))) ((set-effectful e)))
+        (let $b (Big (Arg)))
+        (let $if (If (Num 0) (Arg) $b $b))
+        (run 5)
+        (extract $if :extractor effsafe)
         "#,
     );
-    assert_eq!(term, "(Loop (Arg) (Print (Leaf (NoCtx)) (Arg)))");
+    assert_eq!(term, "(If (Num 0) (Arg) (Big (Arg)) (Big (Arg)))");
+    assert_eq!(cost, 24);
+}
+
+#[test]
+fn set_effectful_accepts_let_bound_variables() {
+    let term = extract_one(
+        r#"
+        (constructor Next (Expr) Expr)
+        (rule ((= e (Arg))) ((let b (Next e)) (set-effectful b)))
+        (let $s0 (Arg))
+        (run 3)
+        (extract (Next $s0) :extractor effsafe)
+        "#,
+    );
+    assert_eq!(term, "(Next (Arg))");
+}
+
+#[test]
+fn unrelated_invalid_enodes_do_not_block_extraction() {
+    let term = extract_one(
+        r#"
+        (constructor Both (Expr Expr) Expr)
+        (rule ((= e (Both a b))) ((set-effectful e)))
+        (let $bad (Both (Arg) (Arg)))
+        (let $good (Print (Num 1) (Arg)))
+        (run 2)
+        (extract $good :extractor effsafe)
+        "#,
+    );
+    assert_eq!(term, "(Print (Num 1) (Arg))");
+}
+
+#[test]
+fn include_subsumed_requires_effsafe() {
+    for command in [
+        "(extract $s0 :include-subsumed)",
+        "(extract $s0 :extractor greedy-dag :include-subsumed)",
+        "(print-function Func :include-subsumed)",
+    ] {
+        let err = extract_error(&format!("(let $s0 (Arg)) {command}"));
+        assert!(
+            err.contains("only supported with :extractor effsafe"),
+            "unexpected error: {err}"
+        );
+    }
 }
 
 #[test]
@@ -281,5 +490,8 @@ fn errors_are_reported() {
         (extract $b :extractor effsafe)
         "#,
     );
-    assert!(err.contains("marked as regions"), "unexpected error: {err}");
+    assert!(
+        err.contains("no finite term") && err.contains("marked as regions"),
+        "unexpected error: {err}"
+    );
 }

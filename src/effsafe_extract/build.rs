@@ -16,7 +16,7 @@ use indexmap::IndexMap;
 use rustc_hash::FxHasher;
 
 use super::EffsafeConfig;
-use super::cost::Cost;
+use super::cost::{Annotation, Cost, RegionBoundary};
 use super::term_graph::{EClass, EClassId, ENode, NodeKind, OpInfo, SortId, TermGraph};
 
 type FxIndexMap<K, V> = IndexMap<K, V, BuildHasherDefault<FxHasher>>;
@@ -36,6 +36,9 @@ struct Builder<'e> {
     egraph: &'e egglog::EGraph,
     config: &'e EffsafeConfig,
     cost_model: &'e dyn DagCostModel<Cost>,
+    boundary: &'e dyn RegionBoundary,
+    /// Effectful e-nodes dropped because they had several state children; see `validate`.
+    dropped: Vec<String>,
     g: TermGraph,
     sort_ids: FxIndexMap<String, SortId>,
     class_ids: FxIndexMap<ClassKey, EClassId>,
@@ -76,6 +79,8 @@ impl<'e> Builder<'e> {
                         kind: NodeKind::Placeholder,
                         cost: 0,
                         children: Vec::new(),
+                        regions: Vec::new(),
+                        boundary: None,
                     }],
                     is_effectful: false,
                     sort: sort_id,
@@ -101,12 +106,16 @@ impl<'e> Builder<'e> {
                 kind: NodeKind::Container(value),
                 cost: self.cost_model.container_cost(self.egraph, sort, value),
                 children,
+                regions: Vec::new(),
+                boundary: None,
             }
         } else {
             ENode {
                 kind: NodeKind::Base(value),
                 cost: self.cost_model.base_value_cost(self.egraph, sort, value),
                 children: Vec::new(),
+                regions: Vec::new(),
+                boundary: None,
             }
         };
         self.g.classes[class].enodes.push(enode);
@@ -138,19 +147,18 @@ impl<'e> Builder<'e> {
                 )));
             }
             let op = self.g.ops.len();
-            self.g.ops.push(OpInfo {
-                name: name.clone(),
-                regions,
-            });
+            self.g.ops.push(OpInfo { name: name.clone() });
             let out_sort = self.sort_id(&ty.output);
-            let mut rows: Vec<(Value, Vec<Value>, Cost)> = Vec::new();
+            let mut rows: Vec<(Value, Vec<Value>, Cost, Option<Annotation>)> = Vec::new();
             self.egraph.constructor_enodes(&name, |enode| {
                 if !enode.subsumed || self.config.include_subsumed {
                     let cost = self.cost_model.enode_cost(self.egraph, func, &enode);
-                    rows.push((enode.eclass, enode.children.to_vec(), cost));
+                    let boundary = (!regions.is_empty())
+                        .then(|| self.boundary.annotate(self.egraph, func, &enode));
+                    rows.push((enode.eclass, enode.children.to_vec(), cost, boundary));
                 }
             })?;
-            for (eclass, children, cost) in rows {
+            for (eclass, children, cost, boundary) in rows {
                 let children = children
                     .iter()
                     .zip(&ty.input)
@@ -161,6 +169,8 @@ impl<'e> Builder<'e> {
                     kind: NodeKind::Op(op),
                     cost,
                     children,
+                    regions: regions.clone(),
+                    boundary,
                 });
             }
         }
@@ -273,29 +283,41 @@ impl<'e> Builder<'e> {
         }
     }
 
-    /// Every effectful e-node has at most one effectful child outside its
-    /// `:regions` positions, and every root is effectful.
-    fn validate(&self, roots: &[EClassId]) -> Result<(), Error> {
-        let g = &self.g;
-        for c in g.class_ids().filter(|&c| g.is_effectful(c)) {
-            for enode in &g.classes[c].enodes {
-                let effectful: Vec<usize> = g
-                    .split_children(enode)
-                    .0
+    /// An effectful e-node with several effectful children outside its
+    /// `:regions` positions has no single state input, so it cannot be on a
+    /// statewalk. Such e-nodes are dropped (and remembered for error messages)
+    /// rather than failing the whole extraction, since the root may not need
+    /// them. Every root must be effectful.
+    fn validate(&mut self, roots: &[EClassId]) -> Result<(), Error> {
+        let effectful: Vec<EClassId> = self
+            .g
+            .class_ids()
+            .filter(|&c| self.g.is_effectful(c))
+            .collect();
+        for c in effectful {
+            let enodes = std::mem::take(&mut self.g.classes[c].enodes);
+            let mut kept = Vec::new();
+            for enode in enodes {
+                let state_children = enode
+                    .children
+                    .iter()
                     .enumerate()
-                    .filter(|&(_, child)| g.is_effectful(child))
-                    .map(|(i, _)| i)
-                    .collect();
-                if effectful.len() > 1 {
-                    let op = g.op_name(enode).unwrap_or("<container>");
-                    return Err(Error::ExtractError(format!(
-                        "effectful e-node {op} has {} effectful children that are not \
-                         marked as regions; annotate the subregions with :regions",
-                        effectful.len()
-                    )));
+                    .filter(|&(i, &child)| {
+                        !enode.regions.contains(&i) && self.g.is_effectful(child)
+                    })
+                    .count();
+                if state_children > 1 {
+                    let op = self.g.op_name(&enode).unwrap_or("<container>");
+                    self.dropped.push(format!(
+                        "{op} ({state_children} effectful children that are not marked as regions)"
+                    ));
+                } else {
+                    kept.push(enode);
                 }
             }
+            self.g.classes[c].enodes = kept;
         }
+        let g = &self.g;
         for &root in roots {
             if !g.is_effectful(root) {
                 let names: Vec<&str> = g.classes[root]
@@ -346,11 +368,11 @@ impl<'e> Builder<'e> {
         for c in g.class_ids().filter(|&c| reachable[c]) {
             let target = new_id[c].unwrap();
             for enode in &g.classes[c].enodes {
-                kept.classes[target].enodes.push(ENode {
-                    kind: enode.kind.clone(),
-                    cost: enode.cost,
-                    children: enode.children.iter().map(|&v| new_id[v].unwrap()).collect(),
-                });
+                kept.classes[target].enodes.push(
+                    enode.with_children(
+                        enode.children.iter().map(|&v| new_id[v].unwrap()).collect(),
+                    ),
+                );
             }
         }
         let roots = roots.iter().map(|&r| new_id[r].unwrap()).collect();
@@ -359,17 +381,39 @@ impl<'e> Builder<'e> {
     }
 }
 
+/// Check that every placeholder is a constructor application of the right sort.
+fn validate_placeholders(egraph: &egglog::EGraph, config: &EffsafeConfig) -> Result<(), Error> {
+    for (sort, expr) in &config.placeholders {
+        let ok = match expr {
+            egglog::ast::Expr::Call(_, head, _) => egraph
+                .get_function(head)
+                .is_some_and(|f| f.func_type().output.name() == sort),
+            _ => false,
+        };
+        if !ok {
+            return Err(Error::ExtractError(format!(
+                "placeholder {expr} for sort {sort} is not a constructor application of that sort"
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Build the extractor's e-graph for `egraph` and resolve the roots.
 pub fn build(
     egraph: &egglog::EGraph,
     config: &EffsafeConfig,
     cost_model: &dyn DagCostModel<Cost>,
+    boundary: &dyn RegionBoundary,
     roots: &Roots,
 ) -> Result<(TermGraph, Vec<EClassId>), Error> {
+    validate_placeholders(egraph, config)?;
     let mut builder = Builder {
         egraph,
         config,
         cost_model,
+        boundary,
+        dropped: Vec::new(),
         g: TermGraph::default(),
         sort_ids: FxIndexMap::default(),
         class_ids: FxIndexMap::default(),
@@ -385,8 +429,13 @@ pub fn build(
         .iter()
         .map(|&r| {
             mapping.classes[r].ok_or_else(|| {
+                let dropped = if builder.dropped.is_empty() {
+                    String::new()
+                } else {
+                    format!("; dropped e-nodes: {:?}", builder.dropped)
+                };
                 Error::ExtractError(format!(
-                    "extraction root has no finite term: {}",
+                    "extraction root has no finite term: {}{dropped}",
                     explain_unextractable(&builder.g, r)
                 ))
             })

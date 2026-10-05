@@ -1,0 +1,32 @@
+;; Pure terms may read many states of the same statewalk. A Print whose value
+;; reads five states, and a pure Add that reads two different states of the
+;; chain it ends up on, are both built from the chosen chain.
+
+(datatype Expr
+  (Arg)
+  (Num i64)
+  (Add Expr Expr)
+  (Read Expr)
+  (Print Expr Expr))
+(rule ((= e (Arg))) ((set-effectful e)))
+(rule ((= e (Print v s))) ((set-effectful e)))
+
+(let $s0 (Arg))
+(let $s1 (Print (Num 1) $s0))
+(let $s1b (Print (Add (Num 0) (Num 1)) $s0))
+(union $s1 $s1b)
+(let $s2 (Print (Num 2) $s1))
+(let $s3 (Print (Num 3) $s2))
+(let $s4 (Print (Num 4) $s3))
+
+;; one value reading five states
+(let $five (Add (Read $s0) (Add (Read $s1) (Add (Read $s2) (Add (Read $s3) (Read $s4))))))
+(let $p (Print $five $s4))
+
+;; one pure node reading two states on the same walk
+(let $two (Add (Read $s1) (Read $s2)))
+(let $q (Print $two $s2))
+
+(run 5)
+(extract $p :extractor effsafe)
+(extract $q :extractor effsafe)

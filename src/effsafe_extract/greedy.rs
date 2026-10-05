@@ -11,7 +11,7 @@ use std::hash::BuildHasherDefault;
 use indexmap::IndexMap;
 use rustc_hash::FxHasher;
 
-use super::cost::{Cost, INFINITE, RegionCostModel};
+use super::cost::{Cost, INFINITE, RegionBoundary};
 use super::term_graph::{
     EClassId, EGraphMapping, ENode, ENodeId, ExtractedNode, Extraction, ExtractionId, TermGraph,
 };
@@ -41,9 +41,13 @@ impl BagCost {
 
     /// Account for depending on `class`, whose chosen term costs `child`.
     pub fn add_child(&mut self, class: EClassId, child: &BagCost) {
+        if child.sum == INFINITE {
+            self.sum = INFINITE;
+            return;
+        }
         let mut overhead = child.sum;
         for (&cid, &c) in &child.bag {
-            overhead -= c;
+            overhead = overhead.saturating_sub(c);
             self.add_class(cid, c);
         }
         self.add_class(class, overhead);
@@ -53,13 +57,13 @@ impl BagCost {
         match self.bag.get_mut(&class) {
             Some(known) => {
                 if *known > cost {
-                    self.sum -= *known - cost;
+                    self.sum = self.sum.saturating_sub(*known - cost);
                     *known = cost;
                 }
             }
             None => {
                 self.bag.insert(class, cost);
-                self.sum += cost;
+                self.sum = self.sum.saturating_add(cost);
             }
         }
     }
@@ -159,13 +163,37 @@ impl<'g> Greedy<'g> {
     }
 }
 
-/// For every e-class, the cheapest e-node and its bag cost. Children at
-/// `:regions` positions are folded by `regions`; the rest are bag costs.
-/// Stops early once `root` is settled.
+/// The effective marginal cost of `enode` given the costs of its subregions:
+/// the boundary fold for e-nodes with `:regions` children, the plain marginal
+/// cost otherwise.
+pub fn effective_cost(
+    g: &TermGraph,
+    boundary: &dyn RegionBoundary,
+    enode: &ENode,
+    region_cost: impl Fn(EClassId) -> Cost,
+) -> Cost {
+    if enode.regions.is_empty() {
+        return enode.cost;
+    }
+    let mut by_position = vec![0; enode.children.len()];
+    for &i in &enode.regions {
+        if g.is_effectful(enode.children[i]) {
+            by_position[i] = region_cost(enode.children[i]);
+        }
+    }
+    let annotation = enode
+        .boundary
+        .as_deref()
+        .expect("e-nodes with regions carry a boundary annotation");
+    boundary.fold(annotation, &by_position)
+}
+
+/// For every e-class, the cheapest e-node and its bag cost. Subregion costs
+/// enter through the boundary fold; the other children are bag costs. Stops
+/// early once `root` is settled.
 pub fn greedy_costs(
     g: &TermGraph,
-    egraph: &egglog::EGraph,
-    regions: &dyn RegionCostModel,
+    boundary: &dyn RegionBoundary,
     root: Option<EClassId>,
 ) -> (Vec<Option<ENodeId>>, Vec<Cost>) {
     let mut greedy = Greedy::new(g);
@@ -183,17 +211,10 @@ pub fn greedy_costs(
                 continue;
             }
             let enode = g.enode(pc, pn);
-            let (plain, region) = g.split_children(enode);
-            let mut cost = BagCost::new(enode.cost);
-            for child in plain {
+            let own = effective_cost(g, boundary, enode, |c| greedy.best[c].sum);
+            let mut cost = BagCost::new(own);
+            for child in g.split_children(enode).0 {
                 cost.add_child(child, &greedy.best[child]);
-            }
-            let region_costs: Vec<Cost> = region.map(|c| greedy.best[c].sum).collect();
-            if !region_costs.is_empty() {
-                let op = g.op_name(enode).expect("only constructors have regions");
-                cost.sum = cost
-                    .sum
-                    .saturating_add(regions.fold_regions(egraph, op, &region_costs));
             }
             greedy.relax(pc, pn, cost);
         }
@@ -203,12 +224,8 @@ pub fn greedy_costs(
 }
 
 /// Estimated cost of every e-class.
-pub fn estimate_class_costs(
-    g: &TermGraph,
-    egraph: &egglog::EGraph,
-    regions: &dyn RegionCostModel,
-) -> Vec<Cost> {
-    greedy_costs(g, egraph, regions, None).1
+pub fn estimate_class_costs(g: &TermGraph, boundary: &dyn RegionBoundary) -> Vec<Cost> {
+    greedy_costs(g, boundary, None).1
 }
 
 /// Cost of an effectful e-node for the statewalk DP: its own cost, the
@@ -216,33 +233,26 @@ pub fn estimate_class_costs(
 /// (effectful children on the statewalk are paid for by the rest of the walk).
 fn statewalk_enode_cost(
     g: &TermGraph,
-    egraph: &egglog::EGraph,
-    regions: &dyn RegionCostModel,
+    boundary: &dyn RegionBoundary,
     class_cost: &[Cost],
     enode: &ENode,
 ) -> Cost {
-    let (plain, region) = g.split_children(enode);
-    let mut cost = enode.cost;
-    for child in plain {
+    let mut cost = effective_cost(g, boundary, enode, |c| class_cost[c]);
+    for child in g.split_children(enode).0 {
         if !g.is_effectful(child) {
             cost = cost.saturating_add(class_cost[child]);
         }
     }
-    let region_costs: Vec<Cost> = region.map(|c| class_cost[c]).collect();
-    if !region_costs.is_empty() {
-        let op = g.op_name(enode).expect("only constructors have regions");
-        cost = cost.saturating_add(regions.fold_regions(egraph, op, &region_costs));
-    }
     cost
 }
 
-/// Statewalk costs for every effectful e-node (pure e-classes get an empty row).
+/// Statewalk costs for every effectful e-node (pure e-classes get an empty
+/// row), given the estimated cost of every e-class.
 pub fn statewalk_costs(
     g: &TermGraph,
-    egraph: &egglog::EGraph,
-    regions: &dyn RegionCostModel,
+    boundary: &dyn RegionBoundary,
+    class_cost: &[Cost],
 ) -> Vec<Vec<Cost>> {
-    let class_cost = estimate_class_costs(g, egraph, regions);
     g.classes
         .iter()
         .map(|class| {
@@ -250,7 +260,7 @@ pub fn statewalk_costs(
                 class
                     .enodes
                     .iter()
-                    .map(|n| statewalk_enode_cost(g, egraph, regions, &class_cost, n))
+                    .map(|n| statewalk_enode_cost(g, boundary, class_cost, n))
                     .collect()
             } else {
                 Vec::new()

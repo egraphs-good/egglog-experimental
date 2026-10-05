@@ -7,7 +7,9 @@ use super::statewalk::Statewalk;
 use super::term_graph::{EClassId, EGraphMapping, Extraction, ExtractionId, TermGraph};
 
 /// Every e-node's children are in range and (unless `allow_subregion_children`)
-/// at most one child is effectful. Empty e-classes are allowed only if `allow_empty`.
+/// every *effectful* e-node has at most one effectful child outside its region
+/// positions. Pure e-nodes may read any number of states. Empty e-classes are
+/// allowed only if `allow_empty`.
 pub fn is_wellformed(g: &TermGraph, allow_empty: bool, allow_subregion_children: bool) -> bool {
     let mut ok = true;
     for c in g.class_ids() {
@@ -17,18 +19,18 @@ pub fn is_wellformed(g: &TermGraph, allow_empty: bool, allow_subregion_children:
             eprintln!("Error: empty e-class {c}");
         }
         for (n, enode) in class.enodes.iter().enumerate() {
-            let mut effectful_children = 0;
-            for &child in &enode.children {
+            let mut state_children = 0;
+            for (i, &child) in enode.children.iter().enumerate() {
                 if child >= g.len() {
                     ok = false;
                     eprintln!("Error: e-node ({c}, {n}) has out-of-range child {child}");
-                } else if g.is_effectful(child) {
-                    effectful_children += 1;
+                } else if g.is_effectful(child) && !enode.regions.contains(&i) {
+                    state_children += 1;
                 }
             }
-            if !allow_subregion_children && effectful_children > 1 {
+            if !allow_subregion_children && class.is_effectful && state_children > 1 {
                 ok = false;
-                eprintln!("Error: e-node ({c}, {n}) has a subregion child");
+                eprintln!("Error: effectful e-node ({c}, {n}) has {state_children} state children");
             }
         }
     }
