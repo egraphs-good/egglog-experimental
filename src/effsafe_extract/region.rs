@@ -16,9 +16,7 @@ use egglog::Error;
 use rustc_hash::FxHashSet;
 
 use super::cost::{Cost, RegionBoundary};
-use super::greedy::{
-    effective_cost, estimate_class_costs, project_statewalk_costs, statewalk_costs,
-};
+use super::greedy::{estimate_class_costs, project_statewalk_costs, statewalk_costs};
 use super::statewalk::{StatewalkOptions, describe_class, extract_region};
 use super::term_graph::{
     EClass, EClassId, EGraphMapping, ENodeId, ExtractedNode, Extraction, ExtractionId, TermGraph,
@@ -107,11 +105,8 @@ impl From<Error> for PlaceError {
 
 struct Regions<'g> {
     g: &'g TermGraph,
-    boundary: &'g dyn RegionBoundary,
     opts: StatewalkOptions,
-    /// Estimated cost of every e-class (global greedy).
-    class_cost: Vec<Cost>,
-    /// Statewalk cost of every effectful e-node.
+    /// Statewalk cost of every effectful e-node (subregions folded in).
     costs: Vec<Vec<Cost>>,
     /// Region number of each region root.
     region_of: Vec<Option<usize>>,
@@ -150,9 +145,7 @@ impl<'g> Regions<'g> {
         }
         Regions {
             g,
-            boundary,
             opts,
-            class_cost,
             costs,
             region_of,
             cache: vec![None; region_roots.len()],
@@ -288,10 +281,10 @@ impl<'g> Regions<'g> {
 
     /// The region e-graph rooted at `root`: the effectful spine reached through
     /// state children, plus the pure e-classes it uses. Subregion children
-    /// (effectful children at `:regions` positions) are dropped from e-nodes,
-    /// whose cost becomes the boundary fold of the subregions' estimated costs,
-    /// and e-nodes with children outside the region, or forbidden for this
-    /// region, are dropped entirely. Returns the (pruned) region, its root, and
+    /// (effectful children at `:regions` positions) are dropped from e-nodes
+    /// (their folded cost enters through the statewalk costs), and e-nodes
+    /// with children outside the region, or forbidden for this region, are
+    /// dropped entirely. Returns the (pruned) region, its root, and
     /// the mapping back into `g`.
     fn build_region(
         &mut self,
@@ -299,8 +292,6 @@ impl<'g> Regions<'g> {
         rid: usize,
     ) -> Result<(TermGraph, EClassId, EGraphMapping), Error> {
         let g = self.g;
-        let boundary = self.boundary;
-        let class_cost = &self.class_cost;
         let forbidden = &self.forbidden[rid];
         let marks = &mut self.marks;
         marks.clear();
@@ -360,8 +351,7 @@ impl<'g> Regions<'g> {
                 }
                 if inside {
                     node_map.push(Some(n));
-                    let cost = effective_cost(g, boundary, enode, |c| class_cost[c]);
-                    enodes.push(enode.without_regions(cost, children));
+                    enodes.push(enode.without_regions(children));
                 }
             }
             region.classes.push(EClass {

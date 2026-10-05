@@ -136,8 +136,11 @@ the e-node's own cost.
 
 The boundary model sees only e-nodes with `:regions` children. Its
 `enode_cost` annotation is computed once per e-node, and `fold_enode_cost`
-receives the subregions' costs in their argument positions and `0` for every
-other child. The result (including the e-node's own cost) is the e-node's
+receives the costs of the children at `:regions` positions in their argument
+positions and `0` for every other child. (A pure e-class at a `:regions`
+position, such as the branches of a conditional that does not touch the
+state, is not a subregion and is extracted within the enclosing region, but
+the fold prices it the same way, so the model's weighting applies to it too.) The result (including the e-node's own cost) is the e-node's
 effective marginal cost in the enclosing region, whose DAG then charges the
 predicate, state and other ordinary children, preserving sharing. A subregion
 used from several e-nodes is extracted and placed once but charged at every

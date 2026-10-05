@@ -67,13 +67,12 @@ impl ENode {
         self.children.is_empty()
     }
 
-    /// A copy of this e-node with marginal cost `cost` (normally the boundary
-    /// fold of its subregions' costs) and `children`, which must correspond
+    /// A copy of this e-node with `children`, which must correspond
     /// position by position to the non-region children of `self`.
-    pub fn without_regions(&self, cost: Cost, children: Vec<EClassId>) -> ENode {
+    pub fn without_regions(&self, children: Vec<EClassId>) -> ENode {
         ENode {
             kind: self.kind.clone(),
-            cost,
+            cost: self.cost,
             children,
             regions: Vec::new(),
             boundary: None,

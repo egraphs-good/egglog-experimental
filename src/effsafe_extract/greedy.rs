@@ -163,11 +163,14 @@ impl<'g> Greedy<'g> {
     }
 }
 
-/// The effective marginal cost of `enode` given the costs of its subregions:
-/// the boundary fold for e-nodes with `:regions` children, the plain marginal
-/// cost otherwise.
+/// The effective marginal cost of `enode` given the costs of its `:regions`
+/// children: the boundary fold for e-nodes with such children, the plain
+/// marginal cost otherwise. A pure e-class at a `:regions` position (the
+/// branches of a conditional that does not touch the state, say) is not a
+/// subregion, but it is still priced through the fold, as a tree, so that the
+/// boundary model's weighting applies to it too.
 pub fn effective_cost(
-    g: &TermGraph,
+    _g: &TermGraph,
     boundary: &dyn RegionBoundary,
     enode: &ENode,
     region_cost: impl Fn(EClassId) -> Cost,
@@ -177,9 +180,7 @@ pub fn effective_cost(
     }
     let mut by_position = vec![0; enode.children.len()];
     for &i in &enode.regions {
-        if g.is_effectful(enode.children[i]) {
-            by_position[i] = region_cost(enode.children[i]);
-        }
+        by_position[i] = region_cost(enode.children[i]);
     }
     let annotation = enode
         .boundary

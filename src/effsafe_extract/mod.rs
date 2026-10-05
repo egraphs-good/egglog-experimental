@@ -199,7 +199,9 @@ pub fn extract_effsafe(
 /// The cost of an extracted program under the same model the search used:
 /// within each region the distinct e-nodes' marginal costs are summed (a DAG
 /// cost), and an e-node with subregions is charged its boundary fold of the
-/// subregions' costs, once per occurrence, in place of its marginal cost.
+/// subregions' costs, once per occurrence, in place of its marginal cost. A
+/// pure term at a `:regions` position belongs to the enclosing region's DAG
+/// and is charged there, so the fold sees `0` for it.
 fn program_cost(
     g: &term_graph::TermGraph,
     boundary: &dyn RegionBoundary,

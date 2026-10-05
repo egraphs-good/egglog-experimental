@@ -364,6 +364,27 @@ fn reported_cost_charges_each_region_occurrence() {
 }
 
 #[test]
+fn pure_children_at_region_positions_are_priced() {
+    // A conditional that does not touch the state is pure, and so are its
+    // branches: they are extracted within the enclosing region, but their
+    // cost still counts (through the boundary fold), so the cheap sum wins
+    // over a Choose whose branches are expensive.
+    let term = extract_one(
+        r#"
+        (constructor Choose (Expr Expr Expr) Expr :regions (1 2))
+        (constructor Big () Expr :cost 100)
+        (let $s0 (Arg))
+        (let $v (Choose (Num 0) (Big) (Big)))
+        (union $v (Add (Num 1) (Num 2)))
+        (let $p (Print $v $s0))
+        (run 5)
+        (extract $p :extractor effsafe)
+        "#,
+    );
+    assert_eq!(term, "(Print (Add (Num 1) (Num 2)) (Arg))");
+}
+
+#[test]
 fn set_effectful_accepts_let_bound_variables() {
     let term = extract_one(
         r#"
