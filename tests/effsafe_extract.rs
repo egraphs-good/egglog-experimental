@@ -223,6 +223,31 @@ fn containers_are_extracted_element_by_element() {
 }
 
 #[test]
+fn containers_carry_the_state() {
+    // The state is passed to Call inside a Vec together with a value. The
+    // container becomes effectful and the statewalk runs through it, so the
+    // value is built from the chosen state chain.
+    let term = extract_one(
+        r#"
+        (sort Exprs (Vec Expr))
+        (constructor Call (String Exprs) Expr)
+        (rule ((= e (Call n args))) ((Effectful e)))
+        (let $s0 (Arg))
+        (let $s1 (Print (Num 1) $s0))
+        (let $s1b (Print (Add (Num 0) (Num 1)) $s0))
+        (union $s1 $s1b)
+        (let $c (Call "f" (vec-of (Read $s1) $s1)))
+        (run 5)
+        (effsafe-extract Effectful $c)
+        "#,
+    );
+    assert_eq!(
+        term,
+        "(Call \"f\" (vec-of (Read (Print (Num 1) (Arg))) (Print (Num 1) (Arg))))"
+    );
+}
+
+#[test]
 fn subsumed_nodes_are_skipped_unless_included() {
     // Mark effectfulness first: subsumed e-nodes no longer match rules.
     let program = r#"

@@ -182,7 +182,9 @@ from firing again, say) can include them with a trailing `:include-subsumed`:
   languages in which the state is linear).
 - `:regions` is accepted on `constructor` and on `datatype` variants, not yet
   inside `datatype*`.
-- Containers are extracted element by element; a container holding an
-  effectful e-class is treated as a pure node.
+- Containers are extracted element by element. A container holding an
+  effectful element is effectful itself and the statewalk runs through it,
+  so a state can be passed inside a `Vec`; a container holding two states is
+  an error, like any e-node with two effectful children.
 - Roots must be effectful. Extracting a pure root is a plain tree extraction,
   which `extract` already provides.

@@ -200,7 +200,44 @@ impl<'e> Builder<'e> {
                 self.g.classes[class].is_effectful = true;
             }
         }
+        self.mark_effectful_containers();
         Ok(())
+    }
+
+    /// A container holding an effectful element carries the state itself, so
+    /// the statewalk runs through it: `(Call "f" (vec-of arg state))` reaches
+    /// `state` through the `Vec`. Containers are never in the effectful
+    /// relation (it ranges over one sort), so this is inferred, to a fixpoint
+    /// for nested containers.
+    fn mark_effectful_containers(&mut self) {
+        let g = &mut self.g;
+        let containers: Vec<EClassId> = g
+            .class_ids()
+            .filter(|&c| {
+                g.classes[c]
+                    .enodes
+                    .iter()
+                    .any(|n| matches!(n.kind, NodeKind::Container(_)))
+            })
+            .collect();
+        let mut changed = true;
+        while changed {
+            changed = false;
+            for &c in &containers {
+                if g.classes[c].is_effectful {
+                    continue;
+                }
+                let carries_state = g.classes[c].enodes.iter().any(|n| {
+                    n.children
+                        .iter()
+                        .any(|&child| g.classes[child].is_effectful)
+                });
+                if carries_state {
+                    g.classes[c].is_effectful = true;
+                    changed = true;
+                }
+            }
+        }
     }
 
     fn resolve_roots(&mut self, roots: &Roots) -> Result<Vec<EClassId>, Error> {
