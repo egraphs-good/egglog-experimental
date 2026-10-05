@@ -1,0 +1,55 @@
+;; Effect-safe extraction of a small language that threads a state value.
+;;
+;; `Print` and `Arg` are effectful: they produce the state. `If` runs one of
+;; two subregions (positions 2 and 3), each of which starts from its own copy
+;; of the state. `Loop` runs its body (position 1) repeatedly.
+
+(datatype Expr
+  (Arg)
+  (Num i64)
+  (Add Expr Expr)
+  (Print Expr Expr)
+  (If Expr Expr Expr Expr :regions (2 3))
+  (Loop Expr Expr :regions (1)))
+(constructor Func (String Expr) Expr)
+
+(relation Effectful (Expr))
+(rule ((= e (Arg))) ((Effectful e)))
+(rule ((= e (Print v s))) ((Effectful e)))
+(rule ((= e (If p s t els))) ((Effectful e)))
+(rule ((= e (Loop s b))) ((Effectful e)))
+(rule ((= e (Func n b))) ((Effectful e)))
+
+;; Two equivalent ways to print 1: the extractor must pick one state chain
+;; and build every pure term from it.
+(let $s0 (Arg))
+(let $one (Num 1))
+(let $p1 (Print $one $s0))
+(let $p2 (Print (Add $one (Num 0)) $s0))
+(union $p1 $p2)
+(let $p3 (Print (Add (Num 2) (Num 3)) $p1))
+
+;; A conditional whose branches are regions with their own state, and a loop.
+(let $body (Print (Num 7) (Arg)))
+(let $i (If $one $p3 $body $body))
+(let $l (Loop $i (Print (Add (Num 4) (Num 4)) (Arg))))
+
+(let $main (Func "main" $l))
+
+(run 10)
+
+(effsafe-extract Effectful $p3)
+(effsafe-extract Effectful $i)
+(effsafe-extract Effectful $p3 $i)
+(effsafe-extract-all Effectful Func)
+
+;; Regions can also be declared without the annotation.
+(datatype Expr2 (Arg2) (Num2 i64) (Print2 Expr2 Expr2) (If2 Expr2 Expr2 Expr2 Expr2))
+(effsafe-regions If2 2 3)
+(relation Effectful2 (Expr2))
+(rule ((= e (Arg2))) ((Effectful2 e)))
+(rule ((= e (Print2 v s))) ((Effectful2 e)))
+(rule ((= e (If2 p s t els))) ((Effectful2 e)))
+(let $j (If2 (Num2 0) (Arg2) (Print2 (Num2 1) (Arg2)) (Arg2)))
+(run 5)
+(effsafe-extract Effectful2 $j)

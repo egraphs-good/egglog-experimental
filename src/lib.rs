@@ -75,6 +75,10 @@
 //!   one [`MultiExtractOutput`] whose public fields expose shared term storage
 //!   and ordered per-root variant IDs.
 //! - [`KeepBestCommand`] compacts selected tables to their best terms.
+//! - [`effsafe_extract`] implements `(effsafe-extract rel term...)` and
+//!   `(effsafe-extract-all rel constructor)`: effect-safe extraction for
+//!   languages that thread a state through their terms, configured with
+//!   `:regions` annotations on constructors (see `docs/effsafe-extract.md`).
 //! - `:extractor greedy-dag` enables heuristic DAG-cost extraction for
 //!   `extract`, `multi-extract`, and `keep-best`. Within each independently
 //!   costed root or variant, it charges shared subterms once. It does not
@@ -127,12 +131,33 @@ pub use keep_best::KeepBestCommand;
 mod subst;
 pub use subst::Subst;
 
+pub mod effsafe_extract;
+pub use effsafe_extract::{
+    EffsafeConfig, EffsafeExtractOutput, RegionCostModel, SumRegions, add_effsafe_extract,
+    extract_effsafe,
+};
+
 /// Creates a default [`EGraph`] with every experimental extension registered.
 ///
 /// This is the recommended entry point for running egglog programs that use
 /// this crate. Use [`experimental_parser`] instead when only the parse-time
 /// `for` and `with-ruleset` macros are needed.
 pub fn new_experimental_egraph() -> EGraph {
+    new_experimental_egraph_with_effsafe(DynamicCostModel, Arc::new(SumRegions))
+}
+
+/// Like [`new_experimental_egraph`], but effect-safe extraction prices e-nodes
+/// with `cost_model` and folds subregion costs with `region_costs`.
+///
+/// Use this when embedding egglog in a compiler whose cost heuristics are not
+/// expressible as `:cost` annotations.
+pub fn new_experimental_egraph_with_effsafe<CM>(
+    cost_model: CM,
+    region_costs: Arc<dyn RegionCostModel>,
+) -> EGraph
+where
+    CM: egglog::extract::DagCostModel<egglog::extract::DefaultCost> + Clone + Send + Sync + 'static,
+{
     let mut egraph = EGraph::default();
 
     // Set up the parser with experimental parse-time macros
@@ -183,6 +208,9 @@ pub fn new_experimental_egraph() -> EGraph {
 
     // Substitution over a reachable sub-e-graph.
     egraph.add_full_primitive(Subst, None);
+
+    // Effect-safe extraction with :regions annotations.
+    add_effsafe_extract(&mut egraph, cost_model, region_costs);
     egraph
 }
 

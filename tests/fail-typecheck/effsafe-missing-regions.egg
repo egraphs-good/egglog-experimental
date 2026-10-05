@@ -1,0 +1,15 @@
+;; An effectful e-node with two effectful children and no :regions annotation
+;; is an error: the extractor cannot tell the state input from the subregions.
+(datatype Expr
+  (Arg)
+  (Num i64)
+  (Print Expr Expr)
+  (If Expr Expr Expr Expr))
+(relation Effectful (Expr))
+(rule ((= e (Arg))) ((Effectful e)))
+(rule ((= e (Print v s))) ((Effectful e)))
+(rule ((= e (If p s t els))) ((Effectful e)))
+(let $s0 (Arg))
+(let $i (If (Num 1) $s0 (Print (Num 2) $s0) (Print (Num 3) $s0)))
+(run 5)
+(effsafe-extract Effectful $i)
