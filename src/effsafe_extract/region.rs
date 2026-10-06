@@ -10,7 +10,10 @@
 //! subregion that in turn (transitively) uses the region itself, or a
 //! subregion may have no effect-safe extraction at all. When placing a
 //! subregion fails, the e-nodes that chose it are forbidden in the enclosing
-//! region, which is extracted again without them.
+//! region, which is extracted again without them. Such a failure depends on
+//! what is being placed above, so the exclusions made while placing a failed
+//! subregion are undone with it, and all exclusions are dropped between
+//! extraction roots.
 
 use egglog::Error;
 use rustc_hash::FxHashSet;
@@ -22,29 +25,20 @@ use super::term_graph::{
     EClass, EClassId, EGraphMapping, ENodeId, ExtractedNode, Extraction, ExtractionId, TermGraph,
 };
 
-/// An extraction together with the region each of its nodes belongs to.
-pub struct PlacedExtraction {
-    pub extraction: Extraction,
-    /// Region index (into the regions' numbering) of each node.
-    pub region_of_node: Vec<usize>,
-}
-
 /// Extract every root of `g`.
 pub fn extract_all(
     g: &TermGraph,
     boundary: &dyn RegionBoundary,
     roots: &[EClassId],
     opts: StatewalkOptions,
-) -> Result<Vec<PlacedExtraction>, Error> {
+) -> Result<Vec<Extraction>, Error> {
     let mut regions = Regions::new(g, boundary, roots, opts);
     roots
         .iter()
         .map(|&root| {
             regions.placed.fill(None);
-            let mut out = PlacedExtraction {
-                extraction: Vec::new(),
-                region_of_node: Vec::new(),
-            };
+            regions.clear_forbidden();
+            let mut out = Vec::new();
             regions.place(root, &mut out).map_err(|err| match err {
                 PlaceError::Other(err) => err,
                 PlaceError::Cycle(class) => Error::ExtractError(format!(
@@ -54,7 +48,14 @@ pub fn extract_all(
                     describe_class(g, class)
                 )),
             })?;
-            debug_assert!(super::checks::is_effect_safe(g, root, &out.extraction));
+            // The final check runs in release builds too: it is linear in the
+            // extraction and an unsafe program must never be returned.
+            if !super::checks::is_effect_safe(g, root, &out) {
+                return Err(Error::ExtractError(format!(
+                    "internal error: the extraction of {} is not effect-safe (please report this)",
+                    describe_class(g, root)
+                )));
+            }
             Ok(out)
         })
         .collect()
@@ -115,6 +116,9 @@ struct Regions<'g> {
     /// E-nodes of `g` excluded from each region, because the subregion they
     /// chose could not be placed below it.
     forbidden: Vec<FxHashSet<(EClassId, ENodeId)>>,
+    /// Every exclusion in order, so that those made below a failed placement
+    /// can be undone.
+    forbidden_log: Vec<(usize, (EClassId, ENodeId))>,
     /// Regions currently being placed (on the recursion stack).
     placing: Vec<bool>,
     /// Where each region was placed in the extraction being built.
@@ -150,19 +154,30 @@ impl<'g> Regions<'g> {
             region_of,
             cache: vec![None; region_roots.len()],
             forbidden: vec![FxHashSet::default(); region_roots.len()],
+            forbidden_log: Vec::new(),
             placing: vec![false; region_roots.len()],
             placed: vec![None; region_roots.len()],
             marks: Marks::new(g.len()),
         }
     }
 
+    /// Drop every exclusion (and the cached extractions it affected).
+    fn clear_forbidden(&mut self) {
+        self.undo_forbidden(0);
+    }
+
+    /// Undo the exclusions logged after `checkpoint`.
+    fn undo_forbidden(&mut self, checkpoint: usize) {
+        while self.forbidden_log.len() > checkpoint {
+            let (rid, enode) = self.forbidden_log.pop().unwrap();
+            self.forbidden[rid].remove(&enode);
+            self.cache[rid] = None;
+        }
+    }
+
     /// Append the extraction of the region rooted at `root` to `out`, placing
     /// its subregions first. Returns the position of the root.
-    fn place(
-        &mut self,
-        root: EClassId,
-        out: &mut PlacedExtraction,
-    ) -> Result<ExtractionId, PlaceError> {
+    fn place(&mut self, root: EClassId, out: &mut Extraction) -> Result<ExtractionId, PlaceError> {
         let rid = self.region_of[root].expect("not a region root");
         if let Some(id) = self.placed[rid] {
             return Ok(id);
@@ -180,7 +195,7 @@ impl<'g> Regions<'g> {
         &mut self,
         root: EClassId,
         rid: usize,
-        out: &mut PlacedExtraction,
+        out: &mut Extraction,
     ) -> Result<ExtractionId, PlaceError> {
         let g = self.g;
         loop {
@@ -191,7 +206,7 @@ impl<'g> Regions<'g> {
 
             // Place the subregions first. If one cannot be placed, forbid the
             // e-nodes of this region that chose it and extract the region again.
-            let checkpoint = (out.extraction.len(), self.placed.clone());
+            let checkpoint = (out.len(), self.placed.clone(), self.forbidden_log.len());
             let mut subregions = Vec::new();
             let mut failed: Option<(EClassId, PlaceError)> = None;
             'nodes: for en in &region {
@@ -206,9 +221,11 @@ impl<'g> Regions<'g> {
                 }
             }
             if let Some((child, err)) = failed {
-                out.extraction.truncate(checkpoint.0);
-                out.region_of_node.truncate(checkpoint.0);
+                out.truncate(checkpoint.0);
                 self.placed = checkpoint.1;
+                // Exclusions made while placing the failed subregion were
+                // relative to this attempt; undo them.
+                self.undo_forbidden(checkpoint.2);
                 let culprits: Vec<(EClassId, ENodeId)> = region
                     .iter()
                     .filter(|en| {
@@ -226,12 +243,16 @@ impl<'g> Regions<'g> {
                     describe_class(g, child),
                     culprits.len()
                 );
-                self.forbidden[rid].extend(culprits);
+                for culprit in culprits {
+                    if self.forbidden[rid].insert(culprit) {
+                        self.forbidden_log.push((rid, culprit));
+                    }
+                }
                 self.cache[rid] = None;
                 continue;
             }
 
-            let base = out.extraction.len();
+            let base = out.len();
             let mut subregions = subregions.into_iter();
             for en in &region {
                 let enode = g.enode(en.class, en.node);
@@ -248,15 +269,14 @@ impl<'g> Regions<'g> {
                         }
                     })
                     .collect();
-                out.extraction.push(ExtractedNode {
+                out.push(ExtractedNode {
                     class: en.class,
                     node: en.node,
                     children,
                 });
-                out.region_of_node.push(rid);
             }
-            self.placed[rid] = Some(out.extraction.len() - 1);
-            return Ok(out.extraction.len() - 1);
+            self.placed[rid] = Some(out.len() - 1);
+            return Ok(out.len() - 1);
         }
     }
 
@@ -361,7 +381,7 @@ impl<'g> Regions<'g> {
             });
             to_g.enodes.push(node_map);
         }
-        debug_assert!(super::checks::is_wellformed(&region, true, false));
+        super::checks::validate!(super::checks::is_wellformed(&region, true, false));
 
         let (pruned, region_to_pruned) = region.prune_unextractable(Some(0));
         let Some(pruned_root) = region_to_pruned.classes[0] else {
@@ -373,7 +393,7 @@ impl<'g> Regions<'g> {
             )));
         };
         let pruned_to_g = region_to_pruned.inverse(&pruned).then(&to_g);
-        debug_assert!(super::checks::is_valid_mapping(
+        super::checks::validate!(super::checks::is_valid_mapping(
             &pruned_to_g,
             &pruned,
             g,

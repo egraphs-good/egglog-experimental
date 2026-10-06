@@ -20,6 +20,7 @@ mod region;
 mod set_effectful;
 mod statewalk;
 mod term_graph;
+use term_graph::{Extraction, ExtractionId};
 mod to_term;
 
 use std::collections::HashMap;
@@ -181,9 +182,7 @@ pub fn extract_effsafe(
     }
     let terms = extractions
         .iter()
-        .map(|e| {
-            to_term::extraction_to_term(&g, egraph, &placeholders, &e.extraction, &mut termdag)
-        })
+        .map(|e| to_term::extraction_to_term(&g, egraph, &placeholders, e, &mut termdag))
         .collect();
     let costs = extractions
         .iter()
@@ -196,32 +195,47 @@ pub fn extract_effsafe(
     })
 }
 
-/// The cost of an extracted program under the same model the search used:
-/// within each region the distinct e-nodes' marginal costs are summed (a DAG
-/// cost), and an e-node with subregions is charged its boundary fold of the
-/// subregions' costs, once per occurrence, in place of its marginal cost. A
-/// pure term at a `:regions` position belongs to the enclosing region's DAG
-/// and is charged there, so the fold sees `0` for it.
+/// The cost of an extracted program under the same model the search used: a
+/// DAG up to region boundaries and a tree across them. The nodes reachable
+/// from `root` through children outside `:regions` positions are charged
+/// their marginal cost once each, except that a node with `:regions` children
+/// is charged the boundary fold of those children's costs, each priced on its
+/// own by this same rule. A `:regions` child is therefore charged at every
+/// occurrence, whether it is a subregion or a pure term.
 fn program_cost(
     g: &term_graph::TermGraph,
     boundary: &dyn RegionBoundary,
-    placed: &region::PlacedExtraction,
+    nodes: &Extraction,
 ) -> Cost {
-    let nodes = &placed.extraction;
-    // Subregions are placed before the nodes that use them, so a region's
-    // total is complete by the time a parent node folds it.
-    let mut region_total: FxHashMap<usize, Cost> = FxHashMap::default();
-    for (i, en) in nodes.iter().enumerate() {
-        let enode = g.enode(en.class, en.node);
+    let mut memo = vec![None; nodes.len()];
+    subterm_cost(g, boundary, nodes, nodes.len() - 1, &mut memo)
+}
+
+fn subterm_cost(
+    g: &term_graph::TermGraph,
+    boundary: &dyn RegionBoundary,
+    nodes: &Extraction,
+    root: ExtractionId,
+    memo: &mut [Option<Cost>],
+) -> Cost {
+    if let Some(cost) = memo[root] {
+        return cost;
+    }
+    let mut total: Cost = 0;
+    let mut seen = vec![false; nodes.len()];
+    let mut stack = vec![root];
+    while let Some(id) = stack.pop() {
+        if std::mem::replace(&mut seen[id], true) {
+            continue;
+        }
+        let node = &nodes[id];
+        let enode = g.enode(node.class, node.node);
         let cost = if enode.regions.is_empty() {
             enode.cost
         } else {
             let mut by_position = vec![0; enode.children.len()];
             for &p in &enode.regions {
-                let child = en.children[p];
-                if g.is_effectful(nodes[child].class) {
-                    by_position[p] = region_total[&placed.region_of_node[child]];
-                }
+                by_position[p] = subterm_cost(g, boundary, nodes, node.children[p], memo);
             }
             let annotation = enode
                 .boundary
@@ -229,10 +243,15 @@ fn program_cost(
                 .expect("regions carry an annotation");
             boundary.fold(annotation, &by_position)
         };
-        let total = region_total.entry(placed.region_of_node[i]).or_insert(0);
-        *total = total.saturating_add(cost);
+        total = total.saturating_add(cost);
+        for (position, &child) in node.children.iter().enumerate() {
+            if !enode.regions.contains(&position) {
+                stack.push(child);
+            }
+        }
     }
-    region_total[&placed.region_of_node[nodes.len() - 1]]
+    memo[root] = Some(total);
+    total
 }
 
 /// Split a trailing `:include-subsumed` flag, which lets effect-safe

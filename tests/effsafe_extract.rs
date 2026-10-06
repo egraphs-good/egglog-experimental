@@ -296,12 +296,12 @@ fn placeholders_replace_a_sort() {
     // The replacement is checked: it must be a constructor of the sort.
     let err = extract_error_with(program, placeholder("Ctx", "Num"));
     assert!(
-        err.contains("not a constructor application of that sort"),
+        err.contains("constructor application of that sort"),
         "unexpected error: {err}"
     );
     let err = extract_error_with(program, placeholder("Ctx", "Missing"));
     assert!(
-        err.contains("not a constructor application of that sort"),
+        err.contains("constructor application of that sort"),
         "unexpected error: {err}"
     );
 }

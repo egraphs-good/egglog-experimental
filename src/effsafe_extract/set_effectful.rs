@@ -6,8 +6,13 @@
 //! insertion into the relation `effsafe_effectful_<Sort>` for the sort of
 //! `e`, and declares that relation the first time the sort is seen. The
 //! extractor reads every such relation.
+//!
+//! The sort of `e` comes from egglog's own typechecker: the rule's body is
+//! typechecked together with one synthetic fact per `let` action and per
+//! `set-effectful` argument (`(= <fresh> <expr>)`), which types primitives,
+//! containers and let-bound variables the same way the rule's actions would.
 
-use egglog::ast::{Action, Command, Expr, ParseError, Rule};
+use egglog::ast::{Action, Command, Expr, Fact, ParseError, Rule};
 use egglog::util::SymbolGen;
 use egglog::{CommandMacro, Error, TypeInfo};
 use rustc_hash::FxHashMap;
@@ -47,7 +52,9 @@ impl CommandMacro for SetEffectful {
                 let [arg] = &args[..] else {
                     return Err(usage(call_span));
                 };
-                let sort = sort_of(arg, &FxHashMap::default(), type_info)?;
+                let vars =
+                    sorts_through_facts(&[], &[], std::slice::from_ref(arg), symbol_gen, type_info);
+                let sort = sort_of(arg, &vars, type_info)?;
                 let mut commands =
                     declare_if_needed(&sort, call_span.clone(), type_info, &mut Vec::new());
                 commands.push(Command::Action(Action::Expr(
@@ -86,13 +93,32 @@ fn rewrite_rule(
     symbol_gen: &mut SymbolGen,
     type_info: &TypeInfo,
 ) -> Result<Vec<Command>, Error> {
-    // The sorts of the rule's variables come from typechecking its body.
-    let resolved = type_info.typecheck_facts(symbol_gen, &rule.body)?;
-    let mut vars: FxHashMap<String, String> = FxHashMap::default();
-    for fact in &resolved {
-        fact.visit_vars(&mut |_span, var| {
-            vars.insert(var.name.to_string(), var.sort.name().to_string());
+    // Typecheck the body first (reporting its errors as usual), then again
+    // with the actions' lets and the set-effectful arguments as facts.
+    type_info.typecheck_facts(symbol_gen, &rule.body)?;
+    let mut marks = Vec::new();
+    let mut lets = Vec::new();
+    for action in rule.head.iter() {
+        if let Action::Let(_, var, expr) = action {
+            lets.push((var.clone(), expr.clone()));
+        }
+        action.clone().visit_exprs(&mut |expr| {
+            if let Expr::Call(_, head, args) = &expr
+                && head == SET_EFFECTFUL
+                && let [arg] = &args[..]
+            {
+                marks.push(arg.clone());
+            }
+            expr
         });
+    }
+    let mut vars = sorts_through_facts(&rule.body, &lets, &marks, symbol_gen, type_info);
+    for (var, expr) in &lets {
+        if !vars.contains_key(var)
+            && let Ok(sort) = sort_of(expr, &vars, type_info)
+        {
+            vars.insert(var.clone(), sort);
+        }
     }
     let mut declared: Vec<String> = Vec::new();
     let mut commands: Vec<Command> = Vec::new();
@@ -134,11 +160,6 @@ fn rewrite_rule(
         if let Some(err) = error {
             return Err(err);
         }
-        if let Action::Let(_, var, expr) = action
-            && let Ok(sort) = sort_of(expr, &vars, type_info)
-        {
-            vars.insert(var.clone(), sort);
-        }
         new_actions.push(rewritten);
     }
     let mut head = rule.head.clone();
@@ -149,6 +170,58 @@ fn rewrite_rule(
     Ok(commands)
 }
 
+fn mark_name(i: usize) -> String {
+    format!("__effsafe_mark_{i}")
+}
+
+/// Var-name to sort-name for every variable of `body`, for the let-bound
+/// variables in `lets`, and for the fresh variable `mark_name(i)` bound to
+/// `marks[i]`, found by typechecking `body` extended with one `(= <var>
+/// <expr>)` fact per let and per mark. Falls back to the body alone (or
+/// nothing) when the extended facts do not typecheck; the caller then reports
+/// what it cannot determine.
+fn sorts_through_facts(
+    body: &[Fact],
+    lets: &[(String, Expr)],
+    marks: &[Expr],
+    symbol_gen: &mut SymbolGen,
+    type_info: &TypeInfo,
+) -> FxHashMap<String, String> {
+    let mut facts: Vec<Fact> = body.to_vec();
+    for (var, expr) in lets {
+        facts.push(Fact::Eq(
+            expr.span(),
+            Expr::Var(expr.span(), var.clone()),
+            expr.clone(),
+        ));
+    }
+    for (i, arg) in marks.iter().enumerate() {
+        facts.push(Fact::Eq(
+            arg.span(),
+            Expr::Var(arg.span(), mark_name(i)),
+            arg.clone(),
+        ));
+    }
+    let resolved = type_info
+        .typecheck_facts(symbol_gen, &facts)
+        .or_else(|_| type_info.typecheck_facts(symbol_gen, body))
+        .unwrap_or_default();
+    let mut vars: FxHashMap<String, String> = FxHashMap::default();
+    for fact in &resolved {
+        fact.visit_vars(&mut |_span, var| {
+            vars.insert(var.name.to_string(), var.sort.name().to_string());
+        });
+    }
+    // The marks' sorts are also recorded under the argument's own text, so
+    // `sort_of` finds them without knowing the mark numbering.
+    for (i, arg) in marks.iter().enumerate() {
+        if let Some(sort) = vars.get(&mark_name(i)).cloned() {
+            vars.insert(format!("{arg}"), sort);
+        }
+    }
+    vars
+}
+
 /// The sort of `expr` inside a rule whose variables have the sorts in `vars`.
 fn sort_of(
     expr: &Expr,
@@ -156,6 +229,9 @@ fn sort_of(
     type_info: &TypeInfo,
 ) -> Result<String, Error> {
     let sort = match expr {
+        _ if vars.contains_key(&format!("{expr}")) && !matches!(expr, Expr::Lit(..)) => {
+            vars.get(&format!("{expr}")).cloned()
+        }
         Expr::Var(_, name) => vars.get(name).cloned().or_else(|| {
             type_info
                 .get_global_sort(name)

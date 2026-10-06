@@ -8,6 +8,7 @@ use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 use std::hash::BuildHasherDefault;
 
+use egglog::Error;
 use indexmap::IndexMap;
 use rustc_hash::FxHasher;
 
@@ -125,8 +126,11 @@ impl<'g> Greedy<'g> {
         greedy
     }
 
+    /// Record `node` as the cheapest known e-node of `class` if it is. The
+    /// first e-node of a class is always recorded, even when its cost has
+    /// saturated to `INFINITE`: reachability is not a matter of cost.
     fn relax(&mut self, class: EClassId, node: ENodeId, cost: BagCost) {
-        if cost < self.best[class] {
+        if self.pick[class].is_none() || cost < self.best[class] {
             self.heap.push((Reverse(cost.sum), class));
             self.best[class] = cost;
             self.pick[class] = Some(node);
@@ -198,6 +202,10 @@ pub fn greedy_costs(
     root: Option<EClassId>,
 ) -> (Vec<Option<ENodeId>>, Vec<Cost>) {
     let mut greedy = Greedy::new(g);
+    // A class can be popped again when a later relaxation improves it (a
+    // boundary fold may make a parent cheaper than its subregion); it counts
+    // towards its parents' remaining children only once.
+    let mut processed = vec![false; g.len()];
     while let Some((cost, class)) = greedy.pop_unchecked() {
         if Some(class) == root {
             break;
@@ -207,7 +215,9 @@ pub fn greedy_costs(
         }
         for idx in 0..greedy.parents[class].len() {
             let (pc, pn) = greedy.parents[class][idx];
-            greedy.remaining[pc][pn] -= 1;
+            if !processed[class] {
+                greedy.remaining[pc][pn] -= 1;
+            }
             if greedy.remaining[pc][pn] != 0 {
                 continue;
             }
@@ -219,6 +229,7 @@ pub fn greedy_costs(
             }
             greedy.relax(pc, pn, cost);
         }
+        processed[class] = true;
     }
     let costs = greedy.best.iter().map(|b| b.sum).collect();
     (greedy.pick, costs)
@@ -297,7 +308,7 @@ pub fn project_statewalk_costs(mapping: &EGraphMapping, costs: &[Vec<Cost>]) -> 
 /// settled, the whole term below it is emitted and its e-classes become free
 /// for everyone else to reuse (their cost drops to zero), which is what makes
 /// the shared statewalk pay for pure subterms only once.
-pub fn statewalk_greedy_extraction(g: &TermGraph, root: EClassId) -> Extraction {
+pub fn statewalk_greedy_extraction(g: &TermGraph, root: EClassId) -> Result<Extraction, Error> {
     let mut greedy = Greedy::new(g);
     let mut extraction: Extraction = Vec::new();
     let mut extracted: Vec<Option<ExtractionId>> = vec![None; g.len()];
@@ -334,9 +345,14 @@ pub fn statewalk_greedy_extraction(g: &TermGraph, root: EClassId) -> Extraction 
         }
         processed[class] = true;
     }
-    debug_assert!(extracted[root].is_some());
-    debug_assert!(super::checks::is_effect_safe(g, root, &extraction));
-    extraction
+    if extracted[root].is_none() {
+        return Err(Error::ExtractError(
+            "internal error: the region's root was not extracted from its linearized e-graph"
+                .to_string(),
+        ));
+    }
+    super::checks::validate!(super::checks::is_effect_safe(g, root, &extraction));
+    Ok(extraction)
 }
 
 /// Append the picked term below `class` to `extraction` (skipping e-classes

@@ -114,7 +114,7 @@ impl Region {
         root: EClassId,
         opts: StatewalkOptions,
     ) -> Result<(Self, Vec<u32>), Error> {
-        debug_assert!(super::checks::has_single_arg(g));
+        super::checks::validate!(super::checks::has_single_arg(g));
         let arg = g
             .class_ids()
             .filter(|&c| g.is_effectful(c))
@@ -541,7 +541,7 @@ pub fn statewalk_dp(
         statewalk.push((states[id].class, states[id].pick));
         cur = states[id].prev;
     }
-    debug_assert!(super::checks::is_valid_statewalk(g, root, &statewalk));
+    super::checks::validate!(super::checks::is_valid_statewalk(g, root, &statewalk));
     Ok(statewalk)
 }
 
@@ -604,8 +604,8 @@ pub fn linearize(g: &TermGraph, statewalk: &Statewalk) -> (TermGraph, EGraphMapp
         };
         prev = Some(lin_class);
     }
-    debug_assert!(super::checks::is_wellformed(&lin, true, false));
-    debug_assert!(super::checks::is_valid_mapping(
+    super::checks::validate!(super::checks::is_wellformed(&lin, true, false));
+    super::checks::validate!(super::checks::is_valid_mapping(
         &to_g, &lin, g, false, false, false, true
     ));
     (lin, to_g)
@@ -636,7 +636,7 @@ pub fn extract_region(
     let (pruned, lin_to_pruned) = lin.prune_unextractable(Some(root));
     let t_prune = t2.elapsed();
     let t3 = std::time::Instant::now();
-    let extraction = statewalk_greedy_extraction(&pruned, lin_to_pruned.class(root));
+    let extraction = statewalk_greedy_extraction(&pruned, lin_to_pruned.class(root))?;
     let t_greedy = t3.elapsed();
     let t4 = std::time::Instant::now();
     let extraction = lin_to_pruned
@@ -652,6 +652,6 @@ pub fn extract_region(
             t4.elapsed().as_secs_f64() * 1e3
         );
     }
-    debug_assert!(super::checks::is_effect_safe(g, root, &extraction));
+    super::checks::validate!(super::checks::is_effect_safe(g, root, &extraction));
     Ok(extraction)
 }

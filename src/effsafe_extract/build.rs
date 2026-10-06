@@ -381,22 +381,69 @@ impl<'e> Builder<'e> {
     }
 }
 
-/// Check that every placeholder is a constructor application of the right sort.
+/// Check that every placeholder is a well-typed constructor application of
+/// the right sort: the right arity, with each argument a literal or a nested
+/// constructor application of the expected sort.
 fn validate_placeholders(egraph: &egglog::EGraph, config: &EffsafeConfig) -> Result<(), Error> {
     for (sort, expr) in &config.placeholders {
-        let ok = match expr {
-            egglog::ast::Expr::Call(_, head, _) => egraph
-                .get_function(head)
-                .is_some_and(|f| f.func_type().output.name() == sort),
-            _ => false,
-        };
-        if !ok {
-            return Err(Error::ExtractError(format!(
-                "placeholder {expr} for sort {sort} is not a constructor application of that sort"
-            )));
-        }
+        check_placeholder(egraph, expr, sort).map_err(|why| {
+            Error::ExtractError(format!(
+                "placeholder {expr} for sort {sort} is not a well-typed constructor \
+                 application of that sort: {why}"
+            ))
+        })?;
     }
     Ok(())
+}
+
+fn check_placeholder(
+    egraph: &egglog::EGraph,
+    expr: &egglog::ast::Expr,
+    sort: &str,
+) -> Result<(), String> {
+    use egglog::ast::{Expr, Literal};
+    match expr {
+        Expr::Call(_, head, args) => {
+            let Some(func) = egraph.get_function(head) else {
+                return Err(format!("{head} is not a declared constructor"));
+            };
+            let ty = func.func_type();
+            if ty.output.name() != sort {
+                return Err(format!(
+                    "{head} has sort {}, expected {sort}",
+                    ty.output.name()
+                ));
+            }
+            if args.len() != ty.input.len() {
+                return Err(format!(
+                    "{head} takes {} argument(s), given {}",
+                    ty.input.len(),
+                    args.len()
+                ));
+            }
+            for (arg, arg_sort) in args.iter().zip(&ty.input) {
+                check_placeholder(egraph, arg, arg_sort.name())?;
+            }
+            Ok(())
+        }
+        Expr::Lit(_, lit) => {
+            let lit_sort = match lit {
+                Literal::Int(_) => "i64",
+                Literal::Float(_) => "f64",
+                Literal::String(_) => "String",
+                Literal::Bool(_) => "bool",
+                Literal::Unit => "Unit",
+            };
+            if lit_sort == sort {
+                Ok(())
+            } else {
+                Err(format!(
+                    "literal {lit} has sort {lit_sort}, expected {sort}"
+                ))
+            }
+        }
+        Expr::Var(_, name) => Err(format!("variable {name} is not allowed in a placeholder")),
+    }
 }
 
 /// Build the extractor's e-graph for `egraph` and resolve the roots.

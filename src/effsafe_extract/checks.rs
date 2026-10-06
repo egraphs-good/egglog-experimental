@@ -1,5 +1,9 @@
-//! Invariant checks used in `debug_assert!`s. Each prints what went wrong and
-//! returns `false` instead of panicking so the assertion site is reported.
+//! Invariant checks. Each prints what went wrong and returns `false` instead
+//! of panicking so the assertion site is reported. The final effect-safety
+//! check of every extraction always runs; the internal invariants (well-formed
+//! region graphs, mappings, statewalks) are checked through [`validate!`] in
+//! debug builds, or in any build when the `EFFSAFE_VALIDATE` environment
+//! variable is set.
 
 use std::collections::VecDeque;
 
@@ -10,6 +14,23 @@ use super::term_graph::{EClassId, EGraphMapping, Extraction, ExtractionId, TermG
 /// every *effectful* e-node has at most one effectful child outside its region
 /// positions. Pure e-nodes may read any number of states. Empty e-classes are
 /// allowed only if `allow_empty`.
+/// Whether the internal invariant checks run: debug builds, or
+/// `EFFSAFE_VALIDATE` set in the environment.
+pub fn validate_internals() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| cfg!(debug_assertions) || std::env::var_os("EFFSAFE_VALIDATE").is_some())
+}
+
+/// `assert!` an internal invariant when [`validate_internals`] says so.
+macro_rules! validate {
+    ($cond:expr) => {
+        if $crate::effsafe_extract::checks::validate_internals() {
+            assert!($cond, "effsafe invariant violated: {}", stringify!($cond));
+        }
+    };
+}
+pub(crate) use validate;
+
 pub fn is_wellformed(g: &TermGraph, allow_empty: bool, allow_subregion_children: bool) -> bool {
     let mut ok = true;
     for c in g.class_ids() {
@@ -244,14 +265,25 @@ fn is_effect_safe_region(
     on_walk[root] = true;
     let mut i = 0;
     while i < walk.len() {
+        let node = &extraction[walk[i]];
+        let enode = g.enode(node.class, node.node);
         let mut next = None;
-        for &child in &extraction[walk[i]].children {
+        for (position, &child) in node.children.iter().enumerate() {
             if is_effectful(child) {
-                if next.is_none() {
+                if enode.regions.contains(&position) {
+                    // A subregion, with its own statewalk.
+                    if !checked[child] && !is_effect_safe_region(g, child, extraction, checked) {
+                        return false;
+                    }
+                } else if next.is_none() {
                     next = Some(child);
                     walk.push(child);
                     on_walk[child] = true;
-                } else if !checked[child] && !is_effect_safe_region(g, child, extraction, checked) {
+                } else {
+                    eprintln!(
+                        "Error: effectful node {} has two state children outside its :regions positions",
+                        walk[i]
+                    );
                     return false;
                 }
             } else if !visited[child] {

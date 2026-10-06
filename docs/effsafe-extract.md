@@ -98,8 +98,9 @@ effsafe_state(&mut egraph)
 ```
 
 The extractor does not descend into the sort and emits the placeholder for
-every child of that sort instead; the replacement must be a constructor
-application of the sort. There is no egglog command for this, because the
+every child of that sort instead; the replacement must be a well-typed
+constructor application of the sort (checked when extraction runs: arity,
+and literals or nested constructor applications of the expected sorts). There is no egglog command for this, because the
 extracted term is then no longer a member of the requested e-class.
 
 ## Regions
@@ -140,7 +141,8 @@ receives the costs of the children at `:regions` positions in their argument
 positions and `0` for every other child. (A pure e-class at a `:regions`
 position, such as the branches of a conditional that does not touch the
 state, is not a subregion and is extracted within the enclosing region, but
-the fold prices it the same way, so the model's weighting applies to it too.) The result (including the e-node's own cost) is the e-node's
+the fold prices it the same way, as a tree, so the model's weighting applies
+to it too. This holds for the search and for the reported cost alike.) The result (including the e-node's own cost) is the e-node's
 effective marginal cost in the enclosing region, whose DAG then charges the
 predicate, state and other ordinary children, preserving sharing. A subregion
 used from several e-nodes is extracted and placed once but charged at every
@@ -181,6 +183,16 @@ The annotations and cost models live in the e-graph's extension state
 (`EffsafeState`), so they are cloned and snapshotted with it.
 
 Costs are `u64`s with saturating arithmetic.
+
+## Checking
+
+Every extraction is checked for effect safety before it is returned, in
+release builds too; a failure is an error, never a wrong program. The
+extractor's internal invariants (well-formed region graphs, mappings,
+statewalks) are checked in debug builds, or in any build when the
+`EFFSAFE_VALIDATE` environment variable is set, e.g.
+`EFFSAFE_VALIDATE=1 cargo test --release`. `EFFSAFE_DEBUG` adds detail to
+"no finite term" errors.
 
 ## Commands
 
