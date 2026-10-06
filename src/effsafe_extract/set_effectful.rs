@@ -1,24 +1,34 @@
 //! `(set-effectful e)`: mark the e-class of `e` as effectful.
 //!
 //! Like `set-cost`, this generates a table per sort rather than asking the
-//! program to declare one. A post-parse [`CommandMacro`] sees each rule and
-//! top-level action with its types, replaces `(set-effectful e)` by an
-//! insertion into the relation `effsafe_effectful_<Sort>` for the sort of
-//! `e`, and declares that relation the first time the sort is seen. The
-//! extractor reads every such relation.
+//! program to declare one: `(set-effectful e)` becomes an insertion into the
+//! relation `effsafe_effectful_<Sort>` for the sort of `e`, declared the
+//! first time the sort is seen. The extractor reads every such relation.
 //!
-//! The sort of `e` comes from egglog's own typechecker: the rule's body is
-//! typechecked together with one synthetic fact per `let` action and per
-//! `set-effectful` argument (`(= <fresh> <expr>)`), which types primitives,
-//! containers and let-bound variables the same way the rule's actions would.
+//! The sort of `e` comes from egglog's own action typechecker. A rule whose
+//! actions mention `set-effectful` is turned by a [`CommandMacro`] into the
+//! command `(effsafe-rule "<the rule>")`, which runs with access to the
+//! e-graph: it typechecks the rule's body for the sorts of its variables,
+//! inlines the rule's `let` bindings into each marked expression, and asks
+//! the typechecker ([`EGraph::typecheck_expr_with_bindings_and_output`]) which
+//! eq sort the expression has in the rule head's context. That is exact for
+//! write primitives, literal-sensitive constraints and overloads narrowed by
+//! their consumers alike. A top-level `(set-effectful e)` is a user-defined
+//! command doing the same without bindings.
 
-use egglog::ast::{Action, Command, Expr, Fact, ParseError, Rule};
-use egglog::util::{FreshGen, SymbolGen};
-use egglog::{CommandMacro, Error, TypeInfo};
+use egglog::ast::{Action, Command, Expr, Literal, ParseError, Parser, Rule, RuleEvalMode};
+use egglog::util::SymbolGen;
+use egglog::{
+    ArcSort, CommandMacro, CommandOutput, Context, EGraph, Error, TypeInfo, UserDefinedCommand,
+};
+use egglog_ast::span::Span;
 use rustc_hash::FxHashMap;
 
 /// The macro's name in programs.
 pub const SET_EFFECTFUL: &str = "set-effectful";
+
+/// The command a rule mentioning `set-effectful` is lowered to.
+pub const EFFSAFE_RULE: &str = "effsafe-rule";
 
 const RELATION_PREFIX: &str = "effsafe_effectful_";
 
@@ -32,46 +42,94 @@ pub fn effectful_relation_sort(relation: &str) -> Option<&str> {
     relation.strip_prefix(RELATION_PREFIX)
 }
 
-/// The `set-effectful` command macro; see the module docs.
+/// Lowers a rule whose actions mention `set-effectful` to `effsafe-rule`;
+/// see the module docs.
 pub struct SetEffectful;
 
 impl CommandMacro for SetEffectful {
     fn transform(
         &self,
         command: Command,
-        symbol_gen: &mut SymbolGen,
-        type_info: &TypeInfo,
+        _symbol_gen: &mut SymbolGen,
+        _type_info: &TypeInfo,
     ) -> Result<Vec<Command>, Error> {
         match command {
             Command::Rule { rule } if mentions_set_effectful(&rule.head) => {
-                rewrite_rule(rule, symbol_gen, type_info)
-            }
-            Command::Action(Action::Expr(span, Expr::Call(call_span, head, args)))
-                if head == SET_EFFECTFUL =>
-            {
-                let [arg] = &args[..] else {
-                    return Err(usage(call_span));
-                };
-                let vars =
-                    sorts_through_facts(&[], &[], std::slice::from_ref(arg), symbol_gen, type_info);
-                let sort = sort_of(arg, &vars, type_info)?;
-                let mut commands =
-                    declare_if_needed(&sort, call_span.clone(), type_info, &mut Vec::new());
-                commands.push(Command::Action(Action::Expr(
-                    span,
-                    Expr::Call(call_span, effectful_relation(&sort), args),
-                )));
-                Ok(commands)
+                let span = rule.span.clone();
+                let text = format!("{}", Command::Rule { rule });
+                Ok(vec![Command::UserDefined(
+                    span.clone(),
+                    EFFSAFE_RULE.to_string(),
+                    vec![Expr::Lit(span, Literal::String(text))],
+                )])
             }
             other => Ok(vec![other]),
         }
     }
 }
 
-fn usage(span: egglog_ast::span::Span) -> Error {
+/// `(effsafe-rule "<rule>")`: the rule, with its `set-effectful` actions
+/// rewritten into the generated relations.
+pub struct EffsafeRule;
+
+impl UserDefinedCommand for EffsafeRule {
+    fn update(&self, egraph: &mut EGraph, args: &[Expr]) -> Result<Vec<CommandOutput>, Error> {
+        let [Expr::Lit(span, Literal::String(text))] = args else {
+            return Err(Error::ParseError(ParseError(
+                args.first()
+                    .map(|a| a.span())
+                    .unwrap_or_else(|| egglog::span!()),
+                format!(
+                    "usage: ({EFFSAFE_RULE} \"<rule>\"), produced by rules that use {SET_EFFECTFUL}"
+                ),
+            )));
+        };
+        let mut commands = Parser::default().get_program_from_string(None, text)?;
+        let Some(Command::Rule { rule }) = commands.pop() else {
+            return Err(Error::ParseError(ParseError(
+                span.clone(),
+                format!("{EFFSAFE_RULE}: expected a rule"),
+            )));
+        };
+        if !commands.is_empty() {
+            return Err(Error::ParseError(ParseError(
+                span.clone(),
+                format!("{EFFSAFE_RULE}: expected exactly one rule"),
+            )));
+        }
+        let commands = rewrite_rule(egraph, rule)?;
+        egraph.run_program(commands)
+    }
+}
+
+/// Top-level `(set-effectful e)`.
+pub struct SetEffectfulCommand;
+
+impl UserDefinedCommand for SetEffectfulCommand {
+    fn update(&self, egraph: &mut EGraph, args: &[Expr]) -> Result<Vec<CommandOutput>, Error> {
+        let [arg] = args else {
+            return Err(usage(
+                args.first()
+                    .map(|a| a.span())
+                    .unwrap_or_else(|| egglog::span!()),
+            ));
+        };
+        let span = arg.span();
+        let sort = mark_sort(egraph, arg, &[], Context::Full)?;
+        let mut commands = Vec::new();
+        declare_if_needed(egraph, &sort, span.clone(), &mut Vec::new(), &mut commands);
+        commands.push(Command::Action(Action::Expr(
+            span.clone(),
+            Expr::Call(span, effectful_relation(sort.name()), vec![arg.clone()]),
+        )));
+        egraph.run_program(commands)
+    }
+}
+
+fn usage(span: Span) -> Error {
     Error::ParseError(ParseError(
         span,
-        "usage: (set-effectful <expr>) where <expr> has an eq sort".to_string(),
+        format!("usage: ({SET_EFFECTFUL} <expr>) where <expr> has an eq sort"),
     ))
 }
 
@@ -88,47 +146,33 @@ fn mentions_set_effectful(actions: &egglog::ast::Actions) -> bool {
     found
 }
 
-fn rewrite_rule(
-    rule: Rule,
-    symbol_gen: &mut SymbolGen,
-    type_info: &TypeInfo,
-) -> Result<Vec<Command>, Error> {
-    // Typecheck the body first (reporting its errors as usual), then again
-    // with the actions' lets and the set-effectful arguments as facts.
-    type_info.typecheck_facts(symbol_gen, &rule.body)?;
-    let mut marks = Vec::new();
-    let mut lets = Vec::new();
-    for action in rule.head.iter() {
-        if let Action::Let(_, var, expr) = action {
-            lets.push((var.clone(), expr.clone()));
-        }
-        action.clone().visit_exprs(&mut |expr| {
-            if let Expr::Call(_, head, args) = &expr
-                && head == SET_EFFECTFUL
-                && let [arg] = &args[..]
-            {
-                marks.push(arg.clone());
+/// The rule with every `(set-effectful e)` replaced by an insertion into the
+/// relation for the sort of `e`, preceded by the relations' declarations.
+fn rewrite_rule(egraph: &mut EGraph, rule: Rule) -> Result<Vec<Command>, Error> {
+    // The sorts of the rule's variables, from typechecking its body.
+    let mut symbol_gen = SymbolGen::new(egraph.parser.symbol_gen.reserved_prefix().to_string());
+    let resolved = egraph
+        .type_info()
+        .typecheck_facts(&mut symbol_gen, &rule.body)?;
+    let mut bindings: Vec<(String, Span, ArcSort)> = Vec::new();
+    for fact in &resolved {
+        fact.visit_vars(&mut |span, var| {
+            if !bindings.iter().any(|(name, _, _)| *name == var.name) {
+                bindings.push((var.name.to_string(), span.clone(), var.sort.clone()));
             }
-            expr
         });
     }
-    let mut vars = sorts_through_facts(&rule.body, &lets, &marks, symbol_gen, type_info);
-    // Lets the query typechecker could not type (write primitives) are
-    // inferred here, of any sort, keeping every candidate sort of an
-    // overloaded expression so that a later consumer can narrow it; only the
-    // marked expressions must resolve to a single eq sort.
-    for (var, expr) in &lets {
-        if !vars.contains_key(var)
-            && let Ok(candidates) = infer_candidates(expr, &vars, type_info)
-            && !candidates.is_empty()
-        {
-            vars.insert(var.clone(), candidates);
-        }
-    }
+    let context = match rule.eval_mode {
+        RuleEvalMode::Naive => Context::Full,
+        _ => Context::Write,
+    };
+
+    // Let bindings are inlined into the marked expressions, so that the
+    // typechecker sees each expression whole, in context, and can narrow
+    // overloads by their consumers.
+    let mut lets: FxHashMap<String, Expr> = FxHashMap::default();
     let mut declared: Vec<String> = Vec::new();
     let mut commands: Vec<Command> = Vec::new();
-    // Actions run in order and a `let` binds a variable for the actions after
-    // it, so rewrite one action at a time and record each binding's sort.
     let mut new_actions = Vec::with_capacity(rule.head.len());
     for action in rule.head.iter() {
         let mut error: Option<Error> = None;
@@ -146,15 +190,11 @@ fn rewrite_rule(
                 error = Some(usage(span.clone()));
                 return expr;
             };
-            match sort_of(arg, &vars, type_info) {
+            let probe = inline_lets(arg, &lets);
+            match mark_sort(egraph, &probe, &bindings, context) {
                 Ok(sort) => {
-                    commands.extend(declare_if_needed(
-                        &sort,
-                        span.clone(),
-                        type_info,
-                        &mut declared,
-                    ));
-                    Expr::Call(span.clone(), effectful_relation(&sort), args.clone())
+                    declare_if_needed(egraph, &sort, span.clone(), &mut declared, &mut commands);
+                    Expr::Call(span.clone(), effectful_relation(sort.name()), args.clone())
                 }
                 Err(err) => {
                     error = Some(err);
@@ -164,6 +204,10 @@ fn rewrite_rule(
         });
         if let Some(err) = error {
             return Err(err);
+        }
+        if let Action::Let(_, var, expr) = action {
+            let inlined = inline_lets(expr, &lets);
+            lets.insert(var.clone(), inlined);
         }
         new_actions.push(rewritten);
     }
@@ -175,226 +219,59 @@ fn rewrite_rule(
     Ok(commands)
 }
 
-/// Variable (or marked expression text) to its possible sort names: one entry
-/// when known, several for an overloaded expression a consumer may narrow.
-type Sorts = FxHashMap<String, Vec<String>>;
-
-/// Sort names for every variable of `body`, for the let-bound variables in
-/// `lets`, and for the expressions in `marks`, found with egglog's typechecker
-/// by extending `body` with one `(= <var> <expr>)` fact per let and one
-/// `(= <fresh> <expr>)` fact per mark, the fresh names coming from the symbol
-/// generator so they cannot capture a user variable. The facts are added one
-/// at a time and a fact that does not typecheck (a write primitive, which the
-/// query typechecker cannot type, or something depending on one) is left out,
-/// so that everything else keeps egglog's exact typing, literal-sensitive
-/// constraints included. The caller infers the left-out lets itself.
-fn sorts_through_facts(
-    body: &[Fact],
-    lets: &[(String, Expr)],
-    marks: &[Expr],
-    symbol_gen: &mut SymbolGen,
-    type_info: &TypeInfo,
-) -> Sorts {
-    /// Keep `fact` only if the facts still typecheck with it.
-    fn try_add(
-        facts: &mut Vec<Fact>,
-        fact: Fact,
-        symbol_gen: &mut SymbolGen,
-        type_info: &TypeInfo,
-    ) -> bool {
-        facts.push(fact);
-        if type_info.typecheck_facts(symbol_gen, facts).is_err() {
-            facts.pop();
-            return false;
-        }
-        true
-    }
-    let mut facts: Vec<Fact> = body.to_vec();
-    for (var, expr) in lets {
-        let fact = Fact::Eq(
-            expr.span(),
-            Expr::Var(expr.span(), var.clone()),
-            expr.clone(),
-        );
-        try_add(&mut facts, fact, symbol_gen, type_info);
-    }
-    let mut mark_names: Vec<Option<String>> = Vec::with_capacity(marks.len());
-    for arg in marks {
-        let name = symbol_gen.fresh("effsafe_mark");
-        let fact = Fact::Eq(arg.span(), Expr::Var(arg.span(), name.clone()), arg.clone());
-        let added = try_add(&mut facts, fact, symbol_gen, type_info);
-        mark_names.push(added.then_some(name));
-    }
-    let resolved = type_info
-        .typecheck_facts(symbol_gen, &facts)
-        .unwrap_or_default();
-    let mut vars: Sorts = FxHashMap::default();
-    for fact in &resolved {
-        fact.visit_vars(&mut |_span, var| {
-            vars.insert(var.name.to_string(), vec![var.sort.name().to_string()]);
-        });
-    }
-    // The marks' sorts are also recorded under the argument's own text, so
-    // `sort_of` finds them without knowing the mark numbering.
-    for (arg, name) in marks.iter().zip(&mark_names) {
-        if let Some(name) = name
-            && let Some(sort) = vars.get(name).cloned()
-        {
-            vars.insert(format!("{arg}"), sort);
-        }
-    }
-    vars
-}
-
-/// The possible sorts of `expr` (empty when none can be determined, several
-/// for an overloaded primitive whose output is not pinned down yet).
-/// Variables come from `vars` or the globals; constructor and function calls
-/// from their declared output; primitive calls by trying the primitive's
-/// overloads against every combination of the arguments' candidate sorts and
-/// every registered sort as the output, which covers write primitives that
-/// the query typechecker cannot type. A consumer with a fixed parameter sort
-/// thereby narrows an overloaded producer (`(vec-empty)` passed to a
-/// primitive taking `Exprs`). Identical argument expressions share one
-/// choice, so a variable used in several positions does not multiply the
-/// combinations.
-fn infer_candidates(expr: &Expr, vars: &Sorts, type_info: &TypeInfo) -> Result<Vec<String>, Error> {
-    use egglog::ast::Literal;
-    /// Combinations of the arguments' candidate sorts tried for a primitive.
-    const MAX_COMBINATIONS: usize = 256;
-    Ok(match expr {
-        _ if vars.contains_key(&format!("{expr}")) && !matches!(expr, Expr::Lit(..)) => {
-            vars[&format!("{expr}")].clone()
-        }
-        Expr::Var(_, name) => vars.get(name).cloned().unwrap_or_else(|| {
-            type_info
-                .get_global_sort(name)
-                .map(|s| vec![s.name().to_string()])
-                .unwrap_or_default()
-        }),
-        Expr::Lit(_, lit) => vec![
-            match lit {
-                Literal::Int(_) => "i64",
-                Literal::Float(_) => "f64",
-                Literal::String(_) => "String",
-                Literal::Bool(_) => "bool",
-                Literal::Unit => "Unit",
-            }
-            .to_string(),
-        ],
-        Expr::Call(_, head, args) => {
-            if let Some(f) = type_info.get_func_type(head) {
-                vec![f.output.name().to_string()]
-            } else if let Some(prims) = type_info.get_prims(head) {
-                // Distinct argument expressions, each with its candidate
-                // sorts; `arg_choice[i]` is the distinct expression of `args[i]`.
-                let mut distinct: Vec<String> = Vec::new();
-                let mut arg_candidates: Vec<Vec<egglog::ArcSort>> = Vec::new();
-                let mut arg_choice: Vec<usize> = Vec::with_capacity(args.len());
-                let mut combinations = 1usize;
-                for arg in args {
-                    let text = format!("{arg}");
-                    if let Some(k) = distinct.iter().position(|t| *t == text) {
-                        arg_choice.push(k);
-                        continue;
-                    }
-                    let sorts: Vec<egglog::ArcSort> = infer_candidates(arg, vars, type_info)?
-                        .iter()
-                        .filter_map(|name| type_info.get_sort_by_name(name).cloned())
-                        .collect();
-                    if sorts.is_empty() {
-                        return Ok(Vec::new());
-                    }
-                    combinations = combinations.saturating_mul(sorts.len());
-                    distinct.push(text);
-                    arg_candidates.push(sorts);
-                    arg_choice.push(distinct.len() - 1);
-                }
-                if combinations > MAX_COMBINATIONS {
-                    return Ok(Vec::new());
-                }
-                let outputs = candidate_sorts(type_info);
-                let mut accepted: Vec<String> = Vec::new();
-                let mut indices = vec![0usize; arg_candidates.len()];
-                loop {
-                    let mut tys: Vec<egglog::ArcSort> = arg_choice
-                        .iter()
-                        .map(|&k| arg_candidates[k][indices[k]].clone())
-                        .collect();
-                    tys.push(outputs[0].clone());
-                    for output in &outputs {
-                        *tys.last_mut().unwrap() = output.clone();
-                        if prims.iter().any(|p| p.accept(&tys, type_info))
-                            && !accepted.contains(&output.name().to_string())
-                        {
-                            accepted.push(output.name().to_string());
-                        }
-                    }
-                    // Next combination, odometer style.
-                    let mut k = 0;
-                    loop {
-                        if k == indices.len() {
-                            break;
-                        }
-                        indices[k] += 1;
-                        if indices[k] < arg_candidates[k].len() {
-                            break;
-                        }
-                        indices[k] = 0;
-                        k += 1;
-                    }
-                    if k == indices.len() {
-                        break;
-                    }
-                }
-                accepted
-            } else {
-                Vec::new()
-            }
-        }
+/// `expr` with the rule's earlier `let` bindings substituted.
+fn inline_lets(expr: &Expr, lets: &FxHashMap<String, Expr>) -> Expr {
+    expr.clone().visit_exprs(&mut |e| match &e {
+        Expr::Var(_, name) => lets.get(name).cloned().unwrap_or(e),
+        _ => e,
     })
 }
 
-/// The sorts a primitive call could produce: every registered sort.
-fn candidate_sorts(type_info: &TypeInfo) -> Vec<egglog::ArcSort> {
-    let mut out: Vec<egglog::ArcSort> = type_info.get_arcsorts_by(|_| true);
-    out.sort_by(|a, b| a.name().cmp(b.name()));
-    out.dedup_by(|a, b| a.name() == b.name());
-    out
-}
-
-/// The sort of `expr` inside a rule whose variables have the sorts in `vars`,
-/// which must be a single eq sort.
-fn sort_of(expr: &Expr, vars: &Sorts, type_info: &TypeInfo) -> Result<String, Error> {
+/// The eq sort of `expr` under `bindings` in `context`, by asking the
+/// typechecker for every eq sort; exactly one must fit.
+fn mark_sort(
+    egraph: &mut EGraph,
+    expr: &Expr,
+    bindings: &[(String, Span, ArcSort)],
+    context: Context,
+) -> Result<ArcSort, Error> {
     if matches!(expr, Expr::Lit(..)) {
         return Err(Error::ParseError(ParseError(
             expr.span(),
-            format!("set-effectful: {expr} is a literal, not an eq sort expression"),
+            format!("{SET_EFFECTFUL}: {expr} is a literal, not an eq sort expression"),
         )));
     }
-    let mut candidates = infer_candidates(expr, vars, type_info)?;
-    let sort = match candidates.len() {
-        1 => candidates.pop().unwrap(),
-        0 => {
-            return Err(Error::ParseError(ParseError(
-                expr.span(),
-                format!("set-effectful: cannot determine the sort of {expr}"),
-            )));
+    let mut eq_sorts: Vec<ArcSort> = egraph.type_info().get_arcsorts_by(|s| s.is_eq_sort());
+    eq_sorts.sort_by(|a, b| a.name().cmp(b.name()));
+    eq_sorts.dedup_by(|a, b| a.name() == b.name());
+    let mut accepted: Vec<ArcSort> = Vec::new();
+    let mut last_error = None;
+    for sort in eq_sorts {
+        match egraph.typecheck_expr_with_bindings_and_output(expr, bindings, sort.clone(), context)
+        {
+            Ok(_) => accepted.push(sort),
+            Err(err) => last_error = Some(err),
         }
-        _ => {
-            return Err(Error::ParseError(ParseError(
-                expr.span(),
-                format!(
-                    "set-effectful: the sort of {expr} is ambiguous ({})",
-                    candidates.join(", ")
-                ),
-            )));
-        }
-    };
-    match type_info.get_sort_by_name(&sort) {
-        Some(s) if s.is_eq_sort() => Ok(sort),
+    }
+    match accepted.len() {
+        1 => Ok(accepted.pop().unwrap()),
+        0 => Err(Error::ParseError(ParseError(
+            expr.span(),
+            match last_error {
+                Some(err) => format!("{SET_EFFECTFUL}: {expr} does not have an eq sort: {err}"),
+                None => format!("{SET_EFFECTFUL}: {expr} does not have an eq sort"),
+            },
+        ))),
         _ => Err(Error::ParseError(ParseError(
             expr.span(),
-            format!("set-effectful: {expr} has sort {sort}, which is not an eq sort"),
+            format!(
+                "{SET_EFFECTFUL}: the sort of {expr} is ambiguous ({})",
+                accepted
+                    .iter()
+                    .map(|s| s.name().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
         ))),
     }
 }
@@ -402,19 +279,20 @@ fn sort_of(expr: &Expr, vars: &Sorts, type_info: &TypeInfo) -> Result<String, Er
 /// A `relation` declaration for the sort's effectful table, unless it exists
 /// already (declared by an earlier command, or earlier in this one).
 fn declare_if_needed(
-    sort: &str,
-    span: egglog_ast::span::Span,
-    type_info: &TypeInfo,
+    egraph: &EGraph,
+    sort: &ArcSort,
+    span: Span,
     declared: &mut Vec<String>,
-) -> Vec<Command> {
-    let name = effectful_relation(sort);
-    if type_info.get_func_type(&name).is_some() || declared.contains(&name) {
-        return Vec::new();
+    commands: &mut Vec<Command>,
+) {
+    let name = effectful_relation(sort.name());
+    if egraph.get_function(&name).is_some() || declared.contains(&name) {
+        return;
     }
     declared.push(name.clone());
-    vec![Command::Relation {
+    commands.push(Command::Relation {
         span,
         name,
-        inputs: vec![sort.to_string()],
-    }]
+        inputs: vec![sort.name().to_string()],
+    });
 }

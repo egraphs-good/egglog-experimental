@@ -61,12 +61,14 @@ is effectful only when its type contains the state. Like `set-cost`,
 extractor reads them all. A container (`Vec`, `Set`, ...) holding an
 effectful element is effectful without being marked.
 
-The sort of the marked expression comes from egglog's typechecker: the rule's
-body, its `let` actions and the marked expressions are typechecked together,
-one fact at a time, so an action the query typechecker cannot type (a write
-primitive) only leaves itself and what depends on it out. Those are inferred
-from the primitives' overloads, narrowing overloaded producers by their
-consumers; the marked expression must resolve to a single eq sort.
+The sort of the marked expression comes from egglog's action typechecker. A
+rule that uses `set-effectful` is lowered to `(effsafe-rule "<the rule>")`,
+which runs with the e-graph at hand: it types the rule's variables from the
+body, inlines the rule's `let` bindings into the marked expression and asks
+the typechecker which eq sort fits it in the rule head's context, so write
+primitives, literal-sensitive constraints and overloads narrowed by their
+consumers are all typed exactly as the rule itself would be. The marked
+expression must have exactly one eq sort.
 
 ### `:regions`
 
