@@ -27,8 +27,13 @@ Decisions are marked below; the other questions remain open.
 
 ### Shared builtin definitions and type checking
 
-Could a standard-library setup program describe all host primitives and type
-constructors, so frontends can generate bindings and agree on type checking?
+Proposed discovery model: builtins are implicitly available, and an EGraph
+query exports their portable declarations with optional language metadata.
+Export generic families and all overloads, not just instantiated sorts/tables
+or a map keyed only by name. A saved export can drive binding generation
+without a live EGraph at import time. The query and descriptor format remain
+to be designed; declaring a signature does not supply its native implementation.
+
 Today `Container` and `FuncSort` describe concrete types, each node supplies its
 resolved sort, and host primitives are ambient. `Primitive` declares a computed
 body, not a host signature. There are no declaration-level type variables or
@@ -45,11 +50,11 @@ vec-of<T>(T...) -> Vec<T>
 unstable-vec-map<T,U>((T) -> U, Vec<T>) -> Vec<U>
 ```
 
-Should these live in program declarations, or in a separate builtin catalog
-that generates/checks concrete programs? Specify type-constructor arities,
-type-variable scope, substitution, overload resolution, and how empty containers
-obtain their types. Separate frontend inference/conversions from checking the
-resolved IR. This need not introduce generic user-defined equality sorts.
+Specify type-constructor arities, type-variable scope, substitution, overload
+resolution, and how empty containers obtain their types. The relationship
+between exported host definitions and submitted declarations remains open.
+Separate frontend inference/conversions from checking the resolved IR. This
+need not introduce generic user-defined equality sorts.
 
 **Decided:** use ordinary generic signatures, including homogeneous varargs,
 with a dedicated typing rule for function application: arguments match the
@@ -74,11 +79,12 @@ namespaced annotation on definitions or a separate binding manifest? How are
 unknown annotations preserved, and can they be ignored without changing the
 Egglog definition? This is separate from the existing locations/documentation.
 
-Generating expression builders does not generate native primitive implementations,
-arbitrary preserved methods, or value codecs. Decide which conveniences are
-declarative and which remain handwritten. A useful end-to-end test: export
-Luminal's Rust-defined IR, generate its Python API, author a Python rewrite,
-and consume that rule in Rust without duplicating the IR declarations.
+**Decided:** initially generate the symbolic declarations and expression-building
+API. Host methods such as `Map.value` and host conversions remain ordinary
+handwritten Python. Descriptors do not transport native implementations or
+arbitrary method bodies. A useful end-to-end test: export Luminal's Rust-defined
+IR, generate its Python API, author a Python rewrite, and consume that rule in
+Rust without duplicating the IR declarations.
 
 ### Shared Python/Rust memory
 
