@@ -5,30 +5,23 @@
 //! relation `effsafe_effectful_<Sort>` for the sort of `e`, declared the
 //! first time the sort is seen. The extractor reads every such relation.
 //!
-//! The sort of `e` comes from egglog's own action typechecker. A rule whose
-//! actions mention `set-effectful` is turned by a [`CommandMacro`] into the
-//! command `(effsafe-rule "<the rule>")`, which runs with access to the
-//! e-graph: it typechecks the rule's body for the sorts of its variables,
-//! inlines the rule's `let` bindings into each marked expression, and asks
-//! the typechecker ([`EGraph::typecheck_expr_with_bindings_and_output`]) which
-//! eq sort the expression has in the rule head's context. That is exact for
-//! write primitives, literal-sensitive constraints and overloads narrowed by
-//! their consumers alike. A top-level `(set-effectful e)` is a user-defined
-//! command doing the same without bindings.
+//! The sort of `e` comes from egglog's own rule typechecker
+//! ([`TypeInfo::typecheck_rule`]): the macro replaces each `(set-effectful e)`
+//! action by `(let <fresh> e)`, typechecks the resulting rule (body and head
+//! together, in the contexts the rule's mode gives them), and reads the fresh
+//! variable's sort off the resolved head. A top-level `(set-effectful e)` is
+//! typed as the head of a rule with no body.
 
-use egglog::ast::{Action, Command, Expr, Literal, ParseError, Parser, Rule, RuleEvalMode};
-use egglog::util::SymbolGen;
-use egglog::{
-    ArcSort, CommandMacro, CommandOutput, Context, EGraph, Error, TypeInfo, UserDefinedCommand,
+use egglog::ast::{
+    Action, Actions, Command, Expr, Fact, GenericAction, ParseError, Rule, RuleEvalMode,
 };
+use egglog::util::{FreshGen, SymbolGen};
+use egglog::{ArcSort, CommandMacro, Error, TypeInfo};
+use egglog_ast::generic_ast::GenericActions;
 use egglog_ast::span::Span;
-use rustc_hash::FxHashMap;
 
 /// The macro's name in programs.
 pub const SET_EFFECTFUL: &str = "set-effectful";
-
-/// The command a rule mentioning `set-effectful` is lowered to.
-pub const EFFSAFE_RULE: &str = "effsafe-rule";
 
 const RELATION_PREFIX: &str = "effsafe_effectful_";
 
@@ -42,98 +35,66 @@ pub fn effectful_relation_sort(relation: &str) -> Option<&str> {
     relation.strip_prefix(RELATION_PREFIX)
 }
 
-/// Lowers a rule whose actions mention `set-effectful` to `effsafe-rule`;
-/// see the module docs.
+/// The `set-effectful` command macro; see the module docs.
 pub struct SetEffectful;
 
 impl CommandMacro for SetEffectful {
     fn transform(
         &self,
         command: Command,
-        _symbol_gen: &mut SymbolGen,
-        _type_info: &TypeInfo,
+        symbol_gen: &mut SymbolGen,
+        type_info: &TypeInfo,
     ) -> Result<Vec<Command>, Error> {
         match command {
             Command::Rule { rule } if mentions_set_effectful(&rule.head) => {
-                let span = rule.span.clone();
-                let text = format!("{}", Command::Rule { rule });
-                Ok(vec![Command::UserDefined(
-                    span.clone(),
-                    EFFSAFE_RULE.to_string(),
-                    vec![Expr::Lit(span, Literal::String(text))],
-                )])
+                let (head, mut commands) = resolve_marks(&rule, symbol_gen, type_info)?;
+                commands.push(Command::Rule {
+                    rule: Rule { head, ..rule },
+                });
+                Ok(commands)
+            }
+            Command::Action(action)
+                if mentions_set_effectful(&GenericActions(vec![action.clone()])) =>
+            {
+                let span = action_span(&action);
+                let rule = Rule {
+                    span: span.clone(),
+                    head: GenericActions(vec![action]),
+                    body: Vec::<Fact>::new(),
+                    name: String::new(),
+                    ruleset: String::new(),
+                    eval_mode: RuleEvalMode::Seminaive,
+                    no_decomp: false,
+                    include_subsumed: false,
+                };
+                let (head, mut commands) = resolve_marks(&rule, symbol_gen, type_info)?;
+                commands.extend(head.0.into_iter().map(Command::Action));
+                Ok(commands)
             }
             other => Ok(vec![other]),
         }
     }
 }
 
-/// `(effsafe-rule "<rule>")`: the rule, with its `set-effectful` actions
-/// rewritten into the generated relations.
-pub struct EffsafeRule;
-
-impl UserDefinedCommand for EffsafeRule {
-    fn update(&self, egraph: &mut EGraph, args: &[Expr]) -> Result<Vec<CommandOutput>, Error> {
-        let [Expr::Lit(span, Literal::String(text))] = args else {
-            return Err(Error::ParseError(ParseError(
-                args.first()
-                    .map(|a| a.span())
-                    .unwrap_or_else(|| egglog::span!()),
-                format!(
-                    "usage: ({EFFSAFE_RULE} \"<rule>\"), produced by rules that use {SET_EFFECTFUL}"
-                ),
-            )));
-        };
-        let mut commands = Parser::default().get_program_from_string(None, text)?;
-        let Some(Command::Rule { rule }) = commands.pop() else {
-            return Err(Error::ParseError(ParseError(
-                span.clone(),
-                format!("{EFFSAFE_RULE}: expected a rule"),
-            )));
-        };
-        if !commands.is_empty() {
-            return Err(Error::ParseError(ParseError(
-                span.clone(),
-                format!("{EFFSAFE_RULE}: expected exactly one rule"),
-            )));
-        }
-        let commands = rewrite_rule(egraph, rule)?;
-        egraph.run_program(commands)
-    }
-}
-
-/// Top-level `(set-effectful e)`.
-pub struct SetEffectfulCommand;
-
-impl UserDefinedCommand for SetEffectfulCommand {
-    fn update(&self, egraph: &mut EGraph, args: &[Expr]) -> Result<Vec<CommandOutput>, Error> {
-        let [arg] = args else {
-            return Err(usage(
-                args.first()
-                    .map(|a| a.span())
-                    .unwrap_or_else(|| egglog::span!()),
-            ));
-        };
-        let span = arg.span();
-        let sort = mark_sort(egraph, arg, &[], Context::Full)?;
-        let mut commands = Vec::new();
-        declare_if_needed(egraph, &sort, span.clone(), &mut Vec::new(), &mut commands);
-        commands.push(Command::Action(Action::Expr(
-            span.clone(),
-            Expr::Call(span, effectful_relation(sort.name()), vec![arg.clone()]),
-        )));
-        egraph.run_program(commands)
-    }
-}
-
 fn usage(span: Span) -> Error {
     Error::ParseError(ParseError(
         span,
-        format!("usage: ({SET_EFFECTFUL} <expr>) where <expr> has an eq sort"),
+        format!("usage: ({SET_EFFECTFUL} <expr>) as an action, where <expr> has an eq sort"),
     ))
 }
 
-fn mentions_set_effectful(actions: &egglog::ast::Actions) -> bool {
+fn action_span(action: &Action) -> Span {
+    match action {
+        GenericAction::Let(span, ..)
+        | GenericAction::Set(span, ..)
+        | GenericAction::Change(span, ..)
+        | GenericAction::Union(span, ..)
+        | GenericAction::Panic(span, ..)
+        | GenericAction::Expr(span, ..) => span.clone(),
+    }
+}
+
+fn mentions_set_effectful(actions: &Actions) -> bool {
     let mut found = false;
     actions.clone().visit_exprs(&mut |expr| {
         if let Expr::Call(_, head, _) = &expr
@@ -146,153 +107,118 @@ fn mentions_set_effectful(actions: &egglog::ast::Actions) -> bool {
     found
 }
 
-/// The rule with every `(set-effectful e)` replaced by an insertion into the
-/// relation for the sort of `e`, preceded by the relations' declarations.
-fn rewrite_rule(egraph: &mut EGraph, rule: Rule) -> Result<Vec<Command>, Error> {
-    // The sorts of the rule's variables, from typechecking its body.
-    let mut symbol_gen = SymbolGen::new(egraph.parser.symbol_gen.reserved_prefix().to_string());
-    let resolved = egraph
-        .type_info()
-        .typecheck_facts(&mut symbol_gen, &rule.body)?;
-    let mut bindings: Vec<(String, Span, ArcSort)> = Vec::new();
-    for fact in &resolved {
-        fact.visit_vars(&mut |span, var| {
-            if !bindings.iter().any(|(name, _, _)| *name == var.name) {
-                bindings.push((var.name.to_string(), span.clone(), var.sort.clone()));
+/// The rule's head with every `(set-effectful e)` replaced by an insertion
+/// into the relation for the sort of `e`, and the declarations of relations
+/// not declared yet.
+fn resolve_marks(
+    rule: &Rule,
+    symbol_gen: &mut SymbolGen,
+    type_info: &TypeInfo,
+) -> Result<(Actions, Vec<Command>), Error> {
+    // The probe rule binds each marked expression to a fresh variable.
+    let mut marks: Vec<(String, Span, Expr)> = Vec::new();
+    let mut probe_actions = Vec::with_capacity(rule.head.len());
+    for action in rule.head.iter() {
+        match action {
+            GenericAction::Expr(span, Expr::Call(call_span, head, args))
+                if head == SET_EFFECTFUL =>
+            {
+                let [arg] = &args[..] else {
+                    return Err(usage(call_span.clone()));
+                };
+                if matches!(arg, Expr::Lit(..)) {
+                    return Err(Error::ParseError(ParseError(
+                        arg.span(),
+                        format!("{SET_EFFECTFUL}: {arg} is a literal, not an eq sort expression"),
+                    )));
+                }
+                let fresh = symbol_gen.fresh("effsafe_mark");
+                marks.push((fresh.clone(), call_span.clone(), arg.clone()));
+                probe_actions.push(GenericAction::Let(span.clone(), fresh, arg.clone()));
             }
-        });
+            other if mentions_set_effectful(&GenericActions(vec![other.clone()])) => {
+                return Err(Error::ParseError(ParseError(
+                    action_span(other),
+                    format!(
+                        "{SET_EFFECTFUL} must be an action of its own, not part of another action"
+                    ),
+                )));
+            }
+            other => probe_actions.push(other.clone()),
+        }
     }
-    let context = match rule.eval_mode {
-        RuleEvalMode::Naive => Context::Full,
-        _ => Context::Write,
+    let probe = Rule {
+        head: GenericActions(probe_actions),
+        ..rule.clone()
     };
+    // The e-graph's seminaive setting only decides whether the head may read
+    // the database; the sorts are the same either way, so try the strict
+    // contexts first and the permissive ones if those fail.
+    let resolved = match type_info.typecheck_rule(symbol_gen, &probe, true) {
+        Ok(resolved) => resolved,
+        Err(_) => type_info.typecheck_rule(symbol_gen, &probe, false)?,
+    };
+    let mut sorts: Vec<Option<ArcSort>> = vec![None; marks.len()];
+    for action in resolved.head.iter() {
+        if let GenericAction::Let(_, var, _) = action
+            && let Some(i) = marks.iter().position(|(name, _, _)| *name == var.name)
+        {
+            sorts[i] = Some(var.sort.clone());
+        }
+    }
 
-    // Let bindings are inlined into the marked expressions, so that the
-    // typechecker sees each expression whole, in context, and can narrow
-    // overloads by their consumers.
-    let mut lets: FxHashMap<String, Expr> = FxHashMap::default();
+    // Rewrite the marks into relation insertions.
     let mut declared: Vec<String> = Vec::new();
     let mut commands: Vec<Command> = Vec::new();
-    let mut new_actions = Vec::with_capacity(rule.head.len());
+    let mut marks = marks.into_iter().zip(sorts);
+    let mut head = Vec::with_capacity(rule.head.len());
     for action in rule.head.iter() {
-        let mut error: Option<Error> = None;
-        let rewritten = action.clone().visit_exprs(&mut |expr| {
-            if error.is_some() {
-                return expr;
-            }
-            let Expr::Call(span, head, args) = &expr else {
-                return expr;
-            };
-            if head != SET_EFFECTFUL {
-                return expr;
-            }
-            let [arg] = &args[..] else {
-                error = Some(usage(span.clone()));
-                return expr;
-            };
-            let probe = inline_lets(arg, &lets);
-            match mark_sort(egraph, &probe, &bindings, context) {
-                Ok(sort) => {
-                    declare_if_needed(egraph, &sort, span.clone(), &mut declared, &mut commands);
-                    Expr::Call(span.clone(), effectful_relation(sort.name()), args.clone())
+        match action {
+            GenericAction::Expr(span, Expr::Call(_, name, _)) if name == SET_EFFECTFUL => {
+                let ((_, call_span, arg), sort) = marks.next().expect("one mark per marked action");
+                let sort = sort.expect("the typechecker binds every variable of the head");
+                if !sort.is_eq_sort() {
+                    return Err(Error::ParseError(ParseError(
+                        arg.span(),
+                        format!(
+                            "{SET_EFFECTFUL}: {arg} has sort {}, which is not an eq sort",
+                            sort.name()
+                        ),
+                    )));
                 }
-                Err(err) => {
-                    error = Some(err);
-                    expr
-                }
+                commands.extend(declare_if_needed(
+                    sort.name(),
+                    call_span.clone(),
+                    type_info,
+                    &mut declared,
+                ));
+                head.push(GenericAction::Expr(
+                    span.clone(),
+                    Expr::Call(call_span, effectful_relation(sort.name()), vec![arg]),
+                ));
             }
-        });
-        if let Some(err) = error {
-            return Err(err);
-        }
-        if let Action::Let(_, var, expr) = action {
-            let inlined = inline_lets(expr, &lets);
-            lets.insert(var.clone(), inlined);
-        }
-        new_actions.push(rewritten);
-    }
-    let mut head = rule.head.clone();
-    head.0 = new_actions;
-    commands.push(Command::Rule {
-        rule: Rule { head, ..rule },
-    });
-    Ok(commands)
-}
-
-/// `expr` with the rule's earlier `let` bindings substituted.
-fn inline_lets(expr: &Expr, lets: &FxHashMap<String, Expr>) -> Expr {
-    expr.clone().visit_exprs(&mut |e| match &e {
-        Expr::Var(_, name) => lets.get(name).cloned().unwrap_or(e),
-        _ => e,
-    })
-}
-
-/// The eq sort of `expr` under `bindings` in `context`, by asking the
-/// typechecker for every eq sort; exactly one must fit.
-fn mark_sort(
-    egraph: &mut EGraph,
-    expr: &Expr,
-    bindings: &[(String, Span, ArcSort)],
-    context: Context,
-) -> Result<ArcSort, Error> {
-    if matches!(expr, Expr::Lit(..)) {
-        return Err(Error::ParseError(ParseError(
-            expr.span(),
-            format!("{SET_EFFECTFUL}: {expr} is a literal, not an eq sort expression"),
-        )));
-    }
-    let mut eq_sorts: Vec<ArcSort> = egraph.type_info().get_arcsorts_by(|s| s.is_eq_sort());
-    eq_sorts.sort_by(|a, b| a.name().cmp(b.name()));
-    eq_sorts.dedup_by(|a, b| a.name() == b.name());
-    let mut accepted: Vec<ArcSort> = Vec::new();
-    let mut last_error = None;
-    for sort in eq_sorts {
-        match egraph.typecheck_expr_with_bindings_and_output(expr, bindings, sort.clone(), context)
-        {
-            Ok(_) => accepted.push(sort),
-            Err(err) => last_error = Some(err),
+            other => head.push(other.clone()),
         }
     }
-    match accepted.len() {
-        1 => Ok(accepted.pop().unwrap()),
-        0 => Err(Error::ParseError(ParseError(
-            expr.span(),
-            match last_error {
-                Some(err) => format!("{SET_EFFECTFUL}: {expr} does not have an eq sort: {err}"),
-                None => format!("{SET_EFFECTFUL}: {expr} does not have an eq sort"),
-            },
-        ))),
-        _ => Err(Error::ParseError(ParseError(
-            expr.span(),
-            format!(
-                "{SET_EFFECTFUL}: the sort of {expr} is ambiguous ({})",
-                accepted
-                    .iter()
-                    .map(|s| s.name().to_string())
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            ),
-        ))),
-    }
+    Ok((GenericActions(head), commands))
 }
 
 /// A `relation` declaration for the sort's effectful table, unless it exists
 /// already (declared by an earlier command, or earlier in this one).
 fn declare_if_needed(
-    egraph: &EGraph,
-    sort: &ArcSort,
+    sort: &str,
     span: Span,
+    type_info: &TypeInfo,
     declared: &mut Vec<String>,
-    commands: &mut Vec<Command>,
-) {
-    let name = effectful_relation(sort.name());
-    if egraph.get_function(&name).is_some() || declared.contains(&name) {
-        return;
+) -> Vec<Command> {
+    let name = effectful_relation(sort);
+    if type_info.get_func_type(&name).is_some() || declared.contains(&name) {
+        return Vec::new();
     }
     declared.push(name.clone());
-    commands.push(Command::Relation {
+    vec![Command::Relation {
         span,
         name,
-        inputs: vec![sort.name().to_string()],
-    });
+        inputs: vec![sort.to_string()],
+    }]
 }
