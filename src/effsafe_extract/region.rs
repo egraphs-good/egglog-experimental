@@ -106,6 +106,7 @@ impl From<Error> for PlaceError {
 
 struct Regions<'g> {
     g: &'g TermGraph,
+    boundary: &'g dyn RegionBoundary,
     opts: StatewalkOptions,
     /// Statewalk cost of every effectful e-node (subregions folded in).
     costs: Vec<Vec<Cost>>,
@@ -149,6 +150,7 @@ impl<'g> Regions<'g> {
         }
         Regions {
             g,
+            boundary,
             opts,
             costs,
             region_of,
@@ -287,7 +289,7 @@ impl<'g> Regions<'g> {
         let t_build = t0.elapsed();
         let costs = project_statewalk_costs(&to_g, &self.costs);
         let t1 = std::time::Instant::now();
-        let extraction = extract_region(&region, region_root, &costs, self.opts)?;
+        let extraction = extract_region(&region, self.boundary, region_root, &costs, self.opts)?;
         if log::log_enabled!(log::Level::Debug) {
             log::debug!(
                 "effsafe region classes={} build={:.2}ms extract={:.2}ms",
@@ -356,13 +358,17 @@ impl<'g> Regions<'g> {
                     continue;
                 }
                 let mut children = Vec::with_capacity(enode.children.len());
+                let mut kept = Vec::with_capacity(enode.children.len());
                 let mut inside = true;
                 for (i, &child) in enode.children.iter().enumerate() {
                     if enode.regions.contains(&i) && g.is_effectful(child) {
                         continue;
                     }
                     match marks.get(child) {
-                        Some(rc) => children.push(rc),
+                        Some(rc) => {
+                            children.push(rc);
+                            kept.push(i);
+                        }
                         None => {
                             inside = false;
                             break;
@@ -371,7 +377,7 @@ impl<'g> Regions<'g> {
                 }
                 if inside {
                     node_map.push(Some(n));
-                    enodes.push(enode.without_regions(children));
+                    enodes.push(enode.without_regions(&kept, children, class.is_effectful));
                 }
             }
             region.classes.push(EClass {

@@ -44,9 +44,17 @@ pub struct ENode {
     /// Marginal cost of this e-node, not counting its children.
     pub cost: Cost,
     pub children: Vec<EClassId>,
-    /// Positions in `children` that start subregions (from `:regions`), sorted.
-    /// Empty inside a region graph, where subregion children are removed.
+    /// Indices in `children` of the children at `:regions` positions, sorted.
+    /// Inside a region graph, effectful ones (subregions) are removed from
+    /// `children`, and effectful e-nodes keep none (their subregions' costs
+    /// enter through the statewalk costs); pure e-nodes keep their pure
+    /// `:regions` children here so that the boundary model prices them.
     pub regions: Vec<usize>,
+    /// The original argument position of each entry of `regions`. Equal to
+    /// `regions` outside region graphs.
+    pub region_positions: Vec<usize>,
+    /// The constructor's arity, which the boundary fold's cost vector has.
+    pub arity: usize,
     /// The boundary cost model's annotation, present when `regions` is not empty.
     pub boundary: Option<Annotation>,
 }
@@ -58,6 +66,8 @@ impl std::fmt::Debug for ENode {
             .field("cost", &self.cost)
             .field("children", &self.children)
             .field("regions", &self.regions)
+            .field("region_positions", &self.region_positions)
+            .field("arity", &self.arity)
             .finish_non_exhaustive()
     }
 }
@@ -67,15 +77,41 @@ impl ENode {
         self.children.is_empty()
     }
 
-    /// A copy of this e-node with `children`, which must correspond
-    /// position by position to the non-region children of `self`.
-    pub fn without_regions(&self, children: Vec<EClassId>) -> ENode {
+    /// A copy of this e-node for a region graph: `children` are the children
+    /// at the original indices `kept` (in order), the subregions having been
+    /// dropped. A pure e-node keeps its remaining `:regions` children as
+    /// regions, with the boundary annotation, so that pure-term selection
+    /// prices them through the boundary model; an effectful e-node keeps none
+    /// (its statewalk cost already folds its subregions).
+    pub fn without_regions(
+        &self,
+        kept: &[usize],
+        children: Vec<EClassId>,
+        effectful: bool,
+    ) -> ENode {
+        let mut regions = Vec::new();
+        let mut region_positions = Vec::new();
+        if !effectful {
+            for (new_index, &old_index) in kept.iter().enumerate() {
+                if let Some(k) = self.regions.iter().position(|&r| r == old_index) {
+                    regions.push(new_index);
+                    region_positions.push(self.region_positions[k]);
+                }
+            }
+        }
+        let boundary = if regions.is_empty() {
+            None
+        } else {
+            self.boundary.clone()
+        };
         ENode {
             kind: self.kind.clone(),
             cost: self.cost,
             children,
-            regions: Vec::new(),
-            boundary: None,
+            regions,
+            region_positions,
+            arity: self.arity,
+            boundary,
         }
     }
 
@@ -86,6 +122,8 @@ impl ENode {
             cost: self.cost,
             children,
             regions: self.regions.clone(),
+            region_positions: self.region_positions.clone(),
+            arity: self.arity,
             boundary: self.boundary.clone(),
         }
     }

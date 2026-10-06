@@ -80,6 +80,8 @@ impl<'e> Builder<'e> {
                         cost: 0,
                         children: Vec::new(),
                         regions: Vec::new(),
+                        region_positions: Vec::new(),
+                        arity: 0,
                         boundary: None,
                     }],
                     is_effectful: false,
@@ -96,17 +98,20 @@ impl<'e> Builder<'e> {
         }
         let class = self.class_for(sort_id, value);
         let enode = if sort.is_container_sort() {
-            let children = self
+            let children: Vec<EClassId> = self
                 .egraph
                 .container_inner_values(sort, value)
                 .into_iter()
                 .map(|(inner_sort, inner)| self.child_class(&inner_sort, inner))
                 .collect();
+            let arity = children.len();
             ENode {
                 kind: NodeKind::Container(value),
                 cost: self.cost_model.container_cost(self.egraph, sort, value),
                 children,
                 regions: Vec::new(),
+                region_positions: Vec::new(),
+                arity,
                 boundary: None,
             }
         } else {
@@ -115,6 +120,8 @@ impl<'e> Builder<'e> {
                 cost: self.cost_model.base_value_cost(self.egraph, sort, value),
                 children: Vec::new(),
                 regions: Vec::new(),
+                region_positions: Vec::new(),
+                arity: 0,
                 boundary: None,
             }
         };
@@ -159,17 +166,20 @@ impl<'e> Builder<'e> {
                 }
             })?;
             for (eclass, children, cost, boundary) in rows {
-                let children = children
+                let children: Vec<EClassId> = children
                     .iter()
                     .zip(&ty.input)
                     .map(|(&v, sort)| self.child_class(sort, v))
                     .collect();
                 let class = self.class_for(out_sort, eclass);
+                let arity = children.len();
                 self.g.classes[class].enodes.push(ENode {
                     kind: NodeKind::Op(op),
                     cost,
                     children,
                     regions: regions.clone(),
+                    region_positions: regions.clone(),
+                    arity,
                     boundary,
                 });
             }
@@ -408,6 +418,9 @@ fn check_placeholder(
                 return Err(format!("{head} is not a declared constructor"));
             };
             let ty = func.func_type();
+            if ty.subtype != egglog::ast::FunctionSubtype::Constructor {
+                return Err(format!("{head} is a function, not a constructor"));
+            }
             if ty.output.name() != sort {
                 return Err(format!(
                     "{head} has sort {}, expected {sort}",

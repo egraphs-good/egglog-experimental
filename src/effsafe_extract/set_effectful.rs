@@ -222,13 +222,18 @@ fn sorts_through_facts(
     vars
 }
 
-/// The sort of `expr` inside a rule whose variables have the sorts in `vars`.
-fn sort_of(
+/// The sort of `expr`, or `None` when it cannot be determined. Variables come
+/// from `vars` or the globals; constructor and function calls from their
+/// declared output; primitive calls by trying the primitive's overloads
+/// against every sort visible in the rule (the sorts of its variables), which
+/// covers write primitives that the query typechecker cannot type.
+fn infer_sort(
     expr: &Expr,
     vars: &FxHashMap<String, String>,
     type_info: &TypeInfo,
-) -> Result<String, Error> {
-    let sort = match expr {
+) -> Result<Option<String>, Error> {
+    use egglog::ast::Literal;
+    Ok(match expr {
         _ if vars.contains_key(&format!("{expr}")) && !matches!(expr, Expr::Lit(..)) => {
             vars.get(&format!("{expr}")).cloned()
         }
@@ -237,16 +242,91 @@ fn sort_of(
                 .get_global_sort(name)
                 .map(|s| s.name().to_string())
         }),
-        Expr::Call(_, head, _) => type_info
-            .get_func_type(head)
-            .map(|f| f.output.name().to_string()),
-        Expr::Lit(..) => {
-            return Err(Error::ParseError(ParseError(
-                expr.span(),
-                format!("set-effectful: {expr} is a literal, not an eq sort expression"),
-            )));
+        Expr::Lit(_, lit) => Some(
+            match lit {
+                Literal::Int(_) => "i64",
+                Literal::Float(_) => "f64",
+                Literal::String(_) => "String",
+                Literal::Bool(_) => "bool",
+                Literal::Unit => "Unit",
+            }
+            .to_string(),
+        ),
+        Expr::Call(span, head, args) => {
+            if let Some(f) = type_info.get_func_type(head) {
+                Some(f.output.name().to_string())
+            } else if let Some(prims) = type_info.get_prims(head) {
+                let mut arg_sorts = Vec::with_capacity(args.len());
+                for arg in args {
+                    let Some(sort) = infer_sort(arg, vars, type_info)? else {
+                        return Ok(None);
+                    };
+                    let Some(sort) = type_info.get_sort_by_name(&sort) else {
+                        return Ok(None);
+                    };
+                    arg_sorts.push(sort.clone());
+                }
+                let mut accepted: Vec<String> = Vec::new();
+                for candidate in candidate_sorts(vars, type_info) {
+                    let mut tys = arg_sorts.clone();
+                    tys.push(candidate.clone());
+                    if prims.iter().any(|p| p.accept(&tys, type_info))
+                        && !accepted.contains(&candidate.name().to_string())
+                    {
+                        accepted.push(candidate.name().to_string());
+                    }
+                }
+                match accepted.len() {
+                    1 => accepted.pop(),
+                    0 => None,
+                    _ => {
+                        return Err(Error::ParseError(ParseError(
+                            span.clone(),
+                            format!(
+                                "set-effectful: the sort of {expr} is ambiguous ({})",
+                                accepted.join(", ")
+                            ),
+                        )));
+                    }
+                }
+            } else {
+                None
+            }
         }
-    };
+    })
+}
+
+/// The sorts a primitive call in the rule could produce: those of the rule's
+/// variables. (Sorts nested inside containers are not tried: egglog's
+/// `inner_sorts` is not implemented for every container sort. Container
+/// element access such as `vec-get` is typed through the query typechecker
+/// instead.)
+fn candidate_sorts(vars: &FxHashMap<String, String>, type_info: &TypeInfo) -> Vec<egglog::ArcSort> {
+    let mut out: Vec<egglog::ArcSort> = Vec::new();
+    for name in vars.values() {
+        if out.iter().any(|s| s.name() == name) {
+            continue;
+        }
+        if let Some(sort) = type_info.get_sort_by_name(name) {
+            out.push(sort.clone());
+        }
+    }
+    out
+}
+
+/// The sort of `expr` inside a rule whose variables have the sorts in `vars`.
+fn sort_of(
+    expr: &Expr,
+    vars: &FxHashMap<String, String>,
+    type_info: &TypeInfo,
+) -> Result<String, Error> {
+    if matches!(expr, Expr::Lit(..)) {
+        return Err(Error::ParseError(ParseError(
+            expr.span(),
+            format!("set-effectful: {expr} is a literal, not an eq sort expression"),
+        )));
+    }
+    let sort = infer_sort(expr, vars, type_info)?;
     let Some(sort) = sort else {
         return Err(Error::ParseError(ParseError(
             expr.span(),

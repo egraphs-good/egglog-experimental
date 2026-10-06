@@ -20,7 +20,7 @@ mod region;
 mod set_effectful;
 mod statewalk;
 mod term_graph;
-use term_graph::{Extraction, ExtractionId};
+use term_graph::Extraction;
 mod to_term;
 
 use std::collections::HashMap;
@@ -197,61 +197,64 @@ pub fn extract_effsafe(
 
 /// The cost of an extracted program under the same model the search used: a
 /// DAG up to region boundaries and a tree across them. The nodes reachable
-/// from `root` through children outside `:regions` positions are charged
-/// their marginal cost once each, except that a node with `:regions` children
-/// is charged the boundary fold of those children's costs, each priced on its
-/// own by this same rule. A `:regions` child is therefore charged at every
-/// occurrence, whether it is a subregion or a pure term.
+/// from a region root through children outside `:regions` positions are
+/// charged their marginal cost once each, except that a node with `:regions`
+/// children is charged the boundary fold of those children's costs, each
+/// priced on its own by this same rule. A `:regions` child is therefore
+/// charged at every occurrence, whether it is a subregion or a pure term.
+///
+/// Iterative: the extraction lists children before parents, so pricing the
+/// `:regions` children in index order makes every one available when a node
+/// above it needs it.
 fn program_cost(
     g: &term_graph::TermGraph,
     boundary: &dyn RegionBoundary,
     nodes: &Extraction,
 ) -> Cost {
-    let mut memo = vec![None; nodes.len()];
-    subterm_cost(g, boundary, nodes, nodes.len() - 1, &mut memo)
-}
-
-fn subterm_cost(
-    g: &term_graph::TermGraph,
-    boundary: &dyn RegionBoundary,
-    nodes: &Extraction,
-    root: ExtractionId,
-    memo: &mut [Option<Cost>],
-) -> Cost {
-    if let Some(cost) = memo[root] {
-        return cost;
-    }
-    let mut total: Cost = 0;
-    let mut seen = vec![false; nodes.len()];
-    let mut stack = vec![root];
-    while let Some(id) = stack.pop() {
-        if std::mem::replace(&mut seen[id], true) {
-            continue;
-        }
-        let node = &nodes[id];
+    let mut is_region_root = vec![false; nodes.len()];
+    is_region_root[nodes.len() - 1] = true;
+    for node in nodes {
         let enode = g.enode(node.class, node.node);
-        let cost = if enode.regions.is_empty() {
-            enode.cost
-        } else {
-            let mut by_position = vec![0; enode.children.len()];
-            for &p in &enode.regions {
-                by_position[p] = subterm_cost(g, boundary, nodes, node.children[p], memo);
-            }
-            let annotation = enode
-                .boundary
-                .as_deref()
-                .expect("regions carry an annotation");
-            boundary.fold(annotation, &by_position)
-        };
-        total = total.saturating_add(cost);
-        for (position, &child) in node.children.iter().enumerate() {
-            if !enode.regions.contains(&position) {
-                stack.push(child);
-            }
+        for &i in &enode.regions {
+            is_region_root[node.children[i]] = true;
         }
     }
-    memo[root] = Some(total);
-    total
+    let mut cost_of_root: Vec<Option<Cost>> = vec![None; nodes.len()];
+    let mut seen = vec![usize::MAX; nodes.len()];
+    for root in (0..nodes.len()).filter(|&r| is_region_root[r]) {
+        let mut total: Cost = 0;
+        let mut stack = vec![root];
+        while let Some(id) = stack.pop() {
+            if seen[id] == root {
+                continue;
+            }
+            seen[id] = root;
+            let node = &nodes[id];
+            let enode = g.enode(node.class, node.node);
+            let cost = if enode.regions.is_empty() {
+                enode.cost
+            } else {
+                let mut by_position = vec![0; enode.arity];
+                for (&i, &position) in enode.regions.iter().zip(&enode.region_positions) {
+                    by_position[position] = cost_of_root[node.children[i]]
+                        .expect("regions children are priced before their parents");
+                }
+                let annotation = enode
+                    .boundary
+                    .as_deref()
+                    .expect("regions carry an annotation");
+                boundary.fold(annotation, &by_position)
+            };
+            total = total.saturating_add(cost);
+            for (i, &child) in node.children.iter().enumerate() {
+                if !enode.regions.contains(&i) {
+                    stack.push(child);
+                }
+            }
+        }
+        cost_of_root[root] = Some(total);
+    }
+    cost_of_root[nodes.len() - 1].expect("the root is priced")
 }
 
 /// Split a trailing `:include-subsumed` flag, which lets effect-safe

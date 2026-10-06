@@ -152,11 +152,15 @@ impl<'g> Greedy<'g> {
         self.heap.pop().map(|(Reverse(cost), class)| (cost, class))
     }
 
-    /// Bag cost of `enode` given the current best costs of its children.
+    /// Bag cost of `enode` given the current best costs of its children
+    /// outside `:regions` positions (those at `:regions` positions are priced
+    /// by the boundary fold in `own`).
     fn plain_cost(&self, own: Cost, enode: &ENode) -> BagCost {
         let mut cost = BagCost::new(own);
-        for &child in &enode.children {
-            cost.add_child(child, &self.best[child]);
+        for (i, &child) in enode.children.iter().enumerate() {
+            if !enode.regions.contains(&i) {
+                cost.add_child(child, &self.best[child]);
+            }
         }
         cost
     }
@@ -182,9 +186,9 @@ pub fn effective_cost(
     if enode.regions.is_empty() {
         return enode.cost;
     }
-    let mut by_position = vec![0; enode.children.len()];
-    for &i in &enode.regions {
-        by_position[i] = region_cost(enode.children[i]);
+    let mut by_position = vec![0; enode.arity];
+    for (&i, &position) in enode.regions.iter().zip(&enode.region_positions) {
+        by_position[position] = region_cost(enode.children[i]);
     }
     let annotation = enode
         .boundary
@@ -308,7 +312,11 @@ pub fn project_statewalk_costs(mapping: &EGraphMapping, costs: &[Vec<Cost>]) -> 
 /// settled, the whole term below it is emitted and its e-classes become free
 /// for everyone else to reuse (their cost drops to zero), which is what makes
 /// the shared statewalk pay for pure subterms only once.
-pub fn statewalk_greedy_extraction(g: &TermGraph, root: EClassId) -> Result<Extraction, Error> {
+pub fn statewalk_greedy_extraction(
+    g: &TermGraph,
+    boundary: &dyn RegionBoundary,
+    root: EClassId,
+) -> Result<Extraction, Error> {
     let mut greedy = Greedy::new(g);
     let mut extraction: Extraction = Vec::new();
     let mut extracted: Vec<Option<ExtractionId>> = vec![None; g.len()];
@@ -339,7 +347,13 @@ pub fn statewalk_greedy_extraction(g: &TermGraph, root: EClassId) -> Result<Extr
                 continue;
             }
             let enode = g.enode(pc, pn);
-            let own = if g.is_effectful(pc) { 0 } else { enode.cost };
+            // Pure e-nodes with `:regions` children are priced by the
+            // boundary model, their region children as trees.
+            let own = if g.is_effectful(pc) {
+                0
+            } else {
+                effective_cost(g, boundary, enode, |c| greedy.best[c].sum)
+            };
             let cost = greedy.plain_cost(own, enode);
             greedy.relax(pc, pn, cost);
         }

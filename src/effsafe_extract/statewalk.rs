@@ -20,7 +20,7 @@ use egglog::Error;
 use rand_mt::Mt64;
 use rustc_hash::FxHashMap;
 
-use super::cost::Cost;
+use super::cost::{Cost, RegionBoundary};
 use super::greedy::statewalk_greedy_extraction;
 use super::persistent::{Id as VersionId, PersistentBitSet, PersistentCounters};
 use super::term_graph::{EClass, EClassId, EGraphMapping, ENodeId, Extraction, TermGraph};
@@ -615,6 +615,7 @@ pub fn linearize(g: &TermGraph, statewalk: &Statewalk) -> (TermGraph, EGraphMapp
 /// along it, and greedily extract the pure terms it needs.
 pub fn extract_region(
     g: &TermGraph,
+    boundary: &dyn RegionBoundary,
     root: EClassId,
     costs: &[Vec<Cost>],
     opts: StatewalkOptions,
@@ -636,7 +637,7 @@ pub fn extract_region(
     let (pruned, lin_to_pruned) = lin.prune_unextractable(Some(root));
     let t_prune = t2.elapsed();
     let t3 = std::time::Instant::now();
-    let extraction = statewalk_greedy_extraction(&pruned, lin_to_pruned.class(root))?;
+    let extraction = statewalk_greedy_extraction(&pruned, boundary, lin_to_pruned.class(root))?;
     let t_greedy = t3.elapsed();
     let t4 = std::time::Instant::now();
     let extraction = lin_to_pruned
