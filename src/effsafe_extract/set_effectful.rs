@@ -180,13 +180,14 @@ fn rewrite_rule(
 type Sorts = FxHashMap<String, Vec<String>>;
 
 /// Sort names for every variable of `body`, for the let-bound variables in
-/// `lets`, and for the expressions in `marks`, found by typechecking `body`
-/// extended with one `(= <var> <expr>)` fact per let and one
+/// `lets`, and for the expressions in `marks`, found with egglog's typechecker
+/// by extending `body` with one `(= <var> <expr>)` fact per let and one
 /// `(= <fresh> <expr>)` fact per mark, the fresh names coming from the symbol
-/// generator so they cannot capture a user variable. Falls back to the body
-/// alone (or nothing) when the extended facts do not typecheck, in which case
-/// no mark is attributed; the caller then infers what it can and reports what
-/// it cannot determine.
+/// generator so they cannot capture a user variable. The facts are added one
+/// at a time and a fact that does not typecheck (a write primitive, which the
+/// query typechecker cannot type, or something depending on one) is left out,
+/// so that everything else keeps egglog's exact typing, literal-sensitive
+/// constraints included. The caller infers the left-out lets itself.
 fn sorts_through_facts(
     body: &[Fact],
     lets: &[(String, Expr)],
@@ -194,34 +195,39 @@ fn sorts_through_facts(
     symbol_gen: &mut SymbolGen,
     type_info: &TypeInfo,
 ) -> Sorts {
+    /// Keep `fact` only if the facts still typecheck with it.
+    fn try_add(
+        facts: &mut Vec<Fact>,
+        fact: Fact,
+        symbol_gen: &mut SymbolGen,
+        type_info: &TypeInfo,
+    ) -> bool {
+        facts.push(fact);
+        if type_info.typecheck_facts(symbol_gen, facts).is_err() {
+            facts.pop();
+            return false;
+        }
+        true
+    }
     let mut facts: Vec<Fact> = body.to_vec();
     for (var, expr) in lets {
-        facts.push(Fact::Eq(
+        let fact = Fact::Eq(
             expr.span(),
             Expr::Var(expr.span(), var.clone()),
             expr.clone(),
-        ));
+        );
+        try_add(&mut facts, fact, symbol_gen, type_info);
     }
-    let mark_names: Vec<String> = marks
-        .iter()
-        .map(|_| symbol_gen.fresh("effsafe_mark"))
-        .collect();
-    for (arg, name) in marks.iter().zip(&mark_names) {
-        facts.push(Fact::Eq(
-            arg.span(),
-            Expr::Var(arg.span(), name.clone()),
-            arg.clone(),
-        ));
+    let mut mark_names: Vec<Option<String>> = Vec::with_capacity(marks.len());
+    for arg in marks {
+        let name = symbol_gen.fresh("effsafe_mark");
+        let fact = Fact::Eq(arg.span(), Expr::Var(arg.span(), name.clone()), arg.clone());
+        let added = try_add(&mut facts, fact, symbol_gen, type_info);
+        mark_names.push(added.then_some(name));
     }
-    let (resolved, extended) = match type_info.typecheck_facts(symbol_gen, &facts) {
-        Ok(resolved) => (resolved, true),
-        Err(_) => (
-            type_info
-                .typecheck_facts(symbol_gen, body)
-                .unwrap_or_default(),
-            false,
-        ),
-    };
+    let resolved = type_info
+        .typecheck_facts(symbol_gen, &facts)
+        .unwrap_or_default();
     let mut vars: Sorts = FxHashMap::default();
     for fact in &resolved {
         fact.visit_vars(&mut |_span, var| {
@@ -230,11 +236,11 @@ fn sorts_through_facts(
     }
     // The marks' sorts are also recorded under the argument's own text, so
     // `sort_of` finds them without knowing the mark numbering.
-    if extended {
-        for (arg, name) in marks.iter().zip(&mark_names) {
-            if let Some(sort) = vars.get(name).cloned() {
-                vars.insert(format!("{arg}"), sort);
-            }
+    for (arg, name) in marks.iter().zip(&mark_names) {
+        if let Some(name) = name
+            && let Some(sort) = vars.get(name).cloned()
+        {
+            vars.insert(format!("{arg}"), sort);
         }
     }
     vars
@@ -248,7 +254,9 @@ fn sorts_through_facts(
 /// every registered sort as the output, which covers write primitives that
 /// the query typechecker cannot type. A consumer with a fixed parameter sort
 /// thereby narrows an overloaded producer (`(vec-empty)` passed to a
-/// primitive taking `Exprs`).
+/// primitive taking `Exprs`). Identical argument expressions share one
+/// choice, so a variable used in several positions does not multiply the
+/// combinations.
 fn infer_candidates(expr: &Expr, vars: &Sorts, type_info: &TypeInfo) -> Result<Vec<String>, Error> {
     use egglog::ast::Literal;
     /// Combinations of the arguments' candidate sorts tried for a primitive.
@@ -277,9 +285,18 @@ fn infer_candidates(expr: &Expr, vars: &Sorts, type_info: &TypeInfo) -> Result<V
             if let Some(f) = type_info.get_func_type(head) {
                 vec![f.output.name().to_string()]
             } else if let Some(prims) = type_info.get_prims(head) {
-                let mut arg_candidates: Vec<Vec<egglog::ArcSort>> = Vec::with_capacity(args.len());
+                // Distinct argument expressions, each with its candidate
+                // sorts; `arg_choice[i]` is the distinct expression of `args[i]`.
+                let mut distinct: Vec<String> = Vec::new();
+                let mut arg_candidates: Vec<Vec<egglog::ArcSort>> = Vec::new();
+                let mut arg_choice: Vec<usize> = Vec::with_capacity(args.len());
                 let mut combinations = 1usize;
                 for arg in args {
+                    let text = format!("{arg}");
+                    if let Some(k) = distinct.iter().position(|t| *t == text) {
+                        arg_choice.push(k);
+                        continue;
+                    }
                     let sorts: Vec<egglog::ArcSort> = infer_candidates(arg, vars, type_info)?
                         .iter()
                         .filter_map(|name| type_info.get_sort_by_name(name).cloned())
@@ -288,7 +305,9 @@ fn infer_candidates(expr: &Expr, vars: &Sorts, type_info: &TypeInfo) -> Result<V
                         return Ok(Vec::new());
                     }
                     combinations = combinations.saturating_mul(sorts.len());
+                    distinct.push(text);
                     arg_candidates.push(sorts);
+                    arg_choice.push(distinct.len() - 1);
                 }
                 if combinations > MAX_COMBINATIONS {
                     return Ok(Vec::new());
@@ -297,10 +316,9 @@ fn infer_candidates(expr: &Expr, vars: &Sorts, type_info: &TypeInfo) -> Result<V
                 let mut accepted: Vec<String> = Vec::new();
                 let mut indices = vec![0usize; arg_candidates.len()];
                 loop {
-                    let mut tys: Vec<egglog::ArcSort> = indices
+                    let mut tys: Vec<egglog::ArcSort> = arg_choice
                         .iter()
-                        .zip(&arg_candidates)
-                        .map(|(&i, sorts)| sorts[i].clone())
+                        .map(|&k| arg_candidates[k][indices[k]].clone())
                         .collect();
                     tys.push(outputs[0].clone());
                     for output in &outputs {
