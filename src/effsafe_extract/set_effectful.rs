@@ -13,7 +13,7 @@
 //! containers and let-bound variables the same way the rule's actions would.
 
 use egglog::ast::{Action, Command, Expr, Fact, ParseError, Rule};
-use egglog::util::SymbolGen;
+use egglog::util::{FreshGen, SymbolGen};
 use egglog::{CommandMacro, Error, TypeInfo};
 use rustc_hash::FxHashMap;
 
@@ -114,12 +114,15 @@ fn rewrite_rule(
     }
     let mut vars = sorts_through_facts(&rule.body, &lets, &marks, symbol_gen, type_info);
     // Lets the query typechecker could not type (write primitives) are
-    // inferred here, of any sort; only the marked expressions must be eq sorts.
+    // inferred here, of any sort, keeping every candidate sort of an
+    // overloaded expression so that a later consumer can narrow it; only the
+    // marked expressions must resolve to a single eq sort.
     for (var, expr) in &lets {
         if !vars.contains_key(var)
-            && let Ok(Some(sort)) = infer_sort(expr, &vars, type_info)
+            && let Ok(candidates) = infer_candidates(expr, &vars, type_info)
+            && !candidates.is_empty()
         {
-            vars.insert(var.clone(), sort);
+            vars.insert(var.clone(), candidates);
         }
     }
     let mut declared: Vec<String> = Vec::new();
@@ -172,23 +175,25 @@ fn rewrite_rule(
     Ok(commands)
 }
 
-fn mark_name(i: usize) -> String {
-    format!("__effsafe_mark_{i}")
-}
+/// Variable (or marked expression text) to its possible sort names: one entry
+/// when known, several for an overloaded expression a consumer may narrow.
+type Sorts = FxHashMap<String, Vec<String>>;
 
-/// Var-name to sort-name for every variable of `body`, for the let-bound
-/// variables in `lets`, and for the fresh variable `mark_name(i)` bound to
-/// `marks[i]`, found by typechecking `body` extended with one `(= <var>
-/// <expr>)` fact per let and per mark. Falls back to the body alone (or
-/// nothing) when the extended facts do not typecheck; the caller then reports
-/// what it cannot determine.
+/// Sort names for every variable of `body`, for the let-bound variables in
+/// `lets`, and for the expressions in `marks`, found by typechecking `body`
+/// extended with one `(= <var> <expr>)` fact per let and one
+/// `(= <fresh> <expr>)` fact per mark, the fresh names coming from the symbol
+/// generator so they cannot capture a user variable. Falls back to the body
+/// alone (or nothing) when the extended facts do not typecheck, in which case
+/// no mark is attributed; the caller then infers what it can and reports what
+/// it cannot determine.
 fn sorts_through_facts(
     body: &[Fact],
     lets: &[(String, Expr)],
     marks: &[Expr],
     symbol_gen: &mut SymbolGen,
     type_info: &TypeInfo,
-) -> FxHashMap<String, String> {
+) -> Sorts {
     let mut facts: Vec<Fact> = body.to_vec();
     for (var, expr) in lets {
         facts.push(Fact::Eq(
@@ -197,54 +202,68 @@ fn sorts_through_facts(
             expr.clone(),
         ));
     }
-    for (i, arg) in marks.iter().enumerate() {
+    let mark_names: Vec<String> = marks
+        .iter()
+        .map(|_| symbol_gen.fresh("effsafe_mark"))
+        .collect();
+    for (arg, name) in marks.iter().zip(&mark_names) {
         facts.push(Fact::Eq(
             arg.span(),
-            Expr::Var(arg.span(), mark_name(i)),
+            Expr::Var(arg.span(), name.clone()),
             arg.clone(),
         ));
     }
-    let resolved = type_info
-        .typecheck_facts(symbol_gen, &facts)
-        .or_else(|_| type_info.typecheck_facts(symbol_gen, body))
-        .unwrap_or_default();
-    let mut vars: FxHashMap<String, String> = FxHashMap::default();
+    let (resolved, extended) = match type_info.typecheck_facts(symbol_gen, &facts) {
+        Ok(resolved) => (resolved, true),
+        Err(_) => (
+            type_info
+                .typecheck_facts(symbol_gen, body)
+                .unwrap_or_default(),
+            false,
+        ),
+    };
+    let mut vars: Sorts = FxHashMap::default();
     for fact in &resolved {
         fact.visit_vars(&mut |_span, var| {
-            vars.insert(var.name.to_string(), var.sort.name().to_string());
+            vars.insert(var.name.to_string(), vec![var.sort.name().to_string()]);
         });
     }
     // The marks' sorts are also recorded under the argument's own text, so
     // `sort_of` finds them without knowing the mark numbering.
-    for (i, arg) in marks.iter().enumerate() {
-        if let Some(sort) = vars.get(&mark_name(i)).cloned() {
-            vars.insert(format!("{arg}"), sort);
+    if extended {
+        for (arg, name) in marks.iter().zip(&mark_names) {
+            if let Some(sort) = vars.get(name).cloned() {
+                vars.insert(format!("{arg}"), sort);
+            }
         }
     }
     vars
 }
 
-/// The sort of `expr`, or `None` when it cannot be determined. Variables come
-/// from `vars` or the globals; constructor and function calls from their
-/// declared output; primitive calls by trying the primitive's overloads
-/// against every registered sort as the output, which covers write
-/// primitives that the query typechecker cannot type.
-fn infer_sort(
-    expr: &Expr,
-    vars: &FxHashMap<String, String>,
-    type_info: &TypeInfo,
-) -> Result<Option<String>, Error> {
+/// The possible sorts of `expr` (empty when none can be determined, several
+/// for an overloaded primitive whose output is not pinned down yet).
+/// Variables come from `vars` or the globals; constructor and function calls
+/// from their declared output; primitive calls by trying the primitive's
+/// overloads against every combination of the arguments' candidate sorts and
+/// every registered sort as the output, which covers write primitives that
+/// the query typechecker cannot type. A consumer with a fixed parameter sort
+/// thereby narrows an overloaded producer (`(vec-empty)` passed to a
+/// primitive taking `Exprs`).
+fn infer_candidates(expr: &Expr, vars: &Sorts, type_info: &TypeInfo) -> Result<Vec<String>, Error> {
     use egglog::ast::Literal;
+    /// Combinations of the arguments' candidate sorts tried for a primitive.
+    const MAX_COMBINATIONS: usize = 256;
     Ok(match expr {
         _ if vars.contains_key(&format!("{expr}")) && !matches!(expr, Expr::Lit(..)) => {
-            vars.get(&format!("{expr}")).cloned()
+            vars[&format!("{expr}")].clone()
         }
-        Expr::Var(_, name) => vars.get(name).cloned().or_else(|| {
+        Expr::Var(_, name) => vars.get(name).cloned().unwrap_or_else(|| {
             type_info
                 .get_global_sort(name)
-                .map(|s| s.name().to_string())
+                .map(|s| vec![s.name().to_string()])
+                .unwrap_or_default()
         }),
-        Expr::Lit(_, lit) => Some(
+        Expr::Lit(_, lit) => vec![
             match lit {
                 Literal::Int(_) => "i64",
                 Literal::Float(_) => "f64",
@@ -253,46 +272,65 @@ fn infer_sort(
                 Literal::Unit => "Unit",
             }
             .to_string(),
-        ),
-        Expr::Call(span, head, args) => {
+        ],
+        Expr::Call(_, head, args) => {
             if let Some(f) = type_info.get_func_type(head) {
-                Some(f.output.name().to_string())
+                vec![f.output.name().to_string()]
             } else if let Some(prims) = type_info.get_prims(head) {
-                let mut arg_sorts = Vec::with_capacity(args.len());
+                let mut arg_candidates: Vec<Vec<egglog::ArcSort>> = Vec::with_capacity(args.len());
+                let mut combinations = 1usize;
                 for arg in args {
-                    let Some(sort) = infer_sort(arg, vars, type_info)? else {
-                        return Ok(None);
-                    };
-                    let Some(sort) = type_info.get_sort_by_name(&sort) else {
-                        return Ok(None);
-                    };
-                    arg_sorts.push(sort.clone());
+                    let sorts: Vec<egglog::ArcSort> = infer_candidates(arg, vars, type_info)?
+                        .iter()
+                        .filter_map(|name| type_info.get_sort_by_name(name).cloned())
+                        .collect();
+                    if sorts.is_empty() {
+                        return Ok(Vec::new());
+                    }
+                    combinations = combinations.saturating_mul(sorts.len());
+                    arg_candidates.push(sorts);
                 }
+                if combinations > MAX_COMBINATIONS {
+                    return Ok(Vec::new());
+                }
+                let outputs = candidate_sorts(type_info);
                 let mut accepted: Vec<String> = Vec::new();
-                for candidate in candidate_sorts(type_info) {
-                    let mut tys = arg_sorts.clone();
-                    tys.push(candidate.clone());
-                    if prims.iter().any(|p| p.accept(&tys, type_info))
-                        && !accepted.contains(&candidate.name().to_string())
-                    {
-                        accepted.push(candidate.name().to_string());
+                let mut indices = vec![0usize; arg_candidates.len()];
+                loop {
+                    let mut tys: Vec<egglog::ArcSort> = indices
+                        .iter()
+                        .zip(&arg_candidates)
+                        .map(|(&i, sorts)| sorts[i].clone())
+                        .collect();
+                    tys.push(outputs[0].clone());
+                    for output in &outputs {
+                        *tys.last_mut().unwrap() = output.clone();
+                        if prims.iter().any(|p| p.accept(&tys, type_info))
+                            && !accepted.contains(&output.name().to_string())
+                        {
+                            accepted.push(output.name().to_string());
+                        }
+                    }
+                    // Next combination, odometer style.
+                    let mut k = 0;
+                    loop {
+                        if k == indices.len() {
+                            break;
+                        }
+                        indices[k] += 1;
+                        if indices[k] < arg_candidates[k].len() {
+                            break;
+                        }
+                        indices[k] = 0;
+                        k += 1;
+                    }
+                    if k == indices.len() {
+                        break;
                     }
                 }
-                match accepted.len() {
-                    1 => accepted.pop(),
-                    0 => None,
-                    _ => {
-                        return Err(Error::ParseError(ParseError(
-                            span.clone(),
-                            format!(
-                                "set-effectful: the sort of {expr} is ambiguous ({})",
-                                accepted.join(", ")
-                            ),
-                        )));
-                    }
-                }
+                accepted
             } else {
-                None
+                Vec::new()
             }
         }
     })
@@ -306,24 +344,33 @@ fn candidate_sorts(type_info: &TypeInfo) -> Vec<egglog::ArcSort> {
     out
 }
 
-/// The sort of `expr` inside a rule whose variables have the sorts in `vars`.
-fn sort_of(
-    expr: &Expr,
-    vars: &FxHashMap<String, String>,
-    type_info: &TypeInfo,
-) -> Result<String, Error> {
+/// The sort of `expr` inside a rule whose variables have the sorts in `vars`,
+/// which must be a single eq sort.
+fn sort_of(expr: &Expr, vars: &Sorts, type_info: &TypeInfo) -> Result<String, Error> {
     if matches!(expr, Expr::Lit(..)) {
         return Err(Error::ParseError(ParseError(
             expr.span(),
             format!("set-effectful: {expr} is a literal, not an eq sort expression"),
         )));
     }
-    let sort = infer_sort(expr, vars, type_info)?;
-    let Some(sort) = sort else {
-        return Err(Error::ParseError(ParseError(
-            expr.span(),
-            format!("set-effectful: cannot determine the sort of {expr}"),
-        )));
+    let mut candidates = infer_candidates(expr, vars, type_info)?;
+    let sort = match candidates.len() {
+        1 => candidates.pop().unwrap(),
+        0 => {
+            return Err(Error::ParseError(ParseError(
+                expr.span(),
+                format!("set-effectful: cannot determine the sort of {expr}"),
+            )));
+        }
+        _ => {
+            return Err(Error::ParseError(ParseError(
+                expr.span(),
+                format!(
+                    "set-effectful: the sort of {expr} is ambiguous ({})",
+                    candidates.join(", ")
+                ),
+            )));
+        }
     };
     match type_info.get_sort_by_name(&sort) {
         Some(s) if s.is_eq_sort() => Ok(sort),

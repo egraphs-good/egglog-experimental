@@ -61,6 +61,13 @@ is effectful only when its type contains the state. Like `set-cost`,
 extractor reads them all. A container (`Vec`, `Set`, ...) holding an
 effectful element is effectful without being marked.
 
+The sort of the marked expression comes from egglog's typechecker (the rule's
+body, its `let` actions and the marked expressions are typechecked together).
+Expressions the query typechecker cannot type, such as the results of write
+primitives, are inferred from the primitives' overloads, narrowing
+overloaded producers by their consumers; the marked expression must resolve
+to a single eq sort.
+
 ### `:regions`
 
 An effectful e-node may have one effectful child that continues its region's

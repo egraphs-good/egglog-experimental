@@ -343,8 +343,11 @@ pub fn project_statewalk_costs(mapping: &EGraphMapping, costs: &[Vec<Cost>]) -> 
 /// `class_cost` of those children: their independent (globally estimated)
 /// cost, not the sharing-discounted cost within this region, since a
 /// `:regions` child is charged at every occurrence. Such a fold can make an
-/// e-node cheaper than its own children, so a pick that would lead back to
-/// its own e-class through the current picks is skipped.
+/// e-node cheaper than its own children, after which any cheaper pick (not
+/// only one with regions) could lead back to its own e-class through the
+/// current picks; once a pure e-node with regions has been picked, every
+/// cheaper candidate is checked for that and skipped if so. Without such
+/// picks, costs are monotone along picks and cycles cannot form.
 pub fn statewalk_greedy_extraction(
     g: &TermGraph,
     boundary: &dyn RegionBoundary,
@@ -356,6 +359,7 @@ pub fn statewalk_greedy_extraction(
     let mut extracted: Vec<Option<ExtractionId>> = vec![None; g.len()];
     let mut processed = vec![false; g.len()];
     let mut member_index: Vec<Option<usize>> = vec![None; g.len()];
+    let mut guard_cycles = false;
 
     while let Some(class) = greedy.pop() {
         if g.is_effectful(class) {
@@ -389,12 +393,15 @@ pub fn statewalk_greedy_extraction(
                 effective_cost(g, boundary, enode, |c| class_cost[c])
             };
             let cost = greedy.plain_cost(own, enode);
-            if !enode.regions.is_empty()
-                && cost < greedy.best[pc]
-                && greedy.reaches(&enode.children, pc, &extracted)
-            {
+            let cheaper = greedy.pick[pc].is_none() || cost < greedy.best[pc];
+            if !cheaper {
                 continue;
             }
+            let boundary_pick = !enode.regions.is_empty() && !g.is_effectful(pc);
+            if (guard_cycles || boundary_pick) && greedy.reaches(&enode.children, pc, &extracted) {
+                continue;
+            }
+            guard_cycles |= boundary_pick;
             greedy.relax(pc, pn, cost);
         }
         processed[class] = true;
