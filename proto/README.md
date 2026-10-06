@@ -23,6 +23,7 @@ that a program is invalid. Frontend parity has not been demonstrated end to end.
 ## Open questions
 
 These are directions to explore, not changes already made to the schema.
+Decisions are marked below; the other questions remain open.
 
 ### Shared builtin definitions and type checking
 
@@ -50,11 +51,13 @@ type-variable scope, substitution, overload resolution, and how empty containers
 obtain their types. Separate frontend inference/conversions from checking the
 resolved IR. This need not introduce generic user-defined equality sorts.
 
-Functions need a separate check: applying `Fn<(A...), R>` takes a heterogeneous
-argument list, not repetitions of one type. Python still has special cases for
-[application](https://github.com/egraphs-good/egglog-python/blob/ff72f601a972ca1eb7cb0a1d299813f5d65b1a14/python/egglog/runtime.py#L522-L538)
-and [partial application](https://github.com/egraphs-good/egglog-python/blob/ff72f601a972ca1eb7cb0a1d299813f5d65b1a14/python/egglog/egraph.py#L548-L553).
-Can the signature language express those, or should they remain explicitly special?
+**Decided:** use ordinary generic signatures, including homogeneous varargs,
+with a dedicated typing rule for function application: arguments match the
+function's parameter sorts, and the call has its result sort. Do not add
+heterogeneous type packs to the signature language. This follows Python's
+[application special case](https://github.com/egraphs-good/egglog-python/blob/ff72f601a972ca1eb7cb0a1d299813f5d65b1a14/python/egglog/runtime.py#L522-L538).
+`Lambda` and `PartialCall` retain their structural typing rules. Binding
+generation remains a goal; the decision does not choose a Rust arity strategy.
 
 ### High-level bindings and language metadata
 
