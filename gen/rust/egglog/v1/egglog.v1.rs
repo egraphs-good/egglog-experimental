@@ -23,11 +23,11 @@
 /// exhaustion is inconclusive, not validity or invalidity. A verifier must also
 /// check remaining bounds, types, binding, groundedness, arity, and declarations.
 /// Sorts are acyclic; expression cycles must pass through a `Union` node.
-/// Install all declarations before commands, order-independently and without
-/// executing their bodies.
+/// Install all declarations and named ruleset bindings before commands,
+/// order-independently and without executing their bodies.
 /// Definitions installed on this handle may be referenced by name without
-/// resending them. Node and sort indices always refer to this Program's arenas,
-/// not previous requests; all referenced entries must be included here.
+/// resending them. Node, sort and ruleset indices always refer to this Program's
+/// arenas, not previous requests; all referenced entries must be included here.
 /// Execute only commands, in order, and the expressions they demand. Unused
 /// arena entries are not executed; arena membership is not an execution root.
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -52,6 +52,10 @@ pub struct Program {
     /// Optional provenance. Omit spans for a normalized/unlocated program.
     #[prost(message, repeated, tag = "6")]
     pub files: ::prost::alloc::vec::Vec<SourceFile>,
+    /// Ruleset occurrences, shared by index within this submission. Named roots
+    /// retain their reachable occurrences; see Ruleset for cross-request reuse.
+    #[prost(message, repeated, tag = "7")]
+    pub rulesets: ::prost::alloc::vec::Vec<Ruleset>,
 }
 /// Source metadata supports diagnostic locations and documentation, not
 /// arbitrary comment attachment, formatting or source round-tripping.
@@ -647,7 +651,7 @@ pub struct Declaration {
     /// Optional documentation; excluded from semantic identity.
     #[prost(string, tag = "9")]
     pub doc: ::prost::alloc::string::String,
-    #[prost(oneof = "declaration::Kind", tags = "1, 2, 3, 4, 5, 6")]
+    #[prost(oneof = "declaration::Kind", tags = "1, 2, 3, 4")]
     pub kind: ::core::option::Option<declaration::Kind>,
 }
 /// Nested message and enum types in `Declaration`.
@@ -662,10 +666,6 @@ pub mod declaration {
         Relation(super::Relation),
         #[prost(message, tag = "4")]
         Primitive(super::Primitive),
-        #[prost(message, tag = "5")]
-        Ruleset(super::Ruleset),
-        #[prost(message, tag = "6")]
-        CombinedRuleset(super::CombinedRuleset),
     }
 }
 /// An argument's sort and optional label. Calls are positional; labels are not
@@ -748,27 +748,87 @@ pub struct Primitive {
     #[prost(uint32, optional, tag = "4")]
     pub body: ::core::option::Option<u32>,
 }
-/// An immutable ordered rule collection. The empty name denotes the default
-/// ruleset and follows the same contract. Identical resends preserve installed
-/// rules and their state; changing membership, order, or rule definitions under
-/// the same name is an error. Extensions use a new ruleset or composition.
+/// An immutable ruleset occurrence: an ordered rule list or composition.
+/// Absent name is anonymous; present empty name denotes the default rule list.
+/// A present name binds this occurrence on the e-graph handle. Names are
+/// immutable: compatible resends retain the occurrence and all reachable
+/// children, including anonymous ones, with their rule state. Changes to body
+/// kind, ordered contents, rule definitions/options or sharing are conflicts.
+/// Compare expression subgraphs as in Declaration; provenance is not identity.
 /// Frontends may build mutably before emitting a complete definition.
-/// Each rule occurrence belongs to its declaring ruleset. Equal names/bodies
-/// in distinct rulesets are independent occurrences with independent state;
-/// compositions reuse the existing occurrences rather than declaring copies.
+///
+/// Compare same-name presentations' bodies and internal sharing before
+/// identifying entries. Compatible presentations then identify corresponding
+/// entries as the same occurrences. After those correspondences, one consistent
+/// match must preserve sharing across all named-root closures: no merging
+/// distinct occurrences or splitting shared ones. Conflicting identity
+/// requirements from installed roots are errors.
+/// A matched local entry reuses its retained occurrence everywhere, including
+/// a direct Run of that index. Unmatched occurrences are fresh for each
+/// submission; equal anonymous bodies alone never imply shared state.
+/// Repeated references to one entry share its rule state, including across loop
+/// iterations in this Program.
+/// Named roots retain their entire reachable closure across requests; a later
+/// name-only reference does not need to resend those entries or their bodies.
+/// Whether a resend may add a new name to a retained anonymous child remains
+/// unresolved; occurrence matching does not decide that alias-binding policy.
+/// Each rule occurrence belongs to its leaf ruleset. Compositions reference
+/// those occurrences rather than declaring copies. Cyclic compositions are
+/// invalid, including cycles through names; these are normative semantic checks.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct Ruleset {
-    #[prost(string, tag = "1")]
-    pub name: ::prost::alloc::string::String,
-    #[prost(message, repeated, tag = "2")]
+    #[prost(string, optional, tag = "1")]
+    pub name: ::core::option::Option<::prost::alloc::string::String>,
+    /// Optional origin and documentation; excluded from semantic identity.
+    #[prost(message, optional, tag = "4")]
+    pub span: ::core::option::Option<Span>,
+    #[prost(string, tag = "5")]
+    pub doc: ::prost::alloc::string::String,
+    #[prost(oneof = "ruleset::Kind", tags = "2, 3")]
+    pub kind: ::core::option::Option<ruleset::Kind>,
+}
+/// Nested message and enum types in `Ruleset`.
+pub mod ruleset {
+    #[derive(Clone, PartialEq, ::prost::Oneof)]
+    pub enum Kind {
+        #[prost(message, tag = "2")]
+        Rules(super::RuleList),
+        #[prost(message, tag = "3")]
+        Combined(super::CombinedRuleset),
+    }
+}
+/// The leaf body of a Ruleset. May be empty.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct RuleList {
+    #[prost(message, repeated, tag = "1")]
     pub rules: ::prost::alloc::vec::Vec<RuleDecl>,
+}
+/// A request-local occurrence or a named binding on the e-graph handle.
+/// Names may be installed by this Program or an earlier one. Missing names
+/// and out-of-range indices are errors. An explicitly empty name selects the
+/// default ruleset; an unset reference does not implicitly select it.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct RulesetRef {
+    #[prost(oneof = "ruleset_ref::Kind", tags = "1, 2")]
+    pub kind: ::core::option::Option<ruleset_ref::Kind>,
+}
+/// Nested message and enum types in `RulesetRef`.
+pub mod ruleset_ref {
+    #[derive(Clone, PartialEq, Eq, Hash, ::prost::Oneof)]
+    pub enum Kind {
+        /// index into Program.rulesets
+        #[prost(uint32, tag = "1")]
+        Index(u32),
+        #[prost(string, tag = "2")]
+        Name(::prost::alloc::string::String),
+    }
 }
 /// A rule, or a directional or bidirectional rewrite, with common execution
 /// options and source metadata.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct RuleDecl {
-    /// Stable occurrence name, unique within the declaring Ruleset. Identical
-    /// resends reuse that occurrence; names are not global rule identities.
+    /// Stable occurrence name, unique within its leaf Ruleset. A matched enclosing
+    /// ruleset retains that occurrence; names are not global rule identities.
     #[prost(string, tag = "4")]
     pub name: ::prost::alloc::string::String,
     /// Required for every rule and rewrite; no implicit default.
@@ -842,18 +902,13 @@ pub struct BiRewrite {
     #[prost(uint32, repeated, tag = "4")]
     pub conditions: ::prost::alloc::vec::Vec<u32>,
 }
-/// An immutable named composition of fixed child rulesets, declared in this
-/// Program or already installed. Later submissions cannot change its children.
-/// References reuse each child's rule occurrences and state, even if another
-/// composition selects that same child.
-/// May be empty. Shares the ruleset namespace but holds no rules directly; the
-/// empty name is reserved for the default `Ruleset`.
-#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+/// The composition body of a Ruleset: an ordered list of fixed child references.
+/// May be empty. Contains no rules directly; name and provenance belong to the
+/// enclosing Ruleset. Repeated/shared children retain their occurrence identity.
+#[derive(Clone, PartialEq, ::prost::Message)]
 pub struct CombinedRuleset {
-    #[prost(string, tag = "1")]
-    pub name: ::prost::alloc::string::String,
-    #[prost(string, repeated, tag = "2")]
-    pub rulesets: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    #[prost(message, repeated, tag = "1")]
+    pub rulesets: ::prost::alloc::vec::Vec<RulesetRef>,
 }
 // ---------------------------------------------------------------------------
 // COMMANDS — the `Command.kind` arms after `action`, in arm order.
@@ -912,9 +967,8 @@ pub struct Check {
 /// `RunReport`.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct Run {
-    /// Empty selects the default ruleset.
-    #[prost(string, tag = "1")]
-    pub ruleset: ::prost::alloc::string::String,
+    #[prost(message, optional, tag = "1")]
+    pub ruleset: ::core::option::Option<RulesetRef>,
     /// Empty means no scheduler; otherwise names a `BindScheduler` instance.
     #[prost(string, tag = "2")]
     pub scheduler: ::prost::alloc::string::String,
@@ -1155,6 +1209,8 @@ pub struct RunProgramResponse {
 /// `egraph_id` are transport faults and never appear here.
 ///
 /// The locators below are optional, subject to the rule-attribution invariant.
+/// Anonymous-ruleset attribution is unresolved; the name-based fields below
+/// must not be filled with invented names or IDs.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct Error {
     #[prost(enumeration = "ErrorCode", tag = "1")]
@@ -1182,8 +1238,9 @@ pub struct Error {
     /// Diagnostic only, and not a `Span`: `Span.file` indexes USER source.
     #[prost(string, tag = "6")]
     pub engine_origin: ::prost::alloc::string::String,
-    /// Declaring ruleset, even when invoked through a CombinedRuleset. Empty is
-    /// the default ruleset when rule is present, otherwise no attribution.
+    /// Provisional named-ruleset attribution.
+    /// Empty denotes the default ruleset when rule is present, otherwise no
+    /// attribution; it must not be repurposed as an anonymous occurrence ID.
     #[prost(string, tag = "7")]
     pub ruleset: ::prost::alloc::string::String,
 }
@@ -1217,6 +1274,9 @@ pub mod command_output {
         TableStats(super::TableStatsResult),
     }
 }
+/// Reporting and attribution are provisional, especially for anonymous
+/// rulesets and nested/repeated execution. The existing name-based fields do
+/// not define exact occurrence keys or a complete execution hierarchy.
 /// One command's report. Across iterations, updated is ORed and can_stop is
 /// ANDed. A loop's aggregate records history, not its termination reason.
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -1268,14 +1328,15 @@ pub struct RuleReport {
     pub matches: u64,
     #[prost(uint64, tag = "3")]
     pub search_and_apply_nanos: u64,
-    /// Declaring ruleset, even when run through a CombinedRuleset. Empty denotes
-    /// the default ruleset.
+    /// Provisional named-ruleset attribution.
+    /// Empty denotes the default ruleset, not an anonymous occurrence ID.
     #[prost(string, tag = "4")]
     pub ruleset: ::prost::alloc::string::String,
 }
 /// One ruleset's execution statistics.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct RulesetReport {
+    /// Provisional name-based attribution; not an anonymous occurrence ID.
     #[prost(string, tag = "1")]
     pub ruleset: ::prost::alloc::string::String,
     #[prost(uint64, tag = "2")]

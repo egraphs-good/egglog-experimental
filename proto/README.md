@@ -7,7 +7,7 @@ feedback, not as a finished API. The wire format may change during review.
 Start with [egglog.proto](egglog/v1/egglog.proto). Its validation annotations
 and comments are the specification. The main pieces are:
 
-- Flat expression and sort arenas, with explicit types and shared references.
+- Flat expression, sort, and ruleset arenas, with explicit shared references.
 - Immutable declarations and rulesets, separate from ordered commands.
 - Native scalar, container, and function values. Custom values carry opaque
   bytes and explicit child references; symbolic computation remains a call.
@@ -94,12 +94,34 @@ Rust without duplicating the IR declarations.
 
 ### Unnamed rulesets and declaration reuse
 
-- **Ruleset arena:** should immutable rulesets live in an arena with optional
-  names, so commands and compositions can reference unnamed collections? Today
-  rulesets are named declarations; an empty name selects the single default
-  ruleset, not a fresh unnamed one. Work out references and occurrence identity
-  within and across submissions without losing installed rule state or sharing
-  it accidentally. This does not reopen mutable rulesets.
+- **Ruleset arena — decided:** immutable rulesets live in `Program.rulesets`,
+  with a rule-list or composition body and optional name. Runs and composition
+  children use an arena index or an installed name. An absent name is anonymous;
+  a present empty name retains the default ruleset. Named roots retain their
+  reachable anonymous children and rule state across requests. Compatible
+  presentations of the same name compare internal sharing before identifying
+  corresponding occurrences. Resends must then preserve sharing across all
+  named roots.
+  Conflicting identity requirements are errors. A matched index reuses the
+  retained occurrence everywhere it is referenced.
+  Other anonymous entries are fresh per submission, even when their bodies
+  are equal. Repeated references and loop iterations within one submission
+  share state. Composition cycles are invalid. These contracts are specified
+  in the schema; runtime enforcement remains unimplemented.
+
+  ```text
+  request 1: rulesets[0] = unnamed rule list
+             rulesets[1] = name "opt", composition [index 0]
+             run(index 1)
+  request 2: run(name "opt")  # retains the same unnamed child and rule state
+  request 3: rulesets[0] = equal unnamed rule list; run(index 0)  # fresh
+  ```
+
+  This is the same indirection principle as a persistent top-level capture:
+  its name survives while arena indices remain local. Existing captures lower
+  to nullary functions and sets; this does not add general expression bindings.
+  Whether resending a named parent can give a new name to its retained
+  anonymous child remains open.
 - **Declaration reuse — decided:** programs may refer to definitions already
   installed on the same e-graph handle without resending them. Builtin calls
   resolve against implicitly available host primitives without requiring
@@ -112,6 +134,15 @@ Rust without duplicating the IR declarations.
   that message. An `EqSort` entry also idempotently declares its name. Standalone
   snapshots retain complete table declarations and transitive user-defined
   dependencies. Host catalog discovery and its descriptor format remain open.
+
+### Reporting and timing attribution
+
+Reconsider reporting separately, including timings, ruleset/rule attribution,
+nested loops, repeated placements, and command-output association. The current
+flat outputs and name-based report/error fields are provisional and cannot
+identify anonymous ruleset occurrences. No reporting representation is chosen
+by the ruleset-arena decision; do not invent occurrence names or discard data
+to fit those fields. Execution progress and loop termination remain as specified.
 
 ### Shared Python/Rust memory
 

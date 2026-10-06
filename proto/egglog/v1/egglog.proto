@@ -27,11 +27,11 @@ import "buf/validate/validate.proto";
 // exhaustion is inconclusive, not validity or invalidity. A verifier must also
 // check remaining bounds, types, binding, groundedness, arity, and declarations.
 // Sorts are acyclic; expression cycles must pass through a `Union` node.
-// Install all declarations before commands, order-independently and without
-// executing their bodies.
+// Install all declarations and named ruleset bindings before commands,
+// order-independently and without executing their bodies.
 // Definitions installed on this handle may be referenced by name without
-// resending them. Node and sort indices always refer to this Program's arenas,
-// not previous requests; all referenced entries must be included here.
+// resending them. Node, sort and ruleset indices always refer to this Program's
+// arenas, not previous requests; all referenced entries must be included here.
 // Execute only commands, in order, and the expressions they demand. Unused
 // arena entries are not executed; arena membership is not an execution root.
 message Program {
@@ -84,6 +84,17 @@ message Program {
       "this.declarations.all(d, !has(d.constructor) || "
       "!has(d.constructor.cost) || d.constructor.cost < uint(size(this.nodes)))"
   };
+  // Direct composition edges only. Name resolution, composition cycles, Run
+  // references (including nested commands) and retained occurrence matching
+  // remain normative, not established by this nonrecursive CEL rule.
+  option (buf.validate.message).cel = {
+    id: "program.ruleset_refs_in_range"
+    message: "composition indices must index rulesets"
+    expression:
+      "this.rulesets.all(r, !has(r.combined) || "
+      "r.combined.rulesets.all(ref, !has(ref.index) || "
+      "ref.index < uint(size(this.rulesets))))"
+  };
   // Reject relation children with matching argument sort IDs and Unit result.
   // Structural-sort equivalence and complete declared/ambient resolution
   // remain normative: different IDs for equivalent sorts can escape this rule.
@@ -135,6 +146,10 @@ message Program {
 
   // Optional provenance. Omit spans for a normalized/unlocated program.
   repeated SourceFile files = 6;
+
+  // Ruleset occurrences, shared by index within this submission. Named roots
+  // retain their reachable occurrences; see Ruleset for cross-request reuse.
+  repeated Ruleset rulesets = 7;
 }
 
 // Source metadata supports diagnostic locations and documentation, not
@@ -645,8 +660,6 @@ message Declaration {
     Function function = 2;
     Relation relation = 3;
     Primitive primitive = 4;
-    Ruleset ruleset = 5;
-    CombinedRuleset combined_ruleset = 6;
   }
 
   // Optional diagnostic origin; excluded from semantic identity.
@@ -711,17 +724,70 @@ message Primitive {
   optional uint32 body = 4 [(buf.validate.field).required = true]; // index into the enclosing `nodes`
 }
 
-// An immutable ordered rule collection. The empty name denotes the default
-// ruleset and follows the same contract. Identical resends preserve installed
-// rules and their state; changing membership, order, or rule definitions under
-// the same name is an error. Extensions use a new ruleset or composition.
+// An immutable ruleset occurrence: an ordered rule list or composition.
+// Absent name is anonymous; present empty name denotes the default rule list.
+// A present name binds this occurrence on the e-graph handle. Names are
+// immutable: compatible resends retain the occurrence and all reachable
+// children, including anonymous ones, with their rule state. Changes to body
+// kind, ordered contents, rule definitions/options or sharing are conflicts.
+// Compare expression subgraphs as in Declaration; provenance is not identity.
 // Frontends may build mutably before emitting a complete definition.
-// Each rule occurrence belongs to its declaring ruleset. Equal names/bodies
-// in distinct rulesets are independent occurrences with independent state;
-// compositions reuse the existing occurrences rather than declaring copies.
+//
+// Compare same-name presentations' bodies and internal sharing before
+// identifying entries. Compatible presentations then identify corresponding
+// entries as the same occurrences. After those correspondences, one consistent
+// match must preserve sharing across all named-root closures: no merging
+// distinct occurrences or splitting shared ones. Conflicting identity
+// requirements from installed roots are errors.
+// A matched local entry reuses its retained occurrence everywhere, including
+// a direct Run of that index. Unmatched occurrences are fresh for each
+// submission; equal anonymous bodies alone never imply shared state.
+// Repeated references to one entry share its rule state, including across loop
+// iterations in this Program.
+// Named roots retain their entire reachable closure across requests; a later
+// name-only reference does not need to resend those entries or their bodies.
+// Whether a resend may add a new name to a retained anonymous child remains
+// unresolved; occurrence matching does not decide that alias-binding policy.
+// Each rule occurrence belongs to its leaf ruleset. Compositions reference
+// those occurrences rather than declaring copies. Cyclic compositions are
+// invalid, including cycles through names; these are normative semantic checks.
 message Ruleset {
-  string name = 1;
-  repeated RuleDecl rules = 2;
+  option (buf.validate.message).cel = {
+    id: "ruleset.default_is_rule_list"
+    message: "the default ruleset must be a rule list"
+    expression: "!has(this.name) || this.name != '' || has(this.rules)"
+  };
+
+  optional string name = 1;
+
+  oneof kind {
+    option (buf.validate.oneof).required = true;
+
+    RuleList rules = 2;
+    CombinedRuleset combined = 3;
+  }
+
+  // Optional origin and documentation; excluded from semantic identity.
+  Span span = 4;
+  string doc = 5;
+}
+
+// The leaf body of a Ruleset. May be empty.
+message RuleList {
+  repeated RuleDecl rules = 1;
+}
+
+// A request-local occurrence or a named binding on the e-graph handle.
+// Names may be installed by this Program or an earlier one. Missing names
+// and out-of-range indices are errors. An explicitly empty name selects the
+// default ruleset; an unset reference does not implicitly select it.
+message RulesetRef {
+  oneof kind {
+    option (buf.validate.oneof).required = true;
+
+    uint32 index = 1; // index into Program.rulesets
+    string name = 2;
+  }
 }
 
 // A rule, or a directional or bidirectional rewrite, with common execution
@@ -735,8 +801,8 @@ message RuleDecl {
     BiRewrite birewrite = 3;
   }
 
-  // Stable occurrence name, unique within the declaring Ruleset. Identical
-  // resends reuse that occurrence; names are not global rule identities.
+  // Stable occurrence name, unique within its leaf Ruleset. A matched enclosing
+  // ruleset retains that occurrence; names are not global rule identities.
   string name = 4 [(buf.validate.field).string.min_len = 1];
 
   // Required for every rule and rewrite; no implicit default.
@@ -798,15 +864,11 @@ message BiRewrite {
   repeated uint32 conditions = 4 [packed = true]; // index into the enclosing `nodes`
 }
 
-// An immutable named composition of fixed child rulesets, declared in this
-// Program or already installed. Later submissions cannot change its children.
-// References reuse each child's rule occurrences and state, even if another
-// composition selects that same child.
-// May be empty. Shares the ruleset namespace but holds no rules directly; the
-// empty name is reserved for the default `Ruleset`.
+// The composition body of a Ruleset: an ordered list of fixed child references.
+// May be empty. Contains no rules directly; name and provenance belong to the
+// enclosing Ruleset. Repeated/shared children retain their occurrence identity.
 message CombinedRuleset {
-  string name = 1 [(buf.validate.field).string.min_len = 1];
-  repeated string rulesets = 2;
+  repeated RulesetRef rulesets = 1;
 }
 
 // ---------------------------------------------------------------------------
@@ -849,8 +911,7 @@ message Check {
 // Execute one ruleset step, optionally using a bound scheduler. Returns
 // `RunReport`.
 message Run {
-  // Empty selects the default ruleset.
-  string ruleset = 1;
+  RulesetRef ruleset = 1 [(buf.validate.field).required = true];
 
   // Empty means no scheduler; otherwise names a `BindScheduler` instance.
   string scheduler = 2;
@@ -1149,6 +1210,8 @@ message RunProgramResponse {
 // `egraph_id` are transport faults and never appear here.
 //
 // The locators below are optional, subject to the rule-attribution invariant.
+// Anonymous-ruleset attribution is unresolved; the name-based fields below
+// must not be filled with invented names or IDs.
 message Error {
   option (buf.validate.message).cel = {
     id: "error.rule_attribution"
@@ -1182,8 +1245,9 @@ message Error {
   // Diagnostic only, and not a `Span`: `Span.file` indexes USER source.
   string engine_origin = 6;
 
-  // Declaring ruleset, even when invoked through a CombinedRuleset. Empty is
-  // the default ruleset when rule is present, otherwise no attribution.
+  // Provisional named-ruleset attribution.
+  // Empty denotes the default ruleset when rule is present, otherwise no
+  // attribution; it must not be repurposed as an anonymous occurrence ID.
   string ruleset = 7;
 }
 
@@ -1235,6 +1299,9 @@ message CommandOutput {
   }
 }
 
+// Reporting and attribution are provisional, especially for anonymous
+// rulesets and nested/repeated execution. The existing name-based fields do
+// not define exact occurrence keys or a complete execution hierarchy.
 // One command's report. Across iterations, updated is ORed and can_stop is
 // ANDed. A loop's aggregate records history, not its termination reason.
 message RunReport {
@@ -1303,13 +1370,14 @@ message RuleReport {
   string rule = 1;
   uint64 matches = 2;
   uint64 search_and_apply_nanos = 3;
-  // Declaring ruleset, even when run through a CombinedRuleset. Empty denotes
-  // the default ruleset.
+  // Provisional named-ruleset attribution.
+  // Empty denotes the default ruleset, not an anonymous occurrence ID.
   string ruleset = 4;
 }
 
 // One ruleset's execution statistics.
 message RulesetReport {
+  // Provisional name-based attribution; not an anonymous occurrence ID.
   string ruleset = 1;
   uint64 search_and_apply_nanos = 2;
   uint64 merge_nanos = 3;
@@ -1526,11 +1594,7 @@ message FrozenEGraph {
   repeated Node nodes = 2;
 
   repeated Sort sorts = 3;
-  repeated Declaration declarations = 4 [(buf.validate.field).repeated.items.cel = {
-    id: "frozen_egraph.data_declaration"
-    message: "frozen declarations cannot contain rulesets"
-    expression: "!has(this.ruleset) && !has(this.combined_ruleset)"
-  }];
+  repeated Declaration declarations = 4;
 
   // Subsumed ROWS, named by a call node that addresses them — never by the
   // group containing them: a row is subsumed, a class is not. A ROW IS ITS KEY
