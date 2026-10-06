@@ -61,12 +61,16 @@ is effectful only when its type contains the state. Like `set-cost`,
 extractor reads them all. A container (`Vec`, `Set`, ...) holding an
 effectful element is effectful without being marked.
 
-The sort of the marked expression comes from egglog's rule typechecker: the
-macro replaces each `(set-effectful e)` action by `(let <fresh> e)`,
-typechecks the rule as egglog itself would (body and head together, in the
-contexts the rule's mode gives them) and reads the fresh variable's sort off
-the resolved rule. `set-effectful` must be an action of its own, and the
-expression must have an eq sort.
+The sort of the marked expression comes from egglog's rule typechecker,
+applied when the rule is run: a rule that uses `set-effectful` is lowered to
+`(effsafe-rule <id>)`, which replaces each `(set-effectful e)` action by
+`(let <fresh> e)`, typechecks that rule as egglog itself would (body and head
+together, in the contexts the rule's mode and the e-graph's seminaive setting
+give them, with the declarations other macros emitted for the rule already in
+place) and reads the fresh variables' sorts off the result. An overloaded
+expression the plain `let` leaves ambiguous is retried as an insertion into
+the relation of each eq sort in turn, so the eq-sort requirement decides it. `set-effectful` must be an action of its own, and the
+expression must have exactly one eq sort.
 
 ### `:regions`
 
