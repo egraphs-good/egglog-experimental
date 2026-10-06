@@ -94,8 +94,9 @@ Rust without duplicating the IR declarations.
 
 ### Unnamed rulesets and declaration reuse
 
-- **Ruleset arena — decided:** immutable rulesets live in `Program.rulesets`,
-  with a rule-list or composition body and optional name. Runs and composition
+- **Ruleset identity — decided:** immutable rulesets have optional names and
+  share state by occurrence identity. The current provisional wire layout uses
+  `Program.rulesets`, with a rule-list or composition body. Runs and composition
   children use an arena index or an installed name. An absent name is anonymous;
   a present empty name retains the default ruleset. Named roots retain their
   reachable anonymous children and rule state across requests. Compatible
@@ -122,6 +123,14 @@ Rust without duplicating the IR declarations.
   to nullary functions and sets; this does not add general expression bindings.
   Whether resending a named parent can give a new name to its retained
   anonymous child remains open.
+- **Once per Run — decided:** flatten transitive inclusion in order, considering
+  each rule occurrence only at its first inclusion. Distinct equal rules remain
+  independent. Separate Runs and loop iterations select independently; this
+  does not limit firings from query matches or override the scheduler.
+- **Rule-level sharing — proposed:** a rule arena would let multiple rulesets
+  reference the same rule occurrence directly, without copying it. This is a
+  layout proposal only; the current schema still requires `RuleDecl` names and
+  assigns each rule occurrence to a leaf ruleset. No rule arena is implemented.
 - **Declaration reuse — decided:** programs may refer to definitions already
   installed on the same e-graph handle without resending them. Builtin calls
   resolve against implicitly available host primitives without requiring

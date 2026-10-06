@@ -2102,6 +2102,12 @@ class Run(Message[_RunFields]):
     """
     Execute one ruleset step, optionally using a bound scheduler. Returns
     `RunReport`.
+    Flatten the selected ruleset transitively in inclusion order, retaining each
+    rule occurrence only at its first inclusion in this complete Run. Identity,
+    not name or structural equality, determines duplication; distinct equal
+    rules remain independent. This only deduplicates selection within one Run:
+    separate Runs and loop iterations select independently. It does not limit
+    firings from query matches or override scheduler decisions.
 
     ```proto
     message egglog.v1.Run
