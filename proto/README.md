@@ -68,16 +68,22 @@ generation remains a goal; the decision does not choose a Rust arity strategy.
 
 Protobuf codegen produces message classes, not ergonomic Egglog APIs. Could
 builtin and user declarations also generate Python classes, Rust methods, and
-bindings for other languages? For example, one signature might be presented
+Egglog source? For example, one signature might be presented
 as Python `m[k]` and Rust `m.get(k)`, with the same underlying call.
+
+**Decided:** start with typed metadata for Rust, Python, and Egglog source only;
+defer arbitrary extension payloads and other languages. Egglog presentation
+metadata is where datatype grouping and related surface syntax belong, rather
+than adding a second semantic datatype declaration. This describes how to
+present definitions, not original formatting or source round-tripping.
 
 Python's [declarations](https://github.com/egraphs-good/egglog-python/blob/ff72f601a972ca1eb7cb0a1d299813f5d65b1a14/python/egglog/declarations.py#L311-L324)
 distinguish constructors, methods, class methods, properties, and preserved host
 methods. Potential metadata includes module/type names, receiver placement,
-operators, argument order, defaults, and conversions. Should this be an open,
-namespaced annotation on definitions or a separate binding manifest? How are
-unknown annotations preserved, and can they be ignored without changing the
-Egglog definition? This is separate from the existing locations/documentation.
+operators, argument order, defaults, and conversions. Exact fields, attachment
+points (including datatype groups), validation, and treatment in declaration
+identity remain to be designed. This is separate from the existing diagnostic
+locations/documentation; it does not add another copy of those fields.
 
 **Decided:** initially generate the symbolic declarations and expression-building
 API. Host methods such as `Map.value` and host conversions remain ordinary
@@ -85,6 +91,24 @@ handwritten Python. Descriptors do not transport native implementations or
 arbitrary method bodies. A useful end-to-end test: export Luminal's Rust-defined
 IR, generate its Python API, author a Python rewrite, and consume that rule in
 Rust without duplicating the IR declarations.
+
+### Unnamed rulesets and declaration reuse
+
+- **Ruleset arena:** should immutable rulesets live in an arena with optional
+  names, so commands and compositions can reference unnamed collections? Today
+  rulesets are named declarations; an empty name selects the single default
+  ruleset, not a fresh unnamed one. Work out references and occurrence identity
+  within and across submissions without losing installed rule state or sharing
+  it accidentally. This does not reopen mutable rulesets.
+- **Declaration reuse:** must each program carry all its definitions, or can it
+  refer to previously installed ones? The draft already retains immutable named
+  definitions and accepts identical resends; calls and compositions can refer
+  to installed names. Make the submission/discovery contract consistent for
+  user definitions and implicitly available builtins, without requiring fixed
+  builtin descriptions to be sent with every message. Clarify what each payload
+  must include, how missing/conflicting definitions are diagnosed, and which
+  references are request-local versus handle-scoped. Current node/sort indices
+  are payload-local, not persistent IDs. Keep standalone snapshots self-contained.
 
 ### Shared Python/Rust memory
 
