@@ -618,6 +618,7 @@ pub fn extract_region(
     boundary: &dyn RegionBoundary,
     root: EClassId,
     costs: &[Vec<Cost>],
+    class_costs: &[Cost],
     opts: StatewalkOptions,
 ) -> Result<Extraction, Error> {
     let t0 = std::time::Instant::now();
@@ -637,13 +638,20 @@ pub fn extract_region(
     let (pruned, lin_to_pruned) = lin.prune_unextractable(Some(root));
     let t_prune = t2.elapsed();
     let t3 = std::time::Instant::now();
-    let extraction = statewalk_greedy_extraction(&pruned, boundary, lin_to_pruned.class(root))?;
+    let pruned_to_g = lin_to_pruned.inverse(&pruned).then(&lin_to_g);
+    let pruned_class_costs: Vec<Cost> = pruned
+        .class_ids()
+        .map(|c| class_costs[pruned_to_g.class(c)])
+        .collect();
+    let extraction = statewalk_greedy_extraction(
+        &pruned,
+        boundary,
+        &pruned_class_costs,
+        lin_to_pruned.class(root),
+    )?;
     let t_greedy = t3.elapsed();
     let t4 = std::time::Instant::now();
-    let extraction = lin_to_pruned
-        .inverse(&pruned)
-        .then(&lin_to_g)
-        .apply(&extraction);
+    let extraction = pruned_to_g.apply(&extraction);
     if log::log_enabled!(log::Level::Debug) {
         log::debug!(
             "effsafe linearize={:.2}ms prune={:.2}ms greedy={:.2}ms map={:.2}ms",

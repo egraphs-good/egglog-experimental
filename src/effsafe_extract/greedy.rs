@@ -169,6 +169,32 @@ impl<'g> Greedy<'g> {
         self.g
             .enode(class, self.pick[class].expect("e-class has no pick"))
     }
+
+    /// Whether the current picks below any of `from` reach `target`, through
+    /// e-classes that are not yet extracted (an extracted e-class is a finished
+    /// term and cannot contain `target` unless `target` is extracted too).
+    fn reaches(
+        &self,
+        from: &[EClassId],
+        target: EClassId,
+        extracted: &[Option<ExtractionId>],
+    ) -> bool {
+        let mut seen = vec![false; self.g.len()];
+        let mut stack: Vec<EClassId> = from.to_vec();
+        while let Some(class) = stack.pop() {
+            if class == target {
+                return true;
+            }
+            if seen[class] || extracted[class].is_some() {
+                continue;
+            }
+            seen[class] = true;
+            if let Some(node) = self.pick[class] {
+                stack.extend(self.g.enode(class, node).children.iter().copied());
+            }
+        }
+        false
+    }
 }
 
 /// The effective marginal cost of `enode` given the costs of its `:regions`
@@ -312,9 +338,17 @@ pub fn project_statewalk_costs(mapping: &EGraphMapping, costs: &[Vec<Cost>]) -> 
 /// settled, the whole term below it is emitted and its e-classes become free
 /// for everyone else to reuse (their cost drops to zero), which is what makes
 /// the shared statewalk pay for pure subterms only once.
+///
+/// A pure e-node with `:regions` children is priced by the boundary fold over
+/// `class_cost` of those children: their independent (globally estimated)
+/// cost, not the sharing-discounted cost within this region, since a
+/// `:regions` child is charged at every occurrence. Such a fold can make an
+/// e-node cheaper than its own children, so a pick that would lead back to
+/// its own e-class through the current picks is skipped.
 pub fn statewalk_greedy_extraction(
     g: &TermGraph,
     boundary: &dyn RegionBoundary,
+    class_cost: &[Cost],
     root: EClassId,
 ) -> Result<Extraction, Error> {
     let mut greedy = Greedy::new(g);
@@ -352,9 +386,15 @@ pub fn statewalk_greedy_extraction(
             let own = if g.is_effectful(pc) {
                 0
             } else {
-                effective_cost(g, boundary, enode, |c| greedy.best[c].sum)
+                effective_cost(g, boundary, enode, |c| class_cost[c])
             };
             let cost = greedy.plain_cost(own, enode);
+            if !enode.regions.is_empty()
+                && cost < greedy.best[pc]
+                && greedy.reaches(&enode.children, pc, &extracted)
+            {
+                continue;
+            }
             greedy.relax(pc, pn, cost);
         }
         processed[class] = true;

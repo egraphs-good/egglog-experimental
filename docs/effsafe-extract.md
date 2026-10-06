@@ -144,7 +144,11 @@ position, such as the branches of a conditional that does not touch the
 state, is not a subregion and is extracted within the enclosing region, but
 the fold prices it the same way, as a tree, so the model's weighting applies
 to it too. This holds for the cost estimates, for the selection of pure terms
-within a region and for the reported cost alike.) The result (including the e-node's own cost) is the e-node's
+within a region and for the reported cost alike. When selecting pure terms,
+the fold sees each `:regions` child's independent, globally estimated cost,
+not the discounted cost it may have within the region because the statewalk
+already uses it, and a fold that would make an e-node cheaper than a term
+containing it is not allowed to close a cycle.) The result (including the e-node's own cost) is the e-node's
 effective marginal cost in the enclosing region, whose DAG then charges the
 predicate, state and other ordinary children, preserving sharing. A subregion
 used from several e-nodes is extracted and placed once but charged at every

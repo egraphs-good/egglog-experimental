@@ -108,6 +108,8 @@ struct Regions<'g> {
     g: &'g TermGraph,
     boundary: &'g dyn RegionBoundary,
     opts: StatewalkOptions,
+    /// Estimated cost of every e-class (global greedy).
+    class_cost: Vec<Cost>,
     /// Statewalk cost of every effectful e-node (subregions folded in).
     costs: Vec<Vec<Cost>>,
     /// Region number of each region root.
@@ -152,6 +154,7 @@ impl<'g> Regions<'g> {
             g,
             boundary,
             opts,
+            class_cost,
             costs,
             region_of,
             cache: vec![None; region_roots.len()],
@@ -288,8 +291,19 @@ impl<'g> Regions<'g> {
         let (region, region_root, to_g) = self.build_region(root, rid)?;
         let t_build = t0.elapsed();
         let costs = project_statewalk_costs(&to_g, &self.costs);
+        let class_costs: Vec<Cost> = region
+            .class_ids()
+            .map(|c| self.class_cost[to_g.class(c)])
+            .collect();
         let t1 = std::time::Instant::now();
-        let extraction = extract_region(&region, self.boundary, region_root, &costs, self.opts)?;
+        let extraction = extract_region(
+            &region,
+            self.boundary,
+            region_root,
+            &costs,
+            &class_costs,
+            self.opts,
+        )?;
         if log::log_enabled!(log::Level::Debug) {
             log::debug!(
                 "effsafe region classes={} build={:.2}ms extract={:.2}ms",

@@ -113,9 +113,11 @@ fn rewrite_rule(
         });
     }
     let mut vars = sorts_through_facts(&rule.body, &lets, &marks, symbol_gen, type_info);
+    // Lets the query typechecker could not type (write primitives) are
+    // inferred here, of any sort; only the marked expressions must be eq sorts.
     for (var, expr) in &lets {
         if !vars.contains_key(var)
-            && let Ok(sort) = sort_of(expr, &vars, type_info)
+            && let Ok(Some(sort)) = infer_sort(expr, &vars, type_info)
         {
             vars.insert(var.clone(), sort);
         }
@@ -225,8 +227,8 @@ fn sorts_through_facts(
 /// The sort of `expr`, or `None` when it cannot be determined. Variables come
 /// from `vars` or the globals; constructor and function calls from their
 /// declared output; primitive calls by trying the primitive's overloads
-/// against every sort visible in the rule (the sorts of its variables), which
-/// covers write primitives that the query typechecker cannot type.
+/// against every registered sort as the output, which covers write
+/// primitives that the query typechecker cannot type.
 fn infer_sort(
     expr: &Expr,
     vars: &FxHashMap<String, String>,
@@ -267,7 +269,7 @@ fn infer_sort(
                     arg_sorts.push(sort.clone());
                 }
                 let mut accepted: Vec<String> = Vec::new();
-                for candidate in candidate_sorts(vars, type_info) {
+                for candidate in candidate_sorts(type_info) {
                     let mut tys = arg_sorts.clone();
                     tys.push(candidate.clone());
                     if prims.iter().any(|p| p.accept(&tys, type_info))
@@ -296,21 +298,11 @@ fn infer_sort(
     })
 }
 
-/// The sorts a primitive call in the rule could produce: those of the rule's
-/// variables. (Sorts nested inside containers are not tried: egglog's
-/// `inner_sorts` is not implemented for every container sort. Container
-/// element access such as `vec-get` is typed through the query typechecker
-/// instead.)
-fn candidate_sorts(vars: &FxHashMap<String, String>, type_info: &TypeInfo) -> Vec<egglog::ArcSort> {
-    let mut out: Vec<egglog::ArcSort> = Vec::new();
-    for name in vars.values() {
-        if out.iter().any(|s| s.name() == name) {
-            continue;
-        }
-        if let Some(sort) = type_info.get_sort_by_name(name) {
-            out.push(sort.clone());
-        }
-    }
+/// The sorts a primitive call could produce: every registered sort.
+fn candidate_sorts(type_info: &TypeInfo) -> Vec<egglog::ArcSort> {
+    let mut out: Vec<egglog::ArcSort> = type_info.get_arcsorts_by(|_| true);
+    out.sort_by(|a, b| a.name().cmp(b.name()));
+    out.dedup_by(|a, b| a.name() == b.name());
     out
 }
 
