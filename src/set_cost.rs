@@ -21,7 +21,7 @@ use crate::{
     },
 };
 use egglog::{
-    ArcSort, CommandOutput, EGraph, Enode, RawValues, Read, TermId, UserDefinedCommand, Value,
+    ArcSort, CommandOutput, EGraph, Enode, Read, TermId, UserDefinedCommand, Value,
     ast::*,
     extract::{DEFAULT_COST_MODEL, DagCostModel, DefaultCost, TreeCostModelFromDag},
     span,
@@ -226,7 +226,7 @@ impl DagCostModel<DefaultCost> for DynamicCostModel {
         let name = get_cost_table_name(func.name());
         if egraph.get_function(&name).is_some() {
             egraph
-                .read(|state| state.lookup(&name, RawValues(enode.children.to_vec())))
+                .read(|state| state.lookup(&name, enode.children))
                 .ok()
                 .flatten()
                 .map(|c| {
