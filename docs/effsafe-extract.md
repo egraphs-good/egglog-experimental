@@ -63,7 +63,8 @@ effectful element is effectful without being marked.
 
 The sort of the marked expression comes from egglog's rule typechecker,
 applied when the rule is run: a rule that uses `set-effectful` is lowered to
-`(effsafe-rule <id>)`, which replaces each `(set-effectful e)` action by
+`(effsafe-rule "<the rule>")`, which re-parses the rule (internal symbols
+included) and replaces each `(set-effectful e)` action by
 `(let <fresh> e)`, typechecks that rule as egglog itself would (body and head
 together, in the contexts the rule's mode and the e-graph's seminaive setting
 give them, with the declarations other macros emitted for the rule already in

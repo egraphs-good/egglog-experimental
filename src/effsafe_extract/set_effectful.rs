@@ -8,8 +8,9 @@
 //! The sort of `e` comes from egglog's own rule typechecker
 //! ([`TypeInfo::typecheck_rule`]), applied when the rule is run rather than
 //! when it is parsed: a [`CommandMacro`] lowers a rule whose head mentions
-//! `set-effectful` to `(effsafe-rule <id>)`, keeping the parsed rule in a
-//! process-local table, and that command, with the e-graph at hand, replaces
+//! `set-effectful` to `(effsafe-rule "<the rule, printed>")`, and that
+//! command, with the e-graph at hand, re-parses the rule (allowing the
+//! internal symbols other macros gave it, such as `@_` for wildcards), replaces
 //! each `(set-effectful e)` action by `(let <fresh> e)`, typechecks the probe
 //! rule with the e-graph's actual seminaive setting, reads the fresh variables'
 //! sorts off the resolved head and runs the rewritten rule. If `e` is an
@@ -23,12 +24,8 @@
 //! A top-level `(set-effectful e)` is a user-defined command typed the same
 //! way, as the head of a rule with no body in the top-level (`Full`) context.
 
-use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{LazyLock, Mutex};
-
 use egglog::ast::{
-    Action, Command, Expr, Fact, GenericAction, Literal, ParseError, ResolvedRule, Rule,
+    Action, Command, Expr, Fact, GenericAction, Literal, ParseError, Parser, ResolvedRule, Rule,
     RuleEvalMode,
 };
 use egglog::util::{FreshGen, SymbolGen};
@@ -54,14 +51,6 @@ pub fn effectful_relation_sort(relation: &str) -> Option<&str> {
     relation.strip_prefix(RELATION_PREFIX)
 }
 
-/// Rules lowered to `effsafe-rule`, by id. Rules are plain data and a
-/// program is run by one process, so this is the simplest faithful way to
-/// hand the parsed rule (with the internal symbols other macros gave it) from
-/// the macro to the command.
-static PENDING_RULES: LazyLock<Mutex<HashMap<u64, Rule>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
-static NEXT_RULE_ID: AtomicU64 = AtomicU64::new(0);
-
 /// Lowers a rule whose actions mention `set-effectful` to `effsafe-rule`;
 /// see the module docs.
 pub struct SetEffectful;
@@ -75,13 +64,15 @@ impl CommandMacro for SetEffectful {
     ) -> Result<Vec<Command>, Error> {
         match command {
             Command::Rule { rule } if mentions_set_effectful(&rule.head) => {
+                // The rule travels as text so that the lowered program is
+                // self-contained and deterministic; `effsafe-rule` re-parses
+                // it with internal symbols allowed.
                 let span = rule.span.clone();
-                let id = NEXT_RULE_ID.fetch_add(1, Ordering::Relaxed);
-                PENDING_RULES.lock().unwrap().insert(id, rule);
+                let text = format!("{}", Command::Rule { rule });
                 Ok(vec![Command::UserDefined(
                     span.clone(),
                     EFFSAFE_RULE.to_string(),
-                    vec![Expr::Lit(span, Literal::Int(id as i64))],
+                    vec![Expr::Lit(span, Literal::String(text))],
                 )])
             }
             other => Ok(vec![other]),
@@ -89,8 +80,8 @@ impl CommandMacro for SetEffectful {
     }
 }
 
-/// `(effsafe-rule <id>)`: the lowered rule, with its `set-effectful` actions
-/// rewritten into the generated relations.
+/// `(effsafe-rule "<rule>")`: the lowered rule, with its `set-effectful`
+/// actions rewritten into the generated relations.
 pub struct EffsafeRule;
 
 impl UserDefinedCommand for EffsafeRule {
@@ -99,23 +90,28 @@ impl UserDefinedCommand for EffsafeRule {
             .first()
             .map(|a| a.span())
             .unwrap_or_else(|| egglog::span!());
-        let [Expr::Lit(_, Literal::Int(id))] = args else {
+        let [Expr::Lit(_, Literal::String(text))] = args else {
             return Err(Error::ParseError(ParseError(
                 span,
-                format!("usage: ({EFFSAFE_RULE} <id>), produced by rules that use {SET_EFFECTFUL}"),
+                format!(
+                    "usage: ({EFFSAFE_RULE} \"<rule>\"), produced by rules that use {SET_EFFECTFUL}"
+                ),
             )));
         };
-        let rule = PENDING_RULES
-            .lock()
-            .unwrap()
-            .get(&(*id as u64))
-            .cloned()
-            .ok_or_else(|| {
-                Error::ParseError(ParseError(
+        // A plain parser (no macros, which have already been applied) that
+        // accepts the internal symbols earlier macros introduced.
+        let mut parser = Parser::default();
+        parser.ensure_no_reserved_symbols = false;
+        let mut commands = parser.get_program_from_string(None, text)?;
+        let rule = match (commands.pop(), commands.is_empty()) {
+            (Some(Command::Rule { rule }), true) => rule,
+            _ => {
+                return Err(Error::ParseError(ParseError(
                     span,
-                    format!("{EFFSAFE_RULE}: unknown rule {id}; this command is produced by rules that use {SET_EFFECTFUL}"),
-                ))
-            })?;
+                    format!("{EFFSAFE_RULE}: expected exactly one rule"),
+                )));
+            }
+        };
         let global_seminaive = egraph.seminaive;
         let (mut commands, rule) = rewrite_rule(egraph, rule, global_seminaive)?;
         commands.push(Command::Rule { rule });
