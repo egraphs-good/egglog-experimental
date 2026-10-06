@@ -17,9 +17,9 @@ default = ["bin"]
 bin = ["egglog/bin"]
 
 [dependencies]
-egglog = { version = "3.0.0", git = "https://github.com/egraphs-good/egglog.git", rev = "90635860397ce710f8c0a4eeb04154a8ebc3ac05", default-features = false }
-egglog-ast = { version = "3.0.0", git = "https://github.com/egraphs-good/egglog.git", rev = "90635860397ce710f8c0a4eeb04154a8ebc3ac05", default-features = false }
-egglog-reports = { version = "3.0.0", git = "https://github.com/egraphs-good/egglog.git", rev = "90635860397ce710f8c0a4eeb04154a8ebc3ac05", default-features = false }
+egglog = { version = "3.0.0", path = "../../egglog/herbie-performance", default-features = false }
+egglog-ast = { version = "3.0.0", path = "../../egglog/herbie-performance/egglog-ast", default-features = false }
+egglog-reports = { version = "3.0.0", path = "../../egglog/herbie-performance/egglog-reports", default-features = false }
 
 num = "0.4.3"
 lazy_static = "1.4"
@@ -32,3 +32,7 @@ hashbrown = "0.16.0"
 [dev-dependencies]
 glob = "0.3.1"
 libtest-mimic = "0.8.1"
+
+[profile.profiling]
+inherits = "release"
+debug = true
