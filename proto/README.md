@@ -20,10 +20,10 @@ validity. The remaining requirements are normative comments. CEL can exhaust
 its evaluation budget on large valid inputs; that is inconclusive, not proof
 that a program is invalid. Frontend parity has not been demonstrated end to end.
 
-## Open questions
+## Design decisions and open questions
 
-These are directions to explore, not changes already made to the schema.
-Decisions are marked below; the other questions remain open.
+Decisions are marked below; the other questions remain open. The schema's
+comments and annotations remain the normative contract.
 
 ### Shared builtin definitions and type checking
 
@@ -100,15 +100,18 @@ Rust without duplicating the IR declarations.
   ruleset, not a fresh unnamed one. Work out references and occurrence identity
   within and across submissions without losing installed rule state or sharing
   it accidentally. This does not reopen mutable rulesets.
-- **Declaration reuse:** must each program carry all its definitions, or can it
-  refer to previously installed ones? The draft already retains immutable named
-  definitions and accepts identical resends; calls and compositions can refer
-  to installed names. Make the submission/discovery contract consistent for
-  user definitions and implicitly available builtins, without requiring fixed
-  builtin descriptions to be sent with every message. Clarify what each payload
-  must include, how missing/conflicting definitions are diagnosed, and which
-  references are request-local versus handle-scoped. Current node/sort indices
-  are payload-local, not persistent IDs. Keep standalone snapshots self-contained.
+- **Declaration reuse — decided:** programs may refer to definitions already
+  installed on the same e-graph handle without resending them. Builtin calls
+  resolve against implicitly available host primitives without requiring
+  builtin declarations. Calls resolve by name and argument/result
+  sorts; missing or ambiguous matches are errors. Full definition resends are
+  optional compatibility checks: identical definitions are no-ops, conflicts
+  are errors. There are no signature-only imports. This is specified in the
+  schema comments; runtime enforcement remains unimplemented. Each payload
+  still includes every referenced node/sort arena entry; indices are local to
+  that message. An `EqSort` entry also idempotently declares its name. Standalone
+  snapshots retain complete table declarations and transitive user-defined
+  dependencies. Host catalog discovery and its descriptor format remain open.
 
 ### Shared Python/Rust memory
 

@@ -25,6 +25,9 @@
 /// Sorts are acyclic; expression cycles must pass through a `Union` node.
 /// Install all declarations before commands, order-independently and without
 /// executing their bodies.
+/// Definitions installed on this handle may be referenced by name without
+/// resending them. Node and sort indices always refer to this Program's arenas,
+/// not previous requests; all referenced entries must be included here.
 /// Execute only commands, in order, and the expressions they demand. Unused
 /// arena entries are not executed; arena membership is not an execution root.
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -297,7 +300,8 @@ pub struct Union {
     #[prost(uint32, repeated, tag = "1")]
     pub members: ::prost::alloc::vec::Vec<u32>,
 }
-/// Positional application of a declared callable or ambient host primitive.
+/// Positional application of a callable declared in the enclosing payload,
+/// already installed on the handle, or implicitly provided by the host.
 /// The enclosing node's sort matches the result; relation calls use Unit.
 /// Resolve the name using argument and result sorts across declared and ambient
 /// candidates. A declaration adds a candidate; it does not shadow ambient
@@ -624,8 +628,10 @@ pub struct SetCost {
 // DECLARATIONS — the `Declaration.kind` arms in arm order, with their parts.
 // ---------------------------------------------------------------------------
 
-/// Order-independent, immutable definitions. New names may be added; resending
-/// an identical definition is a no-op, and conflicting definitions are errors.
+/// Order-independent, immutable definitions. New names may be added. Resending
+/// a complete definition is optional and checks compatibility: identical
+/// definitions are no-ops; conflicting definitions are errors. There is no
+/// separate signature-only import form.
 /// Compare referenced expression subgraphs structurally, not request-local
 /// indices. Provenance and argument labels do not participate in identity.
 /// Comparison must preserve Union sharing/identity topology; ordinary syntax
