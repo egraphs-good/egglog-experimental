@@ -17,9 +17,9 @@ default = ["bin"]
 bin = ["egglog/bin"]
 
 [dependencies]
-egglog = { version = "3.0.0", git = "https://github.com/oflatt-claude/egglog.git", rev = "de4a742", default-features = false }
-egglog-ast = { version = "3.0.0", git = "https://github.com/oflatt-claude/egglog.git", rev = "de4a742", default-features = false }
-egglog-reports = { version = "3.0.0", git = "https://github.com/oflatt-claude/egglog.git", rev = "de4a742", default-features = false }
+egglog = { version = "3.0.0", git = "https://github.com/oflatt-claude/egglog.git", rev = "25f3cee", default-features = false }
+egglog-ast = { version = "3.0.0", git = "https://github.com/oflatt-claude/egglog.git", rev = "25f3cee", default-features = false }
+egglog-reports = { version = "3.0.0", git = "https://github.com/oflatt-claude/egglog.git", rev = "25f3cee", default-features = false }
 
 num = "0.4.3"
 lazy_static = "1.4"
