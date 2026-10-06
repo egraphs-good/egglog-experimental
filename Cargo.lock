@@ -389,7 +389,6 @@ name = "egglog-bridge"
 version = "3.0.0"
 dependencies = [
  "anyhow",
- "dyn-clone",
  "egglog-concurrency",
  "egglog-core-relations",
  "egglog-numeric-id",
