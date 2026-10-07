@@ -35,7 +35,8 @@
 /// such list. Each loop-body iteration starts an independent scope; nested lists
 /// never inherit the outer mapping, which resumes after they return. Rule
 /// firings and other commands' evaluated inputs have their own scopes as in Union.
-/// Sort.var is legal only in HostPrimitive signatures. Node sorts, lambda
+/// Sort.var is legal only in HostPrimitive signatures and their presentation
+/// owner/trait patterns, sharing that signature's binder. Node sorts, lambda
 /// parameter sorts, cost sorts and concrete declaration signatures must be
 /// recursively closed. CEL rejects direct variable roots; closure is normative.
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -111,8 +112,8 @@ pub struct Span {
 
 /// Closed types are structurally interned. Equal container/function shapes
 /// denote the same sort.
-/// Signatures reuse these shapes with binder-local variables. A shared variable
-/// or pattern is interpreted independently in each enclosing GenericSignature;
+/// Signatures and their presentation patterns reuse binder-local variables.
+/// A shared pattern is interpreted independently in each GenericSignature;
 /// arena sharing never shares substitutions between signatures or calls.
 /// Sorts are acyclic through Container.args and FuncSort.params/result. CEL
 /// checks direct indices, not acyclicity or recursive variable scope.
@@ -146,10 +147,14 @@ pub mod sort {
 }
 /// A nullary equality sort. An entry also declares it; repeated declarations
 /// of the same name are idempotent. Its name cannot also name a host sort family.
+/// Metadata is excluded from sort identity and follows SortMetadata's separate
+/// first-supply/resupply contract.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct EqSort {
     #[prost(string, tag = "1")]
     pub name: ::prost::alloc::string::String,
+    #[prost(message, optional, tag = "2")]
+    pub metadata: ::core::option::Option<SortMetadata>,
 }
 /// A nullary host sort-family application, such as Unit, bool, i64 or String.
 /// The family must have arity zero. It is non-unionable.
@@ -160,7 +165,7 @@ pub struct PrimSort {
 }
 /// An application of a positive-arity host sort family, such as Vec<i64> or
 /// Map<String, Math>. The argument count must equal the family's arity. Arguments
-/// may be signature patterns only inside a GenericSignature; otherwise closed.
+/// may be patterns only in a GenericSignature or its presentation; otherwise closed.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct Container {
     #[prost(string, tag = "1")]
@@ -170,7 +175,8 @@ pub struct Container {
     pub args: ::prost::alloc::vec::Vec<u32>,
 }
 /// A structural function type, not a named host sort family. Its parameter and
-/// result sorts may be patterns only inside a GenericSignature; otherwise closed.
+/// result sorts may be patterns in a GenericSignature or its presentation;
+/// otherwise closed.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct FuncSort {
     /// index into the enclosing `sorts`
@@ -201,6 +207,9 @@ pub struct FuncSort {
 ///    must be legal in that execution context. Hosts publish the capabilities
 ///    of ambient primitives; receivers check these obligations. A Union in an
 ///    evaluated body can write, even though the body contains only expressions.
+/// - Presentation defaults are closed symbolic templates, not evaluated at
+///    installation/export. Lambda bodies keep their own binders; every expanded
+///    use must satisfy its ordinary execution context's typing/effect rules.
 /// - Inert values (declared costs and extracted data) contain no variables,
 ///    GetCost reads or Union and must be finite. Saved code bodies retain
 ///    their own binders, so these are use-site rules, not bans on an entire arena.
@@ -677,7 +686,8 @@ pub struct SetCost {
 /// they never install native code. Referencing an ambient definition by name
 /// does not require resending its descriptor.
 /// Compare referenced expression subgraphs structurally, not request-local
-/// indices. Provenance and argument labels do not participate in identity.
+/// indices. Provenance, argument labels and presentation metadata do not
+/// participate in semantic identity; metadata has its own resupply checks.
 /// Comparison must preserve Union sharing/identity topology; ordinary syntax
 /// sharing may differ. One empty Union reused twice is not two fresh Unions.
 /// Callable names are unique across Constructor, Function, Relation, Primitive
@@ -694,6 +704,8 @@ pub struct Declaration {
     /// Optional diagnostic origin; excluded from semantic identity.
     #[prost(message, optional, tag = "7")]
     pub span: ::core::option::Option<Span>,
+    #[prost(message, optional, tag = "8")]
+    pub metadata: ::core::option::Option<CallableMetadata>,
     /// Optional documentation; excluded from semantic identity.
     #[prost(string, tag = "9")]
     pub doc: ::prost::alloc::string::String,
@@ -808,6 +820,8 @@ pub struct HostSortFamily {
     pub name: ::prost::alloc::string::String,
     #[prost(uint32, tag = "2")]
     pub arity: u32,
+    #[prost(message, optional, tag = "3")]
+    pub metadata: ::core::option::Option<SortMetadata>,
 }
 /// A host-implemented callable. Submission asserts that a compatible native
 /// implementation is available; it supplies neither a body nor executable code.
@@ -855,6 +869,241 @@ pub struct GenericSignature {
 /// PartialCall supplies its effective complete call as described there.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct FunctionApplication {
+}
+// ---------------------------------------------------------------------------
+// LANGUAGE PRESENTATION — optional views, never additional core definitions.
+// ---------------------------------------------------------------------------
+
+/// Each language block is fixed when first supplied for the semantic definition.
+/// Absence makes no assertion/removal; another language may first arrive later.
+/// Reconcile all supplies order-independently, including repeated same-name
+/// declarations/EqSort entries, before interning away duplicate presentations.
+/// Agreeing supplies are allowed; conflicting supplies are errors. Compare
+/// arena references structurally, not by index. Sort comparison excludes attached
+/// metadata; default calls identify their core callee, not its presentation.
+/// Compare all default roots within each language block together, preserving
+/// shared/distinct Union topology.
+/// Metadata never changes semantic definition identity or duplicates docs/spans.
+///
+/// Without a Python/Rust block, generators derive conservative type/free-function
+/// wrappers, preserving exact core names, signatures and argument order. Derived
+/// wrappers install no metadata. Empty blocks carry no hiding instruction; their
+/// generation behavior and identifier normalization are not specified here.
+/// Malformed individual metadata and conflicting resupply are installation errors.
+/// Cross-definition Python/Rust binding collisions are generation errors for all
+/// explicit/derived combinations, never silent fallback, overwrite or renaming.
+/// High-level generators and these runtime checks remain unimplemented.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct SortMetadata {
+    #[prost(message, optional, tag = "1")]
+    pub python: ::core::option::Option<TypeBinding>,
+    #[prost(message, optional, tag = "2")]
+    pub rust: ::core::option::Option<TypeBinding>,
+    #[prost(message, optional, tag = "3")]
+    pub egglog: ::core::option::Option<EgglogTypeBinding>,
+}
+/// A target-language type path (module/crate segments, then type name), distinct
+/// from its core sort/family name. Parameters remain in core family order.
+/// Optional labels name those parameters; if supplied, their count equals arity.
+/// They introduce no Sort.var binder. Nullary EqSort/families have no parameters.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct TypeBinding {
+    #[prost(string, repeated, tag = "1")]
+    pub path: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    #[prost(string, repeated, tag = "2")]
+    pub type_params: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+}
+/// Surface sort/family symbol; family parameters retain core order.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct EgglogTypeBinding {
+    #[prost(string, tag = "1")]
+    pub symbol: ::prost::alloc::string::String,
+}
+/// The same per-language lifetime/compatibility contract as SortMetadata.
+/// No view changes the core signature. A surface call supplies every core input
+/// exactly once after receiver mapping, defaults and tail expansion; it emits an
+/// ordinary Call in core argument order. Parameter names are surface names, not
+/// binders for defaults. Views of generic host primitives share that signature's
+/// type binder for owner/trait sort patterns; other views have no type binder.
+/// Presentation cannot rescue a core call whose generic substitution is not
+/// determined by its concrete argument/result sorts under the usual call rules.
+/// Recursive binder/owner/default typing checks are normative.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct CallableMetadata {
+    #[prost(message, optional, tag = "1")]
+    pub python: ::core::option::Option<PythonBindings>,
+    #[prost(message, optional, tag = "2")]
+    pub rust: ::core::option::Option<RustBindings>,
+    #[prost(message, optional, tag = "3")]
+    pub egglog: ::core::option::Option<EgglogBindings>,
+}
+/// Owner identity, not a display path. A sort pattern refers to the enclosing
+/// callable's signature binder, or must be closed when it has no generic binder.
+/// The function marker is only for FunctionApplication's structural function
+/// wrapper: receiver core input 0, with tail/result derived from its concrete
+/// FuncSort. It introduces neither a named sort family nor a type-pack binder.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct BindingOwner {
+    #[prost(oneof = "binding_owner::Kind", tags = "1, 2")]
+    pub kind: ::core::option::Option<binding_owner::Kind>,
+}
+/// Nested message and enum types in `BindingOwner`.
+pub mod binding_owner {
+    #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Oneof)]
+    pub enum Kind {
+        /// index into Program.sorts
+        #[prost(uint32, tag = "1")]
+        Sort(u32),
+        #[prost(message, tag = "2")]
+        Function(super::FunctionTypeOwner),
+    }
+}
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct FunctionTypeOwner {
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct PythonBindings {
+    #[prost(message, repeated, tag = "1")]
+    pub views: ::prost::alloc::vec::Vec<PythonCallable>,
+}
+/// Free functions use a qualified path; members use one name resolved on owner.
+/// INITIALIZER instead omits path and derives __init__.
+/// METHOD/PROPERTY map a real core input as receiver. INITIALIZER/CLASS_METHOD
+/// have no core self/cls input. Only INITIALIZER requires result = owner;
+/// class methods and class variables may return a different sort.
+/// METHOD/PROPERTY receiver sort must match owner under the same substitution.
+/// PROPERTY has only a receiver; CLASS_VARIABLE is a nullary expression view.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct PythonCallable {
+    #[prost(enumeration = "PythonCallKind", tag = "1")]
+    pub kind: i32,
+    #[prost(string, repeated, tag = "2")]
+    pub path: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    #[prost(message, optional, tag = "3")]
+    pub owner: ::core::option::Option<BindingOwner>,
+    /// fixed core input, not implicit Python self/cls
+    #[prost(uint32, optional, tag = "4")]
+    pub receiver: ::core::option::Option<u32>,
+    /// surface order, excluding receiver
+    #[prost(message, repeated, tag = "5")]
+    pub params: ::prost::alloc::vec::Vec<PythonParameter>,
+    /// Replace this supplied argument wrapper with the Call result and return
+    /// Python None. Applies to free functions as well as methods. The fixed input
+    /// and core result sorts must agree; this does not change the core result to
+    /// Unit or assert a database effect. Initializers cannot use this convention.
+    #[prost(uint32, optional, tag = "6")]
+    pub mutates: ::core::option::Option<u32>,
+}
+/// Ordered surface parameter. Fixed core inputs occupy [0, n). If the signature
+/// has varargs, one logical tail slot n represents all varargs; it must be last
+/// in surface order and have no default. FunctionApplication has fixed slot 0
+/// plus tail slot 1, whose heterogeneous sorts come from the actual FuncSort.
+/// No redundant varargs flag or generic expression template is introduced.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct PythonParameter {
+    #[prost(uint32, optional, tag = "1")]
+    pub core_input: ::core::option::Option<u32>,
+    #[prost(string, tag = "2")]
+    pub name: ::prost::alloc::string::String,
+    /// Typed symbolic syntax, not an evaluated/captured value. It must have no
+    /// free/query variables; lambda-local bound variables are allowed. Calls are
+    /// allowed and installation/export never evaluates them. Node sorts remain
+    /// concrete; a default can constrain a generic call's substitution at use.
+    /// Check each use under its binder: sharing a node with a lambda body does
+    /// not bind that node in a capture or another default root.
+    /// Expand omitted defaults together into the emitted call with fresh Union
+    /// identities, preserving sharing within that expansion; no cross-call cache
+    /// of classes/values. Check ordinary binding, typing and effect rules at use.
+    ///
+    /// index into Program.nodes
+    #[prost(uint32, optional, tag = "3")]
+    pub default_expr: ::core::option::Option<u32>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct RustBindings {
+    #[prost(message, repeated, tag = "1")]
+    pub views: ::prost::alloc::vec::Vec<RustCallable>,
+}
+/// No owner means free function (qualified path); otherwise path is one member
+/// name. Owner without receiver is associated; with receiver it is a method.
+/// trait_impl selects a trait implementation, which may have either form.
+/// Associated-function output need not equal owner. Receiver's core sort matches
+/// owner; borrowing only affects wrapper ownership, not that semantic sort.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct RustCallable {
+    #[prost(string, repeated, tag = "1")]
+    pub path: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    #[prost(message, optional, tag = "2")]
+    pub owner: ::core::option::Option<BindingOwner>,
+    /// impl Trait for &Owner, independent of receiver syntax
+    #[prost(bool, tag = "3")]
+    pub borrowed_self: bool,
+    #[prost(message, optional, tag = "4")]
+    pub receiver: ::core::option::Option<RustReceiver>,
+    /// surface order, excluding receiver
+    #[prost(message, repeated, tag = "5")]
+    pub params: ::prost::alloc::vec::Vec<RustParameter>,
+    #[prost(message, optional, tag = "6")]
+    pub trait_impl: ::core::option::Option<RustTrait>,
+}
+/// Receiver ownership relative to impl Self: self or &self. For an impl on
+/// &Owner, by-value self is already &Owner, while &self is &&Owner.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct RustReceiver {
+    #[prost(uint32, optional, tag = "1")]
+    pub core_input: ::core::option::Option<u32>,
+    #[prost(bool, tag = "2")]
+    pub borrowed: bool,
+}
+/// Same fixed/tail input-slot convention as PythonParameter. Borrowing describes
+/// a fixed wrapper or the tail's elements, not a new core reference sort.
+/// Into/iterator conveniences remain generator policy; no host converter body.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct RustParameter {
+    #[prost(uint32, optional, tag = "1")]
+    pub core_input: ::core::option::Option<u32>,
+    #[prost(string, tag = "2")]
+    pub name: ::prost::alloc::string::String,
+    #[prost(bool, tag = "3")]
+    pub borrowed: bool,
+}
+/// Named trait, explicit type arguments, and an optional associated output such
+/// as std::ops::Add<Rhs>::Output. That associated type is the core result wrapper.
+/// Types reuse the callable's signature binder, including mixed/concrete owner
+/// applications. Trait conformance/coherence is checked during Rust generation.
+/// Arbitrary associated types, lifetimes, const generics, mutable borrowing and
+/// where-clause/code payloads are not represented by this limited view.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct RustTrait {
+    #[prost(string, repeated, tag = "1")]
+    pub path: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    #[prost(message, repeated, tag = "2")]
+    pub args: ::prost::alloc::vec::Vec<RustType>,
+    #[prost(string, optional, tag = "3")]
+    pub output_associated_type: ::core::option::Option<::prost::alloc::string::String>,
+}
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct RustType {
+    /// index into Program.sorts
+    #[prost(uint32, optional, tag = "1")]
+    pub sort: ::core::option::Option<u32>,
+    #[prost(bool, tag = "2")]
+    pub borrowed: bool,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct EgglogBindings {
+    #[prost(message, repeated, tag = "1")]
+    pub views: ::prost::alloc::vec::Vec<EgglogCallable>,
+}
+/// Surface symbol in core argument order. datatype_member is valid only for a
+/// Constructor: group it under its existing equality output sort's presentation.
+/// It does not add a datatype definition or select a text-overload policy.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct EgglogCallable {
+    #[prost(string, tag = "1")]
+    pub symbol: ::prost::alloc::string::String,
+    #[prost(bool, tag = "2")]
+    pub datatype_member: bool,
 }
 /// An immutable ruleset occurrence: an ordered rule list or composition.
 /// An absent name adds no binding and leaves an unmatched occurrence anonymous.
@@ -1193,9 +1442,13 @@ pub struct Extract {
 /// declaration descriptors, including generic families and every distinct core
 /// callable. Export each ruleset occurrence once, even if multiple roots reach it.
 /// Include saved code and its dependencies without executing it.
+/// Include supplied language metadata and all metadata-only sort/default-node
+/// dependencies, remapping their arena references. Do not export derived wrapper
+/// defaults as if they were supplied metadata. Preserve default-root Union
+/// sharing without evaluating templates or confusing them with stored classes.
 /// Host implementations/codecs remain external.
 /// HostSortFamily and HostPrimitive describe the catalog, including generic
-/// signatures and all referenced sort patterns. These descriptor graphs may
+/// signatures, presentation patterns and all referenced sorts. These graphs may
 /// contain Sort.var; the reconstruction data and concrete definitions may not.
 /// Host binding and export remain unimplemented; never silently omit definitions.
 ///
@@ -1730,6 +1983,47 @@ impl ChangeKind {
             "CHANGE_KIND_UNSPECIFIED" => Some(Self::Unspecified),
             "CHANGE_KIND_DELETE" => Some(Self::Delete),
             "CHANGE_KIND_SUBSUME" => Some(Self::Subsume),
+            _ => None,
+        }
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum PythonCallKind {
+    Unspecified = 0,
+    Function = 1,
+    Initializer = 2,
+    Method = 3,
+    ClassMethod = 4,
+    Property = 5,
+    ClassVariable = 6,
+}
+impl PythonCallKind {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "PYTHON_CALL_KIND_UNSPECIFIED",
+            Self::Function => "PYTHON_CALL_KIND_FUNCTION",
+            Self::Initializer => "PYTHON_CALL_KIND_INITIALIZER",
+            Self::Method => "PYTHON_CALL_KIND_METHOD",
+            Self::ClassMethod => "PYTHON_CALL_KIND_CLASS_METHOD",
+            Self::Property => "PYTHON_CALL_KIND_PROPERTY",
+            Self::ClassVariable => "PYTHON_CALL_KIND_CLASS_VARIABLE",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "PYTHON_CALL_KIND_UNSPECIFIED" => Some(Self::Unspecified),
+            "PYTHON_CALL_KIND_FUNCTION" => Some(Self::Function),
+            "PYTHON_CALL_KIND_INITIALIZER" => Some(Self::Initializer),
+            "PYTHON_CALL_KIND_METHOD" => Some(Self::Method),
+            "PYTHON_CALL_KIND_CLASS_METHOD" => Some(Self::ClassMethod),
+            "PYTHON_CALL_KIND_PROPERTY" => Some(Self::Property),
+            "PYTHON_CALL_KIND_CLASS_VARIABLE" => Some(Self::ClassVariable),
             _ => None,
         }
     }

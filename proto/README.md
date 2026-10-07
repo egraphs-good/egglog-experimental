@@ -44,7 +44,7 @@ namespace with `EqSort`; callable names occupy a separate namespace.
 `HostPrimitive` selects an ordinary `GenericSignature` or the dedicated
 `FunctionApplication` typing form. A signature has an ordered type-parameter
 binder, fixed inputs, a required output, and an optional homogeneous varargs
-tail. It uses the existing sort arena with signature-only `Sort.var` indices.
+tail. It uses the existing sort arena with signature-bound `Sort.var` indices.
 Parameter labels are diagnostic: changing their spelling does not change the
 definition. A shared pattern is interpreted independently in each signature's
 binder; neither arena sharing nor export combines binders or substitutions.
@@ -117,11 +117,12 @@ present definitions, not original formatting or source round-tripping.
 
 Python's [declarations](https://github.com/egraphs-good/egglog-python/blob/ff72f601a972ca1eb7cb0a1d299813f5d65b1a14/python/egglog/declarations.py#L311-L324)
 distinguish constructors, methods, class methods, properties, and preserved host
-methods. Potential metadata includes module/type names, receiver placement,
-operators, argument order, defaults, and conversions. Exact fields, attachment
-points (including datatype groups), and validation remain to be designed.
-This is separate from existing diagnostic locations/documentation; it does not
-add another copy of those fields.
+methods. `SortMetadata` now attaches to `EqSort` and `HostSortFamily`;
+`CallableMetadata` attaches to callable `Declaration` arms. Both have optional
+Python, Rust, and Egglog blocks, without duplicating locations/documentation.
+Type bindings carry qualified display paths and optional parameter labels in
+core family order. Callable views carry explicit surface-to-core input mappings;
+owner sort patterns identify semantic types, not their display paths.
 
 **Decided:** freeze each language's metadata block when first supplied for a
 definition. An absent language on a later compatible redeclaration makes no
@@ -129,8 +130,11 @@ assertion and removes nothing; another language may first be supplied later.
 A subsequent block for an already-supplied language must match the fixed block.
 Adding or changing a same-language alias after that first block is rejected.
 Presentation metadata is independent of semantic definition identity.
-No metadata wire layout or runtime implementation is chosen yet; matching and
-normalization details remain to be specified.
+Repeated same-name supplies in one Program are reconciled before interning;
+agreeing blocks are allowed. Compare referenced sort/default structures after
+arena remapping, without recursively comparing their presentation metadata.
+Default-root comparison preserves shared versus distinct `Union` occurrences.
+Runtime matching and language-name normalization remain unimplemented.
 
 **Decided:** without a Python/Rust presentation block for a definition, generate
 plain symbolic types and free functions with API identifiers derived from core
@@ -145,7 +149,45 @@ rejects malformed individual metadata and conflicting resupply of one declaratio
 fixed language block. These defaults are derived output, not supplied metadata:
 they install or freeze no block, so later explicit metadata
 remains that language's first supply. The exact naming/normalization algorithm
-is undecided; high-level generators and metadata wire layout are unimplemented.
+is undecided; high-level generators and runtime metadata checks are unimplemented.
+
+Python views distinguish free functions, initializers, methods, class methods,
+properties, and class variables. Ordered parameter records give core-input
+positions, names, and optional default expressions. Initializers derive `__init__`
+without storing a path. Receivers are mapped inputs; initializers/class methods
+introduce no core `self`/`cls` argument. Only an
+initializer requires its result to match its owner. An optional mutated-input
+index also supports free functions: replace that wrapper with the core result
+and return Python `None`, without changing the core signature or effects.
+
+**Decided:** defaults are closed symbolic expressions, not captured runtime
+values: calls and lambda-bound variables are allowed, but free/query variables
+are not. Never evaluate defaults during installation or export. Their node sorts
+are concrete and may constrain generic call substitution when used. Expand an
+emitted call's omitted defaults together, with fresh `Union` identities and
+preserved internal sharing; then check the actual use's binding/effect rules.
+
+Rust views distinguish free/associated/receiver/trait forms through their fields.
+Borrowed impl `Self` and receiver borrowing are separate: `impl Add for &T` with
+`self` differs from `impl Trait for T` with `&self`. Parameters and trait arguments
+record wrapper ownership; an optional associated output name such as `Output`
+maps to the core result. Arbitrary associated types, lifetimes, const generics,
+mutable borrowing, and executable host bodies are outside this limited layout.
+
+Ordinary varargs use one final logical parameter slot derived from the signature,
+with no default or redundant varargs flag. `FunctionApplication` instead has a
+function input and a heterogeneous tail derived from its concrete `FuncSort`.
+A structural-function owner marker represents `__call__` without a fake family
+or new type-pack binder. Other owner/trait patterns use only the enclosing
+callable's existing generic binder; metadata cannot introduce generic nodes.
+Egglog views carry symbols and constructor datatype membership, grouped by the
+existing output equality sort, without new datatype or text-overload semantics.
+
+`Freeze` retains supplied blocks and their metadata-only dependencies, remapping
+arenas without executing defaults or freezing derived wrapper choices. CEL checks
+direct shapes, positions and bounds. Recursive default closure, owner/receiver
+typing, metadata compatibility, and target-language generation remain normative
+requirements, not implemented semantic checks.
 
 **Decided:** initially generate the symbolic declarations and expression-building
 API. Host methods such as `Map.value` and host conversions remain ordinary
