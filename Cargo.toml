@@ -32,7 +32,3 @@ hashbrown = "0.16.0"
 [dev-dependencies]
 glob = "0.3.1"
 libtest-mimic = "0.8.1"
-
-[profile.profiling]
-inherits = "release"
-debug = true
