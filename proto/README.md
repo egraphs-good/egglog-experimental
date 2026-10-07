@@ -397,10 +397,20 @@ and memory use on the same graph before choosing.
   equivalent resends may change ordinary syntax sharing but must preserve
   `Union` identity topology. The contract is specified; enforcement is not yet
   implemented. This does not propose another Python-only validator.
-- **Frontend coverage:** exercise text, Python, and Rust producers against the
-  same cases. Document which file-I/O, expected-failure, and printing/statistics
-  commands are frontend/test-harness conveniences versus shared operations.
-  Keep the selected literal extraction-count restriction explicit.
+- **Frontend boundaries:** datatype/include/operator/default syntax lowers in
+  the producer. Frontend CSV input decodes to ordinary declarations/actions;
+  file and pretty output render structured observations. `function_size` and
+  `function_values` use `PrintSize` and `PrintFunction` results respectively.
+  Standalone `Check` responses support `check_bool`/`check_fail`: distinguish
+  success from `CHECK_FAILED` and propagate other failures. General `fail`
+  remains external test-harness logic, not a catch or rollback inside a Program.
+  Frontend `push`/`pop` can use a `CloneEGraph` handle stack. Native extraction's
+  best-count zero lowers to `variants = 1`; this IR accepts literal counts only.
+  Exact graph-owned `lookup_function_value` results and values passed to custom
+  cost callbacks are not `PrintFunction`'s extracted representatives; those
+  remain host-adapter work, not a new RPC or a claim of full Python parity.
+  These adapters and shared text/Python/Rust producer conformance tests remain
+  unimplemented.
 - **Deferred:** proofs. Current-state export/restoration and optional recording
   are specified above but have no runtime implementation.
 
