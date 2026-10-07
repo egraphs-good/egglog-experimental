@@ -119,9 +119,18 @@ Python's [declarations](https://github.com/egraphs-good/egglog-python/blob/ff72f
 distinguish constructors, methods, class methods, properties, and preserved host
 methods. Potential metadata includes module/type names, receiver placement,
 operators, argument order, defaults, and conversions. Exact fields, attachment
-points (including datatype groups), validation, and treatment in declaration
-identity remain to be designed. This is separate from the existing diagnostic
-locations/documentation; it does not add another copy of those fields.
+points (including datatype groups), and validation remain to be designed.
+This is separate from existing diagnostic locations/documentation; it does not
+add another copy of those fields.
+
+**Decided:** freeze each language's metadata block when first supplied for a
+definition. An absent language on a later compatible redeclaration makes no
+assertion and removes nothing; another language may first be supplied later.
+A subsequent block for an already-supplied language must match the fixed block.
+Adding or changing a same-language alias after that first block is rejected.
+Presentation metadata is independent of semantic definition identity.
+No metadata wire layout or runtime implementation is chosen yet; matching and
+normalization details remain to be specified.
 
 **Decided:** initially generate the symbolic declarations and expression-building
 API. Host methods such as `Map.value` and host conversions remain ordinary
