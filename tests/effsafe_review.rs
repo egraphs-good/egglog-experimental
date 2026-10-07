@@ -1,8 +1,6 @@
-//! Regression tests from the second review of the effect-safe extractor
-//! (egglog-experimental PR 77): saturated costs, context-dependent region
-//! cycles, region positions in the safety checker, reported costs of pure
-//! `:regions` children, placeholder typing and `set-effectful` on
-//! primitive-typed let bindings.
+//! Regression tests from the review of egglog-experimental PR 77.
+//! These assert the intended behavior and expose bugs in commit 0e9fdc4.
+//! See docs/reviews/pr77-effsafe-review.md for findings and reproduction commands.
 
 use egglog::ast::Expr;
 use egglog::extract::{DefaultCost, TreeCostModel};
@@ -23,11 +21,11 @@ const LANG: &str = r#"
   (If Expr Expr Expr Expr :regions (2 3))
   (Loop Expr Expr :regions (1)))
 (constructor Func (String Expr) Expr)
-(rule ((= e (Arg))) ((set-effectful e)))
-(rule ((= e (Print v s))) ((set-effectful e)))
-(rule ((= e (If p s t els))) ((set-effectful e)))
-(rule ((= e (Loop s b))) ((set-effectful e)))
-(rule ((= e (Func n b))) ((set-effectful e)))
+(rule ((= e (Arg))) ((set-effectful Expr e)))
+(rule ((= e (Print v s))) ((set-effectful Expr e)))
+(rule ((= e (If p s t els))) ((set-effectful Expr e)))
+(rule ((= e (Loop s b))) ((set-effectful Expr e)))
+(rule ((= e (Func n b))) ((set-effectful Expr e)))
 "#;
 
 /// Run `program` after the language prelude on an e-graph prepared by
@@ -158,7 +156,7 @@ fn review_region_before_state_with_read() {
     let term = extract_one(
         r#"
       (constructor BodyFirst (Expr Expr) Expr :regions (0))
-      (rule ((= e (BodyFirst b s))) ((set-effectful e)))
+      (rule ((= e (BodyFirst b s))) ((set-effectful Expr e)))
       (let $s (Print (Num 1) (Arg)))
       (let $l (BodyFirst (Print (Num 2) (Arg)) $s))
       (let $root (Print (Read $s) $l))
@@ -220,7 +218,7 @@ fn review_set_effectful_primitive_let() {
       (rule ((= e (Arg)))
          ((let v (vec-of (Next e)))
           (let b (vec-get v 0))
-          (set-effectful b)))
+          (set-effectful Expr b)))
       (let $s0 (Arg))
       (run 3)
       (extract (Next $s0) :extractor effsafe)
@@ -240,7 +238,7 @@ fn review_cyclic_cache_across_roots() {
             "{LANG}\n{}",
             r#"
       (constructor Expensive (Expr Expr) Expr :cost 100)
-      (rule ((= e (Expensive v s))) ((set-effectful e)))
+      (rule ((= e (Expensive v s))) ((set-effectful Expr e)))
       (let $a (Expensive (Num 1) (Arg)))
       (let $b (Loop (Arg) $a))
       (union $a (Loop (Arg) $b))
@@ -286,7 +284,7 @@ fn review_cyclic_cache_within_single_root() {
     let term = extract_one_with(
         r#"
       (constructor Expensive (Expr Expr) Expr :cost 100)
-      (rule ((= e (Expensive v s))) ((set-effectful e)))
+      (rule ((= e (Expensive v s))) ((set-effectful Expr e)))
       (let $a (Expensive (Num 1) (Arg)))
       (let $b (Loop (Arg) $a))
       (union $a (Loop (Arg) $b))

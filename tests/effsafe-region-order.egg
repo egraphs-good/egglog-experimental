@@ -8,10 +8,10 @@
   (Print Expr Expr)
   (Loop Expr Expr :regions (0))              ; body, inputs
   (If Expr Expr Expr Expr :regions (0 1)))   ; then, else, pred, inputs
-(rule ((= e (Arg))) ((set-effectful e)))
-(rule ((= e (Print v s))) ((set-effectful e)))
-(rule ((= e (Loop b s))) ((set-effectful e)))
-(rule ((= e (If t els p s))) ((set-effectful e)))
+(rule ((= e (Arg))) ((set-effectful Expr e)))
+(rule ((= e (Print v s))) ((set-effectful Expr e)))
+(rule ((= e (Loop b s))) ((set-effectful Expr e)))
+(rule ((= e (If t els p s))) ((set-effectful Expr e)))
 
 (let $s0 (Arg))
 (let $p1 (Print (Num 1) $s0))

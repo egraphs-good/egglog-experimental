@@ -8,8 +8,8 @@ use egglog_experimental::new_experimental_egraph;
 
 const LANG: &str = r#"
   (datatype Expr (Arg) (Print Expr Expr))
-  (rule ((= e (Arg))) ((set-effectful e)))
-  (rule ((= e (Print v s))) ((set-effectful e)))
+  (rule ((= e (Arg))) ((set-effectful Expr e)))
+  (rule ((= e (Print v s))) ((set-effectful Expr e)))
 "#;
 
 fn run(program: &str) {
@@ -27,13 +27,16 @@ fn review7_identical_calls_can_have_different_sorts() {
       (primitive make-state (Exprs Ints) Expr (FromVec _0))
       (rule ((= e (Arg)))
         ((let state (make-state (vec-empty) (vec-empty)))
-         (set-effectful state)))
+         (set-effectful Expr state)))
       (Arg)
       (run 3)
       (check (effsafe_effectful_Expr (FromVec (vec-empty))))
     "#;
     // Each call occurrence is resolved independently by the action typechecker.
-    run(&program.replace("(set-effectful state)", "(effsafe_effectful_Expr state)"));
+    run(&program.replace(
+        "(set-effectful Expr state)",
+        "(effsafe_effectful_Expr state)",
+    ));
     run(program);
 }
 
@@ -55,14 +58,17 @@ fn review7_distinct_arguments_are_constrained_before_cutoff() {
     program.push_str(
         r#"
       (let state (make-state v0 v1 v2 v3 v4 v5 v6 v7 v8))
-      (set-effectful state)))
+      (set-effectful Expr state)))
       (Arg)
       (run 3)
       (check (effsafe_effectful_Expr (FromVec (vec-empty))))
     "#,
     );
     run(&program.replace("(sort Ints (Vec i64))", ""));
-    run(&program.replace("(set-effectful state)", "(effsafe_effectful_Expr state)"));
+    run(&program.replace(
+        "(set-effectful Expr state)",
+        "(effsafe_effectful_Expr state)",
+    ));
     run(&program);
 }
 
@@ -78,7 +84,7 @@ fn review7_literal_constraint_with_nested_write() {
       (rule ((= e (Arg)))
         ((let f (unstable-fn "State" (write e)))
          (let state (unstable-app f))
-         (set-effectful state)))
+         (set-effectful Expr state)))
       (Arg)
       (run 3)
       (check (effsafe_effectful_Expr (State (Use (Arg)))))
@@ -88,6 +94,9 @@ fn review7_literal_constraint_with_nested_write() {
         "(let f (unstable-fn \"State\" (write e)))",
         "(let partial (write e)) (let f (unstable-fn \"State\" partial))",
     ));
-    run(&program.replace("(set-effectful state)", "(effsafe_effectful_Expr state)"));
+    run(&program.replace(
+        "(set-effectful Expr state)",
+        "(effsafe_effectful_Expr state)",
+    ));
     run(program);
 }

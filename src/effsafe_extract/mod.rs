@@ -1,5 +1,5 @@
 //! Effect-safe extraction: `(extract e :extractor effsafe)`,
-//! `(print-function Ctor :extractor effsafe)`, `(set-effectful e)`, and the
+//! `(print-function Ctor :extractor effsafe)`, `(set-effectful Sort e)`, and the
 //! `:regions` annotation on `constructor` and `datatype` declarations
 //! (lowered to `effsafe-regions`).
 //!
@@ -34,7 +34,7 @@ use rustc_hash::FxHashMap;
 
 pub use build::Roots;
 pub use cost::{Cost, RegionBoundary};
-pub use set_effectful::{EffsafeRule, SetEffectful, SetEffectfulCommand, effectful_relation};
+pub use set_effectful::{SetEffectful, effectful_relation};
 pub use statewalk::StatewalkOptions;
 
 /// The language's effect annotations, collected from `:regions` and
@@ -573,11 +573,9 @@ pub fn add_effsafe_extract(egraph: &mut EGraph) {
     egraph
         .parser
         .add_command_macro(Arc::new(RegionsAnnotation { head: "datatype*" }));
-    let commands: [(&str, Arc<dyn UserDefinedCommand>); 4] = [
+    let commands: [(&str, Arc<dyn UserDefinedCommand>); 2] = [
         ("effsafe-regions", Arc::new(EffsafeRegions)),
         ("print-function", Arc::new(PrintFunction)),
-        (set_effectful::SET_EFFECTFUL, Arc::new(SetEffectfulCommand)),
-        (set_effectful::EFFSAFE_RULE, Arc::new(EffsafeRule)),
     ];
     for (name, command) in commands {
         egraph.add_command(name.into(), command).unwrap();

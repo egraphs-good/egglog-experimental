@@ -10,8 +10,8 @@ use egglog_experimental::{DynamicCostModel, new_experimental_egraph, set_effsafe
 
 const LANG: &str = r#"
   (datatype Expr (Arg) (Print Expr Expr))
-  (rule ((= e (Arg))) ((set-effectful e)))
-  (rule ((= e (Print v s))) ((set-effectful e)))
+  (rule ((= e (Arg))) ((set-effectful Expr e)))
+  (rule ((= e (Print v s))) ((set-effectful Expr e)))
 "#;
 
 fn run(program: &str, setup: impl FnOnce(&mut EGraph)) -> Vec<CommandOutput> {
@@ -38,14 +38,17 @@ fn review4_primitive_result_sort_not_in_body() {
       (primitive make-state (Input) Expr (Arg))
       (rule ((= input (InputValue)))
          ((let state (make-state input))
-          (set-effectful state)))
+          (set-effectful Expr state)))
       (InputValue)
       (run 3)
       (check (effsafe_effectful_Expr (Arg)))
     "#;
     // The action typechecker knows the declared result sort of this primitive.
     run(
-        &program.replace("(set-effectful state)", "(effsafe_effectful_Expr state)"),
+        &program.replace(
+            "(set-effectful Expr state)",
+            "(effsafe_effectful_Expr state)",
+        ),
         |_| {},
     );
     run(program, |_| {});
@@ -56,12 +59,12 @@ fn review4_top_level_write_primitive_mark() {
     let program = r#"
       (constructor Next (Expr) Expr)
       (primitive make-state (Expr) Expr (Next _0))
-      (set-effectful (make-state (Arg)))
+      (set-effectful Expr (make-state (Arg)))
       (check (effsafe_effectful_Expr (Next (Arg))))
     "#;
     run(
         &program.replace(
-            "(set-effectful (make-state",
+            "(set-effectful Expr (make-state",
             "(effsafe_effectful_Expr (make-state",
         ),
         |_| {},
@@ -77,13 +80,16 @@ fn review4_write_primitive_after_base_sort_let() {
       (rule ((= e (Arg)))
          ((let n 0)
           (let state (make-state n))
-          (set-effectful state)))
+          (set-effectful Expr state)))
       (Arg)
       (run 3)
       (check (effsafe_effectful_Expr (FromInt 0)))
     "#;
     run(
-        &program.replace("(set-effectful state)", "(effsafe_effectful_Expr state)"),
+        &program.replace(
+            "(set-effectful Expr state)",
+            "(effsafe_effectful_Expr state)",
+        ),
         |_| {},
     );
     run(program, |_| {});

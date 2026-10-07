@@ -24,7 +24,7 @@ fn substitution_program(eval_mode: &str) -> String {
       (sort Replacements (Map Expr Expr))
       (rule ((= e (Arg)))
         ((let state (unstable-subst (State e) (map-empty)))
-         (set-effectful state))
+         (set-effectful Expr state))
         {eval_mode})
       (Arg)
       (run 1)
@@ -37,7 +37,10 @@ fn substitution_program(eval_mode: &str) -> String {
 fn review8_unsafe_seminaive_head_has_full_context() {
     let program = substitution_program(":unsafe-seminaive");
     run(
-        &program.replace("(set-effectful state)", "(effsafe_effectful_Expr state)"),
+        &program.replace(
+            "(set-effectful Expr state)",
+            "(effsafe_effectful_Expr state)",
+        ),
         true,
     );
     run(&substitution_program(":naive"), true);
@@ -48,7 +51,10 @@ fn review8_unsafe_seminaive_head_has_full_context() {
 fn review8_global_nonseminaive_head_has_full_context() {
     let program = substitution_program("");
     run(
-        &program.replace("(set-effectful state)", "(effsafe_effectful_Expr state)"),
+        &program.replace(
+            "(set-effectful Expr state)",
+            "(effsafe_effectful_Expr state)",
+        ),
         false,
     );
     run(&program, false);
@@ -62,12 +68,15 @@ fn review8_rule_head_can_constrain_body_overloads() {
       (constructor FromVec (Exprs) Expr)
       (rule ((= xs (vec-empty)))
         ((let state (FromVec xs))
-         (set-effectful state)))
+         (set-effectful Expr state)))
       (run 1)
       (check (effsafe_effectful_Expr (FromVec (vec-empty))))
     "#;
     run(
-        &program.replace("(set-effectful state)", "(effsafe_effectful_Expr state)"),
+        &program.replace(
+            "(set-effectful Expr state)",
+            "(effsafe_effectful_Expr state)",
+        ),
         true,
     );
     run(program, true);
@@ -76,13 +85,16 @@ fn review8_rule_head_can_constrain_body_overloads() {
 #[test]
 fn review8_rule_body_accepts_wildcards() {
     let program = r#"
-      (rule ((= state (State _))) ((set-effectful state)))
+      (rule ((= state (State _))) ((set-effectful Expr state)))
       (State (Arg))
       (run 1)
       (check (effsafe_effectful_Expr (State (Arg))))
     "#;
     run(
-        &program.replace("(set-effectful state)", "(effsafe_effectful_Expr state)"),
+        &program.replace(
+            "(set-effectful Expr state)",
+            "(effsafe_effectful_Expr state)",
+        ),
         true,
     );
     run(program, true);
@@ -94,14 +106,14 @@ fn review8_rule_accepts_set_cost_macro_bindings() {
       (with-dynamic-cost (constructor Costed (Expr) Expr))
       (rule ((= e (Arg)))
         ((set-cost (Costed e) 10)
-         (set-effectful (Costed e))))
+         (set-effectful Expr (Costed e))))
       (Arg)
       (run 1)
       (check (effsafe_effectful_Expr (Costed (Arg))))
     "#;
     run(
         &program.replace(
-            "(set-effectful (Costed e))",
+            "(set-effectful Expr (Costed e))",
             "(effsafe_effectful_Expr (Costed e))",
         ),
         true,
@@ -123,7 +135,7 @@ fn review8_shared_lets_stay_compact() {
         let mark = if mode.starts_with("control") {
             "effsafe_effectful_Expr"
         } else {
-            "set-effectful"
+            "set-effectful Expr"
         };
         let value = if mode.ends_with("shared") { "v22" } else { "e" };
         program.push_str(&format!(
@@ -176,13 +188,16 @@ fn review8_other_head_actions_constrain_shared_lets() {
         ((let values (vec-of e))
          (Save values)
          (let state (vec-get values 0))
-         (set-effectful state)))
+         (set-effectful Expr state)))
       (Arg)
       (run 1)
       (check (effsafe_effectful_Expr (Arg)))
     "#;
     run(
-        &program.replace("(set-effectful state)", "(effsafe_effectful_Expr state)"),
+        &program.replace(
+            "(set-effectful Expr state)",
+            "(effsafe_effectful_Expr state)",
+        ),
         true,
     );
     run(program, true);

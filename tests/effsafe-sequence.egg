@@ -10,9 +10,9 @@
   (Cons Stmt Block))
 (constructor Fn (String Block) Block)
 
-(rule ((= b (Nil))) ((set-effectful b)))
-(rule ((= b (Cons s r))) ((set-effectful b)))
-(rule ((= b (Fn n body))) ((set-effectful b)))
+(rule ((= b (Nil))) ((set-effectful Block b)))
+(rule ((= b (Cons s r))) ((set-effectful Block b)))
+(rule ((= b (Fn n body))) ((set-effectful Block b)))
 
 ;; a dead assignment followed by a re-assignment can be dropped
 (rewrite (Cons (Assign x v) (Cons (Assign x w) rest)) (Cons (Assign x w) rest))

@@ -7,9 +7,9 @@
   (Read Expr)                ; pure read of a state
   (Print Expr Expr)
   (Loop Expr Expr :regions (1)))
-(rule ((= e (Arg))) ((set-effectful e)))
-(rule ((= e (Print v s))) ((set-effectful e)))
-(rule ((= e (Loop i b))) ((set-effectful e)))
+(rule ((= e (Arg))) ((set-effectful Expr e)))
+(rule ((= e (Print v s))) ((set-effectful Expr e)))
+(rule ((= e (Loop i b))) ((set-effectful Expr e)))
 (let $s0 (Arg))
 (let $s1 (Print (Num 1) $s0))
 ;; the body prints a read of the outer state s1 rather than of its own Arg

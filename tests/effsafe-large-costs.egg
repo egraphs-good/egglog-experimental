@@ -6,9 +6,9 @@
   (Num i64)
   (Huge Expr Expr :cost 9000000000000000000)
   (Loop Expr Expr :regions (1)))
-(rule ((= e (Arg))) ((set-effectful e)))
-(rule ((= e (Huge v s))) ((set-effectful e)))
-(rule ((= e (Loop s b))) ((set-effectful e)))
+(rule ((= e (Arg))) ((set-effectful Expr e)))
+(rule ((= e (Huge v s))) ((set-effectful Expr e)))
+(rule ((= e (Loop s b))) ((set-effectful Expr e)))
 
 (let $s0 (Arg))
 (let $h1 (Huge (Num 1) $s0))

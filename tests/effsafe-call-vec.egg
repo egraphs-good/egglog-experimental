@@ -8,9 +8,9 @@
   (Read Expr))
 (sort Exprs (Vec Expr))
 (constructor Call (String Exprs) Expr)
-(rule ((= e (Arg))) ((set-effectful e)))
-(rule ((= e (Print v s))) ((set-effectful e)))
-(rule ((= e (Call n args))) ((set-effectful e)))
+(rule ((= e (Arg))) ((set-effectful Expr e)))
+(rule ((= e (Print v s))) ((set-effectful Expr e)))
+(rule ((= e (Call n args))) ((set-effectful Expr e)))
 
 (let $s0 (Arg))
 (let $s1 (Print (Num 1) $s0))

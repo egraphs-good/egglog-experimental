@@ -1,8 +1,7 @@
 //! Regression tests from the ninth review of the effect-safe extractor
 //! (egglog-experimental PR 77): `set-effectful` after another macro's
 //! generated declaration, in the real top-level and non-seminaive contexts,
-//! and constraining an overloaded expression to eq sorts.
-//! primitive contexts, and the eq-sort constraint on marked expressions.
+//! and constraining an overloaded expression to the explicit eq sort.
 
 use egglog::constraint::{SimpleTypeConstraint, TypeConstraint};
 use egglog::{
@@ -72,14 +71,17 @@ fn review9_mark_fresh_macro_result() {
       (rule ((= e (Arg)))
         ((let state (unstable-fresh! Expr))
          (Seen state)
-         (set-effectful state)))
+         (set-effectful Expr state)))
       (Arg)
       (run 1)
       (check (Seen state) (effsafe_effectful_Expr state))
     "#;
     for text in [
-        program.replace("(set-effectful state)", "(effsafe_effectful_Expr state)"),
-        program.to_owned(),
+        program.replace(
+            "(set-effectful Expr state)",
+            "(effsafe_effectful_Expr state)",
+        ),
+        program.replace("(relation effsafe_effectful_Expr (Expr))", ""),
     ] {
         new_experimental_egraph()
             .parse_and_run_program(None, &text)
@@ -88,7 +90,7 @@ fn review9_mark_fresh_macro_result() {
 }
 
 #[test]
-fn review9_top_level_mark_does_not_choose_write_only_overload() {
+fn review9_top_level_mark_selects_the_explicit_sort() {
     let mut eg = with_context_overloads();
     let expr = eg
         .parser
@@ -100,37 +102,37 @@ fn review9_top_level_mark_does_not_choose_write_only_overload() {
         error.to_string().contains("Failed to infer a type"),
         "{error}"
     );
-    let result = eg.parse_and_run_program(None, "(set-effectful (choose-state))");
-    if result.is_ok() {
-        eg.parse_and_run_program(None, "(check (effsafe_effectful_Expr (Arg)))")
-            .unwrap();
-    }
-    assert!(
-        result.is_err(),
-        "an ambiguous top-level mark silently selected the Expr write overload"
-    );
+    eg.parse_and_run_program(
+        None,
+        r#"
+        (set-effectful Expr (choose-state))
+        (set-effectful Other (choose-state))
+        (check (effsafe_effectful_Expr (Arg))
+               (effsafe_effectful_Other (OtherArg)))
+        "#,
+    )
+    .unwrap();
 }
 
 #[test]
-fn review9_global_nonseminaive_mark_does_not_choose_write_only_overload() {
-    let program = "(rule () ((set-effectful (choose-state))))";
-    let mut explicit = with_context_overloads();
-    assert!(
-        explicit
-            .parse_and_run_program(None, "(rule () ((set-effectful (choose-state))) :naive)")
-            .is_err()
-    );
-    let mut eg = with_context_overloads();
-    eg.seminaive = false;
-    let result = eg.parse_and_run_program(None, program);
-    if result.is_ok() {
-        eg.parse_and_run_program(None, "(run 1) (check (effsafe_effectful_Expr (Arg)))")
-            .unwrap();
+fn review9_nonseminaive_mark_selects_the_explicit_sort() {
+    for (seminaive, mode) in [(true, ":naive"), (false, "")] {
+        let mut eg = with_context_overloads();
+        eg.seminaive = seminaive;
+        eg.parse_and_run_program(
+            None,
+            &format!(
+                r#"
+                (rule () ((set-effectful Expr (choose-state))
+                          (set-effectful Other (choose-state))) {mode})
+                (run 1)
+                (check (effsafe_effectful_Expr (Arg))
+                       (effsafe_effectful_Other (OtherArg)))
+                "#,
+            ),
+        )
+        .unwrap();
     }
-    assert!(
-        result.is_err(),
-        "a globally non-seminaive mark silently selected the Expr write overload"
-    );
 }
 
 #[test]
@@ -144,7 +146,7 @@ fn review9_rule_mark_constrains_an_overload_to_eq_sorts() {
 }
 
 fn check_eq_constraint(in_rule: bool) {
-    for mark in ["effsafe_effectful_Expr", "set-effectful"] {
+    for mark in ["effsafe_effectful_Expr", "set-effectful Expr"] {
         let mut eg = new_experimental_egraph();
         eg.parse_and_run_program(
             None,

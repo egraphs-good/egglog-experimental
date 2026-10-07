@@ -13,11 +13,11 @@
   (Loop Expr Expr :regions (1)))
 (constructor Func (String Expr) Expr)
 
-(rule ((= e (Arg))) ((set-effectful e)))
-(rule ((= e (Print v s))) ((set-effectful e)))
-(rule ((= e (If p s t els))) ((set-effectful e)))
-(rule ((= e (Loop s b))) ((set-effectful e)))
-(rule ((= e (Func n b))) ((set-effectful e)))
+(rule ((= e (Arg))) ((set-effectful Expr e)))
+(rule ((= e (Print v s))) ((set-effectful Expr e)))
+(rule ((= e (If p s t els))) ((set-effectful Expr e)))
+(rule ((= e (Loop s b))) ((set-effectful Expr e)))
+(rule ((= e (Func n b))) ((set-effectful Expr e)))
 
 ;; Two equivalent ways to print 1: the extractor must pick one state chain
 ;; and build every pure term from it.
@@ -47,9 +47,9 @@
 ;; `:regions` works on `constructor` declarations too.
 (datatype Expr2 (Arg2) (Num2 i64) (Print2 Expr2 Expr2))
 (constructor If2 (Expr2 Expr2 Expr2 Expr2) Expr2 :regions (2 3))
-(rule ((= e (Arg2))) ((set-effectful e)))
-(rule ((= e (Print2 v s))) ((set-effectful e)))
-(rule ((= e (If2 p s t els))) ((set-effectful e)))
+(rule ((= e (Arg2))) ((set-effectful Expr2 e)))
+(rule ((= e (Print2 v s))) ((set-effectful Expr2 e)))
+(rule ((= e (If2 p s t els))) ((set-effectful Expr2 e)))
 (let $j (If2 (Num2 0) (Arg2) (Print2 (Num2 1) (Arg2)) (Arg2)))
 (run 5)
 (extract $j :extractor effsafe)

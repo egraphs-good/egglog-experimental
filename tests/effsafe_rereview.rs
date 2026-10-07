@@ -22,11 +22,11 @@ const LANG: &str = r#"
   (If Expr Expr Expr Expr :regions (2 3))
   (Loop Expr Expr :regions (1)))
 (constructor Func (String Expr) Expr)
-(rule ((= e (Arg))) ((set-effectful e)))
-(rule ((= e (Print v s))) ((set-effectful e)))
-(rule ((= e (If p s t els))) ((set-effectful e)))
-(rule ((= e (Loop s b))) ((set-effectful e)))
-(rule ((= e (Func n b))) ((set-effectful e)))
+(rule ((= e (Arg))) ((set-effectful Expr e)))
+(rule ((= e (Print v s))) ((set-effectful Expr e)))
+(rule ((= e (If p s t els))) ((set-effectful Expr e)))
+(rule ((= e (Loop s b))) ((set-effectful Expr e)))
+(rule ((= e (Func n b))) ((set-effectful Expr e)))
 "#;
 
 /// Run `program` after the language prelude on an e-graph prepared by
@@ -154,14 +154,14 @@ fn rereview_set_effectful_write_primitive_let() {
       (primitive next (Expr) Expr (Next _0))
       (rule ((= e (Arg)))
          ((let b (next e))
-          (set-effectful b)))
+          (set-effectful Expr b)))
       (let $s0 (Arg))
       (run 3)
       (extract $s0 :extractor effsafe)
     "#;
     // The ordinary action typechecker accepts this with the generated relation.
     assert_eq!(
-        extract_one(&program.replace("(set-effectful b)", "(effsafe_effectful_Expr b)")),
+        extract_one(&program.replace("(set-effectful Expr b)", "(effsafe_effectful_Expr b)")),
         "(Arg)"
     );
     assert_eq!(extract_one(program), "(Arg)");

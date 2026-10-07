@@ -9,8 +9,8 @@ use egglog_experimental::{DynamicCostModel, new_experimental_egraph, set_effsafe
 
 const LANG: &str = r#"
   (datatype Expr (Arg) (Print Expr Expr))
-  (rule ((= e (Arg))) ((set-effectful e)))
-  (rule ((= e (Print v s))) ((set-effectful e)))
+  (rule ((= e (Arg))) ((set-effectful Expr e)))
+  (rule ((= e (Print v s))) ((set-effectful Expr e)))
 "#;
 
 fn run(program: &str, setup: impl FnOnce(&mut EGraph)) -> Vec<CommandOutput> {
@@ -87,7 +87,7 @@ fn review5_write_primitive_context_types_empty_container() {
       (rule ((= e (Arg)))
         ((let values (vec-empty))
          (let state (make-state values))
-         (set-effectful state)))
+         (set-effectful Expr state)))
       (Arg)
       (run 3)
       (check (effsafe_effectful_Expr (FromVec (vec-empty))))
@@ -95,7 +95,10 @@ fn review5_write_primitive_context_types_empty_container() {
     // With only one Vec sort the fallback can guess its type.
     run(&program.replace("(sort Ints (Vec i64))", ""), |_| {});
     run(
-        &program.replace("(set-effectful state)", "(effsafe_effectful_Expr state)"),
+        &program.replace(
+            "(set-effectful Expr state)",
+            "(effsafe_effectful_Expr state)",
+        ),
         |_| {},
     );
     run(program, |_| {});
@@ -105,13 +108,13 @@ fn review5_write_primitive_context_types_empty_container() {
 fn review5_mark_names_do_not_capture_rule_variables() {
     let program = r#"
       (rule ((= e (Arg)) (= __effsafe_mark_0 0))
-        ((set-effectful e)))
+        ((set-effectful Expr e)))
       (Arg)
       (run 3)
       (check (effsafe_effectful_Expr (Arg)))
     "#;
     run(
-        &program.replace("(set-effectful e)", "(effsafe_effectful_Expr e)"),
+        &program.replace("(set-effectful Expr e)", "(effsafe_effectful_Expr e)"),
         |_| {},
     );
     run(

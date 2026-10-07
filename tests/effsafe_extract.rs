@@ -20,11 +20,11 @@ const LANG: &str = r#"
   (If Expr Expr Expr Expr :regions (2 3))
   (Loop Expr Expr :regions (1)))
 (constructor Func (String Expr) Expr)
-(rule ((= e (Arg))) ((set-effectful e)))
-(rule ((= e (Print v s))) ((set-effectful e)))
-(rule ((= e (If p s t els))) ((set-effectful e)))
-(rule ((= e (Loop s b))) ((set-effectful e)))
-(rule ((= e (Func n b))) ((set-effectful e)))
+(rule ((= e (Arg))) ((set-effectful Expr e)))
+(rule ((= e (Print v s))) ((set-effectful Expr e)))
+(rule ((= e (If p s t els))) ((set-effectful Expr e)))
+(rule ((= e (Loop s b))) ((set-effectful Expr e)))
+(rule ((= e (Func n b))) ((set-effectful Expr e)))
 "#;
 
 /// Run `program` after the language prelude on an e-graph prepared by
@@ -314,7 +314,7 @@ fn cyclic_region_choices_are_avoided() {
     let term = extract_one_with(
         r#"
         (constructor Expensive (Expr Expr) Expr :cost 100)
-        (rule ((= e (Expensive v s))) ((set-effectful e)))
+        (rule ((= e (Expensive v s))) ((set-effectful Expr e)))
         (let $s0 (Arg))
         (let $r (Expensive (Num 1) $s0))
         (union $r (Loop $s0 $r))
@@ -352,7 +352,7 @@ fn reported_cost_charges_each_region_occurrence() {
     let (term, cost) = extract_with_cost(
         r#"
         (constructor Big (Expr) Expr :cost 9)
-        (rule ((= e (Big s))) ((set-effectful e)))
+        (rule ((= e (Big s))) ((set-effectful Expr e)))
         (let $b (Big (Arg)))
         (let $if (If (Num 0) (Arg) $b $b))
         (run 5)
@@ -389,7 +389,7 @@ fn set_effectful_accepts_let_bound_variables() {
     let term = extract_one(
         r#"
         (constructor Next (Expr) Expr)
-        (rule ((= e (Arg))) ((let b (Next e)) (set-effectful b)))
+        (rule ((= e (Arg))) ((let b (Next e)) (set-effectful Expr b)))
         (let $s0 (Arg))
         (run 3)
         (extract (Next $s0) :extractor effsafe)
@@ -399,11 +399,87 @@ fn set_effectful_accepts_let_bound_variables() {
 }
 
 #[test]
+fn set_effectful_requires_an_explicit_eq_sort() {
+    for action in [
+        "(set-effectful)",
+        "(set-effectful (Arg))",
+        "(set-effectful Expr)",
+        "(set-effectful Expr (Arg) (Arg))",
+        "(set-effectful (Arg) (Arg))",
+        "(set-effectful \"Expr\" (Arg))",
+    ] {
+        for command in [action.to_owned(), format!("(rule () ({action}))")] {
+            let err = extract_error(&command);
+            assert!(
+                err.contains("usage: (set-effectful <Sort> <expr>)"),
+                "{err}"
+            );
+        }
+    }
+    for (action, message) in [
+        ("(set-effectful Missing (Arg))", "unknown sort Missing"),
+        ("(set-effectful i64 1)", "i64 is not an eq sort"),
+        (
+            "(sort Exprs (Vec Expr)) (set-effectful Exprs (vec-of (Arg)))",
+            "Exprs is not an eq sort",
+        ),
+    ] {
+        let err = extract_error(action);
+        assert!(err.contains(message), "{err}");
+    }
+}
+
+#[test]
+fn set_effectful_typechecks_the_expression_against_the_sort() {
+    for action in ["(set-effectful Expr 1)", "(set-effectful Other (Arg))"] {
+        for command in [action.to_owned(), format!("(rule () ({action}))")] {
+            let mut egraph = new_experimental_egraph();
+            egraph
+                .parse_and_run_program(None, "(datatype Expr (Arg)) (datatype Other (OtherArg))")
+                .unwrap();
+            let err = egraph.parse_and_run_program(None, &command).unwrap_err();
+            assert!(matches!(err, egglog::Error::TypeError(_)), "{err}");
+        }
+    }
+}
+
+#[test]
+fn set_effectful_declares_each_sort_once_and_restores_after_pop() {
+    let mut egraph = new_experimental_egraph();
+    egraph
+        .parse_and_run_program(
+            None,
+            r#"
+            (datatype Expr (Arg) (Next Expr))
+            (datatype Other (OtherArg))
+            (push)
+            (set-effectful Expr (Arg))
+            (pop)
+            (ruleset mark)
+            (rule ((= e (Arg)))
+                ((set-effectful Expr e)
+                 (set-effectful Expr (Next e))
+                 (set-effectful Other (OtherArg)))
+                :ruleset mark :name "mark states")
+            (Arg)
+            (run mark 1)
+            (check (effsafe_effectful_Expr (Arg))
+                   (effsafe_effectful_Expr (Next (Arg)))
+                   (effsafe_effectful_Other (OtherArg)))
+            (let $state (Next (Next (Arg))))
+            (set-effectful Expr $state)
+            (check (effsafe_effectful_Expr $state))
+            "#,
+        )
+        .unwrap();
+}
+
+#[test]
 fn unrelated_invalid_enodes_do_not_block_extraction() {
     let term = extract_one(
         r#"
         (constructor Both (Expr Expr) Expr)
-        (rule ((= e (Both a b))) ((set-effectful e)))
+        (rule ((= e (Both a b))) ((set-effectful Expr e)))
         (let $bad (Both (Arg) (Arg)))
         (let $good (Print (Num 1) (Arg)))
         (run 2)
@@ -455,7 +531,7 @@ fn containers_carry_the_state() {
         r#"
         (sort Exprs (Vec Expr))
         (constructor Call (String Exprs) Expr)
-        (rule ((= e (Call n args))) ((set-effectful e)))
+        (rule ((= e (Call n args))) ((set-effectful Expr e)))
         (let $s0 (Arg))
         (let $s1 (Print (Num 1) $s0))
         (let $s1b (Print (Add (Num 0) (Num 1)) $s0))
@@ -496,7 +572,7 @@ fn errors_are_reported() {
     let err = extract_error("(let $n (Num 1)) (run 1) (extract $n :extractor effsafe)");
     assert!(err.contains("not effectful"), "unexpected error: {err}");
 
-    let err = extract_error("(set-effectful 1)");
+    let err = extract_error("(set-effectful i64 1)");
     assert!(err.contains("not an eq sort"), "unexpected error: {err}");
 
     let err = extract_error("(effsafe-regions Print 5)");
@@ -505,7 +581,7 @@ fn errors_are_reported() {
     let err = extract_error(
         r#"
         (constructor Both (Expr Expr) Expr)
-        (rule ((= e (Both a b))) ((set-effectful e)))
+        (rule ((= e (Both a b))) ((set-effectful Expr e)))
         (let $b (Both (Arg) (Arg)))
         (run 2)
         (extract $b :extractor effsafe)

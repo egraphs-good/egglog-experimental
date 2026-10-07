@@ -77,7 +77,7 @@
 //! - [`KeepBestCommand`] compacts selected tables to their best terms.
 //! - [`effsafe_extract`] adds `(extract term :extractor effsafe)` and
 //!   `(print-function Ctor :extractor effsafe)`: effect-safe extraction for languages
-//!   that thread a state through their terms. `(set-effectful e)` marks the
+//!   that thread a state through their terms. `(set-effectful Sort e)` marks the
 //!   effectful e-classes and `:regions` annotations on constructors mark
 //!   subregions (see `docs/effsafe-extract.md`).
 //! - `:extractor greedy-dag` enables heuristic DAG-cost extraction for

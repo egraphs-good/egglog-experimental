@@ -12,9 +12,9 @@
   (Load Expr Expr)           ; (Load ptr mem) -> value, pure
   (Ret Expr Expr))           ; (Ret value mem) -> mem
 
-(rule ((= e (Mem))) ((set-effectful e)))
-(rule ((= e (Store p v m))) ((set-effectful e)))
-(rule ((= e (Ret v m))) ((set-effectful e)))
+(rule ((= e (Mem))) ((set-effectful Expr e)))
+(rule ((= e (Store p v m))) ((set-effectful Expr e)))
+(rule ((= e (Ret v m))) ((set-effectful Expr e)))
 
 ;; store-to-load forwarding
 (rewrite (Load p (Store p v m)) v)

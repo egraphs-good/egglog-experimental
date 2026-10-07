@@ -8,9 +8,9 @@
   (Mul Expr Expr)
   (Print Expr Expr)
   (If Expr Expr Expr Expr :regions (2 3)))   ; pred inputs then else
-(rule ((= e (Arg))) ((set-effectful e)))
-(rule ((= e (Print v s))) ((set-effectful e)))
-(rule ((= e (If p i t els))) ((set-effectful e)))
+(rule ((= e (Arg))) ((set-effectful Expr e)))
+(rule ((= e (Print v s))) ((set-effectful Expr e)))
+(rule ((= e (If p i t els))) ((set-effectful Expr e)))
 
 (with-dynamic-cost (constructor Expensive (i64) Expr))
 

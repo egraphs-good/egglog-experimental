@@ -47,11 +47,11 @@ Three things tell the extractor about the language.
 
 ### `set-effectful`
 
-`(set-effectful e)` marks the e-class of `e` as carrying the state. It is an
+`(set-effectful Expr e)` marks the e-class of `e` as carrying the state. It is an
 action, so rules can use it:
 
 ```lisp
-(rule ((= e (Print v s))) ((set-effectful e)))
+(rule ((= e (Print v s))) ((set-effectful Expr e)))
 ```
 
 Effectfulness is a property of e-classes, not constructors: in eggcc an `If`
@@ -61,17 +61,11 @@ is effectful only when its type contains the state. Like `set-cost`,
 extractor reads them all. A container (`Vec`, `Set`, ...) holding an
 effectful element is effectful without being marked.
 
-The sort of the marked expression comes from egglog's rule typechecker,
-applied when the rule is run: a rule that uses `set-effectful` is lowered to
-`(effsafe-rule "<the rule>")`, which re-parses the rule (internal symbols
-included) and replaces each `(set-effectful e)` action by
-`(let <fresh> e)`, typechecks that rule as egglog itself would (body and head
-together, in the contexts the rule's mode and the e-graph's seminaive setting
-give them, with the declarations other macros emitted for the rule already in
-place) and reads the fresh variables' sorts off the result. An overloaded
-expression the plain `let` leaves ambiguous is retried as an insertion into
-the relation of each eq sort in turn, so the eq-sort requirement decides it. `set-effectful` must be an action of its own, and the
-expression must have exactly one eq sort.
+The sort is required: `(set-effectful Sort e)` must name an existing eq sort.
+It expands directly to a relation insertion, so egglog's normal typechecker
+checks `e` against `Sort` together with the surrounding rule. This also lets
+the explicit sort resolve overloaded expressions. The action works both at
+top level and in rule heads, including on values bound by earlier actions.
 
 ### `:regions`
 
@@ -217,7 +211,7 @@ statewalks) are checked in debug builds, or in any build when the
 ```lisp
 (extract <expr> :extractor effsafe [:include-subsumed])
 (print-function <constructor> [n] :extractor effsafe [:include-subsumed])
-(set-effectful <expr>)
+(set-effectful <Sort> <expr>)
 (effsafe-regions <constructor> <position>...)   ; what :regions lowers to
 ```
 

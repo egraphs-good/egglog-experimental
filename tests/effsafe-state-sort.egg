@@ -11,9 +11,9 @@
     (Plus Value Value)
     (Clock World)))          ; reads the time from a world, pure
 
-(rule ((= w (Init))) ((set-effectful w)))
-(rule ((= w (Tick p))) ((set-effectful w)))
-(rule ((= w (Emit v p))) ((set-effectful w)))
+(rule ((= w (Init))) ((set-effectful World w)))
+(rule ((= w (Tick p))) ((set-effectful World w)))
+(rule ((= w (Emit v p))) ((set-effectful World w)))
 
 (rewrite (Plus (Lit a) (Lit b)) (Lit (+ a b)))
 
