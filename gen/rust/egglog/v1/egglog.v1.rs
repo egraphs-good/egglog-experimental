@@ -4,7 +4,7 @@
 // exists; no IR runtime is implemented. This draft uses ir_version = 1;
 // receivers must reject unsupported versions. Overview: proto/README.md.
 // Every arena index must name an existing entry in its enclosing program,
-// response, or snapshot. CEL checks the direct node/sort edges below; other
+// or response. CEL checks the direct node/sort edges below; other
 // references, including roots in commands and outputs, remain normative.
 // A fact is a bare node index; equality is a `Union` node, so `(= a b)` is a
 // fact naming a union of a and b.
@@ -30,6 +30,11 @@
 /// arenas, not previous requests; all referenced entries must be included here.
 /// Execute only commands, in order, and the expressions they demand. Unused
 /// arena entries are not executed; arena membership is not an execution root.
+/// Direct Actions in one execution of a command list share a Union identity
+/// scope, even across intervening non-Action commands. Program.commands is one
+/// such list. Each loop-body iteration starts an independent scope; nested lists
+/// never inherit the outer mapping, which resumes after they return. Rule
+/// firings and other commands' evaluated inputs have their own scopes as in Union.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct Program {
     /// This draft's IR version is 1. Reject unsupported values rather than
@@ -56,6 +61,14 @@ pub struct Program {
     /// retain their reachable occurrences; see Ruleset for cross-request reuse.
     #[prost(message, repeated, tag = "7")]
     pub rulesets: ::prost::alloc::vec::Vec<Ruleset>,
+    /// Optional compatibility precondition, not a request to reconfigure the
+    /// handle: must structurally equal its creation-time cost sort C. Reject a
+    /// mismatch before installing definitions or executing commands. Freeze
+    /// always includes it so the exported Program describes its required C.
+    ///
+    /// index into this Program's sorts
+    #[prost(uint32, optional, tag = "8")]
+    pub cost_sort: ::core::option::Option<u32>,
 }
 /// Source metadata supports diagnostic locations and documentation, not
 /// arbitrary comment attachment, formatting or source round-tripping.
@@ -71,8 +84,8 @@ pub struct SourceFile {
 }
 /// A byte range. Resolve `file` against the nearest arena-owning payload's
 /// `files`: `Program`, `CreateEGraphRequest`, `RunProgramResponse`, or
-/// `FrozenEGraph`. Re-emission must remap or include those files, or strip the
-/// spans, including origins from definitions installed by earlier requests;
+/// a nested exported `Program`. Re-emission must remap or include those files,
+/// or strip spans, including origins from definitions installed by earlier requests;
 /// dangling indices are invalid. The range is half-open [start, end), with
 /// start <= end. If contents are present, both offsets must be UTF-8 character
 /// boundaries within their byte length, including for an explicitly empty
@@ -164,7 +177,7 @@ pub struct FuncSort {
 ///
 /// USE CONTEXT IS NORMATIVE. Every use must be valid independently, even when
 /// one node is shared between code and data. The contexts are query, action,
-/// deferred code, frozen data, and extracted data:
+/// deferred code, and inert value data:
 /// Rule queries, rewrite LHSs/conditions, checks, and loop-until facts are queries.
 /// Rule heads, rewrite RHSs, top-level actions, and operations' evaluated inputs
 /// use the action context.
@@ -176,8 +189,8 @@ pub struct FuncSort {
 ///    must be legal in that execution context. Hosts publish the capabilities
 ///    of ambient primitives; receivers check these obligations. A Union in an
 ///    evaluated body can write, even though the body contains only expressions.
-/// - Frozen and extracted data contain no variables or GetCost reads. Extracted
-///    data also contains no Union and must be finite. Saved code bodies retain
+/// - Inert values (declared costs and extracted data) contain no variables,
+///    GetCost reads or Union and must be finite. Saved code bodies retain
 ///    their own binders, so these are use-site rules, not bans on an entire arena.
 /// Scalar values are inert. Child-bearing values follow the surrounding
 /// context; constructing a value does not grant inverse query matching or
@@ -225,17 +238,18 @@ pub mod node {
         GetCost(super::GetCost),
     }
 }
-/// A CLASS: a group of arena entries denoting the same stored value. The node's
-/// INDEX names the group; the enclosing `sort_id` is the group's sort.
+/// A class/equality group. The node's INDEX identifies its occurrence; the
+/// enclosing `sort_id` is the group's sort.
 ///
 /// Member roles follow from the callee's declaration, never from position:
-///    constructor call    an extraction alternative in this class
-///    function call       a stored row whose output is this group's value
-///    primitive value     the group's exact concrete value
+///    constructor call    an extraction alternative when stored in this class
+///    function call       a lookup whose result participates in the equality
+///    primitive value     an exact concrete value participating in the equality
 /// A function call member is never an extraction alternative.
 ///
-/// A UNIT-SORTED ROW TAKES NO GROUP: the bare `Call` node is the whole record.
-/// That covers relation rows and rows of Unit-returning functions.
+/// Exports write function rows with Set, including Unit-returning functions;
+/// they do not evaluate function Call members to recreate missing rows.
+/// Relation rows are inserted with a bare Call, never a Union member.
 ///
 /// MEANING DEPENDS ON POSITION, and the position PROPAGATES into nested
 /// expressions — a union may be an argument, as in `f(Union\[a, b\])`:
@@ -243,26 +257,28 @@ pub mod node {
 ///              `(= a b)`. NEVER mutates.
 ///    action    merge a and b's classes, then pass the resulting class to `f`.
 ///              Equality sorts only; a base sort needs the directional `Set`.
-///    snapshot  reference the already-recorded value; the merge already happened.
 /// Union is a value node, not restricted to a standalone action. Top-level
 /// input uses the action context only when a command demands its evaluation.
 /// Nesting does not permit reordering around reads, effects or row conflicts.
 ///
 /// An empty union allocates a fresh equality class in an ACTION context,
-/// including as a call argument; no temporary constructor row is needed. In a
-/// snapshot it records an existing empty equality class without allocating.
+/// including as a call argument; no temporary constructor row is needed.
 /// Every empty union requires an equality sort. Queries require a nonempty
 /// union; actions require an equality sort even when nonempty. Nonempty
-/// primitive-sort unions are permitted in queries and frozen data. Extracted
+/// primitive-sort unions are permitted in queries. Extracted
 /// data forbids unions; deferred code obeys its execution context as in Node.
 ///
 /// During one rule firing, a Union location identifies one class across the
-/// whole ordered head. Each nested primitive/lambda invocation starts a fresh
-/// evaluation unit. A top-level Action has its own unit; all evaluated inputs
-/// of another command share one unit for that execution of the command.
+/// whole ordered head. Direct Actions in an executed command list share one
+/// unit as specified on Program; each loop iteration uses a fresh unit.
+/// Each primitive/lambda invocation starts a fresh unit. All evaluated inputs
+/// of another command share one independent unit for that command execution.
 /// On first action use, establish the class identity before evaluating members;
 /// references and backedges reuse it without reevaluating those members. Later
-/// units may allocate fresh classes. Queries remain nonallocating constraints.
+/// units may allocate fresh classes. Retained mappings follow canonical class
+/// identity through intervening unions, rebuilds and Runs. Queries, including
+/// Check and loop-until facts, neither read nor populate this evaluation mapping;
+/// they remain nonallocating constraints.
 /// This identity rule does not memoize ordinary calls.
 ///
 /// CANONICALIZATION MAY IDENTIFY DISTINCT LOCATIONS. A row belongs to exactly
@@ -341,7 +357,7 @@ pub struct Call {
 /// database read, permitted only where the execution context allows reads;
 /// in particular, not in SEMINAIVE heads or Pure/Write code contexts.
 /// Target arguments inherit their use's context and binder. GetCost is not
-/// inert data: it cannot occur in frozen/extracted data or declaration costs,
+/// inert data: it cannot occur in extracted data or declaration costs,
 /// though saved code may contain it subject to its execution context.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct GetCost {
@@ -394,7 +410,7 @@ pub struct PartialCall {
 ///
 /// Evaluated children run left-to-right in field/list order (map key then value
 /// per entry). Sets deduplicate; maps use the last value for an equal key.
-/// Frozen/extracted values are inert semantic contents: Set elements and Map
+/// Exported/extracted value payloads encode semantic contents: Set elements and Map
 /// keys are unique, MultiSet repeats preserve multiplicity, and their enumeration
 /// order is unspecified. Vec/Pair order is significant. Query capabilities and
 /// groundedness are unchanged: query child inputs must be grounded; these
@@ -710,7 +726,7 @@ pub struct Function {
     /// index into the enclosing `sorts`
     #[prost(uint32, tag = "3")]
     pub output: u32,
-    /// Deferred code bound only over old and new, including in a frozen
+    /// Deferred code bound only over old and new, including in an exported
     /// declaration. Absent asserts equality on conflict.
     ///
     /// index into the enclosing `nodes`
@@ -742,7 +758,7 @@ pub struct Primitive {
     #[prost(uint32, tag = "3")]
     pub output: u32,
     /// Deferred code bound only over _0, _1, ... for the inputs in declaration
-    /// order, including in a frozen declaration.
+    /// order, including in an exported declaration.
     ///
     /// index into the enclosing `nodes`
     #[prost(uint32, optional, tag = "4")]
@@ -1064,7 +1080,54 @@ pub struct Extract {
     #[prost(string, tag = "4")]
     pub cost_model: ::prost::alloc::string::String,
 }
-/// Take an immutable logical snapshot. Returns `FrozenEGraph`.
+/// Export the complete current state as a normal Program; no filtering.
+/// Returns CommandOutput.program, owning its nodes, sorts and source files.
+/// This is current state, not request history or an engine checkpoint: omit
+/// scheduler instances, execution cursors, caches, reports and host resources.
+///
+/// Include every installed declaration and sort, even unused or empty tables;
+/// every installed named ruleset and its retained anonymous closure, preserving
+/// occurrence sharing; and all builtin declaration descriptors, including
+/// generic families and overloads. Saved code and its dependencies are included
+/// without executing it. Host implementations/codecs remain external.
+/// The builtin descriptor layout is still unresolved: the current Declaration
+/// cannot encode that complete catalog. This contract does not claim complete
+/// export support; a receiver must fail rather than silently omit definitions.
+///
+/// Set Program.cost_sort to the handle's C. Restoration executes the export on
+/// a fresh, data-empty handle with structurally equal C and compatible host
+/// capabilities. Definition installation follows Program's normal rules. This
+/// restores logical state with fresh execution state. Execution against existing
+/// data still follows ordinary Program/action semantics, with no restoration
+/// equivalence guarantee. Scheduler/seminaive history is not resumed.
+///
+/// The export's commands are one ordered list of ordinary Actions, with no
+/// queries, Runs, loops or other commands. Emit exactly one direct Action.term
+/// for each canonical equality class, naming its unique Union location whose
+/// members are all its constructor rows. Include empty/unreachable classes.
+/// Emit relation rows as direct Action.term Calls; write every function row,
+/// including Unit outputs, with Set. Then emit SetCost annotations, then Change
+/// with SUBSUME for subsumed constructor rows; no DELETE or panic actions.
+/// These explicit roots inventory stored classes, not arbitrary arena nodes or
+/// Union locations in saved code. Shared Union locations preserve references
+/// across this list. Keep all canonical rows and extant cost/subsumption
+/// annotations. A row is its typed callee and canonical arguments, not a Call
+/// node's identity. Each constructor/relation row has one inventory occurrence;
+/// each function/cost key is written once. A canonical export restored into empty
+/// data must not depend on replaying conflict merges.
+///
+/// Exported values use exact PrimitiveValue payloads and shared class references,
+/// not primitive calls, function lookups or extraction. Lambda bodies and saved
+/// definitions remain deferred code; captures, partial arguments, custom args
+/// and costs preserve their references. Generic inspection never evaluates
+/// these actions or materializes custom values. Executing them is explicit
+/// trusted materialization and requires the appropriate host codecs.
+/// Pure non-equality value cycles have no selected ordinary-action construction;
+/// their export support remains unresolved, not an implied acyclicity rule for
+/// other uses. If any required state/definition/value cannot be represented,
+/// Freeze fails with EVALUATION_FAILED instead of returning a partial export.
+/// Export completeness, canonical keys and reference preservation are normative
+/// obligations, not established by Program's local CEL checks.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct Freeze {
 }
@@ -1141,7 +1204,7 @@ pub struct Saturate {
 /// unsupported configuration is an adapter/lifecycle error, not RunProgram.error.
 /// Frontends may offer an i64 default, but the wire always specifies C. Creating
 /// a handle does not require a value codec or extraction model for every sort.
-/// Costs in Program, response and frozen arenas must agree with C structurally,
+/// Costs in Program and response arenas must agree with C structurally,
 /// never by comparing arena-local indices.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct CreateEGraphRequest {
@@ -1199,7 +1262,7 @@ pub struct RunProgramResponse {
     #[prost(message, repeated, tag = "3")]
     pub outputs: ::prost::alloc::vec::Vec<CommandOutput>,
     /// Origins for this response's nodes, sorts and errors, including installed
-    /// definitions from earlier requests. Each nested frozen payload owns its files.
+    /// definitions from earlier requests. Each exported Program owns its files.
     #[prost(message, repeated, tag = "4")]
     pub files: ::prost::alloc::vec::Vec<SourceFile>,
     /// Absent on success. Present means execution stopped; `outputs` is the
@@ -1271,7 +1334,7 @@ pub mod command_output {
         #[prost(message, tag = "2")]
         Extraction(super::ExtractResult),
         #[prost(message, tag = "3")]
-        Frozen(super::FrozenEGraph),
+        Program(super::Program),
         #[prost(message, tag = "4")]
         Sizes(super::TableSizes),
         #[prost(message, tag = "5")]
@@ -1373,7 +1436,7 @@ pub struct ExtractedTerm {
     /// index into `RunProgramResponse.nodes`
     #[prost(uint32, tag = "1")]
     pub term: u32,
-    /// The cost as INERT VALUE DATA, using the same payloads as frozen values,
+    /// The cost as INERT VALUE DATA, using PrimitiveValue payloads,
     /// never an expression to evaluate. Its sort is the handle's C;
     /// there is no promotion from i64 to BigInt or other implicit domain change.
     /// Select its representation/host codec by sort_id and RunProgramResponse.sorts.
@@ -1386,109 +1449,6 @@ pub struct ExtractedTerm {
     /// able to tell an unencodable cost from an encoded zero.
     ///
     /// index into `RunProgramResponse.nodes`
-    #[prost(uint32, optional, tag = "2")]
-    pub cost: ::core::option::Option<u32>,
-}
-/// Logical data and its schema for inspection, visualization and custom extraction.
-/// Not an executable program or an engine checkpoint: no caches, scheduler
-/// cursors, rulesets, schedules or host resources. Consumers decode data without
-/// executing primitives, rules, merges or extraction.
-/// `stored` inventories the state; arena membership alone does not. Starting
-/// from those entries, value edges carry the frozen-data context: Call arguments,
-/// Union members and PrimitiveValue children, including custom args regardless
-/// of sort kind. Lambda bodies and saved definitions are separately scoped code.
-/// Stored data contains no Var; a node valid in code is still invalid if also
-/// reached as data.
-///
-/// Non-Unit table outputs use Union groups; every Union reached as frozen data
-/// denotes an inventoried stored group. Direct scalar/container data roots need
-/// no separate inventory entry. Unit-sorted table rows are inventoried as bare
-/// Calls to Functions or Relations, never primitives. Group members record rows
-/// or concrete values as in Union. Saved code and unused
-/// syntax may share this arena without becoming stored state.
-///
-/// NOT AN EXTRACTION: keep every class, including ones no root reaches and ones
-/// with no constructor alternatives. Keep every table's complete declaration,
-/// even when empty, including merge bodies and extraction attributes. Include
-/// transitive user-defined dependencies of these declarations and stored values:
-/// sorts, callable definitions, and code referenced by merges, Lambda bodies and
-/// PartialCall targets. Host implementations and codecs remain external.
-/// The receiver must check actual row presence, canonical class identity,
-/// and inventory completeness; CEL does not establish those semantic facts.
-///
-/// `costs` preserves every extant constructor-row cost annotation. Its target
-/// row must be present, since deleting the row also deletes the annotation.
-/// Target arguments and cost values are additional data roots; targets are
-/// inert row keys and do not evaluate a constructor lookup/insertion.
-/// Constructor declaration costs are also closed, inert data roots.
-/// If a required value, including any stored cost, cannot be encoded, Freeze
-/// fails with EVALUATION_FAILED instead of omitting it.
-///
-/// Base/container values use PrimitiveValue payloads, never codec-name Calls.
-/// Constructor/function row Calls remain inert records, not operations to run.
-/// CustomValue transports host data with explicit dependencies; generic decode
-/// and inspection must not materialize it or invoke host Debug/unpickle hooks.
-/// Host conversion is a separate trusted operation requiring the sort's codec.
-/// Set/MultiSet/Map enumeration remains unspecified; frozen Set elements and
-/// Map keys are unique by semantic equality, and MapEntry fixes each pairing.
-///
-/// Class identity is snapshot-local, not a live handle. Restoration remains
-/// deferred; the intended boundary preserves table semantics while a later
-/// Program supplies rulesets and commands. It does not resume execution history.
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct FrozenEGraph {
-    #[prost(uint32, tag = "1")]
-    pub ir_version: u32,
-    /// Shared state/value syntax and saved code. Stored membership is explicit;
-    /// a consumer cannot infer it from a node's kind or lack of incoming edges.
-    #[prost(message, repeated, tag = "2")]
-    pub nodes: ::prost::alloc::vec::Vec<Node>,
-    #[prost(message, repeated, tag = "3")]
-    pub sorts: ::prost::alloc::vec::Vec<Sort>,
-    #[prost(message, repeated, tag = "4")]
-    pub declarations: ::prost::alloc::vec::Vec<Declaration>,
-    /// Subsumed ROWS, named by a call node that addresses them — never by the
-    /// group containing them: a row is subsumed, a class is not. A ROW IS ITS KEY
-    /// (see `Union`), so listing either of two structurally equal call nodes
-    /// subsumes the same row. Semantic, not metadata: extraction must skip them.
-    /// Targets are stored Constructor row Calls in inventoried groups, and need
-    /// not be entries of stored themselves. Function and Relation rows cannot
-    /// be subsumed.
-    ///
-    /// index into the enclosing `nodes`
-    #[prost(uint32, repeated, tag = "5")]
-    pub subsumed: ::prost::alloc::vec::Vec<u32>,
-    /// Origins for this snapshot's nodes, sorts and declarations, not
-    /// request/response indices.
-    #[prost(message, repeated, tag = "6")]
-    pub files: ::prost::alloc::vec::Vec<SourceFile>,
-    /// Complete inventory of stored Union groups and bare Unit table Calls.
-    /// Include every class, even unreachable or empty ones; list each index once.
-    /// This is not a list of all nodes reachable through saved code.
-    ///
-    /// index into this message's nodes
-    #[prost(uint32, repeated, tag = "7")]
-    pub stored: ::prost::alloc::vec::Vec<u32>,
-    #[prost(message, repeated, tag = "8")]
-    pub costs: ::prost::alloc::vec::Vec<FrozenCost>,
-    /// The handle's C, structurally identical to its creation-time cost sort.
-    ///
-    /// index into this message's sorts
-    #[prost(uint32, optional, tag = "9")]
-    pub cost_sort: ::core::option::Option<u32>,
-}
-/// One extant constructor-row cost annotation. Targets must name present
-/// Constructor rows; deletion removes the annotation. Keys resolve by typed
-/// callee, including result sort, and closed data arguments. Each logical key
-/// occurs once. Values are closed frozen data of C, decoded without
-/// evaluation; inventoried Union references and cycles follow frozen-data rules.
-/// Context, structural-sort equality, and key uniqueness remain semantic checks.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct FrozenCost {
-    /// Call index into FrozenEGraph.nodes
-    #[prost(uint32, optional, tag = "1")]
-    pub target: ::core::option::Option<u32>,
-    /// index into FrozenEGraph.nodes
     #[prost(uint32, optional, tag = "2")]
     pub cost: ::core::option::Option<u32>,
 }

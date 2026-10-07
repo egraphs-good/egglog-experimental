@@ -11,8 +11,8 @@ and comments are the specification. The main pieces are:
 - Immutable declarations and rulesets, separate from ordered commands.
 - Native scalar, container, and function values. Custom values carry opaque
   bytes and explicit child references; symbolic computation remains a call.
-- Lossless logical snapshots with declarations, cycles, and empty e-classes.
-  A snapshot is not an engine checkpoint; restoration is deferred.
+- Complete current-state export as an ordinary `Program`, including definitions,
+  logical data, cycles, and empty e-classes. This is not an engine checkpoint.
 
 There is no engine lowering, runtime, or service implementation yet. CEL checks
 directly expressible constraints, not full typing, binding, effects, or cycle
@@ -141,8 +141,72 @@ Rust without duplicating the IR declarations.
   schema comments; runtime enforcement remains unimplemented. Each payload
   still includes every referenced node/sort arena entry; indices are local to
   that message. An `EqSort` entry also idempotently declares its name. Standalone
-  snapshots retain complete table declarations and transitive user-defined
-  dependencies. Host catalog discovery and its descriptor format remain open.
+  exports retain all installed definitions and their dependencies. Host catalog
+  discovery and its descriptor format remain open.
+
+### Current-state export and optional recording
+
+**Decided:** `Freeze` returns one complete current-state `Program`, with no
+filtering and no separate snapshot message or loading instruction. Include all
+installed declarations and sorts, named rulesets and their retained anonymous
+children, and builtin descriptors, even when unused. Preserve occurrence sharing.
+The commands reconstruct all logical data, including empty/unreachable classes,
+constructor alternatives, function and relation rows, subsumption, captures, and
+assigned row costs. Historical commands, scheduler instances, seminaive cursors,
+reports, caches, and host resources are not part of this export.
+
+The export is an ordered list of ordinary actions: one direct `Action.term` for
+each canonical equality class (a unique Union containing its constructor rows),
+relation insertions, function `Set`s including Unit outputs, `SetCost`s, then
+constructor subsumption. It contains no queries, runs, loops, or other commands.
+Values use exact payloads and shared class references;
+function rows are writes, not calls to evaluate or extraction alternatives.
+There is no need to extract a finite representative to construct a cyclic or
+empty equality class. Every canonical function/cost key is written once, so
+restoration into empty data does not depend on replaying conflict merges.
+This normalized shape can be inspected without running its commands or decoding
+opaque custom payloads.
+
+**Action identity — decided:** direct actions in one execution of a command list
+share their `Union` identity mapping, including across intervening observations
+or other commands. Each loop-body iteration has its own mapping; nested lists
+do not inherit the outer mapping, which resumes afterward. Each rule firing,
+primitive/lambda invocation, and other command's evaluated inputs has its own
+scope. Retained references follow canonical identity through intervening unions,
+rebuilds, and runs. Queries neither read nor populate this mapping. Ordinary call
+nodes remain shared syntax, not memoized values.
+
+```text
+nodes[0] = E: Union[]
+commands = [Set(f(), index 0), Set(g(), index 0)]
+# Both rows reference the same empty class in this execution.
+# A new execution or a loop-body iteration allocates a fresh class.
+```
+
+An exported `Program.cost_sort` records the handle's immutable cost sort C;
+normal requests may omit it. When present it is a compatibility precondition,
+checked before installing definitions or running commands, not reconfiguration.
+Restore by executing the export on a fresh, data-empty
+handle with the same C and compatible host capabilities. Rules start with fresh
+execution state. Against existing data the Program still uses ordinary action
+semantics, without a restoration-equivalence guarantee.
+
+This contract is not implemented. Complete builtin descriptors still need the
+generic catalog layout discussed above; `Primitive` cannot stand in for a host
+signature. The proposed rule arena also remains a separate layout question.
+Custom value reconstruction requires trusted codecs, and pure non-equality value
+cycles have no selected ordinary-action construction. These are explicit support
+gaps, not permission to silently omit definitions or values or to claim a
+complete export. `Freeze` must fail when required state cannot be represented.
+
+**Recording — decided:** an adapter may opt into recording original `Program`
+requests, handle creation/configuration, and their outcomes in order. Recording
+is off by default and separate from current-state export; no runtime recorder or
+new RPC is supplied here. Preserve request boundaries and request-local arenas;
+naively concatenating Programs changes references and action identity scopes.
+Record failures and completed outputs as well as successes. Earlier effects can
+survive failure, so this is an execution record, not a promise of exact replay
+or an engine checkpoint.
 
 ### Reporting and timing attribution
 
@@ -181,8 +245,8 @@ and memory use on the same graph before choosing.
   same cases. Document which file-I/O, expected-failure, and printing/statistics
   commands are frontend/test-harness conveniences versus shared operations.
   Keep the selected literal extraction-count restriction explicit.
-- **Deferred:** snapshot restoration and proofs. Restoration would recover
-  logical data/schema, not scheduler history or an engine checkpoint.
+- **Deferred:** proofs. Current-state export/restoration and optional recording
+  are specified above but have no runtime implementation.
 
 A small next experiment: describe `Vec`/`Map` and the signatures above once,
 generate Python and Rust expression APIs, and compare their resolved IR and
