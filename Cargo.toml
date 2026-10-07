@@ -17,9 +17,9 @@ default = ["bin"]
 bin = ["egglog/bin"]
 
 [dependencies]
-egglog = { version = "3.0.0", path = "../../egglog/herbie-performance", default-features = false }
-egglog-ast = { version = "3.0.0", path = "../../egglog/herbie-performance/egglog-ast", default-features = false }
-egglog-reports = { version = "3.0.0", path = "../../egglog/herbie-performance/egglog-reports", default-features = false }
+egglog = { version = "3.0.0", git = "https://github.com/egraphs-good/egglog.git", rev = "b7aa0886ba79d24548327d923646aad7f32e6a57", default-features = false }
+egglog-ast = { version = "3.0.0", git = "https://github.com/egraphs-good/egglog.git", rev = "b7aa0886ba79d24548327d923646aad7f32e6a57", default-features = false }
+egglog-reports = { version = "3.0.0", git = "https://github.com/egraphs-good/egglog.git", rev = "b7aa0886ba79d24548327d923646aad7f32e6a57", default-features = false }
 
 num = "0.4.3"
 lazy_static = "1.4"

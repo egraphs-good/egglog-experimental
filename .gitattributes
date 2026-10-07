@@ -1,0 +1,3 @@
+examples/herbie/*.egg linguist-generated=true
+benchmarks/herbie/samples.csv linguist-generated=true
+benchmarks/herbie/results.json linguist-generated=true

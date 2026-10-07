@@ -1,0 +1,674 @@
+{
+  "scope": {
+    "engine": "egglog-experimental",
+    "mode": "normal",
+    "proofs": false,
+    "threads": 1,
+    "timing": "whole process; normal output captured to temporary files",
+    "blocks": 10,
+    "sequence": "ABBA",
+    "warmups_per_endpoint_per_dump": 1,
+    "observations_per_endpoint_per_dump": 20,
+    "confidence": "95% independent Fieller; Student t with 19 degrees of freedom",
+    "timeout_seconds": 30
+  },
+  "inputs": [
+    {
+      "file": "rewrite16.egg",
+      "original_sha256": "d1fee9b87deb97b916757086cc047f60cafa234bf1b7c080b8b47377d61e3c5f",
+      "modern_sha256": "fa29e571db60f7dd3f2c23e4d8ad09dba1b542f62e04fc2625af45665a4a676a",
+      "set_to_union_count": 7
+    },
+    {
+      "file": "rewrite15.egg",
+      "original_sha256": "07c280eabdaae3c2ab85f10c321e2799f392bef3175d73f800c5408da8bcf7cd",
+      "modern_sha256": "fffb9498fbd9a67b71016660ad8fd1ad6654e9b7ff87f51aae0745225c0c775e",
+      "set_to_union_count": 2
+    },
+    {
+      "file": "rewrite17.egg",
+      "original_sha256": "d456751261277b35e6ceaf827906506b759162f43169d22204204bd07ff2c578",
+      "modern_sha256": "38b3f6538064d804ec0011343221215f988af62993ebcaf4cae21e3349becf65",
+      "set_to_union_count": 24
+    },
+    {
+      "file": "rewrite66.egg",
+      "original_sha256": "7c2e05d13ef32ac187227904261b25b9253d1b1eca19f7b09fe9ef76d0209ac8",
+      "modern_sha256": "0c991a1904ba4d300d62be327065cdc85d6d8bf8ab12dccbb174d6c46d6b6285",
+      "set_to_union_count": 97
+    },
+    {
+      "file": "rewrite88.egg",
+      "original_sha256": "da0d15a7fe48183ed17ca1926bd2393edc5a09f3ef7fbced2a4288fe8cd9b8ac",
+      "modern_sha256": "f494f2dd6c2a1ad656c46e26f39ed6f6ae01cefca25878087dda7a04f7a172b3",
+      "set_to_union_count": 4
+    }
+  ],
+  "endpoints": {
+    "baseline": {
+      "label": "baseline",
+      "binary_sha256": "363ce210fbd04746b60b4b780c17c637032378320313bb061b22e64fc02e0b53",
+      "profile": "release",
+      "source": {
+        "egglog": {
+          "head": "4821547da08c1a8e5a2f530625f1648f13b058a3",
+          "patch_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "lock_sha256": "cdf230b75909a740d54147c11f02dbd605df1becc966c5b840451e1263898611"
+        },
+        "experimental": {
+          "head": "b14ef1d7f68fc7b893b3fd83c6a6b3cd9e303085",
+          "patch_sha256": "0fcb747b0adf71534a603456c39b59c78bfa5df2b69ed8b250b04b955121b17b",
+          "lock_sha256": "f289163c32cc6e3d5205101ddfdff6eecbf1f66d9d6401a59198b12a75ddd9c3"
+        }
+      },
+      "rustc": "rustc 1.91.0 (f8297e351 2025-10-28)\nbinary: rustc\ncommit-hash: f8297e351a40c1439a467bbbb6879088047f50b3\ncommit-date: 2025-10-28\nhost: aarch64-apple-darwin\nrelease: 1.91.0\nLLVM version: 21.1.2\n",
+      "cargo": "cargo 1.91.0 (ea2d97820 2025-10-10)",
+      "environment": {},
+      "host": "macOS-26.6-arm64-arm-64bit-Mach-O",
+      "build_note": "Recorded binary used local path dependencies at the specified engine source, not the older egglog git revision in experimental main."
+    },
+    "scoped-names": {
+      "label": "scoped-names",
+      "binary_sha256": "d158ea6471ab72a539d0b9eae0ce5473ad04b94ca3d702c27603da561d2852f4",
+      "profile": "release",
+      "source": {
+        "egglog": {
+          "head": "4821547da08c1a8e5a2f530625f1648f13b058a3",
+          "patch_sha256": "540090b37fd3bda8e552969e0b55f07ed0987fbeb872da636b5f8edec9968ac3",
+          "lock_sha256": "cdf230b75909a740d54147c11f02dbd605df1becc966c5b840451e1263898611"
+        },
+        "experimental": {
+          "head": "b14ef1d7f68fc7b893b3fd83c6a6b3cd9e303085",
+          "patch_sha256": "0fcb747b0adf71534a603456c39b59c78bfa5df2b69ed8b250b04b955121b17b",
+          "lock_sha256": "f289163c32cc6e3d5205101ddfdff6eecbf1f66d9d6401a59198b12a75ddd9c3"
+        }
+      },
+      "rustc": "rustc 1.91.0 (f8297e351 2025-10-28)\nbinary: rustc\ncommit-hash: f8297e351a40c1439a467bbbb6879088047f50b3\ncommit-date: 2025-10-28\nhost: aarch64-apple-darwin\nrelease: 1.91.0\nLLVM version: 21.1.2\n",
+      "cargo": "cargo 1.91.0 (ea2d97820 2025-10-10)",
+      "environment": {},
+      "host": "macOS-26.6-arm64-arm-64bit-Mach-O",
+      "equivalent_committed_source": {
+        "egglog": "c628da74",
+        "experimental": "4f390ad"
+      },
+      "build_note": "Recorded binary used local path dependencies at the specified engine source, not the older egglog git revision in experimental main."
+    },
+    "goal-final-v1": {
+      "label": "goal-final-v1",
+      "binary_sha256": "e332211cfb6924cb7d9682e52f2cbba5bb112a7fc4c4abf79878cfe9eeb7ed42",
+      "profile": "release",
+      "source": {
+        "egglog": {
+          "head": "b7aa0886ba79d24548327d923646aad7f32e6a57",
+          "patch_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "lock_sha256": "993a360bab424316cdf6c7c2c9aabb1a1dad5045ad738547fdb6b1e6e8da7365"
+        },
+        "experimental": {
+          "head": "b70dcde3b82f5c59d66db53a31fa5b22d1c531c8",
+          "patch_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "lock_sha256": "e49c4918f3f068012035c07fab09cdc8ddb84062a0f70b6eb414d509ceb4ea7f"
+        }
+      },
+      "rustc": "rustc 1.91.0 (f8297e351 2025-10-28)\nbinary: rustc\ncommit-hash: f8297e351a40c1439a467bbbb6879088047f50b3\ncommit-date: 2025-10-28\nhost: aarch64-apple-darwin\nrelease: 1.91.0\nLLVM version: 21.1.2\n",
+      "cargo": "cargo 1.91.0 (ea2d97820 2025-10-10)",
+      "environment": {},
+      "host": "macOS-26.6-arm64-arm-64bit-Mach-O",
+      "build_note": "Recorded binary used local path dependencies at the specified engine source, not the older egglog git revision in experimental main."
+    }
+  },
+  "cohorts": {
+    "cumulative": {
+      "before": "baseline",
+      "after": "goal-final-v1",
+      "started_utc": "2026-10-07T00:18:23.496017+00:00",
+      "completed_utc": "2026-10-07T00:18:48.321776+00:00",
+      "original_jsonl_sha256": "7d0860edc52c83e635d5852aec7b07da0f53d6bb38ff635c32727d76afa09df3",
+      "original_driver_sha256": "2b4fb949badd982d7abf9684135cd61fe8290b9e75893d1f17ab10a6e8329640",
+      "original_helper_hashes": {
+        "runner-snapshot/benchmarking/__init__.py": "37dfb03a41db4e970329742b74c7afbd4e9824ce50f8ce5d774d2bac5a653999",
+        "runner-snapshot/benchmarking/admission.py": "3fe7b58ceff328c45cd211e4f035b5f4df06c53cb9d57ae7abc057557f6c37bf",
+        "runner-snapshot/benchmarking/baseline_selection.py": "9e8eecd31c7c3ed00b7e033936598cd248a53c5f4b336d06717d8f1354b0b637",
+        "runner-snapshot/benchmarking/benchmark.py": "1e1de1f682ab2815ac23d103127b17a49100d9c6a15947c62d1f7fcb94ba13db",
+        "runner-snapshot/benchmarking/collection.py": "ddd948d2c67f6eda223040457f12b8bdb639ece4e11abd8ee95a168ec815361a",
+        "runner-snapshot/benchmarking/engines.py": "ff65737f4f413c02eab8fd250470f96dba4bb6d5ee2a00c9ecc7b08ebe0a30a0",
+        "runner-snapshot/benchmarking/math_workloads.py": "c8d0cc256ff0bb54a051725151dbaf533c710aeb4c020b3fcb22582cffe90a6c",
+        "runner-snapshot/benchmarking/memory_guard.py": "5384d741dccbe32701b1d77f6f13f9b3119f59f3d5efe80b27b75c0571b52a68",
+        "runner-snapshot/benchmarking/models.py": "79a37da7d9b7b09a78d66862fa11a20d013af5b0cb9220094c77d85226a84269",
+        "runner-snapshot/benchmarking/pilot.py": "c187c40c51062db50b6c356dbb0562aae2f1a8266977b8cde23b7a62d399deab",
+        "runner-snapshot/benchmarking/processes.py": "21f1184ba33fa8a45a7bcfcae32e9b4568c15c93cfa04f47a0b77deddea8e073",
+        "runner-snapshot/benchmarking/profile.py": "8b10463e72c0a8d4b172fde2fdcc28f58fba3da892ac2eb5ab0de8c8616ff8e0",
+        "runner-snapshot/benchmarking/reports/__init__.py": "2003ed28278e5cfe78056830036b95e0bf88745492f86cf18d2932bc7c159fdc",
+        "runner-snapshot/benchmarking/reports/analysis.py": "201815599a1ef0db12eb64e3d9b030662d7be792bc707d5b873b089bb0fd0654",
+        "runner-snapshot/benchmarking/reports/catalog.py": "76c115c53260141ebcdd6e92dca73c461e55a24b2f5ecacd68f0330e0f845aa9",
+        "runner-snapshot/benchmarking/reports/interactive.py": "a14b8ddff51bbea50b7b987a92c2ed638b31e6d0c73ab25edfe4c2c4b8827c6d",
+        "runner-snapshot/benchmarking/reports/interactive_runtime.py": "c5fd9ddb366fdda32ba4146591cac87a6adafeee02c93c0e5a065c1325c7b70a",
+        "runner-snapshot/benchmarking/reports/presentation.py": "9267083688172cadce68a5292c541c5b977dcec797a2f7e139b4feed76ceb16d",
+        "runner-snapshot/benchmarking/reports/render.py": "1a26a1d7b5393bb11f0b70d4bd46cf2915eeb4a1ba00631baf77a0753c194383",
+        "runner-snapshot/benchmarking/reports/store.py": "2eba216e744a41201965ff7ec8617bf271801999e9a38e9211c379121e758619",
+        "runner-snapshot/benchmarking/samply_analysis.py": "9909294ce1087ff7556e991f6df42399e551642f7b6cac254c236b3453b57a85",
+        "runner-snapshot/benchmarking/suites.py": "232598f51dfd0a5070da77513c8ee51f1aeaba4ecfa0049600e1748406610c89",
+        "runner-snapshot/benchmarking/targets.py": "63b6ce0aff4de9a524ab24f2b1a903241199f42bef0aae70ff8da67ad8e0cebe",
+        "runner-snapshot/benchmarking/workloads.py": "f55ebda8f582dc7372c2846750f070d78a8eb0a7c7a6485d1fe92b0a5d1e0def"
+      },
+      "host": "macOS-26.6-arm64-arm-64bit-Mach-O",
+      "python": "3.13.11 (main, Dec 17 2025, 20:55:16) [Clang 21.1.4 ]",
+      "scipy": "1.18.0",
+      "summary": [
+        {
+          "file": "rewrite16",
+          "metric": "wall_sec",
+          "baseline": {
+            "point": 0.0706443418021081,
+            "ci_low": 0.07027769143348007,
+            "ci_high": 0.07101099217073613
+          },
+          "candidate": {
+            "point": 0.05697395434835926,
+            "ci_low": 0.056152026140470344,
+            "ci_high": 0.05779588255624817
+          },
+          "ratio": {
+            "point": 0.8064899876618158,
+            "ci_low": 0.7941467544865137,
+            "ci_high": 0.8188766708750781
+          },
+          "result": "lower",
+          "issue": null
+        },
+        {
+          "file": "rewrite16",
+          "metric": "max_rss_bytes",
+          "baseline": {
+            "point": 69185536.0,
+            "ci_low": 69104926.51333159,
+            "ci_high": 69266145.48666841
+          },
+          "candidate": {
+            "point": 43375820.8,
+            "ci_low": 43263552.563745804,
+            "ci_high": 43488089.03625419
+          },
+          "ratio": {
+            "point": 0.6269492629210822,
+            "ci_low": 0.625170566451751,
+            "ci_high": 0.6287296615672356
+          },
+          "result": "lower",
+          "issue": null
+        },
+        {
+          "file": "rewrite15",
+          "metric": "wall_sec",
+          "baseline": {
+            "point": 0.04179307704907842,
+            "ci_low": 0.041532876675582975,
+            "ci_high": 0.042053277422573865
+          },
+          "candidate": {
+            "point": 0.027600502004497686,
+            "ci_low": 0.027473582470941744,
+            "ci_high": 0.027727421538053628
+          },
+          "ratio": {
+            "point": 0.6604084684189653,
+            "ci_low": 0.6553223337031606,
+            "ci_high": 0.6655458027385106
+          },
+          "result": "lower",
+          "issue": null
+        },
+        {
+          "file": "rewrite15",
+          "metric": "max_rss_bytes",
+          "baseline": {
+            "point": 43132518.4,
+            "ci_low": 43032807.139570676,
+            "ci_high": 43232229.66042932
+          },
+          "candidate": {
+            "point": 25282969.6,
+            "ci_low": 25169282.496161446,
+            "ci_high": 25396656.703838557
+          },
+          "ratio": {
+            "point": 0.5861695662083112,
+            "ci_low": 0.5832089972632271,
+            "ci_high": 0.5891364003450756
+          },
+          "result": "lower",
+          "issue": null
+        },
+        {
+          "file": "rewrite17",
+          "metric": "wall_sec",
+          "baseline": {
+            "point": 0.10900539169961121,
+            "ci_low": 0.10863386146436485,
+            "ci_high": 0.10937692193485757
+          },
+          "candidate": {
+            "point": 0.09476881860755385,
+            "ci_low": 0.09457710156448505,
+            "ci_high": 0.09496053565062264
+          },
+          "ratio": {
+            "point": 0.8693956980468505,
+            "ci_low": 0.8659598977128663,
+            "ci_high": 0.8728516980796112
+          },
+          "result": "lower",
+          "issue": null
+        },
+        {
+          "file": "rewrite17",
+          "metric": "max_rss_bytes",
+          "baseline": {
+            "point": 78186905.6,
+            "ci_low": 78050681.76885559,
+            "ci_high": 78323129.4311444
+          },
+          "candidate": {
+            "point": 51577651.2,
+            "ci_low": 51420200.581452385,
+            "ci_high": 51735101.81854762
+          },
+          "ratio": {
+            "point": 0.659671217375816,
+            "ci_low": 0.6573545414258611,
+            "ci_high": 0.6619918982746688
+          },
+          "result": "lower",
+          "issue": null
+        },
+        {
+          "file": "rewrite66",
+          "metric": "wall_sec",
+          "baseline": {
+            "point": 0.31169085414439907,
+            "ci_low": 0.31053682968055885,
+            "ci_high": 0.3128448786082393
+          },
+          "candidate": {
+            "point": 0.3022914874978596,
+            "ci_low": 0.30152645618585094,
+            "ci_high": 0.3030565188098683
+          },
+          "ratio": {
+            "point": 0.969843944660035,
+            "ci_low": 0.9655076733853719,
+            "ci_high": 0.974206806019373
+          },
+          "result": "lower",
+          "issue": null
+        },
+        {
+          "file": "rewrite66",
+          "metric": "max_rss_bytes",
+          "baseline": {
+            "point": 75572019.2,
+            "ci_low": 75448766.43669447,
+            "ci_high": 75695271.96330553
+          },
+          "candidate": {
+            "point": 53968076.8,
+            "ci_low": 53805425.04671289,
+            "ci_high": 54130728.553287104
+          },
+          "ratio": {
+            "point": 0.7141277601326814,
+            "ci_low": 0.711682453768141,
+            "ci_high": 0.7165768655763893
+          },
+          "result": "lower",
+          "issue": null
+        },
+        {
+          "file": "rewrite88",
+          "metric": "wall_sec",
+          "baseline": {
+            "point": 0.08879800624854398,
+            "ci_low": 0.08860165995938381,
+            "ci_high": 0.08899435253770414
+          },
+          "candidate": {
+            "point": 0.07209600429341663,
+            "ci_low": 0.07188755890071738,
+            "ci_high": 0.07230444968611588
+          },
+          "ratio": {
+            "point": 0.8119101693749885,
+            "ci_low": 0.8089589138463533,
+            "ci_high": 0.8148693641460965
+          },
+          "result": "lower",
+          "issue": null
+        },
+        {
+          "file": "rewrite88",
+          "metric": "max_rss_bytes",
+          "baseline": {
+            "point": 97305395.2,
+            "ci_low": 97171365.32818504,
+            "ci_high": 97439425.07181497
+          },
+          "candidate": {
+            "point": 60361113.6,
+            "ci_low": 60232556.71128052,
+            "ci_high": 60489670.488719486
+          },
+          "ratio": {
+            "point": 0.6203264831917562,
+            "ci_low": 0.6187542646447534,
+            "ci_high": 0.6219010555980878
+          },
+          "result": "lower",
+          "issue": null
+        }
+      ]
+    },
+    "incremental": {
+      "before": "scoped-names",
+      "after": "goal-final-v1",
+      "started_utc": "2026-10-07T00:17:58.716015+00:00",
+      "completed_utc": "2026-10-07T00:18:23.037448+00:00",
+      "original_jsonl_sha256": "8e10c6d88e771f6730841906fe5ba61c8ac2c624bb82ad93f1ed329f14437aa0",
+      "original_driver_sha256": "2b4fb949badd982d7abf9684135cd61fe8290b9e75893d1f17ab10a6e8329640",
+      "original_helper_hashes": {
+        "runner-snapshot/benchmarking/__init__.py": "37dfb03a41db4e970329742b74c7afbd4e9824ce50f8ce5d774d2bac5a653999",
+        "runner-snapshot/benchmarking/admission.py": "3fe7b58ceff328c45cd211e4f035b5f4df06c53cb9d57ae7abc057557f6c37bf",
+        "runner-snapshot/benchmarking/baseline_selection.py": "9e8eecd31c7c3ed00b7e033936598cd248a53c5f4b336d06717d8f1354b0b637",
+        "runner-snapshot/benchmarking/benchmark.py": "1e1de1f682ab2815ac23d103127b17a49100d9c6a15947c62d1f7fcb94ba13db",
+        "runner-snapshot/benchmarking/collection.py": "ddd948d2c67f6eda223040457f12b8bdb639ece4e11abd8ee95a168ec815361a",
+        "runner-snapshot/benchmarking/engines.py": "ff65737f4f413c02eab8fd250470f96dba4bb6d5ee2a00c9ecc7b08ebe0a30a0",
+        "runner-snapshot/benchmarking/math_workloads.py": "c8d0cc256ff0bb54a051725151dbaf533c710aeb4c020b3fcb22582cffe90a6c",
+        "runner-snapshot/benchmarking/memory_guard.py": "5384d741dccbe32701b1d77f6f13f9b3119f59f3d5efe80b27b75c0571b52a68",
+        "runner-snapshot/benchmarking/models.py": "79a37da7d9b7b09a78d66862fa11a20d013af5b0cb9220094c77d85226a84269",
+        "runner-snapshot/benchmarking/pilot.py": "c187c40c51062db50b6c356dbb0562aae2f1a8266977b8cde23b7a62d399deab",
+        "runner-snapshot/benchmarking/processes.py": "21f1184ba33fa8a45a7bcfcae32e9b4568c15c93cfa04f47a0b77deddea8e073",
+        "runner-snapshot/benchmarking/profile.py": "8b10463e72c0a8d4b172fde2fdcc28f58fba3da892ac2eb5ab0de8c8616ff8e0",
+        "runner-snapshot/benchmarking/reports/__init__.py": "2003ed28278e5cfe78056830036b95e0bf88745492f86cf18d2932bc7c159fdc",
+        "runner-snapshot/benchmarking/reports/analysis.py": "201815599a1ef0db12eb64e3d9b030662d7be792bc707d5b873b089bb0fd0654",
+        "runner-snapshot/benchmarking/reports/catalog.py": "76c115c53260141ebcdd6e92dca73c461e55a24b2f5ecacd68f0330e0f845aa9",
+        "runner-snapshot/benchmarking/reports/interactive.py": "a14b8ddff51bbea50b7b987a92c2ed638b31e6d0c73ab25edfe4c2c4b8827c6d",
+        "runner-snapshot/benchmarking/reports/interactive_runtime.py": "c5fd9ddb366fdda32ba4146591cac87a6adafeee02c93c0e5a065c1325c7b70a",
+        "runner-snapshot/benchmarking/reports/presentation.py": "9267083688172cadce68a5292c541c5b977dcec797a2f7e139b4feed76ceb16d",
+        "runner-snapshot/benchmarking/reports/render.py": "1a26a1d7b5393bb11f0b70d4bd46cf2915eeb4a1ba00631baf77a0753c194383",
+        "runner-snapshot/benchmarking/reports/store.py": "2eba216e744a41201965ff7ec8617bf271801999e9a38e9211c379121e758619",
+        "runner-snapshot/benchmarking/samply_analysis.py": "9909294ce1087ff7556e991f6df42399e551642f7b6cac254c236b3453b57a85",
+        "runner-snapshot/benchmarking/suites.py": "232598f51dfd0a5070da77513c8ee51f1aeaba4ecfa0049600e1748406610c89",
+        "runner-snapshot/benchmarking/targets.py": "63b6ce0aff4de9a524ab24f2b1a903241199f42bef0aae70ff8da67ad8e0cebe",
+        "runner-snapshot/benchmarking/workloads.py": "f55ebda8f582dc7372c2846750f070d78a8eb0a7c7a6485d1fe92b0a5d1e0def"
+      },
+      "host": "macOS-26.6-arm64-arm-64bit-Mach-O",
+      "python": "3.13.11 (main, Dec 17 2025, 20:55:16) [Clang 21.1.4 ]",
+      "scipy": "1.18.0",
+      "summary": [
+        {
+          "file": "rewrite16",
+          "metric": "wall_sec",
+          "baseline": {
+            "point": 0.06539656879613176,
+            "ci_low": 0.06426913377083876,
+            "ci_high": 0.06652400382142476
+          },
+          "candidate": {
+            "point": 0.057101985500776206,
+            "ci_low": 0.0558274710629077,
+            "ci_high": 0.05837649993864471
+          },
+          "ratio": {
+            "point": 0.873164854853269,
+            "ci_low": 0.848793734433955,
+            "ci_high": 0.8980551678339349
+          },
+          "result": "lower",
+          "issue": null
+        },
+        {
+          "file": "rewrite16",
+          "metric": "max_rss_bytes",
+          "baseline": {
+            "point": 56301158.4,
+            "ci_low": 56214645.69414096,
+            "ci_high": 56387671.105859034
+          },
+          "candidate": {
+            "point": 43344691.2,
+            "ci_low": 43203444.1092221,
+            "ci_high": 43485938.29077791
+          },
+          "ratio": {
+            "point": 0.7698721026670742,
+            "ci_low": 0.767100213042535,
+            "ci_high": 0.7726476278802216
+          },
+          "result": "lower",
+          "issue": null
+        },
+        {
+          "file": "rewrite15",
+          "metric": "wall_sec",
+          "baseline": {
+            "point": 0.03680935625307029,
+            "ci_low": 0.036556321715898565,
+            "ci_high": 0.03706239079024201
+          },
+          "candidate": {
+            "point": 0.02776211870223051,
+            "ci_low": 0.027201871795728853,
+            "ci_high": 0.028322365608732164
+          },
+          "ratio": {
+            "point": 0.7542136437095353,
+            "ci_low": 0.7381698237703106,
+            "ci_high": 0.7703287469926693
+          },
+          "result": "lower",
+          "issue": null
+        },
+        {
+          "file": "rewrite15",
+          "metric": "max_rss_bytes",
+          "baseline": {
+            "point": 35050291.2,
+            "ci_low": 34985507.72639901,
+            "ci_high": 35115074.673600994
+          },
+          "candidate": {
+            "point": 25344409.6,
+            "ci_low": 25191618.71602584,
+            "ci_high": 25497200.483974162
+          },
+          "ratio": {
+            "point": 0.7230869910718459,
+            "ci_low": 0.7185299876186276,
+            "ci_high": 0.7276489349832483
+          },
+          "result": "lower",
+          "issue": null
+        },
+        {
+          "file": "rewrite17",
+          "metric": "wall_sec",
+          "baseline": {
+            "point": 0.10248382919962751,
+            "ci_low": 0.10201777596489832,
+            "ci_high": 0.1029498824343567
+          },
+          "candidate": {
+            "point": 0.09527623949252302,
+            "ci_low": 0.09415959747513455,
+            "ci_high": 0.09639288150991149
+          },
+          "ratio": {
+            "point": 0.9296709562533532,
+            "ci_low": 0.9180027851812648,
+            "ci_high": 0.9413775801818195
+          },
+          "result": "lower",
+          "issue": null
+        },
+        {
+          "file": "rewrite17",
+          "metric": "max_rss_bytes",
+          "baseline": {
+            "point": 64783155.2,
+            "ci_low": 64633793.80291683,
+            "ci_high": 64932516.59708317
+          },
+          "candidate": {
+            "point": 51629260.8,
+            "ci_low": 51520176.60592398,
+            "ci_high": 51738344.99407601
+          },
+          "ratio": {
+            "point": 0.7969550208014566,
+            "ci_low": 0.7944669706870233,
+            "ci_high": 0.7994515435540126
+          },
+          "result": "lower",
+          "issue": null
+        },
+        {
+          "file": "rewrite66",
+          "metric": "wall_sec",
+          "baseline": {
+            "point": 0.3078548479519668,
+            "ci_low": 0.3068653510744766,
+            "ci_high": 0.30884434482945705
+          },
+          "candidate": {
+            "point": 0.3030047979496885,
+            "ci_low": 0.3015044224871035,
+            "ci_high": 0.30450517341227346
+          },
+          "ratio": {
+            "point": 0.9842456598148649,
+            "ci_low": 0.9784454239140065,
+            "ci_high": 0.9900662321521182
+          },
+          "result": "lower",
+          "issue": null
+        },
+        {
+          "file": "rewrite66",
+          "metric": "max_rss_bytes",
+          "baseline": {
+            "point": 64599654.4,
+            "ci_low": 64465906.509310156,
+            "ci_high": 64733402.29068984
+          },
+          "candidate": {
+            "point": 53903360.0,
+            "ci_low": 53704973.65743609,
+            "ci_high": 54101746.34256391
+          },
+          "ratio": {
+            "point": 0.8344218014887709,
+            "ci_low": 0.8309017759039035,
+            "ci_high": 0.837948980778094
+          },
+          "result": "lower",
+          "issue": null
+        },
+        {
+          "file": "rewrite88",
+          "metric": "wall_sec",
+          "baseline": {
+            "point": 0.0832318666492938,
+            "ci_low": 0.08060163051462557,
+            "ci_high": 0.08586210278396203
+          },
+          "candidate": {
+            "point": 0.07373895419732435,
+            "ci_low": 0.07112171977713806,
+            "ci_high": 0.07635618861751063
+          },
+          "ratio": {
+            "point": 0.8859461786196766,
+            "ci_low": 0.844698849352749,
+            "ci_high": 0.9289647644276069
+          },
+          "result": "lower",
+          "issue": null
+        },
+        {
+          "file": "rewrite88",
+          "metric": "max_rss_bytes",
+          "baseline": {
+            "point": 79354265.6,
+            "ci_low": 79228997.46796717,
+            "ci_high": 79479533.73203282
+          },
+          "candidate": {
+            "point": 60361113.6,
+            "ci_low": 60225436.0731089,
+            "ci_high": 60496791.12689111
+          },
+          "ratio": {
+            "point": 0.7606536730396004,
+            "ci_low": 0.7585662722713209,
+            "ci_high": 0.7627448648507358
+          },
+          "result": "lower",
+          "issue": null
+        }
+      ]
+    }
+  },
+  "validation": {
+    "all_five_stdout_and_parsed_witnesses_identical": true,
+    "rewrite17_bad_merge_flags": [
+      "false",
+      "false",
+      "false",
+      "true"
+    ],
+    "rewrite17_final_bad_merge_is_followed_by_rollback": true
+  },
+  "diagnostic_profile": {
+    "note": "Late retained profile before the final hasher-only edit. Inclusive percentages overlap; not acceptance timings.",
+    "source": {
+      "egglog": "36bdbc7f9ff62c223cc0863312b8231b0f09582c",
+      "experimental": "b70dcde3b82f5c59d66db53a31fa5b22d1c531c8"
+    },
+    "binary_sha256": "6ac9b53736e7aeedc902e2153cbcfc13c63344a3101d90d14366f50a082d9960",
+    "iterations": 140,
+    "sampled_cpu_seconds": 7.800863000000019,
+    "warnings": [
+      "could not resolve 173 application frame address(es)"
+    ],
+    "inclusive": [
+      {
+        "name": "egglog::EGraph::run_rules::hb29a88e97a06308b",
+        "cpu_seconds": 2.9828539999999952,
+        "percent": 38.23748731390344
+      },
+      {
+        "name": "egglog::typechecking::TypeInfo::typecheck_rule::h638e964208231fa0",
+        "cpu_seconds": 1.1648849999999984,
+        "percent": 14.932770899834999
+      },
+      {
+        "name": "<egglog_ast::generic_ast::GenericRule<egglog::core::ResolvedCall,egglog::ast::expr::ResolvedVar> as egglog::core::ResolvedRuleExt>::to_canonicalized_core_rule::hc7324e840ea01365",
+        "cpu_seconds": 0.7898119999999996,
+        "percent": 10.124674667405358
+      },
+      {
+        "name": "egglog::extract::_<impl egglog::EGraph>::extract_variants_with_cost_model::hed523fd388dc1da4",
+        "cpu_seconds": 0.73615,
+        "percent": 9.436776418198836
+      },
+      {
+        "name": "egglog::EGraph::push::hee36236be4d3a7b1",
+        "cpu_seconds": 0.25842500000000007,
+        "percent": 3.312774496872967
+      },
+      {
+        "name": "<egglog_experimental::set_cost::DynamicCostModel as egglog::extract::DagCostModel<u64>>::enode_cost::h192730ba2e08247c",
+        "cpu_seconds": 0.18506800000000007,
+        "percent": 2.372404181434793
+      }
+    ]
+  }
+}
