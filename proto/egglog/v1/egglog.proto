@@ -30,7 +30,7 @@ import "buf/validate/validate.proto";
 // Install all declarations and named ruleset bindings before commands,
 // order-independently and without executing their bodies.
 // Definitions installed on this handle may be referenced by name without
-// resending them. Node, sort and ruleset indices always refer to this Program's
+// resending them. Node, sort, rule and ruleset indices refer to this Program's
 // arenas, not previous requests; all referenced entries must be included here.
 // Execute only commands, in order, and the expressions they demand. Unused
 // arena entries are not executed; arena membership is not an execution root.
@@ -172,6 +172,31 @@ message Program {
       "r.combined.rulesets.all(ref, !has(ref.index) || "
       "ref.index < uint(size(this.rulesets))))"
   };
+  option (buf.validate.message).cel = {
+    id: "program.rule_refs_in_range"
+    message: "rule-list indices must index the rule arena"
+    expression:
+      "this.rulesets.all(s, !has(s.rules) || "
+      "s.rules.rules.all(i, i < uint(size(this.rules))))"
+  };
+  // Direct rule roots only; binding, typing, effects and occurrence matching
+  // remain normative. Node-child bounds are checked separately above.
+  option (buf.validate.message).cel = {
+    id: "program.rule_node_refs_in_range"
+    message: "rule query, head and rewrite roots must index nodes"
+    expression:
+      "this.rules.all(r, "
+      "(has(r.rule) ? r.rule.query : "
+      "has(r.rewrite) ? [r.rewrite.lhs, r.rewrite.rhs] + r.rewrite.conditions : "
+      "has(r.birewrite) ? [r.birewrite.lhs, r.birewrite.rhs] + r.birewrite.conditions : [])"
+      ".all(i, i < uint(size(this.nodes))) && "
+      "(!has(r.rule) || r.rule.head.all(a, "
+      "(has(a.term) ? [a.term] : "
+      "has(a.set) ? a.set.target.args + [a.set.value] : "
+      "has(a.change) ? a.change.target.args : "
+      "has(a.set_cost) ? a.set_cost.target.args + [a.set_cost.cost] : [])"
+      ".all(i, i < uint(size(this.nodes))))))"
+  };
   // Reject relation children with matching argument sort IDs and Unit result.
   // Structural-sort equivalence and complete declared/ambient resolution
   // remain normative: different IDs for equivalent sorts can escape this rule.
@@ -233,6 +258,12 @@ message Program {
   // mismatch before installing definitions or executing commands. Freeze
   // always includes it so the exported Program describes its required C.
   optional uint32 cost_sort = 8; // index into this Program's sorts
+
+  // Rule occurrences, shared across rule lists by index. Equal entries remain
+  // distinct occurrences; labels never identify them. Unused entries do not
+  // execute. Only named ruleset roots retain reachable rules across requests;
+  // other rules are request-local and omitted by Freeze.
+  repeated RuleDecl rules = 9;
 }
 
 // Source metadata supports diagnostic locations and documentation, not
@@ -1210,14 +1241,18 @@ message EgglogCallable {
 // immutable: compatible resends retain the occurrence and all reachable
 // children, including anonymous ones, with their rule state. Changes to body
 // kind, ordered contents, rule definitions/options or sharing are conflicts.
-// Compare expression subgraphs as in Declaration; provenance is not identity.
+// Compare expression subgraphs as in Declaration; rule labels and provenance
+// are not identity.
 // Frontends may build mutably before emitting a complete definition.
 //
-// Compare same-name presentations' bodies and internal sharing before
-// identifying entries. Compatible presentations then identify corresponding
-// entries as the same occurrences. After those correspondences, one consistent
-// match must preserve sharing across all named-root closures: no merging
-// distinct occurrences or splitting shared ones. Conflicting identity
+// Compare same-name presentations' bodies and internal rule/ruleset sharing
+// before identifying entries. Compatible presentations identify corresponding
+// ruleset occurrences, but cannot collapse distinct local rule-arena entries:
+// duplicate named-root presentations must reuse the required rule indices.
+// One consistent match must
+// preserve BOTH rule and ruleset sharing across all named-root closures: no
+// merging distinct occurrences or splitting shared ones. In particular [r,r]
+// cannot match [s,t] by merging distinct equal rules s/t. Conflicting identity
 // requirements from installed roots are errors.
 // A matched local entry reuses its retained occurrence everywhere, including
 // a direct Run of that index. Unmatched occurrences are fresh for each
@@ -1229,14 +1264,15 @@ message EgglogCallable {
 // A resend anchored by an already-installed named parent may give a matched
 // anonymous child its first name, retaining that occurrence and its rule state.
 // Compare bodies and sharing before applying this new binding; names are not
-// part of the child's body. Each occurrence has at most one assigned name:
+// part of the child's body. Each ruleset occurrence has at most one assigned name:
 // renaming an already-named occurrence, proposing two different names for one
 // matched occurrence, or binding an occupied name to another occurrence is an
 // error. Repeating the same compatible binding is a no-op. Omitting a matched
 // child's name does not remove its installed binding. Name assignments must be
 // consistent across all matches; equal anonymous bodies alone are not anchors.
-// Each rule occurrence belongs to its leaf ruleset. Compositions reference
-// those occurrences rather than declaring copies. Cyclic compositions are
+// A matched rule entry reuses that retained occurrence in every referencing
+// leaf, including new/unmatched leaves. No leaf owns a rule exclusively.
+// Equal bodies or labels alone never establish a match. Cyclic compositions are
 // invalid, including cycles through names; these are normative semantic checks.
 message Ruleset {
   option (buf.validate.message).cel = {
@@ -1259,9 +1295,11 @@ message Ruleset {
   string doc = 5;
 }
 
-// The leaf body of a Ruleset. May be empty.
+// An ordered selection of rule occurrences. May be empty or repeat an index;
+// Run retains each occurrence only at its first inclusion. Different leaves
+// may share entries without copying them or creating separate rule state.
 message RuleList {
-  repeated RuleDecl rules = 1;
+  repeated uint32 rules = 1 [packed = true]; // indices into Program.rules
 }
 
 // A request-local occurrence or a named binding on the e-graph handle.
@@ -1279,8 +1317,12 @@ message RulesetRef {
   }
 }
 
-// A rule, or a directional or bidirectional rewrite, with common execution
-// options and source metadata.
+// A rule occurrence, or a directional/bidirectional rewrite occurrence, with
+// immutable body/options and diagnostic metadata. Its Program.rules entry is
+// the request-local identity, not structural equality or a label. References
+// share the occurrence and its rule-owned execution state across groups/Run
+// sites. This does not identify distinct scheduler instances or combine their
+// scheduler-owned state.
 message RuleDecl {
   oneof kind {
     option (buf.validate.oneof).required = true;
@@ -1290,9 +1332,9 @@ message RuleDecl {
     BiRewrite birewrite = 3;
   }
 
-  // Stable occurrence name, unique within its leaf Ruleset. A matched enclosing
-  // ruleset retains that occurrence; names are not global rule identities.
-  string name = 4 [(buf.validate.field).string.min_len = 1];
+  // Optional diagnostic label; may repeat and never binds or identifies a rule.
+  // Changing/omitting it does not affect compatible occurrence matching.
+  optional string name = 4 [(buf.validate.field).string.min_len = 1];
 
   // Required for every rule and rewrite; no implicit default.
   RuleEvalMode eval_mode = 5 [
@@ -1506,9 +1548,12 @@ enum Extractor {
 //
 // Include every installed declaration and sort, even unused or empty tables;
 // every installed named ruleset and its retained closure, preserving occurrence
-// sharing and each occurrence's current assigned name, if any; and all builtin
+// sharing and assigned ruleset names; and all builtin
 // declaration descriptors, including generic families and every distinct core
-// callable. Export each ruleset occurrence once, even if multiple roots reach it.
+// callable. Export each retained rule and ruleset occurrence once, even if
+// multiple roots/leaves reach it. Remap RuleList indices into exported rules,
+// preserving shared and distinct rule occurrences independently of labels.
+// Omit transient rules/rulesets not retained through named roots.
 // Include saved code and its dependencies without executing it.
 // Include supplied language metadata and all metadata-only sort/default-node
 // dependencies, remapping their arena references. Do not export derived wrapper
@@ -1795,15 +1840,20 @@ message RunProgramResponse {
 // One authored RuleDecl occurrence, including both directions of a BiRewrite.
 // Pick one valid route from the request's ruleset arena or an installed named
 // root, following composition-child positions (and resolving their refs), to
-// a leaf RuleList. `rule` indexes that leaf. The route must identify the actual
-// occurrence, including retained anonymous leaves absent from this request.
+// a leaf RuleList. `rule` is a position in that leaf, NOT a Program.rules index;
+// the selected entry resolves to its rule occurrence. This also locates retained
+// rules/leaves absent from the request. A rule shared by multiple leaves or
+// repeated positions still has one response-local catalog entry.
 // Bounds, name resolution and terminal-leaf checks are normative. Multiple
 // routes to the same occurrence do not create additional catalog entries.
 message RuleAttribution {
   RulesetRef root = 1 [(buf.validate.field).required = true];
   repeated uint32 children = 2;
-  uint32 rule = 3;
-  string name = 4; // authored RuleDecl.name; diagnostic, never a fabricated ID
+  uint32 rule = 3; // ordinal within the selected RuleList
+
+  // A supplied diagnostic label from this occurrence, absent if it has none.
+  // Representative provenance only, never an invented or lookup identity.
+  optional string name = 4 [(buf.validate.field).string.min_len = 1];
   Span span = 5;
 }
 

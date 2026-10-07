@@ -7,7 +7,7 @@ feedback, not as a finished API. The wire format may change during review.
 Start with [egglog.proto](egglog/v1/egglog.proto). Its validation annotations
 and comments are the specification. The main pieces are:
 
-- Flat expression, sort, and ruleset arenas, with explicit shared references.
+- Flat expression, sort, rule, and ruleset arenas, with shared references.
 - Immutable declarations and rulesets, separate from ordered commands.
 - Native scalar, container, and function values. Custom values carry opaque
   bytes and explicit child references; symbolic computation remains a call.
@@ -199,15 +199,17 @@ Rust without duplicating the IR declarations.
 ### Unnamed rulesets and declaration reuse
 
 - **Ruleset identity — decided:** immutable rulesets have optional names and
-  share state by occurrence identity. The current provisional wire layout uses
+  share state by occurrence identity. The wire layout uses
   `Program.rulesets`, with a rule-list or composition body. Runs and composition
   children use an arena index or an installed name. An absent name adds no
   binding; an unmatched entry without a name is anonymous. A present empty name
   retains the default ruleset. Named roots retain their
   reachable anonymous children and rule state across requests. Compatible
   presentations of the same name compare internal sharing before identifying
-  corresponding occurrences. Resends must then preserve sharing across all
-  named roots.
+  corresponding occurrences. Resends must then preserve both rule and ruleset
+  sharing across all named roots, without merging distinct occurrences or
+  splitting shared ones. Rule labels do not participate in matching.
+  Duplicate named-root presentations cannot collapse distinct rule-arena entries.
   Conflicting identity requirements are errors. A matched index reuses the
   retained occurrence everywhere it is referenced.
   Other anonymous entries are fresh per submission, even when their bodies
@@ -228,7 +230,7 @@ Rust without duplicating the IR declarations.
   to nullary functions and sets; this does not add general expression bindings.
   Resending an already-installed named parent may give a matched anonymous
   child its first name, preserving that occurrence and its rule state. Match
-  bodies and sharing before applying the new binding. Each occurrence may have
+  bodies and sharing before applying the new binding. Each ruleset occurrence may have
   only one name: renaming it, assigning two different names to one occurrence,
   or reusing a name bound to another occurrence is an error. An omitted name
   does not remove an existing binding. Equal anonymous bodies alone never
@@ -237,10 +239,18 @@ Rust without duplicating the IR declarations.
   each rule occurrence only at its first inclusion. Distinct equal rules remain
   independent. Separate Runs and loop iterations select independently; this
   does not limit firings from query matches or override the scheduler.
-- **Rule-level sharing — proposed:** a rule arena would let multiple rulesets
-  reference the same rule occurrence directly, without copying it. This is a
-  layout proposal only; the current schema still requires `RuleDecl` names and
-  assigns each rule occurrence to a leaf ruleset. No rule arena is implemented.
+- **Rule-level sharing — decided:** `Program.rules` holds `RuleDecl` occurrences;
+  each `RuleList.rules` is an ordered list of arena indices. Different leaves
+  and repeated positions may reference the same occurrence; equal separate
+  entries remain distinct. Names are optional diagnostic labels, may repeat,
+  and provide no rule lookup or identity. A rule matched through an installed
+  named root is reused even in a newly added leaf that references its index.
+  A wholly unanchored resubmission remains fresh. References share the rule and
+  its rule-owned state across groups/Run sites; distinct scheduler instances and
+  their scheduler-owned state remain separate. CEL checks direct indices;
+  matching and execution are unimplemented.
+  Only named roots retain rules across requests; unretained entries are omitted
+  from `Freeze`, and arena membership alone never executes a rule.
 - **Declaration reuse — decided:** programs may refer to definitions already
   installed on the same e-graph handle without resending them. Builtin calls
   resolve against implicitly available host primitives without requiring
@@ -262,7 +272,8 @@ Rust without duplicating the IR declarations.
 **Decided:** `Freeze` returns one complete current-state `Program`, with no
 filtering and no separate snapshot message or loading instruction. Include all
 installed declarations and sorts, named rulesets and their retained anonymous
-children, and builtin descriptors, even when unused. Preserve occurrence sharing.
+children and rules, and builtin descriptors, even when unused. Emit each retained
+rule/ruleset occurrence once, remapping leaf indices and preserving sharing.
 The commands reconstruct all logical data, including empty/unreachable classes,
 constructor alternatives, function and relation rows, subsumption, captures, and
 assigned row costs. Historical commands, scheduler instances, seminaive cursors,
@@ -306,9 +317,8 @@ semantics, without a restoration-equivalence guarantee.
 
 This contract is not implemented. `HostSortFamily` and `HostPrimitive` provide
 the generic catalog layout; host binding, semantic validation, and full export
-still need implementation. The proposed rule arena remains a separate layout
-question. Custom value reconstruction requires trusted codecs. No ordinary
-native pure non-equality self-cycle has been established; arbitrary host-codec
+still need implementation. Custom value reconstruction requires trusted codecs.
+No ordinary native pure non-equality self-cycle has been established; arbitrary host-codec
 cycles remain unproven. `Freeze` must fail when required state cannot be
 represented, not silently omit it or claim a complete export.
 
@@ -353,10 +363,11 @@ empty summary is complete. Completeness does not promise every optional metric.
 `RunProgramResponse.rules` gives each attributed occurrence one local index,
 shared by profile rows and errors even with profiling off. A `RuleAttribution`
 routes from a request-local ruleset or installed named root, through composition
-child positions to a leaf rule ordinal. This covers retained anonymous leaves
-without invented names or a new rule arena. Names and spans are diagnostic;
-distinct equal occurrences stay distinct, and both directions of an authored
-`BiRewrite` share one entry. Path resolution and identity checks remain normative
+child positions to a leaf rule ordinal, not a `Program.rules` index. The selected
+list entry identifies the rule, including retained rules absent from the request.
+Shared rules have one response catalog entry regardless of route. Names and spans
+are diagnostic; distinct equal occurrences stay distinct, and both directions of
+an authored `BiRewrite` share one entry. Path resolution and identity checks remain normative
 semantic requirements. Detailed traces and runtime implementation are deferred.
 Only referenced catalog entries are returned; profiling off without a rule error
 returns none.

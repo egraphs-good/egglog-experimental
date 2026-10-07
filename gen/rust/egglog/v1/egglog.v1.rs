@@ -26,7 +26,7 @@
 /// Install all declarations and named ruleset bindings before commands,
 /// order-independently and without executing their bodies.
 /// Definitions installed on this handle may be referenced by name without
-/// resending them. Node, sort and ruleset indices always refer to this Program's
+/// resending them. Node, sort, rule and ruleset indices refer to this Program's
 /// arenas, not previous requests; all referenced entries must be included here.
 /// Execute only commands, in order, and the expressions they demand. Unused
 /// arena entries are not executed; arena membership is not an execution root.
@@ -73,6 +73,12 @@ pub struct Program {
     /// index into this Program's sorts
     #[prost(uint32, optional, tag = "8")]
     pub cost_sort: ::core::option::Option<u32>,
+    /// Rule occurrences, shared across rule lists by index. Equal entries remain
+    /// distinct occurrences; labels never identify them. Unused entries do not
+    /// execute. Only named ruleset roots retain reachable rules across requests;
+    /// other rules are request-local and omitted by Freeze.
+    #[prost(message, repeated, tag = "9")]
+    pub rules: ::prost::alloc::vec::Vec<RuleDecl>,
 }
 /// Source metadata supports diagnostic locations and documentation, not
 /// arbitrary comment attachment, formatting or source round-tripping.
@@ -1112,14 +1118,18 @@ pub struct EgglogCallable {
 /// immutable: compatible resends retain the occurrence and all reachable
 /// children, including anonymous ones, with their rule state. Changes to body
 /// kind, ordered contents, rule definitions/options or sharing are conflicts.
-/// Compare expression subgraphs as in Declaration; provenance is not identity.
+/// Compare expression subgraphs as in Declaration; rule labels and provenance
+/// are not identity.
 /// Frontends may build mutably before emitting a complete definition.
 ///
-/// Compare same-name presentations' bodies and internal sharing before
-/// identifying entries. Compatible presentations then identify corresponding
-/// entries as the same occurrences. After those correspondences, one consistent
-/// match must preserve sharing across all named-root closures: no merging
-/// distinct occurrences or splitting shared ones. Conflicting identity
+/// Compare same-name presentations' bodies and internal rule/ruleset sharing
+/// before identifying entries. Compatible presentations identify corresponding
+/// ruleset occurrences, but cannot collapse distinct local rule-arena entries:
+/// duplicate named-root presentations must reuse the required rule indices.
+/// One consistent match must
+/// preserve BOTH rule and ruleset sharing across all named-root closures: no
+/// merging distinct occurrences or splitting shared ones. In particular \[r,r\]
+/// cannot match \[s,t\] by merging distinct equal rules s/t. Conflicting identity
 /// requirements from installed roots are errors.
 /// A matched local entry reuses its retained occurrence everywhere, including
 /// a direct Run of that index. Unmatched occurrences are fresh for each
@@ -1131,14 +1141,15 @@ pub struct EgglogCallable {
 /// A resend anchored by an already-installed named parent may give a matched
 /// anonymous child its first name, retaining that occurrence and its rule state.
 /// Compare bodies and sharing before applying this new binding; names are not
-/// part of the child's body. Each occurrence has at most one assigned name:
+/// part of the child's body. Each ruleset occurrence has at most one assigned name:
 /// renaming an already-named occurrence, proposing two different names for one
 /// matched occurrence, or binding an occupied name to another occurrence is an
 /// error. Repeating the same compatible binding is a no-op. Omitting a matched
 /// child's name does not remove its installed binding. Name assignments must be
 /// consistent across all matches; equal anonymous bodies alone are not anchors.
-/// Each rule occurrence belongs to its leaf ruleset. Compositions reference
-/// those occurrences rather than declaring copies. Cyclic compositions are
+/// A matched rule entry reuses that retained occurrence in every referencing
+/// leaf, including new/unmatched leaves. No leaf owns a rule exclusively.
+/// Equal bodies or labels alone never establish a match. Cyclic compositions are
 /// invalid, including cycles through names; these are normative semantic checks.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct Ruleset {
@@ -1162,11 +1173,14 @@ pub mod ruleset {
         Combined(super::CombinedRuleset),
     }
 }
-/// The leaf body of a Ruleset. May be empty.
-#[derive(Clone, PartialEq, ::prost::Message)]
+/// An ordered selection of rule occurrences. May be empty or repeat an index;
+/// Run retains each occurrence only at its first inclusion. Different leaves
+/// may share entries without copying them or creating separate rule state.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct RuleList {
-    #[prost(message, repeated, tag = "1")]
-    pub rules: ::prost::alloc::vec::Vec<RuleDecl>,
+    /// indices into Program.rules
+    #[prost(uint32, repeated, tag = "1")]
+    pub rules: ::prost::alloc::vec::Vec<u32>,
 }
 /// A request-local occurrence or a named binding on the e-graph handle.
 /// Names may be installed by this Program or an earlier one. Missing names
@@ -1190,14 +1204,18 @@ pub mod ruleset_ref {
         Name(::prost::alloc::string::String),
     }
 }
-/// A rule, or a directional or bidirectional rewrite, with common execution
-/// options and source metadata.
+/// A rule occurrence, or a directional/bidirectional rewrite occurrence, with
+/// immutable body/options and diagnostic metadata. Its Program.rules entry is
+/// the request-local identity, not structural equality or a label. References
+/// share the occurrence and its rule-owned execution state across groups/Run
+/// sites. This does not identify distinct scheduler instances or combine their
+/// scheduler-owned state.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct RuleDecl {
-    /// Stable occurrence name, unique within its leaf Ruleset. A matched enclosing
-    /// ruleset retains that occurrence; names are not global rule identities.
-    #[prost(string, tag = "4")]
-    pub name: ::prost::alloc::string::String,
+    /// Optional diagnostic label; may repeat and never binds or identifies a rule.
+    /// Changing/omitting it does not affect compatible occurrence matching.
+    #[prost(string, optional, tag = "4")]
+    pub name: ::core::option::Option<::prost::alloc::string::String>,
     /// Required for every rule and rewrite; no implicit default.
     #[prost(enumeration = "RuleEvalMode", tag = "5")]
     pub eval_mode: i32,
@@ -1438,9 +1456,12 @@ pub struct Extract {
 ///
 /// Include every installed declaration and sort, even unused or empty tables;
 /// every installed named ruleset and its retained closure, preserving occurrence
-/// sharing and each occurrence's current assigned name, if any; and all builtin
+/// sharing and assigned ruleset names; and all builtin
 /// declaration descriptors, including generic families and every distinct core
-/// callable. Export each ruleset occurrence once, even if multiple roots reach it.
+/// callable. Export each retained rule and ruleset occurrence once, even if
+/// multiple roots/leaves reach it. Remap RuleList indices into exported rules,
+/// preserving shared and distinct rule occurrences independently of labels.
+/// Omit transient rules/rulesets not retained through named roots.
 /// Include saved code and its dependencies without executing it.
 /// Include supplied language metadata and all metadata-only sort/default-node
 /// dependencies, remapping their arena references. Do not export derived wrapper
@@ -1649,8 +1670,10 @@ pub struct RunProgramResponse {
 /// One authored RuleDecl occurrence, including both directions of a BiRewrite.
 /// Pick one valid route from the request's ruleset arena or an installed named
 /// root, following composition-child positions (and resolving their refs), to
-/// a leaf RuleList. `rule` indexes that leaf. The route must identify the actual
-/// occurrence, including retained anonymous leaves absent from this request.
+/// a leaf RuleList. `rule` is a position in that leaf, NOT a Program.rules index;
+/// the selected entry resolves to its rule occurrence. This also locates retained
+/// rules/leaves absent from the request. A rule shared by multiple leaves or
+/// repeated positions still has one response-local catalog entry.
 /// Bounds, name resolution and terminal-leaf checks are normative. Multiple
 /// routes to the same occurrence do not create additional catalog entries.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
@@ -1659,11 +1682,13 @@ pub struct RuleAttribution {
     pub root: ::core::option::Option<RulesetRef>,
     #[prost(uint32, repeated, tag = "2")]
     pub children: ::prost::alloc::vec::Vec<u32>,
+    /// ordinal within the selected RuleList
     #[prost(uint32, tag = "3")]
     pub rule: u32,
-    /// authored RuleDecl.name; diagnostic, never a fabricated ID
-    #[prost(string, tag = "4")]
-    pub name: ::prost::alloc::string::String,
+    /// A supplied diagnostic label from this occurrence, absent if it has none.
+    /// Representative provenance only, never an invented or lookup identity.
+    #[prost(string, optional, tag = "4")]
+    pub name: ::core::option::Option<::prost::alloc::string::String>,
     #[prost(message, optional, tag = "5")]
     pub span: ::core::option::Option<Span>,
 }
