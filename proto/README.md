@@ -27,17 +27,28 @@ comments and annotations remain the normative contract.
 
 ### Shared builtin definitions and type checking
 
-Proposed discovery model: builtins are implicitly available, and an EGraph
-query exports their portable declarations with optional language metadata.
-Export generic families and every distinct core callable, not just instantiated
-sorts/tables. A saved export can drive binding generation without a live EGraph
-at import time. The query and descriptor format remain
-to be designed; declaring a signature does not supply its native implementation.
+**Decided:** generic definitions are limited to host primitive signatures and
+host sort families. Tables, computed `Primitive` bodies, and user equality
+sorts remain concrete; frontends may specialize generic user code before this
+boundary. Host descriptors assert an available compatible implementation;
+they do not supply native code. Builtins remain implicitly available, so calls
+do not have to resend their descriptors.
 
-Today `Container` and `FuncSort` describe concrete types, each node supplies its
-resolved sort, and host primitives are ambient. `Primitive` declares a computed
-body, not a host signature. There are no declaration-level type variables or
-generic signatures.
+`Declaration` has `HostSortFamily` and `HostPrimitive` arms, sharing the existing
+documentation and provenance fields. A family records its name and arity:
+nullary families such as `i64` use `PrimSort`, while positive-arity families
+such as `Vec` and `Map` use `Container` with exactly that many arguments.
+Function types remain structural `FuncSort`s. Family names share the sort
+namespace with `EqSort`; callable names occupy a separate namespace.
+
+`HostPrimitive` selects an ordinary `GenericSignature` or the dedicated
+`FunctionApplication` typing form. A signature has an ordered type-parameter
+binder, fixed inputs, a required output, and an optional homogeneous varargs
+tail. It uses the existing sort arena with signature-only `Sort.var` indices.
+Parameter labels are diagnostic: changing their spelling does not change the
+definition. A shared pattern is interpreted independently in each signature's
+binder; neither arena sharing nor export combines binders or substitutions.
+Compatibility compares ordered binder positions and structural signatures.
 
 Python already separates generic declarations from concrete expression types.
 Its [signatures](https://github.com/egraphs-good/egglog-python/blob/ff72f601a972ca1eb7cb0a1d299813f5d65b1a14/python/egglog/declarations.py#L752-L791)
@@ -47,29 +58,49 @@ support type variables and a repeated argument type. Useful test cases are:
 map-get<K,V>(Map<K,V>, K) -> V
 map-empty<K,V>() -> Map<K,V>
 vec-of<T>(T...) -> Vec<T>
-unstable-vec-map<T,U>((T) -> U, Vec<T>) -> Vec<U>
+vec-map<T,U>((T) -> U, Vec<T>) -> Vec<U>
 ```
 
-Specify type-constructor arities, type-variable scope, substitution, and how
-empty containers obtain their types. The relationship between exported host
-definitions and submitted declarations remains open.
-Separate frontend inference/conversions from checking the resolved IR. This
-need not introduce generic user-defined equality sorts.
+Each actual call supplies concrete argument and result sorts. Matching all of
+them must determine every parameter consistently, including parameters found
+only in the result: `map-empty() : Map<i64,String>` determines both parameters,
+and `vec-of() : Vec<String>` determines its element type. In contrast,
+`count<T>(...T) -> i64` with zero arguments leaves `T` undetermined and is
+rejected. There is no call-level type-argument list, implicit conversion,
+subtyping, or overload search.
+
+Node/value sorts, lambda parameter sorts, cost sorts, and concrete declaration
+signatures must be recursively closed. Creation and ordinary response sort
+arenas contain no variables; a nested exported `Program` may include signature
+patterns. CEL checks direct bounds, variable roots, and declared family uses.
+Recursive closedness, binder scope, signature matching, family resolution, and
+compatible descriptor resends remain semantic checks, not implemented yet.
 
 **Decided:** each core callable has one unique name across user and host
 definitions; the core does not select from same-name overloads. Frontends lower
 overloaded syntax such as `+` to the appropriate unique callable name and make
 conversions explicit before this boundary. Generics remain: a call instantiates
 one named generic definition, rather than choosing an overload. No concrete
-naming convention or generic descriptor layout is chosen here.
+naming convention is chosen here.
 
-**Decided:** use ordinary generic signatures, including homogeneous varargs,
-with a dedicated typing rule for function application: arguments match the
-function's parameter sorts, and the call has its result sort. Do not add
-heterogeneous type packs to the signature language. This follows Python's
+`FunctionApplication` describes a named primitive called through normal `Call`:
+the first argument has a concrete function type, remaining arguments match its
+parameter sorts, and the call has its result sort. It needs no heterogeneous
+type packs. This follows Python's
 [application special case](https://github.com/egraphs-good/egglog-python/blob/ff72f601a972ca1eb7cb0a1d299813f5d65b1a14/python/egglog/runtime.py#L522-L538).
-`Lambda` and `PartialCall` retain their structural typing rules. Binding
-generation remains a goal; the decision does not choose a Rust arity strategy.
+For `PartialCall`, captured argument sorts plus the resulting `FuncSort.params`
+form the effective complete argument list; `FuncSort.result` supplies its result.
+Apply the target's typing form to that complete call, including varargs or
+function application, and require every generic parameter to be determined.
+The existing relation-capability restriction still applies.
+
+Complete `Freeze` exports include these descriptors and their signature patterns,
+even when unused; freezing a fresh empty handle therefore exposes its ambient
+catalog. Definitions-only filtering is deferred. Saved catalogs can support
+binding generation, but native implementation, codec, and execution-capability
+compatibility must be established by the host; matching descriptors alone cannot
+establish it.
+No runtime catalog adapter or generated high-level bindings are implemented.
 
 ### High-level bindings and language metadata
 
@@ -151,12 +182,14 @@ Rust without duplicating the IR declarations.
   and result sorts check that signature, including any generic instantiation.
   Missing names and signature mismatches are errors. Full definition resends are
   optional compatibility checks: identical definitions are no-ops, conflicts
-  are errors. There are no signature-only imports. This is specified in the
-  schema comments; runtime enforcement remains unimplemented. Each payload
-  still includes every referenced node/sort arena entry; indices are local to
-  that message. An `EqSort` entry also idempotently declares its name. Standalone
-  exports retain all installed definitions and their dependencies. Host catalog
-  discovery and its descriptor format remain open.
+  are errors. User definitions have no signature-only imports; host descriptors
+  are complete compatibility assertions about external implementations.
+  This is specified in the schema comments; runtime enforcement remains
+  unimplemented. Each payload still includes every referenced node/sort arena
+  entry; indices are local to that message. An `EqSort` entry also idempotently
+  declares its name. Standalone
+  exports retain all installed definitions and their dependencies. Host binding
+  remains unimplemented.
 
 ### Current-state export and optional recording
 
@@ -205,13 +238,13 @@ handle with the same C and compatible host capabilities. Rules start with fresh
 execution state. Against existing data the Program still uses ordinary action
 semantics, without a restoration-equivalence guarantee.
 
-This contract is not implemented. Complete builtin descriptors still need the
-generic catalog layout discussed above; `Primitive` cannot stand in for a host
-signature. The proposed rule arena also remains a separate layout question.
-Custom value reconstruction requires trusted codecs, and pure non-equality value
-cycles have no selected ordinary-action construction. These are explicit support
-gaps, not permission to silently omit definitions or values or to claim a
-complete export. `Freeze` must fail when required state cannot be represented.
+This contract is not implemented. `HostSortFamily` and `HostPrimitive` provide
+the generic catalog layout; host binding, semantic validation, and full export
+still need implementation. The proposed rule arena remains a separate layout
+question. Custom value reconstruction requires trusted codecs. No ordinary
+native pure non-equality self-cycle has been established; arbitrary host-codec
+cycles remain unproven. `Freeze` must fail when required state cannot be
+represented, not silently omit it or claim a complete export.
 
 **Recording — decided:** an adapter may opt into recording original `Program`
 requests, handle creation/configuration, and their outcomes in order. Recording
@@ -246,10 +279,11 @@ and memory use on the same graph before choosing.
 
 ### Remaining review work
 
-- **Host catalog:** how do both sides discover compatible primitive signatures,
-  execution capabilities, value codecs, and cost models? Descriptions do not
-  transport executable host code. Include custom values with explicit e-class
-  children in encoding/remapping/rebuild tests; generic inspection stays inert.
+- **Host binding:** implement catalog discovery and compatibility checks for
+  native implementations, execution capabilities, value codecs, and cost models.
+  Descriptions do not transport executable host code. Include custom values
+  with explicit e-class children in encoding/remapping/rebuild tests; generic
+  inspection stays inert.
 - **Semantic conformance:** implement and test the checks beyond CEL: types,
   binding, contexts/effects, cycles, and declaration equivalence. In particular,
   equivalent resends may change ordinary syntax sharing but must preserve

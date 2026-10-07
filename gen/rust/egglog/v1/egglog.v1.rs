@@ -35,6 +35,9 @@
 /// such list. Each loop-body iteration starts an independent scope; nested lists
 /// never inherit the outer mapping, which resumes after they return. Rule
 /// firings and other commands' evaluated inputs have their own scopes as in Union.
+/// Sort.var is legal only in HostPrimitive signatures. Node sorts, lambda
+/// parameter sorts, cost sorts and concrete declaration signatures must be
+/// recursively closed. CEL rejects direct variable roots; closure is normative.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct Program {
     /// This draft's IR version is 1. Reject unsupported values rather than
@@ -103,13 +106,16 @@ pub struct Span {
     pub end: u32,
 }
 // ---------------------------------------------------------------------------
-// SORTS — the sort arena and its four kinds.
+// SORTS — shared concrete types and signature patterns.
 // ---------------------------------------------------------------------------
 
-/// Structural, interned types. Equal container/function shapes denote the same
-/// sort; differently named aliases of one container shape are not distinct.
+/// Closed types are structurally interned. Equal container/function shapes
+/// denote the same sort.
+/// Signatures reuse these shapes with binder-local variables. A shared variable
+/// or pattern is interpreted independently in each enclosing GenericSignature;
+/// arena sharing never shares substitutions between signatures or calls.
 /// Sorts are acyclic through Container.args and FuncSort.params/result. CEL
-/// checks those indices, not acyclicity.
+/// checks direct indices, not acyclicity or recursive variable scope.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct Sort {
     /// Optional representative origin and documentation; excluded from sort
@@ -118,7 +124,7 @@ pub struct Sort {
     pub span: ::core::option::Option<Span>,
     #[prost(string, tag = "6")]
     pub doc: ::prost::alloc::string::String,
-    #[prost(oneof = "sort::Kind", tags = "1, 2, 3, 4")]
+    #[prost(oneof = "sort::Kind", tags = "1, 2, 3, 4, 7")]
     pub kind: ::core::option::Option<sort::Kind>,
 }
 /// Nested message and enum types in `Sort`.
@@ -133,23 +139,28 @@ pub mod sort {
         Container(super::Container),
         #[prost(message, tag = "4")]
         Func(super::FuncSort),
+        /// index into the enclosing GenericSignature.type_params
+        #[prost(uint32, tag = "7")]
+        Var(u32),
     }
 }
 /// A nullary equality sort. An entry also declares it; repeated declarations
-/// of the same name are idempotent.
+/// of the same name are idempotent. Its name cannot also name a host sort family.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct EqSort {
     #[prost(string, tag = "1")]
     pub name: ::prost::alloc::string::String,
 }
-/// A host-provided, non-unionable sort, such as Unit, bool, i64, f64, String,
-/// or BigInt.
+/// A nullary host sort-family application, such as Unit, bool, i64 or String.
+/// The family must have arity zero. It is non-unionable.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct PrimSort {
     #[prost(string, tag = "1")]
     pub name: ::prost::alloc::string::String,
 }
-/// A structural container instantiation, such as Vec<i64> or Map<String, Math>.
+/// An application of a positive-arity host sort family, such as Vec<i64> or
+/// Map<String, Math>. The argument count must equal the family's arity. Arguments
+/// may be signature patterns only inside a GenericSignature; otherwise closed.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct Container {
     #[prost(string, tag = "1")]
@@ -158,7 +169,8 @@ pub struct Container {
     #[prost(uint32, repeated, tag = "2")]
     pub args: ::prost::alloc::vec::Vec<u32>,
 }
-/// A structural function type.
+/// A structural function type, not a named host sort family. Its parameter and
+/// result sorts may be patterns only inside a GenericSignature; otherwise closed.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct FuncSort {
     /// index into the enclosing `sorts`
@@ -328,6 +340,8 @@ pub struct Union {
 /// that definition's signature. Generic instantiation does not select another
 /// definition. Frontends resolve overloaded surface syntax and conversions
 /// before this boundary. Missing names and signature mismatches are errors.
+/// HostPrimitive's typing form checks all concrete argument AND result sorts;
+/// every generic parameter must be determined. There are no call-level type args.
 ///
 /// Relation calls are restricted to row positions: a query fact, `Action.term`,
 /// `Change.target`, or `FunctionRow.call`. They cannot be value arguments,
@@ -391,7 +405,12 @@ pub struct Lambda {
     pub body: u32,
 }
 /// A function value with a prefix of a named callable's arguments applied. The
-/// callee is a declared name, never a lambda or another dynamic function value.
+/// callee is a named installed or ambient callable, never a dynamic function
+/// value. Its enclosing sort is a closed FuncSort. Concatenate captured argument
+/// sorts with that FuncSort's remaining params, and use its result as the result
+/// sort of a complete call to the callee. Check this effective call using the
+/// callee's typing form, including varargs or FunctionApplication. It must fully
+/// determine every generic parameter, even with zero or all arguments captured.
 /// Whether a relation can be partially applied is a signature/capability
 /// question; its arguments still cannot contain relation rows as values.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
@@ -652,15 +671,24 @@ pub struct SetCost {
 
 /// Order-independent, immutable definitions. New names may be added. Resending
 /// a complete definition is optional and checks compatibility: identical
-/// definitions are no-ops; conflicting definitions are errors. There is no
-/// separate signature-only import form.
+/// definitions are no-ops; conflicting definitions are errors. User tables and
+/// computed primitives have complete, concrete definitions, not signature-only
+/// imports. Host descriptors instead assert an available compatible provider;
+/// they never install native code. Referencing an ambient definition by name
+/// does not require resending its descriptor.
 /// Compare referenced expression subgraphs structurally, not request-local
 /// indices. Provenance and argument labels do not participate in identity.
 /// Comparison must preserve Union sharing/identity topology; ordinary syntax
 /// sharing may differ. One empty Union reused twice is not two fresh Unions.
-/// Callable names are unique across Constructor, Function, Relation, Primitive,
-/// and ambient host definitions. Compatible resends retain the existing
-/// definition; a conflicting declaration cannot shadow a host definition.
+/// Callable names are unique across Constructor, Function, Relation, Primitive
+/// and HostPrimitive, including ambient definitions. HostSortFamily names occupy
+/// the sort namespace with EqSort, separate from callable names. Compatible
+/// resends retain the definition; conflicting names never shadow definitions.
+/// Host descriptor compatibility compares family arity or primitive typing form
+/// and structural signature, including ordered binder positions. Parameter
+/// labels are diagnostic; alpha-renaming those labels is compatible.
+/// Native implementation, codec and execution-capability compatibility remain
+/// host obligations; descriptor equality alone does not establish them.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct Declaration {
     /// Optional diagnostic origin; excluded from semantic identity.
@@ -669,7 +697,7 @@ pub struct Declaration {
     /// Optional documentation; excluded from semantic identity.
     #[prost(string, tag = "9")]
     pub doc: ::prost::alloc::string::String,
-    #[prost(oneof = "declaration::Kind", tags = "1, 2, 3, 4")]
+    #[prost(oneof = "declaration::Kind", tags = "1, 2, 3, 4, 5, 6")]
     pub kind: ::core::option::Option<declaration::Kind>,
 }
 /// Nested message and enum types in `Declaration`.
@@ -684,6 +712,10 @@ pub mod declaration {
         Relation(super::Relation),
         #[prost(message, tag = "4")]
         Primitive(super::Primitive),
+        #[prost(message, tag = "5")]
+        HostSortFamily(super::HostSortFamily),
+        #[prost(message, tag = "6")]
+        HostPrimitive(super::HostPrimitive),
     }
 }
 /// An argument's sort and optional label. Calls are positional; labels are not
@@ -696,7 +728,7 @@ pub struct Arg {
     #[prost(string, tag = "2")]
     pub name: ::prost::alloc::string::String,
 }
-/// A constructor whose output is an equality sort.
+/// A concrete constructor whose output is an equality sort.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct Constructor {
     #[prost(string, tag = "1")]
@@ -718,7 +750,7 @@ pub struct Constructor {
     #[prost(bool, tag = "5")]
     pub unextractable: bool,
 }
-/// A table-backed function.
+/// A concrete table-backed function.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct Function {
     #[prost(string, tag = "1")]
@@ -735,7 +767,7 @@ pub struct Function {
     #[prost(uint32, optional, tag = "4")]
     pub merge: ::core::option::Option<u32>,
 }
-/// A set of tuples, inserted by an action call and matched by row existence.
+/// A concrete set of tuples, inserted by an action call and matched by row existence.
 /// The declaration has no output field; typed calls have implicit sort Unit.
 /// It has no merge body and is not a valid `Set` target.
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -745,8 +777,8 @@ pub struct Relation {
     #[prost(message, repeated, tag = "2")]
     pub inputs: ::prost::alloc::vec::Vec<Arg>,
 }
-/// A program-defined computed function. Host primitives are ambient and need
-/// no declaration here. Its body and transitive callees must be legal at every
+/// A concrete program-defined computed function, distinct from HostPrimitive.
+/// Its body and transitive callees must be legal at every
 /// use, using host-published ambient capabilities; the receiver checks this.
 /// An expression-only body may still write through Union. No effect-inference
 /// algorithm or fallback for recursive definitions is prescribed here.
@@ -765,6 +797,64 @@ pub struct Primitive {
     /// index into the enclosing `nodes`
     #[prost(uint32, optional, tag = "4")]
     pub body: ::core::option::Option<u32>,
+}
+/// A named host sort family, including nullary scalar sorts. Names are immutable;
+/// compatible resends agree on arity. An arity-zero family uses PrimSort, never
+/// Container; a positive-arity family uses Container. No generic user equality
+/// sorts or implementation/codec code are declared by this descriptor.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct HostSortFamily {
+    #[prost(string, tag = "1")]
+    pub name: ::prost::alloc::string::String,
+    #[prost(uint32, tag = "2")]
+    pub arity: u32,
+}
+/// A host-implemented callable. Submission asserts that a compatible native
+/// implementation is available; it supplies neither a body nor executable code.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct HostPrimitive {
+    #[prost(string, tag = "1")]
+    pub name: ::prost::alloc::string::String,
+    #[prost(oneof = "host_primitive::Typing", tags = "2, 3")]
+    pub typing: ::core::option::Option<host_primitive::Typing>,
+}
+/// Nested message and enum types in `HostPrimitive`.
+pub mod host_primitive {
+    #[derive(Clone, PartialEq, ::prost::Oneof)]
+    pub enum Typing {
+        #[prost(message, tag = "2")]
+        Signature(super::GenericSignature),
+        #[prost(message, tag = "3")]
+        Application(super::FunctionApplication),
+    }
+}
+/// An ordinary host signature: a fixed prefix followed by zero or more
+/// homogeneous varargs when present. Sort indices reference Program.sorts.
+/// Sort.var indices bind by position in type_params; labels do not bind by name
+/// and need not be distinct. All variable uses, including nested Container and
+/// FuncSort patterns, must be in this signature's binder. Each actual call
+/// matches all concrete argument and result sorts structurally to obtain one
+/// consistent, complete substitution. Reject undetermined parameters: e.g.
+/// count<T>(...T)->i64 cannot be called with zero arguments, whereas an empty
+/// vec-of<T>(...T)->Vec<T> determines T from its concrete result sort.
+/// No conversion, subtyping, overload search or heterogeneous type packs.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct GenericSignature {
+    #[prost(string, repeated, tag = "1")]
+    pub type_params: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    #[prost(message, repeated, tag = "2")]
+    pub inputs: ::prost::alloc::vec::Vec<Arg>,
+    #[prost(uint32, optional, tag = "3")]
+    pub output: ::core::option::Option<u32>,
+    #[prost(message, optional, tag = "4")]
+    pub varargs: ::core::option::Option<Arg>,
+}
+/// Dedicated typing for a named application primitive, still invoked by Call.
+/// The first effective argument must have a concrete FuncSort; the remaining
+/// arguments exactly match its params, and the call result matches its result.
+/// PartialCall supplies its effective complete call as described there.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct FunctionApplication {
 }
 /// An immutable ruleset occurrence: an ordered rule list or composition.
 /// An absent name adds no binding and leaves an unmatched occurrence anonymous.
@@ -1102,9 +1192,10 @@ pub struct Extract {
 /// callable. Export each ruleset occurrence once, even if multiple roots reach it.
 /// Include saved code and its dependencies without executing it.
 /// Host implementations/codecs remain external.
-/// The builtin descriptor layout is still unresolved: the current Declaration
-/// cannot encode that complete catalog. This contract does not claim complete
-/// export support; a receiver must fail rather than silently omit definitions.
+/// HostSortFamily and HostPrimitive describe the catalog, including generic
+/// signatures and all referenced sort patterns. These descriptor graphs may
+/// contain Sort.var; the reconstruction data and concrete definitions may not.
+/// Host binding and export remain unimplemented; never silently omit definitions.
 ///
 /// Set Program.cost_sort to the handle's C. Restoration executes the export on
 /// a fresh, data-empty handle with structurally equal C and compatible host
@@ -1134,9 +1225,7 @@ pub struct Extract {
 /// and costs preserve their references. Generic inspection never evaluates
 /// these actions or materializes custom values. Executing them is explicit
 /// trusted materialization and requires the appropriate host codecs.
-/// Pure non-equality value cycles have no selected ordinary-action construction;
-/// their export support remains unresolved, not an implied acyclicity rule for
-/// other uses. If any required state/definition/value cannot be represented,
+/// If any required state/definition/value cannot be represented,
 /// Freeze fails with EVALUATION_FAILED instead of returning a partial export.
 /// Export completeness, canonical keys and reference preservation are normative
 /// obligations, not established by Program's local CEL checks.
@@ -1212,7 +1301,7 @@ pub struct Saturate {
     pub max_iterations: ::core::option::Option<u64>,
 }
 /// Create an empty e-graph with immutable cost sort C. Resolve and validate this
-/// acyclic structural sort arena before allocating a handle. An invalid or
+/// acyclic, recursively closed sort arena before allocating a handle. An invalid or
 /// unsupported configuration is an adapter/lifecycle error, not RunProgram.error.
 /// Frontends may offer an i64 default, but the wire always specifies C. Creating
 /// a handle does not require a value codec or extraction model for every sort.
@@ -1261,7 +1350,8 @@ pub struct RunProgramRequest {
     #[prost(message, optional, tag = "2")]
     pub program: ::core::option::Option<Program>,
 }
-/// Results have their own arenas, independent of the request.
+/// Results have their own concrete arenas, independent of the request. Nested
+/// exported Programs own separate arenas and may contain signature patterns.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct RunProgramResponse {
     #[prost(message, repeated, tag = "1")]

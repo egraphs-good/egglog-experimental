@@ -39,16 +39,23 @@ import "buf/validate/validate.proto";
 // such list. Each loop-body iteration starts an independent scope; nested lists
 // never inherit the outer mapping, which resumes after they return. Rule
 // firings and other commands' evaluated inputs have their own scopes as in Union.
+// Sort.var is legal only in HostPrimitive signatures. Node sorts, lambda
+// parameter sorts, cost sorts and concrete declaration signatures must be
+// recursively closed. CEL rejects direct variable roots; closure is normative.
 message Program {
   option (buf.validate.message).cel = {
     id: "program.cost_sort_in_range"
-    message: "cost_sort must index sorts when present"
-    expression: "!has(this.cost_sort) || this.cost_sort < uint(size(this.sorts))"
+    message: "cost_sort must index a non-variable sort when present"
+    expression:
+      "!has(this.cost_sort) || (this.cost_sort < uint(size(this.sorts)) && "
+      "!has(this.sorts[int(this.cost_sort)].var))"
   };
   option (buf.validate.message).cel = {
     id: "program.node_sort_in_range"
-    message: "every node sort_id must index sorts"
-    expression: "this.nodes.all(n, n.sort_id < uint(size(this.sorts)))"
+    message: "every node sort_id must index a non-variable sort"
+    expression:
+      "this.nodes.all(n, n.sort_id < uint(size(this.sorts)) && "
+      "!has(this.sorts[int(n.sort_id)].var))"
   };
   option (buf.validate.message).cel = {
     id: "program.node_refs_in_range"
@@ -78,7 +85,44 @@ message Program {
       "has(s.func) ? s.func.params + [s.func.result] : [])"
       ".all(i, i < uint(size(this.sorts)))) && "
       "this.nodes.all(n, !has(n.primitive_value) || !has(n.primitive_value.lambda) || "
-      "n.primitive_value.lambda.param_types.all(i, i < uint(size(this.sorts))))"
+      "n.primitive_value.lambda.param_types.all(i, i < uint(size(this.sorts)) && "
+      "!has(this.sorts[int(i)].var)))"
+  };
+  option (buf.validate.message).cel = {
+    id: "program.concrete_signature_roots"
+    message: "concrete declaration signatures must index non-variable sorts"
+    expression:
+      "this.declarations.all(d, "
+      "(has(d.constructor) ? d.constructor.inputs.map(a, a.sort) + [d.constructor.output] : "
+      "has(d.function) ? d.function.inputs.map(a, a.sort) + [d.function.output] : "
+      "has(d.relation) ? d.relation.inputs.map(a, a.sort) : "
+      "has(d.primitive) ? d.primitive.inputs.map(a, a.sort) + [d.primitive.output] : [])"
+      ".all(i, i < uint(size(this.sorts)) && !has(this.sorts[int(i)].var)))"
+  };
+  // Bounds and direct variable roots only; follow nested patterns with the
+  // enclosing signature's binder in the semantic verifier.
+  option (buf.validate.message).cel = {
+    id: "program.generic_signature_roots"
+    message: "signature sorts must exist and direct variables must be bound"
+    expression:
+      "this.declarations.all(d, !has(d.host_primitive) || "
+      "!has(d.host_primitive.signature) || [d.host_primitive.signature].all(sig, "
+      "(sig.inputs.map(a, a.sort) + (has(sig.output) ? [sig.output] : []) + "
+      "(has(sig.varargs) ? [sig.varargs.sort] : [])).all(i, "
+      "i < uint(size(this.sorts)) && (!has(this.sorts[int(i)].var) || "
+      "this.sorts[int(i)].var < uint(size(sig.type_params))))))"
+  };
+  // Ambient family resolution remains normative. This checks declared families
+  // against every direct application, including those in signature patterns.
+  option (buf.validate.message).cel = {
+    id: "program.host_sort_family_uses"
+    message: "host sort uses must match family arity and cannot name equality sorts"
+    expression:
+      "this.declarations.all(d, !has(d.host_sort_family) || this.sorts.all(s, "
+      "(!has(s.prim) || s.prim.name != d.host_sort_family.name || d.host_sort_family.arity == uint(0)) && "
+      "(!has(s.container) || s.container.name != d.host_sort_family.name || "
+      "uint(size(s.container.args)) == d.host_sort_family.arity) && "
+      "(!has(s.eq) || s.eq.name != d.host_sort_family.name)))"
   };
   option (buf.validate.message).cel = {
     id: "program.empty_union_eq_sort"
@@ -199,13 +243,16 @@ message Span {
 }
 
 // ---------------------------------------------------------------------------
-// SORTS — the sort arena and its four kinds.
+// SORTS — shared concrete types and signature patterns.
 // ---------------------------------------------------------------------------
 
-// Structural, interned types. Equal container/function shapes denote the same
-// sort; differently named aliases of one container shape are not distinct.
+// Closed types are structurally interned. Equal container/function shapes
+// denote the same sort.
+// Signatures reuse these shapes with binder-local variables. A shared variable
+// or pattern is interpreted independently in each enclosing GenericSignature;
+// arena sharing never shares substitutions between signatures or calls.
 // Sorts are acyclic through Container.args and FuncSort.params/result. CEL
-// checks those indices, not acyclicity.
+// checks direct indices, not acyclicity or recursive variable scope.
 message Sort {
   oneof kind {
     option (buf.validate.oneof).required = true;
@@ -214,6 +261,7 @@ message Sort {
     PrimSort prim = 2;
     Container container = 3;
     FuncSort func = 4;
+    uint32 var = 7; // index into the enclosing GenericSignature.type_params
   }
 
   // Optional representative origin and documentation; excluded from sort
@@ -223,24 +271,30 @@ message Sort {
 }
 
 // A nullary equality sort. An entry also declares it; repeated declarations
-// of the same name are idempotent.
+// of the same name are idempotent. Its name cannot also name a host sort family.
 message EqSort {
   string name = 1 [(buf.validate.field).string.min_len = 1];
 }
 
-// A host-provided, non-unionable sort, such as Unit, bool, i64, f64, String,
-// or BigInt.
+// A nullary host sort-family application, such as Unit, bool, i64 or String.
+// The family must have arity zero. It is non-unionable.
 message PrimSort {
   string name = 1 [(buf.validate.field).string.min_len = 1];
 }
 
-// A structural container instantiation, such as Vec<i64> or Map<String, Math>.
+// An application of a positive-arity host sort family, such as Vec<i64> or
+// Map<String, Math>. The argument count must equal the family's arity. Arguments
+// may be signature patterns only inside a GenericSignature; otherwise closed.
 message Container {
   string name = 1 [(buf.validate.field).string.min_len = 1];
-  repeated uint32 args = 2 [packed = true]; // index into the enclosing `sorts`
+  repeated uint32 args = 2 [
+    packed = true,
+    (buf.validate.field).repeated.min_items = 1
+  ]; // index into the enclosing `sorts`
 }
 
-// A structural function type.
+// A structural function type, not a named host sort family. Its parameter and
+// result sorts may be patterns only inside a GenericSignature; otherwise closed.
 message FuncSort {
   repeated uint32 params = 1 [packed = true]; // index into the enclosing `sorts`
   uint32 result = 2; // index into the enclosing `sorts`
@@ -394,6 +448,8 @@ message Union {
 // that definition's signature. Generic instantiation does not select another
 // definition. Frontends resolve overloaded surface syntax and conversions
 // before this boundary. Missing names and signature mismatches are errors.
+// HostPrimitive's typing form checks all concrete argument AND result sorts;
+// every generic parameter must be determined. There are no call-level type args.
 //
 // Relation calls are restricted to row positions: a query fact, `Action.term`,
 // `Change.target`, or `FunctionRow.call`. They cannot be value arguments,
@@ -445,7 +501,12 @@ message Lambda {
 }
 
 // A function value with a prefix of a named callable's arguments applied. The
-// callee is a declared name, never a lambda or another dynamic function value.
+// callee is a named installed or ambient callable, never a dynamic function
+// value. Its enclosing sort is a closed FuncSort. Concatenate captured argument
+// sorts with that FuncSort's remaining params, and use its result as the result
+// sort of a complete call to the callee. Check this effective call using the
+// callee's typing form, including varargs or FunctionApplication. It must fully
+// determine every generic parameter, even with zero or all arguments captured.
 // Whether a relation can be partially applied is a signature/capability
 // question; its arguments still cannot contain relation rows as values.
 message PartialCall {
@@ -664,15 +725,24 @@ message SetCost {
 
 // Order-independent, immutable definitions. New names may be added. Resending
 // a complete definition is optional and checks compatibility: identical
-// definitions are no-ops; conflicting definitions are errors. There is no
-// separate signature-only import form.
+// definitions are no-ops; conflicting definitions are errors. User tables and
+// computed primitives have complete, concrete definitions, not signature-only
+// imports. Host descriptors instead assert an available compatible provider;
+// they never install native code. Referencing an ambient definition by name
+// does not require resending its descriptor.
 // Compare referenced expression subgraphs structurally, not request-local
 // indices. Provenance and argument labels do not participate in identity.
 // Comparison must preserve Union sharing/identity topology; ordinary syntax
 // sharing may differ. One empty Union reused twice is not two fresh Unions.
-// Callable names are unique across Constructor, Function, Relation, Primitive,
-// and ambient host definitions. Compatible resends retain the existing
-// definition; a conflicting declaration cannot shadow a host definition.
+// Callable names are unique across Constructor, Function, Relation, Primitive
+// and HostPrimitive, including ambient definitions. HostSortFamily names occupy
+// the sort namespace with EqSort, separate from callable names. Compatible
+// resends retain the definition; conflicting names never shadow definitions.
+// Host descriptor compatibility compares family arity or primitive typing form
+// and structural signature, including ordered binder positions. Parameter
+// labels are diagnostic; alpha-renaming those labels is compatible.
+// Native implementation, codec and execution-capability compatibility remain
+// host obligations; descriptor equality alone does not establish them.
 message Declaration {
   oneof kind {
     option (buf.validate.oneof).required = true;
@@ -681,6 +751,8 @@ message Declaration {
     Function function = 2;
     Relation relation = 3;
     Primitive primitive = 4;
+    HostSortFamily host_sort_family = 5;
+    HostPrimitive host_primitive = 6;
   }
 
   // Optional diagnostic origin; excluded from semantic identity.
@@ -697,7 +769,7 @@ message Arg {
   string name = 2;
 }
 
-// A constructor whose output is an equality sort.
+// A concrete constructor whose output is an equality sort.
 message Constructor {
   string name = 1 [(buf.validate.field).string.min_len = 1];
   repeated Arg inputs = 2;
@@ -712,7 +784,7 @@ message Constructor {
   bool unextractable = 5;
 }
 
-// A table-backed function.
+// A concrete table-backed function.
 message Function {
   string name = 1 [(buf.validate.field).string.min_len = 1];
   repeated Arg inputs = 2;
@@ -723,7 +795,7 @@ message Function {
   optional uint32 merge = 4; // index into the enclosing `nodes`
 }
 
-// A set of tuples, inserted by an action call and matched by row existence.
+// A concrete set of tuples, inserted by an action call and matched by row existence.
 // The declaration has no output field; typed calls have implicit sort Unit.
 // It has no merge body and is not a valid `Set` target.
 message Relation {
@@ -731,8 +803,8 @@ message Relation {
   repeated Arg inputs = 2;
 }
 
-// A program-defined computed function. Host primitives are ambient and need
-// no declaration here. Its body and transitive callees must be legal at every
+// A concrete program-defined computed function, distinct from HostPrimitive.
+// Its body and transitive callees must be legal at every
 // use, using host-published ambient capabilities; the receiver checks this.
 // An expression-only body may still write through Union. No effect-inference
 // algorithm or fallback for recursive definitions is prescribed here.
@@ -744,6 +816,51 @@ message Primitive {
   // order, including in an exported declaration.
   optional uint32 body = 4 [(buf.validate.field).required = true]; // index into the enclosing `nodes`
 }
+
+// A named host sort family, including nullary scalar sorts. Names are immutable;
+// compatible resends agree on arity. An arity-zero family uses PrimSort, never
+// Container; a positive-arity family uses Container. No generic user equality
+// sorts or implementation/codec code are declared by this descriptor.
+message HostSortFamily {
+  string name = 1 [(buf.validate.field).string.min_len = 1];
+  uint32 arity = 2;
+}
+
+// A host-implemented callable. Submission asserts that a compatible native
+// implementation is available; it supplies neither a body nor executable code.
+message HostPrimitive {
+  string name = 1 [(buf.validate.field).string.min_len = 1];
+
+  oneof typing {
+    option (buf.validate.oneof).required = true;
+
+    GenericSignature signature = 2;
+    FunctionApplication application = 3;
+  }
+}
+
+// An ordinary host signature: a fixed prefix followed by zero or more
+// homogeneous varargs when present. Sort indices reference Program.sorts.
+// Sort.var indices bind by position in type_params; labels do not bind by name
+// and need not be distinct. All variable uses, including nested Container and
+// FuncSort patterns, must be in this signature's binder. Each actual call
+// matches all concrete argument and result sorts structurally to obtain one
+// consistent, complete substitution. Reject undetermined parameters: e.g.
+// count<T>(...T)->i64 cannot be called with zero arguments, whereas an empty
+// vec-of<T>(...T)->Vec<T> determines T from its concrete result sort.
+// No conversion, subtyping, overload search or heterogeneous type packs.
+message GenericSignature {
+  repeated string type_params = 1;
+  repeated Arg inputs = 2;
+  optional uint32 output = 3 [(buf.validate.field).required = true];
+  Arg varargs = 4;
+}
+
+// Dedicated typing for a named application primitive, still invoked by Call.
+// The first effective argument must have a concrete FuncSort; the remaining
+// arguments exactly match its params, and the call result matches its result.
+// PartialCall supplies its effective complete call as described there.
+message FunctionApplication {}
 
 // An immutable ruleset occurrence: an ordered rule list or composition.
 // An absent name adds no binding and leaves an unmatched occurrence anonymous.
@@ -1051,9 +1168,10 @@ enum Extractor {
 // callable. Export each ruleset occurrence once, even if multiple roots reach it.
 // Include saved code and its dependencies without executing it.
 // Host implementations/codecs remain external.
-// The builtin descriptor layout is still unresolved: the current Declaration
-// cannot encode that complete catalog. This contract does not claim complete
-// export support; a receiver must fail rather than silently omit definitions.
+// HostSortFamily and HostPrimitive describe the catalog, including generic
+// signatures and all referenced sort patterns. These descriptor graphs may
+// contain Sort.var; the reconstruction data and concrete definitions may not.
+// Host binding and export remain unimplemented; never silently omit definitions.
 //
 // Set Program.cost_sort to the handle's C. Restoration executes the export on
 // a fresh, data-empty handle with structurally equal C and compatible host
@@ -1083,9 +1201,7 @@ enum Extractor {
 // and costs preserve their references. Generic inspection never evaluates
 // these actions or materializes custom values. Executing them is explicit
 // trusted materialization and requires the appropriate host codecs.
-// Pure non-equality value cycles have no selected ordinary-action construction;
-// their export support remains unresolved, not an implied acyclicity rule for
-// other uses. If any required state/definition/value cannot be represented,
+// If any required state/definition/value cannot be represented,
 // Freeze fails with EVALUATION_FAILED instead of returning a partial export.
 // Export completeness, canonical keys and reference preservation are normative
 // obligations, not established by Program's local CEL checks.
@@ -1171,13 +1287,18 @@ service EgglogService {
 }
 
 // Create an empty e-graph with immutable cost sort C. Resolve and validate this
-// acyclic structural sort arena before allocating a handle. An invalid or
+// acyclic, recursively closed sort arena before allocating a handle. An invalid or
 // unsupported configuration is an adapter/lifecycle error, not RunProgram.error.
 // Frontends may offer an i64 default, but the wire always specifies C. Creating
 // a handle does not require a value codec or extraction model for every sort.
 // Costs in Program and response arenas must agree with C structurally,
 // never by comparing arena-local indices.
 message CreateEGraphRequest {
+  option (buf.validate.message).cel = {
+    id: "create_egraph_request.closed_sorts"
+    message: "creation sorts cannot contain signature variables"
+    expression: "this.sorts.all(s, !has(s.var))"
+  };
   option (buf.validate.message).cel = {
     id: "create_egraph_request.cost_sort_in_range"
     message: "cost_sort must index sorts"
@@ -1224,8 +1345,14 @@ message RunProgramRequest {
   Program program = 2;
 }
 
-// Results have their own arenas, independent of the request.
+// Results have their own concrete arenas, independent of the request. Nested
+// exported Programs own separate arenas and may contain signature patterns.
 message RunProgramResponse {
+  option (buf.validate.message).cel = {
+    id: "run_program_response.closed_sorts"
+    message: "response sorts cannot contain signature variables"
+    expression: "this.sorts.all(s, !has(s.var))"
+  };
   option (buf.validate.message).cel = {
     id: "run_program_response.node_sort_in_range"
     message: "every node sort_id must index sorts"
