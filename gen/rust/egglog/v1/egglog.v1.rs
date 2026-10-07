@@ -923,6 +923,8 @@ pub struct RuleList {
 /// Names may be installed by this Program or an earlier one. Missing names
 /// and out-of-range indices are errors. An explicitly empty name selects the
 /// default ruleset; an unset reference does not implicitly select it.
+/// In RuleAttribution, indices refer to the associated request's Program,
+/// and names resolve on the handle used by that request.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct RulesetRef {
     #[prost(oneof = "ruleset_ref::Kind", tags = "1, 2")]
@@ -1079,8 +1081,8 @@ pub struct Check {
     #[prost(uint32, repeated, tag = "1")]
     pub facts: ::prost::alloc::vec::Vec<u32>,
 }
-/// Execute one ruleset step, optionally using a bound scheduler. Returns
-/// `RunReport`.
+/// Execute one ruleset step, optionally using a bound scheduler. A completed
+/// top-level Run returns RunOutcome; nested Runs contribute to their loop.
 /// Flatten the selected ruleset transitively in inclusion order, retaining each
 /// rule occurrence only at its first inclusion in this complete Run. Identity,
 /// not name or structural equality, determines duplication; distinct equal
@@ -1263,8 +1265,8 @@ pub struct PrintTableStats {
     pub tables: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
 }
 /// Execute `body` exactly `times` times, unless `until` matches or execution
-/// fails. Does not stop early when the database is unchanged. Returns
-/// `RunReport`.
+/// fails. Does not stop early when the database is unchanged. A completed
+/// top-level Repeat returns LoopOutcome.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct Repeat {
     #[prost(message, repeated, tag = "1")]
@@ -1281,7 +1283,7 @@ pub struct Repeat {
 /// Repeat `body` until a complete iteration can stop, or a bound or `until`
 /// condition ends it. Stop only when the iteration made no changes and every
 /// consulted scheduler permits stopping. An unbounded body may diverge.
-/// Returns `RunReport`.
+/// A completed top-level Saturate returns LoopOutcome.
 ///
 /// Progress is recomputed each iteration over every mutation in the body:
 /// actions, `keep_best`, extraction-root evaluation, and nested loops. Row
@@ -1349,6 +1351,12 @@ pub struct RunProgramRequest {
     pub egraph_id: u64,
     #[prost(message, optional, tag = "2")]
     pub program: ::core::option::Option<Program>,
+    /// Off by default and scoped to this request. False disables optional profile
+    /// collection/retention, not just serialization. Scheduler-required counters,
+    /// progress and stopping checks remain. Outcomes and requested observations
+    /// are independent of this flag. Collection-off needs runtime implementation.
+    #[prost(bool, tag = "3")]
+    pub profile: bool,
 }
 /// Results have their own concrete arenas, independent of the request. Nested
 /// exported Programs own separate arenas and may contain signature patterns.
@@ -1358,19 +1366,65 @@ pub struct RunProgramResponse {
     pub nodes: ::prost::alloc::vec::Vec<Node>,
     #[prost(message, repeated, tag = "2")]
     pub sorts: ::prost::alloc::vec::Vec<Sort>,
-    /// Flat execution order; commands without outputs contribute no entry.
-    /// Repeated executions contribute repeated entries. No iteration paths
-    /// or nested output structure are recorded.
+    /// Completion order. Each completed TOP-LEVEL Run/Repeat/Saturate contributes
+    /// one compact outcome; nested control commands contribute none. Every
+    /// requested observation contributes its output, including repeated executions
+    /// inside loops. Commands without outputs contribute no entry.
     #[prost(message, repeated, tag = "3")]
     pub outputs: ::prost::alloc::vec::Vec<CommandOutput>,
-    /// Origins for this response's nodes, sorts and errors, including installed
-    /// definitions from earlier requests. Each exported Program owns its files.
+    /// Origins for this response's nodes, sorts, rules and errors, including
+    /// installed definitions from earlier requests. Exported Programs own files.
     #[prost(message, repeated, tag = "4")]
     pub files: ::prost::alloc::vec::Vec<SourceFile>,
-    /// Absent on success. Present means execution stopped; `outputs` is the
-    /// prefix that completed, and every entry in it is valid.
+    /// Absent on success. Present means execution stopped; `outputs` contains
+    /// completed outputs, and every entry is valid. A failed loop has
+    /// no outcome, but observations completed within it remain here.
     #[prost(message, optional, tag = "5")]
     pub error: ::core::option::Option<Error>,
+    /// Only occurrence identities referenced by error/profile, not global IDs or
+    /// definition copies. Shared occurrences reuse one index; distinct equal
+    /// occurrences have distinct indices even when diagnostics coincide. Include
+    /// attribution needed by an error even when profile collection is off;
+    /// otherwise an off response has no catalog entries.
+    #[prost(message, repeated, tag = "6")]
+    pub rules: ::prost::alloc::vec::Vec<RuleAttribution>,
+    /// Present iff requested, including when no Run was entered or validation
+    /// failed. Summary only: no dynamic iteration coordinates or event history.
+    #[prost(message, optional, tag = "7")]
+    pub profile: ::core::option::Option<ProfileSummary>,
+}
+/// One authored RuleDecl occurrence, including both directions of a BiRewrite.
+/// Pick one valid route from the request's ruleset arena or an installed named
+/// root, following composition-child positions (and resolving their refs), to
+/// a leaf RuleList. `rule` indexes that leaf. The route must identify the actual
+/// occurrence, including retained anonymous leaves absent from this request.
+/// Bounds, name resolution and terminal-leaf checks are normative. Multiple
+/// routes to the same occurrence do not create additional catalog entries.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct RuleAttribution {
+    #[prost(message, optional, tag = "1")]
+    pub root: ::core::option::Option<RulesetRef>,
+    #[prost(uint32, repeated, tag = "2")]
+    pub children: ::prost::alloc::vec::Vec<u32>,
+    #[prost(uint32, tag = "3")]
+    pub rule: u32,
+    /// authored RuleDecl.name; diagnostic, never a fabricated ID
+    #[prost(string, tag = "4")]
+    pub name: ::prost::alloc::string::String,
+    #[prost(message, optional, tag = "5")]
+    pub span: ::core::option::Option<Span>,
+}
+/// One dynamic command execution in the submitted Program. path\[0\] indexes
+/// Program.commands; each later component indexes the previous Repeat/Saturate
+/// command's body. iterations gives the zero-based iteration of each enclosing
+/// loop, outermost first. It does not include the target loop's own iteration.
+/// Bounds and command kinds are checked against the request, not this response.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct CommandLocation {
+    #[prost(uint32, repeated, packed = "false", tag = "1")]
+    pub path: ::prost::alloc::vec::Vec<u32>,
+    #[prost(uint64, repeated, tag = "2")]
+    pub iterations: ::prost::alloc::vec::Vec<u64>,
 }
 /// A failure that ended the program. Effects completed before it are retained —
 /// there is no rollback — and no later command runs; a caller needing
@@ -1379,9 +1433,8 @@ pub struct RunProgramResponse {
 /// Engine failures only. A decode fault, an unknown method and an unknown
 /// `egraph_id` are transport faults and never appear here.
 ///
-/// The locators below are optional, subject to the rule-attribution invariant.
-/// Anonymous-ruleset attribution is unresolved; the name-based fields below
-/// must not be filled with invented names or IDs.
+/// Source and command locators are independent: a rule expression can supply
+/// the span while its executing Run supplies the command location.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct Error {
     #[prost(enumeration = "ErrorCode", tag = "1")]
@@ -1389,42 +1442,41 @@ pub struct Error {
     /// Engine text, formatted for humans. NEVER parsed; wording is not contract.
     #[prost(string, tag = "2")]
     pub message: ::prost::alloc::string::String,
-    /// User-source origin. Absent when the engine has no user span; absence is the
-    /// unset message, never a zero offset.
+    /// Most specific known user-source origin (e.g. failing expression, then
+    /// rule); fall back to the active command's span. Absent if none is known,
+    /// never represented by a fabricated zero offset.
     #[prost(message, optional, tag = "3")]
     pub span: ::core::option::Option<Span>,
-    /// A failure inside a loop body reports the enclosing TOP-LEVEL command.
-    /// Absent when the failure precedes execution.
+    /// Innermost active command, not its enclosing top-level loop. A failure in
+    /// a loop's own pre-check locates that loop, with only its enclosing iteration
+    /// coordinates. Absent when the failure precedes command execution.
+    #[prost(message, optional, tag = "4")]
+    pub location: ::core::option::Option<CommandLocation>,
+    /// Supplied structurally for an attributed rule/rewrite failure, never parsed
+    /// from message text. Presence is independent of profile collection.
     ///
-    /// index into `Program.commands`
-    #[prost(uint32, optional, tag = "4")]
-    pub command: ::core::option::Option<u32>,
-    /// Authored RuleDecl.name for an attributed rule/rewrite failure; empty means
-    /// no rule attribution, in which case ruleset must also be empty.
-    /// Supplied structurally, not recovered from the engine's message text.
-    /// Both directions of a BiRewrite retain the same authored attribution.
-    #[prost(string, tag = "5")]
-    pub rule: ::prost::alloc::string::String,
+    /// index into RunProgramResponse.rules
+    #[prost(uint32, optional, tag = "5")]
+    pub rule: ::core::option::Option<u32>,
     /// Engine-internal origin as `file:line:col`; empty when there is none.
     /// Diagnostic only, and not a `Span`: `Span.file` indexes USER source.
     #[prost(string, tag = "6")]
     pub engine_origin: ::prost::alloc::string::String,
-    /// Provisional named-ruleset attribution.
-    /// Empty denotes the default ruleset when rule is present, otherwise no
-    /// attribution; it must not be repurposed as an anonymous occurrence ID.
-    #[prost(string, tag = "7")]
-    pub ruleset: ::prost::alloc::string::String,
 }
 // ---------------------------------------------------------------------------
 // COMMAND OUTPUTS — the `CommandOutput.kind` arms, in arm order.
 // ---------------------------------------------------------------------------
 
-/// Run, Repeat, and Saturate return reports; observations return their matching
-/// arm. Actions, checks, scheduler bindings, and keep_best produce no entry.
+/// Completed top-level control commands return compact outcomes; observations
+/// return their matching arm at every nesting depth. Actions, checks, scheduler
+/// bindings, and keep_best produce no entry. The arm must match the located
+/// request command. Nested control outcomes are folded, never appended here.
 /// Execution errors are `RunProgramResponse.error`, not an arm here.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct CommandOutput {
-    #[prost(oneof = "command_output::Kind", tags = "1, 2, 3, 4, 5, 6")]
+    #[prost(message, optional, tag = "7")]
+    pub location: ::core::option::Option<CommandLocation>,
+    #[prost(oneof = "command_output::Kind", tags = "1, 2, 3, 4, 5, 6, 8")]
     pub kind: ::core::option::Option<command_output::Kind>,
 }
 /// Nested message and enum types in `CommandOutput`.
@@ -1432,7 +1484,7 @@ pub mod command_output {
     #[derive(Clone, PartialEq, ::prost::Oneof)]
     pub enum Kind {
         #[prost(message, tag = "1")]
-        Report(super::RunReport),
+        Run(super::RunOutcome),
         #[prost(message, tag = "2")]
         Extraction(super::ExtractResult),
         #[prost(message, tag = "3")]
@@ -1443,44 +1495,32 @@ pub mod command_output {
         PrintedFunction(super::PrintedFunction),
         #[prost(message, tag = "6")]
         TableStats(super::TableStatsResult),
+        #[prost(message, tag = "8")]
+        Loop(super::LoopOutcome),
     }
 }
-/// Reporting and attribution are provisional, especially for anonymous
-/// rulesets and nested/repeated execution. The existing name-based fields do
-/// not define exact occurrence keys or a complete execution hierarchy.
-/// One command's report. Across iterations, updated is ORed and can_stop is
-/// ANDed. A loop's aggregate records history, not its termination reason.
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct RunReport {
+/// One completed Run, independent of optional profiling.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct RunOutcome {
     #[prost(bool, tag = "1")]
     pub updated: bool,
-    /// The body made no changes and every consulted scheduler permits stopping.
+    /// This Run made no changes and its scheduler, if any, permits stopping.
+    /// Does not by itself prove saturation under a resource-limited scheduler.
     #[prost(bool, tag = "2")]
     pub can_stop: bool,
-    #[prost(message, repeated, tag = "3")]
-    pub iterations: ::prost::alloc::vec::Vec<IterationReport>,
-    #[prost(message, repeated, tag = "4")]
-    pub rules: ::prost::alloc::vec::Vec<RuleReport>,
-    #[prost(message, repeated, tag = "5")]
-    pub rulesets: ::prost::alloc::vec::Vec<RulesetReport>,
-    /// Required for Repeat/Saturate; absent for Run. Independent of progress.
-    #[prost(enumeration = "TerminationReason", optional, tag = "6")]
-    pub termination: ::core::option::Option<i32>,
-    /// Body execution count; zero for bare `Run`. Distinct from `iterations`.
-    #[prost(uint64, tag = "7")]
-    pub loop_iterations: u64,
 }
-/// One rule iteration's telemetry; distinct from loop-body iteration counts.
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct IterationReport {
+/// One completed Repeat/Saturate, including zero-body-execution completion.
+/// No historical can_stop aggregate: termination states why this loop ended.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct LoopOutcome {
+    /// any mutation across the whole loop, including nested work
     #[prost(bool, tag = "1")]
-    pub changed: bool,
+    pub updated: bool,
+    /// completed executions of this loop's body
     #[prost(uint64, tag = "2")]
-    pub search_and_apply_nanos: u64,
-    #[prost(uint64, tag = "3")]
-    pub rebuild_nanos: u64,
-    #[prost(message, repeated, tag = "4")]
-    pub table_sizes: ::prost::alloc::vec::Vec<TableSize>,
+    pub iterations: u64,
+    #[prost(enumeration = "TerminationReason", optional, tag = "3")]
+    pub termination: ::core::option::Option<i32>,
 }
 /// One table's row count.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
@@ -1490,32 +1530,61 @@ pub struct TableSize {
     #[prost(uint64, tag = "2")]
     pub rows: u64,
 }
-/// One rule's execution statistics.
-#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct RuleReport {
-    #[prost(string, tag = "1")]
-    pub rule: ::prost::alloc::string::String,
-    #[prost(uint64, tag = "2")]
-    pub matches: u64,
-    #[prost(uint64, tag = "3")]
-    pub search_and_apply_nanos: u64,
-    /// Provisional named-ruleset attribution.
-    /// Empty denotes the default ruleset, not an anonymous occurrence ID.
-    #[prost(string, tag = "4")]
-    pub ruleset: ::prost::alloc::string::String,
+/// Aggregate coverage of this request, not a trace. Complete iff the whole
+/// request succeeded; false includes work observed before failure, including
+/// a failing Run. Exactly one entry per entered static Run site; no unentered
+/// site appears. Completion says nothing about availability of individual
+/// optional metrics. No collection budget/truncation is defined here.
+/// Per-iteration histories are deferred.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ProfileSummary {
+    #[prost(bool, tag = "1")]
+    pub complete: bool,
+    #[prost(message, repeated, tag = "2")]
+    pub runs: ::prost::alloc::vec::Vec<RunSummary>,
 }
-/// One ruleset's execution statistics.
-#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct RulesetReport {
-    /// Provisional name-based attribution; not an anonymous occurrence ID.
-    #[prost(string, tag = "1")]
-    pub ruleset: ::prost::alloc::string::String,
-    #[prost(uint64, tag = "2")]
-    pub search_and_apply_nanos: u64,
-    #[prost(uint64, tag = "3")]
-    pub merge_nanos: u64,
-    #[prost(uint64, tag = "4")]
-    pub rebuild_nanos: u64,
+/// All invocations of one static Run command, across enclosing loop iterations.
+/// Path uses CommandLocation.path without dynamic coordinates. The site must
+/// resolve to Run in the request. Each selected occurrence contributes once per
+/// Run's selection, not once per group membership; BiRewrite directions share
+/// one authored occurrence. No nested-loop or ruleset totals duplicate this work.
+/// Optional metrics total the observed work across these invocations. Omit a
+/// total if any required measurement is unavailable or cannot be faithfully
+/// attributed; do not serialize only its known subset.
+/// Present zero means measured zero, never unavailable. Per-rule timing is a
+/// breakdown of Run timing, not additional elapsed time to add to it. These
+/// phase measurements need not partition wall time; no total elapsed is given.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct RunSummary {
+    #[prost(uint32, repeated, packed = "false", tag = "1")]
+    pub command_path: ::prost::alloc::vec::Vec<u32>,
+    #[prost(uint64, optional, tag = "2")]
+    pub search_and_apply_nanos: ::core::option::Option<u64>,
+    #[prost(uint64, optional, tag = "3")]
+    pub merge_nanos: ::core::option::Option<u64>,
+    #[prost(uint64, optional, tag = "4")]
+    pub rebuild_nanos: ::core::option::Option<u64>,
+    #[prost(message, repeated, tag = "5")]
+    pub rules: ::prost::alloc::vec::Vec<RuleSummary>,
+    /// entered Runs, including a failing final invocation
+    #[prost(uint64, tag = "6")]
+    pub invocations: u64,
+}
+/// Statistics for one response-local authored occurrence at one static Run site.
+/// Both BiRewrite directions and internal decomposition contribute here only
+/// when the engine can attribute the measurement faithfully to that occurrence.
+/// Otherwise leave it absent rather than fabricating a count or timing.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct RuleSummary {
+    /// index into RunProgramResponse.rules
+    #[prost(uint32, optional, tag = "1")]
+    pub rule: ::core::option::Option<u32>,
+    /// Observed complete source-query matches, not changed rows or internal
+    /// decomposition matches. Does not count potential matches beyond a limit.
+    #[prost(uint64, optional, tag = "2")]
+    pub matches: ::core::option::Option<u64>,
+    #[prost(uint64, optional, tag = "3")]
+    pub search_and_apply_nanos: ::core::option::Option<u64>,
 }
 /// One result per requested root, in request order.
 #[derive(Clone, PartialEq, ::prost::Message)]

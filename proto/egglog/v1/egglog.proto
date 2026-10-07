@@ -927,6 +927,8 @@ message RuleList {
 // Names may be installed by this Program or an earlier one. Missing names
 // and out-of-range indices are errors. An explicitly empty name selects the
 // default ruleset; an unset reference does not implicitly select it.
+// In RuleAttribution, indices refer to the associated request's Program,
+// and names resolve on the handle used by that request.
 message RulesetRef {
   oneof kind {
     option (buf.validate.oneof).required = true;
@@ -1054,8 +1056,8 @@ message Check {
   repeated uint32 facts = 1 [packed = true]; // index into the enclosing `nodes`
 }
 
-// Execute one ruleset step, optionally using a bound scheduler. Returns
-// `RunReport`.
+// Execute one ruleset step, optionally using a bound scheduler. A completed
+// top-level Run returns RunOutcome; nested Runs contribute to their loop.
 // Flatten the selected ruleset transitively in inclusion order, retaining each
 // rule occurrence only at its first inclusion in this complete Run. Identity,
 // not name or structural equality, determines duplication; distinct equal
@@ -1240,8 +1242,8 @@ message PrintTableStats {
 }
 
 // Execute `body` exactly `times` times, unless `until` matches or execution
-// fails. Does not stop early when the database is unchanged. Returns
-// `RunReport`.
+// fails. Does not stop early when the database is unchanged. A completed
+// top-level Repeat returns LoopOutcome.
 message Repeat {
   repeated Command body = 1;
 
@@ -1255,7 +1257,7 @@ message Repeat {
 // Repeat `body` until a complete iteration can stop, or a bound or `until`
 // condition ends it. Stop only when the iteration made no changes and every
 // consulted scheduler permits stopping. An unbounded body may diverge.
-// Returns `RunReport`.
+// A completed top-level Saturate returns LoopOutcome.
 //
 // Progress is recomputed each iteration over every mutation in the body:
 // actions, `keep_best`, extraction-root evaluation, and nested loops. Row
@@ -1343,6 +1345,12 @@ message DestroyEGraphResponse {}
 message RunProgramRequest {
   uint64 egraph_id = 1;
   Program program = 2;
+
+  // Off by default and scoped to this request. False disables optional profile
+  // collection/retention, not just serialization. Scheduler-required counters,
+  // progress and stopping checks remain. Outcomes and requested observations
+  // are independent of this flag. Collection-off needs runtime implementation.
+  bool profile = 3;
 }
 
 // Results have their own concrete arenas, independent of the request. Nested
@@ -1395,22 +1403,79 @@ message RunProgramResponse {
       "this.nodes.all(n, !has(n.union) || size(n.union.members) > 0 || "
       "(n.sort_id < uint(size(this.sorts)) && has(this.sorts[int(n.sort_id)].eq)))"
   };
+  option (buf.validate.message).cel = {
+    id: "run_program_response.rule_refs_in_range"
+    message: "error and profile rule references must index response rules"
+    expression:
+      "(!has(this.error) || !has(this.error.rule) || this.error.rule < uint(size(this.rules))) && "
+      "(!has(this.profile) || this.profile.runs.all(s, "
+      "s.rules.all(r, r.rule < uint(size(this.rules)))))"
+  };
+  option (buf.validate.message).cel = {
+    id: "run_program_response.profile_completion"
+    message: "a present profile is complete exactly when the request succeeded"
+    expression: "!has(this.profile) || this.profile.complete == !has(this.error)"
+  };
 
   repeated Node nodes = 1;
   repeated Sort sorts = 2;
 
-  // Flat execution order; commands without outputs contribute no entry.
-  // Repeated executions contribute repeated entries. No iteration paths
-  // or nested output structure are recorded.
+  // Completion order. Each completed TOP-LEVEL Run/Repeat/Saturate contributes
+  // one compact outcome; nested control commands contribute none. Every
+  // requested observation contributes its output, including repeated executions
+  // inside loops. Commands without outputs contribute no entry.
   repeated CommandOutput outputs = 3;
 
-  // Origins for this response's nodes, sorts and errors, including installed
-  // definitions from earlier requests. Each exported Program owns its files.
+  // Origins for this response's nodes, sorts, rules and errors, including
+  // installed definitions from earlier requests. Exported Programs own files.
   repeated SourceFile files = 4;
 
-  // Absent on success. Present means execution stopped; `outputs` is the
-  // prefix that completed, and every entry in it is valid.
+  // Absent on success. Present means execution stopped; `outputs` contains
+  // completed outputs, and every entry is valid. A failed loop has
+  // no outcome, but observations completed within it remain here.
   Error error = 5;
+
+  // Only occurrence identities referenced by error/profile, not global IDs or
+  // definition copies. Shared occurrences reuse one index; distinct equal
+  // occurrences have distinct indices even when diagnostics coincide. Include
+  // attribution needed by an error even when profile collection is off;
+  // otherwise an off response has no catalog entries.
+  repeated RuleAttribution rules = 6;
+
+  // Present iff requested, including when no Run was entered or validation
+  // failed. Summary only: no dynamic iteration coordinates or event history.
+  ProfileSummary profile = 7;
+}
+
+// One authored RuleDecl occurrence, including both directions of a BiRewrite.
+// Pick one valid route from the request's ruleset arena or an installed named
+// root, following composition-child positions (and resolving their refs), to
+// a leaf RuleList. `rule` indexes that leaf. The route must identify the actual
+// occurrence, including retained anonymous leaves absent from this request.
+// Bounds, name resolution and terminal-leaf checks are normative. Multiple
+// routes to the same occurrence do not create additional catalog entries.
+message RuleAttribution {
+  RulesetRef root = 1 [(buf.validate.field).required = true];
+  repeated uint32 children = 2;
+  uint32 rule = 3;
+  string name = 4; // authored RuleDecl.name; diagnostic, never a fabricated ID
+  Span span = 5;
+}
+
+// One dynamic command execution in the submitted Program. path[0] indexes
+// Program.commands; each later component indexes the previous Repeat/Saturate
+// command's body. iterations gives the zero-based iteration of each enclosing
+// loop, outermost first. It does not include the target loop's own iteration.
+// Bounds and command kinds are checked against the request, not this response.
+message CommandLocation {
+  option (buf.validate.message).cel = {
+    id: "command_location.iteration_depth"
+    message: "one iteration coordinate is required per enclosing loop"
+    expression: "size(this.path) == size(this.iterations) + 1"
+  };
+
+  repeated uint32 path = 1 [(buf.validate.field).repeated.min_items = 1];
+  repeated uint64 iterations = 2;
 }
 
 // A failure that ended the program. Effects completed before it are retained —
@@ -1420,16 +1485,9 @@ message RunProgramResponse {
 // Engine failures only. A decode fault, an unknown method and an unknown
 // `egraph_id` are transport faults and never appear here.
 //
-// The locators below are optional, subject to the rule-attribution invariant.
-// Anonymous-ruleset attribution is unresolved; the name-based fields below
-// must not be filled with invented names or IDs.
+// Source and command locators are independent: a rule expression can supply
+// the span while its executing Run supplies the command location.
 message Error {
-  option (buf.validate.message).cel = {
-    id: "error.rule_attribution"
-    message: "ruleset attribution requires a rule"
-    expression: "this.rule != '' || this.ruleset == ''"
-  };
-
   ErrorCode code = 1 [(buf.validate.field).enum = {
     defined_only: true
     not_in: [0]
@@ -1438,28 +1496,23 @@ message Error {
   // Engine text, formatted for humans. NEVER parsed; wording is not contract.
   string message = 2 [(buf.validate.field).string.min_len = 1];
 
-  // User-source origin. Absent when the engine has no user span; absence is the
-  // unset message, never a zero offset.
+  // Most specific known user-source origin (e.g. failing expression, then
+  // rule); fall back to the active command's span. Absent if none is known,
+  // never represented by a fabricated zero offset.
   Span span = 3;
 
-  // A failure inside a loop body reports the enclosing TOP-LEVEL command.
-  // Absent when the failure precedes execution.
-  optional uint32 command = 4; // index into `Program.commands`
+  // Innermost active command, not its enclosing top-level loop. A failure in
+  // a loop's own pre-check locates that loop, with only its enclosing iteration
+  // coordinates. Absent when the failure precedes command execution.
+  CommandLocation location = 4;
 
-  // Authored RuleDecl.name for an attributed rule/rewrite failure; empty means
-  // no rule attribution, in which case ruleset must also be empty.
-  // Supplied structurally, not recovered from the engine's message text.
-  // Both directions of a BiRewrite retain the same authored attribution.
-  string rule = 5;
+  // Supplied structurally for an attributed rule/rewrite failure, never parsed
+  // from message text. Presence is independent of profile collection.
+  optional uint32 rule = 5; // index into RunProgramResponse.rules
 
   // Engine-internal origin as `file:line:col`; empty when there is none.
   // Diagnostic only, and not a `Span`: `Span.file` indexes USER source.
   string engine_origin = 6;
-
-  // Provisional named-ruleset attribution.
-  // Empty denotes the default ruleset when rule is present, otherwise no
-  // attribution; it must not be repurposed as an anonymous occurrence ID.
-  string ruleset = 7;
 }
 
 // Failure classes: one value per class of remedy, not one per engine error.
@@ -1494,45 +1547,69 @@ enum ErrorCode {
 // COMMAND OUTPUTS — the `CommandOutput.kind` arms, in arm order.
 // ---------------------------------------------------------------------------
 
-// Run, Repeat, and Saturate return reports; observations return their matching
-// arm. Actions, checks, scheduler bindings, and keep_best produce no entry.
+// Completed top-level control commands return compact outcomes; observations
+// return their matching arm at every nesting depth. Actions, checks, scheduler
+// bindings, and keep_best produce no entry. The arm must match the located
+// request command. Nested control outcomes are folded, never appended here.
 // Execution errors are `RunProgramResponse.error`, not an arm here.
 message CommandOutput {
+  option (buf.validate.message).cel = {
+    id: "command_output.top_level_outcome"
+    message: "control outcomes are only emitted for top-level commands"
+    expression: "(!has(this.run) && !has(this.loop)) || size(this.location.path) == 1"
+  };
+
   oneof kind {
     option (buf.validate.oneof).required = true;
 
-    RunReport report = 1;
+    RunOutcome run = 1;
     ExtractResult extraction = 2;
     Program program = 3;
     TableSizes sizes = 4;
     PrintedFunction printed_function = 5;
     TableStatsResult table_stats = 6;
+    LoopOutcome loop = 8;
   }
+
+  CommandLocation location = 7 [(buf.validate.field).required = true];
 }
 
-// Reporting and attribution are provisional, especially for anonymous
-// rulesets and nested/repeated execution. The existing name-based fields do
-// not define exact occurrence keys or a complete execution hierarchy.
-// One command's report. Across iterations, updated is ORed and can_stop is
-// ANDed. A loop's aggregate records history, not its termination reason.
-message RunReport {
+// One completed Run, independent of optional profiling.
+message RunOutcome {
+  option (buf.validate.message).cel = {
+    id: "run_outcome.can_stop"
+    message: "a Run that updated the database cannot also permit stopping"
+    expression: "!this.updated || !this.can_stop"
+  };
+
   bool updated = 1;
 
-  // The body made no changes and every consulted scheduler permits stopping.
+  // This Run made no changes and its scheduler, if any, permits stopping.
+  // Does not by itself prove saturation under a resource-limited scheduler.
   bool can_stop = 2;
+}
 
-  repeated IterationReport iterations = 3;
-  repeated RuleReport rules = 4;
-  repeated RulesetReport rulesets = 5;
+// One completed Repeat/Saturate, including zero-body-execution completion.
+// No historical can_stop aggregate: termination states why this loop ended.
+message LoopOutcome {
+  option (buf.validate.message).cel = {
+    id: "loop_outcome.zero_iterations"
+    message: "zero iterations cannot update data or establish saturation"
+    expression:
+      "this.iterations > 0 || (!this.updated && "
+      "this.termination in [2, 4])"
+  };
 
-  // Required for Repeat/Saturate; absent for Run. Independent of progress.
-  optional TerminationReason termination = 6 [(buf.validate.field).enum = {
-    defined_only: true
-    not_in: [0]
-  }];
+  bool updated = 1; // any mutation across the whole loop, including nested work
+  uint64 iterations = 2; // completed executions of this loop's body
 
-  // Body execution count; zero for bare `Run`. Distinct from `iterations`.
-  uint64 loop_iterations = 7;
+  optional TerminationReason termination = 3 [
+    (buf.validate.field).required = true,
+    (buf.validate.field).enum = {
+      defined_only: true
+      not_in: [0]
+    }
+  ];
 }
 
 // Why a loop ended. Execution failure is not a reason here; it is reported as
@@ -1562,37 +1639,66 @@ enum TerminationReason {
   TERMINATION_REASON_SCHEDULER_LIMIT = 5;
 }
 
-// One rule iteration's telemetry; distinct from loop-body iteration counts.
-message IterationReport {
-  bool changed = 1;
-  uint64 search_and_apply_nanos = 2;
-  uint64 rebuild_nanos = 3;
-  repeated TableSize table_sizes = 4;
-}
-
 // One table's row count.
 message TableSize {
   string table = 1;
   uint64 rows = 2;
 }
 
-// One rule's execution statistics.
-message RuleReport {
-  string rule = 1;
-  uint64 matches = 2;
-  uint64 search_and_apply_nanos = 3;
-  // Provisional named-ruleset attribution.
-  // Empty denotes the default ruleset, not an anonymous occurrence ID.
-  string ruleset = 4;
+// Aggregate coverage of this request, not a trace. Complete iff the whole
+// request succeeded; false includes work observed before failure, including
+// a failing Run. Exactly one entry per entered static Run site; no unentered
+// site appears. Completion says nothing about availability of individual
+// optional metrics. No collection budget/truncation is defined here.
+// Per-iteration histories are deferred.
+message ProfileSummary {
+  option (buf.validate.message).cel = {
+    id: "profile_summary.unique_sites"
+    message: "each static Run site has one aggregate"
+    expression: "this.runs.all(r, this.runs.filter(s, s.command_path == r.command_path).size() == 1)"
+  };
+
+  bool complete = 1;
+  repeated RunSummary runs = 2;
 }
 
-// One ruleset's execution statistics.
-message RulesetReport {
-  // Provisional name-based attribution; not an anonymous occurrence ID.
-  string ruleset = 1;
-  uint64 search_and_apply_nanos = 2;
-  uint64 merge_nanos = 3;
-  uint64 rebuild_nanos = 4;
+// All invocations of one static Run command, across enclosing loop iterations.
+// Path uses CommandLocation.path without dynamic coordinates. The site must
+// resolve to Run in the request. Each selected occurrence contributes once per
+// Run's selection, not once per group membership; BiRewrite directions share
+// one authored occurrence. No nested-loop or ruleset totals duplicate this work.
+// Optional metrics total the observed work across these invocations. Omit a
+// total if any required measurement is unavailable or cannot be faithfully
+// attributed; do not serialize only its known subset.
+// Present zero means measured zero, never unavailable. Per-rule timing is a
+// breakdown of Run timing, not additional elapsed time to add to it. These
+// phase measurements need not partition wall time; no total elapsed is given.
+message RunSummary {
+  option (buf.validate.message).cel = {
+    id: "run_summary.unique_rules"
+    message: "each rule occurrence has one aggregate per Run site"
+    expression: "this.rules.all(r, this.rules.filter(s, s.rule == r.rule).size() == 1)"
+  };
+
+  repeated uint32 command_path = 1 [(buf.validate.field).repeated.min_items = 1];
+  optional uint64 search_and_apply_nanos = 2;
+  optional uint64 merge_nanos = 3;
+  optional uint64 rebuild_nanos = 4;
+  repeated RuleSummary rules = 5;
+  uint64 invocations = 6 [(buf.validate.field).uint64.gte = 1]; // entered Runs, including a failing final invocation
+}
+
+// Statistics for one response-local authored occurrence at one static Run site.
+// Both BiRewrite directions and internal decomposition contribute here only
+// when the engine can attribute the measurement faithfully to that occurrence.
+// Otherwise leave it absent rather than fabricating a count or timing.
+message RuleSummary {
+  optional uint32 rule = 1 [(buf.validate.field).required = true]; // index into RunProgramResponse.rules
+
+  // Observed complete source-query matches, not changed rows or internal
+  // decomposition matches. Does not count potential matches beyond a limit.
+  optional uint64 matches = 2;
+  optional uint64 search_and_apply_nanos = 3;
 }
 
 // One result per requested root, in request order.

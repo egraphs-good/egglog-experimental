@@ -266,12 +266,43 @@ or an engine checkpoint.
 
 ### Reporting and timing attribution
 
-Reconsider reporting separately, including timings, ruleset/rule attribution,
-nested loops, repeated placements, and command-output association. The current
-flat outputs and name-based report/error fields are provisional and cannot
-identify anonymous ruleset occurrences. No reporting representation is chosen
-by the ruleset-arena decision; do not invent occurrence names or discard data
-to fit those fields. Execution progress and loop termination remain as specified.
+**Decided:** `RunProgramRequest.profile` is off by default. Off disables optional
+diagnostic collection and retention, not just output; scheduler-required counters,
+progress, and stopping checks are unchanged. This is a schema contract, not an
+implemented collection-off path or a performance claim.
+
+Each completed top-level `Run` returns `RunOutcome` (`updated`, `can_stop`);
+`Repeat` and `Saturate` return `LoopOutcome` (any update, body-execution count,
+termination reason). Nested control outcomes are folded into their enclosing
+loop, not emitted separately. Zero-iteration loops still have an outcome.
+Historical `can_stop` values are not ANDed into a loop's stopping status.
+
+All requested observations remain in completion order, including inside loops
+and with profiling off. Each output has a `CommandLocation`: a static command
+path plus one zero-based iteration coordinate per enclosing loop. Errors locate
+the innermost active command independently of their most specific source span.
+A failed loop has no outcome, but its completed observations and earlier effects
+remain; execution and termination semantics are unchanged.
+
+Opt-in `ProfileSummary` aggregates by static `Run` site and response-local rule
+occurrence. It counts entered invocations and retains no per-iteration history.
+Run sites own search/apply, merge, and rebuild totals; group membership does not
+duplicate work. Rule metrics are breakdowns, not additional elapsed time.
+Present metrics cover all observed work in their aggregate; an unavailable total
+is absent, not a known subset or zero. A failed request has an explicitly
+incomplete summary, including observed work from a failing Run; a successful
+empty summary is complete. Completeness does not promise every optional metric.
+
+`RunProgramResponse.rules` gives each attributed occurrence one local index,
+shared by profile rows and errors even with profiling off. A `RuleAttribution`
+routes from a request-local ruleset or installed named root, through composition
+child positions to a leaf rule ordinal. This covers retained anonymous leaves
+without invented names or a new rule arena. Names and spans are diagnostic;
+distinct equal occurrences stay distinct, and both directions of an authored
+`BiRewrite` share one entry. Path resolution and identity checks remain normative
+semantic requirements. Detailed traces and runtime implementation are deferred.
+Only referenced catalog entries are returned; profiling off without a rule error
+returns none.
 
 ### Shared Python/Rust memory
 
