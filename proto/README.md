@@ -135,9 +135,13 @@ normalization details remain to be specified.
 **Decided:** without a Python/Rust presentation block for a definition, generate
 plain symbolic types and free functions with API identifiers derived from core
 names. Behind those identifiers, preserve exact core names, signatures, and
-argument order; do not infer operators or receivers. Naming collisions, including
-with explicit mappings, are errors. These defaults are derived output, not
-supplied metadata: they install or freeze no block, so later explicit metadata
+argument order; do not infer operators or receivers. Cross-declaration Python/Rust
+binding collisions (explicit/explicit, explicit/derived, or derived/derived) are
+target-language generation errors, not declaration-installation errors. Generators
+must error, not fall back, overwrite, or rename bindings. Engine installation still
+rejects malformed individual metadata and conflicting resupply of one declaration's
+fixed language block. These defaults are derived output, not supplied metadata:
+they install or freeze no block, so later explicit metadata
 remains that language's first supply. The exact naming/normalization algorithm
 is undecided; high-level generators and metadata wire layout are unimplemented.
 
