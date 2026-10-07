@@ -134,7 +134,9 @@ normalization details remain to be specified.
 
 **Decided:** without a Python/Rust presentation block for a definition, generate
 plain symbolic types and free functions with API identifiers derived from core
-names. Behind those identifiers, preserve exact core names, signatures, and
+names. Missing metadata never hides a definition; explicit hiding is outside
+this draft's scope, with no special meaning assigned to an empty block.
+Behind those identifiers, preserve exact core names, signatures, and
 argument order; do not infer operators or receivers. Cross-declaration Python/Rust
 binding collisions (explicit/explicit, explicit/derived, or derived/derived) are
 target-language generation errors, not declaration-installation errors. Generators
