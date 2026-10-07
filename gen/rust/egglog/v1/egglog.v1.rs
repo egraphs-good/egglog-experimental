@@ -323,9 +323,11 @@ pub struct Union {
 /// Positional application of a callable declared in the enclosing payload,
 /// already installed on the handle, or implicitly provided by the host.
 /// The enclosing node's sort matches the result; relation calls use Unit.
-/// Resolve the name using argument and result sorts across declared and ambient
-/// candidates. A declaration adds a candidate; it does not shadow ambient
-/// primitives. Missing or ambiguous exact resolution is an error.
+/// The name identifies one callable across installed and ambient definitions;
+/// there are no same-name overload sets. Check argument and result sorts against
+/// that definition's signature. Generic instantiation does not select another
+/// definition. Frontends resolve overloaded surface syntax and conversions
+/// before this boundary. Missing names and signature mismatches are errors.
 ///
 /// Relation calls are restricted to row positions: a query fact, `Action.term`,
 /// `Change.target`, or `FunctionRow.call`. They cannot be value arguments,
@@ -656,9 +658,9 @@ pub struct SetCost {
 /// indices. Provenance and argument labels do not participate in identity.
 /// Comparison must preserve Union sharing/identity topology; ordinary syntax
 /// sharing may differ. One empty Union reused twice is not two fresh Unions.
-/// Declared callable names are unique across Constructor, Function, Relation,
-/// and Primitive kinds; compatible resends retain the existing definition.
-/// Ambient primitive candidates still participate in Call's typed resolution.
+/// Callable names are unique across Constructor, Function, Relation, Primitive,
+/// and ambient host definitions. Compatible resends retain the existing
+/// definition; a conflicting declaration cannot shadow a host definition.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct Declaration {
     /// Optional diagnostic origin; excluded from semantic identity.
@@ -765,7 +767,8 @@ pub struct Primitive {
     pub body: ::core::option::Option<u32>,
 }
 /// An immutable ruleset occurrence: an ordered rule list or composition.
-/// Absent name is anonymous; present empty name denotes the default rule list.
+/// An absent name adds no binding and leaves an unmatched occurrence anonymous.
+/// A present empty name denotes the default rule list.
 /// A present name binds this occurrence on the e-graph handle. Names are
 /// immutable: compatible resends retain the occurrence and all reachable
 /// children, including anonymous ones, with their rule state. Changes to body
@@ -786,8 +789,15 @@ pub struct Primitive {
 /// iterations in this Program.
 /// Named roots retain their entire reachable closure across requests; a later
 /// name-only reference does not need to resend those entries or their bodies.
-/// Whether a resend may add a new name to a retained anonymous child remains
-/// unresolved; occurrence matching does not decide that alias-binding policy.
+/// A resend anchored by an already-installed named parent may give a matched
+/// anonymous child its first name, retaining that occurrence and its rule state.
+/// Compare bodies and sharing before applying this new binding; names are not
+/// part of the child's body. Each occurrence has at most one assigned name:
+/// renaming an already-named occurrence, proposing two different names for one
+/// matched occurrence, or binding an occupied name to another occurrence is an
+/// error. Repeating the same compatible binding is a no-op. Omitting a matched
+/// child's name does not remove its installed binding. Name assignments must be
+/// consistent across all matches; equal anonymous bodies alone are not anchors.
 /// Each rule occurrence belongs to its leaf ruleset. Compositions reference
 /// those occurrences rather than declaring copies. Cyclic compositions are
 /// invalid, including cycles through names; these are normative semantic checks.
@@ -1086,10 +1096,12 @@ pub struct Extract {
 /// scheduler instances, execution cursors, caches, reports and host resources.
 ///
 /// Include every installed declaration and sort, even unused or empty tables;
-/// every installed named ruleset and its retained anonymous closure, preserving
-/// occurrence sharing; and all builtin declaration descriptors, including
-/// generic families and overloads. Saved code and its dependencies are included
-/// without executing it. Host implementations/codecs remain external.
+/// every installed named ruleset and its retained closure, preserving occurrence
+/// sharing and each occurrence's current assigned name, if any; and all builtin
+/// declaration descriptors, including generic families and every distinct core
+/// callable. Export each ruleset occurrence once, even if multiple roots reach it.
+/// Include saved code and its dependencies without executing it.
+/// Host implementations/codecs remain external.
 /// The builtin descriptor layout is still unresolved: the current Declaration
 /// cannot encode that complete catalog. This contract does not claim complete
 /// export support; a receiver must fail rather than silently omit definitions.

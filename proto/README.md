@@ -29,9 +29,9 @@ comments and annotations remain the normative contract.
 
 Proposed discovery model: builtins are implicitly available, and an EGraph
 query exports their portable declarations with optional language metadata.
-Export generic families and all overloads, not just instantiated sorts/tables
-or a map keyed only by name. A saved export can drive binding generation
-without a live EGraph at import time. The query and descriptor format remain
+Export generic families and every distinct core callable, not just instantiated
+sorts/tables. A saved export can drive binding generation without a live EGraph
+at import time. The query and descriptor format remain
 to be designed; declaring a signature does not supply its native implementation.
 
 Today `Container` and `FuncSort` describe concrete types, each node supplies its
@@ -50,11 +50,18 @@ vec-of<T>(T...) -> Vec<T>
 unstable-vec-map<T,U>((T) -> U, Vec<T>) -> Vec<U>
 ```
 
-Specify type-constructor arities, type-variable scope, substitution, overload
-resolution, and how empty containers obtain their types. The relationship
-between exported host definitions and submitted declarations remains open.
+Specify type-constructor arities, type-variable scope, substitution, and how
+empty containers obtain their types. The relationship between exported host
+definitions and submitted declarations remains open.
 Separate frontend inference/conversions from checking the resolved IR. This
 need not introduce generic user-defined equality sorts.
+
+**Decided:** each core callable has one unique name across user and host
+definitions; the core does not select from same-name overloads. Frontends lower
+overloaded syntax such as `+` to the appropriate unique callable name and make
+conversions explicit before this boundary. Generics remain: a call instantiates
+one named generic definition, rather than choosing an overload. No concrete
+naming convention or generic descriptor layout is chosen here.
 
 **Decided:** use ordinary generic signatures, including homogeneous varargs,
 with a dedicated typing rule for function application: arguments match the
@@ -97,8 +104,9 @@ Rust without duplicating the IR declarations.
 - **Ruleset identity — decided:** immutable rulesets have optional names and
   share state by occurrence identity. The current provisional wire layout uses
   `Program.rulesets`, with a rule-list or composition body. Runs and composition
-  children use an arena index or an installed name. An absent name is anonymous;
-  a present empty name retains the default ruleset. Named roots retain their
+  children use an arena index or an installed name. An absent name adds no
+  binding; an unmatched entry without a name is anonymous. A present empty name
+  retains the default ruleset. Named roots retain their
   reachable anonymous children and rule state across requests. Compatible
   presentations of the same name compare internal sharing before identifying
   corresponding occurrences. Resends must then preserve sharing across all
@@ -121,8 +129,13 @@ Rust without duplicating the IR declarations.
   This is the same indirection principle as a persistent top-level capture:
   its name survives while arena indices remain local. Existing captures lower
   to nullary functions and sets; this does not add general expression bindings.
-  Whether resending a named parent can give a new name to its retained
-  anonymous child remains open.
+  Resending an already-installed named parent may give a matched anonymous
+  child its first name, preserving that occurrence and its rule state. Match
+  bodies and sharing before applying the new binding. Each occurrence may have
+  only one name: renaming it, assigning two different names to one occurrence,
+  or reusing a name bound to another occurrence is an error. An omitted name
+  does not remove an existing binding. Equal anonymous bodies alone never
+  establish a match; complete export preserves each occurrence's assigned name.
 - **Once per Run — decided:** flatten transitive inclusion in order, considering
   each rule occurrence only at its first inclusion. Distinct equal rules remain
   independent. Separate Runs and loop iterations select independently; this
@@ -134,8 +147,9 @@ Rust without duplicating the IR declarations.
 - **Declaration reuse — decided:** programs may refer to definitions already
   installed on the same e-graph handle without resending them. Builtin calls
   resolve against implicitly available host primitives without requiring
-  builtin declarations. Calls resolve by name and argument/result
-  sorts; missing or ambiguous matches are errors. Full definition resends are
+  builtin declarations. A call's unique name selects its definition; argument
+  and result sorts check that signature, including any generic instantiation.
+  Missing names and signature mismatches are errors. Full definition resends are
   optional compatibility checks: identical definitions are no-ops, conflicts
   are errors. There are no signature-only imports. This is specified in the
   schema comments; runtime enforcement remains unimplemented. Each payload
