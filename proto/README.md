@@ -104,9 +104,9 @@ No runtime catalog adapter or generated high-level bindings are implemented.
 
 ### High-level bindings and language metadata
 
-Protobuf codegen produces message classes, not ergonomic Egglog APIs. Could
-builtin and user declarations also generate Python classes, Rust methods, and
-Egglog source? For example, one signature might be presented
+Protobuf codegen produces message classes, not ergonomic Egglog APIs. Planned
+high-level generators use builtin and user declarations to produce Python/Rust
+symbolic APIs and Egglog source. For example, one signature might be presented
 as Python `m[k]` and Rust `m.get(k)`, with the same underlying call.
 
 **Decided:** start with typed metadata for Rust, Python, and Egglog source only;
@@ -131,6 +131,15 @@ Adding or changing a same-language alias after that first block is rejected.
 Presentation metadata is independent of semantic definition identity.
 No metadata wire layout or runtime implementation is chosen yet; matching and
 normalization details remain to be specified.
+
+**Decided:** without a Python/Rust presentation block for a definition, generate
+plain symbolic types and free functions with API identifiers derived from core
+names. Behind those identifiers, preserve exact core names, signatures, and
+argument order; do not infer operators or receivers. Naming collisions, including
+with explicit mappings, are errors. These defaults are derived output, not
+supplied metadata: they install or freeze no block, so later explicit metadata
+remains that language's first supply. The exact naming/normalization algorithm
+is undecided; high-level generators and metadata wire layout are unimplemented.
 
 **Decided:** initially generate the symbolic declarations and expression-building
 API. Host methods such as `Map.value` and host conversions remain ordinary
