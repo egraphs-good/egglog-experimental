@@ -4,7 +4,7 @@
 //! next one, and stop on a transport or decoded execution error. Parsing is eager
 //! (like native source execution); resolution is sequential so a later type error
 //! does not erase an executed prefix. Native syntax is never executed here.
-//! Rulesets are fixed after their first run. Relations, primitives, local lets,
+//! Rulesets are fixed after their first run. Relations, uncatalogued primitives, local lets,
 //! proof modes, dynamic costs and general schedules remain unsupported.
 
 use super::*;
@@ -507,11 +507,12 @@ impl Source {
         rule_head: bool,
         depth: usize,
     ) -> Result<pb::Call, String> {
-        let ResolvedCall::Func(function) = function else {
-            return Err("source primitives require catalog mapping".into());
+        let name = match function {
+            ResolvedCall::Func(function) => function.name.clone(),
+            ResolvedCall::Primitive(primitive) => primitive.export_builtin(&mut self.program)?,
         };
         Ok(pb::Call {
-            func: function.name.clone(),
+            func: name,
             args: args
                 .iter()
                 .map(|expr| self.expr(expr, rule_head, depth + 1))
@@ -655,6 +656,8 @@ pub fn render(program: &pb::Program) -> Result<String, TransportError> {
         if program.ir_version != 1 {
             return Err("unsupported source IR version".into());
         }
+        let mut native = crate::new_experimental_egraph();
+        validate_host_declarations(program, &mut native)?;
         // Native AST Display assumes symbols are source atoms; protobuf names
         // need not be. Validate every interpolated identifier before formatting,
         // using the native parser rather than maintaining another token grammar.
@@ -703,7 +706,7 @@ pub fn render(program: &pb::Program) -> Result<String, TransportError> {
                 _ => (),
             }
         }
-        let mut parser = crate::new_experimental_egraph().parser;
+        let mut parser = native.parser;
         for name in names {
             if !matches!(parser.get_expr_from_string(None, name), Ok(Expr::Var(_, parsed)) if parsed == name) {
                 return Err(format!("identifier {name:?} cannot be rendered as one native source atom"));
@@ -760,6 +763,7 @@ pub fn render(program: &pb::Program) -> Result<String, TransportError> {
                         term_constructor: None,
                         unextractable: true,
                     },
+                    pb::declaration::Kind::HostPrimitive(_) | pb::declaration::Kind::HostSortFamily(_) => continue,
                     _ => return Err("unsupported source declaration".into()),
                 },
             );

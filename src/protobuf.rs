@@ -16,9 +16,9 @@ use std::fmt;
 use std::sync::Arc;
 
 use egglog::ast::{self, Action, Command, Expr, Fact, Literal};
+use egglog::proto as pb;
 use egglog::{ArcSort, EGraph, Term, TermDag, TermId, Value, span};
 use egglog_ast::span::{EgglogSpan, SrcFile};
-use egglog_proto as pb;
 use prost::Message;
 
 pub mod source;
@@ -288,6 +288,7 @@ impl Session {
                 return Err(format!("sort kind mismatch for {name}").into());
             }
         }
+        validate_host_declarations(program, &mut staged.graph)?;
         // Expression lowering detects invalid indices/cycles even in unused
         // arena entries; variables acquire their binder at each use below.
         for (index, node) in program.nodes.iter().enumerate() {
@@ -317,6 +318,15 @@ impl Session {
                 matches!(declaration.kind, Some(pb::declaration::Kind::Function(_)))
             }))
         {
+            if matches!(
+                declaration.kind,
+                Some(
+                    pb::declaration::Kind::HostPrimitive(_)
+                        | pb::declaration::Kind::HostSortFamily(_)
+                )
+            ) {
+                continue; // Already checked against the native catalog above.
+            }
             let span = native_span(program, declaration.span.as_ref())?;
             if declaration.bindings.is_some() {
                 return Err("presentation bindings are not supported yet".into());
@@ -370,16 +380,44 @@ impl Session {
         }
         for node in &program.nodes {
             if let Some(pb::node::Kind::Call(call)) = &node.kind {
-                let signature = staged.graph.type_info().get_func_type(&call.func).ok_or_else(|| format!("unknown table {} (ambient primitive catalog mapping is not implemented)", call.func))?.clone();
-                if signature.input.len() != call.args.len()
-                    || signature.output.name() != sort_name(&program.sorts[node.sort_id as usize])?
+                if let Some(signature) = staged.graph.type_info().get_func_type(&call.func).cloned()
                 {
-                    return Err(format!("call signature mismatch for {}", call.func).into());
-                }
-                for (argument, expected) in call.args.iter().zip(&signature.input) {
-                    if node_sort(program, *argument)? != expected.name() {
-                        return Err(format!("argument sort mismatch for {}", call.func).into());
+                    if signature.input.len() != call.args.len()
+                        || signature.output.name()
+                            != sort_name(&program.sorts[node.sort_id as usize])?
+                    {
+                        return Err(format!("call signature mismatch for {}", call.func).into());
                     }
+                    for (argument, expected) in call.args.iter().zip(&signature.input) {
+                        if node_sort(program, *argument)? != expected.name() {
+                            return Err(format!("argument sort mismatch for {}", call.func).into());
+                        }
+                    }
+                } else {
+                    // This is an exact definition-key assertion, not a source
+                    // alias lookup. The native checker below uses the same key
+                    // and the existing registration's context ids.
+                    let primitive = pb::HostPrimitive {
+                        name: call.func.clone(),
+                        typing: Some(pb::host_primitive::Typing::Signature(
+                            pb::GenericSignature {
+                                inputs: call
+                                    .args
+                                    .iter()
+                                    .map(|index| pb::Arg {
+                                        sort: program.nodes[*index as usize].sort_id,
+                                        name: String::new(),
+                                    })
+                                    .collect(),
+                                output: Some(node.sort_id),
+                                ..Default::default()
+                            },
+                        )),
+                    };
+                    staged
+                        .graph
+                        .type_info()
+                        .check_builtin(program, &primitive, None)?;
                 }
             }
         }
@@ -930,6 +968,38 @@ fn signature(
                 .ok_or("output sort index out of bounds")?,
         )?,
     })
+}
+
+fn validate_host_declarations(program: &pb::Program, graph: &mut EGraph) -> Result<(), String> {
+    for declaration in &program.declarations {
+        match &declaration.kind {
+            Some(pb::declaration::Kind::HostPrimitive(primitive)) => {
+                graph.type_info().check_builtin(
+                    program,
+                    primitive,
+                    declaration.bindings.as_ref(),
+                )?;
+            }
+            Some(pb::declaration::Kind::HostSortFamily(family)) => {
+                let sort = graph
+                    .get_sort_by_name(&family.name)
+                    .ok_or_else(|| format!("unknown host sort family {}", family.name))?;
+                if family.arity != 0
+                    || family.bindings.is_some()
+                    || declaration.bindings.is_some()
+                    || sort.is_eq_sort()
+                    || sort.is_container_sort()
+                {
+                    return Err(format!(
+                        "unsupported or incompatible host sort family {}",
+                        family.name
+                    ));
+                }
+            }
+            _ => (),
+        }
+    }
+    Ok(())
 }
 
 fn expression(

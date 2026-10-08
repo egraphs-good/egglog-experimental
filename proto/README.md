@@ -107,7 +107,8 @@ catalog. Definitions-only filtering is deferred. Saved catalogs can support
 binding generation, but native implementation, codec, and execution-capability
 compatibility must be established by the host; matching descriptors alone cannot
 establish it.
-No runtime catalog adapter or generated high-level bindings are implemented.
+The initial engine-owned scalar catalog path below is implemented; complete
+catalog export, generic families and generated high-level bindings are not.
 
 ### High-level language bindings
 
@@ -449,7 +450,11 @@ coverage, not evidence already established by wire roundtrip tests.
 [Rust](../gen/rust/egglog/v1/egglog.v1.rs) message sources are checked in for
 inspection. The Rust messages are also the reusable `egglog-proto` crate at
 `gen/rust`; its handwritten `Cargo.toml` and `lib.rs` include the generated
-message file directly. Python packaging remains a later migration step.
+message file directly. Core pins a published revision of this leaf and exposes
+it as `egglog::proto`; experimental consumes that re-export, not a second local
+leaf dependency. Schema updates follow schema/leaf revision S → core revision C
+→ experimental revision E, preserving one Rust message package identity.
+Python packaging remains a later migration step.
 Python uses `protobuf-py`, with `protovalidate` for validation; versions are
 locked in `uv.lock`. The Rust messages use `prost` (tested with 0.14.4).
 Imported Rust validation definitions also require `prost-types`. No gRPC
@@ -474,10 +479,11 @@ The current executable subset is deliberately limited:
 - Tree extraction with costs, duplicate roots and shared result nodes; extracted
   table rows; native e-graph clone and destruction.
 - Profile-enabled execution with command locations and compact run summaries.
+- Catalog-backed i64/f64 addition through distinct host definition keys.
 
 Unsupported forms fail explicitly. These include profile-off (the native engine
 still collects timing data), action/nested/empty Union identities, complex values
-and codecs, ambient primitive catalog mappings, relations, declaration/ruleset
+and codecs, other primitive catalog mappings, relations, declaration/ruleset
 resupply, anonymous/combined/shared rulesets, nondefault rule modes, schedulers,
 loops, snapshots, proof requests, merge table reads, and custom cost models.
 Expressions deeper than 256 nodes or requiring more than 65,536 native tree
@@ -518,7 +524,8 @@ publication. Global references remain distinct captured-function calls.
 
 Experimental `extract` is an extension command. This producer explicitly
 resolves only its static tree form; dynamic costs and extractor options remain
-unsupported. Relations, primitive declarations/calls, proof modes, local lets,
+unsupported. Relations, program-defined primitives and uncatalogued primitive
+calls, proof modes, local lets,
 globals in rule heads, bidirectional rewrites, general unions/schedules,
 includes, multi-command command macros and other extension commands are separate
 gates.
@@ -531,6 +538,33 @@ The tests execute that rendered source after reparsing and compare observations 
 the byte-adapter path. They also cover ordered captures, failure prefixes and
 mutated/corrupt byte controls. Run `cargo test --test protobuf source_`; this is a
 small semantic roundtrip checkpoint, not migration of the source corpus.
+
+### Initial engine-owned builtin definitions
+
+Core's primitive macro accepts an optional `[id = "provider.definition"]` next
+to the existing source alias. The same type annotations produce a canonical
+protobuf signature; migrated native constraints are compiled from that record,
+not another signature table. The native body, validator and allowed-context
+entrypoints are unchanged. i64 `+` uses `egglog.core.i64.add`, while f64 `+` uses
+`egglog.core.f64.add`. Source still uses the overloaded `+`; source resolution
+selects the registration before exporting its exact wire key. A decoded call
+cannot substitute a source alias or switch overloads through inference.
+
+`TypeInfo::builtin_catalog()` returns the migrated protobuf definitions and
+explicit lists of undescribed primitive registrations, presort factories and
+installed non-equality sorts. Export performs no application or validation of
+values. Conflicting registration keys fail catalog export/lookup while existing
+unrelated native aliases keep their behavior. Compatible host descriptor resends
+are assertions, not implementation replacement. Rendering retains exact keys,
+which the native registry recognizes as the same registration identities.
+
+This checkpoint implements closed scalar signatures only. It does not implement
+complete `Freeze`, generic Vec/Map/Fn definitions, wrapper generation, custom
+codecs or capability/proof metadata export. The generic signature/family records
+remain the next compiler input; opaque constraints are never scraped into a
+second signature registry. In core, run
+`cargo test --no-default-features --test builtin_catalog`; in this repository,
+run `cargo test --test protobuf`.
 
 To regenerate, install Buf (tested with 1.73.0), uv, and Rust/Cargo, then run
 from the repository root:

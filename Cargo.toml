@@ -17,11 +17,10 @@ default = ["bin"]
 bin = ["egglog/bin"]
 
 [dependencies]
-egglog-proto = { path = "gen/rust" }
 prost = "0.14.4"
-egglog = { version = "3.0.0", git = "https://github.com/egraphs-good/egglog.git", rev = "67ad696437a7d3f23c0e2d5c7b0e679363787867", default-features = false }
-egglog-ast = { version = "3.0.0", git = "https://github.com/egraphs-good/egglog.git", rev = "67ad696437a7d3f23c0e2d5c7b0e679363787867", default-features = false }
-egglog-reports = { version = "3.0.0", git = "https://github.com/egraphs-good/egglog.git", rev = "67ad696437a7d3f23c0e2d5c7b0e679363787867", default-features = false }
+egglog = { version = "3.0.0", git = "https://github.com/egraphs-good/egglog.git", rev = "05ecbcddc6304aa32213f240fa7bf26bd5ea40af", default-features = false }
+egglog-ast = { version = "3.0.0", git = "https://github.com/egraphs-good/egglog.git", rev = "05ecbcddc6304aa32213f240fa7bf26bd5ea40af", default-features = false }
+egglog-reports = { version = "3.0.0", git = "https://github.com/egraphs-good/egglog.git", rev = "05ecbcddc6304aa32213f240fa7bf26bd5ea40af", default-features = false }
 
 num = "0.4.3"
 lazy_static = "1.4"

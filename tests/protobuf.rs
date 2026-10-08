@@ -1,6 +1,214 @@
+use egglog_experimental::proto as pb;
 use egglog_experimental::{new_experimental_egraph, protobuf::Engine};
-use egglog_proto as pb;
 use prost::Message;
+
+#[test]
+fn source_scalar_builtin_definitions_select_distinct_overloads() {
+    use egglog_experimental::protobuf::source::{Source, render};
+    let text = "(extract (+ 1 2)) (extract (+ 1.0 2.0))";
+    let mut native = new_experimental_egraph();
+    native.parse_and_run_program(None, text).unwrap();
+    let mut reparsed = new_experimental_egraph();
+    let mut engine = Engine::default();
+    let id = create(&mut engine);
+    let mut observed = vec![];
+    let mut keys = vec![];
+    for program in Source::new(None, text).unwrap() {
+        let program = pb::Program::decode(program.unwrap().encode_to_vec().as_slice()).unwrap();
+        let definitions = program
+            .declarations
+            .iter()
+            .filter_map(|declaration| match &declaration.kind {
+                Some(pb::declaration::Kind::HostPrimitive(primitive)) => {
+                    Some(primitive.name.clone())
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(definitions.len(), 1);
+        keys.extend(definitions);
+        reparsed
+            .parse_and_run_program(None, &render(&program).unwrap())
+            .unwrap();
+        let response = run(&mut engine, id, program);
+        assert_eq!(response.error, None);
+        let Some(pb::command_output::Kind::Extraction(result)) = &response.outputs[0].kind else {
+            panic!("expected extraction")
+        };
+        observed.push(value(&response, result.roots[0].variants[0].term));
+    }
+    assert_eq!(keys, ["egglog.core.i64.add", "egglog.core.f64.add"]);
+    assert_eq!(observed, ["3", "3.0"]);
+}
+
+#[test]
+fn builtin_wire_identity_and_descriptor_errors_prevent_mutation() {
+    use egglog_experimental::protobuf::source::Source;
+    for corrupt in 0..7 {
+        let mut engine = Engine::default();
+        let id = create(&mut engine);
+        let mut source = Source::new(None, "(function observed () i64 :merge new) (set (observed) 0) (set (observed) (+ 1 2)) (extract (observed))").unwrap();
+        for _ in 0..2 {
+            assert_eq!(
+                run(&mut engine, id, source.next().unwrap().unwrap()).error,
+                None
+            );
+        }
+        let mut program = source.next().unwrap().unwrap();
+        let index = program.nodes.iter().position(|node| matches!(&node.kind, Some(pb::node::Kind::Call(call)) if call.func == "egglog.core.i64.add")).unwrap();
+        match corrupt {
+            0 | 1 => {
+                let Some(pb::node::Kind::Call(call)) = &mut program.nodes[index].kind else {
+                    unreachable!()
+                };
+                call.func = if corrupt == 0 {
+                    "egglog.core.f64.add"
+                } else {
+                    "missing.builtin"
+                }
+                .into();
+            }
+            2 => {
+                let sort = program.sorts.len() as u32;
+                program.sorts.push(pb::Sort {
+                    kind: Some(pb::sort::Kind::Family(pb::HostSort {
+                        name: "f64".into(),
+                        args: vec![],
+                    })),
+                    ..Default::default()
+                });
+                program.nodes[index].sort_id = sort;
+            }
+            3 => {
+                let declaration = program
+                    .declarations
+                    .iter_mut()
+                    .find_map(|declaration| match &mut declaration.kind {
+                        Some(pb::declaration::Kind::HostPrimitive(primitive)) => Some(primitive),
+                        _ => None,
+                    })
+                    .unwrap();
+                let Some(pb::host_primitive::Typing::Signature(signature)) =
+                    &mut declaration.typing
+                else {
+                    unreachable!()
+                };
+                signature.inputs.pop();
+            }
+            4 => {
+                let Some(pb::node::Kind::Call(call)) = &mut program.nodes[index].kind else {
+                    unreachable!()
+                };
+                call.func = "+".into(); // Source aliases are not wire identities.
+            }
+            5 => {
+                let declaration = program
+                    .declarations
+                    .iter_mut()
+                    .find(|declaration| {
+                        matches!(
+                            &declaration.kind,
+                            Some(pb::declaration::Kind::HostPrimitive(_))
+                        )
+                    })
+                    .unwrap();
+                declaration
+                    .bindings
+                    .as_mut()
+                    .unwrap()
+                    .egglog
+                    .as_mut()
+                    .unwrap()
+                    .views[0]
+                    .symbol = "wrong-alias".into();
+            }
+            6 => {
+                let family = program
+                    .declarations
+                    .iter_mut()
+                    .find_map(|declaration| match &mut declaration.kind {
+                        Some(pb::declaration::Kind::HostSortFamily(family)) => Some(family),
+                        _ => None,
+                    })
+                    .unwrap();
+                family.arity = 1;
+            }
+            _ => unreachable!(),
+        }
+        assert!(run(&mut engine, id, program).error.is_some());
+        let response = run(&mut engine, id, source.next().unwrap().unwrap());
+        assert_eq!(response.error, None);
+        let Some(pb::command_output::Kind::Extraction(result)) = &response.outputs[0].kind else {
+            panic!("expected observation")
+        };
+        assert_eq!(value(&response, result.roots[0].variants[0].term), "0");
+    }
+}
+
+#[test]
+fn source_builtin_overflow_preserves_executed_prefix() {
+    use egglog_experimental::protobuf::source::Source;
+    let text = "(function observed () i64 :merge new) (set (observed) 4) (set (observed) (+ 9223372036854775807 1)) (set (observed) 9)";
+    assert!(
+        new_experimental_egraph()
+            .parse_and_run_program(None, text)
+            .is_err()
+    );
+    let mut engine = Engine::default();
+    let id = create(&mut engine);
+    let mut source = Source::new(None, text).unwrap();
+    for _ in 0..2 {
+        assert_eq!(
+            run(&mut engine, id, source.next().unwrap().unwrap()).error,
+            None
+        );
+    }
+    let failure = run(&mut engine, id, source.next().unwrap().unwrap());
+    assert_eq!(
+        failure.error.as_ref().unwrap().code,
+        i32::from(pb::ErrorCode::EvaluationFailed)
+    );
+    assert_eq!(
+        failure
+            .error
+            .as_ref()
+            .unwrap()
+            .location
+            .as_ref()
+            .unwrap()
+            .path,
+        [0]
+    );
+    let mut observation = source.next().unwrap().unwrap();
+    let Some(pb::command::Kind::Action(pb::Action {
+        kind: Some(pb::action::Kind::Set(set)),
+        ..
+    })) = &observation.commands[0].kind
+    else {
+        unreachable!()
+    };
+    let root = observation.nodes.len() as u32;
+    observation.nodes.push(pb::Node {
+        sort_id: 0,
+        kind: Some(pb::node::Kind::Call(set.target.clone().unwrap())),
+        ..Default::default()
+    });
+    observation.commands = vec![pb::Command {
+        kind: Some(pb::command::Kind::Extract(pb::Extract {
+            roots: vec![root],
+            variants: 1,
+            extractor: pb::Extractor::Tree.into(),
+            ..Default::default()
+        })),
+        ..Default::default()
+    }];
+    let response = run(&mut engine, id, observation);
+    assert_eq!(response.error, None);
+    let Some(pb::command_output::Kind::Extraction(result)) = &response.outputs[0].kind else {
+        panic!("expected observation")
+    };
+    assert_eq!(value(&response, result.roots[0].variants[0].term), "4");
+}
 
 #[test]
 fn source_fixture_executes_and_renders_from_decoded_programs() {
@@ -782,6 +990,7 @@ fn value(response: &pb::RunProgramResponse, index: u32) -> String {
     match response.nodes[index as usize].kind.as_ref().unwrap() {
         pb::node::Kind::PrimitiveValue(value) => match value.value.as_ref().unwrap() {
             pb::primitive_value::Value::I64(n) => n.to_string(),
+            pb::primitive_value::Value::F64Bits(bits) => format!("{:?}", f64::from_bits(*bits)),
             other => panic!("unexpected value: {other:?}"),
         },
         pb::node::Kind::Call(call) => format!(
