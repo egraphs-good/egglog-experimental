@@ -2,7 +2,8 @@
 //!
 //! This initial subset supports equality sorts/constructors, exact selectors,
 //! callback rewrites, named flat rulesets and byte-backed register/check/extract.
-//! I64/F64 literals and addition are generated from engine-owned metadata. Foreign open
+//! I64/F64 literals/addition and generic Vec operations use engine-owned metadata.
+//! Ordered Vec value decoding retains child expression ownership. Foreign open
 //! binders, arbitrary declarations, frozen graphs and general schedules are not
 //! accepted yet; no source/AST execution fallback exists.
 use egglog::proto as pb;

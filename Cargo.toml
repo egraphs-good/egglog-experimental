@@ -46,3 +46,7 @@ required-features = ["typed"]
 [[example]]
 name = "typed_proto_scalars"
 required-features = ["typed"]
+
+[[example]]
+name = "typed_proto_vec"
+required-features = ["typed"]

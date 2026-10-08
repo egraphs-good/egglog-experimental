@@ -191,6 +191,71 @@ impl ::core::convert::TryFrom<&self::F64> for ::core::primitive::f64 {
     }
 }
 
+/// A protobuf-owned ordered vector expression. Native calls remain symbolic.
+#[derive(
+    ::core::clone::Clone,
+    ::core::fmt::Debug,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
+    ::core::hash::Hash,
+)]
+pub struct Vec<__EgglogType0: crate::typed::EgglogValue>(
+    crate::typed::expr::Expr,
+    ::core::marker::PhantomData<fn() -> __EgglogType0>,
+);
+impl<__EgglogType0: crate::typed::EgglogValue> crate::typed::expr::ValueInput
+    for self::Vec<__EgglogType0>
+{
+    type Owned = Self;
+}
+impl<__EgglogType0: crate::typed::EgglogValue> ::core::convert::From<&self::Vec<__EgglogType0>>
+    for self::Vec<__EgglogType0>
+{
+    fn from(__egglog_value: &Self) -> Self {
+        ::core::clone::Clone::clone(__egglog_value)
+    }
+}
+impl<__EgglogType0: crate::typed::EgglogValue> crate::typed::EgglogValue
+    for self::Vec<__EgglogType0>
+{
+    fn sort_ref() -> crate::typed::SortRef {
+        let mut __egglog_record =
+            ::core::clone::Clone::clone(crate::typed::storage::builtin_catalog());
+        __egglog_record.arena = crate::typed::storage::Arena::Declaration;
+        __egglog_record.index = 2;
+        crate::typed::SortRef::family(
+            &__egglog_record,
+            ::std::vec![<__EgglogType0 as crate::typed::EgglogValue>::sort_ref()],
+        )
+        .expect("generated family arity")
+    }
+    fn expression(&self) -> &crate::typed::expr::Expr {
+        &self.0
+    }
+    fn from_expression(__egglog_value: crate::typed::expr::Expr) -> Self {
+        Self(__egglog_value, ::core::marker::PhantomData)
+    }
+}
+impl<__EgglogType0: crate::typed::EgglogValue> ::core::convert::TryFrom<&self::Vec<__EgglogType0>>
+    for ::std::vec::Vec<__EgglogType0>
+{
+    type Error = crate::typed::TypedError;
+    fn try_from(
+        __egglog_value: &self::Vec<__EgglogType0>,
+    ) -> ::core::result::Result<Self, Self::Error> {
+        let mut __egglog_items = ::std::vec::Vec::new();
+        for __egglog_child in __egglog_value
+            .0
+            .vec_elements(&<__EgglogType0 as crate::typed::EgglogValue>::sort_ref())?
+        {
+            __egglog_items.push(
+                <__EgglogType0 as crate::typed::EgglogValue>::from_expression(__egglog_child),
+            );
+        }
+        ::core::result::Result::Ok(__egglog_items)
+    }
+}
+
 impl ::core::ops::Add<self::F64> for self::F64 {
     type Output = self::F64;
     fn add(self, __egglog_rhs: self::F64) -> Self::Output {
@@ -324,5 +389,79 @@ impl ::core::ops::Add<&self::I64> for &self::I64 {
                 ::core::clone::Clone::clone(&__egglog_rhs.0)
             ],
         ))
+    }
+}
+
+impl<__EgglogType0: crate::typed::EgglogValue> self::Vec<__EgglogType0> {
+    /// Author a catalog-defined call without evaluating its arguments.
+    pub fn empty() -> self::Vec<__EgglogType0> {
+        let __egglog_args = ::std::vec![];
+
+        let mut __egglog_record =
+            ::core::clone::Clone::clone(crate::typed::storage::builtin_catalog());
+        __egglog_record.arena = crate::typed::storage::Arena::Declaration;
+        __egglog_record.index = 5;
+        <self::Vec<__EgglogType0> as crate::typed::EgglogValue>::from_expression(
+            crate::typed::expr::Expr::call_with_result(
+                &crate::typed::decl::Callable(__egglog_record),
+                __egglog_args,
+                <self::Vec<__EgglogType0> as crate::typed::EgglogValue>::sort_ref(),
+            )
+            .expect("generated generic call disagrees with its descriptor"),
+        )
+    }
+}
+
+impl<__EgglogType0: crate::typed::EgglogValue> self::Vec<__EgglogType0> {
+    /// Author a catalog-defined call without evaluating its arguments.
+    pub fn get(&self, __egglog_arg_0: impl ::core::convert::Into<self::I64>) -> __EgglogType0 {
+        let __egglog_args = ::std::vec![::core::clone::Clone::clone(&self.0), {
+            let __egglog_value: self::I64 = ::core::convert::Into::into(__egglog_arg_0);
+            ::core::clone::Clone::clone(<self::I64 as crate::typed::EgglogValue>::expression(
+                &__egglog_value,
+            ))
+        }];
+
+        let mut __egglog_record =
+            ::core::clone::Clone::clone(crate::typed::storage::builtin_catalog());
+        __egglog_record.arena = crate::typed::storage::Arena::Declaration;
+        __egglog_record.index = 6;
+        <__EgglogType0 as crate::typed::EgglogValue>::from_expression(
+            crate::typed::expr::Expr::call_with_result(
+                &crate::typed::decl::Callable(__egglog_record),
+                __egglog_args,
+                <__EgglogType0 as crate::typed::EgglogValue>::sort_ref(),
+            )
+            .expect("generated generic call disagrees with its descriptor"),
+        )
+    }
+}
+
+impl<__EgglogType0: crate::typed::EgglogValue> self::Vec<__EgglogType0> {
+    /// Author a catalog-defined call without evaluating its arguments.
+    pub fn of(
+        __egglog_arg_0: impl ::core::iter::IntoIterator<
+            Item = impl ::core::convert::Into<__EgglogType0>,
+        >,
+    ) -> self::Vec<__EgglogType0> {
+        let mut __egglog_args = ::std::vec![];
+        for __egglog_value in ::core::iter::IntoIterator::into_iter(__egglog_arg_0) {
+            let __egglog_value: __EgglogType0 = ::core::convert::Into::into(__egglog_value);
+            __egglog_args.push(::core::clone::Clone::clone(
+                <__EgglogType0 as crate::typed::EgglogValue>::expression(&__egglog_value),
+            ));
+        }
+        let mut __egglog_record =
+            ::core::clone::Clone::clone(crate::typed::storage::builtin_catalog());
+        __egglog_record.arena = crate::typed::storage::Arena::Declaration;
+        __egglog_record.index = 7;
+        <self::Vec<__EgglogType0> as crate::typed::EgglogValue>::from_expression(
+            crate::typed::expr::Expr::call_with_result(
+                &crate::typed::decl::Callable(__egglog_record),
+                __egglog_args,
+                <self::Vec<__EgglogType0> as crate::typed::EgglogValue>::sort_ref(),
+            )
+            .expect("generated generic call disagrees with its descriptor"),
+        )
     }
 }

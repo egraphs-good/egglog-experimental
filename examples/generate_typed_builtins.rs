@@ -1,4 +1,4 @@
-//! Generate the first Rust scalar surface from the actual native catalog.
+//! Generate the Rust scalar and Vec surfaces from the actual native catalog.
 //! Run without `--features typed` to bootstrap the generated source/resource;
 //! use `--check` to detect either API or catalog drift. Nothing runs at import.
 use egglog_experimental::proto as pb;
@@ -201,7 +201,7 @@ fn generate(program: &pb::Program) -> Result<(String, Vec<String>), String> {
     let record_local = local_name("record", &occupied);
     let node_local = local_name("node", &occupied);
     let mut identities = HashSet::new();
-    for declaration in &program.declarations {
+    for (declaration_index, declaration) in program.declarations.iter().enumerate() {
         let (sort, name) = match &declaration.kind {
             Some(pb::declaration::Kind::HostSortFamily(f)) => (true, &f.name),
             Some(pb::declaration::Kind::HostPrimitive(p)) => (false, &p.name),
@@ -217,6 +217,15 @@ fn generate(program: &pb::Program) -> Result<(String, Vec<String>), String> {
             deferred.push(family.name.clone());
             continue;
         };
+        if family.name == "Vec" {
+            let name = binding.path.last().ok_or("missing Vec Rust path")?;
+            identifier(name)?;
+            if !public_names.insert(name.clone()) {
+                return Err(format!("Rust type collision: {name}"));
+            }
+            emit_vec_type(program, declaration_index, &mut source, &occupied)?;
+            continue;
+        }
         // These are schema-defined value codecs, not a primitive signature or
         // a family-to-wrapper-name table. The Rust name comes from TypeBinding.
         let (host, arm, encode, decode) = match family.name.as_str() {
@@ -335,6 +344,10 @@ impl ::core::convert::TryFrom<&self::{name}> for {host} {{
                 primitive.name
             ));
         };
+        if !signature.type_params.is_empty() {
+            emit_generic_views(program, index, &mut source, &mut implementations, &occupied)?;
+            continue;
+        }
         if !signature.type_params.is_empty()
             || signature.varargs.is_some()
             || signature.inputs.len() != 2
@@ -435,6 +448,320 @@ impl ::core::ops::Add<{param_type}> for {self_type} {{
     Ok((source, deferred))
 }
 
+// Translate the actual sort arena into Rust types. This derives presentation
+// only: no family/callable signatures are restated in an emitter registry.
+fn rust_type(program: &pb::Program, root: u32, parameters: &[String]) -> Result<String, String> {
+    let mut rendered: BTreeMap<u32, String> = BTreeMap::new();
+    let mut active = HashSet::new();
+    let mut pending = vec![(root, false)];
+    while let Some((index, finish)) = pending.pop() {
+        if rendered.contains_key(&index) {
+            continue;
+        }
+        let kind = program
+            .sorts
+            .get(index as usize)
+            .and_then(|s| s.kind.as_ref())
+            .ok_or("missing Rust sort pattern")?;
+        if !finish {
+            if !active.insert(index) {
+                return Err("cyclic Rust sort pattern".into());
+            }
+            pending.push((index, true));
+            if let pb::sort::Kind::Family(f) = kind {
+                pending.extend(f.args.iter().rev().map(|child| (*child, false)));
+            }
+            continue;
+        }
+        let ty = match kind {
+            pb::sort::Kind::Var(i) => parameters
+                .get(*i as usize)
+                .ok_or("unbound Rust type parameter")?
+                .clone(),
+            pb::sort::Kind::Family(f) => {
+                let definition = program
+                    .declarations
+                    .iter()
+                    .find_map(|d| match &d.kind {
+                        Some(pb::declaration::Kind::HostSortFamily(h)) if h.name == f.name => {
+                            Some(h)
+                        }
+                        _ => None,
+                    })
+                    .ok_or("missing Rust family definition")?;
+                let binding = definition
+                    .bindings
+                    .as_ref()
+                    .and_then(|b| b.rust.as_ref())
+                    .ok_or("missing Rust family binding")?;
+                if definition.arity as usize != f.args.len()
+                    || binding.path.len() != 4
+                    || binding.path[..3] != ["egglog_experimental", "typed", "builtins"]
+                    || (!binding.type_params.is_empty()
+                        && binding.type_params.len() != f.args.len())
+                {
+                    return Err("unsupported Rust family binding".into());
+                }
+                identifier(&binding.path[3])?;
+                let mut name = format!("self::{}", binding.path[3]);
+                if !f.args.is_empty() {
+                    name.push('<');
+                    name.push_str(
+                        &f.args
+                            .iter()
+                            .map(|i| rendered[i].as_str())
+                            .collect::<Vec<_>>()
+                            .join(", "),
+                    );
+                    name.push('>');
+                }
+                name
+            }
+            _ => return Err("unsupported generated Rust sort pattern".into()),
+        };
+        active.remove(&index);
+        rendered.insert(index, ty);
+    }
+    Ok(rendered.remove(&root).unwrap())
+}
+
+// Private generic identifiers cannot capture any authored public type. Core
+// binder labels remain diagnostic; their positions determine the Rust mapping.
+fn generic_parameters(program: &pb::Program, count: usize) -> Vec<String> {
+    let mut occupied: HashSet<String> = program
+        .declarations
+        .iter()
+        .filter_map(|d| {
+            let Some(pb::declaration::Kind::HostSortFamily(f)) = &d.kind else {
+                return None;
+            };
+            f.bindings.as_ref()?.rust.as_ref()?.path.last().cloned()
+        })
+        .collect();
+    (0..count)
+        .map(|index| {
+            let mut name = format!("__EgglogType{index}");
+            while !occupied.insert(name.clone()) {
+                name.push('_');
+            }
+            name
+        })
+        .collect()
+}
+
+// Vec's payload codec is schema-defined, like the scalar codecs above. The
+// public path/arity comes from the actual family declaration, not a method map.
+fn emit_vec_type(
+    program: &pb::Program,
+    index: usize,
+    source: &mut String,
+    occupied: &HashSet<&str>,
+) -> Result<(), String> {
+    let Some(pb::declaration::Kind::HostSortFamily(family)) = &program.declarations[index].kind
+    else {
+        unreachable!()
+    };
+    let binding = family
+        .bindings
+        .as_ref()
+        .and_then(|b| b.rust.as_ref())
+        .ok_or("missing Vec binding")?;
+    if family.arity != 1
+        || binding.path.len() != 4
+        || binding.path[..3] != ["egglog_experimental", "typed", "builtins"]
+        || (!binding.type_params.is_empty() && binding.type_params.len() != 1)
+    {
+        return Err("unsupported Vec type binding".into());
+    }
+    let name = &binding.path[3];
+    let t = &generic_parameters(program, 1)[0];
+    let value = local_name("value", occupied);
+    let record = local_name("record", occupied);
+    let items = local_name("items", occupied);
+    let child = local_name("child", occupied);
+    writeln!(source, r#"
+/// A protobuf-owned ordered vector expression. Native calls remain symbolic.
+#[derive(::core::clone::Clone, ::core::fmt::Debug, ::core::cmp::PartialEq, ::core::cmp::Eq, ::core::hash::Hash)]
+pub struct {name}<{t}: crate::typed::EgglogValue>(crate::typed::expr::Expr, ::core::marker::PhantomData<fn() -> {t}>);
+impl<{t}: crate::typed::EgglogValue> crate::typed::expr::ValueInput for self::{name}<{t}> {{ type Owned = Self; }}
+impl<{t}: crate::typed::EgglogValue> ::core::convert::From<&self::{name}<{t}>> for self::{name}<{t}> {{
+    fn from({value}: &Self) -> Self {{ ::core::clone::Clone::clone({value}) }}
+}}
+impl<{t}: crate::typed::EgglogValue> crate::typed::EgglogValue for self::{name}<{t}> {{
+    fn sort_ref() -> crate::typed::SortRef {{
+        let mut {record} = ::core::clone::Clone::clone(crate::typed::storage::builtin_catalog());
+        {record}.arena = crate::typed::storage::Arena::Declaration;
+        {record}.index = {index};
+        crate::typed::SortRef::family(&{record}, ::std::vec![<{t} as crate::typed::EgglogValue>::sort_ref()]).expect("generated family arity")
+    }}
+    fn expression(&self) -> &crate::typed::expr::Expr {{ &self.0 }}
+    fn from_expression({value}: crate::typed::expr::Expr) -> Self {{ Self({value}, ::core::marker::PhantomData) }}
+}}
+impl<{t}: crate::typed::EgglogValue> ::core::convert::TryFrom<&self::{name}<{t}>> for ::std::vec::Vec<{t}> {{
+    type Error = crate::typed::TypedError;
+    fn try_from({value}: &self::{name}<{t}>) -> ::core::result::Result<Self, Self::Error> {{
+        let mut {items} = ::std::vec::Vec::new();
+        for {child} in {value}.0.vec_elements(&<{t} as crate::typed::EgglogValue>::sort_ref())? {{
+            {items}.push(<{t} as crate::typed::EgglogValue>::from_expression({child}));
+        }}
+        ::core::result::Result::Ok({items})
+    }}
+}}
+"#).unwrap();
+    Ok(())
+}
+
+fn emit_generic_views(
+    program: &pb::Program,
+    index: usize,
+    source: &mut String,
+    implementations: &mut HashSet<(String, String)>,
+    occupied: &HashSet<&str>,
+) -> Result<(), String> {
+    let declaration = &program.declarations[index];
+    let Some(pb::declaration::Kind::HostPrimitive(primitive)) = &declaration.kind else {
+        unreachable!()
+    };
+    let Some(pb::host_primitive::Typing::Signature(signature)) = &primitive.typing else {
+        return Err("unsupported generic typing".into());
+    };
+    let rust = declaration
+        .bindings
+        .as_ref()
+        .and_then(|b| b.rust.as_ref())
+        .ok_or("missing generic Rust views")?;
+    if rust.views.is_empty() {
+        return Err("empty generic Rust views".into());
+    }
+    let parameters = generic_parameters(program, signature.type_params.len());
+    let generics = parameters
+        .iter()
+        .map(|t| format!("{t}: crate::typed::EgglogValue"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let output = rust_type(
+        program,
+        signature.output.ok_or("missing generic output")?,
+        &parameters,
+    )?;
+    let value = local_name("value", occupied);
+    let record = local_name("record", occupied);
+    let args = local_name("args", occupied);
+    for view in &rust.views {
+        let Some(pb::binding_owner::Kind::Sort(owner)) =
+            view.owner.as_ref().and_then(|o| o.kind.as_ref())
+        else {
+            return Err("generic Rust view requires a family owner".into());
+        };
+        let Some(pb::sort::Kind::Family(family)) = program
+            .sorts
+            .get(*owner as usize)
+            .and_then(|s| s.kind.as_ref())
+        else {
+            return Err("generic Rust owner must be a family application".into());
+        };
+        if family.name != "Vec"
+            || family.args.len() != parameters.len()
+            || view.path.len() != 1
+            || view.trait_impl.is_some()
+            || view.borrowed_self
+        {
+            return Err("unsupported generic Rust member view".into());
+        }
+        for (position, sort) in family.args.iter().enumerate() {
+            if !matches!(program.sorts[*sort as usize].kind, Some(pb::sort::Kind::Var(i)) if i as usize == position)
+            {
+                return Err("generic owner must determine its binder in family order".into());
+            }
+        }
+        let owner = rust_type(program, *owner, &parameters)?;
+        let method = &view.path[0];
+        identifier(method)?;
+        if !implementations.insert((owner.clone(), method.clone())) {
+            return Err("duplicate generic Rust method".into());
+        }
+        let mut inputs = vec![None; signature.inputs.len()];
+        let mut tail = None;
+        let mut params = vec![];
+        if let Some(receiver) = &view.receiver {
+            let slot = receiver.core_input.ok_or("missing receiver slot")? as usize;
+            let input = signature
+                .inputs
+                .get(slot)
+                .ok_or("receiver slot out of range")?;
+            if rust_type(program, input.sort, &parameters)? != owner {
+                return Err("receiver differs from owner".into());
+            }
+            inputs[slot] = Some("::core::clone::Clone::clone(&self.0)".to_string());
+            params.push(if receiver.borrowed {
+                "&self".into()
+            } else {
+                "self".into()
+            });
+        }
+        for (position, param) in view.params.iter().enumerate() {
+            identifier(&param.name)?;
+            if param.borrowed {
+                return Err("borrowed generic parameter views are not supported yet".into());
+            }
+            let slot = param.core_input.ok_or("missing parameter slot")? as usize;
+            let name = local_name(&format!("arg_{position}"), occupied);
+            if slot < inputs.len() {
+                let ty = rust_type(program, signature.inputs[slot].sort, &parameters)?;
+                if inputs[slot].is_some() {
+                    return Err("repeated generic input slot".into());
+                }
+                params.push(format!("{name}: impl ::core::convert::Into<{ty}>"));
+                inputs[slot] = Some(format!(
+                    "{{ let {value}: {ty} = ::core::convert::Into::into({name}); ::core::clone::Clone::clone(<{ty} as crate::typed::EgglogValue>::expression(&{value})) }}"
+                ));
+            } else if slot == inputs.len() && position + 1 == view.params.len() && tail.is_none() {
+                let ty = rust_type(
+                    program,
+                    signature
+                        .varargs
+                        .as_ref()
+                        .ok_or("unexpected tail slot")?
+                        .sort,
+                    &parameters,
+                )?;
+                params.push(format!("{name}: impl ::core::iter::IntoIterator<Item = impl ::core::convert::Into<{ty}>>"));
+                tail = Some((name, ty));
+            } else {
+                return Err("invalid generic input mapping".into());
+            }
+        }
+        if inputs.iter().any(Option::is_none) || tail.is_some() != signature.varargs.is_some() {
+            return Err("generic Rust view omits a core input".into());
+        }
+        let inputs = inputs
+            .into_iter()
+            .map(Option::unwrap)
+            .collect::<Vec<_>>()
+            .join(", ");
+        let mutability = if tail.is_some() { "mut " } else { "" };
+        let tail_code = tail.map_or_else(String::new, |(name, ty)| format!("for {value} in ::core::iter::IntoIterator::into_iter({name}) {{ let {value}: {ty} = ::core::convert::Into::into({value}); {args}.push(::core::clone::Clone::clone(<{ty} as crate::typed::EgglogValue>::expression(&{value}))); }}"));
+        let params = params.join(", ");
+        writeln!(source, r#"
+impl<{generics}> {owner} {{
+    /// Author a catalog-defined call without evaluating its arguments.
+    pub fn {method}({params}) -> {output} {{
+        let {mutability}{args} = ::std::vec![{inputs}];
+        {tail_code}
+        let mut {record} = ::core::clone::Clone::clone(crate::typed::storage::builtin_catalog());
+        {record}.arena = crate::typed::storage::Arena::Declaration;
+        {record}.index = {index};
+        <{output} as crate::typed::EgglogValue>::from_expression(crate::typed::expr::Expr::call_with_result(
+            &crate::typed::decl::Callable({record}), {args},
+            <{output} as crate::typed::EgglogValue>::sort_ref(),
+        ).expect("generated generic call disagrees with its descriptor"))
+    }}
+}}
+"#).unwrap();
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -466,7 +793,11 @@ mod tests {
                     f.bindings.as_mut().unwrap().rust.as_mut().unwrap().path[3] = name.into();
                 }
                 if let Some(rust) = d.bindings.as_mut().and_then(|b| b.rust.as_mut()) {
-                    for view in &mut rust.views {
+                    for view in rust
+                        .views
+                        .iter_mut()
+                        .filter(|view| view.trait_impl.is_some())
+                    {
                         view.params[0].name = parameter.into();
                     }
                 }
@@ -495,7 +826,11 @@ mod tests {
             let mut program = original.clone();
             for d in &mut program.declarations {
                 if let Some(rust) = d.bindings.as_mut().and_then(|b| b.rust.as_mut()) {
-                    for view in &mut rust.views {
+                    for view in rust
+                        .views
+                        .iter_mut()
+                        .filter(|view| view.trait_impl.is_some())
+                    {
                         view.params[0].name = parameter.into();
                     }
                 }
@@ -556,6 +891,7 @@ mod tests {
                 .as_ref()
                 .and_then(|b| b.rust.as_ref())
                 .and_then(|r| r.views.first())
+                .filter(|view| view.trait_impl.is_some())
             else {
                 continue;
             };
@@ -608,10 +944,12 @@ mod tests {
         let (source, deferred) = generate(&p).unwrap();
         assert!(source.contains("pub struct I64"));
         assert!(source.contains("pub struct F64"));
+        let has_vec_view = p.declarations.iter().any(|d| matches!(&d.kind,
+            Some(pb::declaration::Kind::HostSortFamily(f)) if f.name == "Vec" && f.bindings.as_ref().is_some_and(|b| b.rust.is_some())));
         assert_eq!(
             deferred.len(),
-            4,
-            "Vec family and its three operations remain visible"
+            if has_vec_view { 0 } else { 4 },
+            "unbound Vec APIs remain explicitly deferred"
         );
         assert_eq!(source.matches("fn add(self,").count(), 8);
         assert_locations(&p, &source);
@@ -777,5 +1115,159 @@ mod tests {
             .unwrap();
         rust.views.push(rust.views[0].clone());
         assert!(generate(&p).is_err());
+    }
+
+    #[test]
+    fn native_vec_views_drive_generic_members_and_relocated_declarations() {
+        let mut program = egglog_experimental::new_experimental_egraph()
+            .type_info()
+            .builtin_catalog()
+            .unwrap()
+            .definitions;
+        let family = program
+            .declarations
+            .iter()
+            .find_map(|d| match &d.kind {
+                Some(pb::declaration::Kind::HostSortFamily(f)) if f.name == "Vec" => Some(f),
+                _ => None,
+            })
+            .unwrap();
+        assert!(
+            family.bindings.as_ref().is_some_and(|b| b.rust.is_some()),
+            "this gate requires the actual engine-owned Vec Rust metadata checkpoint"
+        );
+        let original = program.clone();
+        for permute in [false, true] {
+            if permute {
+                program.declarations.reverse();
+            }
+            let (source, deferred) = generate(&program).unwrap();
+            assert!(deferred.is_empty());
+            let parameters = generic_parameters(&program, 1);
+            for (index, d) in program.declarations.iter().enumerate() {
+                if let Some(pb::declaration::Kind::HostSortFamily(f)) = &d.kind {
+                    if f.name == "Vec" {
+                        let name = &f.bindings.as_ref().unwrap().rust.as_ref().unwrap().path[3];
+                        let start = format!(
+                            "crate::typed::EgglogValue for self::{name}<{}>",
+                            parameters[0]
+                        );
+                        let body = source.split_once(&start).unwrap().1;
+                        let body = body.split_once("fn expression").unwrap().0;
+                        assert!(body.contains(&format!(".index = {index};")));
+                    }
+                }
+                let Some(pb::declaration::Kind::HostPrimitive(p)) = &d.kind else {
+                    continue;
+                };
+                let Some(pb::host_primitive::Typing::Signature(s)) = &p.typing else {
+                    continue;
+                };
+                if s.type_params.is_empty() {
+                    continue;
+                }
+                let views = &d.bindings.as_ref().unwrap().rust.as_ref().unwrap().views;
+                for view in views {
+                    let Some(pb::binding_owner::Kind::Sort(owner)) =
+                        view.owner.as_ref().unwrap().kind
+                    else {
+                        panic!()
+                    };
+                    let owner = rust_type(&program, owner, &parameters).unwrap();
+                    let start = format!(
+                        "impl<{}: crate::typed::EgglogValue> {owner} {{",
+                        parameters[0]
+                    );
+                    let method = format!("pub fn {}(", view.path[0]);
+                    let body = source
+                        .split(&start)
+                        .skip(1)
+                        .find(|part| part.contains(&method))
+                        .unwrap();
+                    let body = body.split_once("\n}\n").unwrap().0;
+                    assert!(
+                        body.contains(&format!(".index = {index};")),
+                        "wrong record location for {}",
+                        p.name
+                    );
+                    assert!(body.contains(&format!(
+                        "-> {}",
+                        rust_type(&program, s.output.unwrap(), &parameters).unwrap()
+                    )));
+                }
+            }
+        }
+        let mut renamed = original.clone();
+        let get = renamed
+            .declarations
+            .iter()
+            .position(|d| {
+                matches!(&d.kind,
+            Some(pb::declaration::Kind::HostPrimitive(p)) if p.name == "egglog.core.vec.get")
+            })
+            .unwrap();
+        renamed.declarations[get]
+            .bindings
+            .as_mut()
+            .unwrap()
+            .rust
+            .as_mut()
+            .unwrap()
+            .views[0]
+            .path[0] = "pick".into();
+        assert!(generate(&renamed).unwrap().0.contains("pub fn pick("));
+        renamed.declarations[get]
+            .bindings
+            .as_mut()
+            .unwrap()
+            .rust
+            .as_mut()
+            .unwrap()
+            .views[0]
+            .receiver
+            .as_mut()
+            .unwrap()
+            .core_input = Some(1);
+        assert!(
+            generate(&renamed).is_err(),
+            "wrong receiver must not be ignored"
+        );
+
+        let mut changed_output = original.clone();
+        let integer = changed_output
+            .sorts
+            .iter()
+            .position(|s| {
+                matches!(&s.kind,
+                Some(pb::sort::Kind::Family(f)) if f.name == "i64" && f.args.is_empty())
+            })
+            .unwrap() as u32;
+        let Some(pb::declaration::Kind::HostPrimitive(p)) =
+            &mut changed_output.declarations[get].kind
+        else {
+            panic!()
+        };
+        let Some(pb::host_primitive::Typing::Signature(signature)) = &mut p.typing else {
+            panic!()
+        };
+        signature.output = Some(integer);
+        let source = generate(&changed_output).unwrap().0;
+        let header = source.split_once("pub fn get(").unwrap().1;
+        let header = header.split_once(" {").unwrap().0;
+        assert!(header.contains(&format!(
+            "-> {}",
+            rust_type(&changed_output, integer, &generic_parameters(&changed_output, 1)).unwrap()
+        )));
+        let mut labels = original.clone();
+        for d in &mut labels.declarations {
+            if let Some(pb::declaration::Kind::HostPrimitive(p)) = &mut d.kind {
+                if let Some(pb::host_primitive::Typing::Signature(s)) = &mut p.typing {
+                    for label in &mut s.type_params {
+                        *label = "RenamedDiagnostic".into();
+                    }
+                }
+            }
+        }
+        assert_eq!(generate(&labels).unwrap().0, generate(&original).unwrap().0);
     }
 }

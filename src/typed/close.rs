@@ -61,6 +61,13 @@ pub(super) fn binder(roots: &[Record]) -> Result<HashMap<String, String>, TypedE
                 }
             }
             Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
+                value: Some(pb::primitive_value::Value::Vec(values)),
+            })) => {
+                for child in values.items.iter().rev() {
+                    pending.push(r.resolve(Arena::Node, *child)?);
+                }
+            }
+            Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
                 value:
                     Some(pb::primitive_value::Value::I64(_) | pb::primitive_value::Value::F64Bits(_)),
             })) => {}

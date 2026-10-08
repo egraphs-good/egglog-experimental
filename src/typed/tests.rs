@@ -9,6 +9,181 @@ use prost::Message;
 use std::sync::Arc;
 
 #[test]
+fn family_sort_comparison_resolves_slots_not_raw_indices() {
+    use super::{EgglogValue, builtins::I64};
+    let family = super::storage::builtin_catalog()
+        .declaration("Vec", true)
+        .unwrap();
+    let integers = SortRef::family(&family, vec![I64::sort_ref()]).unwrap();
+    let atoms = SortRef::family(&family, vec![SortRef::equality("Atom")]).unwrap();
+    assert!(
+        integers != atoms,
+        "same local slot 0 must not hide different imported sorts"
+    );
+    let mut slots = std::array::from_fn(|_| vec![]);
+    slots[Arena::Sort as usize] = vec![
+        Slot::External(SortRef::equality("Unused").0),
+        Slot::External(I64::sort_ref().0),
+    ];
+    let shifted = SortRef(
+        publish(
+            pb::Program {
+                ir_version: 1,
+                sorts: vec![pb::Sort {
+                    kind: Some(pb::sort::Kind::Family(pb::HostSort {
+                        name: "Vec".into(),
+                        args: vec![1],
+                    })),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+            slots,
+            vec![family],
+            Arena::Sort,
+            0,
+        )
+        .unwrap(),
+    );
+    assert!(
+        integers == shifted,
+        "equal sorts at different slots must agree"
+    );
+}
+
+#[test]
+fn generic_calls_infer_from_actual_arguments_and_result_records() {
+    use super::{EgglogValue, builtins::I64};
+    let catalog = super::storage::builtin_catalog();
+    let family = catalog.declaration("Vec", true).unwrap();
+    let integers = SortRef::family(&family, vec![I64::sort_ref()]).unwrap();
+    let atoms = SortRef::family(&family, vec![SortRef::equality("A")]).unwrap();
+    let empty = Callable(catalog.declaration("egglog.core.vec.empty", false).unwrap());
+    let of = Callable(catalog.declaration("egglog.core.vec.of", false).unwrap());
+    let get = Callable(catalog.declaration("egglog.core.vec.get", false).unwrap());
+    assert!(Expr::call_with_result(&empty, vec![], integers.clone()).is_ok());
+    assert!(Expr::call_with_result(&of, vec![], atoms.clone()).is_ok());
+    assert!(Expr::call_with_result(&empty, vec![], I64::sort_ref()).is_err());
+    let scalar = I64::from(7).expression().clone();
+    assert!(Expr::call_with_result(&of, vec![scalar.clone()], atoms).is_err());
+    let vector = Expr::call_with_result(&of, vec![scalar.clone()], integers).unwrap();
+    assert!(
+        Expr::call_with_result(&get, vec![vector.clone(), scalar.clone()], I64::sort_ref()).is_ok()
+    );
+    assert!(Expr::call_with_result(&get, vec![vector, scalar], SortRef::equality("A")).is_err());
+}
+
+#[test]
+fn vec_calls_and_values_preserve_actual_ordered_child_records() {
+    use super::{
+        EgglogValue,
+        builtins::{I64, Vec as EVec},
+    };
+    let leaf = I64::from(7);
+    let vector = EVec::<I64>::of([leaf.clone(), I64::from(11), leaf.clone()]);
+    let weak = Arc::downgrade(vector.expression().0.owner.as_ref().unwrap());
+    let p = packed_query(&[vector.expression().0.clone()]);
+    let Some(pb::node::Kind::Call(call)) = &p.nodes[0].kind else {
+        panic!()
+    };
+    assert_eq!(call.func, "egglog.core.vec.of");
+    assert_eq!(call.args.len(), 3);
+    assert_eq!(call.args[0], call.args[2]);
+    for (index, expected) in call.args.iter().zip([7, 11, 7]) {
+        assert!(matches!(&p.nodes[*index as usize].kind,
+            Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue { value: Some(pb::primitive_value::Value::I64(v)) })) if *v == expected));
+    }
+    let owner = vector.expression().0.owner.as_ref().unwrap();
+    assert_eq!(owner.program.nodes.len(), 1);
+    assert_eq!(owner.slots[Arena::Node as usize].len(), 3);
+    drop(vector);
+    assert!(
+        weak.upgrade().is_none(),
+        "retained leaf must not retain parent"
+    );
+    let sort = EVec::<I64>::sort_ref();
+    let first = leaf.expression().0.clone();
+    let second = I64::from(11).expression().0.clone();
+    let value = |items, imports| {
+        Expr(node(
+            &sort,
+            pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
+                value: Some(pb::primitive_value::Value::Vec(pb::ValueList { items })),
+            }),
+            imports,
+            vec![],
+        ))
+    };
+    let a = value(vec![0, 1, 0], vec![first.clone(), second.clone()]);
+    let relocated = value(vec![1, 0, 1], vec![second.clone(), first.clone()]);
+    let different = value(vec![0, 1, 0], vec![second, first]);
+    assert_eq!(a, relocated);
+    assert_ne!(
+        a, different,
+        "raw equal ValueList indices are not equal values"
+    );
+    let mut ah = std::hash::DefaultHasher::new();
+    let mut bh = std::hash::DefaultHasher::new();
+    std::hash::Hash::hash(&a, &mut ah);
+    std::hash::Hash::hash(&relocated, &mut bh);
+    assert_eq!(
+        std::hash::Hasher::finish(&ah),
+        std::hash::Hasher::finish(&bh)
+    );
+
+    let named = super::var::<I64>("__typed_v_0");
+    let fresh = super::expr::variable::<I64>(super::expr::fresh_scope(), 0);
+    let with_variables = value(
+        vec![1, 0, 1],
+        vec![named.expression().0.clone(), fresh.expression().0.clone()],
+    );
+    let p = packed_query(&[with_variables.0]);
+    let Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
+        value: Some(pb::primitive_value::Value::Vec(items)),
+    })) = &p.nodes[0].kind
+    else {
+        panic!()
+    };
+    assert_eq!(items.items[0], items.items[2]);
+    assert!(matches!(&p.nodes[items.items[0] as usize].kind,
+        Some(pb::node::Kind::Var(name)) if name == "__typed_v_1"));
+    assert!(matches!(&p.nodes[items.items[1] as usize].kind,
+        Some(pb::node::Kind::Var(name)) if name == "__typed_v_0"));
+
+    let atom = SortRef::equality("VecOwnershipAtom");
+    let family = super::storage::builtin_catalog()
+        .declaration("Vec", true)
+        .unwrap();
+    let vector_sort = SortRef::family(&family, vec![atom.clone()]).unwrap();
+    let of = Callable(
+        super::storage::builtin_catalog()
+            .declaration("egglog.core.vec.of", false)
+            .unwrap(),
+    );
+    let leaf = Expr::call(&Callable::constructor("Leaf", vec![], atom.clone()), vec![]);
+    let pack = Callable::constructor("Pack", vec![vector_sort.clone()], atom);
+    for growing_first in [false, true] {
+        let mut term = leaf.clone();
+        for _ in 0..100_000 {
+            let children = if growing_first {
+                vec![term, leaf.clone()]
+            } else {
+                vec![leaf.clone(), term]
+            };
+            let vector = Expr::call_with_result(&of, children, vector_sort.clone()).unwrap();
+            let owner = vector.0.owner.as_ref().unwrap();
+            assert_eq!(owner.program.nodes.len(), 1);
+            assert_eq!(owner.slots[Arena::Node as usize].len(), 2);
+            assert_eq!(owner.declarations.len(), 1);
+            term = Expr::call(&pack, vec![vector]);
+        }
+        let weak = Arc::downgrade(term.0.owner.as_ref().unwrap());
+        std::thread::spawn(move || drop(term)).join().unwrap();
+        assert!(weak.upgrade().is_none());
+    }
+}
+
+#[test]
 // Symbolic Add preserves ordered children; swapping operands also changes
 // which operator implementation owns the growing input. It is not arithmetic.
 #[allow(clippy::if_same_then_else)]

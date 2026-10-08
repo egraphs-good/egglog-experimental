@@ -127,11 +127,70 @@ impl Expr {
                 "callable input sort"
             );
         }
+        let output = SortRef(callable.0.resolve(Arena::Sort, output).unwrap());
+        Self::build_call(callable, name, arguments, output)
+    }
+
+    pub(super) fn call_with_result(
+        callable: &Callable,
+        arguments: Vec<Self>,
+        output: SortRef,
+    ) -> Result<Self, TypedError> {
+        let owner = callable.0.owner.as_ref().unwrap();
+        let Some(pb::declaration::Kind::HostPrimitive(primitive)) =
+            &owner.program.declarations[callable.0.index as usize].kind
+        else {
+            return Err(TypedError::Invalid("expected host callable".into()));
+        };
+        let Some(pb::host_primitive::Typing::Signature(signature)) = &primitive.typing else {
+            return Err(TypedError::Invalid("unsupported callable typing".into()));
+        };
+        if arguments.len() < signature.inputs.len()
+            || (signature.varargs.is_none() && arguments.len() != signature.inputs.len())
+        {
+            return Err(TypedError::Invalid("callable arity".into()));
+        }
+        let mut bindings = vec![None; signature.type_params.len()];
+        for (position, argument) in arguments.iter().enumerate() {
+            let expected = signature
+                .inputs
+                .get(position)
+                .or(signature.varargs.as_ref())
+                .unwrap();
+            let node = &argument.0.owner.as_ref().unwrap().program.nodes[argument.0.index as usize];
+            SortRef(callable.0.resolve(Arena::Sort, expected.sort)?).match_pattern(
+                &SortRef(argument.0.resolve(Arena::Sort, node.sort_id)?),
+                &mut bindings,
+            )?;
+        }
+        SortRef(
+            callable.0.resolve(
+                Arena::Sort,
+                signature
+                    .output
+                    .ok_or_else(|| TypedError::Invalid("missing result pattern".into()))?,
+            )?,
+        )
+        .match_pattern(&output, &mut bindings)?;
+        if bindings.iter().any(Option::is_none) {
+            return Err(TypedError::Invalid("undetermined generic parameter".into()));
+        }
+        Ok(Self::build_call(
+            callable,
+            &primitive.name,
+            arguments,
+            output,
+        ))
+    }
+
+    // Publish one generated Call and location-only imports. Both closed and
+    // generic validation paths share this ownership/record construction boundary.
+    fn build_call(callable: &Callable, name: &str, arguments: Vec<Self>, output: SortRef) -> Self {
         let program = pb::Program {
             ir_version: 1,
             nodes: vec![pb::Node {
                 kind: Some(pb::node::Kind::Call(pb::Call {
-                    func: name.clone(),
+                    func: name.into(),
                     args: (0..arguments.len() as u32).collect(),
                 })),
                 ..Default::default()
@@ -140,10 +199,139 @@ impl Expr {
         };
         let mut slots = std::array::from_fn(|_| vec![]);
         slots[Arena::Node as usize] = arguments.into_iter().map(|a| Slot::External(a.0)).collect();
-        slots[Arena::Sort as usize] = vec![Slot::External(
-            callable.0.resolve(Arena::Sort, output).unwrap(),
-        )];
+        slots[Arena::Sort as usize] = vec![Slot::External(output.0)];
         Self(publish(program, slots, vec![callable.0.clone()], Arena::Node, 0).unwrap())
+    }
+
+    // Exact container decoding validates the finite inert closure before
+    // exposing child wrappers. It never evaluates a symbolic vec-of/get Call.
+    pub(super) fn vec_elements(&self, element: &SortRef) -> Result<Vec<Self>, TypedError> {
+        let owner = self.0.owner.as_ref().unwrap();
+        let node = &owner.program.nodes[self.0.index as usize];
+        let Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
+            value: Some(pb::primitive_value::Value::Vec(values)),
+        })) = &node.kind
+        else {
+            return Err(TypedError::Decode("expected an inert Vec value".into()));
+        };
+        let sort = self.0.resolve(Arena::Sort, node.sort_id)?;
+        let Some(pb::sort::Kind::Family(f)) =
+            &sort.owner.as_ref().unwrap().program.sorts[sort.index as usize].kind
+        else {
+            return Err(TypedError::Decode("Vec payload/sort mismatch".into()));
+        };
+        if f.name != "Vec"
+            || f.args.len() != 1
+            || SortRef(sort.resolve(Arena::Sort, f.args[0])?) != *element
+        {
+            return Err(TypedError::Decode("Vec element sort mismatch".into()));
+        }
+        self.validate_inert()?;
+        values
+            .items
+            .iter()
+            .map(|i| self.0.resolve(Arena::Node, *i).map(Self))
+            .collect()
+    }
+
+    pub(super) fn validate_inert(&self) -> Result<(), TypedError> {
+        let mut colors = HashMap::new();
+        let mut pending = vec![(self.0.clone(), false)];
+        while let Some((record, finish)) = pending.pop() {
+            let owner = record.owner.as_ref().unwrap();
+            let key = (owner.id, record.index);
+            if finish {
+                colors.insert(key, 2);
+                continue;
+            }
+            match colors.get(&key) {
+                Some(2) => continue,
+                Some(1) => {
+                    return Err(TypedError::Decode(
+                        "cyclic extraction is not inert data".into(),
+                    ));
+                }
+                _ => {}
+            }
+            colors.insert(key, 1);
+            pending.push((record.clone(), true));
+            let node = &owner.program.nodes[record.index as usize];
+            let sort = SortRef(record.resolve(Arena::Sort, node.sort_id)?);
+            sort.validate_closed()?;
+            let children: &[u32] = match &node.kind {
+                Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
+                    value: Some(pb::primitive_value::Value::Vec(values)),
+                })) => {
+                    let Some(pb::sort::Kind::Family(f)) =
+                        &sort.0.owner.as_ref().unwrap().program.sorts[sort.0.index as usize].kind
+                    else {
+                        return Err(TypedError::Decode("Vec payload/sort mismatch".into()));
+                    };
+                    if f.name != "Vec" || f.args.len() != 1 {
+                        return Err(TypedError::Decode("Vec payload/sort mismatch".into()));
+                    }
+                    let expected = SortRef(sort.0.resolve(Arena::Sort, f.args[0])?);
+                    for index in &values.items {
+                        let child = record.resolve(Arena::Node, *index)?;
+                        let node =
+                            &child.owner.as_ref().unwrap().program.nodes[child.index as usize];
+                        if SortRef(child.resolve(Arena::Sort, node.sort_id)?) != expected {
+                            return Err(TypedError::Decode(
+                                "Vec payload element sort mismatch".into(),
+                            ));
+                        }
+                    }
+                    &values.items
+                }
+                Some(pb::node::Kind::PrimitiveValue(value)) => {
+                    validate_literal(&sort, value)?;
+                    &[]
+                }
+                Some(pb::node::Kind::Call(call)) => {
+                    let declaration = record.declaration(&call.func, false)?;
+                    let Some(pb::declaration::Kind::Constructor(constructor)) =
+                        &declaration.owner.as_ref().unwrap().program.declarations
+                            [declaration.index as usize]
+                            .kind
+                    else {
+                        return Err(TypedError::Decode(
+                            "extracted call is not a constructor".into(),
+                        ));
+                    };
+                    if call.args.len() != constructor.inputs.len()
+                        || sort != SortRef(declaration.resolve(Arena::Sort, constructor.output)?)
+                    {
+                        return Err(TypedError::Decode(format!(
+                            "invalid extraction signature for {}",
+                            call.func
+                        )));
+                    }
+                    for (index, input) in call.args.iter().zip(&constructor.inputs) {
+                        let child = record.resolve(Arena::Node, *index)?;
+                        let node =
+                            &child.owner.as_ref().unwrap().program.nodes[child.index as usize];
+                        if SortRef(child.resolve(Arena::Sort, node.sort_id)?)
+                            != SortRef(declaration.resolve(Arena::Sort, input.sort)?)
+                        {
+                            return Err(TypedError::Decode(format!(
+                                "invalid extraction argument sort for {}",
+                                call.func
+                            )));
+                        }
+                    }
+                    &call.args
+                }
+                _ => {
+                    return Err(TypedError::Decode(
+                        "extraction must contain inert constructor/value data".into(),
+                    ));
+                }
+            };
+            for index in children.iter().rev() {
+                pending.push((record.resolve(Arena::Node, *index)?, false));
+            }
+        }
+        Ok(())
     }
 
     pub(super) fn select(
@@ -216,9 +404,29 @@ impl PartialEq for Expr {
             match (&na.kind, &nb.kind) {
                 (Some(pb::node::Kind::Var(a)), Some(pb::node::Kind::Var(b))) if a == b => {}
                 (
+                    Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
+                        value: Some(pb::primitive_value::Value::Vec(va)),
+                    })),
+                    Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
+                        value: Some(pb::primitive_value::Value::Vec(vb)),
+                    })),
+                ) if va.items.len() == vb.items.len() => {
+                    for (ia, ib) in va.items.iter().zip(&vb.items) {
+                        pending.push((
+                            a.resolve(Arena::Node, *ia).unwrap(),
+                            b.resolve(Arena::Node, *ib).unwrap(),
+                        ));
+                    }
+                }
+                (
                     Some(pb::node::Kind::PrimitiveValue(a)),
                     Some(pb::node::Kind::PrimitiveValue(b)),
-                ) if a == b => {}
+                ) if matches!(
+                    a.value,
+                    Some(
+                        pb::primitive_value::Value::I64(_) | pb::primitive_value::Value::F64Bits(_)
+                    )
+                ) && a == b => {}
                 (Some(pb::node::Kind::Call(ca)), Some(pb::node::Kind::Call(cb)))
                     if ca.func == cb.func && ca.args.len() == cb.args.len() =>
                 {
@@ -257,26 +465,22 @@ impl Hash for Expr {
                 continue;
             }
             let node = &owner.program.nodes[record.index as usize];
-            if !finish && let Some(pb::node::Kind::Call(c)) = &node.kind {
+            let children: &[u32] = match &node.kind {
+                Some(pb::node::Kind::Call(c)) => &c.args,
+                Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
+                    value: Some(pb::primitive_value::Value::Vec(v)),
+                })) => &v.items,
+                _ => &[],
+            };
+            if !finish && !children.is_empty() {
                 pending.push((record.clone(), true));
-                for i in c.args.iter().rev() {
+                for i in children.iter().rev() {
                     pending.push((record.resolve(Arena::Node, *i).unwrap(), false));
                 }
                 continue;
             }
             let mut h = DefaultHasher::new();
-            let sort = record.resolve(Arena::Sort, node.sort_id).unwrap();
-            match &sort.owner.as_ref().unwrap().program.sorts[sort.index as usize].kind {
-                Some(pb::sort::Kind::Eq(name)) => {
-                    0u8.hash(&mut h);
-                    name.hash(&mut h);
-                }
-                Some(pb::sort::Kind::Family(f)) if f.args.is_empty() => {
-                    1u8.hash(&mut h);
-                    f.name.hash(&mut h);
-                }
-                _ => unreachable!("expression sort outside the scalar/equality subset"),
-            }
+            SortRef(record.resolve(Arena::Sort, node.sort_id).unwrap()).hash(&mut h);
             match &node.kind {
                 Some(pb::node::Kind::Var(v)) => {
                     0u8.hash(&mut h);
@@ -305,6 +509,16 @@ impl Hash for Expr {
                         pb::primitive_value::Value::F64Bits(bits) => {
                             4u8.hash(&mut h);
                             bits.hash(&mut h);
+                        }
+                        pb::primitive_value::Value::Vec(values) => {
+                            5u8.hash(&mut h);
+                            values.items.len().hash(&mut h);
+                            for i in &values.items {
+                                let child = record.resolve(Arena::Node, *i).unwrap();
+                                hashes
+                                    [&(child.owner.as_ref().unwrap().id, child.arena, child.index)]
+                                    .hash(&mut h);
+                            }
                         }
                         _ => unreachable!("unsupported typed scalar codec"),
                     }

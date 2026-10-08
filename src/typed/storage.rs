@@ -159,6 +159,13 @@ fn visit(
                 }
                 pb::node::Kind::Var(_) => {}
                 pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
+                    value: Some(pb::primitive_value::Value::Vec(values)),
+                }) => {
+                    for child in &mut values.items {
+                        *child = map(Arena::Node, *child)?;
+                    }
+                }
+                pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
                     value:
                         Some(
                             pb::primitive_value::Value::I64(_)

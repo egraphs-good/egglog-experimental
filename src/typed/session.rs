@@ -210,7 +210,7 @@ impl EGraph {
         }
     }
 
-    /// Tree-extract a value and own the decoded finite constructor/scalar closure.
+    /// Tree-extract a value and own its finite constructor/scalar/Vec closure.
     pub fn extract<L: ValueInput>(&mut self, root: L) -> Result<L::Owned, TypedError> {
         let mut packer = Packer::default();
         let index = packer.intern(root.borrow().expression().0.clone(), 0);
@@ -256,6 +256,7 @@ fn adopt(
     let mut ids = HashMap::from([(root, 0u32)]);
     let mut pending = vec![root];
     let mut sorts = HashMap::new();
+    let mut sort_pending = vec![];
     let mut cursor = 0;
     while cursor < pending.len() {
         let old = pending[cursor];
@@ -264,139 +265,215 @@ fn adopt(
             .get(old as usize)
             .cloned()
             .ok_or_else(|| TypedError::Decode("invalid response node index".into()))?;
-        let sort = response
-            .sorts
-            .get(node.sort_id as usize)
-            .ok_or_else(|| TypedError::Decode("invalid response sort index".into()))?;
         let index = if let Some(index) = sorts.get(&node.sort_id) {
             *index
         } else {
             let index = program.sorts.len() as u32;
-            match &sort.kind {
-                Some(pb::sort::Kind::Eq(name)) => {
-                    program.declarations.push(pb::Declaration {
-                        kind: Some(pb::declaration::Kind::EqSort(pb::EqSort {
-                            name: name.clone(),
-                            ..Default::default()
-                        })),
-                        ..Default::default()
-                    });
-                }
-                Some(pb::sort::Kind::Family(f))
-                    if f.args.is_empty() && matches!(f.name.as_str(), "i64" | "f64") =>
-                {
-                    declarations
-                        .push(super::storage::builtin_catalog().declaration(&f.name, true)?);
-                }
-                _ => return Err(TypedError::Decode("unsupported extracted sort".into())),
-            }
-            program.sorts.push(sort.clone());
+            program.sorts.push(pb::Sort::default());
+            sort_pending.push(node.sort_id);
             sorts.insert(node.sort_id, index);
             index
         };
         node.sort_id = index;
-        match &mut node.kind {
-            Some(pb::node::Kind::Call(call)) => {
-                for child in &mut call.args {
-                    let next = ids.len() as u32;
-                    if let std::collections::hash_map::Entry::Vacant(entry) = ids.entry(*child) {
-                        entry.insert(next);
-                        pending.push(*child);
-                    }
-                    *child = ids[child];
-                }
-            }
+        let children: &mut [u32] = match &mut node.kind {
+            Some(pb::node::Kind::Call(call)) => &mut call.args,
+            Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
+                value: Some(pb::primitive_value::Value::Vec(values)),
+            })) => &mut values.items,
             Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
                 value:
                     Some(pb::primitive_value::Value::I64(_) | pb::primitive_value::Value::F64Bits(_)),
-            })) => {}
+            })) => &mut [],
             _ => {
                 return Err(TypedError::Decode(
-                    "extraction must contain inert constructor/scalar data".into(),
+                    "extraction must contain inert constructor/value data".into(),
                 ));
             }
+        };
+        for child in children {
+            let next = ids.len() as u32;
+            if let std::collections::hash_map::Entry::Vacant(entry) = ids.entry(*child) {
+                entry.insert(next);
+                pending.push(*child);
+            }
+            *child = ids[child];
         }
         program.nodes.push(node);
         cursor += 1;
     }
-    // The selected term must be finite, not merely index-closed. Use an explicit
-    // DFS stack so a legitimate deep extraction does not consume the Rust stack.
-    let mut colors = vec![0u8; program.nodes.len()];
-    let mut pending = vec![(0usize, false)];
-    while let Some((index, finish)) = pending.pop() {
-        if finish {
-            colors[index] = 2;
-            continue;
-        }
-        match colors[index] {
-            2 => continue,
-            1 => {
-                return Err(TypedError::Decode(
-                    "cyclic extraction is not inert data".into(),
-                ));
+    let mut cursor = 0;
+    while cursor < sort_pending.len() {
+        let old = sort_pending[cursor];
+        let mut sort = response
+            .sorts
+            .get(old as usize)
+            .cloned()
+            .ok_or_else(|| TypedError::Decode("invalid response sort index".into()))?;
+        match &mut sort.kind {
+            Some(pb::sort::Kind::Eq(name)) => program.declarations.push(pb::Declaration {
+                kind: Some(pb::declaration::Kind::EqSort(pb::EqSort {
+                    name: name.clone(),
+                    ..Default::default()
+                })),
+                ..Default::default()
+            }),
+            Some(pb::sort::Kind::Family(f))
+                if (f.name == "Vec" && f.args.len() == 1)
+                    || (matches!(f.name.as_str(), "i64" | "f64") && f.args.is_empty()) =>
+            {
+                declarations.push(super::storage::builtin_catalog().declaration(&f.name, true)?);
+                for child in &mut f.args {
+                    let next = sorts.len() as u32;
+                    if let std::collections::hash_map::Entry::Vacant(entry) = sorts.entry(*child) {
+                        entry.insert(next);
+                        sort_pending.push(*child);
+                        program.sorts.push(pb::Sort::default());
+                    }
+                    *child = sorts[child];
+                }
             }
-            _ => colors[index] = 1,
+            _ => return Err(TypedError::Decode("unsupported extracted sort".into())),
         }
-        pending.push((index, true));
-        if let Some(pb::node::Kind::Call(call)) = &program.nodes[index].kind {
-            for child in call.args.iter().rev() {
-                pending.push((*child as usize, false));
-            }
-        }
+        program.sorts[sorts[&old] as usize] = sort;
+        cursor += 1;
     }
     let mut slots = std::array::from_fn(|_| vec![]);
     slots[Arena::Node as usize] = (0..program.nodes.len() as u32).map(Slot::Local).collect();
     slots[Arena::Sort as usize] = (0..program.sorts.len() as u32).map(Slot::Local).collect();
-    let root = publish(program, slots, declarations, Arena::Node, 0)?;
-    let owner = root.owner.as_ref().unwrap();
-    for node in &owner.program.nodes {
-        if let Some(pb::node::Kind::PrimitiveValue(value)) = &node.kind {
-            super::expr::validate_literal(
-                &super::SortRef(root.resolve(Arena::Sort, node.sort_id)?),
-                value,
-            )?;
-            continue;
-        }
-        let Some(pb::node::Kind::Call(call)) = &node.kind else {
-            unreachable!()
-        };
-        let declaration = root.declaration(&call.func, false)?;
-        let Some(pb::declaration::Kind::Constructor(constructor)) =
-            &declaration.owner.as_ref().unwrap().program.declarations[declaration.index as usize]
-                .kind
-        else {
-            return Err(TypedError::Decode(
-                "extracted call is not a constructor".into(),
-            ));
-        };
-        if call.args.len() != constructor.inputs.len()
-            || super::SortRef(root.resolve(Arena::Sort, node.sort_id)?)
-                != super::SortRef(declaration.resolve(Arena::Sort, constructor.output)?)
-        {
-            return Err(TypedError::Decode(format!(
-                "invalid extraction signature for {}",
-                call.func
-            )));
-        }
-        for (child, input) in call.args.iter().zip(&constructor.inputs) {
-            let sort = owner.program.nodes[*child as usize].sort_id;
-            if super::SortRef(root.resolve(Arena::Sort, sort)?)
-                != super::SortRef(declaration.resolve(Arena::Sort, input.sort)?)
-            {
-                return Err(TypedError::Decode(format!(
-                    "invalid extraction argument sort for {}",
-                    call.func
-                )));
-            }
-        }
-    }
-    Ok(Expr(root))
+    let result = Expr(publish(program, slots, declarations, Arena::Node, 0)?);
+    result.validate_inert()?;
+    Ok(result)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::typed::{SortRef, decl::Callable};
+
+    #[test]
+    fn vec_response_adoption_checks_relocation_payloads_and_cycles() {
+        use crate::typed::{EgglogValue, builtins::I64};
+        let response = pb::RunProgramResponse {
+            sorts: vec![
+                pb::Sort {
+                    kind: Some(pb::sort::Kind::Family(pb::HostSort {
+                        name: "i64".into(),
+                        args: vec![],
+                    })),
+                    ..Default::default()
+                },
+                pb::Sort {
+                    kind: Some(pb::sort::Kind::Family(pb::HostSort {
+                        name: "Vec".into(),
+                        args: vec![0],
+                    })),
+                    ..Default::default()
+                },
+            ],
+            nodes: vec![
+                pb::Node {
+                    sort_id: 1,
+                    kind: Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
+                        value: Some(pb::primitive_value::Value::Vec(pb::ValueList {
+                            items: vec![1, 2, 1],
+                        })),
+                    })),
+                    ..Default::default()
+                },
+                pb::Node {
+                    kind: Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
+                        value: Some(pb::primitive_value::Value::I64(7)),
+                    })),
+                    ..Default::default()
+                },
+                pb::Node {
+                    kind: Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
+                        value: Some(pb::primitive_value::Value::I64(11)),
+                    })),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        let value = adopt(&response, 0, vec![]).unwrap();
+        let children = value.vec_elements(&I64::sort_ref()).unwrap();
+        assert_eq!(children[0].0.index, children[2].0.index);
+        assert_eq!(
+            children
+                .iter()
+                .map(|c| i64::try_from(&I64::from_expression(c.clone())).unwrap())
+                .collect::<Vec<_>>(),
+            [7, 11, 7]
+        );
+        let mut missing = response.clone();
+        let Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
+            value: Some(pb::primitive_value::Value::Vec(items)),
+        })) = &mut missing.nodes[0].kind
+        else {
+            panic!()
+        };
+        items.items[0] = 99;
+        assert!(
+            matches!(adopt(&missing, 0, vec![]), Err(TypedError::Decode(s)) if s == "invalid response node index")
+        );
+        let mut wrong = response.clone();
+        wrong.nodes[1].sort_id = 1;
+        assert!(
+            matches!(adopt(&wrong, 0, vec![]), Err(TypedError::Decode(s)) if s == "Vec payload element sort mismatch")
+        );
+        let mut cyclic_sort = response;
+        let Some(pb::sort::Kind::Family(f)) = &mut cyclic_sort.sorts[1].kind else {
+            panic!()
+        };
+        f.args[0] = 1;
+        assert!(
+            matches!(adopt(&cyclic_sort, 0, vec![]), Err(TypedError::Invalid(s)) if s == "cyclic concrete sort")
+        );
+
+        let atom = SortRef::equality("A");
+        let family = super::super::storage::builtin_catalog()
+            .declaration("Vec", true)
+            .unwrap();
+        let vector = SortRef::family(&family, vec![atom.clone()]).unwrap();
+        let pack = Callable::constructor("Pack", vec![vector], atom);
+        let cycle = pb::RunProgramResponse {
+            sorts: vec![
+                pb::Sort {
+                    kind: Some(pb::sort::Kind::Eq("A".into())),
+                    ..Default::default()
+                },
+                pb::Sort {
+                    kind: Some(pb::sort::Kind::Family(pb::HostSort {
+                        name: "Vec".into(),
+                        args: vec![0],
+                    })),
+                    ..Default::default()
+                },
+            ],
+            nodes: vec![
+                pb::Node {
+                    sort_id: 1,
+                    kind: Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
+                        value: Some(pb::primitive_value::Value::Vec(pb::ValueList {
+                            items: vec![1],
+                        })),
+                    })),
+                    ..Default::default()
+                },
+                pb::Node {
+                    kind: Some(pb::node::Kind::Call(pb::Call {
+                        func: "Pack".into(),
+                        args: vec![0],
+                    })),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        assert!(
+            matches!(adopt(&cycle, 0, vec![pack.0]), Err(TypedError::Decode(s)) if s == "cyclic extraction is not inert data")
+        );
+    }
 
     #[test]
     fn scalar_bytes_and_decoder_payload_types() {
