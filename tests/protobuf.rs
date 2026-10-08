@@ -36,6 +36,138 @@ fn native_catalog_snapshot_is_deterministic_and_installs_as_bytes() {
     }
 }
 
+#[test]
+fn declaration_doc_presence_survives_bytes_without_changing_execution_or_resupply() {
+    let mut encodings = vec![];
+    for first in [None, Some(""), Some(" docs\n")] {
+        let mut program = constant_fixture(&["test", "CURRENT"], &["test", "EMPTY"]);
+        for declaration in &mut program.declarations {
+            declaration.doc = first.map(str::to_owned);
+        }
+        let encoded = program.encode_to_vec();
+        let decoded = pb::Program::decode(encoded.as_slice()).unwrap();
+        assert_eq!(decoded, program);
+        assert!(
+            decoded
+                .declarations
+                .iter()
+                .all(|d| d.doc.as_deref() == first)
+        );
+        encodings.push(encoded);
+        let mut engine = Engine::default();
+        let id = create(&mut engine);
+        assert_eq!(run(&mut engine, id, program.clone()).error, None);
+        let clone = pb::CloneEGraphResponse::decode(
+            engine
+                .clone_egraph(&pb::CloneEGraphRequest { egraph_id: id }.encode_to_vec())
+                .unwrap()
+                .as_slice(),
+        )
+        .unwrap()
+        .egraph_id;
+        let mut renderer = egglog_experimental::protobuf::source::Renderer::default();
+        let mut native = new_experimental_egraph();
+        native
+            .parse_and_run_program(None, &renderer.render(&program).unwrap())
+            .unwrap();
+        for later in [None, Some(""), Some("other")] {
+            let mut resupply = program.clone();
+            for declaration in &mut resupply.declarations {
+                declaration.doc = later.map(str::to_owned);
+            }
+            for handle in [id, clone] {
+                let response = run(&mut engine, handle, resupply.clone());
+                assert_eq!(response.error, None);
+                let Some(pb::command_output::Kind::Extraction(result)) = &response.outputs[0].kind
+                else {
+                    unreachable!()
+                };
+                assert_eq!(value(&response, result.roots[0].variants[0].term), "20");
+            }
+            native
+                .parse_and_run_program(None, &renderer.render(&resupply).unwrap())
+                .unwrap();
+            let Some(pb::declaration::Kind::Constructor(constructor)) =
+                &mut resupply.declarations[1].kind
+            else {
+                unreachable!()
+            };
+            constructor.unextractable = true;
+            resupply.commands = vec![program.commands[0].clone()]; // Would write current=10.
+            assert!(run(&mut engine, id, resupply.clone()).error.is_some());
+            assert!(renderer.render(&resupply).is_err());
+        }
+        let mut observation = program;
+        observation.declarations.clear();
+        observation.commands = vec![observation.commands.last().unwrap().clone()];
+        let response = run(&mut engine, id, observation);
+        assert_eq!(response.error, None);
+        let Some(pb::command_output::Kind::Extraction(result)) = &response.outputs[0].kind else {
+            unreachable!()
+        };
+        assert_eq!(value(&response, result.roots[0].variants[0].term), "20");
+    }
+    assert!(
+        encodings[0] != encodings[1]
+            && encodings[1] != encodings[2]
+            && encodings[0] != encodings[2]
+    );
+    // This is byte transport/resupply behavior, not a Freeze or text-doc exporter.
+}
+
+#[test]
+fn repeated_tail_descriptors_preserve_width_and_reject_incompatible_providers_before_writes() {
+    let mut native = new_experimental_egraph();
+    let mut canonical = constant_fixture(&["test", "CURRENT"], &["test", "EMPTY"]);
+    native
+        .type_info()
+        .export_builtin_definition("egglog.core.vec.of", &mut canonical)
+        .unwrap();
+    let mut engine = Engine::default();
+    let id = create(&mut engine);
+    assert_eq!(run(&mut engine, id, canonical.clone()).error, None);
+    let mut renderer = egglog_experimental::protobuf::source::Renderer::default();
+    renderer.render(&canonical).unwrap();
+    for width in [0, 2, 3] {
+        let mut conflicting = canonical.clone();
+        let primitive = conflicting
+            .declarations
+            .iter_mut()
+            .find_map(|d| match &mut d.kind {
+                Some(pb::declaration::Kind::HostPrimitive(p)) if p.name == "egglog.core.vec.of" => {
+                    Some(p)
+                }
+                _ => None,
+            })
+            .unwrap();
+        let Some(pb::host_primitive::Typing::Signature(signature)) = &mut primitive.typing else {
+            unreachable!()
+        };
+        assert_eq!(signature.varargs.len(), 1);
+        signature.varargs = vec![signature.varargs[0].clone(); width];
+        conflicting.commands = vec![canonical.commands[0].clone()]; // Must not write current=10.
+        let decoded = pb::Program::decode(conflicting.encode_to_vec().as_slice()).unwrap();
+        assert_eq!(
+            decoded, conflicting,
+            "repeated equal patterns must not collapse"
+        );
+        assert!(run(&mut engine, id, decoded).error.is_some());
+        assert!(renderer.render(&conflicting).is_err());
+    }
+    let mut observation = canonical.clone();
+    observation.declarations.clear();
+    observation.commands = vec![observation.commands.last().unwrap().clone()];
+    let response = run(&mut engine, id, observation);
+    assert_eq!(response.error, None);
+    let Some(pb::command_output::Kind::Extraction(result)) = &response.outputs[0].kind else {
+        unreachable!()
+    };
+    assert_eq!(value(&response, result.roots[0].variants[0].term), "20");
+    assert_eq!(run(&mut engine, id, canonical).error, None);
+    // The registered Vec provider has width1. Wider groups transport faithfully
+    // but cannot replace its signature; no Map execution is claimed here.
+}
+
 fn constant_fixture(current_path: &[&str], constructor_path: &[&str]) -> pb::Program {
     let mut p = fixture();
     p.rules.clear();
