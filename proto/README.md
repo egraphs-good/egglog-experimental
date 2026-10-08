@@ -148,6 +148,15 @@ high-level generators use builtin and user declarations to produce Python/Rust
 symbolic APIs and Egglog source. For example, one signature might be presented
 as Python `m[k]` and Rust `m.get(k)`, with the same underlying call.
 
+Public Python APIs must be statically checkable with MyPy; typed Rust APIs must
+enforce their types at compilation. Test accepted calls and rejected wrong-sort
+or arity cases, not only runtime validation. A wire signature need not dictate
+the public argument shape: keep Python's existing `Map.empty`, `insert`, and
+indexing API without adding `Map.of`; Rust's existing `Map::of` accepts an
+iterator of typed key/value tuples and flattens them internally. This constraint
+also applies to default generated bindings: report unsupported generation rather
+than weakening types to expose a primitive.
+
 **Decided:** start with typed bindings for Rust, Python, and Egglog source only;
 defer arbitrary extension payloads and other languages. Egglog presentation
 bindings are where datatype grouping and related surface syntax belong, rather
