@@ -3,16 +3,294 @@ use super::{
     decl::Callable,
     expr::Expr,
     pb,
-    storage::{Arena, Packer, Record, Slot, publish},
+    storage::{Arena, DeclarationKind, Packer, Record, Slot, publish},
 };
 use prost::Message;
 use std::sync::Arc;
+
+// The same spelling deliberately names a nominal sort, an applied family,
+// and a constructor. Imports retain the original generated records.
+fn namespace_fragment(imported: bool, reversed: bool, missing: Option<DeclarationKind>) -> Record {
+    let mut declarations = vec![
+        (
+            DeclarationKind::EqSort,
+            pb::declaration::Kind::EqSort(pb::EqSort {
+                name: "Shared".into(),
+                bindings: Some(pb::SortBindings {
+                    rust: Some(pb::TypeBinding {
+                        path: vec!["Original".into()],
+                        type_params: vec![],
+                    }),
+                    ..Default::default()
+                }),
+            }),
+        ),
+        (
+            DeclarationKind::HostSortFamily,
+            pb::declaration::Kind::HostSortFamily(pb::HostSortFamily {
+                name: "Shared".into(),
+                arity: 1,
+                ..Default::default()
+            }),
+        ),
+        (
+            DeclarationKind::Callable,
+            pb::declaration::Kind::Constructor(pb::Constructor {
+                name: "Shared".into(),
+                output: 0,
+                ..Default::default()
+            }),
+        ),
+    ];
+    if reversed {
+        declarations.reverse();
+    }
+    let mut program = pb::Program {
+        ir_version: 1,
+        sorts: vec![
+            pb::Sort {
+                kind: Some(pb::sort::Kind::Eq("Shared".into())),
+                ..Default::default()
+            },
+            pb::Sort {
+                kind: Some(pb::sort::Kind::Family(pb::HostSort {
+                    name: "Shared".into(),
+                    args: vec![0],
+                })),
+                ..Default::default()
+            },
+        ],
+        nodes: vec![pb::Node {
+            sort_id: 0,
+            kind: Some(pb::node::Kind::Call(pb::Call {
+                func: "Shared".into(),
+                args: vec![],
+            })),
+            ..Default::default()
+        }],
+        declarations: declarations
+            .into_iter()
+            .filter(|(kind, _)| Some(*kind) != missing)
+            .map(|(_, kind)| pb::Declaration {
+                kind: Some(kind),
+                ..Default::default()
+            })
+            .collect(),
+        ..Default::default()
+    };
+    let slots = || {
+        let mut slots = std::array::from_fn(|_| vec![]);
+        slots[Arena::Sort as usize] = vec![Slot::Local(0), Slot::Local(1)];
+        slots
+    };
+    let imports = if imported {
+        let source = publish(program.clone(), slots(), vec![], Arena::Node, 0).unwrap();
+        let records = (0..program.declarations.len())
+            .map(|index| Record {
+                owner: source.owner.clone(),
+                arena: Arena::Declaration,
+                index: index as u32,
+            })
+            .collect();
+        program.declarations.clear();
+        records
+    } else {
+        vec![]
+    };
+    publish(program, slots(), imports, Arena::Node, 0).unwrap()
+}
+
+#[test]
+fn nominal_family_and_callable_names_close_independently() {
+    for imported in [false, true] {
+        for reversed in [false, true] {
+            let root = namespace_fragment(imported, reversed, None);
+            let nominal = SortRef(root.resolve(Arena::Sort, 0).unwrap());
+            let family = SortRef(root.resolve(Arena::Sort, 1).unwrap());
+            family.validate_closed().unwrap();
+            assert!(nominal != family);
+            assert!(nominal == SortRef::equality("Shared"));
+            for kind in [
+                DeclarationKind::EqSort,
+                DeclarationKind::HostSortFamily,
+                DeclarationKind::Callable,
+            ] {
+                let declaration = root.declaration("Shared", kind).unwrap();
+                let actual = &declaration.owner.as_ref().unwrap().program.declarations
+                    [declaration.index as usize]
+                    .kind;
+                assert!(matches!(
+                    (kind, actual),
+                    (
+                        DeclarationKind::EqSort,
+                        Some(pb::declaration::Kind::EqSort(_))
+                    ) | (
+                        DeclarationKind::HostSortFamily,
+                        Some(pb::declaration::Kind::HostSortFamily(_))
+                    ) | (
+                        DeclarationKind::Callable,
+                        Some(pb::declaration::Kind::Constructor(_))
+                    )
+                ));
+                if imported {
+                    assert!(root.owner.as_ref().unwrap().declarations.iter().any(|r| {
+                        Arc::ptr_eq(
+                            r.owner.as_ref().unwrap(),
+                            declaration.owner.as_ref().unwrap(),
+                        ) && r.index == declaration.index
+                    }));
+                } else {
+                    // Wrong-kind local records must not shadow the correct import.
+                    let mut program = root.owner.as_ref().unwrap().program.clone();
+                    program
+                        .declarations
+                        .retain(|d| d.kind.as_ref() != actual.as_ref());
+                    let mut slots = std::array::from_fn(|_| vec![]);
+                    slots[Arena::Sort as usize] = vec![Slot::Local(0), Slot::Local(1)];
+                    let mixed =
+                        publish(program, slots, vec![declaration.clone()], Arena::Node, 0).unwrap();
+                    let selected = mixed.declaration("Shared", kind).unwrap();
+                    assert!(Arc::ptr_eq(
+                        selected.owner.as_ref().unwrap(),
+                        declaration.owner.as_ref().unwrap()
+                    ));
+                    assert_eq!(selected.index, declaration.index);
+                }
+            }
+            let definition = root
+                .declaration("Shared", DeclarationKind::HostSortFamily)
+                .unwrap();
+            let applied = SortRef::family(&definition, vec![nominal]).unwrap();
+            assert!(applied == family);
+            assert!(SortRef::family(&definition, vec![]).is_err());
+            let hash = |sort: &SortRef| {
+                let mut h = std::hash::DefaultHasher::new();
+                std::hash::Hash::hash(sort, &mut h);
+                std::hash::Hasher::finish(&h)
+            };
+            assert_eq!(hash(&applied), hash(&family));
+            for family_first in [false, true] {
+                let mut roots = [root.clone(), family.0.clone()];
+                if family_first {
+                    roots.reverse();
+                }
+                let mut packer = Packer::default();
+                for record in roots {
+                    packer.intern(record, 0);
+                }
+                packer.finish().unwrap();
+                assert_eq!(packer.program.declarations.len(), 3);
+                assert!(packer.program.declarations.iter().any(|d| matches!(
+                    &d.kind, Some(pb::declaration::Kind::EqSort(d)) if d.name == "Shared"
+                )));
+                assert!(packer.program.declarations.iter().any(|d| matches!(
+                    &d.kind, Some(pb::declaration::Kind::HostSortFamily(d)) if d.name == "Shared"
+                )));
+                assert!(packer.program.declarations.iter().any(|d| matches!(
+                    &d.kind, Some(pb::declaration::Kind::Constructor(d)) if d.name == "Shared"
+                )));
+                let bytes = packer.program.encode_to_vec();
+                assert_eq!(
+                    pb::Program::decode(bytes.as_slice()).unwrap(),
+                    packer.program
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn missing_declaration_kind_never_uses_a_same_named_other_kind() {
+    for imported in [false, true] {
+        for reversed in [false, true] {
+            for missing in [
+                DeclarationKind::EqSort,
+                DeclarationKind::HostSortFamily,
+                DeclarationKind::Callable,
+            ] {
+                let root = namespace_fragment(imported, reversed, Some(missing));
+                assert!(root.declaration("Shared", missing).is_err());
+                let required = match missing {
+                    DeclarationKind::EqSort => root.resolve(Arena::Sort, 0).unwrap(),
+                    DeclarationKind::HostSortFamily => {
+                        let family = root.resolve(Arena::Sort, 1).unwrap();
+                        assert!(SortRef(family.clone()).validate_closed().is_err());
+                        family
+                    }
+                    DeclarationKind::Callable => root,
+                };
+                let mut packer = Packer::default();
+                packer.intern(required, 0);
+                assert!(packer.finish().is_err());
+            }
+        }
+    }
+}
+
+#[test]
+fn namespace_split_keeps_same_kind_and_callable_kind_conflicts() {
+    for changed in 0..4 {
+        let root = namespace_fragment(false, false, None);
+        let mut program = root.owner.as_ref().unwrap().program.clone();
+        match changed {
+            0 => {
+                let Some(pb::declaration::Kind::EqSort(d)) = &mut program.declarations[0].kind
+                else {
+                    unreachable!()
+                };
+                d.bindings = Some(pb::SortBindings {
+                    rust: Some(pb::TypeBinding {
+                        path: vec!["Changed".into()],
+                        type_params: vec![],
+                    }),
+                    ..Default::default()
+                });
+            }
+            1 => {
+                let Some(pb::declaration::Kind::HostSortFamily(d)) =
+                    &mut program.declarations[1].kind
+                else {
+                    unreachable!()
+                };
+                d.arity = 2;
+            }
+            2 => {
+                let Some(pb::declaration::Kind::Constructor(d)) = &mut program.declarations[2].kind
+                else {
+                    unreachable!()
+                };
+                d.unextractable = true;
+            }
+            _ => {
+                program.declarations[2].kind =
+                    Some(pb::declaration::Kind::HostPrimitive(pb::HostPrimitive {
+                        name: "Shared".into(),
+                        typing: Some(pb::host_primitive::Typing::Signature(
+                            pb::GenericSignature {
+                                output: Some(0),
+                                ..Default::default()
+                            },
+                        )),
+                    }));
+            }
+        }
+        let mut slots = std::array::from_fn(|_| vec![]);
+        slots[Arena::Sort as usize] = vec![Slot::Local(0), Slot::Local(1)];
+        let other = publish(program, slots, vec![], Arena::Node, 0).unwrap();
+        let mut packer = Packer::default();
+        for record in [root, other] {
+            packer.intern(record.resolve(Arena::Sort, 1).unwrap(), 0);
+            packer.intern(record, 0);
+        }
+        assert!(packer.finish().is_err(), "conflict case {changed}");
+    }
+}
 
 #[test]
 fn family_sort_comparison_resolves_slots_not_raw_indices() {
     use super::{EgglogValue, builtins::I64};
     let family = super::storage::builtin_catalog()
-        .declaration("Vec", true)
+        .declaration("Vec", DeclarationKind::HostSortFamily)
         .unwrap();
     let integers = SortRef::family(&family, vec![I64::sort_ref()]).unwrap();
     let atoms = SortRef::family(&family, vec![SortRef::equality("Atom")]).unwrap();
@@ -55,12 +333,26 @@ fn family_sort_comparison_resolves_slots_not_raw_indices() {
 fn generic_calls_infer_from_actual_arguments_and_result_records() {
     use super::{EgglogValue, builtins::I64};
     let catalog = super::storage::builtin_catalog();
-    let family = catalog.declaration("Vec", true).unwrap();
+    let family = catalog
+        .declaration("Vec", DeclarationKind::HostSortFamily)
+        .unwrap();
     let integers = SortRef::family(&family, vec![I64::sort_ref()]).unwrap();
     let atoms = SortRef::family(&family, vec![SortRef::equality("A")]).unwrap();
-    let empty = Callable(catalog.declaration("egglog.core.vec.empty", false).unwrap());
-    let of = Callable(catalog.declaration("egglog.core.vec.of", false).unwrap());
-    let get = Callable(catalog.declaration("egglog.core.vec.get", false).unwrap());
+    let empty = Callable(
+        catalog
+            .declaration("egglog.core.vec.empty", DeclarationKind::Callable)
+            .unwrap(),
+    );
+    let of = Callable(
+        catalog
+            .declaration("egglog.core.vec.of", DeclarationKind::Callable)
+            .unwrap(),
+    );
+    let get = Callable(
+        catalog
+            .declaration("egglog.core.vec.get", DeclarationKind::Callable)
+            .unwrap(),
+    );
     assert!(Expr::call_with_result(&empty, vec![], integers.clone()).is_ok());
     assert!(Expr::call_with_result(&of, vec![], atoms.clone()).is_ok());
     assert!(Expr::call_with_result(&empty, vec![], I64::sort_ref()).is_err());
@@ -377,12 +669,12 @@ fn vec_calls_and_values_preserve_actual_ordered_child_records() {
 
     let atom = SortRef::equality("VecOwnershipAtom");
     let family = super::storage::builtin_catalog()
-        .declaration("Vec", true)
+        .declaration("Vec", DeclarationKind::HostSortFamily)
         .unwrap();
     let vector_sort = SortRef::family(&family, vec![atom.clone()]).unwrap();
     let of = Callable(
         super::storage::builtin_catalog()
-            .declaration("egglog.core.vec.of", false)
+            .declaration("egglog.core.vec.of", DeclarationKind::Callable)
             .unwrap(),
     );
     let leaf = Expr::call(&Callable::constructor("Leaf", vec![], atom.clone()), vec![]);

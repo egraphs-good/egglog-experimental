@@ -3,7 +3,7 @@ use super::{
     expr::{Expr, ValueInput},
     pb,
     rule::{Facts, Ruleset, ensure_sort},
-    storage::{Arena, Key, Packer, Record, Slot, publish},
+    storage::{Arena, DeclarationKind, Key, Packer, Record, Slot, publish},
 };
 use prost::Message;
 use std::collections::{HashMap, HashSet};
@@ -321,7 +321,10 @@ fn adopt(
                 if (f.name == "Vec" && f.args.len() == 1)
                     || (matches!(f.name.as_str(), "i64" | "f64") && f.args.is_empty()) =>
             {
-                declarations.push(super::storage::builtin_catalog().declaration(&f.name, true)?);
+                declarations.push(
+                    super::storage::builtin_catalog()
+                        .declaration(&f.name, DeclarationKind::HostSortFamily)?,
+                );
                 for child in &mut f.args {
                     let next = sorts.len() as u32;
                     if let std::collections::hash_map::Entry::Vacant(entry) = sorts.entry(*child) {
@@ -432,7 +435,7 @@ mod tests {
 
         let atom = SortRef::equality("A");
         let family = super::super::storage::builtin_catalog()
-            .declaration("Vec", true)
+            .declaration("Vec", DeclarationKind::HostSortFamily)
             .unwrap();
         let vector = SortRef::family(&family, vec![atom.clone()]).unwrap();
         let pack = Callable::constructor("Pack", vec![vector], atom);
@@ -523,7 +526,7 @@ mod tests {
         let mut declarations = declarations;
         declarations.push(
             super::super::storage::builtin_catalog()
-                .declaration("egglog.core.i64.add", false)
+                .declaration("egglog.core.i64.add", DeclarationKind::Callable)
                 .unwrap(),
         );
         let error = adopt(&response, term, declarations).unwrap_err();

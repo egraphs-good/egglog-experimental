@@ -1069,12 +1069,15 @@ mod tests {
         let (source, deferred) = generate(&p).unwrap();
         assert!(source.contains("pub struct I64"));
         assert!(source.contains("pub struct F64"));
-        let has_vec_view = p.declarations.iter().any(|d| matches!(&d.kind,
-            Some(pb::declaration::Kind::HostSortFamily(f)) if f.name == "Vec" && f.bindings.as_ref().is_some_and(|b| b.rust.is_some())));
         assert_eq!(
-            deferred.len(),
-            if has_vec_view { 0 } else { 4 },
-            "unbound Vec APIs remain explicitly deferred"
+            deferred,
+            [
+                "Pair",
+                "egglog.core.pair.first",
+                "egglog.core.pair.make",
+                "egglog.core.pair.second",
+            ],
+            "all native Pair records remain retained without Rust views"
         );
         assert_eq!(source.matches("fn add(self,").count(), 8);
         assert_locations(&p, &source);
@@ -1266,8 +1269,17 @@ mod tests {
             if permute {
                 program.declarations.reverse();
             }
-            let (source, deferred) = generate(&program).unwrap();
-            assert!(deferred.is_empty());
+            let (source, mut deferred) = generate(&program).unwrap();
+            deferred.sort();
+            assert_eq!(
+                deferred,
+                [
+                    "Pair",
+                    "egglog.core.pair.first",
+                    "egglog.core.pair.make",
+                    "egglog.core.pair.second",
+                ]
+            );
             let parameters = generic_parameters(&program, 1);
             for (index, d) in program.declarations.iter().enumerate() {
                 if let Some(pb::declaration::Kind::HostSortFamily(f)) = &d.kind {
@@ -1291,7 +1303,10 @@ mod tests {
                 if s.type_params.is_empty() {
                     continue;
                 }
-                let views = &d.bindings.as_ref().unwrap().rust.as_ref().unwrap().views;
+                let Some(rust) = d.bindings.as_ref().and_then(|b| b.rust.as_ref()) else {
+                    continue;
+                };
+                let views = &rust.views;
                 for view in views {
                     let Some(pb::binding_owner::Kind::Sort(owner)) =
                         view.owner.as_ref().unwrap().kind

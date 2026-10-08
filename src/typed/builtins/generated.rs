@@ -262,7 +262,7 @@ impl ::core::ops::Add<self::F64> for self::F64 {
         let mut __egglog_record =
             ::core::clone::Clone::clone(crate::typed::storage::builtin_catalog());
         __egglog_record.arena = crate::typed::storage::Arena::Declaration;
-        __egglog_record.index = 3;
+        __egglog_record.index = 4;
         <self::F64 as crate::typed::EgglogValue>::from_expression(crate::typed::expr::Expr::call(
             &crate::typed::decl::Callable(__egglog_record),
             ::std::vec![
@@ -279,7 +279,7 @@ impl ::core::ops::Add<&self::F64> for self::F64 {
         let mut __egglog_record =
             ::core::clone::Clone::clone(crate::typed::storage::builtin_catalog());
         __egglog_record.arena = crate::typed::storage::Arena::Declaration;
-        __egglog_record.index = 3;
+        __egglog_record.index = 4;
         <self::F64 as crate::typed::EgglogValue>::from_expression(crate::typed::expr::Expr::call(
             &crate::typed::decl::Callable(__egglog_record),
             ::std::vec![
@@ -296,7 +296,7 @@ impl ::core::ops::Add<self::F64> for &self::F64 {
         let mut __egglog_record =
             ::core::clone::Clone::clone(crate::typed::storage::builtin_catalog());
         __egglog_record.arena = crate::typed::storage::Arena::Declaration;
-        __egglog_record.index = 3;
+        __egglog_record.index = 4;
         <self::F64 as crate::typed::EgglogValue>::from_expression(crate::typed::expr::Expr::call(
             &crate::typed::decl::Callable(__egglog_record),
             ::std::vec![
@@ -313,7 +313,7 @@ impl ::core::ops::Add<&self::F64> for &self::F64 {
         let mut __egglog_record =
             ::core::clone::Clone::clone(crate::typed::storage::builtin_catalog());
         __egglog_record.arena = crate::typed::storage::Arena::Declaration;
-        __egglog_record.index = 3;
+        __egglog_record.index = 4;
         <self::F64 as crate::typed::EgglogValue>::from_expression(crate::typed::expr::Expr::call(
             &crate::typed::decl::Callable(__egglog_record),
             ::std::vec![
@@ -330,7 +330,7 @@ impl ::core::ops::Add<self::I64> for self::I64 {
         let mut __egglog_record =
             ::core::clone::Clone::clone(crate::typed::storage::builtin_catalog());
         __egglog_record.arena = crate::typed::storage::Arena::Declaration;
-        __egglog_record.index = 4;
+        __egglog_record.index = 5;
         <self::I64 as crate::typed::EgglogValue>::from_expression(crate::typed::expr::Expr::call(
             &crate::typed::decl::Callable(__egglog_record),
             ::std::vec![
@@ -347,7 +347,7 @@ impl ::core::ops::Add<&self::I64> for self::I64 {
         let mut __egglog_record =
             ::core::clone::Clone::clone(crate::typed::storage::builtin_catalog());
         __egglog_record.arena = crate::typed::storage::Arena::Declaration;
-        __egglog_record.index = 4;
+        __egglog_record.index = 5;
         <self::I64 as crate::typed::EgglogValue>::from_expression(crate::typed::expr::Expr::call(
             &crate::typed::decl::Callable(__egglog_record),
             ::std::vec![
@@ -364,7 +364,7 @@ impl ::core::ops::Add<self::I64> for &self::I64 {
         let mut __egglog_record =
             ::core::clone::Clone::clone(crate::typed::storage::builtin_catalog());
         __egglog_record.arena = crate::typed::storage::Arena::Declaration;
-        __egglog_record.index = 4;
+        __egglog_record.index = 5;
         <self::I64 as crate::typed::EgglogValue>::from_expression(crate::typed::expr::Expr::call(
             &crate::typed::decl::Callable(__egglog_record),
             ::std::vec![
@@ -381,7 +381,7 @@ impl ::core::ops::Add<&self::I64> for &self::I64 {
         let mut __egglog_record =
             ::core::clone::Clone::clone(crate::typed::storage::builtin_catalog());
         __egglog_record.arena = crate::typed::storage::Arena::Declaration;
-        __egglog_record.index = 4;
+        __egglog_record.index = 5;
         <self::I64 as crate::typed::EgglogValue>::from_expression(crate::typed::expr::Expr::call(
             &crate::typed::decl::Callable(__egglog_record),
             ::std::vec![
@@ -400,7 +400,7 @@ impl<__EgglogType0: crate::typed::EgglogValue> self::Vec<__EgglogType0> {
         let mut __egglog_record =
             ::core::clone::Clone::clone(crate::typed::storage::builtin_catalog());
         __egglog_record.arena = crate::typed::storage::Arena::Declaration;
-        __egglog_record.index = 5;
+        __egglog_record.index = 9;
         <self::Vec<__EgglogType0> as crate::typed::EgglogValue>::from_expression(
             crate::typed::expr::Expr::call_with_result(
                 &crate::typed::decl::Callable(__egglog_record),
@@ -425,7 +425,7 @@ impl<__EgglogType0: crate::typed::EgglogValue> self::Vec<__EgglogType0> {
         let mut __egglog_record =
             ::core::clone::Clone::clone(crate::typed::storage::builtin_catalog());
         __egglog_record.arena = crate::typed::storage::Arena::Declaration;
-        __egglog_record.index = 6;
+        __egglog_record.index = 10;
         <__EgglogType0 as crate::typed::EgglogValue>::from_expression(
             crate::typed::expr::Expr::call_with_result(
                 &crate::typed::decl::Callable(__egglog_record),
@@ -454,7 +454,7 @@ impl<__EgglogType0: crate::typed::EgglogValue> self::Vec<__EgglogType0> {
         let mut __egglog_record =
             ::core::clone::Clone::clone(crate::typed::storage::builtin_catalog());
         __egglog_record.arena = crate::typed::storage::Arena::Declaration;
-        __egglog_record.index = 7;
+        __egglog_record.index = 11;
         <self::Vec<__EgglogType0> as crate::typed::EgglogValue>::from_expression(
             crate::typed::expr::Expr::call_with_result(
                 &crate::typed::decl::Callable(__egglog_record),

@@ -11,6 +11,24 @@ impl Atom {
     pub fn B() -> Self;
 }
 
+#[sort(name = "Pair")]
+pub struct Pair;
+#[declarations]
+impl Pair {
+    pub fn P() -> Self;
+}
+
+#[test]
+fn nominal_pair_name_executes_without_renaming_the_native_family() -> Result<(), TypedError> {
+    assert!(Pair::sort_ref() == egglog_experimental::typed::SortRef::equality("Pair"));
+    let value = Pair::P();
+    let mut graph = EGraph::default();
+    graph.register(&value)?;
+    assert!(graph.check(eq(&value, &value))?);
+    assert_eq!(graph.extract(&value)?, value);
+    Ok(())
+}
+
 #[sort]
 pub struct Math;
 #[declarations]

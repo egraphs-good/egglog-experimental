@@ -41,6 +41,13 @@ pub(super) enum Arena {
     Ruleset,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(super) enum DeclarationKind {
+    EqSort,
+    HostSortFamily,
+    Callable,
+}
+
 #[derive(Clone)]
 pub(super) struct Record {
     pub owner: Option<Arc<Owner>>,
@@ -104,13 +111,21 @@ impl Record {
         }
     }
 
-    pub fn declaration(&self, name: &str, sort: bool) -> Result<Self, TypedError> {
+    pub fn declaration(&self, name: &str, kind: DeclarationKind) -> Result<Self, TypedError> {
         let owner = self.owner.as_ref().unwrap();
         let matches = |d: &pb::Declaration| match &d.kind {
-            Some(pb::declaration::Kind::EqSort(d)) => sort && d.name == name,
-            Some(pb::declaration::Kind::HostSortFamily(d)) => sort && d.name == name,
-            Some(pb::declaration::Kind::Constructor(d)) => !sort && d.name == name,
-            Some(pb::declaration::Kind::HostPrimitive(d)) => !sort && d.name == name,
+            Some(pb::declaration::Kind::EqSort(d)) => {
+                kind == DeclarationKind::EqSort && d.name == name
+            }
+            Some(pb::declaration::Kind::HostSortFamily(d)) => {
+                kind == DeclarationKind::HostSortFamily && d.name == name
+            }
+            Some(pb::declaration::Kind::Constructor(d)) => {
+                kind == DeclarationKind::Callable && d.name == name
+            }
+            Some(pb::declaration::Kind::HostPrimitive(d)) => {
+                kind == DeclarationKind::Callable && d.name == name
+            }
             _ => false,
         };
         if let Some(index) = owner.program.declarations.iter().position(matches) {
@@ -125,7 +140,7 @@ impl Record {
             .iter()
             .find(|r| matches(&r.owner.as_ref().unwrap().program.declarations[r.index as usize]))
             .cloned()
-            .ok_or_else(|| TypedError::Invalid(format!("declaration unavailable: {name}")))
+            .ok_or_else(|| TypedError::Invalid(format!("{kind:?} declaration unavailable: {name}")))
     }
 }
 
@@ -455,7 +470,10 @@ impl Packer {
                             })?;
                         }
                         Some(pb::node::Kind::Call(call)) => {
-                            self.intern(record.declaration(&call.func, false)?, 0);
+                            self.intern(
+                                record.declaration(&call.func, DeclarationKind::Callable)?,
+                                0,
+                            );
                         }
                         _ => {}
                     }
@@ -465,10 +483,13 @@ impl Packer {
                     let s = owner.program.sorts[record.index as usize].clone();
                     match &s.kind {
                         Some(pb::sort::Kind::Eq(name)) => {
-                            self.intern(record.declaration(name, true)?, 0);
+                            self.intern(record.declaration(name, DeclarationKind::EqSort)?, 0);
                         }
                         Some(pb::sort::Kind::Family(f)) => {
-                            self.intern(record.declaration(&f.name, true)?, 0);
+                            self.intern(
+                                record.declaration(&f.name, DeclarationKind::HostSortFamily)?,
+                                0,
+                            );
                         }
                         _ => {}
                     }
@@ -504,7 +525,7 @@ impl Packer {
                 Arena::Declaration => {
                     let d = one.declarations.pop().unwrap();
                     // Keep actual records for validating decoded finite data.
-                    // Sort/callable names have separate wire namespaces.
+                    // This index holds constructors, not either sort namespace.
                     if let Some(pb::declaration::Kind::Constructor(c)) = &d.kind {
                         self.declarations.insert(c.name.clone(), record.clone());
                     }
@@ -522,14 +543,18 @@ impl Packer {
         let mut seen = HashMap::new();
         let mut kept = vec![];
         for d in &self.program.declarations {
-            let (sort, name) = match &d.kind {
-                Some(pb::declaration::Kind::EqSort(d)) => (true, &d.name),
-                Some(pb::declaration::Kind::HostSortFamily(d)) => (true, &d.name),
-                Some(pb::declaration::Kind::Constructor(d)) => (false, &d.name),
-                Some(pb::declaration::Kind::HostPrimitive(d)) => (false, &d.name),
+            let (kind, name) = match &d.kind {
+                Some(pb::declaration::Kind::EqSort(d)) => (DeclarationKind::EqSort, &d.name),
+                Some(pb::declaration::Kind::HostSortFamily(d)) => {
+                    (DeclarationKind::HostSortFamily, &d.name)
+                }
+                Some(pb::declaration::Kind::Constructor(d)) => (DeclarationKind::Callable, &d.name),
+                Some(pb::declaration::Kind::HostPrimitive(d)) => {
+                    (DeclarationKind::Callable, &d.name)
+                }
                 _ => unreachable!(),
             };
-            if let Some(previous) = seen.insert((sort, name), d) {
+            if let Some(previous) = seen.insert((kind, name), d) {
                 if !super::decl::compatible(&self.program, previous, d) {
                     return Err(TypedError::Invalid(format!(
                         "conflicting declaration {name}"

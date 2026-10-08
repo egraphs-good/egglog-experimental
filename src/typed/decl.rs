@@ -1,6 +1,6 @@
 use super::{
     TypedError, pb,
-    storage::{Arena, Packer, Record, Slot, publish},
+    storage::{Arena, DeclarationKind, Packer, Record, Slot, publish},
 };
 use std::{
     collections::{HashMap, HashSet},
@@ -74,7 +74,8 @@ impl SortRef {
             match &owner.program.sorts[record.index as usize].kind {
                 Some(pb::sort::Kind::Eq(_)) => {}
                 Some(pb::sort::Kind::Family(f)) => {
-                    let declaration = record.declaration(&f.name, true)?;
+                    let declaration =
+                        record.declaration(&f.name, DeclarationKind::HostSortFamily)?;
                     let Some(pb::declaration::Kind::HostSortFamily(d)) =
                         &declaration.owner.as_ref().unwrap().program.declarations
                             [declaration.index as usize]

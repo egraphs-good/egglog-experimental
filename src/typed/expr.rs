@@ -2,7 +2,7 @@ use super::{
     SortRef, TypedError,
     decl::Callable,
     pb,
-    storage::{Arena, Key, Record, Slot, publish},
+    storage::{Arena, DeclarationKind, Key, Record, Slot, publish},
 };
 use std::{
     collections::{HashMap, HashSet},
@@ -295,7 +295,7 @@ impl Expr {
                     &[]
                 }
                 Some(pb::node::Kind::Call(call)) => {
-                    let declaration = record.declaration(&call.func, false)?;
+                    let declaration = record.declaration(&call.func, DeclarationKind::Callable)?;
                     let Some(pb::declaration::Kind::Constructor(constructor)) =
                         &declaration.owner.as_ref().unwrap().program.declarations
                             [declaration.index as usize]
@@ -352,7 +352,9 @@ impl Expr {
                 "selector must return one direct constructor".into(),
             ));
         };
-        let declaration = pattern.0.declaration(&call.func, false)?;
+        let declaration = pattern
+            .0
+            .declaration(&call.func, DeclarationKind::Callable)?;
         if !matches!(
             &declaration.owner.as_ref().unwrap().program.declarations[declaration.index as usize]
                 .kind,
@@ -377,7 +379,12 @@ impl Expr {
         let Some(pb::node::Kind::Call(actual)) = &n.kind else {
             return Ok(None);
         };
-        if !super::decl::same_callable(&self.0.declaration(&actual.func, false)?, &declaration)? {
+        if !super::decl::same_callable(
+            &self
+                .0
+                .declaration(&actual.func, DeclarationKind::Callable)?,
+            &declaration,
+        )? {
             return Ok(None);
         }
         actual
@@ -438,8 +445,8 @@ impl PartialEq for Expr {
                     if ca.func == cb.func && ca.args.len() == cb.args.len() =>
                 {
                     if !super::decl::same_callable(
-                        &a.declaration(&ca.func, false).unwrap(),
-                        &b.declaration(&cb.func, false).unwrap(),
+                        &a.declaration(&ca.func, DeclarationKind::Callable).unwrap(),
+                        &b.declaration(&cb.func, DeclarationKind::Callable).unwrap(),
                     )
                     .unwrap_or(false)
                     {
