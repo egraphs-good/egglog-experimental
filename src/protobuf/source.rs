@@ -130,6 +130,18 @@ impl Source {
             for command in resolved {
                 match command {
                     N::Sort {
+                        name,
+                        presort_and_args: Some(_),
+                        uf: None,
+                        proof_func: None,
+                        container_rebuild: None,
+                        proof_constructors: None,
+                        unionable: true,
+                        ..
+                    } => {
+                        self.sort(&name)?;
+                    }
+                    N::Sort {
                         span,
                         name,
                         presort_and_args: None,
@@ -582,32 +594,7 @@ impl Source {
             .graph
             .get_sort_by_name(name)
             .ok_or_else(|| format!("unknown sort {name}"))?;
-        let kind = if native.is_eq_sort() {
-            pb::sort::Kind::Eq(name.into())
-        } else if matches!(name, "i64" | "f64" | "String" | "bool" | "Unit") {
-            pb::sort::Kind::Family(pb::HostSort {
-                name: name.into(),
-                args: vec![],
-            })
-        } else {
-            return Err(format!(
-                "source sort {name} requires provider/catalog mapping"
-            ));
-        };
-        if let Some(index) = self
-            .program
-            .sorts
-            .iter()
-            .position(|sort| sort.kind.as_ref() == Some(&kind))
-        {
-            return u32::try_from(index).map_err(|_| "too many source sorts".into());
-        }
-        let index = u32::try_from(self.program.sorts.len()).map_err(|_| "too many source sorts")?;
-        self.program.sorts.push(pb::Sort {
-            kind: Some(kind),
-            ..Default::default()
-        });
-        Ok(index)
+        self.graph.export_sort(native, &mut self.program.sorts)
     }
 
     fn span(&mut self, span: &ast::Span) -> Result<Option<pb::Span>, String> {
@@ -652,6 +639,49 @@ impl Iterator for Source {
 /// This does not execute or retain the source, and rejects unsupported forms.
 /// Submit successive rendered phases to the same native graph in source order.
 pub fn render(program: &pb::Program) -> Result<String, TransportError> {
+    if program.sorts.iter().any(|sort| matches!(&sort.kind, Some(pb::sort::Kind::Family(family)) if !family.args.is_empty())) {
+        return Err(TransportError("container phases require the stateful source Renderer".into()));
+    }
+    render_prepared(program, vec![])
+}
+
+/// Stateful, typechecking-only renderer. Tracks structural sort declarations
+/// across phases; callers submit each result in order and stop on an error.
+pub struct Renderer {
+    session: Session,
+}
+
+impl Default for Renderer {
+    fn default() -> Self {
+        Self {
+            session: Session {
+                graph: crate::new_experimental_egraph(),
+                request: 0,
+                rulesets: HashMap::new(),
+                origins: HashMap::new(),
+            },
+        }
+    }
+}
+
+impl Renderer {
+    /// Validates and renders one phase, retaining only type/definition state.
+    pub fn render(&mut self, program: &pb::Program) -> Result<String, TransportError> {
+        let mut lowered = program.clone();
+        let (session, materialized) = self
+            .session
+            .prepare(&mut lowered)
+            .map_err(|e| TransportError(e.0.message))?;
+        let source = render_prepared(&lowered, materialized)?;
+        self.session = session;
+        Ok(source)
+    }
+}
+
+fn render_prepared(
+    program: &pb::Program,
+    materialized: Vec<Command>,
+) -> Result<String, TransportError> {
     let result = (|| -> Result<Vec<Command>, String> {
         if program.ir_version != 1 {
             return Err("unsupported source IR version".into());
@@ -666,6 +696,7 @@ pub fn render(program: &pb::Program) -> Result<String, TransportError> {
             match &sort.kind {
                 Some(pb::sort::Kind::Eq(name)) => names.push(name.as_str()),
                 Some(pb::sort::Kind::Family(family)) => names.push(family.name.as_str()),
+                Some(pb::sort::Kind::Var(_)) => (),
                 _ => return Err("unsupported source sort".into()),
             }
         }
@@ -714,6 +745,15 @@ pub fn render(program: &pb::Program) -> Result<String, TransportError> {
         }
         let mut commands = vec![];
         for declaration in &program.declarations {
+            if let Some(pb::declaration::Kind::EqSort(sort)) = &declaration.kind {
+                commands.push(Command::Sort {
+                    span: native_span(program, declaration.span.as_ref())?, name: sort.name.clone(), presort_and_args: None,
+                    uf: None, proof_func: None, container_rebuild: None, proof_constructors: None, unionable: true,
+                });
+            }
+        }
+        commands.extend(materialized);
+        for declaration in &program.declarations {
             let span = native_span(program, declaration.span.as_ref())?;
             commands.push(
                 match declaration
@@ -721,16 +761,7 @@ pub fn render(program: &pb::Program) -> Result<String, TransportError> {
                     .as_ref()
                     .ok_or("missing declaration kind")?
                 {
-                    pb::declaration::Kind::EqSort(sort) => Command::Sort {
-                        span,
-                        name: sort.name.clone(),
-                        presort_and_args: None,
-                        uf: None,
-                        proof_func: None,
-                        container_rebuild: None,
-                        proof_constructors: None,
-                        unionable: true,
-                    },
+                    pb::declaration::Kind::EqSort(_) => continue,
                     pb::declaration::Kind::Constructor(constructor) => Command::Constructor {
                         span,
                         name: constructor.name.clone(),

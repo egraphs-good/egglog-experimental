@@ -471,7 +471,7 @@ effects and observations. Native ASTs are transient lowering products.
 
 The current executable subset is deliberately limited:
 
-- Equality sorts and the five scalar host sorts; explicit constructor/function
+- Equality sorts, the five scalar host sorts and nested Vec applications; explicit constructor/function
   declarations with scalar static costs and merge bodies using values,
   old/new variables, and constructors.
 - Ordered actions and persistent captures expressed as nullary function sets.
@@ -480,9 +480,10 @@ The current executable subset is deliberately limited:
   table rows; native e-graph clone and destruction.
 - Profile-enabled execution with command locations and compact run summaries.
 - Catalog-backed i64/f64 addition through distinct host definition keys.
+- Generic Vec empty/of/get, ordered Vec value payloads and extracted Vec data.
 
 Unsupported forms fail explicitly. These include profile-off (the native engine
-still collects timing data), action/nested/empty Union identities, complex values
+still collects timing data), action/nested/empty Union identities, other complex values
 and codecs, other primitive catalog mappings, relations, declaration/ruleset
 resupply, anonymous/combined/shared rulesets, nondefault rule modes, schedulers,
 loops, snapshots, proof requests, merge table reads, and custom cost models.
@@ -539,6 +540,22 @@ the byte-adapter path. They also cover ordered captures, failure prefixes and
 mutated/corrupt byte controls. Run `cargo test --test protobuf source_`; this is a
 small semantic roundtrip checkpoint, not migration of the source corpus.
 
+Container phases use `protobuf::source::Renderer::default()` and its `render`
+method, retaining the type/definition state across phases. It emits each closed
+structural Vec sort once, including children before parents; rendering executes
+no user actions. The stateless `render` entrypoint retains the scalar subset
+and explicitly rejects container phases. Native source resolution remains
+nominal, so two source aliases for Vec<i64> do not become interchangeable before
+export; after resolution both map to one structural wire sort.
+
+The adapter currently reserves `__egglog_proto_` and `__egglog_instance_` for
+derived native sort/instance names. Authored equality-sort and callable
+declarations using those prefixes fail before installation or effects. This is
+a temporary valid-name conformance gap, not a final naming policy; systematic
+public/private name separation remains required. Do not rely on an unlikely
+prefix to avoid collisions. Reordered wire sort arenas and cloned sessions do
+not change the structural sort identity.
+
 ### Initial engine-owned builtin definitions
 
 Core's primitive macro accepts an optional `[id = "provider.definition"]` next
@@ -552,16 +569,27 @@ cannot substitute a source alias or switch overloads through inference.
 
 `TypeInfo::builtin_catalog()` returns the migrated protobuf definitions and
 explicit lists of undescribed primitive registrations, presort factories and
-installed non-equality sorts. Export performs no application or validation of
+installed non-equality sorts. Reserved but undescribed family operations are
+also inventoried before any instances exist. Export performs no application or validation of
 values. Conflicting registration keys fail catalog export/lookup while existing
 unrelated native aliases keep their behavior. Compatible host descriptor resends
 are assertions, not implementation replacement. Rendering retains exact keys,
 which the native registry recognizes as the same registration identities.
 
-This checkpoint implements closed scalar signatures only. It does not implement
-complete `Freeze`, generic Vec/Map/Fn definitions, wrapper generation, custom
+Vec's three canonical generic definitions are registered with its presort before
+instantiation. The `[instance = binding]` primitive macro derives constraints
+from those same protobuf patterns and checks runtime conversion/arity agreement;
+there is no handwritten native signature beside the record. Native nominal
+instances share one wire definition key. Decoded calls validate all argument
+and result sorts before selecting a derived native instance lookup key, pointing
+to the same implementation, validator and context IDs. This preserves output-only
+typing of an empty Vec even with several concrete shapes installed. These
+compiler lookup keys never become wire declarations or exported sort names.
+
+This checkpoint does not implement complete `Freeze`, other Vec operations,
+generic Map/Fn definitions, wrapper generation, custom
 codecs or capability/proof metadata export. The generic signature/family records
-remain the next compiler input; opaque constraints are never scraped into a
+remain the compiler input; opaque constraints are never scraped into a
 second signature registry. In core, run
 `cargo test --no-default-features --test builtin_catalog`; in this repository,
 run `cargo test --test protobuf`.

@@ -3,6 +3,286 @@ use egglog_experimental::{new_experimental_egraph, protobuf::Engine};
 use prost::Message;
 
 #[test]
+fn source_vec_calls_execute_through_bytes() {
+    use egglog_experimental::protobuf::source::{Renderer, Source};
+    let text = r#"
+        (sort V (Vec i64)) (sort W (Vec i64)) (sort Nested (Vec W))
+        (function v () V :merge new) (function w () W :merge new)
+        (function nested () Nested :merge new)
+        (set (v) (vec-empty)) (set (w) (vec-of 3 4))
+        (set (nested) (vec-of (w)))
+        (check (= (vec-get (w) 1) 4))
+        (extract (vec-get (vec-get (nested) 0) 1))
+        (extract (v)) (extract (nested))
+    "#;
+    new_experimental_egraph()
+        .parse_and_run_program(None, text)
+        .unwrap();
+    let mut engine = Engine::default();
+    let id = create(&mut engine);
+    let mut results = vec![];
+    let mut renderer = Renderer::default();
+    let mut rendered = new_experimental_egraph();
+    for program in Source::new(None, text).unwrap() {
+        let program = pb::Program::decode(program.unwrap().encode_to_vec().as_slice()).unwrap();
+        let source = renderer.render(&program).unwrap();
+        rendered.parse_and_run_program(None, &source).unwrap();
+        let response = run(&mut engine, id, program);
+        assert_eq!(response.error, None);
+        for output in &response.outputs {
+            if let Some(pb::command_output::Kind::Extraction(result)) = &output.kind {
+                results.push(value(&response, result.roots[0].variants[0].term));
+                let reingest = pb::Program {
+                    ir_version: 1,
+                    sorts: response.sorts.clone(),
+                    nodes: response.nodes.clone(),
+                    commands: vec![pb::Command {
+                        kind: Some(pb::command::Kind::Extract(pb::Extract {
+                            roots: vec![result.roots[0].variants[0].term],
+                            variants: 1,
+                            extractor: pb::Extractor::Tree.into(),
+                            ..Default::default()
+                        })),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                };
+                assert_eq!(run(&mut engine, id, reingest.clone()).error, None);
+                rendered
+                    .parse_and_run_program(None, &renderer.render(&reingest).unwrap())
+                    .unwrap();
+            }
+        }
+    }
+    assert_eq!(results, ["4", "[]", "[[3, 4]]"]);
+}
+
+#[test]
+fn vec_empty_result_annotations_survive_multiple_shapes_and_rendering() {
+    use egglog_experimental::protobuf::source::{Renderer, Source};
+    let text = r#"(sort V (Vec i64)) (extract (vec-empty)) (sort S (Vec String))
+        (function empty () V :merge new) (set (empty) (vec-empty)) (extract (empty))"#;
+    let mut renderer = Renderer::default();
+    let mut reparsed = new_experimental_egraph();
+    let mut engine = Engine::default();
+    let id = create(&mut engine);
+    for (index, phase) in Source::new(None, text).unwrap().enumerate() {
+        let mut program = phase.unwrap();
+        if index == 5 {
+            let Some(pb::command::Kind::Extract(extract)) = &program.commands[0].kind else {
+                unreachable!()
+            };
+            program.nodes[extract.roots[0] as usize].kind = Some(pb::node::Kind::Call(pb::Call {
+                func: "egglog.core.vec.empty".into(),
+                args: vec![],
+            }));
+        }
+        reparsed
+            .parse_and_run_program(None, &renderer.render(&program).unwrap())
+            .unwrap();
+        let response = run(&mut engine, id, program.clone());
+        assert_eq!(response.error, None);
+        if index == 5 {
+            let Some(pb::command_output::Kind::Extraction(result)) = &response.outputs[0].kind
+            else {
+                unreachable!()
+            };
+            assert_eq!(value(&response, result.roots[0].variants[0].term), "[]");
+            let bytes = engine
+                .clone_egraph(&pb::CloneEGraphRequest { egraph_id: id }.encode_to_vec())
+                .unwrap();
+            let clone = pb::CloneEGraphResponse::decode(bytes.as_slice())
+                .unwrap()
+                .egraph_id;
+            assert!(program.declarations.is_empty());
+            let last = program.sorts.len() as u32 - 1;
+            program.sorts.reverse();
+            for sort in &mut program.sorts {
+                if let Some(pb::sort::Kind::Family(family)) = &mut sort.kind {
+                    for index in &mut family.args {
+                        *index = last - *index;
+                    }
+                }
+            }
+            for node in &mut program.nodes {
+                node.sort_id = last - node.sort_id;
+            }
+            assert_eq!(run(&mut engine, clone, program.clone()).error, None);
+            reparsed
+                .parse_and_run_program(None, &renderer.render(&program).unwrap())
+                .unwrap();
+        }
+    }
+}
+
+#[test]
+fn vec_corrupt_annotations_and_private_names_reject_before_mutation() {
+    use egglog_experimental::protobuf::source::Source;
+    for corrupt in 0..9 {
+        let text = "(sort V (Vec i64)) (function observed () i64 :merge new) (set (observed) 0) (set (observed) (vec-get (vec-of 7) 0)) (extract (observed))";
+        let mut source = Source::new(None, text).unwrap();
+        let mut engine = Engine::default();
+        let id = create(&mut engine);
+        for _ in 0..3 {
+            assert_eq!(
+                run(&mut engine, id, source.next().unwrap().unwrap()).error,
+                None
+            );
+        }
+        let mut program = source.next().unwrap().unwrap();
+        let get = program.nodes.iter().position(|n| matches!(&n.kind, Some(pb::node::Kind::Call(c)) if c.func == "egglog.core.vec.get")).unwrap();
+        let vec_sort = program.sorts.iter().position(|s| matches!(&s.kind, Some(pb::sort::Kind::Family(f)) if f.name == "Vec" && matches!(program.sorts[f.args[0] as usize].kind, Some(pb::sort::Kind::Family(_))))).unwrap();
+        match corrupt {
+            0 => {
+                let Some(pb::node::Kind::Call(call)) = &mut program.nodes[get].kind else {
+                    unreachable!()
+                };
+                call.func = "vec-get".into();
+            }
+            1 => program.nodes[get].sort_id = vec_sort as u32,
+            2 | 8 => {
+                let index = program.sorts.len() as u32;
+                program.sorts.push(pb::Sort {
+                    kind: Some(pb::sort::Kind::Family(pb::HostSort {
+                        name: "f64".into(),
+                        args: vec![],
+                    })),
+                    ..Default::default()
+                });
+                let literal = program
+                    .nodes
+                    .iter_mut()
+                    .find(|n| {
+                        matches!(
+                            &n.kind,
+                            Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
+                                value: Some(pb::primitive_value::Value::I64(7))
+                            }))
+                        )
+                    })
+                    .unwrap();
+                literal.sort_id = index;
+                literal.kind = Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
+                    value: Some(pb::primitive_value::Value::F64Bits(7.0f64.to_bits())),
+                }));
+                if corrupt == 8 {
+                    let node = program.nodes.iter_mut().find(|n| matches!(&n.kind, Some(pb::node::Kind::Call(c)) if c.func == "egglog.core.vec.of")).unwrap();
+                    let Some(pb::node::Kind::Call(call)) = node.kind.take() else {
+                        unreachable!()
+                    };
+                    node.kind = Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
+                        value: Some(pb::primitive_value::Value::Vec(pb::ValueList {
+                            items: call.args,
+                        })),
+                    }));
+                }
+            }
+            3 => {
+                let variable = program
+                    .sorts
+                    .iter_mut()
+                    .find(|s| matches!(s.kind, Some(pb::sort::Kind::Var(_))))
+                    .unwrap();
+                variable.kind = Some(pb::sort::Kind::Var(1));
+            }
+            4 => {
+                let Some(pb::sort::Kind::Family(f)) = &mut program.sorts[vec_sort].kind else {
+                    unreachable!()
+                };
+                f.args[0] = vec_sort as u32;
+            }
+            5 => {
+                let family = program
+                    .declarations
+                    .iter_mut()
+                    .find_map(|d| match &mut d.kind {
+                        Some(pb::declaration::Kind::HostSortFamily(f)) if f.name == "Vec" => {
+                            Some(f)
+                        }
+                        _ => None,
+                    })
+                    .unwrap();
+                family.arity = 2;
+            }
+            6 => program.declarations.push(pb::Declaration {
+                kind: Some(pb::declaration::Kind::EqSort(pb::EqSort {
+                    name: "__egglog_proto_vec_3_i64".into(),
+                    ..Default::default()
+                })),
+                ..Default::default()
+            }),
+            7 => {
+                let Some(pb::node::Kind::Call(call)) = &mut program.nodes[get].kind else {
+                    unreachable!()
+                };
+                call.args.pop();
+            }
+            _ => unreachable!(),
+        }
+        assert!(
+            run(&mut engine, id, program).error.is_some(),
+            "corruption {corrupt}"
+        );
+        let response = run(&mut engine, id, source.next().unwrap().unwrap());
+        assert_eq!(response.error, None);
+        let Some(pb::command_output::Kind::Extraction(result)) = &response.outputs[0].kind else {
+            unreachable!()
+        };
+        assert_eq!(value(&response, result.roots[0].variants[0].term), "0");
+    }
+}
+
+#[test]
+fn vec_lookup_failure_and_nominal_source_error_preserve_prefixes() {
+    use egglog_experimental::protobuf::source::Source;
+    let mut engine = Engine::default();
+    let id = create(&mut engine);
+    let text = "(sort V (Vec i64)) (function observed () i64 :merge new) (set (observed) 4) (set (observed) (vec-get (vec-of 8) 3)) (extract (observed))";
+    let mut source = Source::new(None, text).unwrap();
+    for _ in 0..3 {
+        assert_eq!(
+            run(&mut engine, id, source.next().unwrap().unwrap()).error,
+            None
+        );
+    }
+    let failure = run(&mut engine, id, source.next().unwrap().unwrap());
+    assert_eq!(
+        failure.error.as_ref().unwrap().code,
+        i32::from(pb::ErrorCode::EvaluationFailed)
+    );
+    assert_eq!(
+        failure
+            .error
+            .as_ref()
+            .unwrap()
+            .location
+            .as_ref()
+            .unwrap()
+            .path,
+        [0]
+    );
+    let response = run(&mut engine, id, source.next().unwrap().unwrap());
+    let Some(pb::command_output::Kind::Extraction(result)) = &response.outputs[0].kind else {
+        unreachable!()
+    };
+    assert_eq!(value(&response, result.roots[0].variants[0].term), "4");
+
+    let text = "(sort A (Vec i64)) (function a () A :merge new) (set (a) (vec-of 1)) (sort B (Vec i64)) (function b () B :merge new) (set (b) (vec-of 2)) (set (b) (a))";
+    let mut source = Source::new(None, text).unwrap();
+    let id = create(&mut engine);
+    for _ in 0..6 {
+        assert_eq!(
+            run(&mut engine, id, source.next().unwrap().unwrap()).error,
+            None
+        );
+    }
+    assert!(
+        source.next().unwrap().is_err(),
+        "source nominal aliases must not become interchangeable"
+    );
+}
+
+#[test]
 fn source_scalar_builtin_definitions_select_distinct_overloads() {
     use egglog_experimental::protobuf::source::{Source, render};
     let text = "(extract (+ 1 2)) (extract (+ 1.0 2.0))";
@@ -988,9 +1268,17 @@ fn run(engine: &mut Engine, egraph_id: u64, program: pb::Program) -> pb::RunProg
 
 fn value(response: &pb::RunProgramResponse, index: u32) -> String {
     match response.nodes[index as usize].kind.as_ref().unwrap() {
-        pb::node::Kind::PrimitiveValue(value) => match value.value.as_ref().unwrap() {
+        pb::node::Kind::PrimitiveValue(primitive) => match primitive.value.as_ref().unwrap() {
             pb::primitive_value::Value::I64(n) => n.to_string(),
             pb::primitive_value::Value::F64Bits(bits) => format!("{:?}", f64::from_bits(*bits)),
+            pb::primitive_value::Value::Vec(list) => format!(
+                "[{}]",
+                list.items
+                    .iter()
+                    .map(|i| value(response, *i))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
             other => panic!("unexpected value: {other:?}"),
         },
         pb::node::Kind::Call(call) => format!(

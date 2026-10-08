@@ -1,6 +1,6 @@
 //! In-process compatibility adapter for encoded protobuf requests.
 //!
-//! This first executable slice supports concrete equality/scalar sorts,
+//! This executable slice supports concrete equality/scalar/Vec sorts,
 //! constructors, functions, ordered actions, flat named rulesets, checks,
 //! extraction, and table observations. Unsupported forms fail explicitly before
 //! installation. In particular, profiling must currently be requested: the
@@ -109,8 +109,8 @@ impl Engine {
             ..Default::default()
         };
         let graph = crate::new_experimental_egraph();
-        for sort in &program.sorts {
-            let name = sort_name(sort).map_err(TransportError)?;
+        for (index, sort) in program.sorts.iter().enumerate() {
+            let name = sort_name(&program.sorts, index as u32).map_err(TransportError)?;
             let native = graph
                 .get_sort_by_name(&name)
                 .ok_or_else(|| TransportError(format!("unknown creation sort {name}")))?;
@@ -182,7 +182,7 @@ impl Engine {
             }),
             ..Default::default()
         };
-        let Some(program) = request.program else {
+        let Some(mut program) = request.program else {
             response.error = Some(pb::Error {
                 code: pb::ErrorCode::InvalidProgram.into(),
                 message: "missing program".into(),
@@ -192,12 +192,12 @@ impl Engine {
         };
         response.files = program.files.clone();
         let prepared = if request.profile {
-            session.prepare(&program)
+            session.prepare(&mut program)
         } else {
             Err("profile=false is unsupported until native collection can be disabled".into())
         };
         match prepared {
-            Ok(staged) => *session = staged,
+            Ok((staged, _)) => *session = staged,
             Err(error) => {
                 response.error = Some(*error.0);
                 return Ok(response.encode_to_vec());
@@ -247,7 +247,7 @@ impl Engine {
 impl Session {
     // Work on a clone until every definition, node annotation, and command has
     // been checked. Only supported declaration commands run here, never actions.
-    fn prepare(&self, program: &pb::Program) -> Result<Self, PreparationError> {
+    fn prepare(&self, program: &mut pb::Program) -> Result<(Self, Vec<Command>), PreparationError> {
         if program.ir_version != 1 {
             return Err(format!("unsupported IR version {}", program.ir_version).into());
         }
@@ -277,9 +277,15 @@ impl Session {
                     .map_err(|error| error.to_string())?;
             }
         }
-        for sort in &program.sorts {
-            let name = sort_name(sort)?;
+        validate_private_names(program)?;
+        let materialized = materialize_sorts(program, &mut staged.graph)?;
+        for (index, sort) in program.sorts.iter().enumerate() {
             native_span(program, sort.span.as_ref())?;
+            let Some(name) =
+                structural_sort_name(&program.sorts, index as u32, &mut HashSet::new())?
+            else {
+                continue;
+            };
             let native = staged
                 .graph
                 .get_sort_by_name(&name)
@@ -289,6 +295,7 @@ impl Session {
             }
         }
         validate_host_declarations(program, &mut staged.graph)?;
+        lower_vec_values(program)?;
         // Expression lowering detects invalid indices/cycles even in unused
         // arena entries; variables acquire their binder at each use below.
         for (index, node) in program.nodes.iter().enumerate() {
@@ -379,48 +386,22 @@ impl Session {
                 .map_err(|error| error.to_string())?;
         }
         for node in &program.nodes {
-            if let Some(pb::node::Kind::Call(call)) = &node.kind {
-                if let Some(signature) = staged.graph.type_info().get_func_type(&call.func).cloned()
+            if let Some(pb::node::Kind::Call(call)) = &node.kind
+                && let Some(signature) = staged.graph.type_info().get_func_type(&call.func).cloned()
+            {
+                if signature.input.len() != call.args.len()
+                    || signature.output.name() != sort_name(&program.sorts, node.sort_id)?
                 {
-                    if signature.input.len() != call.args.len()
-                        || signature.output.name()
-                            != sort_name(&program.sorts[node.sort_id as usize])?
-                    {
-                        return Err(format!("call signature mismatch for {}", call.func).into());
+                    return Err(format!("call signature mismatch for {}", call.func).into());
+                }
+                for (argument, expected) in call.args.iter().zip(&signature.input) {
+                    if node_sort(program, *argument)? != expected.name() {
+                        return Err(format!("argument sort mismatch for {}", call.func).into());
                     }
-                    for (argument, expected) in call.args.iter().zip(&signature.input) {
-                        if node_sort(program, *argument)? != expected.name() {
-                            return Err(format!("argument sort mismatch for {}", call.func).into());
-                        }
-                    }
-                } else {
-                    // This is an exact definition-key assertion, not a source
-                    // alias lookup. The native checker below uses the same key
-                    // and the existing registration's context ids.
-                    let primitive = pb::HostPrimitive {
-                        name: call.func.clone(),
-                        typing: Some(pb::host_primitive::Typing::Signature(
-                            pb::GenericSignature {
-                                inputs: call
-                                    .args
-                                    .iter()
-                                    .map(|index| pb::Arg {
-                                        sort: program.nodes[*index as usize].sort_id,
-                                        name: String::new(),
-                                    })
-                                    .collect(),
-                                output: Some(node.sort_id),
-                                ..Default::default()
-                            },
-                        )),
-                    };
-                    staged
-                        .graph
-                        .type_info()
-                        .check_builtin(program, &primitive, None)?;
                 }
             }
         }
+        lower_builtin_calls(program, &mut staged.graph)?;
         for action in program
             .commands
             .iter()
@@ -552,7 +533,7 @@ impl Session {
                     .map_err(|error| error.to_string())?;
             }
         }
-        Ok(staged)
+        Ok((staged, materialized))
     }
 
     fn lower_command(
@@ -714,9 +695,10 @@ impl Session {
                             )
                         })?;
                         let cost_sort = encode_sort(
+                            &self.graph,
                             &self.graph.get_sort_by_name("i64").unwrap().clone(),
                             response,
-                        );
+                        )?;
                         let cost_index = response.nodes.len() as u32;
                         response.nodes.push(pb::Node {
                             sort_id: cost_sort,
@@ -883,9 +865,32 @@ impl Session {
     }
 }
 
-fn sort_name(sort: &pb::Sort) -> Result<String, String> {
-    match sort.kind.as_ref() {
-        Some(pb::sort::Kind::Eq(name)) if !name.is_empty() => Ok(name.clone()),
+fn structural_sort_name(
+    sorts: &[pb::Sort],
+    index: u32,
+    active: &mut HashSet<u32>,
+) -> Result<Option<String>, String> {
+    if active.len() >= 256 || !active.insert(index) {
+        return Err("cyclic or too-deep sort".into());
+    }
+    let sort = sorts
+        .get(index as usize)
+        .ok_or("sort index out of bounds")?;
+    let result = match sort.kind.as_ref() {
+        Some(pb::sort::Kind::Eq(name)) if !name.is_empty() => Ok(Some(name.clone())),
+        Some(pb::sort::Kind::Var(_)) => Ok(None),
+        Some(pb::sort::Kind::Family(family)) if family.name == "Vec" && family.args.len() == 1 => {
+            structural_sort_name(sorts, family.args[0], active).and_then(|child| {
+                child
+                    .map(|child| {
+                        if child.len() > 65_536 {
+                            return Err("native sort name exceeds adapter limit".into());
+                        }
+                        Ok(format!("__egglog_proto_vec_{}_{}", child.len(), child))
+                    })
+                    .transpose()
+            })
+        }
         Some(pb::sort::Kind::Family(family))
             if family.args.is_empty()
                 && matches!(
@@ -893,10 +898,196 @@ fn sort_name(sort: &pb::Sort) -> Result<String, String> {
                     "i64" | "f64" | "String" | "bool" | "Unit"
                 ) =>
         {
-            Ok(family.name.clone())
+            Ok(Some(family.name.clone()))
         }
-        _ => Err("only equality sorts and the five scalar host sorts are supported yet".into()),
+        _ => Err("only equality, scalar and Vec sorts are supported yet".into()),
+    };
+    active.remove(&index);
+    result
+}
+
+fn sort_name(sorts: &[pb::Sort], index: u32) -> Result<String, String> {
+    structural_sort_name(sorts, index, &mut HashSet::new())?
+        .ok_or_else(|| "runtime sort contains an open type parameter".into())
+}
+
+fn validate_private_names(program: &pb::Program) -> Result<(), String> {
+    let reserved =
+        |name: &str| name.starts_with("__egglog_proto_") || name.starts_with("__egglog_instance_");
+    for sort in &program.sorts {
+        if let Some(pb::sort::Kind::Eq(name)) = &sort.kind
+            && reserved(name)
+        {
+            return Err("adapter private sort namespace is reserved in this slice".into());
+        }
     }
+    for declaration in &program.declarations {
+        let name = match &declaration.kind {
+            Some(pb::declaration::Kind::EqSort(s)) => &s.name,
+            Some(pb::declaration::Kind::Constructor(f)) => &f.name,
+            Some(pb::declaration::Kind::Function(f)) => &f.name,
+            _ => continue,
+        };
+        if reserved(name) {
+            return Err("adapter private declaration namespace is reserved in this slice".into());
+        }
+    }
+    Ok(())
+}
+
+// Materialization runs on staged state. Open patterns remain in their signature
+// arenas; only closed shapes install native sorts, in child-before-parent order.
+fn materialize_sorts(program: &pb::Program, graph: &mut EGraph) -> Result<Vec<Command>, String> {
+    fn visit(
+        program: &pb::Program,
+        index: u32,
+        graph: &mut EGraph,
+        commands: &mut Vec<Command>,
+        seen: &mut HashSet<u32>,
+    ) -> Result<(), String> {
+        if !seen.insert(index) {
+            return Ok(());
+        }
+        let name = structural_sort_name(&program.sorts, index, &mut HashSet::new())?;
+        let Some(name) = name else {
+            return Ok(());
+        };
+        let Some(pb::sort::Kind::Family(family)) = &program.sorts[index as usize].kind else {
+            return Ok(());
+        };
+        if family.args.is_empty() {
+            return Ok(());
+        }
+        for child in &family.args {
+            visit(program, *child, graph, commands, seen)?;
+        }
+        if let Some(existing) = graph.get_sort_by_name(&name) {
+            let mut expected = vec![];
+            let expected_id = egglog::builtin::import_sort(&program.sorts, index, &mut expected)?;
+            if graph.export_sort(existing, &mut expected)? != expected_id {
+                return Err("private sort name collision".into());
+            }
+            return Ok(());
+        }
+        let command = Command::Sort {
+            span: native_span(program, program.sorts[index as usize].span.as_ref())?,
+            name,
+            presort_and_args: Some((
+                family.name.clone(),
+                family
+                    .args
+                    .iter()
+                    .map(|i| sort_name(&program.sorts, *i).map(|name| Expr::Var(span!(), name)))
+                    .collect::<Result<_, _>>()?,
+            )),
+            uf: None,
+            proof_func: None,
+            container_rebuild: None,
+            proof_constructors: None,
+            unionable: true,
+        };
+        graph
+            .run_program(vec![command.clone()])
+            .map_err(|e| e.to_string())?;
+        commands.push(command);
+        Ok(())
+    }
+    let mut commands = vec![];
+    let mut seen = HashSet::new();
+    for index in 0..program.sorts.len() {
+        visit(program, index as u32, graph, &mut commands, &mut seen)?;
+    }
+    Ok(commands)
+}
+
+// This ephemeral lowering copy is never emitted as wire IR. Complete annotations
+// choose compiler instance keys before the native AST drops result types.
+fn lower_builtin_calls(program: &mut pb::Program, graph: &mut EGraph) -> Result<(), String> {
+    let mut replacements = vec![];
+    for (index, node) in program.nodes.iter().enumerate() {
+        if let Some(pb::node::Kind::Call(call)) = &node.kind {
+            if graph.type_info().get_func_type(&call.func).is_some() {
+                continue;
+            }
+            let args: Vec<_> = call
+                .args
+                .iter()
+                .map(|i| {
+                    program
+                        .nodes
+                        .get(*i as usize)
+                        .map(|n| n.sort_id)
+                        .ok_or("node index out of bounds")
+                })
+                .collect::<Result<_, _>>()?;
+            let sorts = args
+                .iter()
+                .copied()
+                .chain([node.sort_id])
+                .map(|i| {
+                    graph
+                        .get_sort_by_name(&sort_name(&program.sorts, i)?)
+                        .cloned()
+                        .ok_or_else(|| "unknown closed sort".into())
+                })
+                .collect::<Result<Vec<_>, String>>()?;
+            replacements.push((
+                index,
+                graph.type_info().resolve_builtin(
+                    program,
+                    &call.func,
+                    &args,
+                    node.sort_id,
+                    &sorts,
+                )?,
+            ));
+        }
+    }
+    for (index, name) in replacements {
+        let Some(pb::node::Kind::Call(call)) = &mut program.nodes[index].kind else {
+            unreachable!()
+        };
+        call.func = name;
+    }
+    Ok(())
+}
+
+// The native Vec constructor interns precisely this ordered container payload.
+// Validate contents first; the resulting calls are internal compatibility code,
+// never a claim that the wire value payload was a symbolic authored Call.
+fn lower_vec_values(program: &mut pb::Program) -> Result<(), String> {
+    let mut replacements = vec![];
+    for (index, node) in program.nodes.iter().enumerate() {
+        if let Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
+            value: Some(pb::primitive_value::Value::Vec(values)),
+        })) = &node.kind
+        {
+            let Some(pb::sort::Kind::Family(family)) = program
+                .sorts
+                .get(node.sort_id as usize)
+                .and_then(|s| s.kind.as_ref())
+            else {
+                return Err("Vec payload requires Vec sort".into());
+            };
+            if family.name != "Vec" || family.args.len() != 1 {
+                return Err("Vec payload/sort mismatch".into());
+            }
+            let expected = sort_name(&program.sorts, family.args[0])?;
+            for item in &values.items {
+                if node_sort(program, *item)? != expected {
+                    return Err("Vec payload element sort mismatch".into());
+                }
+            }
+            replacements.push((index, values.items.clone()));
+        }
+    }
+    for (index, args) in replacements {
+        program.nodes[index].kind = Some(pb::node::Kind::Call(pb::Call {
+            func: "egglog.core.vec.of".into(),
+            args,
+        }));
+    }
+    Ok(())
 }
 
 fn node_sort(program: &pb::Program, index: u32) -> Result<String, String> {
@@ -904,12 +1095,7 @@ fn node_sort(program: &pb::Program, index: u32) -> Result<String, String> {
         .nodes
         .get(index as usize)
         .ok_or("node index out of bounds")?;
-    sort_name(
-        program
-            .sorts
-            .get(node.sort_id as usize)
-            .ok_or("node sort index out of bounds")?,
-    )
+    sort_name(&program.sorts, node.sort_id)
 }
 
 fn native_span(program: &pb::Program, span: Option<&pb::Span>) -> Result<ast::Span, String> {
@@ -950,23 +1136,11 @@ fn signature(
 ) -> Result<ast::Schema, String> {
     let input = inputs
         .iter()
-        .map(|argument| {
-            sort_name(
-                program
-                    .sorts
-                    .get(argument.sort as usize)
-                    .ok_or("input sort index out of bounds")?,
-            )
-        })
+        .map(|argument| sort_name(&program.sorts, argument.sort))
         .collect::<Result<_, _>>()?;
     Ok(ast::Schema {
         input,
-        output: sort_name(
-            program
-                .sorts
-                .get(output as usize)
-                .ok_or("output sort index out of bounds")?,
-        )?,
+        output: sort_name(&program.sorts, output)?,
     })
 }
 
@@ -981,6 +1155,13 @@ fn validate_host_declarations(program: &pb::Program, graph: &mut EGraph) -> Resu
                 )?;
             }
             Some(pb::declaration::Kind::HostSortFamily(family)) => {
+                if family.name == "Vec" {
+                    let catalog = graph.type_info().builtin_catalog()?;
+                    if family.bindings.is_some() || declaration.bindings.is_some() || !catalog.definitions.declarations.iter().any(|d| matches!(&d.kind, Some(pb::declaration::Kind::HostSortFamily(expected)) if expected == family)) {
+                        return Err("unsupported or incompatible Vec family descriptor".into());
+                    }
+                    continue;
+                }
                 let sort = graph
                     .get_sort_by_name(&family.name)
                     .ok_or_else(|| format!("unknown host sort family {}", family.name))?;
@@ -1275,28 +1456,14 @@ fn check_variables(
     Ok(())
 }
 
-fn encode_sort(sort: &ArcSort, response: &mut pb::RunProgramResponse) -> u32 {
-    let kind = if sort.is_eq_sort() {
-        pb::sort::Kind::Eq(sort.name().to_owned())
-    } else {
-        pb::sort::Kind::Family(pb::HostSort {
-            name: sort.name().to_owned(),
-            args: vec![],
-        })
-    };
-    if let Some(index) = response
-        .sorts
-        .iter()
-        .position(|sort| sort.kind.as_ref() == Some(&kind))
-    {
-        return index as u32;
-    }
-    let index = response.sorts.len() as u32;
-    response.sorts.push(pb::Sort {
-        kind: Some(kind),
-        ..Default::default()
-    });
-    index
+fn encode_sort(
+    graph: &EGraph,
+    sort: &ArcSort,
+    response: &mut pb::RunProgramResponse,
+) -> Result<u32, egglog::Error> {
+    graph
+        .export_sort(sort, &mut response.sorts)
+        .map_err(egglog::Error::ExtractError)
 }
 
 fn encode_term(
@@ -1321,6 +1488,25 @@ fn encode_term(
                 Literal::Unit => pb::primitive_value::Value::Unit(pb::Unit {}),
             }),
         }),
+        Term::App(name, children)
+            if (name == "vec-of" || name == "vec-empty") && sort.is_container_sort() =>
+        {
+            let sort_id = encode_sort(graph, sort, response)?;
+            if !matches!(&response.sorts[sort_id as usize].kind, Some(pb::sort::Kind::Family(family)) if family.name == "Vec")
+            {
+                return Err(egglog::Error::ExtractError("Vec term/sort mismatch".into()));
+            }
+            let element = &sort.inner_sorts()[0];
+            let elements = children
+                .iter()
+                .map(|child| encode_term(graph, terms, *child, element, response, cache))
+                .collect::<Result<_, _>>()?;
+            pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
+                value: Some(pb::primitive_value::Value::Vec(pb::ValueList {
+                    items: elements,
+                })),
+            })
+        }
         Term::App(name, children) => {
             let signature = graph
                 .get_function(name)
@@ -1344,7 +1530,7 @@ fn encode_term(
             ));
         }
     };
-    let sort_id = encode_sort(sort, response);
+    let sort_id = encode_sort(graph, sort, response)?;
     let index = response.nodes.len() as u32;
     response.nodes.push(pb::Node {
         sort_id,
