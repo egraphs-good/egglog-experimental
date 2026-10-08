@@ -166,7 +166,12 @@ is undecided; high-level generation remains frontend work. Runtime checks for
 the bounded executable declaration/default subset are implemented below.
 
 Python views distinguish free functions, initializers, methods, class methods,
-properties, and class variables. Ordered parameter records give core-input
+properties, class variables, and ownerless constants. A `CONSTANT` view names a
+nullary concrete expression (`C`), with a qualified path and no owner, receiver,
+parameters or mutated input. It does not evaluate a body during installation or
+export. A nullary `FUNCTION` remains callable (`C()`); arity never implies a
+constant view. Consumer generation and runtime acceptance require their own gates.
+Ordered parameter records give core-input
 positions, names, and optional default expressions. Initializers derive `__init__`
 without storing a path. Receivers are mapped inputs; initializers/class methods
 introduce no core `self`/`cls` argument. Only an
@@ -700,8 +705,8 @@ make proto-test
 These use local generator plugins. Initial tool/dependency downloads may need
 network access. Commit generated sources together with schema changes.
 On a clean checkout, `make proto-drift` regenerates and detects tracked changes.
-`make proto-test` runs focused proof/resource wire/validation tests with the generated
-Python messages; it does not run Egglog or independently check a proof.
+`make proto-test` runs focused presentation/proof/resource wire validation with
+the generated Python messages; it does not run Egglog or independently check a proof.
 
 A Python wire/validation smoke check, after `uv sync --locked`:
 
