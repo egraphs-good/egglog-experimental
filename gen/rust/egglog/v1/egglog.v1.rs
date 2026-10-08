@@ -65,14 +65,6 @@ pub struct Program {
     /// retain their reachable occurrences; see Ruleset for cross-request reuse.
     #[prost(message, repeated, tag = "7")]
     pub rulesets: ::prost::alloc::vec::Vec<Ruleset>,
-    /// Optional compatibility precondition, not a request to reconfigure the
-    /// handle: must structurally equal its creation-time cost sort C. Reject a
-    /// mismatch before installing definitions or executing commands. Freeze
-    /// always includes it so the exported Program describes its required C.
-    ///
-    /// index into this Program's sorts
-    #[prost(uint32, optional, tag = "8")]
-    pub cost_sort: ::core::option::Option<u32>,
     /// Rule occurrences, shared across rule lists by index. Equal entries remain
     /// distinct occurrences; labels never identify them. Unused entries do not
     /// execute. Only named ruleset roots retain reachable rules across requests;
@@ -121,29 +113,30 @@ pub struct Span {
 /// Signatures and their presentation patterns reuse binder-local variables.
 /// A shared pattern is interpreted independently in each GenericSignature;
 /// arena sharing never shares substitutions between signatures or calls.
-/// Sorts are acyclic through Container.args and FuncSort.params/result. CEL
+/// Sorts are acyclic through HostSort.args and FuncSort.params/result. CEL
 /// checks direct indices, not acyclicity or recursive variable scope.
+/// References do not declare sorts: resolve equality names and host families
+/// against local declarations, installed definitions or ambient host families.
+/// Missing names and kind/arity mismatches are errors. Builtin references do
+/// not require explicit descriptor declarations. Response references resolve
+/// against the associated handle; their arenas do not redeclare definitions.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct Sort {
-    /// Optional representative origin and documentation; excluded from sort
-    /// identity. Equivalent structural sorts need not preserve every occurrence.
+    /// Optional representative type-use origin; excluded from sort identity.
+    /// Documentation and language bindings belong to the defining Declaration.
     #[prost(message, optional, tag = "5")]
     pub span: ::core::option::Option<Span>,
-    #[prost(string, tag = "6")]
-    pub doc: ::prost::alloc::string::String,
-    #[prost(oneof = "sort::Kind", tags = "1, 2, 3, 4, 7")]
+    #[prost(oneof = "sort::Kind", tags = "1, 2, 4, 7")]
     pub kind: ::core::option::Option<sort::Kind>,
 }
 /// Nested message and enum types in `Sort`.
 pub mod sort {
     #[derive(Clone, PartialEq, Eq, Hash, ::prost::Oneof)]
     pub enum Kind {
-        #[prost(message, tag = "1")]
-        Eq(super::EqSort),
+        #[prost(string, tag = "1")]
+        Eq(::prost::alloc::string::String),
         #[prost(message, tag = "2")]
-        Prim(super::PrimSort),
-        #[prost(message, tag = "3")]
-        Container(super::Container),
+        Family(super::HostSort),
         #[prost(message, tag = "4")]
         Func(super::FuncSort),
         /// index into the enclosing GenericSignature.type_params
@@ -151,29 +144,12 @@ pub mod sort {
         Var(u32),
     }
 }
-/// A nullary equality sort. An entry also declares it; repeated declarations
-/// of the same name are idempotent. Its name cannot also name a host sort family.
-/// Bindings are excluded from sort identity and follow SortBindings' separate
-/// first-supply/resupply contract.
+/// A host-family application: no args for i64/Unit, or e.g. Vec<i64> and
+/// Map<String, Math>. Arg count equals declared family arity, including zero.
+/// Args may be patterns only in a GenericSignature or its bindings; otherwise
+/// recursively closed. Host-family sorts are not equality sorts.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct EqSort {
-    #[prost(string, tag = "1")]
-    pub name: ::prost::alloc::string::String,
-    #[prost(message, optional, tag = "2")]
-    pub bindings: ::core::option::Option<SortBindings>,
-}
-/// A nullary host sort-family application, such as Unit, bool, i64 or String.
-/// The family must have arity zero. It is non-unionable.
-#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct PrimSort {
-    #[prost(string, tag = "1")]
-    pub name: ::prost::alloc::string::String,
-}
-/// An application of a positive-arity host sort family, such as Vec<i64> or
-/// Map<String, Math>. The argument count must equal the family's arity. Arguments
-/// may be patterns only in a GenericSignature or its presentation; otherwise closed.
-#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct Container {
+pub struct HostSort {
     #[prost(string, tag = "1")]
     pub name: ::prost::alloc::string::String,
     /// index into the enclosing `sorts`
@@ -409,9 +385,9 @@ pub struct Lambda {
 /// Native values, selected and typed by the enclosing Node.sort_id. The five
 /// scalar arms retain their exact payloads: f64_bits preserves IEEE-754 bits,
 /// while Egglog equality identifies signed zeroes and all NaN bit patterns.
-/// BigInt/BigRat/Rational use the corresponding PrimSort; vec/set/multiset/map/
-/// pair/maybe use matching Container shapes; lambda/partial_call use FuncSort.
-/// CustomValue supports host sorts, including nullary PrimSorts with children.
+/// BigInt/BigRat/Rational and vec/set/multiset/map/pair/maybe use their matching
+/// HostSort family applications; lambda/partial_call use FuncSort.
+/// CustomValue supports host sorts, including nullary families with value children.
 /// Verify payload/sort agreement and child types; CEL checks their indices only.
 ///
 /// Evaluated children run left-to-right in field/list order (map key then value
@@ -540,7 +516,8 @@ pub struct MaybeValue {
 }
 /// For host sorts without a dedicated PrimitiveValue arm. The exact enclosing
 /// sort selects the codec and its valid arg arity/sorts; no separate type tag.
-/// PrimSort may have args too (e.g. PyObject without type parameters).
+/// A nullary family may still have value args (e.g. PyObject); these are not
+/// HostSort's type args and need not have the same arity.
 /// All Egglog references are explicit args. Payload bytes may refer to arg slots,
 /// never arena/class indices, engine Value IDs or raw process pointers. Traversal,
 /// rebuilding and remapping must rewrite args regardless of sort kind, without
@@ -552,7 +529,7 @@ pub struct MaybeValue {
 /// never materialize/unpickle or invoke host Debug hooks. Opaque bytes/args may
 /// be retained without a codec; explicit trusted materialization, evaluation or
 /// Freeze encoding requires one or fails. This declares future host obligations,
-/// including reference-aware PrimSort rebuilding, not existing runtime support.
+/// including reference-aware nullary-family rebuilding, not existing runtime support.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct CustomValue {
     #[prost(bytes = "vec", tag = "1")]
@@ -653,7 +630,7 @@ pub struct SetCost {
     pub cost: ::core::option::Option<u32>,
 }
 // ---------------------------------------------------------------------------
-// DECLARATIONS — the `Declaration.kind` arms in arm order, with their parts.
+// DECLARATIONS — immutable sort and callable definitions.
 // ---------------------------------------------------------------------------
 
 /// Order-independent, immutable definitions. New names may be added. Resending
@@ -687,7 +664,7 @@ pub struct Declaration {
     /// Optional documentation; excluded from semantic identity.
     #[prost(string, tag = "9")]
     pub doc: ::prost::alloc::string::String,
-    #[prost(oneof = "declaration::Kind", tags = "1, 2, 3, 4, 5, 6")]
+    #[prost(oneof = "declaration::Kind", tags = "1, 2, 3, 4, 5, 6, 10")]
     pub kind: ::core::option::Option<declaration::Kind>,
 }
 /// Nested message and enum types in `Declaration`.
@@ -706,6 +683,8 @@ pub mod declaration {
         HostSortFamily(super::HostSortFamily),
         #[prost(message, tag = "6")]
         HostPrimitive(super::HostPrimitive),
+        #[prost(message, tag = "10")]
+        EqSort(super::EqSort),
     }
 }
 /// An argument's sort and optional label. Calls are positional; labels are not
@@ -717,6 +696,16 @@ pub struct Arg {
     pub sort: u32,
     #[prost(string, tag = "2")]
     pub name: ::prost::alloc::string::String,
+}
+/// A concrete nullary equality-sort definition. Its name shares the sort
+/// namespace with host families; same-name compatible resends are idempotent.
+/// Bindings have SortBindings' separate first-supply/resupply contract.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct EqSort {
+    #[prost(string, tag = "1")]
+    pub name: ::prost::alloc::string::String,
+    #[prost(message, optional, tag = "2")]
+    pub bindings: ::core::option::Option<SortBindings>,
 }
 /// A concrete constructor whose output is an equality sort.
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -789,8 +778,8 @@ pub struct Primitive {
     pub body: ::core::option::Option<u32>,
 }
 /// A named host sort family, including nullary scalar sorts. Names are immutable;
-/// compatible resends agree on arity. An arity-zero family uses PrimSort, never
-/// Container; a positive-arity family uses Container. No generic user equality
+/// compatible resends agree on arity. Every application uses HostSort, including
+/// arity-zero families. No generic user equality
 /// sorts or implementation/codec code are declared by this descriptor.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct HostSortFamily {
@@ -823,7 +812,7 @@ pub mod host_primitive {
 /// An ordinary host signature: a fixed prefix followed by zero or more
 /// homogeneous varargs when present. Sort indices reference Program.sorts.
 /// Sort.var indices bind by position in type_params; labels do not bind by name
-/// and need not be distinct. All variable uses, including nested Container and
+/// and need not be distinct. All variable uses, including nested HostSort and
 /// FuncSort patterns, must be in this signature's binder. Each actual call
 /// matches all concrete argument and result sorts structurally to obtain one
 /// consistent, complete substitution. Reject undetermined parameters: e.g.
@@ -855,7 +844,7 @@ pub struct FunctionApplication {
 /// Each language block is fixed when first supplied for the semantic definition.
 /// Absence makes no assertion/removal; another language may first arrive later.
 /// Reconcile all supplies order-independently, including repeated same-name
-/// declarations/EqSort entries, before interning away duplicate presentations.
+/// declarations, before interning away duplicate presentations.
 /// Agreeing supplies are allowed; conflicting supplies are errors. Compare
 /// arena references structurally, not by index. Sort comparison excludes attached
 /// bindings; default calls identify their core callee, not its presentation.
@@ -1425,8 +1414,8 @@ pub struct Extract {
     #[prost(string, tag = "4")]
     pub cost_model: ::prost::alloc::string::String,
 }
-/// Export the complete current state as a normal Program; no filtering.
-/// Returns CommandOutput.program, owning its nodes, sorts and source files.
+/// Export complete logical options and a reconstruction Program; no filtering.
+/// Returns CommandOutput.snapshot; its Program owns nodes, sorts and source files.
 /// This is current state, not request history or an engine checkpoint: omit
 /// scheduler instances, execution cursors, caches, reports and host resources.
 ///
@@ -1449,12 +1438,11 @@ pub struct Extract {
 /// contain Sort.var; the reconstruction data and concrete definitions may not.
 /// Host binding and export remain unimplemented; never silently omit definitions.
 ///
-/// Set Program.cost_sort to the handle's C. Restoration executes the export on
-/// a fresh, data-empty handle with structurally equal C and compatible host
-/// capabilities. Definition installation follows Program's normal rules. This
-/// restores logical state with fresh execution state. Execution against existing
-/// data still follows ordinary Program/action semantics, with no restoration
-/// equivalence guarantee. Scheduler/seminaive history is not resumed.
+/// Return EGraphSnapshot with the handle's logical options and this Program.
+/// Do not export resource settings such as threads. See EGraphSnapshot for
+/// fresh-handle restoration with compatible C and host capabilities. Definition
+/// installation follows Program's normal rules; scheduler/seminaive history
+/// is not resumed.
 ///
 /// The export's commands are one ordered list of ordinary Actions, with no
 /// queries, Runs, loops or other commands. Emit exactly one direct Action.term
@@ -1552,27 +1540,62 @@ pub struct Saturate {
     #[prost(uint64, optional, tag = "3")]
     pub max_iterations: ::core::option::Option<u64>,
 }
-/// Create an empty e-graph with immutable cost sort C. Resolve and validate this
-/// acyclic, recursively closed sort arena before allocating a handle. An invalid or
-/// unsupported configuration is an adapter/lifecycle error, not RunProgram.error.
-/// Frontends may offer an i64 default, but the wire always specifies C. Creating
-/// a handle does not require a value codec or extraction model for every sort.
-/// Costs in Program and response arenas must agree with C structurally,
-/// never by comparing arena-local indices.
+/// Immutable logical settings, shared by creation and snapshots. cost_sort
+/// indexes CreateEGraphRequest.sorts or EGraphSnapshot.program.sorts respectively.
+/// C may be any supported, acyclic, recursively closed sort, including a custom
+/// equality sort or a host-family/function type. Frontends may offer an i64
+/// default, but the wire always specifies C. No value codec or extraction model
+/// is required merely to select C. Costs in executed Programs and responses must
+/// agree with C structurally, never by comparing arena-local indices.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct EGraphOptions {
+    #[prost(uint32, optional, tag = "1")]
+    pub cost_sort: ::core::option::Option<u32>,
+}
+/// Create an empty e-graph without executing a Program. Resolve the sort-only
+/// declarations against ambient host definitions, then validate options and this
+/// acyclic, recursively closed sort arena before allocating a handle. Equality
+/// declarations allow custom C without an already-existing handle. Compatible
+/// repeated definitions are allowed; conflicting kind/arity/bindings are errors.
+/// Successful creation retains these sort declarations on the new handle, so
+/// later Programs may reference their names without resending definitions.
+/// Unsupported options/resources are lifecycle errors, not RunProgram.error.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct CreateEGraphRequest {
     #[prost(message, repeated, tag = "1")]
     pub sorts: ::prost::alloc::vec::Vec<Sort>,
-    /// index into this message's sorts
-    #[prost(uint32, optional, tag = "2")]
-    pub cost_sort: ::core::option::Option<u32>,
+    #[prost(message, optional, tag = "2")]
+    pub options: ::core::option::Option<EGraphOptions>,
     #[prost(message, repeated, tag = "3")]
     pub files: ::prost::alloc::vec::Vec<SourceFile>,
+    #[prost(message, repeated, tag = "4")]
+    pub declarations: ::prost::alloc::vec::Vec<Declaration>,
+    /// Resource request, never exported as logical state. Absent leaves policy to
+    /// the receiver; zero requests automatic parallelism; positive requests that
+    /// thread count. Reject unsupported requests rather than silently ignoring.
+    #[prost(uint32, optional, tag = "5")]
+    pub threads: ::core::option::Option<u32>,
 }
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct CreateEGraphResponse {
     #[prost(uint64, tag = "1")]
     pub egraph_id: u64,
+}
+/// Portable logical state, not an execution checkpoint. The Program owns all
+/// arenas/files, including the C selected by options. Only C's reachable sort
+/// graph must be closed; unrelated generic signature patterns may remain.
+/// Restore by remapping C's closed sort graph and needed sort declarations into
+/// a CreateEGraphRequest, selecting receiver resource settings, then executing
+/// program normally on the fresh compatible handle. No creation-time commands
+/// or resumed scheduler/seminaive state are implied. Executing program against
+/// an existing handle still has ordinary Program semantics; callers must check
+/// option compatibility for any restoration equivalence claim.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct EGraphSnapshot {
+    #[prost(message, optional, tag = "1")]
+    pub options: ::core::option::Option<EGraphOptions>,
+    #[prost(message, optional, tag = "2")]
+    pub program: ::core::option::Option<Program>,
 }
 /// Clone the addressed e-graph, retaining C. No complexity guarantee.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
@@ -1742,7 +1765,7 @@ pub mod command_output {
         #[prost(message, tag = "2")]
         Extraction(super::ExtractResult),
         #[prost(message, tag = "3")]
-        Program(super::Program),
+        Snapshot(super::EGraphSnapshot),
         #[prost(message, tag = "4")]
         Sizes(super::TableSizes),
         #[prost(message, tag = "5")]

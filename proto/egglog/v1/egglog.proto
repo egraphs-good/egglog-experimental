@@ -45,13 +45,6 @@ import "buf/validate/validate.proto";
 // recursively closed. CEL rejects direct variable roots; closure is normative.
 message Program {
   option (buf.validate.message).cel = {
-    id: "program.cost_sort_in_range"
-    message: "cost_sort must index a non-variable sort when present"
-    expression:
-      "!has(this.cost_sort) || (this.cost_sort < uint(size(this.sorts)) && "
-      "!has(this.sorts[int(this.cost_sort)].var))"
-  };
-  option (buf.validate.message).cel = {
     id: "program.node_sort_in_range"
     message: "every node sort_id must index a non-variable sort"
     expression:
@@ -82,7 +75,7 @@ message Program {
     message: "sort children must index sorts"
     expression:
       "this.sorts.all(s, "
-      "(has(s.container) ? s.container.args : "
+      "(has(s.family) ? s.family.args : "
       "has(s.func) ? s.func.params + [s.func.result] : [])"
       ".all(i, i < uint(size(this.sorts))))"
   };
@@ -141,17 +134,31 @@ message Program {
       "(has(v.trait_impl) ? v.trait_impl.args.map(a, a.sort) : [])).all(i, "
       "i < uint(size(this.sorts)) && (!has(this.sorts[int(i)].var) || this.sorts[int(i)].var < uint(n))))))"
   };
-  // Ambient family resolution remains normative. This checks declared families
-  // against every direct application, including those in signature patterns.
+  // Same-kind compatible resends are allowed; equality/family names cannot
+  // collide even when no arena entry uses either definition.
   option (buf.validate.message).cel = {
-    id: "program.host_sort_family_uses"
-    message: "host sort uses must match family arity and cannot name equality sorts"
+    id: "program.sort_declarations"
+    message: "sort names must have one kind and host-family arity"
     expression:
-      "this.declarations.all(d, !has(d.host_sort_family) || this.sorts.all(s, "
-      "(!has(s.prim) || s.prim.name != d.host_sort_family.name || d.host_sort_family.arity == uint(0)) && "
-      "(!has(s.container) || s.container.name != d.host_sort_family.name || "
-      "uint(size(s.container.args)) == d.host_sort_family.arity) && "
-      "(!has(s.eq) || s.eq.name != d.host_sort_family.name)))"
+      "this.declarations.all(d, "
+      "(!has(d.eq_sort) || this.declarations.all(e, "
+      "!has(e.host_sort_family) || d.eq_sort.name != e.host_sort_family.name)) && "
+      "(!has(d.host_sort_family) || this.declarations.all(e, !has(e.host_sort_family) || "
+      "d.host_sort_family.name != e.host_sort_family.name || "
+      "d.host_sort_family.arity == e.host_sort_family.arity)))"
+  };
+  // Ambient/installed resolution remains normative. Check local declarations
+  // against direct references/applications, including signature patterns.
+  option (buf.validate.message).cel = {
+    id: "program.sort_uses"
+    message: "sort references must agree with declared kinds and family arities"
+    expression:
+      "this.declarations.all(d, this.sorts.all(s, "
+      "(!has(d.host_sort_family) || "
+      "((!has(s.family) || s.family.name != d.host_sort_family.name || "
+      "uint(size(s.family.args)) == d.host_sort_family.arity) && "
+      "(!has(s.eq) || s.eq != d.host_sort_family.name))) && "
+      "(!has(d.eq_sort) || !has(s.family) || s.family.name != d.eq_sort.name)))"
   };
   option (buf.validate.message).cel = {
     id: "program.empty_union_eq_sort"
@@ -227,8 +234,9 @@ message Program {
       ".all(i, i < uint(size(this.nodes)) && "
       "(!has(this.nodes[int(i)].call) || "
       "this.nodes[int(i)].sort_id >= uint(size(this.sorts)) || "
-      "!has(this.sorts[int(this.nodes[int(i)].sort_id)].prim) || "
-      "this.sorts[int(this.nodes[int(i)].sort_id)].prim.name != 'Unit' || "
+      "!has(this.sorts[int(this.nodes[int(i)].sort_id)].family) || "
+      "this.sorts[int(this.nodes[int(i)].sort_id)].family.name != 'Unit' || "
+      "size(this.sorts[int(this.nodes[int(i)].sort_id)].family.args) != 0 || "
       "!this.nodes[int(i)].call.args.all(a, a < uint(size(this.nodes))) || "
       "!this.declarations.exists(d, has(d.relation) && "
       "d.relation.name == this.nodes[int(i)].call.func && "
@@ -259,12 +267,6 @@ message Program {
   // Ruleset occurrences, shared by index within this submission. Named roots
   // retain their reachable occurrences; see Ruleset for cross-request reuse.
   repeated Ruleset rulesets = 7;
-
-  // Optional compatibility precondition, not a request to reconfigure the
-  // handle: must structurally equal its creation-time cost sort C. Reject a
-  // mismatch before installing definitions or executing commands. Freeze
-  // always includes it so the exported Program describes its required C.
-  optional uint32 cost_sort = 8; // index into this Program's sorts
 
   // Rule occurrences, shared across rule lists by index. Equal entries remain
   // distinct occurrences; labels never identify them. Unused entries do not
@@ -312,57 +314,35 @@ message Span {
 // Signatures and their presentation patterns reuse binder-local variables.
 // A shared pattern is interpreted independently in each GenericSignature;
 // arena sharing never shares substitutions between signatures or calls.
-// Sorts are acyclic through Container.args and FuncSort.params/result. CEL
+// Sorts are acyclic through HostSort.args and FuncSort.params/result. CEL
 // checks direct indices, not acyclicity or recursive variable scope.
+// References do not declare sorts: resolve equality names and host families
+// against local declarations, installed definitions or ambient host families.
+// Missing names and kind/arity mismatches are errors. Builtin references do
+// not require explicit descriptor declarations. Response references resolve
+// against the associated handle; their arenas do not redeclare definitions.
 message Sort {
   oneof kind {
     option (buf.validate.oneof).required = true;
 
-    EqSort eq = 1;
-    PrimSort prim = 2;
-    Container container = 3;
+    string eq = 1 [(buf.validate.field).string.min_len = 1];
+    HostSort family = 2;
     FuncSort func = 4;
     uint32 var = 7; // index into the enclosing GenericSignature.type_params
   }
 
-  // Optional representative origin and documentation; excluded from sort
-  // identity. Equivalent structural sorts need not preserve every occurrence.
+  // Optional representative type-use origin; excluded from sort identity.
+  // Documentation and language bindings belong to the defining Declaration.
   Span span = 5;
-  string doc = 6;
 }
 
-// A nullary equality sort. An entry also declares it; repeated declarations
-// of the same name are idempotent. Its name cannot also name a host sort family.
-// Bindings are excluded from sort identity and follow SortBindings' separate
-// first-supply/resupply contract.
-message EqSort {
-  option (buf.validate.message).cel = {
-    id: "eq_sort.presentation_parameters"
-    message: "a nullary equality sort has no presentation type parameters"
-    expression:
-      "!has(this.bindings) || "
-      "(size(this.bindings.python.type_params) == 0 && size(this.bindings.rust.type_params) == 0)"
-  };
-
+// A host-family application: no args for i64/Unit, or e.g. Vec<i64> and
+// Map<String, Math>. Arg count equals declared family arity, including zero.
+// Args may be patterns only in a GenericSignature or its bindings; otherwise
+// recursively closed. Host-family sorts are not equality sorts.
+message HostSort {
   string name = 1 [(buf.validate.field).string.min_len = 1];
-  SortBindings bindings = 2;
-}
-
-// A nullary host sort-family application, such as Unit, bool, i64 or String.
-// The family must have arity zero. It is non-unionable.
-message PrimSort {
-  string name = 1 [(buf.validate.field).string.min_len = 1];
-}
-
-// An application of a positive-arity host sort family, such as Vec<i64> or
-// Map<String, Math>. The argument count must equal the family's arity. Arguments
-// may be patterns only in a GenericSignature or its presentation; otherwise closed.
-message Container {
-  string name = 1 [(buf.validate.field).string.min_len = 1];
-  repeated uint32 args = 2 [
-    packed = true,
-    (buf.validate.field).repeated.min_items = 1
-  ]; // index into the enclosing `sorts`
+  repeated uint32 args = 2 [packed = true]; // index into the enclosing `sorts`
 }
 
 // A structural function type, not a named host sort family. Its parameter and
@@ -570,9 +550,9 @@ message Lambda {
 // Native values, selected and typed by the enclosing Node.sort_id. The five
 // scalar arms retain their exact payloads: f64_bits preserves IEEE-754 bits,
 // while Egglog equality identifies signed zeroes and all NaN bit patterns.
-// BigInt/BigRat/Rational use the corresponding PrimSort; vec/set/multiset/map/
-// pair/maybe use matching Container shapes; lambda/partial_call use FuncSort.
-// CustomValue supports host sorts, including nullary PrimSorts with children.
+// BigInt/BigRat/Rational and vec/set/multiset/map/pair/maybe use their matching
+// HostSort family applications; lambda/partial_call use FuncSort.
+// CustomValue supports host sorts, including nullary families with value children.
 // Verify payload/sort agreement and child types; CEL checks their indices only.
 //
 // Evaluated children run left-to-right in field/list order (map key then value
@@ -672,7 +652,8 @@ message MaybeValue {
 
 // For host sorts without a dedicated PrimitiveValue arm. The exact enclosing
 // sort selects the codec and its valid arg arity/sorts; no separate type tag.
-// PrimSort may have args too (e.g. PyObject without type parameters).
+// A nullary family may still have value args (e.g. PyObject); these are not
+// HostSort's type args and need not have the same arity.
 // All Egglog references are explicit args. Payload bytes may refer to arg slots,
 // never arena/class indices, engine Value IDs or raw process pointers. Traversal,
 // rebuilding and remapping must rewrite args regardless of sort kind, without
@@ -684,7 +665,7 @@ message MaybeValue {
 // never materialize/unpickle or invoke host Debug hooks. Opaque bytes/args may
 // be retained without a codec; explicit trusted materialization, evaluation or
 // Freeze encoding requires one or fails. This declares future host obligations,
-// including reference-aware PrimSort rebuilding, not existing runtime support.
+// including reference-aware nullary-family rebuilding, not existing runtime support.
 message CustomValue {
   bytes payload = 1;
   repeated uint32 args = 2 [packed = true]; // index into the enclosing `nodes`
@@ -766,7 +747,7 @@ message SetCost {
 }
 
 // ---------------------------------------------------------------------------
-// DECLARATIONS — the `Declaration.kind` arms in arm order, with their parts.
+// DECLARATIONS — immutable sort and callable definitions.
 // ---------------------------------------------------------------------------
 
 // Order-independent, immutable definitions. New names may be added. Resending
@@ -793,8 +774,8 @@ message SetCost {
 message Declaration {
   option (buf.validate.message).cel = {
     id: "declaration.callable_bindings"
-    message: "host sort-family bindings belong on HostSortFamily"
-    expression: "!has(this.host_sort_family) || !has(this.bindings)"
+    message: "sort bindings belong on EqSort or HostSortFamily"
+    expression: "!(has(this.eq_sort) || has(this.host_sort_family)) || !has(this.bindings)"
   };
   option (buf.validate.message).cel = {
     id: "declaration.presentation_inputs"
@@ -842,6 +823,7 @@ message Declaration {
     Primitive primitive = 4;
     HostSortFamily host_sort_family = 5;
     HostPrimitive host_primitive = 6;
+    EqSort eq_sort = 10;
   }
 
   // Optional diagnostic origin; excluded from semantic identity.
@@ -858,6 +840,22 @@ message Declaration {
 message Arg {
   uint32 sort = 1; // index into the enclosing `sorts`
   string name = 2;
+}
+
+// A concrete nullary equality-sort definition. Its name shares the sort
+// namespace with host families; same-name compatible resends are idempotent.
+// Bindings have SortBindings' separate first-supply/resupply contract.
+message EqSort {
+  option (buf.validate.message).cel = {
+    id: "eq_sort.presentation_parameters"
+    message: "a nullary equality sort has no presentation type parameters"
+    expression:
+      "!has(this.bindings) || "
+      "(size(this.bindings.python.type_params) == 0 && size(this.bindings.rust.type_params) == 0)"
+  };
+
+  string name = 1 [(buf.validate.field).string.min_len = 1];
+  SortBindings bindings = 2;
 }
 
 // A concrete constructor whose output is an equality sort.
@@ -909,8 +907,8 @@ message Primitive {
 }
 
 // A named host sort family, including nullary scalar sorts. Names are immutable;
-// compatible resends agree on arity. An arity-zero family uses PrimSort, never
-// Container; a positive-arity family uses Container. No generic user equality
+// compatible resends agree on arity. Every application uses HostSort, including
+// arity-zero families. No generic user equality
 // sorts or implementation/codec code are declared by this descriptor.
 message HostSortFamily {
   option (buf.validate.message).cel = {
@@ -942,7 +940,7 @@ message HostPrimitive {
 // An ordinary host signature: a fixed prefix followed by zero or more
 // homogeneous varargs when present. Sort indices reference Program.sorts.
 // Sort.var indices bind by position in type_params; labels do not bind by name
-// and need not be distinct. All variable uses, including nested Container and
+// and need not be distinct. All variable uses, including nested HostSort and
 // FuncSort patterns, must be in this signature's binder. Each actual call
 // matches all concrete argument and result sorts structurally to obtain one
 // consistent, complete substitution. Reject undetermined parameters: e.g.
@@ -969,7 +967,7 @@ message FunctionApplication {}
 // Each language block is fixed when first supplied for the semantic definition.
 // Absence makes no assertion/removal; another language may first arrive later.
 // Reconcile all supplies order-independently, including repeated same-name
-// declarations/EqSort entries, before interning away duplicate presentations.
+// declarations, before interning away duplicate presentations.
 // Agreeing supplies are allowed; conflicting supplies are errors. Compare
 // arena references structurally, not by index. Sort comparison excludes attached
 // bindings; default calls identify their core callee, not its presentation.
@@ -1522,8 +1520,8 @@ enum Extractor {
   EXTRACTOR_GREEDY_DAG = 2;
 }
 
-// Export the complete current state as a normal Program; no filtering.
-// Returns CommandOutput.program, owning its nodes, sorts and source files.
+// Export complete logical options and a reconstruction Program; no filtering.
+// Returns CommandOutput.snapshot; its Program owns nodes, sorts and source files.
 // This is current state, not request history or an engine checkpoint: omit
 // scheduler instances, execution cursors, caches, reports and host resources.
 //
@@ -1546,12 +1544,11 @@ enum Extractor {
 // contain Sort.var; the reconstruction data and concrete definitions may not.
 // Host binding and export remain unimplemented; never silently omit definitions.
 //
-// Set Program.cost_sort to the handle's C. Restoration executes the export on
-// a fresh, data-empty handle with structurally equal C and compatible host
-// capabilities. Definition installation follows Program's normal rules. This
-// restores logical state with fresh execution state. Execution against existing
-// data still follows ordinary Program/action semantics, with no restoration
-// equivalence guarantee. Scheduler/seminaive history is not resumed.
+// Return EGraphSnapshot with the handle's logical options and this Program.
+// Do not export resource settings such as threads. See EGraphSnapshot for
+// fresh-handle restoration with compatible C and host capabilities. Definition
+// installation follows Program's normal rules; scheduler/seminaive history
+// is not resumed.
 //
 // The export's commands are one ordered list of ordinary Actions, with no
 // queries, Runs, loops or other commands. Emit exactly one direct Action.term
@@ -1659,13 +1656,25 @@ service EgglogService {
   rpc RunProgram(RunProgramRequest) returns (RunProgramResponse);
 }
 
-// Create an empty e-graph with immutable cost sort C. Resolve and validate this
-// acyclic, recursively closed sort arena before allocating a handle. An invalid or
-// unsupported configuration is an adapter/lifecycle error, not RunProgram.error.
-// Frontends may offer an i64 default, but the wire always specifies C. Creating
-// a handle does not require a value codec or extraction model for every sort.
-// Costs in Program and response arenas must agree with C structurally,
-// never by comparing arena-local indices.
+// Immutable logical settings, shared by creation and snapshots. cost_sort
+// indexes CreateEGraphRequest.sorts or EGraphSnapshot.program.sorts respectively.
+// C may be any supported, acyclic, recursively closed sort, including a custom
+// equality sort or a host-family/function type. Frontends may offer an i64
+// default, but the wire always specifies C. No value codec or extraction model
+// is required merely to select C. Costs in executed Programs and responses must
+// agree with C structurally, never by comparing arena-local indices.
+message EGraphOptions {
+  optional uint32 cost_sort = 1 [(buf.validate.field).required = true];
+}
+
+// Create an empty e-graph without executing a Program. Resolve the sort-only
+// declarations against ambient host definitions, then validate options and this
+// acyclic, recursively closed sort arena before allocating a handle. Equality
+// declarations allow custom C without an already-existing handle. Compatible
+// repeated definitions are allowed; conflicting kind/arity/bindings are errors.
+// Successful creation retains these sort declarations on the new handle, so
+// later Programs may reference their names without resending definitions.
+// Unsupported options/resources are lifecycle errors, not RunProgram.error.
 message CreateEGraphRequest {
   option (buf.validate.message).cel = {
     id: "create_egraph_request.closed_sorts"
@@ -1674,26 +1683,81 @@ message CreateEGraphRequest {
   };
   option (buf.validate.message).cel = {
     id: "create_egraph_request.cost_sort_in_range"
-    message: "cost_sort must index sorts"
-    expression: "has(this.cost_sort) && this.cost_sort < uint(size(this.sorts))"
+    message: "options.cost_sort must index sorts"
+    expression: "has(this.options.cost_sort) && this.options.cost_sort < uint(size(this.sorts))"
   };
   option (buf.validate.message).cel = {
     id: "create_egraph_request.sort_refs_in_range"
     message: "sort children must index sorts"
     expression:
       "this.sorts.all(s, "
-      "(has(s.container) ? s.container.args : "
+      "(has(s.family) ? s.family.args : "
       "has(s.func) ? s.func.params + [s.func.result] : [])"
       ".all(i, i < uint(size(this.sorts))))"
   };
+  option (buf.validate.message).cel = {
+    id: "create_egraph_request.sort_declarations_only"
+    message: "creation accepts only equality-sort and host sort-family declarations"
+    expression: "this.declarations.all(d, has(d.eq_sort) || has(d.host_sort_family))"
+  };
+  option (buf.validate.message).cel = {
+    id: "create_egraph_request.sort_declarations"
+    message: "sort names must have one kind and host-family arity"
+    expression:
+      "this.declarations.all(d, "
+      "(!has(d.eq_sort) || this.declarations.all(e, "
+      "!has(e.host_sort_family) || d.eq_sort.name != e.host_sort_family.name)) && "
+      "(!has(d.host_sort_family) || this.declarations.all(e, !has(e.host_sort_family) || "
+      "d.host_sort_family.name != e.host_sort_family.name || "
+      "d.host_sort_family.arity == e.host_sort_family.arity)))"
+  };
+  option (buf.validate.message).cel = {
+    id: "create_egraph_request.sort_uses"
+    message: "sort references must agree with declared kinds and family arities"
+    expression:
+      "this.declarations.all(d, this.sorts.all(s, "
+      "(!has(d.host_sort_family) || "
+      "((!has(s.family) || s.family.name != d.host_sort_family.name || "
+      "uint(size(s.family.args)) == d.host_sort_family.arity) && "
+      "(!has(s.eq) || s.eq != d.host_sort_family.name))) && "
+      "(!has(d.eq_sort) || !has(s.family) || s.family.name != d.eq_sort.name)))"
+  };
 
   repeated Sort sorts = 1;
-  optional uint32 cost_sort = 2 [(buf.validate.field).required = true]; // index into this message's sorts
+  EGraphOptions options = 2 [(buf.validate.field).required = true];
   repeated SourceFile files = 3;
+  repeated Declaration declarations = 4;
+
+  // Resource request, never exported as logical state. Absent leaves policy to
+  // the receiver; zero requests automatic parallelism; positive requests that
+  // thread count. Reject unsupported requests rather than silently ignoring.
+  optional uint32 threads = 5;
 }
 
 message CreateEGraphResponse {
   uint64 egraph_id = 1;
+}
+
+// Portable logical state, not an execution checkpoint. The Program owns all
+// arenas/files, including the C selected by options. Only C's reachable sort
+// graph must be closed; unrelated generic signature patterns may remain.
+// Restore by remapping C's closed sort graph and needed sort declarations into
+// a CreateEGraphRequest, selecting receiver resource settings, then executing
+// program normally on the fresh compatible handle. No creation-time commands
+// or resumed scheduler/seminaive state are implied. Executing program against
+// an existing handle still has ordinary Program semantics; callers must check
+// option compatibility for any restoration equivalence claim.
+message EGraphSnapshot {
+  option (buf.validate.message).cel = {
+    id: "egraph_snapshot.cost_sort_in_range"
+    message: "options.cost_sort must index a non-variable sort in program"
+    expression:
+      "has(this.options.cost_sort) && this.options.cost_sort < uint(size(this.program.sorts)) && "
+      "!has(this.program.sorts[int(this.options.cost_sort)].var)"
+  };
+
+  EGraphOptions options = 1 [(buf.validate.field).required = true];
+  Program program = 2 [(buf.validate.field).required = true];
 }
 
 // Clone the addressed e-graph, retaining C. No complexity guarantee.
@@ -1761,7 +1825,7 @@ message RunProgramResponse {
     message: "sort children must index sorts"
     expression:
       "this.sorts.all(s, "
-      "(has(s.container) ? s.container.args : "
+      "(has(s.family) ? s.family.args : "
       "has(s.func) ? s.func.params + [s.func.result] : [])"
       ".all(i, i < uint(size(this.sorts))))"
   };
@@ -1938,7 +2002,7 @@ message CommandOutput {
 
     RunOutcome run = 1;
     ExtractResult extraction = 2;
-    Program program = 3;
+    EGraphSnapshot snapshot = 3;
     TableSizes sizes = 4;
     PrintedFunction printed_function = 5;
     TableStatsResult table_stats = 6;

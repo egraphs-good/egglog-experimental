@@ -11,8 +11,9 @@ and comments are the specification. The main pieces are:
 - Immutable declarations and rulesets, separate from ordered commands.
 - Native scalar, container, and function values. Custom values carry opaque
   bytes and explicit child references; symbolic computation remains a call.
-- Complete current-state export as an ordinary `Program`, including definitions,
-  logical data, cycles, and empty e-classes. This is not an engine checkpoint.
+- Complete current-state export as a snapshot of logical options and an ordinary
+  `Program`, including definitions, logical data, cycles, and empty e-classes.
+  This is not an engine checkpoint.
 
 There is no engine lowering, runtime, or service implementation yet. CEL checks
 directly expressible constraints, not full typing, binding, effects, or cycle
@@ -34,12 +35,14 @@ boundary. Host descriptors assert an available compatible implementation;
 they do not supply native code. Builtins remain implicitly available, so calls
 do not have to resend their descriptors.
 
-`Declaration` has `HostSortFamily` and `HostPrimitive` arms, sharing the existing
-documentation and provenance fields. A family records its name and arity:
-nullary families such as `i64` use `PrimSort`, while positive-arity families
-such as `Vec` and `Map` use `Container` with exactly that many arguments.
+`Declaration` has `EqSort`, `HostSortFamily`, and `HostPrimitive` arms, sharing
+documentation and provenance fields. `Sort.eq` references an equality-sort name;
+`Sort.family` applies a host family through `HostSort{name,args}`, with exactly
+its declared arity, including zero for `i64` or `Unit`. References never declare
+definitions. Builtin families and installed sorts need not be redeclared.
 Function types remain structural `FuncSort`s. Family names share the sort
-namespace with `EqSort`; callable names occupy a separate namespace.
+namespace with equality sorts; callable names occupy a separate namespace.
+Type-use spans may remain on `Sort`, but docs and bindings belong to definitions.
 
 `HostPrimitive` selects an ordinary `GenericSignature` or the dedicated
 `FunctionApplication` typing form. A signature has an ordered type-parameter
@@ -265,15 +268,16 @@ Rust without duplicating the IR declarations.
   are complete compatibility assertions about external implementations.
   This is specified in the schema comments; runtime enforcement remains
   unimplemented. Each payload still includes every referenced node/sort arena
-  entry; indices are local to that message. An `EqSort` entry also idempotently
-  declares its name. Standalone
+  entry; indices are local to that message. Equality sorts are defined by
+  `Declaration.eq_sort`, not by arena references. Standalone
   exports retain all installed definitions and their dependencies. Host binding
   remains unimplemented.
 
 ### Current-state export and optional recording
 
-**Decided:** `Freeze` returns one complete current-state `Program`, with no
-filtering and no separate snapshot message or loading instruction. Include all
+**Decided:** `Freeze` returns one `EGraphSnapshot{options,program}`, with complete
+logical settings and an ordinary reconstruction `Program`, without filtering
+or a special loading instruction. Include all
 installed declarations and sorts, named rulesets and their retained anonymous
 children and rules, and builtin descriptors, even when unused. Emit each retained
 rule/ruleset occurrence once, remapping leaf indices and preserving sharing.
@@ -310,13 +314,22 @@ commands = [Set(f(), index 0), Set(g(), index 0)]
 # A new execution or a loop-body iteration allocates a fresh class.
 ```
 
-An exported `Program.cost_sort` records the handle's immutable cost sort C;
-normal requests may omit it. When present it is a compatibility precondition,
-checked before installing definitions or running commands, not reconfiguration.
-Restore by executing the export on a fresh, data-empty
-handle with the same C and compatible host capabilities. Rules start with fresh
-execution state. Against existing data the Program still uses ordinary action
-semantics, without a restoration-equivalence guarantee.
+`EGraphOptions` records the immutable cost sort C, indexing creation's `sorts`
+or the snapshot's `program.sorts`. C may be any supported closed sort, including
+a custom equality sort. Ordinary Programs have no configuration precondition.
+Creation accepts only sort declarations, resolves them and the closed type arena
+before allocating a handle, and executes no Program. Its optional `threads` is a
+resource request: absent selects receiver policy, zero requests automatic
+parallelism, positive requests that count; unsupported requests fail creation.
+Resources are not exported.
+
+Restore by remapping C's reachable closed sort graph and needed sort declarations
+into a creation request, then executing the exported Program on that fresh handle
+with compatible host capabilities. Unrelated generic signature patterns may stay
+in the snapshot; do not copy its entire sort arena into the closed creation arena.
+Rules start with fresh execution state. Against an existing handle the Program
+still uses ordinary action semantics; callers must check options for any
+restoration-equivalence guarantee.
 
 This contract is not implemented. `HostSortFamily` and `HostPrimitive` provide
 the generic catalog layout; host binding, semantic validation, and full export
@@ -455,7 +468,7 @@ from protovalidate import validate
 
 program = ir.Program(
     ir_version=1,
-    sorts=[ir.Sort(kind=Oneof("prim", ir.PrimSort(name="i64")))],
+    sorts=[ir.Sort(kind=Oneof("family", ir.HostSort(name="i64")))],
     nodes=[ir.Node(sort_id=0, kind=Oneof("primitive_value",
         ir.PrimitiveValue(value=Oneof("i64", 42))))],
 )
