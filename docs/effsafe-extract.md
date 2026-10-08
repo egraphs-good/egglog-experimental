@@ -113,9 +113,11 @@ information needed to preserve meaning.
 
 Regions follow Section 7.1 of the paper. A *region* is reachable from an
 effectful root through state children and pure children, excluding subregions. Every
-region must have exactly one *entry*: an effectful e-node with no state child
-outside `:regions` positions (a function argument, say). Regions with multiple
-entry e-nodes are rejected. Within a region, the extractor:
+region must have exactly one *entry e-class*, containing an effectful e-node
+with no state child outside `:regions` positions (a function argument, say).
+Multiple entry e-nodes in that class are allowed: extraction chooses the
+cheapest whose pure children need no state. Distinct entry e-classes are
+rejected. Within a region, the extractor:
 
 1. chooses a chain from root to entry using estimated costs, requiring every
    pure dependency of the chain to be extractable from it;

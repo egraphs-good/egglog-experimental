@@ -130,6 +130,21 @@ fn check_options(g: &TermGraph, root: EClassId, expected: Option<Cost>) {
 }
 
 #[test]
+fn entry_alternatives_compete_on_cost() {
+    let mut fixture = Satellites::new(0);
+    fixture.g.classes[0].enodes = vec![node(10, vec![]), node(2, vec![])];
+    check_options(&fixture.g, fixture.root, Some(3));
+}
+
+#[test]
+fn an_entry_cannot_read_its_own_state() {
+    let mut fixture = Satellites::new(0);
+    let read = add_class(&mut fixture.g, false, vec![node(0, vec![0])]);
+    fixture.g.classes[0].enodes = vec![node(0, vec![read]), node(2, vec![])];
+    check_options(&fixture.g, fixture.root, Some(3));
+}
+
+#[test]
 fn satellite_root_has_the_shortest_walk() {
     let fixture = Satellites::new(7);
     check_options(&fixture.g, fixture.states[6], Some(2));

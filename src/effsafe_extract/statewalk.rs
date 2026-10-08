@@ -73,6 +73,23 @@ fn set_bit(bits: &mut [u64], i: usize) {
     bits[i >> 6] |= 1 << (i & 63);
 }
 
+fn saturate_pure(
+    parents: &[Vec<(EClassId, ENodeId)>],
+    remaining: &mut [Vec<u32>],
+    extractable: &mut [bool],
+    mut queue: VecDeque<EClassId>,
+) {
+    while let Some(u) = queue.pop_front() {
+        for &(pc, pn) in &parents[u] {
+            remaining[pc][pn] -= 1;
+            if remaining[pc][pn] == 0 && !extractable[pc] {
+                extractable[pc] = true;
+                queue.push_back(pc);
+            }
+        }
+    }
+}
+
 /// Everything about a region the DP needs that does not depend on the DP state.
 struct Region {
     arg: (EClassId, ENodeId),
@@ -102,22 +119,23 @@ impl Region {
     fn new(
         g: &TermGraph,
         root: EClassId,
+        costs: &[Vec<Cost>],
         opts: StatewalkOptions,
     ) -> Result<(Self, Vec<u32>), Error> {
-        let mut entries = g
+        let entries: Vec<_> = g
             .enode_ids()
-            .filter(|&(c, n)| g.is_effectful(c) && g.state_child(g.enode(c, n)).is_none());
-        let arg = entries.next().ok_or_else(|| {
+            .filter(|&(c, n)| g.is_effectful(c) && g.state_child(g.enode(c, n)).is_none())
+            .collect();
+        let &(arg_class, _) = entries.first().ok_or_else(|| {
             Error::ExtractError(format!(
                 "the region rooted at {} has no entry: no effectful e-node without an \
                      effectful child (a region needs its own argument or initial state)",
                 describe_class(g, root)
             ))
         })?;
-        let entry_count = 1 + entries.count();
-        if entry_count != 1 {
+        if entries.iter().any(|&(c, _)| c != arg_class) {
             return Err(Error::ExtractError(format!(
-                "the region rooted at {} has {entry_count} entry e-nodes; \
+                "the region rooted at {} has multiple entry e-classes; \
                  effect-safe extraction requires exactly one",
                 describe_class(g, root)
             )));
@@ -143,26 +161,43 @@ impl Region {
             }
         }
 
-        // Extractable from the entry alone: the entry, pure leaves, and their closure.
+        // Entry alternatives must be extractable before any state is available.
         let mut init_extractable = vec![false; n];
         let mut queue = VecDeque::new();
-        init_extractable[arg.0] = true;
-        queue.push_back(arg.0);
         for c in g.class_ids() {
             if !g.is_effectful(c) && g.classes[c].enodes.iter().any(|e| e.is_leaf()) {
                 init_extractable[c] = true;
                 queue.push_back(c);
             }
         }
-        while let Some(u) = queue.pop_front() {
-            for &(pc, pn) in &parents_pure[u] {
-                child_count[pc][pn] -= 1;
-                if child_count[pc][pn] == 0 && !init_extractable[pc] {
-                    init_extractable[pc] = true;
-                    queue.push_back(pc);
-                }
-            }
-        }
+        saturate_pure(
+            &parents_pure,
+            &mut child_count,
+            &mut init_extractable,
+            queue,
+        );
+        let arg = entries
+            .into_iter()
+            .filter(|&(c, n)| {
+                g.enode(c, n)
+                    .children
+                    .iter()
+                    .all(|&child| init_extractable[child])
+            })
+            .min_by_key(|&(c, n)| costs[c][n])
+            .ok_or_else(|| {
+                Error::ExtractError(format!(
+                    "the region rooted at {} has no entry extractable without a state",
+                    describe_class(g, root)
+                ))
+            })?;
+        init_extractable[arg_class] = true;
+        saturate_pure(
+            &parents_pure,
+            &mut child_count,
+            &mut init_extractable,
+            VecDeque::from([arg_class]),
+        );
 
         // Dense numbering of the remaining e-classes, and the flat counter array
         // of the remaining pure e-nodes' children.
@@ -404,7 +439,7 @@ pub fn statewalk_dp(
     costs: &[Vec<Cost>],
     opts: StatewalkOptions,
 ) -> Result<Statewalk, Error> {
-    let (region, counts) = Region::new(g, root, opts)?;
+    let (region, counts) = Region::new(g, root, costs, opts)?;
     let n_compressed = region.compressed.iter().flatten().count();
 
     let mut versions = Versions {

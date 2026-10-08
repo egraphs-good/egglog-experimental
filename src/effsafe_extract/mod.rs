@@ -145,7 +145,7 @@ impl Display for EffsafeExtractOutput {
 /// Extract `roots` effect-safely. Effectful e-classes are those marked with
 /// `set-effectful`. `cost_model` gives each e-node's marginal cost within its
 /// region; `boundary` composes subregion costs (see [`set_effsafe_cost_models`]).
-/// Returns an extraction error if a region does not have exactly one entry.
+/// Each extracted region must have exactly one entry e-class.
 pub fn extract_effsafe(
     egraph: &EGraph,
     roots: &Roots,

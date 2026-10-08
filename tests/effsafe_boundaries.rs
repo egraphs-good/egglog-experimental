@@ -193,40 +193,63 @@ fn mixed_pure_and_effectful_boundaries_keep_their_cost_positions() {
 }
 
 #[test]
-fn multiple_entries_return_an_extraction_error() {
-    for alternatives in ["(union a (B))", "(union root (Step (B)))"] {
-        let program = format!(
-            r#"
+fn entry_alternatives_in_one_class_are_supported() {
+    let program = r#"
+        (datatype E (A :cost 10) (B :cost 2) (Step E))
+        (let a (A))
+        (union a (B))
+        (set-effectful E a)
+        (let root (Step a))
+        (set-effectful E root)
+        (extract root :extractor effsafe)
+    "#;
+    assert_eq!(
+        extracted(
+            new_experimental_egraph()
+                .parse_and_run_program(None, program)
+                .unwrap()
+        ),
+        ("(Step (B))".into(), 3)
+    );
+}
+
+#[test]
+fn multiple_entry_classes_return_an_extraction_error() {
+    let program = r#"
             (datatype E (A) (B) (Step E))
             (let a (A))
             (let root (Step a))
-            {alternatives}
+            (union root (Step (B)))
             (set-effectful E a)
             (set-effectful E (B))
             (set-effectful E root)
             (extract root :extractor effsafe)
-            "#
-        );
-        let error = new_experimental_egraph()
-            .parse_and_run_program(None, &program)
-            .unwrap_err();
-        assert!(matches!(error, Error::ExtractError(_)), "{error}");
-        assert!(error.to_string().contains("2 entry e-nodes"), "{error}");
-    }
+            "#;
+    let error = new_experimental_egraph()
+        .parse_and_run_program(None, program)
+        .unwrap_err();
+    assert!(matches!(error, Error::ExtractError(_)), "{error}");
+    assert!(
+        error.to_string().contains("multiple entry e-classes"),
+        "{error}"
+    );
 }
 
 #[test]
 fn invalid_subregions_below_pure_nodes_allow_an_alternative() {
     let program = r#"
-        (datatype E (A) (B) (C) (Read E :regions (0)) (Alt :cost 50) (Step E E))
+        (datatype E (A) (B) (C) (Next E) (Read E :regions (0)) (Alt :cost 50) (Step E E))
         (let a (A))
         (let b (B))
-        (union b (C))
-        (let value (Read b))
+        (let bad (Next b))
+        (union bad (Next (C)))
+        (let value (Read bad))
         (union value (Alt))
         (let root (Step a value))
         (set-effectful E a)
         (set-effectful E b)
+        (set-effectful E (C))
+        (set-effectful E bad)
         (set-effectful E root)
         (extract root :extractor effsafe)
     "#;
