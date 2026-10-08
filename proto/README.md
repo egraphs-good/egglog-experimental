@@ -48,14 +48,41 @@ Function types remain structural `FuncSort`s. Family names share the sort
 namespace with equality sorts; callable names occupy a separate namespace.
 Type-use spans may remain on `Sort`, but docs and bindings belong to definitions.
 
+`Declaration.doc` preserves absence, explicitly empty text, and nonempty text,
+matching existing Python callable/class documentation readers. It remains
+excluded from semantic identity; compatible resupply retains the first stored
+declaration's documentation. Only this doc field has explicit presence; rule
+and ruleset docs are unchanged. This draft changes generated Rust to
+`Option<String>`. Python accepts `None` as unset but its scalar getter still
+returns `""` when absent; readers must use `has_field("doc")`, not truthiness,
+to recover absence. Absent/nonempty canonical bytes remain unchanged, but old
+receivers lose explicit-empty presence on reencoding.
+ProtoJSON distinguishes an omitted field from `"doc":""`. As with the tail
+change below, preserving this distinction requires coordinated consumer pins.
+
 `HostPrimitive` selects an ordinary `GenericSignature` or the dedicated
 `FunctionApplication` typing form. A signature has an ordered type-parameter
-binder, fixed inputs, a required output, and an optional homogeneous varargs
-tail. It uses the existing sort arena with signature-bound `Sort.var` indices.
+binder, fixed inputs, a required output, and an ordered `varargs` pattern.
+An empty pattern means no tail; a one-element pattern means homogeneous varargs;
+a wider pattern repeats as an ordered group. The flat argument count after the
+fixed prefix must be a multiple of the nonempty pattern's width. Width and order
+are semantic, including `[T, T]`; there is no tuple/group expression node.
+It uses the existing sort arena with signature-bound `Sort.var` indices.
 Parameter labels are diagnostic: changing their spelling does not change the
 definition. A shared pattern is interpreted independently in each signature's
 binder; neither arena sharing nor export combines binders or substitutions.
 Compatibility compares ordered binder positions and structural signatures.
+
+This draft changes field 4 from a singular `Arg` to `repeated Arg`, with
+coordinated immutable schema, engine, and frontend pins, not a deployed stable
+old-wire guarantee. Canonical zero/one-tail binary encodings are unchanged.
+Generated Rust changes `Option<Arg>` to `Vec<Arg>`, Python changes `Arg | None`
+to `list[Arg]`, and ProtoJSON changes the tail object to an array. Old receivers
+are unsafe for wider patterns: they collapse or merge repeated field occurrences
+and lose the pattern width. Previously duplicated singular-field encodings also
+change meaning. `ir_version = 1` does not detect this draft incompatibility;
+all consumers must migrate together. The schema can describe grouped tails;
+native matching, Map registration, and frontend generation are separate gates.
 
 Python already separates generic declarations from concrete expression types.
 Its [signatures](https://github.com/egraphs-good/egglog-python/blob/ff72f601a972ca1eb7cb0a1d299813f5d65b1a14/python/egglog/declarations.py#L752-L791)
@@ -64,6 +91,7 @@ support type variables and a repeated argument type. Useful test cases are:
 ```text
 map-get<K,V>(Map<K,V>, K) -> V
 map-empty<K,V>() -> Map<K,V>
+map-of<K,V>((K,V)...) -> Map<K,V>  # flat key,value arguments, not tuple values
 vec-of<T>(T...) -> Vec<T>
 vec-map<T,U>((T) -> U, Vec<T>) -> Vec<U>
 ```
@@ -168,7 +196,9 @@ the bounded executable declaration/default subset are implemented below.
 Python views distinguish free functions, initializers, methods, class methods,
 properties, class variables, and ownerless constants. A `CONSTANT` view names a
 nullary concrete expression (`C`), with a qualified path and no owner, receiver,
-parameters or mutated input. It does not evaluate a body during installation or
+parameters or mutated input. Its path is nonempty, but the final component may
+be empty to preserve an empty constant name; preceding components stay nonempty.
+It does not evaluate a body during installation or
 export. A nullary `FUNCTION` remains callable (`C()`); arity never implies a
 constant view. The bounded runtime acceptance below does not establish frontend
 generation.
@@ -194,9 +224,10 @@ record wrapper ownership; an optional associated output name such as `Output`
 maps to the core result. Arbitrary associated types, lifetimes, const generics,
 mutable borrowing, and executable host bodies are outside this limited layout.
 
-Ordinary varargs use one final logical parameter slot derived from the signature,
-with no default or redundant varargs flag. `FunctionApplication` instead has a
-function input and a heterogeneous tail derived from its concrete `FuncSort`.
+Ordinary varargs use one final logical parameter slot for the whole flat tail,
+regardless of pattern width, with no default, receiver, or redundant varargs flag.
+`FunctionApplication` instead has a function input and a heterogeneous tail
+derived from its concrete `FuncSort`.
 A structural-function owner marker represents `__call__` without a fake family
 or new type-pack binder. Other owner/trait patterns use only the enclosing
 callable's existing generic binder; bindings cannot introduce generic nodes.

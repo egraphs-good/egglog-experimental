@@ -276,7 +276,8 @@ fn generate(program: &pb::Program) -> Result<(String, Vec<String>), String> {
         }
         let doc = format!(
             "A protobuf-owned symbolic {} value. Structural equality preserves exact literal payloads.\n\n{}",
-            family.name, declaration.doc
+            family.name,
+            declaration.doc.as_deref().unwrap_or_default()
         );
         writeln!(source, r#"
 #[doc = {doc:?}]
@@ -344,12 +345,19 @@ impl ::core::convert::TryFrom<&self::{name}> for {host} {{
                 primitive.name
             ));
         };
+        if signature.varargs.len() > 1 {
+            return Err(format!(
+                "unsupported selected Rust tail width {} for {}",
+                signature.varargs.len(),
+                primitive.name
+            ));
+        }
         if !signature.type_params.is_empty() {
             emit_generic_views(program, index, &mut source, &mut implementations, &occupied)?;
             continue;
         }
         if !signature.type_params.is_empty()
-            || signature.varargs.is_some()
+            || !signature.varargs.is_empty()
             || signature.inputs.len() != 2
         {
             return Err(format!(
@@ -720,7 +728,7 @@ fn emit_generic_views(
                     program,
                     signature
                         .varargs
-                        .as_ref()
+                        .first()
                         .ok_or("unexpected tail slot")?
                         .sort,
                     &parameters,
@@ -731,7 +739,7 @@ fn emit_generic_views(
                 return Err("invalid generic input mapping".into());
             }
         }
-        if inputs.iter().any(Option::is_none) || tail.is_some() != signature.varargs.is_some() {
+        if inputs.iter().any(Option::is_none) || tail.is_none() != signature.varargs.is_empty() {
             return Err("generic Rust view omits a core input".into());
         }
         let inputs = inputs
@@ -765,6 +773,123 @@ impl<{generics}> {owner} {{
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn optional_documentation_renders_without_rewriting_records() {
+        let original = egglog_experimental::new_experimental_egraph()
+            .type_info()
+            .builtin_catalog()
+            .unwrap()
+            .definitions;
+        let index = original
+            .declarations
+            .iter()
+            .position(|d| {
+                matches!(&d.kind,
+                Some(pb::declaration::Kind::HostSortFamily(f)) if f.name == "i64")
+            })
+            .unwrap();
+        let mut sources = vec![];
+        let mut encodings = vec![];
+        for doc in [None, Some(""), Some("Quoted \"docs\"\nsecond line")] {
+            let mut program = original.clone();
+            program.declarations[index].doc = doc.map(str::to_owned);
+            let before = program.encode_to_vec();
+            let (source, _) = generate(&program).unwrap();
+            let expected = format!(
+                "A protobuf-owned symbolic i64 value. Structural equality preserves exact literal payloads.\n\n{}",
+                doc.unwrap_or_default()
+            );
+            assert!(source.contains(&format!("#[doc = {expected:?}]")));
+            assert_eq!(program.encode_to_vec(), before);
+            assert_eq!(
+                pb::Program::decode(before.as_slice()).unwrap().declarations[index]
+                    .doc
+                    .as_deref(),
+                doc
+            );
+            sources.push(source);
+            encodings.push(before);
+        }
+        assert_eq!(sources[0], sources[1], "absent and empty docs render alike");
+        assert_ne!(sources[1], sources[2]);
+        assert_ne!(
+            encodings[0], encodings[1],
+            "documentation presence stays on the wire"
+        );
+        assert_ne!(encodings[1], encodings[2]);
+    }
+
+    #[test]
+    fn grouped_tail_views_are_explicitly_rejected_but_records_are_retained() {
+        let original = egglog_experimental::new_experimental_egraph()
+            .type_info()
+            .builtin_catalog()
+            .unwrap()
+            .definitions;
+        let (source, _) = generate(&original).unwrap();
+        let of = source
+            .split_once("pub fn of(")
+            .unwrap()
+            .1
+            .split_once(" {")
+            .unwrap()
+            .0;
+        assert!(of.contains("impl ::core::iter::IntoIterator<Item = impl ::core::convert::Into<"));
+        let integer = original
+            .sorts
+            .iter()
+            .position(|s| {
+                matches!(&s.kind,
+            Some(pb::sort::Kind::Family(f)) if f.name == "i64" && f.args.is_empty())
+            })
+            .unwrap() as u32;
+        for name in ["egglog.core.vec.of", "egglog.core.i64.add"] {
+            let index = original
+                .declarations
+                .iter()
+                .position(|d| {
+                    matches!(&d.kind,
+                Some(pb::declaration::Kind::HostPrimitive(p)) if p.name == name)
+                })
+                .unwrap();
+            for width in [2, 3] {
+                let mut program = original.clone();
+                let Some(pb::declaration::Kind::HostPrimitive(primitive)) =
+                    &mut program.declarations[index].kind
+                else {
+                    panic!()
+                };
+                let Some(pb::host_primitive::Typing::Signature(signature)) = &mut primitive.typing
+                else {
+                    panic!()
+                };
+                let pattern = signature
+                    .varargs
+                    .first()
+                    .or_else(|| signature.inputs.first())
+                    .unwrap()
+                    .clone();
+                signature.varargs = vec![pattern; width];
+                if width == 3 {
+                    signature.varargs[1].sort = integer;
+                }
+                assert_eq!(
+                    generate(&program).unwrap_err(),
+                    format!("unsupported selected Rust tail width {width} for {name}")
+                );
+                // Removing only Rust selection must retain every native field,
+                // including all group positions, docs, and other language views.
+                program.declarations[index].bindings.as_mut().unwrap().rust = None;
+                program.declarations[index].doc = Some(String::new());
+                let before = program.encode_to_vec();
+                let (_, deferred) = generate(&program).unwrap();
+                assert!(deferred.iter().any(|deferred| deferred == name));
+                assert_eq!(program.encode_to_vec(), before);
+                assert_eq!(pb::Program::decode(before.as_slice()).unwrap(), program);
+            }
+        }
+    }
 
     #[test]
     fn ordinary_metadata_names_cannot_capture_generated_support() {

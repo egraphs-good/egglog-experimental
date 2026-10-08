@@ -107,7 +107,7 @@ impl Expr {
                         panic!("unsupported callable typing");
                     };
                     assert!(
-                        signature.type_params.is_empty() && signature.varargs.is_none(),
+                        signature.type_params.is_empty() && signature.varargs.is_empty(),
                         "generic host calls await instantiation support"
                     );
                     (
@@ -145,18 +145,25 @@ impl Expr {
         let Some(pb::host_primitive::Typing::Signature(signature)) = &primitive.typing else {
             return Err(TypedError::Invalid("unsupported callable typing".into()));
         };
-        if arguments.len() < signature.inputs.len()
-            || (signature.varargs.is_none() && arguments.len() != signature.inputs.len())
-        {
+        let tail_len = arguments
+            .len()
+            .checked_sub(signature.inputs.len())
+            .ok_or_else(|| TypedError::Invalid("callable arity".into()))?;
+        let valid_tail = if signature.varargs.is_empty() {
+            tail_len == 0
+        } else {
+            tail_len.is_multiple_of(signature.varargs.len())
+        };
+        if !valid_tail {
             return Err(TypedError::Invalid("callable arity".into()));
         }
         let mut bindings = vec![None; signature.type_params.len()];
-        for (position, argument) in arguments.iter().enumerate() {
-            let expected = signature
+        for (argument, expected) in arguments.iter().zip(
+            signature
                 .inputs
-                .get(position)
-                .or(signature.varargs.as_ref())
-                .unwrap();
+                .iter()
+                .chain(signature.varargs.iter().cycle()),
+        ) {
             let node = &argument.0.owner.as_ref().unwrap().program.nodes[argument.0.index as usize];
             SortRef(callable.0.resolve(Arena::Sort, expected.sort)?).match_pattern(
                 &SortRef(argument.0.resolve(Arena::Sort, node.sort_id)?),

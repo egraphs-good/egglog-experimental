@@ -74,6 +74,231 @@ fn generic_calls_infer_from_actual_arguments_and_result_records() {
 }
 
 #[test]
+fn generic_tail_patterns_keep_group_width_and_share_every_binding() {
+    use super::{
+        EgglogValue,
+        builtins::{F64, I64},
+    };
+    // Locations 0/1 are binder variables; 2/3 import concrete scalar sorts.
+    let declaration = |inputs: &[u32], tail: &[u32], output, parameters| {
+        let mut slots = std::array::from_fn(|_| vec![]);
+        slots[Arena::Sort as usize] = vec![
+            Slot::Local(0),
+            Slot::Local(1),
+            Slot::External(I64::sort_ref().0),
+            Slot::External(F64::sort_ref().0),
+        ];
+        Callable(
+            publish(
+                pb::Program {
+                    ir_version: 1,
+                    sorts: (0..2)
+                        .map(|i| pb::Sort {
+                            kind: Some(pb::sort::Kind::Var(i)),
+                            ..Default::default()
+                        })
+                        .collect(),
+                    declarations: vec![pb::Declaration {
+                        kind: Some(pb::declaration::Kind::HostPrimitive(pb::HostPrimitive {
+                            name: "test.grouped".into(),
+                            typing: Some(pb::host_primitive::Typing::Signature(
+                                pb::GenericSignature {
+                                    type_params: (0..parameters).map(|i| format!("T{i}")).collect(),
+                                    inputs: inputs
+                                        .iter()
+                                        .map(|sort| pb::Arg {
+                                            sort: *sort,
+                                            ..Default::default()
+                                        })
+                                        .collect(),
+                                    varargs: tail
+                                        .iter()
+                                        .map(|sort| pb::Arg {
+                                            sort: *sort,
+                                            ..Default::default()
+                                        })
+                                        .collect(),
+                                    output: Some(output),
+                                },
+                            )),
+                        })),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                },
+                slots,
+                vec![],
+                Arena::Declaration,
+                0,
+            )
+            .unwrap(),
+        )
+    };
+    let integer = I64::from(7).expression().clone();
+    let float = F64::from(2.5).expression().clone();
+    let fixed = declaration(&[0], &[], 0, 1);
+    assert!(Expr::call_with_result(&fixed, vec![integer.clone()], I64::sort_ref()).is_ok());
+    for arguments in [vec![], vec![integer.clone(), integer.clone()]] {
+        assert!(Expr::call_with_result(&fixed, arguments, I64::sort_ref()).is_err());
+    }
+    let homogeneous = declaration(&[], &[0], 0, 1);
+    assert!(Expr::call_with_result(&homogeneous, vec![], I64::sort_ref()).is_ok());
+    assert!(
+        Expr::call_with_result(&homogeneous, vec![integer.clone(); 3], I64::sort_ref()).is_ok()
+    );
+    let repeated = declaration(&[], &[0, 0], 0, 1);
+    for count in [0, 2, 4] {
+        assert!(
+            Expr::call_with_result(&repeated, vec![integer.clone(); count], I64::sort_ref())
+                .is_ok()
+        );
+    }
+    for count in [1, 3] {
+        assert!(
+            Expr::call_with_result(&repeated, vec![integer.clone(); count], I64::sort_ref())
+                .is_err(),
+            "equal tail patterns must not collapse their group width"
+        );
+    }
+    let pairs = declaration(&[1], &[0, 1], 0, 2);
+    let valid = vec![
+        float.clone(),
+        integer.clone(),
+        float.clone(),
+        integer.clone(),
+        float.clone(),
+    ];
+    assert!(Expr::call_with_result(&pairs, valid.clone(), I64::sort_ref()).is_ok());
+    assert!(Expr::call_with_result(&pairs, vec![float.clone()], I64::sort_ref()).is_ok());
+    assert!(Expr::call_with_result(&pairs, vec![], I64::sort_ref()).is_err());
+    assert!(Expr::call_with_result(&pairs, valid[..4].to_vec(), I64::sort_ref()).is_err());
+    assert!(Expr::call_with_result(&pairs, valid.clone(), F64::sort_ref()).is_err());
+    let mut swapped = valid.clone();
+    swapped.swap(1, 2);
+    assert!(Expr::call_with_result(&pairs, swapped, I64::sort_ref()).is_err());
+    for position in [0, 2, 4] {
+        let mut invalid = valid.clone();
+        invalid[position] = integer.clone();
+        assert!(
+            Expr::call_with_result(&pairs, invalid, I64::sort_ref()).is_err(),
+            "fixed prefix and every group share the same substitution"
+        );
+    }
+    let triples = declaration(&[], &[0, 1, 0], 0, 2);
+    let mut arguments: Vec<_> = (0..3)
+        .flat_map(|_| [integer.clone(), float.clone(), integer.clone()])
+        .collect();
+    assert!(Expr::call_with_result(&triples, arguments.clone(), I64::sort_ref()).is_ok());
+    arguments[4] = integer.clone();
+    assert!(
+        Expr::call_with_result(&triples, arguments, I64::sort_ref()).is_err(),
+        "a mismatch inside the middle group must be checked"
+    );
+    assert!(
+        Expr::call_with_result(&declaration(&[], &[0, 1], 0, 2), vec![], I64::sort_ref()).is_err(),
+        "result inference must not leave the other parameter undetermined"
+    );
+    assert!(
+        Expr::call_with_result(&declaration(&[], &[0], 2, 1), vec![], I64::sort_ref()).is_err(),
+        "a concrete result cannot determine an unused tail parameter"
+    );
+    assert!(
+        Expr::call_with_result(
+            &declaration(&[], &[2, 3], 2, 0),
+            vec![integer.clone(), integer],
+            I64::sort_ref()
+        )
+        .is_err(),
+        "concrete tail positions are checked too"
+    );
+}
+
+#[test]
+fn grouped_declarations_relocate_every_tail_position() {
+    use super::{
+        EgglogValue,
+        builtins::{F64, I64},
+    };
+    let declaration = |imports: Vec<SortRef>, tail: Vec<u32>| {
+        let mut slots = std::array::from_fn(|_| vec![]);
+        slots[Arena::Sort as usize] = imports.into_iter().map(|s| Slot::External(s.0)).collect();
+        Callable(
+            publish(
+                pb::Program {
+                    ir_version: 1,
+                    declarations: vec![pb::Declaration {
+                        kind: Some(pb::declaration::Kind::HostPrimitive(pb::HostPrimitive {
+                            name: "test.relocated.group".into(),
+                            typing: Some(pb::host_primitive::Typing::Signature(
+                                pb::GenericSignature {
+                                    inputs: vec![pb::Arg {
+                                        sort: tail[0],
+                                        name: "prefix".into(),
+                                    }],
+                                    output: Some(tail[0]),
+                                    varargs: tail
+                                        .into_iter()
+                                        .enumerate()
+                                        .map(|(i, sort)| pb::Arg {
+                                            sort,
+                                            name: format!("item{i}"),
+                                        })
+                                        .collect(),
+                                    ..Default::default()
+                                },
+                            )),
+                        })),
+                        doc: Some("retain complete grouped record".into()),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                },
+                slots,
+                vec![],
+                Arena::Declaration,
+                0,
+            )
+            .unwrap(),
+        )
+    };
+    let original = declaration(vec![I64::sort_ref(), F64::sort_ref()], vec![0, 1, 0]);
+    let relocated = declaration(vec![F64::sort_ref(), I64::sort_ref()], vec![1, 0, 1]);
+    let changed = declaration(vec![I64::sort_ref(), I64::sort_ref()], vec![0, 1, 0]);
+    assert!(super::decl::same_callable(&original.0, &relocated.0).unwrap());
+    assert!(super::decl::same_callable(&original.0, &changed.0).is_err());
+    let mut programs = vec![];
+    for callable in [&original, &relocated] {
+        let mut packer = Packer::default();
+        packer.intern(callable.0.clone(), 0);
+        packer.finish().unwrap();
+        let declaration = &packer.program.declarations[0];
+        assert_eq!(
+            declaration.doc.as_deref(),
+            Some("retain complete grouped record")
+        );
+        let Some(pb::declaration::Kind::HostPrimitive(primitive)) = &declaration.kind else {
+            panic!()
+        };
+        let Some(pb::host_primitive::Typing::Signature(signature)) = &primitive.typing else {
+            panic!()
+        };
+        assert_eq!(signature.varargs.len(), 3);
+        for (position, (arg, family)) in signature
+            .varargs
+            .iter()
+            .zip(["i64", "f64", "i64"])
+            .enumerate()
+        {
+            assert_eq!(arg.name, format!("item{position}"));
+            assert!(matches!(&packer.program.sorts[arg.sort as usize].kind,
+                Some(pb::sort::Kind::Family(f)) if f.name == family));
+        }
+        programs.push(packer.program.encode_to_vec());
+    }
+    assert_eq!(programs[0], programs[1]);
+}
+
+#[test]
 fn vec_calls_and_values_preserve_actual_ordered_child_records() {
     use super::{
         EgglogValue,
@@ -630,7 +855,7 @@ fn generated_rule_fields_and_occurrence_locations_are_authoritative() {
 fn declaration_diagnostics_do_not_change_local_compatibility() {
     let sort = SortRef::equality("M");
     let leaf = Expr::call(&Callable::constructor("Leaf", vec![], sort.clone()), vec![]);
-    let declaration = |label: &str, doc: &str, unextractable: bool| {
+    let declaration = |label: &str, doc: Option<&str>, unextractable: bool| {
         let mut slots = std::array::from_fn(|_| vec![]);
         slots[Arena::Sort as usize] = vec![Slot::External(sort.0.clone())];
         Callable(
@@ -648,7 +873,7 @@ fn declaration_diagnostics_do_not_change_local_compatibility() {
                             unextractable,
                             ..Default::default()
                         })),
-                        doc: doc.into(),
+                        doc: doc.map(str::to_owned),
                         ..Default::default()
                     }],
                     ..Default::default()
@@ -661,37 +886,51 @@ fn declaration_diagnostics_do_not_change_local_compatibility() {
             .unwrap(),
         )
     };
-    let first = declaration("old label", "first docs", false);
-    let second = declaration("new label", "second docs", false);
-    assert!(super::decl::same_callable(&first.0, &second.0).unwrap());
-    let mut packed = Packer::default();
-    packed.intern(Expr::call(&first, vec![leaf.clone()]).0, 0);
-    packed.intern(Expr::call(&second, vec![leaf.clone()]).0, 0);
-    packed
-        .finish()
-        .expect("diagnostic-only changes are compatible");
-    let wraps: Vec<_> = packed
-        .program
-        .declarations
-        .iter()
-        .filter(
-            |d| matches!(&d.kind, Some(pb::declaration::Kind::Constructor(c)) if c.name == "Wrap"),
-        )
-        .collect();
-    assert_eq!(wraps.len(), 1);
-    assert_eq!(
-        wraps[0].doc, "first docs",
-        "packing retains first-use metadata"
-    );
+    for doc in [None, Some(""), Some("first docs")] {
+        let first = declaration("old label", doc, false);
+        let mut packed = Packer::default();
+        packed.intern(Expr::call(&first, vec![leaf.clone()]).0, 0);
+        for resupplied in [None, Some(""), Some("second docs")] {
+            let second = declaration("new label", resupplied, false);
+            assert!(super::decl::same_callable(&first.0, &second.0).unwrap());
+            packed.intern(Expr::call(&second, vec![leaf.clone()]).0, 0);
+        }
+        packed
+            .finish()
+            .expect("diagnostic-only changes are compatible");
+        let wraps: Vec<_> = packed
+            .program
+            .declarations
+            .iter()
+            .filter(
+                |d| matches!(&d.kind, Some(pb::declaration::Kind::Constructor(c)) if c.name == "Wrap"),
+            )
+            .collect();
+        assert_eq!(wraps.len(), 1);
+        assert_eq!(
+            *wraps[0],
+            first.0.owner.as_ref().unwrap().program.declarations[0],
+            "packing retains the complete first record, including documentation presence"
+        );
+        let encoded = packed.program.encode_to_vec();
+        assert_eq!(
+            pb::Program::decode(encoded.as_slice()).unwrap(),
+            packed.program
+        );
 
-    let mut conflict = Packer::default();
-    conflict.intern(Expr::call(&first, vec![leaf.clone()]).0, 0);
-    conflict.intern(
-        Expr::call(&declaration("ignored", "ignored", true), vec![leaf]).0,
-        0,
-    );
-    assert!(
-        conflict.finish().is_err(),
-        "semantic constructor options still conflict"
-    );
+        let mut conflict = Packer::default();
+        conflict.intern(Expr::call(&first, vec![leaf.clone()]).0, 0);
+        conflict.intern(
+            Expr::call(
+                &declaration("ignored", Some("ignored"), true),
+                vec![leaf.clone()],
+            )
+            .0,
+            0,
+        );
+        assert!(
+            conflict.finish().is_err(),
+            "semantic constructor options still conflict"
+        );
+    }
 }
