@@ -15,11 +15,201 @@ fn native_catalog_snapshot_is_deterministic_and_installs_as_bytes() {
         .unwrap()
         .definitions;
     assert_eq!(first.encode_to_vec(), second.encode_to_vec());
+    let family = first
+        .declarations
+        .iter()
+        .find_map(|d| match &d.kind {
+            Some(pb::declaration::Kind::HostSortFamily(f)) if f.name == "Vec" => Some(f),
+            _ => None,
+        })
+        .unwrap();
+    let binding = family.bindings.as_ref().expect("native Vec metadata");
+    assert!(binding.python.is_none());
+    assert_eq!(
+        binding.rust.as_ref().unwrap().path,
+        ["egglog_experimental", "typed", "builtins", "Vec"]
+    );
     let mut engine = Engine::default();
     let id = create(&mut engine);
     for program in [first, second] {
         assert_eq!(run(&mut engine, id, program).error, None);
     }
+}
+
+fn constant_fixture() -> pb::Program {
+    let mut p = fixture();
+    p.rules.clear();
+    p.rulesets.clear();
+    p.declarations.push(pb::Declaration {
+        kind: Some(pb::declaration::Kind::Constructor(pb::Constructor {
+            name: "Empty".into(),
+            output: 1,
+            ..Default::default()
+        })),
+        ..Default::default()
+    });
+    for (index, name) in [(3, "CURRENT"), (5, "EMPTY")] {
+        p.declarations[index].bindings = Some(pb::CallableBindings {
+            python: Some(pb::PythonBindings {
+                views: vec![pb::PythonCallable {
+                    kind: pb::PythonCallKind::Constant.into(),
+                    path: vec!["test".into(), name.into()],
+                    ..Default::default()
+                }],
+            }),
+            ..Default::default()
+        });
+    }
+    p.nodes.push(pb::Node {
+        sort_id: 1,
+        kind: Some(pb::node::Kind::Call(pb::Call {
+            func: "Empty".into(),
+            args: vec![],
+        })),
+        ..Default::default()
+    });
+    let mut extraction = p.commands[7].clone();
+    let Some(pb::command::Kind::Extract(e)) = &mut extraction.kind else {
+        unreachable!()
+    };
+    e.roots = vec![4, p.nodes.len() as u32 - 1];
+    p.commands.truncate(4); // Set current, capture, Set current, Check both values.
+    p.commands.push(extraction);
+    p
+}
+
+#[test]
+fn constant_function_and_constructor_execute_as_bytes_and_resupply() {
+    let program = constant_fixture();
+    let encoded = program.encode_to_vec();
+    assert_eq!(pb::Program::decode(encoded.as_slice()).unwrap(), program);
+    let mut engine = Engine::default();
+    let id = create(&mut engine);
+    let mut renderer = egglog_experimental::protobuf::source::Renderer::default();
+    let mut native = new_experimental_egraph();
+    for _ in 0..2 {
+        let response = run(&mut engine, id, program.clone());
+        assert_eq!(response.error, None);
+        let Some(pb::command_output::Kind::Extraction(e)) = &response.outputs[0].kind else {
+            panic!("extraction")
+        };
+        assert_eq!(value(&response, e.roots[0].variants[0].term), "20");
+        assert!(
+            matches!(&response.nodes[e.roots[1].variants[0].term as usize].kind, Some(pb::node::Kind::Call(c)) if c.func == "Empty" && c.args.is_empty())
+        );
+        let outputs = native
+            .parse_and_run_program(None, &renderer.render(&program).unwrap())
+            .unwrap();
+        let egglog_experimental::CommandOutput::ExtractBest(dag, _, root) = &outputs[0] else {
+            panic!("native extraction")
+        };
+        assert_eq!(dag.to_string(*root), "20");
+        assert_eq!(outputs.len(), 2);
+    }
+    // Presentation survives byte ownership; rendering is executable semantics,
+    // not a Python surface exporter or a retained native-AST execution path.
+    assert_eq!(program.encode_to_vec(), encoded);
+}
+
+#[test]
+fn constant_metadata_conflicts_reject_before_writes_and_clone_keeps_prefix_state() {
+    let program = constant_fixture();
+    let mut engine = Engine::default();
+    let id = create(&mut engine);
+    assert_eq!(run(&mut engine, id, program.clone()).error, None);
+    let clone = pb::CloneEGraphResponse::decode(
+        engine
+            .clone_egraph(&pb::CloneEGraphRequest { egraph_id: id }.encode_to_vec())
+            .unwrap()
+            .as_slice(),
+    )
+    .unwrap()
+    .egraph_id;
+    let mut observation = program.clone();
+    observation.commands = program.commands[3..].to_vec();
+    for bad in 0..8 {
+        let mut invalid = program.clone();
+        let view = &mut invalid.declarations[3]
+            .bindings
+            .as_mut()
+            .unwrap()
+            .python
+            .as_mut()
+            .unwrap()
+            .views[0];
+        match bad {
+            0 => view.path.clear(),
+            1 => view.kind = pb::PythonCallKind::Function.into(), // Valid view, incompatible resupply.
+            2 => view.receiver = Some(0),
+            3 => {
+                view.owner = Some(pb::BindingOwner {
+                    kind: Some(pb::binding_owner::Kind::Sort(0)),
+                })
+            }
+            4 => view.params.push(pb::PythonParameter {
+                core_input: Some(0),
+                name: "x".into(),
+                ..Default::default()
+            }),
+            5 => view.kind = 99,
+            6 | 7 => {
+                let Some(pb::declaration::Kind::Function(f)) = &mut invalid.declarations[3].kind
+                else {
+                    unreachable!()
+                };
+                if bad == 6 {
+                    f.inputs.push(pb::Arg {
+                        name: "x".into(),
+                        sort: 0,
+                    });
+                } else {
+                    f.output = 1;
+                }
+            }
+            _ => unreachable!(),
+        }
+        // The first action would write 10; preparation must fail before it runs.
+        assert_eq!(
+            run(&mut engine, id, invalid).error.unwrap().code,
+            pb::ErrorCode::InvalidProgram as i32,
+            "bad case {bad}"
+        );
+        assert_eq!(
+            run(&mut engine, id, observation.clone()).error,
+            None,
+            "bad case {bad}"
+        );
+    }
+    assert!(engine.run(&[0xff]).is_err());
+    assert_eq!(run(&mut engine, id, observation.clone()).error, None);
+    let mut runtime = program.clone();
+    runtime.commands = vec![
+        program.commands[0].clone(),
+        pb::Command {
+            kind: Some(pb::command::Kind::Action(pb::Action {
+                kind: Some(pb::action::Kind::Panic("after constant write".into())),
+                ..Default::default()
+            })),
+            ..Default::default()
+        },
+        program.commands[2].clone(),
+    ];
+    assert_eq!(
+        run(&mut engine, id, runtime).error.unwrap().code,
+        pb::ErrorCode::Panic as i32
+    );
+    assert_eq!(
+        run(&mut engine, clone, observation.clone()).error,
+        None,
+        "clone remains at 20"
+    );
+    observation.commands.remove(0); // Extract the committed prefix, without the old 20 check.
+    let response = run(&mut engine, id, observation);
+    assert_eq!(response.error, None);
+    let Some(pb::command_output::Kind::Extraction(e)) = &response.outputs[0].kind else {
+        panic!("extraction")
+    };
+    assert_eq!(value(&response, e.roots[0].variants[0].term), "10");
 }
 
 fn host_default_program(default_node: u32) -> pb::Program {

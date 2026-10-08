@@ -170,7 +170,8 @@ properties, class variables, and ownerless constants. A `CONSTANT` view names a
 nullary concrete expression (`C`), with a qualified path and no owner, receiver,
 parameters or mutated input. It does not evaluate a body during installation or
 export. A nullary `FUNCTION` remains callable (`C()`); arity never implies a
-constant view. Consumer generation and runtime acceptance require their own gates.
+constant view. The bounded runtime acceptance below does not establish frontend
+generation.
 Ordered parameter records give core-input
 positions, names, and optional default expressions. Initializers derive `__init__`
 without storing a path. Receivers are mapped inputs; initializers/class methods
@@ -549,8 +550,10 @@ The current executable subset is deliberately limited:
   declaration/default closures retained across requests and clones. Each
   language block is fixed on its first supply; absent later blocks do not erase
   it. References compare structurally, including shared Union default topology.
-- Python/Rust scalar type and addition views supplied by native registration;
-  intact user sort/callable views, including closed scalar/Vec initializer defaults.
+- Python/Rust scalar type and addition views and Rust Vec type/empty/of/get
+  views supplied by native registration; intact user sort/callable views,
+  including ownerless Python CONSTANT views on nullary constructors/functions
+  and closed scalar/Vec initializer defaults.
   Default calls are checked, never evaluated during installation/export. Actual
   omitted-argument expansion remains the frontend's responsibility.
 
@@ -683,6 +686,10 @@ and result sorts before selecting a derived native instance lookup key, pointing
 to the same implementation, validator and context IDs. This preserves output-only
 typing of an empty Vec even with several concrete shapes installed. These
 compiler lookup keys never become wire declarations or exported sort names.
+Rust presentation names the family `egglog_experimental::typed::builtins::Vec<T>`:
+`empty`/`of` are associated views, `of` maps the variadic tail, and `get` borrows
+its receiver. Python Vec views remain absent; neither language's frontend
+generation is inferred from registration alone.
 
 This checkpoint does not implement complete `Freeze`, other Vec operations,
 generic Map/Fn definitions, wrapper generation, custom
