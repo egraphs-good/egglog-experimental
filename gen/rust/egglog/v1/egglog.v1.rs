@@ -933,13 +933,17 @@ pub struct PythonBindings {
     #[prost(message, repeated, tag = "1")]
     pub views: ::prost::alloc::vec::Vec<PythonCallable>,
 }
-/// Free functions use a qualified path; members use one name resolved on owner.
+/// Free functions and CONSTANT use a qualified path; members use one name on owner.
 /// INITIALIZER instead omits path and derives __init__.
 /// METHOD/PROPERTY map a real core input as receiver. INITIALIZER/CLASS_METHOD
 /// have no core self/cls input. Only INITIALIZER requires result = owner;
 /// class methods and class variables may return a different sort.
 /// METHOD/PROPERTY receiver sort must match owner under the same substitution.
 /// PROPERTY has only a receiver; CLASS_VARIABLE is a nullary expression view.
+/// CONSTANT is an ownerless named expression (C, not C()), backed by a nullary
+/// concrete core signature. It has no receiver, parameters or mutated input.
+/// It does not change declaration semantics or evaluate a body at installation
+/// or export. FUNCTION stays callable even when its core signature is nullary.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct PythonCallable {
     #[prost(enumeration = "PythonCallKind", tag = "1")]
@@ -2235,6 +2239,7 @@ pub enum PythonCallKind {
     ClassMethod = 4,
     Property = 5,
     ClassVariable = 6,
+    Constant = 7,
 }
 impl PythonCallKind {
     /// String value of the enum field names used in the ProtoBuf definition.
@@ -2250,6 +2255,7 @@ impl PythonCallKind {
             Self::ClassMethod => "PYTHON_CALL_KIND_CLASS_METHOD",
             Self::Property => "PYTHON_CALL_KIND_PROPERTY",
             Self::ClassVariable => "PYTHON_CALL_KIND_CLASS_VARIABLE",
+            Self::Constant => "PYTHON_CALL_KIND_CONSTANT",
         }
     }
     /// Creates an enum from field names used in the ProtoBuf definition.
@@ -2262,6 +2268,7 @@ impl PythonCallKind {
             "PYTHON_CALL_KIND_CLASS_METHOD" => Some(Self::ClassMethod),
             "PYTHON_CALL_KIND_PROPERTY" => Some(Self::Property),
             "PYTHON_CALL_KIND_CLASS_VARIABLE" => Some(Self::ClassVariable),
+            "PYTHON_CALL_KIND_CONSTANT" => Some(Self::Constant),
             _ => None,
         }
     }

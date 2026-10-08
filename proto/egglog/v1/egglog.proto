@@ -803,6 +803,14 @@ message Declaration {
       "(!t || (size(v.params) > 0 && v.params[size(v.params)-1].core_input == uint(n))))))"
   };
   option (buf.validate.message).cel = {
+    id: "declaration.constant_signature"
+    message: "constant views require a concrete signature without generic parameters"
+    expression:
+      "!has(this.bindings) || this.bindings.python.views.all(v, v.kind != 7 || "
+      "(!has(this.host_primitive) || (has(this.host_primitive.signature) && "
+      "size(this.host_primitive.signature.type_params) == 0)))"
+  };
+  option (buf.validate.message).cel = {
     id: "declaration.presentation_special_forms"
     message: "function-wrapper owners require application receiver zero; datatype members require constructors"
     expression:
@@ -1038,23 +1046,27 @@ message PythonBindings {
   repeated PythonCallable views = 1;
 }
 
-// Free functions use a qualified path; members use one name resolved on owner.
+// Free functions and CONSTANT use a qualified path; members use one name on owner.
 // INITIALIZER instead omits path and derives __init__.
 // METHOD/PROPERTY map a real core input as receiver. INITIALIZER/CLASS_METHOD
 // have no core self/cls input. Only INITIALIZER requires result = owner;
 // class methods and class variables may return a different sort.
 // METHOD/PROPERTY receiver sort must match owner under the same substitution.
 // PROPERTY has only a receiver; CLASS_VARIABLE is a nullary expression view.
+// CONSTANT is an ownerless named expression (C, not C()), backed by a nullary
+// concrete core signature. It has no receiver, parameters or mutated input.
+// It does not change declaration semantics or evaluate a body at installation
+// or export. FUNCTION stays callable even when its core signature is nullary.
 message PythonCallable {
   option (buf.validate.message).cel = {
     id: "python_callable.owner_and_receiver"
     message: "Python callable form determines owner and receiver presence"
     expression:
-      "(this.kind == 1 ? !has(this.owner) : has(this.owner)) && "
+      "(this.kind in [1, 7] ? !has(this.owner) : has(this.owner)) && "
       "((this.kind in [3, 5]) == has(this.receiver)) && "
       "(this.kind == 2 ? size(this.path) == 0 : "
-      "this.kind == 1 ? size(this.path) > 0 : size(this.path) == 1) && "
-      "(!(this.kind in [5, 6]) || size(this.params) == 0)"
+      "this.kind in [1, 7] ? size(this.path) > 0 : size(this.path) == 1) && "
+      "(!(this.kind in [5, 6, 7]) || size(this.params) == 0)"
   };
   option (buf.validate.message).cel = {
     id: "python_callable.unique_inputs"
@@ -1096,6 +1108,7 @@ enum PythonCallKind {
   PYTHON_CALL_KIND_CLASS_METHOD = 4;
   PYTHON_CALL_KIND_PROPERTY = 5;
   PYTHON_CALL_KIND_CLASS_VARIABLE = 6;
+  PYTHON_CALL_KIND_CONSTANT = 7;
 }
 
 // Ordered surface parameter. Fixed core inputs occupy [0, n). If the signature
