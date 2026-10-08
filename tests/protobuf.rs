@@ -1158,6 +1158,733 @@ fn initializer_metadata_accepts_expanded_default_calls_and_rejects_semantic_resu
     }
 }
 
+fn pair_fixture() -> pb::Program {
+    pb::Program {
+        ir_version: 1,
+        sorts: vec![
+            pb::Sort {
+                kind: Some(pb::sort::Kind::Family(pb::HostSort {
+                    name: "i64".into(),
+                    args: vec![],
+                })),
+                ..Default::default()
+            },
+            pb::Sort {
+                kind: Some(pb::sort::Kind::Family(pb::HostSort {
+                    name: "String".into(),
+                    args: vec![],
+                })),
+                ..Default::default()
+            },
+            pb::Sort {
+                kind: Some(pb::sort::Kind::Family(pb::HostSort {
+                    name: "Pair".into(),
+                    args: vec![0, 1],
+                })),
+                ..Default::default()
+            },
+        ],
+        declarations: vec![pb::Declaration {
+            kind: Some(pb::declaration::Kind::HostSortFamily(pb::HostSortFamily {
+                name: "Pair".into(),
+                arity: 2,
+                bindings: None,
+            })),
+            ..Default::default()
+        }],
+        nodes: vec![
+            pb::Node {
+                sort_id: 0,
+                kind: Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
+                    value: Some(pb::primitive_value::Value::I64(1)),
+                })),
+                ..Default::default()
+            },
+            pb::Node {
+                sort_id: 1,
+                kind: Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
+                    value: Some(pb::primitive_value::Value::String("x".into())),
+                })),
+                ..Default::default()
+            },
+            pb::Node {
+                sort_id: 2,
+                kind: Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
+                    value: Some(pb::primitive_value::Value::Pair(pb::PairValue {
+                        first: Some(0),
+                        second: Some(1),
+                    })),
+                })),
+                ..Default::default()
+            },
+        ],
+        commands: vec![pb::Command {
+            kind: Some(pb::command::Kind::Extract(pb::Extract {
+                roots: vec![2],
+                variants: 1,
+                extractor: pb::Extractor::Tree.into(),
+                ..Default::default()
+            })),
+            ..Default::default()
+        }],
+        ..Default::default()
+    }
+}
+
+#[test]
+fn pair_value_bytes_extract_reingest_and_render() {
+    use egglog_experimental::protobuf::source::Renderer;
+    let mut program = pair_fixture();
+    let mut engine = Engine::default();
+    let id = create(&mut engine);
+    let mut renderer = Renderer::default();
+    let mut native = new_experimental_egraph();
+    for _ in 0..2 {
+        let decoded = pb::Program::decode(program.encode_to_vec().as_slice()).unwrap();
+        assert_eq!(decoded, program);
+        let response = run(&mut engine, id, decoded);
+        assert_eq!(response.error, None);
+        let Some(pb::command_output::Kind::Extraction(result)) = &response.outputs[0].kind else {
+            panic!("extraction")
+        };
+        let root = result.roots[0].variants[0].term;
+        let node = &response.nodes[root as usize];
+        let Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
+            value: Some(pb::primitive_value::Value::Pair(pair)),
+        })) = &node.kind
+        else {
+            panic!("PairValue, not a symbolic Call")
+        };
+        let Some(pb::sort::Kind::Family(family)) = &response.sorts[node.sort_id as usize].kind
+        else {
+            panic!("Pair family")
+        };
+        assert_eq!(family.name, "Pair");
+        assert_eq!(family.args.len(), 2);
+        assert_eq!(
+            response.nodes[pair.first.unwrap() as usize].sort_id,
+            family.args[0]
+        );
+        assert_eq!(
+            response.nodes[pair.second.unwrap() as usize].sort_id,
+            family.args[1]
+        );
+        assert_eq!(value(&response, root), "(pair 1 \"x\")");
+        native
+            .parse_and_run_program(None, &renderer.render(&program).unwrap())
+            .unwrap();
+        program = pb::Program {
+            ir_version: 1,
+            sorts: response.sorts,
+            nodes: response.nodes,
+            commands: vec![pb::Command {
+                kind: Some(pb::command::Kind::Extract(pb::Extract {
+                    roots: vec![root],
+                    variants: 1,
+                    extractor: pb::Extractor::Tree.into(),
+                    ..Default::default()
+                })),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+    }
+}
+
+#[test]
+fn pair_source_calls_execute_through_bytes() {
+    use egglog_experimental::protobuf::source::{Renderer, Source};
+    let text = r#"
+        (sort P (Pair i64 String)) (sort Q (Pair i64 String)) (sort R (Pair String i64))
+        (function p () P :merge new) (function q () Q :merge new) (function r () R :merge new)
+        (set (p) (pair 1 "x"))
+        (set (q) (pair 2 "y")) (set (r) (pair "z" 3))
+        (check (= (pair-first (p)) 1) (= (pair-second (p)) "x"))
+        (check (= (pair-first (q)) 2) (= (pair-second (r)) 3))
+        (extract (pair-first (p))) (extract (pair-second (p))) (extract (p))
+    "#;
+    new_experimental_egraph()
+        .parse_and_run_program(None, text)
+        .unwrap();
+    let mut engine = Engine::default();
+    let id = create(&mut engine);
+    let mut renderer = Renderer::default();
+    let mut native = new_experimental_egraph();
+    let mut keys = std::collections::BTreeSet::new();
+    let mut results = vec![];
+    for phase in Source::new(None, text).unwrap() {
+        let program = pb::Program::decode(phase.unwrap().encode_to_vec().as_slice()).unwrap();
+        for node in &program.nodes {
+            if let Some(pb::node::Kind::Call(call)) = &node.kind {
+                assert!(!matches!(
+                    call.func.as_str(),
+                    "pair" | "pair-first" | "pair-second"
+                ));
+                if call.func.starts_with("egglog.core.pair.") {
+                    keys.insert(call.func.clone());
+                }
+            }
+        }
+        let response = run(&mut engine, id, program.clone());
+        assert_eq!(response.error, None);
+        native
+            .parse_and_run_program(None, &renderer.render(&program).unwrap())
+            .unwrap();
+        for output in &response.outputs {
+            if let Some(pb::command_output::Kind::Extraction(result)) = &output.kind {
+                results.push(value(&response, result.roots[0].variants[0].term));
+            }
+        }
+    }
+    assert_eq!(
+        keys.into_iter().collect::<Vec<_>>(),
+        [
+            "egglog.core.pair.first",
+            "egglog.core.pair.make",
+            "egglog.core.pair.second"
+        ]
+    );
+    assert_eq!(results, ["1", "\"x\"", "(pair 1 \"x\")"]);
+}
+
+#[test]
+fn pair_invalid_payloads_and_annotations_reject_before_mutation() {
+    use egglog_experimental::protobuf::source::{Renderer, Source};
+    let phases = Source::new(
+        None,
+        "(function observed () i64 :merge new) (set (observed) 0) (check (= (observed) 0))",
+    )
+    .unwrap()
+    .collect::<Result<Vec<_>, _>>()
+    .unwrap();
+    let mut engine = Engine::default();
+    let id = create(&mut engine);
+    let mut renderer = Renderer::default();
+    for program in &phases[..2] {
+        assert_eq!(run(&mut engine, id, program.clone()).error, None);
+        renderer.render(program).unwrap();
+    }
+    for bad in 0..14 {
+        let mut invalid = pair_fixture();
+        invalid.commands.insert(
+            0,
+            pb::Command {
+                kind: Some(pb::command::Kind::Action(pb::Action {
+                    kind: Some(pb::action::Kind::Set(pb::Set {
+                        target: Some(pb::Call {
+                            func: "observed".into(),
+                            args: vec![],
+                        }),
+                        value: Some(0),
+                    })),
+                    ..Default::default()
+                })),
+                ..Default::default()
+            },
+        );
+        match bad {
+            0..=3 => {
+                let Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
+                    value: Some(pb::primitive_value::Value::Pair(pair)),
+                })) = &mut invalid.nodes[2].kind
+                else {
+                    unreachable!()
+                };
+                match bad {
+                    0 => pair.first = None,
+                    1 => pair.second = None,
+                    2 => pair.first = Some(999),
+                    _ => std::mem::swap(&mut pair.first, &mut pair.second),
+                }
+            }
+            4 => invalid.nodes[2].sort_id = 0,
+            5 | 6 | 12 => {
+                let Some(pb::sort::Kind::Family(f)) = &mut invalid.sorts[2].kind else {
+                    unreachable!()
+                };
+                match bad {
+                    5 => {
+                        f.args.pop();
+                    }
+                    6 => f.args.reverse(),
+                    _ => f.args[0] = 2,
+                }
+            }
+            7 => {
+                invalid.nodes[0].kind = Some(pb::node::Kind::Call(pb::Call {
+                    func: "egglog.core.i64.add".into(),
+                    args: vec![0, 0],
+                }))
+            }
+            8 => {
+                let mut unused = invalid.nodes[2].clone();
+                let Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
+                    value: Some(pb::primitive_value::Value::Pair(pair)),
+                })) = &mut unused.kind
+                else {
+                    unreachable!()
+                };
+                pair.second = Some(999);
+                invalid.nodes.push(unused);
+            }
+            9..=11 => {
+                invalid.nodes[2].kind = Some(pb::node::Kind::Call(pb::Call {
+                    func: match bad {
+                        9 => "egglog.core.pair.missing",
+                        10 => "pair",
+                        _ => "egglog.core.pair.make",
+                    }
+                    .into(),
+                    args: if bad == 11 { vec![1, 0] } else { vec![0, 1] },
+                }))
+            }
+            _ => invalid.nodes[0].kind = Some(pb::node::Kind::Var("unbound".into())),
+        }
+        assert!(
+            run(&mut engine, id, invalid.clone()).error.is_some(),
+            "bad {bad}"
+        );
+        assert!(renderer.render(&invalid).is_err(), "render bad {bad}");
+        assert_eq!(
+            run(&mut engine, id, phases[2].clone()).error,
+            None,
+            "mutation after bad {bad}"
+        );
+    }
+    assert!(engine.run(&[0xff]).is_err());
+    assert_eq!(run(&mut engine, id, phases[2].clone()).error, None);
+    assert_eq!(run(&mut engine, id, pair_fixture()).error, None);
+    renderer.render(&pair_fixture()).unwrap();
+}
+
+#[test]
+fn pair_nested_values_rebuild_and_keep_user_constructor_provenance() {
+    use egglog_experimental::protobuf::source::{Renderer, Source};
+    let text = r#"
+        (datatype N (A) (B))
+        (sort P (Pair N i64)) (sort V (Vec P)) (sort Nested (Pair P V))
+        (function p () P :merge new) (function n () Nested :merge new)
+        (set (p) (pair (A) 7)) (set (n) (pair (p) (vec-of (p))))
+        (rewrite (A) (B)) (run 1)
+        (check (= (pair-first (p)) (B)))
+        (check (= (pair-second (vec-get (pair-second (n)) 0)) 7))
+        (extract (n))
+    "#;
+    new_experimental_egraph()
+        .parse_and_run_program(None, text)
+        .unwrap();
+    let mut engine = Engine::default();
+    let id = create(&mut engine);
+    let mut renderer = Renderer::default();
+    let mut native = new_experimental_egraph();
+    let mut observation = pb::Program::default();
+    for phase in Source::new(None, text).unwrap() {
+        let program = pb::Program::decode(phase.unwrap().encode_to_vec().as_slice()).unwrap();
+        let response = run(&mut engine, id, program.clone());
+        assert_eq!(response.error, None);
+        native
+            .parse_and_run_program(None, &renderer.render(&program).unwrap())
+            .unwrap();
+        if let Some(pb::command_output::Kind::Extraction(result)) =
+            response.outputs.first().and_then(|o| o.kind.as_ref())
+        {
+            let root = result.roots[0].variants[0].term;
+            assert!(
+                response
+                    .sorts
+                    .iter()
+                    .any(|s| matches!(&s.kind, Some(pb::sort::Kind::Eq(name)) if name == "N"))
+            );
+            let Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
+                value: Some(pb::primitive_value::Value::Pair(pair)),
+            })) = &response.nodes[root as usize].kind
+            else {
+                panic!("nested Pair")
+            };
+            let Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
+                value: Some(pb::primitive_value::Value::Vec(vec)),
+            })) = &response.nodes[pair.second.unwrap() as usize].kind
+            else {
+                panic!("nested Vec")
+            };
+            assert_eq!(
+                pair.first,
+                Some(vec.items[0]),
+                "typed term cache preserves shared children"
+            );
+            observation = program;
+        }
+    }
+    observation.commands = vec![pb::Command {
+        kind: Some(pb::command::Kind::PrintFunction(pb::PrintFunction {
+            table: "n".into(),
+            max_rows: 10,
+        })),
+        ..Default::default()
+    }];
+    let table = run(&mut engine, id, observation.clone());
+    assert_eq!(table.error, None);
+    assert!(matches!(
+        table.outputs[0].kind,
+        Some(pb::command_output::Kind::PrintedFunction(_))
+    ));
+    assert!(table.nodes.iter().any(|n| matches!(
+        &n.kind,
+        Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
+            value: Some(pb::primitive_value::Value::Pair(_))
+        }))
+    )));
+    native
+        .parse_and_run_program(None, &renderer.render(&observation).unwrap())
+        .unwrap();
+
+    let mut user = pair_fixture();
+    user.sorts.push(pb::Sort {
+        kind: Some(pb::sort::Kind::Eq("Pair".into())),
+        ..Default::default()
+    });
+    user.declarations.extend([
+        pb::Declaration {
+            kind: Some(pb::declaration::Kind::EqSort(pb::EqSort {
+                name: "Pair".into(),
+                bindings: None,
+            })),
+            ..Default::default()
+        },
+        pb::Declaration {
+            kind: Some(pb::declaration::Kind::Constructor(pb::Constructor {
+                name: "pair".into(),
+                inputs: vec![
+                    pb::Arg {
+                        name: "first".into(),
+                        sort: 0,
+                    },
+                    pb::Arg {
+                        name: "second".into(),
+                        sort: 1,
+                    },
+                ],
+                output: 3,
+                ..Default::default()
+            })),
+            ..Default::default()
+        },
+    ]);
+    user.nodes.push(pb::Node {
+        sort_id: 3,
+        kind: Some(pb::node::Kind::Call(pb::Call {
+            func: "pair".into(),
+            args: vec![0, 1],
+        })),
+        ..Default::default()
+    });
+    let Some(pb::command::Kind::Extract(e)) = &mut user.commands[0].kind else {
+        unreachable!()
+    };
+    e.roots.push(3);
+    let response = run(&mut engine, id, user.clone());
+    assert_eq!(
+        response.error.unwrap().code,
+        pb::ErrorCode::InvalidProgram as i32,
+        "EqSort Pair conflicts with the host family in the sort namespace"
+    );
+    user.sorts[3].kind = Some(pb::sort::Kind::Eq("UserPair".into()));
+    let Some(pb::declaration::Kind::EqSort(eq)) = &mut user.declarations[1].kind else {
+        unreachable!()
+    };
+    eq.name = "UserPair".into();
+    let response = run(&mut engine, id, user.clone());
+    assert_eq!(response.error, None);
+    let Some(pb::command_output::Kind::Extraction(e)) = &response.outputs[0].kind else {
+        panic!("extraction")
+    };
+    assert!(
+        matches!(&response.nodes[e.roots[1].variants[0].term as usize].kind, Some(pb::node::Kind::Call(c)) if c.func == "pair")
+    );
+    native
+        .parse_and_run_program(None, &renderer.render(&user).unwrap())
+        .unwrap();
+}
+
+#[test]
+fn pair_value_queries_require_grounded_children() {
+    use egglog_experimental::protobuf::source::{Renderer, Source};
+    let text = r#"
+        (sort P (Pair i64 String)) (datatype Box (N i64))
+        (function stored () P :no-merge) (function observed () i64 :merge new)
+        (set (stored) (pair 7 "x")) (set (observed) 0) (N 7)
+        (rule ((N x) (= (stored) (pair x "x"))) ((set (observed) x)))
+        (run 1) (check (= (observed) 7))
+    "#;
+    new_experimental_egraph()
+        .parse_and_run_program(None, text)
+        .unwrap();
+    let observation = Source::new(
+        None,
+        "(function observed () i64 :merge new) (check (= (observed) 0))",
+    )
+    .unwrap()
+    .last()
+    .unwrap()
+    .unwrap();
+    let mut engine = Engine::default();
+    let id = create(&mut engine);
+    let mut renderer = Renderer::default();
+    let mut checked_ungrounded = false;
+    for phase in Source::new(None, text).unwrap() {
+        let mut program = phase.unwrap();
+        if !program.rules.is_empty() {
+            for node in &mut program.nodes {
+                if let Some(pb::node::Kind::Call(call)) = &node.kind
+                    && call.func == "egglog.core.pair.make"
+                {
+                    node.kind = Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
+                        value: Some(pb::primitive_value::Value::Pair(pb::PairValue {
+                            first: Some(call.args[0]),
+                            second: Some(call.args[1]),
+                        })),
+                    }));
+                }
+            }
+            if !checked_ungrounded {
+                let mut ungrounded = program.clone();
+                let Some(pb::rule_decl::Kind::Rule(rule)) = &mut ungrounded.rules[0].kind else {
+                    unreachable!()
+                };
+                assert_eq!(rule.query.len(), 2);
+                rule.query.remove(0); // Remove the constructor fact that binds x.
+                ungrounded.rulesets = vec![pb::Ruleset {
+                    name: Some("pair-grounding-probe".into()),
+                    kind: Some(pb::ruleset::Kind::Rules(pb::RuleList { rules: vec![0] })),
+                    ..Default::default()
+                }];
+                let response = run(&mut engine, id, ungrounded.clone());
+                assert!(
+                    response.error.is_some(),
+                    "Pair payload must not inverse-match its child variable"
+                );
+                assert!(renderer.render(&ungrounded).is_err());
+                assert_eq!(run(&mut engine, id, observation.clone()).error, None);
+                checked_ungrounded = true;
+            }
+        }
+        assert_eq!(run(&mut engine, id, program.clone()).error, None);
+        renderer.render(&program).unwrap();
+    }
+}
+
+#[test]
+fn pair_defaults_and_runtime_prefixes_survive_resupply_and_clone() {
+    use egglog_experimental::protobuf::source::Renderer;
+    let mut program = pair_fixture();
+    program.nodes.push(pb::Node {
+        sort_id: 2,
+        kind: Some(pb::node::Kind::Var("new".into())),
+        ..Default::default()
+    });
+    program.declarations.extend([
+        pb::Declaration {
+            kind: Some(pb::declaration::Kind::Function(pb::Function {
+                name: "stored".into(),
+                inputs: vec![],
+                output: 2,
+                merge: Some(3),
+            })),
+            ..Default::default()
+        },
+        pb::Declaration {
+            kind: Some(pb::declaration::Kind::Function(pb::Function {
+                name: "take_pair".into(),
+                inputs: vec![pb::Arg {
+                    name: "p".into(),
+                    sort: 2,
+                }],
+                output: 0,
+                merge: None,
+            })),
+            bindings: Some(pb::CallableBindings {
+                python: Some(pb::PythonBindings {
+                    views: vec![pb::PythonCallable {
+                        kind: pb::PythonCallKind::Function.into(),
+                        path: vec!["test".into(), "take_pair".into()],
+                        params: vec![pb::PythonParameter {
+                            core_input: Some(0),
+                            name: "p".into(),
+                            default_expr: Some(2),
+                        }],
+                        ..Default::default()
+                    }],
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
+    ]);
+    let write = pb::Command {
+        kind: Some(pb::command::Kind::Action(pb::Action {
+            kind: Some(pb::action::Kind::Set(pb::Set {
+                target: Some(pb::Call {
+                    func: "stored".into(),
+                    args: vec![],
+                }),
+                value: Some(2),
+            })),
+            ..Default::default()
+        })),
+        ..Default::default()
+    };
+    program.commands.insert(0, write);
+    let mut engine = Engine::default();
+    let id = create(&mut engine);
+    let mut renderer = Renderer::default();
+    for _ in 0..3 {
+        assert_eq!(run(&mut engine, id, program.clone()).error, None);
+        renderer.render(&program).unwrap();
+    }
+    let clone = pb::CloneEGraphResponse::decode(
+        engine
+            .clone_egraph(&pb::CloneEGraphRequest { egraph_id: id }.encode_to_vec())
+            .unwrap()
+            .as_slice(),
+    )
+    .unwrap()
+    .egraph_id;
+    let mut conflict = program.clone();
+    conflict.nodes[0].kind = Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
+        value: Some(pb::primitive_value::Value::I64(99)),
+    }));
+    assert!(run(&mut engine, id, conflict.clone()).error.is_some());
+    assert!(renderer.render(&conflict).is_err());
+    program.declarations.clear();
+    program.nodes[0].kind = Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
+        value: Some(pb::primitive_value::Value::I64(2)),
+    }));
+    program.commands.insert(
+        1,
+        pb::Command {
+            kind: Some(pb::command::Kind::Action(pb::Action {
+                kind: Some(pb::action::Kind::Panic("after Pair write".into())),
+                ..Default::default()
+            })),
+            ..Default::default()
+        },
+    );
+    let response = run(&mut engine, id, program.clone());
+    assert_eq!(response.error.unwrap().code, pb::ErrorCode::Panic as i32);
+    program.nodes = vec![pb::Node {
+        sort_id: 2,
+        kind: Some(pb::node::Kind::Call(pb::Call {
+            func: "stored".into(),
+            args: vec![],
+        })),
+        ..Default::default()
+    }];
+    program.commands = vec![pb::Command {
+        kind: Some(pb::command::Kind::Extract(pb::Extract {
+            roots: vec![0],
+            variants: 1,
+            extractor: pb::Extractor::Tree.into(),
+            ..Default::default()
+        })),
+        ..Default::default()
+    }];
+    for (handle, expected) in [(id, "(pair 2 \"x\")"), (clone, "(pair 1 \"x\")")] {
+        let response = run(&mut engine, handle, program.clone());
+        assert_eq!(response.error, None);
+        let Some(pb::command_output::Kind::Extraction(e)) = &response.outputs[0].kind else {
+            unreachable!()
+        };
+        assert_eq!(value(&response, e.roots[0].variants[0].term), expected);
+    }
+}
+
+#[test]
+fn pair_payload_children_evaluate_first_then_second() {
+    let mut program = pair_fixture();
+    for (name, output) in [("left", 0), ("right", 1)] {
+        program.declarations.push(pb::Declaration {
+            kind: Some(pb::declaration::Kind::Function(pb::Function {
+                name: name.into(),
+                inputs: vec![],
+                output,
+                merge: None,
+            })),
+            ..Default::default()
+        });
+        program.nodes[output as usize].kind = Some(pb::node::Kind::Call(pb::Call {
+            func: name.into(),
+            args: vec![],
+        }));
+    }
+    let mut engine = Engine::default();
+    let id = create(&mut engine);
+    let mut errors = vec![];
+    for root in [0, 1, 2] {
+        program.commands = vec![pb::Command {
+            kind: Some(pb::command::Kind::Action(pb::Action {
+                kind: Some(pb::action::Kind::Term(root)),
+                ..Default::default()
+            })),
+            ..Default::default()
+        }];
+        errors.push(run(&mut engine, id, program.clone()).error.unwrap());
+    }
+    assert_ne!(
+        errors[0].message, errors[1].message,
+        "the two missing reads must distinguish order"
+    );
+    assert_eq!(
+        errors[2].message, errors[0].message,
+        "the Pair fails at its first child"
+    );
+    program.nodes.push(pb::Node {
+        sort_id: 0,
+        kind: Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
+            value: Some(pb::primitive_value::Value::I64(8)),
+        })),
+        ..Default::default()
+    });
+    program.commands.insert(
+        0,
+        pb::Command {
+            kind: Some(pb::command::Kind::Action(pb::Action {
+                kind: Some(pb::action::Kind::Set(pb::Set {
+                    target: Some(pb::Call {
+                        func: "left".into(),
+                        args: vec![],
+                    }),
+                    value: Some(3),
+                })),
+                ..Default::default()
+            })),
+            ..Default::default()
+        },
+    );
+    assert_eq!(
+        run(&mut engine, id, program.clone()).error.unwrap().message,
+        errors[1].message
+    );
+    program.commands = vec![pb::Command {
+        kind: Some(pb::command::Kind::Extract(pb::Extract {
+            roots: vec![0],
+            variants: 1,
+            extractor: pb::Extractor::Tree.into(),
+            ..Default::default()
+        })),
+        ..Default::default()
+    }];
+    let response = run(&mut engine, id, program);
+    assert_eq!(response.error, None);
+    let Some(pb::command_output::Kind::Extraction(e)) = &response.outputs[0].kind else {
+        unreachable!()
+    };
+    assert_eq!(
+        value(&response, e.roots[0].variants[0].term),
+        "8",
+        "earlier Set survives the second-child failure"
+    );
+}
+
 #[test]
 fn source_vec_calls_execute_through_bytes() {
     use egglog_experimental::protobuf::source::{Renderer, Source};
@@ -2447,6 +3174,12 @@ fn value(response: &pb::RunProgramResponse, index: u32) -> String {
         pb::node::Kind::PrimitiveValue(primitive) => match primitive.value.as_ref().unwrap() {
             pb::primitive_value::Value::I64(n) => n.to_string(),
             pb::primitive_value::Value::F64Bits(bits) => format!("{:?}", f64::from_bits(*bits)),
+            pb::primitive_value::Value::String(s) => format!("{s:?}"),
+            pb::primitive_value::Value::Pair(pair) => format!(
+                "(pair {} {})",
+                value(response, pair.first.unwrap()),
+                value(response, pair.second.unwrap())
+            ),
             pb::primitive_value::Value::Vec(list) => format!(
                 "[{}]",
                 list.items
