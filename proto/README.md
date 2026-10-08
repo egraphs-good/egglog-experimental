@@ -15,7 +15,9 @@ and comments are the specification. The main pieces are:
   `Program`, including definitions, logical data, cycles, and empty e-classes.
   This is not an engine checkpoint.
 
-There is no engine lowering, runtime, or service implementation yet. CEL checks
+An initial in-process bytes adapter lives in
+[`src/protobuf.rs`](../src/protobuf.rs); its supported slice is described below.
+It is not frontend conformance or a complete service implementation. CEL checks
 directly expressible constraints, not full typing, binding, effects, or cycle
 validity. The remaining requirements are normative comments. CEL can exhaust
 its evaluation budget on large valid inputs; that is inconclusive, not proof
@@ -445,11 +447,47 @@ coverage, not evidence already established by wire roundtrip tests.
 
 [Python](../gen/python/egglog/v1/egglog_pb.py) and
 [Rust](../gen/rust/egglog/v1/egglog.v1.rs) message sources are checked in for
-inspection. They are not an installable SDK or an integrated Rust crate.
+inspection. The Rust messages are also the reusable `egglog-proto` crate at
+`gen/rust`; its handwritten `Cargo.toml` and `lib.rs` include the generated
+message file directly. Python packaging remains a later migration step.
 Python uses `protobuf-py`, with `protovalidate` for validation; versions are
 locked in `uv.lock`. The Rust messages use `prost` (tested with 0.14.4).
 Imported Rust validation definitions also require `prost-types`. No gRPC
 transport is generated or required.
+
+### Initial executable Rust slice
+
+`egglog_experimental::protobuf::Engine` exposes `create`, `clone_egraph`,
+`destroy`, and `run`. Every method accepts encoded request bytes and returns
+encoded response bytes. Decode failures and unknown handles are transport
+errors; program failures are `RunProgramResponse.error`. Whole-program
+validation occurs before installation, while runtime errors preserve completed
+effects and observations. Native ASTs are transient lowering products.
+
+The current executable subset is deliberately limited:
+
+- Equality sorts and the five scalar host sorts; explicit constructor/function
+  declarations with scalar static costs and merge bodies using values,
+  old/new variables, and constructors.
+- Ordered actions and persistent captures expressed as nullary function sets.
+- Query equality groups, flat named seminaive rulesets, rewrites, and checks.
+- Tree extraction with costs, duplicate roots and shared result nodes; extracted
+  table rows; native e-graph clone and destruction.
+- Profile-enabled execution with command locations and compact run summaries.
+
+Unsupported forms fail explicitly. These include profile-off (the native engine
+still collects timing data), action/nested/empty Union identities, complex values
+and codecs, ambient primitive catalog mappings, relations, declaration/ruleset
+resupply, anonymous/combined/shared rulesets, nondefault rule modes, schedulers,
+loops, snapshots, proof requests, merge table reads, and custom cost models.
+Expressions deeper than 256 nodes or requiring more than 65,536 native tree
+nodes are currently rejected. This is a checkpoint, not a narrowing of
+the conformance goal. Source producers, generated frontend APIs, exact snapshots,
+and Python/Rust/Luminal migration remain unimplemented.
+
+The focused regression is `cargo test --test protobuf`. It compares the native
+fixture with decoded results and checks invalid-byte controls and post-failure
+state. No frontend suite is counted as migrated by these tests.
 
 To regenerate, install Buf (tested with 1.73.0), uv, and Rust/Cargo, then run
 from the repository root:

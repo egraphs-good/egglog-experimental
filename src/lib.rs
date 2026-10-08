@@ -92,6 +92,7 @@ use egglog::prelude::add_base_sort;
 pub use egglog::*;
 use std::sync::Arc;
 
+pub mod protobuf;
 pub mod rational;
 pub use rational::*;
 pub mod scheduling;

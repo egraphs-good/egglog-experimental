@@ -42,7 +42,8 @@ proto-lint:
 	buf build
 
 proto-clean:
-	rm -rf gen
+	# Preserve the handwritten Rust package manifest and include module.
+	rm -rf gen/python gen/rust/egglog gen/rust/buf
 
 # `gen/` is committed, so it can drift from the schema. This fails if it has.
 proto-drift: proto-gen

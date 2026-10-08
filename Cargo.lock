@@ -125,6 +125,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "72f5acc6cb2ba439de613abc23857ec3d78374d8ed5ac84e9d11336e87da8649"
 
 [[package]]
+name = "bytes"
+version = "1.12.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fc652a48c352aef3ea3aed32080501cf3ef6ed5da78602a020c991775b0aff04"
+
+[[package]]
 name = "cc"
 version = "1.4.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -341,7 +347,7 @@ checksum = "d0881ea181b1df73ff77ffaaf9c7544ecc11e82fba9b5f27b262a3c73a332555"
 [[package]]
 name = "egglog"
 version = "3.0.0"
-source = "git+https://github.com/egraphs-good/egglog.git?rev=90635860397ce710f8c0a4eeb04154a8ebc3ac05#90635860397ce710f8c0a4eeb04154a8ebc3ac05"
+source = "git+https://github.com/egraphs-good/egglog.git?rev=d78f6bb9cf0c5e9659accabb1e6c127535fee271#d78f6bb9cf0c5e9659accabb1e6c127535fee271"
 dependencies = [
  "chrono",
  "clap",
@@ -373,7 +379,7 @@ dependencies = [
 [[package]]
 name = "egglog-add-primitive"
 version = "3.0.0"
-source = "git+https://github.com/egraphs-good/egglog.git?rev=90635860397ce710f8c0a4eeb04154a8ebc3ac05#90635860397ce710f8c0a4eeb04154a8ebc3ac05"
+source = "git+https://github.com/egraphs-good/egglog.git?rev=d78f6bb9cf0c5e9659accabb1e6c127535fee271#d78f6bb9cf0c5e9659accabb1e6c127535fee271"
 dependencies = [
  "quote",
  "syn 2.0.119",
@@ -382,7 +388,7 @@ dependencies = [
 [[package]]
 name = "egglog-ast"
 version = "3.0.0"
-source = "git+https://github.com/egraphs-good/egglog.git?rev=90635860397ce710f8c0a4eeb04154a8ebc3ac05#90635860397ce710f8c0a4eeb04154a8ebc3ac05"
+source = "git+https://github.com/egraphs-good/egglog.git?rev=d78f6bb9cf0c5e9659accabb1e6c127535fee271#d78f6bb9cf0c5e9659accabb1e6c127535fee271"
 dependencies = [
  "ordered-float",
 ]
@@ -390,7 +396,7 @@ dependencies = [
 [[package]]
 name = "egglog-bridge"
 version = "3.0.0"
-source = "git+https://github.com/egraphs-good/egglog.git?rev=90635860397ce710f8c0a4eeb04154a8ebc3ac05#90635860397ce710f8c0a4eeb04154a8ebc3ac05"
+source = "git+https://github.com/egraphs-good/egglog.git?rev=d78f6bb9cf0c5e9659accabb1e6c127535fee271#d78f6bb9cf0c5e9659accabb1e6c127535fee271"
 dependencies = [
  "anyhow",
  "dyn-clone",
@@ -413,7 +419,7 @@ dependencies = [
 [[package]]
 name = "egglog-concurrency"
 version = "3.0.0"
-source = "git+https://github.com/egraphs-good/egglog.git?rev=90635860397ce710f8c0a4eeb04154a8ebc3ac05#90635860397ce710f8c0a4eeb04154a8ebc3ac05"
+source = "git+https://github.com/egraphs-good/egglog.git?rev=d78f6bb9cf0c5e9659accabb1e6c127535fee271#d78f6bb9cf0c5e9659accabb1e6c127535fee271"
 dependencies = [
  "arc-swap",
  "bumpalo",
@@ -425,7 +431,7 @@ dependencies = [
 [[package]]
 name = "egglog-core-relations"
 version = "3.0.0"
-source = "git+https://github.com/egraphs-good/egglog.git?rev=90635860397ce710f8c0a4eeb04154a8ebc3ac05#90635860397ce710f8c0a4eeb04154a8ebc3ac05"
+source = "git+https://github.com/egraphs-good/egglog.git?rev=d78f6bb9cf0c5e9659accabb1e6c127535fee271#d78f6bb9cf0c5e9659accabb1e6c127535fee271"
 dependencies = [
  "anyhow",
  "bumpalo",
@@ -456,6 +462,7 @@ version = "3.0.0"
 dependencies = [
  "egglog",
  "egglog-ast",
+ "egglog-proto",
  "egglog-reports",
  "fixedbitset",
  "glob",
@@ -464,18 +471,26 @@ dependencies = [
  "libtest-mimic",
  "log",
  "num",
+ "prost",
  "stacker",
 ]
 
 [[package]]
 name = "egglog-numeric-id"
 version = "3.0.0"
-source = "git+https://github.com/egraphs-good/egglog.git?rev=90635860397ce710f8c0a4eeb04154a8ebc3ac05#90635860397ce710f8c0a4eeb04154a8ebc3ac05"
+source = "git+https://github.com/egraphs-good/egglog.git?rev=d78f6bb9cf0c5e9659accabb1e6c127535fee271#d78f6bb9cf0c5e9659accabb1e6c127535fee271"
+
+[[package]]
+name = "egglog-proto"
+version = "0.1.0"
+dependencies = [
+ "prost",
+]
 
 [[package]]
 name = "egglog-reports"
 version = "3.0.0"
-source = "git+https://github.com/egraphs-good/egglog.git?rev=90635860397ce710f8c0a4eeb04154a8ebc3ac05#90635860397ce710f8c0a4eeb04154a8ebc3ac05"
+source = "git+https://github.com/egraphs-good/egglog.git?rev=d78f6bb9cf0c5e9659accabb1e6c127535fee271#d78f6bb9cf0c5e9659accabb1e6c127535fee271"
 dependencies = [
  "clap",
  "hashbrown 0.16.1",
@@ -489,7 +504,7 @@ dependencies = [
 [[package]]
 name = "egglog-union-find"
 version = "3.0.0"
-source = "git+https://github.com/egraphs-good/egglog.git?rev=90635860397ce710f8c0a4eeb04154a8ebc3ac05#90635860397ce710f8c0a4eeb04154a8ebc3ac05"
+source = "git+https://github.com/egraphs-good/egglog.git?rev=d78f6bb9cf0c5e9659accabb1e6c127535fee271#d78f6bb9cf0c5e9659accabb1e6c127535fee271"
 dependencies = [
  "crossbeam",
  "egglog-concurrency",
@@ -509,6 +524,12 @@ dependencies = [
  "serde",
  "serde_json",
 ]
+
+[[package]]
+name = "either"
+version = "1.19.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0e9c71c2167ca323c882b99918929403426e2373ea17242ff5653e0d5e1058be"
 
 [[package]]
 name = "enum-map"
@@ -752,6 +773,15 @@ name = "is_terminal_polyfill"
 version = "1.70.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a6cb138bb79a146c1bd460005623e142ef0181e3d0219cb493e02f7d08a35695"
+
+[[package]]
+name = "itertools"
+version = "0.14.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2b192c782037fadd9cfa75548310488aabdbf3d2da73885b31bd0abd03351285"
+dependencies = [
+ "either",
+]
 
 [[package]]
 name = "itoa"
@@ -1071,6 +1101,29 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "985e7ec9bb745e6ce6535b544d84d6cd6f7ad8bd711c398938ae983b91a766d9"
 dependencies = [
  "unicode-ident",
+]
+
+[[package]]
+name = "prost"
+version = "0.14.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "528ac67416ff8646872a3c02cad9cc4ee5dc9f9540c9b10771855c95cb2e5ae1"
+dependencies = [
+ "bytes",
+ "prost-derive",
+]
+
+[[package]]
+name = "prost-derive"
+version = "0.14.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b570b25f7617e43d59005d0990ccb79e950a423952cea19671b7a876da390adf"
+dependencies = [
+ "anyhow",
+ "itertools",
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
 ]
 
 [[package]]
