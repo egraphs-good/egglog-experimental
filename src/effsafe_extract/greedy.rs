@@ -1,10 +1,9 @@
 //! Greedy bottom-up extraction with *bag* costs.
 //!
 //! A bag cost is the sum of the costs of the distinct e-classes a term uses,
-//! so shared subterms are only paid for once. It is cheap to maintain but not
-//! guaranteed optimal, which is fine for an estimate.
+//! so shared subterms are charged once. These estimates need not be optimal.
 
-use std::cmp::Reverse;
+use std::cmp::{Ordering, Reverse};
 use std::collections::BinaryHeap;
 use std::hash::BuildHasherDefault;
 
@@ -84,13 +83,13 @@ impl PartialEq for BagCost {
 impl Eq for BagCost {}
 
 impl PartialOrd for BagCost {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         Some(self.cmp(other))
     }
 }
 
 impl Ord for BagCost {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+    fn cmp(&self, other: &Self) -> Ordering {
         self.sum.cmp(&other.sum)
     }
 }
@@ -204,22 +203,17 @@ impl<'g> Greedy<'g> {
 /// subregion, but it is still priced through the fold, as a tree, so that the
 /// boundary model's weighting applies to it too.
 pub fn effective_cost(
-    _g: &TermGraph,
     boundary: &dyn RegionBoundary,
     enode: &ENode,
     region_cost: impl Fn(EClassId) -> Cost,
 ) -> Cost {
-    if enode.regions.is_empty() {
+    let Some(annotation) = enode.boundary.as_deref() else {
         return enode.cost;
-    }
+    };
     let mut by_position = vec![0; enode.arity];
     for (&i, &position) in enode.regions.iter().zip(&enode.region_positions) {
         by_position[position] = region_cost(enode.children[i]);
     }
-    let annotation = enode
-        .boundary
-        .as_deref()
-        .expect("e-nodes with regions carry a boundary annotation");
     boundary.fold(annotation, &by_position)
 }
 
@@ -252,7 +246,7 @@ pub fn greedy_costs(
                 continue;
             }
             let enode = g.enode(pc, pn);
-            let own = effective_cost(g, boundary, enode, |c| greedy.best[c].sum);
+            let own = effective_cost(boundary, enode, |c| greedy.best[c].sum);
             let mut cost = BagCost::new(own);
             for child in g.split_children(enode).0 {
                 cost.add_child(child, &greedy.best[child]);
@@ -279,7 +273,7 @@ fn statewalk_enode_cost(
     class_cost: &[Cost],
     enode: &ENode,
 ) -> Cost {
-    let mut cost = effective_cost(g, boundary, enode, |c| class_cost[c]);
+    let mut cost = effective_cost(boundary, enode, |c| class_cost[c]);
     for child in g.split_children(enode).0 {
         if !g.is_effectful(child) {
             cost = cost.saturating_add(class_cost[child]);
@@ -331,23 +325,9 @@ pub fn project_statewalk_costs(mapping: &EGraphMapping, costs: &[Vec<Cost>]) -> 
         .collect()
 }
 
-/// Greedily extract `root` from a *linearized* e-graph, in which every
-/// effectful e-class has exactly one e-node (its statewalk pick).
-///
-/// Pure e-classes are settled cheapest first. Whenever an effectful e-class is
-/// settled, the whole term below it is emitted and its e-classes become free
-/// for everyone else to reuse (their cost drops to zero), which is what makes
-/// the shared statewalk pay for pure subterms only once.
-///
-/// A pure e-node with `:regions` children is priced by the boundary fold over
-/// `class_cost` of those children: their independent (globally estimated)
-/// cost, not the sharing-discounted cost within this region, since a
-/// `:regions` child is charged at every occurrence. Such a fold can make an
-/// e-node cheaper than its own children, after which any cheaper pick (not
-/// only one with regions) could lead back to its own e-class through the
-/// current picks; once a pure e-node with regions has been picked, every
-/// cheaper candidate is checked for that and skipped if so. Without such
-/// picks, costs are monotone along picks and cycles cannot form.
+/// Greedily extract `root` from a linearized graph, where every effectful
+/// e-class has exactly one e-node. Shared pure terms are charged once within
+/// the region; `:regions` children use their independent `class_cost` estimates.
 pub fn statewalk_greedy_extraction(
     g: &TermGraph,
     boundary: &dyn RegionBoundary,
@@ -390,13 +370,15 @@ pub fn statewalk_greedy_extraction(
             let own = if g.is_effectful(pc) {
                 0
             } else {
-                effective_cost(g, boundary, enode, |c| class_cost[c])
+                effective_cost(boundary, enode, |c| class_cost[c])
             };
             let cost = greedy.plain_cost(own, enode);
             let cheaper = greedy.pick[pc].is_none() || cost < greedy.best[pc];
             if !cheaper {
                 continue;
             }
+            // Boundary folds can make a parent cheaper than its children.
+            // After such a pick, even ordinary alternatives can close a cycle.
             let boundary_pick = !enode.regions.is_empty() && !g.is_effectful(pc);
             if (guard_cycles || boundary_pick) && greedy.reaches(&enode.children, pc, &extracted) {
                 continue;

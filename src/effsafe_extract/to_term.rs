@@ -1,6 +1,6 @@
 //! Turn an extraction into egglog terms.
 
-use egglog::{TermDag, TermId};
+use egglog::{EGraph, TermDag, TermId};
 use rustc_hash::FxHashMap;
 
 use super::term_graph::{Extraction, NodeKind, SortId, TermGraph};
@@ -9,7 +9,7 @@ use super::term_graph::{Extraction, NodeKind, SortId, TermGraph};
 /// the root last. `placeholders` gives the term for each placeholder sort.
 pub fn extraction_to_term(
     g: &TermGraph,
-    egraph: &egglog::EGraph,
+    egraph: &EGraph,
     placeholders: &FxHashMap<SortId, TermId>,
     extraction: &Extraction,
     termdag: &mut TermDag,

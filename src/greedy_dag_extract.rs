@@ -19,16 +19,6 @@ use hashbrown::{HashMap, hash_map::Entry};
 use std::collections::{HashSet, VecDeque};
 use std::sync::Arc;
 
-/// `:extractor` is an ordinary identifier, so user-defined commands receive it
-/// as a plain [`Expr::Var`] positional argument like any other name. Only the
-/// trailing `:extractor <symbol>` pair is read as the selector, so a value that
-/// happens to be named `:extractor` elsewhere in the argument list, or a
-/// non-symbol final argument, stays positional.
-///
-/// A trailing `<symbol> <symbol>` pair remains ambiguous and resolves to the
-/// selector, which also keeps a misspelled extractor name an error rather than
-/// silently positional. Removing that last case needs a surface form ordinary
-/// `Expr::Var` parsing cannot produce.
 /// Which extractor a command's trailing `:extractor <name>` selects.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Extractor {
@@ -40,6 +30,16 @@ pub enum Extractor {
     Effsafe,
 }
 
+/// `:extractor` is an ordinary identifier, so user-defined commands receive it
+/// as a plain [`Expr::Var`] positional argument like any other name. Only the
+/// trailing `:extractor <symbol>` pair is read as the selector, so a value that
+/// happens to be named `:extractor` elsewhere in the argument list, or a
+/// non-symbol final argument, stays positional.
+///
+/// A trailing `<symbol> <symbol>` pair remains ambiguous and resolves to the
+/// selector, which also keeps a misspelled extractor name an error rather than
+/// silently positional. Removing that last case needs a surface form ordinary
+/// `Expr::Var` parsing cannot produce.
 pub(crate) fn split_trailing_extractor(args: &[Expr]) -> Result<(&[Expr], Extractor), Error> {
     let Some([keyword, extractor]) = args.last_chunk::<2>() else {
         return Ok((args, Extractor::Tree));

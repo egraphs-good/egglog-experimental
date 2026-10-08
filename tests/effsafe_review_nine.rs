@@ -1,7 +1,4 @@
-//! Regression tests from the ninth review of the effect-safe extractor
-//! (egglog-experimental PR 77): `set-effectful` after another macro's
-//! generated declaration, in the real top-level and non-seminaive contexts,
-//! and constraining an overloaded expression to the explicit eq sort.
+//! Marks of generated fresh values and overloads selected by an explicit sort.
 
 use egglog::constraint::{SimpleTypeConstraint, TypeConstraint};
 use egglog::{

@@ -1,8 +1,4 @@
-//! Regression tests from the fourth review of the effect-safe extractor
-//! (egglog-experimental PR 77): discounted boundary folds that close a cycle,
-//! `:regions` children priced independently of in-region sharing, and
-//! `set-effectful` on write primitives with any output sort or after lets of
-//! base sorts.
+//! Discounted cycles, region-local sharing, and marks of write-primitive results.
 
 use egglog::extract::{DefaultCost, TreeCostModel};
 use egglog::{ArcSort, CommandOutput, EGraph, Enode, Function, Value};

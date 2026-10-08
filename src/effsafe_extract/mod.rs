@@ -1,15 +1,13 @@
-//! Effect-safe extraction: `(extract e :extractor effsafe)`,
-//! `(print-function Ctor :extractor effsafe)`, `(set-effectful Sort e)`, and the
-//! `:regions` annotation on `constructor` and `datatype` declarations
-//! (lowered to `effsafe-regions`).
+//! Effect-safe extraction for languages that thread an explicit state.
 //!
-//! This is the *statewalk DP* of Flatt et al., "Efficient Extraction for
-//! Effectful E-graphs" (OOPSLA 2026, <https://doi.org/10.1145/3839530>).
-//! See `docs/effsafe-extract.md` for the language-level description. In short:
-//! the program marks effectful e-classes with `set-effectful`, annotates which
-//! constructor arguments start subregions, and the extractor chooses one
-//! effectful e-node per e-class along each region's *statewalk* such that the
-//! pure terms those e-nodes need are extractable from the chosen state.
+//! Mark state-carrying e-classes with `(set-effectful Sort e)` and subregion
+//! arguments with `:regions`, then use `(extract e :extractor effsafe)` or
+//! `(print-function Ctor :extractor effsafe)`. Pure terms are extracted from
+//! the state chain chosen for their region.
+//!
+//! See `docs/effsafe-extract.md` for the language interface and the statewalk
+//! algorithm of Flatt et al., "Efficient Extraction for Effectful E-graphs"
+//! (OOPSLA 2026, <https://doi.org/10.1145/3839530>).
 
 mod build;
 mod checks;
@@ -20,54 +18,55 @@ mod region;
 mod set_effectful;
 mod statewalk;
 mod term_graph;
-use term_graph::Extraction;
 mod to_term;
 
 use std::collections::HashMap;
+use std::fmt::{Debug, Display, Formatter, Result as FmtResult};
 use std::sync::Arc;
 
 use egglog::ast::{Command, Expr, Literal, Macro, ParseError, Parser, PrintFunctionMode, Sexp};
-use egglog::extract::{DagCostModel, TreeCostModelFromDag};
+use egglog::extract::{DagCostModel, TreeCostModel, TreeCostModelFromDag};
 use egglog::{CommandOutput, EGraph, Error, TermDag, TermId, UserDefinedCommand, span};
 use egglog_ast::span::Span;
 use rustc_hash::FxHashMap;
+
+use crate::DynamicCostModel;
+use term_graph::{Extraction, SortId, TermGraph};
 
 pub use build::Roots;
 pub use cost::{Cost, RegionBoundary};
 pub use set_effectful::{SetEffectful, effectful_relation};
 pub use statewalk::StatewalkOptions;
 
-/// The language's effect annotations, collected from `:regions` and
-/// `effsafe-placeholder` as the program runs.
+/// Region annotations and extraction options for the language.
 #[derive(Clone, Debug, Default)]
 pub struct EffsafeConfig {
     /// Constructor name to the argument positions that start subregions.
+    /// Positions may be in any order; duplicates are ignored.
     pub regions: HashMap<String, Vec<usize>>,
-    /// Sort name to the constructor application that stands in for every value
-    /// of that sort. Extraction does not descend into these sorts; the
-    /// replacement must be a nullary-or-not constructor of the sort (checked
-    /// when extraction runs). Set from Rust by embedders whose terms refer
-    /// back to the region they are in (eggcc's contexts); there is no egglog
-    /// command for it, since it changes the extracted term's meaning.
+    /// Sort name to a replacement for every child value of that sort.
+    /// Extraction does not descend into these values. Each replacement must
+    /// be a well-typed constructor application with literal or constructor
+    /// arguments; extraction returns an error otherwise.
+    ///
+    /// Placeholders can produce terms outside the requested e-class. The
+    /// caller must restore any information needed to preserve meaning.
     pub placeholders: HashMap<String, Expr>,
-    /// Extract from subsumed e-nodes too. egglog's own extractors skip them;
-    /// a program whose rules subsume e-nodes for reasons other than
-    /// extraction can opt back in with a trailing `:include-subsumed`.
+    /// Include subsumed e-nodes, which are skipped by default.
     pub include_subsumed: bool,
+    /// Optimizations used when searching each region's statewalk.
+    pub statewalk: StatewalkOptions,
 }
 
-/// Everything effect-safe extraction keeps on an e-graph: the annotations and
-/// the cost models. Stored as egglog extension state, so it is cloned and
-/// snapshotted with the e-graph. Change the models with
-/// [`set_effsafe_cost_models`].
+/// Configuration and cost models, cloned and snapshotted with the e-graph.
+/// Change the models with [`set_effsafe_cost_models`].
 #[derive(Clone)]
 pub struct EffsafeState {
     /// Annotations from `:regions` / `effsafe-regions`, and placeholders.
     pub config: EffsafeConfig,
     /// Marginal costs within a region: e-nodes, base values and containers.
     pub cost_model: Arc<dyn DagCostModel<Cost> + Send + Sync>,
-    /// How an e-node's subregions' costs compose with its own (a
-    /// [`TreeCostModel`](egglog::extract::TreeCostModel) at region boundaries).
+    /// Combines the costs of children at `:regions` positions with the node's own cost.
     pub boundary: Arc<dyn RegionBoundary>,
 }
 
@@ -75,14 +74,14 @@ impl Default for EffsafeState {
     fn default() -> Self {
         EffsafeState {
             config: EffsafeConfig::default(),
-            cost_model: Arc::new(crate::DynamicCostModel),
-            boundary: Arc::new(TreeCostModelFromDag(crate::DynamicCostModel)),
+            cost_model: Arc::new(DynamicCostModel),
+            boundary: Arc::new(TreeCostModelFromDag(DynamicCostModel)),
         }
     }
 }
 
-impl std::fmt::Debug for EffsafeState {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl Debug for EffsafeState {
+    fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
         f.debug_struct("EffsafeState")
             .field("config", &self.config)
             .finish_non_exhaustive()
@@ -98,21 +97,19 @@ pub fn effsafe_state(egraph: &mut EGraph) -> &mut EffsafeState {
 /// Use `cost_model` for marginal costs within regions and `boundary` to
 /// compose subregion costs at region boundaries.
 ///
-/// `boundary` is a [`TreeCostModel`](egglog::extract::TreeCostModel): for an
-/// e-node with `:regions` children its `enode_cost` annotation is kept, and
-/// `fold_enode_cost` is called with the subregions' costs in their argument
-/// positions and `0` for every other child. The result replaces the e-node's
-/// marginal cost in the enclosing region, whose DAG then charges the ordinary
-/// children. The default is the dynamic cost model (`:cost` and `set-cost`)
-/// wrapped in `TreeCostModelFromDag`, which adds the subregions up. A compiler
-/// embedding egglog can supply heuristics such as charging only the more
-/// expensive branch of a conditional or weighting a loop body.
+/// The boundary model receives child costs at `:regions` positions and `0`
+/// elsewhere. Its fold must include the node's own cost; ordinary children
+/// are charged separately in the enclosing region. Each annotated child is
+/// charged per occurrence, including pure children.
+///
+/// Defaults use [`DynamicCostModel`] and [`TreeCostModelFromDag`], which sums
+/// the annotated child costs. Use saturating arithmetic in custom folds.
 pub fn set_effsafe_cost_models<B>(
     egraph: &mut EGraph,
     cost_model: impl DagCostModel<Cost> + Send + Sync + 'static,
     boundary: B,
 ) where
-    B: egglog::extract::TreeCostModel<Cost> + Send + Sync + 'static,
+    B: TreeCostModel<Cost> + Send + Sync + 'static,
     B::EnodeCost: Clone + Send + Sync + 'static,
 {
     let state = effsafe_state(egraph);
@@ -127,13 +124,13 @@ pub struct EffsafeExtractOutput {
     pub termdag: TermDag,
     /// Root terms, in request order (or e-class order for a whole constructor).
     pub terms: Vec<TermId>,
-    /// Per root, the sum of the marginal costs of the distinct e-nodes in its
-    /// extracted DAG (subregion folds are not included).
+    /// Cost per root under the configured models: shared terms are charged
+    /// once within each region, and annotated children once per occurrence.
     pub costs: Vec<Cost>,
 }
 
-impl std::fmt::Display for EffsafeExtractOutput {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl Display for EffsafeExtractOutput {
+    fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
         if let [term] = self.terms[..] {
             return writeln!(f, "{}", self.termdag.to_string(term));
         }
@@ -148,6 +145,7 @@ impl std::fmt::Display for EffsafeExtractOutput {
 /// Extract `roots` effect-safely. Effectful e-classes are those marked with
 /// `set-effectful`. `cost_model` gives each e-node's marginal cost within its
 /// region; `boundary` composes subregion costs (see [`set_effsafe_cost_models`]).
+/// Returns an extraction error if a region does not have exactly one entry.
 pub fn extract_effsafe(
     egraph: &EGraph,
     roots: &Roots,
@@ -155,12 +153,22 @@ pub fn extract_effsafe(
     cost_model: &dyn DagCostModel<Cost>,
     boundary: &dyn RegionBoundary,
 ) -> Result<EffsafeExtractOutput, Error> {
+    extract_effsafe_with_limit(egraph, roots, config, cost_model, boundary, None)
+}
+
+fn extract_effsafe_with_limit(
+    egraph: &EGraph,
+    roots: &Roots,
+    config: &EffsafeConfig,
+    cost_model: &dyn DagCostModel<Cost>,
+    boundary: &dyn RegionBoundary,
+    max_roots: Option<usize>,
+) -> Result<EffsafeExtractOutput, Error> {
     let t0 = std::time::Instant::now();
-    let (g, root_classes) = build::build(egraph, config, cost_model, boundary, roots)?;
+    let (g, root_classes) = build::build(egraph, config, cost_model, boundary, roots, max_roots)?;
     let t_build = t0.elapsed();
     let t1 = std::time::Instant::now();
-    let extractions =
-        region::extract_all(&g, boundary, &root_classes, StatewalkOptions::default())?;
+    let extractions = region::extract_all(&g, boundary, &root_classes, config.statewalk)?;
     let t_regions = t1.elapsed();
     if log::log_enabled!(log::Level::Debug) {
         let enodes: usize = g.classes.iter().map(|c| c.enodes.len()).sum();
@@ -174,7 +182,7 @@ pub fn extract_effsafe(
         );
     }
     let mut termdag = TermDag::default();
-    let mut placeholders: FxHashMap<term_graph::SortId, TermId> = FxHashMap::default();
+    let mut placeholders: FxHashMap<SortId, TermId> = FxHashMap::default();
     for (sort_id, sort) in g.sorts.iter().enumerate() {
         if let Some(expr) = config.placeholders.get(sort.name()) {
             placeholders.insert(sort_id, termdag.expr_to_term(expr));
@@ -195,22 +203,10 @@ pub fn extract_effsafe(
     })
 }
 
-/// The cost of an extracted program under the same model the search used: a
-/// DAG up to region boundaries and a tree across them. The nodes reachable
-/// from a region root through children outside `:regions` positions are
-/// charged their marginal cost once each, except that a node with `:regions`
-/// children is charged the boundary fold of those children's costs, each
-/// priced on its own by this same rule. A `:regions` child is therefore
-/// charged at every occurrence, whether it is a subregion or a pure term.
-///
-/// Iterative: the extraction lists children before parents, so pricing the
-/// `:regions` children in index order makes every one available when a node
-/// above it needs it.
-fn program_cost(
-    g: &term_graph::TermGraph,
-    boundary: &dyn RegionBoundary,
-    nodes: &Extraction,
-) -> Cost {
+/// Price the selected program as a DAG within regions and a tree across
+/// `:regions` boundaries, including boundaries whose children are pure.
+fn program_cost(g: &TermGraph, boundary: &dyn RegionBoundary, nodes: &Extraction) -> Cost {
+    // Children precede parents, so boundary costs are ready before use.
     let mut is_region_root = vec![false; nodes.len()];
     is_region_root[nodes.len() - 1] = true;
     for node in nodes {
@@ -257,8 +253,7 @@ fn program_cost(
     cost_of_root[nodes.len() - 1].expect("the root is priced")
 }
 
-/// Split a trailing `:include-subsumed` flag, which lets effect-safe
-/// extraction extract from subsumed e-nodes, off a command's arguments.
+/// Remove a trailing `:include-subsumed` flag and report whether it was present.
 pub(crate) fn split_include_subsumed(args: &[Expr]) -> (&[Expr], bool) {
     match args {
         [rest @ .., Expr::Var(_, flag)] if flag == ":include-subsumed" => (rest, true),
@@ -271,15 +266,17 @@ pub(crate) fn extract_with_options(
     egraph: &mut EGraph,
     include_subsumed: bool,
     roots: &Roots,
+    max_roots: Option<usize>,
 ) -> Result<EffsafeExtractOutput, Error> {
     let mut state = effsafe_state(egraph).clone();
     state.config.include_subsumed |= include_subsumed;
-    extract_effsafe(
+    extract_effsafe_with_limit(
         egraph,
         roots,
         &state.config,
         state.cost_model.as_ref(),
         state.boundary.as_ref(),
+        max_roots,
     )
 }
 
@@ -413,11 +410,9 @@ impl UserDefinedCommand for PrintFunction {
                 &format!("{name} is not a declared table"),
             ));
         };
-        let output = extract_with_options(egraph, include_subsumed, &Roots::Constructor(&name))?;
-        let mut terms: Vec<(TermId, TermId)> = output.terms.iter().map(|&t| (t, t)).collect();
-        if let Some(n) = rows {
-            terms.truncate(n);
-        }
+        let output =
+            extract_with_options(egraph, include_subsumed, &Roots::Constructor(&name), rows)?;
+        let terms: Vec<(TermId, TermId)> = output.terms.iter().map(|&t| (t, t)).collect();
         let result = CommandOutput::PrintFunction(function, output.termdag, terms, mode);
         if let Some((mut file, path)) = file {
             use std::io::Write;
@@ -428,14 +423,12 @@ impl UserDefinedCommand for PrintFunction {
     }
 }
 
-/// Parse-time macro that lets `constructor` and `datatype` declarations carry
-/// `:regions (<position>...)`. The option is stripped, the declaration is
-/// parsed as usual, and an `effsafe-regions` command follows it.
+/// Add `:regions (<position>...)` to constructor and datatype declarations.
 struct RegionsAnnotation {
     head: &'static str,
 }
 
-/// `Sexp` is not `Clone`; copy one by hand.
+// `Sexp` does not implement `Clone`.
 fn clone_sexp(sexp: &Sexp) -> Sexp {
     match sexp {
         Sexp::Literal(lit, span) => Sexp::Literal(lit.clone(), span.clone()),
@@ -557,12 +550,12 @@ impl Macro<Vec<Command>> for RegionsAnnotation {
     }
 }
 
-/// Register effect-safe extraction on an e-graph: the `:regions` annotation
-/// (and `effsafe-regions`, its lowering), `set-effectful`, and
-/// `print-function` with `:extractor effsafe`. The `:extractor effsafe` of
-/// `extract` lives in the dynamic-cost `extract` command (`set_cost.rs`).
-/// Cost models default to the dynamic cost model with summed subregions; see
-/// [`set_effsafe_cost_models`].
+/// Register `:regions`, `effsafe-regions`, `set-effectful`, and
+/// `print-function` with `:extractor effsafe`.
+///
+/// Also register [`crate::add_set_cost`] to enable `extract :extractor effsafe`.
+/// [`crate::new_experimental_egraph`] registers both. See
+/// [`set_effsafe_cost_models`] to customize the default dynamic cost models.
 pub fn add_effsafe_extract(egraph: &mut EGraph) {
     egraph.parser.add_command_macro(Arc::new(RegionsAnnotation {
         head: "constructor",

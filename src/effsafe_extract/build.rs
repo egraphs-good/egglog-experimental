@@ -1,17 +1,12 @@
-//! Build the extractor's e-graph from an egglog e-graph.
-//!
-//! Every extractable constructor row becomes an e-node; base values and
-//! containers become leaf-like nodes; children of placeholder sorts point at a
-//! single placeholder e-class per sort. Effectful e-classes are those in the
-//! program's effectful relation. The result is restricted to what the roots
-//! reach and pruned of e-nodes that cannot be part of a finite term.
+//! Build the reachable extraction graph, applying effect annotations,
+//! placeholders, and subsumption options. Prune nodes with no finite term.
 
 use std::collections::VecDeque;
 use std::hash::BuildHasherDefault;
 
-use egglog::ast::FunctionSubtype;
+use egglog::ast::{Expr, FunctionSubtype, Literal};
 use egglog::extract::DagCostModel;
-use egglog::{ArcSort, Error, Value};
+use egglog::{ArcSort, EGraph, Error, Value};
 use indexmap::IndexMap;
 use rustc_hash::FxHasher;
 
@@ -33,7 +28,7 @@ pub enum Roots<'a> {
 type ClassKey = (SortId, Value);
 
 struct Builder<'e> {
-    egraph: &'e egglog::EGraph,
+    egraph: &'e EGraph,
     config: &'e EffsafeConfig,
     cost_model: &'e dyn DagCostModel<Cost>,
     boundary: &'e dyn RegionBoundary,
@@ -146,7 +141,9 @@ impl<'e> Builder<'e> {
             .collect();
         for (name, func) in functions {
             let ty = func.func_type();
-            let regions = self.config.regions.get(&name).cloned().unwrap_or_default();
+            let mut regions = self.config.regions.get(&name).cloned().unwrap_or_default();
+            regions.sort_unstable();
+            regions.dedup();
             if let Some(&bad) = regions.iter().find(|&&p| p >= ty.input.len()) {
                 return Err(Error::ExtractError(format!(
                     "constructor {name} has {} arguments, but :regions names position {bad}",
@@ -220,11 +217,7 @@ impl<'e> Builder<'e> {
         Ok(())
     }
 
-    /// A container holding an effectful element carries the state itself, so
-    /// the statewalk runs through it: `(Call "f" (vec-of arg state))` reaches
-    /// `state` through the `Vec`. Containers are never in the effectful
-    /// relation (it ranges over one sort), so this is inferred, to a fixpoint
-    /// for nested containers.
+    /// Mark containers holding effectful elements, including nested containers.
     fn mark_effectful_containers(&mut self) {
         let g = &mut self.g;
         let containers: Vec<EClassId> = g
@@ -293,11 +286,8 @@ impl<'e> Builder<'e> {
         }
     }
 
-    /// An effectful e-node with several effectful children outside its
-    /// `:regions` positions has no single state input, so it cannot be on a
-    /// statewalk. Such e-nodes are dropped (and remembered for error messages)
-    /// rather than failing the whole extraction, since the root may not need
-    /// them. Every root must be effectful.
+    /// Drop effectful e-nodes with multiple state inputs outside `:regions`.
+    /// Return an error if any root is pure.
     fn validate(&mut self, roots: &[EClassId]) -> Result<(), Error> {
         let effectful: Vec<EClassId> = self
             .g
@@ -394,7 +384,7 @@ impl<'e> Builder<'e> {
 /// Check that every placeholder is a well-typed constructor application of
 /// the right sort: the right arity, with each argument a literal or a nested
 /// constructor application of the expected sort.
-fn validate_placeholders(egraph: &egglog::EGraph, config: &EffsafeConfig) -> Result<(), Error> {
+fn validate_placeholders(egraph: &EGraph, config: &EffsafeConfig) -> Result<(), Error> {
     for (sort, expr) in &config.placeholders {
         check_placeholder(egraph, expr, sort).map_err(|why| {
             Error::ExtractError(format!(
@@ -406,19 +396,14 @@ fn validate_placeholders(egraph: &egglog::EGraph, config: &EffsafeConfig) -> Res
     Ok(())
 }
 
-fn check_placeholder(
-    egraph: &egglog::EGraph,
-    expr: &egglog::ast::Expr,
-    sort: &str,
-) -> Result<(), String> {
-    use egglog::ast::{Expr, Literal};
+fn check_placeholder(egraph: &EGraph, expr: &Expr, sort: &str) -> Result<(), String> {
     match expr {
         Expr::Call(_, head, args) => {
             let Some(func) = egraph.get_function(head) else {
                 return Err(format!("{head} is not a declared constructor"));
             };
             let ty = func.func_type();
-            if ty.subtype != egglog::ast::FunctionSubtype::Constructor {
+            if ty.subtype != FunctionSubtype::Constructor {
                 return Err(format!("{head} is a function, not a constructor"));
             }
             if ty.output.name() != sort {
@@ -459,13 +444,14 @@ fn check_placeholder(
     }
 }
 
-/// Build the extractor's e-graph for `egraph` and resolve the roots.
+/// Build the extractor's e-graph, limiting the roots before validation.
 pub fn build(
-    egraph: &egglog::EGraph,
+    egraph: &EGraph,
     config: &EffsafeConfig,
     cost_model: &dyn DagCostModel<Cost>,
     boundary: &dyn RegionBoundary,
     roots: &Roots,
+    max_roots: Option<usize>,
 ) -> Result<(TermGraph, Vec<EClassId>), Error> {
     validate_placeholders(egraph, config)?;
     let mut builder = Builder {
@@ -481,7 +467,10 @@ pub fn build(
     };
     builder.collect()?;
     builder.mark_effectful()?;
-    let roots = builder.resolve_roots(roots)?;
+    let mut roots = builder.resolve_roots(roots)?;
+    if let Some(limit) = max_roots {
+        roots.truncate(limit);
+    }
     builder.validate(&roots)?;
     let roots = builder.restrict_to_reachable(&roots);
     let (pruned, mapping) = builder.g.prune_unextractable(None);
@@ -504,10 +493,7 @@ pub fn build(
     Ok((pruned, roots))
 }
 
-/// Why e-class `class` has no finite term: summarize the e-classes without a
-/// finite term by sort, and list the ones with no extractable e-node at all,
-/// which are the usual culprits (a sort whose only constructors are
-/// `:unextractable`, or one that should be a placeholder).
+/// Describe a root with no finite term, including missing extractable constructors.
 fn explain_unextractable(g: &TermGraph, class: EClassId) -> String {
     let extractable = g.extractable_classes();
     let root_ops: Vec<&str> = g.classes[class]

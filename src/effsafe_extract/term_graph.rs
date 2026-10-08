@@ -1,13 +1,11 @@
-//! The index-based e-graph the effect-safe extractor works on.
-//!
-//! E-classes are numbered densely and every e-node lives in exactly one
-//! e-class. An e-class is *effectful* when the program marked it so (see
-//! [`super::EffsafeConfig`]); the effectful e-nodes chosen for a region form
-//! its *statewalk*. Everything else is pure.
+//! The extraction graph. Each e-node belongs to one e-class, whose
+//! effectfulness comes from `set-effectful` or from holding an effectful value.
 
 use std::collections::VecDeque;
+use std::fmt::{Debug, Formatter, Result as FmtResult};
+use std::ops::Range;
 
-use egglog::Value;
+use egglog::{ArcSort, Value};
 
 use super::cost::{Annotation, Cost};
 
@@ -41,26 +39,27 @@ pub enum NodeKind {
 #[derive(Clone)]
 pub struct ENode {
     pub kind: NodeKind,
-    /// Marginal cost of this e-node, not counting its children.
+    /// Marginal cost of this e-node. Pure e-nodes with removed subregions
+    /// include their estimated boundary costs here.
     pub cost: Cost,
     pub children: Vec<EClassId>,
     /// Indices in `children` of the children at `:regions` positions, sorted.
     /// Inside a region graph, effectful ones (subregions) are removed from
     /// `children`, and effectful e-nodes keep none (their subregions' costs
     /// enter through the statewalk costs); pure e-nodes keep their pure
-    /// `:regions` children here so that the boundary model prices them.
+    /// `:regions` children here so they are not charged again within the DAG.
     pub regions: Vec<usize>,
     /// The original argument position of each entry of `regions`. Equal to
     /// `regions` outside region graphs.
     pub region_positions: Vec<usize>,
     /// The constructor's arity, which the boundary fold's cost vector has.
     pub arity: usize,
-    /// The boundary cost model's annotation, present when `regions` is not empty.
+    /// The boundary annotation, if boundary costs have not been folded into `cost`.
     pub boundary: Option<Annotation>,
 }
 
-impl std::fmt::Debug for ENode {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl Debug for ENode {
+    fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
         f.debug_struct("ENode")
             .field("kind", &self.kind)
             .field("cost", &self.cost)
@@ -80,9 +79,9 @@ impl ENode {
     /// A copy of this e-node for a region graph: `children` are the children
     /// at the original indices `kept` (in order), the subregions having been
     /// dropped. A pure e-node keeps its remaining `:regions` children as
-    /// regions, with the boundary annotation, so that pure-term selection
-    /// prices them through the boundary model; an effectful e-node keeps none
-    /// (its statewalk cost already folds its subregions).
+    /// regions; an effectful e-node keeps none (its statewalk cost already
+    /// folds its subregions). For a pure e-node with removed subregions,
+    /// the caller must fold boundary costs into `cost` and clear `boundary`.
     pub fn without_regions(
         &self,
         kept: &[usize],
@@ -140,7 +139,7 @@ pub struct EClass {
 pub struct TermGraph {
     pub classes: Vec<EClass>,
     pub ops: Vec<OpInfo>,
-    pub sorts: Vec<egglog::ArcSort>,
+    pub sorts: Vec<ArcSort>,
 }
 
 impl TermGraph {
@@ -148,7 +147,7 @@ impl TermGraph {
         self.classes.len()
     }
 
-    pub fn class_ids(&self) -> std::ops::Range<EClassId> {
+    pub fn class_ids(&self) -> Range<EClassId> {
         0..self.len()
     }
 
@@ -180,8 +179,7 @@ impl TermGraph {
         &enode.regions
     }
 
-    /// The children of `enode` with their position, split into
-    /// `(non-region children, region children)`.
+    /// Child e-classes split into `(non-region children, region children)`.
     pub fn split_children<'a>(
         &'a self,
         enode: &'a ENode,

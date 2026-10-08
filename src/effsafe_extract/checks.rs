@@ -6,18 +6,15 @@
 //! variable is set.
 
 use std::collections::VecDeque;
+use std::sync::OnceLock;
 
 use super::statewalk::Statewalk;
 use super::term_graph::{EClassId, EGraphMapping, Extraction, ExtractionId, TermGraph};
 
-/// Every e-node's children are in range and (unless `allow_subregion_children`)
-/// every *effectful* e-node has at most one effectful child outside its region
-/// positions. Pure e-nodes may read any number of states. Empty e-classes are
-/// allowed only if `allow_empty`.
 /// Whether the internal invariant checks run: debug builds, or
 /// `EFFSAFE_VALIDATE` set in the environment.
 pub fn validate_internals() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| cfg!(debug_assertions) || std::env::var_os("EFFSAFE_VALIDATE").is_some())
 }
 
@@ -31,6 +28,9 @@ macro_rules! validate {
 }
 pub(crate) use validate;
 
+/// Check child indices and, unless `allow_subregion_children`, require each
+/// effectful e-node to have at most one state child outside `:regions`.
+/// Empty e-classes are allowed only if `allow_empty`.
 pub fn is_wellformed(g: &TermGraph, allow_empty: bool, allow_subregion_children: bool) -> bool {
     let mut ok = true;
     for c in g.class_ids() {
@@ -146,32 +146,6 @@ pub fn is_valid_mapping(
     true
 }
 
-/// A region has exactly one entry: one effectful e-node with no effectful children.
-pub fn has_single_arg(g: &TermGraph) -> bool {
-    let args: Vec<EClassId> = g
-        .class_ids()
-        .filter(|&c| g.is_effectful(c))
-        .flat_map(|c| {
-            g.classes[c]
-                .enodes
-                .iter()
-                .filter(|n| g.state_child(n).is_none())
-                .map(move |_| c)
-        })
-        .collect();
-    match args.len() {
-        1 => true,
-        0 => {
-            eprintln!("Error: region has no entry e-node");
-            false
-        }
-        k => {
-            eprintln!("Error: region has {k} entry e-nodes (in e-classes {args:?})");
-            false
-        }
-    }
-}
-
 /// `statewalk` runs from `root` down to a leaf, each step through the
 /// effectful child of the previous e-node.
 pub fn is_valid_statewalk(g: &TermGraph, root: EClassId, statewalk: &Statewalk) -> bool {
@@ -240,8 +214,8 @@ pub fn is_valid_extraction(g: &TermGraph, root: EClassId, extraction: &Extractio
     true
 }
 
-/// `extraction` is effect safe: within each region, pure nodes only use
-/// effectful nodes on that region's statewalk.
+/// `extraction` is effect safe: outside explicit subregions, pure nodes only
+/// use effectful nodes on their region's statewalk.
 pub fn is_effect_safe(g: &TermGraph, root: EClassId, extraction: &Extraction) -> bool {
     if !is_valid_extraction(g, root, extraction) {
         return false;
@@ -293,11 +267,17 @@ fn is_effect_safe_region(
         }
         i += 1;
     }
-    // Pure nodes may only depend on effectful nodes on this region's statewalk.
+    // Outside explicit subregions, pure nodes may only use states on this walk.
     while let Some(u) = pure_queue.pop_front() {
-        for &child in &extraction[u].children {
+        let node = &extraction[u];
+        let enode = g.enode(node.class, node.node);
+        for (position, &child) in node.children.iter().enumerate() {
             if is_effectful(child) {
-                if !on_walk[child] {
+                if enode.regions.contains(&position) {
+                    if !checked[child] && !is_effect_safe_region(g, child, extraction, checked) {
+                        return false;
+                    }
+                } else if !on_walk[child] {
                     eprintln!(
                         "Error: pure node {u} uses effectful node {child}, which is not on its region's statewalk"
                     );

@@ -1,8 +1,4 @@
-//! Regression tests from the eighth review of the effect-safe extractor
-//! (egglog-experimental PR 77): `set-effectful` in rules with wildcards and
-//! `set-cost`, with long chains of shared lets, in `:unsafe-seminaive` and
-//! non-seminaive e-graphs, and with head actions constraining body and
-//! let-bound overloads.
+//! Marking in rules with wildcards, action macros, shared lets, and varied evaluation modes.
 
 use egglog_experimental::new_experimental_egraph;
 

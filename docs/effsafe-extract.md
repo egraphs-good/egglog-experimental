@@ -54,18 +54,13 @@ action, so rules can use it:
 (rule ((= e (Print v s))) ((set-effectful Expr e)))
 ```
 
-Effectfulness is a property of e-classes, not constructors: in eggcc an `If`
-is effectful only when its type contains the state. Like `set-cost`,
-`set-effectful` stores its facts in a generated relation per sort
-(`effsafe_effectful_<Sort>`), declared the first time a sort is marked; the
-extractor reads them all. A container (`Vec`, `Set`, ...) holding an
-effectful element is effectful without being marked.
+The first argument must name an existing eq sort; `e` must have that sort.
+The action also works at top level and on values bound by earlier actions.
+The explicit sort can resolve overloaded expressions.
 
-The sort is required: `(set-effectful Sort e)` must name an existing eq sort.
-It expands directly to a relation insertion, so egglog's normal typechecker
-checks `e` against `Sort` together with the surrounding rule. This also lets
-the explicit sort resolve overloaded expressions. The action works both at
-top level and in rule heads, including on values bound by earlier actions.
+Effectfulness is a property of e-classes, not constructors: an `If` is
+effectful only when its result carries the state. A container (`Vec`, `Set`,
+...) holding an effectful element is effectful without being marked.
 
 ### `:regions`
 
@@ -84,6 +79,10 @@ positions that start subregions:
 
 The annotation lowers to the command `(effsafe-regions If 2 3)`, which
 programs can also write directly if the declaration cannot be changed.
+
+Pure e-nodes can also start effectful subregions at annotated positions.
+Those subregions have their own statewalks; other effectful dependencies of
+the pure e-node must belong to the enclosing statewalk.
 
 An effectful e-node with two effectful children outside its `:regions`
 positions has no single state input. Such e-nodes are skipped (the extraction
@@ -105,27 +104,27 @@ effsafe_state(&mut egraph)
 
 The extractor does not descend into the sort and emits the placeholder for
 every child of that sort instead; the replacement must be a well-typed
-constructor application of the sort (checked when extraction runs: a
-constructor rather than a function, the arity, and literals or nested
-constructor applications of the expected sorts). There is no egglog command for this, because the
-extracted term is then no longer a member of the requested e-class.
+constructor application of the sort, with literal or nested constructor
+arguments. Invalid replacements cause an extraction error. Placeholders can
+produce a term outside the requested e-class; the embedder must restore any
+information needed to preserve meaning.
 
 ## Regions
 
-Regions follow Section 7.1 of the paper. A *region* is the part of the e-graph reachable from an effectful root
-through state children and pure children, but not through subregions. Every
-region has exactly one *entry*: an effectful e-node with no effectful children
-(a function argument, say). Within a region, the extractor:
+Regions follow Section 7.1 of the paper. A *region* is reachable from an
+effectful root through state children and pure children, excluding subregions. Every
+region must have exactly one *entry*: an effectful e-node with no state child
+outside `:regions` positions (a function argument, say). Regions with multiple
+entry e-nodes are rejected. Within a region, the extractor:
 
-1. finds the cheapest chain of effectful e-nodes from the root down to the
-   entry such that every pure term the chain needs is extractable from it (a
-   dynamic program over the set of extractable pure e-classes, hashed and
-   shared between states);
+1. chooses a chain from root to entry using estimated costs, requiring every
+   pure dependency of the chain to be extractable from it;
 2. linearizes the region along that chain; and
 3. extracts the pure terms greedily, charging a pure e-class once per region.
 
 Subregions are extracted the same way and placed below the e-nodes that use
-them. A subregion used from several places is extracted once.
+them. Search costs are heuristic; the result need not have the lowest possible
+DAG cost.
 
 ## Costs
 
@@ -142,23 +141,15 @@ In the egglog frontend the `DagCostModel` is the dynamic cost model, so
 `TreeCostModelFromDag` of the same model, which adds the subregions' costs to
 the e-node's own cost.
 
-The boundary model sees only e-nodes with `:regions` children. Its
-`enode_cost` annotation is computed once per e-node, and `fold_enode_cost`
-receives the costs of the children at `:regions` positions in their argument
-positions and `0` for every other child. (A pure e-class at a `:regions`
-position, such as the branches of a conditional that does not touch the
-state, is not a subregion and is extracted within the enclosing region, but
-the fold prices it the same way, as a tree, so the model's weighting applies
-to it too. This holds for the cost estimates, for the selection of pure terms
-within a region and for the reported cost alike. When selecting pure terms,
-the fold sees each `:regions` child's independent, globally estimated cost,
-not the discounted cost it may have within the region because the statewalk
-already uses it, and a fold that would make an e-node cheaper than a term
-containing it is not allowed to close a cycle.) The result (including the e-node's own cost) is the e-node's
-effective marginal cost in the enclosing region, whose DAG then charges the
-predicate, state and other ordinary children, preserving sharing. A subregion
-used from several e-nodes is extracted and placed once but charged at every
-use, as a tree would.
+The boundary model applies to e-nodes with `:regions` children. Its
+`fold_enode_cost` receives costs at those argument positions and `0` elsewhere.
+The result must include the node's own cost. Ordinary children, including
+predicates and state inputs, are charged separately in the enclosing region.
+
+Each annotated child is charged per occurrence, even when two arguments
+share the same subregion. Pure children at `:regions` positions remain in
+the enclosing region but are priced independently through the same fold.
+Search uses their estimated costs; reported costs use the selected terms.
 
 A compiler embedding egglog installs its own models with
 `set_effsafe_cost_models`. eggcc, for instance, charges both branches of an
@@ -175,8 +166,8 @@ impl TreeCostModel<DefaultCost> for Heuristics {
     }
     fn fold_enode_cost(&self, (name, own): Self::EnodeCost, child_costs: &[DefaultCost]) -> DefaultCost {
         match (name.as_str(), child_costs) {
-            ("If", &[_, _, then, els]) => own + then.max(els) + then.min(els) / 4,
-            ("Loop", &[_, body]) => own + body.saturating_mul(100),
+            ("If", &[_, _, then, els]) => own.saturating_add(then.max(els)).saturating_add(then.min(els) / 4),
+            ("Loop", &[_, body]) => own.saturating_add(body.saturating_mul(100)),
             _ => child_costs.iter().fold(own, |acc, c| acc.saturating_add(*c)),
         }
     }
@@ -187,19 +178,20 @@ set_effsafe_cost_models(&mut egraph, MyNodeCosts, Heuristics);
 ```
 
 The reported cost of an extraction is the extracted program's cost under the
-same models: for the example above, an `If` of cost 1 whose branches cost 10
+same models. With the default sum, an `If` of cost 1 whose branches cost 10
 each reports `1 + 10 + 10 = 21` (plus its predicate and state) even though the
 two branches are the same shared region.
 
 The annotations and cost models live in the e-graph's extension state
 (`EffsafeState`), so they are cloned and snapshotted with it.
 
-Costs are `u64`s with saturating arithmetic.
+Costs are `u64`s. The extractor uses saturating addition; custom cost models
+should also use saturating arithmetic.
 
 ## Checking
 
-Every extraction is checked for effect safety before it is returned, in
-release builds too; a failure is an error, never a wrong program. The
+Every extraction is checked for effect safety before it is returned, including
+in release builds. A failed final check returns an extraction error. The
 extractor's internal invariants (well-formed region graphs, mappings,
 statewalks) are checked in debug builds, or in any build when the
 `EFFSAFE_VALIDATE` environment variable is set, e.g.
@@ -216,12 +208,13 @@ statewalks) are checked in debug builds, or in any build when the
 ```
 
 `extract ... :extractor effsafe` extracts the expression's e-class, which must be
-effectful, and reports it like any `extract` (see Costs for what the cost
-means). `print-function ...
-:extractor effsafe` extracts every e-class that holds an e-node of the constructor, in
-e-class order, sharing regions between them, and prints one term per
-e-class. Variants (`extract e n`), `multi-extract` and `keep-best` do not support
+effectful, and reports it like any `extract` (see Costs).
+`print-function ... :extractor effsafe` prints one term for each e-class
+holding an e-node of the constructor, in e-class order. Variants (`extract e n`), `multi-extract` and `keep-best` do not support
 `:extractor effsafe`.
+
+An optional row limit on `print-function` selects the roots before extraction.
+Unselected roots need not be effectful or extractable.
 
 `:include-subsumed` is an error with the other extractors.
 
@@ -231,6 +224,10 @@ an e-graph (placeholders included), and `set_effsafe_cost_models` installs
 custom cost models. Programmatic callers read the terms from the
 `CommandOutput::ExtractBest` or `CommandOutput::PrintFunction` the commands
 return.
+
+`EffsafeConfig::regions` accepts positions in any order and ignores duplicates.
+`EffsafeConfig::statewalk` controls liveness and satellite pruning; both are
+enabled by default.
 
 ## Subsumed e-nodes
 
@@ -244,10 +241,10 @@ from firing again, say) can include them with `:include-subsumed`:
 
 ## Limitations
 
-- Pure e-nodes must not use effectful e-nodes that are not on their region's
-  statewalk; the language's rewrites must preserve this (it holds for
+- Outside explicit subregions, pure e-nodes must not use effectful e-nodes
+  that are not on their region's statewalk; rewrites must preserve this (it holds for
   languages in which the state is linear).
-- A container holding two states is an error, like any e-node with two
-  effectful children.
-- Roots must be marked with `set-effectful`. Extracting a pure root is a plain
-  tree extraction, which `extract` without `:extractor effsafe` already provides.
+- A container holding two states is skipped, like other effectful e-nodes
+  with multiple state inputs outside `:regions`.
+- Roots must be effectful. Pure roots are rejected; use `extract` without
+  `:extractor effsafe` for ordinary tree extraction.

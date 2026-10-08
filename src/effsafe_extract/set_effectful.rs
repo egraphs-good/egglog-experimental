@@ -1,9 +1,8 @@
 //! `(set-effectful Sort e)`: mark the e-class of `e` as effectful.
 //!
-//! The explicit eq sort selects a generated relation `effsafe_effectful_<Sort>`,
-//! declared on first use. The command macro rewrites each mark directly into
-//! an insertion into that relation. Egglog's normal typechecking then checks
-//! the expression against the supplied sort along with the surrounding actions.
+//! `Sort` must be an existing eq sort, and `e` must have that sort. Marks may
+//! appear at top level or in rule heads. The per-sort relation is declared on
+//! first use; no separate declaration is needed.
 
 use egglog::ast::{Action, Command, Expr, ParseError};
 use egglog::util::SymbolGen;

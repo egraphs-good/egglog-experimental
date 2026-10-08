@@ -1,7 +1,4 @@
-//! Regression tests from the third review of the effect-safe extractor
-//! (egglog-experimental PR 77): boundary cost models in pure-term selection,
-//! deep chains of pure `:regions` children in the cost evaluator, write
-//! primitives under `set-effectful`, and placeholders that name functions.
+//! Boundary pricing, deep pure terms, write primitives, and placeholder validation.
 
 use egglog::ast::Expr;
 use egglog::extract::{DefaultCost, TreeCostModel};

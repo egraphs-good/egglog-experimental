@@ -1,14 +1,7 @@
-//! Versioned arrays for the statewalk DP: each DP state owns a version of the
-//! extractable-set bit set and of the pure e-nodes' child counters.
+//! Versioned sets and counters for the statewalk dynamic program.
 //!
-//! A version is a whole copy of the array behind an `Rc`; versions created in
-//! the current generation (see `new_version`) are updated in place, older
-//! ones are copied on write. That makes an update O(n) in the region size
-//! rather than the O(log n) of a persistent tree, but regions are small (the
-//! largest in eggcc's benchmarks has a few hundred e-classes, a handful of
-//! words) and measurements showed the copy-on-write version at least as fast
-//! as the B-tree the C++ implementation used, on real benchmarks and on a
-//! synthetic 5000-step statewalk, with far less code.
+//! Call `new_version` before branching from a saved version. Updates within
+//! a generation may change that generation's version; older versions remain valid.
 
 use std::rc::Rc;
 
@@ -55,7 +48,7 @@ impl Versions {
     }
 }
 
-/// Persistent array of counters that only ever decrease (one `u32` each).
+/// Versioned counters that only decrease.
 #[derive(Default)]
 pub struct PersistentCounters {
     versions: Versions,
@@ -81,7 +74,7 @@ impl PersistentCounters {
     }
 }
 
-/// Persistent bit set (one `u32` word per 32 bits).
+/// Versioned set of bit indices.
 #[derive(Default)]
 pub struct PersistentBitSet {
     versions: Versions,
@@ -89,7 +82,7 @@ pub struct PersistentBitSet {
 
 impl PersistentBitSet {
     pub fn init(&mut self, data: &[u32]) -> Id {
-        // `data` holds one bit per element, as in `persistent.rs`.
+        // Each input element contributes its low bit.
         let words: Vec<u32> = data
             .chunks(32)
             .map(|chunk| {

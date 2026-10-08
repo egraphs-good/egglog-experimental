@@ -16,6 +16,7 @@
 
 use crate::{
     Error,
+    effsafe_extract::Roots,
     greedy_dag_extract::{
         Extractor, extract_best_greedy_dag, extract_variants_greedy_dag, split_trailing_extractor,
     },
@@ -324,7 +325,8 @@ impl UserDefinedCommand for CustomExtract {
             let output = crate::effsafe_extract::extract_with_options(
                 egraph,
                 include_subsumed,
-                &crate::effsafe_extract::Roots::Values(roots),
+                &Roots::Values(roots),
+                None,
             )?;
             let term = output.terms[0];
             let cost = output.costs[0];

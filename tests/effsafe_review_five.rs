@@ -1,7 +1,4 @@
-//! Regression tests from the fifth review of the effect-safe extractor
-//! (egglog-experimental PR 77): ordinary picks closing a cycle through a
-//! discounted boundary pick, consumer-constrained typing of overloaded
-//! primitives under `set-effectful`, and synthetic mark names.
+//! Mixed region cycles, overloaded primitives, and variable hygiene.
 
 use egglog::extract::{DefaultCost, TreeCostModel};
 use egglog::{ArcSort, CommandOutput, EGraph, Enode, Function, Value};
@@ -92,7 +89,7 @@ fn review5_write_primitive_context_types_empty_container() {
       (run 3)
       (check (effsafe_effectful_Expr (FromVec (vec-empty))))
     "#;
-    // With only one Vec sort the fallback can guess its type.
+    // Cover both a single Vec sort and overloaded Vec sorts.
     run(&program.replace("(sort Ints (Vec i64))", ""), |_| {});
     run(
         &program.replace(

@@ -1,7 +1,4 @@
-//! Regression tests from the sixth review of the effect-safe extractor
-//! (egglog-experimental PR 77): `set-effectful` typing with an unrelated
-//! write primitive in the same rule, and a fixed-signature primitive applied
-//! to one overloaded variable many times.
+//! Typing shared overloaded variables and literal-sensitive primitives.
 
 use egglog_experimental::new_experimental_egraph;
 
@@ -33,7 +30,7 @@ fn review6_primitive_with_many_constrained_arguments() {
       (run 3)
       (check (effsafe_effectful_Expr (FromVec (vec-empty))))
     "#;
-    // A single vector sort avoids the fallback's combinatorial limit.
+    // Compare a single Vec sort with overloaded Vec sorts.
     run(&program.replace("(sort Ints (Vec i64))", ""));
     // Normal action typing handles both vector sorts and this fixed signature.
     run(&program.replace(
@@ -61,7 +58,7 @@ fn review6_primitive_inference_preserves_literal_arguments() {
       (run 3)
       (check (effsafe_effectful_Expr (State)))
     "#;
-    // Without an unrelated write, query typing preserves the literal target.
+    // Adding an unrelated write must preserve the literal target.
     run(&program.replace("(let side (write e))", ""));
     run(&program.replace(
         "(set-effectful Expr state)",

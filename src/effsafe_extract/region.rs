@@ -1,7 +1,7 @@
 //! Splitting the e-graph into regions and extracting them one at a time.
 //!
 //! A region root is an extraction root or any effectful e-class at a
-//! `:regions` position of an effectful e-node (the body of an `If` branch or
+//! `:regions` position of an e-node (the body of an `If` branch or
 //! a `DoWhile`, say). Each region is extracted on its own by the statewalk DP;
 //! the results are stitched together by placing subregions below the e-nodes
 //! that use them.
@@ -19,7 +19,9 @@ use egglog::Error;
 use rustc_hash::FxHashSet;
 
 use super::cost::{Cost, RegionBoundary};
-use super::greedy::{estimate_class_costs, project_statewalk_costs, statewalk_costs};
+use super::greedy::{
+    effective_cost, estimate_class_costs, project_statewalk_costs, statewalk_costs,
+};
 use super::statewalk::{StatewalkOptions, describe_class, extract_region};
 use super::term_graph::{
     EClass, EClassId, EGraphMapping, ENodeId, ExtractedNode, Extraction, ExtractionId, TermGraph,
@@ -48,8 +50,7 @@ pub fn extract_all(
                     describe_class(g, class)
                 )),
             })?;
-            // The final check runs in release builds too: it is linear in the
-            // extraction and an unsafe program must never be returned.
+            // Reject unsafe results in release builds too.
             if !super::checks::is_effect_safe(g, root, &out) {
                 return Err(Error::ExtractError(format!(
                     "internal error: the extraction of {} is not effect-safe (please report this)",
@@ -61,7 +62,7 @@ pub fn extract_all(
         .collect()
 }
 
-/// Per-e-class marks that reset in O(1) by bumping a generation counter.
+/// Per-e-class marks that can be cleared between traversals.
 struct Marks {
     generation: Vec<u32>,
     value: Vec<usize>,
@@ -318,7 +319,7 @@ impl<'g> Regions<'g> {
     /// The region e-graph rooted at `root`: the effectful spine reached through
     /// state children, plus the pure e-classes it uses. Subregion children
     /// (effectful children at `:regions` positions) are dropped from e-nodes
-    /// (their folded cost enters through the statewalk costs), and e-nodes
+    /// (their cost is folded into the parent), and e-nodes
     /// with children outside the region, or forbidden for this region, are
     /// dropped entirely. Returns the (pruned) region, its root, and
     /// the mapping back into `g`.
@@ -391,7 +392,14 @@ impl<'g> Regions<'g> {
                 }
                 if inside {
                     node_map.push(Some(n));
-                    enodes.push(enode.without_regions(&kept, children, class.is_effectful));
+                    let mut local = enode.without_regions(&kept, children, class.is_effectful);
+                    if !class.is_effectful && kept.len() != enode.children.len() {
+                        // Fold before dropping subregions so pure-node selection
+                        // includes them, together with any pure region children.
+                        local.cost = effective_cost(self.boundary, enode, |c| self.class_cost[c]);
+                        local.boundary = None;
+                    }
+                    enodes.push(local);
                 }
             }
             region.classes.push(EClass {
@@ -427,7 +435,7 @@ impl<'g> Regions<'g> {
 }
 
 /// Extraction roots first, then every effectful e-class at a `:regions`
-/// position of some effectful e-node. Each e-class appears once.
+/// position of any e-node. Each e-class appears once.
 fn region_roots(g: &TermGraph, roots: &[EClassId]) -> Vec<EClassId> {
     let mut is_root = vec![false; g.len()];
     let mut out = Vec::new();
@@ -440,7 +448,7 @@ fn region_roots(g: &TermGraph, roots: &[EClassId]) -> Vec<EClassId> {
     for &root in roots {
         add(root, &mut out);
     }
-    for c in g.class_ids().filter(|&c| g.is_effectful(c)) {
+    for c in g.class_ids() {
         for enode in &g.classes[c].enodes {
             for child in g.region_children(enode) {
                 add(child, &mut out);

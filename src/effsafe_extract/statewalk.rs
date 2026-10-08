@@ -1,17 +1,9 @@
 //! The statewalk dynamic program (Section 6 of Flatt et al., "Efficient
 //! Extraction for Effectful E-graphs", OOPSLA 2026).
 //!
-//! A *region* is an e-graph in which effectful e-classes form a chain from the
-//! region's root down to its *entry*, an effectful e-node with no effectful
-//! children (a function's argument, say). Extracting the region means choosing one
-//! effectful e-node per e-class on that chain (the *statewalk*) so that every
-//! pure term the chosen e-nodes need is extractable from the chosen state, and
-//! the total cost is minimal.
-//!
-//! The DP walks the chain upwards from the entry. A DP state is an effectful
-//! e-class together with the set of pure e-classes that are extractable given
-//! the statewalk so far (kept in a persistent bit set and hashed, so states
-//! with the same extractable set are merged).
+//! Choose a state chain from the region's root to its single entry, requiring
+//! the chain's pure dependencies to be extractable from that chain. Minimize
+//! the supplied statewalk costs, then greedily extract the pure terms.
 
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, VecDeque};
@@ -25,18 +17,20 @@ use super::greedy::statewalk_greedy_extraction;
 use super::persistent::{Id as VersionId, PersistentBitSet, PersistentCounters};
 use super::term_graph::{EClass, EClassId, EGraphMapping, ENodeId, Extraction, TermGraph};
 
+#[cfg(test)]
+mod tests;
+
 /// The chosen effectful e-nodes of a region, from the root down to the entry.
 pub type Statewalk = Vec<(EClassId, ENodeId)>;
 
-/// Optimizations of the DP. Both are on by default; the flags exist for experiments.
+/// Statewalk search optimizations. Both are enabled by default.
 #[derive(Clone, Copy, Debug)]
 pub struct StatewalkOptions {
     /// Ignore pure e-classes that no later part of the statewalk can use when
     /// comparing DP states.
     pub liveness: bool,
-    /// Only visit one *satellite* (an effectful e-class whose only effectful
-    /// parent and child are the same e-class) per DP state unless it changes
-    /// the extractable set.
+    /// Skip repeated visits to non-root *satellites*: effectful e-classes
+    /// whose only effectful parent and child are the same e-class.
     pub satellite: bool,
 }
 
@@ -71,9 +65,6 @@ struct VersionInfo {
     counters: VersionId,
 }
 
-/// Satellites are only skipped for e-classes with more than this many of them.
-const SATELLITE_BAR: usize = 6;
-
 fn bit(bits: &[u64], i: usize) -> bool {
     (bits[i >> 6] >> (i & 63)) & 1 != 0
 }
@@ -103,9 +94,8 @@ struct Region {
     /// `live_delta[c][p]`: compressed pure e-classes live at `c` but not at its
     /// effectful parent `p`.
     live_delta: Vec<FxHashMap<EClassId, Vec<usize>>>,
-    /// The e-class an effectful e-class is a satellite of, if any.
+    /// The e-class a non-root effectful e-class is a satellite of, if any.
     satellite_of: Vec<Option<EClassId>>,
-    satellite_count: Vec<usize>,
 }
 
 impl Region {
@@ -114,24 +104,24 @@ impl Region {
         root: EClassId,
         opts: StatewalkOptions,
     ) -> Result<(Self, Vec<u32>), Error> {
-        super::checks::validate!(super::checks::has_single_arg(g));
-        let arg = g
-            .class_ids()
-            .filter(|&c| g.is_effectful(c))
-            .find_map(|c| {
-                g.classes[c]
-                    .enodes
-                    .iter()
-                    .position(|n| g.state_child(n).is_none())
-                    .map(|n| (c, n))
-            })
-            .ok_or_else(|| {
-                Error::ExtractError(format!(
-                    "the region rooted at {} has no entry: no effectful e-node without an \
+        let mut entries = g
+            .enode_ids()
+            .filter(|&(c, n)| g.is_effectful(c) && g.state_child(g.enode(c, n)).is_none());
+        let arg = entries.next().ok_or_else(|| {
+            Error::ExtractError(format!(
+                "the region rooted at {} has no entry: no effectful e-node without an \
                      effectful child (a region needs its own argument or initial state)",
-                    describe_class(g, root)
-                ))
-            })?;
+                describe_class(g, root)
+            ))
+        })?;
+        let entry_count = 1 + entries.count();
+        if entry_count != 1 {
+            return Err(Error::ExtractError(format!(
+                "the region rooted at {} has {entry_count} entry e-nodes; \
+                 effect-safe extraction requires exactly one",
+                describe_class(g, root)
+            )));
+        }
 
         let n = g.len();
         let mut parents_pure = vec![Vec::new(); n];
@@ -252,9 +242,8 @@ impl Region {
         }
 
         let mut satellite_of = vec![None; n];
-        let mut satellite_count = vec![0; n];
         if opts.satellite {
-            for i in g.class_ids().filter(|&c| g.is_effectful(c)) {
+            for i in g.class_ids().filter(|&c| g.is_effectful(c) && c != root) {
                 // A satellite's e-nodes all share one effectful child, which is
                 // also its only effectful parent.
                 let mut candidate: Option<EClassId> = None;
@@ -282,9 +271,6 @@ impl Region {
                 });
                 satellite_of[i] = candidate;
             }
-            for c in satellite_of.iter().flatten() {
-                satellite_count[*c] += 1;
-            }
         }
 
         let region = Region {
@@ -298,7 +284,6 @@ impl Region {
             live,
             live_delta,
             satellite_of,
-            satellite_count,
         };
         Ok((region, counts))
     }
@@ -461,11 +446,12 @@ pub fn statewalk_dp(
         }
         let u = states[uid].class;
         let u_version = states[uid].extractable;
-        let skip_satellites = region.satellite_count[u] > SATELLITE_BAR;
-        let mut satellite_visited = false;
         for &(v, vn) in &region.parents_effectful[u] {
-            let is_satellite = region.satellite_of[v] == Some(u);
-            if skip_satellites && is_satellite && satellite_visited {
+            let already_extractable = versions.is_extractable(&region, u_version, v);
+            if region.satellite_of[v] == Some(u) && already_extractable {
+                // This non-root detour must return to u, adds no extractable
+                // e-classes, and has nonnegative cost. A first visit cannot be
+                // skipped: satellites can have different return dependencies.
                 continue;
             }
             let enode = g.enode(v, vn);
@@ -481,17 +467,11 @@ pub fn statewalk_dp(
                 continue;
             }
             let old_hash = versions.info[&u_version].masked_hash;
-            let (new_version, new_hash) = if versions.is_extractable(&region, u_version, v) {
+            let (new_version, new_hash) = if already_extractable {
                 (u_version, old_hash)
             } else {
                 versions.saturate(&region, opts, u_version, u, v)
             };
-            if skip_satellites && is_satellite {
-                if new_hash == old_hash {
-                    continue;
-                }
-                satellite_visited = true;
-            }
             match state_by_hash[v].get(&new_hash) {
                 None => {
                     let vid = states.len();

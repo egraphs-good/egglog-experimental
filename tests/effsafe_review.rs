@@ -1,6 +1,5 @@
-//! Regression tests from the review of egglog-experimental PR 77.
-//! These assert the intended behavior and expose bugs in commit 0e9fdc4.
-//! See docs/reviews/pr77-effsafe-review.md for findings and reproduction commands.
+//! Extraction regressions for saturated costs, region cycles, placeholders,
+//! and primitive-bound effectful values.
 
 use egglog::ast::Expr;
 use egglog::extract::{DefaultCost, TreeCostModel};

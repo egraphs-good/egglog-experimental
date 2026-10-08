@@ -1,8 +1,4 @@
-//! Regression tests from the seventh review of the effect-safe extractor
-//! (egglog-experimental PR 77): `set-effectful` typing of independent
-//! overloaded calls, of many distinct overloaded bindings consumed by one
-//! fixed-signature primitive, and of a literal-sensitive constraint with a
-//! write primitive nested in the same expression.
+//! Typing independent overloads, many arguments, and nested writes.
 
 use egglog_experimental::new_experimental_egraph;
 
@@ -89,7 +85,7 @@ fn review7_literal_constraint_with_nested_write() {
       (run 3)
       (check (effsafe_effectful_Expr (State (Use (Arg)))))
     "#;
-    // Splitting out the partial argument lets query typing see the real literal.
+    // Inline and let-bound partial arguments must resolve to the same sort.
     run(&program.replace(
         "(let f (unstable-fn \"State\" (write e)))",
         "(let partial (write e)) (let f (unstable-fn \"State\" partial))",
