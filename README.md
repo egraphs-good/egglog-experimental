@@ -3,6 +3,8 @@
 This repo implements several experimental extensions to the core [`egglog`](https://github.com/egraphs-good/egglog).
 Currently, this can be thought of as a standard library to `egglog`.
 
+The [Herbie rewrite examples](examples/herbie) include five standalone workloads.
+
 You can use the egglog [Zulip](https://egraphs.zulipchat.com/#narrow/stream/375765-egglog) to ask questions and suggest improvements to this repo.
 
 ## Trying it out
