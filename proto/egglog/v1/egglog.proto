@@ -839,8 +839,9 @@ message Declaration {
 
   CallableBindings bindings = 8;
 
-  // Optional documentation; excluded from semantic identity.
-  string doc = 9;
+  // Optional documentation; excluded from semantic identity. Absent and
+  // explicitly empty documentation remain distinct.
+  optional string doc = 9;
 }
 
 // An argument's sort and optional label. Calls are positional; labels are not

@@ -661,9 +661,10 @@ pub struct Declaration {
     pub span: ::core::option::Option<Span>,
     #[prost(message, optional, tag = "8")]
     pub bindings: ::core::option::Option<CallableBindings>,
-    /// Optional documentation; excluded from semantic identity.
-    #[prost(string, tag = "9")]
-    pub doc: ::prost::alloc::string::String,
+    /// Optional documentation; excluded from semantic identity. Absent and
+    /// explicitly empty documentation remain distinct.
+    #[prost(string, optional, tag = "9")]
+    pub doc: ::core::option::Option<::prost::alloc::string::String>,
     #[prost(oneof = "declaration::Kind", tags = "1, 2, 3, 4, 5, 6, 10")]
     pub kind: ::core::option::Option<declaration::Kind>,
 }

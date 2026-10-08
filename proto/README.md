@@ -48,6 +48,18 @@ Function types remain structural `FuncSort`s. Family names share the sort
 namespace with equality sorts; callable names occupy a separate namespace.
 Type-use spans may remain on `Sort`, but docs and bindings belong to definitions.
 
+`Declaration.doc` preserves absence, explicitly empty text, and nonempty text,
+matching existing Python callable/class documentation readers. It remains
+excluded from semantic identity; compatible resupply retains the first stored
+declaration's documentation. Only this doc field has explicit presence; rule
+and ruleset docs are unchanged. This draft changes generated Rust to
+`Option<String>`. Python accepts `None` as unset but its scalar getter still
+returns `""` when absent; readers must use `has_field("doc")`, not truthiness,
+to recover absence. Absent/nonempty canonical bytes remain unchanged, but old
+receivers lose explicit-empty presence on reencoding.
+ProtoJSON distinguishes an omitted field from `"doc":""`. As with the tail
+change below, preserving this distinction requires coordinated consumer pins.
+
 `HostPrimitive` selects an ordinary `GenericSignature` or the dedicated
 `FunctionApplication` typing form. A signature has an ordered type-parameter
 binder, fixed inputs, a required output, and an ordered `varargs` pattern.
