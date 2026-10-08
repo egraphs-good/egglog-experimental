@@ -344,7 +344,9 @@ positive native count as uint64, not a requested value or frontend CPU estimate.
 Unsupported updates fail before mutation; updates must preserve existing rule
 cursors and logical state. Clone inherits the effective count, later updates are
 handle-local, and resources remain outside snapshots. The protocol is specified
-and wire-tested; its adapter implementation is the next gate. Immutable logical
+and implemented by `Engine::configure_resources`, using the native getter/setter
+without cloning execution state. Invalid handles, missing/unknown operations and
+unsupported requests fail explicitly. Immutable logical
 options, future-rule defaults and report-policy controls are not resource fields.
 
 Restore by remapping C's reachable closed sort graph and needed sort declarations
@@ -435,6 +437,9 @@ and memory use on the same graph before choosing.
 
 `EGraphOptions.execution_mode` selects ordinary execution (the default), term
 encoding, proofs, or proof testing. Clone retains the mode and proof state.
+The current byte adapter accepts only NORMAL; other or unknown mode values fail
+creation before allocating a handle. Prove/ProveExists fail Program preparation
+before any actions execute until native proof integration is implemented.
 Snapshots retain the mode, but logical reconstruction does not preserve original
 derivations. `Prove` uses the same conjunctive facts as `Check`; `ProveExists`
 targets a constructor name without inserting a witness. Proof testing executes
@@ -517,8 +522,8 @@ transport is generated or required.
 ### Initial executable Rust slice
 
 `egglog_experimental::protobuf::Engine` exposes `create`, `clone_egraph`,
-`destroy`, and `run`. Every method accepts encoded request bytes and returns
-encoded response bytes. Decode failures and unknown handles are transport
+`destroy`, `configure_resources`, and `run`. Every method accepts encoded request
+bytes and returns encoded response bytes. Decode failures and unknown handles are transport
 errors; program failures are `RunProgramResponse.error`. Whole-program
 validation occurs before installation, while runtime errors preserve completed
 effects and observations. Native ASTs are transient lowering products.
