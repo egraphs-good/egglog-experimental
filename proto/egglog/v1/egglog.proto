@@ -108,7 +108,7 @@ message Program {
       "this.declarations.all(d, !has(d.host_primitive) || "
       "!has(d.host_primitive.signature) || [d.host_primitive.signature].all(sig, "
       "(sig.inputs.map(a, a.sort) + (has(sig.output) ? [sig.output] : []) + "
-      "(has(sig.varargs) ? [sig.varargs.sort] : [])).all(i, "
+      "sig.varargs.map(a, a.sort)).all(i, "
       "i < uint(size(this.sorts)) && (!has(this.sorts[int(i)].var) || "
       "this.sorts[int(i)].var < uint(size(sig.type_params))))))"
   };
@@ -788,7 +788,7 @@ message Declaration {
       "has(this.primitive) ? size(this.primitive.inputs) : "
       "has(this.host_primitive.signature) ? size(this.host_primitive.signature.inputs) : "
       "has(this.host_primitive.application) ? 1 : 0].all(n, "
-      "[has(this.host_primitive.application) || has(this.host_primitive.signature.varargs)].all(t, "
+      "[has(this.host_primitive.application) || size(this.host_primitive.signature.varargs) > 0].all(t, "
       "this.bindings.python.views.all(v, "
       "size(v.params) + (has(v.receiver) ? 1 : 0) == n + (t ? 1 : 0) && "
       "(!has(v.receiver) || v.receiver < uint(n)) && "
@@ -946,12 +946,18 @@ message HostPrimitive {
 }
 
 // An ordinary host signature: a fixed prefix followed by zero or more
-// homogeneous varargs when present. Sort indices reference Program.sorts.
+// repetitions of the ordered varargs pattern. An empty pattern means no tail
+// (exact fixed arity); one Arg describes homogeneous varargs. For a nonempty
+// pattern, the actual argument count minus the fixed prefix must be a multiple
+// of the pattern width. Pattern order and width are semantic, even [T, T];
+// arguments remain flat, with no tuple/group node. Sort indices reference
+// Program.sorts.
 // Sort.var indices bind by position in type_params; labels do not bind by name
 // and need not be distinct. All variable uses, including nested HostSort and
 // FuncSort patterns, must be in this signature's binder. Each actual call
 // matches all concrete argument and result sorts structurally to obtain one
-// consistent, complete substitution. Reject undetermined parameters: e.g.
+// consistent, complete substitution across all repetitions and the result.
+// Reject undetermined parameters: e.g.
 // count<T>(...T)->i64 cannot be called with zero arguments, whereas an empty
 // vec-of<T>(...T)->Vec<T> determines T from its concrete result sort.
 // No conversion, subtyping, overload search or heterogeneous type packs.
@@ -959,7 +965,7 @@ message GenericSignature {
   repeated string type_params = 1;
   repeated Arg inputs = 2;
   optional uint32 output = 3 [(buf.validate.field).required = true];
-  Arg varargs = 4;
+  repeated Arg varargs = 4;
 }
 
 // Dedicated typing for a named application primitive, still invoked by Call.
@@ -1120,9 +1126,10 @@ enum PythonCallKind {
 }
 
 // Ordered surface parameter. Fixed core inputs occupy [0, n). If the signature
-// has varargs, one logical tail slot n represents all varargs; it must be last
-// in surface order and have no default. FunctionApplication has fixed slot 0
-// plus tail slot 1, whose heterogeneous sorts come from the actual FuncSort.
+// has a nonempty varargs pattern, one logical tail slot n represents the whole
+// flat tail, not one slot per pattern position. It must be last in surface
+// order, have no default, and cannot be a receiver. FunctionApplication has
+// fixed slot 0 plus tail slot 1, whose heterogeneous sorts come from the actual FuncSort.
 // No redundant varargs flag or generic expression template is introduced.
 message PythonParameter {
   optional uint32 core_input = 1 [(buf.validate.field).required = true];

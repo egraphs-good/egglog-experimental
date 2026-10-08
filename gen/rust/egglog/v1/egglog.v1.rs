@@ -810,12 +810,18 @@ pub mod host_primitive {
     }
 }
 /// An ordinary host signature: a fixed prefix followed by zero or more
-/// homogeneous varargs when present. Sort indices reference Program.sorts.
+/// repetitions of the ordered varargs pattern. An empty pattern means no tail
+/// (exact fixed arity); one Arg describes homogeneous varargs. For a nonempty
+/// pattern, the actual argument count minus the fixed prefix must be a multiple
+/// of the pattern width. Pattern order and width are semantic, even \[T, T\];
+/// arguments remain flat, with no tuple/group node. Sort indices reference
+/// Program.sorts.
 /// Sort.var indices bind by position in type_params; labels do not bind by name
 /// and need not be distinct. All variable uses, including nested HostSort and
 /// FuncSort patterns, must be in this signature's binder. Each actual call
 /// matches all concrete argument and result sorts structurally to obtain one
-/// consistent, complete substitution. Reject undetermined parameters: e.g.
+/// consistent, complete substitution across all repetitions and the result.
+/// Reject undetermined parameters: e.g.
 /// count<T>(...T)->i64 cannot be called with zero arguments, whereas an empty
 /// vec-of<T>(...T)->Vec<T> determines T from its concrete result sort.
 /// No conversion, subtyping, overload search or heterogeneous type packs.
@@ -827,8 +833,8 @@ pub struct GenericSignature {
     pub inputs: ::prost::alloc::vec::Vec<Arg>,
     #[prost(uint32, optional, tag = "3")]
     pub output: ::core::option::Option<u32>,
-    #[prost(message, optional, tag = "4")]
-    pub varargs: ::core::option::Option<Arg>,
+    #[prost(message, repeated, tag = "4")]
+    pub varargs: ::prost::alloc::vec::Vec<Arg>,
 }
 /// Dedicated typing for a named application primitive, still invoked by Call.
 /// The first effective argument must have a concrete FuncSort; the remaining
@@ -967,9 +973,10 @@ pub struct PythonCallable {
     pub mutates: ::core::option::Option<u32>,
 }
 /// Ordered surface parameter. Fixed core inputs occupy [0, n). If the signature
-/// has varargs, one logical tail slot n represents all varargs; it must be last
-/// in surface order and have no default. FunctionApplication has fixed slot 0
-/// plus tail slot 1, whose heterogeneous sorts come from the actual FuncSort.
+/// has a nonempty varargs pattern, one logical tail slot n represents the whole
+/// flat tail, not one slot per pattern position. It must be last in surface
+/// order, have no default, and cannot be a receiver. FunctionApplication has
+/// fixed slot 0 plus tail slot 1, whose heterogeneous sorts come from the actual FuncSort.
 /// No redundant varargs flag or generic expression template is introduced.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct PythonParameter {

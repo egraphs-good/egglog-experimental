@@ -115,7 +115,7 @@ class BindingSchemaTests(unittest.TestCase):
                 Oneof("host_primitive", ir.HostPrimitive(name="host.C", typing=Oneof("signature", signature)))
                 for signature in [
                     ir.GenericSignature(inputs=[argument], output=0),
-                    ir.GenericSignature(varargs=argument, output=0),
+                    ir.GenericSignature(varargs=[argument], output=0),
                     ir.GenericSignature(type_params=["T"], output=0),
                 ]
             ],
