@@ -1,0 +1,23 @@
+# Python toolchain for the protobuf IR in proto/.
+#
+# buf.gen.yaml invokes the Python generator through uv. Buf and the Rust
+# generator are separate prerequisites; see proto/README.md. Nothing in the
+# existing Rust crate depends on this project.
+[project]
+name = "egglog-ir-codegen"
+version = "0.0.0"
+description = "Python codegen and validation for proto/egglog/v1."
+requires-python = ">=3.10"
+dependencies = [
+    # Buf's Python runtime. NOTE: PyPI classifies it Development Status :: 3 -
+    # Alpha. Chosen over the standard protobuf runtime for oneof pattern
+    # matching, which suits an IR that is one large variant type. The schema
+    # does not depend on this choice of Python runtime.
+    "protobuf-py>=0.5.0",
+    # Runs the CEL rules in the schema. 2.x pairs with protobuf-py; the standard
+    # protobuf runtime would need protovalidate==1.2.0 instead.
+    "protovalidate>=2.0.0",
+]
+
+[dependency-groups]
+dev = ["protoc-gen-py>=0.5.0"]
