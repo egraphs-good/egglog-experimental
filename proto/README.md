@@ -364,8 +364,14 @@ All requested observations remain in completion order, including inside loops
 and with profiling off. Each output has a `CommandLocation`: a static command
 path plus one zero-based iteration coordinate per enclosing loop. Errors locate
 the innermost active command independently of their most specific source span.
+Source fallback is expression, action, rule, then active command.
 A failed loop has no outcome, but its completed observations and earlier effects
 remain; execution and termination semantics are unchanged.
+
+`PrintedFunction.table` identifies rows whose argument/output cells are ordinary
+extracted values; relation outputs are Unit. Any cell without finite extraction
+fails the whole command. Table statistics pair each exact response sort reference
+with its distinct-value count, in input order followed by output.
 
 Opt-in `ProfileSummary` aggregates by static `Run` site and response-local rule
 occurrence. It counts entered invocations and retains no per-iteration history.

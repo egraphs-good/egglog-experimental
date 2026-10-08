@@ -116,7 +116,7 @@ pub struct Span {
 /// Sorts are acyclic through HostSort.args and FuncSort.params/result. CEL
 /// checks direct indices, not acyclicity or recursive variable scope.
 /// References do not declare sorts: resolve equality names and host families
-/// against local declarations, installed definitions or ambient host families.
+/// against local declarations, installed definitions or ambient host definitions.
 /// Missing names and kind/arity mismatches are errors. Builtin references do
 /// not require explicit descriptor declarations. Response references resolve
 /// against the associated handle; their arenas do not redeclare definitions.
@@ -348,7 +348,7 @@ pub struct Union {
 ///
 /// For Node.call, the enclosing node's sort matches the result; relation calls
 /// use Unit. Relation calls are restricted to row positions: a query fact,
-/// `Action.term`, `Action.delete`, or `FunctionRow.call`. They cannot be value
+/// `Action.term`, or `Action.delete`. They cannot be value
 /// arguments, `Set.value`, `Union` members, lambda captures/results, or deferred code.
 /// The restriction applies to installed and ambient names as well as local
 /// declarations. A relation row is the bare `Call` node itself; see `Union`
@@ -1719,8 +1719,8 @@ pub struct Error {
     /// Engine text, formatted for humans. NEVER parsed; wording is not contract.
     #[prost(string, tag = "2")]
     pub message: ::prost::alloc::string::String,
-    /// Most specific known user-source origin (e.g. failing expression, then
-    /// rule); fall back to the active command's span. Absent if none is known,
+    /// Most specific known user-source origin: failing expression, then Action,
+    /// then rule; fall back to the active command's span. Absent if none is known,
     /// never represented by a fabricated zero offset.
     #[prost(message, optional, tag = "3")]
     pub span: ::core::option::Option<Span>,
@@ -1917,13 +1917,13 @@ pub struct PrintedFunction {
 /// One extracted table row. A relation row's output is `PrimitiveValue.unit`.
 /// Every argument and output has finite extraction; an unavailable cell makes
 /// the entire PrintFunction command fail instead of omitting or marking a row.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+/// The enclosing PrintedFunction.table identifies the table. Cells are ordinary
+/// values, not a synthetic row-position Call or a re-evaluated table lookup.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct FunctionRow {
-    /// Call with extracted arguments.
-    ///
-    /// index into `RunProgramResponse.nodes`
-    #[prost(uint32, tag = "1")]
-    pub call: u32,
+    /// indices into `RunProgramResponse.nodes`
+    #[prost(uint32, repeated, tag = "1")]
+    pub args: ::prost::alloc::vec::Vec<u32>,
     /// index into `RunProgramResponse.nodes`
     #[prost(uint32, tag = "2")]
     pub output: u32,
@@ -1936,21 +1936,27 @@ pub struct TableStatsResult {
     #[prost(message, repeated, tag = "1")]
     pub stats: ::prost::alloc::vec::Vec<TableStats>,
 }
-/// Column statistics, including the output column.
+/// Per-column statistics in input declaration order, then output (Unit for a
+/// relation). PairOutDegree indices address this columns list.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct TableStats {
     #[prost(string, tag = "1")]
     pub table: ::prost::alloc::string::String,
     #[prost(uint64, tag = "2")]
     pub rows: u64,
-    /// Column sort names in order, including the output.
-    #[prost(string, repeated, tag = "3")]
-    pub column_sorts: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
-    /// Distinct values in column order.
-    #[prost(uint64, repeated, tag = "4")]
-    pub distinct_counts: ::prost::alloc::vec::Vec<u64>,
+    #[prost(message, repeated, tag = "3")]
+    pub columns: ::prost::alloc::vec::Vec<ColumnStats>,
     #[prost(message, repeated, tag = "5")]
     pub out_degrees: ::prost::alloc::vec::Vec<PairOutDegree>,
+}
+/// Exact column type and its distinct-value count; no textual type reconstruction.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ColumnStats {
+    /// index into `RunProgramResponse.sorts`
+    #[prost(uint32, tag = "1")]
+    pub sort: u32,
+    #[prost(uint64, tag = "2")]
+    pub distinct_count: u64,
 }
 /// Every ordered pair of distinct columns, plus output -> combined inputs
 /// for tables with at least two input columns.

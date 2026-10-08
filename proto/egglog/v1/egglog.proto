@@ -91,10 +91,10 @@ message Program {
       ".all(i, i < uint(size(this.sorts)) && !has(this.sorts[int(i)].var)))"
   };
   option (buf.validate.message).cel = {
-    id: "program.lambda_signature"
-    message: "lambdas require a function sort with non-variable parameter/result roots"
+    id: "program.function_value_signature"
+    message: "function values require a function sort with non-variable parameter/result roots"
     expression:
-      "this.nodes.all(n, !has(n.primitive_value.lambda) || "
+      "this.nodes.all(n, !(has(n.primitive_value.lambda) || has(n.primitive_value.partial_call)) || "
       "(n.sort_id < uint(size(this.sorts)) && has(this.sorts[int(n.sort_id)].func) && "
       "[this.sorts[int(n.sort_id)].func].all(f, (f.params + [f.result]).all(i, "
       "i < uint(size(this.sorts)) && !has(this.sorts[int(i)].var)))))"
@@ -317,7 +317,7 @@ message Span {
 // Sorts are acyclic through HostSort.args and FuncSort.params/result. CEL
 // checks direct indices, not acyclicity or recursive variable scope.
 // References do not declare sorts: resolve equality names and host families
-// against local declarations, installed definitions or ambient host families.
+// against local declarations, installed definitions or ambient host definitions.
 // Missing names and kind/arity mismatches are errors. Builtin references do
 // not require explicit descriptor declarations. Response references resolve
 // against the associated handle; their arenas do not redeclare definitions.
@@ -521,7 +521,7 @@ message Union {
 //
 // For Node.call, the enclosing node's sort matches the result; relation calls
 // use Unit. Relation calls are restricted to row positions: a query fact,
-// `Action.term`, `Action.delete`, or `FunctionRow.call`. They cannot be value
+// `Action.term`, or `Action.delete`. They cannot be value
 // arguments, `Set.value`, `Union` members, lambda captures/results, or deferred code.
 // The restriction applies to installed and ambient names as well as local
 // declarations. A relation row is the bare `Call` node itself; see `Union`
@@ -1830,11 +1830,28 @@ message RunProgramResponse {
       ".all(i, i < uint(size(this.sorts))))"
   };
   option (buf.validate.message).cel = {
+    id: "run_program_response.function_value_signature"
+    message: "function values require a function sort"
+    expression:
+      "this.nodes.all(n, !(has(n.primitive_value.lambda) || has(n.primitive_value.partial_call)) || "
+      "(n.sort_id < uint(size(this.sorts)) && has(this.sorts[int(n.sort_id)].func)))"
+  };
+  option (buf.validate.message).cel = {
     id: "run_program_response.empty_union_eq_sort"
     message: "an empty union requires an equality sort"
     expression:
       "this.nodes.all(n, !has(n.union) || size(n.union.members) > 0 || "
       "(n.sort_id < uint(size(this.sorts)) && has(this.sorts[int(n.sort_id)].eq)))"
+  };
+  option (buf.validate.message).cel = {
+    id: "run_program_response.table_output_refs_in_range"
+    message: "printed cells and column sorts must index the response arenas"
+    expression:
+      "this.outputs.all(o, "
+      "(!has(o.printed_function) || o.printed_function.rows.all(r, "
+      "(r.args + [r.output]).all(i, i < uint(size(this.nodes))))) && "
+      "(!has(o.table_stats) || o.table_stats.stats.all(t, "
+      "t.columns.all(c, c.sort < uint(size(this.sorts))))))"
   };
   option (buf.validate.message).cel = {
     id: "run_program_response.rule_refs_in_range"
@@ -1934,8 +1951,8 @@ message Error {
   // Engine text, formatted for humans. NEVER parsed; wording is not contract.
   string message = 2 [(buf.validate.field).string.min_len = 1];
 
-  // Most specific known user-source origin (e.g. failing expression, then
-  // rule); fall back to the active command's span. Absent if none is known,
+  // Most specific known user-source origin: failing expression, then Action,
+  // then rule; fall back to the active command's span. Absent if none is known,
   // never represented by a fabricated zero offset.
   Span span = 3;
 
@@ -2184,9 +2201,10 @@ message PrintedFunction {
 // One extracted table row. A relation row's output is `PrimitiveValue.unit`.
 // Every argument and output has finite extraction; an unavailable cell makes
 // the entire PrintFunction command fail instead of omitting or marking a row.
+// The enclosing PrintedFunction.table identifies the table. Cells are ordinary
+// values, not a synthetic row-position Call or a re-evaluated table lookup.
 message FunctionRow {
-  // Call with extracted arguments.
-  uint32 call = 1; // index into `RunProgramResponse.nodes`
+  repeated uint32 args = 1 [packed = true]; // indices into `RunProgramResponse.nodes`
   uint32 output = 2; // index into `RunProgramResponse.nodes`
   bool subsumed = 3;
 }
@@ -2196,15 +2214,19 @@ message TableStatsResult {
   repeated TableStats stats = 1;
 }
 
-// Column statistics, including the output column.
+// Per-column statistics in input declaration order, then output (Unit for a
+// relation). PairOutDegree indices address this columns list.
 message TableStats {
   string table = 1;
   uint64 rows = 2;
-  // Column sort names in order, including the output.
-  repeated string column_sorts = 3 [packed = false];
-  // Distinct values in column order.
-  repeated uint64 distinct_counts = 4 [packed = true];
+  repeated ColumnStats columns = 3;
   repeated PairOutDegree out_degrees = 5;
+}
+
+// Exact column type and its distinct-value count; no textual type reconstruction.
+message ColumnStats {
+  uint32 sort = 1; // index into `RunProgramResponse.sorts`
+  uint64 distinct_count = 2;
 }
 
 // Every ordered pair of distinct columns, plus output -> combined inputs
