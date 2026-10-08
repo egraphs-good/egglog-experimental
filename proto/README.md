@@ -329,6 +329,12 @@ resource request: absent selects receiver policy, zero requests automatic
 parallelism, positive requests that count; unsupported requests fail creation.
 Resources are not exported.
 
+The current byte adapter honors this thread request using the native per-egraph
+configuration API; clones retain that configuration. Wasm rejects counts above
+one. An absent field leaves the native default unchanged. Creation's existing
+i64 cost-sort and no-declaration limits still apply; native thread-pool resource
+allocation behavior is unchanged.
+
 Restore by remapping C's reachable closed sort graph and needed sort declarations
 into a creation request, then executing the exported Program on that fresh handle
 with compatible host capabilities. Unrelated generic signature patterns may stay

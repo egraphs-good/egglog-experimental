@@ -2295,6 +2295,76 @@ fn creation_rejects_unresolved_sorts_and_profile_off_is_explicit() {
 }
 
 #[test]
+fn creation_threads_execute_and_preserve_clone_and_error_prefixes() {
+    for threads in [0, 1, 2] {
+        if cfg!(target_family = "wasm") && threads > 1 {
+            continue;
+        }
+        let mut engine = Engine::default();
+        let request = pb::CreateEGraphRequest {
+            sorts: fixture().sorts[..1].to_vec(),
+            options: Some(pb::EGraphOptions { cost_sort: Some(0) }),
+            threads: Some(threads),
+            ..Default::default()
+        };
+        let bytes = engine.create(&request.encode_to_vec()).unwrap();
+        let id = pb::CreateEGraphResponse::decode(bytes.as_slice())
+            .unwrap()
+            .egraph_id;
+        assert_eq!(run(&mut engine, id, fixture()).error, None);
+        let bytes = engine
+            .clone_egraph(&pb::CloneEGraphRequest { egraph_id: id }.encode_to_vec())
+            .unwrap();
+        let clone = pb::CloneEGraphResponse::decode(bytes.as_slice())
+            .unwrap()
+            .egraph_id;
+        let mut prefix = fixture();
+        prefix.declarations.clear();
+        prefix.rules.clear();
+        prefix.rulesets.clear();
+        prefix.commands = vec![
+            prefix.commands[2].clone(),
+            pb::Command {
+                kind: Some(pb::command::Kind::Action(pb::Action {
+                    kind: Some(pb::action::Kind::Panic("thread prefix".into())),
+                    ..Default::default()
+                })),
+                ..Default::default()
+            },
+            prefix.commands[0].clone(),
+        ];
+        let Some(pb::command::Kind::Action(pb::Action {
+            kind: Some(pb::action::Kind::Set(set)),
+            ..
+        })) = &mut prefix.commands[0].kind
+        else {
+            unreachable!()
+        };
+        set.value = Some(2); // current := 30, then panic, never current := 10.
+        let failed = run(&mut engine, id, prefix.clone());
+        assert_eq!(failed.error.unwrap().location.unwrap().path, [1]);
+        prefix.commands = vec![pb::Command {
+            kind: Some(pb::command::Kind::Extract(pb::Extract {
+                roots: vec![4],
+                variants: 1,
+                extractor: pb::Extractor::Tree.into(),
+                ..Default::default()
+            })),
+            ..Default::default()
+        }];
+        for (handle, expected) in [(id, "30"), (clone, "20")] {
+            let response = run(&mut engine, handle, prefix.clone());
+            assert_eq!(response.error, None);
+            let Some(pb::command_output::Kind::Extraction(result)) = &response.outputs[0].kind
+            else {
+                unreachable!()
+            };
+            assert_eq!(value(&response, result.roots[0].variants[0].term), expected);
+        }
+    }
+}
+
+#[test]
 fn malformed_bytes_and_invalid_programs_do_not_mutate() {
     let mut engine = Engine::default();
     let id = create(&mut engine);
