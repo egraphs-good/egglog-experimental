@@ -942,6 +942,7 @@ pub struct PythonBindings {
 /// PROPERTY has only a receiver; CLASS_VARIABLE is a nullary expression view.
 /// CONSTANT is an ownerless named expression (C, not C()), backed by a nullary
 /// concrete core signature. It has no receiver, parameters or mutated input.
+/// Its path is nonempty, but its final name may be empty; qualifiers stay nonempty.
 /// It does not change declaration semantics or evaluate a body at installation
 /// or export. FUNCTION stays callable even when its core signature is nullary.
 #[derive(Clone, PartialEq, ::prost::Message)]

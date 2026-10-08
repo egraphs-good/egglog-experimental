@@ -60,9 +60,41 @@ class BindingSchemaTests(unittest.TestCase):
         self.assertNotEqual(function, constant)
         self.assertNotEqual(function.to_binary(), constant.to_binary())
 
-    def test_constant_has_only_a_nonempty_qualified_path(self):
+    def test_constant_preserves_an_empty_final_name(self):
+        for path in [[""], ["example", ""]]:
+            with self.subTest(path=path):
+                program = constant_program(Oneof("function", ir.Function(name="C", output=0)), path=path)
+                validate(program)
+                decoded = ir.Program.from_binary(program.to_binary())
+                self.assertEqual(decoded, program)
+                self.assertEqual(decoded.declarations[1].bindings.python.views[0].path, path)
+
+    def test_other_python_forms_keep_nonempty_path_components(self):
+        views = [
+            ir.PythonCallable(kind=ir.PythonCallKind.FUNCTION, path=[""]),
+            ir.PythonCallable(kind=ir.PythonCallKind.FUNCTION, path=["example", ""]),
+            ir.PythonCallable(
+                kind=ir.PythonCallKind.CLASS_VARIABLE, path=[""],
+                owner=ir.BindingOwner(kind=Oneof("sort", 1)),
+            ),
+            ir.PythonCallable(
+                kind=ir.PythonCallKind.METHOD, path=[""], receiver=0,
+                owner=ir.BindingOwner(kind=Oneof("sort", 1)),
+            ),
+        ]
+        for view in views:
+            with self.subTest(view=view), self.assertRaises(ValidationError):
+                validate(view)
+        # Initializers still derive their name and deliberately have no path.
+        validate(ir.PythonCallable(
+            kind=ir.PythonCallKind.INITIALIZER,
+            owner=ir.BindingOwner(kind=Oneof("sort", 1)),
+        ))
+
+    def test_constant_has_a_nonempty_path_and_nonempty_qualifiers(self):
         invalid = [
-            {"path": []}, {"path": ["example", ""]},
+            {"path": []}, {"path": ["", "C"]}, {"path": ["", ""]},
+            {"path": ["example", "", "C"]}, {"path": ["example", "", ""]},
             {"owner": ir.BindingOwner(kind=Oneof("sort", 1))},
             {"receiver": 0},
             {"params": [ir.PythonParameter(core_input=0, name="unused")]},

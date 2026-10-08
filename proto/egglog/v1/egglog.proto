@@ -1055,9 +1055,17 @@ message PythonBindings {
 // PROPERTY has only a receiver; CLASS_VARIABLE is a nullary expression view.
 // CONSTANT is an ownerless named expression (C, not C()), backed by a nullary
 // concrete core signature. It has no receiver, parameters or mutated input.
+// Its path is nonempty, but its final name may be empty; qualifiers stay nonempty.
 // It does not change declaration semantics or evaluate a body at installation
 // or export. FUNCTION stays callable even when its core signature is nullary.
 message PythonCallable {
+  option (buf.validate.message).cel = {
+    id: "python_callable.path_components"
+    message: "only a constant's final name may be an empty path component"
+    expression:
+      "this.path.filter(p, p == '').size() == "
+      "(this.kind == 7 && size(this.path) > 0 && this.path[size(this.path)-1] == '' ? 1 : 0)"
+  };
   option (buf.validate.message).cel = {
     id: "python_callable.owner_and_receiver"
     message: "Python callable form determines owner and receiver presence"
@@ -1088,7 +1096,7 @@ message PythonCallable {
     defined_only: true
     not_in: [0]
   }];
-  repeated string path = 2 [(buf.validate.field).repeated.items.string.min_len = 1];
+  repeated string path = 2;
   BindingOwner owner = 3;
   optional uint32 receiver = 4; // fixed core input, not implicit Python self/cls
   repeated PythonParameter params = 5; // surface order, excluding receiver
