@@ -52,6 +52,9 @@ pub struct Engine {
 #[derive(Clone)]
 struct Session {
     graph: EGraph,
+    // Authored definitions and presentation/default closures, never execution ASTs.
+    definitions: pb::Program,
+    names: NativeNames,
     request: u64,
     rulesets: HashMap<String, String>,
     // Native rule identifiers are an adapter index, never authored identity.
@@ -129,6 +132,8 @@ impl Engine {
             self.next_id,
             Session {
                 graph,
+                definitions: pb::Program::default(),
+                names: NativeNames::default(),
                 request: 0,
                 rulesets: HashMap::new(),
                 origins: HashMap::new(),
@@ -253,13 +258,37 @@ impl Session {
         }
         let mut staged = self.clone();
         staged.request += 1;
-        for declaration in &program.declarations {
+        if staged.definitions.ir_version == 0 {
+            staged.definitions = staged.graph.type_info().builtin_catalog()?.definitions;
+        }
+        let added =
+            egglog::builtin::definitions::reconcile_declarations(program, &mut staged.definitions)?;
+        validate_private_names(program)?;
+        staged.names = project_names(program, &staged.definitions);
+        for (declaration, added) in program.declarations.iter().zip(&added) {
+            if !added {
+                continue;
+            }
+            let name = match &declaration.kind {
+                Some(pb::declaration::Kind::EqSort(s)) => &s.name,
+                Some(pb::declaration::Kind::Constructor(f)) => &f.name,
+                Some(pb::declaration::Kind::Function(f)) => &f.name,
+                _ => continue,
+            };
+            if staged.graph.get_sort_by_name(name).is_some()
+                || staged.graph.get_function(name).is_some()
+                || staged.graph.type_info().is_primitive(name)
+            {
+                return Err(format!("native declaration namespace collision: {name}").into());
+            }
+        }
+        for (declaration, added) in program.declarations.iter().zip(&added) {
+            if !added {
+                continue;
+            }
             if let Some(pb::declaration::Kind::EqSort(sort)) = &declaration.kind {
                 if sort.name.is_empty() {
                     return Err("equality sort name must not be empty".into());
-                }
-                if sort.bindings.is_some() || declaration.bindings.is_some() {
-                    return Err("presentation bindings are not supported yet".into());
                 }
                 let command = Command::Sort {
                     span: native_span(program, declaration.span.as_ref())?,
@@ -277,7 +306,6 @@ impl Session {
                     .map_err(|error| error.to_string())?;
             }
         }
-        validate_private_names(program)?;
         let materialized = materialize_sorts(program, &mut staged.graph)?;
         for (index, sort) in program.sorts.iter().enumerate() {
             native_span(program, sort.span.as_ref())?;
@@ -296,6 +324,23 @@ impl Session {
         }
         validate_host_declarations(program, &mut staged.graph)?;
         lower_vec_values(program)?;
+        // The canonical records above remain intact. The execution/rendering
+        // copy contains only genuinely new native declarations.
+        program.declarations = std::mem::take(&mut program.declarations)
+            .into_iter()
+            .zip(added)
+            .filter_map(|(d, added)| {
+                (added
+                    || matches!(
+                        d.kind,
+                        Some(
+                            pb::declaration::Kind::HostPrimitive(_)
+                                | pb::declaration::Kind::HostSortFamily(_)
+                        )
+                    ))
+                .then_some(d)
+            })
+            .collect();
         // Expression lowering detects invalid indices/cycles even in unused
         // arena entries; variables acquire their binder at each use below.
         for (index, node) in program.nodes.iter().enumerate() {
@@ -335,9 +380,6 @@ impl Session {
                 continue; // Already checked against the native catalog above.
             }
             let span = native_span(program, declaration.span.as_ref())?;
-            if declaration.bindings.is_some() {
-                return Err("presentation bindings are not supported yet".into());
-            }
             let command = match declaration.kind.as_ref().ok_or("missing declaration kind")? {
                 pb::declaration::Kind::EqSort(_) => continue,
                 pb::declaration::Kind::Constructor(constructor) => {
@@ -683,6 +725,7 @@ impl Session {
                     for variant in variants {
                         let term = encode_term(
                             &self.graph,
+                            &self.names,
                             &extracted.termdag,
                             variant.term,
                             &sort,
@@ -696,6 +739,7 @@ impl Session {
                         })?;
                         let cost_sort = encode_sort(
                             &self.graph,
+                            &self.names,
                             &self.graph.get_sort_by_name("i64").unwrap().clone(),
                             response,
                         )?;
@@ -745,7 +789,12 @@ impl Session {
                 let mut terms = extracted.terms.iter();
                 let mut cache = HashMap::new();
                 let mut output = pb::PrintedFunction {
-                    table: print.table.clone(),
+                    table: self
+                        .names
+                        .callables
+                        .get(&print.table)
+                        .unwrap_or(&print.table)
+                        .clone(),
                     rows: vec![],
                 };
                 for (_, _, subsumed) in rows {
@@ -762,6 +811,7 @@ impl Session {
                         })?;
                         cells.push(encode_term(
                             &self.graph,
+                            &self.names,
                             &extracted.termdag,
                             term.term,
                             sort,
@@ -863,6 +913,109 @@ impl Session {
         }
         Ok(())
     }
+}
+
+// Derived reverse indexes only; the stored generated declarations retain their
+// public names. Never decode arbitrary native symbols merely by their prefix.
+#[derive(Clone, Default)]
+struct NativeNames {
+    sorts: HashMap<String, String>,
+    callables: HashMap<String, String>,
+}
+
+// Namespace tags separate sorts, callables, and query leaves. Hex is injective
+// over UTF-8 and always a native source atom, including for punctuation names.
+fn native_name(namespace: &str, logical: &str) -> String {
+    use std::fmt::Write;
+    let mut result = format!("__egglog_proto_{namespace}_");
+    for byte in logical.bytes() {
+        write!(result, "{byte:02x}").unwrap();
+    }
+    result
+}
+
+// Project the ephemeral execution copy, not the canonical declaration store.
+// Unknown user references are projected too: they must not access a physical
+// symbol by spelling it, and native validation will reject the unbound name.
+fn project_names(program: &mut pb::Program, definitions: &pb::Program) -> NativeNames {
+    let mut names = NativeNames::default();
+    let mut host_keys = HashSet::new();
+    for declaration in &definitions.declarations {
+        match &declaration.kind {
+            Some(pb::declaration::Kind::EqSort(s)) => {
+                names
+                    .sorts
+                    .insert(native_name("sort", &s.name), s.name.clone());
+            }
+            Some(pb::declaration::Kind::Constructor(f)) => {
+                names
+                    .callables
+                    .insert(native_name("call", &f.name), f.name.clone());
+            }
+            Some(pb::declaration::Kind::Function(f)) => {
+                names
+                    .callables
+                    .insert(native_name("call", &f.name), f.name.clone());
+            }
+            Some(pb::declaration::Kind::HostPrimitive(p)) => {
+                host_keys.insert(p.name.as_str());
+            }
+            _ => (),
+        }
+    }
+    let project_call = |name: &mut String| {
+        if !host_keys.contains(name.as_str()) {
+            *name = native_name("call", name);
+        }
+    };
+    for sort in &mut program.sorts {
+        if let Some(pb::sort::Kind::Eq(name)) = &mut sort.kind {
+            *name = native_name("sort", name);
+        }
+    }
+    for declaration in &mut program.declarations {
+        match &mut declaration.kind {
+            Some(pb::declaration::Kind::EqSort(s)) => s.name = native_name("sort", &s.name),
+            Some(pb::declaration::Kind::Constructor(f)) => f.name = native_name("call", &f.name),
+            Some(pb::declaration::Kind::Function(f)) => f.name = native_name("call", &f.name),
+            _ => (),
+        }
+    }
+    for node in &mut program.nodes {
+        if let Some(pb::node::Kind::Call(call)) = &mut node.kind {
+            project_call(&mut call.func);
+        }
+    }
+    for command in &mut program.commands {
+        if let Some(pb::command::Kind::PrintFunction(print)) = &mut command.kind {
+            project_call(&mut print.table);
+        }
+    }
+    for action in program
+        .commands
+        .iter_mut()
+        .filter_map(|c| match &mut c.kind {
+            Some(pb::command::Kind::Action(a)) => Some(a),
+            _ => None,
+        })
+        .chain(program.rules.iter_mut().flat_map(|r| match &mut r.kind {
+            Some(pb::rule_decl::Kind::Rule(r)) => r.head.as_mut_slice(),
+            _ => &mut [],
+        }))
+    {
+        match &mut action.kind {
+            Some(pb::action::Kind::Set(set)) => {
+                if let Some(call) = &mut set.target {
+                    project_call(&mut call.func);
+                }
+            }
+            Some(pb::action::Kind::Delete(call) | pb::action::Kind::Subsume(call)) => {
+                project_call(&mut call.func)
+            }
+            _ => (),
+        }
+    }
+    names
 }
 
 fn structural_sort_name(
@@ -1145,19 +1298,18 @@ fn signature(
 }
 
 fn validate_host_declarations(program: &pb::Program, graph: &mut EGraph) -> Result<(), String> {
+    // Presentation/defaults were reconciled against the full staged context.
+    // Provider checks must not revalidate saved code in a pruned namespace.
     for declaration in &program.declarations {
         match &declaration.kind {
             Some(pb::declaration::Kind::HostPrimitive(primitive)) => {
-                graph.type_info().check_builtin(
-                    program,
-                    primitive,
-                    declaration.bindings.as_ref(),
-                )?;
+                graph
+                    .type_info()
+                    .check_builtin_signature(program, primitive)?;
             }
             Some(pb::declaration::Kind::HostSortFamily(family)) => {
                 if family.name == "Vec" {
-                    let catalog = graph.type_info().builtin_catalog()?;
-                    if family.bindings.is_some() || declaration.bindings.is_some() || !catalog.definitions.declarations.iter().any(|d| matches!(&d.kind, Some(pb::declaration::Kind::HostSortFamily(expected)) if expected == family)) {
+                    if family.arity != 1 || declaration.bindings.is_some() {
                         return Err("unsupported or incompatible Vec family descriptor".into());
                     }
                     continue;
@@ -1166,7 +1318,6 @@ fn validate_host_declarations(program: &pb::Program, graph: &mut EGraph) -> Resu
                     .get_sort_by_name(&family.name)
                     .ok_or_else(|| format!("unknown host sort family {}", family.name))?;
                 if family.arity != 0
-                    || family.bindings.is_some()
                     || declaration.bindings.is_some()
                     || sort.is_eq_sort()
                     || sort.is_container_sort()
@@ -1273,7 +1424,16 @@ fn facts(program: &pb::Program, indices: &[u32]) -> Result<Vec<Fact>, String> {
             )?));
         }
     }
-    Ok(result)
+    // Facts introduce query binders. Rename at this use, not in the arena:
+    // the same Var node may also be the special `old`/`new` of a merge.
+    Ok(result
+        .into_iter()
+        .map(|fact| {
+            fact.map_symbols(&mut |head| head, &mut |leaf: String| {
+                native_name("var", &leaf)
+            })
+        })
+        .collect())
 }
 
 fn lower_action(program: &pb::Program, action: &pb::Action) -> Result<Vec<Action>, String> {
@@ -1354,8 +1514,10 @@ fn lower_rule(
                 ruleset.into(),
                 ast::Rewrite {
                     span,
-                    lhs: expression(program, rewrite.lhs, &mut HashSet::new())?,
-                    rhs: expression(program, rewrite.rhs, &mut HashSet::new())?,
+                    lhs: expression(program, rewrite.lhs, &mut HashSet::new())?
+                        .map_symbols(&mut |h| h, &mut |v: String| native_name("var", &v)),
+                    rhs: expression(program, rewrite.rhs, &mut HashSet::new())?
+                        .map_symbols(&mut |h| h, &mut |v: String| native_name("var", &v)),
                     conditions: facts(program, &rewrite.conditions)?,
                     name: name.into(),
                 },
@@ -1404,7 +1566,8 @@ fn lower_rule(
                             .into_iter()
                             .flatten()
                             .collect(),
-                    ),
+                    )
+                    .map_symbols(&mut |h| h, &mut |v: String| native_name("var", &v)),
                     body: facts(program, &body.query)?,
                     name: name.into(),
                     ruleset: ruleset.into(),
@@ -1458,16 +1621,28 @@ fn check_variables(
 
 fn encode_sort(
     graph: &EGraph,
+    names: &NativeNames,
     sort: &ArcSort,
     response: &mut pb::RunProgramResponse,
 ) -> Result<u32, egglog::Error> {
-    graph
-        .export_sort(sort, &mut response.sorts)
+    let mut sorts = vec![];
+    let index = graph
+        .export_sort(sort, &mut sorts)
+        .map_err(egglog::Error::ExtractError)?;
+    for sort in &mut sorts {
+        if let Some(pb::sort::Kind::Eq(name)) = &mut sort.kind
+            && let Some(logical) = names.sorts.get(name)
+        {
+            *name = logical.clone();
+        }
+    }
+    egglog::builtin::import_sort(&sorts, index, &mut response.sorts)
         .map_err(egglog::Error::ExtractError)
 }
 
 fn encode_term(
     graph: &EGraph,
+    names: &NativeNames,
     terms: &TermDag,
     term: TermId,
     sort: &ArcSort,
@@ -1491,7 +1666,7 @@ fn encode_term(
         Term::App(name, children)
             if (name == "vec-of" || name == "vec-empty") && sort.is_container_sort() =>
         {
-            let sort_id = encode_sort(graph, sort, response)?;
+            let sort_id = encode_sort(graph, names, sort, response)?;
             if !matches!(&response.sorts[sort_id as usize].kind, Some(pb::sort::Kind::Family(family)) if family.name == "Vec")
             {
                 return Err(egglog::Error::ExtractError("Vec term/sort mismatch".into()));
@@ -1499,7 +1674,7 @@ fn encode_term(
             let element = &sort.inner_sorts()[0];
             let elements = children
                 .iter()
-                .map(|child| encode_term(graph, terms, *child, element, response, cache))
+                .map(|child| encode_term(graph, names, terms, *child, element, response, cache))
                 .collect::<Result<_, _>>()?;
             pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
                 value: Some(pb::primitive_value::Value::Vec(pb::ValueList {
@@ -1517,10 +1692,12 @@ fn encode_term(
             let args = children
                 .iter()
                 .zip(&signature.input)
-                .map(|(child, sort)| encode_term(graph, terms, *child, sort, response, cache))
+                .map(|(child, sort)| {
+                    encode_term(graph, names, terms, *child, sort, response, cache)
+                })
                 .collect::<Result<_, _>>()?;
             pb::node::Kind::Call(pb::Call {
-                func: name.clone(),
+                func: names.callables.get(name).unwrap_or(name).clone(),
                 args,
             })
         }
@@ -1530,7 +1707,7 @@ fn encode_term(
             ));
         }
     };
-    let sort_id = encode_sort(graph, sort, response)?;
+    let sort_id = encode_sort(graph, names, sort, response)?;
     let index = response.nodes.len() as u32;
     response.nodes.push(pb::Node {
         sort_id,
@@ -1539,4 +1716,105 @@ fn encode_term(
     });
     cache.insert(key, index);
     Ok(index)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[derive(Clone)]
+    struct ForeignPrimitive(String);
+
+    impl egglog::Primitive for ForeignPrimitive {
+        fn name(&self) -> &str {
+            &self.0
+        }
+        fn get_type_constraints(
+            &self,
+            _: &ast::Span,
+        ) -> Box<dyn egglog::constraint::TypeConstraint> {
+            panic!("occupied provider must not be typechecked")
+        }
+    }
+
+    impl egglog::PurePrim for ForeignPrimitive {
+        fn apply<'a, 'db>(&self, _: egglog::PureState<'a, 'db>, _: &[Value]) -> Option<Value> {
+            panic!("occupied provider must not execute")
+        }
+    }
+
+    #[test]
+    fn foreign_physical_symbols_are_rejected_without_reuse_or_mutation() {
+        for namespace in ["sort", "call"] {
+            for foreign_kind in ["sort", "function", "primitive"] {
+                let name = native_name(namespace, "Public");
+                let mut graph = crate::new_experimental_egraph();
+                match foreign_kind {
+                    "sort" => {
+                        graph
+                            .parse_and_run_program(None, &format!("(sort {name})"))
+                            .unwrap();
+                    }
+                    "function" => {
+                        graph
+                            .parse_and_run_program(
+                                None,
+                                &format!("(function {name} () i64 :merge new) (set ({name}) 7)"),
+                            )
+                            .unwrap();
+                    }
+                    _ => graph.add_pure_primitive(ForeignPrimitive(name.clone()), None),
+                }
+                let session = Session {
+                    graph,
+                    definitions: pb::Program::default(),
+                    names: NativeNames::default(),
+                    request: 0,
+                    rulesets: HashMap::new(),
+                    origins: HashMap::new(),
+                };
+                let mut program = pb::Program {
+                    ir_version: 1,
+                    sorts: vec![pb::Sort {
+                        kind: Some(pb::sort::Kind::Family(pb::HostSort {
+                            name: "i64".into(),
+                            args: vec![],
+                        })),
+                        ..Default::default()
+                    }],
+                    declarations: vec![pb::Declaration {
+                        kind: Some(if namespace == "sort" {
+                            pb::declaration::Kind::EqSort(pb::EqSort {
+                                name: "Public".into(),
+                                ..Default::default()
+                            })
+                        } else {
+                            pb::declaration::Kind::Function(pb::Function {
+                                name: "Public".into(),
+                                output: 0,
+                                ..Default::default()
+                            })
+                        }),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                };
+                let error = session.prepare(&mut program).err().unwrap();
+                assert!(
+                    error
+                        .0
+                        .message
+                        .contains("native declaration namespace collision")
+                );
+                assert_eq!(session.definitions, pb::Program::default());
+                if foreign_kind == "function" {
+                    session
+                        .graph
+                        .clone()
+                        .parse_and_run_program(None, &format!("(check (= ({name}) 7))"))
+                        .unwrap();
+                }
+            }
+        }
+    }
 }

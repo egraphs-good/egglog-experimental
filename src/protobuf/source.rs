@@ -521,7 +521,13 @@ impl Source {
     ) -> Result<pb::Call, String> {
         let name = match function {
             ResolvedCall::Func(function) => function.name.clone(),
-            ResolvedCall::Primitive(primitive) => primitive.export_builtin(&mut self.program)?,
+            ResolvedCall::Primitive(primitive) => {
+                let key = primitive.export_builtin(&mut self.program)?;
+                self.graph
+                    .type_info()
+                    .export_builtin_definition(&key, &mut self.program)?;
+                key
+            }
         };
         Ok(pb::Call {
             func: name,
@@ -642,7 +648,17 @@ pub fn render(program: &pb::Program) -> Result<String, TransportError> {
     if program.sorts.iter().any(|sort| matches!(&sort.kind, Some(pb::sort::Kind::Family(family)) if !family.args.is_empty())) {
         return Err(TransportError("container phases require the stateful source Renderer".into()));
     }
-    render_prepared(program, vec![])
+    let mut definitions = crate::new_experimental_egraph()
+        .type_info()
+        .builtin_catalog()
+        .map_err(TransportError)?
+        .definitions;
+    egglog::builtin::definitions::reconcile_declarations(program, &mut definitions)
+        .map_err(TransportError)?;
+    validate_private_names(program).map_err(TransportError)?;
+    let mut lowered = program.clone();
+    project_names(&mut lowered, &definitions);
+    render_prepared(&lowered, vec![])
 }
 
 /// Stateful, typechecking-only renderer. Tracks structural sort declarations
@@ -656,6 +672,8 @@ impl Default for Renderer {
         Self {
             session: Session {
                 graph: crate::new_experimental_egraph(),
+                definitions: pb::Program::default(),
+                names: NativeNames::default(),
                 request: 0,
                 rulesets: HashMap::new(),
                 origins: HashMap::new(),
@@ -833,6 +851,13 @@ fn render_prepared(
                 ),
                 pb::command::Kind::Check(check) => {
                     commands.push(Command::Check(span, facts(program, &check.facts)?))
+                }
+                pb::command::Kind::PrintFunction(print) => {
+                    commands.push(Command::PrintFunction(
+                        span, print.table.clone(),
+                        if print.max_rows == 0 { None } else { Some(usize::try_from(print.max_rows).map_err(|_| "table row limit exceeds native usize")?) },
+                        None, ast::PrintFunctionMode::Default,
+                    ));
                 }
                 pb::command::Kind::Extract(extract)
                     if extract.extractor == i32::from(pb::Extractor::Tree)

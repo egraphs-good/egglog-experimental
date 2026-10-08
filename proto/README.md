@@ -79,7 +79,8 @@ signatures must be recursively closed. Creation and ordinary response sort
 arenas contain no variables; a nested exported `Program` may include signature
 patterns. CEL checks direct bounds, variable roots, and declared family uses.
 Recursive closedness, binder scope, signature matching, family resolution, and
-compatible descriptor resends remain semantic checks, not implemented yet.
+compatible descriptor resends are semantic checks. The executable subset below
+implements these for its supported scalar/Vec signatures and declarations.
 
 **Decided:** each core callable has one unique name across user and host
 definitions; the core does not select from same-name overloads. Frontends lower
@@ -143,7 +144,8 @@ Repeated same-name supplies in one Program are reconciled before interning;
 agreeing blocks are allowed. Compare referenced sort/default structures after
 arena remapping, without recursively comparing their presentation bindings.
 Default-root comparison preserves shared versus distinct `Union` occurrences.
-Runtime matching and language-name normalization remain unimplemented.
+The supported adapter declarations implement this runtime matching;
+target-language generation and name normalization remain frontend work.
 
 **Decided:** without a Python/Rust presentation block for a definition, generate
 plain symbolic types and free functions with API identifiers derived from core
@@ -158,7 +160,8 @@ rejects malformed individual bindings and conflicting resupply of one declaratio
 fixed language block. These defaults are derived output, not supplied bindings:
 they install or freeze no block, so later explicit bindings
 remain that language's first supply. The exact naming/normalization algorithm
-is undecided; high-level generators and runtime bindings checks are unimplemented.
+is undecided; high-level generation remains frontend work. Runtime checks for
+the bounded executable declaration/default subset are implemented below.
 
 Python views distinguish free functions, initializers, methods, class methods,
 properties, and class variables. Ordered parameter records give core-input
@@ -481,10 +484,18 @@ The current executable subset is deliberately limited:
 - Profile-enabled execution with command locations and compact run summaries.
 - Catalog-backed i64/f64 addition through distinct host definition keys.
 - Generic Vec empty/of/get, ordered Vec value payloads and extracted Vec data.
+- Compatible EqSort/Constructor/Function resupply, with canonical protobuf
+  declaration/default closures retained across requests and clones. Each
+  language block is fixed on its first supply; absent later blocks do not erase
+  it. References compare structurally, including shared Union default topology.
+- Python/Rust scalar type and addition views supplied by native registration;
+  intact user sort/callable views, including closed scalar/Vec initializer defaults.
+  Default calls are checked, never evaluated during installation/export. Actual
+  omitted-argument expansion remains the frontend's responsibility.
 
 Unsupported forms fail explicitly. These include profile-off (the native engine
 still collects timing data), action/nested/empty Union identities, other complex values
-and codecs, other primitive catalog mappings, relations, declaration/ruleset
+and codecs, other primitive catalog mappings, relations, ruleset
 resupply, anonymous/combined/shared rulesets, nondefault rule modes, schedulers,
 loops, snapshots, proof requests, merge table reads, and custom cost models.
 Expressions deeper than 256 nodes or requiring more than 65,536 native tree
@@ -495,6 +506,18 @@ snapshots, and Python/Rust/Luminal migration remain unimplemented.
 The focused regression is `cargo test --test protobuf`. It compares the native
 fixture with decoded results and checks invalid-byte controls and post-failure
 state. No frontend suite is counted as migrated by these tests.
+
+`cargo run --example export_builtin_catalog -- catalog.pb` constructs the normal
+provider-registered native engine at generation time and writes its canonical
+`Program` bytes. It prints the existing incomplete-registration inventory to
+stderr. Frontend packages can ship that resource and decode it without creating
+an EGraph during authoring. Pin the generating core/experimental/leaf revisions;
+the resource can be checked against the runtime provider by submitting its
+declarations in an empty-command request. This is a partial catalog, not Freeze.
+Lambda/partial-call defaults, other value codecs and unsupported execution forms
+remain explicit gaps; scalar/Vec default checking does not establish their
+compatibility. Native text rendering preserves executable semantics, not Python
+or Rust presentation metadata.
 
 ### Initial source producer
 
@@ -532,29 +555,43 @@ includes, multi-command command macros and other extension commands are separate
 gates.
 
 `protobuf::source::render` converts the producer's decoded Programs back to
-native source, reusing the adapter's expression/action/rule lowering. The source
-renderer rejects identifiers or expression actions whose spelling changes their
-meaning in the native parser (for example a function call printed as `panic`).
+native source, reusing the adapter's expression/action/rule lowering. User sorts
+and callables use deterministic private native symbols, so a logical callable
+named `panic` is still rendered as a call rather than a native Panic action.
+Identifiers outside the projected namespaces (such as ruleset names) must still
+be valid native source atoms. Rendering preserves execution semantics, not
+logical declaration names or presentation metadata when the text is reimported.
 The tests execute that rendered source after reparsing and compare observations with
 the byte-adapter path. They also cover ordered captures, failure prefixes and
 mutated/corrupt byte controls. Run `cargo test --test protobuf source_`; this is a
 small semantic roundtrip checkpoint, not migration of the source corpus.
 
 Container phases use `protobuf::source::Renderer::default()` and its `render`
-method, retaining the type/definition state across phases. It emits each closed
+method, retaining the type/definition state across phases. Compatible declaration
+resupplies are checked but not emitted as duplicate native declarations. It emits each closed
 structural Vec sort once, including children before parents; rendering executes
 no user actions. The stateless `render` entrypoint retains the scalar subset
 and explicitly rejects container phases. Native source resolution remains
 nominal, so two source aliases for Vec<i64> do not become interchangeable before
 export; after resolution both map to one structural wire sort.
 
+The wire sort and callable namespaces remain separate even for the same logical
+name and across requests. All user equality sorts and constructor/function names
+are projected with distinct namespace tags and UTF-8 hex encoding; host
+definition keys retain exact-key dispatch. Query variables are renamed at their
+binder use, independently of merge `old`/`new`. Canonical declarations and binding
+defaults retain their logical names. Extraction, nested returned sorts and table
+results reverse only adapter-owned names before wire interning. Foreign occupied
+native symbols reject preparation instead of being reused or overwritten.
+
 The adapter currently reserves `__egglog_proto_` and `__egglog_instance_` for
-derived native sort/instance names. Authored equality-sort and callable
+derived native sort/callable/variable/instance names. Authored equality-sort and callable
 declarations using those prefixes fail before installation or effects. This is
-a temporary valid-name conformance gap, not a final naming policy; systematic
-public/private name separation remains required. Do not rely on an unlikely
-prefix to avoid collisions. Reordered wire sort arenas and cloned sessions do
-not change the structural sort identity.
+a temporary valid-name conformance gap, not a final naming policy; removing this
+restriction remains required. Native diagnostic prose may expose private names;
+structured diagnostic name translation is also unfinished. Do not rely on an
+unlikely prefix to avoid collisions. Reordered wire sort arenas, declaration
+arrival order and cloned sessions do not change derived native identity.
 
 ### Initial engine-owned builtin definitions
 

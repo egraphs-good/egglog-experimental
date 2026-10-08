@@ -28,5 +28,10 @@ Check out the crate documentation (built locally) for the current list of implem
 Releases are coordinated with compatible releases of egglog.
 
 The [protobuf IR draft](proto/README.md) explores a shared representation for
-text, Python, and Rust frontends. It is a design proposal, not an implemented
-engine interface.
+text, Python, and Rust frontends. A bounded in-process byte adapter and source
+producer are implemented; complete frontend conformance remains unfinished.
+Wire sort/callable namespaces and logical result names are preserved through
+derived native names; rendered source uses those private implementation names.
+`cargo run --example export_builtin_catalog -- catalog.pb` exports native-owned
+definitions and scalar presentation records for frontend generation, with the
+remaining catalog gaps printed separately. It is not a Freeze snapshot.
