@@ -134,31 +134,26 @@ message Program {
       "(has(v.trait_impl) ? v.trait_impl.args.map(a, a.sort) : [])).all(i, "
       "i < uint(size(this.sorts)) && (!has(this.sorts[int(i)].var) || this.sorts[int(i)].var < uint(n))))))"
   };
-  // Same-kind compatible resends are allowed; equality/family names cannot
-  // collide even when no arena entry uses either definition.
+  // Nominal equality sorts and host families have distinct name spaces.
+  // Same-family resends must agree on arity even without an arena use.
   option (buf.validate.message).cel = {
     id: "program.sort_declarations"
-    message: "sort names must have one kind and host-family arity"
+    message: "same-name host-family declarations must agree on arity"
     expression:
-      "this.declarations.all(d, "
-      "(!has(d.eq_sort) || this.declarations.all(e, "
-      "!has(e.host_sort_family) || d.eq_sort.name != e.host_sort_family.name)) && "
-      "(!has(d.host_sort_family) || this.declarations.all(e, !has(e.host_sort_family) || "
+      "this.declarations.all(d, !has(d.host_sort_family) || "
+      "this.declarations.all(e, !has(e.host_sort_family) || "
       "d.host_sort_family.name != e.host_sort_family.name || "
-      "d.host_sort_family.arity == e.host_sort_family.arity)))"
+      "d.host_sort_family.arity == e.host_sort_family.arity))"
   };
   // Ambient/installed resolution remains normative. Check local declarations
   // against direct references/applications, including signature patterns.
   option (buf.validate.message).cel = {
     id: "program.sort_uses"
-    message: "sort references must agree with declared kinds and family arities"
+    message: "host-family applications must agree with declared family arities"
     expression:
-      "this.declarations.all(d, this.sorts.all(s, "
-      "(!has(d.host_sort_family) || "
-      "((!has(s.family) || s.family.name != d.host_sort_family.name || "
-      "uint(size(s.family.args)) == d.host_sort_family.arity) && "
-      "(!has(s.eq) || s.eq != d.host_sort_family.name))) && "
-      "(!has(d.eq_sort) || !has(s.family) || s.family.name != d.eq_sort.name)))"
+      "this.declarations.all(d, !has(d.host_sort_family) || "
+      "this.sorts.all(s, !has(s.family) || s.family.name != d.host_sort_family.name || "
+      "uint(size(s.family.args)) == d.host_sort_family.arity))"
   };
   option (buf.validate.message).cel = {
     id: "program.empty_union_eq_sort"
@@ -317,8 +312,10 @@ message Span {
 // Sorts are acyclic through HostSort.args and FuncSort.params/result. CEL
 // checks direct indices, not acyclicity or recursive variable scope.
 // References do not declare sorts: resolve equality names and host families
-// against local declarations, installed definitions or ambient host definitions.
-// Missing names and kind/arity mismatches are errors. Builtin references do
+// against local declarations, installed definitions or ambient host definitions
+// in their respective namespaces: eq only resolves EqSort, family only resolves
+// HostSortFamily. Equal name spellings do not identify or substitute these kinds.
+// Missing names and family-arity mismatches are errors. Builtin references do
 // not require explicit descriptor declarations. Response references resolve
 // against the associated handle; their arenas do not redeclare definitions.
 message Sort {
@@ -763,9 +760,10 @@ message SetCost {
 // Comparison must preserve Union sharing/identity topology; ordinary syntax
 // sharing may differ. One empty Union reused twice is not two fresh Unions.
 // Callable names are unique across Constructor, Function, Relation, Primitive
-// and HostPrimitive, including ambient definitions. HostSortFamily names occupy
-// the sort namespace with EqSort, separate from callable names. Compatible
-// resends retain the definition; conflicting names never shadow definitions.
+// and HostPrimitive, including ambient definitions. EqSort, HostSortFamily and
+// callable names occupy three distinct namespaces, selected by existing kind
+// tags. Equal spellings may coexist across namespaces. Compatible resends retain
+// the definition; conflicts within a namespace never shadow definitions.
 // Host descriptor compatibility compares family arity or primitive typing form
 // and structural signature, including ordered binder positions. Parameter
 // labels are diagnostic; alpha-renaming those labels is compatible.
@@ -851,8 +849,8 @@ message Arg {
   string name = 2;
 }
 
-// A concrete nullary equality-sort definition. Its name shares the sort
-// namespace with host families; same-name compatible resends are idempotent.
+// A concrete nullary equality-sort definition. Its nominal namespace is distinct
+// from host families and callables; same-name compatible resends are idempotent.
 // Bindings have SortBindings' separate first-supply/resupply contract.
 message EqSort {
   option (buf.validate.message).cel = {
@@ -1740,7 +1738,8 @@ enum ExecutionMode {
 // declarations against ambient host definitions, then validate options and this
 // acyclic, recursively closed sort arena before allocating a handle. Equality
 // declarations allow custom C without an already-existing handle. Compatible
-// repeated definitions are allowed; conflicting kind/arity/bindings are errors.
+// repeated definitions are allowed; conflicting arity/bindings within a
+// namespace are errors. EqSort and HostSortFamily may have the same name.
 // Successful creation retains these sort declarations on the new handle, so
 // later Programs may reference their names without resending definitions.
 // Unsupported options/resources are lifecycle errors, not RunProgram.error.
@@ -1771,25 +1770,20 @@ message CreateEGraphRequest {
   };
   option (buf.validate.message).cel = {
     id: "create_egraph_request.sort_declarations"
-    message: "sort names must have one kind and host-family arity"
+    message: "same-name host-family declarations must agree on arity"
     expression:
-      "this.declarations.all(d, "
-      "(!has(d.eq_sort) || this.declarations.all(e, "
-      "!has(e.host_sort_family) || d.eq_sort.name != e.host_sort_family.name)) && "
-      "(!has(d.host_sort_family) || this.declarations.all(e, !has(e.host_sort_family) || "
+      "this.declarations.all(d, !has(d.host_sort_family) || "
+      "this.declarations.all(e, !has(e.host_sort_family) || "
       "d.host_sort_family.name != e.host_sort_family.name || "
-      "d.host_sort_family.arity == e.host_sort_family.arity)))"
+      "d.host_sort_family.arity == e.host_sort_family.arity))"
   };
   option (buf.validate.message).cel = {
     id: "create_egraph_request.sort_uses"
-    message: "sort references must agree with declared kinds and family arities"
+    message: "host-family applications must agree with declared family arities"
     expression:
-      "this.declarations.all(d, this.sorts.all(s, "
-      "(!has(d.host_sort_family) || "
-      "((!has(s.family) || s.family.name != d.host_sort_family.name || "
-      "uint(size(s.family.args)) == d.host_sort_family.arity) && "
-      "(!has(s.eq) || s.eq != d.host_sort_family.name))) && "
-      "(!has(d.eq_sort) || !has(s.family) || s.family.name != d.eq_sort.name)))"
+      "this.declarations.all(d, !has(d.host_sort_family) || "
+      "this.sorts.all(s, !has(s.family) || s.family.name != d.host_sort_family.name || "
+      "uint(size(s.family.args)) == d.host_sort_family.arity))"
   };
 
   repeated Sort sorts = 1;

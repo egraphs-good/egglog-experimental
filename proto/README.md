@@ -44,9 +44,22 @@ documentation and provenance fields. `Sort.eq` references an equality-sort name;
 `Sort.family` applies a host family through `HostSort{name,args}`, with exactly
 its declared arity, including zero for `i64` or `Unit`. References never declare
 definitions. Builtin families and installed sorts need not be redeclared.
-Function types remain structural `FuncSort`s. Family names share the sort
-namespace with equality sorts; callable names occupy a separate namespace.
+Function types remain structural `FuncSort`s. Nominal equality-sort names,
+host-family names and callable names occupy three distinct namespaces, selected
+by their existing oneof tags. Thus EqSort `Pair`, HostSortFamily `Pair` and a
+callable `Pair` may coexist without changing their names. `Sort.eq` resolves only
+an EqSort; `Sort.family` resolves only a HostSortFamily, never a same-spelled
+definition of another kind. Missing definitions remain errors checked against
+local, installed and ambient definitions. Same-family resends and applications
+must still agree on arity; all callable kinds still share one namespace.
 Type-use spans may remain on `Sort`, but docs and bindings belong to definitions.
+
+This namespace refinement uses no new field or encoding and retains draft
+`ir_version = 1`: all previously valid encodings keep their meanings. New
+cross-namespace coexistence requires coordinated immutable schema, engine and
+frontend pins. Old validators reject it, and old name-only indexes may conflate
+the definitions; mixed-epoch readers are not supported. CEL checks local family
+arity, not complete installed-name resolution or resupply compatibility.
 
 `Declaration.doc` preserves absence, explicitly empty text, and nonempty text,
 matching existing Python callable/class documentation readers. It remains
@@ -683,8 +696,9 @@ nominal, so two source aliases for Vec<i64> do not become interchangeable before
 export; after resolution both map to one structural wire sort.
 
 Pair uses the same stateful path, preserving its two ordered child sorts.
-Native source can declare an equality sort named `Pair`, but the canonical host
-family occupies that wire sort name: `(sort Pair) (constructor P () Pair) (P)`
+Native source can declare an equality sort named `Pair`. The schema now admits
+coexistence with the canonical host family, but runtime reconciliation still
+needs the corresponding namespace migration: `(sort Pair) (constructor P () Pair) (P)`
 does not yet roundtrip. This is a full-source conformance gap, not an invalid
 native program. User constructors named `pair` on distinct equality sorts remain
 user calls, not Pair payloads. A separate existing validation gap concerns
@@ -694,8 +708,8 @@ Pair with `PairValue(Var(x), "x")` can therefore pass preparation without a
 binding for `x`; installing that rule rejects it. Payload children do not gain
 inverse matching. Neither gap is resolved by this container checkpoint.
 
-The wire sort and callable namespaces remain separate even for the same logical
-name and across requests. All user equality sorts and constructor/function names
+The adapter already separates nominal sort and callable names even for the same
+logical name and across requests. All user equality sorts and constructor/function names
 are projected with distinct namespace tags and UTF-8 hex encoding; host
 definition keys retain exact-key dispatch. Query variables are renamed at their
 binder use, independently of merge `old`/`new`. Canonical declarations and binding

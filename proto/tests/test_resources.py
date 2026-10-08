@@ -9,6 +9,54 @@ from gen.python.egglog.v1 import egglog_pb as ir
 
 
 class ResourceSchemaTests(unittest.TestCase):
+    def test_creation_separates_nominal_and_host_family_names(self):
+        nominal = ir.Declaration(kind=Oneof("eq_sort", ir.EqSort(name="Pair")))
+        family = ir.Declaration(kind=Oneof("host_sort_family", ir.HostSortFamily(name="Pair", arity=2)))
+        for declarations in ([nominal, family], [family, nominal], [nominal, family, nominal, family]):
+            with self.subTest(declarations=declarations):
+                request = ir.CreateEGraphRequest(
+                    sorts=[
+                        ir.Sort(kind=Oneof("eq", "Pair")),
+                        ir.Sort(kind=Oneof("family", ir.HostSort(name="Pair", args=[0, 0]))),
+                    ],
+                    options=ir.EGraphOptions(cost_sort=0),
+                    declarations=declarations,
+                )
+                validate(request)
+                self.assertEqual(ir.CreateEGraphRequest.from_binary(request.to_binary()), request)
+
+    def test_creation_retains_same_family_arity_and_application_checks(self):
+        nominal = ir.Declaration(kind=Oneof("eq_sort", ir.EqSort(name="Pair")))
+        family = ir.Declaration(kind=Oneof("host_sort_family", ir.HostSortFamily(name="Pair", arity=2)))
+        conflict = ir.Declaration(kind=Oneof("host_sort_family", ir.HostSortFamily(name="Pair", arity=1)))
+        for declarations in ([nominal, family, conflict], [conflict, family, nominal]):
+            with self.subTest(declarations=declarations), self.assertRaises(ValidationError):
+                validate(ir.CreateEGraphRequest(
+                    sorts=[ir.Sort(kind=Oneof("eq", "Pair"))],
+                    options=ir.EGraphOptions(cost_sort=0), declarations=declarations,
+                ))
+        for width in (0, 1, 3):
+            with self.subTest(width=width), self.assertRaises(ValidationError):
+                validate(ir.CreateEGraphRequest(
+                    sorts=[
+                        ir.Sort(kind=Oneof("eq", "Pair")),
+                        ir.Sort(kind=Oneof("family", ir.HostSort(name="Pair", args=[0] * width))),
+                    ],
+                    options=ir.EGraphOptions(cost_sort=0), declarations=[nominal, family],
+                ))
+
+    def test_creation_still_rejects_callable_declarations(self):
+        with self.assertRaises(ValidationError):
+            validate(ir.CreateEGraphRequest(
+                sorts=[ir.Sort(kind=Oneof("eq", "Pair"))],
+                options=ir.EGraphOptions(cost_sort=0),
+                declarations=[
+                    ir.Declaration(kind=Oneof("eq_sort", ir.EqSort(name="Pair"))),
+                    ir.Declaration(kind=Oneof("host_sort_family", ir.HostSortFamily(name="Pair", arity=2))),
+                    ir.Declaration(kind=Oneof("constructor", ir.Constructor(name="Pair", output=0))),
+                ],
+            ))
+
     def test_query_and_update_are_distinct_including_auto_zero(self):
         operations = [Oneof("query", ir.Unit()), *[Oneof("threads", n) for n in (0, 1, 2, 2**32 - 1)]]
         for operation in operations:
