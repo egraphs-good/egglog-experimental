@@ -14,6 +14,8 @@ and comments are the specification. The main pieces are:
 - Complete current-state export as a snapshot of logical options and an ordinary
   `Program`, including definitions, logical data, cycles, and empty e-classes.
   This is not an engine checkpoint.
+- Existing proof requests and structured results from the current proof engine,
+  with proof enablement selected in `EGraphOptions`.
 
 An initial in-process bytes adapter lives in
 [`src/protobuf.rs`](../src/protobuf.rs); its supported slice is described below.
@@ -335,6 +337,16 @@ one. An absent field leaves the native default unchanged. Creation's existing
 i64 cost-sort and no-declaration limits still apply; native thread-pool resource
 allocation behavior is unchanged.
 
+`ConfigureEGraphResources` specifies live resource query/update over the same
+bytes boundary. Its required operation selects an inert query or a thread-count
+update (zero means auto, positive means exact). Success returns the effective
+positive native count as uint64, not a requested value or frontend CPU estimate.
+Unsupported updates fail before mutation; updates must preserve existing rule
+cursors and logical state. Clone inherits the effective count, later updates are
+handle-local, and resources remain outside snapshots. The protocol is specified
+and wire-tested; its adapter implementation is the next gate. Immutable logical
+options, future-rule defaults and report-policy controls are not resource fields.
+
 Restore by remapping C's reachable closed sort graph and needed sort declarations
 into a creation request, then executing the exported Program on that fresh handle
 with compatible host capabilities. Unrelated generic signature patterns may stay
@@ -419,6 +431,39 @@ That is a possible implementation route, not something the current generators
 provide automatically. Compare construction, traversal, crossing the boundary,
 and memory use on the same graph before choosing.
 
+### Existing proof engine
+
+`EGraphOptions.execution_mode` selects ordinary execution (the default), term
+encoding, proofs, or proof testing. Clone retains the mode and proof state.
+Snapshots retain the mode, but logical reconstruction does not preserve original
+derivations. `Prove` uses the same conjunctive facts as `Check`; `ProveExists`
+targets a constructor name without inserting a witness. Proof testing executes
+checks as proof requests. Preserve native ordering: `Prove` can complete a helper
+run and its effects before proof extraction fails. Successful proof requests
+return the proof at the originating command location, including inside loops.
+
+This draft leaves native maintenance `Run` emission, output locations, and
+optional profiling attribution unresolved. CEL accepts nested `Run` payloads
+as wire capacity only; it does not require their emission or select a reporting
+policy. The authored-command reporting rules above do not settle this question.
+
+`ProofResult` contains separate, inert term and proof arenas. Terms have no sort:
+native proof propositions can describe a function row with inputs and output as
+children. All eight native justifications are represented, including explicit
+substitutions, shared premises, container normalization, and the `Eval` side
+condition placeholder. Native IDs are remapped to result-local indices, so
+inspection does not require a live e-graph. A native proof failure carries a
+structured reason, independently of its diagnostic text.
+
+CEL checks required fields, oneofs, direct reference bounds, unique substitution
+names, and error-detail consistency. Shared decoders must additionally check
+acyclicity and reachability with bounded-stack traversal. This is transport for
+the existing checked/simplified proof, not a new proof engine or a standalone
+checker; rule context and compatible host validators remain external. The
+schema tests establish wire/CEL behavior only. Native execution and the existing
+desugar/proof-checker-context treatment still require adapter integration and
+conformance tests.
+
 ### Remaining review work
 
 - **Host binding:** implement catalog discovery and compatibility checks for
@@ -445,8 +490,8 @@ and memory use on the same graph before choosing.
   remain host-adapter work, not a new RPC or a claim of full Python parity.
   These adapters and shared text/Python/Rust producer conformance tests remain
   unimplemented.
-- **Deferred:** proofs. Current-state export/restoration and optional recording
-  are specified above but have no runtime implementation.
+- Current-state export/restoration and optional recording are specified above
+  but have no runtime implementation.
 
 A small next experiment: describe `Vec`/`Map` and the signatures above once,
 generate Python and Rust expression APIs, and compare their resolved IR and
@@ -644,11 +689,14 @@ from the repository root:
 cargo install --locked protoc-gen-prost --version 0.5.0
 make proto-gen
 make proto-lint
+make proto-test
 ```
 
 These use local generator plugins. Initial tool/dependency downloads may need
 network access. Commit generated sources together with schema changes.
 On a clean checkout, `make proto-drift` regenerates and detects tracked changes.
+`make proto-test` runs focused proof/resource wire/validation tests with the generated
+Python messages; it does not run Egglog or independently check a proof.
 
 A Python wire/validation smoke check, after `uv sync --locked`:
 

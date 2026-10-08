@@ -4,8 +4,8 @@ package egglog.v1;
 
 import "buf/validate/validate.proto";
 
-// Draft proposed v1 of a typed, language-neutral Egglog IR. Rust/Python codegen
-// exists; no IR runtime is implemented. This draft uses ir_version = 1;
+// Draft proposed v1 of a typed, language-neutral Egglog IR, with generated
+// Rust/Python messages. This draft uses ir_version = 1;
 // receivers must reject unsupported versions. Overview: proto/README.md.
 // Every arena index must name an existing entry in its enclosing program,
 // or response. CEL checks the direct node/sort edges below; other
@@ -15,7 +15,7 @@ import "buf/validate/validate.proto";
 // Validation rules and normative comments in this file are the specification.
 // Unknown versions/enums are errors; Rust consumers must check raw enum values.
 // Producers expand datatype/default-argument/include syntax before this boundary.
-// No scope stack: clone an e-graph to save state. Proofs are not represented.
+// No scope stack: clone an e-graph to save state, including its proof state.
 
 // ---------------------------------------------------------------------------
 // PROGRAM AND PROVENANCE — the request payload and the shared span vocabulary.
@@ -1405,6 +1405,9 @@ message Command {
 
     Repeat repeat = 11;
     Saturate saturate = 12;
+
+    Prove prove = 14;
+    ProveExists prove_exists = 15;
   }
 
   // Origin. Locates a failure attributed to a command rather than an
@@ -1416,6 +1419,23 @@ message Command {
 // One conjunctive query. All facts share the same variable bindings.
 message Check {
   repeated uint32 facts = 1 [packed = true]; // index into the enclosing `nodes`
+}
+
+// Prove one conjunctive query with Check's typing and variable-binding rules.
+// Uses the existing proof engine: this installs/runs a helper rule before proof
+// extraction, so it can mutate state and fail after completing helper effects.
+// PROOF_TESTING treats Check the same way. Maintenance reporting remains
+// unresolved; see CommandOutput.
+// Do not reject solely because proofs are disabled before running the native
+// command: witness failure and completed effects follow native execution order.
+message Prove {
+  repeated uint32 facts = 1 [packed = true]; // index into the enclosing `nodes`
+}
+
+// Request a proof for an existing witness of this declared constructor. The
+// target is a name, not an evaluated call or arguments that insert a witness.
+message ProveExists {
+  string constructor = 1 [(buf.validate.field).string.min_len = 1];
 }
 
 // Execute one ruleset step, optionally using a bound scheduler. A completed
@@ -1523,7 +1543,9 @@ enum Extractor {
 // Export complete logical options and a reconstruction Program; no filtering.
 // Returns CommandOutput.snapshot; its Program owns nodes, sorts and source files.
 // This is current state, not request history or an engine checkpoint: omit
-// scheduler instances, execution cursors, caches, reports and host resources.
+// scheduler instances, execution cursors, caches, reports, proof history and
+// host resources. Preserve execution_mode, but reconstruction does not preserve
+// original derivations or promise equivalent proof results.
 //
 // Include every installed declaration and sort, even unused or empty tables;
 // every installed named ruleset and its retained closure, preserving occurrence
@@ -1645,14 +1667,16 @@ message Saturate {
 // SERVICE — the operations, their request/response types, and failure.
 // ---------------------------------------------------------------------------
 
-// E-graph lifecycle and program execution. Every other operation composes
-// inside a `Program`, so there are four rpcs rather than one per command.
+// E-graph lifecycle, runtime resources, and program execution. Logical
+// operations compose inside a `Program`, rather than one rpc per command.
 // Intended for an in-process typed/bytes adapter; no network transport is
-// required. No engine adapter or service implementation is included yet.
+// required. The bounded compatibility adapter implements only part of this
+// contract; unsupported operations must fail explicitly.
 service EgglogService {
   rpc CreateEGraph(CreateEGraphRequest) returns (CreateEGraphResponse);
   rpc CloneEGraph(CloneEGraphRequest) returns (CloneEGraphResponse);
   rpc DestroyEGraph(DestroyEGraphRequest) returns (DestroyEGraphResponse);
+  rpc ConfigureEGraphResources(ConfigureEGraphResourcesRequest) returns (ConfigureEGraphResourcesResponse);
   rpc RunProgram(RunProgramRequest) returns (RunProgramResponse);
 }
 
@@ -1665,6 +1689,22 @@ service EgglogService {
 // agree with C structurally, never by comparing arena-local indices.
 message EGraphOptions {
   optional uint32 cost_sort = 1 [(buf.validate.field).required = true];
+
+  // Select before executing user declarations. Host providers must be installed
+  // before term encoding captures their typechecking/validation environment.
+  ExecutionMode execution_mode = 2 [(buf.validate.field).enum.defined_only = true];
+}
+
+// Existing engine treatments; NORMAL is the default when the field is absent.
+enum ExecutionMode {
+  // buf:lint:ignore ENUM_ZERO_VALUE_SUFFIX
+  EXECUTION_MODE_NORMAL = 0;
+  // Instrument terms without generating proofs.
+  EXECUTION_MODE_TERM_ENCODING = 1;
+  // Generate proofs for explicit Prove and ProveExists requests.
+  EXECUTION_MODE_PROOFS = 2;
+  // Generate proofs and execute each Check as Prove.
+  EXECUTION_MODE_PROOF_TESTING = 3;
 }
 
 // Create an empty e-graph without executing a Program. Resolve the sort-only
@@ -1760,7 +1800,8 @@ message EGraphSnapshot {
   Program program = 2 [(buf.validate.field).required = true];
 }
 
-// Clone the addressed e-graph, retaining C. No complexity guarantee.
+// Clone the addressed e-graph, retaining C, execution mode and proof state.
+// No complexity guarantee.
 message CloneEGraphRequest {
   uint64 egraph_id = 1;
 }
@@ -1775,6 +1816,39 @@ message DestroyEGraphRequest {
 }
 
 message DestroyEGraphResponse {}
+
+// Query or update runtime resources on an existing handle, never logical
+// settings or Program state. Completed updates affect subsequent calls; they
+// do not reconfigure an in-flight Run. Clone inherits effective resources and
+// later updates are handle-local. Resources are not part of a frozen snapshot.
+//
+// Reject malformed, missing/unknown operations, invalid handles and unsupported
+// requests before changing resources or execution state. In particular, an
+// update must not reset rule cursors or otherwise act like cloning/restoration.
+// Resource allocation failures retain the receiver's native failure boundary;
+// this contract does not require native allocation panics to be recoverable.
+message ConfigureEGraphResourcesRequest {
+  uint64 egraph_id = 1;
+
+  oneof operation {
+    option (buf.validate.oneof).required = true;
+
+    // Observe the current effective settings without changing them.
+    Unit query = 2;
+    // Zero requests automatic parallelism resolved at this update; positive
+    // requests that exact count. Unsupported requests fail, never clamp or
+    // silently succeed. This has the same request domain as creation. An
+    // explicit operation distinguishes query from setting automatic zero.
+    uint32 threads = 3;
+  }
+}
+
+message ConfigureEGraphResourcesResponse {
+  // Actual effective native count after query/update, never the requested zero
+  // or a frontend estimate. uint64 accommodates the receiver's native count
+  // without narrowing to the uint32 request domain.
+  uint64 threads = 1 [(buf.validate.field).uint64.gte = 1];
+}
 
 // Execute a program against an existing e-graph.
 message RunProgramRequest {
@@ -1873,7 +1947,9 @@ message RunProgramResponse {
   // Completion order. Each completed TOP-LEVEL Run/Repeat/Saturate contributes
   // one compact outcome; nested control commands contribute none. Every
   // requested observation contributes its output, including repeated executions
-  // inside loops. Commands without outputs contribute no entry.
+  // inside loops. Successful proof requests contribute their proof. Native
+  // maintenance outputs and their profiling attribution remain unresolved;
+  // see CommandOutput.
   repeated CommandOutput outputs = 3;
 
   // Origins for this response's nodes, sorts, rules and errors, including
@@ -1943,6 +2019,12 @@ message CommandLocation {
 // Source and command locators are independent: a rule expression can supply
 // the span while its executing Run supplies the command location.
 message Error {
+  option (buf.validate.message).cel = {
+    id: "error.proof_failure"
+    message: "proof failure details are required exactly for PROOF_FAILED"
+    expression: "has(this.proof_failure) == (this.code == 7)"
+  };
+
   ErrorCode code = 1 [(buf.validate.field).enum = {
     defined_only: true
     not_in: [0]
@@ -1968,6 +2050,10 @@ message Error {
   // Engine-internal origin as `file:line:col`; empty when there is none.
   // Diagnostic only, and not a `Span`: `Span.file` indexes USER source.
   string engine_origin = 6;
+
+  // Native runtime proof failure, supplied structurally, never parsed from text.
+  // Earlier parsing/typechecking failures retain their ordinary error class.
+  ProofFailure proof_failure = 7;
 }
 
 // Failure classes: one value per class of remedy, not one per engine error.
@@ -1996,22 +2082,49 @@ enum ErrorCode {
 
   // A named ruleset, scheduler, table or cost model does not exist.
   ERROR_CODE_UNKNOWN_NAME = 6;
+
+  // A proof request failed; proof_failure distinguishes its native cause.
+  ERROR_CODE_PROOF_FAILED = 7;
+}
+
+// Causes from the current engine's ProveExistsError, not proof-checker verdicts.
+message ProofFailure {
+  ProofFailureReason reason = 1 [(buf.validate.field).enum = {
+    defined_only: true
+    not_in: [0]
+  }];
+  // Present when supplied by the native failure, such as a missing witness.
+  optional string constructor = 2 [(buf.validate.field).string.min_len = 1];
+}
+
+enum ProofFailureReason {
+  PROOF_FAILURE_REASON_UNSPECIFIED = 0;
+  PROOF_FAILURE_REASON_REQUIRES_CONSTRUCTOR = 1;
+  PROOF_FAILURE_REASON_PRIMITIVES_UNSUPPORTED = 2;
+  PROOF_FAILURE_REASON_QUERY_DID_NOT_MATCH = 3;
+  PROOF_FAILURE_REASON_PROOFS_NOT_ENABLED = 4;
 }
 
 // ---------------------------------------------------------------------------
 // COMMAND OUTPUTS — the `CommandOutput.kind` arms, in arm order.
 // ---------------------------------------------------------------------------
 
-// Completed top-level control commands return compact outcomes; observations
-// return their matching arm at every nesting depth. Actions, checks, scheduler
-// bindings, and keep_best produce no entry. The arm must match the located
-// request command. Nested control outcomes are folded, never appended here.
+// For authored commands, completed top-level controls return compact outcomes;
+// observations return their matching arm at every nesting depth. Actions,
+// ordinary checks, scheduler bindings, and keep_best have no requested output.
+// Successful Prove/ProveExists and PROOF_TESTING Check return a proof at their
+// own location. These requested outputs must match the located command. Nested
+// authored control outcomes are folded, never appended here.
+// Native maintenance Run emission, output locations and optional profiling
+// attribution remain unresolved. CEL permits nested Run payloads as structural
+// capacity, not an emission requirement; request/output matching remains an
+// adapter obligation.
 // Execution errors are `RunProgramResponse.error`, not an arm here.
 message CommandOutput {
   option (buf.validate.message).cel = {
-    id: "command_output.top_level_outcome"
-    message: "control outcomes are only emitted for top-level commands"
-    expression: "(!has(this.run) && !has(this.loop)) || size(this.location.path) == 1"
+    id: "command_output.top_level_loop_outcome"
+    message: "loop outcomes are only emitted for top-level commands"
+    expression: "!has(this.loop) || size(this.location.path) == 1"
   };
 
   oneof kind {
@@ -2024,12 +2137,142 @@ message CommandOutput {
     PrintedFunction printed_function = 5;
     TableStatsResult table_stats = 6;
     LoopOutcome loop = 8;
+    ProofResult proof = 9;
   }
 
   CommandLocation location = 7 [(buf.validate.field).required = true];
 }
 
-// One completed Run, independent of optional profiling.
+// An inert export of the existing engine's checked/simplified proof. These
+// arenas belong only to this result, not to the response's typed Node arena.
+// IDs are remapped local indices, never native TermId/ProofId or live handles.
+// Retain shared subterms/subproofs and premise order; export only the closure
+// reachable from root through proof premises, propositions and substitutions.
+// Both graphs must be acyclic. CEL checks direct presence/oneofs/bounds only:
+// shared decoders must check cycles and reachability with bounded-stack graph
+// traversal before exposing the result. Producers also traverse iteratively
+// and range-check index conversion; arbitrary arena order is allowed.
+// This is a certificate relative to the original program and its compatible
+// host validators/normalizers. They are not serialized, and this message does
+// not define a new checker or imply standalone proof validity from CEL checks.
+message ProofResult {
+  option (buf.validate.message).cel = {
+    id: "proof_result.root_in_range"
+    message: "root must index proofs"
+    expression: "has(this.root) && this.root < uint(size(this.proofs))"
+  };
+  option (buf.validate.message).cel = {
+    id: "proof_result.term_refs_in_range"
+    message: "term children, propositions and substitutions must index terms"
+    expression:
+      "this.terms.all(t, !has(t.app) || t.app.children.all(i, i < uint(size(this.terms)))) && "
+      "this.proofs.all(p, [p.lhs, p.rhs].all(i, i < uint(size(this.terms))) && "
+      "(!has(p.rule) || p.rule.substitution.all(b, b.term < uint(size(this.terms)))))"
+  };
+  option (buf.validate.message).cel = {
+    id: "proof_result.proof_refs_in_range"
+    message: "justification premises must index proofs"
+    expression:
+      "this.proofs.all(p, "
+      "(has(p.rule) ? p.rule.premise_proofs : "
+      "has(p.merge_fn) ? [p.merge_fn.old_proof, p.merge_fn.new_proof] : "
+      "has(p.trans) ? [p.trans.left, p.trans.right] : "
+      "has(p.sym) ? [p.sym] : "
+      "has(p.congr) ? [p.congr.proof, p.congr.child_proof] : "
+      "has(p.container_normalize) ? [p.container_normalize] : [])"
+      ".all(i, i < uint(size(this.proofs))))"
+  };
+
+  repeated ProofTerm terms = 1;
+  repeated ProofStep proofs = 2;
+  optional uint32 root = 3 [(buf.validate.field).required = true];
+}
+
+// The native TermDag syntax, without invented sorts or executable call typing.
+// A function-row proposition may include both inputs and output as children.
+message ProofTerm {
+  oneof kind {
+    option (buf.validate.oneof).required = true;
+
+    int64 i64 = 1;
+    // Preserve all IEEE-754 bits, including signed zero and NaN payloads.
+    fixed64 f64_bits = 2;
+    string string = 3;
+    bool bool = 4;
+    Unit unit = 5;
+    string var = 6;
+    ProofApp app = 7;
+  }
+}
+
+message ProofApp {
+  string head = 1;
+  repeated uint32 children = 2 [packed = true]; // indices into ProofResult.terms
+}
+
+// One proposition lhs = rhs paired with exactly one native justification.
+// This is not general reflexivity: native Fiat justifies asserted terms and
+// primitive reflexive equalities; arbitrary t = t is not assumed.
+message ProofStep {
+  optional uint32 lhs = 1 [(buf.validate.field).required = true];
+  optional uint32 rhs = 2 [(buf.validate.field).required = true];
+
+  oneof justification {
+    option (buf.validate.oneof).required = true;
+
+    Unit fiat = 3;
+    ProofRule rule = 4;
+    ProofMergeFn merge_fn = 5;
+    ProofTrans trans = 6;
+    uint32 sym = 7; // proof index
+    ProofCongr congr = 8;
+    uint32 container_normalize = 9; // proof index; native checker normalizes rhs
+    // Placeholder for a container side condition re-evaluated against its rule
+    // body by the native checker. Its proposition proves nothing on its own.
+    Unit eval = 10;
+  }
+}
+
+message ProofRule {
+  option (buf.validate.message).cel = {
+    id: "proof_rule.unique_substitution"
+    message: "substitution variable names must be unique"
+    expression: "this.substitution.all(b, this.substitution.filter(c, c.name == b.name).size() == 1)"
+  };
+
+  string name = 1;
+  repeated uint32 premise_proofs = 2 [packed = true]; // indices into ProofResult.proofs
+  // Emit in name order for deterministic encoding. Names identify native rule
+  // variables; values index ProofResult.terms. No duplicate keys are allowed.
+  repeated ProofBinding substitution = 3;
+}
+
+message ProofBinding {
+  string name = 1;
+  optional uint32 term = 2 [(buf.validate.field).required = true];
+}
+
+message ProofMergeFn {
+  string function = 1;
+  optional uint32 old_proof = 2 [(buf.validate.field).required = true];
+  optional uint32 new_proof = 3 [(buf.validate.field).required = true];
+}
+
+message ProofTrans {
+  optional uint32 left = 1 [(buf.validate.field).required = true];
+  optional uint32 right = 2 [(buf.validate.field).required = true];
+}
+
+// The first proof's rhs must be an application; child_index addresses one of
+// its children, and child_proof proves its replacement. Term shape/child bounds
+// and proposition agreement are semantic proof checks, not CEL validation.
+message ProofCongr {
+  optional uint32 proof = 1 [(buf.validate.field).required = true];
+  optional uint32 child_index = 2 [(buf.validate.field).required = true];
+  optional uint32 child_proof = 3 [(buf.validate.field).required = true];
+}
+
+// One completed run, independent of optional profiling.
 message RunOutcome {
   option (buf.validate.message).cel = {
     id: "run_outcome.can_stop"
@@ -2105,6 +2348,7 @@ message TableSize {
 // a failing Run. Exactly one entry per entered static Run site; no unentered
 // site appears. Completion says nothing about availability of individual
 // optional metrics. No collection budget/truncation is defined here.
+// Native maintenance attribution is unresolved; see CommandOutput.
 // Per-iteration histories are deferred.
 message ProfileSummary {
   option (buf.validate.message).cel = {
@@ -2117,9 +2361,10 @@ message ProfileSummary {
   repeated RunSummary runs = 2;
 }
 
-// All invocations of one static Run command, across enclosing loop iterations.
-// Path uses CommandLocation.path without dynamic coordinates. The site must
-// resolve to Run in the request. Each selected occurrence contributes once per
+// All invocations of one static authored Run command, across enclosing loop
+// iterations. Path uses CommandLocation.path without dynamic coordinates; the
+// site resolves to that Run command. Native maintenance attribution remains
+// unresolved; see CommandOutput. Each selected occurrence contributes once per
 // Run's selection, not once per group membership; BiRewrite directions share
 // one authored occurrence. No nested-loop or ruleset totals duplicate this work.
 // Optional metrics total the observed work across these invocations. Omit a
