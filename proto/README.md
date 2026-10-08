@@ -44,9 +44,22 @@ documentation and provenance fields. `Sort.eq` references an equality-sort name;
 `Sort.family` applies a host family through `HostSort{name,args}`, with exactly
 its declared arity, including zero for `i64` or `Unit`. References never declare
 definitions. Builtin families and installed sorts need not be redeclared.
-Function types remain structural `FuncSort`s. Family names share the sort
-namespace with equality sorts; callable names occupy a separate namespace.
+Function types remain structural `FuncSort`s. Nominal equality-sort names,
+host-family names and callable names occupy three distinct namespaces, selected
+by their existing oneof tags. Thus EqSort `Pair`, HostSortFamily `Pair` and a
+callable `Pair` may coexist without changing their names. `Sort.eq` resolves only
+an EqSort; `Sort.family` resolves only a HostSortFamily, never a same-spelled
+definition of another kind. Missing definitions remain errors checked against
+local, installed and ambient definitions. Same-family resends and applications
+must still agree on arity; all callable kinds still share one namespace.
 Type-use spans may remain on `Sort`, but docs and bindings belong to definitions.
+
+This namespace refinement uses no new field or encoding and retains draft
+`ir_version = 1`: all previously valid encodings keep their meanings. New
+cross-namespace coexistence requires coordinated immutable schema, engine and
+frontend pins. Old validators reject it, and old name-only indexes may conflate
+the definitions; mixed-epoch readers are not supported. CEL checks local family
+arity, not complete installed-name resolution or resupply compatibility.
 
 `Declaration.doc` preserves absence, explicitly empty text, and nonempty text,
 matching existing Python callable/class documentation readers. It remains
@@ -110,7 +123,7 @@ arenas contain no variables; a nested exported `Program` may include signature
 patterns. CEL checks direct bounds, variable roots, and declared family uses.
 Recursive closedness, binder scope, signature matching, family resolution, and
 compatible descriptor resends are semantic checks. The executable subset below
-implements these for its supported scalar/Vec signatures and declarations.
+implements these for its supported scalar/Vec/Pair signatures and declarations.
 
 **Decided:** each core callable has one unique name across user and host
 definitions; the core does not select from same-name overloads. Frontends lower
@@ -147,6 +160,16 @@ Protobuf codegen produces message classes, not ergonomic Egglog APIs. Planned
 high-level generators use builtin and user declarations to produce Python/Rust
 symbolic APIs and Egglog source. For example, one signature might be presented
 as Python `m[k]` and Rust `m.get(k)`, with the same underlying call.
+
+Public Python APIs must be statically checkable with MyPy; typed Rust APIs must
+enforce their types at compilation. Test accepted calls and rejected wrong-sort
+or arity cases, not only runtime validation. A wire signature need not dictate
+the public argument shape. Current Python uses `Map.empty`, `insert`, and
+indexing; Rust's existing `Map::of` accepts typed key/value tuples. A shared bulk
+interface using host tuples versus actual Egglog Pair values remains open; core
+container changes are allowed while preserving existing frontend behavior.
+Default generated bindings must also preserve static types: report unsupported
+generation rather than weakening types to expose a primitive.
 
 **Decided:** start with typed bindings for Rust, Python, and Egglog source only;
 defer arbitrary extension payloads and other languages. Egglog presentation
@@ -567,7 +590,7 @@ effects and observations. Native ASTs are transient lowering products.
 
 The current executable subset is deliberately limited:
 
-- Equality sorts, the five scalar host sorts and nested Vec applications; explicit constructor/function
+- Equality sorts, the five scalar host sorts and nested Vec/Pair applications; explicit constructor/function
   declarations with scalar static costs and merge bodies using values,
   old/new variables, and constructors.
 - Ordered actions and persistent captures expressed as nullary function sets.
@@ -577,6 +600,8 @@ The current executable subset is deliberately limited:
 - Profile-enabled execution with command locations and compact run summaries.
 - Catalog-backed i64/f64 addition through distinct host definition keys.
 - Generic Vec empty/of/get, ordered Vec value payloads and extracted Vec data.
+- Generic Pair construction/first/second, ordered Pair value payloads and
+  extracted/table Pair data, including nested Vec/Pair and equality-sort children.
 - Compatible EqSort/Constructor/Function resupply, with canonical protobuf
   declaration/default closures retained across requests and clones. Each
   language block is fixed on its first supply; absent later blocks do not erase
@@ -584,7 +609,7 @@ The current executable subset is deliberately limited:
 - Python/Rust scalar type and addition views and Rust Vec type/empty/of/get
   views supplied by native registration; intact user sort/callable views,
   including ownerless Python CONSTANT views on nullary constructors/functions
-  and closed scalar/Vec initializer defaults.
+  and closed scalar/Vec/Pair initializer defaults.
   Default calls are checked, never evaluated during installation/export. Actual
   omitted-argument expansion remains the frontend's responsibility.
 
@@ -610,7 +635,7 @@ an EGraph during authoring. Pin the generating core/experimental/leaf revisions;
 the resource can be checked against the runtime provider by submitting its
 declarations in an empty-command request. This is a partial catalog, not Freeze.
 Lambda/partial-call defaults, other value codecs and unsupported execution forms
-remain explicit gaps; scalar/Vec default checking does not establish their
+remain explicit gaps; scalar/Vec/Pair default checking does not establish their
 compatibility. Native text rendering preserves executable semantics, not Python
 or Rust presentation metadata.
 
@@ -670,8 +695,20 @@ and explicitly rejects container phases. Native source resolution remains
 nominal, so two source aliases for Vec<i64> do not become interchangeable before
 export; after resolution both map to one structural wire sort.
 
-The wire sort and callable namespaces remain separate even for the same logical
-name and across requests. All user equality sorts and constructor/function names
+Pair uses the same stateful path, preserving its two ordered child sorts.
+Native `(sort Pair) (constructor P () Pair)` now coexists with the host family,
+including actual `Pair<Pair,i64>` values through source, bytes, extraction and
+stateful rendering. Nominal `Sort.eq("Pair")` and structural `Sort.family("Pair", ...)`
+retain their exact logical names and distinct kinds. User constructors named
+`pair` remain user calls, not Pair payloads. An existing validation gap concerns
+unreferenced rules: preparation typechecks them, but native groundedness checking
+runs only when a ruleset installs them. An unreferenced query equating a stored
+Pair with `PairValue(Var(x), "x")` can therefore pass preparation without a
+binding for `x`; installing that rule rejects it. Payload children do not gain
+inverse matching. That unused-rule validation gap remains unresolved.
+
+The adapter separates nominal sort, host-family and callable names even for the
+same logical name and across requests. All user equality sorts and constructor/function names
 are projected with distinct namespace tags and UTF-8 hex encoding; host
 definition keys retain exact-key dispatch. Query variables are renamed at their
 binder use, independently of merge `old`/`new`. Canonical declarations and binding
@@ -721,6 +758,13 @@ Rust presentation names the family `egglog_experimental::typed::builtins::Vec<T>
 `empty`/`of` are associated views, `of` maps the variadic tail, and `get` borrows
 its receiver. Python Vec views remain absent; neither language's frontend
 generation is inferred from registration alone.
+
+Pair similarly registers one arity-two family and exact
+`egglog.core.pair.make`/`first`/`second` definitions before instances exist.
+They retain native aliases `pair`/`pair-first`/`pair-second`, implementation
+identities and proof validators. Pair payloads lower only in the temporary
+execution/rendering copy; canonical saved declarations/defaults stay intact.
+Pair currently has Egglog callable views only, not new Python/Rust authoring APIs.
 
 This checkpoint does not implement complete `Freeze`, other Vec operations,
 generic Map/Fn definitions, wrapper generation, custom

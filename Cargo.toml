@@ -23,9 +23,9 @@ typed = ["dep:egglog-experimental-typed-macros"]
 [dependencies]
 prost = "0.14.4"
 egglog-experimental-typed-macros = { path = "typed-macros", version = "3.0.0", optional = true }
-egglog = { version = "3.0.0", git = "https://github.com/egraphs-good/egglog.git", rev = "6067fbcce31baeb974b12f9676b7b443b8441f59", default-features = false }
-egglog-ast = { version = "3.0.0", git = "https://github.com/egraphs-good/egglog.git", rev = "6067fbcce31baeb974b12f9676b7b443b8441f59", default-features = false }
-egglog-reports = { version = "3.0.0", git = "https://github.com/egraphs-good/egglog.git", rev = "6067fbcce31baeb974b12f9676b7b443b8441f59", default-features = false }
+egglog = { version = "3.0.0", git = "https://github.com/egraphs-good/egglog.git", rev = "bd7de1657a529dad3b731001edc78386874864fc", default-features = false }
+egglog-ast = { version = "3.0.0", git = "https://github.com/egraphs-good/egglog.git", rev = "bd7de1657a529dad3b731001edc78386874864fc", default-features = false }
+egglog-reports = { version = "3.0.0", git = "https://github.com/egraphs-good/egglog.git", rev = "bd7de1657a529dad3b731001edc78386874864fc", default-features = false }
 
 num = "0.4.3"
 lazy_static = "1.4"

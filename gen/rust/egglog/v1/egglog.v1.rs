@@ -116,8 +116,10 @@ pub struct Span {
 /// Sorts are acyclic through HostSort.args and FuncSort.params/result. CEL
 /// checks direct indices, not acyclicity or recursive variable scope.
 /// References do not declare sorts: resolve equality names and host families
-/// against local declarations, installed definitions or ambient host definitions.
-/// Missing names and kind/arity mismatches are errors. Builtin references do
+/// against local declarations, installed definitions or ambient host definitions
+/// in their respective namespaces: eq only resolves EqSort, family only resolves
+/// HostSortFamily. Equal name spellings do not identify or substitute these kinds.
+/// Missing names and family-arity mismatches are errors. Builtin references do
 /// not require explicit descriptor declarations. Response references resolve
 /// against the associated handle; their arenas do not redeclare definitions.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
@@ -646,9 +648,10 @@ pub struct SetCost {
 /// Comparison must preserve Union sharing/identity topology; ordinary syntax
 /// sharing may differ. One empty Union reused twice is not two fresh Unions.
 /// Callable names are unique across Constructor, Function, Relation, Primitive
-/// and HostPrimitive, including ambient definitions. HostSortFamily names occupy
-/// the sort namespace with EqSort, separate from callable names. Compatible
-/// resends retain the definition; conflicting names never shadow definitions.
+/// and HostPrimitive, including ambient definitions. EqSort, HostSortFamily and
+/// callable names occupy three distinct namespaces, selected by existing kind
+/// tags. Equal spellings may coexist across namespaces. Compatible resends retain
+/// the definition; conflicts within a namespace never shadow definitions.
 /// Host descriptor compatibility compares family arity or primitive typing form
 /// and structural signature, including ordered binder positions. Parameter
 /// labels are diagnostic; alpha-renaming those labels is compatible.
@@ -698,8 +701,8 @@ pub struct Arg {
     #[prost(string, tag = "2")]
     pub name: ::prost::alloc::string::String,
 }
-/// A concrete nullary equality-sort definition. Its name shares the sort
-/// namespace with host families; same-name compatible resends are idempotent.
+/// A concrete nullary equality-sort definition. Its nominal namespace is distinct
+/// from host families and callables; same-name compatible resends are idempotent.
 /// Bindings have SortBindings' separate first-supply/resupply contract.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct EqSort {
@@ -1599,7 +1602,8 @@ pub struct EGraphOptions {
 /// declarations against ambient host definitions, then validate options and this
 /// acyclic, recursively closed sort arena before allocating a handle. Equality
 /// declarations allow custom C without an already-existing handle. Compatible
-/// repeated definitions are allowed; conflicting kind/arity/bindings are errors.
+/// repeated definitions are allowed; conflicting arity/bindings within a
+/// namespace are errors. EqSort and HostSortFamily may have the same name.
 /// Successful creation retains these sort declarations on the new handle, so
 /// later Programs may reference their names without resending definitions.
 /// Unsupported options/resources are lifecycle errors, not RunProgram.error.

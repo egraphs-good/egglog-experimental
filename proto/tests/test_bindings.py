@@ -1,4 +1,4 @@
-"""Presentation wire/CEL checks, not callable execution or binding installation."""
+"""Declaration/presentation wire checks, not execution or binding installation."""
 
 import unittest
 
@@ -30,6 +30,64 @@ def constant_program(core, **view_fields):
 
 
 class BindingSchemaTests(unittest.TestCase):
+    def test_nominal_family_and_callable_names_are_distinct(self):
+        nominal = ir.Declaration(kind=Oneof("eq_sort", ir.EqSort(name="Pair")))
+        family = ir.Declaration(kind=Oneof("host_sort_family", ir.HostSortFamily(name="Pair", arity=2)))
+        callable_ = ir.Declaration(kind=Oneof("constructor", ir.Constructor(
+            name="Pair", inputs=[ir.Arg(sort=1)], output=0,
+        )))
+        sorts = [
+            ir.Sort(kind=Oneof("eq", "Pair")),
+            ir.Sort(kind=Oneof("family", ir.HostSort(name="Pair", args=[0, 0]))),
+        ]
+        for declarations in ([nominal, family, callable_], [callable_, family, nominal]):
+            with self.subTest(declarations=declarations):
+                program = ir.Program(ir_version=1, sorts=sorts, declarations=declarations)
+                validate(program)
+                decoded = ir.Program.from_binary(program.to_binary())
+                self.assertEqual(decoded, program)
+                self.assertEqual(decoded.sorts[0].kind, Oneof("eq", "Pair"))
+                self.assertEqual(decoded.sorts[1].kind.field, "family")
+                self.assertEqual(decoded.sorts[1].kind.value.name, "Pair")
+
+    def test_same_namespace_resupply_still_checks_family_arity(self):
+        nominal = ir.Declaration(kind=Oneof("eq_sort", ir.EqSort(name="Pair")))
+        family = ir.Declaration(kind=Oneof("host_sort_family", ir.HostSortFamily(name="Pair", arity=2)))
+        # Compatible resends are allowed even without an arena use. Metadata
+        # compatibility and installed-name resolution remain semantic checks.
+        validate(ir.Program(ir_version=1, declarations=[nominal, family, nominal, family]))
+        conflict = ir.Declaration(kind=Oneof("host_sort_family", ir.HostSortFamily(name="Pair", arity=1)))
+        for declarations in ([nominal, family, conflict], [conflict, nominal, family]):
+            with self.subTest(declarations=declarations), self.assertRaises(ValidationError):
+                validate(ir.Program(ir_version=1, declarations=declarations))
+
+    def test_nominal_declaration_does_not_mask_bad_family_application(self):
+        for width in (0, 1, 3):
+            with self.subTest(width=width), self.assertRaises(ValidationError):
+                validate(ir.Program(
+                    ir_version=1,
+                    sorts=[
+                        ir.Sort(kind=Oneof("eq", "Pair")),
+                        ir.Sort(kind=Oneof("family", ir.HostSort(name="Pair", args=[0] * width))),
+                    ],
+                    declarations=[
+                        ir.Declaration(kind=Oneof("eq_sort", ir.EqSort(name="Pair"))),
+                        ir.Declaration(kind=Oneof("host_sort_family", ir.HostSortFamily(name="Pair", arity=2))),
+                    ],
+                ))
+
+    def test_sort_kind_wire_tags_are_unchanged(self):
+        # These existing tags already distinguish identical name spellings.
+        cases = [
+            (ir.Sort(kind=Oneof("eq", "Pair")), b"\x0a\x04Pair"),
+            (ir.Sort(kind=Oneof("family", ir.HostSort(name="Pair", args=[0, 0]))),
+             b"\x12\x0a\x0a\x04Pair\x12\x02\x00\x00"),
+        ]
+        for sort, encoded in cases:
+            with self.subTest(sort=sort):
+                self.assertEqual(sort.to_binary(), encoded)
+                self.assertEqual(ir.Sort.from_binary(encoded), sort)
+
     def test_constant_roundtrips_on_concrete_nullary_callables(self):
         declarations = [
             Oneof("constructor", ir.Constructor(name="C", output=1)),

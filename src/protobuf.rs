@@ -1,6 +1,6 @@
 //! In-process compatibility adapter for encoded protobuf requests.
 //!
-//! This executable slice supports concrete equality/scalar/Vec sorts,
+//! This executable slice supports concrete equality/scalar/Vec/Pair sorts,
 //! constructors, functions, ordered actions, flat named rulesets, checks,
 //! extraction, and table observations. Unsupported forms fail explicitly before
 //! installation. In particular, profiling must currently be requested: the
@@ -373,7 +373,7 @@ impl Session {
             }
         }
         validate_host_declarations(program, &mut staged.graph)?;
-        lower_vec_values(program)?;
+        lower_container_values(program)?;
         // The canonical records above remain intact. The execution/rendering
         // copy contains only genuinely new native declarations.
         program.declarations = std::mem::take(&mut program.declarations)
@@ -607,8 +607,9 @@ impl Session {
             }
             staged.rulesets.insert(name.clone(), native_name);
         }
-        // Native resolution verifies groundedness, binders, and action contexts
-        // on a scratch type environment. No runtime actions occur in this pass.
+        // Native resolution verifies types, binders, and action contexts on a
+        // scratch environment. Groundedness is checked during rule installation
+        // above; unreferenced rules do not receive that later compiler pass yet.
         let mut checker = staged.graph.clone();
         for rule in &program.rules {
             let command = lower_rule(program, rule, "", "__protobuf_validate_unused")?;
@@ -1094,6 +1095,25 @@ fn structural_sort_name(
                     .transpose()
             })
         }
+        Some(pb::sort::Kind::Family(family)) if family.name == "Pair" && family.args.len() == 2 => {
+            let first = structural_sort_name(sorts, family.args[0], active)?;
+            let second = structural_sort_name(sorts, family.args[1], active)?;
+            first
+                .zip(second)
+                .map(|(first, second)| {
+                    if first.len() + second.len() > 65_536 {
+                        return Err("native sort name exceeds adapter limit".into());
+                    }
+                    Ok(format!(
+                        "__egglog_proto_pair_{}_{}_{}_{}",
+                        first.len(),
+                        first,
+                        second.len(),
+                        second
+                    ))
+                })
+                .transpose()
+        }
         Some(pb::sort::Kind::Family(family))
             if family.args.is_empty()
                 && matches!(
@@ -1103,7 +1123,7 @@ fn structural_sort_name(
         {
             Ok(Some(family.name.clone()))
         }
-        _ => Err("only equality, scalar and Vec sorts are supported yet".into()),
+        _ => Err("only equality, scalar, Vec and Pair sorts are supported yet".into()),
     };
     active.remove(&index);
     result
@@ -1255,38 +1275,56 @@ fn lower_builtin_calls(program: &mut pb::Program, graph: &mut EGraph) -> Result<
     Ok(())
 }
 
-// The native Vec constructor interns precisely this ordered container payload.
+// The native Vec/Pair constructors intern these ordered container payloads.
 // Validate contents first; the resulting calls are internal compatibility code,
 // never a claim that the wire value payload was a symbolic authored Call.
-fn lower_vec_values(program: &mut pb::Program) -> Result<(), String> {
+fn lower_container_values(program: &mut pb::Program) -> Result<(), String> {
     let mut replacements = vec![];
     for (index, node) in program.nodes.iter().enumerate() {
-        if let Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
-            value: Some(pb::primitive_value::Value::Vec(values)),
-        })) = &node.kind
+        if let Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue { value: Some(value) })) =
+            &node.kind
         {
+            let (name, arity, key, args) = match value {
+                pb::primitive_value::Value::Vec(values) => {
+                    ("Vec", 1, "egglog.core.vec.of", values.items.clone())
+                }
+                pb::primitive_value::Value::Pair(pair) => (
+                    "Pair",
+                    2,
+                    "egglog.core.pair.make",
+                    vec![
+                        pair.first.ok_or("missing Pair first child")?,
+                        pair.second.ok_or("missing Pair second child")?,
+                    ],
+                ),
+                _ => continue,
+            };
             let Some(pb::sort::Kind::Family(family)) = program
                 .sorts
                 .get(node.sort_id as usize)
                 .and_then(|s| s.kind.as_ref())
             else {
-                return Err("Vec payload requires Vec sort".into());
+                return Err(format!("{name} payload requires {name} sort"));
             };
-            if family.name != "Vec" || family.args.len() != 1 {
-                return Err("Vec payload/sort mismatch".into());
+            if family.name != name || family.args.len() != arity {
+                return Err(format!("{name} payload/sort mismatch"));
             }
-            let expected = sort_name(&program.sorts, family.args[0])?;
-            for item in &values.items {
-                if node_sort(program, *item)? != expected {
-                    return Err("Vec payload element sort mismatch".into());
+            let expected = family
+                .args
+                .iter()
+                .map(|i| sort_name(&program.sorts, *i))
+                .collect::<Result<Vec<_>, _>>()?;
+            for (position, item) in args.iter().enumerate() {
+                if node_sort(program, *item)? != expected[if arity == 1 { 0 } else { position }] {
+                    return Err(format!("{name} payload element sort mismatch"));
                 }
             }
-            replacements.push((index, values.items.clone()));
+            replacements.push((index, key, args));
         }
     }
-    for (index, args) in replacements {
+    for (index, key, args) in replacements {
         program.nodes[index].kind = Some(pb::node::Kind::Call(pb::Call {
-            func: "egglog.core.vec.of".into(),
+            func: key.into(),
             args,
         }));
     }
@@ -1358,9 +1396,13 @@ fn validate_host_declarations(program: &pb::Program, graph: &mut EGraph) -> Resu
                     .check_builtin_signature(program, primitive)?;
             }
             Some(pb::declaration::Kind::HostSortFamily(family)) => {
-                if family.name == "Vec" {
-                    if family.arity != 1 || declaration.bindings.is_some() {
-                        return Err("unsupported or incompatible Vec family descriptor".into());
+                if matches!(family.name.as_str(), "Vec" | "Pair") {
+                    let arity = if family.name == "Vec" { 1 } else { 2 };
+                    if family.arity != arity || declaration.bindings.is_some() {
+                        return Err(format!(
+                            "unsupported or incompatible {} family descriptor",
+                            family.name
+                        ));
                     }
                     continue;
                 }
@@ -1729,6 +1771,26 @@ fn encode_term(
             pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
                 value: Some(pb::primitive_value::Value::Vec(pb::ValueList {
                     items: elements,
+                })),
+            })
+        }
+        Term::App(name, children) if name == "pair" && sort.is_container_sort() => {
+            let sort_id = encode_sort(graph, names, sort, response)?;
+            let inner = sort.inner_sorts();
+            if !matches!(&response.sorts[sort_id as usize].kind, Some(pb::sort::Kind::Family(family)) if family.name == "Pair" && family.args.len() == 2)
+                || children.len() != 2
+                || inner.len() != 2
+            {
+                return Err(egglog::Error::ExtractError(
+                    "Pair term/sort/arity mismatch".into(),
+                ));
+            }
+            let first = encode_term(graph, names, terms, children[0], &inner[0], response, cache)?;
+            let second = encode_term(graph, names, terms, children[1], &inner[1], response, cache)?;
+            pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
+                value: Some(pb::primitive_value::Value::Pair(pb::PairValue {
+                    first: Some(first),
+                    second: Some(second),
                 })),
             })
         }
