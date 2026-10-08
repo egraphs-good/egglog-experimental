@@ -90,9 +90,17 @@ impl Engine {
     /// Decodes a creation request and returns an encoded handle.
     pub fn create(&mut self, bytes: &[u8]) -> Result<Vec<u8>, TransportError> {
         let request = pb::CreateEGraphRequest::decode(bytes)?;
-        if request.threads.is_some() || !request.declarations.is_empty() {
+        if let Some(options) = &request.options
+            && options.execution_mode != i32::from(pb::ExecutionMode::Normal)
+        {
+            return Err(TransportError(format!(
+                "unsupported execution mode {}; only NORMAL executes in this adapter",
+                options.execution_mode
+            )));
+        }
+        if !request.declarations.is_empty() {
             return Err(TransportError(
-                "thread requests and creation declarations are not supported yet".into(),
+                "creation declarations are not supported yet".into(),
             ));
         }
         let cost = request
@@ -111,7 +119,7 @@ impl Engine {
             files: request.files,
             ..Default::default()
         };
-        let graph = crate::new_experimental_egraph();
+        let mut graph = crate::new_experimental_egraph();
         for (index, sort) in program.sorts.iter().enumerate() {
             let name = sort_name(&program.sorts, index as u32).map_err(TransportError)?;
             let native = graph
@@ -123,6 +131,17 @@ impl Engine {
                 )));
             }
             native_span(&program, sort.span.as_ref()).map_err(TransportError)?;
+        }
+        if let Some(threads) = request.threads {
+            if cfg!(target_family = "wasm") && threads > 1 {
+                return Err(TransportError(
+                    "native wasm execution supports at most one thread".into(),
+                ));
+            }
+            graph.set_num_threads(
+                usize::try_from(threads)
+                    .map_err(|_| TransportError("thread count exceeds native usize".into()))?,
+            );
         }
         self.next_id = self
             .next_id
@@ -171,6 +190,37 @@ impl Engine {
             .remove(&request.egraph_id)
             .ok_or_else(|| TransportError("unknown egraph_id".into()))?;
         Ok(pb::DestroyEGraphResponse {}.encode_to_vec())
+    }
+
+    /// Queries or updates native resources without cloning logical/execution
+    /// state. Allocation failures retain the native thread-pool failure boundary.
+    pub fn configure_resources(&mut self, bytes: &[u8]) -> Result<Vec<u8>, TransportError> {
+        let request = pb::ConfigureEGraphResourcesRequest::decode(bytes)?;
+        let operation = request
+            .operation
+            .ok_or_else(|| TransportError("missing or unknown resource operation".into()))?;
+        let session = self
+            .graphs
+            .get_mut(&request.egraph_id)
+            .ok_or_else(|| TransportError("unknown egraph_id".into()))?;
+        match operation {
+            pb::configure_e_graph_resources_request::Operation::Query(_) => (),
+            pb::configure_e_graph_resources_request::Operation::Threads(threads) => {
+                if cfg!(target_family = "wasm") && threads > 1 {
+                    return Err(TransportError(
+                        "native wasm execution supports at most one thread".into(),
+                    ));
+                }
+                let threads = usize::try_from(threads)
+                    .map_err(|_| TransportError("thread count exceeds native usize".into()))?;
+                session.graph.set_num_threads(threads);
+            }
+        }
+        Ok(pb::ConfigureEGraphResourcesResponse {
+            threads: u64::try_from(session.graph.num_threads())
+                .map_err(|_| TransportError("native thread count exceeds uint64".into()))?,
+        }
+        .encode_to_vec())
     }
 
     /// Executes only the decoded program and returns encoded results and prefix errors.
@@ -1722,8 +1772,203 @@ fn encode_term(
 mod tests {
     use super::*;
 
+    #[test]
+    fn creation_threads_match_native_policy_and_survive_clone() {
+        for threads in [None, Some(0), Some(1), Some(2)] {
+            let request = pb::CreateEGraphRequest {
+                sorts: vec![pb::Sort {
+                    kind: Some(pb::sort::Kind::Family(pb::HostSort {
+                        name: "i64".into(),
+                        args: vec![],
+                    })),
+                    ..Default::default()
+                }],
+                options: Some(pb::EGraphOptions {
+                    cost_sort: Some(0),
+                    ..Default::default()
+                }),
+                threads,
+                ..Default::default()
+            };
+            let mut engine = Engine::default();
+            assert!(engine.create(&[0xff]).is_err());
+            // Invalid creation must fail before configuring a potentially large pool.
+            let mut invalid = request.clone();
+            invalid.options = None;
+            invalid.threads = Some(u32::MAX);
+            assert!(engine.create(&invalid.encode_to_vec()).is_err());
+            assert_eq!(engine.next_id, 0);
+            assert!(engine.graphs.is_empty());
+            let bytes = engine.create(&request.encode_to_vec());
+            if cfg!(target_family = "wasm") && threads.is_some_and(|n| n > 1) {
+                assert!(bytes.is_err());
+                continue;
+            }
+            let id = pb::CreateEGraphResponse::decode(bytes.unwrap().as_slice())
+                .unwrap()
+                .egraph_id;
+            let mut native = crate::new_experimental_egraph();
+            if let Some(threads) = threads {
+                native.set_num_threads(usize::try_from(threads).unwrap());
+            }
+            assert_eq!(engine.graphs[&id].graph.num_threads(), native.num_threads());
+            let cloned = engine
+                .clone_egraph(&pb::CloneEGraphRequest { egraph_id: id }.encode_to_vec())
+                .unwrap();
+            let clone = pb::CloneEGraphResponse::decode(cloned.as_slice())
+                .unwrap()
+                .egraph_id;
+            assert_eq!(
+                engine.graphs[&clone].graph.num_threads(),
+                native.num_threads()
+            );
+        }
+    }
+
     #[derive(Clone)]
     struct ForeignPrimitive(String);
+
+    #[test]
+    fn resource_queries_and_updates_use_live_native_state_without_cloning() {
+        use pb::configure_e_graph_resources_request::Operation;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        #[derive(Default)]
+        struct CloneWitness(Arc<AtomicUsize>);
+        impl Clone for CloneWitness {
+            fn clone(&self) -> Self {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Self(self.0.clone())
+            }
+        }
+        let mut engine = Engine::default();
+        let request = pb::CreateEGraphRequest {
+            sorts: vec![pb::Sort {
+                kind: Some(pb::sort::Kind::Family(pb::HostSort {
+                    name: "i64".into(),
+                    args: vec![],
+                })),
+                ..Default::default()
+            }],
+            options: Some(pb::EGraphOptions {
+                cost_sort: Some(0),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let created = engine.create(&request.encode_to_vec()).unwrap();
+        let id = pb::CreateEGraphResponse::decode(created.as_slice())
+            .unwrap()
+            .egraph_id;
+        let clones = engine
+            .graphs
+            .get_mut(&id)
+            .unwrap()
+            .graph
+            .extension_state_or_default::<CloneWitness>()
+            .0
+            .clone();
+        let mut native = crate::new_experimental_egraph();
+        for operation in [
+            Operation::Query(pb::Unit {}),
+            Operation::Threads(0),
+            Operation::Threads(1),
+            Operation::Threads(2),
+            Operation::Query(pb::Unit {}),
+        ] {
+            let request = pb::ConfigureEGraphResourcesRequest {
+                egraph_id: id,
+                operation: Some(operation),
+            };
+            let result = engine.configure_resources(&request.encode_to_vec());
+            if cfg!(target_family = "wasm") && matches!(operation, Operation::Threads(n) if n > 1) {
+                assert!(result.is_err());
+            } else {
+                if let Operation::Threads(n) = operation {
+                    native.set_num_threads(usize::try_from(n).unwrap());
+                }
+                let response =
+                    pb::ConfigureEGraphResourcesResponse::decode(result.unwrap().as_slice())
+                        .unwrap();
+                assert_eq!(
+                    response.threads,
+                    u64::try_from(native.num_threads()).unwrap()
+                );
+                assert_eq!(engine.graphs[&id].graph.num_threads(), native.num_threads());
+            }
+            assert_eq!(
+                clones.load(Ordering::SeqCst),
+                0,
+                "resource access must not clone native state/cursors"
+            );
+        }
+        let previous = engine.graphs[&id].graph.num_threads();
+        let mut unknown = pb::ConfigureEGraphResourcesRequest {
+            egraph_id: id,
+            operation: None,
+        }
+        .encode_to_vec();
+        unknown.extend([0x22, 0x00]); // Unknown operation field4, not a query.
+        for bytes in [
+            vec![0xff],
+            unknown,
+            pb::ConfigureEGraphResourcesRequest {
+                egraph_id: id,
+                operation: None,
+            }
+            .encode_to_vec(),
+            pb::ConfigureEGraphResourcesRequest {
+                egraph_id: u64::MAX,
+                operation: Some(Operation::Threads(1)),
+            }
+            .encode_to_vec(),
+        ] {
+            assert!(engine.configure_resources(&bytes).is_err());
+            assert_eq!(engine.graphs[&id].graph.num_threads(), previous);
+            assert_eq!(clones.load(Ordering::SeqCst), 0);
+        }
+        engine
+            .destroy(&pb::DestroyEGraphRequest { egraph_id: id }.encode_to_vec())
+            .unwrap();
+        assert!(
+            engine
+                .configure_resources(
+                    &pb::ConfigureEGraphResourcesRequest {
+                        egraph_id: id,
+                        operation: Some(Operation::Query(pb::Unit {}))
+                    }
+                    .encode_to_vec()
+                )
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn unsupported_creation_modes_do_not_allocate_handles() {
+        let mut engine = Engine::default();
+        for execution_mode in [1, 2, 3, 99, -1] {
+            let request = pb::CreateEGraphRequest {
+                sorts: vec![pb::Sort {
+                    kind: Some(pb::sort::Kind::Family(pb::HostSort {
+                        name: "i64".into(),
+                        args: vec![],
+                    })),
+                    ..Default::default()
+                }],
+                options: Some(pb::EGraphOptions {
+                    cost_sort: Some(0),
+                    execution_mode,
+                }),
+                ..Default::default()
+            };
+            let result = engine.create(&request.encode_to_vec());
+            assert!(
+                result.is_err(),
+                "unsupported mode {execution_mode} must not silently use normal execution"
+            );
+            assert_eq!(engine.next_id, 0);
+            assert!(engine.graphs.is_empty());
+        }
+    }
 
     impl egglog::Primitive for ForeignPrimitive {
         fn name(&self) -> &str {

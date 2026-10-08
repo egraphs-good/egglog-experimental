@@ -39,7 +39,10 @@ impl EGraph {
                 })),
                 ..Default::default()
             }],
-            options: Some(pb::EGraphOptions { cost_sort: Some(0) }),
+            options: Some(pb::EGraphOptions {
+                cost_sort: Some(0),
+                execution_mode: pb::ExecutionMode::Normal as i32,
+            }),
             ..Default::default()
         };
         let response = engine
