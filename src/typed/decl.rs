@@ -1,6 +1,6 @@
 use super::{
     TypedError, pb,
-    storage::{Arena, Record, Slot, publish},
+    storage::{Arena, Packer, Record, Slot, publish},
 };
 
 /// A view of an owned generated Sort, not an independent sort description.
@@ -87,72 +87,47 @@ impl Callable {
 }
 
 pub(super) fn compatible(program: &pb::Program, a: &pb::Declaration, b: &pb::Declaration) -> bool {
-    let mut a = a.clone();
-    let mut b = b.clone();
-    // Local packing compares declaration meaning, not first-use diagnostics.
-    // This is not an installed-declaration resupply check; the engine owns it.
-    a.doc.clear();
-    b.doc.clear();
-    a.span = None;
-    b.span = None;
-    match (&mut a.kind, &mut b.kind) {
-        (
-            Some(pb::declaration::Kind::Constructor(a)),
-            Some(pb::declaration::Kind::Constructor(b)),
-        ) => {
-            if a.inputs.len() != b.inputs.len() {
-                return false;
-            }
-            for (a, b) in a.inputs.iter_mut().zip(&mut b.inputs) {
-                if program.sorts[a.sort as usize].kind != program.sorts[b.sort as usize].kind {
-                    return false;
-                }
-                a.sort = 0;
-                b.sort = 0;
-                a.name.clear();
-                b.name.clear();
-            }
-            if program.sorts[a.output as usize].kind != program.sorts[b.output as usize].kind {
-                return false;
-            }
-            a.output = 0;
-            b.output = 0;
-        }
-        (Some(pb::declaration::Kind::EqSort(_)), Some(pb::declaration::Kind::EqSort(_))) => {}
-        _ => return false,
-    }
-    a == b
+    // Reuse the shared generated-record comparison for this packet only.
+    // Admitted declarations have no node-valued costs/defaults; no expression
+    // graph is copied. Installed/provider compatibility remains the engine's.
+    let incoming = pb::Program {
+        ir_version: 1,
+        sorts: program.sorts.clone(),
+        declarations: vec![a.clone(), b.clone()],
+        ..Default::default()
+    };
+    egglog::builtin::definitions::reconcile_declarations(
+        &incoming,
+        &mut pb::Program {
+            ir_version: 1,
+            ..Default::default()
+        },
+    )
+    .is_ok()
 }
 
 pub(super) fn same_callable(a: &Record, b: &Record) -> Result<bool, TypedError> {
-    let pa = &a.owner.as_ref().unwrap().program;
-    let pb = &b.owner.as_ref().unwrap().program;
-    let Some(pb::declaration::Kind::Constructor(ca)) = &pa.declarations[a.index as usize].kind
-    else {
-        unreachable!()
+    let oa = a.owner.as_ref().unwrap();
+    let ob = b.owner.as_ref().unwrap();
+    if oa.id == ob.id && a.index == b.index {
+        return Ok(true);
+    }
+    let name_a = match &oa.program.declarations[a.index as usize].kind {
+        Some(pb::declaration::Kind::Constructor(c)) => &c.name,
+        Some(pb::declaration::Kind::HostPrimitive(p)) => &p.name,
+        _ => unreachable!(),
     };
-    let Some(pb::declaration::Kind::Constructor(cb)) = &pb.declarations[b.index as usize].kind
-    else {
-        unreachable!()
+    let name_b = match &ob.program.declarations[b.index as usize].kind {
+        Some(pb::declaration::Kind::Constructor(c)) => &c.name,
+        Some(pb::declaration::Kind::HostPrimitive(p)) => &p.name,
+        _ => unreachable!(),
     };
-    if ca.name != cb.name {
+    if name_a != name_b {
         return Ok(false);
     }
-    let same = ca.inputs.len() == cb.inputs.len()
-        && ca.cost == cb.cost
-        && ca.unextractable == cb.unextractable
-        && ca.inputs.iter().zip(&cb.inputs).all(|(sa, sb)| {
-            SortRef(a.resolve(Arena::Sort, sa.sort).unwrap())
-                == SortRef(b.resolve(Arena::Sort, sb.sort).unwrap())
-        })
-        && SortRef(a.resolve(Arena::Sort, ca.output)?)
-            == SortRef(b.resolve(Arena::Sort, cb.output)?);
-    if same {
-        Ok(true)
-    } else {
-        Err(TypedError::Invalid(format!(
-            "conflicting declaration {}",
-            ca.name
-        )))
-    }
+    let mut packer = Packer::default();
+    packer.intern(a.clone(), 0);
+    packer.intern(b.clone(), 0);
+    packer.finish()?;
+    Ok(true)
 }

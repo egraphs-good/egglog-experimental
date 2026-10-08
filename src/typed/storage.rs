@@ -1,14 +1,36 @@
 //! Immutable protobuf records and location-only imports. No semantic shadow IR.
 use super::{TypedError, pb};
+use prost::Message;
 use std::{
     collections::HashMap,
     sync::{
-        Arc,
+        Arc, OnceLock,
         atomic::{AtomicUsize, Ordering},
     },
 };
 
 static NEXT_OWNER: AtomicUsize = AtomicUsize::new(0);
+
+// Keep support items outside the authored builtins namespace, so valid type
+// names cannot capture them. The owner still retains exactly the generated
+// catalog records, without native discovery or copied semantic signatures.
+pub(super) fn builtin_catalog() -> &'static Record {
+    static CATALOG: OnceLock<Record> = OnceLock::new();
+    CATALOG.get_or_init(|| {
+        let program = pb::Program::decode(include_bytes!("builtins/catalog.pb").as_slice())
+            .expect("generated catalog is valid protobuf");
+        assert!(
+            program.nodes.is_empty() && program.rules.is_empty() && program.rulesets.is_empty()
+        );
+        let mut slots = std::array::from_fn(|_| vec![]);
+        slots[Arena::Sort as usize] = (0..program.sorts.len() as u32).map(Slot::Local).collect();
+        slots[Arena::Declaration as usize] = (0..program.declarations.len() as u32)
+            .map(Slot::Local)
+            .collect();
+        publish(program, slots, vec![], Arena::Sort, 0)
+            .expect("unsupported generated catalog shape")
+    })
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(super) enum Arena {
@@ -86,7 +108,9 @@ impl Record {
         let owner = self.owner.as_ref().unwrap();
         let matches = |d: &pb::Declaration| match &d.kind {
             Some(pb::declaration::Kind::EqSort(d)) => sort && d.name == name,
+            Some(pb::declaration::Kind::HostSortFamily(d)) => sort && d.name == name,
             Some(pb::declaration::Kind::Constructor(d)) => !sort && d.name == name,
+            Some(pb::declaration::Kind::HostPrimitive(d)) => !sort && d.name == name,
             _ => false,
         };
         if let Some(index) = owner.program.declarations.iter().position(matches) {
@@ -134,29 +158,93 @@ fn visit(
                     }
                 }
                 pb::node::Kind::Var(_) => {}
+                pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
+                    value:
+                        Some(
+                            pb::primitive_value::Value::I64(_)
+                            | pb::primitive_value::Value::F64Bits(_),
+                        ),
+                }) => {}
                 _ => return Err(invalid()),
             }
         }
         Arena::Sort => {
-            let s = &program.sorts[index as usize];
-            if s.span.is_some() || !matches!(s.kind, Some(pb::sort::Kind::Eq(_))) {
+            let s = &mut program.sorts[index as usize];
+            if s.span.is_some() {
                 return Err(invalid());
+            }
+            match s.kind.as_mut().ok_or_else(invalid)? {
+                pb::sort::Kind::Eq(_) | pb::sort::Kind::Var(_) => {}
+                pb::sort::Kind::Family(f) => {
+                    for arg in &mut f.args {
+                        *arg = map(Arena::Sort, *arg)?;
+                    }
+                }
+                _ => return Err(invalid()),
             }
         }
         Arena::Declaration => {
             let d = &mut program.declarations[index as usize];
-            if d.span.is_some() || d.bindings.is_some() {
+            if d.span.is_some() {
                 return Err(invalid());
             }
             match d.kind.as_mut().ok_or_else(invalid)? {
-                pb::declaration::Kind::EqSort(_) => {}
+                pb::declaration::Kind::EqSort(_) | pb::declaration::Kind::HostSortFamily(_) => {}
                 pb::declaration::Kind::Constructor(c) if c.cost.is_none() => {
                     for a in &mut c.inputs {
                         a.sort = map(Arena::Sort, a.sort)?;
                     }
                     c.output = map(Arena::Sort, c.output)?;
                 }
+                pb::declaration::Kind::HostPrimitive(p) => {
+                    let Some(pb::host_primitive::Typing::Signature(signature)) = &mut p.typing
+                    else {
+                        return Err(invalid());
+                    };
+                    for arg in signature
+                        .inputs
+                        .iter_mut()
+                        .chain(signature.varargs.iter_mut())
+                    {
+                        arg.sort = map(Arena::Sort, arg.sort)?;
+                    }
+                    let output = signature.output.as_mut().ok_or_else(invalid)?;
+                    *output = map(Arena::Sort, *output)?;
+                }
                 _ => return Err(invalid()),
+            }
+            if let Some(bindings) = &mut d.bindings {
+                if let Some(python) = &mut bindings.python {
+                    for view in &mut python.views {
+                        if let Some(owner) = &mut view.owner {
+                            let Some(pb::binding_owner::Kind::Sort(sort)) = &mut owner.kind else {
+                                return Err(invalid());
+                            };
+                            *sort = map(Arena::Sort, *sort)?;
+                        }
+                        // Saved defaults need their own binder closure support;
+                        // the scalar catalog contains none.
+                        if view.params.iter().any(|p| p.default_expr.is_some()) {
+                            return Err(invalid());
+                        }
+                    }
+                }
+                if let Some(rust) = &mut bindings.rust {
+                    for view in &mut rust.views {
+                        if let Some(owner) = &mut view.owner {
+                            let Some(pb::binding_owner::Kind::Sort(sort)) = &mut owner.kind else {
+                                return Err(invalid());
+                            };
+                            *sort = map(Arena::Sort, *sort)?;
+                        }
+                        if let Some(trait_impl) = &mut view.trait_impl {
+                            for arg in &mut trait_impl.args {
+                                let sort = arg.sort.as_mut().ok_or_else(invalid)?;
+                                *sort = map(Arena::Sort, *sort)?;
+                            }
+                        }
+                    }
+                }
             }
         }
         Arena::Rule => {
@@ -368,8 +456,14 @@ impl Packer {
                 }
                 Arena::Sort => {
                     let s = owner.program.sorts[record.index as usize].clone();
-                    if let Some(pb::sort::Kind::Eq(name)) = &s.kind {
-                        self.intern(record.declaration(name, true)?, 0);
+                    match &s.kind {
+                        Some(pb::sort::Kind::Eq(name)) => {
+                            self.intern(record.declaration(name, true)?, 0);
+                        }
+                        Some(pb::sort::Kind::Family(f)) => {
+                            self.intern(record.declaration(&f.name, true)?, 0);
+                        }
+                        _ => {}
                     }
                     one.sorts.push(s);
                 }
@@ -402,6 +496,8 @@ impl Packer {
                 Arena::Sort => self.program.sorts[index as usize] = one.sorts.pop().unwrap(),
                 Arena::Declaration => {
                     let d = one.declarations.pop().unwrap();
+                    // Keep actual records for validating decoded finite data.
+                    // Sort/callable names have separate wire namespaces.
                     if let Some(pb::declaration::Kind::Constructor(c)) = &d.kind {
                         self.declarations.insert(c.name.clone(), record.clone());
                     }
@@ -421,7 +517,9 @@ impl Packer {
         for d in &self.program.declarations {
             let (sort, name) = match &d.kind {
                 Some(pb::declaration::Kind::EqSort(d)) => (true, &d.name),
+                Some(pb::declaration::Kind::HostSortFamily(d)) => (true, &d.name),
                 Some(pb::declaration::Kind::Constructor(d)) => (false, &d.name),
+                Some(pb::declaration::Kind::HostPrimitive(d)) => (false, &d.name),
                 _ => unreachable!(),
             };
             if let Some(previous) = seen.insert((sort, name), d) {

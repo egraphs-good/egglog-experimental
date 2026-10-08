@@ -2,10 +2,11 @@
 //!
 //! This initial subset supports equality sorts/constructors, exact selectors,
 //! callback rewrites, named flat rulesets and byte-backed register/check/extract.
-//! Scalar builtin APIs await engine-owned Rust catalog metadata. Foreign open
+//! I64/F64 literals and addition are generated from engine-owned metadata. Foreign open
 //! binders, arbitrary declarations, frozen graphs and general schedules are not
 //! accepted yet; no source/AST execution fallback exists.
 use egglog::proto as pb;
+pub mod builtins;
 mod close;
 mod decl;
 mod expr;

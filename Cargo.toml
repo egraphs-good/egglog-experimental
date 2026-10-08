@@ -42,3 +42,7 @@ libtest-mimic = "0.8.1"
 [[example]]
 name = "typed_proto_basic"
 required-features = ["typed"]
+
+[[example]]
+name = "typed_proto_scalars"
+required-features = ["typed"]

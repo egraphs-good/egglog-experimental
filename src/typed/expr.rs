@@ -63,6 +63,26 @@ pub fn variable<S: EgglogValue>(scope: u64, slot: usize) -> S {
 }
 
 impl Expr {
+    pub(super) fn literal(sort: SortRef, value: pb::PrimitiveValue) -> Result<Self, TypedError> {
+        validate_literal(&sort, &value)?;
+        let mut slots = std::array::from_fn(|_| vec![]);
+        slots[Arena::Sort as usize] = vec![Slot::External(sort.0)];
+        Ok(Self(publish(
+            pb::Program {
+                ir_version: 1,
+                nodes: vec![pb::Node {
+                    kind: Some(pb::node::Kind::PrimitiveValue(value)),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+            slots,
+            vec![],
+            Arena::Node,
+            0,
+        )?))
+    }
+
     fn variable(sort: SortRef, token: String) -> Self {
         let mut slots = std::array::from_fn(|_| vec![]);
         slots[Arena::Sort as usize] = vec![Slot::External(sort.0)];
@@ -79,25 +99,39 @@ impl Expr {
 
     pub fn call(callable: &Callable, arguments: Vec<Self>) -> Self {
         let owner = callable.0.owner.as_ref().unwrap();
-        let Some(pb::declaration::Kind::Constructor(c)) =
-            &owner.program.declarations[callable.0.index as usize].kind
-        else {
-            unreachable!()
-        };
-        assert_eq!(c.inputs.len(), arguments.len(), "constructor arity");
-        for (arg, expected) in arguments.iter().zip(&c.inputs) {
+        let (name, inputs, output) =
+            match &owner.program.declarations[callable.0.index as usize].kind {
+                Some(pb::declaration::Kind::Constructor(c)) => (&c.name, &c.inputs, c.output),
+                Some(pb::declaration::Kind::HostPrimitive(p)) => {
+                    let Some(pb::host_primitive::Typing::Signature(signature)) = &p.typing else {
+                        panic!("unsupported callable typing");
+                    };
+                    assert!(
+                        signature.type_params.is_empty() && signature.varargs.is_none(),
+                        "generic host calls await instantiation support"
+                    );
+                    (
+                        &p.name,
+                        &signature.inputs,
+                        signature.output.expect("callable result sort"),
+                    )
+                }
+                _ => panic!("unsupported callable declaration"),
+            };
+        assert_eq!(inputs.len(), arguments.len(), "callable arity");
+        for (arg, expected) in arguments.iter().zip(inputs) {
             let node = &arg.0.owner.as_ref().unwrap().program.nodes[arg.0.index as usize];
             assert!(
                 SortRef(arg.0.resolve(Arena::Sort, node.sort_id).unwrap())
                     == SortRef(callable.0.resolve(Arena::Sort, expected.sort).unwrap()),
-                "constructor input sort"
+                "callable input sort"
             );
         }
         let program = pb::Program {
             ir_version: 1,
             nodes: vec![pb::Node {
                 kind: Some(pb::node::Kind::Call(pb::Call {
-                    func: c.name.clone(),
+                    func: name.clone(),
                     args: (0..arguments.len() as u32).collect(),
                 })),
                 ..Default::default()
@@ -107,7 +141,7 @@ impl Expr {
         let mut slots = std::array::from_fn(|_| vec![]);
         slots[Arena::Node as usize] = arguments.into_iter().map(|a| Slot::External(a.0)).collect();
         slots[Arena::Sort as usize] = vec![Slot::External(
-            callable.0.resolve(Arena::Sort, c.output).unwrap(),
+            callable.0.resolve(Arena::Sort, output).unwrap(),
         )];
         Self(publish(program, slots, vec![callable.0.clone()], Arena::Node, 0).unwrap())
     }
@@ -123,6 +157,16 @@ impl Expr {
                 "selector must return one direct constructor".into(),
             ));
         };
+        let declaration = pattern.0.declaration(&call.func, false)?;
+        if !matches!(
+            &declaration.owner.as_ref().unwrap().program.declarations[declaration.index as usize]
+                .kind,
+            Some(pb::declaration::Kind::Constructor(_))
+        ) {
+            return Err(TypedError::Invalid(
+                "selector must return a constructor, not a host operation".into(),
+            ));
+        }
         if call.args.len() != variables.len()
             || call
                 .args
@@ -138,10 +182,7 @@ impl Expr {
         let Some(pb::node::Kind::Call(actual)) = &n.kind else {
             return Ok(None);
         };
-        if !super::decl::same_callable(
-            &self.0.declaration(&actual.func, false)?,
-            &pattern.0.declaration(&call.func, false)?,
-        )? {
+        if !super::decl::same_callable(&self.0.declaration(&actual.func, false)?, &declaration)? {
             return Ok(None);
         }
         actual
@@ -174,6 +215,10 @@ impl PartialEq for Expr {
             }
             match (&na.kind, &nb.kind) {
                 (Some(pb::node::Kind::Var(a)), Some(pb::node::Kind::Var(b))) if a == b => {}
+                (
+                    Some(pb::node::Kind::PrimitiveValue(a)),
+                    Some(pb::node::Kind::PrimitiveValue(b)),
+                ) if a == b => {}
                 (Some(pb::node::Kind::Call(ca)), Some(pb::node::Kind::Call(cb)))
                     if ca.func == cb.func && ca.args.len() == cb.args.len() =>
                 {
@@ -221,12 +266,17 @@ impl Hash for Expr {
             }
             let mut h = DefaultHasher::new();
             let sort = record.resolve(Arena::Sort, node.sort_id).unwrap();
-            let Some(pb::sort::Kind::Eq(name)) =
-                &sort.owner.as_ref().unwrap().program.sorts[sort.index as usize].kind
-            else {
-                unreachable!()
-            };
-            name.hash(&mut h);
+            match &sort.owner.as_ref().unwrap().program.sorts[sort.index as usize].kind {
+                Some(pb::sort::Kind::Eq(name)) => {
+                    0u8.hash(&mut h);
+                    name.hash(&mut h);
+                }
+                Some(pb::sort::Kind::Family(f)) if f.args.is_empty() => {
+                    1u8.hash(&mut h);
+                    f.name.hash(&mut h);
+                }
+                _ => unreachable!("expression sort outside the scalar/equality subset"),
+            }
             match &node.kind {
                 Some(pb::node::Kind::Var(v)) => {
                     0u8.hash(&mut h);
@@ -245,6 +295,19 @@ impl Hash for Expr {
                 Some(pb::node::Kind::Union(_)) => {
                     2u8.hash(&mut h);
                     key.hash(&mut h);
+                }
+                Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue { value: Some(value) })) => {
+                    match value {
+                        pb::primitive_value::Value::I64(value) => {
+                            3u8.hash(&mut h);
+                            value.hash(&mut h);
+                        }
+                        pb::primitive_value::Value::F64Bits(bits) => {
+                            4u8.hash(&mut h);
+                            bits.hash(&mut h);
+                        }
+                        _ => unreachable!("unsupported typed scalar codec"),
+                    }
                 }
                 _ => unreachable!(),
             }
@@ -266,7 +329,31 @@ impl std::fmt::Debug for Expr {
             Some(pb::node::Kind::Call(c)) => write!(f, "Call({:?}, {} args)", c.func, c.args.len()),
             Some(pb::node::Kind::Var(v)) => write!(f, "Var({v:?})"),
             Some(pb::node::Kind::Union(u)) => write!(f, "Union({} members)", u.members.len()),
+            Some(pb::node::Kind::PrimitiveValue(v)) => write!(f, "Literal({:?})", v.value),
             _ => f.write_str("unsupported node"),
         }
+    }
+}
+
+// The schema defines these codecs. This checks a literal invariant, not a
+// callable signature or native numeric equivalence (f64 payloads are bits).
+pub(super) fn validate_literal(
+    sort: &SortRef,
+    value: &pb::PrimitiveValue,
+) -> Result<(), TypedError> {
+    let kind = &sort.0.owner.as_ref().unwrap().program.sorts[sort.0.index as usize].kind;
+    if let Some(pb::sort::Kind::Family(family)) = kind
+        && family.args.is_empty()
+        && matches!(
+            (&*family.name, &value.value),
+            ("i64", Some(pb::primitive_value::Value::I64(_)))
+                | ("f64", Some(pb::primitive_value::Value::F64Bits(_)))
+        )
+    {
+        Ok(())
+    } else {
+        Err(TypedError::Decode(
+            "scalar payload does not match its sort".into(),
+        ))
     }
 }

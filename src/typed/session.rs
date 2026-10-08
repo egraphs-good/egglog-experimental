@@ -30,7 +30,7 @@ impl EGraph {
     pub fn new() -> Result<Self, TypedError> {
         let mut engine = crate::protobuf::Engine::default();
         // Creation's fixed i64 cost domain is an adapter requirement, not a
-        // Rust primitive callable registry. No typed scalar API is exposed.
+        // Rust primitive callable registry.
         let request = pb::CreateEGraphRequest {
             sorts: vec![pb::Sort {
                 kind: Some(pb::sort::Kind::Family(pb::HostSort {
@@ -207,7 +207,7 @@ impl EGraph {
         }
     }
 
-    /// Tree-extract one equality value and own the decoded finite term closure.
+    /// Tree-extract a value and own the decoded finite constructor/scalar closure.
     pub fn extract<L: ValueInput>(&mut self, root: L) -> Result<L::Owned, TypedError> {
         let mut packer = Packer::default();
         let index = packer.intern(root.borrow().expression().0.clone(), 0);
@@ -244,7 +244,7 @@ impl EGraph {
 fn adopt(
     response: &pb::RunProgramResponse,
     root: u32,
-    declarations: Vec<Record>,
+    mut declarations: Vec<Record>,
 ) -> Result<Expr, TypedError> {
     let mut program = pb::Program {
         ir_version: 1,
@@ -269,35 +269,49 @@ fn adopt(
             *index
         } else {
             let index = program.sorts.len() as u32;
-            let Some(pb::sort::Kind::Eq(name)) = &sort.kind else {
-                return Err(TypedError::Decode(
-                    "typed extraction currently supports equality sorts".into(),
-                ));
-            };
+            match &sort.kind {
+                Some(pb::sort::Kind::Eq(name)) => {
+                    program.declarations.push(pb::Declaration {
+                        kind: Some(pb::declaration::Kind::EqSort(pb::EqSort {
+                            name: name.clone(),
+                            ..Default::default()
+                        })),
+                        ..Default::default()
+                    });
+                }
+                Some(pb::sort::Kind::Family(f))
+                    if f.args.is_empty() && matches!(f.name.as_str(), "i64" | "f64") =>
+                {
+                    declarations
+                        .push(super::storage::builtin_catalog().declaration(&f.name, true)?);
+                }
+                _ => return Err(TypedError::Decode("unsupported extracted sort".into())),
+            }
             program.sorts.push(sort.clone());
-            program.declarations.push(pb::Declaration {
-                kind: Some(pb::declaration::Kind::EqSort(pb::EqSort {
-                    name: name.clone(),
-                    ..Default::default()
-                })),
-                ..Default::default()
-            });
             sorts.insert(node.sort_id, index);
             index
         };
         node.sort_id = index;
-        let Some(pb::node::Kind::Call(call)) = &mut node.kind else {
-            return Err(TypedError::Decode(
-                "extraction must contain inert constructor data, not an open binder".into(),
-            ));
-        };
-        for child in &mut call.args {
-            let next = ids.len() as u32;
-            if let std::collections::hash_map::Entry::Vacant(entry) = ids.entry(*child) {
-                entry.insert(next);
-                pending.push(*child);
+        match &mut node.kind {
+            Some(pb::node::Kind::Call(call)) => {
+                for child in &mut call.args {
+                    let next = ids.len() as u32;
+                    if let std::collections::hash_map::Entry::Vacant(entry) = ids.entry(*child) {
+                        entry.insert(next);
+                        pending.push(*child);
+                    }
+                    *child = ids[child];
+                }
             }
-            *child = ids[child];
+            Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
+                value:
+                    Some(pb::primitive_value::Value::I64(_) | pb::primitive_value::Value::F64Bits(_)),
+            })) => {}
+            _ => {
+                return Err(TypedError::Decode(
+                    "extraction must contain inert constructor/scalar data".into(),
+                ));
+            }
         }
         program.nodes.push(node);
         cursor += 1;
@@ -321,11 +335,10 @@ fn adopt(
             _ => colors[index] = 1,
         }
         pending.push((index, true));
-        let Some(pb::node::Kind::Call(call)) = &program.nodes[index].kind else {
-            unreachable!()
-        };
-        for child in call.args.iter().rev() {
-            pending.push((*child as usize, false));
+        if let Some(pb::node::Kind::Call(call)) = &program.nodes[index].kind {
+            for child in call.args.iter().rev() {
+                pending.push((*child as usize, false));
+            }
         }
     }
     let mut slots = std::array::from_fn(|_| vec![]);
@@ -334,6 +347,13 @@ fn adopt(
     let root = publish(program, slots, declarations, Arena::Node, 0)?;
     let owner = root.owner.as_ref().unwrap();
     for node in &owner.program.nodes {
+        if let Some(pb::node::Kind::PrimitiveValue(value)) = &node.kind {
+            super::expr::validate_literal(
+                &super::SortRef(root.resolve(Arena::Sort, node.sort_id)?),
+                value,
+            )?;
+            continue;
+        }
         let Some(pb::node::Kind::Call(call)) = &node.kind else {
             unreachable!()
         };
@@ -342,7 +362,9 @@ fn adopt(
             &declaration.owner.as_ref().unwrap().program.declarations[declaration.index as usize]
                 .kind
         else {
-            unreachable!()
+            return Err(TypedError::Decode(
+                "extracted call is not a constructor".into(),
+            ));
         };
         if call.args.len() != constructor.inputs.len()
             || super::SortRef(root.resolve(Arena::Sort, node.sort_id)?)
@@ -372,6 +394,64 @@ fn adopt(
 mod tests {
     use super::*;
     use crate::typed::{SortRef, decl::Callable};
+
+    #[test]
+    fn scalar_bytes_and_decoder_payload_types() {
+        use crate::typed::builtins::{F64, I64};
+        let mut graph = EGraph::default();
+        let result = graph.extract(I64::from(2) + I64::from(3)).unwrap();
+        assert_eq!(i64::try_from(&result).unwrap(), 5);
+        let (input, output) = graph.last_wire.as_ref().unwrap();
+        let request = pb::RunProgramRequest::decode(input.as_slice()).unwrap();
+        let p = request.program.unwrap();
+        assert!(p.nodes.iter().any(|n| matches!(&n.kind,
+            Some(pb::node::Kind::Call(c)) if c.func == "egglog.core.i64.add")));
+        assert!(!p.nodes.iter().any(|n| matches!(&n.kind,
+            Some(pb::node::Kind::Call(c)) if c.func == "+")));
+        let mut response = pb::RunProgramResponse::decode(output.as_slice()).unwrap();
+        let Some(pb::command_output::Kind::Extraction(extracted)) = &response.outputs[0].kind
+        else {
+            panic!()
+        };
+        let term = extracted.roots[0].variants[0].term;
+        let declarations = graph.declarations.values().cloned().collect::<Vec<_>>();
+        assert!(ensure_sort::<I64>(adopt(&response, term, declarations.clone()).unwrap()).is_ok());
+        assert!(ensure_sort::<F64>(adopt(&response, term, declarations.clone()).unwrap()).is_err());
+        response.nodes[term as usize].kind =
+            Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
+                value: Some(pb::primitive_value::Value::F64Bits(0)),
+            }));
+        assert!(
+            adopt(&response, term, declarations.clone()).is_err(),
+            "f64 payload in i64 sort"
+        );
+        let sort_id = response.nodes[term as usize].sort_id;
+        let first = response.nodes.len() as u32;
+        for value in [2, 3] {
+            response.nodes.push(pb::Node {
+                sort_id,
+                kind: Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
+                    value: Some(pb::primitive_value::Value::I64(value)),
+                })),
+                ..Default::default()
+            });
+        }
+        response.nodes[term as usize].kind = Some(pb::node::Kind::Call(pb::Call {
+            func: "egglog.core.i64.add".into(),
+            args: vec![first, first + 1],
+        }));
+        let mut declarations = declarations;
+        declarations.push(
+            super::super::storage::builtin_catalog()
+                .declaration("egglog.core.i64.add", false)
+                .unwrap(),
+        );
+        let error = adopt(&response, term, declarations).unwrap_err();
+        assert!(
+            matches!(error, TypedError::Decode(ref message) if message == "extracted call is not a constructor"),
+            "wrong rejection guard: {error}"
+        );
+    }
 
     fn response(args: Vec<u32>, child: bool) -> (pb::RunProgramResponse, Vec<Record>) {
         let sort = SortRef::equality("M");

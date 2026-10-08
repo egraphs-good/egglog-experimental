@@ -8,6 +8,99 @@ use super::{
 use prost::Message;
 use std::sync::Arc;
 
+#[test]
+// Symbolic Add preserves ordered children; swapping operands also changes
+// which operator implementation owns the growing input. It is not arithmetic.
+#[allow(clippy::if_same_then_else)]
+fn scalar_records_remain_authoritative_and_parents_are_reclaimed() {
+    use super::{EgglogValue, builtins::I64};
+    let leaf = I64::from(7);
+    let a = &leaf + I64::from(11);
+    let weak = Arc::downgrade(a.expression().0.owner.as_ref().unwrap());
+    let packed = packed_query(&[a.expression().0.clone()]);
+    let Some(pb::node::Kind::Call(call)) = &packed.nodes[0].kind else {
+        panic!()
+    };
+    assert_eq!(call.func, "egglog.core.i64.add");
+    assert_eq!(call.args.len(), 2);
+    for (id, expected) in call.args.iter().zip([7, 11]) {
+        assert!(matches!(&packed.nodes[*id as usize].kind,
+            Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
+                value: Some(pb::primitive_value::Value::I64(value))
+            })) if *value == expected));
+    }
+    assert_eq!(
+        packed.declarations.len(),
+        2,
+        "only reachable scalar family and primitive"
+    );
+    drop(a);
+    assert!(
+        weak.upgrade().is_none(),
+        "retained leaf cannot retain parents"
+    );
+    for left in [false, true] {
+        let mut value = leaf.clone();
+        for _ in 0..100_000 {
+            value = if left { value + &leaf } else { &leaf + value };
+            let owner = value.expression().0.owner.as_ref().unwrap();
+            assert_eq!(owner.program.nodes.len(), 1);
+            assert_eq!(owner.slots[Arena::Node as usize].len(), 2);
+            assert_eq!(owner.declarations.len(), 1);
+        }
+        let weak = Arc::downgrade(value.expression().0.owner.as_ref().unwrap());
+        std::thread::spawn(move || drop(value)).join().unwrap();
+        assert!(weak.upgrade().is_none());
+    }
+}
+
+#[test]
+fn host_calls_read_changed_generated_definitions_not_cached_signatures() {
+    use super::{EgglogValue, builtins::I64};
+    let mut program = super::storage::builtin_catalog()
+        .owner
+        .as_ref()
+        .unwrap()
+        .program
+        .clone();
+    let index = program
+        .declarations
+        .iter()
+        .position(|d| {
+            matches!(&d.kind,
+        Some(pb::declaration::Kind::HostPrimitive(h)) if h.name == "egglog.core.i64.add")
+        })
+        .unwrap();
+    let Some(pb::declaration::Kind::HostPrimitive(primitive)) =
+        &mut program.declarations[index].kind
+    else {
+        panic!()
+    };
+    primitive.name = "test.changed.generated.key".into();
+    let mut slots = std::array::from_fn(|_| vec![]);
+    slots[Arena::Sort as usize] = (0..program.sorts.len() as u32).map(Slot::Local).collect();
+    slots[Arena::Declaration as usize] = (0..program.declarations.len() as u32)
+        .map(Slot::Local)
+        .collect();
+    let callable =
+        Callable(publish(program, slots, vec![], Arena::Declaration, index as u32).unwrap());
+    let call = Expr::call(
+        &callable,
+        vec![
+            I64::from(7).expression().clone(),
+            I64::from(11).expression().clone(),
+        ],
+    );
+    let packed = packed_query(&[call.0]);
+    assert!(
+        matches!(&packed.nodes[0].kind, Some(pb::node::Kind::Call(c)) if c.func == "test.changed.generated.key")
+    );
+    assert!(packed.declarations.iter().any(|d| matches!(&d.kind,
+        Some(pb::declaration::Kind::HostPrimitive(h)) if h.name == "test.changed.generated.key")));
+    assert!(!packed.declarations.iter().any(|d| matches!(&d.kind,
+        Some(pb::declaration::Kind::HostPrimitive(h)) if h.name == "egglog.core.i64.add")));
+}
+
 // A private raw-record builder lets tests mutate only generated fields before
 // immutable publication, without an authoring-side semantic representation.
 fn node(

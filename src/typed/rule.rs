@@ -45,7 +45,10 @@ pub struct Rule(pub(super) Record);
 pub struct Ruleset(pub(super) Record);
 
 /// Rewrite a matched expression to a value using the query's bindings.
-pub fn rewrite<L: ValueInput>(left: L, right: impl Into<L::Owned>) -> Rule {
+pub fn rewrite<L: ValueInput>(left: L, right: impl Into<L::Owned>) -> Rule
+where
+    L::Owned: super::EqualitySort,
+{
     let left = left.borrow().expression().clone();
     let right = right.into();
     let mut slots = std::array::from_fn(|_| vec![]);

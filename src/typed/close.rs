@@ -60,6 +60,10 @@ pub(super) fn binder(roots: &[Record]) -> Result<HashMap<String, String>, TypedE
                     pending.push(r.resolve(Arena::Node, *i)?);
                 }
             }
+            Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
+                value:
+                    Some(pb::primitive_value::Value::I64(_) | pb::primitive_value::Value::F64Bits(_)),
+            })) => {}
             _ => return Err(TypedError::Invalid("unsupported binder shape".into())),
         }
     }
