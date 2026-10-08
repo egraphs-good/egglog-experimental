@@ -94,6 +94,8 @@ use std::sync::Arc;
 
 pub mod protobuf;
 pub mod rational;
+#[cfg(feature = "typed")]
+pub mod typed;
 pub use rational::*;
 pub mod scheduling;
 pub use scheduling::*;

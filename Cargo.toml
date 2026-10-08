@@ -8,6 +8,9 @@ keywords = ["e-graphs", "egglog", "datalog", "compiler", "equality"]
 license = "MIT"
 readme = "README.md"
 
+[workspace]
+members = ["typed-macros"]
+
 [[test]]
 harness = false
 name = "files"
@@ -15,9 +18,11 @@ name = "files"
 [features]
 default = ["bin"]
 bin = ["egglog/bin"]
+typed = ["dep:egglog-experimental-typed-macros"]
 
 [dependencies]
 prost = "0.14.4"
+egglog-experimental-typed-macros = { path = "typed-macros", version = "3.0.0", optional = true }
 egglog = { version = "3.0.0", git = "https://github.com/egraphs-good/egglog.git", rev = "6fba0ecd4cfbb7cb1f97a3f50e854299a3d66a48", default-features = false }
 egglog-ast = { version = "3.0.0", git = "https://github.com/egraphs-good/egglog.git", rev = "6fba0ecd4cfbb7cb1f97a3f50e854299a3d66a48", default-features = false }
 egglog-reports = { version = "3.0.0", git = "https://github.com/egraphs-good/egglog.git", rev = "6fba0ecd4cfbb7cb1f97a3f50e854299a3d66a48", default-features = false }
@@ -33,3 +38,7 @@ hashbrown = "0.16.0"
 [dev-dependencies]
 glob = "0.3.1"
 libtest-mimic = "0.8.1"
+
+[[example]]
+name = "typed_proto_basic"
+required-features = ["typed"]
