@@ -696,20 +696,19 @@ nominal, so two source aliases for Vec<i64> do not become interchangeable before
 export; after resolution both map to one structural wire sort.
 
 Pair uses the same stateful path, preserving its two ordered child sorts.
-Native source can declare an equality sort named `Pair`. The schema now admits
-coexistence with the canonical host family, but runtime reconciliation still
-needs the corresponding namespace migration: `(sort Pair) (constructor P () Pair) (P)`
-does not yet roundtrip. This is a full-source conformance gap, not an invalid
-native program. User constructors named `pair` on distinct equality sorts remain
-user calls, not Pair payloads. A separate existing validation gap concerns
+Native `(sort Pair) (constructor P () Pair)` now coexists with the host family,
+including actual `Pair<Pair,i64>` values through source, bytes, extraction and
+stateful rendering. Nominal `Sort.eq("Pair")` and structural `Sort.family("Pair", ...)`
+retain their exact logical names and distinct kinds. User constructors named
+`pair` remain user calls, not Pair payloads. An existing validation gap concerns
 unreferenced rules: preparation typechecks them, but native groundedness checking
 runs only when a ruleset installs them. An unreferenced query equating a stored
 Pair with `PairValue(Var(x), "x")` can therefore pass preparation without a
 binding for `x`; installing that rule rejects it. Payload children do not gain
-inverse matching. Neither gap is resolved by this container checkpoint.
+inverse matching. That unused-rule validation gap remains unresolved.
 
-The adapter already separates nominal sort and callable names even for the same
-logical name and across requests. All user equality sorts and constructor/function names
+The adapter separates nominal sort, host-family and callable names even for the
+same logical name and across requests. All user equality sorts and constructor/function names
 are projected with distinct namespace tags and UTF-8 hex encoding; host
 definition keys retain exact-key dispatch. Query variables are renamed at their
 binder use, independently of merge `old`/`new`. Canonical declarations and binding
