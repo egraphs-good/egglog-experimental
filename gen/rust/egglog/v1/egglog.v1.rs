@@ -153,14 +153,14 @@ pub mod sort {
 }
 /// A nullary equality sort. An entry also declares it; repeated declarations
 /// of the same name are idempotent. Its name cannot also name a host sort family.
-/// Metadata is excluded from sort identity and follows SortMetadata's separate
+/// Bindings are excluded from sort identity and follow SortBindings' separate
 /// first-supply/resupply contract.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct EqSort {
     #[prost(string, tag = "1")]
     pub name: ::prost::alloc::string::String,
     #[prost(message, optional, tag = "2")]
-    pub metadata: ::core::option::Option<SortMetadata>,
+    pub bindings: ::core::option::Option<SortBindings>,
 }
 /// A nullary host sort-family application, such as Unit, bool, i64 or String.
 /// The family must have arity zero. It is non-unionable.
@@ -217,14 +217,14 @@ pub struct FuncSort {
 ///    installation/export. Lambda bodies keep their own binders; every expanded
 ///    use must satisfy its ordinary execution context's typing/effect rules.
 /// - Inert values (declared costs and extracted data) contain no variables,
-///    GetCost reads or Union and must be finite. Saved code bodies retain
+///    get_cost reads or Union and must be finite. Saved code bodies retain
 ///    their own binders, so these are use-site rules, not bans on an entire arena.
 /// Scalar values are inert. Child-bearing values follow the surrounding
 /// context; constructing a value does not grant inverse query matching or
 /// relax groundedness. Calls and host value materialization must obey their
 /// enclosing execution context's capabilities, including query-mode restrictions.
 ///
-/// Call/GetCost arguments, Union members and PrimitiveValue children inherit
+/// Call/get_cost arguments, Union members and PrimitiveValue children inherit
 /// the surrounding context and binder. Each is a value position: a row position
 /// never propagates to children. A lambda body starts its own code
 /// context and binder, also in a value position. See Call for relation rows.
@@ -258,11 +258,22 @@ pub mod node {
         PrimitiveValue(super::PrimitiveValue),
         #[prost(message, tag = "4")]
         Call(super::Call),
-        /// A class, and the only way to denote one. See `Union`.
+        /// An explicit identity-bearing class/equality group. See `Union`.
         #[prost(message, tag = "7")]
         Union(super::Union),
+        /// Read a Constructor row's explicitly assigned per-row cost, yielding C.
+        /// The target addresses the row without evaluating/inserting the constructor.
+        /// Functions, Relations and primitives are invalid targets. No declared-cost
+        /// or model fallback occurs; assigned zero differs from absent annotation.
+        /// In queries this is a relational pattern over assigned costs: key variables
+        /// may bind in the query binder; an absent annotation contributes no match.
+        /// It has seminaive dependencies like a table lookup, not a Pure-only primitive.
+        /// When evaluated, evaluate args once each, left-to-right, then read the cost;
+        /// absence fails with EVALUATION_FAILED. This requires a read-capable context,
+        /// so is invalid in SEMINAIVE heads or Pure/Write code. Args inherit the use's
+        /// context/binder. Not inert data; saved code may use it under these rules.
         #[prost(message, tag = "9")]
-        GetCost(super::GetCost),
+        GetCost(super::Call),
     }
 }
 /// A class/equality group. The node's INDEX identifies its occurrence; the
@@ -331,7 +342,7 @@ pub mod node {
 /// visited set.
 ///
 /// NORMATIVE: a cycle MUST pass through a union node. Removing Union's outgoing
-/// edges must leave an acyclic graph of Call/GetCost arguments and every
+/// edges must leave an acyclic graph of Call/get_cost arguments and every
 /// PrimitiveValue child, including custom args and lambda bodies/captures.
 /// Union members still obey their inherited use context and bounds.
 /// A call reaching itself with no class boundary is invalid, not a recursive
@@ -347,9 +358,10 @@ pub struct Union {
     #[prost(uint32, repeated, tag = "1")]
     pub members: ::prost::alloc::vec::Vec<u32>,
 }
-/// Positional application of a callable declared in the enclosing payload,
+/// A callable name and positional arguments. The enclosing field determines
+/// whether it is an application, row address, cost read, or partial application.
+/// The callable is declared in the enclosing payload,
 /// already installed on the handle, or implicitly provided by the host.
-/// The enclosing node's sort matches the result; relation calls use Unit.
 /// The name identifies one callable across installed and ambient definitions;
 /// there are no same-name overload sets. Check argument and result sorts against
 /// that definition's signature. Generic instantiation does not select another
@@ -358,9 +370,10 @@ pub struct Union {
 /// HostPrimitive's typing form checks all concrete argument AND result sorts;
 /// every generic parameter must be determined. There are no call-level type args.
 ///
-/// Relation calls are restricted to row positions: a query fact, `Action.term`,
-/// `Change.target`, or `FunctionRow.call`. They cannot be value arguments,
-/// `Set.value`, `Union` members, lambda captures/results, or deferred code.
+/// For Node.call, the enclosing node's sort matches the result; relation calls
+/// use Unit. Relation calls are restricted to row positions: a query fact,
+/// `Action.term`, `Action.delete`, or `FunctionRow.call`. They cannot be value
+/// arguments, `Set.value`, `Union` members, lambda captures/results, or deferred code.
 /// The restriction applies to installed and ambient names as well as local
 /// declarations. A relation row is the bare `Call` node itself; see `Union`
 /// for the Unit-sorted row rule.
@@ -372,33 +385,12 @@ pub struct Call {
     #[prost(uint32, repeated, tag = "2")]
     pub args: ::prost::alloc::vec::Vec<u32>,
 }
-/// Read a constructor row's explicitly assigned per-row cost, with result sort
-/// C. The target must resolve to a Constructor; Functions, Relations and
-/// primitives are invalid. The target addresses the row without evaluating or
-/// inserting the constructor itself. No declared-cost or model fallback occurs;
-/// an assigned zero is a value, while an absent annotation is not zero.
-///
-/// In a query this is a relational pattern over assigned costs, sharing the
-/// query binder and permitting key variables to bind. An absent annotation
-/// contributes no match. It participates in seminaive dependencies like a
-/// table lookup; it is not a host primitive subject to Pure-only query rules.
-///
-/// When evaluated, evaluate target arguments once each, left-to-right, then
-/// read the assigned cost. Absence fails with EVALUATION_FAILED. This is a
-/// database read, permitted only where the execution context allows reads;
-/// in particular, not in SEMINAIVE heads or Pure/Write code contexts.
-/// Target arguments inherit their use's context and binder. GetCost is not
-/// inert data: it cannot occur in extracted data or declaration costs,
-/// though saved code may contain it subject to its execution context.
-#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct GetCost {
-    #[prost(message, optional, tag = "1")]
-    pub target: ::core::option::Option<Call>,
-}
 /// A closed function body with explicit captures. Body variables are _0, _1,
 /// ...: captures first, then parameters. Nested lambdas capture explicitly.
+/// The enclosing node has a concrete FuncSort, which supplies parameter sorts
+/// and the required body result sort; the Lambda does not repeat that signature.
 /// The body cannot use the surrounding binder: its complete binder is _0
-/// through _(captures.size + param_types.size - 1), empty when that sum is zero.
+/// through _(captures.size + FuncSort.params.size - 1), empty when that sum is zero.
 /// Captures inherit the surrounding use context, including its data restrictions;
 /// the body is separately scoped deferred code, even in a stored/extracted value.
 /// Function values use PrimitiveValue.lambda; application remains a Call.
@@ -410,31 +402,9 @@ pub struct Lambda {
     /// index into the enclosing `nodes`
     #[prost(uint32, repeated, tag = "1")]
     pub captures: ::prost::alloc::vec::Vec<u32>,
-    /// Parameter sorts; body variables start at _k after the captures.
-    ///
-    /// index into the enclosing `sorts`
-    #[prost(uint32, repeated, tag = "2")]
-    pub param_types: ::prost::alloc::vec::Vec<u32>,
     /// index into the enclosing `nodes`
     #[prost(uint32, tag = "3")]
     pub body: u32,
-}
-/// A function value with a prefix of a named callable's arguments applied. The
-/// callee is a named installed or ambient callable, never a dynamic function
-/// value. Its enclosing sort is a closed FuncSort. Concatenate captured argument
-/// sorts with that FuncSort's remaining params, and use its result as the result
-/// sort of a complete call to the callee. Check this effective call using the
-/// callee's typing form, including varargs or FunctionApplication. It must fully
-/// determine every generic parameter, even with zero or all arguments captured.
-/// Whether a relation can be partially applied is a signature/capability
-/// question; its arguments still cannot contain relation rows as values.
-#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct PartialCall {
-    #[prost(string, tag = "1")]
-    pub func: ::prost::alloc::string::String,
-    /// index into the enclosing `nodes`
-    #[prost(uint32, repeated, tag = "2")]
-    pub args: ::prost::alloc::vec::Vec<u32>,
 }
 /// Native values, selected and typed by the enclosing Node.sort_id. The five
 /// scalar arms retain their exact payloads: f64_bits preserves IEEE-754 bits,
@@ -496,8 +466,15 @@ pub mod primitive_value {
         Maybe(super::MaybeValue),
         #[prost(message, tag = "15")]
         Lambda(super::Lambda),
+        /// A function value with a named callable's argument prefix captured, never
+        /// a dynamic function value. The enclosing node has a closed FuncSort.
+        /// Concatenate captured arg sorts with its remaining params and use its result
+        /// to check one effective complete call under the callee's typing form,
+        /// including varargs or FunctionApplication. This must determine all generic
+        /// parameters, even with zero/all args captured. Relation partial application
+        /// remains a signature/capability question; captured args are value positions.
         #[prost(message, tag = "16")]
-        PartialCall(super::PartialCall),
+        PartialCall(super::Call),
         #[prost(message, tag = "17")]
         Custom(super::CustomValue),
     }
@@ -595,7 +572,7 @@ pub struct Unit {
 /// An ordered mutation or expression evaluation. Sharing syntax does not bind
 /// or retain its result; there is no rule-local let form. Persistent top-level
 /// captures lower to nullary functions plus sets.
-/// Set, Change and SetCost are standalone actions, not value expressions.
+/// Set, delete, subsume and SetCost are standalone actions, not value expressions.
 /// Execute action lists in order; each Set uses the function's conflict policy
 /// if that write conflicts. Rule matches and rebuilds have no global order here.
 /// Deliberate coverage limit: a read cannot be retained across later writes by
@@ -607,7 +584,7 @@ pub struct Action {
     /// or merged. A located `panic` needs this span because it has no operand node.
     #[prost(message, optional, tag = "6")]
     pub span: ::core::option::Option<Span>,
-    #[prost(oneof = "action::Kind", tags = "1, 2, 3, 4, 5")]
+    #[prost(oneof = "action::Kind", tags = "1, 2, 3, 7, 4, 5")]
     pub kind: ::core::option::Option<action::Kind>,
 }
 /// Nested message and enum types in `Action`.
@@ -624,8 +601,14 @@ pub mod action {
         /// NOT subsumable into one: it chooses which row is written.
         #[prost(message, tag = "2")]
         Set(super::Set),
+        /// Delete a Constructor, Function or Relation row without constructing it.
+        /// Deleting a constructor row also deletes its per-row cost annotation.
         #[prost(message, tag = "3")]
-        Change(super::Change),
+        Delete(super::Call),
+        /// Subsume only a Constructor row without constructing it, retaining its
+        /// row and cost annotation. Function and Relation targets are invalid.
+        #[prost(message, tag = "7")]
+        Subsume(super::Call),
         #[prost(string, tag = "4")]
         Panic(::prost::alloc::string::String),
         #[prost(message, tag = "5")]
@@ -642,17 +625,6 @@ pub struct Set {
     /// index into the enclosing `nodes`
     #[prost(uint32, optional, tag = "2")]
     pub value: ::core::option::Option<u32>,
-}
-/// Delete or subsume an addressed row without constructing it. DELETE accepts
-/// Constructor, Function and Relation rows; deleting a constructor row also
-/// deletes its per-row cost annotation. SUBSUME accepts only Constructor rows,
-/// retaining the row and its cost; Function and Relation targets are invalid.
-#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct Change {
-    #[prost(message, optional, tag = "1")]
-    pub target: ::core::option::Option<Call>,
-    #[prost(enumeration = "ChangeKind", tag = "2")]
-    pub kind: i32,
 }
 /// Write one constructor row's extraction cost. Usable in rule heads.
 ///
@@ -692,8 +664,8 @@ pub struct SetCost {
 /// they never install native code. Referencing an ambient definition by name
 /// does not require resending its descriptor.
 /// Compare referenced expression subgraphs structurally, not request-local
-/// indices. Provenance, argument labels and presentation metadata do not
-/// participate in semantic identity; metadata has its own resupply checks.
+/// indices. Provenance, argument labels and language bindings do not
+/// participate in semantic identity; bindings have their own resupply checks.
 /// Comparison must preserve Union sharing/identity topology; ordinary syntax
 /// sharing may differ. One empty Union reused twice is not two fresh Unions.
 /// Callable names are unique across Constructor, Function, Relation, Primitive
@@ -711,7 +683,7 @@ pub struct Declaration {
     #[prost(message, optional, tag = "7")]
     pub span: ::core::option::Option<Span>,
     #[prost(message, optional, tag = "8")]
-    pub metadata: ::core::option::Option<CallableMetadata>,
+    pub bindings: ::core::option::Option<CallableBindings>,
     /// Optional documentation; excluded from semantic identity.
     #[prost(string, tag = "9")]
     pub doc: ::prost::alloc::string::String,
@@ -827,7 +799,7 @@ pub struct HostSortFamily {
     #[prost(uint32, tag = "2")]
     pub arity: u32,
     #[prost(message, optional, tag = "3")]
-    pub metadata: ::core::option::Option<SortMetadata>,
+    pub bindings: ::core::option::Option<SortBindings>,
 }
 /// A host-implemented callable. Submission asserts that a compatible native
 /// implementation is available; it supplies neither a body nor executable code.
@@ -872,12 +844,12 @@ pub struct GenericSignature {
 /// Dedicated typing for a named application primitive, still invoked by Call.
 /// The first effective argument must have a concrete FuncSort; the remaining
 /// arguments exactly match its params, and the call result matches its result.
-/// PartialCall supplies its effective complete call as described there.
+/// PrimitiveValue.partial_call supplies an effective complete call; see that field.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct FunctionApplication {
 }
 // ---------------------------------------------------------------------------
-// LANGUAGE PRESENTATION — optional views, never additional core definitions.
+// LANGUAGE BINDINGS — optional views, never additional core definitions.
 // ---------------------------------------------------------------------------
 
 /// Each language block is fixed when first supplied for the semantic definition.
@@ -886,21 +858,21 @@ pub struct FunctionApplication {
 /// declarations/EqSort entries, before interning away duplicate presentations.
 /// Agreeing supplies are allowed; conflicting supplies are errors. Compare
 /// arena references structurally, not by index. Sort comparison excludes attached
-/// metadata; default calls identify their core callee, not its presentation.
+/// bindings; default calls identify their core callee, not its presentation.
 /// Compare all default roots within each language block together, preserving
 /// shared/distinct Union topology.
-/// Metadata never changes semantic definition identity or duplicates docs/spans.
+/// Bindings never change semantic definition identity or duplicate docs/spans.
 ///
 /// Without a Python/Rust block, generators derive conservative type/free-function
 /// wrappers, preserving exact core names, signatures and argument order. Derived
-/// wrappers install no metadata. Empty blocks carry no hiding instruction; their
+/// wrappers install no bindings. Empty blocks carry no hiding instruction; their
 /// generation behavior and identifier normalization are not specified here.
-/// Malformed individual metadata and conflicting resupply are installation errors.
+/// Malformed individual bindings and conflicting resupply are installation errors.
 /// Cross-definition Python/Rust binding collisions are generation errors for all
 /// explicit/derived combinations, never silent fallback, overwrite or renaming.
 /// High-level generators and these runtime checks remain unimplemented.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct SortMetadata {
+pub struct SortBindings {
     #[prost(message, optional, tag = "1")]
     pub python: ::core::option::Option<TypeBinding>,
     #[prost(message, optional, tag = "2")]
@@ -925,7 +897,7 @@ pub struct EgglogTypeBinding {
     #[prost(string, tag = "1")]
     pub symbol: ::prost::alloc::string::String,
 }
-/// The same per-language lifetime/compatibility contract as SortMetadata.
+/// The same per-language lifetime/compatibility contract as SortBindings.
 /// No view changes the core signature. A surface call supplies every core input
 /// exactly once after receiver mapping, defaults and tail expansion; it emits an
 /// ordinary Call in core argument order. Parameter names are surface names, not
@@ -935,7 +907,7 @@ pub struct EgglogTypeBinding {
 /// determined by its concrete argument/result sorts under the usual call rules.
 /// Recursive binder/owner/default typing checks are normative.
 #[derive(Clone, PartialEq, ::prost::Message)]
-pub struct CallableMetadata {
+pub struct CallableBindings {
     #[prost(message, optional, tag = "1")]
     pub python: ::core::option::Option<PythonBindings>,
     #[prost(message, optional, tag = "2")]
@@ -1111,6 +1083,10 @@ pub struct EgglogCallable {
     #[prost(bool, tag = "2")]
     pub datatype_member: bool,
 }
+// ---------------------------------------------------------------------------
+// RULES AND RULESETS — shared occurrences and named roots.
+// ---------------------------------------------------------------------------
+
 /// An immutable ruleset occurrence: an ordered rule list or composition.
 /// An absent name adds no binding and leaves an unmatched occurrence anonymous.
 /// A present empty name denotes the default rule list.
@@ -1126,10 +1102,10 @@ pub struct EgglogCallable {
 /// before identifying entries. Compatible presentations identify corresponding
 /// ruleset occurrences, but cannot collapse distinct local rule-arena entries:
 /// duplicate named-root presentations must reuse the required rule indices.
-/// One consistent match must
-/// preserve BOTH rule and ruleset sharing across all named-root closures: no
-/// merging distinct occurrences or splitting shared ones. In particular \[r,r\]
-/// cannot match \[s,t\] by merging distinct equal rules s/t. Conflicting identity
+/// One consistent match must preserve BOTH rule and ruleset sharing across all
+/// named-root closures: no merging distinct occurrences or splitting shared ones.
+/// In particular \[r,r\] cannot match \[s,t\] by merging distinct equal rules s/t.
+/// Conflicting identity
 /// requirements from installed roots are errors.
 /// A matched local entry reuses its retained occurrence everywhere, including
 /// a direct Run of that index. Unmatched occurrences are fresh for each
@@ -1463,9 +1439,9 @@ pub struct Extract {
 /// preserving shared and distinct rule occurrences independently of labels.
 /// Omit transient rules/rulesets not retained through named roots.
 /// Include saved code and its dependencies without executing it.
-/// Include supplied language metadata and all metadata-only sort/default-node
+/// Include supplied language bindings and all bindings-only sort/default-node
 /// dependencies, remapping their arena references. Do not export derived wrapper
-/// defaults as if they were supplied metadata. Preserve default-root Union
+/// defaults as if they were supplied bindings. Preserve default-root Union
 /// sharing without evaluating templates or confusing them with stored classes.
 /// Host implementations/codecs remain external.
 /// HostSortFamily and HostPrimitive describe the catalog, including generic
@@ -1485,8 +1461,8 @@ pub struct Extract {
 /// for each canonical equality class, naming its unique Union location whose
 /// members are all its constructor rows. Include empty/unreachable classes.
 /// Emit relation rows as direct Action.term Calls; write every function row,
-/// including Unit outputs, with Set. Then emit SetCost annotations, then Change
-/// with SUBSUME for subsumed constructor rows; no DELETE or panic actions.
+/// including Unit outputs, with Set. Then emit SetCost annotations, then subsume
+/// for subsumed constructor rows; no delete or panic actions.
 /// These explicit roots inventory stored classes, not arbitrary arena nodes or
 /// Union locations in saved code. Shared Union locations preserve references
 /// across this list. Keep all canonical rows and extant cost/subsumption
@@ -1982,36 +1958,6 @@ pub struct OutDegreeStats {
     #[prost(double, tag = "6")]
     pub p75: f64,
 }
-/// Row mutation kinds.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
-#[repr(i32)]
-pub enum ChangeKind {
-    Unspecified = 0,
-    Delete = 1,
-    Subsume = 2,
-}
-impl ChangeKind {
-    /// String value of the enum field names used in the ProtoBuf definition.
-    ///
-    /// The values are not transformed in any way and thus are considered stable
-    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
-    pub fn as_str_name(&self) -> &'static str {
-        match self {
-            Self::Unspecified => "CHANGE_KIND_UNSPECIFIED",
-            Self::Delete => "CHANGE_KIND_DELETE",
-            Self::Subsume => "CHANGE_KIND_SUBSUME",
-        }
-    }
-    /// Creates an enum from field names used in the ProtoBuf definition.
-    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
-        match value {
-            "CHANGE_KIND_UNSPECIFIED" => Some(Self::Unspecified),
-            "CHANGE_KIND_DELETE" => Some(Self::Delete),
-            "CHANGE_KIND_SUBSUME" => Some(Self::Subsume),
-            _ => None,
-        }
-    }
-}
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]
 pub enum PythonCallKind {
@@ -2135,7 +2081,7 @@ pub enum ErrorCode {
     /// An authored `panic` action fired.
     Panic = 3,
     /// A primitive or merge failed at run time, including unresolvable merges,
-    /// a directly evaluated GetCost has no assigned annotation, or Freeze cannot
+    /// a directly evaluated get_cost has no assigned annotation, or Freeze cannot
     /// encode a required value with a supported codec.
     EvaluationFailed = 4,
     /// The requested extractor/cost-model pair is incompatible, or an operation

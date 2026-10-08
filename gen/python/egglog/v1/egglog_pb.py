@@ -290,13 +290,13 @@ class Sort(Message[_SortFields]):
         span: Span | None
         doc: str
 
-_EqSortFields: TypeAlias = Literal["name", "metadata"]
+_EqSortFields: TypeAlias = Literal["name", "bindings"]
 
 class EqSort(Message[_EqSortFields]):
     """
     A nullary equality sort. An entry also declares it; repeated declarations
     of the same name are idempotent. Its name cannot also name a host sort family.
-    Metadata is excluded from sort identity and follows SortMetadata's separate
+    Bindings are excluded from sort identity and follow SortBindings' separate
     first-supply/resupply contract.
 
     ```proto
@@ -308,13 +308,13 @@ class EqSort(Message[_EqSortFields]):
             ```proto
             string name = 1;
             ```
-        metadata:
+        bindings:
             ```proto
-            optional egglog.v1.SortMetadata metadata = 2;
+            optional egglog.v1.SortBindings bindings = 2;
             ```
     """
 
-    __slots__ = ("name", "metadata")
+    __slots__ = ("name", "bindings")
 
     if TYPE_CHECKING:
 
@@ -322,12 +322,12 @@ class EqSort(Message[_EqSortFields]):
             self,
             *,
             name: str = "",
-            metadata: SortMetadata | None = None,
+            bindings: SortBindings | None = None,
         ) -> None:
             pass
 
         name: str
-        metadata: SortMetadata | None
+        bindings: SortBindings | None
 
 _PrimSortFields: TypeAlias = Literal["name"]
 
@@ -467,14 +467,14 @@ class Node(Message[_NodeFields]):
       installation/export. Lambda bodies keep their own binders; every expanded
       use must satisfy its ordinary execution context's typing/effect rules.
     - Inert values (declared costs and extracted data) contain no variables,
-      GetCost reads or Union and must be finite. Saved code bodies retain
+      get_cost reads or Union and must be finite. Saved code bodies retain
       their own binders, so these are use-site rules, not bans on an entire arena.
     Scalar values are inert. Child-bearing values follow the surrounding
     context; constructing a value does not grant inverse query matching or
     relax groundedness. Calls and host value materialization must obey their
     enclosing execution context's capabilities, including query-mode restrictions.
 
-    Call/GetCost arguments, Union members and PrimitiveValue children inherit
+    Call/get_cost arguments, Union members and PrimitiveValue children inherit
     the surrounding context and binder. Each is a value position: a row position
     never propagates to children. A lambda body starts its own code
     context and binder, also in a value position. See Call for relation rows.
@@ -514,13 +514,13 @@ class Node(Message[_NodeFields]):
             self,
             *,
             sort_id: int = 0,
-            kind: Oneof[Literal["var"], str] | Oneof[Literal["primitive_value"], PrimitiveValue] | Oneof[Literal["call"], Call] | Oneof[Literal["union"], Union] | Oneof[Literal["get_cost"], GetCost] | None = None,
+            kind: Oneof[Literal["var"], str] | Oneof[Literal["primitive_value"], PrimitiveValue] | Oneof[Literal["call"], Call] | Oneof[Literal["union"], Union] | Oneof[Literal["get_cost"], Call] | None = None,
             span: Span | None = None,
         ) -> None:
             pass
 
         sort_id: int
-        kind: Oneof[Literal["var"], str] | Oneof[Literal["primitive_value"], PrimitiveValue] | Oneof[Literal["call"], Call] | Oneof[Literal["union"], Union] | Oneof[Literal["get_cost"], GetCost] | None
+        kind: Oneof[Literal["var"], str] | Oneof[Literal["primitive_value"], PrimitiveValue] | Oneof[Literal["call"], Call] | Oneof[Literal["union"], Union] | Oneof[Literal["get_cost"], Call] | None
         span: Span | None
 
 _UnionFields: TypeAlias = Literal["members"]
@@ -593,7 +593,7 @@ class Union(Message[_UnionFields]):
     visited set.
 
     NORMATIVE: a cycle MUST pass through a union node. Removing Union's outgoing
-    edges must leave an acyclic graph of Call/GetCost arguments and every
+    edges must leave an acyclic graph of Call/get_cost arguments and every
     PrimitiveValue child, including custom args and lambda bodies/captures.
     Union members still obey their inherited use context and bounds.
     A call reaching itself with no class boundary is invalid, not a recursive
@@ -634,9 +634,10 @@ _CallFields: TypeAlias = Literal["func", "args"]
 
 class Call(Message[_CallFields]):
     """
-    Positional application of a callable declared in the enclosing payload,
+    A callable name and positional arguments. The enclosing field determines
+    whether it is an application, row address, cost read, or partial application.
+    The callable is declared in the enclosing payload,
     already installed on the handle, or implicitly provided by the host.
-    The enclosing node's sort matches the result; relation calls use Unit.
     The name identifies one callable across installed and ambient definitions;
     there are no same-name overload sets. Check argument and result sorts against
     that definition's signature. Generic instantiation does not select another
@@ -645,9 +646,10 @@ class Call(Message[_CallFields]):
     HostPrimitive's typing form checks all concrete argument AND result sorts;
     every generic parameter must be determined. There are no call-level type args.
 
-    Relation calls are restricted to row positions: a query fact, `Action.term`,
-    `Change.target`, or `FunctionRow.call`. They cannot be value arguments,
-    `Set.value`, `Union` members, lambda captures/results, or deferred code.
+    For Node.call, the enclosing node's sort matches the result; relation calls
+    use Unit. Relation calls are restricted to row positions: a query fact,
+    `Action.term`, `Action.delete`, or `FunctionRow.call`. They cannot be value
+    arguments, `Set.value`, `Union` members, lambda captures/results, or deferred code.
     The restriction applies to installed and ambient names as well as local
     declarations. A relation row is the bare `Call` node itself; see `Union`
     for the Unit-sorted row rule.
@@ -684,61 +686,16 @@ class Call(Message[_CallFields]):
         func: str
         args: list[int]
 
-_GetCostFields: TypeAlias = Literal["target"]
-
-class GetCost(Message[_GetCostFields]):
-    """
-    Read a constructor row's explicitly assigned per-row cost, with result sort
-    C. The target must resolve to a Constructor; Functions, Relations and
-    primitives are invalid. The target addresses the row without evaluating or
-    inserting the constructor itself. No declared-cost or model fallback occurs;
-    an assigned zero is a value, while an absent annotation is not zero.
-
-    In a query this is a relational pattern over assigned costs, sharing the
-    query binder and permitting key variables to bind. An absent annotation
-    contributes no match. It participates in seminaive dependencies like a
-    table lookup; it is not a host primitive subject to Pure-only query rules.
-
-    When evaluated, evaluate target arguments once each, left-to-right, then
-    read the assigned cost. Absence fails with EVALUATION_FAILED. This is a
-    database read, permitted only where the execution context allows reads;
-    in particular, not in SEMINAIVE heads or Pure/Write code contexts.
-    Target arguments inherit their use's context and binder. GetCost is not
-    inert data: it cannot occur in extracted data or declaration costs,
-    though saved code may contain it subject to its execution context.
-
-    ```proto
-    message egglog.v1.GetCost
-    ```
-
-    Attributes:
-        target:
-            ```proto
-            optional egglog.v1.Call target = 1;
-            ```
-    """
-
-    __slots__ = ("target",)
-
-    if TYPE_CHECKING:
-
-        def __init__(
-            self,
-            *,
-            target: Call | None = None,
-        ) -> None:
-            pass
-
-        target: Call | None
-
-_LambdaFields: TypeAlias = Literal["captures", "param_types", "body"]
+_LambdaFields: TypeAlias = Literal["captures", "body"]
 
 class Lambda(Message[_LambdaFields]):
     """
     A closed function body with explicit captures. Body variables are _0, _1,
     ...: captures first, then parameters. Nested lambdas capture explicitly.
+    The enclosing node has a concrete FuncSort, which supplies parameter sorts
+    and the required body result sort; the Lambda does not repeat that signature.
     The body cannot use the surrounding binder: its complete binder is _0
-    through _(captures.size + param_types.size - 1), empty when that sum is zero.
+    through _(captures.size + FuncSort.params.size - 1), empty when that sum is zero.
     Captures inherit the surrounding use context, including its data restrictions;
     the body is separately scoped deferred code, even in a stored/extracted value.
     Function values use PrimitiveValue.lambda; application remains a Call.
@@ -757,14 +714,6 @@ class Lambda(Message[_LambdaFields]):
             ```proto
             repeated uint32 captures = 1 [packed = true];
             ```
-        param_types:
-            Parameter sorts; body variables start at _k after the captures.
-
-            index into the enclosing `sorts`
-
-            ```proto
-            repeated uint32 param_types = 2 [packed = true];
-            ```
         body:
             index into the enclosing `nodes`
 
@@ -773,7 +722,7 @@ class Lambda(Message[_LambdaFields]):
             ```
     """
 
-    __slots__ = ("captures", "param_types", "body")
+    __slots__ = ("captures", "body")
 
     if TYPE_CHECKING:
 
@@ -781,60 +730,12 @@ class Lambda(Message[_LambdaFields]):
             self,
             *,
             captures: list[int] | None = None,
-            param_types: list[int] | None = None,
             body: int = 0,
         ) -> None:
             pass
 
         captures: list[int]
-        param_types: list[int]
         body: int
-
-_PartialCallFields: TypeAlias = Literal["func", "args"]
-
-class PartialCall(Message[_PartialCallFields]):
-    """
-    A function value with a prefix of a named callable's arguments applied. The
-    callee is a named installed or ambient callable, never a dynamic function
-    value. Its enclosing sort is a closed FuncSort. Concatenate captured argument
-    sorts with that FuncSort's remaining params, and use its result as the result
-    sort of a complete call to the callee. Check this effective call using the
-    callee's typing form, including varargs or FunctionApplication. It must fully
-    determine every generic parameter, even with zero or all arguments captured.
-    Whether a relation can be partially applied is a signature/capability
-    question; its arguments still cannot contain relation rows as values.
-
-    ```proto
-    message egglog.v1.PartialCall
-    ```
-
-    Attributes:
-        func:
-            ```proto
-            string func = 1;
-            ```
-        args:
-            index into the enclosing `nodes`
-
-            ```proto
-            repeated uint32 args = 2 [packed = true];
-            ```
-    """
-
-    __slots__ = ("func", "args")
-
-    if TYPE_CHECKING:
-
-        def __init__(
-            self,
-            *,
-            func: str = "",
-            args: list[int] | None = None,
-        ) -> None:
-            pass
-
-        func: str
-        args: list[int]
 
 _PrimitiveValueFields: TypeAlias = Literal["i64", "f64_bits", "string", "bool", "unit", "big_int", "big_rat", "rational", "vec", "set", "multiset", "map", "pair", "maybe", "lambda", "partial_call", "custom"]
 
@@ -877,11 +778,11 @@ class PrimitiveValue(Message[_PrimitiveValueFields]):
         def __init__(
             self,
             *,
-            value: Oneof[Literal["i64"], int] | Oneof[Literal["f64_bits"], int] | Oneof[Literal["string"], str] | Oneof[Literal["bool"], bool] | Oneof[Literal["unit"], Unit] | Oneof[Literal["big_int"], str] | Oneof[Literal["big_rat"], BigRat] | Oneof[Literal["rational"], Rational] | Oneof[Literal["vec"], ValueList] | Oneof[Literal["set"], ValueList] | Oneof[Literal["multiset"], ValueList] | Oneof[Literal["map"], MapValue] | Oneof[Literal["pair"], PairValue] | Oneof[Literal["maybe"], MaybeValue] | Oneof[Literal["lambda"], Lambda] | Oneof[Literal["partial_call"], PartialCall] | Oneof[Literal["custom"], CustomValue] | None = None,
+            value: Oneof[Literal["i64"], int] | Oneof[Literal["f64_bits"], int] | Oneof[Literal["string"], str] | Oneof[Literal["bool"], bool] | Oneof[Literal["unit"], Unit] | Oneof[Literal["big_int"], str] | Oneof[Literal["big_rat"], BigRat] | Oneof[Literal["rational"], Rational] | Oneof[Literal["vec"], ValueList] | Oneof[Literal["set"], ValueList] | Oneof[Literal["multiset"], ValueList] | Oneof[Literal["map"], MapValue] | Oneof[Literal["pair"], PairValue] | Oneof[Literal["maybe"], MaybeValue] | Oneof[Literal["lambda"], Lambda] | Oneof[Literal["partial_call"], Call] | Oneof[Literal["custom"], CustomValue] | None = None,
         ) -> None:
             pass
 
-        value: Oneof[Literal["i64"], int] | Oneof[Literal["f64_bits"], int] | Oneof[Literal["string"], str] | Oneof[Literal["bool"], bool] | Oneof[Literal["unit"], Unit] | Oneof[Literal["big_int"], str] | Oneof[Literal["big_rat"], BigRat] | Oneof[Literal["rational"], Rational] | Oneof[Literal["vec"], ValueList] | Oneof[Literal["set"], ValueList] | Oneof[Literal["multiset"], ValueList] | Oneof[Literal["map"], MapValue] | Oneof[Literal["pair"], PairValue] | Oneof[Literal["maybe"], MaybeValue] | Oneof[Literal["lambda"], Lambda] | Oneof[Literal["partial_call"], PartialCall] | Oneof[Literal["custom"], CustomValue] | None
+        value: Oneof[Literal["i64"], int] | Oneof[Literal["f64_bits"], int] | Oneof[Literal["string"], str] | Oneof[Literal["bool"], bool] | Oneof[Literal["unit"], Unit] | Oneof[Literal["big_int"], str] | Oneof[Literal["big_rat"], BigRat] | Oneof[Literal["rational"], Rational] | Oneof[Literal["vec"], ValueList] | Oneof[Literal["set"], ValueList] | Oneof[Literal["multiset"], ValueList] | Oneof[Literal["map"], MapValue] | Oneof[Literal["pair"], PairValue] | Oneof[Literal["maybe"], MaybeValue] | Oneof[Literal["lambda"], Lambda] | Oneof[Literal["partial_call"], Call] | Oneof[Literal["custom"], CustomValue] | None
 
 _BigRatFields: TypeAlias = Literal["numerator", "denominator"]
 
@@ -1201,14 +1102,14 @@ class Unit(Message[_UnitFields]):
         ) -> None:
             pass
 
-_ActionFields: TypeAlias = Literal["term", "set", "change", "panic", "set_cost", "span"]
+_ActionFields: TypeAlias = Literal["term", "set", "delete", "subsume", "panic", "set_cost", "span"]
 
 class Action(Message[_ActionFields]):
     """
     An ordered mutation or expression evaluation. Sharing syntax does not bind
     or retain its result; there is no rule-local let form. Persistent top-level
     captures lower to nullary functions plus sets.
-    Set, Change and SetCost are standalone actions, not value expressions.
+    Set, delete, subsume and SetCost are standalone actions, not value expressions.
     Execute action lists in order; each Set uses the function's conflict policy
     if that write conflicts. Rule matches and rebuilds have no global order here.
     Deliberate coverage limit: a read cannot be retained across later writes by
@@ -1240,12 +1141,12 @@ class Action(Message[_ActionFields]):
         def __init__(
             self,
             *,
-            kind: Oneof[Literal["term"], int] | Oneof[Literal["set"], Set] | Oneof[Literal["change"], Change] | Oneof[Literal["panic"], str] | Oneof[Literal["set_cost"], SetCost] | None = None,
+            kind: Oneof[Literal["term"], int] | Oneof[Literal["set"], Set] | Oneof[Literal["delete"], Call] | Oneof[Literal["subsume"], Call] | Oneof[Literal["panic"], str] | Oneof[Literal["set_cost"], SetCost] | None = None,
             span: Span | None = None,
         ) -> None:
             pass
 
-        kind: Oneof[Literal["term"], int] | Oneof[Literal["set"], Set] | Oneof[Literal["change"], Change] | Oneof[Literal["panic"], str] | Oneof[Literal["set_cost"], SetCost] | None
+        kind: Oneof[Literal["term"], int] | Oneof[Literal["set"], Set] | Oneof[Literal["delete"], Call] | Oneof[Literal["subsume"], Call] | Oneof[Literal["panic"], str] | Oneof[Literal["set_cost"], SetCost] | None
         span: Span | None
 
 _SetFields: TypeAlias = Literal["target", "value"]
@@ -1287,45 +1188,6 @@ class Set(Message[_SetFields]):
 
         target: Call | None
         value: int
-
-_ChangeFields: TypeAlias = Literal["target", "kind"]
-
-class Change(Message[_ChangeFields]):
-    """
-    Delete or subsume an addressed row without constructing it. DELETE accepts
-    Constructor, Function and Relation rows; deleting a constructor row also
-    deletes its per-row cost annotation. SUBSUME accepts only Constructor rows,
-    retaining the row and its cost; Function and Relation targets are invalid.
-
-    ```proto
-    message egglog.v1.Change
-    ```
-
-    Attributes:
-        target:
-            ```proto
-            optional egglog.v1.Call target = 1;
-            ```
-        kind:
-            ```proto
-            egglog.v1.ChangeKind kind = 2;
-            ```
-    """
-
-    __slots__ = ("target", "kind")
-
-    if TYPE_CHECKING:
-
-        def __init__(
-            self,
-            *,
-            target: Call | None = None,
-            kind: ChangeKind | None = None,
-        ) -> None:
-            pass
-
-        target: Call | None
-        kind: ChangeKind
 
 _SetCostFields: TypeAlias = Literal["target", "cost"]
 
@@ -1382,7 +1244,7 @@ class SetCost(Message[_SetCostFields]):
         target: Call | None
         cost: int
 
-_DeclarationFields: TypeAlias = Literal["constructor", "function", "relation", "primitive", "host_sort_family", "host_primitive", "span", "metadata", "doc"]
+_DeclarationFields: TypeAlias = Literal["constructor", "function", "relation", "primitive", "host_sort_family", "host_primitive", "span", "bindings", "doc"]
 
 class Declaration(Message[_DeclarationFields]):
     """
@@ -1394,8 +1256,8 @@ class Declaration(Message[_DeclarationFields]):
     they never install native code. Referencing an ambient definition by name
     does not require resending its descriptor.
     Compare referenced expression subgraphs structurally, not request-local
-    indices. Provenance, argument labels and presentation metadata do not
-    participate in semantic identity; metadata has its own resupply checks.
+    indices. Provenance, argument labels and language bindings do not
+    participate in semantic identity; bindings have their own resupply checks.
     Comparison must preserve Union sharing/identity topology; ordinary syntax
     sharing may differ. One empty Union reused twice is not two fresh Unions.
     Callable names are unique across Constructor, Function, Relation, Primitive
@@ -1423,9 +1285,9 @@ class Declaration(Message[_DeclarationFields]):
             ```proto
             optional egglog.v1.Span span = 7;
             ```
-        metadata:
+        bindings:
             ```proto
-            optional egglog.v1.CallableMetadata metadata = 8;
+            optional egglog.v1.CallableBindings bindings = 8;
             ```
         doc:
             Optional documentation; excluded from semantic identity.
@@ -1435,7 +1297,7 @@ class Declaration(Message[_DeclarationFields]):
             ```
     """
 
-    __slots__ = ("span", "metadata", "doc", "kind")
+    __slots__ = ("span", "bindings", "doc", "kind")
 
     if TYPE_CHECKING:
 
@@ -1444,14 +1306,14 @@ class Declaration(Message[_DeclarationFields]):
             *,
             kind: Oneof[Literal["constructor"], Constructor] | Oneof[Literal["function"], Function] | Oneof[Literal["relation"], Relation] | Oneof[Literal["primitive"], Primitive] | Oneof[Literal["host_sort_family"], HostSortFamily] | Oneof[Literal["host_primitive"], HostPrimitive] | None = None,
             span: Span | None = None,
-            metadata: CallableMetadata | None = None,
+            bindings: CallableBindings | None = None,
             doc: str = "",
         ) -> None:
             pass
 
         kind: Oneof[Literal["constructor"], Constructor] | Oneof[Literal["function"], Function] | Oneof[Literal["relation"], Relation] | Oneof[Literal["primitive"], Primitive] | Oneof[Literal["host_sort_family"], HostSortFamily] | Oneof[Literal["host_primitive"], HostPrimitive] | None
         span: Span | None
-        metadata: CallableMetadata | None
+        bindings: CallableBindings | None
         doc: str
 
 _ArgFields: TypeAlias = Literal["sort", "name"]
@@ -1709,7 +1571,7 @@ class Primitive(Message[_PrimitiveFields]):
         output: int
         body: int
 
-_HostSortFamilyFields: TypeAlias = Literal["name", "arity", "metadata"]
+_HostSortFamilyFields: TypeAlias = Literal["name", "arity", "bindings"]
 
 class HostSortFamily(Message[_HostSortFamilyFields]):
     """
@@ -1731,13 +1593,13 @@ class HostSortFamily(Message[_HostSortFamilyFields]):
             ```proto
             uint32 arity = 2;
             ```
-        metadata:
+        bindings:
             ```proto
-            optional egglog.v1.SortMetadata metadata = 3;
+            optional egglog.v1.SortBindings bindings = 3;
             ```
     """
 
-    __slots__ = ("name", "arity", "metadata")
+    __slots__ = ("name", "arity", "bindings")
 
     if TYPE_CHECKING:
 
@@ -1746,13 +1608,13 @@ class HostSortFamily(Message[_HostSortFamilyFields]):
             *,
             name: str = "",
             arity: int = 0,
-            metadata: SortMetadata | None = None,
+            bindings: SortBindings | None = None,
         ) -> None:
             pass
 
         name: str
         arity: int
-        metadata: SortMetadata | None
+        bindings: SortBindings | None
 
 _HostPrimitiveFields: TypeAlias = Literal["name", "signature", "application"]
 
@@ -1855,7 +1717,7 @@ class FunctionApplication(Message[_FunctionApplicationFields]):
     Dedicated typing for a named application primitive, still invoked by Call.
     The first effective argument must have a concrete FuncSort; the remaining
     arguments exactly match its params, and the call result matches its result.
-    PartialCall supplies its effective complete call as described there.
+    PrimitiveValue.partial_call supplies an effective complete call; see that field.
 
     ```proto
     message egglog.v1.FunctionApplication
@@ -1871,9 +1733,9 @@ class FunctionApplication(Message[_FunctionApplicationFields]):
         ) -> None:
             pass
 
-_SortMetadataFields: TypeAlias = Literal["python", "rust", "egglog"]
+_SortBindingsFields: TypeAlias = Literal["python", "rust", "egglog"]
 
-class SortMetadata(Message[_SortMetadataFields]):
+class SortBindings(Message[_SortBindingsFields]):
     """
     Each language block is fixed when first supplied for the semantic definition.
     Absence makes no assertion/removal; another language may first arrive later.
@@ -1881,22 +1743,22 @@ class SortMetadata(Message[_SortMetadataFields]):
     declarations/EqSort entries, before interning away duplicate presentations.
     Agreeing supplies are allowed; conflicting supplies are errors. Compare
     arena references structurally, not by index. Sort comparison excludes attached
-    metadata; default calls identify their core callee, not its presentation.
+    bindings; default calls identify their core callee, not its presentation.
     Compare all default roots within each language block together, preserving
     shared/distinct Union topology.
-    Metadata never changes semantic definition identity or duplicates docs/spans.
+    Bindings never change semantic definition identity or duplicate docs/spans.
 
     Without a Python/Rust block, generators derive conservative type/free-function
     wrappers, preserving exact core names, signatures and argument order. Derived
-    wrappers install no metadata. Empty blocks carry no hiding instruction; their
+    wrappers install no bindings. Empty blocks carry no hiding instruction; their
     generation behavior and identifier normalization are not specified here.
-    Malformed individual metadata and conflicting resupply are installation errors.
+    Malformed individual bindings and conflicting resupply are installation errors.
     Cross-definition Python/Rust binding collisions are generation errors for all
     explicit/derived combinations, never silent fallback, overwrite or renaming.
     High-level generators and these runtime checks remain unimplemented.
 
     ```proto
-    message egglog.v1.SortMetadata
+    message egglog.v1.SortBindings
     ```
 
     Attributes:
@@ -2000,11 +1862,11 @@ class EgglogTypeBinding(Message[_EgglogTypeBindingFields]):
 
         symbol: str
 
-_CallableMetadataFields: TypeAlias = Literal["python", "rust", "egglog"]
+_CallableBindingsFields: TypeAlias = Literal["python", "rust", "egglog"]
 
-class CallableMetadata(Message[_CallableMetadataFields]):
+class CallableBindings(Message[_CallableBindingsFields]):
     """
-    The same per-language lifetime/compatibility contract as SortMetadata.
+    The same per-language lifetime/compatibility contract as SortBindings.
     No view changes the core signature. A surface call supplies every core input
     exactly once after receiver mapping, defaults and tail expansion; it emits an
     ordinary Call in core argument order. Parameter names are surface names, not
@@ -2015,7 +1877,7 @@ class CallableMetadata(Message[_CallableMetadataFields]):
     Recursive binder/owner/default typing checks are normative.
 
     ```proto
-    message egglog.v1.CallableMetadata
+    message egglog.v1.CallableBindings
     ```
 
     Attributes:
@@ -2608,10 +2470,10 @@ class Ruleset(Message[_RulesetFields]):
     before identifying entries. Compatible presentations identify corresponding
     ruleset occurrences, but cannot collapse distinct local rule-arena entries:
     duplicate named-root presentations must reuse the required rule indices.
-    One consistent match must
-    preserve BOTH rule and ruleset sharing across all named-root closures: no
-    merging distinct occurrences or splitting shared ones. In particular [r,r]
-    cannot match [s,t] by merging distinct equal rules s/t. Conflicting identity
+    One consistent match must preserve BOTH rule and ruleset sharing across all
+    named-root closures: no merging distinct occurrences or splitting shared ones.
+    In particular [r,r] cannot match [s,t] by merging distinct equal rules s/t.
+    Conflicting identity
     requirements from installed roots are errors.
     A matched local entry reuses its retained occurrence everywhere, including
     a direct Run of that index. Unmatched occurrences are fresh for each
@@ -3377,9 +3239,9 @@ class Freeze(Message[_FreezeFields]):
     preserving shared and distinct rule occurrences independently of labels.
     Omit transient rules/rulesets not retained through named roots.
     Include saved code and its dependencies without executing it.
-    Include supplied language metadata and all metadata-only sort/default-node
+    Include supplied language bindings and all bindings-only sort/default-node
     dependencies, remapping their arena references. Do not export derived wrapper
-    defaults as if they were supplied metadata. Preserve default-root Union
+    defaults as if they were supplied bindings. Preserve default-root Union
     sharing without evaluating templates or confusing them with stored classes.
     Host implementations/codecs remain external.
     HostSortFamily and HostPrimitive describe the catalog, including generic
@@ -3399,8 +3261,8 @@ class Freeze(Message[_FreezeFields]):
     for each canonical equality class, naming its unique Union location whose
     members are all its constructor rows. Include empty/unreachable classes.
     Emit relation rows as direct Action.term Calls; write every function row,
-    including Unit outputs, with Set. Then emit SetCost annotations, then Change
-    with SUBSUME for subsumed constructor rows; no DELETE or panic actions.
+    including Unit outputs, with Set. Then emit SetCost annotations, then subsume
+    for subsumed constructor rows; no delete or panic actions.
     These explicit roots inventory stored classes, not arbitrary arena nodes or
     Union locations in saved code. Shared Union locations preserve references
     across this list. Keep all canonical rows and extant cost/subsumption
@@ -4912,33 +4774,6 @@ class OutDegreeStats(Message[_OutDegreeStatsFields]):
         median: float
         p75: float
 
-class ChangeKind(Enum):
-    """
-    Row mutation kinds.
-
-    ```proto
-    enum egglog.v1.ChangeKind
-    ```
-
-    Attributes:
-        UNSPECIFIED:
-            ```proto
-            CHANGE_KIND_UNSPECIFIED = 0
-            ```
-        DELETE:
-            ```proto
-            CHANGE_KIND_DELETE = 1
-            ```
-        SUBSUME:
-            ```proto
-            CHANGE_KIND_SUBSUME = 2
-            ```
-    """
-
-    UNSPECIFIED = 0
-    DELETE = 1
-    SUBSUME = 2
-
 class PythonCallKind(Enum):
     """
     ```proto
@@ -5086,7 +4921,7 @@ class ErrorCode(Enum):
             ```
         EVALUATION_FAILED:
             A primitive or merge failed at run time, including unresolvable merges,
-            a directly evaluated GetCost has no assigned annotation, or Freeze cannot
+            a directly evaluated get_cost has no assigned annotation, or Freeze cannot
             encode a required value with a supported codec.
 
             ```proto
@@ -5178,7 +5013,7 @@ class TerminationReason(Enum):
 
 
 _DESC = file_desc(
-    b'\n\x16egglog/v1/egglog.proto\x12\tegglog.v1\x1a\x1bbuf/validate/validate.proto"\xad6\n\x07Program\x12&\n\nir_version\x18\x01 \x01(\rR\tirVersionB\x07\xbaH\x04*\x02 \x00\x12%\n\x05nodes\x18\x02 \x03(\x0b2\x0f.egglog.v1.NodeR\x05nodes\x12%\n\x05sorts\x18\x03 \x03(\x0b2\x0f.egglog.v1.SortR\x05sorts\x12:\n\x0cdeclarations\x18\x04 \x03(\x0b2\x16.egglog.v1.DeclarationR\x0cdeclarations\x12.\n\x08commands\x18\x05 \x03(\x0b2\x12.egglog.v1.CommandR\x08commands\x12+\n\x05files\x18\x06 \x03(\x0b2\x15.egglog.v1.SourceFileR\x05files\x12.\n\x08rulesets\x18\x07 \x03(\x0b2\x12.egglog.v1.RulesetR\x08rulesets\x12 \n\tcost_sort\x18\x08 \x01(\rH\x00R\x08costSort\x88\x01\x01\x12)\n\x05rules\x18\t \x03(\x0b2\x13.egglog.v1.RuleDeclR\x05rulesB\x0c\n\n_cost_sort:\x873\xbaH\x833\x1a\xc3\x01\n\x1aprogram.cost_sort_in_range\x125cost_sort must index a non-variable sort when present\x1an!has(this.cost_sort) || (this.cost_sort < uint(size(this.sorts)) && !has(this.sorts[int(this.cost_sort)].var))\x1a\xae\x01\n\x1aprogram.node_sort_in_range\x121every node sort_id must index a non-variable sort\x1a]this.nodes.all(n, n.sort_id < uint(size(this.sorts)) && !has(this.sorts[int(n.sort_id)].var))\x1a\xab\x05\n\x1aprogram.node_refs_in_range\x12\x1enode children must index nodes\x1a\xec\x04this.nodes.all(n, (has(n.call) ? n.call.args : has(n.get_cost) ? n.get_cost.target.args : has(n.union) ? n.union.members : has(n.primitive_value) ? [n.primitive_value].map(v, has(v.lambda) ? v.lambda.captures + [v.lambda.body] : has(v.partial_call) ? v.partial_call.args : has(v.vec) ? v.vec.items : has(v.set) ? v.set.items : has(v.multiset) ? v.multiset.items : has(v.map) ? v.map.entries.map(e, e.key) + v.map.entries.map(e, e.value) : has(v.pair) ? [v.pair.first, v.pair.second] : has(v.maybe) && has(v.maybe.value) ? [v.maybe.value] : has(v.custom) ? v.custom.args : [])[0] : []).all(i, i < uint(size(this.nodes))))\x1a\xa5\x03\n\x1aprogram.sort_refs_in_range\x129sort children and lambda parameter sorts must index sorts\x1a\xcb\x02this.sorts.all(s, (has(s.container) ? s.container.args : has(s.func) ? s.func.params + [s.func.result] : []).all(i, i < uint(size(this.sorts)))) && this.nodes.all(n, !has(n.primitive_value) || !has(n.primitive_value.lambda) || n.primitive_value.lambda.param_types.all(i, i < uint(size(this.sorts)) && !has(this.sorts[int(i)].var)))\x1a\xe7\x03\n program.concrete_signature_roots\x12=concrete declaration signatures must index non-variable sorts\x1a\x83\x03this.declarations.all(d, (has(d.constructor) ? d.constructor.inputs.map(a, a.sort) + [d.constructor.output] : has(d.function) ? d.function.inputs.map(a, a.sort) + [d.function.output] : has(d.relation) ? d.relation.inputs.map(a, a.sort) : has(d.primitive) ? d.primitive.inputs.map(a, a.sort) + [d.primitive.output] : []).all(i, i < uint(size(this.sorts)) && !has(this.sorts[int(i)].var)))\x1a\xd1\x03\n\x1fprogram.generic_signature_roots\x12=signature sorts must exist and direct variables must be bound\x1a\xee\x02this.declarations.all(d, !has(d.host_primitive) || !has(d.host_primitive.signature) || [d.host_primitive.signature].all(sig, (sig.inputs.map(a, a.sort) + (has(sig.output) ? [sig.output] : []) + (has(sig.varargs) ? [sig.varargs.sort] : [])).all(i, i < uint(size(this.sorts)) && (!has(this.sorts[int(i)].var) || this.sorts[int(i)].var < uint(size(sig.type_params))))))\x1a\xba\x02\n\x1eprogram.metadata_default_roots\x12Hpresentation defaults must index nodes and cannot be free variable roots\x1a\xcd\x01this.declarations.all(d, !has(d.metadata) || d.metadata.python.views.all(v, v.params.all(p, !has(p.default_expr) || (p.default_expr < uint(size(this.nodes)) && !has(this.nodes[int(p.default_expr)].var)))))\x1a\xde\x05\n\x1bprogram.metadata_sort_roots\x12Tpresentation sort references must exist and direct variables use the callable binder\x1a\xe8\x04this.declarations.all(d, !has(d.metadata) || [has(d.host_primitive) && has(d.host_primitive.signature) ? size(d.host_primitive.signature.type_params) : 0].all(n, d.metadata.python.views.all(v, (!has(v.owner) || !has(v.owner.sort)) || [v.owner.sort].all(i, i < uint(size(this.sorts)) && (!has(this.sorts[int(i)].var) || this.sorts[int(i)].var < uint(n)))) && d.metadata.rust.views.all(v, ((has(v.owner) && has(v.owner.sort) ? [v.owner.sort] : []) + (has(v.trait_impl) ? v.trait_impl.args.map(a, a.sort) : [])).all(i, i < uint(size(this.sorts)) && (!has(this.sorts[int(i)].var) || this.sorts[int(i)].var < uint(n))))))\x1a\xcb\x03\n\x1dprogram.host_sort_family_uses\x12Ehost sort uses must match family arity and cannot name equality sorts\x1a\xe2\x02this.declarations.all(d, !has(d.host_sort_family) || this.sorts.all(s, (!has(s.prim) || s.prim.name != d.host_sort_family.name || d.host_sort_family.arity == uint(0)) && (!has(s.container) || s.container.name != d.host_sort_family.name || uint(size(s.container.args)) == d.host_sort_family.arity) && (!has(s.eq) || s.eq.name != d.host_sort_family.name)))\x1a\xd5\x01\n\x1bprogram.empty_union_eq_sort\x12(an empty union requires an equality sort\x1a\x8b\x01this.nodes.all(n, !has(n.union) || size(n.union.members) > 0 || (n.sort_id < uint(size(this.sorts)) && has(this.sorts[int(n.sort_id)].eq)))\x1a\xca\x01\n!program.constructor_cost_in_range\x12+declared constructor costs must index nodes\x1axthis.declarations.all(d, !has(d.constructor) || !has(d.constructor.cost) || d.constructor.cost < uint(size(this.nodes)))\x1a\xcb\x01\n\x1dprogram.ruleset_refs_in_range\x12\'composition indices must index rulesets\x1a\x80\x01this.rulesets.all(r, !has(r.combined) || r.combined.rulesets.all(ref, !has(ref.index) || ref.index < uint(size(this.rulesets))))\x1a\xa2\x01\n\x1aprogram.rule_refs_in_range\x12+rule-list indices must index the rule arena\x1aWthis.rulesets.all(s, !has(s.rules) || s.rules.rules.all(i, i < uint(size(this.rules))))\x1a\xcb\x04\n\x1fprogram.rule_node_refs_in_range\x123rule query, head and rewrite roots must index nodes\x1a\xf2\x03this.rules.all(r, (has(r.rule) ? r.rule.query : has(r.rewrite) ? [r.rewrite.lhs, r.rewrite.rhs] + r.rewrite.conditions : has(r.birewrite) ? [r.birewrite.lhs, r.birewrite.rhs] + r.birewrite.conditions : []).all(i, i < uint(size(this.nodes))) && (!has(r.rule) || r.rule.head.all(a, (has(a.term) ? [a.term] : has(a.set) ? a.set.target.args + [a.set.value] : has(a.change) ? a.change.target.args : has(a.set_cost) ? a.set_cost.target.args + [a.set_cost.cost] : []).all(i, i < uint(size(this.nodes))))))\x1a\xa3\t\n\x19program.relation_children\x120a declared relation call cannot be a value child\x1a\xd3\x08this.nodes.all(n, (has(n.call) ? n.call.args : has(n.get_cost) ? n.get_cost.target.args : has(n.union) ? n.union.members : has(n.primitive_value) ? [n.primitive_value].map(v, has(v.lambda) ? v.lambda.captures + [v.lambda.body] : has(v.partial_call) ? v.partial_call.args : has(v.vec) ? v.vec.items : has(v.set) ? v.set.items : has(v.multiset) ? v.multiset.items : has(v.map) ? v.map.entries.map(e, e.key) + v.map.entries.map(e, e.value) : has(v.pair) ? [v.pair.first, v.pair.second] : has(v.maybe) && has(v.maybe.value) ? [v.maybe.value] : has(v.custom) ? v.custom.args : [])[0] : []).all(i, i < uint(size(this.nodes)) && (!has(this.nodes[int(i)].call) || this.nodes[int(i)].sort_id >= uint(size(this.sorts)) || !has(this.sorts[int(this.nodes[int(i)].sort_id)].prim) || this.sorts[int(this.nodes[int(i)].sort_id)].prim.name != \'Unit\' || !this.nodes[int(i)].call.args.all(a, a < uint(size(this.nodes))) || !this.declarations.exists(d, has(d.relation) && d.relation.name == this.nodes[int(i)].call.func && d.relation.inputs.map(a, a.sort) == this.nodes[int(i)].call.args.map(a, this.nodes[int(a)].sort_id)))))"N\n\nSourceFile\x12\x12\n\x04name\x18\x01 \x01(\tR\x04name\x12\x1f\n\x08contents\x18\x02 \x01(\tH\x00R\x08contents\x88\x01\x01B\x0b\n\t_contents"\x95\x01\n\x04Span\x12\x12\n\x04file\x18\x01 \x01(\rR\x04file\x12\x14\n\x05start\x18\x02 \x01(\rR\x05start\x12\x10\n\x03end\x18\x03 \x01(\rR\x03end:Q\xbaHN\x1aL\n\x12span.ordered_range\x12\x1espan start must not exceed end\x1a\x16this.start <= this.end"\x91\x02\n\x04Sort\x12#\n\x02eq\x18\x01 \x01(\x0b2\x11.egglog.v1.EqSortH\x00R\x02eq\x12)\n\x04prim\x18\x02 \x01(\x0b2\x13.egglog.v1.PrimSortH\x00R\x04prim\x124\n\tcontainer\x18\x03 \x01(\x0b2\x14.egglog.v1.ContainerH\x00R\tcontainer\x12)\n\x04func\x18\x04 \x01(\x0b2\x13.egglog.v1.FuncSortH\x00R\x04func\x12\x12\n\x03var\x18\x07 \x01(\rH\x00R\x03var\x12#\n\x04span\x18\x05 \x01(\x0b2\x0f.egglog.v1.SpanR\x04span\x12\x10\n\x03doc\x18\x06 \x01(\tR\x03docB\r\n\x04kind\x12\x05\xbaH\x02\x08\x01"\xb5\x02\n\x06EqSort\x12\x1b\n\x04name\x18\x01 \x01(\tR\x04nameB\x07\xbaH\x04r\x02\x10\x01\x123\n\x08metadata\x18\x02 \x01(\x0b2\x17.egglog.v1.SortMetadataR\x08metadata:\xd8\x01\xbaH\xd4\x01\x1a\xd1\x01\n\x1feq_sort.presentation_parameters\x12;a nullary equality sort has no presentation type parameters\x1aq!has(this.metadata) || (size(this.metadata.python.type_params) == 0 && size(this.metadata.rust.type_params) == 0)"\'\n\x08PrimSort\x12\x1b\n\x04name\x18\x01 \x01(\tR\x04nameB\x07\xbaH\x04r\x02\x10\x01"H\n\tContainer\x12\x1b\n\x04name\x18\x01 \x01(\tR\x04nameB\x07\xbaH\x04r\x02\x10\x01\x12\x1e\n\x04args\x18\x02 \x03(\rR\x04argsB\n\x10\x01\xbaH\x05\x92\x01\x02\x08\x01">\n\x08FuncSort\x12\x1a\n\x06params\x18\x01 \x03(\rR\x06paramsB\x02\x10\x01\x12\x16\n\x06result\x18\x02 \x01(\rR\x06result"\xb8\x02\n\x04Node\x12\x17\n\x07sort_id\x18\x01 \x01(\rR\x06sortId\x12\x1b\n\x03var\x18\x02 \x01(\tH\x00R\x03varB\x07\xbaH\x04r\x02\x10\x01\x12D\n\x0fprimitive_value\x18\x03 \x01(\x0b2\x19.egglog.v1.PrimitiveValueH\x00R\x0eprimitiveValue\x12%\n\x04call\x18\x04 \x01(\x0b2\x0f.egglog.v1.CallH\x00R\x04call\x12(\n\x05union\x18\x07 \x01(\x0b2\x10.egglog.v1.UnionH\x00R\x05union\x12/\n\x08get_cost\x18\t \x01(\x0b2\x12.egglog.v1.GetCostH\x00R\x07getCost\x12#\n\x04span\x18\x08 \x01(\x0b2\x0f.egglog.v1.SpanR\x04spanB\r\n\x04kind\x12\x05\xbaH\x02\x08\x01"%\n\x05Union\x12\x1c\n\x07members\x18\x01 \x03(\rR\x07membersB\x02\x10\x01";\n\x04Call\x12\x1b\n\x04func\x18\x01 \x01(\tR\x04funcB\x07\xbaH\x04r\x02\x10\x01\x12\x16\n\x04args\x18\x02 \x03(\rR\x04argsB\x02\x10\x01":\n\x07GetCost\x12/\n\x06target\x18\x01 \x01(\x0b2\x0f.egglog.v1.CallR\x06targetB\x06\xbaH\x03\xc8\x01\x01"a\n\x06Lambda\x12\x1e\n\x08captures\x18\x01 \x03(\rR\x08capturesB\x02\x10\x01\x12#\n\x0bparam_types\x18\x02 \x03(\rR\nparamTypesB\x02\x10\x01\x12\x12\n\x04body\x18\x03 \x01(\rR\x04body"B\n\x0bPartialCall\x12\x1b\n\x04func\x18\x01 \x01(\tR\x04funcB\x07\xbaH\x04r\x02\x10\x01\x12\x16\n\x04args\x18\x02 \x03(\rR\x04argsB\x02\x10\x01"\xe8\x05\n\x0ePrimitiveValue\x12\x12\n\x03i64\x18\x01 \x01(\x03H\x00R\x03i64\x12\x1b\n\x08f64_bits\x18\x02 \x01(\x06H\x00R\x07f64Bits\x12\x18\n\x06string\x18\x03 \x01(\tH\x00R\x06string\x12\x14\n\x04bool\x18\x04 \x01(\x08H\x00R\x04bool\x12%\n\x04unit\x18\x05 \x01(\x0b2\x0f.egglog.v1.UnitH\x00R\x04unit\x125\n\x07big_int\x18\x06 \x01(\tH\x00R\x06bigIntB\x1a\xbaH\x17r\x152\x13^(0|-?[1-9][0-9]*)$\x12,\n\x07big_rat\x18\x07 \x01(\x0b2\x11.egglog.v1.BigRatH\x00R\x06bigRat\x121\n\x08rational\x18\x08 \x01(\x0b2\x13.egglog.v1.RationalH\x00R\x08rational\x12(\n\x03vec\x18\t \x01(\x0b2\x14.egglog.v1.ValueListH\x00R\x03vec\x12(\n\x03set\x18\n \x01(\x0b2\x14.egglog.v1.ValueListH\x00R\x03set\x122\n\x08multiset\x18\x0b \x01(\x0b2\x14.egglog.v1.ValueListH\x00R\x08multiset\x12\'\n\x03map\x18\x0c \x01(\x0b2\x13.egglog.v1.MapValueH\x00R\x03map\x12*\n\x04pair\x18\r \x01(\x0b2\x14.egglog.v1.PairValueH\x00R\x04pair\x12-\n\x05maybe\x18\x0e \x01(\x0b2\x15.egglog.v1.MaybeValueH\x00R\x05maybe\x12+\n\x06lambda\x18\x0f \x01(\x0b2\x11.egglog.v1.LambdaH\x00R\x06lambda\x12;\n\x0cpartial_call\x18\x10 \x01(\x0b2\x16.egglog.v1.PartialCallH\x00R\x0bpartialCall\x120\n\x06custom\x18\x11 \x01(\x0b2\x16.egglog.v1.CustomValueH\x00R\x06customB\x0e\n\x05value\x12\x05\xbaH\x02\x08\x01"\xeb\x01\n\x06BigRat\x128\n\tnumerator\x18\x01 \x01(\tR\tnumeratorB\x1a\xbaH\x17r\x152\x13^(0|-?[1-9][0-9]*)$\x126\n\x0bdenominator\x18\x02 \x01(\tR\x0bdenominatorB\x14\xbaH\x11r\x0f2\r^[1-9][0-9]*$:o\xbaHl\x1aj\n\x16big_rat.canonical_zero\x12\x1ezero must have denominator one\x1a0this.numerator != \'0\' || this.denominator == \'1\'"\xc1\x01\n\x08Rational\x12\x1c\n\tnumerator\x18\x01 \x01(\x03R\tnumerator\x12)\n\x0bdenominator\x18\x02 \x01(\x03R\x0bdenominatorB\x07\xbaH\x04"\x02 \x00:l\xbaHi\x1ag\n\x17rational.canonical_zero\x12\x1ezero must have denominator one\x1a,this.numerator != 0 || this.denominator == 1"%\n\tValueList\x12\x18\n\x05items\x18\x01 \x03(\rR\x05itemsB\x02\x10\x01"9\n\x08MapValue\x12-\n\x07entries\x18\x01 \x03(\x0b2\x13.egglog.v1.MapEntryR\x07entries"^\n\x08MapEntry\x12\x1d\n\x03key\x18\x01 \x01(\rH\x00R\x03keyB\x06\xbaH\x03\xc8\x01\x01\x88\x01\x01\x12!\n\x05value\x18\x02 \x01(\rH\x01R\x05valueB\x06\xbaH\x03\xc8\x01\x01\x88\x01\x01B\x06\n\x04_keyB\x08\n\x06_value"h\n\tPairValue\x12!\n\x05first\x18\x01 \x01(\rH\x00R\x05firstB\x06\xbaH\x03\xc8\x01\x01\x88\x01\x01\x12#\n\x06second\x18\x02 \x01(\rH\x01R\x06secondB\x06\xbaH\x03\xc8\x01\x01\x88\x01\x01B\x08\n\x06_firstB\t\n\x07_second"1\n\nMaybeValue\x12\x19\n\x05value\x18\x01 \x01(\rH\x00R\x05value\x88\x01\x01B\x08\n\x06_value"?\n\x0bCustomValue\x12\x18\n\x07payload\x18\x01 \x01(\x0cR\x07payload\x12\x16\n\x04args\x18\x02 \x03(\rR\x04argsB\x02\x10\x01"\x06\n\x04Unit"\xec\x01\n\x06Action\x12\x14\n\x04term\x18\x01 \x01(\rH\x00R\x04term\x12"\n\x03set\x18\x02 \x01(\x0b2\x0e.egglog.v1.SetH\x00R\x03set\x12+\n\x06change\x18\x03 \x01(\x0b2\x11.egglog.v1.ChangeH\x00R\x06change\x12\x16\n\x05panic\x18\x04 \x01(\tH\x00R\x05panic\x12/\n\x08set_cost\x18\x05 \x01(\x0b2\x12.egglog.v1.SetCostH\x00R\x07setCost\x12#\n\x04span\x18\x06 \x01(\x0b2\x0f.egglog.v1.SpanR\x04spanB\r\n\x04kind\x12\x05\xbaH\x02\x08\x01"c\n\x03Set\x12/\n\x06target\x18\x01 \x01(\x0b2\x0f.egglog.v1.CallR\x06targetB\x06\xbaH\x03\xc8\x01\x01\x12!\n\x05value\x18\x02 \x01(\rH\x00R\x05valueB\x06\xbaH\x03\xc8\x01\x01\x88\x01\x01B\x08\n\x06_value"q\n\x06Change\x12/\n\x06target\x18\x01 \x01(\x0b2\x0f.egglog.v1.CallR\x06targetB\x06\xbaH\x03\xc8\x01\x01\x126\n\x04kind\x18\x02 \x01(\x0e2\x15.egglog.v1.ChangeKindR\x04kindB\x0b\xbaH\x08\xc8\x01\x01\x82\x01\x02\x10\x01"d\n\x07SetCost\x12/\n\x06target\x18\x01 \x01(\x0b2\x0f.egglog.v1.CallR\x06targetB\x06\xbaH\x03\xc8\x01\x01\x12\x1f\n\x04cost\x18\x02 \x01(\rH\x00R\x04costB\x06\xbaH\x03\xc8\x01\x01\x88\x01\x01B\x07\n\x05_cost"\x8c\x13\n\x0bDeclaration\x12:\n\x0bconstructor\x18\x01 \x01(\x0b2\x16.egglog.v1.ConstructorH\x00R\x0bconstructor\x121\n\x08function\x18\x02 \x01(\x0b2\x13.egglog.v1.FunctionH\x00R\x08function\x121\n\x08relation\x18\x03 \x01(\x0b2\x13.egglog.v1.RelationH\x00R\x08relation\x124\n\tprimitive\x18\x04 \x01(\x0b2\x14.egglog.v1.PrimitiveH\x00R\tprimitive\x12E\n\x10host_sort_family\x18\x05 \x01(\x0b2\x19.egglog.v1.HostSortFamilyH\x00R\x0ehostSortFamily\x12A\n\x0ehost_primitive\x18\x06 \x01(\x0b2\x18.egglog.v1.HostPrimitiveH\x00R\rhostPrimitive\x12#\n\x04span\x18\x07 \x01(\x0b2\x0f.egglog.v1.SpanR\x04span\x127\n\x08metadata\x18\x08 \x01(\x0b2\x1b.egglog.v1.CallableMetadataR\x08metadata\x12\x10\n\x03doc\x18\t \x01(\tR\x03docB\r\n\x04kind\x12\x05\xbaH\x02\x08\x01:\x9b\x0f\xbaH\x97\x0f\x1a\x88\x01\n\x1ddeclaration.callable_metadata\x123host sort-family metadata belongs on HostSortFamily\x1a2!has(this.host_sort_family) || !has(this.metadata)\x1a\xe3\t\n\x1fdeclaration.presentation_inputs\x12Psurface mappings must cover fixed inputs and any final logical tail exactly once\x1a\xed\x08!has(this.metadata) || [has(this.constructor) ? size(this.constructor.inputs) : has(this.function) ? size(this.function.inputs) : has(this.relation) ? size(this.relation.inputs) : has(this.primitive) ? size(this.primitive.inputs) : has(this.host_primitive.signature) ? size(this.host_primitive.signature.inputs) : has(this.host_primitive.application) ? 1 : 0].all(n, [has(this.host_primitive.application) || has(this.host_primitive.signature.varargs)].all(t, this.metadata.python.views.all(v, size(v.params) + (has(v.receiver) ? 1 : 0) == n + (t ? 1 : 0) && (!has(v.receiver) || v.receiver < uint(n)) && (!has(v.mutates) || v.mutates < uint(n)) && v.params.all(p, p.core_input < uint(n + (t ? 1 : 0))) && (!t || (size(v.params) > 0 && v.params[size(v.params)-1].core_input == uint(n) && !has(v.params[size(v.params)-1].default_expr)))) && this.metadata.rust.views.all(v, size(v.params) + (has(v.receiver) ? 1 : 0) == n + (t ? 1 : 0) && (!has(v.receiver) || v.receiver.core_input < uint(n)) && v.params.all(p, p.core_input < uint(n + (t ? 1 : 0))) && (!t || (size(v.params) > 0 && v.params[size(v.params)-1].core_input == uint(n))))))\x1a\xa3\x04\n&declaration.presentation_special_forms\x12`function-wrapper owners require application receiver zero; datatype members require constructors\x1a\x96\x03!has(this.metadata) || (this.metadata.python.views.all(v, !has(v.owner.function) || (has(this.host_primitive.application) && has(v.receiver) && v.receiver == uint(0))) && this.metadata.rust.views.all(v, !has(v.owner.function) || (has(this.host_primitive.application) && has(v.receiver) && v.receiver.core_input == uint(0))) && this.metadata.egglog.views.all(v, !v.datatype_member || has(this.constructor)))"-\n\x03Arg\x12\x12\n\x04sort\x18\x01 \x01(\rR\x04sort\x12\x12\n\x04name\x18\x02 \x01(\tR\x04name"\xb2\x01\n\x0bConstructor\x12\x1b\n\x04name\x18\x01 \x01(\tR\x04nameB\x07\xbaH\x04r\x02\x10\x01\x12&\n\x06inputs\x18\x02 \x03(\x0b2\x0e.egglog.v1.ArgR\x06inputs\x12\x16\n\x06output\x18\x03 \x01(\rR\x06output\x12\x17\n\x04cost\x18\x04 \x01(\rH\x00R\x04cost\x88\x01\x01\x12$\n\runextractable\x18\x05 \x01(\x08R\runextractableB\x07\n\x05_cost"\x8c\x01\n\x08Function\x12\x1b\n\x04name\x18\x01 \x01(\tR\x04nameB\x07\xbaH\x04r\x02\x10\x01\x12&\n\x06inputs\x18\x02 \x03(\x0b2\x0e.egglog.v1.ArgR\x06inputs\x12\x16\n\x06output\x18\x03 \x01(\rR\x06output\x12\x19\n\x05merge\x18\x04 \x01(\rH\x00R\x05merge\x88\x01\x01B\x08\n\x06_merge"O\n\x08Relation\x12\x1b\n\x04name\x18\x01 \x01(\tR\x04nameB\x07\xbaH\x04r\x02\x10\x01\x12&\n\x06inputs\x18\x02 \x03(\x0b2\x0e.egglog.v1.ArgR\x06inputs"\x92\x01\n\tPrimitive\x12\x1b\n\x04name\x18\x01 \x01(\tR\x04nameB\x07\xbaH\x04r\x02\x10\x01\x12&\n\x06inputs\x18\x02 \x03(\x0b2\x0e.egglog.v1.ArgR\x06inputs\x12\x16\n\x06output\x18\x03 \x01(\rR\x06output\x12\x1f\n\x04body\x18\x04 \x01(\rH\x00R\x04bodyB\x06\xbaH\x03\xc8\x01\x01\x88\x01\x01B\x07\n\x05_body"\x81\x03\n\x0eHostSortFamily\x12\x1b\n\x04name\x18\x01 \x01(\tR\x04nameB\x07\xbaH\x04r\x02\x10\x01\x12\x14\n\x05arity\x18\x02 \x01(\rR\x05arity\x123\n\x08metadata\x18\x03 \x01(\x0b2\x17.egglog.v1.SortMetadataR\x08metadata:\x86\x02\xbaH\x82\x02\x1a\xff\x01\n(host_sort_family.presentation_parameters\x12Cexplicit presentation type-parameter labels must match family arity\x1a\x8d\x01!has(this.metadata) || [this.metadata.python, this.metadata.rust].all(m, size(m.type_params) == 0 || uint(size(m.type_params)) == this.arity)"\xbe\x01\n\rHostPrimitive\x12\x1b\n\x04name\x18\x01 \x01(\tR\x04nameB\x07\xbaH\x04r\x02\x10\x01\x12;\n\tsignature\x18\x02 \x01(\x0b2\x1b.egglog.v1.GenericSignatureH\x00R\tsignature\x12B\n\x0bapplication\x18\x03 \x01(\x0b2\x1e.egglog.v1.FunctionApplicationH\x00R\x0bapplicationB\x0f\n\x06typing\x12\x05\xbaH\x02\x08\x01"\xb5\x01\n\x10GenericSignature\x12\x1f\n\x0btype_params\x18\x01 \x03(\tR\ntypeParams\x12&\n\x06inputs\x18\x02 \x03(\x0b2\x0e.egglog.v1.ArgR\x06inputs\x12#\n\x06output\x18\x03 \x01(\rH\x00R\x06outputB\x06\xbaH\x03\xc8\x01\x01\x88\x01\x01\x12(\n\x07varargs\x18\x04 \x01(\x0b2\x0e.egglog.v1.ArgR\x07varargsB\t\n\x07_output"\x15\n\x13FunctionApplication"\xa0\x01\n\x0cSortMetadata\x12.\n\x06python\x18\x01 \x01(\x0b2\x16.egglog.v1.TypeBindingR\x06python\x12*\n\x04rust\x18\x02 \x01(\x0b2\x16.egglog.v1.TypeBindingR\x04rust\x124\n\x06egglog\x18\x03 \x01(\x0b2\x1c.egglog.v1.EgglogTypeBindingR\x06egglog"^\n\x0bTypeBinding\x12 \n\x04path\x18\x01 \x03(\tR\x04pathB\x0c\xbaH\t\x92\x01\x06"\x04r\x02\x10\x01\x12-\n\x0btype_params\x18\x02 \x03(\tR\ntypeParamsB\x0c\xbaH\t\x92\x01\x06"\x04r\x02\x10\x01"+\n\x11EgglogTypeBinding\x12\x16\n\x06symbol\x18\x01 \x01(\tR\x06symbol"\xa5\x01\n\x10CallableMetadata\x121\n\x06python\x18\x01 \x01(\x0b2\x19.egglog.v1.PythonBindingsR\x06python\x12+\n\x04rust\x18\x02 \x01(\x0b2\x17.egglog.v1.RustBindingsR\x04rust\x121\n\x06egglog\x18\x03 \x01(\x0b2\x19.egglog.v1.EgglogBindingsR\x06egglog"o\n\x0cBindingOwner\x12\x14\n\x04sort\x18\x01 \x01(\rH\x00R\x04sort\x12:\n\x08function\x18\x02 \x01(\x0b2\x1c.egglog.v1.FunctionTypeOwnerH\x00R\x08functionB\r\n\x04kind\x12\x05\xbaH\x02\x08\x01"\x13\n\x11FunctionTypeOwner"A\n\x0ePythonBindings\x12/\n\x05views\x18\x01 \x03(\x0b2\x19.egglog.v1.PythonCallableR\x05views"\x82\t\n\x0ePythonCallable\x129\n\x04kind\x18\x01 \x01(\x0e2\x19.egglog.v1.PythonCallKindR\x04kindB\n\xbaH\x07\x82\x01\x04\x10\x01 \x00\x12 \n\x04path\x18\x02 \x03(\tR\x04pathB\x0c\xbaH\t\x92\x01\x06"\x04r\x02\x10\x01\x12-\n\x05owner\x18\x03 \x01(\x0b2\x17.egglog.v1.BindingOwnerR\x05owner\x12\x1f\n\x08receiver\x18\x04 \x01(\rH\x00R\x08receiver\x88\x01\x01\x122\n\x06params\x18\x05 \x03(\x0b2\x1a.egglog.v1.PythonParameterR\x06params\x12\x1d\n\x07mutates\x18\x06 \x01(\rH\x01R\x07mutates\x88\x01\x01B\x0b\n\t_receiverB\n\n\x08_mutates:\xd6\x06\xbaH\xd2\x06\x1a\xe9\x02\n"python_callable.owner_and_receiver\x12;Python callable form determines owner and receiver presence\x1a\x85\x02(this.kind == 1 ? !has(this.owner) : has(this.owner)) && ((this.kind in [3, 5]) == has(this.receiver)) && (this.kind == 2 ? size(this.path) == 0 : this.kind == 1 ? size(this.path) > 0 : size(this.path) == 1) && (!(this.kind in [5, 6]) || size(this.params) == 0)\x1a\xeb\x01\n\x1dpython_callable.unique_inputs\x12:each surface parameter/receiver maps a distinct core input\x1a\x8d\x01this.params.all(p, (!has(this.receiver) || p.core_input != this.receiver) && this.params.filter(q, q.core_input == p.core_input).size() == 1)\x1a\xf5\x01\n\x1dpython_callable.mutated_input\x129a mutated argument must be a mapped receiver or parameter\x1a\x98\x01!has(this.mutates) || (this.kind != 2 && ((has(this.receiver) && this.mutates == this.receiver) || this.params.exists(p, p.core_input == this.mutates)))"\xa2\x01\n\x0fPythonParameter\x12*\n\ncore_input\x18\x01 \x01(\rH\x00R\tcoreInputB\x06\xbaH\x03\xc8\x01\x01\x88\x01\x01\x12\x1b\n\x04name\x18\x02 \x01(\tR\x04nameB\x07\xbaH\x04r\x02\x10\x01\x12&\n\x0cdefault_expr\x18\x03 \x01(\rH\x01R\x0bdefaultExpr\x88\x01\x01B\r\n\x0b_core_inputB\x0f\n\r_default_expr"=\n\x0cRustBindings\x12-\n\x05views\x18\x01 \x03(\x0b2\x17.egglog.v1.RustCallableR\x05views"\xa8\x06\n\x0cRustCallable\x12"\n\x04path\x18\x01 \x03(\tR\x04pathB\x0e\xbaH\x0b\x92\x01\x08\x08\x01"\x04r\x02\x10\x01\x12-\n\x05owner\x18\x02 \x01(\x0b2\x17.egglog.v1.BindingOwnerR\x05owner\x12#\n\rborrowed_self\x18\x03 \x01(\x08R\x0cborrowedSelf\x123\n\x08receiver\x18\x04 \x01(\x0b2\x17.egglog.v1.RustReceiverR\x08receiver\x120\n\x06params\x18\x05 \x03(\x0b2\x18.egglog.v1.RustParameterR\x06params\x123\n\ntrait_impl\x18\x06 \x01(\x0b2\x14.egglog.v1.RustTraitR\ttraitImpl:\x83\x04\xbaH\xff\x03\x1a\x85\x02\n\x13rust_callable.owner\x126Rust member/trait/borrowed-Self forms require an owner\x1a\xb5\x01(!has(this.receiver) || has(this.owner)) && (!has(this.trait_impl) || has(this.owner)) && (!this.borrowed_self || has(this.trait_impl)) && (!has(this.owner) || size(this.path) == 1)\x1a\xf4\x01\n\x1brust_callable.unique_inputs\x12:each surface parameter/receiver maps a distinct core input\x1a\x98\x01this.params.all(p, (!has(this.receiver) || p.core_input != this.receiver.core_input) && this.params.filter(q, q.core_input == p.core_input).size() == 1)"e\n\x0cRustReceiver\x12*\n\ncore_input\x18\x01 \x01(\rH\x00R\tcoreInputB\x06\xbaH\x03\xc8\x01\x01\x88\x01\x01\x12\x1a\n\x08borrowed\x18\x02 \x01(\x08R\x08borrowedB\r\n\x0b_core_input"\x83\x01\n\rRustParameter\x12*\n\ncore_input\x18\x01 \x01(\rH\x00R\tcoreInputB\x06\xbaH\x03\xc8\x01\x01\x88\x01\x01\x12\x1b\n\x04name\x18\x02 \x01(\tR\x04nameB\x07\xbaH\x04r\x02\x10\x01\x12\x1a\n\x08borrowed\x18\x03 \x01(\x08R\x08borrowedB\r\n\x0b_core_input"\xb7\x01\n\tRustTrait\x12"\n\x04path\x18\x01 \x03(\tR\x04pathB\x0e\xbaH\x0b\x92\x01\x08\x08\x01"\x04r\x02\x10\x01\x12\'\n\x04args\x18\x02 \x03(\x0b2\x13.egglog.v1.RustTypeR\x04args\x12B\n\x16output_associated_type\x18\x03 \x01(\tH\x00R\x14outputAssociatedTypeB\x07\xbaH\x04r\x02\x10\x01\x88\x01\x01B\x19\n\x17_output_associated_type"P\n\x08RustType\x12\x1f\n\x04sort\x18\x01 \x01(\rH\x00R\x04sortB\x06\xbaH\x03\xc8\x01\x01\x88\x01\x01\x12\x1a\n\x08borrowed\x18\x02 \x01(\x08R\x08borrowedB\x07\n\x05_sort"A\n\x0eEgglogBindings\x12/\n\x05views\x18\x01 \x03(\x0b2\x19.egglog.v1.EgglogCallableR\x05views"Z\n\x0eEgglogCallable\x12\x1f\n\x06symbol\x18\x01 \x01(\tR\x06symbolB\x07\xbaH\x04r\x02\x10\x01\x12\'\n\x0fdatatype_member\x18\x02 \x01(\x08R\x0edatatypeMember"\xdf\x02\n\x07Ruleset\x12\x17\n\x04name\x18\x01 \x01(\tH\x01R\x04name\x88\x01\x01\x12+\n\x05rules\x18\x02 \x01(\x0b2\x13.egglog.v1.RuleListH\x00R\x05rules\x128\n\x08combined\x18\x03 \x01(\x0b2\x1a.egglog.v1.CombinedRulesetH\x00R\x08combined\x12#\n\x04span\x18\x04 \x01(\x0b2\x0f.egglog.v1.SpanR\x04span\x12\x10\n\x03doc\x18\x05 \x01(\tR\x03docB\r\n\x04kind\x12\x05\xbaH\x02\x08\x01B\x07\n\x05_name:\x84\x01\xbaH\x80\x01\x1a~\n\x1cruleset.default_is_rule_list\x12\'the default ruleset must be a rule list\x1a5!has(this.name) || this.name != \'\' || has(this.rules)"$\n\x08RuleList\x12\x18\n\x05rules\x18\x01 \x03(\rR\x05rulesB\x02\x10\x01"I\n\nRulesetRef\x12\x16\n\x05index\x18\x01 \x01(\rH\x00R\x05index\x12\x14\n\x04name\x18\x02 \x01(\tH\x00R\x04nameB\r\n\x04kind\x12\x05\xbaH\x02\x08\x01"\x93\x03\n\x08RuleDecl\x12%\n\x04rule\x18\x01 \x01(\x0b2\x0f.egglog.v1.RuleH\x00R\x04rule\x12.\n\x07rewrite\x18\x02 \x01(\x0b2\x12.egglog.v1.RewriteH\x00R\x07rewrite\x124\n\tbirewrite\x18\x03 \x01(\x0b2\x14.egglog.v1.BiRewriteH\x00R\tbirewrite\x12 \n\x04name\x18\x04 \x01(\tH\x01R\x04nameB\x07\xbaH\x04r\x02\x10\x01\x88\x01\x01\x12A\n\teval_mode\x18\x05 \x01(\x0e2\x17.egglog.v1.RuleEvalModeR\x08evalModeB\x0b\xbaH\x08\xc8\x01\x01\x82\x01\x02\x10\x01\x12\x1b\n\tno_decomp\x18\x06 \x01(\x08R\x08noDecomp\x12)\n\x10include_subsumed\x18\x07 \x01(\x08R\x0fincludeSubsumed\x12#\n\x04span\x18\x08 \x01(\x0b2\x0f.egglog.v1.SpanR\x04span\x12\x10\n\x03doc\x18\t \x01(\tR\x03docB\r\n\x04kind\x12\x05\xbaH\x02\x08\x01B\x07\n\x05_name"G\n\x04Rule\x12\x18\n\x05query\x18\x02 \x03(\rR\x05queryB\x02\x10\x01\x12%\n\x04head\x18\x03 \x03(\x0b2\x11.egglog.v1.ActionR\x04head"k\n\x07Rewrite\x12\x10\n\x03lhs\x18\x02 \x01(\rR\x03lhs\x12\x10\n\x03rhs\x18\x03 \x01(\rR\x03rhs\x12"\n\nconditions\x18\x04 \x03(\rR\nconditionsB\x02\x10\x01\x12\x18\n\x07subsume\x18\x05 \x01(\x08R\x07subsume"S\n\tBiRewrite\x12\x10\n\x03lhs\x18\x02 \x01(\rR\x03lhs\x12\x10\n\x03rhs\x18\x03 \x01(\rR\x03rhs\x12"\n\nconditions\x18\x04 \x03(\rR\nconditionsB\x02\x10\x01"D\n\x0fCombinedRuleset\x121\n\x08rulesets\x18\x01 \x03(\x0b2\x15.egglog.v1.RulesetRefR\x08rulesets"\xb0\x05\n\x07Command\x12+\n\x06action\x18\x01 \x01(\x0b2\x11.egglog.v1.ActionH\x00R\x06action\x12(\n\x05check\x18\x02 \x01(\x0b2\x10.egglog.v1.CheckH\x00R\x05check\x12"\n\x03run\x18\x03 \x01(\x0b2\x0e.egglog.v1.RunH\x00R\x03run\x12A\n\x0ebind_scheduler\x18\x04 \x01(\x0b2\x18.egglog.v1.BindSchedulerH\x00R\rbindScheduler\x122\n\tkeep_best\x18\x05 \x01(\x0b2\x13.egglog.v1.KeepBestH\x00R\x08keepBest\x12.\n\x07extract\x18\x06 \x01(\x0b2\x12.egglog.v1.ExtractH\x00R\x07extract\x12+\n\x06freeze\x18\x07 \x01(\x0b2\x11.egglog.v1.FreezeH\x00R\x06freeze\x125\n\nprint_size\x18\x08 \x01(\x0b2\x14.egglog.v1.PrintSizeH\x00R\tprintSize\x12A\n\x0eprint_function\x18\t \x01(\x0b2\x18.egglog.v1.PrintFunctionH\x00R\rprintFunction\x12H\n\x11print_table_stats\x18\n \x01(\x0b2\x1a.egglog.v1.PrintTableStatsH\x00R\x0fprintTableStats\x12+\n\x06repeat\x18\x0b \x01(\x0b2\x11.egglog.v1.RepeatH\x00R\x06repeat\x121\n\x08saturate\x18\x0c \x01(\x0b2\x13.egglog.v1.SaturateH\x00R\x08saturate\x12#\n\x04span\x18\r \x01(\x0b2\x0f.egglog.v1.SpanR\x04spanB\r\n\x04kind\x12\x05\xbaH\x02\x08\x01"!\n\x05Check\x12\x18\n\x05facts\x18\x01 \x03(\rR\x05factsB\x02\x10\x01"\\\n\x03Run\x127\n\x07ruleset\x18\x01 \x01(\x0b2\x15.egglog.v1.RulesetRefR\x07rulesetB\x06\xbaH\x03\xc8\x01\x01\x12\x1c\n\tscheduler\x18\x02 \x01(\tR\tscheduler"h\n\rBindScheduler\x12\x1b\n\x04name\x18\x01 \x01(\tR\x04nameB\x07\xbaH\x04r\x02\x10\x01\x12:\n\tscheduler\x18\x02 \x01(\x0b2\x14.egglog.v1.SchedulerR\tschedulerB\x06\xbaH\x03\xc8\x01\x01"K\n\tScheduler\x12/\n\x08back_off\x18\x01 \x01(\x0b2\x12.egglog.v1.BackOffH\x00R\x07backOffB\r\n\x04kind\x12\x05\xbaH\x02\x08\x01"\xa5\x01\n\x07BackOff\x12$\n\x0bmatch_limit\x18\x01 \x01(\x04H\x00R\nmatchLimit\x88\x01\x01\x12"\n\nban_length\x18\x02 \x01(\x04H\x01R\tbanLength\x88\x01\x01\x12"\n\nnode_limit\x18\x03 \x01(\x04H\x02R\tnodeLimit\x88\x01\x01B\x0e\n\x0c_match_limitB\r\n\x0b_ban_lengthB\r\n\x0b_node_limit"\x94\x01\n\x08KeepBest\x12(\n\x06tables\x18\x01 \x03(\tR\x06tablesB\x10\x10\x00\xbaH\x0b\x92\x01\x08\x08\x01"\x04r\x02\x10\x01\x12?\n\textractor\x18\x02 \x01(\x0e2\x14.egglog.v1.ExtractorR\textractorB\x0b\xbaH\x08\xc8\x01\x01\x82\x01\x02\x10\x01\x12\x1d\n\ncost_model\x18\x03 \x01(\tR\tcostModel"\xb0\x01\n\x07Extract\x12 \n\x05roots\x18\x01 \x03(\rR\x05rootsB\n\x10\x01\xbaH\x05\x92\x01\x02\x08\x01\x12#\n\x08variants\x18\x02 \x01(\rR\x08variantsB\x07\xbaH\x04*\x02(\x01\x12?\n\textractor\x18\x03 \x01(\x0e2\x14.egglog.v1.ExtractorR\textractorB\x0b\xbaH\x08\xc8\x01\x01\x82\x01\x02\x10\x01\x12\x1d\n\ncost_model\x18\x04 \x01(\tR\tcostModel"\x08\n\x06Freeze"3\n\tPrintSize\x12&\n\x06tables\x18\x01 \x03(\tR\x06tablesB\x0e\x10\x00\xbaH\t\x92\x01\x06"\x04r\x02\x10\x01"I\n\rPrintFunction\x12\x1d\n\x05table\x18\x01 \x01(\tR\x05tableB\x07\xbaH\x04r\x02\x10\x01\x12\x19\n\x08max_rows\x18\x02 \x01(\x04R\x07maxRows"9\n\x0fPrintTableStats\x12&\n\x06tables\x18\x01 \x03(\tR\x06tablesB\x0e\x10\x00\xbaH\t\x92\x01\x06"\x04r\x02\x10\x01"w\n\x06Repeat\x12&\n\x04body\x18\x01 \x03(\x0b2\x12.egglog.v1.CommandR\x04body\x12\x18\n\x05until\x18\x02 \x03(\rR\x05untilB\x02\x10\x01\x12!\n\x05times\x18\x03 \x01(\x04H\x00R\x05timesB\x06\xbaH\x03\xc8\x01\x01\x88\x01\x01B\x08\n\x06_times"\x94\x01\n\x08Saturate\x12&\n\x04body\x18\x01 \x03(\x0b2\x12.egglog.v1.CommandR\x04body\x12\x18\n\x05until\x18\x02 \x03(\rR\x05untilB\x02\x10\x01\x123\n\x0emax_iterations\x18\x03 \x01(\x04H\x00R\rmaxIterationsB\x07\xbaH\x042\x02(\x01\x88\x01\x01B\x11\n\x0f_max_iterations"\x8a\x05\n\x13CreateEGraphRequest\x12%\n\x05sorts\x18\x01 \x03(\x0b2\x0f.egglog.v1.SortR\x05sorts\x12(\n\tcost_sort\x18\x02 \x01(\rH\x00R\x08costSortB\x06\xbaH\x03\xc8\x01\x01\x88\x01\x01\x12+\n\x05files\x18\x03 \x03(\x0b2\x15.egglog.v1.SourceFileR\x05filesB\x0c\n\n_cost_sort:\xe6\x03\xbaH\xe2\x03\x1aw\n"create_egraph_request.closed_sorts\x121creation sorts cannot contain signature variables\x1a\x1ethis.sorts.all(s, !has(s.var))\x1a\x86\x01\n(create_egraph_request.cost_sort_in_range\x12\x1acost_sort must index sorts\x1a>has(this.cost_sort) && this.cost_sort < uint(size(this.sorts))\x1a\xdd\x01\n(create_egraph_request.sort_refs_in_range\x12\x1esort children must index sorts\x1a\x90\x01this.sorts.all(s, (has(s.container) ? s.container.args : has(s.func) ? s.func.params + [s.func.result] : []).all(i, i < uint(size(this.sorts))))"3\n\x14CreateEGraphResponse\x12\x1b\n\tegraph_id\x18\x01 \x01(\x04R\x08egraphId"1\n\x12CloneEGraphRequest\x12\x1b\n\tegraph_id\x18\x01 \x01(\x04R\x08egraphId"2\n\x13CloneEGraphResponse\x12\x1b\n\tegraph_id\x18\x01 \x01(\x04R\x08egraphId"3\n\x14DestroyEGraphRequest\x12\x1b\n\tegraph_id\x18\x01 \x01(\x04R\x08egraphId"\x17\n\x15DestroyEGraphResponse"x\n\x11RunProgramRequest\x12\x1b\n\tegraph_id\x18\x01 \x01(\x04R\x08egraphId\x12,\n\x07program\x18\x02 \x01(\x0b2\x12.egglog.v1.ProgramR\x07program\x12\x18\n\x07profile\x18\x03 \x01(\x08R\x07profile"\xe5\x12\n\x12RunProgramResponse\x12%\n\x05nodes\x18\x01 \x03(\x0b2\x0f.egglog.v1.NodeR\x05nodes\x12%\n\x05sorts\x18\x02 \x03(\x0b2\x0f.egglog.v1.SortR\x05sorts\x122\n\x07outputs\x18\x03 \x03(\x0b2\x18.egglog.v1.CommandOutputR\x07outputs\x12+\n\x05files\x18\x04 \x03(\x0b2\x15.egglog.v1.SourceFileR\x05files\x12&\n\x05error\x18\x05 \x01(\x0b2\x10.egglog.v1.ErrorR\x05error\x120\n\x05rules\x18\x06 \x03(\x0b2\x1a.egglog.v1.RuleAttributionR\x05rules\x123\n\x07profile\x18\x07 \x01(\x0b2\x19.egglog.v1.ProfileSummaryR\x07profile:\x90\x10\xbaH\x8c\x10\x1av\n!run_program_response.closed_sorts\x121response sorts cannot contain signature variables\x1a\x1ethis.sorts.all(s, !has(s.var))\x1a\x85\x01\n\'run_program_response.node_sort_in_range\x12#every node sort_id must index sorts\x1a5this.nodes.all(n, n.sort_id < uint(size(this.sorts)))\x1a\xb8\x05\n\'run_program_response.node_refs_in_range\x12\x1enode children must index nodes\x1a\xec\x04this.nodes.all(n, (has(n.call) ? n.call.args : has(n.get_cost) ? n.get_cost.target.args : has(n.union) ? n.union.members : has(n.primitive_value) ? [n.primitive_value].map(v, has(v.lambda) ? v.lambda.captures + [v.lambda.body] : has(v.partial_call) ? v.partial_call.args : has(v.vec) ? v.vec.items : has(v.set) ? v.set.items : has(v.multiset) ? v.multiset.items : has(v.map) ? v.map.entries.map(e, e.key) + v.map.entries.map(e, e.value) : has(v.pair) ? [v.pair.first, v.pair.second] : has(v.maybe) && has(v.maybe.value) ? [v.maybe.value] : has(v.custom) ? v.custom.args : [])[0] : []).all(i, i < uint(size(this.nodes))))\x1a\x92\x03\n\'run_program_response.sort_refs_in_range\x129sort children and lambda parameter sorts must index sorts\x1a\xab\x02this.sorts.all(s, (has(s.container) ? s.container.args : has(s.func) ? s.func.params + [s.func.result] : []).all(i, i < uint(size(this.sorts)))) && this.nodes.all(n, !has(n.primitive_value) || !has(n.primitive_value.lambda) || n.primitive_value.lambda.param_types.all(i, i < uint(size(this.sorts))))\x1a\xe2\x01\n(run_program_response.empty_union_eq_sort\x12(an empty union requires an equality sort\x1a\x8b\x01this.nodes.all(n, !has(n.union) || size(n.union.members) > 0 || (n.sort_id < uint(size(this.sorts)) && has(this.sorts[int(n.sort_id)].eq)))\x1a\xa5\x02\n\'run_program_response.rule_refs_in_range\x12;error and profile rule references must index response rules\x1a\xbc\x01(!has(this.error) || !has(this.error.rule) || this.error.rule < uint(size(this.rules))) && (!has(this.profile) || this.profile.runs.all(s, s.rules.all(r, r.rule < uint(size(this.rules)))))\x1a\xac\x01\n\'run_program_response.profile_completion\x12@a present profile is complete exactly when the request succeeded\x1a?!has(this.profile) || this.profile.complete == !has(this.error)"\xc4\x01\n\x0fRuleAttribution\x121\n\x04root\x18\x01 \x01(\x0b2\x15.egglog.v1.RulesetRefR\x04rootB\x06\xbaH\x03\xc8\x01\x01\x12\x1a\n\x08children\x18\x02 \x03(\rR\x08children\x12\x12\n\x04rule\x18\x03 \x01(\rR\x04rule\x12 \n\x04name\x18\x04 \x01(\tH\x00R\x04nameB\x07\xbaH\x04r\x02\x10\x01\x88\x01\x01\x12#\n\x04span\x18\x05 \x01(\x0b2\x0f.egglog.v1.SpanR\x04spanB\x07\n\x05_name"\xe2\x01\n\x0fCommandLocation\x12\x1c\n\x04path\x18\x01 \x03(\rR\x04pathB\x08\xbaH\x05\x92\x01\x02\x08\x01\x12\x1e\n\niterations\x18\x02 \x03(\x04R\niterations:\x90\x01\xbaH\x8c\x01\x1a\x89\x01\n command_location.iteration_depth\x127one iteration coordinate is required per enclosing loop\x1a,size(this.path) == size(this.iterations) + 1"\x84\x02\n\x05Error\x124\n\x04code\x18\x01 \x01(\x0e2\x14.egglog.v1.ErrorCodeR\x04codeB\n\xbaH\x07\x82\x01\x04\x10\x01 \x00\x12!\n\x07message\x18\x02 \x01(\tR\x07messageB\x07\xbaH\x04r\x02\x10\x01\x12#\n\x04span\x18\x03 \x01(\x0b2\x0f.egglog.v1.SpanR\x04span\x126\n\x08location\x18\x04 \x01(\x0b2\x1a.egglog.v1.CommandLocationR\x08location\x12\x17\n\x04rule\x18\x05 \x01(\rH\x00R\x04rule\x88\x01\x01\x12#\n\rengine_origin\x18\x06 \x01(\tR\x0cengineOriginB\x07\n\x05_rule"\x87\x05\n\rCommandOutput\x12)\n\x03run\x18\x01 \x01(\x0b2\x15.egglog.v1.RunOutcomeH\x00R\x03run\x12:\n\nextraction\x18\x02 \x01(\x0b2\x18.egglog.v1.ExtractResultH\x00R\nextraction\x12.\n\x07program\x18\x03 \x01(\x0b2\x12.egglog.v1.ProgramH\x00R\x07program\x12-\n\x05sizes\x18\x04 \x01(\x0b2\x15.egglog.v1.TableSizesH\x00R\x05sizes\x12G\n\x10printed_function\x18\x05 \x01(\x0b2\x1a.egglog.v1.PrintedFunctionH\x00R\x0fprintedFunction\x12>\n\x0btable_stats\x18\x06 \x01(\x0b2\x1b.egglog.v1.TableStatsResultH\x00R\ntableStats\x12,\n\x04loop\x18\x08 \x01(\x0b2\x16.egglog.v1.LoopOutcomeH\x00R\x04loop\x12>\n\x08location\x18\x07 \x01(\x0b2\x1a.egglog.v1.CommandLocationR\x08locationB\x06\xbaH\x03\xc8\x01\x01B\r\n\x04kind\x12\x05\xbaH\x02\x08\x01:\xa9\x01\xbaH\xa5\x01\x1a\xa2\x01\n command_output.top_level_outcome\x128control outcomes are only emitted for top-level commands\x1aD(!has(this.run) && !has(this.loop)) || size(this.location.path) == 1"\xbc\x01\n\nRunOutcome\x12\x18\n\x07updated\x18\x01 \x01(\x08R\x07updated\x12\x19\n\x08can_stop\x18\x02 \x01(\x08R\x07canStop:y\xbaHv\x1at\n\x14run_outcome.can_stop\x12;a Run that updated the database cannot also permit stopping\x1a\x1f!this.updated || !this.can_stop"\xd5\x02\n\x0bLoopOutcome\x12\x18\n\x07updated\x18\x01 \x01(\x08R\x07updated\x12\x1e\n\niterations\x18\x02 \x01(\x04R\niterations\x12R\n\x0btermination\x18\x03 \x01(\x0e2\x1c.egglog.v1.TerminationReasonH\x00R\x0bterminationB\r\xbaH\n\xc8\x01\x01\x82\x01\x04\x10\x01 \x00\x88\x01\x01B\x0e\n\x0c_termination:\xa7\x01\xbaH\xa3\x01\x1a\xa0\x01\n\x1cloop_outcome.zero_iterations\x12:zero iterations cannot update data or establish saturation\x1aDthis.iterations > 0 || (!this.updated && this.termination in [2, 4])"5\n\tTableSize\x12\x14\n\x05table\x18\x01 \x01(\tR\x05table\x12\x12\n\x04rows\x18\x02 \x01(\x04R\x04rows"\xfc\x01\n\x0eProfileSummary\x12\x1a\n\x08complete\x18\x01 \x01(\x08R\x08complete\x12)\n\x04runs\x18\x02 \x03(\x0b2\x15.egglog.v1.RunSummaryR\x04runs:\xa2\x01\xbaH\x9e\x01\x1a\x9b\x01\n\x1cprofile_summary.unique_sites\x12&each static Run site has one aggregate\x1aSthis.runs.all(r, this.runs.filter(s, s.command_path == r.command_path).size() == 1)"\xf9\x03\n\nRunSummary\x12+\n\x0ccommand_path\x18\x01 \x03(\rR\x0bcommandPathB\x08\xbaH\x05\x92\x01\x02\x08\x01\x128\n\x16search_and_apply_nanos\x18\x02 \x01(\x04H\x00R\x13searchAndApplyNanos\x88\x01\x01\x12$\n\x0bmerge_nanos\x18\x03 \x01(\x04H\x01R\nmergeNanos\x88\x01\x01\x12(\n\rrebuild_nanos\x18\x04 \x01(\x04H\x02R\x0crebuildNanos\x88\x01\x01\x12,\n\x05rules\x18\x05 \x03(\x0b2\x16.egglog.v1.RuleSummaryR\x05rules\x12)\n\x0binvocations\x18\x06 \x01(\x04R\x0binvocationsB\x07\xbaH\x042\x02(\x01B\x19\n\x17_search_and_apply_nanosB\x0e\n\x0c_merge_nanosB\x10\n\x0e_rebuild_nanos:\x9d\x01\xbaH\x99\x01\x1a\x96\x01\n\x18run_summary.unique_rules\x123each rule occurrence has one aggregate per Run site\x1aEthis.rules.all(r, this.rules.filter(s, s.rule == r.rule).size() == 1)"\xb7\x01\n\x0bRuleSummary\x12\x1f\n\x04rule\x18\x01 \x01(\rH\x00R\x04ruleB\x06\xbaH\x03\xc8\x01\x01\x88\x01\x01\x12\x1d\n\x07matches\x18\x02 \x01(\x04H\x01R\x07matches\x88\x01\x01\x128\n\x16search_and_apply_nanos\x18\x03 \x01(\x04H\x02R\x13searchAndApplyNanos\x88\x01\x01B\x07\n\x05_ruleB\n\n\x08_matchesB\x19\n\x17_search_and_apply_nanos"?\n\rExtractResult\x12.\n\x05roots\x18\x01 \x03(\x0b2\x18.egglog.v1.ExtractedRootR\x05roots"E\n\rExtractedRoot\x124\n\x08variants\x18\x01 \x03(\x0b2\x18.egglog.v1.ExtractedTermR\x08variants"E\n\rExtractedTerm\x12\x12\n\x04term\x18\x01 \x01(\rR\x04term\x12\x17\n\x04cost\x18\x02 \x01(\rH\x00R\x04cost\x88\x01\x01B\x07\n\x05_cost"8\n\nTableSizes\x12*\n\x05sizes\x18\x01 \x03(\x0b2\x14.egglog.v1.TableSizeR\x05sizes"S\n\x0fPrintedFunction\x12\x14\n\x05table\x18\x01 \x01(\tR\x05table\x12*\n\x04rows\x18\x02 \x03(\x0b2\x16.egglog.v1.FunctionRowR\x04rows"U\n\x0bFunctionRow\x12\x12\n\x04call\x18\x01 \x01(\rR\x04call\x12\x16\n\x06output\x18\x02 \x01(\rR\x06output\x12\x1a\n\x08subsumed\x18\x03 \x01(\x08R\x08subsumed"?\n\x10TableStatsResult\x12+\n\x05stats\x18\x01 \x03(\x0b2\x15.egglog.v1.TableStatsR\x05stats"\xc5\x01\n\nTableStats\x12\x14\n\x05table\x18\x01 \x01(\tR\x05table\x12\x12\n\x04rows\x18\x02 \x01(\x04R\x04rows\x12%\n\x0ccolumn_sorts\x18\x03 \x03(\tR\x0bcolumnSortsB\x02\x10\x00\x12+\n\x0fdistinct_counts\x18\x04 \x03(\x04R\x0edistinctCountsB\x02\x10\x01\x129\n\x0bout_degrees\x18\x05 \x03(\x0b2\x18.egglog.v1.PairOutDegreeR\noutDegrees"x\n\rPairOutDegree\x12\x1a\n\x06source\x18\x01 \x03(\rR\x06sourceB\x02\x10\x01\x12\x1a\n\x06target\x18\x02 \x03(\rR\x06targetB\x02\x10\x01\x12/\n\x05stats\x18\x03 \x01(\x0b2\x19.egglog.v1.OutDegreeStatsR\x05stats"\x84\x01\n\x0eOutDegreeStats\x12\x10\n\x03min\x18\x01 \x01(\x04R\x03min\x12\x10\n\x03max\x18\x02 \x01(\x04R\x03max\x12\x12\n\x04mean\x18\x03 \x01(\x01R\x04mean\x12\x10\n\x03p25\x18\x04 \x01(\x01R\x03p25\x12\x16\n\x06median\x18\x05 \x01(\x01R\x06median\x12\x10\n\x03p75\x18\x06 \x01(\x01R\x03p75*Z\n\nChangeKind\x12\x1b\n\x17CHANGE_KIND_UNSPECIFIED\x10\x00\x12\x16\n\x12CHANGE_KIND_DELETE\x10\x01\x12\x17\n\x13CHANGE_KIND_SUBSUME\x10\x02*\xf7\x01\n\x0ePythonCallKind\x12 \n\x1cPYTHON_CALL_KIND_UNSPECIFIED\x10\x00\x12\x1d\n\x19PYTHON_CALL_KIND_FUNCTION\x10\x01\x12 \n\x1cPYTHON_CALL_KIND_INITIALIZER\x10\x02\x12\x1b\n\x17PYTHON_CALL_KIND_METHOD\x10\x03\x12!\n\x1dPYTHON_CALL_KIND_CLASS_METHOD\x10\x04\x12\x1d\n\x19PYTHON_CALL_KIND_PROPERTY\x10\x05\x12#\n\x1fPYTHON_CALL_KIND_CLASS_VARIABLE\x10\x06*\x8b\x01\n\x0cRuleEvalMode\x12\x1e\n\x1aRULE_EVAL_MODE_UNSPECIFIED\x10\x00\x12\x1c\n\x18RULE_EVAL_MODE_SEMINAIVE\x10\x01\x12\x18\n\x14RULE_EVAL_MODE_NAIVE\x10\x02\x12#\n\x1fRULE_EVAL_MODE_UNSAFE_SEMINAIVE\x10\x03*T\n\tExtractor\x12\x19\n\x15EXTRACTOR_UNSPECIFIED\x10\x00\x12\x12\n\x0eEXTRACTOR_TREE\x10\x01\x12\x18\n\x14EXTRACTOR_GREEDY_DAG\x10\x02*\xdb\x01\n\tErrorCode\x12\x1a\n\x16ERROR_CODE_UNSPECIFIED\x10\x00\x12\x1e\n\x1aERROR_CODE_INVALID_PROGRAM\x10\x01\x12\x1b\n\x17ERROR_CODE_CHECK_FAILED\x10\x02\x12\x14\n\x10ERROR_CODE_PANIC\x10\x03\x12 \n\x1cERROR_CODE_EVALUATION_FAILED\x10\x04\x12 \n\x1cERROR_CODE_EXTRACTION_FAILED\x10\x05\x12\x1b\n\x17ERROR_CODE_UNKNOWN_NAME\x10\x06*\xf5\x01\n\x11TerminationReason\x12"\n\x1eTERMINATION_REASON_UNSPECIFIED\x10\x00\x12 \n\x1cTERMINATION_REASON_SATURATED\x10\x01\x12$\n TERMINATION_REASON_COUNT_REACHED\x10\x02\x12&\n"TERMINATION_REASON_ITERATION_LIMIT\x10\x03\x12$\n TERMINATION_REASON_UNTIL_MATCHED\x10\x04\x12&\n"TERMINATION_REASON_SCHEDULER_LIMIT\x10\x052\xcd\x02\n\rEgglogService\x12O\n\x0cCreateEGraph\x12\x1e.egglog.v1.CreateEGraphRequest\x1a\x1f.egglog.v1.CreateEGraphResponse\x12L\n\x0bCloneEGraph\x12\x1d.egglog.v1.CloneEGraphRequest\x1a\x1e.egglog.v1.CloneEGraphResponse\x12R\n\rDestroyEGraph\x12\x1f.egglog.v1.DestroyEGraphRequest\x1a .egglog.v1.DestroyEGraphResponse\x12I\n\nRunProgram\x12\x1c.egglog.v1.RunProgramRequest\x1a\x1d.egglog.v1.RunProgramResponseb\x06proto3',
+    b'\n\x16egglog/v1/egglog.proto\x12\tegglog.v1\x1a\x1bbuf/validate/validate.proto"\xd77\n\x07Program\x12&\n\nir_version\x18\x01 \x01(\rR\tirVersionB\x07\xbaH\x04*\x02 \x00\x12%\n\x05nodes\x18\x02 \x03(\x0b2\x0f.egglog.v1.NodeR\x05nodes\x12%\n\x05sorts\x18\x03 \x03(\x0b2\x0f.egglog.v1.SortR\x05sorts\x12:\n\x0cdeclarations\x18\x04 \x03(\x0b2\x16.egglog.v1.DeclarationR\x0cdeclarations\x12.\n\x08commands\x18\x05 \x03(\x0b2\x12.egglog.v1.CommandR\x08commands\x12+\n\x05files\x18\x06 \x03(\x0b2\x15.egglog.v1.SourceFileR\x05files\x12.\n\x08rulesets\x18\x07 \x03(\x0b2\x12.egglog.v1.RulesetR\x08rulesets\x12 \n\tcost_sort\x18\x08 \x01(\rH\x00R\x08costSort\x88\x01\x01\x12)\n\x05rules\x18\t \x03(\x0b2\x13.egglog.v1.RuleDeclR\x05rulesB\x0c\n\n_cost_sort:\xb14\xbaH\xad4\x1a\xc3\x01\n\x1aprogram.cost_sort_in_range\x125cost_sort must index a non-variable sort when present\x1an!has(this.cost_sort) || (this.cost_sort < uint(size(this.sorts)) && !has(this.sorts[int(this.cost_sort)].var))\x1a\xae\x01\n\x1aprogram.node_sort_in_range\x121every node sort_id must index a non-variable sort\x1a]this.nodes.all(n, n.sort_id < uint(size(this.sorts)) && !has(this.sorts[int(n.sort_id)].var))\x1a\xa4\x05\n\x1aprogram.node_refs_in_range\x12\x1enode children must index nodes\x1a\xe5\x04this.nodes.all(n, (has(n.call) ? n.call.args : has(n.get_cost) ? n.get_cost.args : has(n.union) ? n.union.members : has(n.primitive_value) ? [n.primitive_value].map(v, has(v.lambda) ? v.lambda.captures + [v.lambda.body] : has(v.partial_call) ? v.partial_call.args : has(v.vec) ? v.vec.items : has(v.set) ? v.set.items : has(v.multiset) ? v.multiset.items : has(v.map) ? v.map.entries.map(e, e.key) + v.map.entries.map(e, e.value) : has(v.pair) ? [v.pair.first, v.pair.second] : has(v.maybe) && has(v.maybe.value) ? [v.maybe.value] : has(v.custom) ? v.custom.args : [])[0] : []).all(i, i < uint(size(this.nodes))))\x1a\xcf\x01\n\x1aprogram.sort_refs_in_range\x12\x1esort children must index sorts\x1a\x90\x01this.sorts.all(s, (has(s.container) ? s.container.args : has(s.func) ? s.func.params + [s.func.result] : []).all(i, i < uint(size(this.sorts))))\x1a\xe7\x03\n program.concrete_signature_roots\x12=concrete declaration signatures must index non-variable sorts\x1a\x83\x03this.declarations.all(d, (has(d.constructor) ? d.constructor.inputs.map(a, a.sort) + [d.constructor.output] : has(d.function) ? d.function.inputs.map(a, a.sort) + [d.function.output] : has(d.relation) ? d.relation.inputs.map(a, a.sort) : has(d.primitive) ? d.primitive.inputs.map(a, a.sort) + [d.primitive.output] : []).all(i, i < uint(size(this.sorts)) && !has(this.sorts[int(i)].var)))\x1a\xf0\x02\n\x18program.lambda_signature\x12Hlambdas require a function sort with non-variable parameter/result roots\x1a\x89\x02this.nodes.all(n, !has(n.primitive_value.lambda) || (n.sort_id < uint(size(this.sorts)) && has(this.sorts[int(n.sort_id)].func) && [this.sorts[int(n.sort_id)].func].all(f, (f.params + [f.result]).all(i, i < uint(size(this.sorts)) && !has(this.sorts[int(i)].var)))))\x1a\xd1\x03\n\x1fprogram.generic_signature_roots\x12=signature sorts must exist and direct variables must be bound\x1a\xee\x02this.declarations.all(d, !has(d.host_primitive) || !has(d.host_primitive.signature) || [d.host_primitive.signature].all(sig, (sig.inputs.map(a, a.sort) + (has(sig.output) ? [sig.output] : []) + (has(sig.varargs) ? [sig.varargs.sort] : [])).all(i, i < uint(size(this.sorts)) && (!has(this.sorts[int(i)].var) || this.sorts[int(i)].var < uint(size(sig.type_params))))))\x1a\xba\x02\n\x1eprogram.bindings_default_roots\x12Hpresentation defaults must index nodes and cannot be free variable roots\x1a\xcd\x01this.declarations.all(d, !has(d.bindings) || d.bindings.python.views.all(v, v.params.all(p, !has(p.default_expr) || (p.default_expr < uint(size(this.nodes)) && !has(this.nodes[int(p.default_expr)].var)))))\x1a\xde\x05\n\x1bprogram.bindings_sort_roots\x12Tpresentation sort references must exist and direct variables use the callable binder\x1a\xe8\x04this.declarations.all(d, !has(d.bindings) || [has(d.host_primitive) && has(d.host_primitive.signature) ? size(d.host_primitive.signature.type_params) : 0].all(n, d.bindings.python.views.all(v, (!has(v.owner) || !has(v.owner.sort)) || [v.owner.sort].all(i, i < uint(size(this.sorts)) && (!has(this.sorts[int(i)].var) || this.sorts[int(i)].var < uint(n)))) && d.bindings.rust.views.all(v, ((has(v.owner) && has(v.owner.sort) ? [v.owner.sort] : []) + (has(v.trait_impl) ? v.trait_impl.args.map(a, a.sort) : [])).all(i, i < uint(size(this.sorts)) && (!has(this.sorts[int(i)].var) || this.sorts[int(i)].var < uint(n))))))\x1a\xcb\x03\n\x1dprogram.host_sort_family_uses\x12Ehost sort uses must match family arity and cannot name equality sorts\x1a\xe2\x02this.declarations.all(d, !has(d.host_sort_family) || this.sorts.all(s, (!has(s.prim) || s.prim.name != d.host_sort_family.name || d.host_sort_family.arity == uint(0)) && (!has(s.container) || s.container.name != d.host_sort_family.name || uint(size(s.container.args)) == d.host_sort_family.arity) && (!has(s.eq) || s.eq.name != d.host_sort_family.name)))\x1a\xd5\x01\n\x1bprogram.empty_union_eq_sort\x12(an empty union requires an equality sort\x1a\x8b\x01this.nodes.all(n, !has(n.union) || size(n.union.members) > 0 || (n.sort_id < uint(size(this.sorts)) && has(this.sorts[int(n.sort_id)].eq)))\x1a\xca\x01\n!program.constructor_cost_in_range\x12+declared constructor costs must index nodes\x1axthis.declarations.all(d, !has(d.constructor) || !has(d.constructor.cost) || d.constructor.cost < uint(size(this.nodes)))\x1a\xcb\x01\n\x1dprogram.ruleset_refs_in_range\x12\'composition indices must index rulesets\x1a\x80\x01this.rulesets.all(r, !has(r.combined) || r.combined.rulesets.all(ref, !has(ref.index) || ref.index < uint(size(this.rulesets))))\x1a\xa2\x01\n\x1aprogram.rule_refs_in_range\x12+rule-list indices must index the rule arena\x1aWthis.rulesets.all(s, !has(s.rules) || s.rules.rules.all(i, i < uint(size(this.rules))))\x1a\xe6\x04\n\x1fprogram.rule_node_refs_in_range\x123rule query, head and rewrite roots must index nodes\x1a\x8d\x04this.rules.all(r, (has(r.rule) ? r.rule.query : has(r.rewrite) ? [r.rewrite.lhs, r.rewrite.rhs] + r.rewrite.conditions : has(r.birewrite) ? [r.birewrite.lhs, r.birewrite.rhs] + r.birewrite.conditions : []).all(i, i < uint(size(this.nodes))) && (!has(r.rule) || r.rule.head.all(a, (has(a.term) ? [a.term] : has(a.set) ? a.set.target.args + [a.set.value] : has(a.delete) ? a.delete.args : has(a.subsume) ? a.subsume.args : has(a.set_cost) ? a.set_cost.target.args + [a.set_cost.cost] : []).all(i, i < uint(size(this.nodes))))))\x1a\x9c\t\n\x19program.relation_children\x120a declared relation call cannot be a value child\x1a\xcc\x08this.nodes.all(n, (has(n.call) ? n.call.args : has(n.get_cost) ? n.get_cost.args : has(n.union) ? n.union.members : has(n.primitive_value) ? [n.primitive_value].map(v, has(v.lambda) ? v.lambda.captures + [v.lambda.body] : has(v.partial_call) ? v.partial_call.args : has(v.vec) ? v.vec.items : has(v.set) ? v.set.items : has(v.multiset) ? v.multiset.items : has(v.map) ? v.map.entries.map(e, e.key) + v.map.entries.map(e, e.value) : has(v.pair) ? [v.pair.first, v.pair.second] : has(v.maybe) && has(v.maybe.value) ? [v.maybe.value] : has(v.custom) ? v.custom.args : [])[0] : []).all(i, i < uint(size(this.nodes)) && (!has(this.nodes[int(i)].call) || this.nodes[int(i)].sort_id >= uint(size(this.sorts)) || !has(this.sorts[int(this.nodes[int(i)].sort_id)].prim) || this.sorts[int(this.nodes[int(i)].sort_id)].prim.name != \'Unit\' || !this.nodes[int(i)].call.args.all(a, a < uint(size(this.nodes))) || !this.declarations.exists(d, has(d.relation) && d.relation.name == this.nodes[int(i)].call.func && d.relation.inputs.map(a, a.sort) == this.nodes[int(i)].call.args.map(a, this.nodes[int(a)].sort_id)))))"N\n\nSourceFile\x12\x12\n\x04name\x18\x01 \x01(\tR\x04name\x12\x1f\n\x08contents\x18\x02 \x01(\tH\x00R\x08contents\x88\x01\x01B\x0b\n\t_contents"\x95\x01\n\x04Span\x12\x12\n\x04file\x18\x01 \x01(\rR\x04file\x12\x14\n\x05start\x18\x02 \x01(\rR\x05start\x12\x10\n\x03end\x18\x03 \x01(\rR\x03end:Q\xbaHN\x1aL\n\x12span.ordered_range\x12\x1espan start must not exceed end\x1a\x16this.start <= this.end"\x91\x02\n\x04Sort\x12#\n\x02eq\x18\x01 \x01(\x0b2\x11.egglog.v1.EqSortH\x00R\x02eq\x12)\n\x04prim\x18\x02 \x01(\x0b2\x13.egglog.v1.PrimSortH\x00R\x04prim\x124\n\tcontainer\x18\x03 \x01(\x0b2\x14.egglog.v1.ContainerH\x00R\tcontainer\x12)\n\x04func\x18\x04 \x01(\x0b2\x13.egglog.v1.FuncSortH\x00R\x04func\x12\x12\n\x03var\x18\x07 \x01(\rH\x00R\x03var\x12#\n\x04span\x18\x05 \x01(\x0b2\x0f.egglog.v1.SpanR\x04span\x12\x10\n\x03doc\x18\x06 \x01(\tR\x03docB\r\n\x04kind\x12\x05\xbaH\x02\x08\x01"\xb5\x02\n\x06EqSort\x12\x1b\n\x04name\x18\x01 \x01(\tR\x04nameB\x07\xbaH\x04r\x02\x10\x01\x123\n\x08bindings\x18\x02 \x01(\x0b2\x17.egglog.v1.SortBindingsR\x08bindings:\xd8\x01\xbaH\xd4\x01\x1a\xd1\x01\n\x1feq_sort.presentation_parameters\x12;a nullary equality sort has no presentation type parameters\x1aq!has(this.bindings) || (size(this.bindings.python.type_params) == 0 && size(this.bindings.rust.type_params) == 0)"\'\n\x08PrimSort\x12\x1b\n\x04name\x18\x01 \x01(\tR\x04nameB\x07\xbaH\x04r\x02\x10\x01"H\n\tContainer\x12\x1b\n\x04name\x18\x01 \x01(\tR\x04nameB\x07\xbaH\x04r\x02\x10\x01\x12\x1e\n\x04args\x18\x02 \x03(\rR\x04argsB\n\x10\x01\xbaH\x05\x92\x01\x02\x08\x01">\n\x08FuncSort\x12\x1a\n\x06params\x18\x01 \x03(\rR\x06paramsB\x02\x10\x01\x12\x16\n\x06result\x18\x02 \x01(\rR\x06result"\xb5\x02\n\x04Node\x12\x17\n\x07sort_id\x18\x01 \x01(\rR\x06sortId\x12\x1b\n\x03var\x18\x02 \x01(\tH\x00R\x03varB\x07\xbaH\x04r\x02\x10\x01\x12D\n\x0fprimitive_value\x18\x03 \x01(\x0b2\x19.egglog.v1.PrimitiveValueH\x00R\x0eprimitiveValue\x12%\n\x04call\x18\x04 \x01(\x0b2\x0f.egglog.v1.CallH\x00R\x04call\x12(\n\x05union\x18\x07 \x01(\x0b2\x10.egglog.v1.UnionH\x00R\x05union\x12,\n\x08get_cost\x18\t \x01(\x0b2\x0f.egglog.v1.CallH\x00R\x07getCost\x12#\n\x04span\x18\x08 \x01(\x0b2\x0f.egglog.v1.SpanR\x04spanB\r\n\x04kind\x12\x05\xbaH\x02\x08\x01"%\n\x05Union\x12\x1c\n\x07members\x18\x01 \x03(\rR\x07membersB\x02\x10\x01";\n\x04Call\x12\x1b\n\x04func\x18\x01 \x01(\tR\x04funcB\x07\xbaH\x04r\x02\x10\x01\x12\x16\n\x04args\x18\x02 \x03(\rR\x04argsB\x02\x10\x01"<\n\x06Lambda\x12\x1e\n\x08captures\x18\x01 \x03(\rR\x08capturesB\x02\x10\x01\x12\x12\n\x04body\x18\x03 \x01(\rR\x04body"\xe1\x05\n\x0ePrimitiveValue\x12\x12\n\x03i64\x18\x01 \x01(\x03H\x00R\x03i64\x12\x1b\n\x08f64_bits\x18\x02 \x01(\x06H\x00R\x07f64Bits\x12\x18\n\x06string\x18\x03 \x01(\tH\x00R\x06string\x12\x14\n\x04bool\x18\x04 \x01(\x08H\x00R\x04bool\x12%\n\x04unit\x18\x05 \x01(\x0b2\x0f.egglog.v1.UnitH\x00R\x04unit\x125\n\x07big_int\x18\x06 \x01(\tH\x00R\x06bigIntB\x1a\xbaH\x17r\x152\x13^(0|-?[1-9][0-9]*)$\x12,\n\x07big_rat\x18\x07 \x01(\x0b2\x11.egglog.v1.BigRatH\x00R\x06bigRat\x121\n\x08rational\x18\x08 \x01(\x0b2\x13.egglog.v1.RationalH\x00R\x08rational\x12(\n\x03vec\x18\t \x01(\x0b2\x14.egglog.v1.ValueListH\x00R\x03vec\x12(\n\x03set\x18\n \x01(\x0b2\x14.egglog.v1.ValueListH\x00R\x03set\x122\n\x08multiset\x18\x0b \x01(\x0b2\x14.egglog.v1.ValueListH\x00R\x08multiset\x12\'\n\x03map\x18\x0c \x01(\x0b2\x13.egglog.v1.MapValueH\x00R\x03map\x12*\n\x04pair\x18\r \x01(\x0b2\x14.egglog.v1.PairValueH\x00R\x04pair\x12-\n\x05maybe\x18\x0e \x01(\x0b2\x15.egglog.v1.MaybeValueH\x00R\x05maybe\x12+\n\x06lambda\x18\x0f \x01(\x0b2\x11.egglog.v1.LambdaH\x00R\x06lambda\x124\n\x0cpartial_call\x18\x10 \x01(\x0b2\x0f.egglog.v1.CallH\x00R\x0bpartialCall\x120\n\x06custom\x18\x11 \x01(\x0b2\x16.egglog.v1.CustomValueH\x00R\x06customB\x0e\n\x05value\x12\x05\xbaH\x02\x08\x01"\xeb\x01\n\x06BigRat\x128\n\tnumerator\x18\x01 \x01(\tR\tnumeratorB\x1a\xbaH\x17r\x152\x13^(0|-?[1-9][0-9]*)$\x126\n\x0bdenominator\x18\x02 \x01(\tR\x0bdenominatorB\x14\xbaH\x11r\x0f2\r^[1-9][0-9]*$:o\xbaHl\x1aj\n\x16big_rat.canonical_zero\x12\x1ezero must have denominator one\x1a0this.numerator != \'0\' || this.denominator == \'1\'"\xc1\x01\n\x08Rational\x12\x1c\n\tnumerator\x18\x01 \x01(\x03R\tnumerator\x12)\n\x0bdenominator\x18\x02 \x01(\x03R\x0bdenominatorB\x07\xbaH\x04"\x02 \x00:l\xbaHi\x1ag\n\x17rational.canonical_zero\x12\x1ezero must have denominator one\x1a,this.numerator != 0 || this.denominator == 1"%\n\tValueList\x12\x18\n\x05items\x18\x01 \x03(\rR\x05itemsB\x02\x10\x01"9\n\x08MapValue\x12-\n\x07entries\x18\x01 \x03(\x0b2\x13.egglog.v1.MapEntryR\x07entries"^\n\x08MapEntry\x12\x1d\n\x03key\x18\x01 \x01(\rH\x00R\x03keyB\x06\xbaH\x03\xc8\x01\x01\x88\x01\x01\x12!\n\x05value\x18\x02 \x01(\rH\x01R\x05valueB\x06\xbaH\x03\xc8\x01\x01\x88\x01\x01B\x06\n\x04_keyB\x08\n\x06_value"h\n\tPairValue\x12!\n\x05first\x18\x01 \x01(\rH\x00R\x05firstB\x06\xbaH\x03\xc8\x01\x01\x88\x01\x01\x12#\n\x06second\x18\x02 \x01(\rH\x01R\x06secondB\x06\xbaH\x03\xc8\x01\x01\x88\x01\x01B\x08\n\x06_firstB\t\n\x07_second"1\n\nMaybeValue\x12\x19\n\x05value\x18\x01 \x01(\rH\x00R\x05value\x88\x01\x01B\x08\n\x06_value"?\n\x0bCustomValue\x12\x18\n\x07payload\x18\x01 \x01(\x0cR\x07payload\x12\x16\n\x04args\x18\x02 \x03(\rR\x04argsB\x02\x10\x01"\x06\n\x04Unit"\x97\x02\n\x06Action\x12\x14\n\x04term\x18\x01 \x01(\rH\x00R\x04term\x12"\n\x03set\x18\x02 \x01(\x0b2\x0e.egglog.v1.SetH\x00R\x03set\x12)\n\x06delete\x18\x03 \x01(\x0b2\x0f.egglog.v1.CallH\x00R\x06delete\x12+\n\x07subsume\x18\x07 \x01(\x0b2\x0f.egglog.v1.CallH\x00R\x07subsume\x12\x16\n\x05panic\x18\x04 \x01(\tH\x00R\x05panic\x12/\n\x08set_cost\x18\x05 \x01(\x0b2\x12.egglog.v1.SetCostH\x00R\x07setCost\x12#\n\x04span\x18\x06 \x01(\x0b2\x0f.egglog.v1.SpanR\x04spanB\r\n\x04kind\x12\x05\xbaH\x02\x08\x01"c\n\x03Set\x12/\n\x06target\x18\x01 \x01(\x0b2\x0f.egglog.v1.CallR\x06targetB\x06\xbaH\x03\xc8\x01\x01\x12!\n\x05value\x18\x02 \x01(\rH\x00R\x05valueB\x06\xbaH\x03\xc8\x01\x01\x88\x01\x01B\x08\n\x06_value"d\n\x07SetCost\x12/\n\x06target\x18\x01 \x01(\x0b2\x0f.egglog.v1.CallR\x06targetB\x06\xbaH\x03\xc8\x01\x01\x12\x1f\n\x04cost\x18\x02 \x01(\rH\x00R\x04costB\x06\xbaH\x03\xc8\x01\x01\x88\x01\x01B\x07\n\x05_cost"\x8b\x13\n\x0bDeclaration\x12:\n\x0bconstructor\x18\x01 \x01(\x0b2\x16.egglog.v1.ConstructorH\x00R\x0bconstructor\x121\n\x08function\x18\x02 \x01(\x0b2\x13.egglog.v1.FunctionH\x00R\x08function\x121\n\x08relation\x18\x03 \x01(\x0b2\x13.egglog.v1.RelationH\x00R\x08relation\x124\n\tprimitive\x18\x04 \x01(\x0b2\x14.egglog.v1.PrimitiveH\x00R\tprimitive\x12E\n\x10host_sort_family\x18\x05 \x01(\x0b2\x19.egglog.v1.HostSortFamilyH\x00R\x0ehostSortFamily\x12A\n\x0ehost_primitive\x18\x06 \x01(\x0b2\x18.egglog.v1.HostPrimitiveH\x00R\rhostPrimitive\x12#\n\x04span\x18\x07 \x01(\x0b2\x0f.egglog.v1.SpanR\x04span\x127\n\x08bindings\x18\x08 \x01(\x0b2\x1b.egglog.v1.CallableBindingsR\x08bindings\x12\x10\n\x03doc\x18\t \x01(\tR\x03docB\r\n\x04kind\x12\x05\xbaH\x02\x08\x01:\x9a\x0f\xbaH\x96\x0f\x1a\x87\x01\n\x1ddeclaration.callable_bindings\x122host sort-family bindings belong on HostSortFamily\x1a2!has(this.host_sort_family) || !has(this.bindings)\x1a\xe3\t\n\x1fdeclaration.presentation_inputs\x12Psurface mappings must cover fixed inputs and any final logical tail exactly once\x1a\xed\x08!has(this.bindings) || [has(this.constructor) ? size(this.constructor.inputs) : has(this.function) ? size(this.function.inputs) : has(this.relation) ? size(this.relation.inputs) : has(this.primitive) ? size(this.primitive.inputs) : has(this.host_primitive.signature) ? size(this.host_primitive.signature.inputs) : has(this.host_primitive.application) ? 1 : 0].all(n, [has(this.host_primitive.application) || has(this.host_primitive.signature.varargs)].all(t, this.bindings.python.views.all(v, size(v.params) + (has(v.receiver) ? 1 : 0) == n + (t ? 1 : 0) && (!has(v.receiver) || v.receiver < uint(n)) && (!has(v.mutates) || v.mutates < uint(n)) && v.params.all(p, p.core_input < uint(n + (t ? 1 : 0))) && (!t || (size(v.params) > 0 && v.params[size(v.params)-1].core_input == uint(n) && !has(v.params[size(v.params)-1].default_expr)))) && this.bindings.rust.views.all(v, size(v.params) + (has(v.receiver) ? 1 : 0) == n + (t ? 1 : 0) && (!has(v.receiver) || v.receiver.core_input < uint(n)) && v.params.all(p, p.core_input < uint(n + (t ? 1 : 0))) && (!t || (size(v.params) > 0 && v.params[size(v.params)-1].core_input == uint(n))))))\x1a\xa3\x04\n&declaration.presentation_special_forms\x12`function-wrapper owners require application receiver zero; datatype members require constructors\x1a\x96\x03!has(this.bindings) || (this.bindings.python.views.all(v, !has(v.owner.function) || (has(this.host_primitive.application) && has(v.receiver) && v.receiver == uint(0))) && this.bindings.rust.views.all(v, !has(v.owner.function) || (has(this.host_primitive.application) && has(v.receiver) && v.receiver.core_input == uint(0))) && this.bindings.egglog.views.all(v, !v.datatype_member || has(this.constructor)))"-\n\x03Arg\x12\x12\n\x04sort\x18\x01 \x01(\rR\x04sort\x12\x12\n\x04name\x18\x02 \x01(\tR\x04name"\xb2\x01\n\x0bConstructor\x12\x1b\n\x04name\x18\x01 \x01(\tR\x04nameB\x07\xbaH\x04r\x02\x10\x01\x12&\n\x06inputs\x18\x02 \x03(\x0b2\x0e.egglog.v1.ArgR\x06inputs\x12\x16\n\x06output\x18\x03 \x01(\rR\x06output\x12\x17\n\x04cost\x18\x04 \x01(\rH\x00R\x04cost\x88\x01\x01\x12$\n\runextractable\x18\x05 \x01(\x08R\runextractableB\x07\n\x05_cost"\x8c\x01\n\x08Function\x12\x1b\n\x04name\x18\x01 \x01(\tR\x04nameB\x07\xbaH\x04r\x02\x10\x01\x12&\n\x06inputs\x18\x02 \x03(\x0b2\x0e.egglog.v1.ArgR\x06inputs\x12\x16\n\x06output\x18\x03 \x01(\rR\x06output\x12\x19\n\x05merge\x18\x04 \x01(\rH\x00R\x05merge\x88\x01\x01B\x08\n\x06_merge"O\n\x08Relation\x12\x1b\n\x04name\x18\x01 \x01(\tR\x04nameB\x07\xbaH\x04r\x02\x10\x01\x12&\n\x06inputs\x18\x02 \x03(\x0b2\x0e.egglog.v1.ArgR\x06inputs"\x92\x01\n\tPrimitive\x12\x1b\n\x04name\x18\x01 \x01(\tR\x04nameB\x07\xbaH\x04r\x02\x10\x01\x12&\n\x06inputs\x18\x02 \x03(\x0b2\x0e.egglog.v1.ArgR\x06inputs\x12\x16\n\x06output\x18\x03 \x01(\rR\x06output\x12\x1f\n\x04body\x18\x04 \x01(\rH\x00R\x04bodyB\x06\xbaH\x03\xc8\x01\x01\x88\x01\x01B\x07\n\x05_body"\x81\x03\n\x0eHostSortFamily\x12\x1b\n\x04name\x18\x01 \x01(\tR\x04nameB\x07\xbaH\x04r\x02\x10\x01\x12\x14\n\x05arity\x18\x02 \x01(\rR\x05arity\x123\n\x08bindings\x18\x03 \x01(\x0b2\x17.egglog.v1.SortBindingsR\x08bindings:\x86\x02\xbaH\x82\x02\x1a\xff\x01\n(host_sort_family.presentation_parameters\x12Cexplicit presentation type-parameter labels must match family arity\x1a\x8d\x01!has(this.bindings) || [this.bindings.python, this.bindings.rust].all(m, size(m.type_params) == 0 || uint(size(m.type_params)) == this.arity)"\xbe\x01\n\rHostPrimitive\x12\x1b\n\x04name\x18\x01 \x01(\tR\x04nameB\x07\xbaH\x04r\x02\x10\x01\x12;\n\tsignature\x18\x02 \x01(\x0b2\x1b.egglog.v1.GenericSignatureH\x00R\tsignature\x12B\n\x0bapplication\x18\x03 \x01(\x0b2\x1e.egglog.v1.FunctionApplicationH\x00R\x0bapplicationB\x0f\n\x06typing\x12\x05\xbaH\x02\x08\x01"\xb5\x01\n\x10GenericSignature\x12\x1f\n\x0btype_params\x18\x01 \x03(\tR\ntypeParams\x12&\n\x06inputs\x18\x02 \x03(\x0b2\x0e.egglog.v1.ArgR\x06inputs\x12#\n\x06output\x18\x03 \x01(\rH\x00R\x06outputB\x06\xbaH\x03\xc8\x01\x01\x88\x01\x01\x12(\n\x07varargs\x18\x04 \x01(\x0b2\x0e.egglog.v1.ArgR\x07varargsB\t\n\x07_output"\x15\n\x13FunctionApplication"\xa0\x01\n\x0cSortBindings\x12.\n\x06python\x18\x01 \x01(\x0b2\x16.egglog.v1.TypeBindingR\x06python\x12*\n\x04rust\x18\x02 \x01(\x0b2\x16.egglog.v1.TypeBindingR\x04rust\x124\n\x06egglog\x18\x03 \x01(\x0b2\x1c.egglog.v1.EgglogTypeBindingR\x06egglog"^\n\x0bTypeBinding\x12 \n\x04path\x18\x01 \x03(\tR\x04pathB\x0c\xbaH\t\x92\x01\x06"\x04r\x02\x10\x01\x12-\n\x0btype_params\x18\x02 \x03(\tR\ntypeParamsB\x0c\xbaH\t\x92\x01\x06"\x04r\x02\x10\x01"+\n\x11EgglogTypeBinding\x12\x16\n\x06symbol\x18\x01 \x01(\tR\x06symbol"\xa5\x01\n\x10CallableBindings\x121\n\x06python\x18\x01 \x01(\x0b2\x19.egglog.v1.PythonBindingsR\x06python\x12+\n\x04rust\x18\x02 \x01(\x0b2\x17.egglog.v1.RustBindingsR\x04rust\x121\n\x06egglog\x18\x03 \x01(\x0b2\x19.egglog.v1.EgglogBindingsR\x06egglog"o\n\x0cBindingOwner\x12\x14\n\x04sort\x18\x01 \x01(\rH\x00R\x04sort\x12:\n\x08function\x18\x02 \x01(\x0b2\x1c.egglog.v1.FunctionTypeOwnerH\x00R\x08functionB\r\n\x04kind\x12\x05\xbaH\x02\x08\x01"\x13\n\x11FunctionTypeOwner"A\n\x0ePythonBindings\x12/\n\x05views\x18\x01 \x03(\x0b2\x19.egglog.v1.PythonCallableR\x05views"\x82\t\n\x0ePythonCallable\x129\n\x04kind\x18\x01 \x01(\x0e2\x19.egglog.v1.PythonCallKindR\x04kindB\n\xbaH\x07\x82\x01\x04\x10\x01 \x00\x12 \n\x04path\x18\x02 \x03(\tR\x04pathB\x0c\xbaH\t\x92\x01\x06"\x04r\x02\x10\x01\x12-\n\x05owner\x18\x03 \x01(\x0b2\x17.egglog.v1.BindingOwnerR\x05owner\x12\x1f\n\x08receiver\x18\x04 \x01(\rH\x00R\x08receiver\x88\x01\x01\x122\n\x06params\x18\x05 \x03(\x0b2\x1a.egglog.v1.PythonParameterR\x06params\x12\x1d\n\x07mutates\x18\x06 \x01(\rH\x01R\x07mutates\x88\x01\x01B\x0b\n\t_receiverB\n\n\x08_mutates:\xd6\x06\xbaH\xd2\x06\x1a\xe9\x02\n"python_callable.owner_and_receiver\x12;Python callable form determines owner and receiver presence\x1a\x85\x02(this.kind == 1 ? !has(this.owner) : has(this.owner)) && ((this.kind in [3, 5]) == has(this.receiver)) && (this.kind == 2 ? size(this.path) == 0 : this.kind == 1 ? size(this.path) > 0 : size(this.path) == 1) && (!(this.kind in [5, 6]) || size(this.params) == 0)\x1a\xeb\x01\n\x1dpython_callable.unique_inputs\x12:each surface parameter/receiver maps a distinct core input\x1a\x8d\x01this.params.all(p, (!has(this.receiver) || p.core_input != this.receiver) && this.params.filter(q, q.core_input == p.core_input).size() == 1)\x1a\xf5\x01\n\x1dpython_callable.mutated_input\x129a mutated argument must be a mapped receiver or parameter\x1a\x98\x01!has(this.mutates) || (this.kind != 2 && ((has(this.receiver) && this.mutates == this.receiver) || this.params.exists(p, p.core_input == this.mutates)))"\xa2\x01\n\x0fPythonParameter\x12*\n\ncore_input\x18\x01 \x01(\rH\x00R\tcoreInputB\x06\xbaH\x03\xc8\x01\x01\x88\x01\x01\x12\x1b\n\x04name\x18\x02 \x01(\tR\x04nameB\x07\xbaH\x04r\x02\x10\x01\x12&\n\x0cdefault_expr\x18\x03 \x01(\rH\x01R\x0bdefaultExpr\x88\x01\x01B\r\n\x0b_core_inputB\x0f\n\r_default_expr"=\n\x0cRustBindings\x12-\n\x05views\x18\x01 \x03(\x0b2\x17.egglog.v1.RustCallableR\x05views"\xa8\x06\n\x0cRustCallable\x12"\n\x04path\x18\x01 \x03(\tR\x04pathB\x0e\xbaH\x0b\x92\x01\x08\x08\x01"\x04r\x02\x10\x01\x12-\n\x05owner\x18\x02 \x01(\x0b2\x17.egglog.v1.BindingOwnerR\x05owner\x12#\n\rborrowed_self\x18\x03 \x01(\x08R\x0cborrowedSelf\x123\n\x08receiver\x18\x04 \x01(\x0b2\x17.egglog.v1.RustReceiverR\x08receiver\x120\n\x06params\x18\x05 \x03(\x0b2\x18.egglog.v1.RustParameterR\x06params\x123\n\ntrait_impl\x18\x06 \x01(\x0b2\x14.egglog.v1.RustTraitR\ttraitImpl:\x83\x04\xbaH\xff\x03\x1a\x85\x02\n\x13rust_callable.owner\x126Rust member/trait/borrowed-Self forms require an owner\x1a\xb5\x01(!has(this.receiver) || has(this.owner)) && (!has(this.trait_impl) || has(this.owner)) && (!this.borrowed_self || has(this.trait_impl)) && (!has(this.owner) || size(this.path) == 1)\x1a\xf4\x01\n\x1brust_callable.unique_inputs\x12:each surface parameter/receiver maps a distinct core input\x1a\x98\x01this.params.all(p, (!has(this.receiver) || p.core_input != this.receiver.core_input) && this.params.filter(q, q.core_input == p.core_input).size() == 1)"e\n\x0cRustReceiver\x12*\n\ncore_input\x18\x01 \x01(\rH\x00R\tcoreInputB\x06\xbaH\x03\xc8\x01\x01\x88\x01\x01\x12\x1a\n\x08borrowed\x18\x02 \x01(\x08R\x08borrowedB\r\n\x0b_core_input"\x83\x01\n\rRustParameter\x12*\n\ncore_input\x18\x01 \x01(\rH\x00R\tcoreInputB\x06\xbaH\x03\xc8\x01\x01\x88\x01\x01\x12\x1b\n\x04name\x18\x02 \x01(\tR\x04nameB\x07\xbaH\x04r\x02\x10\x01\x12\x1a\n\x08borrowed\x18\x03 \x01(\x08R\x08borrowedB\r\n\x0b_core_input"\xb7\x01\n\tRustTrait\x12"\n\x04path\x18\x01 \x03(\tR\x04pathB\x0e\xbaH\x0b\x92\x01\x08\x08\x01"\x04r\x02\x10\x01\x12\'\n\x04args\x18\x02 \x03(\x0b2\x13.egglog.v1.RustTypeR\x04args\x12B\n\x16output_associated_type\x18\x03 \x01(\tH\x00R\x14outputAssociatedTypeB\x07\xbaH\x04r\x02\x10\x01\x88\x01\x01B\x19\n\x17_output_associated_type"P\n\x08RustType\x12\x1f\n\x04sort\x18\x01 \x01(\rH\x00R\x04sortB\x06\xbaH\x03\xc8\x01\x01\x88\x01\x01\x12\x1a\n\x08borrowed\x18\x02 \x01(\x08R\x08borrowedB\x07\n\x05_sort"A\n\x0eEgglogBindings\x12/\n\x05views\x18\x01 \x03(\x0b2\x19.egglog.v1.EgglogCallableR\x05views"Z\n\x0eEgglogCallable\x12\x1f\n\x06symbol\x18\x01 \x01(\tR\x06symbolB\x07\xbaH\x04r\x02\x10\x01\x12\'\n\x0fdatatype_member\x18\x02 \x01(\x08R\x0edatatypeMember"\xdf\x02\n\x07Ruleset\x12\x17\n\x04name\x18\x01 \x01(\tH\x01R\x04name\x88\x01\x01\x12+\n\x05rules\x18\x02 \x01(\x0b2\x13.egglog.v1.RuleListH\x00R\x05rules\x128\n\x08combined\x18\x03 \x01(\x0b2\x1a.egglog.v1.CombinedRulesetH\x00R\x08combined\x12#\n\x04span\x18\x04 \x01(\x0b2\x0f.egglog.v1.SpanR\x04span\x12\x10\n\x03doc\x18\x05 \x01(\tR\x03docB\r\n\x04kind\x12\x05\xbaH\x02\x08\x01B\x07\n\x05_name:\x84\x01\xbaH\x80\x01\x1a~\n\x1cruleset.default_is_rule_list\x12\'the default ruleset must be a rule list\x1a5!has(this.name) || this.name != \'\' || has(this.rules)"$\n\x08RuleList\x12\x18\n\x05rules\x18\x01 \x03(\rR\x05rulesB\x02\x10\x01"I\n\nRulesetRef\x12\x16\n\x05index\x18\x01 \x01(\rH\x00R\x05index\x12\x14\n\x04name\x18\x02 \x01(\tH\x00R\x04nameB\r\n\x04kind\x12\x05\xbaH\x02\x08\x01"\x93\x03\n\x08RuleDecl\x12%\n\x04rule\x18\x01 \x01(\x0b2\x0f.egglog.v1.RuleH\x00R\x04rule\x12.\n\x07rewrite\x18\x02 \x01(\x0b2\x12.egglog.v1.RewriteH\x00R\x07rewrite\x124\n\tbirewrite\x18\x03 \x01(\x0b2\x14.egglog.v1.BiRewriteH\x00R\tbirewrite\x12 \n\x04name\x18\x04 \x01(\tH\x01R\x04nameB\x07\xbaH\x04r\x02\x10\x01\x88\x01\x01\x12A\n\teval_mode\x18\x05 \x01(\x0e2\x17.egglog.v1.RuleEvalModeR\x08evalModeB\x0b\xbaH\x08\xc8\x01\x01\x82\x01\x02\x10\x01\x12\x1b\n\tno_decomp\x18\x06 \x01(\x08R\x08noDecomp\x12)\n\x10include_subsumed\x18\x07 \x01(\x08R\x0fincludeSubsumed\x12#\n\x04span\x18\x08 \x01(\x0b2\x0f.egglog.v1.SpanR\x04span\x12\x10\n\x03doc\x18\t \x01(\tR\x03docB\r\n\x04kind\x12\x05\xbaH\x02\x08\x01B\x07\n\x05_name"G\n\x04Rule\x12\x18\n\x05query\x18\x02 \x03(\rR\x05queryB\x02\x10\x01\x12%\n\x04head\x18\x03 \x03(\x0b2\x11.egglog.v1.ActionR\x04head"k\n\x07Rewrite\x12\x10\n\x03lhs\x18\x02 \x01(\rR\x03lhs\x12\x10\n\x03rhs\x18\x03 \x01(\rR\x03rhs\x12"\n\nconditions\x18\x04 \x03(\rR\nconditionsB\x02\x10\x01\x12\x18\n\x07subsume\x18\x05 \x01(\x08R\x07subsume"S\n\tBiRewrite\x12\x10\n\x03lhs\x18\x02 \x01(\rR\x03lhs\x12\x10\n\x03rhs\x18\x03 \x01(\rR\x03rhs\x12"\n\nconditions\x18\x04 \x03(\rR\nconditionsB\x02\x10\x01"D\n\x0fCombinedRuleset\x121\n\x08rulesets\x18\x01 \x03(\x0b2\x15.egglog.v1.RulesetRefR\x08rulesets"\xb0\x05\n\x07Command\x12+\n\x06action\x18\x01 \x01(\x0b2\x11.egglog.v1.ActionH\x00R\x06action\x12(\n\x05check\x18\x02 \x01(\x0b2\x10.egglog.v1.CheckH\x00R\x05check\x12"\n\x03run\x18\x03 \x01(\x0b2\x0e.egglog.v1.RunH\x00R\x03run\x12A\n\x0ebind_scheduler\x18\x04 \x01(\x0b2\x18.egglog.v1.BindSchedulerH\x00R\rbindScheduler\x122\n\tkeep_best\x18\x05 \x01(\x0b2\x13.egglog.v1.KeepBestH\x00R\x08keepBest\x12.\n\x07extract\x18\x06 \x01(\x0b2\x12.egglog.v1.ExtractH\x00R\x07extract\x12+\n\x06freeze\x18\x07 \x01(\x0b2\x11.egglog.v1.FreezeH\x00R\x06freeze\x125\n\nprint_size\x18\x08 \x01(\x0b2\x14.egglog.v1.PrintSizeH\x00R\tprintSize\x12A\n\x0eprint_function\x18\t \x01(\x0b2\x18.egglog.v1.PrintFunctionH\x00R\rprintFunction\x12H\n\x11print_table_stats\x18\n \x01(\x0b2\x1a.egglog.v1.PrintTableStatsH\x00R\x0fprintTableStats\x12+\n\x06repeat\x18\x0b \x01(\x0b2\x11.egglog.v1.RepeatH\x00R\x06repeat\x121\n\x08saturate\x18\x0c \x01(\x0b2\x13.egglog.v1.SaturateH\x00R\x08saturate\x12#\n\x04span\x18\r \x01(\x0b2\x0f.egglog.v1.SpanR\x04spanB\r\n\x04kind\x12\x05\xbaH\x02\x08\x01"!\n\x05Check\x12\x18\n\x05facts\x18\x01 \x03(\rR\x05factsB\x02\x10\x01"\\\n\x03Run\x127\n\x07ruleset\x18\x01 \x01(\x0b2\x15.egglog.v1.RulesetRefR\x07rulesetB\x06\xbaH\x03\xc8\x01\x01\x12\x1c\n\tscheduler\x18\x02 \x01(\tR\tscheduler"h\n\rBindScheduler\x12\x1b\n\x04name\x18\x01 \x01(\tR\x04nameB\x07\xbaH\x04r\x02\x10\x01\x12:\n\tscheduler\x18\x02 \x01(\x0b2\x14.egglog.v1.SchedulerR\tschedulerB\x06\xbaH\x03\xc8\x01\x01"K\n\tScheduler\x12/\n\x08back_off\x18\x01 \x01(\x0b2\x12.egglog.v1.BackOffH\x00R\x07backOffB\r\n\x04kind\x12\x05\xbaH\x02\x08\x01"\xa5\x01\n\x07BackOff\x12$\n\x0bmatch_limit\x18\x01 \x01(\x04H\x00R\nmatchLimit\x88\x01\x01\x12"\n\nban_length\x18\x02 \x01(\x04H\x01R\tbanLength\x88\x01\x01\x12"\n\nnode_limit\x18\x03 \x01(\x04H\x02R\tnodeLimit\x88\x01\x01B\x0e\n\x0c_match_limitB\r\n\x0b_ban_lengthB\r\n\x0b_node_limit"\x94\x01\n\x08KeepBest\x12(\n\x06tables\x18\x01 \x03(\tR\x06tablesB\x10\x10\x00\xbaH\x0b\x92\x01\x08\x08\x01"\x04r\x02\x10\x01\x12?\n\textractor\x18\x02 \x01(\x0e2\x14.egglog.v1.ExtractorR\textractorB\x0b\xbaH\x08\xc8\x01\x01\x82\x01\x02\x10\x01\x12\x1d\n\ncost_model\x18\x03 \x01(\tR\tcostModel"\xb0\x01\n\x07Extract\x12 \n\x05roots\x18\x01 \x03(\rR\x05rootsB\n\x10\x01\xbaH\x05\x92\x01\x02\x08\x01\x12#\n\x08variants\x18\x02 \x01(\rR\x08variantsB\x07\xbaH\x04*\x02(\x01\x12?\n\textractor\x18\x03 \x01(\x0e2\x14.egglog.v1.ExtractorR\textractorB\x0b\xbaH\x08\xc8\x01\x01\x82\x01\x02\x10\x01\x12\x1d\n\ncost_model\x18\x04 \x01(\tR\tcostModel"\x08\n\x06Freeze"3\n\tPrintSize\x12&\n\x06tables\x18\x01 \x03(\tR\x06tablesB\x0e\x10\x00\xbaH\t\x92\x01\x06"\x04r\x02\x10\x01"I\n\rPrintFunction\x12\x1d\n\x05table\x18\x01 \x01(\tR\x05tableB\x07\xbaH\x04r\x02\x10\x01\x12\x19\n\x08max_rows\x18\x02 \x01(\x04R\x07maxRows"9\n\x0fPrintTableStats\x12&\n\x06tables\x18\x01 \x03(\tR\x06tablesB\x0e\x10\x00\xbaH\t\x92\x01\x06"\x04r\x02\x10\x01"w\n\x06Repeat\x12&\n\x04body\x18\x01 \x03(\x0b2\x12.egglog.v1.CommandR\x04body\x12\x18\n\x05until\x18\x02 \x03(\rR\x05untilB\x02\x10\x01\x12!\n\x05times\x18\x03 \x01(\x04H\x00R\x05timesB\x06\xbaH\x03\xc8\x01\x01\x88\x01\x01B\x08\n\x06_times"\x94\x01\n\x08Saturate\x12&\n\x04body\x18\x01 \x03(\x0b2\x12.egglog.v1.CommandR\x04body\x12\x18\n\x05until\x18\x02 \x03(\rR\x05untilB\x02\x10\x01\x123\n\x0emax_iterations\x18\x03 \x01(\x04H\x00R\rmaxIterationsB\x07\xbaH\x042\x02(\x01\x88\x01\x01B\x11\n\x0f_max_iterations"\x8a\x05\n\x13CreateEGraphRequest\x12%\n\x05sorts\x18\x01 \x03(\x0b2\x0f.egglog.v1.SortR\x05sorts\x12(\n\tcost_sort\x18\x02 \x01(\rH\x00R\x08costSortB\x06\xbaH\x03\xc8\x01\x01\x88\x01\x01\x12+\n\x05files\x18\x03 \x03(\x0b2\x15.egglog.v1.SourceFileR\x05filesB\x0c\n\n_cost_sort:\xe6\x03\xbaH\xe2\x03\x1aw\n"create_egraph_request.closed_sorts\x121creation sorts cannot contain signature variables\x1a\x1ethis.sorts.all(s, !has(s.var))\x1a\x86\x01\n(create_egraph_request.cost_sort_in_range\x12\x1acost_sort must index sorts\x1a>has(this.cost_sort) && this.cost_sort < uint(size(this.sorts))\x1a\xdd\x01\n(create_egraph_request.sort_refs_in_range\x12\x1esort children must index sorts\x1a\x90\x01this.sorts.all(s, (has(s.container) ? s.container.args : has(s.func) ? s.func.params + [s.func.result] : []).all(i, i < uint(size(this.sorts))))"3\n\x14CreateEGraphResponse\x12\x1b\n\tegraph_id\x18\x01 \x01(\x04R\x08egraphId"1\n\x12CloneEGraphRequest\x12\x1b\n\tegraph_id\x18\x01 \x01(\x04R\x08egraphId"2\n\x13CloneEGraphResponse\x12\x1b\n\tegraph_id\x18\x01 \x01(\x04R\x08egraphId"3\n\x14DestroyEGraphRequest\x12\x1b\n\tegraph_id\x18\x01 \x01(\x04R\x08egraphId"\x17\n\x15DestroyEGraphResponse"x\n\x11RunProgramRequest\x12\x1b\n\tegraph_id\x18\x01 \x01(\x04R\x08egraphId\x12,\n\x07program\x18\x02 \x01(\x0b2\x12.egglog.v1.ProgramR\x07program\x12\x18\n\x07profile\x18\x03 \x01(\x08R\x07profile"\xa8\x11\n\x12RunProgramResponse\x12%\n\x05nodes\x18\x01 \x03(\x0b2\x0f.egglog.v1.NodeR\x05nodes\x12%\n\x05sorts\x18\x02 \x03(\x0b2\x0f.egglog.v1.SortR\x05sorts\x122\n\x07outputs\x18\x03 \x03(\x0b2\x18.egglog.v1.CommandOutputR\x07outputs\x12+\n\x05files\x18\x04 \x03(\x0b2\x15.egglog.v1.SourceFileR\x05files\x12&\n\x05error\x18\x05 \x01(\x0b2\x10.egglog.v1.ErrorR\x05error\x120\n\x05rules\x18\x06 \x03(\x0b2\x1a.egglog.v1.RuleAttributionR\x05rules\x123\n\x07profile\x18\x07 \x01(\x0b2\x19.egglog.v1.ProfileSummaryR\x07profile:\xd3\x0e\xbaH\xcf\x0e\x1av\n!run_program_response.closed_sorts\x121response sorts cannot contain signature variables\x1a\x1ethis.sorts.all(s, !has(s.var))\x1a\x85\x01\n\'run_program_response.node_sort_in_range\x12#every node sort_id must index sorts\x1a5this.nodes.all(n, n.sort_id < uint(size(this.sorts)))\x1a\xb1\x05\n\'run_program_response.node_refs_in_range\x12\x1enode children must index nodes\x1a\xe5\x04this.nodes.all(n, (has(n.call) ? n.call.args : has(n.get_cost) ? n.get_cost.args : has(n.union) ? n.union.members : has(n.primitive_value) ? [n.primitive_value].map(v, has(v.lambda) ? v.lambda.captures + [v.lambda.body] : has(v.partial_call) ? v.partial_call.args : has(v.vec) ? v.vec.items : has(v.set) ? v.set.items : has(v.multiset) ? v.multiset.items : has(v.map) ? v.map.entries.map(e, e.key) + v.map.entries.map(e, e.value) : has(v.pair) ? [v.pair.first, v.pair.second] : has(v.maybe) && has(v.maybe.value) ? [v.maybe.value] : has(v.custom) ? v.custom.args : [])[0] : []).all(i, i < uint(size(this.nodes))))\x1a\xdc\x01\n\'run_program_response.sort_refs_in_range\x12\x1esort children must index sorts\x1a\x90\x01this.sorts.all(s, (has(s.container) ? s.container.args : has(s.func) ? s.func.params + [s.func.result] : []).all(i, i < uint(size(this.sorts))))\x1a\xe2\x01\n(run_program_response.empty_union_eq_sort\x12(an empty union requires an equality sort\x1a\x8b\x01this.nodes.all(n, !has(n.union) || size(n.union.members) > 0 || (n.sort_id < uint(size(this.sorts)) && has(this.sorts[int(n.sort_id)].eq)))\x1a\xa5\x02\n\'run_program_response.rule_refs_in_range\x12;error and profile rule references must index response rules\x1a\xbc\x01(!has(this.error) || !has(this.error.rule) || this.error.rule < uint(size(this.rules))) && (!has(this.profile) || this.profile.runs.all(s, s.rules.all(r, r.rule < uint(size(this.rules)))))\x1a\xac\x01\n\'run_program_response.profile_completion\x12@a present profile is complete exactly when the request succeeded\x1a?!has(this.profile) || this.profile.complete == !has(this.error)"\xc4\x01\n\x0fRuleAttribution\x121\n\x04root\x18\x01 \x01(\x0b2\x15.egglog.v1.RulesetRefR\x04rootB\x06\xbaH\x03\xc8\x01\x01\x12\x1a\n\x08children\x18\x02 \x03(\rR\x08children\x12\x12\n\x04rule\x18\x03 \x01(\rR\x04rule\x12 \n\x04name\x18\x04 \x01(\tH\x00R\x04nameB\x07\xbaH\x04r\x02\x10\x01\x88\x01\x01\x12#\n\x04span\x18\x05 \x01(\x0b2\x0f.egglog.v1.SpanR\x04spanB\x07\n\x05_name"\xe2\x01\n\x0fCommandLocation\x12\x1c\n\x04path\x18\x01 \x03(\rR\x04pathB\x08\xbaH\x05\x92\x01\x02\x08\x01\x12\x1e\n\niterations\x18\x02 \x03(\x04R\niterations:\x90\x01\xbaH\x8c\x01\x1a\x89\x01\n command_location.iteration_depth\x127one iteration coordinate is required per enclosing loop\x1a,size(this.path) == size(this.iterations) + 1"\x84\x02\n\x05Error\x124\n\x04code\x18\x01 \x01(\x0e2\x14.egglog.v1.ErrorCodeR\x04codeB\n\xbaH\x07\x82\x01\x04\x10\x01 \x00\x12!\n\x07message\x18\x02 \x01(\tR\x07messageB\x07\xbaH\x04r\x02\x10\x01\x12#\n\x04span\x18\x03 \x01(\x0b2\x0f.egglog.v1.SpanR\x04span\x126\n\x08location\x18\x04 \x01(\x0b2\x1a.egglog.v1.CommandLocationR\x08location\x12\x17\n\x04rule\x18\x05 \x01(\rH\x00R\x04rule\x88\x01\x01\x12#\n\rengine_origin\x18\x06 \x01(\tR\x0cengineOriginB\x07\n\x05_rule"\x87\x05\n\rCommandOutput\x12)\n\x03run\x18\x01 \x01(\x0b2\x15.egglog.v1.RunOutcomeH\x00R\x03run\x12:\n\nextraction\x18\x02 \x01(\x0b2\x18.egglog.v1.ExtractResultH\x00R\nextraction\x12.\n\x07program\x18\x03 \x01(\x0b2\x12.egglog.v1.ProgramH\x00R\x07program\x12-\n\x05sizes\x18\x04 \x01(\x0b2\x15.egglog.v1.TableSizesH\x00R\x05sizes\x12G\n\x10printed_function\x18\x05 \x01(\x0b2\x1a.egglog.v1.PrintedFunctionH\x00R\x0fprintedFunction\x12>\n\x0btable_stats\x18\x06 \x01(\x0b2\x1b.egglog.v1.TableStatsResultH\x00R\ntableStats\x12,\n\x04loop\x18\x08 \x01(\x0b2\x16.egglog.v1.LoopOutcomeH\x00R\x04loop\x12>\n\x08location\x18\x07 \x01(\x0b2\x1a.egglog.v1.CommandLocationR\x08locationB\x06\xbaH\x03\xc8\x01\x01B\r\n\x04kind\x12\x05\xbaH\x02\x08\x01:\xa9\x01\xbaH\xa5\x01\x1a\xa2\x01\n command_output.top_level_outcome\x128control outcomes are only emitted for top-level commands\x1aD(!has(this.run) && !has(this.loop)) || size(this.location.path) == 1"\xbc\x01\n\nRunOutcome\x12\x18\n\x07updated\x18\x01 \x01(\x08R\x07updated\x12\x19\n\x08can_stop\x18\x02 \x01(\x08R\x07canStop:y\xbaHv\x1at\n\x14run_outcome.can_stop\x12;a Run that updated the database cannot also permit stopping\x1a\x1f!this.updated || !this.can_stop"\xd5\x02\n\x0bLoopOutcome\x12\x18\n\x07updated\x18\x01 \x01(\x08R\x07updated\x12\x1e\n\niterations\x18\x02 \x01(\x04R\niterations\x12R\n\x0btermination\x18\x03 \x01(\x0e2\x1c.egglog.v1.TerminationReasonH\x00R\x0bterminationB\r\xbaH\n\xc8\x01\x01\x82\x01\x04\x10\x01 \x00\x88\x01\x01B\x0e\n\x0c_termination:\xa7\x01\xbaH\xa3\x01\x1a\xa0\x01\n\x1cloop_outcome.zero_iterations\x12:zero iterations cannot update data or establish saturation\x1aDthis.iterations > 0 || (!this.updated && this.termination in [2, 4])"5\n\tTableSize\x12\x14\n\x05table\x18\x01 \x01(\tR\x05table\x12\x12\n\x04rows\x18\x02 \x01(\x04R\x04rows"\xfc\x01\n\x0eProfileSummary\x12\x1a\n\x08complete\x18\x01 \x01(\x08R\x08complete\x12)\n\x04runs\x18\x02 \x03(\x0b2\x15.egglog.v1.RunSummaryR\x04runs:\xa2\x01\xbaH\x9e\x01\x1a\x9b\x01\n\x1cprofile_summary.unique_sites\x12&each static Run site has one aggregate\x1aSthis.runs.all(r, this.runs.filter(s, s.command_path == r.command_path).size() == 1)"\xf9\x03\n\nRunSummary\x12+\n\x0ccommand_path\x18\x01 \x03(\rR\x0bcommandPathB\x08\xbaH\x05\x92\x01\x02\x08\x01\x128\n\x16search_and_apply_nanos\x18\x02 \x01(\x04H\x00R\x13searchAndApplyNanos\x88\x01\x01\x12$\n\x0bmerge_nanos\x18\x03 \x01(\x04H\x01R\nmergeNanos\x88\x01\x01\x12(\n\rrebuild_nanos\x18\x04 \x01(\x04H\x02R\x0crebuildNanos\x88\x01\x01\x12,\n\x05rules\x18\x05 \x03(\x0b2\x16.egglog.v1.RuleSummaryR\x05rules\x12)\n\x0binvocations\x18\x06 \x01(\x04R\x0binvocationsB\x07\xbaH\x042\x02(\x01B\x19\n\x17_search_and_apply_nanosB\x0e\n\x0c_merge_nanosB\x10\n\x0e_rebuild_nanos:\x9d\x01\xbaH\x99\x01\x1a\x96\x01\n\x18run_summary.unique_rules\x123each rule occurrence has one aggregate per Run site\x1aEthis.rules.all(r, this.rules.filter(s, s.rule == r.rule).size() == 1)"\xb7\x01\n\x0bRuleSummary\x12\x1f\n\x04rule\x18\x01 \x01(\rH\x00R\x04ruleB\x06\xbaH\x03\xc8\x01\x01\x88\x01\x01\x12\x1d\n\x07matches\x18\x02 \x01(\x04H\x01R\x07matches\x88\x01\x01\x128\n\x16search_and_apply_nanos\x18\x03 \x01(\x04H\x02R\x13searchAndApplyNanos\x88\x01\x01B\x07\n\x05_ruleB\n\n\x08_matchesB\x19\n\x17_search_and_apply_nanos"?\n\rExtractResult\x12.\n\x05roots\x18\x01 \x03(\x0b2\x18.egglog.v1.ExtractedRootR\x05roots"E\n\rExtractedRoot\x124\n\x08variants\x18\x01 \x03(\x0b2\x18.egglog.v1.ExtractedTermR\x08variants"E\n\rExtractedTerm\x12\x12\n\x04term\x18\x01 \x01(\rR\x04term\x12\x17\n\x04cost\x18\x02 \x01(\rH\x00R\x04cost\x88\x01\x01B\x07\n\x05_cost"8\n\nTableSizes\x12*\n\x05sizes\x18\x01 \x03(\x0b2\x14.egglog.v1.TableSizeR\x05sizes"S\n\x0fPrintedFunction\x12\x14\n\x05table\x18\x01 \x01(\tR\x05table\x12*\n\x04rows\x18\x02 \x03(\x0b2\x16.egglog.v1.FunctionRowR\x04rows"U\n\x0bFunctionRow\x12\x12\n\x04call\x18\x01 \x01(\rR\x04call\x12\x16\n\x06output\x18\x02 \x01(\rR\x06output\x12\x1a\n\x08subsumed\x18\x03 \x01(\x08R\x08subsumed"?\n\x10TableStatsResult\x12+\n\x05stats\x18\x01 \x03(\x0b2\x15.egglog.v1.TableStatsR\x05stats"\xc5\x01\n\nTableStats\x12\x14\n\x05table\x18\x01 \x01(\tR\x05table\x12\x12\n\x04rows\x18\x02 \x01(\x04R\x04rows\x12%\n\x0ccolumn_sorts\x18\x03 \x03(\tR\x0bcolumnSortsB\x02\x10\x00\x12+\n\x0fdistinct_counts\x18\x04 \x03(\x04R\x0edistinctCountsB\x02\x10\x01\x129\n\x0bout_degrees\x18\x05 \x03(\x0b2\x18.egglog.v1.PairOutDegreeR\noutDegrees"x\n\rPairOutDegree\x12\x1a\n\x06source\x18\x01 \x03(\rR\x06sourceB\x02\x10\x01\x12\x1a\n\x06target\x18\x02 \x03(\rR\x06targetB\x02\x10\x01\x12/\n\x05stats\x18\x03 \x01(\x0b2\x19.egglog.v1.OutDegreeStatsR\x05stats"\x84\x01\n\x0eOutDegreeStats\x12\x10\n\x03min\x18\x01 \x01(\x04R\x03min\x12\x10\n\x03max\x18\x02 \x01(\x04R\x03max\x12\x12\n\x04mean\x18\x03 \x01(\x01R\x04mean\x12\x10\n\x03p25\x18\x04 \x01(\x01R\x03p25\x12\x16\n\x06median\x18\x05 \x01(\x01R\x06median\x12\x10\n\x03p75\x18\x06 \x01(\x01R\x03p75*\xf7\x01\n\x0ePythonCallKind\x12 \n\x1cPYTHON_CALL_KIND_UNSPECIFIED\x10\x00\x12\x1d\n\x19PYTHON_CALL_KIND_FUNCTION\x10\x01\x12 \n\x1cPYTHON_CALL_KIND_INITIALIZER\x10\x02\x12\x1b\n\x17PYTHON_CALL_KIND_METHOD\x10\x03\x12!\n\x1dPYTHON_CALL_KIND_CLASS_METHOD\x10\x04\x12\x1d\n\x19PYTHON_CALL_KIND_PROPERTY\x10\x05\x12#\n\x1fPYTHON_CALL_KIND_CLASS_VARIABLE\x10\x06*\x8b\x01\n\x0cRuleEvalMode\x12\x1e\n\x1aRULE_EVAL_MODE_UNSPECIFIED\x10\x00\x12\x1c\n\x18RULE_EVAL_MODE_SEMINAIVE\x10\x01\x12\x18\n\x14RULE_EVAL_MODE_NAIVE\x10\x02\x12#\n\x1fRULE_EVAL_MODE_UNSAFE_SEMINAIVE\x10\x03*T\n\tExtractor\x12\x19\n\x15EXTRACTOR_UNSPECIFIED\x10\x00\x12\x12\n\x0eEXTRACTOR_TREE\x10\x01\x12\x18\n\x14EXTRACTOR_GREEDY_DAG\x10\x02*\xdb\x01\n\tErrorCode\x12\x1a\n\x16ERROR_CODE_UNSPECIFIED\x10\x00\x12\x1e\n\x1aERROR_CODE_INVALID_PROGRAM\x10\x01\x12\x1b\n\x17ERROR_CODE_CHECK_FAILED\x10\x02\x12\x14\n\x10ERROR_CODE_PANIC\x10\x03\x12 \n\x1cERROR_CODE_EVALUATION_FAILED\x10\x04\x12 \n\x1cERROR_CODE_EXTRACTION_FAILED\x10\x05\x12\x1b\n\x17ERROR_CODE_UNKNOWN_NAME\x10\x06*\xf5\x01\n\x11TerminationReason\x12"\n\x1eTERMINATION_REASON_UNSPECIFIED\x10\x00\x12 \n\x1cTERMINATION_REASON_SATURATED\x10\x01\x12$\n TERMINATION_REASON_COUNT_REACHED\x10\x02\x12&\n"TERMINATION_REASON_ITERATION_LIMIT\x10\x03\x12$\n TERMINATION_REASON_UNTIL_MATCHED\x10\x04\x12&\n"TERMINATION_REASON_SCHEDULER_LIMIT\x10\x052\xcd\x02\n\rEgglogService\x12O\n\x0cCreateEGraph\x12\x1e.egglog.v1.CreateEGraphRequest\x1a\x1f.egglog.v1.CreateEGraphResponse\x12L\n\x0bCloneEGraph\x12\x1d.egglog.v1.CloneEGraphRequest\x1a\x1e.egglog.v1.CloneEGraphResponse\x12R\n\rDestroyEGraph\x12\x1f.egglog.v1.DestroyEGraphRequest\x1a .egglog.v1.DestroyEGraphResponse\x12I\n\nRunProgram\x12\x1c.egglog.v1.RunProgramRequest\x1a\x1d.egglog.v1.RunProgramResponseb\x06proto3',
     [
         validate_pb.desc(),
     ],
@@ -5194,9 +5029,7 @@ _DESC = file_desc(
         "Node": Node,
         "Union": Union,
         "Call": Call,
-        "GetCost": GetCost,
         "Lambda": Lambda,
-        "PartialCall": PartialCall,
         "PrimitiveValue": PrimitiveValue,
         "BigRat": BigRat,
         "Rational": Rational,
@@ -5209,7 +5042,6 @@ _DESC = file_desc(
         "Unit": Unit,
         "Action": Action,
         "Set": Set,
-        "Change": Change,
         "SetCost": SetCost,
         "Declaration": Declaration,
         "Arg": Arg,
@@ -5221,10 +5053,10 @@ _DESC = file_desc(
         "HostPrimitive": HostPrimitive,
         "GenericSignature": GenericSignature,
         "FunctionApplication": FunctionApplication,
-        "SortMetadata": SortMetadata,
+        "SortBindings": SortBindings,
         "TypeBinding": TypeBinding,
         "EgglogTypeBinding": EgglogTypeBinding,
-        "CallableMetadata": CallableMetadata,
+        "CallableBindings": CallableBindings,
         "BindingOwner": BindingOwner,
         "FunctionTypeOwner": FunctionTypeOwner,
         "PythonBindings": PythonBindings,
@@ -5288,7 +5120,6 @@ _DESC = file_desc(
         "TableStats": TableStats,
         "PairOutDegree": PairOutDegree,
         "OutDegreeStats": OutDegreeStats,
-        "ChangeKind": ChangeKind,
         "PythonCallKind": PythonCallKind,
         "RuleEvalMode": RuleEvalMode,
         "Extractor": Extractor,

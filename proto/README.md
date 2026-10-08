@@ -88,11 +88,13 @@ the first argument has a concrete function type, remaining arguments match its
 parameter sorts, and the call has its result sort. It needs no heterogeneous
 type packs. This follows Python's
 [application special case](https://github.com/egraphs-good/egglog-python/blob/ff72f601a972ca1eb7cb0a1d299813f5d65b1a14/python/egglog/runtime.py#L522-L538).
-For `PartialCall`, captured argument sorts plus the resulting `FuncSort.params`
-form the effective complete argument list; `FuncSort.result` supplies its result.
+For `PrimitiveValue.partial_call`, captured argument sorts plus the resulting
+`FuncSort.params` form the effective complete argument list; `FuncSort.result`
+supplies its result.
 Apply the target's typing form to that complete call, including varargs or
 function application, and require every generic parameter to be determined.
-The existing relation-capability restriction still applies.
+The existing relation-capability restriction still applies. A `Lambda` stores only
+captures and its body; its enclosing `FuncSort` supplies parameter and result sorts.
 
 Complete `Freeze` exports include these descriptors and their signature patterns,
 even when unused; freezing a fresh empty handle therefore exposes its ambient
@@ -102,54 +104,55 @@ compatibility must be established by the host; matching descriptors alone cannot
 establish it.
 No runtime catalog adapter or generated high-level bindings are implemented.
 
-### High-level bindings and language metadata
+### High-level language bindings
 
 Protobuf codegen produces message classes, not ergonomic Egglog APIs. Planned
 high-level generators use builtin and user declarations to produce Python/Rust
 symbolic APIs and Egglog source. For example, one signature might be presented
 as Python `m[k]` and Rust `m.get(k)`, with the same underlying call.
 
-**Decided:** start with typed metadata for Rust, Python, and Egglog source only;
+**Decided:** start with typed bindings for Rust, Python, and Egglog source only;
 defer arbitrary extension payloads and other languages. Egglog presentation
-metadata is where datatype grouping and related surface syntax belong, rather
+bindings are where datatype grouping and related surface syntax belong, rather
 than adding a second semantic datatype declaration. This describes how to
 present definitions, not original formatting or source round-tripping.
 
 Python's [declarations](https://github.com/egraphs-good/egglog-python/blob/ff72f601a972ca1eb7cb0a1d299813f5d65b1a14/python/egglog/declarations.py#L311-L324)
 distinguish constructors, methods, class methods, properties, and preserved host
-methods. `SortMetadata` now attaches to `EqSort` and `HostSortFamily`;
-`CallableMetadata` attaches to callable `Declaration` arms. Both have optional
-Python, Rust, and Egglog blocks, without duplicating locations/documentation.
+methods. `SortBindings` now attaches to `EqSort` and `HostSortFamily`;
+`CallableBindings` attaches to callable `Declaration` arms through `bindings`.
+Both have optional Python, Rust, and Egglog blocks, without duplicating
+locations/documentation.
 Type bindings carry qualified display paths and optional parameter labels in
 core family order. Callable views carry explicit surface-to-core input mappings;
 owner sort patterns identify semantic types, not their display paths.
 
-**Decided:** freeze each language's metadata block when first supplied for a
+**Decided:** freeze each language's bindings block when first supplied for a
 definition. An absent language on a later compatible redeclaration makes no
 assertion and removes nothing; another language may first be supplied later.
 A subsequent block for an already-supplied language must match the fixed block.
 Adding or changing a same-language alias after that first block is rejected.
-Presentation metadata is independent of semantic definition identity.
+Presentation bindings are independent of semantic definition identity.
 Repeated same-name supplies in one Program are reconciled before interning;
 agreeing blocks are allowed. Compare referenced sort/default structures after
-arena remapping, without recursively comparing their presentation metadata.
+arena remapping, without recursively comparing their presentation bindings.
 Default-root comparison preserves shared versus distinct `Union` occurrences.
 Runtime matching and language-name normalization remain unimplemented.
 
 **Decided:** without a Python/Rust presentation block for a definition, generate
 plain symbolic types and free functions with API identifiers derived from core
-names. Missing metadata never hides a definition; explicit hiding is outside
+names. Missing bindings never hide a definition; explicit hiding is outside
 this draft's scope, with no special meaning assigned to an empty block.
 Behind those identifiers, preserve exact core names, signatures, and
 argument order; do not infer operators or receivers. Cross-declaration Python/Rust
 binding collisions (explicit/explicit, explicit/derived, or derived/derived) are
 target-language generation errors, not declaration-installation errors. Generators
 must error, not fall back, overwrite, or rename bindings. Engine installation still
-rejects malformed individual metadata and conflicting resupply of one declaration's
-fixed language block. These defaults are derived output, not supplied metadata:
-they install or freeze no block, so later explicit metadata
-remains that language's first supply. The exact naming/normalization algorithm
-is undecided; high-level generators and runtime metadata checks are unimplemented.
+rejects malformed individual bindings and conflicting resupply of one declaration's
+fixed language block. These defaults are derived output, not supplied bindings:
+they install or freeze no block, so later explicit bindings
+remain that language's first supply. The exact naming/normalization algorithm
+is undecided; high-level generators and runtime bindings checks are unimplemented.
 
 Python views distinguish free functions, initializers, methods, class methods,
 properties, and class variables. Ordered parameter records give core-input
@@ -179,14 +182,14 @@ with no default or redundant varargs flag. `FunctionApplication` instead has a
 function input and a heterogeneous tail derived from its concrete `FuncSort`.
 A structural-function owner marker represents `__call__` without a fake family
 or new type-pack binder. Other owner/trait patterns use only the enclosing
-callable's existing generic binder; metadata cannot introduce generic nodes.
+callable's existing generic binder; bindings cannot introduce generic nodes.
 Egglog views carry symbols and constructor datatype membership, grouped by the
 existing output equality sort, without new datatype or text-overload semantics.
 
-`Freeze` retains supplied blocks and their metadata-only dependencies, remapping
+`Freeze` retains supplied blocks and their bindings-only dependencies, remapping
 arenas without executing defaults or freezing derived wrapper choices. CEL checks
 direct shapes, positions and bounds. Recursive default closure, owner/receiver
-typing, metadata compatibility, and target-language generation remain normative
+typing, bindings compatibility, and target-language generation remain normative
 requirements, not implemented semantic checks.
 
 **Decided:** initially generate the symbolic declarations and expression-building

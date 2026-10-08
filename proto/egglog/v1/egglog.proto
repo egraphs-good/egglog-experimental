@@ -64,7 +64,7 @@ message Program {
     expression:
       "this.nodes.all(n, "
       "(has(n.call) ? n.call.args : "
-      "has(n.get_cost) ? n.get_cost.target.args : "
+      "has(n.get_cost) ? n.get_cost.args : "
       "has(n.union) ? n.union.members : "
       "has(n.primitive_value) ? [n.primitive_value].map(v, "
       "has(v.lambda) ? v.lambda.captures + [v.lambda.body] : "
@@ -79,15 +79,12 @@ message Program {
   };
   option (buf.validate.message).cel = {
     id: "program.sort_refs_in_range"
-    message: "sort children and lambda parameter sorts must index sorts"
+    message: "sort children must index sorts"
     expression:
       "this.sorts.all(s, "
       "(has(s.container) ? s.container.args : "
       "has(s.func) ? s.func.params + [s.func.result] : [])"
-      ".all(i, i < uint(size(this.sorts)))) && "
-      "this.nodes.all(n, !has(n.primitive_value) || !has(n.primitive_value.lambda) || "
-      "n.primitive_value.lambda.param_types.all(i, i < uint(size(this.sorts)) && "
-      "!has(this.sorts[int(i)].var)))"
+      ".all(i, i < uint(size(this.sorts))))"
   };
   option (buf.validate.message).cel = {
     id: "program.concrete_signature_roots"
@@ -99,6 +96,15 @@ message Program {
       "has(d.relation) ? d.relation.inputs.map(a, a.sort) : "
       "has(d.primitive) ? d.primitive.inputs.map(a, a.sort) + [d.primitive.output] : [])"
       ".all(i, i < uint(size(this.sorts)) && !has(this.sorts[int(i)].var)))"
+  };
+  option (buf.validate.message).cel = {
+    id: "program.lambda_signature"
+    message: "lambdas require a function sort with non-variable parameter/result roots"
+    expression:
+      "this.nodes.all(n, !has(n.primitive_value.lambda) || "
+      "(n.sort_id < uint(size(this.sorts)) && has(this.sorts[int(n.sort_id)].func) && "
+      "[this.sorts[int(n.sort_id)].func].all(f, (f.params + [f.result]).all(i, "
+      "i < uint(size(this.sorts)) && !has(this.sorts[int(i)].var)))))"
   };
   // Bounds and direct variable roots only; follow nested patterns with the
   // enclosing signature's binder in the semantic verifier.
@@ -114,24 +120,24 @@ message Program {
       "this.sorts[int(i)].var < uint(size(sig.type_params))))))"
   };
   option (buf.validate.message).cel = {
-    id: "program.metadata_default_roots"
+    id: "program.bindings_default_roots"
     message: "presentation defaults must index nodes and cannot be free variable roots"
     expression:
-      "this.declarations.all(d, !has(d.metadata) || d.metadata.python.views.all(v, "
+      "this.declarations.all(d, !has(d.bindings) || d.bindings.python.views.all(v, "
       "v.params.all(p, !has(p.default_expr) || (p.default_expr < uint(size(this.nodes)) && "
       "!has(this.nodes[int(p.default_expr)].var)))))"
   };
   option (buf.validate.message).cel = {
-    id: "program.metadata_sort_roots"
+    id: "program.bindings_sort_roots"
     message: "presentation sort references must exist and direct variables use the callable binder"
     expression:
-      "this.declarations.all(d, !has(d.metadata) || "
+      "this.declarations.all(d, !has(d.bindings) || "
       "[has(d.host_primitive) && has(d.host_primitive.signature) ? "
       "size(d.host_primitive.signature.type_params) : 0].all(n, "
-      "d.metadata.python.views.all(v, "
+      "d.bindings.python.views.all(v, "
       "(!has(v.owner) || !has(v.owner.sort)) || [v.owner.sort].all(i, "
       "i < uint(size(this.sorts)) && (!has(this.sorts[int(i)].var) || this.sorts[int(i)].var < uint(n)))) && "
-      "d.metadata.rust.views.all(v, ((has(v.owner) && has(v.owner.sort) ? [v.owner.sort] : []) + "
+      "d.bindings.rust.views.all(v, ((has(v.owner) && has(v.owner.sort) ? [v.owner.sort] : []) + "
       "(has(v.trait_impl) ? v.trait_impl.args.map(a, a.sort) : [])).all(i, "
       "i < uint(size(this.sorts)) && (!has(this.sorts[int(i)].var) || this.sorts[int(i)].var < uint(n))))))"
   };
@@ -193,7 +199,8 @@ message Program {
       "(!has(r.rule) || r.rule.head.all(a, "
       "(has(a.term) ? [a.term] : "
       "has(a.set) ? a.set.target.args + [a.set.value] : "
-      "has(a.change) ? a.change.target.args : "
+      "has(a.delete) ? a.delete.args : "
+      "has(a.subsume) ? a.subsume.args : "
       "has(a.set_cost) ? a.set_cost.target.args + [a.set_cost.cost] : [])"
       ".all(i, i < uint(size(this.nodes))))))"
   };
@@ -206,7 +213,7 @@ message Program {
     expression:
       "this.nodes.all(n, "
       "(has(n.call) ? n.call.args : "
-      "has(n.get_cost) ? n.get_cost.target.args : "
+      "has(n.get_cost) ? n.get_cost.args : "
       "has(n.union) ? n.union.members : "
       "has(n.primitive_value) ? [n.primitive_value].map(v, "
       "has(v.lambda) ? v.lambda.captures + [v.lambda.body] : "
@@ -326,19 +333,19 @@ message Sort {
 
 // A nullary equality sort. An entry also declares it; repeated declarations
 // of the same name are idempotent. Its name cannot also name a host sort family.
-// Metadata is excluded from sort identity and follows SortMetadata's separate
+// Bindings are excluded from sort identity and follow SortBindings' separate
 // first-supply/resupply contract.
 message EqSort {
   option (buf.validate.message).cel = {
     id: "eq_sort.presentation_parameters"
     message: "a nullary equality sort has no presentation type parameters"
     expression:
-      "!has(this.metadata) || "
-      "(size(this.metadata.python.type_params) == 0 && size(this.metadata.rust.type_params) == 0)"
+      "!has(this.bindings) || "
+      "(size(this.bindings.python.type_params) == 0 && size(this.bindings.rust.type_params) == 0)"
   };
 
   string name = 1 [(buf.validate.field).string.min_len = 1];
-  SortMetadata metadata = 2;
+  SortBindings bindings = 2;
 }
 
 // A nullary host sort-family application, such as Unit, bool, i64 or String.
@@ -391,14 +398,14 @@ message FuncSort {
 //   installation/export. Lambda bodies keep their own binders; every expanded
 //   use must satisfy its ordinary execution context's typing/effect rules.
 // - Inert values (declared costs and extracted data) contain no variables,
-//   GetCost reads or Union and must be finite. Saved code bodies retain
+//   get_cost reads or Union and must be finite. Saved code bodies retain
 //   their own binders, so these are use-site rules, not bans on an entire arena.
 // Scalar values are inert. Child-bearing values follow the surrounding
 // context; constructing a value does not grant inverse query matching or
 // relax groundedness. Calls and host value materialization must obey their
 // enclosing execution context's capabilities, including query-mode restrictions.
 //
-// Call/GetCost arguments, Union members and PrimitiveValue children inherit
+// Call/get_cost arguments, Union members and PrimitiveValue children inherit
 // the surrounding context and binder. Each is a value position: a row position
 // never propagates to children. A lambda body starts its own code
 // context and binder, also in a value position. See Call for relation rows.
@@ -416,10 +423,21 @@ message Node {
     PrimitiveValue primitive_value = 3;
     Call call = 4;
 
-    // A class, and the only way to denote one. See `Union`.
+    // An explicit identity-bearing class/equality group. See `Union`.
     Union union = 7;
 
-    GetCost get_cost = 9;
+    // Read a Constructor row's explicitly assigned per-row cost, yielding C.
+    // The target addresses the row without evaluating/inserting the constructor.
+    // Functions, Relations and primitives are invalid targets. No declared-cost
+    // or model fallback occurs; assigned zero differs from absent annotation.
+    // In queries this is a relational pattern over assigned costs: key variables
+    // may bind in the query binder; an absent annotation contributes no match.
+    // It has seminaive dependencies like a table lookup, not a Pure-only primitive.
+    // When evaluated, evaluate args once each, left-to-right, then read the cost;
+    // absence fails with EVALUATION_FAILED. This requires a read-capable context,
+    // so is invalid in SEMINAIVE heads or Pure/Write code. Args inherit the use's
+    // context/binder. Not inert data; saved code may use it under these rules.
+    Call get_cost = 9;
   }
 
   // One optional origin. Producers may share ordinary syntax with one chosen
@@ -495,7 +513,7 @@ message Node {
 // visited set.
 //
 // NORMATIVE: a cycle MUST pass through a union node. Removing Union's outgoing
-// edges must leave an acyclic graph of Call/GetCost arguments and every
+// edges must leave an acyclic graph of Call/get_cost arguments and every
 // PrimitiveValue child, including custom args and lambda bodies/captures.
 // Union members still obey their inherited use context and bounds.
 // A call reaching itself with no class boundary is invalid, not a recursive
@@ -509,9 +527,10 @@ message Union {
   repeated uint32 members = 1 [packed = true]; // index into the enclosing `nodes`
 }
 
-// Positional application of a callable declared in the enclosing payload,
+// A callable name and positional arguments. The enclosing field determines
+// whether it is an application, row address, cost read, or partial application.
+// The callable is declared in the enclosing payload,
 // already installed on the handle, or implicitly provided by the host.
-// The enclosing node's sort matches the result; relation calls use Unit.
 // The name identifies one callable across installed and ambient definitions;
 // there are no same-name overload sets. Check argument and result sorts against
 // that definition's signature. Generic instantiation does not select another
@@ -520,9 +539,10 @@ message Union {
 // HostPrimitive's typing form checks all concrete argument AND result sorts;
 // every generic parameter must be determined. There are no call-level type args.
 //
-// Relation calls are restricted to row positions: a query fact, `Action.term`,
-// `Change.target`, or `FunctionRow.call`. They cannot be value arguments,
-// `Set.value`, `Union` members, lambda captures/results, or deferred code.
+// For Node.call, the enclosing node's sort matches the result; relation calls
+// use Unit. Relation calls are restricted to row positions: a query fact,
+// `Action.term`, `Action.delete`, or `FunctionRow.call`. They cannot be value
+// arguments, `Set.value`, `Union` members, lambda captures/results, or deferred code.
 // The restriction applies to installed and ambient names as well as local
 // declarations. A relation row is the bare `Call` node itself; see `Union`
 // for the Unit-sorted row rule.
@@ -531,32 +551,12 @@ message Call {
   repeated uint32 args = 2 [packed = true]; // index into the enclosing `nodes`
 }
 
-// Read a constructor row's explicitly assigned per-row cost, with result sort
-// C. The target must resolve to a Constructor; Functions, Relations and
-// primitives are invalid. The target addresses the row without evaluating or
-// inserting the constructor itself. No declared-cost or model fallback occurs;
-// an assigned zero is a value, while an absent annotation is not zero.
-//
-// In a query this is a relational pattern over assigned costs, sharing the
-// query binder and permitting key variables to bind. An absent annotation
-// contributes no match. It participates in seminaive dependencies like a
-// table lookup; it is not a host primitive subject to Pure-only query rules.
-//
-// When evaluated, evaluate target arguments once each, left-to-right, then
-// read the assigned cost. Absence fails with EVALUATION_FAILED. This is a
-// database read, permitted only where the execution context allows reads;
-// in particular, not in SEMINAIVE heads or Pure/Write code contexts.
-// Target arguments inherit their use's context and binder. GetCost is not
-// inert data: it cannot occur in extracted data or declaration costs,
-// though saved code may contain it subject to its execution context.
-message GetCost {
-  Call target = 1 [(buf.validate.field).required = true];
-}
-
 // A closed function body with explicit captures. Body variables are _0, _1,
 // ...: captures first, then parameters. Nested lambdas capture explicitly.
+// The enclosing node has a concrete FuncSort, which supplies parameter sorts
+// and the required body result sort; the Lambda does not repeat that signature.
 // The body cannot use the surrounding binder: its complete binder is _0
-// through _(captures.size + param_types.size - 1), empty when that sum is zero.
+// through _(captures.size + FuncSort.params.size - 1), empty when that sum is zero.
 // Captures inherit the surrounding use context, including its data restrictions;
 // the body is separately scoped deferred code, even in a stored/extracted value.
 // Function values use PrimitiveValue.lambda; application remains a Call.
@@ -564,23 +564,7 @@ message GetCost {
 message Lambda {
   // Evaluated when the lambda is constructed; bound as _0 through _(k-1).
   repeated uint32 captures = 1 [packed = true]; // index into the enclosing `nodes`
-  // Parameter sorts; body variables start at _k after the captures.
-  repeated uint32 param_types = 2 [packed = true]; // index into the enclosing `sorts`
   uint32 body = 3; // index into the enclosing `nodes`
-}
-
-// A function value with a prefix of a named callable's arguments applied. The
-// callee is a named installed or ambient callable, never a dynamic function
-// value. Its enclosing sort is a closed FuncSort. Concatenate captured argument
-// sorts with that FuncSort's remaining params, and use its result as the result
-// sort of a complete call to the callee. Check this effective call using the
-// callee's typing form, including varargs or FunctionApplication. It must fully
-// determine every generic parameter, even with zero or all arguments captured.
-// Whether a relation can be partially applied is a signature/capability
-// question; its arguments still cannot contain relation rows as values.
-message PartialCall {
-  string func = 1 [(buf.validate.field).string.min_len = 1];
-  repeated uint32 args = 2 [packed = true]; // index into the enclosing `nodes`
 }
 
 // Native values, selected and typed by the enclosing Node.sort_id. The five
@@ -621,7 +605,14 @@ message PrimitiveValue {
     PairValue pair = 13;
     MaybeValue maybe = 14;
     Lambda lambda = 15;
-    PartialCall partial_call = 16;
+    // A function value with a named callable's argument prefix captured, never
+    // a dynamic function value. The enclosing node has a closed FuncSort.
+    // Concatenate captured arg sorts with its remaining params and use its result
+    // to check one effective complete call under the callee's typing form,
+    // including varargs or FunctionApplication. This must determine all generic
+    // parameters, even with zero/all args captured. Relation partial application
+    // remains a signature/capability question; captured args are value positions.
+    Call partial_call = 16;
     CustomValue custom = 17;
   }
 }
@@ -709,7 +700,7 @@ message Unit {}
 // An ordered mutation or expression evaluation. Sharing syntax does not bind
 // or retain its result; there is no rule-local let form. Persistent top-level
 // captures lower to nullary functions plus sets.
-// Set, Change and SetCost are standalone actions, not value expressions.
+// Set, delete, subsume and SetCost are standalone actions, not value expressions.
 // Execute action lists in order; each Set uses the function's conflict policy
 // if that write conflicts. Rule matches and rebuilds have no global order here.
 // Deliberate coverage limit: a read cannot be retained across later writes by
@@ -726,7 +717,13 @@ message Action {
     // NOT subsumable into one: it chooses which row is written.
     Set set = 2;
 
-    Change change = 3;
+    // Delete a Constructor, Function or Relation row without constructing it.
+    // Deleting a constructor row also deletes its per-row cost annotation.
+    Call delete = 3;
+
+    // Subsume only a Constructor row without constructing it, retaining its
+    // row and cost annotation. Function and Relation targets are invalid.
+    Call subsume = 7;
     string panic = 4;
     SetCost set_cost = 5;
   }
@@ -743,26 +740,6 @@ message Action {
 message Set {
   Call target = 1 [(buf.validate.field).required = true];
   optional uint32 value = 2 [(buf.validate.field).required = true]; // index into the enclosing `nodes`
-}
-
-// Delete or subsume an addressed row without constructing it. DELETE accepts
-// Constructor, Function and Relation rows; deleting a constructor row also
-// deletes its per-row cost annotation. SUBSUME accepts only Constructor rows,
-// retaining the row and its cost; Function and Relation targets are invalid.
-message Change {
-  Call target = 1 [(buf.validate.field).required = true];
-
-  ChangeKind kind = 2 [
-    (buf.validate.field).required = true,
-    (buf.validate.field).enum.defined_only = true
-  ];
-}
-
-// Row mutation kinds.
-enum ChangeKind {
-  CHANGE_KIND_UNSPECIFIED = 0;
-  CHANGE_KIND_DELETE = 1;
-  CHANGE_KIND_SUBSUME = 2;
 }
 
 // Write one constructor row's extraction cost. Usable in rule heads.
@@ -800,8 +777,8 @@ message SetCost {
 // they never install native code. Referencing an ambient definition by name
 // does not require resending its descriptor.
 // Compare referenced expression subgraphs structurally, not request-local
-// indices. Provenance, argument labels and presentation metadata do not
-// participate in semantic identity; metadata has its own resupply checks.
+// indices. Provenance, argument labels and language bindings do not
+// participate in semantic identity; bindings have their own resupply checks.
 // Comparison must preserve Union sharing/identity topology; ordinary syntax
 // sharing may differ. One empty Union reused twice is not two fresh Unions.
 // Callable names are unique across Constructor, Function, Relation, Primitive
@@ -815,15 +792,15 @@ message SetCost {
 // host obligations; descriptor equality alone does not establish them.
 message Declaration {
   option (buf.validate.message).cel = {
-    id: "declaration.callable_metadata"
-    message: "host sort-family metadata belongs on HostSortFamily"
-    expression: "!has(this.host_sort_family) || !has(this.metadata)"
+    id: "declaration.callable_bindings"
+    message: "host sort-family bindings belong on HostSortFamily"
+    expression: "!has(this.host_sort_family) || !has(this.bindings)"
   };
   option (buf.validate.message).cel = {
     id: "declaration.presentation_inputs"
     message: "surface mappings must cover fixed inputs and any final logical tail exactly once"
     expression:
-      "!has(this.metadata) || "
+      "!has(this.bindings) || "
       "[has(this.constructor) ? size(this.constructor.inputs) : "
       "has(this.function) ? size(this.function.inputs) : "
       "has(this.relation) ? size(this.relation.inputs) : "
@@ -831,14 +808,14 @@ message Declaration {
       "has(this.host_primitive.signature) ? size(this.host_primitive.signature.inputs) : "
       "has(this.host_primitive.application) ? 1 : 0].all(n, "
       "[has(this.host_primitive.application) || has(this.host_primitive.signature.varargs)].all(t, "
-      "this.metadata.python.views.all(v, "
+      "this.bindings.python.views.all(v, "
       "size(v.params) + (has(v.receiver) ? 1 : 0) == n + (t ? 1 : 0) && "
       "(!has(v.receiver) || v.receiver < uint(n)) && "
       "(!has(v.mutates) || v.mutates < uint(n)) && "
       "v.params.all(p, p.core_input < uint(n + (t ? 1 : 0))) && "
       "(!t || (size(v.params) > 0 && v.params[size(v.params)-1].core_input == uint(n) && "
       "!has(v.params[size(v.params)-1].default_expr)))) && "
-      "this.metadata.rust.views.all(v, "
+      "this.bindings.rust.views.all(v, "
       "size(v.params) + (has(v.receiver) ? 1 : 0) == n + (t ? 1 : 0) && "
       "(!has(v.receiver) || v.receiver.core_input < uint(n)) && "
       "v.params.all(p, p.core_input < uint(n + (t ? 1 : 0))) && "
@@ -848,12 +825,12 @@ message Declaration {
     id: "declaration.presentation_special_forms"
     message: "function-wrapper owners require application receiver zero; datatype members require constructors"
     expression:
-      "!has(this.metadata) || ("
-      "this.metadata.python.views.all(v, !has(v.owner.function) || "
+      "!has(this.bindings) || ("
+      "this.bindings.python.views.all(v, !has(v.owner.function) || "
       "(has(this.host_primitive.application) && has(v.receiver) && v.receiver == uint(0))) && "
-      "this.metadata.rust.views.all(v, !has(v.owner.function) || "
+      "this.bindings.rust.views.all(v, !has(v.owner.function) || "
       "(has(this.host_primitive.application) && has(v.receiver) && v.receiver.core_input == uint(0))) && "
-      "this.metadata.egglog.views.all(v, !v.datatype_member || has(this.constructor)))"
+      "this.bindings.egglog.views.all(v, !v.datatype_member || has(this.constructor)))"
   };
 
   oneof kind {
@@ -870,7 +847,7 @@ message Declaration {
   // Optional diagnostic origin; excluded from semantic identity.
   Span span = 7;
 
-  CallableMetadata metadata = 8;
+  CallableBindings bindings = 8;
 
   // Optional documentation; excluded from semantic identity.
   string doc = 9;
@@ -940,13 +917,13 @@ message HostSortFamily {
     id: "host_sort_family.presentation_parameters"
     message: "explicit presentation type-parameter labels must match family arity"
     expression:
-      "!has(this.metadata) || [this.metadata.python, this.metadata.rust].all(m, "
+      "!has(this.bindings) || [this.bindings.python, this.bindings.rust].all(m, "
       "size(m.type_params) == 0 || uint(size(m.type_params)) == this.arity)"
   };
 
   string name = 1 [(buf.validate.field).string.min_len = 1];
   uint32 arity = 2;
-  SortMetadata metadata = 3;
+  SortBindings bindings = 3;
 }
 
 // A host-implemented callable. Submission asserts that a compatible native
@@ -982,11 +959,11 @@ message GenericSignature {
 // Dedicated typing for a named application primitive, still invoked by Call.
 // The first effective argument must have a concrete FuncSort; the remaining
 // arguments exactly match its params, and the call result matches its result.
-// PartialCall supplies its effective complete call as described there.
+// PrimitiveValue.partial_call supplies an effective complete call; see that field.
 message FunctionApplication {}
 
 // ---------------------------------------------------------------------------
-// LANGUAGE PRESENTATION — optional views, never additional core definitions.
+// LANGUAGE BINDINGS — optional views, never additional core definitions.
 // ---------------------------------------------------------------------------
 
 // Each language block is fixed when first supplied for the semantic definition.
@@ -995,20 +972,20 @@ message FunctionApplication {}
 // declarations/EqSort entries, before interning away duplicate presentations.
 // Agreeing supplies are allowed; conflicting supplies are errors. Compare
 // arena references structurally, not by index. Sort comparison excludes attached
-// metadata; default calls identify their core callee, not its presentation.
+// bindings; default calls identify their core callee, not its presentation.
 // Compare all default roots within each language block together, preserving
 // shared/distinct Union topology.
-// Metadata never changes semantic definition identity or duplicates docs/spans.
+// Bindings never change semantic definition identity or duplicate docs/spans.
 //
 // Without a Python/Rust block, generators derive conservative type/free-function
 // wrappers, preserving exact core names, signatures and argument order. Derived
-// wrappers install no metadata. Empty blocks carry no hiding instruction; their
+// wrappers install no bindings. Empty blocks carry no hiding instruction; their
 // generation behavior and identifier normalization are not specified here.
-// Malformed individual metadata and conflicting resupply are installation errors.
+// Malformed individual bindings and conflicting resupply are installation errors.
 // Cross-definition Python/Rust binding collisions are generation errors for all
 // explicit/derived combinations, never silent fallback, overwrite or renaming.
 // High-level generators and these runtime checks remain unimplemented.
-message SortMetadata {
+message SortBindings {
   TypeBinding python = 1;
   TypeBinding rust = 2;
   EgglogTypeBinding egglog = 3;
@@ -1028,7 +1005,7 @@ message EgglogTypeBinding {
   string symbol = 1;
 }
 
-// The same per-language lifetime/compatibility contract as SortMetadata.
+// The same per-language lifetime/compatibility contract as SortBindings.
 // No view changes the core signature. A surface call supplies every core input
 // exactly once after receiver mapping, defaults and tail expansion; it emits an
 // ordinary Call in core argument order. Parameter names are surface names, not
@@ -1037,7 +1014,7 @@ message EgglogTypeBinding {
 // Presentation cannot rescue a core call whose generic substitution is not
 // determined by its concrete argument/result sorts under the usual call rules.
 // Recursive binder/owner/default typing checks are normative.
-message CallableMetadata {
+message CallableBindings {
   PythonBindings python = 1;
   RustBindings rust = 2;
   EgglogBindings egglog = 3;
@@ -1234,6 +1211,10 @@ message EgglogCallable {
   bool datatype_member = 2;
 }
 
+// ---------------------------------------------------------------------------
+// RULES AND RULESETS — shared occurrences and named roots.
+// ---------------------------------------------------------------------------
+
 // An immutable ruleset occurrence: an ordered rule list or composition.
 // An absent name adds no binding and leaves an unmatched occurrence anonymous.
 // A present empty name denotes the default rule list.
@@ -1249,10 +1230,10 @@ message EgglogCallable {
 // before identifying entries. Compatible presentations identify corresponding
 // ruleset occurrences, but cannot collapse distinct local rule-arena entries:
 // duplicate named-root presentations must reuse the required rule indices.
-// One consistent match must
-// preserve BOTH rule and ruleset sharing across all named-root closures: no
-// merging distinct occurrences or splitting shared ones. In particular [r,r]
-// cannot match [s,t] by merging distinct equal rules s/t. Conflicting identity
+// One consistent match must preserve BOTH rule and ruleset sharing across all
+// named-root closures: no merging distinct occurrences or splitting shared ones.
+// In particular [r,r] cannot match [s,t] by merging distinct equal rules s/t.
+// Conflicting identity
 // requirements from installed roots are errors.
 // A matched local entry reuses its retained occurrence everywhere, including
 // a direct Run of that index. Unmatched occurrences are fresh for each
@@ -1555,9 +1536,9 @@ enum Extractor {
 // preserving shared and distinct rule occurrences independently of labels.
 // Omit transient rules/rulesets not retained through named roots.
 // Include saved code and its dependencies without executing it.
-// Include supplied language metadata and all metadata-only sort/default-node
+// Include supplied language bindings and all bindings-only sort/default-node
 // dependencies, remapping their arena references. Do not export derived wrapper
-// defaults as if they were supplied metadata. Preserve default-root Union
+// defaults as if they were supplied bindings. Preserve default-root Union
 // sharing without evaluating templates or confusing them with stored classes.
 // Host implementations/codecs remain external.
 // HostSortFamily and HostPrimitive describe the catalog, including generic
@@ -1577,8 +1558,8 @@ enum Extractor {
 // for each canonical equality class, naming its unique Union location whose
 // members are all its constructor rows. Include empty/unreachable classes.
 // Emit relation rows as direct Action.term Calls; write every function row,
-// including Unit outputs, with Set. Then emit SetCost annotations, then Change
-// with SUBSUME for subsumed constructor rows; no DELETE or panic actions.
+// including Unit outputs, with Set. Then emit SetCost annotations, then subsume
+// for subsumed constructor rows; no delete or panic actions.
 // These explicit roots inventory stored classes, not arbitrary arena nodes or
 // Union locations in saved code. Shared Union locations preserve references
 // across this list. Keep all canonical rows and extant cost/subsumption
@@ -1762,7 +1743,7 @@ message RunProgramResponse {
     expression:
       "this.nodes.all(n, "
       "(has(n.call) ? n.call.args : "
-      "has(n.get_cost) ? n.get_cost.target.args : "
+      "has(n.get_cost) ? n.get_cost.args : "
       "has(n.union) ? n.union.members : "
       "has(n.primitive_value) ? [n.primitive_value].map(v, "
       "has(v.lambda) ? v.lambda.captures + [v.lambda.body] : "
@@ -1777,14 +1758,12 @@ message RunProgramResponse {
   };
   option (buf.validate.message).cel = {
     id: "run_program_response.sort_refs_in_range"
-    message: "sort children and lambda parameter sorts must index sorts"
+    message: "sort children must index sorts"
     expression:
       "this.sorts.all(s, "
       "(has(s.container) ? s.container.args : "
       "has(s.func) ? s.func.params + [s.func.result] : [])"
-      ".all(i, i < uint(size(this.sorts)))) && "
-      "this.nodes.all(n, !has(n.primitive_value) || !has(n.primitive_value.lambda) || "
-      "n.primitive_value.lambda.param_types.all(i, i < uint(size(this.sorts))))"
+      ".all(i, i < uint(size(this.sorts))))"
   };
   option (buf.validate.message).cel = {
     id: "run_program_response.empty_union_eq_sort"
@@ -1924,7 +1903,7 @@ enum ErrorCode {
   ERROR_CODE_PANIC = 3;
 
   // A primitive or merge failed at run time, including unresolvable merges,
-  // a directly evaluated GetCost has no assigned annotation, or Freeze cannot
+  // a directly evaluated get_cost has no assigned annotation, or Freeze cannot
   // encode a required value with a supported codec.
   ERROR_CODE_EVALUATION_FAILED = 4;
 
