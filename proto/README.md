@@ -482,12 +482,55 @@ resupply, anonymous/combined/shared rulesets, nondefault rule modes, schedulers,
 loops, snapshots, proof requests, merge table reads, and custom cost models.
 Expressions deeper than 256 nodes or requiring more than 65,536 native tree
 nodes are currently rejected. This is a checkpoint, not a narrowing of
-the conformance goal. Source producers, generated frontend APIs, exact snapshots,
-and Python/Rust/Luminal migration remain unimplemented.
+the conformance goal. Full source coverage, generated frontend APIs, exact
+snapshots, and Python/Rust/Luminal migration remain unimplemented.
 
 The focused regression is `cargo test --test protobuf`. It compares the native
 fixture with decoded results and checks invalid-byte controls and post-failure
 state. No frontend suite is counted as migrated by these tests.
+
+### Initial source producer
+
+`protobuf::source::Source` parses once and yields ordered protobuf `Program`
+phases using the existing native desugarer and typechecker, before global removal
+or proof instrumentation. Submit each phase through `Engine::run` using encoded
+requests and decode its response **before advancing the iterator**. Stop on any
+transport, source-resolution, or decoded execution error. This preserves effects
+of earlier successful phases when a later source command fails. The producer
+executes no user actions; previously submitted source/AST is never an execution
+fallback. Start with a fresh, compatible handle; importing an existing handle's
+authoring catalog is not implemented.
+
+The first source slice supports datatypes, scalar/equality-sort functions,
+ordered top-level lets, ordinary rules and directional rewrites, fixed named
+theories, one-step runs, checks, and static tree extraction. Lets become nullary
+function sets at their source positions. Rulesets are emitted when first run;
+adding rules afterward is explicitly rejected until occurrence-preserving
+immutable versions are implemented. Future rules are never hoisted into earlier
+runs. Rewrite provenance is retained through native resolution so its typed
+components can populate the existing `Rewrite` message, without treating an
+arbitrary union rule as a rewrite.
+
+Rules retain their source labels and spans. Query-local variables are renamed
+after native source-position validation into a namespace disjoint from parsed
+declarations/bindings, so later declarations cannot change delayed rule
+publication. Global references remain distinct captured-function calls.
+
+Experimental `extract` is an extension command. This producer explicitly
+resolves only its static tree form; dynamic costs and extractor options remain
+unsupported. Relations, primitive declarations/calls, proof modes, local lets,
+globals in rule heads, bidirectional rewrites, general unions/schedules,
+includes, multi-command command macros and other extension commands are separate
+gates.
+
+`protobuf::source::render` converts the producer's decoded Programs back to
+native source, reusing the adapter's expression/action/rule lowering. The source
+renderer rejects identifiers or expression actions whose spelling changes their
+meaning in the native parser (for example a function call printed as `panic`).
+The tests execute that rendered source after reparsing and compare observations with
+the byte-adapter path. They also cover ordered captures, failure prefixes and
+mutated/corrupt byte controls. Run `cargo test --test protobuf source_`; this is a
+small semantic roundtrip checkpoint, not migration of the source corpus.
 
 To regenerate, install Buf (tested with 1.73.0), uv, and Rust/Cargo, then run
 from the repository root:

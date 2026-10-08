@@ -2,6 +2,570 @@ use egglog_experimental::{new_experimental_egraph, protobuf::Engine};
 use egglog_proto as pb;
 use prost::Message;
 
+#[test]
+fn source_fixture_executes_and_renders_from_decoded_programs() {
+    use egglog_experimental::protobuf::source::{Source, render};
+    let source = r#"
+        (datatype Math (Num i64) (Box Math))
+        (function current () i64 :merge new)
+        (function captured () i64 :no-merge)
+        (ruleset simplify)
+        (rewrite (Box x) x :ruleset simplify)
+        (set (current) 10)
+        (set (captured) (current))
+        (set (current) 20)
+        (check (= (current) 20) (= (captured) 10))
+        (Box (Num (current)))
+        (run simplify 1)
+        (check (= (Box (Num 20)) (Num 20)))
+        (extract (Box (Num (current))))
+        (extract (captured))
+    "#;
+    let mut engine = Engine::default();
+    let id = create(&mut engine);
+    let mut reparsed = new_experimental_egraph();
+    let mut extracted = vec![];
+    let mut native_extracted = vec![];
+    let mut runs = 0;
+    for program in Source::new(Some("source.egg".into()), source).unwrap() {
+        let program = program.unwrap();
+        let decoded = pb::Program::decode(program.encode_to_vec().as_slice()).unwrap();
+        let rendered = render(&decoded).unwrap();
+        for output in reparsed.parse_and_run_program(None, &rendered).unwrap() {
+            if let egglog_experimental::CommandOutput::ExtractBest(dag, _, root) = output {
+                native_extracted.push(dag.to_string(root));
+            }
+        }
+        let response = run(&mut engine, id, decoded);
+        assert_eq!(response.error, None);
+        for output in &response.outputs {
+            match output.kind.as_ref().unwrap() {
+                pb::command_output::Kind::Extraction(result) => {
+                    extracted.push(value(&response, result.roots[0].variants[0].term));
+                }
+                pb::command_output::Kind::Run(_) => runs += 1,
+                _ => panic!("unexpected output"),
+            }
+        }
+    }
+    assert_eq!(runs, 1);
+    assert_eq!(extracted, ["(Num 20)", "10"]);
+    assert_eq!(native_extracted, extracted);
+}
+
+#[test]
+fn source_captures_before_later_writes() {
+    use egglog_experimental::protobuf::source::Source;
+    let mut engine = Engine::default();
+    let id = create(&mut engine);
+    let mut extracted = vec![];
+    for program in Source::new(
+        None,
+        r#"
+        (function f () i64 :merge new)
+        (set (f) 0)
+        (let $x (f))
+        (set (f) 1)
+        (check (= $x 0) (= (f) 1))
+        (extract $x)
+        (extract (f))
+    "#,
+    )
+    .unwrap()
+    {
+        let response = run(&mut engine, id, program.unwrap());
+        assert_eq!(response.error, None);
+        for output in &response.outputs {
+            if let Some(pb::command_output::Kind::Extraction(result)) = &output.kind {
+                extracted.push(value(&response, result.roots[0].variants[0].term));
+            }
+        }
+    }
+    assert_eq!(extracted, ["0", "1"]);
+}
+
+#[test]
+fn source_resolution_and_runtime_errors_preserve_only_executed_prefixes() {
+    use egglog_experimental::protobuf::source::Source;
+    let mut before_declaration =
+        Source::new(None, "(set (late) 1) (function late () i64 :merge new)").unwrap();
+    assert!(before_declaration.next().unwrap().is_err());
+    assert!(before_declaration.next().is_none());
+    for tail in ["(set (missing) 2)", "(check (= (f) 2))"] {
+        let mut engine = Engine::default();
+        let id = create(&mut engine);
+        let mut source = Source::new(
+            None,
+            &format!("(function f () i64 :merge new) (set (f) 1) {tail} (set (f) 3)"),
+        )
+        .unwrap();
+        let mut failed = false;
+        for program in source.by_ref() {
+            let Ok(program) = program else {
+                failed = true;
+                break;
+            };
+            let response = run(&mut engine, id, program);
+            if response.error.is_some() {
+                failed = true;
+                break;
+            }
+        }
+        assert!(failed);
+        let mut observation = fixture();
+        observation.declarations.clear();
+        observation.rules.clear();
+        observation.rulesets.clear();
+        observation.sorts.truncate(1);
+        observation.nodes = vec![pb::Node {
+            sort_id: 0,
+            kind: Some(pb::node::Kind::Call(pb::Call {
+                func: "f".into(),
+                args: vec![],
+            })),
+            ..Default::default()
+        }];
+        observation.commands = vec![pb::Command {
+            kind: Some(pb::command::Kind::Extract(pb::Extract {
+                roots: vec![0],
+                variants: 1,
+                extractor: pb::Extractor::Tree.into(),
+                ..Default::default()
+            })),
+            ..Default::default()
+        }];
+        let response = run(&mut engine, id, observation);
+        assert_eq!(response.error, None);
+        let Some(pb::command_output::Kind::Extraction(result)) = &response.outputs[0].kind else {
+            panic!("missing extraction")
+        };
+        assert_eq!(value(&response, result.roots[0].variants[0].term), "1");
+    }
+}
+
+#[test]
+fn source_byte_mutation_controls_execution() {
+    use egglog_experimental::protobuf::source::{Source, render};
+    let mut engine = Engine::default();
+    let id = create(&mut engine);
+    let mut source = Source::new(
+        None,
+        "(function f () i64 :merge new) (set (f) 1) (extract (f))",
+    )
+    .unwrap();
+    assert_eq!(
+        run(&mut engine, id, source.next().unwrap().unwrap()).error,
+        None
+    );
+    let program = source.next().unwrap().unwrap();
+    let mut request = pb::RunProgramRequest {
+        egraph_id: id,
+        program: Some(program),
+        profile: true,
+    };
+    let mut bytes = request.encode_to_vec();
+    bytes.push(0x80);
+    assert!(engine.run(&bytes).is_err());
+    let observation = source.next().unwrap().unwrap();
+    assert!(
+        run(&mut engine, id, observation.clone()).error.is_some(),
+        "malformed set must not create the row"
+    );
+    for node in &mut request.program.as_mut().unwrap().nodes {
+        if let Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
+            value: Some(pb::primitive_value::Value::I64(value)),
+        })) = &mut node.kind
+        {
+            *value = 7;
+        }
+    }
+    assert!(
+        render(request.program.as_ref().unwrap())
+            .unwrap()
+            .contains("7")
+    );
+    let response =
+        pb::RunProgramResponse::decode(engine.run(&request.encode_to_vec()).unwrap().as_slice())
+            .unwrap();
+    assert_eq!(response.error, None);
+    let response = run(&mut engine, id, observation);
+    let Some(pb::command_output::Kind::Extraction(result)) = &response.outputs[0].kind else {
+        panic!("missing extraction")
+    };
+    assert_eq!(value(&response, result.roots[0].variants[0].term), "7");
+}
+
+#[test]
+fn source_native_hook_preserves_globals_without_executing_actions() {
+    use egglog_experimental::ast::{GenericAction, GenericExpr, GenericFact, GenericNCommand};
+    let mut graph = new_experimental_egraph();
+    let commands = graph
+        .parse_program(
+            None,
+            "(function f () i64 :no-merge) (let $x (f)) (check (= $x 0))",
+        )
+        .unwrap();
+    let mut resolved = vec![];
+    for command in commands {
+        resolved.extend(graph.resolve_command_preserving_globals(command).unwrap());
+    }
+    assert!(
+        graph.get_function("f").is_none(),
+        "resolution must not install a runtime table"
+    );
+    let GenericNCommand::CoreAction(GenericAction::Let(_, binding, _)) = &resolved[1] else {
+        panic!("global binding was lowered prematurely")
+    };
+    assert_eq!(binding.sort.name(), "i64");
+    let GenericNCommand::Check(_, facts) = &resolved[2] else {
+        panic!("expected check")
+    };
+    let GenericFact::Eq(_, GenericExpr::Var(_, reference), _) = &facts[0] else {
+        panic!("global reference was lowered prematurely")
+    };
+    assert!(reference.is_global_ref);
+    assert_eq!(reference.name, "$x");
+}
+
+#[test]
+fn source_hook_refactor_preserves_native_proof_pipeline() {
+    use egglog_experimental::{CommandOutput, EGraph};
+    for mut graph in [EGraph::new_with_term_encoding(), EGraph::new_with_proofs()] {
+        graph
+            .parse_and_run_program(None, "(datatype E (Num i64)) (Num 2) (check (Num 2))")
+            .unwrap();
+        if graph.are_proofs_enabled() {
+            let outputs = graph
+                .parse_and_run_program(None, "(prove (Num 2))")
+                .unwrap();
+            assert!(
+                outputs
+                    .iter()
+                    .any(|output| matches!(output, CommandOutput::ProveExists { .. }))
+            );
+        }
+    }
+}
+
+#[test]
+fn source_rejects_late_rule_growth_and_unimplemented_provenance() {
+    use egglog_experimental::protobuf::source::Source;
+    let mut source = Source::new(None, "(datatype M (Num i64) (Box M)) (ruleset r) (Box (Num 1)) (run r 1) (rewrite (Box x) x :ruleset r)").unwrap();
+    for _ in 0..4 {
+        assert!(source.next().unwrap().is_ok());
+    }
+    assert!(
+        source
+            .next()
+            .unwrap()
+            .unwrap_err()
+            .to_string()
+            .contains("after its first run")
+    );
+    assert!(source.next().is_none());
+    for text in ["(relation R (i64))", "(primitive p (i64) i64 _0)"] {
+        assert!(Source::new(None, text).unwrap().next().unwrap().is_err());
+    }
+}
+
+#[test]
+fn source_rejects_include_without_panicking() {
+    use egglog_experimental::protobuf::source::Source;
+    assert!(
+        Source::new(None, "(include \"not-read.egg\")")
+            .unwrap()
+            .next()
+            .unwrap()
+            .is_err()
+    );
+}
+
+#[test]
+fn source_validates_each_rule_before_following_effects() {
+    use egglog_experimental::protobuf::source::Source;
+    let mut engine = Engine::default();
+    let id = create(&mut engine);
+    let mut source = Source::new(
+        None,
+        r#"
+        (datatype E (A))
+        (function f (E) E :merge new)
+        (function observed () i64 :merge new)
+        (ruleset r)
+        (rewrite (f x) x :ruleset r :subsume)
+        (set (observed) 1)
+        (run r 1)
+    "#,
+    )
+    .unwrap();
+    for _ in 0..4 {
+        assert_eq!(
+            run(&mut engine, id, source.next().unwrap().unwrap()).error,
+            None
+        );
+    }
+    let rule = source.next().unwrap().unwrap();
+    assert!(
+        run(&mut engine, id, rule).error.is_some(),
+        "invalid rule must fail at its source position, not a future run"
+    );
+}
+
+#[test]
+fn source_keeps_native_rule_names_and_global_shadowing_checks() {
+    use egglog_experimental::protobuf::source::Source;
+    for (text, prefix_len) in [
+        (
+            r#"(datatype E (A) (B)) (ruleset r) (rule () ((A)) :ruleset r :name "dup") (rule () ((B)) :ruleset r :name "dup")"#,
+            3,
+        ),
+        ("(let $x 0) (check (= x 1))", 1),
+        (
+            "(function f () i64 :no-merge) (set (f) 2) (check (= (f) f) (= f 2))",
+            2,
+        ),
+    ] {
+        let mut native = new_experimental_egraph();
+        assert!(native.parse_and_run_program(None, text).is_err());
+        let mut source = Source::new(None, text).unwrap();
+        for _ in 0..prefix_len {
+            assert!(source.next().unwrap().is_ok());
+        }
+        assert!(
+            source.next().unwrap().is_err(),
+            "native source rejection must survive: {text}"
+        );
+    }
+}
+
+#[test]
+fn source_renderer_rejects_identifier_injection() {
+    use egglog_experimental::protobuf::source::render;
+    let injected = "f () i64 :merge new)\n(panic \"injected\")\n(function g";
+    for target in 0..5 {
+        let mut program = fixture();
+        program.commands.truncate(1);
+        match target {
+            0 => {
+                let Some(pb::declaration::Kind::Function(function)) =
+                    &mut program.declarations[3].kind
+                else {
+                    panic!("expected function")
+                };
+                function.name = injected.into();
+            }
+            1 => program.sorts[1].kind = Some(pb::sort::Kind::Eq(injected.into())),
+            2 => program.nodes[3].kind = Some(pb::node::Kind::Var(injected.into())),
+            3 => program.rulesets[0].name = Some(injected.into()),
+            4 => {
+                let Some(pb::command::Kind::Action(pb::Action {
+                    kind: Some(pb::action::Kind::Set(set)),
+                    ..
+                })) = &mut program.commands[0].kind
+                else {
+                    panic!("expected set")
+                };
+                set.target.as_mut().unwrap().func = injected.into();
+            }
+            _ => unreachable!(),
+        }
+        assert!(render(&program).is_err());
+    }
+}
+
+#[test]
+fn source_global_fresh_name_collision_canary() {
+    use egglog_experimental::protobuf::source::Source;
+    // Core's test_fresh_name_collision_globals, also through protobuf. The
+    // x/x1 hints used to mint the same name after ten intervening captures.
+    let mut text = String::from(
+        r#"
+        (sort B)
+        (constructor var (String) B)
+        (constructor and2 (B B) B)
+        (constructor or2 (B B) B)
+        (let x (var "x"))
+        (let y (var "y"))
+    "#,
+    );
+    for i in 1..=10 {
+        text.push_str(&format!("(let t{i} (or2 x y))\n"));
+    }
+    text.push_str(
+        r#"(let x1 (var "x1")) (let out (and2 x x1)) (check (= out (and2 (var "x") x1)))"#,
+    );
+    new_experimental_egraph()
+        .parse_and_run_program(None, &text)
+        .unwrap();
+    let mut engine = Engine::default();
+    let id = create(&mut engine);
+    for program in Source::new(None, &text).unwrap() {
+        assert_eq!(run(&mut engine, id, program.unwrap()).error, None);
+    }
+}
+
+#[test]
+fn source_rule_locals_do_not_escape_into_later_declarations() {
+    use egglog_experimental::protobuf::source::{Source, render};
+    let text = r#"
+        (datatype E (Num i64))
+        (function observed () i64 :merge new)
+        (let captured 7)
+        (ruleset r)
+        (rule ((= e (Num x)) (= x captured)) ((set (observed) x)) :ruleset r :name "keep")
+        (function x () i64 :merge new)
+        (function __proto_source_local_0_0 () i64 :merge new)
+        (Num 7)
+        (run r 1)
+        (check (= (observed) 7))
+        (extract (observed))
+    "#;
+    new_experimental_egraph()
+        .parse_and_run_program(None, text)
+        .unwrap();
+    let mut rendered = new_experimental_egraph();
+    let mut engine = Engine::default();
+    let id = create(&mut engine);
+    let mut extracted = None;
+    for program in Source::new(Some("locals.egg".into()), text).unwrap() {
+        let program = pb::Program::decode(program.unwrap().encode_to_vec().as_slice()).unwrap();
+        let response = run(&mut engine, id, program.clone());
+        assert_eq!(response.error, None);
+        rendered
+            .parse_and_run_program(None, &render(&program).unwrap())
+            .unwrap();
+        if let Some(rule) = program.rules.first() {
+            assert_eq!(rule.name.as_deref(), Some("keep"));
+            assert!(rule.span.is_some());
+        }
+        for output in &response.outputs {
+            if let Some(pb::command_output::Kind::Extraction(result)) = &output.kind {
+                extracted = Some(value(&response, result.roots[0].variants[0].term));
+            }
+        }
+    }
+    assert_eq!(extracted.as_deref(), Some("7"));
+}
+
+#[test]
+fn source_renderer_preserves_expression_action_grammar() {
+    use egglog_experimental::protobuf::source::{Source, render};
+    for name in ["panic", "include", "multi-extract"] {
+        let mut engine = Engine::default();
+        let id = create(&mut engine);
+        let text = format!(
+            "(function {name} (String) i64 :merge new) (set ({name} \"hello\") 1) (extract ({name} \"hello\"))"
+        );
+        let mut source = Source::new(None, &text).unwrap();
+        for _ in 0..2 {
+            assert_eq!(
+                run(&mut engine, id, source.next().unwrap().unwrap()).error,
+                None
+            );
+        }
+        let mut program = source.next().unwrap().unwrap();
+        let Some(pb::command::Kind::Extract(extract)) = &program.commands[0].kind else {
+            panic!("expected extract")
+        };
+        let action = pb::Action {
+            kind: Some(pb::action::Kind::Term(extract.roots[0])),
+            ..Default::default()
+        };
+        program.commands[0].kind = Some(pb::command::Kind::Action(action.clone()));
+        let program = pb::Program::decode(program.encode_to_vec().as_slice()).unwrap();
+        assert_eq!(run(&mut engine, id, program.clone()).error, None);
+        assert!(
+            render(&program).is_err(),
+            "top-level {name} must not change command kind"
+        );
+
+        // Native rule heads permit constructor calls, not custom-function
+        // reads, so use a constructor to witness the same grammar boundary.
+        let mut constructors = Source::new(
+            None,
+            &format!("(datatype E ({name} String)) (extract ({name} \"hello\"))"),
+        )
+        .unwrap();
+        let rule_id = create(&mut engine);
+        assert_eq!(
+            run(&mut engine, rule_id, constructors.next().unwrap().unwrap()).error,
+            None
+        );
+        let mut rule_program = constructors.next().unwrap().unwrap();
+        let Some(pb::command::Kind::Extract(extract)) = &rule_program.commands[0].kind else {
+            panic!("expected constructor extract")
+        };
+        let action = pb::Action {
+            kind: Some(pb::action::Kind::Term(extract.roots[0])),
+            ..Default::default()
+        };
+        rule_program.commands.clear();
+        rule_program.rules = vec![pb::RuleDecl {
+            kind: Some(pb::rule_decl::Kind::Rule(pb::Rule {
+                query: vec![],
+                head: vec![action],
+            })),
+            eval_mode: pb::RuleEvalMode::Seminaive.into(),
+            ..Default::default()
+        }];
+        rule_program.rulesets = vec![pb::Ruleset {
+            name: Some("r".into()),
+            kind: Some(pb::ruleset::Kind::Rules(pb::RuleList { rules: vec![0] })),
+            ..Default::default()
+        }];
+        assert_eq!(run(&mut engine, rule_id, rule_program.clone()).error, None);
+        assert_eq!(
+            render(&rule_program).is_err(),
+            name == "panic",
+            "rule-head grammar differs from top-level grammar"
+        );
+    }
+}
+
+#[test]
+fn source_plain_rule_and_subsuming_rewrite_roundtrip() {
+    use egglog_experimental::protobuf::source::{Source, render};
+    for (text, expected) in [
+        (
+            r#"(datatype E (A i64)) (function f (i64) i64 :merge new)
+            (rule ((A x)) ((set (f x) x)) :name "copy")
+            (A 7) (run 1) (check (= (f 7) 7)) (extract (f 7))"#,
+            "7",
+        ),
+        (
+            r#"(datatype E (Num i64) (Box E)) (ruleset r)
+            (rewrite (Box x) x :ruleset r :subsume)
+            (Box (Num 1)) (run r 1) (extract (Box (Num 1)))"#,
+            "(Num 1)",
+        ),
+    ] {
+        let mut native = new_experimental_egraph();
+        let mut engine = Engine::default();
+        let id = create(&mut engine);
+        let mut observed = None;
+        for program in Source::new(None, text).unwrap() {
+            let bytes = program.unwrap().encode_to_vec();
+            let program = pb::Program::decode(bytes.as_slice()).unwrap();
+            let outputs = native
+                .parse_and_run_program(None, &render(&program).unwrap())
+                .unwrap();
+            let response = run(&mut engine, id, program);
+            assert_eq!(response.error, None);
+            for output in &response.outputs {
+                if let Some(pb::command_output::Kind::Extraction(result)) = &output.kind {
+                    observed = Some(value(&response, result.roots[0].variants[0].term));
+                    let egglog_experimental::CommandOutput::ExtractBest(dag, _, root) = &outputs[0]
+                    else {
+                        panic!("expected rendered extraction")
+                    };
+                    assert_eq!(dag.to_string(*root), expected);
+                }
+            }
+        }
+        assert_eq!(observed.as_deref(), Some(expected));
+    }
+}
+
 fn fixture() -> pb::Program {
     use pb::{action, command, declaration, node, primitive_value, rule_decl, ruleset, sort};
     let int = |value| pb::Node {

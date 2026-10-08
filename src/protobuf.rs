@@ -21,7 +21,10 @@ use egglog_ast::span::{EgglogSpan, SrcFile};
 use egglog_proto as pb;
 use prost::Message;
 
-/// A malformed transport request or lifecycle error, separate from execution errors.
+pub mod source;
+
+/// A rejected transport, source conversion, or lifecycle operation, separate
+/// from execution errors returned in encoded responses.
 #[derive(Debug)]
 pub struct TransportError(String);
 
