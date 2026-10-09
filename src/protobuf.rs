@@ -2261,7 +2261,7 @@ mod tests {
                 &NativeNames::default(),
                 &terms,
                 term,
-                &graph.get_sort_by_name(sort).unwrap(),
+                graph.get_sort_by_name(sort).unwrap(),
                 &mut response,
                 &mut cache,
             );
