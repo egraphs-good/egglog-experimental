@@ -29,7 +29,7 @@ pub struct StatewalkOptions {
     /// Ignore pure e-classes that no later part of the statewalk can use when
     /// comparing DP states.
     pub liveness: bool,
-    /// Skip repeated visits to non-root *satellites*: effectful e-classes
+    /// Prune and order visits to non-root *satellites*: effectful e-classes
     /// whose only effectful parent and child are the same e-class.
     pub satellite: bool,
 }
@@ -90,6 +90,93 @@ fn saturate_pure(
     }
 }
 
+const SATELLITE_BAR: usize = 6;
+
+struct RequiredSatellite {
+    class: EClassId,
+    cheapest_visits: Vec<ENodeId>,
+    cheapest_returns: Vec<ENodeId>,
+}
+
+fn required_satellites(
+    g: &TermGraph,
+    root: EClassId,
+    satellite_of: &[Option<EClassId>],
+    costs: &[Vec<Cost>],
+) -> Vec<Vec<RequiredSatellite>> {
+    let mut satellites: Vec<Vec<EClassId>> = vec![Vec::new(); g.len()];
+    for (class, hub) in satellite_of.iter().enumerate() {
+        if let Some(hub) = hub {
+            satellites[*hub].push(class);
+        }
+    }
+    let mut required: Vec<Vec<RequiredSatellite>> = (0..g.len()).map(|_| Vec::new()).collect();
+    if !satellites.iter().any(|group| group.len() > SATELLITE_BAR) {
+        return required;
+    }
+    let parents = g.parents();
+    let child_counts = g.child_counts();
+    for (hub, satellites) in satellites
+        .iter()
+        .enumerate()
+        .filter(|(_, group)| group.len() > SATELLITE_BAR)
+    {
+        for &satellite in satellites {
+            // If the root has no finite term without this class, every valid
+            // statewalk must visit it, regardless of which e-nodes it chooses.
+            let mut remaining = child_counts.clone();
+            let mut extractable = vec![false; g.len()];
+            let mut queue = VecDeque::new();
+            for (class, node) in g.enode_ids() {
+                if class != satellite && remaining[class][node] == 0 && !extractable[class] {
+                    extractable[class] = true;
+                    queue.push_back(class);
+                }
+            }
+            while let Some(class) = queue.pop_front() {
+                if extractable[root] {
+                    break;
+                }
+                for &(parent, node) in &parents[class] {
+                    if parent == satellite || extractable[parent] {
+                        continue;
+                    }
+                    remaining[parent][node] -= 1;
+                    if remaining[parent][node] == 0 {
+                        extractable[parent] = true;
+                        queue.push_back(parent);
+                    }
+                }
+            }
+            if extractable[root] {
+                continue;
+            }
+            let min_visit = *costs[satellite].iter().min().unwrap();
+            let cheapest_visits = (0..costs[satellite].len())
+                .filter(|&n| costs[satellite][n] == min_visit)
+                .collect();
+            let returns: Vec<_> = g.classes[hub]
+                .enodes
+                .iter()
+                .enumerate()
+                .filter(|(_, enode)| g.state_child(enode) == Some(satellite))
+                .map(|(node, _)| node)
+                .collect();
+            let min_return = returns.iter().map(|&n| costs[hub][n]).min().unwrap();
+            let cheapest_returns = returns
+                .into_iter()
+                .filter(|&n| costs[hub][n] == min_return)
+                .collect();
+            required[hub].push(RequiredSatellite {
+                class: satellite,
+                cheapest_visits,
+                cheapest_returns,
+            });
+        }
+    }
+    required
+}
+
 /// Everything about a region the DP needs that does not depend on the DP state.
 struct Region {
     arg: (EClassId, ENodeId),
@@ -113,6 +200,7 @@ struct Region {
     live_delta: Vec<FxHashMap<EClassId, Vec<usize>>>,
     /// The e-class a non-root effectful e-class is a satellite of, if any.
     satellite_of: Vec<Option<EClassId>>,
+    required_satellites: Vec<Vec<RequiredSatellite>>,
 }
 
 impl Region {
@@ -308,6 +396,7 @@ impl Region {
             }
         }
 
+        let required_satellites = required_satellites(g, root, &satellite_of, costs);
         let region = Region {
             arg,
             parents_pure,
@@ -319,6 +408,7 @@ impl Region {
             live,
             live_delta,
             satellite_of,
+            required_satellites,
         };
         Ok((region, counts))
     }
@@ -481,12 +571,42 @@ pub fn statewalk_dp(
         }
         let u = states[uid].class;
         let u_version = states[uid].extractable;
+        let mut forced = None;
+        for satellite in &region.required_satellites[u] {
+            let v = satellite.class;
+            if versions.is_extractable(&region, u_version, v) {
+                continue;
+            }
+            let Some(&node) = satellite.cheapest_visits.iter().find(|&&n| {
+                g.enode(v, n)
+                    .children
+                    .iter()
+                    .all(|&c| versions.is_extractable(&region, u_version, c))
+            }) else {
+                continue;
+            };
+            let (after, _) = versions.saturate(&region, opts, u_version, u, v);
+            if satellite.cheapest_returns.iter().any(|&n| {
+                g.enode(u, n)
+                    .children
+                    .iter()
+                    .all(|&c| versions.is_extractable(&region, after, c))
+            }) {
+                // This required round trip is feasible at its minimum cost.
+                // Moving it before any other continuation preserves availability
+                // and cannot increase that continuation's total cost.
+                forced = Some((v, node));
+                break;
+            }
+        }
         for &(v, vn) in &region.parents_effectful[u] {
+            if forced.is_some_and(|chosen| chosen != (v, vn)) {
+                continue;
+            }
             let already_extractable = versions.is_extractable(&region, u_version, v);
             if region.satellite_of[v] == Some(u) && already_extractable {
                 // This non-root detour must return to u, adds no extractable
-                // e-classes, and has nonnegative cost. A first visit cannot be
-                // skipped: satellites can have different return dependencies.
+                // e-classes, and has nonnegative cost.
                 continue;
             }
             let enode = g.enode(v, vn);
@@ -542,6 +662,11 @@ pub fn statewalk_dp(
         }
     }
 
+    log::debug!(
+        "effsafe search states={} versions={}",
+        states.len(),
+        versions.info.len()
+    );
     let Some(best) = best else {
         return Err(Error::ExtractError(format!(
             "no effect-safe extraction for the region rooted at {}: no chain of effectful \

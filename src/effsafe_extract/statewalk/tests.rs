@@ -172,8 +172,49 @@ fn unnecessary_satellites_are_not_forced_into_the_walk() {
 }
 
 #[test]
+fn a_required_satellite_can_be_cheaper_after_another_visit() {
+    let mut fixture = Satellites::new(7);
+    fixture.g.classes[fixture.states[0]].enodes =
+        vec![node(10, vec![0]), node(1, vec![0, fixture.reads[6]])];
+    check_options(&fixture.g, fixture.root, Some(16));
+}
+
+#[test]
+fn a_required_satellite_can_return_more_cheaply_after_another_visit() {
+    let mut fixture = Satellites::new(7);
+    fixture.g.classes[0].enodes[1].cost = 10;
+    fixture.g.classes[0]
+        .enodes
+        .push(node(1, vec![fixture.states[0], fixture.reads[6]]));
+    check_options(&fixture.g, fixture.root, Some(16));
+}
+
+#[test]
+fn required_satellites_can_have_mutually_blocked_cheapest_entries() {
+    let mut fixture = Satellites::new(7);
+    for i in 0..2 {
+        fixture.g.classes[fixture.states[i]].enodes =
+            vec![node(10, vec![0]), node(1, vec![0, fixture.reads[1 - i]])];
+    }
+    check_options(&fixture.g, fixture.root, Some(25));
+}
+
+#[test]
+fn alternative_pure_terms_do_not_make_each_satellite_required() {
+    let mut fixture = Satellites::new(7);
+    let read = add_class(
+        &mut fixture.g,
+        false,
+        fixture.reads.iter().map(|&c| node(0, vec![c])).collect(),
+    );
+    fixture.g.classes[fixture.states[0]].enodes[0].cost = 10;
+    fixture.g.classes[fixture.root].enodes = vec![node(1, vec![0, read])];
+    check_options(&fixture.g, fixture.root, Some(4));
+}
+
+#[test]
 fn satellites_match_exhaustive_search() {
-    for seed in 0..128 {
+    for seed in 0..1024 {
         let mut rng = Mt64::new(seed);
         let mut next = |bound| (rng.next_u64() % bound) as usize;
         let mut fixture = Satellites::new(6 + next(3));
