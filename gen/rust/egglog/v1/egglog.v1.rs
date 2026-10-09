@@ -1712,6 +1712,26 @@ pub struct DestroyEGraphRequest {
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct DestroyEGraphResponse {
 }
+/// Return an active direct clone to its saved scope. The saved handle survives;
+/// the active handle is consumed. Retain the active cumulative native report,
+/// complete symbol generator and monotonic namespace stamp, but restore all
+/// other saved logical/resource state. Do not sum the saved report prefix twice.
+///
+/// Both handles must be live, distinct and directly paired by Clone. Reject if
+/// the saved handle has accepted a Program or resource setter since that Clone;
+/// a resource Query or rejected request does not invalidate pairing. Validate
+/// before mutation. Ordinary Clone/Destroy retain independent copy/discard
+/// semantics. Invalid pairing is a lifecycle error, not RunProgram.error.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ReturnToEGraphRequest {
+    #[prost(uint64, tag = "1")]
+    pub active_id: u64,
+    #[prost(uint64, tag = "2")]
+    pub saved_id: u64,
+}
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ReturnToEGraphResponse {
+}
 /// Query thread resources or update runtime/collection settings on a handle, never logical
 /// settings or Program state. Completed updates affect subsequent calls; they
 /// do not reconfigure an in-flight Run. Clone inherits effective resources and
