@@ -453,20 +453,44 @@ the innermost active command independently of their most specific source span.
 Source fallback is expression, action, rule, then active command.
 A failed loop has no outcome, but its completed observations and earlier effects
 remain; execution and termination semantics are unchanged.
+Native helper/maintenance Runs do not become public outcomes. A requested native
+result completed before trailing maintenance fails remains in the output prefix.
+RunOutcome keeps the requested native schedule's `updated`/`can_stop`, including
+inline helper work; exclusive profiling does not redefine those flags.
 
 `PrintedFunction.table` identifies rows whose argument/output cells are ordinary
 extracted values; relation outputs are Unit. Any cell without finite extraction
 fails the whole command. Table statistics pair each exact response sort reference
 with its distinct-value count, in input order followed by output.
 
-Opt-in `ProfileSummary` aggregates by static `Run` site and response-local rule
-occurrence. It counts entered invocations and retains no per-iteration history.
-Run sites own search/apply, merge, and rebuild totals; group membership does not
-duplicate work. Rule metrics are breakdowns, not additional elapsed time.
+Opt-in `ProfileSummary.runs` aggregates by static authored `Run` site and
+response-local rule occurrence. `maintenance` separately aggregates internal
+Run/query work by its authored cause. A required `MaintenanceSite` selects a
+static command path, declaration index, materialized-sort index, or installing
+ruleset index (including its rules). These refer to the original submitted
+Program before filtering/lowering. Proof-created helpers belong to the proof
+command's site, not to synthetic declarations. Compatible resupply that executes
+no native installation adds no maintenance entry. CEL enforces required sites
+and oneofs, nonempty paths, positive invocation counts, and unique sites;
+request-relative bounds and path/target kinds require the submitted Program.
+
+Both summaries count entered invocations, including failing ones, and retain no
+per-iteration history. Each measured native Run/query invocation contributes to
+exactly one bucket; do not also add an enclosing schedule's aggregate. Authored
+Run totals exclude separately attributed inline/trailing maintenance, while
+native backend rebuilding within an authored invocation stays in its rebuild
+total. Rule metrics are breakdowns, not additional elapsed time. Generated rules
+do not acquire fabricated authored identities. Native provenance determines
+attribution, never name patterns or output positions. These phase measurements
+neither cover all helper CPU work nor partition wall time; no proof-checking,
+reconstruction, or serialization timing is inferred.
 Present metrics cover all observed work in their aggregate; an unavailable total
 is absent, not a known subset or zero. A failed request has an explicitly
-incomplete summary, including observed work from a failing Run; a successful
-empty summary is complete. Completeness does not promise every optional metric.
+incomplete summary, including observed work from a failing Run or installation
+helper; a successful empty summary is complete. Completeness does not promise
+every optional metric. Runtime definition-installation failures retain actual
+registration/effect prefixes, use the definition span, and have no fabricated
+command location; they are not validation failures claiming that nothing ran.
 
 `RunProgramResponse.rules` gives each attributed occurrence one local index,
 shared by profile rows and errors even with profiling off. A `RuleAttribution`
@@ -507,10 +531,14 @@ checks as proof requests. Preserve native ordering: `Prove` can complete a helpe
 run and its effects before proof extraction fails. Successful proof requests
 return the proof at the originating command location, including inside loops.
 
-This draft leaves native maintenance `Run` emission, output locations, and
-optional profiling attribution unresolved. CEL accepts nested `Run` payloads
-as wire capacity only; it does not require their emission or select a reporting
-policy. The authored-command reporting rules above do not settle this question.
+**Decided:** proof mode returns requested results only. Helper Runs remain native
+execution and contribute only to optional profiling, with the exclusive
+attribution described above. CEL rejects nested Run/Loop outcomes and permits
+nested proof/observation results; matching them to the requested command remains
+an adapter check. These are schema capabilities, not implemented byte proof
+execution. The current adapter still requires `profile=true`; it cannot yet
+satisfy the collection-off contract. No profiling-level enum or trace format is
+introduced.
 
 `ProofResult` contains separate, inert term and proof arenas. Terms have no sort:
 native proof propositions can describe a function row with inputs and output as

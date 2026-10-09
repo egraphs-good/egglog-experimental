@@ -145,24 +145,128 @@ class ProofSchemaTests(unittest.TestCase):
                 ir.ProofBinding(name="x", term=0), ir.ProofBinding(name="x", term=1),
             ]))
 
-    def test_nested_run_wire_capacity(self):
-        # Structural acceptance does not require maintenance runs to be emitted.
-        # Command matching belongs to the shared adapter, not this wire test.
+    def test_nested_proofs_are_allowed_but_control_outcomes_are_top_level(self):
+        proof = ir.ProofResult(
+            terms=[ir.ProofTerm(kind=Oneof("i64", 0))],
+            proofs=[ir.ProofStep(lhs=0, rhs=0, justification=Oneof("fiat", ir.Unit()))],
+            root=0,
+        )
         response = ir.RunProgramResponse(
             outputs=[ir.CommandOutput(
-                kind=Oneof("run", ir.RunOutcome(updated=True)),
+                kind=Oneof("proof", proof),
                 location=ir.CommandLocation(path=[0, 1], iterations=[2]),
             )],
         )
         validate(response)
         self.assertEqual(ir.RunProgramResponse.from_binary(response.to_binary()), response)
-        with self.assertRaises(ValidationError):
+        for kind in (
+            Oneof("run", ir.RunOutcome(updated=True)),
+            Oneof("loop", ir.LoopOutcome(
+                iterations=1, termination=ir.TerminationReason.COUNT_REACHED,
+            )),
+        ):
             validate(ir.CommandOutput(
-                kind=Oneof("loop", ir.LoopOutcome(
-                    iterations=1, termination=ir.TerminationReason.COUNT_REACHED,
-                )),
-                location=ir.CommandLocation(path=[0, 1], iterations=[2]),
+                kind=kind, location=ir.CommandLocation(path=[0]),
             ))
+            with self.subTest(kind=kind), self.assertRaises(ValidationError):
+                validate(ir.CommandOutput(
+                    kind=kind,
+                    location=ir.CommandLocation(path=[0, 1], iterations=[2]),
+                ))
+
+    def test_maintenance_sites_roundtrip_with_zero_index_presence(self):
+        targets = [
+            Oneof("command", ir.StaticCommandPath(path=[0])),
+            Oneof("command", ir.StaticCommandPath(path=[2, 1])),
+            Oneof("declaration", 0), Oneof("sort", 0), Oneof("ruleset", 0),
+        ]
+        response = ir.RunProgramResponse(profile=ir.ProfileSummary(
+            complete=True,
+            runs=[ir.RunSummary(command_path=[0], invocations=1)],
+            maintenance=[ir.MaintenanceSummary(
+                site=ir.MaintenanceSite(target=target), invocations=1,
+                search_and_apply_nanos=0,
+            ) for target in targets],
+        ))
+        validate(response)
+        decoded = ir.RunProgramResponse.from_binary(response.to_binary())
+        self.assertEqual(decoded, response)
+        self.assertEqual([row.site.target for row in decoded.profile.maintenance], targets)
+        for row in decoded.profile.maintenance:
+            self.assertTrue(row.has_field("search_and_apply_nanos"))
+            self.assertFalse(row.has_field("merge_nanos"))
+
+    def test_maintenance_requires_site_arm_path_and_positive_invocations(self):
+        invalid = [
+            ir.MaintenanceSummary(invocations=1),
+            ir.MaintenanceSummary(site=ir.MaintenanceSite(), invocations=1),
+            ir.MaintenanceSite(),
+            # Unknown oneof field 5 is not a recognized site, even at index zero.
+            ir.MaintenanceSite.from_binary(b"\x28\x00"),
+            ir.StaticCommandPath(),
+            ir.MaintenanceSummary(site=ir.MaintenanceSite(
+                target=Oneof("command", ir.StaticCommandPath()),
+            ), invocations=1),
+            ir.MaintenanceSummary(site=ir.MaintenanceSite(target=Oneof("declaration", 0))),
+        ]
+        for message in invalid:
+            with self.subTest(message=message), self.assertRaises(ValidationError):
+                validate(message)
+
+    def test_duplicate_maintenance_sites_are_rejected(self):
+        for target in (
+            Oneof("command", ir.StaticCommandPath(path=[2, 1])),
+            Oneof("declaration", 0), Oneof("sort", 0), Oneof("ruleset", 0),
+        ):
+            profile = ir.ProfileSummary(maintenance=[
+                ir.MaintenanceSummary(site=ir.MaintenanceSite(target=target), invocations=1),
+                ir.MaintenanceSummary(
+                    site=ir.MaintenanceSite(target=target), invocations=2, merge_nanos=5,
+                ),
+            ])
+            with self.subTest(target=target), self.assertRaises(ValidationError):
+                validate(profile)
+
+    def test_maintenance_site_bounds_need_the_submitted_program(self):
+        # No request Program is present in a response. These are structurally
+        # valid sites; an adapter must separately check bounds and path kinds.
+        for target in (
+            Oneof("command", ir.StaticCommandPath(path=[99, 88])),
+            Oneof("declaration", 99), Oneof("sort", 99), Oneof("ruleset", 99),
+        ):
+            validate(ir.ProfileSummary(maintenance=[ir.MaintenanceSummary(
+                site=ir.MaintenanceSite(target=target), invocations=1,
+            )]))
+
+    def test_profile_preserves_a_failed_request_prefix(self):
+        response = ir.RunProgramResponse(
+            outputs=[ir.CommandOutput(
+                kind=Oneof("run", ir.RunOutcome(updated=True)),
+                location=ir.CommandLocation(path=[0]),
+            )],
+            error=ir.Error(
+                code=ir.ErrorCode.PROOF_FAILED, message="missing witness",
+                location=ir.CommandLocation(path=[1]),
+                proof_failure=ir.ProofFailure(
+                    reason=ir.ProofFailureReason.QUERY_DID_NOT_MATCH,
+                ),
+            ),
+            profile=ir.ProfileSummary(
+                complete=False,
+                runs=[ir.RunSummary(command_path=[0], invocations=1, merge_nanos=0)],
+                maintenance=[ir.MaintenanceSummary(
+                    site=ir.MaintenanceSite(target=Oneof(
+                        "command", ir.StaticCommandPath(path=[1]),
+                    )),
+                    invocations=2,
+                )],
+            ),
+        )
+        validate(response)
+        self.assertEqual(ir.RunProgramResponse.from_binary(response.to_binary()), response)
+        response.profile.complete = True
+        with self.assertRaises(ValidationError):
+            validate(response)
 
     def test_proof_failure_classification(self):
         for reason in ir.ProofFailureReason:

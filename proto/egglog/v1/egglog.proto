@@ -1451,8 +1451,8 @@ message Check {
 // Prove one conjunctive query with Check's typing and variable-binding rules.
 // Uses the existing proof engine: this installs/runs a helper rule before proof
 // extraction, so it can mutate state and fail after completing helper effects.
-// PROOF_TESTING treats Check the same way. Maintenance reporting remains
-// unresolved; see CommandOutput.
+// PROOF_TESTING treats Check the same way. Only the requested proof is an
+// output; helper work is attributed in optional profiling. See CommandOutput.
 // Do not reject solely because proofs are disabled before running the native
 // command: witness failure and completed effects follow native execution order.
 message Prove {
@@ -1971,8 +1971,8 @@ message RunProgramResponse {
   // one compact outcome; nested control commands contribute none. Every
   // requested observation contributes its output, including repeated executions
   // inside loops. Successful proof requests contribute their proof. Native
-  // maintenance outputs and their profiling attribution remain unresolved;
-  // see CommandOutput.
+  // helper/maintenance Runs contribute no outcomes; their measured work belongs
+  // in optional profiling. See CommandOutput.
   repeated CommandOutput outputs = 3;
 
   // Origins for this response's nodes, sorts, rules and errors, including
@@ -1981,7 +1981,8 @@ message RunProgramResponse {
 
   // Absent on success. Present means execution stopped; `outputs` contains
   // completed outputs, and every entry is valid. A failed loop has
-  // no outcome, but observations completed within it remain here.
+  // no outcome, but observations completed within it remain here. A requested
+  // native result completed before a trailing maintenance failure remains here.
   Error error = 5;
 
   // Only occurrence identities referenced by error/profile, not global IDs or
@@ -2063,7 +2064,8 @@ message Error {
 
   // Innermost active command, not its enclosing top-level loop. A failure in
   // a loop's own pre-check locates that loop, with only its enclosing iteration
-  // coordinates. Absent when the failure precedes command execution.
+  // coordinates. Absent when the failure precedes command execution, including
+  // runtime helper failure during definition installation.
   CommandLocation location = 4;
 
   // Supplied structurally for an attributed rule/rewrite failure, never parsed
@@ -2138,16 +2140,17 @@ enum ProofFailureReason {
 // Successful Prove/ProveExists and PROOF_TESTING Check return a proof at their
 // own location. These requested outputs must match the located command. Nested
 // authored control outcomes are folded, never appended here.
-// Native maintenance Run emission, output locations and optional profiling
-// attribution remain unresolved. CEL permits nested Run payloads as structural
-// capacity, not an emission requirement; request/output matching remains an
-// adapter obligation.
+// Native helper/maintenance Runs never contribute public outcomes. Their
+// measured work is attributed in optional ProfileSummary. This changes neither
+// their execution/effects nor native stopping/error behavior. A requested native
+// result completed before trailing maintenance fails remains in the prefix.
+// Request/output matching remains an adapter obligation.
 // Execution errors are `RunProgramResponse.error`, not an arm here.
 message CommandOutput {
   option (buf.validate.message).cel = {
-    id: "command_output.top_level_loop_outcome"
-    message: "loop outcomes are only emitted for top-level commands"
-    expression: "!has(this.loop) || size(this.location.path) == 1"
+    id: "command_output.top_level_control_outcome"
+    message: "run and loop outcomes are only emitted for top-level commands"
+    expression: "!(has(this.run) || has(this.loop)) || size(this.location.path) == 1"
   };
 
   oneof kind {
@@ -2295,7 +2298,9 @@ message ProofCongr {
   optional uint32 child_proof = 3 [(buf.validate.field).required = true];
 }
 
-// One completed run, independent of optional profiling.
+// One completed requested run, independent of optional profiling. Preserve the
+// requested native schedule's updated/can_stop flags, including inline helper
+// work; do not recompute them from exclusive profiling measurements.
 message RunOutcome {
   option (buf.validate.message).cel = {
     id: "run_outcome.can_stop"
@@ -2368,26 +2373,39 @@ message TableSize {
 
 // Aggregate coverage of this request, not a trace. Complete iff the whole
 // request succeeded; false includes work observed before failure, including
-// a failing Run. Exactly one entry per entered static Run site; no unentered
-// site appears. Completion says nothing about availability of individual
-// optional metrics. No collection budget/truncation is defined here.
-// Native maintenance attribution is unresolved; see CommandOutput.
-// Per-iteration histories are deferred.
+// a failing Run or installation helper. Each entered static authored Run site
+// has one runs entry; each site with entered internal Run/query work has one
+// maintenance entry. No unentered site appears. Completion says nothing about
+// availability of individual optional metrics. No collection budget/truncation
+// or per-iteration history is defined here.
+// Each measured native Run/query invocation contributes to exactly one bucket:
+// authored or maintenance. Do not also sum an enclosing schedule's aggregate.
+// These phase measurements do not cover all command/helper CPU work or partition
+// wall time; no proof reconstruction/checking/serialization time is inferred.
 message ProfileSummary {
   option (buf.validate.message).cel = {
     id: "profile_summary.unique_sites"
     message: "each static Run site has one aggregate"
     expression: "this.runs.all(r, this.runs.filter(s, s.command_path == r.command_path).size() == 1)"
   };
+  option (buf.validate.message).cel = {
+    id: "profile_summary.unique_maintenance_sites"
+    message: "each maintenance site has one aggregate"
+    expression: "this.maintenance.all(r, this.maintenance.filter(s, s.site == r.site).size() == 1)"
+  };
 
   bool complete = 1;
   repeated RunSummary runs = 2;
+  repeated MaintenanceSummary maintenance = 3;
 }
 
 // All invocations of one static authored Run command, across enclosing loop
 // iterations. Path uses CommandLocation.path without dynamic coordinates; the
-// site resolves to that Run command. Native maintenance attribution remains
-// unresolved; see CommandOutput. Each selected occurrence contributes once per
+// site resolves to that Run command. Timings exclude separately attributed
+// internal Run/query invocations, including inline and trailing maintenance.
+// Native backend rebuilding measured within an authored invocation remains in
+// its rebuild_nanos; it is not an additional maintenance invocation.
+// Each selected occurrence contributes once per
 // Run's selection, not once per group membership; BiRewrite directions share
 // one authored occurrence. No nested-loop or ruleset totals duplicate this work.
 // Optional metrics total the observed work across these invocations. Omit a
@@ -2409,6 +2427,46 @@ message RunSummary {
   optional uint64 rebuild_nanos = 4;
   repeated RuleSummary rules = 5;
   uint64 invocations = 6 [(buf.validate.field).uint64.gte = 1]; // entered Runs, including a failing final invocation
+}
+
+// A static command site in the submitted Program, with CommandLocation.path's
+// indexing but no dynamic iteration coordinates. Bounds and intermediate loop
+// kinds require the submitted Program; response-local CEL cannot check them.
+message StaticCommandPath {
+  repeated uint32 path = 1 [(buf.validate.field).repeated.min_items = 1];
+}
+
+// The authored cause of internal work, not a generated helper identity. All
+// indices refer to the ORIGINAL submitted Program before filtering/lowering.
+// Bounds and target kinds are checked against that request, not this response.
+// Definition work has no fabricated command path. A helper created by Prove
+// belongs to its command site, not to a synthetic Program declaration.
+message MaintenanceSite {
+  oneof target {
+    option (buf.validate.oneof).required = true;
+
+    StaticCommandPath command = 1;
+    uint32 declaration = 2; // index into Program.declarations
+    uint32 sort = 3; // newly materialized instance in Program.sorts
+    uint32 ruleset = 4; // installation in Program.rulesets, including its rules
+  }
+}
+
+// Internal native Run/query work caused by one static site, aggregated across
+// all enclosing loop iterations. Compatible resupply that executes no native
+// installation contributes no entry. Identify internal work by native origin,
+// never ruleset-name patterns or output positions. Generated rules are not
+// invented authored occurrences in RunProgramResponse.rules.
+// Phase totals are exclusive of RunSummary and other maintenance entries.
+// Omit a total if any required measurement is unavailable, including a failed
+// invocation without a report or work that cannot be faithfully attributed;
+// never report just the known subset. Present zero means measured zero.
+message MaintenanceSummary {
+  MaintenanceSite site = 1 [(buf.validate.field).required = true];
+  uint64 invocations = 2 [(buf.validate.field).uint64.gte = 1]; // entered internal Runs/queries, including failure
+  optional uint64 search_and_apply_nanos = 3;
+  optional uint64 merge_nanos = 4;
+  optional uint64 rebuild_nanos = 5;
 }
 
 // Statistics for one response-local authored occurrence at one static Run site.

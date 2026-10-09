@@ -1336,8 +1336,8 @@ pub struct Check {
 /// Prove one conjunctive query with Check's typing and variable-binding rules.
 /// Uses the existing proof engine: this installs/runs a helper rule before proof
 /// extraction, so it can mutate state and fail after completing helper effects.
-/// PROOF_TESTING treats Check the same way. Maintenance reporting remains
-/// unresolved; see CommandOutput.
+/// PROOF_TESTING treats Check the same way. Only the requested proof is an
+/// output; helper work is attributed in optional profiling. See CommandOutput.
 /// Do not reject solely because proofs are disabled before running the native
 /// command: witness failure and completed effects follow native execution order.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
@@ -1731,8 +1731,8 @@ pub struct RunProgramResponse {
     /// one compact outcome; nested control commands contribute none. Every
     /// requested observation contributes its output, including repeated executions
     /// inside loops. Successful proof requests contribute their proof. Native
-    /// maintenance outputs and their profiling attribution remain unresolved;
-    /// see CommandOutput.
+    /// helper/maintenance Runs contribute no outcomes; their measured work belongs
+    /// in optional profiling. See CommandOutput.
     #[prost(message, repeated, tag = "3")]
     pub outputs: ::prost::alloc::vec::Vec<CommandOutput>,
     /// Origins for this response's nodes, sorts, rules and errors, including
@@ -1741,7 +1741,8 @@ pub struct RunProgramResponse {
     pub files: ::prost::alloc::vec::Vec<SourceFile>,
     /// Absent on success. Present means execution stopped; `outputs` contains
     /// completed outputs, and every entry is valid. A failed loop has
-    /// no outcome, but observations completed within it remain here.
+    /// no outcome, but observations completed within it remain here. A requested
+    /// native result completed before a trailing maintenance failure remains here.
     #[prost(message, optional, tag = "5")]
     pub error: ::core::option::Option<Error>,
     /// Only occurrence identities referenced by error/profile, not global IDs or
@@ -1816,7 +1817,8 @@ pub struct Error {
     pub span: ::core::option::Option<Span>,
     /// Innermost active command, not its enclosing top-level loop. A failure in
     /// a loop's own pre-check locates that loop, with only its enclosing iteration
-    /// coordinates. Absent when the failure precedes command execution.
+    /// coordinates. Absent when the failure precedes command execution, including
+    /// runtime helper failure during definition installation.
     #[prost(message, optional, tag = "4")]
     pub location: ::core::option::Option<CommandLocation>,
     /// Supplied structurally for an attributed rule/rewrite failure, never parsed
@@ -1853,10 +1855,11 @@ pub struct ProofFailure {
 /// Successful Prove/ProveExists and PROOF_TESTING Check return a proof at their
 /// own location. These requested outputs must match the located command. Nested
 /// authored control outcomes are folded, never appended here.
-/// Native maintenance Run emission, output locations and optional profiling
-/// attribution remain unresolved. CEL permits nested Run payloads as structural
-/// capacity, not an emission requirement; request/output matching remains an
-/// adapter obligation.
+/// Native helper/maintenance Runs never contribute public outcomes. Their
+/// measured work is attributed in optional ProfileSummary. This changes neither
+/// their execution/effects nor native stopping/error behavior. A requested native
+/// result completed before trailing maintenance fails remains in the prefix.
+/// Request/output matching remains an adapter obligation.
 /// Execution errors are `RunProgramResponse.error`, not an arm here.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct CommandOutput {
@@ -2029,7 +2032,9 @@ pub struct ProofCongr {
     #[prost(uint32, optional, tag = "3")]
     pub child_proof: ::core::option::Option<u32>,
 }
-/// One completed run, independent of optional profiling.
+/// One completed requested run, independent of optional profiling. Preserve the
+/// requested native schedule's updated/can_stop flags, including inline helper
+/// work; do not recompute them from exclusive profiling measurements.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct RunOutcome {
     #[prost(bool, tag = "1")]
@@ -2062,22 +2067,31 @@ pub struct TableSize {
 }
 /// Aggregate coverage of this request, not a trace. Complete iff the whole
 /// request succeeded; false includes work observed before failure, including
-/// a failing Run. Exactly one entry per entered static Run site; no unentered
-/// site appears. Completion says nothing about availability of individual
-/// optional metrics. No collection budget/truncation is defined here.
-/// Native maintenance attribution is unresolved; see CommandOutput.
-/// Per-iteration histories are deferred.
+/// a failing Run or installation helper. Each entered static authored Run site
+/// has one runs entry; each site with entered internal Run/query work has one
+/// maintenance entry. No unentered site appears. Completion says nothing about
+/// availability of individual optional metrics. No collection budget/truncation
+/// or per-iteration history is defined here.
+/// Each measured native Run/query invocation contributes to exactly one bucket:
+/// authored or maintenance. Do not also sum an enclosing schedule's aggregate.
+/// These phase measurements do not cover all command/helper CPU work or partition
+/// wall time; no proof reconstruction/checking/serialization time is inferred.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ProfileSummary {
     #[prost(bool, tag = "1")]
     pub complete: bool,
     #[prost(message, repeated, tag = "2")]
     pub runs: ::prost::alloc::vec::Vec<RunSummary>,
+    #[prost(message, repeated, tag = "3")]
+    pub maintenance: ::prost::alloc::vec::Vec<MaintenanceSummary>,
 }
 /// All invocations of one static authored Run command, across enclosing loop
 /// iterations. Path uses CommandLocation.path without dynamic coordinates; the
-/// site resolves to that Run command. Native maintenance attribution remains
-/// unresolved; see CommandOutput. Each selected occurrence contributes once per
+/// site resolves to that Run command. Timings exclude separately attributed
+/// internal Run/query invocations, including inline and trailing maintenance.
+/// Native backend rebuilding measured within an authored invocation remains in
+/// its rebuild_nanos; it is not an additional maintenance invocation.
+/// Each selected occurrence contributes once per
 /// Run's selection, not once per group membership; BiRewrite directions share
 /// one authored occurrence. No nested-loop or ruleset totals duplicate this work.
 /// Optional metrics total the observed work across these invocations. Omit a
@@ -2101,6 +2115,64 @@ pub struct RunSummary {
     /// entered Runs, including a failing final invocation
     #[prost(uint64, tag = "6")]
     pub invocations: u64,
+}
+/// A static command site in the submitted Program, with CommandLocation.path's
+/// indexing but no dynamic iteration coordinates. Bounds and intermediate loop
+/// kinds require the submitted Program; response-local CEL cannot check them.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct StaticCommandPath {
+    #[prost(uint32, repeated, packed = "false", tag = "1")]
+    pub path: ::prost::alloc::vec::Vec<u32>,
+}
+/// The authored cause of internal work, not a generated helper identity. All
+/// indices refer to the ORIGINAL submitted Program before filtering/lowering.
+/// Bounds and target kinds are checked against that request, not this response.
+/// Definition work has no fabricated command path. A helper created by Prove
+/// belongs to its command site, not to a synthetic Program declaration.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct MaintenanceSite {
+    #[prost(oneof = "maintenance_site::Target", tags = "1, 2, 3, 4")]
+    pub target: ::core::option::Option<maintenance_site::Target>,
+}
+/// Nested message and enum types in `MaintenanceSite`.
+pub mod maintenance_site {
+    #[derive(Clone, PartialEq, Eq, Hash, ::prost::Oneof)]
+    pub enum Target {
+        #[prost(message, tag = "1")]
+        Command(super::StaticCommandPath),
+        /// index into Program.declarations
+        #[prost(uint32, tag = "2")]
+        Declaration(u32),
+        /// newly materialized instance in Program.sorts
+        #[prost(uint32, tag = "3")]
+        Sort(u32),
+        /// installation in Program.rulesets, including its rules
+        #[prost(uint32, tag = "4")]
+        Ruleset(u32),
+    }
+}
+/// Internal native Run/query work caused by one static site, aggregated across
+/// all enclosing loop iterations. Compatible resupply that executes no native
+/// installation contributes no entry. Identify internal work by native origin,
+/// never ruleset-name patterns or output positions. Generated rules are not
+/// invented authored occurrences in RunProgramResponse.rules.
+/// Phase totals are exclusive of RunSummary and other maintenance entries.
+/// Omit a total if any required measurement is unavailable, including a failed
+/// invocation without a report or work that cannot be faithfully attributed;
+/// never report just the known subset. Present zero means measured zero.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct MaintenanceSummary {
+    #[prost(message, optional, tag = "1")]
+    pub site: ::core::option::Option<MaintenanceSite>,
+    /// entered internal Runs/queries, including failure
+    #[prost(uint64, tag = "2")]
+    pub invocations: u64,
+    #[prost(uint64, optional, tag = "3")]
+    pub search_and_apply_nanos: ::core::option::Option<u64>,
+    #[prost(uint64, optional, tag = "4")]
+    pub merge_nanos: ::core::option::Option<u64>,
+    #[prost(uint64, optional, tag = "5")]
+    pub rebuild_nanos: ::core::option::Option<u64>,
 }
 /// Statistics for one response-local authored occurrence at one static Run site.
 /// Both BiRewrite directions and internal decomposition contribute here only
