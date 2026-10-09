@@ -21,7 +21,10 @@
 /// predicates; evaluators may exhaust their budgets on large valid inputs.
 /// Implementations may enforce equivalent checks in a scalable verifier. Budget
 /// exhaustion is inconclusive, not validity or invalidity. A verifier must also
-/// check remaining bounds, types, binding, groundedness, arity, and declarations.
+/// check remaining bounds, types, binding, arity, declarations, and groundedness
+/// where required during preparation. Requested Check query planning, including
+/// its groundedness failures, occurs during execution; generated helper/rule
+/// validation remains preparation.
 /// Sorts are acyclic; expression cycles must pass through a `Union` node.
 /// Install all declarations and named ruleset bindings before commands,
 /// order-independently and without executing their bodies.
@@ -35,6 +38,8 @@
 /// such list. Each loop-body iteration starts an independent scope; nested lists
 /// never inherit the outer mapping, which resumes after they return. Rule
 /// firings and other commands' evaluated inputs have their own scopes as in Union.
+/// Fail is transparent to these scopes: a wrapped direct Action still belongs
+/// to its enclosing command list, and the wrapper adds no Union identity scope.
 /// Sort.var is legal only in HostPrimitive signatures and their presentation
 /// owner/trait patterns, sharing that signature's binder. Node sorts, lambda
 /// parameter sorts, cost sorts and concrete declaration signatures must be
@@ -1311,7 +1316,7 @@ pub struct Command {
     /// Surfaces as `Error.span`.
     #[prost(message, optional, tag = "13")]
     pub span: ::core::option::Option<Span>,
-    #[prost(oneof = "command::Kind", tags = "1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 14, 15")]
+    #[prost(oneof = "command::Kind", tags = "1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 14, 15, 16")]
     pub kind: ::core::option::Option<command::Kind>,
 }
 /// Nested message and enum types in `Command`.
@@ -1346,9 +1351,25 @@ pub mod command {
         Prove(super::Prove),
         #[prost(message, tag = "15")]
         ProveExists(super::ProveExists),
+        /// Expect the child's native execution anchor to fail. Lower this wrapper
+        /// before native expansion: prerequisites execute outside the catch, and
+        /// only the final native command is wrapped. An anchor failure succeeds;
+        /// anchor success raises EVALUATION_FAILED. Discard the anchor's outputs
+        /// on either outcome, retaining completed effects and earlier outputs.
+        /// Preparation/typechecking errors, unsupported forms, and failures in
+        /// prerequisite or trailing helpers outside the anchor are not caught.
+        /// This is not rollback and does not catch process panics. Nested wrappers
+        /// retain their distinct expectations and output suppression.
+        /// Adds no binder, command list, Union identity scope, or loop iteration.
+        #[prost(message, tag = "16")]
+        Fail(::prost::alloc::boxed::Box<super::Command>),
     }
 }
 /// One conjunctive query. All facts share the same variable bindings.
+/// Resolve names and types during preparation, but plan the requested query
+/// during execution; a planning/groundedness failure is catchable by Fail at
+/// its native anchor. Internal checks and generated proof helpers retain their
+/// own validation phases and are not moved inside that catch.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct Check {
     /// index into the enclosing `nodes`
@@ -1829,7 +1850,10 @@ pub struct RuleAttribution {
 }
 /// One dynamic command execution in the submitted Program. path\[0\] indexes
 /// Program.commands; each later component indexes the previous Repeat/Saturate
-/// command's body. iterations gives the zero-based iteration of each enclosing
+/// command's body, resolving through any Fail wrappers at that position.
+/// Wrappers add no path component or iteration coordinate. A list-site failure
+/// locates the outer wrapper, with the most specific source span in Error.span.
+/// iterations gives the zero-based iteration of each enclosing
 /// loop, outermost first. It does not include the target loop's own iteration.
 /// Bounds and command kinds are checked against the request, not this response.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
@@ -1898,8 +1922,11 @@ pub struct ProofFailure {
 /// observations return their matching arm at every nesting depth. Actions,
 /// ordinary checks, scheduler bindings, and keep_best have no requested output.
 /// Successful Prove/ProveExists and PROOF_TESTING Check return a proof at their
-/// own location. These requested outputs must match the located command. Nested
-/// authored control outcomes are folded, never appended here.
+/// own location. These requested outputs must match the located command,
+/// resolving through Fail wrappers subject to their suppression below. Nested
+/// authored control outcomes are folded, never appended here. Fail itself has
+/// no requested output and suppresses every output from its native anchor,
+/// including on unexpected success. Earlier outputs outside that anchor remain.
 /// Native helper/maintenance Runs never contribute public outcomes. Their
 /// measured work is attributed in optional ProfileSummary. This changes neither
 /// their execution/effects nor native stopping/error behavior. A requested native
@@ -2132,8 +2159,9 @@ pub struct ProfileSummary {
 }
 /// All invocations of one static authored Run command, across enclosing loop
 /// iterations. Path uses CommandLocation.path without dynamic coordinates; the
-/// site resolves to that Run command. Timings exclude separately attributed
-/// internal Run/query invocations, including inline and trailing maintenance.
+/// site resolves through any Fail wrappers to that Run command. Timings exclude
+/// separately attributed internal Run/query invocations, including inline and
+/// trailing maintenance.
 /// Native backend rebuilding measured within an authored invocation remains in
 /// its rebuild_nanos; it is not an additional maintenance invocation.
 /// Each selected occurrence contributes once per
@@ -2162,8 +2190,9 @@ pub struct RunSummary {
     pub invocations: u64,
 }
 /// A static command site in the submitted Program, with CommandLocation.path's
-/// indexing but no dynamic iteration coordinates. Bounds and intermediate loop
-/// kinds require the submitted Program; response-local CEL cannot check them.
+/// indexing and transparent Fail wrappers, but no dynamic iteration coordinates.
+/// Bounds and intermediate loop kinds require the submitted Program;
+/// response-local CEL cannot check them.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct StaticCommandPath {
     #[prost(uint32, repeated, packed = "false", tag = "1")]
@@ -2523,7 +2552,8 @@ pub enum ErrorCode {
     Panic = 3,
     /// A primitive or merge failed at run time, including unresolvable merges,
     /// a directly evaluated get_cost has no assigned annotation, or Freeze cannot
-    /// encode a required value with a supported codec.
+    /// encode a required value with a supported codec. Also includes an unmet
+    /// expected-failure assertion: Fail's native anchor succeeded.
     EvaluationFailed = 4,
     /// The requested extractor/cost-model pair is incompatible, or an operation
     /// requiring a finite representative (KeepBest or PrintFunction) cannot

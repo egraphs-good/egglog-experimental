@@ -605,9 +605,19 @@ fixtures do not establish full frontend or desugar/proof-checker-context conform
   the producer. Frontend CSV input decodes to ordinary declarations/actions;
   file and pretty output render structured observations. `function_size` and
   `function_values` use `PrintSize` and `PrintFunction` results respectively.
-  Standalone `Check` responses support `check_bool`/`check_fail`: distinguish
-  success from `CHECK_FAILED` and propagate other failures. General `fail`
-  remains external test-harness logic, not a catch or rollback inside a Program.
+  Standalone `Check` responses support `check_bool`: distinguish success from
+  `CHECK_FAILED` and propagate other failures. `check_fail` authors
+  `Command.fail(Check)`; recursive `Command.fail` preserves native expected
+  failure, including nesting, before proof expansion. It catches only the
+  native execution anchor, suppresses that anchor's outputs on either outcome,
+  and retains completed effects and earlier outputs. Unexpected success is
+  `EVALUATION_FAILED`; preparation and helper failures outside the anchor still
+  propagate. Requested Check planning remains in its native execution phase.
+  Fail adds no binding, command-list, Union, or iteration scope. Its wrappers
+  are transparent to command paths, including wrapped loops and profiled Runs.
+  This schema addition does not establish adapter execution support: unsupported
+  wrapped operations must reject before effects. Declarations/rules are not
+  Commands, so expected failure around installation remains a representation gap.
   Frontend `push`/`pop` can use a `CloneEGraph` handle stack. Native extraction's
   best-count zero lowers to `variants = 1`; this IR accepts literal counts only.
   Exact graph-owned `lookup_function_value` results and values passed to custom

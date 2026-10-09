@@ -9,6 +9,116 @@ from protovalidate import ValidationError, validate
 from gen.python.egglog.v1 import egglog_pb as ir
 
 
+class ExpectedFailureSchemaTests(unittest.TestCase):
+    def test_nested_fail_roundtrips_with_distinct_wrapper_and_leaf_spans(self):
+        for kind in (
+            Oneof("check", ir.Check()),
+            Oneof("prove", ir.Prove()),
+            Oneof("prove_exists", ir.ProveExists(constructor="Goal")),
+            Oneof("action", ir.Action(kind=Oneof("panic", "expected"))),
+            Oneof("run", ir.Run(ruleset=ir.RulesetRef(kind=Oneof("name", "")))),
+        ):
+            with self.subTest(kind=kind.field):
+                command = ir.Command(kind=kind, span=ir.Span(start=12, end=19))
+                for start in (6, 0):
+                    command = ir.Command(
+                        kind=Oneof("fail", command), span=ir.Span(start=start, end=20),
+                    )
+                program = ir.Program(
+                    ir_version=1, files=[ir.SourceFile(name="expected.egg")],
+                    commands=[command],
+                )
+                validate(program)
+                for decoded in (
+                    ir.Program.from_binary(program.to_binary()),
+                    ir.Program.from_json(program.to_json()),
+                ):
+                    validate(decoded)
+                    self.assertEqual(decoded, program)
+                    self.assertEqual(decoded.commands[0].kind.value.kind.value.kind, kind)
+                self.assertEqual(
+                    json.loads(program.to_json())["commands"][0]["fail"]["fail"]["span"]["start"],
+                    12,
+                )
+
+    def test_fail_uses_tag_16_and_requires_a_command_at_every_depth(self):
+        nested = ir.Command(kind=Oneof("fail", ir.Command(kind=Oneof(
+            "fail", ir.Command(kind=Oneof("check", ir.Check())),
+        ))))
+        self.assertEqual(nested.to_binary(), bytes.fromhex("8201058201021200"))
+        for encoded in ("", "820100", "820103820100", "8201038a0100"):
+            # The last child contains unknown arm 17, not an expected failure.
+            with self.subTest(encoded=encoded), self.assertRaises(ValidationError):
+                validate(ir.Command.from_binary(bytes.fromhex(encoded)))
+        for invalid in (
+            ir.Command(),
+            ir.Command(kind=Oneof("action", ir.Action())),
+            ir.Command(kind=Oneof("run", ir.Run())),
+            ir.Command(kind=Oneof("prove_exists", ir.ProveExists())),
+            ir.Command(kind=Oneof("check", ir.Check()), span=ir.Span(start=2, end=1)),
+        ):
+            for _ in range(2):
+                invalid = ir.Command(kind=Oneof("fail", invalid))
+            with self.subTest(command=invalid), self.assertRaises(ValidationError):
+                validate(ir.Program(ir_version=1, commands=[invalid]))
+
+    def test_fail_and_loop_nesting_keep_existing_location_shape(self):
+        leaf = ir.Command(kind=Oneof("fail", ir.Command(kind=Oneof("check", ir.Check()))))
+        for kind in (
+            Oneof("repeat", ir.Repeat(body=[leaf], times=1)),
+            Oneof("saturate", ir.Saturate(body=[leaf], max_iterations=1)),
+        ):
+            with self.subTest(kind=kind.field):
+                program = ir.Program(ir_version=1, commands=[
+                    ir.Command(kind=Oneof("fail", ir.Command(kind=kind))),
+                ])
+                validate(program)
+                self.assertEqual(ir.Program.from_binary(program.to_binary()), program)
+        # Wrappers add no list indices or loop coordinates. Request matching,
+        # catch behavior, and output suppression still require the adapter.
+        error = ir.Error(
+            code=ir.ErrorCode.EVALUATION_FAILED, message="expected failure did not occur",
+            location=ir.CommandLocation(path=[0, 0], iterations=[0]),
+        )
+        validate(error)
+        self.assertEqual(ir.Error.from_binary(error.to_binary()), error)
+        validate(ir.StaticCommandPath(path=[0, 0]))
+        validate(ir.RunSummary(command_path=[0, 0], invocations=1))
+        for location in (
+            ir.CommandLocation(path=[0, 0], iterations=[]),
+            ir.CommandLocation(path=[0, 0], iterations=[0, 0]),
+        ):
+            with self.subTest(location=location), self.assertRaises(ValidationError):
+                validate(location)
+
+    def test_existing_command_arm_bytes_are_unchanged(self):
+        # Captured from immutable S1fc before adding Command.fail.
+        cases = [
+            ("action", ir.Action(kind=Oneof("panic", "expected")), "0a0a22086578706563746564"),
+            ("check", ir.Check(), "1200"),
+            ("run", ir.Run(ruleset=ir.RulesetRef(kind=Oneof("name", ""))), "1a040a021200"),
+            ("bind_scheduler", ir.BindScheduler(
+                name="s", scheduler=ir.Scheduler(kind=Oneof("back_off", ir.BackOff())),
+            ), "22070a017312020a00"),
+            ("keep_best", ir.KeepBest(tables=["C"], extractor=ir.Extractor.TREE), "2a050a01431001"),
+            ("extract", ir.Extract(roots=[0], variants=1, extractor=ir.Extractor.TREE), "32070a010010011801"),
+            ("freeze", ir.Freeze(), "3a00"),
+            ("print_size", ir.PrintSize(), "4200"),
+            ("print_function", ir.PrintFunction(table="C"), "4a030a0143"),
+            ("print_table_stats", ir.PrintTableStats(), "5200"),
+            ("repeat", ir.Repeat(times=0), "5a021800"),
+            ("saturate", ir.Saturate(), "6200"),
+            ("prove", ir.Prove(), "7200"),
+            ("prove_exists", ir.ProveExists(constructor="C"), "7a030a0143"),
+        ]
+        for field, payload, encoded in cases:
+            with self.subTest(field=field):
+                command = ir.Command(kind=Oneof(field, payload))
+                validate(command)
+                self.assertEqual(command.to_binary(), bytes.fromhex(encoded))
+                self.assertEqual(ir.Command.from_binary(bytes.fromhex(encoded)), command)
+
+
 class PublicationSchemaTests(unittest.TestCase):
     def test_ruleset_publication_absence_is_not_an_empty_confirmation(self):
         absent = ir.RunProgramResponse.from_binary(b"")
