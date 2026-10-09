@@ -571,8 +571,12 @@ inspection. The Rust messages are also the reusable `egglog-proto` crate at
 `gen/rust`; its handwritten `Cargo.toml` and `lib.rs` include the generated
 message file directly. Core pins a published revision of this leaf and exposes
 it as `egglog::proto`; experimental consumes that re-export, not a second local
-leaf dependency. Schema updates follow schema/leaf revision S → core revision C
-→ experimental revision E, preserving one Rust message package identity.
+leaf dependency. Schema updates require a coherent schema/leaf S → core C
+→ experimental E dependency graph, preserving one Rust message package identity.
+Local experiments can use a task-owned Cargo `--config` file that patches all
+core workspace packages to one checkout. Use that configuration and its matching
+lockfile for every build, test and catalog export; keep the immutable schema leaf
+unchanged. This local wiring does not require publishing integration revisions.
 Python packaging remains a later migration step.
 Python uses `protobuf-py`, with `protovalidate` for validation; versions are
 locked in `uv.lock`. The Rust messages use `prost` (tested with 0.14.4).
@@ -764,7 +768,13 @@ Pair similarly registers one arity-two family and exact
 They retain native aliases `pair`/`pair-first`/`pair-second`, implementation
 identities and proof validators. Pair payloads lower only in the temporary
 execution/rendering copy; canonical saved declarations/defaults stay intact.
-Pair currently has Egglog callable views only, not new Python/Rust authoring APIs.
+Pair's family presentation names `egglog.builtins.Pair<L, R>` in Python and
+`egglog_experimental::typed::builtins::Pair<L, R>` in Rust. Python has an
+initializer with ordered `left`/`right` parameters and `left`/`right` properties;
+Rust has `new` and borrowed `first`/`second` views. These are native-derived
+presentation records, not a claim that frontend generation is complete.
+Python `.value` and Rust `fields()` remain language-side inspection contracts,
+not additional engine primitives.
 
 This checkpoint does not implement complete `Freeze`, other Vec operations,
 generic Map/Fn definitions, wrapper generation, custom

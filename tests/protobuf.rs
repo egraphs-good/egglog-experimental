@@ -1240,6 +1240,14 @@ fn pair_value_bytes_extract_reingest_and_render() {
     let mut renderer = Renderer::default();
     let mut native = new_experimental_egraph();
     for _ in 0..2 {
+        // Reattach the authoritative views to both authored and returned arenas.
+        // The second pass exercises signature/owner relocation around result sorts.
+        for key in ["make", "first", "second"] {
+            native
+                .type_info()
+                .export_builtin_definition(&format!("egglog.core.pair.{key}"), &mut program)
+                .unwrap();
+        }
         let decoded = pb::Program::decode(program.encode_to_vec().as_slice()).unwrap();
         assert_eq!(decoded, program);
         let response = run(&mut engine, id, decoded);
@@ -1314,6 +1322,20 @@ fn pair_source_calls_execute_through_bytes() {
     let mut results = vec![];
     for phase in Source::new(None, text).unwrap() {
         let program = pb::Program::decode(phase.unwrap().encode_to_vec().as_slice()).unwrap();
+        for declaration in &program.declarations {
+            if let Some(pb::declaration::Kind::HostPrimitive(p)) = &declaration.kind
+                && p.name.starts_with("egglog.core.pair.")
+            {
+                let bindings = declaration.bindings.as_ref().unwrap();
+                assert!(bindings.python.is_some() && bindings.rust.is_some());
+                let mut expected = program.clone();
+                native
+                    .type_info()
+                    .export_builtin_definition(&p.name, &mut expected)
+                    .unwrap();
+                assert_eq!(program, expected, "source must retain exact native views");
+            }
+        }
         for node in &program.nodes {
             if let Some(pb::node::Kind::Call(call)) = &node.kind {
                 assert!(!matches!(
@@ -1345,6 +1367,87 @@ fn pair_source_calls_execute_through_bytes() {
         ]
     );
     assert_eq!(results, ["1", "\"x\"", "(pair 1 \"x\")"]);
+}
+
+#[test]
+fn pair_presentations_resupply_and_clone_freeze_before_writes() {
+    use egglog_experimental::protobuf::source::Renderer;
+    let mut provider = new_experimental_egraph();
+    let mut program = constant_fixture(&["test", "CURRENT"], &["test", "EMPTY"]);
+    for key in ["make", "first", "second"] {
+        provider
+            .type_info()
+            .export_builtin_definition(&format!("egglog.core.pair.{key}"), &mut program)
+            .unwrap();
+    }
+    let mut engine = Engine::default();
+    let id = create(&mut engine);
+    let mut renderer = Renderer::default();
+    for _ in 0..2 {
+        assert_eq!(run(&mut engine, id, program.clone()).error, None);
+        provider
+            .parse_and_run_program(None, &renderer.render(&program).unwrap())
+            .unwrap();
+    }
+    let clone = pb::CloneEGraphResponse::decode(
+        engine
+            .clone_egraph(&pb::CloneEGraphRequest { egraph_id: id }.encode_to_vec())
+            .unwrap()
+            .as_slice(),
+    )
+    .unwrap()
+    .egraph_id;
+    for conflict in 0..4 {
+        let mut changed = program.clone();
+        changed.commands.truncate(1); // Would change current=20 back to10.
+        for declaration in &mut changed.declarations {
+            if conflict < 2 {
+                if let Some(pb::declaration::Kind::HostSortFamily(f)) = &mut declaration.kind
+                    && f.name == "Pair"
+                {
+                    let b = f.bindings.as_mut().unwrap();
+                    let binding = if conflict == 0 {
+                        &mut b.python
+                    } else {
+                        &mut b.rust
+                    };
+                    *binding.as_mut().unwrap().path.last_mut().unwrap() = "OtherPair".into();
+                }
+            } else if matches!(&declaration.kind, Some(pb::declaration::Kind::HostPrimitive(p)) if p.name == "egglog.core.pair.first")
+            {
+                let b = declaration.bindings.as_mut().unwrap();
+                if conflict == 2 {
+                    b.python.as_mut().unwrap().views[0].path[0] = "other_left".into();
+                } else {
+                    b.rust.as_mut().unwrap().views[0]
+                        .receiver
+                        .as_mut()
+                        .unwrap()
+                        .borrowed = false;
+                }
+            }
+        }
+        assert!(renderer.render(&changed).is_err());
+        for handle in [id, clone] {
+            let response = run(&mut engine, handle, changed.clone());
+            assert_eq!(
+                response.error.unwrap().code,
+                pb::ErrorCode::InvalidProgram as i32
+            );
+            assert!(response.outputs.is_empty());
+        }
+    }
+    program.declarations.clear();
+    program.commands = vec![program.commands.last().unwrap().clone()];
+    for handle in [id, clone] {
+        let response = run(&mut engine, handle, program.clone());
+        assert_eq!(response.error, None);
+        let Some(pb::command_output::Kind::Extraction(extraction)) = &response.outputs[0].kind
+        else {
+            unreachable!()
+        };
+        assert_eq!(value(&response, extraction.roots[0].variants[0].term), "20");
+    }
 }
 
 #[test]
