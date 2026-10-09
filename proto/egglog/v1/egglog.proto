@@ -1738,14 +1738,15 @@ message PrintSize {
 
 // Rows of one table as extracted representative terms, including subsumed
 // rows. Alternative producers and e-class identity are not preserved. Returns
-// `PrintedFunction` only if every cell of every selected row has a finite
-// extraction. Otherwise the whole command fails with EXTRACTION_FAILED: no
-// partial PrintedFunction is emitted, earlier outputs/effects remain, and
-// later commands do not run. Unselected rows do not affect this requirement.
+// `PrintedFunction` with each selected cell's finite representative or explicit
+// unavailability. No finite extraction is not a command failure; actual
+// extraction/encoding errors still fail the command without a partial output.
+// Earlier outputs/effects remain on error, and later commands do not run.
 message PrintFunction {
   string table = 1 [(buf.validate.field).string.min_len = 1];
-  // Zero selects every row.
-  uint64 max_rows = 2;
+  // Absent selects every row; present zero selects no rows. The table must
+  // exist even when no rows are selected.
+  optional uint64 max_rows = 2;
 }
 
 // Report structural statistics for selected tables, or all visible tables.
@@ -2090,7 +2091,9 @@ message RunProgramResponse {
     expression:
       "this.outputs.all(o, "
       "(!has(o.printed_function) || o.printed_function.rows.all(r, "
-      "(r.args + [r.output]).all(i, i < uint(size(this.nodes))))) && "
+      "(r.args + [r.output]).all(c, "
+      "(has(c.term) && c.term < uint(size(this.nodes))) || "
+      "(has(c.unavailable_sort) && c.unavailable_sort < uint(size(this.sorts)))))) && "
       "(!has(o.table_stats) || o.table_stats.stats.all(t, "
       "t.columns.all(c, c.sort < uint(size(this.sorts))))))"
   };
@@ -2889,21 +2892,37 @@ message TableSizes {
   repeated TableSize sizes = 1;
 }
 
-// Fully extracted selected rows from one successful PrintFunction command.
+// Selected rows from one successful PrintFunction command, in native scan
+// order. Unavailable cells do not omit, reorder or deduplicate rows.
 message PrintedFunction {
   string table = 1;
   repeated FunctionRow rows = 2;
 }
 
-// One extracted table row. A relation row's output is `PrimitiveValue.unit`.
-// Every argument and output has finite extraction; an unavailable cell makes
-// the entire PrintFunction command fail instead of omitting or marking a row.
-// The enclosing PrintedFunction.table identifies the table. Cells are ordinary
-// values, not a synthetic row-position Call or a re-evaluated table lookup.
+// One selected table row. A relation row's output is `PrimitiveValue.unit`.
+// Every input and the output retains its position, whether available or not.
+// The enclosing PrintedFunction.table identifies the table. Available cells
+// are ordinary values, not synthetic row-position Calls or re-evaluated lookups.
 message FunctionRow {
-  repeated uint32 args = 1 [packed = true]; // indices into `RunProgramResponse.nodes`
-  uint32 output = 2; // index into `RunProgramResponse.nodes`
+  repeated TableCell args = 1;
+  TableCell output = 2 [(buf.validate.field).required = true];
   bool subsumed = 3;
+}
+
+// A finite extracted representative, or its concrete sort when no finite
+// representative exists. Unavailability is not a fabricated term or a general
+// error fallback: extraction/encoding errors remain command errors.
+// An unavailable cell carries no e-class identity; sharing its sort does not
+// imply equality with another unavailable cell.
+message TableCell {
+  oneof kind {
+    option (buf.validate.oneof).required = true;
+    // Index into RunProgramResponse.nodes; that Node carries the cell's sort.
+    uint32 term = 1;
+    // Index into RunProgramResponse.sorts, preserving the unavailable cell's
+    // type without allocating a dummy Node. The sort must be recursively closed.
+    uint32 unavailable_sort = 2;
+  }
 }
 
 // Per-table statistics.

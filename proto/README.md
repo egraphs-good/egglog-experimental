@@ -490,10 +490,29 @@ result completed before trailing maintenance fails remains in the output prefix.
 RunOutcome keeps the requested native schedule's `updated`/`can_stop`, including
 inline helper work; exclusive profiling does not redefine those flags.
 
-`PrintedFunction.table` identifies rows whose argument/output cells are ordinary
-extracted values; relation outputs are Unit. Any cell without finite extraction
-fails the whole command. Table statistics pair each exact response sort reference
-with its distinct-value count, in input order followed by output.
+`PrintFunction.max_rows` is optional: absent selects all rows, present zero
+selects none, and a positive value bounds the native scan prefix. The target
+must exist even for zero rows. `PrintedFunction.table` identifies rows whose
+argument/output `TableCell`s contain either an ordinary extracted node reference
+or an `unavailable_sort` response-sort reference when no finite representative
+exists. Positions, multiplicity and subsumed flags remain intact; relation
+outputs are Unit. Unavailability is not a dummy term and does not fail the
+command. Actual extraction/encoding errors still fail without partial output;
+earlier effects/outputs remain and later commands do not run. Table statistics
+pair each exact response sort reference with its distinct-value count, in input
+order followed by output.
+
+This draft refinement supersedes whole-table failure for unavailable cells and
+requires coordinated schema, engine and frontend pins. It keeps `ir_version = 1`,
+but FunctionRow's old integer references and new cell messages are not compatible
+reader layouts. Omitted max_rows bytes retain the all-rows meaning; explicit
+zero now means zero. Rust generates `Option<u64>`; Python readers must use
+`has_field("max_rows")`, since its scalar getter returns zero even when absent.
+This schema change does not establish adapter/source execution parity. The
+next finite adapter checkpoint covers only admitted Constructor/Function
+tables; a Unit-output Function is a cell-codec control, not Relation support.
+Real Relation admission, CSV/file output, encoded table observation and
+Fail-observation remain separate required conformance gates.
 
 Opt-in `ProfileSummary.runs` aggregates by static authored `Run` site and
 response-local rule occurrence. `maintenance` separately aggregates internal

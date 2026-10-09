@@ -1571,17 +1571,18 @@ pub struct PrintSize {
 }
 /// Rows of one table as extracted representative terms, including subsumed
 /// rows. Alternative producers and e-class identity are not preserved. Returns
-/// `PrintedFunction` only if every cell of every selected row has a finite
-/// extraction. Otherwise the whole command fails with EXTRACTION_FAILED: no
-/// partial PrintedFunction is emitted, earlier outputs/effects remain, and
-/// later commands do not run. Unselected rows do not affect this requirement.
+/// `PrintedFunction` with each selected cell's finite representative or explicit
+/// unavailability. No finite extraction is not a command failure; actual
+/// extraction/encoding errors still fail the command without a partial output.
+/// Earlier outputs/effects remain on error, and later commands do not run.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct PrintFunction {
     #[prost(string, tag = "1")]
     pub table: ::prost::alloc::string::String,
-    /// Zero selects every row.
-    #[prost(uint64, tag = "2")]
-    pub max_rows: u64,
+    /// Absent selects every row; present zero selects no rows. The table must
+    /// exist even when no rows are selected.
+    #[prost(uint64, optional, tag = "2")]
+    pub max_rows: ::core::option::Option<u64>,
 }
 /// Report structural statistics for selected tables, or all visible tables.
 /// Returns `TableStatsResult`.
@@ -2520,7 +2521,8 @@ pub struct TableSizes {
     #[prost(message, repeated, tag = "1")]
     pub sizes: ::prost::alloc::vec::Vec<TableSize>,
 }
-/// Fully extracted selected rows from one successful PrintFunction command.
+/// Selected rows from one successful PrintFunction command, in native scan
+/// order. Unavailable cells do not omit, reorder or deduplicate rows.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct PrintedFunction {
     #[prost(string, tag = "1")]
@@ -2528,21 +2530,41 @@ pub struct PrintedFunction {
     #[prost(message, repeated, tag = "2")]
     pub rows: ::prost::alloc::vec::Vec<FunctionRow>,
 }
-/// One extracted table row. A relation row's output is `PrimitiveValue.unit`.
-/// Every argument and output has finite extraction; an unavailable cell makes
-/// the entire PrintFunction command fail instead of omitting or marking a row.
-/// The enclosing PrintedFunction.table identifies the table. Cells are ordinary
-/// values, not a synthetic row-position Call or a re-evaluated table lookup.
-#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+/// One selected table row. A relation row's output is `PrimitiveValue.unit`.
+/// Every input and the output retains its position, whether available or not.
+/// The enclosing PrintedFunction.table identifies the table. Available cells
+/// are ordinary values, not synthetic row-position Calls or re-evaluated lookups.
+#[derive(Clone, PartialEq, ::prost::Message)]
 pub struct FunctionRow {
-    /// indices into `RunProgramResponse.nodes`
-    #[prost(uint32, repeated, tag = "1")]
-    pub args: ::prost::alloc::vec::Vec<u32>,
-    /// index into `RunProgramResponse.nodes`
-    #[prost(uint32, tag = "2")]
-    pub output: u32,
+    #[prost(message, repeated, tag = "1")]
+    pub args: ::prost::alloc::vec::Vec<TableCell>,
+    #[prost(message, optional, tag = "2")]
+    pub output: ::core::option::Option<TableCell>,
     #[prost(bool, tag = "3")]
     pub subsumed: bool,
+}
+/// A finite extracted representative, or its concrete sort when no finite
+/// representative exists. Unavailability is not a fabricated term or a general
+/// error fallback: extraction/encoding errors remain command errors.
+/// An unavailable cell carries no e-class identity; sharing its sort does not
+/// imply equality with another unavailable cell.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct TableCell {
+    #[prost(oneof = "table_cell::Kind", tags = "1, 2")]
+    pub kind: ::core::option::Option<table_cell::Kind>,
+}
+/// Nested message and enum types in `TableCell`.
+pub mod table_cell {
+    #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Oneof)]
+    pub enum Kind {
+        /// Index into RunProgramResponse.nodes; that Node carries the cell's sort.
+        #[prost(uint32, tag = "1")]
+        Term(u32),
+        /// Index into RunProgramResponse.sorts, preserving the unavailable cell's
+        /// type without allocating a dummy Node. The sort must be recursively closed.
+        #[prost(uint32, tag = "2")]
+        UnavailableSort(u32),
+    }
 }
 /// Per-table statistics.
 #[derive(Clone, PartialEq, ::prost::Message)]
