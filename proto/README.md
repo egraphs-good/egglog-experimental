@@ -123,7 +123,7 @@ arenas contain no variables; a nested exported `Program` may include signature
 patterns. CEL checks direct bounds, variable roots, and declared family uses.
 Recursive closedness, binder scope, signature matching, family resolution, and
 compatible descriptor resends are semantic checks. The executable subset below
-implements these for its supported scalar/Vec/Pair signatures and declarations.
+implements these for its supported scalar/Vec/Pair/Map signatures and declarations.
 
 **Decided:** each core callable has one unique name across user and host
 definitions; the core does not select from same-name overloads. Frontends lower
@@ -622,7 +622,7 @@ effects and observations. Native ASTs are transient lowering products.
 
 The current executable subset is deliberately limited:
 
-- Equality sorts, the five scalar host sorts and nested Vec/Pair applications; explicit constructor/function
+- Equality sorts, the five scalar host sorts and nested Vec/Pair/Map applications; explicit constructor/function
   declarations with scalar static costs and merge bodies using values,
   old/new variables, and constructors.
 - Ordered actions and persistent captures expressed as nullary function sets.
@@ -634,14 +634,16 @@ The current executable subset is deliberately limited:
 - Generic Vec empty/of/get, ordered Vec value payloads and extracted Vec data.
 - Generic Pair construction/first/second, ordered Pair value payloads and
   extracted/table Pair data, including nested Vec/Pair and equality-sort children.
+- Generic Map empty/from-pairs/get/insert, ordered Map value payloads and
+  extracted/table Map data, including nested containers and equality-sort keys.
 - Compatible EqSort/Constructor/Function resupply, with canonical protobuf
   declaration/default closures retained across requests and clones. Each
   language block is fixed on its first supply; absent later blocks do not erase
   it. References compare structurally, including shared Union default topology.
-- Python/Rust scalar type and addition views and Rust Vec type/empty/of/get
+- Python/Rust scalar type and addition views and Vec type/empty/of/get
   views supplied by native registration; intact user sort/callable views,
   including ownerless Python CONSTANT views on nullary constructors/functions
-  and closed scalar/Vec/Pair initializer defaults.
+  and closed scalar/Vec/Pair/Map initializer defaults.
   Default calls are checked, never evaluated during installation/export. Actual
   omitted-argument expansion remains the frontend's responsibility.
 
@@ -667,7 +669,7 @@ an EGraph during authoring. Pin the generating core/experimental/leaf revisions;
 the resource can be checked against the runtime provider by submitting its
 declarations in an empty-command request. This is a partial catalog, not Freeze.
 Lambda/partial-call defaults, other value codecs and unsupported execution forms
-remain explicit gaps; scalar/Vec/Pair default checking does not establish their
+remain explicit gaps; scalar/Vec/Pair/Map default checking does not establish their
 compatibility. Native text rendering preserves executable semantics, not Python
 or Rust presentation metadata.
 
@@ -721,7 +723,7 @@ small semantic roundtrip checkpoint, not migration of the source corpus.
 Container phases use `protobuf::source::Renderer::default()` and its `render`
 method, retaining the type/definition state across phases. Compatible declaration
 resupplies are checked but not emitted as duplicate native declarations. It emits each closed
-structural Vec sort once, including children before parents; rendering executes
+structural container sort once, including children before parents; rendering executes
 no user actions. The stateless `render` entrypoint retains the scalar subset
 and explicitly rejects container phases. Native source resolution remains
 nominal, so two source aliases for Vec<i64> do not become interchangeable before
@@ -788,8 +790,9 @@ typing of an empty Vec even with several concrete shapes installed. These
 compiler lookup keys never become wire declarations or exported sort names.
 Rust presentation names the family `egglog_experimental::typed::builtins::Vec<T>`:
 `empty`/`of` are associated views, `of` maps the variadic tail, and `get` borrows
-its receiver. Python Vec views remain absent; neither language's frontend
-generation is inferred from registration alone.
+its receiver. Python names `egglog.builtins.Vec<T>` with a variadic initializer,
+an `empty` class method and `__getitem__`; neither language's frontend generation
+is inferred from registration alone.
 
 Pair similarly registers one arity-two family and exact
 `egglog.core.pair.make`/`first`/`second` definitions before instances exist.
@@ -804,8 +807,31 @@ presentation records, not a claim that frontend generation is complete.
 Python `.value` and Rust `fields()` remain language-side inspection contracts,
 not additional engine primitives.
 
+Map registers `egglog.core.map.empty`/`of`/`get`/`insert` before instances exist.
+The sole canonical `of` signature takes one `Vec<Pair<K,V>>`, including computed
+vectors; its direct native alias is `map-from-pairs`. Legacy flat `map-of`
+remains a native compatibility facade, not another wire callable. The source
+producer lowers children first, then invokes the actual resolved primitive's
+export recipe to preserve ordered references and spans while packing Pair/Vec
+calls. It does not recognize arbitrary user calls by their spelling.
+
+`MapValue` payloads similarly lower only in the temporary execution/rendering
+copy. Missing, out-of-range, cyclic and mistyped children, including unused
+payloads, reject before request actions. Canonical saved defaults retain their
+ordered entries and shared references without accumulating helper nodes.
+Native construction supplies duplicate-key last-write-wins; output uses the
+existing flat native term, actual Map sort provenance and shared encode cache.
+The adapter adds no sorting or deduplication policy. Same-headed user calls in
+the wire callable namespace remain Calls, even where native source would reject
+the name collision. Equality-key rebuild retains the native policy.
+
+Map's Python/Rust family views are `egglog.builtins.Map<K,V>` and
+`egglog_experimental::typed::builtins::Map<K,V>`, with `empty`, `from_pairs`,
+lookup (`__getitem__`/`get`) and immutable `insert`. These registration records
+do not establish frontend execution or proof-mode conformance.
+
 This checkpoint does not implement complete `Freeze`, other Vec operations,
-generic Map/Fn definitions, wrapper generation, custom
+other Map operations, generic Fn definitions, wrapper generation, custom
 codecs or capability/proof metadata export. The generic signature/family records
 remain the compiler input; opaque constraints are never scraped into a
 second signature registry. In core, run

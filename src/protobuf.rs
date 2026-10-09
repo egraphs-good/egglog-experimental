@@ -1,6 +1,6 @@
 //! In-process compatibility adapter for encoded protobuf requests.
 //!
-//! This executable slice supports concrete equality/scalar/Vec/Pair sorts,
+//! This executable slice supports concrete equality/scalar/Vec/Pair/Map sorts,
 //! constructors, functions, ordered actions, flat named rulesets, checks,
 //! extraction, and table observations. Unsupported forms fail explicitly before
 //! installation. In particular, profiling must currently be requested: the
@@ -356,6 +356,9 @@ impl Session {
                     .map_err(|error| error.to_string())?;
             }
         }
+        // Container payloads may introduce the Pair/Vec sorts used to construct
+        // a Map. Only this staged execution copy receives those helper records.
+        lower_container_values(program)?;
         let materialized = materialize_sorts(program, &mut staged.graph)?;
         for (index, sort) in program.sorts.iter().enumerate() {
             native_span(program, sort.span.as_ref())?;
@@ -373,7 +376,6 @@ impl Session {
             }
         }
         validate_host_declarations(program, &mut staged.graph)?;
-        lower_container_values(program)?;
         // The canonical records above remain intact. The execution/rendering
         // copy contains only genuinely new native declarations.
         program.declarations = std::mem::take(&mut program.declarations)
@@ -1095,7 +1097,9 @@ fn structural_sort_name(
                     .transpose()
             })
         }
-        Some(pb::sort::Kind::Family(family)) if family.name == "Pair" && family.args.len() == 2 => {
+        Some(pb::sort::Kind::Family(family))
+            if matches!(family.name.as_str(), "Pair" | "Map") && family.args.len() == 2 =>
+        {
             let first = structural_sort_name(sorts, family.args[0], active)?;
             let second = structural_sort_name(sorts, family.args[1], active)?;
             first
@@ -1105,7 +1109,8 @@ fn structural_sort_name(
                         return Err("native sort name exceeds adapter limit".into());
                     }
                     Ok(format!(
-                        "__egglog_proto_pair_{}_{}_{}_{}",
+                        "__egglog_proto_{}_{}_{}_{}_{}",
+                        family.name.to_ascii_lowercase(),
                         first.len(),
                         first,
                         second.len(),
@@ -1123,7 +1128,7 @@ fn structural_sort_name(
         {
             Ok(Some(family.name.clone()))
         }
-        _ => Err("only equality, scalar, Vec and Pair sorts are supported yet".into()),
+        _ => Err("only equality, scalar, Vec, Pair and Map sorts are supported yet".into()),
     };
     active.remove(&index);
     result
@@ -1275,7 +1280,7 @@ fn lower_builtin_calls(program: &mut pb::Program, graph: &mut EGraph) -> Result<
     Ok(())
 }
 
-// The native Vec/Pair constructors intern these ordered container payloads.
+// The native container constructors intern these ordered payloads.
 // Validate contents first; the resulting calls are internal compatibility code,
 // never a claim that the wire value payload was a symbolic authored Call.
 fn lower_container_values(program: &mut pb::Program) -> Result<(), String> {
@@ -1297,6 +1302,23 @@ fn lower_container_values(program: &mut pb::Program) -> Result<(), String> {
                         pair.second.ok_or("missing Pair second child")?,
                     ],
                 ),
+                pb::primitive_value::Value::Map(map) => (
+                    "Map",
+                    2,
+                    "egglog.core.map.of",
+                    map.entries
+                        .iter()
+                        .map(|entry| {
+                            Ok([
+                                entry.key.ok_or("missing Map key child")?,
+                                entry.value.ok_or("missing Map value child")?,
+                            ])
+                        })
+                        .collect::<Result<Vec<_>, String>>()?
+                        .into_iter()
+                        .flatten()
+                        .collect(),
+                ),
                 _ => continue,
             };
             let Some(pb::sort::Kind::Family(family)) = program
@@ -1315,14 +1337,63 @@ fn lower_container_values(program: &mut pb::Program) -> Result<(), String> {
                 .map(|i| sort_name(&program.sorts, *i))
                 .collect::<Result<Vec<_>, _>>()?;
             for (position, item) in args.iter().enumerate() {
-                if node_sort(program, *item)? != expected[if arity == 1 { 0 } else { position }] {
+                if node_sort(program, *item)? != expected[position % arity] {
                     return Err(format!("{name} payload element sort mismatch"));
                 }
             }
-            replacements.push((index, key, args));
+            replacements.push((
+                index,
+                key,
+                args,
+                (name == "Map").then(|| family.args.clone()),
+            ));
         }
     }
-    for (index, key, args) in replacements {
+    for (index, key, mut args, map_parameters) in replacements {
+        if let Some(parameters) = map_parameters {
+            let mut sorts = program.sorts.clone();
+            let pair_sort = u32::try_from(sorts.len()).map_err(|_| "too many sorts")?;
+            sorts.push(pb::Sort {
+                kind: Some(pb::sort::Kind::Family(pb::HostSort {
+                    name: "Pair".into(),
+                    args: parameters,
+                })),
+                ..Default::default()
+            });
+            let vector_sort = u32::try_from(sorts.len()).map_err(|_| "too many sorts")?;
+            sorts.push(pb::Sort {
+                kind: Some(pb::sort::Kind::Family(pb::HostSort {
+                    name: "Vec".into(),
+                    args: vec![pair_sort],
+                })),
+                ..Default::default()
+            });
+            let pair_sort = egglog::builtin::import_sort(&sorts, pair_sort, &mut program.sorts)?;
+            let vector_sort =
+                egglog::builtin::import_sort(&sorts, vector_sort, &mut program.sorts)?;
+            let mut pairs = vec![];
+            for fields in args.chunks_exact(2) {
+                pairs.push(u32::try_from(program.nodes.len()).map_err(|_| "too many nodes")?);
+                program.nodes.push(pb::Node {
+                    sort_id: pair_sort,
+                    kind: Some(pb::node::Kind::Call(pb::Call {
+                        func: "egglog.core.pair.make".into(),
+                        args: fields.to_vec(),
+                    })),
+                    span: program.nodes[index].span,
+                });
+            }
+            let entries = u32::try_from(program.nodes.len()).map_err(|_| "too many nodes")?;
+            program.nodes.push(pb::Node {
+                sort_id: vector_sort,
+                kind: Some(pb::node::Kind::Call(pb::Call {
+                    func: "egglog.core.vec.of".into(),
+                    args: pairs,
+                })),
+                span: program.nodes[index].span,
+            });
+            args = vec![entries];
+        }
         program.nodes[index].kind = Some(pb::node::Kind::Call(pb::Call {
             func: key.into(),
             args,
@@ -1396,7 +1467,7 @@ fn validate_host_declarations(program: &pb::Program, graph: &mut EGraph) -> Resu
                     .check_builtin_signature(program, primitive)?;
             }
             Some(pb::declaration::Kind::HostSortFamily(family)) => {
-                if matches!(family.name.as_str(), "Vec" | "Pair") {
+                if matches!(family.name.as_str(), "Vec" | "Pair" | "Map") {
                     let arity = if family.name == "Vec" { 1 } else { 2 };
                     if family.arity != arity || declaration.bindings.is_some() {
                         return Err(format!(
@@ -1794,6 +1865,34 @@ fn encode_term(
                 })),
             })
         }
+        Term::App(name, children) if name == "map-of" && sort.is_container_sort() => {
+            let sort_id = encode_sort(graph, names, sort, response)?;
+            let inner = sort.inner_sorts();
+            if !matches!(&response.sorts[sort_id as usize].kind, Some(pb::sort::Kind::Family(family)) if family.name == "Map" && family.args.len() == 2)
+                || !children.len().is_multiple_of(2)
+                || inner.len() != 2
+            {
+                return Err(egglog::Error::ExtractError(
+                    "Map term/sort/arity mismatch".into(),
+                ));
+            }
+            let entries = children
+                .chunks_exact(2)
+                .map(|fields| {
+                    Ok(pb::MapEntry {
+                        key: Some(encode_term(
+                            graph, names, terms, fields[0], &inner[0], response, cache,
+                        )?),
+                        value: Some(encode_term(
+                            graph, names, terms, fields[1], &inner[1], response, cache,
+                        )?),
+                    })
+                })
+                .collect::<Result<_, egglog::Error>>()?;
+            pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
+                value: Some(pb::primitive_value::Value::Map(pb::MapValue { entries })),
+            })
+        }
         Term::App(name, children) => {
             let signature = graph
                 .get_function(name)
@@ -1833,6 +1932,344 @@ fn encode_term(
 #[cfg(test)]
 mod tests {
     use super::*;
+    static HOST_DEFAULT_BODY_CALLS: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(0);
+
+    // These closure tests intentionally need a provider with no Python view.
+    // Vec's real Python metadata is now frozen and cannot serve that fixture.
+    fn host_default_engine() -> (Engine, u64) {
+        let mut engine = Engine::default();
+        let request = pb::CreateEGraphRequest {
+            sorts: vec![pb::Sort {
+                kind: Some(pb::sort::Kind::Family(pb::HostSort {
+                    name: "i64".into(),
+                    args: vec![],
+                })),
+                ..Default::default()
+            }],
+            options: Some(pb::EGraphOptions {
+                cost_sort: Some(0),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let id = pb::CreateEGraphResponse::decode(
+            engine.create(&request.encode_to_vec()).unwrap().as_slice(),
+        )
+        .unwrap()
+        .egraph_id;
+        let graph = &mut engine.graphs.get_mut(&id).unwrap().graph;
+        egglog::add_primitive!(
+            graph,
+            "test-default-identity"[id = "test.default.identity"] = |value: i64| -> i64 {
+                {
+                    HOST_DEFAULT_BODY_CALLS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    value
+                }
+            }
+        );
+        (engine, id)
+    }
+
+    fn run_host_default(
+        engine: &mut Engine,
+        egraph_id: u64,
+        program: pb::Program,
+    ) -> pb::RunProgramResponse {
+        let bytes = engine
+            .run(
+                &pb::RunProgramRequest {
+                    egraph_id,
+                    program: Some(program),
+                    profile: true,
+                }
+                .encode_to_vec(),
+            )
+            .unwrap();
+        pb::RunProgramResponse::decode(bytes.as_slice()).unwrap()
+    }
+
+    fn host_default_program(default_node: u32) -> pb::Program {
+        let (mut fixture, id) = host_default_engine();
+        let mut p = fixture
+            .graphs
+            .get_mut(&id)
+            .unwrap()
+            .graph
+            .type_info()
+            .builtin_catalog()
+            .unwrap()
+            .definitions;
+        let i64_sort = p.sorts.iter().position(|s| matches!(&s.kind, Some(pb::sort::Kind::Family(f)) if f.name == "i64" && f.args.is_empty())).unwrap() as u32;
+        p.nodes = vec![
+            pb::Node {
+                sort_id: i64_sort,
+                kind: Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
+                    value: Some(pb::primitive_value::Value::I64(i64::MAX)),
+                })),
+                ..Default::default()
+            },
+            pb::Node {
+                sort_id: i64_sort,
+                kind: Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
+                    value: Some(pb::primitive_value::Value::I64(1)),
+                })),
+                ..Default::default()
+            },
+            pb::Node {
+                sort_id: i64_sort,
+                kind: Some(pb::node::Kind::Call(pb::Call {
+                    func: "egglog.core.i64.add".into(),
+                    args: vec![0, 1],
+                })),
+                ..Default::default()
+            },
+            pb::Node {
+                sort_id: i64_sort,
+                kind: Some(pb::node::Kind::Call(pb::Call {
+                    func: "current".into(),
+                    args: vec![],
+                })),
+                ..Default::default()
+            },
+        ];
+        p.declarations.push(pb::Declaration {
+            kind: Some(pb::declaration::Kind::Function(pb::Function {
+                name: "current".into(),
+                inputs: vec![],
+                output: i64_sort,
+                merge: None,
+            })),
+            ..Default::default()
+        });
+        let get = p.declarations.iter_mut().find(|d| matches!(&d.kind, Some(pb::declaration::Kind::HostPrimitive(h)) if h.name == "test.default.identity")).unwrap();
+        get.bindings.as_mut().unwrap().python = Some(pb::PythonBindings {
+            views: vec![pb::PythonCallable {
+                kind: pb::PythonCallKind::Function.into(),
+                path: vec!["test".into(), "identity".into()],
+                params: vec![pb::PythonParameter {
+                    core_input: Some(0),
+                    name: "value".into(),
+                    default_expr: Some(default_node),
+                }],
+                ..Default::default()
+            }],
+        });
+        p
+    }
+
+    #[test]
+    fn host_binding_default_keeps_builtin_callee_context_without_evaluation() {
+        let (mut engine, id) = host_default_engine();
+        // MAX + 1 would fail if evaluated. It remains a valid closed template.
+        assert_eq!(
+            run_host_default(&mut engine, id, host_default_program(2)).error,
+            None
+        );
+        assert_eq!(
+            run_host_default(&mut engine, id, host_default_program(2)).error,
+            None
+        );
+        assert!(
+            run_host_default(&mut engine, id, host_default_program(1))
+                .error
+                .is_some()
+        );
+        assert_eq!(
+            HOST_DEFAULT_BODY_CALLS.load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+    }
+
+    #[test]
+    fn host_binding_default_keeps_user_callee_context_without_evaluation() {
+        let (mut engine, id) = host_default_engine();
+        assert_eq!(
+            run_host_default(&mut engine, id, host_default_program(3)).error,
+            None
+        );
+        let mut resend = host_default_program(3);
+        resend
+            .declarations
+            .retain(|d| !matches!(d.kind, Some(pb::declaration::Kind::Function(_))));
+        assert_eq!(
+            run_host_default(&mut engine, id, resend).error,
+            None,
+            "default can refer to an ambient installed table"
+        );
+        assert!(
+            run_host_default(&mut engine, id, host_default_program(1))
+                .error
+                .is_some()
+        );
+        assert_eq!(
+            HOST_DEFAULT_BODY_CALLS.load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+    }
+
+    #[test]
+    fn map_default_saved_closure_never_accumulates_execution_helpers() {
+        let program = pb::Program {
+            ir_version: 1,
+            sorts: vec![
+                pb::Sort {
+                    kind: Some(pb::sort::Kind::Family(pb::HostSort {
+                        name: "i64".into(),
+                        args: vec![],
+                    })),
+                    ..Default::default()
+                },
+                pb::Sort {
+                    kind: Some(pb::sort::Kind::Family(pb::HostSort {
+                        name: "Map".into(),
+                        args: vec![0, 0],
+                    })),
+                    ..Default::default()
+                },
+            ],
+            nodes: vec![
+                pb::Node {
+                    sort_id: 0,
+                    kind: Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
+                        value: Some(pb::primitive_value::Value::I64(7)),
+                    })),
+                    ..Default::default()
+                },
+                pb::Node {
+                    sort_id: 1,
+                    kind: Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
+                        value: Some(pb::primitive_value::Value::Map(pb::MapValue {
+                            entries: vec![
+                                pb::MapEntry {
+                                    key: Some(0),
+                                    value: Some(0)
+                                };
+                                2
+                            ],
+                        })),
+                    })),
+                    ..Default::default()
+                },
+            ],
+            declarations: vec![pb::Declaration {
+                kind: Some(pb::declaration::Kind::Function(pb::Function {
+                    name: "take_map".into(),
+                    inputs: vec![pb::Arg {
+                        name: "map".into(),
+                        sort: 1,
+                    }],
+                    output: 0,
+                    merge: None,
+                })),
+                bindings: Some(pb::CallableBindings {
+                    python: Some(pb::PythonBindings {
+                        views: vec![pb::PythonCallable {
+                            kind: pb::PythonCallKind::Function.into(),
+                            path: vec!["test".into(), "take_map".into()],
+                            params: vec![pb::PythonParameter {
+                                core_input: Some(0),
+                                name: "map".into(),
+                                default_expr: Some(1),
+                            }],
+                            ..Default::default()
+                        }],
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let mut engine = Engine::default();
+        let id = pb::CreateEGraphResponse::decode(
+            engine
+                .create(
+                    &pb::CreateEGraphRequest {
+                        sorts: vec![program.sorts[0].clone()],
+                        options: Some(pb::EGraphOptions {
+                            cost_sort: Some(0),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    }
+                    .encode_to_vec(),
+                )
+                .unwrap()
+                .as_slice(),
+        )
+        .unwrap()
+        .egraph_id;
+        let mut saved = None;
+        for _ in 0..4 {
+            let request = pb::RunProgramRequest {
+                egraph_id: id,
+                program: Some(program.clone()),
+                profile: true,
+            };
+            let response = pb::RunProgramResponse::decode(
+                engine.run(&request.encode_to_vec()).unwrap().as_slice(),
+            )
+            .unwrap();
+            assert_eq!(response.error, None);
+            let definitions = &engine.graphs[&id].definitions;
+            if let Some(previous) = &saved {
+                assert_eq!(
+                    definitions, previous,
+                    "resupply must not grow the saved closure"
+                );
+            }
+            assert_eq!(definitions.nodes.len(), 2);
+            assert!(
+                definitions
+                    .nodes
+                    .iter()
+                    .all(|n| matches!(n.kind, Some(pb::node::Kind::PrimitiveValue(_))))
+            );
+            let map = definitions
+                .nodes
+                .iter()
+                .find_map(|n| match &n.kind {
+                    Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
+                        value: Some(pb::primitive_value::Value::Map(map)),
+                    })) => Some(map),
+                    _ => None,
+                })
+                .unwrap();
+            assert_eq!(map.entries.len(), 2);
+            assert_eq!(map.entries[0], map.entries[1]);
+            assert_eq!(map.entries[0].key, map.entries[0].value);
+            saved = Some(definitions.clone());
+        }
+    }
+
+    #[test]
+    fn map_encoder_rejects_odd_native_terms_and_wrong_container_provenance() {
+        let mut graph = crate::new_experimental_egraph();
+        graph
+            .parse_and_run_program(None, "(sort M (Map i64 i64)) (sort V (Vec i64))")
+            .unwrap();
+        let mut terms = TermDag::default();
+        let child = terms.lit(Literal::Int(7));
+        let odd = terms.app("map-of".into(), vec![child]);
+        let even = terms.app("map-of".into(), vec![child, child]);
+        for (term, sort) in [(odd, "M"), (even, "V")] {
+            let mut response = pb::RunProgramResponse::default();
+            let mut cache = HashMap::new();
+            let result = encode_term(
+                &graph,
+                &NativeNames::default(),
+                &terms,
+                term,
+                &graph.get_sort_by_name(sort).unwrap(),
+                &mut response,
+                &mut cache,
+            );
+            assert!(matches!(result, Err(egglog::Error::ExtractError(_))));
+            assert!(response.nodes.is_empty());
+            assert!(cache.is_empty());
+        }
+    }
 
     #[test]
     fn creation_threads_match_native_policy_and_survive_clone() {

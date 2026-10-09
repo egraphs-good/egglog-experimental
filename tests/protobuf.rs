@@ -24,7 +24,14 @@ fn native_catalog_snapshot_is_deterministic_and_installs_as_bytes() {
         })
         .unwrap();
     let binding = family.bindings.as_ref().expect("native Vec metadata");
-    assert!(binding.python.is_none());
+    assert_eq!(
+        binding.python.as_ref().unwrap().path,
+        ["egglog", "builtins", "Vec"]
+    );
+    assert_eq!(
+        pb::Program::decode(first.encode_to_vec().as_slice()).unwrap(),
+        first
+    );
     assert_eq!(
         binding.rust.as_ref().unwrap().path,
         ["egglog_experimental", "typed", "builtins", "Vec"]
@@ -357,115 +364,6 @@ fn constant_metadata_conflicts_reject_before_writes_and_clone_keeps_prefix_state
         };
         assert_eq!(value(&response, e.roots[0].variants[0].term), "10");
     }
-}
-
-fn host_default_program(default_node: u32) -> pb::Program {
-    let mut p = new_experimental_egraph()
-        .type_info()
-        .builtin_catalog()
-        .unwrap()
-        .definitions;
-    let i64_sort = p.sorts.iter().position(|s| matches!(&s.kind, Some(pb::sort::Kind::Family(f)) if f.name == "i64" && f.args.is_empty())).unwrap() as u32;
-    p.nodes = vec![
-        pb::Node {
-            sort_id: i64_sort,
-            kind: Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
-                value: Some(pb::primitive_value::Value::I64(i64::MAX)),
-            })),
-            ..Default::default()
-        },
-        pb::Node {
-            sort_id: i64_sort,
-            kind: Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
-                value: Some(pb::primitive_value::Value::I64(1)),
-            })),
-            ..Default::default()
-        },
-        pb::Node {
-            sort_id: i64_sort,
-            kind: Some(pb::node::Kind::Call(pb::Call {
-                func: "egglog.core.i64.add".into(),
-                args: vec![0, 1],
-            })),
-            ..Default::default()
-        },
-        pb::Node {
-            sort_id: i64_sort,
-            kind: Some(pb::node::Kind::Call(pb::Call {
-                func: "current".into(),
-                args: vec![],
-            })),
-            ..Default::default()
-        },
-    ];
-    p.declarations.push(pb::Declaration {
-        kind: Some(pb::declaration::Kind::Function(pb::Function {
-            name: "current".into(),
-            inputs: vec![],
-            output: i64_sort,
-            merge: None,
-        })),
-        ..Default::default()
-    });
-    let get = p.declarations.iter_mut().find(|d| matches!(&d.kind, Some(pb::declaration::Kind::HostPrimitive(h)) if h.name == "egglog.core.vec.get")).unwrap();
-    let Some(pb::declaration::Kind::HostPrimitive(h)) = &get.kind else {
-        unreachable!()
-    };
-    let Some(pb::host_primitive::Typing::Signature(s)) = &h.typing else {
-        unreachable!()
-    };
-    get.bindings.as_mut().unwrap().python = Some(pb::PythonBindings {
-        views: vec![pb::PythonCallable {
-            kind: pb::PythonCallKind::Method.into(),
-            path: vec!["get".into()],
-            owner: Some(pb::BindingOwner {
-                kind: Some(pb::binding_owner::Kind::Sort(s.inputs[0].sort)),
-            }),
-            receiver: Some(0),
-            params: vec![pb::PythonParameter {
-                core_input: Some(1),
-                name: "index".into(),
-                default_expr: Some(default_node),
-            }],
-            ..Default::default()
-        }],
-    });
-    p
-}
-
-#[test]
-fn host_binding_default_keeps_builtin_callee_context_without_evaluation() {
-    let mut engine = Engine::default();
-    let id = create(&mut engine);
-    // MAX + 1 would fail if evaluated. It remains a valid closed template.
-    assert_eq!(run(&mut engine, id, host_default_program(2)).error, None);
-    assert_eq!(run(&mut engine, id, host_default_program(2)).error, None);
-    assert!(
-        run(&mut engine, id, host_default_program(1))
-            .error
-            .is_some()
-    );
-}
-
-#[test]
-fn host_binding_default_keeps_user_callee_context_without_evaluation() {
-    let mut engine = Engine::default();
-    let id = create(&mut engine);
-    assert_eq!(run(&mut engine, id, host_default_program(3)).error, None);
-    let mut resend = host_default_program(3);
-    resend
-        .declarations
-        .retain(|d| !matches!(d.kind, Some(pb::declaration::Kind::Function(_))));
-    assert_eq!(
-        run(&mut engine, id, resend).error,
-        None,
-        "default can refer to an ambient installed table"
-    );
-    assert!(
-        run(&mut engine, id, host_default_program(1))
-            .error
-            .is_some()
-    );
 }
 
 #[test]
@@ -1229,6 +1127,533 @@ fn pair_fixture() -> pb::Program {
         }],
         ..Default::default()
     }
+}
+
+fn map_fixture() -> pb::Program {
+    let mut p = pair_fixture();
+    let Some(pb::sort::Kind::Family(f)) = &mut p.sorts[2].kind else {
+        unreachable!()
+    };
+    f.name = "Map".into();
+    let Some(pb::declaration::Kind::HostSortFamily(f)) = &mut p.declarations[0].kind else {
+        unreachable!()
+    };
+    f.name = "Map".into();
+    p.nodes.extend([
+        pb::Node {
+            sort_id: 1,
+            kind: Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
+                value: Some(pb::primitive_value::Value::String("last".into())),
+            })),
+            ..Default::default()
+        },
+        pb::Node {
+            sort_id: 0,
+            kind: Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
+                value: Some(pb::primitive_value::Value::I64(2)),
+            })),
+            ..Default::default()
+        },
+    ]);
+    p.nodes[2].kind = Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
+        value: Some(pb::primitive_value::Value::Map(pb::MapValue {
+            entries: vec![
+                pb::MapEntry {
+                    key: Some(0),
+                    value: Some(1),
+                },
+                pb::MapEntry {
+                    key: Some(4),
+                    value: Some(1),
+                },
+                pb::MapEntry {
+                    key: Some(0),
+                    value: Some(3),
+                },
+            ],
+        })),
+    }));
+    p
+}
+
+#[test]
+fn map_value_bytes_extract_reingest_and_render() {
+    use egglog_experimental::protobuf::source::Renderer;
+    let mut program = map_fixture();
+    let mut engine = Engine::default();
+    let id = create(&mut engine);
+    let mut renderer = Renderer::default();
+    let mut native = new_experimental_egraph();
+    for _ in 0..2 {
+        for key in ["empty", "of", "get", "insert"] {
+            native
+                .type_info()
+                .export_builtin_definition(&format!("egglog.core.map.{key}"), &mut program)
+                .unwrap();
+        }
+        let decoded = pb::Program::decode(program.encode_to_vec().as_slice()).unwrap();
+        assert_eq!(decoded, program);
+        let response = run(&mut engine, id, decoded);
+        assert_eq!(response.error, None);
+        let Some(pb::command_output::Kind::Extraction(result)) = &response.outputs[0].kind else {
+            panic!("extraction")
+        };
+        let root = result.roots[0].variants[0].term;
+        let node = &response.nodes[root as usize];
+        let Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
+            value: Some(pb::primitive_value::Value::Map(map)),
+        })) = &node.kind
+        else {
+            panic!("MapValue, not symbolic Call")
+        };
+        assert_eq!(map.entries.len(), 2);
+        let mut observed = map
+            .entries
+            .iter()
+            .map(|entry| {
+                (
+                    value(&response, entry.key.unwrap()),
+                    value(&response, entry.value.unwrap()),
+                )
+            })
+            .collect::<Vec<_>>();
+        observed.sort();
+        assert_eq!(
+            observed,
+            [
+                ("1".into(), "\"last\"".into()),
+                ("2".into(), "\"x\"".into())
+            ]
+        );
+        let Some(pb::sort::Kind::Family(family)) = &response.sorts[node.sort_id as usize].kind
+        else {
+            panic!("Map sort")
+        };
+        assert_eq!(family.name, "Map");
+        for entry in &map.entries {
+            assert_eq!(
+                response.nodes[entry.key.unwrap() as usize].sort_id,
+                family.args[0]
+            );
+            assert_eq!(
+                response.nodes[entry.value.unwrap() as usize].sort_id,
+                family.args[1]
+            );
+        }
+        native
+            .parse_and_run_program(None, &renderer.render(&program).unwrap())
+            .unwrap();
+        program = pb::Program {
+            ir_version: 1,
+            sorts: response.sorts,
+            nodes: response.nodes,
+            commands: vec![pb::Command {
+                kind: Some(pb::command::Kind::Extract(pb::Extract {
+                    roots: vec![root],
+                    variants: 1,
+                    extractor: pb::Extractor::Tree.into(),
+                    ..Default::default()
+                })),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+    }
+    let mut empty = map_fixture();
+    let Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
+        value: Some(pb::primitive_value::Value::Map(map)),
+    })) = &mut empty.nodes[2].kind
+    else {
+        unreachable!()
+    };
+    map.entries.clear();
+    let response = run(&mut engine, id, empty.clone());
+    assert_eq!(response.error, None);
+    assert!(response.nodes.iter().any(|n| matches!(&n.kind,
+        Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
+            value: Some(pb::primitive_value::Value::Map(map)),
+        })) if map.entries.is_empty())));
+    native
+        .parse_and_run_program(None, &renderer.render(&empty).unwrap())
+        .unwrap();
+}
+
+#[test]
+fn map_flat_and_computed_source_calls_execute_through_bytes() {
+    use egglog_experimental::protobuf::source::{Renderer, Source};
+    let text = r#"
+        (sort M (Map i64 String))
+        (function m () M :merge new)
+        (set (m) (map-of 1 "first" 2 "two" 1 "last"))
+        (check (= (map-get (m) 1) "last"))
+        (sort P (Pair i64 String)) (sort V (Vec P))
+        (function entries () V :merge new)
+        (set (entries) (vec-of (pair 3 "three")))
+        (set (m) (map-from-pairs (entries)))
+        (check (= (map-get (m) 3) "three"))
+        (set (m) (map-insert (m) 3 "updated"))
+        (check (= (map-get (m) 3) "updated"))
+        (set (m) (map-of))
+        (check (= (m) (map-empty)))
+    "#;
+    new_experimental_egraph()
+        .parse_and_run_program(None, text)
+        .unwrap();
+    let mut engine = Engine::default();
+    let id = create(&mut engine);
+    let mut renderer = Renderer::default();
+    let mut native = new_experimental_egraph();
+    let mut final_arena_map_calls = 0;
+    for phase in Source::new(None, text).unwrap() {
+        let program = pb::Program::decode(phase.unwrap().encode_to_vec().as_slice()).unwrap();
+        // Source retains a cumulative node arena, so count only the latest
+        // arena rather than interpreting indices across different Programs.
+        final_arena_map_calls = 0;
+        for node in &program.nodes {
+            if let Some(pb::node::Kind::Call(call)) = &node.kind {
+                assert!(!matches!(call.func.as_str(), "map-of" | "map-from-pairs"));
+                if call.func == "egglog.core.map.of" {
+                    assert_eq!(call.args.len(), 1);
+                    final_arena_map_calls += 1;
+                }
+            }
+        }
+        assert_eq!(run(&mut engine, id, program.clone()).error, None);
+        native
+            .parse_and_run_program(None, &renderer.render(&program).unwrap())
+            .unwrap();
+    }
+    assert_eq!(final_arena_map_calls, 3);
+}
+
+#[test]
+fn unused_map_payloads_reject_before_earlier_writes_and_zero_refs_are_values() {
+    use egglog_experimental::protobuf::source::{Renderer, Source};
+    let phases = Source::new(
+        None,
+        "(function observed () i64 :merge new) (set (observed) 0) (check (= (observed) 0))",
+    )
+    .unwrap()
+    .collect::<Result<Vec<_>, _>>()
+    .unwrap();
+    let mut engine = Engine::default();
+    let id = create(&mut engine);
+    let mut renderer = Renderer::default();
+    for p in &phases[..2] {
+        assert_eq!(run(&mut engine, id, p.clone()).error, None);
+        renderer.render(p).unwrap();
+    }
+    for bad in 0..20 {
+        let mut invalid = map_fixture();
+        // The entire Map is unused, including its first overwritten entry.
+        invalid.commands = vec![pb::Command {
+            kind: Some(pb::command::Kind::Action(pb::Action {
+                kind: Some(pb::action::Kind::Set(pb::Set {
+                    target: Some(pb::Call {
+                        func: "observed".into(),
+                        args: vec![],
+                    }),
+                    value: Some(0),
+                })),
+                ..Default::default()
+            })),
+            ..Default::default()
+        }];
+        match bad {
+            0..=5 => {
+                let Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
+                    value: Some(pb::primitive_value::Value::Map(map)),
+                })) = &mut invalid.nodes[2].kind
+                else {
+                    unreachable!()
+                };
+                match bad {
+                    0 => map.entries[0].key = None,
+                    1 => map.entries[0].value = None,
+                    2 => map.entries[0].key = Some(999),
+                    3 => map.entries[0].value = Some(999),
+                    4 => map.entries[0].key = Some(1),
+                    _ => map.entries[0].value = Some(0),
+                }
+            }
+            6 => invalid.nodes[2].sort_id = 0,
+            7..=9 => {
+                let Some(pb::sort::Kind::Family(f)) = &mut invalid.sorts[2].kind else {
+                    unreachable!()
+                };
+                match bad {
+                    7 => {
+                        f.args.pop();
+                    }
+                    8 => f.args.reverse(),
+                    _ => f.args[0] = 2,
+                }
+            }
+            10 => {
+                invalid.nodes[0].kind = Some(pb::node::Kind::Call(pb::Call {
+                    func: "egglog.core.i64.add".into(),
+                    args: vec![0, 0],
+                }))
+            }
+            11 => {
+                invalid.nodes[1].kind = Some(pb::node::Kind::Union(pb::Union {
+                    members: vec![1, 1],
+                }))
+            }
+            12 => {
+                let Some(pb::declaration::Kind::HostSortFamily(f)) =
+                    &mut invalid.declarations[0].kind
+                else {
+                    unreachable!()
+                };
+                f.arity = 1;
+            }
+            13 | 14 => {
+                invalid.nodes[2].kind = Some(pb::node::Kind::Call(pb::Call {
+                    func: if bad == 13 {
+                        "map-of"
+                    } else {
+                        "egglog.core.map.of"
+                    }
+                    .into(),
+                    args: vec![0, 1],
+                }))
+            }
+            15 => invalid.sorts[2].kind = Some(pb::sort::Kind::Eq("Map".into())),
+            _ => {
+                new_experimental_egraph()
+                    .type_info()
+                    .export_builtin_definition("egglog.core.map.of", &mut invalid)
+                    .unwrap();
+                let declaration = invalid.declarations.last_mut().unwrap();
+                let Some(pb::declaration::Kind::HostPrimitive(p)) = &mut declaration.kind else {
+                    unreachable!()
+                };
+                let Some(pb::host_primitive::Typing::Signature(s)) = &mut p.typing else {
+                    unreachable!()
+                };
+                match bad {
+                    16 => s.inputs[0].sort = s.output.unwrap(),
+                    17 => s.output = Some(s.inputs[0].sort),
+                    18 => {
+                        s.type_params.pop();
+                    }
+                    _ => {
+                        declaration
+                            .bindings
+                            .as_mut()
+                            .unwrap()
+                            .python
+                            .as_mut()
+                            .unwrap()
+                            .views[0]
+                            .owner = Some(pb::BindingOwner {
+                            kind: Some(pb::binding_owner::Kind::Sort(s.inputs[0].sort)),
+                        });
+                    }
+                }
+            }
+        }
+        let response = run(&mut engine, id, invalid.clone());
+        assert_eq!(
+            response.error.unwrap().code,
+            pb::ErrorCode::InvalidProgram as i32,
+            "bad {bad}"
+        );
+        assert!(response.outputs.is_empty());
+        assert!(renderer.render(&invalid).is_err(), "bad {bad}");
+        assert_eq!(run(&mut engine, id, phases[2].clone()).error, None);
+    }
+    let mut zero = map_fixture();
+    let Some(pb::sort::Kind::Family(f)) = &mut zero.sorts[2].kind else {
+        unreachable!()
+    };
+    f.args = vec![0, 0];
+    zero.nodes[2].kind = Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
+        value: Some(pb::primitive_value::Value::Map(pb::MapValue {
+            entries: vec![pb::MapEntry {
+                key: Some(0),
+                value: Some(0),
+            }],
+        })),
+    }));
+    let decoded = pb::Program::decode(zero.encode_to_vec().as_slice()).unwrap();
+    assert_eq!(decoded, zero);
+    let response = run(&mut engine, id, decoded);
+    assert_eq!(response.error, None);
+    let Some(pb::command_output::Kind::Extraction(e)) = &response.outputs[0].kind else {
+        unreachable!()
+    };
+    let Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
+        value: Some(pb::primitive_value::Value::Map(map)),
+    })) = &response.nodes[e.roots[0].variants[0].term as usize].kind
+    else {
+        unreachable!()
+    };
+    assert_eq!(
+        map.entries[0].key, map.entries[0].value,
+        "typed term cache preserves repeated child"
+    );
+}
+
+#[test]
+fn nested_map_source_keeps_nominal_and_same_head_user_provenance() {
+    use egglog_experimental::protobuf::source::{Renderer, Source};
+    let text = r#"
+        (sort Map) (constructor Key () Map)
+        (sort M (Map Map i64)) (sort P (Pair M M)) (sort V (Vec P))
+        (function stored () V :merge new)
+        (set (stored) (vec-of (pair (map-of (Key) 7) (map-of (Key) 7))))
+        (extract (stored))
+    "#;
+    new_experimental_egraph()
+        .parse_and_run_program(None, text)
+        .unwrap();
+    let mut engine = Engine::default();
+    let id = create(&mut engine);
+    let mut renderer = Renderer::default();
+    let mut native = new_experimental_egraph();
+    let mut map_data = false;
+    let mut user_call = false;
+    let mut table_data = false;
+    let mut observation = pb::Program::default();
+    for phase in Source::new(None, text).unwrap() {
+        let program = phase.unwrap();
+        observation = program.clone();
+        let response = run(&mut engine, id, program.clone());
+        assert_eq!(response.error, None);
+        native
+            .parse_and_run_program(None, &renderer.render(&program).unwrap())
+            .unwrap();
+        for (index, node) in response.nodes.iter().enumerate() {
+            match &node.kind {
+                Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
+                    value: Some(pb::primitive_value::Value::Map(map)),
+                })) => {
+                    let Some(pb::sort::Kind::Family(f)) =
+                        &response.sorts[node.sort_id as usize].kind
+                    else {
+                        unreachable!()
+                    };
+                    assert_eq!(f.name, "Map");
+                    assert_eq!(
+                        response.sorts[f.args[0] as usize].kind,
+                        Some(pb::sort::Kind::Eq("Map".into()))
+                    );
+                    assert_eq!(value(&response, map.entries[0].key.unwrap()), "(Key)");
+                    map_data = true;
+                }
+                Some(pb::node::Kind::Call(call)) if call.func == "map-of" => {
+                    assert_eq!(
+                        response.sorts[node.sort_id as usize].kind,
+                        Some(pb::sort::Kind::Eq("Map".into()))
+                    );
+                    user_call = true;
+                }
+                _ => continue,
+            }
+            let reingest = pb::Program {
+                ir_version: 1,
+                sorts: response.sorts.clone(),
+                nodes: response.nodes.clone(),
+                commands: vec![pb::Command {
+                    kind: Some(pb::command::Kind::Extract(pb::Extract {
+                        roots: vec![index as u32],
+                        variants: 1,
+                        extractor: pb::Extractor::Tree.into(),
+                        ..Default::default()
+                    })),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            };
+            assert_eq!(run(&mut engine, id, reingest.clone()).error, None);
+            native
+                .parse_and_run_program(None, &renderer.render(&reingest).unwrap())
+                .unwrap();
+        }
+        table_data |= response
+            .outputs
+            .iter()
+            .any(|o| matches!(o.kind, Some(pb::command_output::Kind::PrintedFunction(_))))
+            && response.nodes.iter().any(|n| {
+                matches!(
+                    n.kind,
+                    Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
+                        value: Some(pb::primitive_value::Value::Map(_))
+                    }))
+                )
+            });
+    }
+    observation.commands = vec![pb::Command {
+        kind: Some(pb::command::Kind::PrintFunction(pb::PrintFunction {
+            table: "stored".into(),
+            max_rows: 10,
+        })),
+        ..Default::default()
+    }];
+    let table = run(&mut engine, id, observation.clone());
+    assert_eq!(table.error, None);
+    table_data |= table.nodes.iter().any(|n| {
+        matches!(
+            n.kind,
+            Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
+                value: Some(pb::primitive_value::Value::Map(_))
+            }))
+        )
+    });
+    native
+        .parse_and_run_program(None, &renderer.render(&observation).unwrap())
+        .unwrap();
+    // Native registration reserves its alias; the wire namespace projection
+    // still admits a distinct authored constructor with the same spelling.
+    for spelling in ["map-of", "map-from-pairs"] {
+        let mut user = map_fixture();
+        user.sorts.push(pb::Sort {
+            kind: Some(pb::sort::Kind::Eq("Map".into())),
+            ..Default::default()
+        });
+        user.declarations.push(pb::Declaration {
+            kind: Some(pb::declaration::Kind::Constructor(pb::Constructor {
+                name: spelling.into(),
+                inputs: vec![pb::Arg {
+                    name: "n".into(),
+                    sort: 0,
+                }],
+                output: 3,
+                ..Default::default()
+            })),
+            ..Default::default()
+        });
+        user.nodes.push(pb::Node {
+            sort_id: 3,
+            kind: Some(pb::node::Kind::Call(pb::Call {
+                func: spelling.into(),
+                args: vec![0],
+            })),
+            ..Default::default()
+        });
+        let Some(pb::command::Kind::Extract(e)) = &mut user.commands[0].kind else {
+            unreachable!()
+        };
+        e.roots.push(5);
+        let response = run(&mut engine, id, user.clone());
+        assert_eq!(response.error, None);
+        let Some(pb::command_output::Kind::Extraction(e)) = &response.outputs[0].kind else {
+            unreachable!()
+        };
+        let node = &response.nodes[e.roots[1].variants[0].term as usize];
+        assert!(matches!(&node.kind, Some(pb::node::Kind::Call(c)) if c.func == spelling));
+        assert_eq!(
+            response.sorts[node.sort_id as usize].kind,
+            Some(pb::sort::Kind::Eq("Map".into()))
+        );
+        native
+            .parse_and_run_program(None, &renderer.render(&user).unwrap())
+            .unwrap();
+        user_call = true;
+    }
+    assert!(map_data && user_call && table_data);
 }
 
 #[test]
@@ -2105,7 +2530,7 @@ fn nominal_pair_wrong_kind_names_reject_before_earlier_writes() {
                 });
                 // This family is outside the admitted codec slice; distinguish
                 // the unsupported-family gate from the provider lookup above.
-                "only equality, scalar, Vec and Pair sorts are supported yet"
+                "only equality, scalar, Vec, Pair and Map sorts are supported yet"
             }
         };
         let response = run(&mut engine, id, invalid.clone());
@@ -2188,6 +2613,79 @@ fn pair_value_queries_require_grounded_children() {
         assert_eq!(run(&mut engine, id, program.clone()).error, None);
         renderer.render(&program).unwrap();
     }
+}
+
+#[test]
+fn map_value_queries_require_grounded_children() {
+    use egglog_experimental::protobuf::source::{Renderer, Source};
+    let text = r#"
+        (sort M (Map i64 String)) (datatype Box (N i64))
+        (function stored () M :no-merge) (function observed () i64 :merge new)
+        (set (stored) (map-of 7 "x")) (set (observed) 0) (N 7)
+        (rule ((N x) (= (stored) (map-of x "x"))) ((set (observed) x)))
+        (run 1) (check (= (observed) 7))
+    "#;
+    new_experimental_egraph()
+        .parse_and_run_program(None, text)
+        .unwrap();
+    let mut engine = Engine::default();
+    let id = create(&mut engine);
+    let mut renderer = Renderer::default();
+    let mut checked_ungrounded = false;
+    for phase in Source::new(None, text).unwrap() {
+        let mut program = phase.unwrap();
+        if !program.rules.is_empty() {
+            for index in 0..program.nodes.len() {
+                if let Some(pb::node::Kind::Call(call)) = &program.nodes[index].kind
+                    && call.func == "egglog.core.map.of"
+                {
+                    let Some(pb::node::Kind::Call(vector)) =
+                        &program.nodes[call.args[0] as usize].kind
+                    else {
+                        unreachable!()
+                    };
+                    let entries = vector
+                        .args
+                        .iter()
+                        .map(|pair| {
+                            let Some(pb::node::Kind::Call(pair)) =
+                                &program.nodes[*pair as usize].kind
+                            else {
+                                unreachable!()
+                            };
+                            pb::MapEntry {
+                                key: Some(pair.args[0]),
+                                value: Some(pair.args[1]),
+                            }
+                        })
+                        .collect();
+                    program.nodes[index].kind =
+                        Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
+                            value: Some(pb::primitive_value::Value::Map(pb::MapValue { entries })),
+                        }));
+                }
+            }
+            if !checked_ungrounded {
+                let mut ungrounded = program.clone();
+                let Some(pb::rule_decl::Kind::Rule(rule)) = &mut ungrounded.rules[0].kind else {
+                    unreachable!()
+                };
+                assert_eq!(rule.query.len(), 2);
+                rule.query.remove(0);
+                ungrounded.rulesets = vec![pb::Ruleset {
+                    name: Some("map-grounding-probe".into()),
+                    kind: Some(pb::ruleset::Kind::Rules(pb::RuleList { rules: vec![0] })),
+                    ..Default::default()
+                }];
+                assert!(run(&mut engine, id, ungrounded.clone()).error.is_some());
+                assert!(renderer.render(&ungrounded).is_err());
+                checked_ungrounded = true;
+            }
+        }
+        assert_eq!(run(&mut engine, id, program.clone()).error, None);
+        renderer.render(&program).unwrap();
+    }
+    assert!(checked_ungrounded);
 }
 
 #[test]
@@ -2400,6 +2898,306 @@ fn pair_payload_children_evaluate_first_then_second() {
         "8",
         "earlier Set survives the second-child failure"
     );
+}
+
+#[test]
+fn map_payload_visits_overwritten_entries_in_order_and_keeps_runtime_prefix() {
+    let mut program = map_fixture();
+    let Some(pb::sort::Kind::Family(f)) = &mut program.sorts[2].kind else {
+        unreachable!()
+    };
+    f.args = vec![0, 0];
+    let reads = ["key0", "value0", "key1", "value1"];
+    program.nodes = reads
+        .iter()
+        .map(|name| pb::Node {
+            sort_id: 0,
+            kind: Some(pb::node::Kind::Call(pb::Call {
+                func: (*name).into(),
+                args: vec![],
+            })),
+            ..Default::default()
+        })
+        .collect();
+    for name in reads {
+        program.declarations.push(pb::Declaration {
+            kind: Some(pb::declaration::Kind::Function(pb::Function {
+                name: name.into(),
+                output: 0,
+                ..Default::default()
+            })),
+            ..Default::default()
+        });
+    }
+    program.nodes.push(pb::Node {
+        sort_id: 2,
+        kind: Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
+            value: Some(pb::primitive_value::Value::Map(pb::MapValue {
+                entries: vec![
+                    pb::MapEntry {
+                        key: Some(0),
+                        value: Some(1),
+                    },
+                    pb::MapEntry {
+                        key: Some(2),
+                        value: Some(3),
+                    },
+                ],
+            })),
+        })),
+        ..Default::default()
+    });
+    program.nodes.push(pb::Node {
+        sort_id: 0,
+        kind: Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
+            value: Some(pb::primitive_value::Value::I64(7)),
+        })),
+        ..Default::default()
+    });
+    let mut engine = Engine::default();
+    let id = create(&mut engine);
+    let mut errors = vec![];
+    for root in 0..4 {
+        program.commands = vec![pb::Command {
+            kind: Some(pb::command::Kind::Action(pb::Action {
+                kind: Some(pb::action::Kind::Term(root)),
+                ..Default::default()
+            })),
+            ..Default::default()
+        }];
+        errors.push(run(&mut engine, id, program.clone()).error.unwrap().message);
+    }
+    assert_eq!(
+        errors
+            .iter()
+            .collect::<std::collections::HashSet<_>>()
+            .len(),
+        4
+    );
+    for (position, expected) in errors.iter().enumerate() {
+        program.commands = (0..position)
+            .map(|i| pb::Command {
+                kind: Some(pb::command::Kind::Action(pb::Action {
+                    kind: Some(pb::action::Kind::Set(pb::Set {
+                        target: Some(pb::Call {
+                            func: reads[i].into(),
+                            args: vec![],
+                        }),
+                        value: Some(5),
+                    })),
+                    ..Default::default()
+                })),
+                ..Default::default()
+            })
+            .collect();
+        program.commands.push(pb::Command {
+            kind: Some(pb::command::Kind::Action(pb::Action {
+                kind: Some(pb::action::Kind::Term(4)),
+                ..Default::default()
+            })),
+            ..Default::default()
+        });
+        let response = run(&mut engine, id, program.clone());
+        assert_eq!(
+            &response.error.unwrap().message,
+            expected,
+            "position {position}"
+        );
+    }
+    // The last failure happened after key0/value0/key1 were written. A Map
+    // duplicate does not suppress its overwritten first value's evaluation.
+    program.commands = vec![pb::Command {
+        kind: Some(pb::command::Kind::Extract(pb::Extract {
+            roots: vec![0, 1, 2],
+            variants: 1,
+            extractor: pb::Extractor::Tree.into(),
+            ..Default::default()
+        })),
+        ..Default::default()
+    }];
+    let response = run(&mut engine, id, program);
+    assert_eq!(response.error, None);
+    let Some(pb::command_output::Kind::Extraction(e)) = &response.outputs[0].kind else {
+        unreachable!()
+    };
+    assert!(
+        e.roots
+            .iter()
+            .all(|r| value(&response, r.variants[0].term) == "7")
+    );
+}
+
+#[test]
+fn map_defaults_clone_and_missing_key_preserve_canonical_records_and_prefix() {
+    use egglog_experimental::protobuf::source::Renderer;
+    let mut program = map_fixture();
+    program.nodes.extend([
+        pb::Node {
+            sort_id: 2,
+            kind: Some(pb::node::Kind::Var("new".into())),
+            ..Default::default()
+        },
+        pb::Node {
+            sort_id: 2,
+            kind: Some(pb::node::Kind::Call(pb::Call {
+                func: "stored".into(),
+                args: vec![],
+            })),
+            ..Default::default()
+        },
+        pb::Node {
+            sort_id: 0,
+            kind: Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
+                value: Some(pb::primitive_value::Value::I64(999)),
+            })),
+            ..Default::default()
+        },
+        pb::Node {
+            sort_id: 1,
+            kind: Some(pb::node::Kind::Call(pb::Call {
+                func: "egglog.core.map.get".into(),
+                args: vec![6, 7],
+            })),
+            ..Default::default()
+        },
+    ]);
+    program.declarations.extend([
+        pb::Declaration {
+            kind: Some(pb::declaration::Kind::Function(pb::Function {
+                name: "stored".into(),
+                output: 2,
+                merge: Some(5),
+                ..Default::default()
+            })),
+            ..Default::default()
+        },
+        pb::Declaration {
+            kind: Some(pb::declaration::Kind::Function(pb::Function {
+                name: "take_map".into(),
+                inputs: vec![pb::Arg {
+                    name: "map".into(),
+                    sort: 2,
+                }],
+                output: 0,
+                merge: None,
+            })),
+            bindings: Some(pb::CallableBindings {
+                python: Some(pb::PythonBindings {
+                    views: vec![pb::PythonCallable {
+                        kind: pb::PythonCallKind::Function.into(),
+                        path: vec!["test".into(), "take_map".into()],
+                        params: vec![pb::PythonParameter {
+                            core_input: Some(0),
+                            name: "map".into(),
+                            default_expr: Some(2),
+                        }],
+                        ..Default::default()
+                    }],
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
+    ]);
+    let write = pb::Command {
+        kind: Some(pb::command::Kind::Action(pb::Action {
+            kind: Some(pb::action::Kind::Set(pb::Set {
+                target: Some(pb::Call {
+                    func: "stored".into(),
+                    args: vec![],
+                }),
+                value: Some(2),
+            })),
+            ..Default::default()
+        })),
+        ..Default::default()
+    };
+    program.commands.insert(0, write);
+    let canonical = program.clone();
+    let mut engine = Engine::default();
+    let id = create(&mut engine);
+    let mut renderer = Renderer::default();
+    let mut native = new_experimental_egraph();
+    for _ in 0..3 {
+        assert_eq!(run(&mut engine, id, program.clone()).error, None);
+        native
+            .parse_and_run_program(None, &renderer.render(&program).unwrap())
+            .unwrap();
+        assert_eq!(program, canonical);
+    }
+    let clone = pb::CloneEGraphResponse::decode(
+        engine
+            .clone_egraph(&pb::CloneEGraphRequest { egraph_id: id }.encode_to_vec())
+            .unwrap()
+            .as_slice(),
+    )
+    .unwrap()
+    .egraph_id;
+    let mut changed = program.clone();
+    changed.nodes[3].kind = Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
+        value: Some(pb::primitive_value::Value::String("updated".into())),
+    }));
+    for handle in [id, clone] {
+        assert_eq!(
+            run(&mut engine, handle, changed.clone())
+                .error
+                .unwrap()
+                .code,
+            pb::ErrorCode::InvalidProgram as i32
+        );
+    }
+    assert!(renderer.render(&changed).is_err());
+    changed.declarations.clear();
+    changed.commands.push(pb::Command {
+        kind: Some(pb::command::Kind::Action(pb::Action {
+            kind: Some(pb::action::Kind::Term(8)),
+            ..Default::default()
+        })),
+        ..Default::default()
+    });
+    let response = run(&mut engine, id, changed.clone());
+    assert_eq!(
+        response.error.unwrap().code,
+        pb::ErrorCode::EvaluationFailed as i32
+    );
+    assert_eq!(
+        response.outputs.len(),
+        1,
+        "completed extraction survives failed lookup"
+    );
+    assert!(
+        native
+            .parse_and_run_program(None, &renderer.render(&changed).unwrap())
+            .is_err()
+    );
+    program.declarations.clear();
+    program.commands = vec![pb::Command {
+        kind: Some(pb::command::Kind::PrintFunction(pb::PrintFunction {
+            table: "stored".into(),
+            max_rows: 10,
+        })),
+        ..Default::default()
+    }];
+    for (handle, expected) in [(id, "\"updated\""), (clone, "\"last\"")] {
+        let response = run(&mut engine, handle, program.clone());
+        assert_eq!(response.error, None);
+        let Some(pb::command_output::Kind::PrintedFunction(table)) = &response.outputs[0].kind
+        else {
+            unreachable!()
+        };
+        let Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
+            value: Some(pb::primitive_value::Value::Map(map)),
+        })) = &response.nodes[table.rows[0].output as usize].kind
+        else {
+            unreachable!()
+        };
+        let entry = map
+            .entries
+            .iter()
+            .find(|e| value(&response, e.key.unwrap()) == "1")
+            .unwrap();
+        assert_eq!(value(&response, entry.value.unwrap()), expected);
+    }
 }
 
 #[test]
@@ -2680,6 +3478,43 @@ fn vec_lookup_failure_and_nominal_source_error_preserve_prefixes() {
         source.next().unwrap().is_err(),
         "source nominal aliases must not become interchangeable"
     );
+}
+
+#[test]
+fn map_source_errors_preserve_only_previously_submitted_phases() {
+    use egglog_experimental::protobuf::source::Source;
+    for failing_value in ["(map-of 1)", "(map-of 1 (- 2 1))"] {
+        let text = format!(
+            "(sort M (Map i64 i64)) (function stored () M :merge new)
+             (set (stored) (map-of 1 7)) (set (stored) {failing_value})
+             (set (stored) (map-of 1 99))"
+        );
+        let mut engine = Engine::default();
+        let id = create(&mut engine);
+        let mut source = Source::new(None, &text).unwrap();
+        for _ in 0..3 {
+            assert_eq!(
+                run(&mut engine, id, source.next().unwrap().unwrap()).error,
+                None
+            );
+        }
+        let failure = source.next().unwrap().unwrap_err();
+        assert!(!failure.to_string().is_empty());
+        assert!(
+            source.next().is_none(),
+            "discard the failed source phase and its suffix"
+        );
+        let observation = Source::new(
+            None,
+            "(sort M (Map i64 i64)) (function stored () M :merge new)
+             (check (= (map-get (stored) 1) 7))",
+        )
+        .unwrap()
+        .last()
+        .unwrap()
+        .unwrap();
+        assert_eq!(run(&mut engine, id, observation).error, None);
+    }
 }
 
 #[test]

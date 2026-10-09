@@ -497,10 +497,10 @@ impl Source {
         let (span, kind) = match action {
             ResolvedAction::Expr(span, expr) => (span, pb::action::Kind::Term(self.expr(expr, rule_head, 0)?)),
             ResolvedAction::Set(span, function, args, value) => (span, pb::action::Kind::Set(pb::Set {
-                target: Some(self.call(function, args, rule_head, 0)?), value: Some(self.expr(value, rule_head, 0)?),
+                target: Some(self.call(function, args, rule_head, 0, span)?), value: Some(self.expr(value, rule_head, 0)?),
             })),
             ResolvedAction::Change(span, change, function, args) => {
-                let call = self.call(function, args, rule_head, 0)?;
+                let call = self.call(function, args, rule_head, 0, span)?;
                 (span, match change { ast::Change::Delete => pb::action::Kind::Delete(call), ast::Change::Subsume => pb::action::Kind::Subsume(call) })
             }
             ResolvedAction::Panic(span, message) if !rule_head => (span, pb::action::Kind::Panic(message.clone())),
@@ -518,24 +518,22 @@ impl Source {
         args: &[ResolvedExpr],
         rule_head: bool,
         depth: usize,
+        span: &ast::Span,
     ) -> Result<pb::Call, String> {
-        let name = match function {
-            ResolvedCall::Func(function) => function.name.clone(),
+        let mut children = Vec::with_capacity(args.len());
+        for expr in args {
+            children.push(self.expr(expr, rule_head, depth + 1)?);
+        }
+        match function {
+            ResolvedCall::Func(function) => Ok(pb::Call {
+                func: function.name.clone(),
+                args: children,
+            }),
             ResolvedCall::Primitive(primitive) => {
-                let key = primitive.export_builtin(&mut self.program)?;
-                self.graph
-                    .type_info()
-                    .export_builtin_definition(&key, &mut self.program)?;
-                key
+                let span = self.span(span)?;
+                primitive.export_builtin_call(&self.graph, &children, span, &mut self.program)
             }
-        };
-        Ok(pb::Call {
-            func: name,
-            args: args
-                .iter()
-                .map(|expr| self.expr(expr, rule_head, depth + 1))
-                .collect::<Result<_, _>>()?,
-        })
+        }
     }
 
     fn expr(&mut self, expr: &ResolvedExpr, rule_head: bool, depth: usize) -> Result<u32, String> {
@@ -579,9 +577,9 @@ impl Source {
                     },
                 )
             }
-            ResolvedExpr::Call(_, function, args) => (
+            ResolvedExpr::Call(span, function, args) => (
                 function.output().name(),
-                pb::node::Kind::Call(self.call(function, args, rule_head, depth)?),
+                pb::node::Kind::Call(self.call(function, args, rule_head, depth, span)?),
             ),
         };
         let sort_id = self.sort(sort)?;
