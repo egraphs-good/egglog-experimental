@@ -1,0 +1,20 @@
+;; Costs saturate instead of overflowing: three e-nodes costing 9e18 each add
+;; up to more than u64::MAX, and the extraction still succeeds.
+
+(datatype Expr
+  (Arg)
+  (Num i64)
+  (Huge Expr Expr :cost 9000000000000000000)
+  (Loop Expr Expr :regions (1)))
+(rule ((= e (Arg))) ((set-effectful Expr e)))
+(rule ((= e (Huge v s))) ((set-effectful Expr e)))
+(rule ((= e (Loop s b))) ((set-effectful Expr e)))
+
+(let $s0 (Arg))
+(let $h1 (Huge (Num 1) $s0))
+(let $h2 (Huge (Num 2) $h1))
+(let $h3 (Huge (Num 3) $h2))
+(let $l (Loop $h3 (Huge (Num 4) (Arg))))
+(run 5)
+(extract $h3 :extractor effsafe)
+(extract $l :extractor effsafe)

@@ -1,0 +1,38 @@
+;; A memory-SSA style IR: a memory token threads through stores, loads read
+;; from a token, and a load from a store to the same address is the stored
+;; value (store-to-load forwarding). Effect-safe extraction must keep every
+;; load reading from the memory state the extracted program actually builds.
+
+(datatype Expr
+  (Mem)                      ; the incoming memory
+  (Num i64)
+  (Ptr String)
+  (Add Expr Expr)
+  (Store Expr Expr Expr)     ; (Store ptr value mem) -> mem
+  (Load Expr Expr)           ; (Load ptr mem) -> value, pure
+  (Ret Expr Expr))           ; (Ret value mem) -> mem
+
+(rule ((= e (Mem))) ((set-effectful Expr e)))
+(rule ((= e (Store p v m))) ((set-effectful Expr e)))
+(rule ((= e (Ret v m))) ((set-effectful Expr e)))
+
+;; store-to-load forwarding
+(rewrite (Load p (Store p v m)) v)
+;; loads commute with stores to other addresses
+(rule ((= l (Load p (Store q v m))) (!= p q)) ((union l (Load p m))))
+
+(let $m0 (Mem))
+(let $m1 (Store (Ptr "x") (Num 1) $m0))
+(let $m2 (Store (Ptr "y") (Num 2) $m1))
+;; read x after both stores: forwards through the store to y
+(let $x (Load (Ptr "x") $m2))
+(let $m3 (Ret (Add $x (Load (Ptr "y") $m2)) $m2))
+(run 10)
+(check (= $x (Num 1)))
+;; Both loads are forwarded; the stores stay because the final memory depends on them.
+(extract $m3 :extractor effsafe)
+
+;; A load the rewrites cannot forward (unknown pointer) must read the chosen state.
+(let $m4 (Ret (Load (Ptr "z") $m2) $m2))
+(run 5)
+(extract $m4 :extractor effsafe)

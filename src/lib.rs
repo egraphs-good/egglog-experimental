@@ -75,6 +75,11 @@
 //!   one [`MultiExtractOutput`] whose public fields expose shared term storage
 //!   and ordered per-root variant IDs.
 //! - [`KeepBestCommand`] compacts selected tables to their best terms.
+//! - [`effsafe_extract`] adds `(extract term :extractor effsafe)` and
+//!   `(print-function Ctor :extractor effsafe)`: effect-safe extraction for languages
+//!   that thread a state through their terms. `(set-effectful Sort e)` marks the
+//!   effectful e-classes and `:regions` annotations on constructors mark
+//!   subregions (see `docs/effsafe-extract.md`).
 //! - `:extractor greedy-dag` enables heuristic DAG-cost extraction for
 //!   `extract`, `multi-extract`, and `keep-best`. Within each independently
 //!   costed root or variant, it charges shared subterms once. It does not
@@ -126,6 +131,12 @@ pub use keep_best::KeepBestCommand;
 
 mod subst;
 pub use subst::Subst;
+
+pub mod effsafe_extract;
+pub use effsafe_extract::{
+    EffsafeConfig, EffsafeExtractOutput, EffsafeState, RegionBoundary, add_effsafe_extract,
+    effsafe_state, extract_effsafe, set_effsafe_cost_models,
+};
 
 /// Creates a default [`EGraph`] with every experimental extension registered.
 ///
@@ -183,6 +194,9 @@ pub fn new_experimental_egraph() -> EGraph {
 
     // Substitution over a reachable sub-e-graph.
     egraph.add_full_primitive(Subst, None);
+
+    // Effect-safe extraction with :regions annotations.
+    add_effsafe_extract(&mut egraph);
     egraph
 }
 

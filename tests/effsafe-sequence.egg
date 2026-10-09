@@ -1,0 +1,23 @@
+;; A statement-list IR: a block is a Cons spine of statements, and the spine
+;; itself is the state. Statements may be rewritten; the extractor keeps one
+;; consistent spine.
+
+(datatype Stmt
+  (Print i64)
+  (Assign String i64))
+(datatype Block
+  (Nil)
+  (Cons Stmt Block))
+(constructor Fn (String Block) Block)
+
+(rule ((= b (Nil))) ((set-effectful Block b)))
+(rule ((= b (Cons s r))) ((set-effectful Block b)))
+(rule ((= b (Fn n body))) ((set-effectful Block b)))
+
+;; a dead assignment followed by a re-assignment can be dropped
+(rewrite (Cons (Assign x v) (Cons (Assign x w) rest)) (Cons (Assign x w) rest))
+
+(let $body (Cons (Assign "a" 1) (Cons (Assign "a" 2) (Cons (Print 2) (Nil)))))
+(let $f (Fn "main" $body))
+(run 5)
+(print-function Fn :extractor effsafe)

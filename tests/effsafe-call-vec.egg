@@ -1,0 +1,19 @@
+;; A call whose arguments, including the state, travel in a Vec. Nothing marks
+;; the Vec effectful (it has a different sort), but it carries the state, so
+;; the extractor treats it as effectful and the statewalk runs through it.
+(datatype Expr
+  (Arg)
+  (Num i64)
+  (Print Expr Expr)
+  (Read Expr))
+(sort Exprs (Vec Expr))
+(constructor Call (String Exprs) Expr)
+(rule ((= e (Arg))) ((set-effectful Expr e)))
+(rule ((= e (Print v s))) ((set-effectful Expr e)))
+(rule ((= e (Call n args))) ((set-effectful Expr e)))
+
+(let $s0 (Arg))
+(let $s1 (Print (Num 1) $s0))
+(let $c (Call "f" (vec-of (Read $s1) (Num 2) $s1)))
+(run 3)
+(extract $c :extractor effsafe)
