@@ -9,6 +9,15 @@ from gen.python.egglog.v1 import egglog_pb as ir
 
 
 class ResourceSchemaTests(unittest.TestCase):
+    def test_report_level_is_an_exclusive_validated_setting(self):
+        for level in (ir.ReportLevel.TIME_ONLY, ir.ReportLevel.WITH_PLAN, ir.ReportLevel.STAGE_INFO):
+            request = ir.ConfigureEGraphResourcesRequest(egraph_id=7, operation=Oneof("report_level", level))
+            validate(request)
+            self.assertEqual(type(request).from_binary(request.to_binary()), request)
+        for level in (0, 99):
+            with self.subTest(level=level), self.assertRaises(ValidationError):
+                validate(ir.ConfigureEGraphResourcesRequest(egraph_id=7, operation=Oneof("report_level", level)))
+
     def test_creation_separates_nominal_and_host_family_names(self):
         nominal = ir.Declaration(kind=Oneof("eq_sort", ir.EqSort(name="Pair")))
         family = ir.Declaration(kind=Oneof("host_sort_family", ir.HostSortFamily(name="Pair", arity=2)))
@@ -68,8 +77,8 @@ class ResourceSchemaTests(unittest.TestCase):
                 self.assertEqual(decoded.operation, operation)
 
     def test_operation_is_required_and_unknown_operation_does_not_become_query(self):
-        # Field1 handle7, then unknown length-delimited operation4 with an empty payload.
-        unknown = ir.ConfigureEGraphResourcesRequest.from_binary(b"\x08\x07\x22\x00")
+        # Field1 handle7, then unknown length-delimited operation5 with an empty payload.
+        unknown = ir.ConfigureEGraphResourcesRequest.from_binary(b"\x08\x07\x2a\x00")
         self.assertIsNone(unknown.operation)
         for request in (ir.ConfigureEGraphResourcesRequest(egraph_id=7), unknown):
             with self.subTest(request=request), self.assertRaises(ValidationError):

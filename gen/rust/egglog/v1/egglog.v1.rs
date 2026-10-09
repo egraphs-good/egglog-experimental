@@ -1316,7 +1316,7 @@ pub struct Command {
     /// Surfaces as `Error.span`.
     #[prost(message, optional, tag = "13")]
     pub span: ::core::option::Option<Span>,
-    #[prost(oneof = "command::Kind", tags = "1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 14, 15, 16")]
+    #[prost(oneof = "command::Kind", tags = "1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 14, 15, 16, 17")]
     pub kind: ::core::option::Option<command::Kind>,
 }
 /// Nested message and enum types in `Command`.
@@ -1363,6 +1363,10 @@ pub mod command {
         /// Adds no binder, command list, Union identity scope, or loop iteration.
         #[prost(message, tag = "16")]
         Fail(::prost::alloc::boxed::Box<super::Command>),
+        /// Observe the actual cumulative native RunReport here. No file destination;
+        /// this observation composes with other commands and follows Fail suppression.
+        #[prost(message, tag = "17")]
+        Stats(super::Unit),
     }
 }
 /// One conjunctive query. All facts share the same variable bindings.
@@ -1708,7 +1712,7 @@ pub struct DestroyEGraphRequest {
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct DestroyEGraphResponse {
 }
-/// Query or update runtime resources on an existing handle, never logical
+/// Query thread resources or update runtime/collection settings on a handle, never logical
 /// settings or Program state. Completed updates affect subsequent calls; they
 /// do not reconfigure an in-flight Run. Clone inherits effective resources and
 /// later updates are handle-local. Resources are not part of a frozen snapshot.
@@ -1722,14 +1726,14 @@ pub struct DestroyEGraphResponse {
 pub struct ConfigureEGraphResourcesRequest {
     #[prost(uint64, tag = "1")]
     pub egraph_id: u64,
-    #[prost(oneof = "configure_e_graph_resources_request::Operation", tags = "2, 3")]
+    #[prost(oneof = "configure_e_graph_resources_request::Operation", tags = "2, 3, 4")]
     pub operation: ::core::option::Option<configure_e_graph_resources_request::Operation>,
 }
 /// Nested message and enum types in `ConfigureEGraphResourcesRequest`.
 pub mod configure_e_graph_resources_request {
     #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Oneof)]
     pub enum Operation {
-        /// Observe the current effective settings without changing them.
+        /// Observe the current effective thread count without changing settings.
         #[prost(message, tag = "2")]
         Query(super::Unit),
         /// Zero requests automatic parallelism resolved at this update; positive
@@ -1738,6 +1742,11 @@ pub mod configure_e_graph_resources_request {
         /// explicit operation distinguishes query from setting automatic zero.
         #[prost(uint32, tag = "3")]
         Threads(u32),
+        /// Set future native report detail. Does not disable collection or retrofit
+        /// existing statistics. Clone inherits this setting; updates are handle-local.
+        /// Query remains a thread-count query, not a report-level getter.
+        #[prost(enumeration = "super::ReportLevel", tag = "4")]
+        ReportLevel(i32),
     }
 }
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
@@ -1761,6 +1770,11 @@ pub struct RunProgramRequest {
     /// are independent of this flag. Collection-off needs runtime implementation.
     #[prost(bool, tag = "3")]
     pub profile: bool,
+    /// Emit actual native detail alongside completed requested top-level controls.
+    /// Emission only: omission does not disable collection/retention. Explicit Stats
+    /// observations always return their full report, independently of this flag.
+    #[prost(bool, tag = "4")]
+    pub include_run_reports: bool,
 }
 /// Results have their own concrete arenas, independent of the request. Nested
 /// exported Programs own separate arenas and may contain signature patterns.
@@ -1788,11 +1802,10 @@ pub struct RunProgramResponse {
     /// native result completed before a trailing maintenance failure remains here.
     #[prost(message, optional, tag = "5")]
     pub error: ::core::option::Option<Error>,
-    /// Only occurrence identities referenced by error/profile, not global IDs or
+    /// Only occurrence identities referenced by errors/profile/reports, not global IDs or
     /// definition copies. Shared occurrences reuse one index; distinct equal
     /// occurrences have distinct indices even when diagnostics coincide. Include
-    /// attribution needed by an error even when profile collection is off;
-    /// otherwise an off response has no catalog entries.
+    /// attribution needed by errors or requested reports even with profiling off.
     #[prost(message, repeated, tag = "6")]
     pub rules: ::prost::alloc::vec::Vec<RuleAttribution>,
     /// Present iff requested, including when no Run was entered or validation
@@ -1937,7 +1950,13 @@ pub struct ProofFailure {
 pub struct CommandOutput {
     #[prost(message, optional, tag = "7")]
     pub location: ::core::option::Option<CommandLocation>,
-    #[prost(oneof = "command_output::Kind", tags = "1, 2, 3, 4, 5, 6, 8, 9")]
+    /// Present exactly when requested for a completed top-level Run/Loop. This is
+    /// the native complete report, not ProfileSummary or a history reconstruction.
+    /// Internal outputs and Fail anchors remain suppressed. A native failure has
+    /// no complete report. Loop termination is not historical aggregate can_stop.
+    #[prost(message, optional, tag = "10")]
+    pub run_report: ::core::option::Option<NativeRunReport>,
+    #[prost(oneof = "command_output::Kind", tags = "1, 2, 3, 4, 5, 6, 8, 9, 11")]
     pub kind: ::core::option::Option<command_output::Kind>,
 }
 /// Nested message and enum types in `CommandOutput`.
@@ -1960,7 +1979,181 @@ pub mod command_output {
         Loop(super::LoopOutcome),
         #[prost(message, tag = "9")]
         Proof(super::ProofResult),
+        #[prost(message, tag = "11")]
+        Statistics(super::NativeRunReport),
     }
+}
+/// Exact native Duration range. Zero is measured zero; absent required durations
+/// are invalid, never an availability signal or an implicit zero.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ReportDuration {
+    #[prost(uint64, tag = "1")]
+    pub seconds: u64,
+    #[prost(uint32, tag = "2")]
+    pub nanos: u32,
+}
+/// One original native map entry. Direct canonical attribution is optional only
+/// when unavailable; native_name is exact diagnostic/fallback data, never parsed
+/// for identity. Unknown attribution must not be silently dropped in projection.
+/// Keep distinct rows even when canonical references agree; Python conversion
+/// and grouping order depends on the original native aggregate boundaries.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct RuleDurationEntry {
+    #[prost(uint32, optional, tag = "1")]
+    pub rule: ::core::option::Option<u32>,
+    #[prost(enumeration = "NativeRuleDirection", optional, tag = "2")]
+    pub direction: ::core::option::Option<i32>,
+    #[prost(string, tag = "3")]
+    pub native_name: ::prost::alloc::string::String,
+    #[prost(message, optional, tag = "4")]
+    pub value: ::core::option::Option<ReportDuration>,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct RuleCountEntry {
+    #[prost(uint32, optional, tag = "1")]
+    pub rule: ::core::option::Option<u32>,
+    #[prost(enumeration = "NativeRuleDirection", optional, tag = "2")]
+    pub direction: ::core::option::Option<i32>,
+    #[prost(string, tag = "3")]
+    pub native_name: ::prost::alloc::string::String,
+    #[prost(uint64, tag = "4")]
+    pub value: u64,
+}
+/// The actual selected logical Run target, not a rule's representative route.
+/// Names may locate retained definitions; indices refer to the current request.
+/// Omit ruleset if unknown, never reuse dangling prior-request indices or infer
+/// a logical target from a generated holder name.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct RulesetDurationEntry {
+    #[prost(message, optional, tag = "1")]
+    pub ruleset: ::core::option::Option<RulesetRef>,
+    #[prost(string, tag = "2")]
+    pub native_name: ::prost::alloc::string::String,
+    #[prost(message, optional, tag = "3")]
+    pub value: ::core::option::Option<ReportDuration>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct NativeRuleReport {
+    /// None differs from a present empty plan
+    #[prost(message, optional, tag = "1")]
+    pub plan: ::core::option::Option<ReportPlan>,
+    #[prost(message, optional, tag = "2")]
+    pub search_and_apply_time: ::core::option::Option<ReportDuration>,
+    #[prost(uint64, tag = "3")]
+    pub num_matches: u64,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct NativeRuleReportsEntry {
+    #[prost(uint32, optional, tag = "1")]
+    pub rule: ::core::option::Option<u32>,
+    #[prost(enumeration = "NativeRuleDirection", optional, tag = "2")]
+    pub direction: ::core::option::Option<i32>,
+    #[prost(string, tag = "3")]
+    pub native_name: ::prost::alloc::string::String,
+    /// native list order and multiplicity
+    #[prost(message, repeated, tag = "4")]
+    pub reports: ::prost::alloc::vec::Vec<NativeRuleReport>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct NativeRuleSetReport {
+    #[prost(bool, tag = "1")]
+    pub changed: bool,
+    #[prost(message, repeated, tag = "2")]
+    pub rule_reports: ::prost::alloc::vec::Vec<NativeRuleReportsEntry>,
+    #[prost(message, optional, tag = "3")]
+    pub search_and_apply_time: ::core::option::Option<ReportDuration>,
+    #[prost(message, optional, tag = "4")]
+    pub merge_time: ::core::option::Option<ReportDuration>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct NativeIterationReport {
+    #[prost(message, optional, tag = "1")]
+    pub rule_set_report: ::core::option::Option<NativeRuleSetReport>,
+    #[prost(message, optional, tag = "2")]
+    pub rebuild_time: ::core::option::Option<ReportDuration>,
+}
+/// Actual native history and all five authoritative maps. Scheduler histories
+/// need not sum to these maps. Do not add ProfileSummary/maintenance totals.
+/// Map rows retain captured enumeration; no order across native runs is promised.
+/// This payload does not promise stronger retention or attribution after pop.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct NativeRunReport {
+    #[prost(message, repeated, tag = "1")]
+    pub iterations: ::prost::alloc::vec::Vec<NativeIterationReport>,
+    #[prost(bool, tag = "2")]
+    pub updated: bool,
+    #[prost(bool, tag = "3")]
+    pub can_stop: bool,
+    #[prost(message, repeated, tag = "4")]
+    pub search_and_apply_time_per_rule: ::prost::alloc::vec::Vec<RuleDurationEntry>,
+    #[prost(message, repeated, tag = "5")]
+    pub num_matches_per_rule: ::prost::alloc::vec::Vec<RuleCountEntry>,
+    #[prost(message, repeated, tag = "6")]
+    pub search_and_apply_time_per_ruleset: ::prost::alloc::vec::Vec<RulesetDurationEntry>,
+    #[prost(message, repeated, tag = "7")]
+    pub merge_time_per_ruleset: ::prost::alloc::vec::Vec<RulesetDurationEntry>,
+    #[prost(message, repeated, tag = "8")]
+    pub rebuild_time_per_ruleset: ::prost::alloc::vec::Vec<RulesetDurationEntry>,
+}
+/// Plan strings/columns are inert native presentation, not executable Node IDs.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ReportColumn {
+    #[prost(string, tag = "1")]
+    pub variable: ::prost::alloc::string::String,
+    #[prost(sint64, tag = "2")]
+    pub column: i64,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ReportScan {
+    #[prost(string, tag = "1")]
+    pub table: ::prost::alloc::string::String,
+    #[prost(message, repeated, tag = "2")]
+    pub columns: ::prost::alloc::vec::Vec<ReportColumn>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ReportIntersect {
+    #[prost(message, repeated, tag = "1")]
+    pub scans: ::prost::alloc::vec::Vec<ReportScan>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ReportFusedIntersect {
+    #[prost(message, optional, tag = "1")]
+    pub cover: ::core::option::Option<ReportScan>,
+    #[prost(message, repeated, tag = "2")]
+    pub to_intersect: ::prost::alloc::vec::Vec<ReportScan>,
+}
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ReportStageStats {
+    #[prost(uint64, tag = "1")]
+    pub num_candidates: u64,
+    #[prost(uint64, tag = "2")]
+    pub num_succeeded: u64,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ReportStage {
+    /// absent means unavailable, not zero
+    #[prost(message, optional, tag = "3")]
+    pub stats: ::core::option::Option<ReportStageStats>,
+    /// indices in this ReportPlan.stages
+    #[prost(uint64, repeated, tag = "4")]
+    pub next: ::prost::alloc::vec::Vec<u64>,
+    #[prost(oneof = "report_stage::Kind", tags = "1, 2")]
+    pub kind: ::core::option::Option<report_stage::Kind>,
+}
+/// Nested message and enum types in `ReportStage`.
+pub mod report_stage {
+    #[derive(Clone, PartialEq, ::prost::Oneof)]
+    pub enum Kind {
+        #[prost(message, tag = "1")]
+        Intersect(super::ReportIntersect),
+        #[prost(message, tag = "2")]
+        FusedIntersect(super::ReportFusedIntersect),
+    }
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ReportPlan {
+    #[prost(message, repeated, tag = "1")]
+    pub stages: ::prost::alloc::vec::Vec<ReportStage>,
 }
 /// An inert export of the existing engine's checked/simplified proof. These
 /// arenas belong only to this result, not to the response's typed Node arena.
@@ -2539,6 +2732,39 @@ impl ExecutionMode {
         }
     }
 }
+/// Native collection detail, independent of optional report serialization.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum ReportLevel {
+    Unspecified = 0,
+    TimeOnly = 1,
+    WithPlan = 2,
+    StageInfo = 3,
+}
+impl ReportLevel {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "REPORT_LEVEL_UNSPECIFIED",
+            Self::TimeOnly => "REPORT_LEVEL_TIME_ONLY",
+            Self::WithPlan => "REPORT_LEVEL_WITH_PLAN",
+            Self::StageInfo => "REPORT_LEVEL_STAGE_INFO",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "REPORT_LEVEL_UNSPECIFIED" => Some(Self::Unspecified),
+            "REPORT_LEVEL_TIME_ONLY" => Some(Self::TimeOnly),
+            "REPORT_LEVEL_WITH_PLAN" => Some(Self::WithPlan),
+            "REPORT_LEVEL_STAGE_INFO" => Some(Self::StageInfo),
+            _ => None,
+        }
+    }
+}
 /// Failure classes: one value per class of remedy, not one per engine error.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]
@@ -2628,6 +2854,38 @@ impl ProofFailureReason {
             "PROOF_FAILURE_REASON_PRIMITIVES_UNSUPPORTED" => Some(Self::PrimitivesUnsupported),
             "PROOF_FAILURE_REASON_QUERY_DID_NOT_MATCH" => Some(Self::QueryDidNotMatch),
             "PROOF_FAILURE_REASON_PROOFS_NOT_ENABLED" => Some(Self::ProofsNotEnabled),
+            _ => None,
+        }
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum NativeRuleDirection {
+    Unspecified = 0,
+    Single = 1,
+    Forward = 2,
+    Reverse = 3,
+}
+impl NativeRuleDirection {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "NATIVE_RULE_DIRECTION_UNSPECIFIED",
+            Self::Single => "NATIVE_RULE_DIRECTION_SINGLE",
+            Self::Forward => "NATIVE_RULE_DIRECTION_FORWARD",
+            Self::Reverse => "NATIVE_RULE_DIRECTION_REVERSE",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "NATIVE_RULE_DIRECTION_UNSPECIFIED" => Some(Self::Unspecified),
+            "NATIVE_RULE_DIRECTION_SINGLE" => Some(Self::Single),
+            "NATIVE_RULE_DIRECTION_FORWARD" => Some(Self::Forward),
+            "NATIVE_RULE_DIRECTION_REVERSE" => Some(Self::Reverse),
             _ => None,
         }
     }

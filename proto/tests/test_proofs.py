@@ -46,8 +46,8 @@ class ExpectedFailureSchemaTests(unittest.TestCase):
             "fail", ir.Command(kind=Oneof("check", ir.Check())),
         ))))
         self.assertEqual(nested.to_binary(), bytes.fromhex("8201058201021200"))
-        for encoded in ("", "820100", "820103820100", "8201038a0100"):
-            # The last child contains unknown arm 17, not an expected failure.
+        for encoded in ("", "820100", "820103820100", "820103920100"):
+            # The last child contains unknown arm 18, not an expected failure.
             with self.subTest(encoded=encoded), self.assertRaises(ValidationError):
                 validate(ir.Command.from_binary(bytes.fromhex(encoded)))
         for invalid in (

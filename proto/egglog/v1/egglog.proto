@@ -1527,6 +1527,10 @@ message Command {
     // retain their distinct expectations and output suppression.
     // Adds no binder, command list, Union identity scope, or loop iteration.
     Command fail = 16;
+
+    // Observe the actual cumulative native RunReport here. No file destination;
+    // this observation composes with other commands and follows Fail suppression.
+    Unit stats = 17;
   }
 
   // Origin. Locates a failure attributed to a command rather than an
@@ -1936,7 +1940,7 @@ message DestroyEGraphRequest {
 
 message DestroyEGraphResponse {}
 
-// Query or update runtime resources on an existing handle, never logical
+// Query thread resources or update runtime/collection settings on a handle, never logical
 // settings or Program state. Completed updates affect subsequent calls; they
 // do not reconfigure an in-flight Run. Clone inherits effective resources and
 // later updates are handle-local. Resources are not part of a frozen snapshot.
@@ -1952,13 +1956,21 @@ message ConfigureEGraphResourcesRequest {
   oneof operation {
     option (buf.validate.oneof).required = true;
 
-    // Observe the current effective settings without changing them.
+    // Observe the current effective thread count without changing settings.
     Unit query = 2;
     // Zero requests automatic parallelism resolved at this update; positive
     // requests that exact count. Unsupported requests fail, never clamp or
     // silently succeed. This has the same request domain as creation. An
     // explicit operation distinguishes query from setting automatic zero.
     uint32 threads = 3;
+
+    // Set future native report detail. Does not disable collection or retrofit
+    // existing statistics. Clone inherits this setting; updates are handle-local.
+    // Query remains a thread-count query, not a report-level getter.
+    ReportLevel report_level = 4 [(buf.validate.field).enum = {
+      defined_only: true
+      not_in: [0]
+    }];
   }
 }
 
@@ -1967,6 +1979,14 @@ message ConfigureEGraphResourcesResponse {
   // or a frontend estimate. uint64 accommodates the receiver's native count
   // without narrowing to the uint32 request domain.
   uint64 threads = 1 [(buf.validate.field).uint64.gte = 1];
+}
+
+// Native collection detail, independent of optional report serialization.
+enum ReportLevel {
+  REPORT_LEVEL_UNSPECIFIED = 0;
+  REPORT_LEVEL_TIME_ONLY = 1;
+  REPORT_LEVEL_WITH_PLAN = 2;
+  REPORT_LEVEL_STAGE_INFO = 3;
 }
 
 // Execute a program against an existing e-graph.
@@ -1979,6 +1999,11 @@ message RunProgramRequest {
   // progress and stopping checks remain. Outcomes and requested observations
   // are independent of this flag. Collection-off needs runtime implementation.
   bool profile = 3;
+
+  // Emit actual native detail alongside completed requested top-level controls.
+  // Emission only: omission does not disable collection/retention. Explicit Stats
+  // observations always return their full report, independently of this flag.
+  bool include_run_reports = 4;
 }
 
 // Results have their own concrete arenas, independent of the request. Nested
@@ -2059,6 +2084,17 @@ message RunProgramResponse {
     message: "a present profile is complete exactly when the request succeeded"
     expression: "!has(this.profile) || this.profile.complete == !has(this.error)"
   };
+  option (buf.validate.message).cel = {
+    id: "run_program_response.report_rule_refs_in_range"
+    message: "report rule references must index response rules"
+    expression:
+      "this.outputs.all(o, !(has(o.run_report) || has(o.statistics)) || "
+      "[has(o.run_report) ? o.run_report : o.statistics].all(r, "
+      "r.search_and_apply_time_per_rule.all(e, !has(e.rule) || e.rule < uint(size(this.rules))) && "
+      "r.num_matches_per_rule.all(e, !has(e.rule) || e.rule < uint(size(this.rules))) && "
+      "r.iterations.all(i, i.rule_set_report.rule_reports.all(e, "
+      "!has(e.rule) || e.rule < uint(size(this.rules))))))"
+  };
 
   repeated Node nodes = 1;
   repeated Sort sorts = 2;
@@ -2081,11 +2117,10 @@ message RunProgramResponse {
   // native result completed before a trailing maintenance failure remains here.
   Error error = 5;
 
-  // Only occurrence identities referenced by error/profile, not global IDs or
+  // Only occurrence identities referenced by errors/profile/reports, not global IDs or
   // definition copies. Shared occurrences reuse one index; distinct equal
   // occurrences have distinct indices even when diagnostics coincide. Include
-  // attribution needed by an error even when profile collection is off;
-  // otherwise an off response has no catalog entries.
+  // attribution needed by errors or requested reports even with profiling off.
   repeated RuleAttribution rules = 6;
 
   // Present iff requested, including when no Run was entered or validation
@@ -2277,6 +2312,15 @@ message CommandOutput {
     message: "run and loop outcomes are only emitted for top-level commands"
     expression: "!(has(this.run) || has(this.loop)) || size(this.location.path) == 1"
   };
+  option (buf.validate.message).cel = {
+    id: "command_output.report_matches_control"
+    message: "a companion report requires a matching control outcome"
+    expression:
+      "!has(this.run_report) || "
+      "(has(this.run) && this.run.updated == this.run_report.updated && "
+      "this.run.can_stop == this.run_report.can_stop) || "
+      "(has(this.loop) && this.loop.updated == this.run_report.updated)"
+  };
 
   oneof kind {
     option (buf.validate.oneof).required = true;
@@ -2289,9 +2333,186 @@ message CommandOutput {
     TableStatsResult table_stats = 6;
     LoopOutcome loop = 8;
     ProofResult proof = 9;
+    NativeRunReport statistics = 11;
   }
 
   CommandLocation location = 7 [(buf.validate.field).required = true];
+
+  // Present exactly when requested for a completed top-level Run/Loop. This is
+  // the native complete report, not ProfileSummary or a history reconstruction.
+  // Internal outputs and Fail anchors remain suppressed. A native failure has
+  // no complete report. Loop termination is not historical aggregate can_stop.
+  NativeRunReport run_report = 10;
+}
+
+// Exact native Duration range. Zero is measured zero; absent required durations
+// are invalid, never an availability signal or an implicit zero.
+message ReportDuration {
+  uint64 seconds = 1;
+  uint32 nanos = 2 [(buf.validate.field).uint32.lt = 1000000000];
+}
+
+enum NativeRuleDirection {
+  NATIVE_RULE_DIRECTION_UNSPECIFIED = 0;
+  NATIVE_RULE_DIRECTION_SINGLE = 1;
+  NATIVE_RULE_DIRECTION_FORWARD = 2;
+  NATIVE_RULE_DIRECTION_REVERSE = 3;
+}
+
+// One original native map entry. Direct canonical attribution is optional only
+// when unavailable; native_name is exact diagnostic/fallback data, never parsed
+// for identity. Unknown attribution must not be silently dropped in projection.
+// Keep distinct rows even when canonical references agree; Python conversion
+// and grouping order depends on the original native aggregate boundaries.
+message RuleDurationEntry {
+  option (buf.validate.message).cel = {
+    id: "rule_duration_entry.paired_attribution"
+    message: "rule and direction must be present together"
+    expression: "has(this.rule) == has(this.direction)"
+  };
+  optional uint32 rule = 1;
+  optional NativeRuleDirection direction = 2 [(buf.validate.field).enum = {
+    defined_only: true
+    not_in: [0]
+  }];
+  string native_name = 3;
+  ReportDuration value = 4 [(buf.validate.field).required = true];
+}
+
+message RuleCountEntry {
+  option (buf.validate.message).cel = {
+    id: "rule_count_entry.paired_attribution"
+    message: "rule and direction must be present together"
+    expression: "has(this.rule) == has(this.direction)"
+  };
+  optional uint32 rule = 1;
+  optional NativeRuleDirection direction = 2 [(buf.validate.field).enum = {
+    defined_only: true
+    not_in: [0]
+  }];
+  string native_name = 3;
+  uint64 value = 4;
+}
+
+// The actual selected logical Run target, not a rule's representative route.
+// Names may locate retained definitions; indices refer to the current request.
+// Omit ruleset if unknown, never reuse dangling prior-request indices or infer
+// a logical target from a generated holder name.
+message RulesetDurationEntry {
+  RulesetRef ruleset = 1;
+  string native_name = 2;
+  ReportDuration value = 3 [(buf.validate.field).required = true];
+}
+
+message NativeRuleReport {
+  ReportPlan plan = 1; // None differs from a present empty plan
+  ReportDuration search_and_apply_time = 2 [(buf.validate.field).required = true];
+  uint64 num_matches = 3;
+}
+
+message NativeRuleReportsEntry {
+  option (buf.validate.message).cel = {
+    id: "native_rule_reports_entry.paired_attribution"
+    message: "rule and direction must be present together"
+    expression: "has(this.rule) == has(this.direction)"
+  };
+  optional uint32 rule = 1;
+  optional NativeRuleDirection direction = 2 [(buf.validate.field).enum = {
+    defined_only: true
+    not_in: [0]
+  }];
+  string native_name = 3;
+  repeated NativeRuleReport reports = 4; // native list order and multiplicity
+}
+
+message NativeRuleSetReport {
+  option (buf.validate.message).cel = {
+    id: "native_rule_set_report.unique_names"
+    message: "native rule map keys must be unique"
+    expression: "this.rule_reports.all(e, this.rule_reports.filter(f, f.native_name == e.native_name).size() == 1)"
+  };
+  bool changed = 1;
+  repeated NativeRuleReportsEntry rule_reports = 2;
+  ReportDuration search_and_apply_time = 3 [(buf.validate.field).required = true];
+  ReportDuration merge_time = 4 [(buf.validate.field).required = true];
+}
+
+message NativeIterationReport {
+  NativeRuleSetReport rule_set_report = 1 [(buf.validate.field).required = true];
+  ReportDuration rebuild_time = 2 [(buf.validate.field).required = true];
+}
+
+// Actual native history and all five authoritative maps. Scheduler histories
+// need not sum to these maps. Do not add ProfileSummary/maintenance totals.
+// Map rows retain captured enumeration; no order across native runs is promised.
+// This payload does not promise stronger retention or attribution after pop.
+message NativeRunReport {
+  option (buf.validate.message).cel = {
+    id: "native_run_report.can_stop"
+    message: "an updated report cannot permit stopping"
+    expression: "!this.updated || !this.can_stop"
+  };
+  option (buf.validate.message).cel = {
+    id: "native_run_report.unique_names"
+    message: "each native map must have unique keys, independently of other maps"
+    expression:
+      "this.search_and_apply_time_per_rule.all(e, this.search_and_apply_time_per_rule.filter(f, f.native_name == e.native_name).size() == 1) && "
+      "this.num_matches_per_rule.all(e, this.num_matches_per_rule.filter(f, f.native_name == e.native_name).size() == 1) && "
+      "this.search_and_apply_time_per_ruleset.all(e, this.search_and_apply_time_per_ruleset.filter(f, f.native_name == e.native_name).size() == 1) && "
+      "this.merge_time_per_ruleset.all(e, this.merge_time_per_ruleset.filter(f, f.native_name == e.native_name).size() == 1) && "
+      "this.rebuild_time_per_ruleset.all(e, this.rebuild_time_per_ruleset.filter(f, f.native_name == e.native_name).size() == 1)"
+  };
+  repeated NativeIterationReport iterations = 1;
+  bool updated = 2;
+  bool can_stop = 3;
+  repeated RuleDurationEntry search_and_apply_time_per_rule = 4;
+  repeated RuleCountEntry num_matches_per_rule = 5;
+  repeated RulesetDurationEntry search_and_apply_time_per_ruleset = 6;
+  repeated RulesetDurationEntry merge_time_per_ruleset = 7;
+  repeated RulesetDurationEntry rebuild_time_per_ruleset = 8;
+}
+
+// Plan strings/columns are inert native presentation, not executable Node IDs.
+message ReportColumn {
+  string variable = 1;
+  sint64 column = 2;
+}
+message ReportScan {
+  string table = 1;
+  repeated ReportColumn columns = 2;
+}
+message ReportIntersect {
+  option (buf.validate.message).cel = {
+    id: "report_intersect.single_columns"
+    message: "each native SingleScan must have exactly one column"
+    expression: "this.scans.all(s, size(s.columns) == 1)"
+  };
+  repeated ReportScan scans = 1;
+}
+message ReportFusedIntersect {
+  ReportScan cover = 1 [(buf.validate.field).required = true];
+  repeated ReportScan to_intersect = 2;
+}
+message ReportStageStats {
+  uint64 num_candidates = 1;
+  uint64 num_succeeded = 2;
+}
+message ReportStage {
+  oneof kind {
+    option (buf.validate.oneof).required = true;
+    ReportIntersect intersect = 1;
+    ReportFusedIntersect fused_intersect = 2;
+  }
+  ReportStageStats stats = 3; // absent means unavailable, not zero
+  repeated uint64 next = 4; // indices in this ReportPlan.stages
+}
+message ReportPlan {
+  option (buf.validate.message).cel = {
+    id: "report_plan.stage_bounds"
+    message: "successors must index this plan's stages"
+    expression: "this.stages.all(s, s.next.all(i, i < uint(size(this.stages))))"
+  };
+  repeated ReportStage stages = 1;
 }
 
 // An inert export of the existing engine's checked/simplified proof. These
