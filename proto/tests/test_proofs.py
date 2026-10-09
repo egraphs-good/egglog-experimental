@@ -1,11 +1,80 @@
-"""Proof wire/CEL checks only; these do not execute or check native proofs."""
+"""Proof/response wire checks; no native proof or publication execution."""
 
+import json
 import unittest
 
 from protobuf import Oneof
 from protovalidate import ValidationError, validate
 
 from gen.python.egglog.v1 import egglog_pb as ir
+
+
+class PublicationSchemaTests(unittest.TestCase):
+    def test_ruleset_publication_absence_is_not_an_empty_confirmation(self):
+        absent = ir.RunProgramResponse.from_binary(b"")
+        self.assertFalse(absent.has_field("ruleset_publication"))
+        self.assertNotIn("rulesetPublication", json.loads(absent.to_json()))
+        with self.assertRaises(ValidationError):
+            validate(absent)
+        present = ir.RunProgramResponse(ruleset_publication=ir.RulesetPublication())
+        validate(present)
+        self.assertEqual(present.to_binary(), b"\x42\x00")
+        self.assertEqual(json.loads(present.to_json())["rulesetPublication"], {})
+        for decoded in (
+            ir.RunProgramResponse.from_binary(present.to_binary()),
+            ir.RunProgramResponse.from_json(present.to_json()),
+        ):
+            self.assertTrue(decoded.has_field("ruleset_publication"))
+            self.assertEqual(decoded.ruleset_publication.names, [])
+            self.assertEqual(decoded, present)
+
+    def test_ruleset_publication_names_roundtrip_including_the_default_name(self):
+        for names in ([], [""], ["named"], ["", "named", "snowman-☃"]):
+            with self.subTest(names=names):
+                response = ir.RunProgramResponse(ruleset_publication=ir.RulesetPublication(names=names))
+                validate(response)
+                for decoded in (
+                    ir.RunProgramResponse.from_binary(response.to_binary()),
+                    ir.RunProgramResponse.from_json(response.to_json()),
+                ):
+                    self.assertEqual(decoded, response)
+                    self.assertEqual(decoded.ruleset_publication.names, names)
+        self.assertEqual(ir.RulesetPublication(names=[""]).to_binary(), b"\x0a\x00")
+
+    def test_ruleset_publication_rejects_duplicate_names(self):
+        for names in (["named", "named"], ["", ""], ["first", "second", "first"]):
+            for message in (
+                ir.RulesetPublication(names=names),
+                ir.RunProgramResponse(ruleset_publication=ir.RulesetPublication(names=names)),
+            ):
+                with self.subTest(names=names, message=type(message).__name__), self.assertRaises(ValidationError):
+                    validate(message)
+
+    def test_ruleset_publication_presence_is_independent_of_profile_and_error(self):
+        cases = [
+            (None, ["", "complete"]),
+            (ir.Error(code=ir.ErrorCode.INVALID_PROGRAM, message="preparation failed"), []),
+            (ir.Error(code=ir.ErrorCode.UNKNOWN_NAME, message="preparation failed"), []),
+            (ir.Error(code=ir.ErrorCode.CHECK_FAILED, message="command failed", location=ir.CommandLocation(path=[0])), ["complete"]),
+        ]
+        for error, names in cases:
+            for profile in (None, ir.ProfileSummary(complete=error is None)):
+                with self.subTest(error=error, profile=profile):
+                    response = ir.RunProgramResponse(
+                        error=error, profile=profile,
+                        ruleset_publication=ir.RulesetPublication(names=names),
+                    )
+                    validate(response)
+                    self.assertEqual(ir.RunProgramResponse.from_binary(response.to_binary()), response)
+                    response.ruleset_publication = None
+                    with self.assertRaises(ValidationError):
+                        validate(response)
+
+    def test_ruleset_publication_membership_needs_the_submitted_request(self):
+        # Like MaintenanceSite request bounds, request-name membership and
+        # truthful completion cannot be checked by response-only CEL. A reader
+        # must reject this name if it was not submitted, despite valid shape.
+        validate(ir.RunProgramResponse(ruleset_publication=ir.RulesetPublication(names=["not-in-request"])))
 
 
 class ProofSchemaTests(unittest.TestCase):
@@ -72,9 +141,12 @@ class ProofSchemaTests(unittest.TestCase):
             proofs=[ir.ProofStep(lhs=6, rhs=6, justification=j) for j in justifications],
             root=8,
         )
-        response = ir.RunProgramResponse(outputs=[ir.CommandOutput(
-            kind=Oneof("proof", result), location=ir.CommandLocation(path=[0]),
-        )])
+        response = ir.RunProgramResponse(
+            ruleset_publication=ir.RulesetPublication(),
+            outputs=[ir.CommandOutput(
+                kind=Oneof("proof", result), location=ir.CommandLocation(path=[0]),
+            )],
+        )
         validate(response)
         decoded = ir.RunProgramResponse.from_binary(response.to_binary())
         self.assertEqual(decoded, response)
@@ -152,6 +224,7 @@ class ProofSchemaTests(unittest.TestCase):
             root=0,
         )
         response = ir.RunProgramResponse(
+            ruleset_publication=ir.RulesetPublication(),
             outputs=[ir.CommandOutput(
                 kind=Oneof("proof", proof),
                 location=ir.CommandLocation(path=[0, 1], iterations=[2]),
@@ -180,14 +253,17 @@ class ProofSchemaTests(unittest.TestCase):
             Oneof("command", ir.StaticCommandPath(path=[2, 1])),
             Oneof("declaration", 0), Oneof("sort", 0), Oneof("ruleset", 0),
         ]
-        response = ir.RunProgramResponse(profile=ir.ProfileSummary(
-            complete=True,
-            runs=[ir.RunSummary(command_path=[0], invocations=1)],
-            maintenance=[ir.MaintenanceSummary(
-                site=ir.MaintenanceSite(target=target), invocations=1,
-                search_and_apply_nanos=0,
-            ) for target in targets],
-        ))
+        response = ir.RunProgramResponse(
+            ruleset_publication=ir.RulesetPublication(),
+            profile=ir.ProfileSummary(
+                complete=True,
+                runs=[ir.RunSummary(command_path=[0], invocations=1)],
+                maintenance=[ir.MaintenanceSummary(
+                    site=ir.MaintenanceSite(target=target), invocations=1,
+                    search_and_apply_nanos=0,
+                ) for target in targets],
+            ),
+        )
         validate(response)
         decoded = ir.RunProgramResponse.from_binary(response.to_binary())
         self.assertEqual(decoded, response)
@@ -240,6 +316,7 @@ class ProofSchemaTests(unittest.TestCase):
 
     def test_profile_preserves_a_failed_request_prefix(self):
         response = ir.RunProgramResponse(
+            ruleset_publication=ir.RulesetPublication(),
             outputs=[ir.CommandOutput(
                 kind=Oneof("run", ir.RunOutcome(updated=True)),
                 location=ir.CommandLocation(path=[0]),

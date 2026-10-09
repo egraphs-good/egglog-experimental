@@ -293,6 +293,17 @@ Rust without duplicating the IR declarations.
 
 ### Unnamed rulesets and declaration reuse
 
+`RunProgramResponse.ruleset_publication` is required independently of profiling
+and errors. Its unique names confirm exactly the submitted compatible ruleset
+presentations whose bindings are retained, including old compatible resupplies
+and completed first naming; `""` denotes the explicit default name. Preparation
+failure confirms none; success or completed definitions followed by command
+error confirms every submitted name. Failure omissions neither revoke earlier
+confirmation nor establish global absence. Readers must also check membership
+against the exact request; response-only validation checks presence/uniqueness.
+Legacy absence means unavailable/unknown, never an empty confirmation, and
+fails this draft's new response contract. This observation is not a state export.
+
 - **Ruleset identity — decided:** immutable rulesets have optional names and
   share state by occurrence identity. The wire layout uses
   `Program.rulesets`, with a rule-list or composition body. Runs and composition

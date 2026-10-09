@@ -1778,6 +1778,29 @@ pub struct RunProgramResponse {
     /// failed. Summary only: no dynamic iteration coordinates or event history.
     #[prost(message, optional, tag = "7")]
     pub profile: ::core::option::Option<ProfileSummary>,
+    /// Present on every valid engine response, independently of profile or error.
+    /// Absent means unavailable/unknown (for example an older peer), never empty;
+    /// such a response does not satisfy this contract.
+    #[prost(message, optional, tag = "8")]
+    pub ruleset_publication: ::core::option::Option<RulesetPublication>,
+}
+/// Exhaustive confirmation of submitted named ruleset presentations for this
+/// request, not a list of all installed names. Each name confirms that all its
+/// submitted presentations passed full compatibility preparation and its binding
+/// is retained at response time. Include compatible already-published resupplies;
+/// new bindings and first-name enrichments require completed publication.
+/// Preparation failure yields no names, even if some already exist. Success,
+/// or completed definition installation followed by a command error, confirms
+/// every distinct submitted name. Omission on failure neither revokes an earlier
+/// confirmation nor establishes global absence. List order has no meaning.
+/// Readers reject duplicate or unsubmitted names. Request correspondence and
+/// truthful completion require the request/engine state; response-only CEL
+/// cannot check them. This carries no occurrence IDs, bodies, or history.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct RulesetPublication {
+    /// The empty string confirms the explicitly named default ruleset.
+    #[prost(string, repeated, tag = "1")]
+    pub names: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
 }
 /// One authored RuleDecl occurrence, including both directions of a BiRewrite.
 /// Pick one valid route from the request's ruleset arena or an installed named
