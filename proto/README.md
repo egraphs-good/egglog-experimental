@@ -521,9 +521,9 @@ and memory use on the same graph before choosing.
 
 `EGraphOptions.execution_mode` selects ordinary execution (the default), term
 encoding, proofs, or proof testing. Clone retains the mode and proof state.
-The current byte adapter accepts only NORMAL; other or unknown mode values fail
-creation before allocating a handle. Prove/ProveExists fail Program preparation
-before any actions execute until native proof integration is implemented.
+The local byte adapter supports all four modes with `profile=true`; unknown
+mode values fail creation before allocating a handle. Flat Prove/ProveExists
+requests use the current native engine and return owned proof bytes.
 Snapshots retain the mode, but logical reconstruction does not preserve original
 derivations. `Prove` uses the same conjunctive facts as `Check`; `ProveExists`
 targets a constructor name without inserting a witness. Proof testing executes
@@ -535,8 +535,9 @@ return the proof at the originating command location, including inside loops.
 execution and contribute only to optional profiling, with the exclusive
 attribution described above. CEL rejects nested Run/Loop outcomes and permits
 nested proof/observation results; matching them to the requested command remains
-an adapter check. These are schema capabilities, not implemented byte proof
-execution. The current adapter still requires `profile=true`; it cannot yet
+an adapter check. Flat byte execution implements requested-only results and
+exclusive authored/maintenance leaf summaries; loops remain unsupported.
+The current adapter still requires `profile=true`; it cannot yet
 satisfy the collection-off contract. No profiling-level enum or trace format is
 introduced.
 
@@ -553,9 +554,8 @@ names, and error-detail consistency. Shared decoders must additionally check
 acyclicity and reachability with bounded-stack traversal. This is transport for
 the existing checked/simplified proof, not a new proof engine or a standalone
 checker; rule context and compatible host validators remain external. The
-schema tests establish wire/CEL behavior only. Native execution and the existing
-desugar/proof-checker-context treatment still require adapter integration and
-conformance tests.
+schema tests establish wire/CEL behavior only. The bounded native/adapter proof
+fixtures do not establish full frontend or desugar/proof-checker-context conformance.
 
 ### Remaining review work
 
@@ -630,6 +630,10 @@ The current executable subset is deliberately limited:
 - Tree extraction with costs, duplicate roots and shared result nodes; extracted
   table rows; native e-graph clone and destruction.
 - Profile-enabled execution with command locations and compact run summaries.
+- NORMAL, TERM_ENCODING, PROOFS and PROOF_TESTING; flat Prove/ProveExists,
+  requested-only outputs, and exclusive maintenance summaries. Preparation
+  compiles on disposable native state without running actions or helpers;
+  live definition installation retains its actual prefix on failure.
 - Catalog-backed i64/f64 addition through distinct host definition keys.
 - Generic Vec empty/of/get, ordered Vec value payloads and extracted Vec data.
 - Generic Pair construction/first/second, ordered Pair value payloads and
@@ -651,7 +655,8 @@ Unsupported forms fail explicitly. These include profile-off (the native engine
 still collects timing data), action/nested/empty Union identities, other complex values
 and codecs, other primitive catalog mappings, relations, ruleset
 resupply, anonymous/combined/shared rulesets, nondefault rule modes, schedulers,
-loops, snapshots, proof requests, merge table reads, and custom cost models.
+loops, snapshots, encoded-mode extraction/table observations, merge table reads,
+and custom cost models.
 Expressions deeper than 256 nodes or requiring more than 65,536 native tree
 nodes are currently rejected. This is a checkpoint, not a narrowing of
 the conformance goal. Full source coverage, generated frontend APIs, exact
@@ -687,7 +692,10 @@ authoring catalog is not implemented.
 
 The first source slice supports datatypes, scalar/equality-sort functions,
 ordered top-level lets, ordinary rules and directional rewrites, fixed named
-theories, one-step runs, checks, and static tree extraction. Lets become nullary
+theories, one-step runs, checks, Prove/ProveExists, and static tree extraction.
+Prove keeps its authored facts instead of publishing the generated helper
+program; Check remains Check so the receiving mode controls proof testing.
+Lets become nullary
 function sets at their source positions. Rulesets are emitted when first run;
 adding rules afterward is explicitly rejected until occurrence-preserving
 immutable versions are implemented. Future rules are never hoisted into earlier
@@ -703,7 +711,7 @@ publication. Global references remain distinct captured-function calls.
 Experimental `extract` is an extension command. This producer explicitly
 resolves only its static tree form; dynamic costs and extractor options remain
 unsupported. Relations, program-defined primitives and uncatalogued primitive
-calls, proof modes, local lets,
+calls, local lets,
 globals in rule heads, bidirectional rewrites, general unions/schedules,
 includes, multi-command command macros and other extension commands are separate
 gates.

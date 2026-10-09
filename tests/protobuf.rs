@@ -4937,11 +4937,11 @@ fn resource_updates_preserve_program_prefix_and_clone_isolation() {
 }
 
 #[test]
-fn unsupported_proof_commands_reject_preparation_before_any_action() {
+fn malformed_proof_commands_reject_preparation_before_any_action() {
     for proof in [
-        pb::command::Kind::Prove(pb::Prove { facts: vec![] }),
+        pb::command::Kind::Prove(pb::Prove { facts: vec![999] }),
         pb::command::Kind::ProveExists(pb::ProveExists {
-            constructor: "Num".into(),
+            constructor: "current".into(),
         }),
     ] {
         let mut engine = Engine::default();

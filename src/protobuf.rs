@@ -1,9 +1,10 @@
 //! In-process compatibility adapter for encoded protobuf requests.
 //!
 //! This executable slice supports concrete equality/scalar/Vec/Pair/Map sorts,
-//! constructors, functions, ordered actions, flat named rulesets, checks,
-//! extraction, and table observations. Unsupported forms fail explicitly before
-//! installation. In particular, profiling must currently be requested: the
+//! constructors, functions, ordered actions, flat named rulesets, checks and
+//! requested proofs in all four modes. Extraction and table observations remain
+//! ordinary-mode only. Unsupported forms fail explicitly before installation.
+//! In particular, profiling must currently be requested: the
 //! native engine cannot yet disable its optional timing collection.
 //!
 //! Decoded protobuf messages supply all authored semantics. Native ASTs exist
@@ -18,9 +19,11 @@ use std::sync::Arc;
 use egglog::ast::{self, Action, Command, Expr, Fact, Literal};
 use egglog::proto as pb;
 use egglog::{ArcSort, EGraph, Term, TermDag, TermId, Value, span};
+use egglog::{ExecutionEvent, ExecutionOrigin};
 use egglog_ast::span::{EgglogSpan, SrcFile};
 use prost::Message;
 
+mod proof;
 pub mod source;
 
 /// A rejected transport, source conversion, or lifecycle operation, separate
@@ -52,6 +55,7 @@ pub struct Engine {
 #[derive(Clone)]
 struct Session {
     graph: EGraph,
+    mode: pb::ExecutionMode,
     // Authored definitions and presentation/default closures, never execution ASTs.
     definitions: pb::Program,
     names: NativeNames,
@@ -59,6 +63,131 @@ struct Session {
     rulesets: HashMap<String, String>,
     // Native rule identifiers are an adapter index, never authored identity.
     origins: HashMap<String, pb::RuleAttribution>,
+    // Successfully registered closed container aliases, including encoded modes
+    // where physical TypeInfo is not the authoring type environment.
+    sorts: HashSet<String>,
+}
+
+struct Installation {
+    command: Command,
+    site: pb::maintenance_site::Target,
+    span: Option<pb::Span>,
+    declaration: Option<usize>,
+    ruleset: Option<(String, String)>,
+    rule: Option<(String, pb::RuleAttribution)>,
+}
+
+struct Prepared {
+    definitions: pb::Program,
+    request: u64,
+    installations: Vec<Installation>,
+    materialized: Vec<Command>,
+    // Canonical declaration indices whose native installation is still pending.
+    pending_declarations: HashSet<usize>,
+}
+
+struct LeafSummary {
+    invocations: u64,
+    nanos: [Option<u64>; 3],
+    rules: HashMap<String, (u64, Option<u64>)>,
+}
+
+impl Default for LeafSummary {
+    fn default() -> Self {
+        Self {
+            invocations: 0,
+            nanos: [Some(0); 3],
+            rules: HashMap::new(),
+        }
+    }
+}
+
+impl LeafSummary {
+    fn finish(
+        &mut self,
+        result: Result<&egglog_reports::RunReport, &egglog::Error>,
+        authored_rules: bool,
+    ) {
+        let Ok(report) = result else {
+            self.nanos = [None; 3];
+            return;
+        };
+        for (total, measured) in self.nanos.iter_mut().zip([
+            &report.search_and_apply_time_per_ruleset,
+            &report.merge_time_per_ruleset,
+            &report.rebuild_time_per_ruleset,
+        ]) {
+            *total = total.and_then(|old| {
+                let elapsed = measured.values().map(|d| d.as_nanos()).sum::<u128>();
+                old.checked_add(u64::try_from(elapsed).ok()?)
+            });
+        }
+        if authored_rules {
+            for (name, matches) in &report.num_matches_per_rule {
+                let (count, nanos) = self.rules.entry(name.to_string()).or_insert((0, Some(0)));
+                *count += *matches as u64;
+                *nanos = nanos.and_then(|old| {
+                    old.checked_add(
+                        report
+                            .search_and_apply_time_per_rule
+                            .get(name)?
+                            .as_nanos()
+                            .try_into()
+                            .ok()?,
+                    )
+                });
+            }
+        }
+    }
+}
+
+fn execution_error(
+    error: egglog::Error,
+    names: &NativeNames,
+    span: Option<pb::Span>,
+    location: Option<pb::CommandLocation>,
+    panic: bool,
+) -> pb::Error {
+    let code = match &error {
+        egglog::Error::CheckError(..) => pb::ErrorCode::CheckFailed,
+        egglog::Error::ExtractError(..) => pb::ErrorCode::ExtractionFailed,
+        egglog::Error::NoSuchRuleset(..) => pb::ErrorCode::UnknownName,
+        egglog::Error::ProofError { .. } => pb::ErrorCode::ProofFailed,
+        _ if panic => pb::ErrorCode::Panic,
+        _ => pb::ErrorCode::EvaluationFailed,
+    };
+    let proof_failure = if let egglog::Error::ProofError { error, .. } = &error {
+        use egglog::proof::ProveExistsError as E;
+        let (reason, constructor) = match error {
+            E::RequiresConstructor => (pb::ProofFailureReason::RequiresConstructor, None),
+            E::PrimitivesUnsupported => (pb::ProofFailureReason::PrimitivesUnsupported, None),
+            E::QueryDidNotMatch { constructor } => (
+                pb::ProofFailureReason::QueryDidNotMatch,
+                Some(
+                    names
+                        .callables
+                        .get(constructor)
+                        .unwrap_or(constructor)
+                        .clone(),
+                ),
+            ),
+            E::ProofsNotEnabled => (pb::ProofFailureReason::ProofsNotEnabled, None),
+        };
+        Some(pb::ProofFailure {
+            reason: reason.into(),
+            constructor,
+        })
+    } else {
+        None
+    };
+    pb::Error {
+        code: code.into(),
+        message: error.to_string(),
+        span,
+        location,
+        proof_failure,
+        ..Default::default()
+    }
 }
 
 // Keep validation failures structured while allowing syntax validators to
@@ -90,14 +219,9 @@ impl Engine {
     /// Decodes a creation request and returns an encoded handle.
     pub fn create(&mut self, bytes: &[u8]) -> Result<Vec<u8>, TransportError> {
         let request = pb::CreateEGraphRequest::decode(bytes)?;
-        if let Some(options) = &request.options
-            && options.execution_mode != i32::from(pb::ExecutionMode::Normal)
-        {
-            return Err(TransportError(format!(
-                "unsupported execution mode {}; only NORMAL executes in this adapter",
-                options.execution_mode
-            )));
-        }
+        let mode =
+            pb::ExecutionMode::try_from(request.options.as_ref().map_or(0, |o| o.execution_mode))
+                .map_err(|_| TransportError("unknown execution mode".into()))?;
         if !request.declarations.is_empty() {
             return Err(TransportError(
                 "creation declarations are not supported yet".into(),
@@ -119,7 +243,13 @@ impl Engine {
             files: request.files,
             ..Default::default()
         };
-        let mut graph = crate::new_experimental_egraph();
+        let graph = crate::new_experimental_egraph();
+        let mut graph = match mode {
+            pb::ExecutionMode::Normal => graph,
+            pb::ExecutionMode::TermEncoding => graph.with_term_encoding_enabled(),
+            pb::ExecutionMode::Proofs => graph.with_proofs_enabled(),
+            pb::ExecutionMode::ProofTesting => graph.with_proofs_enabled().with_proof_testing(),
+        };
         for (index, sort) in program.sorts.iter().enumerate() {
             let name = sort_name(&program.sorts, index as u32).map_err(TransportError)?;
             let native = graph
@@ -151,11 +281,13 @@ impl Engine {
             self.next_id,
             Session {
                 graph,
+                mode,
                 definitions: pb::Program::default(),
                 names: NativeNames::default(),
                 request: 0,
                 rulesets: HashMap::new(),
                 origins: HashMap::new(),
+                sorts: HashSet::new(),
             },
         );
         Ok(pb::CreateEGraphResponse {
@@ -251,12 +383,16 @@ impl Engine {
         } else {
             Err("profile=false is unsupported until native collection can be disabled".into())
         };
-        match prepared {
-            Ok((staged, _)) => *session = staged,
+        let prepared = match prepared {
+            Ok(prepared) => prepared,
             Err(error) => {
                 response.error = Some(*error.0);
                 return Ok(response.encode_to_vec());
             }
+        };
+        if let Err(error) = session.install(prepared, &mut response) {
+            response.error = Some(*error);
+            return Ok(response.encode_to_vec());
         }
         for (index, command) in program.commands.iter().enumerate() {
             let location = pb::CommandLocation {
@@ -265,32 +401,23 @@ impl Engine {
             };
             let result = session.execute(&program, command, &location, &mut response);
             if let Err(error) = result {
-                let code = match &error {
-                    egglog::Error::CheckError(..) => pb::ErrorCode::CheckFailed,
-                    egglog::Error::ExtractError(..) => pb::ErrorCode::ExtractionFailed,
-                    egglog::Error::NoSuchRuleset(..) => pb::ErrorCode::UnknownName,
-                    _ if matches!(
-                        &command.kind,
-                        Some(pb::command::Kind::Action(pb::Action {
-                            kind: Some(pb::action::Kind::Panic(_)),
-                            ..
-                        }))
-                    ) =>
-                    {
-                        pb::ErrorCode::Panic
-                    }
-                    _ => pb::ErrorCode::EvaluationFailed,
-                };
-                response.error = Some(pb::Error {
-                    code: code.into(),
-                    message: error.to_string(),
-                    span: match &command.kind {
+                let panic = matches!(
+                    &command.kind,
+                    Some(pb::command::Kind::Action(pb::Action {
+                        kind: Some(pb::action::Kind::Panic(_)),
+                        ..
+                    }))
+                );
+                response.error = Some(execution_error(
+                    error,
+                    &session.names,
+                    match &command.kind {
                         Some(pb::command::Kind::Action(action)) => action.span.or(command.span),
                         _ => command.span,
                     },
-                    location: Some(location),
-                    ..Default::default()
-                });
+                    Some(location),
+                    panic,
+                ));
                 break;
             }
         }
@@ -300,9 +427,76 @@ impl Engine {
 }
 
 impl Session {
-    // Work on a clone until every definition, node annotation, and command has
-    // been checked. Only supported declaration commands run here, never actions.
-    fn prepare(&self, program: &mut pb::Program) -> Result<(Self, Vec<Command>), PreparationError> {
+    fn install(
+        &mut self,
+        prepared: Prepared,
+        response: &mut pb::RunProgramResponse,
+    ) -> Result<(), Box<pb::Error>> {
+        let Prepared {
+            definitions,
+            request,
+            installations,
+            mut pending_declarations,
+            ..
+        } = prepared;
+        self.request = request;
+        let mut failure = None;
+        for installation in installations {
+            let (result, registered) = self.run_observed(
+                vec![installation.command.clone()],
+                installation.site,
+                None,
+                response,
+            );
+            if registered {
+                if let Some(index) = installation.declaration {
+                    pending_declarations.remove(&index);
+                }
+                if let Some((logical, native)) = installation.ruleset {
+                    self.rulesets.insert(logical, native);
+                }
+                if let Some((name, origin)) = installation.rule {
+                    self.origins.insert(name, origin);
+                }
+                if let Command::Sort {
+                    name,
+                    presort_and_args: Some(_),
+                    ..
+                } = installation.command
+                {
+                    self.sorts.insert(name);
+                }
+            }
+            if let Err(error) = result {
+                failure = Some((error, installation.span));
+                break;
+            }
+        }
+        // Keep canonical arena indices stable, but retain only definitions that
+        // really registered. The compiler clone and its IDs are discarded.
+        self.definitions = definitions;
+        self.definitions.declarations = std::mem::take(&mut self.definitions.declarations)
+            .into_iter()
+            .enumerate()
+            .filter_map(|(index, d)| (!pending_declarations.contains(&index)).then_some(d))
+            .collect();
+        self.names = project_names(&mut pb::Program::default(), &self.definitions);
+        match failure {
+            Some((error, span)) => Err(Box::new(execution_error(
+                error,
+                &self.names,
+                span,
+                None,
+                false,
+            ))),
+            None => Ok(()),
+        }
+    }
+
+    // Authoring resolution selects annotated calls; the native compile-only
+    // boundary then registers and compiles the entire request on a disposable
+    // clone. Neither clone's runtime state or backend IDs are ever adopted.
+    fn prepare(&self, program: &mut pb::Program) -> Result<Prepared, PreparationError> {
         if program.ir_version != 1 {
             return Err(format!("unsupported IR version {}", program.ir_version).into());
         }
@@ -311,10 +505,47 @@ impl Session {
         if staged.definitions.ir_version == 0 {
             staged.definitions = staged.graph.type_info().builtin_catalog()?.definitions;
         }
+        let mut next_declaration = staged.definitions.declarations.len();
         let added =
             egglog::builtin::definitions::reconcile_declarations(program, &mut staged.definitions)?;
+        let declaration_indices: Vec<_> = added
+            .iter()
+            .map(|added| {
+                added.then(|| {
+                    let index = next_declaration;
+                    next_declaration += 1;
+                    index
+                })
+            })
+            .collect();
+        let mut pending_declarations = HashSet::new();
+        let mut installations = vec![];
         validate_private_names(program)?;
         staged.names = project_names(program, &staged.definitions);
+        let mut authored = staged.definitions.clone();
+        project_names(&mut authored, &staged.definitions);
+        let signatures: HashMap<_, _> = authored
+            .declarations
+            .iter()
+            .filter_map(|d| match &d.kind {
+                Some(pb::declaration::Kind::Constructor(c)) => Some((
+                    &c.name,
+                    &c.inputs,
+                    c.output,
+                    ast::FunctionSubtype::Constructor,
+                )),
+                Some(pb::declaration::Kind::Function(f)) => {
+                    Some((&f.name, &f.inputs, f.output, ast::FunctionSubtype::Custom))
+                }
+                _ => None,
+            })
+            .map(|(name, inputs, output, subtype)| {
+                Ok((
+                    name.clone(),
+                    (signature(&authored, inputs, output)?, subtype),
+                ))
+            })
+            .collect::<Result<_, String>>()?;
         for (declaration, added) in program.declarations.iter().zip(&added) {
             if !added {
                 continue;
@@ -332,7 +563,7 @@ impl Session {
                 return Err(format!("native declaration namespace collision: {name}").into());
             }
         }
-        for (declaration, added) in program.declarations.iter().zip(&added) {
+        for (index, (declaration, added)) in program.declarations.iter().zip(&added).enumerate() {
             if !added {
                 continue;
             }
@@ -352,14 +583,36 @@ impl Session {
                 };
                 staged
                     .graph
-                    .run_program(vec![command])
+                    .resolve_command_before_proofs(command.clone())
                     .map_err(|error| error.to_string())?;
+                pending_declarations.insert(declaration_indices[index].unwrap());
+                installations.push(Installation {
+                    command,
+                    site: pb::maintenance_site::Target::Declaration(index as u32),
+                    span: declaration.span,
+                    declaration: declaration_indices[index],
+                    ruleset: None,
+                    rule: None,
+                });
             }
         }
         // Container payloads may introduce the Pair/Vec sorts used to construct
         // a Map. Only this staged execution copy receives those helper records.
-        lower_container_values(program)?;
-        let materialized = materialize_sorts(program, &mut staged.graph)?;
+        let sort_sites = lower_container_values(program)?;
+        let materialized_sorts = materialize_sorts(program, &mut staged.graph, &mut staged.sorts)?;
+        let mut materialized = vec![];
+        for (index, command) in materialized_sorts {
+            materialized.push(command.clone());
+            let site = sort_sites[index as usize];
+            installations.push(Installation {
+                command,
+                site: pb::maintenance_site::Target::Sort(site),
+                span: program.sorts[site as usize].span,
+                declaration: None,
+                ruleset: None,
+                rule: None,
+            });
+        }
         for (index, sort) in program.sorts.iter().enumerate() {
             native_span(program, sort.span.as_ref())?;
             let Some(name) =
@@ -367,32 +620,18 @@ impl Session {
             else {
                 continue;
             };
-            let native = staged
-                .graph
-                .get_sort_by_name(&name)
-                .ok_or_else(|| format!("unknown sort {name}"))?;
-            if native.is_eq_sort() != matches!(sort.kind, Some(pb::sort::Kind::Eq(_))) {
+            let equality = staged.names.sorts.contains_key(&name);
+            if !equality
+                && !staged.sorts.contains(&name)
+                && staged.graph.get_sort_by_name(&name).is_none()
+            {
+                return Err(format!("unknown sort {name}").into());
+            }
+            if equality != matches!(sort.kind, Some(pb::sort::Kind::Eq(_))) {
                 return Err(format!("sort kind mismatch for {name}").into());
             }
         }
         validate_host_declarations(program, &mut staged.graph)?;
-        // The canonical records above remain intact. The execution/rendering
-        // copy contains only genuinely new native declarations.
-        program.declarations = std::mem::take(&mut program.declarations)
-            .into_iter()
-            .zip(added)
-            .filter_map(|(d, added)| {
-                (added
-                    || matches!(
-                        d.kind,
-                        Some(
-                            pb::declaration::Kind::HostPrimitive(_)
-                                | pb::declaration::Kind::HostSortFamily(_)
-                        )
-                    ))
-                .then_some(d)
-            })
-            .collect();
         // Expression lowering detects invalid indices/cycles even in unused
         // arena entries; variables acquire their binder at each use below.
         for (index, node) in program.nodes.iter().enumerate() {
@@ -412,16 +651,26 @@ impl Session {
                 expression(program, index as u32, &mut HashSet::new())?;
             }
         }
-        for declaration in program
+        for (index, declaration) in program
             .declarations
             .iter()
-            .filter(|declaration| {
+            .enumerate()
+            .filter(|(_, declaration)| {
                 !matches!(declaration.kind, Some(pb::declaration::Kind::Function(_)))
             })
-            .chain(program.declarations.iter().filter(|declaration| {
-                matches!(declaration.kind, Some(pb::declaration::Kind::Function(_)))
-            }))
+            .chain(
+                program
+                    .declarations
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, declaration)| {
+                        matches!(declaration.kind, Some(pb::declaration::Kind::Function(_)))
+                    }),
+            )
         {
+            if !added[index] {
+                continue;
+            }
             if matches!(
                 declaration.kind,
                 Some(
@@ -463,7 +712,7 @@ impl Session {
                         while let Some(index) = pending.pop() {
                             if !seen.insert(index) { continue; }
                             if let Some(pb::node::Kind::Call(call)) = &program.nodes[index as usize].kind {
-                                if !staged.graph.get_function(&call.func).is_some_and(|function| function.func_type().subtype == ast::FunctionSubtype::Constructor) {
+                                if !signatures.get(&call.func).is_some_and(|(_, subtype)| *subtype == ast::FunctionSubtype::Constructor) {
                                     return Err("merge table reads are not supported by this slice".into());
                                 }
                                 pending.extend(&call.args);
@@ -476,26 +725,35 @@ impl Session {
             };
             staged
                 .graph
-                .run_program(vec![command])
+                .resolve_command_before_proofs(command.clone())
                 .map_err(|error| error.to_string())?;
+            pending_declarations.insert(declaration_indices[index].unwrap());
+            installations.push(Installation {
+                command,
+                site: pb::maintenance_site::Target::Declaration(index as u32),
+                span: declaration.span,
+                declaration: declaration_indices[index],
+                ruleset: None,
+                rule: None,
+            });
         }
         for node in &program.nodes {
             if let Some(pb::node::Kind::Call(call)) = &node.kind
-                && let Some(signature) = staged.graph.type_info().get_func_type(&call.func).cloned()
+                && let Some((signature, _)) = signatures.get(&call.func)
             {
                 if signature.input.len() != call.args.len()
-                    || signature.output.name() != sort_name(&program.sorts, node.sort_id)?
+                    || signature.output != sort_name(&program.sorts, node.sort_id)?
                 {
                     return Err(format!("call signature mismatch for {}", call.func).into());
                 }
                 for (argument, expected) in call.args.iter().zip(&signature.input) {
-                    if node_sort(program, *argument)? != expected.name() {
+                    if node_sort(program, *argument)? != *expected {
                         return Err(format!("argument sort mismatch for {}", call.func).into());
                     }
                 }
             }
         }
-        lower_builtin_calls(program, &mut staged.graph)?;
+        lower_builtin_calls(program, &staged.graph, &signatures)?;
         for action in program
             .commands
             .iter()
@@ -519,7 +777,7 @@ impl Session {
                 Some(pb::action::Kind::Delete(call)) => (call, None),
                 _ => continue,
             };
-            let function = staged.graph.get_function(&call.func).ok_or_else(|| {
+            let (_, subtype) = signatures.get(&call.func).ok_or_else(|| {
                 PreparationError(Box::new(pb::Error {
                     code: pb::ErrorCode::UnknownName.into(),
                     message: format!("unknown action target {}", call.func),
@@ -527,7 +785,7 @@ impl Session {
                     ..Default::default()
                 }))
             })?;
-            if expected.is_some_and(|expected| function.func_type().subtype != expected) {
+            if expected.is_some_and(|expected| *subtype != expected) {
                 return Err(format!("invalid action target subtype: {}", call.func).into());
             }
         }
@@ -542,12 +800,9 @@ impl Session {
                 let Some(pb::node::Kind::Call(call)) = &lhs.kind else {
                     return Err("subsuming rewrite lhs must be a constructor call".into());
                 };
-                if !staged
-                    .graph
-                    .get_function(&call.func)
-                    .is_some_and(|function| {
-                        function.func_type().subtype == ast::FunctionSubtype::Constructor
-                    })
+                if !signatures
+                    .get(&call.func)
+                    .is_some_and(|(_, subtype)| *subtype == ast::FunctionSubtype::Constructor)
                 {
                     return Err("subsuming rewrite lhs must be a constructor call".into());
                 }
@@ -568,13 +823,18 @@ impl Session {
                 return Err("combined rulesets are not supported yet".into());
             };
             let native_name = format!("__protobuf_{}_{}", staged.request, index);
-            staged
-                .graph
-                .run_program(vec![Command::AddRuleset(
-                    native_span(program, ruleset.span.as_ref())?,
-                    native_name.clone(),
-                )])
-                .map_err(|error| error.to_string())?;
+            let command = Command::AddRuleset(
+                native_span(program, ruleset.span.as_ref())?,
+                native_name.clone(),
+            );
+            installations.push(Installation {
+                command,
+                site: pb::maintenance_site::Target::Ruleset(index as u32),
+                span: ruleset.span,
+                declaration: None,
+                ruleset: Some((name.clone(), native_name.clone())),
+                rule: None,
+            });
             let mut leaf_used = HashSet::new();
             for (ordinal, rule_index) in rules.rules.iter().enumerate() {
                 if !leaf_used.insert(*rule_index) {
@@ -591,44 +851,70 @@ impl Session {
                     .ok_or("rule index out of bounds")?;
                 let native_rule_name = format!("__protobuf_{}_rule_{}", staged.request, rule_index);
                 let command = lower_rule(program, rule, &native_name, &native_rule_name)?;
+                let origin = pb::RuleAttribution {
+                    root: Some(pb::RulesetRef {
+                        kind: Some(pb::ruleset_ref::Kind::Name(name.clone())),
+                    }),
+                    rule: ordinal as u32,
+                    name: rule.name.clone(),
+                    ..Default::default()
+                };
                 staged
-                    .graph
-                    .run_program(vec![command])
-                    .map_err(|error| error.to_string())?;
-                staged.origins.insert(
-                    native_rule_name,
-                    pb::RuleAttribution {
-                        root: Some(pb::RulesetRef {
-                            kind: Some(pb::ruleset_ref::Kind::Name(name.clone())),
-                        }),
-                        rule: ordinal as u32,
-                        name: rule.name.clone(),
-                        ..Default::default()
-                    },
-                );
+                    .origins
+                    .insert(native_rule_name.clone(), origin.clone());
+                installations.push(Installation {
+                    command,
+                    site: pb::maintenance_site::Target::Ruleset(index as u32),
+                    span: rule.span.or(ruleset.span),
+                    declaration: None,
+                    ruleset: None,
+                    rule: Some((native_rule_name, origin)),
+                });
             }
             staged.rulesets.insert(name.clone(), native_name);
         }
-        // Native resolution verifies types, binders, and action contexts on a
-        // scratch environment. Groundedness is checked during rule installation
-        // above; unreferenced rules do not receive that later compiler pass yet.
-        let mut checker = staged.graph.clone();
-        for rule in &program.rules {
-            let command = lower_rule(program, rule, "", "__protobuf_validate_unused")?;
-            checker
-                .resolve_command_before_proofs(command)
-                .map_err(|error| error.to_string())?;
+        let mut validation: Vec<_> = installations.iter().map(|i| i.command.clone()).collect();
+        for (index, rule) in program.rules.iter().enumerate() {
+            if !used.contains(&(index as u32)) {
+                validation.push(lower_rule(
+                    program,
+                    rule,
+                    "",
+                    &format!("__protobuf_{}_unused_{index}", staged.request),
+                )?);
+            }
         }
         for command in &program.commands {
             native_span(program, command.span.as_ref())?;
-            let lowered = staged.lower_command(program, command)?;
-            for command in lowered {
-                checker
-                    .resolve_command_before_proofs(command)
-                    .map_err(|error| error.to_string())?;
-            }
+            validation.extend(staged.lower_command(program, command)?);
         }
-        Ok((staged, materialized))
+        self.graph
+            .validate_program(validation)
+            .map_err(|error| error.to_string())?;
+        // Only rendering needs the filtered declaration view. All runtime sites
+        // above were captured against the original submitted indices.
+        program.declarations = std::mem::take(&mut program.declarations)
+            .into_iter()
+            .zip(added)
+            .filter_map(|(declaration, added)| {
+                (added
+                    || matches!(
+                        declaration.kind,
+                        Some(
+                            pb::declaration::Kind::HostPrimitive(_)
+                                | pb::declaration::Kind::HostSortFamily(_)
+                        )
+                    ))
+                .then_some(declaration)
+            })
+            .collect();
+        Ok(Prepared {
+            definitions: staged.definitions,
+            request: staged.request,
+            installations,
+            materialized,
+            pending_declarations,
+        })
     }
 
     fn lower_command(
@@ -645,6 +931,25 @@ impl Session {
                     .collect());
             }
             pb::command::Kind::Check(check) => Command::Check(span, facts(program, &check.facts)?),
+            pb::command::Kind::Prove(prove) => Command::Prove(span, facts(program, &prove.facts)?),
+            pb::command::Kind::ProveExists(prove) => {
+                let name = self
+                    .names
+                    .callables
+                    .get(&prove.constructor)
+                    .ok_or_else(|| {
+                        PreparationError(Box::new(pb::Error {
+                            code: pb::ErrorCode::UnknownName.into(),
+                            message: format!("unknown constructor {}", prove.constructor),
+                            span: command.span,
+                            ..Default::default()
+                        }))
+                    })?;
+                if !self.definitions.declarations.iter().any(|d| matches!(&d.kind, Some(pb::declaration::Kind::Constructor(c)) if &c.name == name)) {
+                    return Err("prove-exists requires a constructor".into());
+                }
+                Command::ProveExists(span, prove.constructor.clone())
+            }
             pb::command::Kind::Run(run) => {
                 if !run.scheduler.is_empty() {
                     return Err(PreparationError(Box::new(pb::Error {
@@ -689,6 +994,11 @@ impl Session {
                 ))
             }
             pb::command::Kind::Extract(extract) => {
+                if self.mode != pb::ExecutionMode::Normal {
+                    return Err(
+                        "encoded-mode extraction requires native observation support".into(),
+                    );
+                }
                 if extract.roots.is_empty()
                     || extract.variants == 0
                     || !matches!(
@@ -726,10 +1036,15 @@ impl Session {
                     .collect();
             }
             pb::command::Kind::PrintFunction(print) => {
+                if self.mode != pb::ExecutionMode::Normal {
+                    return Err(
+                        "encoded-mode table observation requires native observation support".into(),
+                    );
+                }
                 if print.table.is_empty() {
                     return Err("table name must not be empty".into());
                 }
-                if self.graph.get_function(&print.table).is_none() {
+                if !self.names.callables.contains_key(&print.table) {
                     return Err(PreparationError(Box::new(pb::Error {
                         code: pb::ErrorCode::UnknownName.into(),
                         message: format!("unknown table {}", print.table),
@@ -885,77 +1200,16 @@ impl Session {
                 let commands = self
                     .lower_command(program, command)
                     .expect("validated command");
-                if matches!(command.kind, Some(pb::command::Kind::Run(_))) {
-                    response
-                        .profile
-                        .as_mut()
-                        .unwrap()
-                        .runs
-                        .push(pb::RunSummary {
-                            command_path: location.path.clone(),
-                            invocations: 1,
-                            ..Default::default()
-                        });
-                }
-                let outputs = self.graph.run_program(commands)?;
-                let mut outcome = None;
-                for output in outputs {
-                    if let egglog::CommandOutput::RunSchedule(report) = output {
-                        let mut rules = vec![];
-                        for (name, matches) in &report.num_matches_per_rule {
-                            if let Some(origin) = self.origins.get(name.as_ref()) {
-                                let index = response
-                                    .rules
-                                    .iter()
-                                    .position(|existing| existing == origin)
-                                    .unwrap_or_else(|| {
-                                        response.rules.push(origin.clone());
-                                        response.rules.len() - 1
-                                    });
-                                rules.push(pb::RuleSummary {
-                                    rule: Some(index as u32),
-                                    matches: Some(*matches as u64),
-                                    search_and_apply_nanos: report
-                                        .search_and_apply_time_per_rule
-                                        .get(name)
-                                        .and_then(|duration| duration.as_nanos().try_into().ok()),
-                                });
-                            }
-                        }
-                        *response.profile.as_mut().unwrap().runs.last_mut().unwrap() =
-                            pb::RunSummary {
-                                command_path: location.path.clone(),
-                                invocations: 1,
-                                rules,
-                                search_and_apply_nanos: report
-                                    .search_and_apply_time_per_ruleset
-                                    .values()
-                                    .map(|duration| duration.as_nanos())
-                                    .sum::<u128>()
-                                    .try_into()
-                                    .ok(),
-                                merge_nanos: report
-                                    .merge_time_per_ruleset
-                                    .values()
-                                    .map(|duration| duration.as_nanos())
-                                    .sum::<u128>()
-                                    .try_into()
-                                    .ok(),
-                                rebuild_nanos: report
-                                    .rebuild_time_per_ruleset
-                                    .values()
-                                    .map(|duration| duration.as_nanos())
-                                    .sum::<u128>()
-                                    .try_into()
-                                    .ok(),
-                            };
-                        outcome = Some(pb::command_output::Kind::Run(pb::RunOutcome {
-                            updated: report.updated,
-                            can_stop: report.can_stop,
-                        }));
-                    }
-                }
-                outcome
+                self.run_observed(
+                    commands,
+                    pb::maintenance_site::Target::Command(pb::StaticCommandPath {
+                        path: location.path.clone(),
+                    }),
+                    Some(location),
+                    response,
+                )
+                .0?;
+                None
             }
         };
         if let Some(kind) = output {
@@ -965,6 +1219,142 @@ impl Session {
             });
         }
         Ok(())
+    }
+
+    // Aggregate leaves synchronously, before native schedule union, and publish
+    // each requested anchor immediately. No event history or outer timings are
+    // retained; failure cannot erase a completed output or pretend to be zero.
+    fn run_observed(
+        &mut self,
+        commands: Vec<Command>,
+        site: pb::maintenance_site::Target,
+        location: Option<&pb::CommandLocation>,
+        response: &mut pb::RunProgramResponse,
+    ) -> (Result<(), egglog::Error>, bool) {
+        let mut requested = LeafSummary::default();
+        let mut maintenance = LeafSummary::default();
+        let mut registered = false;
+        let mut export_error = None;
+        let result = self.graph.run_program_observed(
+            commands,
+            &mut |_, origin, output| {
+                if origin != ExecutionOrigin::Requested {
+                    return;
+                }
+                let Some(location) = location else {
+                    return;
+                };
+                let kind = match output {
+                    egglog::CommandOutput::RunSchedule(report) => {
+                        pb::command_output::Kind::Run(pb::RunOutcome {
+                            updated: report.updated,
+                            can_stop: report.can_stop,
+                        })
+                    }
+                    egglog::CommandOutput::ProveExists {
+                        proof_store,
+                        proof_id,
+                    } => match proof::export(&proof_store, proof_id) {
+                        Ok(proof) => pb::command_output::Kind::Proof(proof),
+                        Err(error) => {
+                            export_error = Some(egglog::Error::BackendError(error));
+                            return;
+                        }
+                    },
+                    _ => return,
+                };
+                response.outputs.push(pb::CommandOutput {
+                    kind: Some(kind),
+                    location: Some(location.clone()),
+                });
+            },
+            &mut |_, event| match event {
+                ExecutionEvent::CommandCompleted {
+                    origin: ExecutionOrigin::Requested,
+                    ..
+                } => registered = true,
+                ExecutionEvent::CommandCompleted { .. } => (),
+                ExecutionEvent::RunStarted { origin } => {
+                    if origin == ExecutionOrigin::Requested {
+                        &mut requested
+                    } else {
+                        &mut maintenance
+                    }
+                    .invocations += 1;
+                }
+                ExecutionEvent::RunFinished { origin, result } => {
+                    let authored = origin == ExecutionOrigin::Requested;
+                    if authored {
+                        &mut requested
+                    } else {
+                        &mut maintenance
+                    }
+                    .finish(result, authored && self.mode == pb::ExecutionMode::Normal);
+                }
+            },
+        );
+        let profile = response.profile.as_mut().expect("summary requested");
+        if requested.invocations > 0 {
+            let mut rules = vec![];
+            let mut measured: Vec<_> = requested.rules.into_iter().collect();
+            measured.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+            for (name, (matches, nanos)) in measured {
+                if let Some(origin) = self.origins.get(&name) {
+                    let index = response
+                        .rules
+                        .iter()
+                        .position(|old| old == origin)
+                        .unwrap_or_else(|| {
+                            response.rules.push(origin.clone());
+                            response.rules.len() - 1
+                        });
+                    rules.push(pb::RuleSummary {
+                        rule: Some(index as u32),
+                        matches: Some(matches),
+                        search_and_apply_nanos: nanos,
+                    });
+                }
+            }
+            profile.runs.push(pb::RunSummary {
+                command_path: location
+                    .expect("authored run has a command site")
+                    .path
+                    .clone(),
+                invocations: requested.invocations,
+                rules,
+                search_and_apply_nanos: requested.nanos[0],
+                merge_nanos: requested.nanos[1],
+                rebuild_nanos: requested.nanos[2],
+            });
+        }
+        if maintenance.invocations > 0 {
+            let site = Some(pb::MaintenanceSite { target: Some(site) });
+            if let Some(existing) = profile.maintenance.iter_mut().find(|m| m.site == site) {
+                existing.invocations += maintenance.invocations;
+                for (total, next) in [
+                    &mut existing.search_and_apply_nanos,
+                    &mut existing.merge_nanos,
+                    &mut existing.rebuild_nanos,
+                ]
+                .into_iter()
+                .zip(maintenance.nanos)
+                {
+                    *total = total.and_then(|old| old.checked_add(next?));
+                }
+            } else {
+                profile.maintenance.push(pb::MaintenanceSummary {
+                    site,
+                    invocations: maintenance.invocations,
+                    search_and_apply_nanos: maintenance.nanos[0],
+                    merge_nanos: maintenance.nanos[1],
+                    rebuild_nanos: maintenance.nanos[2],
+                });
+            }
+        }
+        (
+            result.and_then(|()| export_error.map_or(Ok(()), Err)),
+            registered,
+        )
     }
 }
 
@@ -1040,8 +1430,10 @@ fn project_names(program: &mut pb::Program, definitions: &pb::Program) -> Native
         }
     }
     for command in &mut program.commands {
-        if let Some(pb::command::Kind::PrintFunction(print)) = &mut command.kind {
-            project_call(&mut print.table);
+        match &mut command.kind {
+            Some(pb::command::Kind::PrintFunction(print)) => project_call(&mut print.table),
+            Some(pb::command::Kind::ProveExists(prove)) => project_call(&mut prove.constructor),
+            _ => (),
         }
     }
     for action in program
@@ -1165,13 +1557,18 @@ fn validate_private_names(program: &pb::Program) -> Result<(), String> {
 
 // Materialization runs on staged state. Open patterns remain in their signature
 // arenas; only closed shapes install native sorts, in child-before-parent order.
-fn materialize_sorts(program: &pb::Program, graph: &mut EGraph) -> Result<Vec<Command>, String> {
+fn materialize_sorts(
+    program: &pb::Program,
+    graph: &mut EGraph,
+    known: &mut HashSet<String>,
+) -> Result<Vec<(u32, Command)>, String> {
     fn visit(
         program: &pb::Program,
         index: u32,
         graph: &mut EGraph,
-        commands: &mut Vec<Command>,
+        commands: &mut Vec<(u32, Command)>,
         seen: &mut HashSet<u32>,
+        known: &mut HashSet<String>,
     ) -> Result<(), String> {
         if !seen.insert(index) {
             return Ok(());
@@ -1187,7 +1584,10 @@ fn materialize_sorts(program: &pb::Program, graph: &mut EGraph) -> Result<Vec<Co
             return Ok(());
         }
         for child in &family.args {
-            visit(program, *child, graph, commands, seen)?;
+            visit(program, *child, graph, commands, seen, known)?;
+        }
+        if known.contains(&name) {
+            return Ok(());
         }
         if let Some(existing) = graph.get_sort_by_name(&name) {
             let mut expected = vec![];
@@ -1197,6 +1597,7 @@ fn materialize_sorts(program: &pb::Program, graph: &mut EGraph) -> Result<Vec<Co
             }
             return Ok(());
         }
+        known.insert(name.clone());
         let command = Command::Sort {
             span: native_span(program, program.sorts[index as usize].span.as_ref())?,
             name,
@@ -1215,26 +1616,37 @@ fn materialize_sorts(program: &pb::Program, graph: &mut EGraph) -> Result<Vec<Co
             unionable: true,
         };
         graph
-            .run_program(vec![command.clone()])
+            .resolve_command_before_proofs(command.clone())
             .map_err(|e| e.to_string())?;
-        commands.push(command);
+        commands.push((index, command));
         Ok(())
     }
     let mut commands = vec![];
     let mut seen = HashSet::new();
     for index in 0..program.sorts.len() {
-        visit(program, index as u32, graph, &mut commands, &mut seen)?;
+        visit(
+            program,
+            index as u32,
+            graph,
+            &mut commands,
+            &mut seen,
+            known,
+        )?;
     }
     Ok(commands)
 }
 
 // This ephemeral lowering copy is never emitted as wire IR. Complete annotations
 // choose compiler instance keys before the native AST drops result types.
-fn lower_builtin_calls(program: &mut pb::Program, graph: &mut EGraph) -> Result<(), String> {
+fn lower_builtin_calls(
+    program: &mut pb::Program,
+    graph: &EGraph,
+    signatures: &HashMap<String, (ast::Schema, ast::FunctionSubtype)>,
+) -> Result<(), String> {
     let mut replacements = vec![];
     for (index, node) in program.nodes.iter().enumerate() {
         if let Some(pb::node::Kind::Call(call)) = &node.kind {
-            if graph.type_info().get_func_type(&call.func).is_some() {
+            if signatures.contains_key(&call.func) {
                 continue;
             }
             let args: Vec<_> = call
@@ -1252,21 +1664,16 @@ fn lower_builtin_calls(program: &mut pb::Program, graph: &mut EGraph) -> Result<
                 .iter()
                 .copied()
                 .chain([node.sort_id])
-                .map(|i| {
-                    graph
-                        .get_sort_by_name(&sort_name(&program.sorts, i)?)
-                        .cloned()
-                        .ok_or_else(|| "unknown closed sort".into())
-                })
+                .map(|i| sort_name(&program.sorts, i))
                 .collect::<Result<Vec<_>, String>>()?;
             replacements.push((
                 index,
-                graph.type_info().resolve_builtin(
+                graph.resolve_builtin_call(
                     program,
                     &call.func,
                     &args,
                     node.sort_id,
-                    &sorts,
+                    &sorts.iter().map(String::as_str).collect::<Vec<_>>(),
                 )?,
             ));
         }
@@ -1283,7 +1690,8 @@ fn lower_builtin_calls(program: &mut pb::Program, graph: &mut EGraph) -> Result<
 // The native container constructors intern these ordered payloads.
 // Validate contents first; the resulting calls are internal compatibility code,
 // never a claim that the wire value payload was a symbolic authored Call.
-fn lower_container_values(program: &mut pb::Program) -> Result<(), String> {
+fn lower_container_values(program: &mut pb::Program) -> Result<Vec<u32>, String> {
+    let mut sites: Vec<_> = (0..program.sorts.len() as u32).collect();
     let mut replacements = vec![];
     for (index, node) in program.nodes.iter().enumerate() {
         if let Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue { value: Some(value) })) =
@@ -1371,6 +1779,7 @@ fn lower_container_values(program: &mut pb::Program) -> Result<(), String> {
             let pair_sort = egglog::builtin::import_sort(&sorts, pair_sort, &mut program.sorts)?;
             let vector_sort =
                 egglog::builtin::import_sort(&sorts, vector_sort, &mut program.sorts)?;
+            sites.resize(program.sorts.len(), program.nodes[index].sort_id);
             let mut pairs = vec![];
             for fields in args.chunks_exact(2) {
                 pairs.push(u32::try_from(program.nodes.len()).map_err(|_| "too many nodes")?);
@@ -1399,7 +1808,7 @@ fn lower_container_values(program: &mut pb::Program) -> Result<(), String> {
             args,
         }));
     }
-    Ok(())
+    Ok(sites)
 }
 
 fn node_sort(program: &pb::Program, index: u32) -> Result<String, String> {
@@ -2442,9 +2851,9 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_creation_modes_do_not_allocate_handles() {
+    fn unknown_creation_modes_do_not_allocate_handles() {
         let mut engine = Engine::default();
-        for execution_mode in [1, 2, 3, 99, -1] {
+        for execution_mode in [99, -1] {
             let request = pb::CreateEGraphRequest {
                 sorts: vec![pb::Sort {
                     kind: Some(pb::sort::Kind::Family(pb::HostSort {
@@ -2511,11 +2920,13 @@ mod tests {
                 }
                 let session = Session {
                     graph,
+                    mode: pb::ExecutionMode::Normal,
                     definitions: pb::Program::default(),
                     names: NativeNames::default(),
                     request: 0,
                     rulesets: HashMap::new(),
                     origins: HashMap::new(),
+                    sorts: HashSet::new(),
                 };
                 let mut program = pb::Program {
                     ir_version: 1,
@@ -2559,6 +2970,540 @@ mod tests {
                         .unwrap();
                 }
             }
+        }
+    }
+
+    #[test]
+    fn definition_registration_and_requested_proof_survive_trailing_maintenance_failure() {
+        let (mut engine, id) = host_default_engine();
+        let session = engine.graphs.get_mut(&id).unwrap();
+        session.graph = std::mem::take(&mut session.graph).with_proofs_enabled();
+        session.mode = pb::ExecutionMode::Proofs;
+        // Discover native identity through the observed registration event, not
+        // a naming convention, before injecting the test-only failing helper.
+        let commands = session.graph.parse_program(None, "(sort Foreign)").unwrap();
+        let mut helpers = vec![];
+        session
+            .graph
+            .run_program_observed(commands, &mut |_, _, _| {}, &mut |_, event| {
+                if let ExecutionEvent::CommandCompleted {
+                    origin: ExecutionOrigin::Internal,
+                    command: ast::ResolvedNCommand::AddRuleset(_, name),
+                } = event
+                {
+                    helpers.push(name.clone());
+                }
+            })
+            .unwrap();
+        assert_eq!(helpers.len(), 6);
+        let mut phases = source::Source::new(None, "(datatype Num (N i64) (Goal i64)) (ruleset r) (rule ((N x)) ((Goal x)) :ruleset r) (N 1) (run r 1) (prove-exists Goal)").unwrap().peekable();
+        let proof_program = loop {
+            let program = phases.next().unwrap().unwrap();
+            if phases.peek().is_none() {
+                break program;
+            }
+            assert_eq!(run_host_default(&mut engine, id, program).error, None);
+        };
+        let session = engine.graphs.get_mut(&id).unwrap();
+        let mut poison = session
+            .graph
+            .parse_program(None, "(rule () ((panic \"maintenance failed\")))")
+            .unwrap();
+        let Command::Rule { rule } = &mut poison[0] else {
+            unreachable!()
+        };
+        rule.ruleset = helpers.last().unwrap().clone();
+        session.graph.run_program(poison).unwrap();
+        let baseline = session.clone();
+
+        let mut definitions = pb::Program {
+            ir_version: 1,
+            files: vec![pb::SourceFile {
+                name: "install.egg".into(),
+                contents: Some("first second".into()),
+            }],
+            rulesets: vec![
+                pb::Ruleset {
+                    name: Some("first".into()),
+                    span: Some(pb::Span {
+                        file: 0,
+                        start: 0,
+                        end: 5,
+                    }),
+                    kind: Some(pb::ruleset::Kind::Rules(pb::RuleList::default())),
+                    ..Default::default()
+                },
+                pb::Ruleset {
+                    name: Some("second".into()),
+                    span: Some(pb::Span {
+                        file: 0,
+                        start: 6,
+                        end: 12,
+                    }),
+                    kind: Some(pb::ruleset::Kind::Rules(pb::RuleList::default())),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        definitions.commands.push(pb::Command {
+            kind: Some(pb::command::Kind::ProveExists(pb::ProveExists {
+                constructor: "unknown".into(),
+            })),
+            ..Default::default()
+        });
+        let invalid = run_host_default(&mut engine, id, definitions.clone());
+        assert_eq!(
+            invalid.error.unwrap().code,
+            i32::from(pb::ErrorCode::UnknownName)
+        );
+        assert!(invalid.profile.unwrap().maintenance.is_empty());
+        assert!(!engine.graphs[&id].rulesets.contains_key("first"));
+        definitions.commands.clear();
+        let failed = run_host_default(&mut engine, id, definitions.clone());
+        let error = failed.error.unwrap();
+        assert_eq!(error.code, i32::from(pb::ErrorCode::EvaluationFailed));
+        assert_eq!(error.location, None);
+        assert_eq!(error.span, definitions.rulesets[0].span);
+        assert!(failed.outputs.is_empty());
+        let profile = failed.profile.unwrap();
+        assert!(!profile.complete && profile.runs.is_empty());
+        assert_eq!(profile.maintenance.len(), 1);
+        let maintenance = &profile.maintenance[0];
+        assert_eq!(
+            maintenance.site.as_ref().unwrap().target,
+            Some(pb::maintenance_site::Target::Ruleset(0))
+        );
+        assert!(maintenance.invocations > 1); // includes successes before failure
+        assert_eq!(
+            (
+                maintenance.search_and_apply_nanos,
+                maintenance.merge_nanos,
+                maintenance.rebuild_nanos
+            ),
+            (None, None, None)
+        );
+        let session = engine.graphs.get_mut(&id).unwrap();
+        assert!(session.rulesets.contains_key("first"));
+        assert!(!session.rulesets.contains_key("second"));
+        let native_first = session.rulesets["first"].clone();
+        let commands = session
+            .graph
+            .parse_program(None, &format!("(run {native_first} 1)"))
+            .unwrap();
+        session.graph.validate_program(commands).unwrap();
+        definitions.rulesets.remove(0);
+        let prepared = session.prepare(&mut definitions).unwrap();
+        assert_eq!(prepared.installations.len(), 1); // second was never recorded
+
+        engine.graphs.insert(id, baseline);
+        let mut program = proof_program.clone();
+        // Add a distinct native action after the proof, via the actual producer.
+        let mut suffix =
+            source::Source::new(None, "(datatype Num (N i64) (Goal i64)) (N 2)").unwrap();
+        suffix.next().unwrap().unwrap();
+        let suffix = suffix.next().unwrap().unwrap();
+        let original_nodes = program.nodes.len() as u32;
+        program
+            .nodes
+            .extend(suffix.nodes.iter().cloned().map(|mut node| {
+                if let Some(pb::node::Kind::Call(call)) = &mut node.kind {
+                    for index in &mut call.args {
+                        *index += original_nodes;
+                    }
+                }
+                node
+            }));
+        let mut action = suffix.commands[0].clone();
+        let Some(pb::command::Kind::Action(pb::Action {
+            kind: Some(pb::action::Kind::Term(index)),
+            ..
+        })) = &mut action.kind
+        else {
+            unreachable!()
+        };
+        *index += original_nodes;
+        program.commands.push(action);
+        let response = run_host_default(&mut engine, id, program);
+        assert_eq!(
+            response
+                .error
+                .as_ref()
+                .unwrap()
+                .location
+                .as_ref()
+                .unwrap()
+                .path,
+            [0]
+        );
+        assert_eq!(response.outputs.len(), 1);
+        let Some(pb::command_output::Kind::Proof(proof)) = &response.outputs[0].kind else {
+            panic!("completed anchor")
+        };
+        proof::validate(proof).unwrap();
+        assert_eq!(response.profile.as_ref().unwrap().maintenance.len(), 1);
+        assert_eq!(
+            response.profile.as_ref().unwrap().maintenance[0].search_and_apply_nanos,
+            None
+        );
+        let Some(pb::command::Kind::Action(pb::Action {
+            kind: Some(pb::action::Kind::Term(index)),
+            ..
+        })) = suffix.commands[0].kind
+        else {
+            unreachable!()
+        };
+        let mut check = suffix;
+        check.commands = vec![pb::Command {
+            kind: Some(pb::command::Kind::Check(pb::Check { facts: vec![index] })),
+            ..Default::default()
+        }];
+        check.declarations.clear();
+        assert_eq!(
+            run_host_default(&mut engine, id, check).error.unwrap().code,
+            i32::from(pb::ErrorCode::CheckFailed)
+        );
+        engine
+            .destroy(&pb::DestroyEGraphRequest { egraph_id: id }.encode_to_vec())
+            .unwrap();
+        proof::validate(proof).unwrap();
+    }
+
+    #[test]
+    fn preparation_compiles_unused_rules_without_running_bodies_or_validators() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        for mode in [
+            pb::ExecutionMode::Normal,
+            pb::ExecutionMode::TermEncoding,
+            pb::ExecutionMode::Proofs,
+            pb::ExecutionMode::ProofTesting,
+        ] {
+            let calls = Arc::new(AtomicUsize::new(0));
+            let validations = Arc::new(AtomicUsize::new(0));
+            let observed = calls.clone();
+            let validator_calls = validations.clone();
+            let (mut engine, id) = host_default_engine();
+            let session = engine.graphs.get_mut(&id).unwrap();
+            egglog::add_primitive_with_validator!(&mut session.graph, "counted"[id = "test.counted"] = {observed: Arc<AtomicUsize>} |value: i64| -> i64 {{
+                self.ctx.fetch_add(1, Ordering::SeqCst);
+                value
+            }}, move |_: &mut TermDag, args: &[TermId]| -> Option<TermId> {
+                validator_calls.fetch_add(1, Ordering::SeqCst);
+                args.first().copied()
+            });
+            let graph = std::mem::take(&mut session.graph);
+            session.graph = match mode {
+                pb::ExecutionMode::Normal => graph,
+                pb::ExecutionMode::TermEncoding => graph.with_term_encoding_enabled(),
+                pb::ExecutionMode::Proofs => graph.with_proofs_enabled(),
+                pb::ExecutionMode::ProofTesting => graph.with_proofs_enabled().with_proof_testing(),
+            };
+            session.mode = mode;
+            let mut program = pb::Program {
+                ir_version: 1,
+                sorts: vec![
+                    pb::Sort {
+                        kind: Some(pb::sort::Kind::Family(pb::HostSort {
+                            name: "i64".into(),
+                            args: vec![],
+                        })),
+                        ..Default::default()
+                    },
+                    pb::Sort {
+                        kind: Some(pb::sort::Kind::Eq("Num".into())),
+                        ..Default::default()
+                    },
+                ],
+                declarations: vec![
+                    pb::Declaration {
+                        kind: Some(pb::declaration::Kind::EqSort(pb::EqSort {
+                            name: "Num".into(),
+                            ..Default::default()
+                        })),
+                        ..Default::default()
+                    },
+                    pb::Declaration {
+                        kind: Some(pb::declaration::Kind::Constructor(pb::Constructor {
+                            name: "N".into(),
+                            inputs: vec![pb::Arg {
+                                name: "x".into(),
+                                sort: 0,
+                            }],
+                            output: 1,
+                            ..Default::default()
+                        })),
+                        ..Default::default()
+                    },
+                ],
+                nodes: vec![
+                    pb::Node {
+                        sort_id: 0,
+                        kind: Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
+                            value: Some(pb::primitive_value::Value::I64(1)),
+                        })),
+                        ..Default::default()
+                    },
+                    pb::Node {
+                        sort_id: 0,
+                        kind: Some(pb::node::Kind::Call(pb::Call {
+                            func: "test.counted".into(),
+                            args: vec![0],
+                        })),
+                        ..Default::default()
+                    },
+                    pb::Node {
+                        sort_id: 1,
+                        kind: Some(pb::node::Kind::Call(pb::Call {
+                            func: "N".into(),
+                            args: vec![1],
+                        })),
+                        ..Default::default()
+                    },
+                    pb::Node {
+                        sort_id: 0,
+                        kind: Some(pb::node::Kind::Var("x".into())),
+                        ..Default::default()
+                    },
+                    pb::Node {
+                        sort_id: 0,
+                        kind: Some(pb::node::Kind::Call(pb::Call {
+                            func: "test.counted".into(),
+                            args: vec![3],
+                        })),
+                        ..Default::default()
+                    },
+                    pb::Node {
+                        sort_id: 0,
+                        kind: Some(pb::node::Kind::Union(pb::Union {
+                            members: vec![4, 0],
+                        })),
+                        ..Default::default()
+                    },
+                    pb::Node {
+                        sort_id: 1,
+                        kind: Some(pb::node::Kind::Call(pb::Call {
+                            func: "N".into(),
+                            args: vec![3],
+                        })),
+                        ..Default::default()
+                    },
+                ],
+                commands: vec![
+                    pb::Command {
+                        kind: Some(pb::command::Kind::Action(pb::Action {
+                            kind: Some(pb::action::Kind::Term(2)),
+                            ..Default::default()
+                        })),
+                        ..Default::default()
+                    },
+                    pb::Command {
+                        kind: Some(pb::command::Kind::Prove(pb::Prove { facts: vec![2] })),
+                        ..Default::default()
+                    },
+                ],
+                ..Default::default()
+            };
+            let mut invalid = program.clone();
+            invalid.commands.push(pb::Command {
+                kind: Some(pb::command::Kind::Prove(pb::Prove { facts: vec![999] })),
+                ..Default::default()
+            });
+            assert!(run_host_default(&mut engine, id, invalid).error.is_some());
+            let mut ungrounded = program.clone();
+            ungrounded.rules.push(pb::RuleDecl {
+                kind: Some(pb::rule_decl::Kind::Rule(pb::Rule {
+                    query: vec![5],
+                    head: vec![pb::Action {
+                        kind: Some(pb::action::Kind::Term(6)),
+                        ..Default::default()
+                    }],
+                })),
+                eval_mode: pb::RuleEvalMode::Seminaive.into(),
+                ..Default::default()
+            });
+            let error = run_host_default(&mut engine, id, ungrounded).error.unwrap();
+            assert!(error.message.contains("ungrounded"), "{}", error.message);
+            engine.graphs[&id].prepare(&mut program.clone()).unwrap();
+            assert_eq!(calls.load(Ordering::SeqCst), 0);
+            assert_eq!(validations.load(Ordering::SeqCst), 0);
+            if mode != pb::ExecutionMode::Normal {
+                let mut unsupported = program.clone();
+                let Some(pb::node::Kind::Call(call)) = &mut unsupported.nodes[1].kind else {
+                    unreachable!()
+                };
+                call.func = "test.default.identity".into(); // registered, no proof validator
+                let error = run_host_default(&mut engine, id, unsupported)
+                    .error
+                    .unwrap();
+                assert!(error.message.contains("validator"), "{}", error.message);
+            }
+            if matches!(
+                mode,
+                pb::ExecutionMode::Normal | pb::ExecutionMode::TermEncoding
+            ) {
+                program.commands.truncate(1);
+            }
+            assert_eq!(run_host_default(&mut engine, id, program).error, None);
+            assert!(calls.load(Ordering::SeqCst) > 0);
+            if matches!(
+                mode,
+                pb::ExecutionMode::Proofs | pb::ExecutionMode::ProofTesting
+            ) {
+                assert!(validations.load(Ordering::SeqCst) > 0);
+            }
+        }
+    }
+
+    #[test]
+    fn source_render_and_wire_export_agree_under_exact_authored_rule_mapping() {
+        let (mut engine, id) = host_default_engine();
+        let session = engine.graphs.get_mut(&id).unwrap();
+        session.graph = std::mem::take(&mut session.graph).with_proofs_enabled();
+        session.mode = pb::ExecutionMode::Proofs;
+        let mut native = crate::new_experimental_egraph().with_proofs_enabled();
+        let mut renderer = source::Renderer::default();
+        let mut names = HashMap::new();
+        let mut compared = false;
+        for (request, phase) in source::Source::new(None, "(datatype Num (N i64) (Goal i64)) (ruleset r) (rule ((N x)) ((Goal x)) :ruleset r :name \"derive\") (N 1) (run r 1) (prove-exists Goal)").unwrap().enumerate() {
+            let program = phase.unwrap();
+            for ruleset in &program.rulesets {
+                let Some(pb::ruleset::Kind::Rules(rules)) = &ruleset.kind else { unreachable!() };
+                for index in &rules.rules {
+                    names.insert(format!("__protobuf_{}_rule_{index}", request + 1), program.rules[*index as usize].name.clone().unwrap());
+                }
+            }
+            let text = renderer.render(&program).unwrap();
+            let commands = native.parse_program(None, &text).unwrap();
+            let mut native_proof = None;
+            native.run_program_observed(commands, &mut |_, origin, output| {
+                if origin == ExecutionOrigin::Requested && let egglog::CommandOutput::ProveExists { proof_store, proof_id } = output {
+                    native_proof = Some(proof::export(&proof_store, proof_id).unwrap());
+                }
+            }, &mut |_, _| {}).unwrap();
+            let response = run_host_default(&mut engine, id, program);
+            assert_eq!(response.error, None);
+            if let Some(native_proof) = native_proof {
+                let Some(pb::command_output::Kind::Proof(mut wire)) = response.outputs.into_iter().next().unwrap().kind else { unreachable!() };
+                for step in &mut wire.proofs {
+                    if let Some(pb::proof_step::Justification::Rule(rule)) = &mut step.justification {
+                        rule.name = names.get(&rule.name).expect("exact published occurrence").clone();
+                    }
+                }
+                assert_eq!(wire, native_proof); // every term, edge, literal and shared local ID
+                compared = true;
+            }
+        }
+        assert!(compared);
+    }
+
+    #[test]
+    fn leaf_summary_preserves_measured_zero_and_unavailable_totals_independently() {
+        let mut report = egglog_reports::RunReport::default();
+        let mut authored = LeafSummary::default();
+        let mut maintenance = LeafSummary::default();
+        authored.invocations += 1;
+        authored.finish(Ok(&report), true);
+        assert_eq!(authored.nanos, [Some(0); 3]);
+        report
+            .search_and_apply_time_per_ruleset
+            .insert("r".into(), std::time::Duration::from_nanos(7));
+        report
+            .merge_time_per_ruleset
+            .insert("r".into(), std::time::Duration::from_nanos(11));
+        report
+            .rebuild_time_per_ruleset
+            .insert("r".into(), std::time::Duration::from_nanos(13));
+        for _ in 0..2 {
+            maintenance.invocations += 1;
+            maintenance.finish(Ok(&report), false);
+        }
+        assert_eq!(maintenance.nanos, [Some(14), Some(22), Some(26)]);
+        maintenance.invocations += 1;
+        maintenance.finish(
+            Err(&egglog::Error::BackendError("failed leaf".into())),
+            false,
+        );
+        maintenance.invocations += 1;
+        maintenance.finish(Ok(&report), false);
+        assert_eq!(maintenance.invocations, 4);
+        assert_eq!(maintenance.nanos, [None; 3]);
+        assert_eq!(authored.nanos, [Some(0); 3]);
+    }
+
+    #[test]
+    fn installation_sites_use_original_indices_and_resupply_executes_nothing() {
+        let (mut engine, id) = host_default_engine();
+        let session = engine.graphs.get_mut(&id).unwrap();
+        session.graph = std::mem::take(&mut session.graph).with_proofs_enabled();
+        session.mode = pb::ExecutionMode::Proofs;
+        let mut program = source::Source::new(None, "(datatype Num (N i64))")
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap();
+        program.declarations.insert(
+            0,
+            pb::Declaration {
+                kind: Some(pb::declaration::Kind::HostSortFamily(pb::HostSortFamily {
+                    name: "i64".into(),
+                    ..Default::default()
+                })),
+                ..Default::default()
+            },
+        );
+        program.declarations.push(program.declarations[2].clone()); // compatible resupply
+        let i64_sort = program
+            .sorts
+            .iter()
+            .position(|s| matches!(&s.kind, Some(pb::sort::Kind::Family(f)) if f.name == "i64"))
+            .unwrap() as u32;
+        let vector = program.sorts.len() as u32;
+        program.sorts.push(pb::Sort {
+            kind: Some(pb::sort::Kind::Family(pb::HostSort {
+                name: "Vec".into(),
+                args: vec![i64_sort],
+            })),
+            ..Default::default()
+        });
+        program.rulesets.push(pb::Ruleset {
+            name: Some("r".into()),
+            kind: Some(pb::ruleset::Kind::Rules(pb::RuleList::default())),
+            ..Default::default()
+        });
+        let prepared = session.prepare(&mut program.clone()).unwrap();
+        assert_eq!(
+            prepared
+                .installations
+                .iter()
+                .map(|i| i.site.clone())
+                .collect::<Vec<_>>(),
+            [
+                pb::maintenance_site::Target::Declaration(1),
+                pb::maintenance_site::Target::Sort(vector),
+                pb::maintenance_site::Target::Declaration(2),
+                pb::maintenance_site::Target::Ruleset(0),
+            ]
+        );
+        let installed = run_host_default(&mut engine, id, program.clone());
+        assert_eq!(installed.error, None);
+        assert!(installed.outputs.is_empty());
+        let maintenance = installed.profile.unwrap().maintenance;
+        assert_eq!(maintenance.len(), 1); // native Sort/Function registration has no run leaf
+        assert_eq!(
+            maintenance[0].site.as_ref().unwrap().target,
+            Some(pb::maintenance_site::Target::Ruleset(0))
+        );
+        program.rulesets.clear();
+        let cloned = engine
+            .clone_egraph(&pb::CloneEGraphRequest { egraph_id: id }.encode_to_vec())
+            .unwrap();
+        let clone = pb::CloneEGraphResponse::decode(cloned.as_slice())
+            .unwrap()
+            .egraph_id;
+        for id in [id, clone] {
+            let response = run_host_default(&mut engine, id, program.clone());
+            assert_eq!(response.error, None);
+            assert!(response.profile.unwrap().maintenance.is_empty());
         }
     }
 }

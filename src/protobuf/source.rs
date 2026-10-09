@@ -5,7 +5,8 @@
 //! (like native source execution); resolution is sequential so a later type error
 //! does not erase an executed prefix. Native syntax is never executed here.
 //! Rulesets are fixed after their first run. Relations, uncatalogued primitives, local lets,
-//! proof modes, dynamic costs and general schedules remain unsupported.
+//! dynamic costs and general schedules remain unsupported. Proof requests keep
+//! their authored identity; execution mode belongs to the receiving engine.
 
 use super::*;
 use ast::{GenericAction as ResolvedAction, GenericNCommand as N, ResolvedExpr, ResolvedFact};
@@ -95,7 +96,11 @@ impl Source {
                 }
                 _ => None,
             };
+            // Normal desugaring expands Prove into a hidden helper program.
+            // Resolve just its query here, then publish the authored command.
+            let prove = matches!(command, Command::Prove(..));
             let command = match command {
+                Command::Prove(span, facts) => Command::Check(span, facts),
                 // The experimental parser deliberately shadows core extract.
                 // With no cost-mutating commands in this slice its default tree
                 // model agrees with static constructor costs. Do not execute the
@@ -275,7 +280,23 @@ impl Source {
                         let span = self.span(&span)?;
                         self.program.commands.push(pb::Command {
                             span,
-                            kind: Some(pb::command::Kind::Check(pb::Check { facts })),
+                            kind: Some(if prove {
+                                pb::command::Kind::Prove(pb::Prove { facts })
+                            } else {
+                                pb::command::Kind::Check(pb::Check { facts })
+                            }),
+                        });
+                    }
+                    N::ProveExists(span, call) => {
+                        let ResolvedCall::Func(function) = call else {
+                            return Err("source prove-exists requires a constructor".into());
+                        };
+                        let span = self.span(&span)?;
+                        self.program.commands.push(pb::Command {
+                            span,
+                            kind: Some(pb::command::Kind::ProveExists(pb::ProveExists {
+                                constructor: function.name.clone(),
+                            })),
                         });
                     }
                     N::Extract(span, expr, variants) => {
@@ -670,11 +691,13 @@ impl Default for Renderer {
         Self {
             session: Session {
                 graph: crate::new_experimental_egraph(),
+                mode: pb::ExecutionMode::Normal,
                 definitions: pb::Program::default(),
                 names: NativeNames::default(),
                 request: 0,
                 rulesets: HashMap::new(),
                 origins: HashMap::new(),
+                sorts: HashSet::new(),
             },
         }
     }
@@ -684,12 +707,22 @@ impl Renderer {
     /// Validates and renders one phase, retaining only type/definition state.
     pub fn render(&mut self, program: &pb::Program) -> Result<String, TransportError> {
         let mut lowered = program.clone();
-        let (session, materialized) = self
+        let mut prepared = self
             .session
             .prepare(&mut lowered)
             .map_err(|e| TransportError(e.0.message))?;
-        let source = render_prepared(&lowered, materialized)?;
-        self.session = session;
+        let source = render_prepared(&lowered, std::mem::take(&mut prepared.materialized))?;
+        // The renderer's graph is always NORMAL and receives definitions only:
+        // registration compiles rules/merges, but no action or helper runs.
+        self.session
+            .install(
+                prepared,
+                &mut pb::RunProgramResponse {
+                    profile: Some(pb::ProfileSummary::default()),
+                    ..Default::default()
+                },
+            )
+            .map_err(|error| TransportError(error.message))?;
         Ok(source)
     }
 }
@@ -735,6 +768,9 @@ fn render_prepared(
             if let Some(name) = &ruleset.name && !name.is_empty() { names.push(name.as_str()); }
         }
         for command in &program.commands {
+            if let Some(pb::command::Kind::ProveExists(prove)) = &command.kind {
+                names.push(prove.constructor.as_str());
+            }
             if let Some(pb::command::Kind::Run(run)) = &command.kind
                 && let Some(pb::ruleset_ref::Kind::Name(name)) = run.ruleset.as_ref().and_then(|reference| reference.kind.as_ref())
                 && !name.is_empty()
@@ -850,6 +886,12 @@ fn render_prepared(
                 pb::command::Kind::Check(check) => {
                     commands.push(Command::Check(span, facts(program, &check.facts)?))
                 }
+                pb::command::Kind::Prove(prove) => {
+                    commands.push(Command::Prove(span, facts(program, &prove.facts)?))
+                }
+                pb::command::Kind::ProveExists(prove) => {
+                    commands.push(Command::ProveExists(span, prove.constructor.clone()))
+                }
                 pb::command::Kind::PrintFunction(print) => {
                     commands.push(Command::PrintFunction(
                         span, print.table.clone(),
@@ -938,6 +980,14 @@ fn render_prepared(
     .map_err(TransportError)?;
     Ok(result
         .into_iter()
-        .map(|command| format!("{command}\n"))
+        .map(|command| match command {
+            // The experimental parser shadows run-schedule with a callback
+            // command, which cannot be proof-instrumented. The admitted flat
+            // native Run has an equivalent unshadowed source spelling.
+            Command::RunSchedule(ast::Schedule::Run(_, config)) => {
+                format!("(run {} 1)\n", config.ruleset)
+            }
+            command => format!("{command}\n"),
+        })
         .collect())
 }
