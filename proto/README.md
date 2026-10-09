@@ -249,8 +249,29 @@ mutable borrowing, and executable host bodies are outside this limited layout.
 
 Ordinary varargs use one final logical parameter slot for the whole flat tail,
 regardless of pattern width, with no default, receiver, or redundant varargs flag.
+An optional `tail_repetitions` on a Python/Rust view instead gives a
+`HostPrimitive` signature with N fixed inputs and a nonempty width-W tail
+exactly N + R*W fixed view slots. Slot i derives its sort from fixed input i
+or tail position (i-N) % W. There is no remaining logical tail slot. Receivers
+and parameters cover all slots once, with matching sorts; defaults and Python
+mutation remain limited to original fixed inputs. CEL checks the count against
+the supplied mappings by division, without multiplying or expanding R, and
+checks direct receiver/owner sort roots. Recursive structural typing still
+requires the semantic verifier. Python currently admits this field only on
+FUNCTION and METHOD; unused specialized property/constant and other forms
+are explicitly unsupported. The canonical signature/provider and emitted Call
+are unchanged, and ordinary canonical call checking still applies.
+
+Presence matters: absent retains the logical-tail convention, while present
+zero maps only the fixed prefix. Python's scalar getter returns zero in both
+cases; use `has_field("tail_repetitions")`, not truthiness. New consumers preserve
+all valid absent-field encodings and meanings. This is not an old-reader guarantee for new views:
+discarding the field can widen a fixed-arity view back to a variadic surface.
+Preserving these views requires a coordinated schema/consumer epoch; generated
+message bindings and schema validation alone do not establish frontend support.
+
 `FunctionApplication` instead has a function input and a heterogeneous tail
-derived from its concrete `FuncSort`.
+derived from its concrete `FuncSort`, and cannot use `tail_repetitions`.
 A structural-function owner marker represents `__call__` without a fake family
 or new type-pack binder. Other owner/trait patterns use only the enclosing
 callable's existing generic binder; bindings cannot introduce generic nodes.

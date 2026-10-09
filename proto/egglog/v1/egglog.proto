@@ -134,6 +134,29 @@ message Program {
       "(has(v.trait_impl) ? v.trait_impl.args.map(a, a.sort) : [])).all(i, "
       "i < uint(size(this.sorts)) && (!has(this.sorts[int(i)].var) || this.sorts[int(i)].var < uint(n))))))"
   };
+  // Direct receiver/owner roots for fixed-tail views. Variables may be
+  // instantiated; recursive structural matching under the signature's shared
+  // substitution remains normative. Compare shapes, not arena IDs or spans.
+  option (buf.validate.message).cel = {
+    id: "program.presentation_tail_receiver_roots"
+    message: "fixed-tail receiver and owner sort roots must agree"
+    expression:
+      "this.declarations.all(d, !has(d.bindings) || !has(d.host_primitive.signature) || "
+      "[d.host_primitive.signature].all(sig, size(sig.varargs) == 0 || "
+      "(d.bindings.python.views.filter(v, has(v.tail_repetitions) && has(v.receiver) && has(v.owner.sort))"
+      ".map(v, [v.owner.sort, v.receiver]) + "
+      "d.bindings.rust.views.filter(v, has(v.tail_repetitions) && has(v.receiver) && has(v.owner.sort))"
+      ".map(v, [v.owner.sort, v.receiver.core_input])).all(pair, "
+      "[pair[1] < uint(size(sig.inputs)) ? sig.inputs[int(pair[1])].sort : "
+      "sig.varargs[int((pair[1] - uint(size(sig.inputs))) % uint(size(sig.varargs)))].sort].all(i, "
+      "pair[0] < uint(size(this.sorts)) && i < uint(size(this.sorts)) && "
+      "[this.sorts[int(pair[0])]].all(owner, [this.sorts[int(i)]].all(input, "
+      "has(owner.var) || has(input.var) || "
+      "(has(owner.eq) && has(input.eq) && owner.eq == input.eq) || "
+      "(has(owner.family) && has(input.family) && owner.family.name == input.family.name && "
+      "size(owner.family.args) == size(input.family.args)) || "
+      "(has(owner.func) && has(input.func) && size(owner.func.params) == size(input.func.params))))))))"
+  };
   // Nominal equality sorts and host families have distinct name spaces.
   // Same-family resends must agree on arity even without an arena use.
   option (buf.validate.message).cel = {
@@ -777,7 +800,7 @@ message Declaration {
   };
   option (buf.validate.message).cel = {
     id: "declaration.presentation_inputs"
-    message: "surface mappings must cover fixed inputs and any final logical tail exactly once"
+    message: "ordinary surface mappings must cover fixed inputs and any final logical tail exactly once"
     expression:
       "!has(this.bindings) || "
       "[has(this.constructor) ? size(this.constructor.inputs) : "
@@ -787,18 +810,43 @@ message Declaration {
       "has(this.host_primitive.signature) ? size(this.host_primitive.signature.inputs) : "
       "has(this.host_primitive.application) ? 1 : 0].all(n, "
       "[has(this.host_primitive.application) || size(this.host_primitive.signature.varargs) > 0].all(t, "
-      "this.bindings.python.views.all(v, "
+      "this.bindings.python.views.all(v, has(v.tail_repetitions) || ("
       "size(v.params) + (has(v.receiver) ? 1 : 0) == n + (t ? 1 : 0) && "
       "(!has(v.receiver) || v.receiver < uint(n)) && "
       "(!has(v.mutates) || v.mutates < uint(n)) && "
       "v.params.all(p, p.core_input < uint(n + (t ? 1 : 0))) && "
       "(!t || (size(v.params) > 0 && v.params[size(v.params)-1].core_input == uint(n) && "
-      "!has(v.params[size(v.params)-1].default_expr)))) && "
-      "this.bindings.rust.views.all(v, "
+      "!has(v.params[size(v.params)-1].default_expr))))) && "
+      "this.bindings.rust.views.all(v, has(v.tail_repetitions) || ("
       "size(v.params) + (has(v.receiver) ? 1 : 0) == n + (t ? 1 : 0) && "
       "(!has(v.receiver) || v.receiver.core_input < uint(n)) && "
       "v.params.all(p, p.core_input < uint(n + (t ? 1 : 0))) && "
-      "(!t || (size(v.params) > 0 && v.params[size(v.params)-1].core_input == uint(n))))))"
+      "(!t || (size(v.params) > 0 && v.params[size(v.params)-1].core_input == uint(n)))))))"
+  };
+  // Derive R from the supplied mapping count M before visiting its slots:
+  // M >= N, (M-N) % W == 0, R == (M-N) / W. This is N + R*W == M
+  // without overflow-prone multiplication or allocating R repetitions.
+  option (buf.validate.message).cel = {
+    id: "declaration.presentation_tail_repetitions"
+    message: "fixed-tail views require a nonempty host signature tail and exact fixed-slot coverage"
+    expression:
+      "!has(this.bindings) || "
+      "[size(this.host_primitive.signature.inputs)].all(n, "
+      "[size(this.host_primitive.signature.varargs)].all(w, "
+      "this.bindings.python.views.all(v, !has(v.tail_repetitions) || "
+      "(has(this.host_primitive.signature) && w > 0 ? "
+      "[size(v.params) + (has(v.receiver) ? 1 : 0)].all(m, "
+      "m >= n && (m-n) % w == 0 && v.tail_repetitions == uint((m-n) / w) && "
+      "(!has(v.receiver) || v.receiver < uint(m)) && "
+      "(!has(v.mutates) || v.mutates < uint(n)) && "
+      "v.params.all(p, p.core_input < uint(m) && "
+      "(p.core_input < uint(n) || !has(p.default_expr)))) : false)) && "
+      "this.bindings.rust.views.all(v, !has(v.tail_repetitions) || "
+      "(has(this.host_primitive.signature) && w > 0 ? "
+      "[size(v.params) + (has(v.receiver) ? 1 : 0)].all(m, "
+      "m >= n && (m-n) % w == 0 && v.tail_repetitions == uint((m-n) / w) && "
+      "(!has(v.receiver) || v.receiver.core_input < uint(m)) && "
+      "v.params.all(p, p.core_input < uint(m))) : false))))"
   };
   option (buf.validate.message).cel = {
     id: "declaration.constant_signature"
@@ -1025,6 +1073,19 @@ message EgglogTypeBinding {
 // Presentation cannot rescue a core call whose generic substitution is not
 // determined by its concrete argument/result sorts under the usual call rules.
 // Recursive binder/owner/default typing checks are normative.
+// With tail_repetitions absent, a nonempty tail occupies one logical slot.
+// With it present, only a HostPrimitive GenericSignature with a nonempty tail
+// is allowed. For N fixed inputs, tail width W and count R, the view has exactly
+// N + R*W fixed slots, with no logical tail slot. Slot i has the original input
+// sort for i < N, otherwise varargs[(i-N) % W]. Receiver/parameters cover these
+// slots exactly once; receiver owner and all arguments must match these sorts
+// under the canonical signature's substitution. Check count arithmetic and
+// mapped-slot count before expansion. R=0 is valid and distinct from absence.
+// Defaults and Python mutation remain limited to original fixed inputs.
+// This restricts a surface spelling's arity; it introduces no callable, binder,
+// signature, provider or packing node. The emitted Call still checks against
+// the unchanged canonical signature. New consumers preserve absent-field
+// meaning; older consumers that discard this field may widen the surface arity.
 message CallableBindings {
   PythonBindings python = 1;
   RustBindings rust = 2;
@@ -1096,6 +1157,11 @@ message PythonCallable {
       "((has(this.receiver) && this.mutates == this.receiver) || "
       "this.params.exists(p, p.core_input == this.mutates)))"
   };
+  option (buf.validate.message).cel = {
+    id: "python_callable.tail_repetitions_form"
+    message: "fixed-tail Python views currently support only functions and methods"
+    expression: "!has(this.tail_repetitions) || this.kind in [1, 3]"
+  };
 
   PythonCallKind kind = 1 [(buf.validate.field).enum = {
     defined_only: true
@@ -1103,7 +1169,7 @@ message PythonCallable {
   }];
   repeated string path = 2;
   BindingOwner owner = 3;
-  optional uint32 receiver = 4; // fixed core input, not implicit Python self/cls
+  optional uint32 receiver = 4; // fixed view input, not implicit Python self/cls
   repeated PythonParameter params = 5; // surface order, excluding receiver
 
   // Replace this supplied argument wrapper with the Call result and return
@@ -1111,6 +1177,10 @@ message PythonCallable {
   // and core result sorts must agree; this does not change the core result to
   // Unit or assert a database effect. Initializers cannot use this convention.
   optional uint32 mutates = 6;
+
+  // Optional fixed-tail view; see CallableBindings. Supported for FUNCTION and
+  // METHOD only. In particular, zero repetitions do not create a CONSTANT view.
+  optional uint32 tail_repetitions = 7;
 }
 
 enum PythonCallKind {
@@ -1124,11 +1194,13 @@ enum PythonCallKind {
   PYTHON_CALL_KIND_CONSTANT = 7;
 }
 
-// Ordered surface parameter. Fixed core inputs occupy [0, n). If the signature
-// has a nonempty varargs pattern, one logical tail slot n represents the whole
-// flat tail, not one slot per pattern position. It must be last in surface
+// Ordered surface parameter. Without tail_repetitions, fixed core inputs
+// occupy [0, n). A nonempty varargs pattern has one logical tail slot n for the
+// whole flat tail, not one slot per pattern position. It must be last in surface
 // order, have no default, and cannot be a receiver. FunctionApplication has
 // fixed slot 0 plus tail slot 1, whose heterogeneous sorts come from the actual FuncSort.
+// With tail_repetitions present, every slot is fixed, including expanded tail
+// operands; those operands have no default. See CallableBindings for their sorts.
 // No redundant varargs flag or generic expression template is introduced.
 message PythonParameter {
   optional uint32 core_input = 1 [(buf.validate.field).required = true];
@@ -1184,6 +1256,9 @@ message RustCallable {
   RustReceiver receiver = 4;
   repeated RustParameter params = 5; // surface order, excluding receiver
   RustTrait trait_impl = 6;
+
+  // Optional fixed-tail view; see CallableBindings. Borrowing is unchanged.
+  optional uint32 tail_repetitions = 7;
 }
 
 // Receiver ownership relative to impl Self: self or &self. For an impl on

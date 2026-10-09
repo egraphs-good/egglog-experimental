@@ -905,6 +905,19 @@ pub struct EgglogTypeBinding {
 /// Presentation cannot rescue a core call whose generic substitution is not
 /// determined by its concrete argument/result sorts under the usual call rules.
 /// Recursive binder/owner/default typing checks are normative.
+/// With tail_repetitions absent, a nonempty tail occupies one logical slot.
+/// With it present, only a HostPrimitive GenericSignature with a nonempty tail
+/// is allowed. For N fixed inputs, tail width W and count R, the view has exactly
+/// N + R*W fixed slots, with no logical tail slot. Slot i has the original input
+/// sort for i < N, otherwise varargs\[(i-N) % W\]. Receiver/parameters cover these
+/// slots exactly once; receiver owner and all arguments must match these sorts
+/// under the canonical signature's substitution. Check count arithmetic and
+/// mapped-slot count before expansion. R=0 is valid and distinct from absence.
+/// Defaults and Python mutation remain limited to original fixed inputs.
+/// This restricts a surface spelling's arity; it introduces no callable, binder,
+/// signature, provider or packing node. The emitted Call still checks against
+/// the unchanged canonical signature. New consumers preserve absent-field
+/// meaning; older consumers that discard this field may widen the surface arity.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct CallableBindings {
     #[prost(message, optional, tag = "1")]
@@ -963,7 +976,7 @@ pub struct PythonCallable {
     pub path: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
     #[prost(message, optional, tag = "3")]
     pub owner: ::core::option::Option<BindingOwner>,
-    /// fixed core input, not implicit Python self/cls
+    /// fixed view input, not implicit Python self/cls
     #[prost(uint32, optional, tag = "4")]
     pub receiver: ::core::option::Option<u32>,
     /// surface order, excluding receiver
@@ -975,12 +988,18 @@ pub struct PythonCallable {
     /// Unit or assert a database effect. Initializers cannot use this convention.
     #[prost(uint32, optional, tag = "6")]
     pub mutates: ::core::option::Option<u32>,
+    /// Optional fixed-tail view; see CallableBindings. Supported for FUNCTION and
+    /// METHOD only. In particular, zero repetitions do not create a CONSTANT view.
+    #[prost(uint32, optional, tag = "7")]
+    pub tail_repetitions: ::core::option::Option<u32>,
 }
-/// Ordered surface parameter. Fixed core inputs occupy [0, n). If the signature
-/// has a nonempty varargs pattern, one logical tail slot n represents the whole
-/// flat tail, not one slot per pattern position. It must be last in surface
+/// Ordered surface parameter. Without tail_repetitions, fixed core inputs
+/// occupy [0, n). A nonempty varargs pattern has one logical tail slot n for the
+/// whole flat tail, not one slot per pattern position. It must be last in surface
 /// order, have no default, and cannot be a receiver. FunctionApplication has
 /// fixed slot 0 plus tail slot 1, whose heterogeneous sorts come from the actual FuncSort.
+/// With tail_repetitions present, every slot is fixed, including expanded tail
+/// operands; those operands have no default. See CallableBindings for their sorts.
 /// No redundant varargs flag or generic expression template is introduced.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct PythonParameter {
@@ -1028,6 +1047,9 @@ pub struct RustCallable {
     pub params: ::prost::alloc::vec::Vec<RustParameter>,
     #[prost(message, optional, tag = "6")]
     pub trait_impl: ::core::option::Option<RustTrait>,
+    /// Optional fixed-tail view; see CallableBindings. Borrowing is unchanged.
+    #[prost(uint32, optional, tag = "7")]
+    pub tail_repetitions: ::core::option::Option<u32>,
 }
 /// Receiver ownership relative to impl Self: self or &self. For an impl on
 /// &Owner, by-value self is already &Owner, while &self is &&Owner.
