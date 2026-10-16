@@ -127,12 +127,17 @@ pub struct Span {
 /// Missing names and family-arity mismatches are errors. Builtin references do
 /// not require explicit descriptor declarations. Response references resolve
 /// against the associated handle; their arenas do not redeclare definitions.
-#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+#[derive(Clone, PartialEq, ::prost::Message)]
 pub struct Sort {
     /// Optional representative type-use origin; excluded from sort identity.
-    /// Documentation and language bindings belong to the defining Declaration.
+    /// Documentation and family/nominal bindings belong to the defining Declaration.
     #[prost(message, optional, tag = "5")]
     pub span: ::core::option::Option<Span>,
+    /// Optional text aliases, excluded from identity; other frontends may omit them.
+    /// Interning equal sorts collects distinct symbols, without a resupply contract.
+    /// Text frontends resolve spelling collisions; aliases declare no semantic sort.
+    #[prost(message, repeated, tag = "8")]
+    pub egglog_aliases: ::prost::alloc::vec::Vec<EgglogTypeBinding>,
     #[prost(oneof = "sort::Kind", tags = "1, 2, 4, 7")]
     pub kind: ::core::option::Option<sort::Kind>,
 }

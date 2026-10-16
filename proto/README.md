@@ -52,9 +52,14 @@ an EqSort; `Sort.family` resolves only a HostSortFamily, never a same-spelled
 definition of another kind. Missing definitions remain errors checked against
 local, installed and ambient definitions. Same-family resends and applications
 must still agree on arity; all callable kinds still share one namespace.
-Type-use spans may remain on `Sort`, but docs and bindings belong to definitions.
+Type-use spans and optional `egglog_aliases` may remain on `Sort`; neither affects
+type identity. Equal applications collect their text aliases, so `A` and `Z` can
+both name `Maybe<i64>`. Other frontends may omit them. Text frontends handle name
+collisions; docs and family/nominal bindings belong to definitions.
+Text rendering chooses one stable alias; binary records retain all aliases.
 
-This namespace refinement uses no new field or encoding and retains draft
+The three-namespace distinction uses existing tags (unlike the optional alias
+metadata at Sort field 8) and retains draft
 `ir_version = 1`: all previously valid encodings keep their meanings. New
 cross-namespace coexistence requires coordinated immutable schema, engine and
 frontend pins. Old validators reject it, and old name-only indexes may conflate

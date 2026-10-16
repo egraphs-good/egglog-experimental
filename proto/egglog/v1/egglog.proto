@@ -359,8 +359,13 @@ message Sort {
   }
 
   // Optional representative type-use origin; excluded from sort identity.
-  // Documentation and language bindings belong to the defining Declaration.
+  // Documentation and family/nominal bindings belong to the defining Declaration.
   Span span = 5;
+
+  // Optional text aliases, excluded from identity; other frontends may omit them.
+  // Interning equal sorts collects distinct symbols, without a resupply contract.
+  // Text frontends resolve spelling collisions; aliases declare no semantic sort.
+  repeated EgglogTypeBinding egglog_aliases = 8;
 }
 
 // A host-family application: no args for i64/Unit, or e.g. Vec<i64> and

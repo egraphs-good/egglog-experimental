@@ -72,6 +72,19 @@ def tail_view_program(language, *, repetitions=2, prefix=(), tail=(0,), slots=(0
 
 
 class BindingSchemaTests(unittest.TestCase):
+    def test_structural_sort_text_aliases_are_optional_wire_metadata(self):
+        for symbols in ([], ["A"], ["A", "Z"]):
+            program = ir.Program(ir_version=1, sorts=[
+                ir.Sort(kind=Oneof("family", ir.HostSort(name="i64"))),
+                ir.Sort(kind=Oneof("family", ir.HostSort(name="Maybe", args=[0])),
+                        egglog_aliases=[ir.EgglogTypeBinding(symbol=s) for s in symbols]),
+            ])
+            validate(program)
+            self.assertEqual(ir.Program.from_binary(program.to_binary()), program)
+            self.assertEqual(ir.Program.from_json(program.to_json()), program)
+        plain = ir.Sort(kind=Oneof("family", ir.HostSort(name="i64")))
+        self.assertEqual(plain.to_binary(), bytes.fromhex("12050a03693634"))
+
     @unittest.skipUnless(os.environ.get("EGGLOG_TEST_BUILTIN_CATALOG"), "requires a native catalog export")
     def test_exported_append_consumes_one_tail_operand(self):
         program = ir.Program.from_binary(Path(os.environ["EGGLOG_TEST_BUILTIN_CATALOG"]).read_bytes())
