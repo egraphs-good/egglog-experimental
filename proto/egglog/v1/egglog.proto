@@ -139,18 +139,20 @@ message Program {
       "(has(v.trait_impl) ? v.trait_impl.args.map(a, a.sort) : [])).all(i, "
       "i < uint(size(this.sorts)) && (!has(this.sorts[int(i)].var) || this.sorts[int(i)].var < uint(n))))))"
   };
-  // Direct receiver/owner roots for fixed-tail views. Variables may be
+  // Direct receiver/owner roots for fixed-tail and consuming-tail views. Variables may be
   // instantiated; recursive structural matching under the signature's shared
   // substitution remains normative. Compare shapes, not arena IDs or spans.
   option (buf.validate.message).cel = {
     id: "program.presentation_tail_receiver_roots"
-    message: "fixed-tail receiver and owner sort roots must agree"
+    message: "tail receiver and owner sort roots must agree"
     expression:
       "this.declarations.all(d, !has(d.bindings) || !has(d.host_primitive.signature) || "
       "[d.host_primitive.signature].all(sig, size(sig.varargs) == 0 || "
-      "(d.bindings.python.views.filter(v, has(v.tail_repetitions) && has(v.receiver) && has(v.owner.sort))"
+      "(d.bindings.python.views.filter(v, has(v.receiver) && has(v.owner.sort) && "
+      "(has(v.tail_repetitions) || (v.kind == 3 && size(sig.varargs) == 1 && v.receiver == uint(size(sig.inputs)))))"
       ".map(v, [v.owner.sort, v.receiver]) + "
-      "d.bindings.rust.views.filter(v, has(v.tail_repetitions) && has(v.receiver) && has(v.owner.sort))"
+      "d.bindings.rust.views.filter(v, has(v.receiver) && has(v.owner.sort) && "
+      "(has(v.tail_repetitions) || (size(sig.varargs) == 1 && v.receiver.core_input == uint(size(sig.inputs)))))"
       ".map(v, [v.owner.sort, v.receiver.core_input])).all(pair, "
       "[pair[1] < uint(size(sig.inputs)) ? sig.inputs[int(pair[1])].sort : "
       "sig.varargs[int((pair[1] - uint(size(sig.inputs))) % uint(size(sig.varargs)))].sort].all(i, "
@@ -815,18 +817,22 @@ message Declaration {
       "has(this.host_primitive.signature) ? size(this.host_primitive.signature.inputs) : "
       "has(this.host_primitive.application) ? 1 : 0].all(n, "
       "[has(this.host_primitive.application) || size(this.host_primitive.signature.varargs) > 0].all(t, "
-      "this.bindings.python.views.all(v, has(v.tail_repetitions) || ("
-      "size(v.params) + (has(v.receiver) ? 1 : 0) == n + (t ? 1 : 0) && "
-      "(!has(v.receiver) || v.receiver < uint(n)) && "
+      "this.bindings.python.views.all(v, has(v.tail_repetitions) || "
+      "[n + (has(this.host_primitive.signature) && size(this.host_primitive.signature.varargs) == 1 && "
+      "v.kind == 3 && has(v.receiver) && v.receiver == uint(n) ? 1 : 0)].all(m, "
+      "size(v.params) + (has(v.receiver) ? 1 : 0) == m + (t ? 1 : 0) && "
+      "(!has(v.receiver) || v.receiver < uint(m)) && "
       "(!has(v.mutates) || v.mutates < uint(n)) && "
-      "v.params.all(p, p.core_input < uint(n + (t ? 1 : 0))) && "
-      "(!t || (size(v.params) > 0 && v.params[size(v.params)-1].core_input == uint(n) && "
+      "v.params.all(p, p.core_input < uint(m + (t ? 1 : 0))) && "
+      "(!t || (size(v.params) > 0 && v.params[size(v.params)-1].core_input == uint(m) && "
       "!has(v.params[size(v.params)-1].default_expr))))) && "
-      "this.bindings.rust.views.all(v, has(v.tail_repetitions) || ("
-      "size(v.params) + (has(v.receiver) ? 1 : 0) == n + (t ? 1 : 0) && "
-      "(!has(v.receiver) || v.receiver.core_input < uint(n)) && "
-      "v.params.all(p, p.core_input < uint(n + (t ? 1 : 0))) && "
-      "(!t || (size(v.params) > 0 && v.params[size(v.params)-1].core_input == uint(n)))))))"
+      "this.bindings.rust.views.all(v, has(v.tail_repetitions) || "
+      "[n + (has(this.host_primitive.signature) && size(this.host_primitive.signature.varargs) == 1 && "
+      "has(v.receiver) && v.receiver.core_input == uint(n) ? 1 : 0)].all(m, "
+      "size(v.params) + (has(v.receiver) ? 1 : 0) == m + (t ? 1 : 0) && "
+      "(!has(v.receiver) || v.receiver.core_input < uint(m)) && "
+      "v.params.all(p, p.core_input < uint(m + (t ? 1 : 0))) && "
+      "(!t || (size(v.params) > 0 && v.params[size(v.params)-1].core_input == uint(m)))))))"
   };
   // Derive R from the supplied mapping count M before visiting its slots:
   // M >= N, (M-N) % W == 0, R == (M-N) / W. This is N + R*W == M
@@ -1014,10 +1020,24 @@ message HostPrimitive {
 // vec-of<T>(...T)->Vec<T> determines T from its concrete result sort.
 // No conversion, subtyping, overload search or heterogeneous type packs.
 message GenericSignature {
+  option (buf.validate.message).cel = {
+    id: "generic_signature.equality_type_params"
+    message: "equality type parameters must be distinct in-scope binder indices"
+    expression:
+      "this.equality_type_params.all(i, i < size(this.type_params)) && "
+      "this.equality_type_params.all(i, this.equality_type_params.filter(j, j == i).size() == 1)"
+  };
   repeated string type_params = 1;
   repeated Arg inputs = 2;
   optional uint32 output = 3 [(buf.validate.field).required = true];
   repeated Arg varargs = 4;
+
+  // Binder positions, not Program.sorts indices. Each substituted sort must be
+  // exactly Sort.eq; a family containing equality sorts does not qualify.
+  // Strictly increasing and distinct. Absence leaves all binders unrestricted.
+  // CEL checks range/distinctness; catalog consumers additionally reject a
+  // non-increasing list before installation or API generation.
+  repeated uint32 equality_type_params = 5;
 }
 
 // Dedicated typing for a named application primitive, still invoked by Call.
@@ -1202,7 +1222,12 @@ enum PythonCallKind {
 // Ordered surface parameter. Without tail_repetitions, fixed core inputs
 // occupy [0, n). A nonempty varargs pattern has one logical tail slot n for the
 // whole flat tail, not one slot per pattern position. It must be last in surface
-// order, have no default, and cannot be a receiver. FunctionApplication has
+// order and have no default. A METHOD receiver at slot n may consume the first
+// operand of a homogeneous (width-one) tail; the remaining tail occupies slot
+// n+1. This view requires at least one actual tail operand, leaves the core
+// signature unchanged, and is unavailable for a zero-tail call. Grouped tails,
+// properties, and FunctionApplication cannot use this convention.
+// FunctionApplication has
 // fixed slot 0 plus tail slot 1, whose heterogeneous sorts come from the actual FuncSort.
 // With tail_repetitions present, every slot is fixed, including expanded tail
 // operands; those operands have no default. See CallableBindings for their sorts.

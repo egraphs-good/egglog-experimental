@@ -844,6 +844,13 @@ pub struct GenericSignature {
     pub output: ::core::option::Option<u32>,
     #[prost(message, repeated, tag = "4")]
     pub varargs: ::prost::alloc::vec::Vec<Arg>,
+    /// Binder positions, not Program.sorts indices. Each substituted sort must be
+    /// exactly Sort.eq; a family containing equality sorts does not qualify.
+    /// Strictly increasing and distinct. Absence leaves all binders unrestricted.
+    /// CEL checks range/distinctness; catalog consumers additionally reject a
+    /// non-increasing list before installation or API generation.
+    #[prost(uint32, repeated, tag = "5")]
+    pub equality_type_params: ::prost::alloc::vec::Vec<u32>,
 }
 /// Dedicated typing for a named application primitive, still invoked by Call.
 /// The first effective argument must have a concrete FuncSort; the remaining
@@ -1001,7 +1008,12 @@ pub struct PythonCallable {
 /// Ordered surface parameter. Without tail_repetitions, fixed core inputs
 /// occupy [0, n). A nonempty varargs pattern has one logical tail slot n for the
 /// whole flat tail, not one slot per pattern position. It must be last in surface
-/// order, have no default, and cannot be a receiver. FunctionApplication has
+/// order and have no default. A METHOD receiver at slot n may consume the first
+/// operand of a homogeneous (width-one) tail; the remaining tail occupies slot
+/// n+1. This view requires at least one actual tail operand, leaves the core
+/// signature unchanged, and is unavailable for a zero-tail call. Grouped tails,
+/// properties, and FunctionApplication cannot use this convention.
+/// FunctionApplication has
 /// fixed slot 0 plus tail slot 1, whose heterogeneous sorts come from the actual FuncSort.
 /// With tail_repetitions present, every slot is fixed, including expanded tail
 /// operands; those operands have no default. See CallableBindings for their sorts.

@@ -2,7 +2,9 @@
 
 import copy
 import json
+import os
 import unittest
+from pathlib import Path
 
 from protobuf import Oneof
 from protovalidate import ValidationError, validate
@@ -70,6 +72,73 @@ def tail_view_program(language, *, repetitions=2, prefix=(), tail=(0,), slots=(0
 
 
 class BindingSchemaTests(unittest.TestCase):
+    @unittest.skipUnless(os.environ.get("EGGLOG_TEST_BUILTIN_CATALOG"), "requires a native catalog export")
+    def test_exported_append_consumes_one_tail_operand(self):
+        program = ir.Program.from_binary(Path(os.environ["EGGLOG_TEST_BUILTIN_CATALOG"]).read_bytes())
+        validate(program)
+        append = next(d for d in program.declarations if d.kind.value.name == "egglog.core.vec.append")
+        program.declarations = [append]
+        self.assertEqual(append.kind.value.typing.value.inputs, [])
+        self.assertEqual(len(append.kind.value.typing.value.varargs), 1)
+        for language in ("python", "rust"):
+            with self.subTest(language=language):
+                original = copy.deepcopy(program)
+                original.declarations[0].bindings = ir.CallableBindings(**{
+                    language: getattr(append.bindings, language),
+                })
+                validate(original)
+                for mutation in ("duplicate", "missing", "receiver", "group", "owner", "application"):
+                    invalid = copy.deepcopy(original)
+                    declaration = invalid.declarations[0]
+                    view = getattr(declaration.bindings, language).views[0]
+                    if mutation == "duplicate":
+                        view.params[0].core_input = 0
+                    elif mutation == "missing":
+                        view.params.clear()
+                    elif mutation == "receiver":
+                        if language == "python":
+                            view.receiver = 1
+                        else:
+                            view.receiver.core_input = 1
+                    elif mutation == "group":
+                        declaration.kind.value.typing.value.varargs.append(ir.Arg(sort=declaration.kind.value.typing.value.varargs[0].sort))
+                    elif mutation == "owner":
+                        view.owner.kind = Oneof("sort", next(i for i, s in enumerate(invalid.sorts) if s.kind.field == "family" and s.kind.value.name == "i64"))
+                    else:
+                        declaration.kind.value.typing = Oneof("application", ir.FunctionApplication())
+                        # Application already has fixed input 0. Attempt to
+                        # consume tail input 1, not its valid fixed receiver.
+                        view.params[0].core_input = 2
+                        view.params.insert(0, type(view.params[0])(core_input=0, name="function"))
+                        if language == "python":
+                            view.receiver = 1
+                        else:
+                            view.receiver.core_input = 1
+                    with self.subTest(mutation=mutation), self.assertRaises(ValidationError):
+                        validate(invalid)
+        for mutation in ("property", "default", "mutation"):
+            invalid = copy.deepcopy(program)
+            view = invalid.declarations[0].bindings.python.views[0]
+            if mutation == "property":
+                view.kind = ir.PythonCallKind.PROPERTY
+            elif mutation == "default":
+                view.params[0].default_expr = 0
+            else:
+                view.mutates = 0
+            with self.subTest(mutation=mutation), self.assertRaises(ValidationError):
+                validate(invalid)
+
+    def test_consuming_receiver_preserves_free_and_fixed_prefix_controls(self):
+        for language in ("python", "rust"):
+            for fields in [
+                {"receiver": 0, "slots": (1,)},
+                {"prefix": (1,), "receiver": 1, "owner": 0, "slots": (0, 2)},
+                {"prefix": (0,), "receiver": 0, "slots": (1,)},
+                {"slots": (0,)},
+            ]:
+                with self.subTest(language=language, fields=fields):
+                    validate(tail_view_program(language, repetitions=None, **fields))
+
     def test_tail_view_absence_and_present_zero_preserve_wire_and_json_presence(self):
         for language in ("python", "rust"):
             views = []
