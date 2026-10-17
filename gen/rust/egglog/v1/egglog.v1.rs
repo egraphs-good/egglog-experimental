@@ -459,8 +459,8 @@ pub mod primitive_value {
         /// Concatenate captured arg sorts with its remaining params and use its result
         /// to check one effective complete call under the callee's typing form,
         /// including varargs or FunctionApplication. This must determine all generic
-        /// parameters, even with zero/all args captured. Relation partial application
-        /// remains a signature/capability question; captured args are value positions.
+        /// parameters, even with zero/all args captured. Relations cannot be partially
+        /// applied; captured arguments are value positions.
         #[prost(message, tag = "16")]
         PartialCall(super::Call),
         #[prost(message, tag = "17")]

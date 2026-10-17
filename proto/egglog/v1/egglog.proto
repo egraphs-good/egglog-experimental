@@ -622,8 +622,8 @@ message PrimitiveValue {
     // Concatenate captured arg sorts with its remaining params and use its result
     // to check one effective complete call under the callee's typing form,
     // including varargs or FunctionApplication. This must determine all generic
-    // parameters, even with zero/all args captured. Relation partial application
-    // remains a signature/capability question; captured args are value positions.
+    // parameters, even with zero/all args captured. Relations cannot be partially
+    // applied; captured arguments are value positions.
     Call partial_call = 16;
     CustomValue custom = 17;
   }
