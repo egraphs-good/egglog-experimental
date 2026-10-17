@@ -1250,6 +1250,226 @@ mod tests {
     use crate::typed::Ruleset;
 
     #[test]
+    fn generated_predicate_and_size_views_execute_encoded_method_requests() {
+        use crate::typed::builtins::{Bool, I64, bool_ne, get_node_size, get_table_size, value_eq};
+        let mut graph = EGraph::default();
+        for (value, expected, identity) in [
+            (bool_ne(I64::from(2), 3_i64), true, "egglog.core.bool_ne"),
+            (
+                I64::from(2).bool_eq(3_i64),
+                false,
+                "egglog.core.i64.bool_eq",
+            ),
+        ] {
+            assert_eq!(
+                bool::try_from(&graph.extract(value).unwrap()).unwrap(),
+                expected
+            );
+            let request =
+                pb::RunProgramRequest::decode(graph.last_wire.as_ref().unwrap().0.as_slice())
+                    .unwrap()
+                    .program
+                    .unwrap();
+            assert!(
+                request.nodes.iter().any(
+                    |n| matches!(&n.kind, Some(pb::node::Kind::Call(c)) if c.func == identity)
+                )
+            );
+        }
+        for (fact, expected, identity) in [
+            (Bool::from(true).guard(), true, "egglog.core.bool.guard"),
+            (Bool::from(false).guard(), false, "egglog.core.bool.guard"),
+            (value_eq(I64::from(2), 2_i64), true, "egglog.core.value_eq"),
+            (value_eq(I64::from(2), 3_i64), false, "egglog.core.value_eq"),
+        ] {
+            assert_eq!(graph.check(fact).unwrap(), expected);
+            let request =
+                pb::RunProgramRequest::decode(graph.last_wire.as_ref().unwrap().0.as_slice())
+                    .unwrap()
+                    .program
+                    .unwrap();
+            assert!(matches!(
+                request.commands[0].kind,
+                Some(pb::command::Kind::Check(_))
+            ));
+            assert!(
+                request.nodes.iter().any(
+                    |n| matches!(&n.kind, Some(pb::node::Kind::Call(c)) if c.func == identity)
+                )
+            );
+        }
+        for (value, identity, arity) in [
+            (get_node_size(), "egglog.experimental.size.nodes", 0),
+            (
+                get_table_size(std::iter::empty::<&str>()),
+                "egglog.experimental.size.tables",
+                0,
+            ),
+            (
+                get_table_size(["absent-a", "absent-b"]),
+                "egglog.experimental.size.tables",
+                2,
+            ),
+        ] {
+            assert_eq!(i64::try_from(&graph.extract(value).unwrap()).unwrap(), 0);
+            let request =
+                pb::RunProgramRequest::decode(graph.last_wire.as_ref().unwrap().0.as_slice())
+                    .unwrap()
+                    .program
+                    .unwrap();
+            assert!(request.nodes.iter().any(|n| matches!(&n.kind, Some(pb::node::Kind::Call(c)) if c.func == identity && c.args.len() == arity)));
+        }
+    }
+
+    #[test]
+    fn generated_function_input_views_execute_encoded_method_requests() {
+        use crate::typed::builtins::{Function, I64, Map, Maybe, Vec as EVec};
+        let mut graph = EGraph::default();
+        let callback =
+            Function::<(I64,), I64>::with_captures((I64::from(10),), |(captured,), x| captured + x)
+                .unwrap();
+        let values = graph
+            .extract(EVec::<I64>::of([1_i64, 2]).map(callback))
+            .unwrap();
+        assert_eq!(
+            Vec::<I64>::try_from(&values)
+                .unwrap()
+                .iter()
+                .map(|value| i64::try_from(value).unwrap())
+                .collect::<Vec<_>>(),
+            [11, 12]
+        );
+        let mut requests = vec![(
+            graph.last_wire.as_ref().unwrap().0.clone(),
+            "egglog.core.vec.map",
+        )];
+
+        let callback =
+            Function::<(I64, I64, I64), I64>::new(|acc, key, value| acc + key + value).unwrap();
+        let value = graph
+            .extract(
+                Map::<I64, I64>::of([(1_i64, 2_i64), (3_i64, 4_i64)])
+                    .fold_kv(callback, I64::from(0)),
+            )
+            .unwrap();
+        assert_eq!(i64::try_from(&value).unwrap(), 10);
+        requests.push((
+            graph.last_wire.as_ref().unwrap().0.clone(),
+            "egglog.experimental.map.fold_kv",
+        ));
+
+        for (thunk, expected) in [
+            (
+                Function::<(), I64>::new(|| I64::from(7)).unwrap(),
+                Some(I64::from(7)),
+            ),
+            (
+                Function::<(), I64>::new(|| I64::from(1) / I64::from(0)).unwrap(),
+                None,
+            ),
+        ] {
+            let value = graph.extract(Maybe::<I64>::catch(thunk)).unwrap();
+            assert_eq!(Option::<I64>::try_from(&value).unwrap(), expected);
+            requests.push((
+                graph.last_wire.as_ref().unwrap().0.clone(),
+                "egglog.experimental.maybe.catch",
+            ));
+        }
+        let failing_callback = Function::<(I64,), I64>::new(|x| I64::from(1) / x).unwrap();
+        assert_eq!(
+            i64::try_from(
+                &graph
+                    .extract(Maybe::<I64>::none().match_(failing_callback, I64::from(9)))
+                    .unwrap()
+            )
+            .unwrap(),
+            9
+        );
+        requests.push((
+            graph.last_wire.as_ref().unwrap().0.clone(),
+            "egglog.experimental.maybe.match",
+        ));
+        let plus_one = Function::<(I64,), I64>::new(|x| x + I64::from(1)).unwrap();
+        assert_eq!(
+            i64::try_from(
+                &graph
+                    .extract(Maybe::<I64>::some(2_i64).match_(plus_one, I64::from(9)))
+                    .unwrap()
+            )
+            .unwrap(),
+            3
+        );
+        requests.push((
+            graph.last_wire.as_ref().unwrap().0.clone(),
+            "egglog.experimental.maybe.match",
+        ));
+        for (request, identity) in requests {
+            let request = pb::RunProgramRequest::decode(request.as_slice())
+                .unwrap()
+                .program
+                .unwrap();
+            assert!(
+                request.nodes.iter().any(
+                    |n| matches!(&n.kind, Some(pb::node::Kind::Call(c)) if c.func == identity)
+                )
+            );
+            assert!(request.nodes.iter().any(|n| matches!(
+                &n.kind,
+                Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
+                    value: Some(pb::primitive_value::Value::PartialCall(_))
+                }))
+            )));
+        }
+    }
+
+    #[test]
+    fn generated_subst_view_executes_encoded_method_request() {
+        use crate::typed::{
+            builtins::{I64, Map, subst},
+            eq,
+            tests::ActionTerm,
+        };
+        let root = ActionTerm(Expr::call(
+            &Callable::constructor(
+                "BuiltinSubstRoot",
+                vec![],
+                ActionTerm::sort_ref(),
+                None,
+                false,
+            ),
+            vec![],
+        ));
+        let replacement = ActionTerm(Expr::call(
+            &Callable::constructor(
+                "BuiltinSubstReplacement",
+                vec![I64::sort_ref()],
+                ActionTerm::sort_ref(),
+                None,
+                false,
+            ),
+            vec![I64::from(7).expression().clone()],
+        ));
+        let mut graph = EGraph::default();
+        graph.register((&root, &replacement)).unwrap();
+        let copied = subst(
+            root.clone(),
+            Map::<ActionTerm, ActionTerm>::of([(root, replacement.clone())]),
+        );
+        let copied = graph.extract(copied).unwrap();
+        let request = pb::RunProgramRequest::decode(graph.last_wire.as_ref().unwrap().0.as_slice())
+            .unwrap()
+            .program
+            .unwrap();
+        assert!(matches!(
+            request.commands[0].kind,
+            Some(pb::command::Kind::Extract(_))
+        ));
+        assert!(request.nodes.iter().any(|n| matches!(&n.kind, Some(pb::node::Kind::Call(c)) if c.func == "egglog.experimental.subst" && c.args.len() == 2)));
+        assert!(request.nodes.iter().any(|n| matches!(&n.kind, Some(pb::node::Kind::Call(c)) if c.func == "egglog.core.map.of" && c.args.len() == 1)));
+        assert!(graph.check(eq(copied, replacement)).unwrap());
+    }
+
+    #[test]
     fn function_values_decode_rejects_partial_signature_corruption() {
         use crate::typed::builtins::{Function, I64};
         let callback =

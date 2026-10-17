@@ -568,7 +568,6 @@ impl Callable {
             output: inputs.len() as u32,
             cost: cost.as_ref().map(|_| 0),
             unextractable,
-            ..Default::default()
         };
         let mut slots = std::array::from_fn(|_| vec![]);
         slots[Arena::Sort as usize] = inputs

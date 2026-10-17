@@ -1608,7 +1608,9 @@ fn emit_generic_views(
             .iter()
             .enumerate()
             .map(|(i, t)| {
-                if owner.is_some() && signature.equality_type_params.contains(&(i as u32)) {
+                if (owner.is_some() || concrete_inputs)
+                    && signature.equality_type_params.contains(&(i as u32))
+                {
                     format!("{t}: crate::typed::EqualitySort")
                 } else {
                     format!("{t}: {bound}")
@@ -1711,19 +1713,20 @@ fn emit_generic_views(
         let mutability = if tail.is_some() { "mut " } else { "" };
         let tail_code = tail.map_or_else(String::new, |(name, ty)| format!("for {value} in ::core::iter::IntoIterator::into_iter({name}) {{ let {value}: {ty} = ::core::convert::Into::into({value}); {args}.push(::core::clone::Clone::clone(<{ty} as crate::typed::EgglogValue>::expression(&{value}))); }}"));
         let params = params.join(", ");
-        let restrictions = if owner.is_none() && !signature.equality_type_params.is_empty() {
-            format!(
-                " where {}",
-                signature
-                    .equality_type_params
-                    .iter()
-                    .map(|i| { format!("{}: crate::typed::EqualitySort", types[*i as usize]) })
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            )
-        } else {
-            String::new()
-        };
+        let restrictions =
+            if owner.is_none() && !concrete_inputs && !signature.equality_type_params.is_empty() {
+                format!(
+                    " where {}",
+                    signature
+                        .equality_type_params
+                        .iter()
+                        .map(|i| { format!("{}: crate::typed::EqualitySort", types[*i as usize]) })
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            } else {
+                String::new()
+            };
         let (prefix, suffix, method_generics) = match owner {
             Some(owner) => (
                 format!(
@@ -1763,19 +1766,38 @@ fn emit_generic_views(
 mod tests {
     use super::*;
 
-    const DEFERRED: [&str; 11] = [
-        "egglog.core.bool.guard",
-        "egglog.core.bool_ne",
-        "egglog.core.i64.bool_eq",
-        "egglog.core.value_eq",
-        "egglog.core.vec.map",
-        "egglog.experimental.map.fold_kv",
-        "egglog.experimental.maybe.catch",
-        "egglog.experimental.maybe.match",
-        "egglog.experimental.size.nodes",
-        "egglog.experimental.size.tables",
-        "egglog.experimental.subst",
-    ];
+    const DEFERRED: [&str; 0] = [];
+
+    #[test]
+    fn complete_native_catalog_uses_existing_generic_and_function_views() {
+        let program = egglog_experimental::new_experimental_egraph()
+            .type_info()
+            .portable_builtin_catalog()
+            .unwrap()
+            .definitions;
+        let before = program.encode_to_vec();
+        let (source, deferred) = generate(&program).unwrap();
+        assert_eq!(deferred, DEFERRED);
+        assert_eq!(program.encode_to_vec(), before);
+        for method in [
+            "pub fn guard(&self)",
+            "pub fn bool_eq(&self,",
+            "pub fn bool_ne<__EgglogType0: crate::typed::expr::ValueInput>",
+            "pub fn value_eq<__EgglogType0: crate::typed::expr::ValueInput>",
+            "pub fn map<__EgglogType1: crate::typed::EgglogValue>(&self, __egglog_arg_0: self::Function<(__EgglogType0,), __EgglogType1>) -> self::Vec<__EgglogType1>",
+            "pub fn fold_kv<__EgglogType2: crate::typed::EgglogValue>(&self, __egglog_arg_0: self::Function<(__EgglogType2, __EgglogType0, __EgglogType1,), __EgglogType2>, __egglog_arg_1: __EgglogType2) -> __EgglogType2",
+            "pub fn catch(__egglog_arg_0: impl ::core::convert::Into<self::Function<(), __EgglogType0>>) -> self::Maybe<__EgglogType0>",
+            "pub fn match_<__EgglogType1: crate::typed::EgglogValue>(&self, __egglog_arg_0: self::Function<(__EgglogType0,), __EgglogType1>, __egglog_arg_1: __EgglogType1) -> __EgglogType1",
+            "pub fn get_node_size() -> self::I64",
+            "pub fn get_table_size(__egglog_arg_0: impl ::core::iter::IntoIterator<Item = impl ::core::convert::Into<self::String>>) -> self::I64",
+            "pub fn subst<__EgglogType0: crate::typed::EqualitySort, __EgglogType1: crate::typed::EqualitySort>(__egglog_arg_0: __EgglogType0, __egglog_arg_1: self::Map<__EgglogType1, __EgglogType1>) -> __EgglogType0",
+        ] {
+            assert!(
+                source.contains(method),
+                "missing generated method: {method}"
+            );
+        }
+    }
 
     #[test]
     fn generic_free_functions_follow_binders_slots_names_and_results() {
@@ -2096,7 +2118,7 @@ mod tests {
             }
         }
         for method in ["numer", "denom", "lt", "gt", "le", "ge"] {
-            assert!(source.contains(&format!("pub fn {method}(self")));
+            assert!(source.contains(&format!("pub fn {method}(&self")));
         }
         for provider in [
             "egglog.core.bigrat.neg",
@@ -2967,7 +2989,12 @@ mod tests {
                                 family.bindings.as_mut().unwrap().rust = None;
                             }
                             Some(pb::declaration::Kind::HostPrimitive(primitive))
-                                if primitive.name.starts_with("egglog.core.map.") =>
+                                if primitive.name.starts_with("egglog.core.map.")
+                                    || matches!(
+                                        primitive.name.as_str(),
+                                        "egglog.experimental.map.fold_kv"
+                                            | "egglog.experimental.subst"
+                                    ) =>
                             {
                                 declaration.bindings.as_mut().unwrap().rust = None;
                             }
@@ -3711,7 +3738,7 @@ mod tests {
                         "self::Vec<self::I64>"
                     );
                     let body = source
-                        .split_once("pub fn range(self)")
+                        .split_once("pub fn range(&self)")
                         .unwrap()
                         .1
                         .split_once("\n}\n")

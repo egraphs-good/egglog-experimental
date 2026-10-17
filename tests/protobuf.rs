@@ -6568,7 +6568,8 @@ fn size_and_subst_catalog_descriptors_preserve_native_contexts() {
             panic!("provider must own a portable signature")
         };
         let bindings = declaration.bindings.as_ref().unwrap();
-        assert!(bindings.python.is_none() && bindings.rust.is_none());
+        assert!(bindings.python.is_none());
+        assert!(bindings.rust.is_some());
         assert_eq!(bindings.egglog.as_ref().unwrap().views[0].symbol, alias);
         assert_eq!(signature.varargs.len(), usize::from(variadic));
         if alias == "unstable-subst" {

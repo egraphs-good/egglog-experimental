@@ -1631,10 +1631,17 @@ fn remaining_scalar_catalog_preserves_closed_providers() {
                 }
             }
         } else {
-            assert!(
-                bindings.python.is_none() && bindings.rust.is_none(),
-                "{key}"
+            assert!(bindings.python.is_none(), "{key}");
+            let view = &bindings.rust.as_ref().unwrap().views[0];
+            assert_eq!(
+                view.path,
+                [if suffix == "bool.guard" {
+                    "guard"
+                } else {
+                    "bool_eq"
+                }]
             );
+            assert_eq!(view.receiver.as_ref().unwrap().core_input, Some(0));
         }
         let sorts: Vec<_> = names
             .iter()
@@ -1739,7 +1746,18 @@ fn remaining_scalar_generic_catalog_preserves_homogeneous_providers() {
         );
         let bindings = declaration.bindings.as_ref().unwrap();
         assert_eq!(bindings.egglog.as_ref().unwrap().views[0].symbol, alias);
-        assert!(bindings.python.is_none() && bindings.rust.is_none());
+        assert!(bindings.python.is_none());
+        assert_eq!(
+            bindings.rust.as_ref().unwrap().views[0]
+                .path
+                .last()
+                .unwrap(),
+            if key == "egglog.core.bool_ne" {
+                "bool_ne"
+            } else {
+                "value_eq"
+            }
+        );
         for name in [
             "i64", "bool", "f64", "String", "BigInt", "BigRat", "Unit", "Item", "Items", "Ints",
         ] {

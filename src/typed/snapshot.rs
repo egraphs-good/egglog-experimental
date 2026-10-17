@@ -87,9 +87,9 @@ impl Snapshot {
                 }
                 Some(pb::action::Kind::Set(set)) => {
                     if set.target.is_none()
-                        || !set
+                        || set
                             .value
-                            .is_some_and(|value| (value as usize) < program.nodes.len())
+                            .is_none_or(|value| (value as usize) >= program.nodes.len())
                     {
                         return Err(TypedError::Decode(
                             "incomplete snapshot function row".into(),
