@@ -1,7 +1,8 @@
 //! Ordinary Rust authoring backed directly by generated protobuf records.
 //!
 //! This initial subset supports equality sorts/constructors, merged functions, relation predicates, exact selectors,
-//! callback rules/rewrites, immutable groups and byte-backed register/check/extract.
+//! callback rules/rewrites, immutable groups, ordered Run/Repeat/Saturate
+//! schedules and byte-backed register/check/extract/freeze observations.
 //! Flat and composed groups retain shared rule/group occurrences through
 //! request-scoped publication receipts. Names reserved for a failed submission
 //! are not evidence of publication; only confirmed canonical roots anchor reuse.
@@ -16,14 +17,17 @@
 //! A clone starts with an empty scope stack, even inside a scope. Dropping a graph
 //! discards its owned handles; it does not pop or merge work into another graph.
 //! `run` includes actual native detail beside its outcome/profile; `stats` returns
-//! cumulative native statistics. Both retain the complete decoded response and
-//! its rule-attribution catalog, not a second report model. Emitting detail does
+//! cumulative native statistics. Both return `RunReport` with exact generated
+//! native detail and its rule-attribution catalog, not generic command outputs
+//! or a second report model. Emitting detail does
 //! not disable or reconfigure native collection; unavailable plans remain absent.
 //! I64/F64 arithmetic, String/Bool operations, Unit literals and generic
 //! Vec/Pair/Map operations use engine-owned metadata.
 //! Ordered container decoding retains child expression ownership. Foreign open
-//! binders, arbitrary declarations, frozen graphs and general schedules are not
-//! accepted yet; no source/AST execution fallback exists.
+//! binders, arbitrary declarations and schedule forms beyond Run/Repeat/Saturate
+//! are not accepted; no source/AST execution fallback exists. `Snapshot` retains
+//! exported classes, producers and table rows without evaluating roots. Its
+//! typed observations cannot be submitted as live expressions, even transitively.
 //!
 //! Scalar conversions and constructor arguments are checked by Rust. Calls
 //! author symbolic expressions; they do not evaluate those expressions.
@@ -34,7 +38,8 @@
 //! it inserts a row; checking it only tests existence. `delete` addresses the row
 //! without evaluating/inserting it. Set, subsumption, extraction, captures and
 //! nested value uses and relation equality fail before effects.
-//! This subset does not expose retained relation-row identity or table-row data.
+//! `Snapshot::rows` exposes retained function/relation rows with shallow typed
+//! input/output views; these rows are distinct from constructor producers.
 //!
 //! ```
 //! use egglog_experimental::typed::{builtins::Unit, prelude::*};
@@ -105,6 +110,29 @@
 //! symbolic value determines the sort; either wrapper may be borrowed and the
 //! right operand accepts that wrapper's existing conversions. Inequality is
 //! evaluated by the engine, including equality-class merges, not by Rust Eq.
+//!
+//! Constructor `cost` metadata must be a nonnegative inert `I64` value (Rust
+//! integer expressions are converted once when the declaration is initialized).
+//! Symbolic calls, variables and captures are rejected on submission rather than
+//! evaluated. `unextractable` retains the constructor but excludes it from
+//! extraction. Both options are constructor-only.
+//!
+//! ```compile_fail,E0277
+//! use egglog_experimental::typed::{builtins::F64, prelude::*};
+//! #[sort] struct Term;
+//! #[constructor(cost = F64::from(1.0))]
+//! fn term() -> Term;
+//! ```
+//! ```compile_fail
+//! use egglog_experimental::typed::{builtins::I64, prelude::*};
+//! #[function(no_merge, cost = 0)]
+//! fn value() -> I64;
+//! ```
+//! ```compile_fail
+//! use egglog_experimental::typed::prelude::*;
+//! #[relation(unextractable)]
+//! fn predicate();
+//! ```
 //!
 //! ```
 //! use egglog_experimental::typed::{builtins::I64, prelude::*};
@@ -518,9 +546,7 @@
 //! assert!(graph.check(Term::Seen(7))?);
 //! assert!(!graph.check(Term::Seen(8))?);
 //! let stats = graph.stats()?;
-//! let Some(egglog_experimental::proto::command_output::Kind::Statistics(report)) =
-//!     &stats.outputs[0].kind else { panic!("missing statistics") };
-//! assert!(!report.iterations.is_empty());
+//! assert!(!stats.detail.iterations.is_empty());
 //! let shared = ruleset((&marks, &marks)); // canonical composition, no rule copies
 //! graph.run(&shared)?;
 //! graph.push()?;
@@ -1123,8 +1149,10 @@ mod close;
 mod decl;
 mod expr;
 mod rule;
+mod schedule;
 mod selector;
 mod session;
+mod snapshot;
 mod storage;
 
 pub use builtins::ne;
@@ -1136,8 +1164,34 @@ pub use expr::{EgglogValue, EqualitySort, let_, var};
 pub use rule::{
     Action, Fact, Rule, Ruleset, delete, eq, rewrite, rule, ruleset, set, subsume, union,
 };
+pub use schedule::{Schedule, sequence};
 pub use selector::get_args;
 pub use session::EGraph;
+pub use snapshot::{ClassRef, ProducerRef, Snapshot, TableRowRef, ValueRef};
+/// Exact reports returned by high-level run/statistics observations.
+pub mod report {
+    pub use crate::proto::report_stage::Kind as ReportStageKind;
+    pub use crate::proto::{
+        NativeRunReport as NativeReport, ProfileSummary, ReportDuration, RuleAttribution,
+        RulesetPublication,
+    };
+
+    /// Exact native metrics together with their response-local attribution.
+    /// A successful high-level observation has validated all referenced rule
+    /// entries and required metrics; generic command outputs remain private.
+    #[derive(Clone, Debug)]
+    pub struct RunReport {
+        /// Native history and authoritative aggregate maps.
+        pub detail: NativeReport,
+        /// Rule occurrence descriptions indexed by optional metric attribution.
+        pub rules: Vec<RuleAttribution>,
+        /// Exclusive work attribution requested by this typed session.
+        pub profile: Option<ProfileSummary>,
+        /// Confirmed publication of the submitted named rulesets.
+        pub ruleset_publication: Option<RulesetPublication>,
+    }
+}
+pub use report::RunReport;
 
 /// Authoring, decoding or structured engine failure.
 #[derive(Debug)]
@@ -1148,12 +1202,22 @@ pub enum TypedError {
     Decode(String),
     /// The byte engine returned its structured failure unchanged.
     Engine(Box<pb::Error>),
+    /// An ordered retained root could not be observed or reconstructed.
+    UnresolvedRoot {
+        /// Position in the caller's ordered root list, when known.
+        index: Option<usize>,
+        /// The failed observation or reconstruction requirement.
+        reason: String,
+    },
 }
 impl std::fmt::Display for TypedError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Invalid(s) | Self::Decode(s) => f.write_str(s),
             Self::Engine(e) => write!(f, "engine error {}: {}", e.code, e.message),
+            Self::UnresolvedRoot { index, reason } => {
+                write!(f, "unresolved root {index:?}: {reason}")
+            }
         }
     }
 }
@@ -1162,9 +1226,9 @@ impl std::error::Error for TypedError {}
 /// Common authoring types, declaration macros and operations.
 pub mod prelude {
     pub use super::{
-        Action, EGraph, EgglogValue, EqualitySort, Fact, Rule, Ruleset, TypedError, constructor,
-        declarations, delete, eq, function, get_args, let_, ne, relation, rewrite, rule, ruleset,
-        set, sort, subsume, union, var,
+        Action, EGraph, EgglogValue, EqualitySort, Fact, Rule, Ruleset, Schedule, Snapshot,
+        TypedError, constructor, declarations, delete, eq, function, get_args, let_, ne, relation,
+        rewrite, rule, ruleset, sequence, set, sort, subsume, union, var,
     };
 }
 

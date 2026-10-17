@@ -12,6 +12,36 @@ use std::sync::LazyLock;
 #[derive(Clone)]
 pub struct Action(Result<Record, String>);
 
+impl<I: ValueInput> From<I> for Action {
+    /// Retain an expression as an ordered term action in a heterogeneous list.
+    /// This preserves its declarations, capture recipe and observation ownership;
+    /// construction does not evaluate or materialize it.
+    fn from(value: I) -> Self {
+        let mut slots = std::array::from_fn(|_| vec![]);
+        slots[Arena::Node as usize] = vec![Slot::External(value.borrow().expression().0.clone())];
+        Self(
+            publish(
+                pb::Program {
+                    ir_version: 1,
+                    commands: vec![pb::Command {
+                        kind: Some(pb::command::Kind::Action(pb::Action {
+                            kind: Some(pb::action::Kind::Term(0)),
+                            ..Default::default()
+                        })),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                },
+                slots,
+                vec![],
+                Arena::Command,
+                0,
+            )
+            .map_err(|error| error.to_string()),
+        )
+    }
+}
+
 /// Write a direct function row without evaluating its target lookup.
 /// With `no_merge`, assigning a different value to an existing row is an error.
 pub fn set<I: ValueInput>(target: I, value: impl Into<I::Owned>) -> Action {
@@ -47,6 +77,11 @@ pub fn subsume<I: ValueInput>(target: I) -> Action {
 // semantic action tree or name-to-target registry is retained.
 fn row_action(target: &Expr, mut action: pb::action::Kind, value: Option<Expr>) -> Action {
     let build = || -> Result<Record, TypedError> {
+        if target.0.owner.as_ref().unwrap().observed {
+            return Err(TypedError::Invalid(
+                "snapshot observations cannot be used as live row targets".into(),
+            ));
+        }
         if target.0.capture()?.is_some() {
             return Err(TypedError::Invalid(
                 "capture storage is not an authored row target".into(),
@@ -250,6 +285,44 @@ pub fn rule(lhs: impl Facts, rhs: impl Actions) -> Rule {
 }
 
 impl Rule {
+    /// Add an immutable diagnostic presentation, retaining the rule occurrence.
+    pub fn label(self, label: impl Into<String>) -> Self {
+        let label = label.into();
+        let mut program = pb::Program {
+            ir_version: 1,
+            rules: vec![
+                self.0.owner.as_ref().unwrap().program.rules[self.0.index as usize].clone(),
+            ],
+            ..Default::default()
+        };
+        let mut slots = std::array::from_fn(|_| vec![]);
+        visit(&mut program, Arena::Rule, 0, |arena, index| {
+            let position =
+                u32::try_from(slots[arena as usize].len()).expect("protobuf arena exceeds u32");
+            slots[arena as usize].push(Slot::External(self.0.resolve(arena, index)?));
+            Ok(position)
+        })
+        .expect("published rule has valid references");
+        program.rules[0].name = Some(label.clone());
+        let error = self.1.or_else(|| {
+            label
+                .is_empty()
+                .then(|| "rule label must not be empty".into())
+        });
+        let mut record = publish(
+            program,
+            slots,
+            self.0.owner.as_ref().unwrap().declarations.clone(),
+            Arena::Rule,
+            0,
+        )
+        .unwrap();
+        std::sync::Arc::get_mut(record.owner.as_mut().unwrap())
+            .expect("unpublished label")
+            .rule_origin = Some(self.0);
+        Self(record, error)
+    }
+
     /// Append query conditions, publishing a new immutable rule occurrence.
     /// Existing clones and groups keep the original rule. No conditions is a no-op.
     pub fn when(self, conditions: impl Facts) -> Self {

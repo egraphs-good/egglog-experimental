@@ -547,7 +547,13 @@ impl Callable {
         Self(record)
     }
 
-    pub fn constructor(name: &str, inputs: Vec<SortRef>, output: SortRef) -> Self {
+    pub fn constructor(
+        name: &str,
+        inputs: Vec<SortRef>,
+        output: SortRef,
+        cost: Option<Expr>,
+        unextractable: bool,
+    ) -> Self {
         assert!(!name.is_empty(), "constructor names must not be empty");
         let constructor = pb::Constructor {
             name: name.into(),
@@ -560,6 +566,8 @@ impl Callable {
                 })
                 .collect(),
             output: inputs.len() as u32,
+            cost: cost.as_ref().map(|_| 0),
+            unextractable,
             ..Default::default()
         };
         let mut slots = std::array::from_fn(|_| vec![]);
@@ -567,6 +575,10 @@ impl Callable {
             .into_iter()
             .chain(std::iter::once(output))
             .map(|s| Slot::External(s.0))
+            .collect();
+        slots[Arena::Node as usize] = cost
+            .into_iter()
+            .map(|cost| Slot::External(cost.0))
             .collect();
         let program = pb::Program {
             ir_version: 1,

@@ -71,6 +71,10 @@ pub(super) struct Owner {
     pub capture: Option<(u32, u32)>,
     // Function declaration and its two exact parameter locations in Node slots.
     pub merge_parameters: Option<(u32, [u32; 2])>,
+    // Snapshot data are inspectable records, never live authoring inputs.
+    pub observed: bool,
+    // Diagnostic presentations retain the original rule occurrence identity.
+    pub rule_origin: Option<Record>,
 }
 
 // A validated, temporary view of the generated Function/Call/Set linkage.
@@ -103,12 +107,32 @@ impl Drop for Record {
                         pending.push(child);
                     }
                 }
+                if let Some(mut origin) = owner.rule_origin.take()
+                    && let Some(parent) = origin.owner.take()
+                {
+                    pending.push(parent);
+                }
             }
         }
     }
 }
 
 impl Record {
+    pub fn key(&self) -> Key {
+        let mut record = self;
+        while record.arena == Arena::Rule {
+            let Some(origin) = &record.owner.as_ref().unwrap().rule_origin else {
+                break;
+            };
+            record = origin;
+        }
+        (
+            record.owner.as_ref().unwrap().id,
+            record.arena,
+            record.index,
+        )
+    }
+
     pub fn capture(&self) -> Result<Option<CaptureRecipe>, TypedError> {
         let owner = self.owner.as_ref().unwrap();
         let Some((read, initialization)) = owner.capture else {
@@ -252,6 +276,41 @@ impl Record {
 }
 
 pub(super) type Key = (usize, Arena, u32);
+
+// Freeze is an already-checked, complete reconstruction Program. Keep its
+// arenas intact: saved code is not a typed authoring fragment and must not be
+// traversed as though it were stored data.
+pub(super) fn observe(program: pb::Program, root_sort: u32) -> Result<Record, TypedError> {
+    if program.ir_version != 1 || root_sort as usize >= program.sorts.len() {
+        return Err(TypedError::Decode("invalid snapshot Program".into()));
+    }
+    let lengths = [
+        program.nodes.len(),
+        program.sorts.len(),
+        program.declarations.len(),
+        program.rules.len(),
+        program.rulesets.len(),
+        program.commands.len(),
+    ];
+    let slots = lengths.map(|len| (0..len as u32).map(Slot::Local).collect());
+    let id = NEXT_OWNER
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
+        .expect("owner identity exhausted");
+    Ok(Record {
+        owner: Some(Arc::new(Owner {
+            id,
+            program,
+            slots,
+            declarations: vec![],
+            capture: None,
+            merge_parameters: None,
+            observed: true,
+            rule_origin: None,
+        })),
+        arena: Arena::Sort,
+        index: root_sort,
+    })
+}
 
 /// Inspect the reachable canonical closure before packing can erase provenance.
 /// Capture initializer edges belong to authoring, not the nullary wire Call.
@@ -466,11 +525,14 @@ pub(super) fn visit(
             }
             match d.kind.as_mut().ok_or_else(invalid)? {
                 pb::declaration::Kind::EqSort(_) | pb::declaration::Kind::HostSortFamily(_) => {}
-                pb::declaration::Kind::Constructor(c) if c.cost.is_none() => {
+                pb::declaration::Kind::Constructor(c) => {
                     for a in &mut c.inputs {
                         a.sort = map(Arena::Sort, a.sort)?;
                     }
                     c.output = map(Arena::Sort, c.output)?;
+                    if let Some(cost) = &mut c.cost {
+                        *cost = map(Arena::Node, *cost)?;
+                    }
                 }
                 pb::declaration::Kind::Function(f) => {
                     for arg in &mut f.inputs {
@@ -511,7 +573,6 @@ pub(super) fn visit(
                         pb::host_primitive::Typing::Application(_) => {}
                     }
                 }
-                _ => return Err(invalid()),
             }
             let application = matches!(
                 &d.kind,
@@ -709,6 +770,8 @@ pub(super) fn publish(
             declarations,
             capture: None,
             merge_parameters: None,
+            observed: false,
+            rule_origin: None,
         })),
         arena,
         index,
@@ -729,6 +792,7 @@ pub(super) struct Packer {
     pub initializations: Vec<(u32, Record, String)>,
     pub ordinary_callables: std::collections::HashSet<String>,
     pub capture_counter: Option<u64>,
+    pub observed_data: bool,
 }
 
 impl Default for Packer {
@@ -748,6 +812,7 @@ impl Default for Packer {
             initializations: vec![],
             ordinary_callables: std::collections::HashSet::new(),
             capture_counter: None,
+            observed_data: false,
         }
     }
 }
@@ -755,12 +820,14 @@ impl Default for Packer {
 impl Packer {
     pub fn intern(&mut self, record: Record, binder: usize) -> u32 {
         let owner = record.owner.as_ref().unwrap();
+        self.observed_data |=
+            owner.observed && matches!(record.arena, Arena::Node | Arena::Command);
         let context = if matches!(record.arena, Arena::Node | Arena::Command) {
             binder
         } else {
             0
         };
-        let key = ((owner.id, record.arena, record.index), context);
+        let key = (record.key(), context);
         if let Some(index) = self.ids.get(&key) {
             return *index;
         }
@@ -981,6 +1048,25 @@ impl Packer {
                             }
                         }
                         Some(pb::declaration::Kind::Constructor(c)) => {
+                            if let Some(index) = c.cost {
+                                let cost = record.resolve(Arena::Node, index)?;
+                                let node = &cost.owner.as_ref().unwrap().program.nodes
+                                    [cost.index as usize];
+                                let sort = cost.resolve(Arena::Sort, node.sort_id)?;
+                                if super::SortRef(sort)
+                                    != <super::builtins::I64 as super::EgglogValue>::sort_ref()
+                                    || !matches!(
+                                        &node.kind,
+                                        Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
+                                            value: Some(pb::primitive_value::Value::I64(value)),
+                                        })) if *value >= 0
+                                    )
+                                {
+                                    return Err(TypedError::Invalid(
+                                        "constructor costs require a nonnegative inert i64".into(),
+                                    ));
+                                }
+                            }
                             self.ordinary_callables.insert(c.name.clone());
                         }
                         Some(pb::declaration::Kind::Relation(r)) => {
@@ -1246,6 +1332,8 @@ mod tests {
             "Subsumed",
             vec![I64::sort_ref()],
             SortRef::equality("SubsumedSort"),
+            None,
+            false,
         );
         let program = pb::Program {
             ir_version: 1,

@@ -405,8 +405,10 @@ fn union_subsume_records_preserve_operands_closure_and_identity() {
         "ActionRow",
         vec![I64::sort_ref(), I64::sort_ref()],
         ActionTerm::sort_ref(),
+        None,
+        false,
     );
-    let nullary = Callable::constructor("ActionEmpty", vec![], ActionTerm::sort_ref());
+    let nullary = Callable::constructor("ActionEmpty", vec![], ActionTerm::sort_ref(), None, false);
     let target = ActionTerm(Expr::call(
         &definition,
         vec![
@@ -737,7 +739,8 @@ fn typed_table_function_syntax_rejects_inert_data_and_incompatible_selectors() {
     actual.hash(&mut original_hash);
     Expr::call(&independent, vec![key.expression().clone()]).hash(&mut independent_hash);
     assert_eq!(original_hash.finish(), independent_hash.finish());
-    let constructor = Callable::constructor("Same", vec![I64::sort_ref()], I64::sort_ref());
+    let constructor =
+        Callable::constructor("Same", vec![I64::sort_ref()], I64::sort_ref(), None, false);
     let pattern = Expr::call(&constructor, vec![key.expression().clone()]);
     assert!(
         actual
@@ -1893,8 +1896,8 @@ fn set_payload_walkers_handle_deep_finite_data_iteratively() {
         .declaration("Set", DeclarationKind::HostSortFamily)
         .unwrap();
     let set = SortRef::family(&family, vec![atom.clone()]).unwrap();
-    let leaf = Callable::constructor("SetDeepLeaf", vec![], atom.clone());
-    let pack = Callable::constructor("SetDeepPack", vec![set.clone()], atom);
+    let leaf = Callable::constructor("SetDeepLeaf", vec![], atom.clone(), None, false);
+    let pack = Callable::constructor("SetDeepPack", vec![set.clone()], atom, None, false);
     let chain = || {
         let mut term = Expr::call(&leaf, vec![]);
         for _ in 0..10_000 {
@@ -2023,6 +2026,8 @@ fn map_inspection_rejects_same_headed_user_calls_and_wrong_children() {
             name,
             vec![EVec::<Pair<I64, F64>>::sort_ref()],
             Map::<I64, F64>::sort_ref(),
+            None,
+            false,
         );
         let map =
             Map::<I64, F64>::from_expression(Expr::call(&fake, vec![pairs.expression().clone()]));
@@ -2034,7 +2039,13 @@ fn map_inspection_rejects_same_headed_user_calls_and_wrong_children() {
         "egglog.core.vec.empty",
         "egglog.core.vec.of",
     ] {
-        let fake = Callable::constructor(name, vec![], EVec::<Pair<I64, F64>>::sort_ref());
+        let fake = Callable::constructor(
+            name,
+            vec![],
+            EVec::<Pair<I64, F64>>::sort_ref(),
+            None,
+            false,
+        );
         let pairs = EVec::<Pair<I64, F64>>::from_expression(Expr::call(&fake, vec![]));
         assert!(Map::<I64, F64>::from_pairs(pairs).entries().is_err());
     }
@@ -2043,6 +2054,8 @@ fn map_inspection_rejects_same_headed_user_calls_and_wrong_children() {
             name,
             vec![I64::sort_ref(), F64::sort_ref()],
             Pair::<I64, F64>::sort_ref(),
+            None,
+            false,
         );
         let pair = Pair::<I64, F64>::from_expression(Expr::call(
             &fake,
@@ -2059,7 +2072,7 @@ fn map_inspection_rejects_same_headed_user_calls_and_wrong_children() {
     }
     let nominal = SortRef::equality("Map");
     let fake = Map::<I64, F64>::from_expression(Expr::call(
-        &Callable::constructor("map-empty", vec![], nominal),
+        &Callable::constructor("map-empty", vec![], nominal, None, false),
         vec![],
     ));
     assert!(fake.entries().is_err());
@@ -2313,8 +2326,13 @@ fn pair_fields_relocate_preserve_aliases_and_reject_impostors() {
     );
     assert!(wrong_child.validate_inert().is_err());
     for name in ["pair", "egglog.core.pair.make"] {
-        let fake =
-            Callable::constructor(name, vec![I64::sort_ref(), I64::sort_ref()], sort.clone());
+        let fake = Callable::constructor(
+            name,
+            vec![I64::sort_ref(), I64::sort_ref()],
+            sort.clone(),
+            None,
+            false,
+        );
         let call = Expr::call(
             &fake,
             vec![
@@ -2328,7 +2346,10 @@ fn pair_fields_relocate_preserve_aliases_and_reject_impostors() {
         );
     }
     let nominal = SortRef::equality("Pair");
-    let fake = Expr::call(&Callable::constructor("pair", vec![], nominal), vec![]);
+    let fake = Expr::call(
+        &Callable::constructor("pair", vec![], nominal, None, false),
+        vec![],
+    );
     assert!(
         fake.pair_fields(&make, &I64::sort_ref(), &I64::sort_ref())
             .is_err()
@@ -2520,8 +2541,11 @@ fn vec_calls_and_values_preserve_actual_ordered_child_records() {
             .declaration("egglog.core.vec.of", DeclarationKind::Callable)
             .unwrap(),
     );
-    let leaf = Expr::call(&Callable::constructor("Leaf", vec![], atom.clone()), vec![]);
-    let pack = Callable::constructor("Pack", vec![vector_sort.clone()], atom);
+    let leaf = Expr::call(
+        &Callable::constructor("Leaf", vec![], atom.clone(), None, false),
+        vec![],
+    );
+    let pack = Callable::constructor("Pack", vec![vector_sort.clone()], atom, None, false);
     for growing_first in [false, true] {
         let mut term = leaf.clone();
         for _ in 0..100_000 {
@@ -2752,7 +2776,13 @@ fn context_sensitive_packing_and_slot_permutation() {
         vec![],
         vec![],
     );
-    let call = Callable::constructor("Pair", vec![sort.clone(), sort.clone()], sort.clone());
+    let call = Callable::constructor(
+        "Pair",
+        vec![sort.clone(), sort.clone()],
+        sort.clone(),
+        None,
+        false,
+    );
     let original = node(
         &sort,
         pb::node::Kind::Call(pb::Call {
@@ -2801,7 +2831,13 @@ fn context_sensitive_packing_and_slot_permutation() {
         p.program.nodes[two[1] as usize].kind
     );
     // Only the generated callee changes, and the descriptor selected changes.
-    let other = Callable::constructor("Other", vec![sort.clone(), sort.clone()], sort.clone());
+    let other = Callable::constructor(
+        "Other",
+        vec![sort.clone(), sort.clone()],
+        sort.clone(),
+        None,
+        false,
+    );
     let changed = node(
         &sort,
         pb::node::Kind::Call(pb::Call {
@@ -2874,8 +2910,8 @@ fn shared_union_identity_and_flat_cycle_reclamation() {
 #[test]
 fn retained_leaf_releases_all_parents_with_bounded_immediate_imports() {
     let sort = SortRef::equality("M");
-    let leaf_call = Callable::constructor("Leaf", vec![], sort.clone());
-    let pair = Callable::constructor("Pair", vec![sort.clone(), sort.clone()], sort);
+    let leaf_call = Callable::constructor("Leaf", vec![], sort.clone(), None, false);
+    let pair = Callable::constructor("Pair", vec![sort.clone(), sort.clone()], sort, None, false);
     let leaf = Expr::call(&leaf_call, vec![]);
     for left_growing in [false, true] {
         let mut root = leaf.clone();
@@ -2989,7 +3025,10 @@ fn generated_rule_fields_and_occurrence_locations_are_authoritative() {
 #[test]
 fn declaration_diagnostics_do_not_change_local_compatibility() {
     let sort = SortRef::equality("M");
-    let leaf = Expr::call(&Callable::constructor("Leaf", vec![], sort.clone()), vec![]);
+    let leaf = Expr::call(
+        &Callable::constructor("Leaf", vec![], sort.clone(), None, false),
+        vec![],
+    );
     let declaration = |label: &str, doc: Option<&str>, unextractable: bool| {
         let mut slots = std::array::from_fn(|_| vec![]);
         slots[Arena::Sort as usize] = vec![Slot::External(sort.0.clone())];

@@ -262,6 +262,8 @@ fn callable(
     let mut args_record = None;
     let mut no_merge = false;
     let mut merge = None;
+    let mut cost = None;
+    let mut unextractable = false;
     for opt in opts {
         match opt {
             Meta::NameValue(n) if n.path.is_ident("name") => {
@@ -304,6 +306,12 @@ fn callable(
             }
             Meta::Path(p) if p.is_ident("try_from") && kind == CallableKind::Constructor => {
                 try_from = true
+            }
+            Meta::NameValue(n) if n.path.is_ident("cost") && kind == CallableKind::Constructor => {
+                cost = Some(n.value);
+            }
+            Meta::Path(p) if p.is_ident("unextractable") && kind == CallableKind::Constructor => {
+                unextractable = true;
             }
             other => {
                 return Err(syn::Error::new_spanned(
@@ -563,11 +571,24 @@ fn callable(
     } else {
         quote!(<#output as ::egglog_experimental::typed::EgglogValue>::sort_ref(),)
     };
+    let constructor_arguments = if kind == CallableKind::Constructor {
+        let cost = match cost {
+            Some(cost) => quote!({
+                let #value: ::egglog_experimental::typed::builtins::I64 = (#cost).into();
+                Some(::egglog_experimental::typed::EgglogValue::expression(&#value).clone())
+            }),
+            None => quote!(None),
+        };
+        quote!(#cost, #unextractable,)
+    } else {
+        Tokens::new()
+    };
     let construction = quote! {
         ::egglog_experimental::typed::__private::Callable::#factory(
             #nominal, vec![#(<#types as ::egglog_experimental::typed::EgglogValue>::sort_ref()),*],
             #result_argument
             #merge_argument
+            #constructor_arguments
         )
     };
     let initialization = if has_merge {
@@ -1214,6 +1235,8 @@ mod tests {
             quote!(from),
             quote!(from(I64)),
             quote!(try_from),
+            quote!(cost = 0),
+            quote!(unextractable),
         ] {
             assert_eq!(
                 callable(
@@ -1245,6 +1268,38 @@ mod tests {
                     .unwrap_err()
                     .to_string(),
                 expected
+            );
+        }
+    }
+
+    #[test]
+    fn constructor_options_keep_typed_cost_and_extraction_metadata() {
+        let (method, _) = callable(
+            syn::parse_quote!(
+                fn term(value: I64) -> Term;
+            ),
+            options(quote!(cost = I64::from(37), unextractable)).unwrap(),
+            None,
+            CallableKind::Constructor,
+            None,
+        )
+        .unwrap();
+        let method = method.to_string();
+        assert!(method.contains("typed :: builtins :: I64"));
+        assert!(method.contains("I64 :: from (37)"));
+        assert!(method.contains("true"));
+        for option in [quote!(cost = 0), quote!(unextractable)] {
+            assert!(
+                callable(
+                    syn::parse_quote!(
+                        fn f() -> I64;
+                    ),
+                    options(quote!(no_merge, #option)).unwrap(),
+                    None,
+                    CallableKind::Function,
+                    None,
+                )
+                .is_err()
             );
         }
     }

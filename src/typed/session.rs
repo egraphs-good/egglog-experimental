@@ -2,7 +2,7 @@ use super::{
     EgglogValue, TypedError,
     expr::{Expr, ValueInput},
     pb,
-    rule::{Actions, Facts, Ruleset, ensure_sort},
+    rule::{Actions, Facts, ensure_sort},
     storage::{
         Arena, DeclarationKind, Key, Packer, Record, Slot, closure, publish, visit, visit_action,
     },
@@ -63,9 +63,7 @@ impl CapturePlan {
         for record in records {
             let owner = record.owner.as_ref().unwrap();
             let name = match record.arena {
-                Arena::Declaration
-                    if !private_declarations.contains(&(owner.id, record.arena, record.index)) =>
-                {
+                Arena::Declaration if !private_declarations.contains(&record.key()) => {
                     match &owner.program.declarations[record.index as usize].kind {
                         Some(pb::declaration::Kind::Constructor(c)) => Some(&c.name),
                         Some(pb::declaration::Kind::Function(f)) => Some(&f.name),
@@ -183,7 +181,7 @@ impl CapturePlan {
         let mut eligible = true;
         while let Some(record) = pending.pop() {
             let owner = record.owner.as_ref().unwrap();
-            if !seen.insert((owner.id, record.arena, record.index)) {
+            if !seen.insert(record.key()) {
                 continue;
             }
             if record.capture()?.is_some() {
@@ -244,7 +242,7 @@ fn occurrences(root: &Record) -> Result<Vec<Record>, TypedError> {
     let mut result = vec![];
     while let Some(record) = pending.pop() {
         let owner = record.owner.as_ref().unwrap();
-        if !seen.insert((owner.id, record.arena, record.index)) {
+        if !seen.insert(record.key()) {
             continue;
         }
         if record.arena == Arena::Ruleset {
@@ -267,19 +265,15 @@ fn occurrences(root: &Record) -> Result<Vec<Record>, TypedError> {
 impl Publication {
     fn prepare_run(&mut self, root: &Record) -> Result<Packer, TypedError> {
         let target = occurrences(root)?;
-        let target_keys: HashSet<_> = target
-            .iter()
-            .map(|r| (r.owner.as_ref().unwrap().id, r.arena, r.index))
-            .collect();
-        let root_key = (root.owner.as_ref().unwrap().id, root.arena, root.index);
+        let target_keys: HashSet<_> = target.iter().map(|r| r.key()).collect();
+        let root_key = root.key();
         // Reserve every authored name before choosing a private root name.
         for record in &target {
             let owner = record.owner.as_ref().unwrap();
             if record.arena == Arena::Ruleset
                 && let Some(name) = &owner.program.rulesets[record.index as usize].name
             {
-                self.reserved
-                    .insert((owner.id, record.arena, record.index), name.clone());
+                self.reserved.insert(record.key(), name.clone());
             }
         }
         if !self.reserved.contains_key(&root_key) {
@@ -298,31 +292,19 @@ impl Publication {
         let root_index = packer.intern(root.clone(), 0);
         let mut covered = HashSet::new();
         for record in &target {
-            let key = (
-                record.owner.as_ref().unwrap().id,
-                record.arena,
-                record.index,
-            );
+            let key = record.key();
             if covered.contains(&key) {
                 continue;
             }
             if let Some(anchor) = self.anchors.get(&key) {
                 let (anchor, _) = &self.confirmed[anchor];
                 packer.intern(anchor.clone(), 0);
-                covered.extend(
-                    occurrences(anchor)?
-                        .iter()
-                        .map(|r| (r.owner.as_ref().unwrap().id, r.arena, r.index)),
-                );
+                covered.extend(occurrences(anchor)?.iter().map(|r| r.key()));
             }
         }
         packer.finish()?;
         for (index, record) in packer.rulesets.iter().enumerate() {
-            let key = (
-                record.owner.as_ref().unwrap().id,
-                record.arena,
-                record.index,
-            );
+            let key = record.key();
             let confirmed = self.confirmed.get(&key).map(|(_, name)| name.clone());
             let packed = &mut packer.program.rulesets[index];
             if target_keys.contains(&key) {
@@ -399,15 +381,9 @@ impl Publication {
             }
         }
         for (record, name, closure) in confirmed {
-            let key = (
-                record.owner.as_ref().unwrap().id,
-                record.arena,
-                record.index,
-            );
+            let key = record.key();
             for child in closure {
-                self.anchors
-                    .entry((child.owner.as_ref().unwrap().id, child.arena, child.index))
-                    .or_insert(key);
+                self.anchors.entry(child.key()).or_insert(key);
             }
             self.anchors.insert(key, key);
             self.confirmed.insert(key, (record, name));
@@ -623,6 +599,11 @@ impl EGraph {
             ));
         }
         packer.finish()?;
+        if packer.observed_data {
+            return Err(TypedError::Invalid(
+                "snapshot observations cannot be submitted as live expressions".into(),
+            ));
+        }
         if packer
             .ordinary_callables
             .iter()
@@ -680,15 +661,35 @@ impl EGraph {
             Some(error) => match &error.location {
                 None => 0,
                 Some(location) => {
-                    if location.path.len() != 1
-                        || !location.iterations.is_empty()
+                    if location.path.is_empty()
+                        || location.path.len() != location.iterations.len() + 1
                         || location.path[0] as usize >= packer.program.commands.len()
                         || error.code == pb::ErrorCode::InvalidProgram as i32
                     {
                         self.usable = false;
                         return Err(TypedError::Decode(
-                            "invalid flat command failure location; completion unknown".into(),
+                            "invalid command failure location; completion unknown".into(),
                         ));
+                    }
+                    let mut command = &packer.program.commands[location.path[0] as usize];
+                    for child in &location.path[1..] {
+                        let body = match &command.kind {
+                            Some(pb::command::Kind::Repeat(repeat)) => &repeat.body,
+                            Some(pb::command::Kind::Saturate(saturate)) => &saturate.body,
+                            _ => {
+                                self.usable = false;
+                                return Err(TypedError::Decode(
+                                    "failure path enters a non-loop".into(),
+                                ));
+                            }
+                        };
+                        let Some(next) = body.get(*child as usize) else {
+                            self.usable = false;
+                            return Err(TypedError::Decode(
+                                "failure child index out of bounds".into(),
+                            ));
+                        };
+                        command = next;
                     }
                     location.path[0] as usize
                 }
@@ -757,31 +758,126 @@ impl EGraph {
         Ok(())
     }
 
-    /// Returns the decoded wire response, including actual native run detail,
-    /// outcomes, profile and the response-local rule attribution catalog.
-    /// The peer must report ruleset publication, independently of profiling.
-    pub fn run(&mut self, ruleset: &Ruleset) -> Result<pb::RunProgramResponse, TypedError> {
+    /// Execute an authored schedule and return its exact native report with
+    /// validated rule attribution, profiling and publication observations.
+    pub fn run(
+        &mut self,
+        schedule: impl Into<super::Schedule>,
+    ) -> Result<super::RunReport, TypedError> {
+        select_report(self.run_response(schedule)?, false)
+    }
+
+    fn run_response(
+        &mut self,
+        schedule: impl Into<super::Schedule>,
+    ) -> Result<pb::RunProgramResponse, TypedError> {
+        let mut schedule = schedule.into();
         if !self.usable {
             return Err(TypedError::Invalid(
                 "session publication state is unknown".into(),
             ));
         }
-        if let Some(error) = &ruleset.1 {
-            return Err(TypedError::Invalid(error.clone()));
+        for ruleset in &schedule.rulesets {
+            if let Some(error) = &ruleset.1 {
+                return Err(TypedError::Invalid(error.clone()));
+            }
         }
-        let packer = self.publication.prepare_run(&ruleset.0)?;
+        let root = if schedule.rulesets.len() == 1 {
+            schedule.rulesets[0].clone()
+        } else {
+            super::rule::ruleset(schedule.rulesets.clone())
+        };
+        let mut packer = self.publication.prepare_run(&root.0)?;
+        packer.program.commands.clear();
+        let indices: Vec<_> = schedule
+            .rulesets
+            .iter()
+            .map(|ruleset| packer.intern(ruleset.0.clone(), 0))
+            .collect();
+        super::schedule::relocate(&mut schedule.commands, |index| {
+            let index = indices[index as usize];
+            match &packer.program.rulesets[index as usize].name {
+                Some(name) => pb::ruleset_ref::Kind::Name(name.clone()),
+                None => pb::ruleset_ref::Kind::Index(index),
+            }
+        });
+        if schedule.commands.len() == 1 {
+            packer.program.commands = schedule.commands;
+        } else {
+            packer.program.commands.push(pb::Command {
+                kind: Some(pb::command::Kind::Repeat(pb::Repeat {
+                    body: schedule.commands,
+                    times: Some(1),
+                    ..Default::default()
+                })),
+                ..Default::default()
+            });
+        }
         self.execute(packer, true)
     }
 
     /// Observe actual cumulative native statistics, with their attribution catalog.
-    /// Returns the complete decoded response, not a reconstruction from prior runs.
-    pub fn stats(&mut self) -> Result<pb::RunProgramResponse, TypedError> {
+    /// Returns native detail and its attribution, not a reconstruction from prior runs.
+    pub fn stats(&mut self) -> Result<super::RunReport, TypedError> {
+        select_report(self.stats_response()?, true)
+    }
+
+    fn stats_response(&mut self) -> Result<pb::RunProgramResponse, TypedError> {
         let mut packer = Packer::default();
         packer.program.commands.push(pb::Command {
             kind: Some(pb::command::Kind::Stats(pb::Unit {})),
             ..Default::default()
         });
         self.execute(packer, false)
+    }
+
+    /// Observe independent logical state through Freeze bytes without evaluating roots.
+    pub fn freeze(&mut self) -> Result<super::Snapshot, TypedError> {
+        let mut packer = Packer::default();
+        packer.program.commands.push(pb::Command {
+            kind: Some(pb::command::Kind::Freeze(pb::Freeze {})),
+            ..Default::default()
+        });
+        let response = self.execute(packer, false)?;
+        let mut outputs = response.outputs.into_iter();
+        let Some(pb::CommandOutput {
+            kind: Some(pb::command_output::Kind::Snapshot(snapshot)),
+            ..
+        }) = outputs.next()
+        else {
+            return Err(TypedError::Decode("missing Freeze observation".into()));
+        };
+        if outputs.next().is_some() {
+            return Err(TypedError::Decode("extra Freeze observations".into()));
+        }
+        super::Snapshot::from_export(snapshot, self.captures.values().cloned().collect())
+    }
+
+    /// Count visible portable table rows without evaluating any expression.
+    pub fn num_tuples(&mut self) -> Result<usize, TypedError> {
+        let mut packer = Packer::default();
+        packer.program.commands.push(pb::Command {
+            kind: Some(pb::command::Kind::PrintSize(pb::PrintSize::default())),
+            ..Default::default()
+        });
+        let response = self.execute(packer, false)?;
+        let mut outputs = response.outputs.into_iter();
+        let Some(pb::CommandOutput {
+            kind: Some(pb::command_output::Kind::Sizes(sizes)),
+            ..
+        }) = outputs.next()
+        else {
+            return Err(TypedError::Decode("missing table size observation".into()));
+        };
+        if outputs.next().is_some() {
+            return Err(TypedError::Decode("extra table size observations".into()));
+        }
+        sizes.sizes.into_iter().try_fold(0usize, |total, size| {
+            usize::try_from(size.rows)
+                .ok()
+                .and_then(|size| total.checked_add(size))
+                .ok_or_else(|| TypedError::Decode("table row count exceeds usize".into()))
+        })
     }
 
     /// Query all facts in one binder without inserting missing rows.
@@ -840,6 +936,139 @@ impl EGraph {
             self.declarations.values().cloned().collect(),
         )?)
     }
+}
+
+// A high-level observation selects its natural result and validates all
+// required metrics here; consumers never interpret generic command outputs.
+fn select_report(
+    response: pb::RunProgramResponse,
+    statistics: bool,
+) -> Result<super::RunReport, TypedError> {
+    let rules = response.rules;
+    let profile = response.profile;
+    let ruleset_publication = response.ruleset_publication;
+    let mut outputs = response.outputs.into_iter();
+    let output = outputs
+        .next()
+        .ok_or_else(|| TypedError::Decode("missing run report".into()))?;
+    if outputs.next().is_some()
+        || output
+            .location
+            .as_ref()
+            .is_none_or(|location| location.path != [0] || !location.iterations.is_empty())
+    {
+        return Err(TypedError::Decode(
+            "unexpected report observation location".into(),
+        ));
+    }
+    let report = match output.kind {
+        Some(pb::command_output::Kind::Statistics(report)) if statistics => report,
+        Some(pb::command_output::Kind::Run(outcome)) if !statistics => {
+            let report = output
+                .run_report
+                .ok_or_else(|| TypedError::Decode("run detail is missing".into()))?;
+            if outcome.updated != report.updated || outcome.can_stop != report.can_stop {
+                return Err(TypedError::Decode(
+                    "run outcome disagrees with its report".into(),
+                ));
+            }
+            report
+        }
+        Some(pb::command_output::Kind::Loop(outcome)) if !statistics => {
+            let report = output
+                .run_report
+                .ok_or_else(|| TypedError::Decode("loop detail is missing".into()))?;
+            if outcome.updated != report.updated || outcome.termination.is_none() {
+                return Err(TypedError::Decode(
+                    "loop outcome disagrees with its report".into(),
+                ));
+            }
+            report
+        }
+        _ => return Err(TypedError::Decode("wrong report observation kind".into())),
+    };
+    if report.updated && report.can_stop {
+        return Err(TypedError::Decode(
+            "updated report cannot permit stopping".into(),
+        ));
+    }
+    let duration = |value: Option<&pb::ReportDuration>| -> Result<(), TypedError> {
+        if value.is_none_or(|duration| duration.nanos >= 1_000_000_000) {
+            Err(TypedError::Decode(
+                "invalid required report duration".into(),
+            ))
+        } else {
+            Ok(())
+        }
+    };
+    for value in &report.search_and_apply_time_per_rule {
+        duration(value.value.as_ref())?;
+    }
+    for (rule, direction) in report
+        .search_and_apply_time_per_rule
+        .iter()
+        .map(|entry| (entry.rule, entry.direction))
+        .chain(
+            report
+                .num_matches_per_rule
+                .iter()
+                .map(|entry| (entry.rule, entry.direction)),
+        )
+        .chain(
+            report
+                .iterations
+                .iter()
+                .flat_map(|iteration| iteration.rule_set_report.iter())
+                .flat_map(|report| &report.rule_reports)
+                .map(|entry| (entry.rule, entry.direction)),
+        )
+    {
+        if rule.is_some() != direction.is_some()
+            || rule.is_some_and(|index| index as usize >= rules.len())
+        {
+            return Err(TypedError::Decode("invalid report rule attribution".into()));
+        }
+    }
+    for value in report
+        .search_and_apply_time_per_ruleset
+        .iter()
+        .chain(&report.merge_time_per_ruleset)
+        .chain(&report.rebuild_time_per_ruleset)
+    {
+        duration(value.value.as_ref())?;
+    }
+    for iteration in &report.iterations {
+        duration(iteration.rebuild_time.as_ref())?;
+        let ruleset = iteration
+            .rule_set_report
+            .as_ref()
+            .ok_or_else(|| TypedError::Decode("missing iteration ruleset report".into()))?;
+        duration(ruleset.search_and_apply_time.as_ref())?;
+        duration(ruleset.merge_time.as_ref())?;
+        for entry in &ruleset.rule_reports {
+            for rule in &entry.reports {
+                duration(rule.search_and_apply_time.as_ref())?;
+                if let Some(plan) = &rule.plan {
+                    for stage in &plan.stages {
+                        if stage.kind.is_none()
+                            || stage
+                                .next
+                                .iter()
+                                .any(|next| *next as usize >= plan.stages.len())
+                        {
+                            return Err(TypedError::Decode("invalid report plan stage".into()));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok(super::RunReport {
+        detail: report,
+        rules,
+        profile,
+        ruleset_publication,
+    })
 }
 
 // Adopt only the selected inert term closure. Other response nodes can be
@@ -1018,6 +1247,7 @@ fn adopt(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::typed::Ruleset;
 
     #[test]
     fn function_values_decode_rejects_partial_signature_corruption() {
@@ -1093,6 +1323,8 @@ mod tests {
                 "ActionAbsent",
                 vec![I64::sort_ref()],
                 ActionTerm::sort_ref(),
+                None,
+                false,
             );
             let target = ActionTerm(Expr::call(
                 &definition,
@@ -1209,6 +1441,8 @@ mod tests {
                 "ActionLeft",
                 vec![I64::sort_ref(), I64::sort_ref()],
                 ActionTerm::sort_ref(),
+                None,
+                false,
             ),
             vec![
                 I64::from(17).expression().clone(),
@@ -1216,7 +1450,7 @@ mod tests {
             ],
         ));
         let right = ActionTerm(Expr::call(
-            &Callable::constructor("ActionRight", vec![], ActionTerm::sort_ref()),
+            &Callable::constructor("ActionRight", vec![], ActionTerm::sort_ref(), None, false),
             vec![],
         ));
         for in_rule in [false, true] {
@@ -1231,7 +1465,7 @@ mod tests {
                 subsume(&left),
             );
             if in_rule {
-                graph.run(&ruleset(rule((), actions))).unwrap();
+                graph.run_response(&ruleset(rule((), actions))).unwrap();
             } else {
                 graph.register(actions).unwrap();
             }
@@ -1547,7 +1781,11 @@ mod tests {
         assert!(graph.register((set(CaptureRead(9), 9), &forged)).is_err());
         assert!(graph.extract(&forged).is_err());
         assert!(graph.check(&forged).is_err());
-        assert!(graph.run(&ruleset(rule((), set(&forged, 7)))).is_err());
+        assert!(
+            graph
+                .run_response(&ruleset(rule((), set(&forged, 7))))
+                .is_err()
+        );
         assert!(graph.publication.confirmed.is_empty());
         assert!(!graph.check(CaptureRead(9)).unwrap());
         let prefix = I64::from_expression(Expr::call(
@@ -1585,7 +1823,13 @@ mod tests {
         use super::super::{SortRef, builtins::I64, decl::Callable, let_, rule::Fact, set};
         let sort = SortRef::equality("CapturePrefix");
         let node = Expr::call(
-            &Callable::constructor("CapturePrefix.Node", vec![I64::sort_ref()], sort.clone()),
+            &Callable::constructor(
+                "CapturePrefix.Node",
+                vec![I64::sort_ref()],
+                sort.clone(),
+                None,
+                false,
+            ),
             vec![I64::from(7).expression().clone()],
         );
         let read = I64::from_expression(Expr::call(
@@ -1766,13 +2010,7 @@ mod tests {
     fn typed_scope_restores_all_observations_and_drops_only_owned_handles() {
         use super::super::{builtins::I64, rule, rule::Fact, ruleset};
         let observations = |graph: &EGraph| {
-            let identity = |record: &Record| {
-                (
-                    record.owner.as_ref().unwrap().id,
-                    record.arena,
-                    record.index,
-                )
-            };
+            let identity = |record: &Record| record.key();
             (
                 graph.publication.reserved.clone(),
                 graph
@@ -1791,13 +2029,19 @@ mod tests {
         };
         let base = ruleset(());
         let value = Expr::call(
-            &Callable::constructor("Scope.Saved", vec![], SortRef::equality("Scope")),
+            &Callable::constructor(
+                "Scope.Saved",
+                vec![],
+                SortRef::equality("Scope"),
+                None,
+                false,
+            ),
             vec![],
         );
         let child = ruleset((&base, rule(Fact(value), I64::from(7) + I64::from(8))));
         let inner = ruleset((&child, &child, rule((), I64::from(9))));
         let mut graph = EGraph::default();
-        graph.run(&base).unwrap();
+        graph.run_response(&base).unwrap();
         let baseline = observations(&graph);
         let original = graph.handle;
         let engine = graph.engine.clone();
@@ -1807,12 +2051,12 @@ mod tests {
         graph.push().unwrap();
         let middle = graph.handle;
         assert_eq!(graph.scopes[0].handle, original);
-        graph.run(&child).unwrap();
+        graph.run_response(&child).unwrap();
         assert!(graph.declarations.len() > baseline.3.len());
         let child_state = observations(&graph);
         graph.push().unwrap();
         let active = graph.handle;
-        graph.run(&inner).unwrap();
+        graph.run_response(&inner).unwrap();
         graph.pop().unwrap();
         assert_eq!(graph.handle, middle);
         assert_eq!(observations(&graph), child_state);
@@ -1835,7 +2079,7 @@ mod tests {
                 "Return already consumed the child"
             );
         }
-        graph.run(&inner).unwrap();
+        graph.run_response(&inner).unwrap();
         assert!(graph.publication.confirmed.len() > baseline.1.len());
         graph.push().unwrap();
         graph.push().unwrap();
@@ -1857,7 +2101,7 @@ mod tests {
                 "Drop discarded every owned handle"
             );
         }
-        independent.run(&inner).unwrap();
+        independent.run_response(&inner).unwrap();
     }
 
     #[test]
@@ -1866,7 +2110,7 @@ mod tests {
         let group = ruleset(());
         let mut graph = EGraph::default();
         graph.push().unwrap();
-        graph.run(&group).unwrap();
+        graph.run_response(&group).unwrap();
         let active = graph.handle;
         let saved = graph.scopes[0].handle;
         let reserved = graph.publication.reserved.clone();
@@ -1919,7 +2163,7 @@ mod tests {
             confirmed
         );
         assert!(graph.usable);
-        graph.run(&group).unwrap();
+        graph.run_response(&group).unwrap();
     }
 
     #[test]
@@ -1927,7 +2171,7 @@ mod tests {
         use super::super::ruleset;
         let group = ruleset(());
         let mut graph = EGraph::default();
-        graph.run(&group).unwrap();
+        graph.run_response(&group).unwrap();
         graph.push().unwrap();
         let pending = graph.publication.prepare_run(&ruleset(()).0).unwrap();
         assert!(matches!(
@@ -1936,7 +2180,7 @@ mod tests {
         ));
         for error in [
             graph.push().unwrap_err(),
-            graph.run(&group).unwrap_err(),
+            graph.run_response(&group).unwrap_err(),
             graph.try_clone().err().expect("unusable cannot clone"),
         ] {
             assert!(matches!(error, TypedError::Invalid(message)
@@ -1945,7 +2189,7 @@ mod tests {
         assert_eq!(graph.scopes.len(), 1);
         graph.pop().unwrap();
         assert!(graph.usable);
-        graph.run(&group).unwrap();
+        graph.run_response(&group).unwrap();
         graph.push().unwrap();
         let active = graph.handle;
         let saved = graph.scopes[0].handle;
@@ -1973,13 +2217,19 @@ mod tests {
         use super::super::{builtins::I64, rule, rule::Fact, ruleset};
         for preinstalled in [true, false] {
             let value = Expr::call(
-                &Callable::constructor("Scope.Done", vec![], SortRef::equality("Scope")),
+                &Callable::constructor(
+                    "Scope.Done",
+                    vec![],
+                    SortRef::equality("Scope"),
+                    None,
+                    false,
+                ),
                 vec![],
             );
             let group = ruleset(rule(Fact(value.clone()), I64::from(7)));
             let mut graph = EGraph::default();
             if preinstalled {
-                graph.run(&group).unwrap();
+                graph.run_response(&group).unwrap();
             }
             graph.push().unwrap();
             let mut packer = graph.publication.prepare_run(&group.0).unwrap();
@@ -2008,7 +2258,7 @@ mod tests {
             assert_eq!(error.location.as_ref().unwrap().path, [2]);
             assert!(graph.usable, "ordinary error retains valid receipts");
             assert!(graph.check(Fact(value.clone())).unwrap());
-            let before = graph.stats().unwrap();
+            let before = graph.stats_response().unwrap();
             let Some(pb::command_output::Kind::Statistics(before_report)) = &before.outputs[0].kind
             else {
                 panic!("missing scoped statistics")
@@ -2024,7 +2274,7 @@ mod tests {
             );
             graph.pop().unwrap();
             assert!(!graph.check(Fact(value)).unwrap());
-            let after = graph.stats().unwrap();
+            let after = graph.stats_response().unwrap();
             let Some(pb::command_output::Kind::Statistics(after_report)) = &after.outputs[0].kind
             else {
                 panic!("missing restored statistics")
@@ -2068,7 +2318,7 @@ mod tests {
             assert!(direct.error.is_none());
             assert_eq!(after.outputs, direct.outputs);
             assert_eq!(after.rules, direct.rules);
-            graph.run(&group).unwrap();
+            graph.run_response(&group).unwrap();
         }
     }
 
@@ -2078,7 +2328,7 @@ mod tests {
         let group = ruleset(rule((), I64::from(7)));
         let mut graph = EGraph::default();
         let mut detail_off = graph.try_clone().unwrap();
-        let response = graph.run(&group).unwrap();
+        let response = graph.run_response(&group).unwrap();
         let (input, output) = graph.last_wire.as_ref().unwrap();
         assert_eq!(
             pb::RunProgramResponse::decode(output.as_slice()).unwrap(),
@@ -2150,7 +2400,7 @@ mod tests {
                 .map(|rule| rule.matches)
                 .collect::<Vec<_>>()
         );
-        let stats = detail_off.stats().unwrap();
+        let stats = detail_off.stats_response().unwrap();
         assert!(matches!(&stats.outputs[0].kind,
             Some(pb::command_output::Kind::Statistics(report)) if !report.iterations.is_empty()));
         let request =
@@ -2168,7 +2418,13 @@ mod tests {
         use super::super::{builtins::I64, rule, ruleset};
         let group = ruleset(rule((), I64::from(7)));
         let value = Expr::call(
-            &Callable::constructor("Report.Done", vec![], SortRef::equality("Report")),
+            &Callable::constructor(
+                "Report.Done",
+                vec![],
+                SortRef::equality("Report"),
+                None,
+                false,
+            ),
             vec![],
         );
         let mut graph = EGraph::default();
@@ -2210,7 +2466,7 @@ mod tests {
         assert!(graph.usable);
         assert_eq!(graph.publication.confirmed.len(), 1);
         assert!(graph.check(super::super::rule::Fact(value)).unwrap());
-        let observed = graph.stats().unwrap();
+        let observed = graph.stats_response().unwrap();
         let (request, output) = graph.last_wire.as_ref().unwrap();
         assert_eq!(
             pb::RunProgramResponse::decode(output.as_slice()).unwrap(),
@@ -2248,7 +2504,7 @@ mod tests {
         assert_eq!(observed.outputs, direct.outputs);
         assert_eq!(observed.rules, direct.rules);
         assert!(direct.error.is_none());
-        let recovered = graph.run(&group).unwrap();
+        let recovered = graph.run_response(&group).unwrap();
         assert!(recovered.profile.unwrap().complete);
 
         // Decoder-only negative fixture: an unclassified native diagnostic key
@@ -2281,7 +2537,7 @@ mod tests {
             .is_err()
         );
         assert!(
-            matches!(graph.stats(), Err(TypedError::Invalid(message)) if message == "byte engine mutex poisoned")
+            matches!(graph.stats_response(), Err(TypedError::Invalid(message)) if message == "byte engine mutex poisoned")
         );
         assert!(graph.last_wire.is_none());
     }
@@ -2456,7 +2712,7 @@ mod tests {
             parent.0.index,
         );
         let mut graph = EGraph::default();
-        let first = graph.run(&parent).unwrap();
+        let first = graph.run_response(&parent).unwrap();
         let parent_name = graph.publication.confirmed[&parent_key].1.clone();
         assert_eq!(
             first.ruleset_publication.unwrap().names,
@@ -2469,7 +2725,7 @@ mod tests {
         assert_eq!(first_program.rulesets.len(), 2);
         assert!(first_program.rulesets[1].name.is_none());
 
-        let naming = graph.run(&empty).unwrap();
+        let naming = graph.run_response(&empty).unwrap();
         let empty_name = graph.publication.confirmed[&empty_key].1.clone();
         let request =
             pb::RunProgramRequest::decode(graph.last_wire.as_ref().unwrap().0.as_slice()).unwrap();
@@ -2511,7 +2767,7 @@ mod tests {
         ));
 
         let fresh_parent = ruleset(&empty);
-        let response = graph.run(&fresh_parent).unwrap();
+        let response = graph.run_response(&fresh_parent).unwrap();
         let request =
             pb::RunProgramRequest::decode(graph.last_wire.as_ref().unwrap().0.as_slice()).unwrap();
         let program = request.program.unwrap();
@@ -2684,8 +2940,13 @@ mod tests {
     #[test]
     fn completed_definitions_are_confirmed_before_command_error_and_retry() {
         use super::super::{rule::Rule, ruleset};
-        let constructor =
-            Callable::constructor("Published.Value", vec![], SortRef::equality("Published"));
+        let constructor = Callable::constructor(
+            "Published.Value",
+            vec![],
+            SortRef::equality("Published"),
+            None,
+            false,
+        );
         let mut slots = std::array::from_fn(|_| vec![]);
         slots[Arena::Node as usize] = vec![Slot::External(Expr::call(&constructor, vec![]).0)];
         let group = ruleset(Rule(
@@ -2740,7 +3001,7 @@ mod tests {
             "ordinary engine errors do not poison the handle"
         );
         for expected in [1, 0] {
-            let response = graph.run(&group).unwrap();
+            let response = graph.run_response(&group).unwrap();
             let matches: u64 = response
                 .profile
                 .unwrap()
@@ -2764,6 +3025,8 @@ mod tests {
             "FailPublished.Value",
             vec![],
             SortRef::equality("FailPublished"),
+            None,
+            false,
         );
         let value = Expr::call(&constructor, vec![]);
         let group = ruleset(());
@@ -2845,7 +3108,7 @@ mod tests {
                 },
             ];
             assert!(graph.execute(recovery, false).unwrap().error.is_none());
-            assert!(graph.run(&group).unwrap().error.is_none());
+            assert!(graph.run_response(&group).unwrap().error.is_none());
         }
     }
 
@@ -2855,7 +3118,7 @@ mod tests {
         for malformed in 0..4 {
             let group = ruleset(());
             let mut graph = EGraph::default();
-            graph.run(&group).unwrap();
+            graph.run_response(&group).unwrap();
             let pending = graph.publication.prepare_run(&ruleset(()).0).unwrap();
             let name = pending.program.rulesets[0].name.clone().unwrap();
             // Inject only at the response boundary; this is not a claim that
@@ -2896,8 +3159,8 @@ mod tests {
                 .unwrap();
             for error in [
                 graph.register(()).unwrap_err(),
-                graph.run(&group).unwrap_err(),
-                graph.stats().unwrap_err(),
+                graph.run_response(&group).unwrap_err(),
+                graph.stats_response().unwrap_err(),
                 graph.check(()).unwrap_err(),
                 graph.extract(I64::from(0)).unwrap_err(),
                 graph
@@ -2916,7 +3179,7 @@ mod tests {
         use super::super::ruleset;
         let group = ruleset(());
         let mut graph = EGraph::default();
-        graph.run(&group).unwrap();
+        graph.run_response(&group).unwrap();
         let engine = graph.engine.clone();
         let original_handle = graph.handle;
         let mut clone = graph.try_clone().unwrap();
@@ -2924,7 +3187,7 @@ mod tests {
         assert!(Arc::ptr_eq(&graph.engine, &clone.engine));
         assert_eq!(clone.publication.confirmed.len(), 1);
         let new_group = ruleset((&group, ruleset(())));
-        clone.run(&new_group).unwrap();
+        clone.run_response(&new_group).unwrap();
         assert_eq!(graph.publication.confirmed.len(), 1);
         assert!(clone.publication.confirmed.len() > 1);
         assert_eq!(graph.publication.reserved.len(), 1);
@@ -2943,7 +3206,7 @@ mod tests {
                 .is_err(),
             "dropping one wrapper destroys only its handle"
         );
-        clone.run(&group).unwrap();
+        clone.run_response(&group).unwrap();
         let clone_handle = clone.handle;
         drop(clone);
         assert!(
@@ -3502,7 +3765,7 @@ mod tests {
             .declaration("Map", DeclarationKind::HostSortFamily)
             .unwrap();
         let sort = SortRef::family(&family, vec![atom.clone(), F64::sort_ref()]).unwrap();
-        let pack = Callable::constructor("Pack", vec![sort], atom);
+        let pack = Callable::constructor("Pack", vec![sort], atom, None, false);
         let mut cycle = response;
         cycle.sorts[2].kind = Some(pb::sort::Kind::Eq("A".into()));
         cycle.nodes[0].kind = Some(pb::node::Kind::Call(pb::Call {
@@ -3691,7 +3954,7 @@ mod tests {
             vec![atom.clone(), F64::sort_ref()],
         )
         .unwrap();
-        let pack = Callable::constructor("Pack", vec![pair], atom);
+        let pack = Callable::constructor("Pack", vec![pair], atom, None, false);
         let mut cycle = response;
         cycle.sorts[2].kind = Some(pb::sort::Kind::Eq("A".into()));
         cycle.nodes[0].kind = Some(pb::node::Kind::Call(pb::Call {
@@ -3844,7 +4107,7 @@ mod tests {
             .declaration("Maybe", DeclarationKind::HostSortFamily)
             .unwrap();
         let sort = SortRef::family(&family, vec![atom.clone()]).unwrap();
-        let pack = Callable::constructor("Pack", vec![sort], atom);
+        let pack = Callable::constructor("Pack", vec![sort], atom, None, false);
         let mut cycle = response;
         cycle.sorts[0].kind = Some(pb::sort::Kind::Eq("A".into()));
         cycle.nodes[0].kind = Some(pb::node::Kind::Call(pb::Call {
@@ -3941,7 +4204,7 @@ mod tests {
             .declaration("Vec", DeclarationKind::HostSortFamily)
             .unwrap();
         let vector = SortRef::family(&family, vec![atom.clone()]).unwrap();
-        let pack = Callable::constructor("Pack", vec![vector], atom);
+        let pack = Callable::constructor("Pack", vec![vector], atom, None, false);
         let cycle = pb::RunProgramResponse {
             sorts: vec![
                 pb::Sort {
@@ -4280,8 +4543,14 @@ mod tests {
 
     fn response(args: Vec<u32>, child: bool) -> (pb::RunProgramResponse, Vec<Record>) {
         let sort = SortRef::equality("M");
-        let pair = Callable::constructor("Pair", vec![sort.clone(), sort.clone()], sort.clone());
-        let leaf = Callable::constructor("Leaf", vec![], sort);
+        let pair = Callable::constructor(
+            "Pair",
+            vec![sort.clone(), sort.clone()],
+            sort.clone(),
+            None,
+            false,
+        );
+        let leaf = Callable::constructor("Leaf", vec![], sort, None, false);
         let mut response = pb::RunProgramResponse {
             sorts: vec![pb::Sort {
                 kind: Some(pb::sort::Kind::Eq("M".into())),
@@ -4482,7 +4751,7 @@ mod tests {
             .declaration("Set", DeclarationKind::HostSortFamily)
             .unwrap();
         let set = SortRef::family(&family, vec![atom.clone()]).unwrap();
-        let pack = Callable::constructor("Pack", vec![set], atom);
+        let pack = Callable::constructor("Pack", vec![set], atom, None, false);
         let cyclic = pb::RunProgramResponse {
             sorts: vec![
                 pb::Sort {
@@ -4664,11 +4933,23 @@ mod tests {
         }
         observe(&mut graph, ne(I64::from(17), 17), false);
         let left = NeByteTerm(Expr::call(
-            &Callable::constructor("NeByteTerm.Left", vec![], NeByteTerm::sort_ref()),
+            &Callable::constructor(
+                "NeByteTerm.Left",
+                vec![],
+                NeByteTerm::sort_ref(),
+                None,
+                false,
+            ),
             vec![],
         ));
         let right = NeByteTerm(Expr::call(
-            &Callable::constructor("NeByteTerm.Right", vec![], NeByteTerm::sort_ref()),
+            &Callable::constructor(
+                "NeByteTerm.Right",
+                vec![],
+                NeByteTerm::sort_ref(),
+                None,
+                false,
+            ),
             vec![],
         ));
         let left_vec = EggVec::<NeByteTerm>::of([&left]);
@@ -4678,7 +4959,9 @@ mod tests {
             .unwrap();
         observe(&mut graph, ne(&left, &right), true);
         observe(&mut graph, ne(&left_vec, &right_vec), true);
-        graph.run(&ruleset(rewrite(&left, &right))).unwrap();
+        graph
+            .run_response(&ruleset(rewrite(&left, &right)))
+            .unwrap();
         observe(&mut graph, ne(&left, &right), false);
         observe(&mut graph, ne(&left_vec, &right_vec), false);
         assert_ne!(left, right);
@@ -4761,7 +5044,7 @@ mod tests {
     #[test]
     fn actual_bytes_are_encoded_executed_and_decoded() {
         let sort = SortRef::equality("ByteWitness");
-        let leaf = Callable::constructor("ByteWitness.Leaf", vec![], sort);
+        let leaf = Callable::constructor("ByteWitness.Leaf", vec![], sort, None, false);
         let expression = Expr::call(&leaf, vec![]);
         let mut packer = Packer::default();
         let root = packer.intern(expression.0, 0);
@@ -4818,7 +5101,7 @@ mod tests {
         };
         let mut graph = EGraph::default();
         for explicit in ["chosen", "", "__typed_ruleset_3"] {
-            graph.run(&root(Some(explicit))).unwrap();
+            graph.run_response(&root(Some(explicit))).unwrap();
             let request =
                 pb::RunProgramRequest::decode(graph.last_wire.as_ref().unwrap().0.as_slice())
                     .unwrap();
@@ -4836,7 +5119,7 @@ mod tests {
                 Some(pb::ruleset_ref::Kind::Name(explicit.into()))
             );
         }
-        graph.run(&root(None)).unwrap();
+        graph.run_response(&root(None)).unwrap();
         let request =
             pb::RunProgramRequest::decode(graph.last_wire.as_ref().unwrap().0.as_slice()).unwrap();
         assert_eq!(

@@ -1445,15 +1445,17 @@ fn typed_capture_ordered_reads() -> Result<(), TypedError> {
     let before = let_("before", Read(1));
     let after = let_("after", Read(1));
     let mut graph = EGraph::new()?;
-    graph.register((
+    graph.register(vec![
         set(Read(1), 10),
-        &before,
+        (&before).into(),
+        RuleTerms::Input(7).into(),
         delete(Read(1)),
         set(Read(1), 20),
-        &after,
-    ))?;
+        after.clone().into(),
+    ])?;
     assert_eq!(i64::try_from(&graph.extract(&before)?)?, 10);
     assert_eq!(i64::try_from(&graph.extract(&after)?)?, 20);
+    assert!(graph.check(RuleTerms::Input(7))?);
     Ok(())
 }
 
@@ -1651,7 +1653,7 @@ fn typed_table_nullary_head_only_and_query_binders() -> Result<(), TypedError> {
     assert!(!graph.check(Read(7))?);
     graph.register(RuleTerms::Input(7))?;
     let response = graph.run(&conditional)?;
-    assert!(response.outputs[0].run_report.is_some());
+    assert!(response.detail.updated);
     assert_eq!(i64::try_from(&graph.extract(EmptyRead())?)?, 11);
     assert_eq!(i64::try_from(&graph.extract(Read(7))?)?, 7);
     graph.register(delete(EmptyRead()))?;
@@ -1734,7 +1736,7 @@ fn typed_table_prefix_clone_scope_and_nested_borrowed_inputs() -> Result<(), Typ
     cloned.register((delete(Read(1)), set(Read(1), 60)))?;
     assert_eq!(i64::try_from(&cloned.extract(Read(1))?)?, 60);
     assert_eq!(i64::try_from(&graph.extract(Read(1))?)?, 10);
-    assert!(graph.stats()?.error.is_none());
+    graph.stats()?;
     Ok(())
 }
 
@@ -1847,22 +1849,14 @@ fn typed_report_run_and_stats_keep_cumulative_native_work() -> Result<(), TypedE
     for input in [1, 2] {
         graph.register(RuleTerms::Input(input))?;
         let run = graph.run(&group)?;
-        let detail = run.outputs[0]
-            .run_report
-            .as_ref()
-            .expect("native Run detail");
+        let detail = &run.detail;
         matches += detail
             .num_matches_per_rule
             .iter()
             .map(|row| row.value)
             .sum::<u64>();
         let stats = graph.stats()?;
-        let [output] = stats.outputs.as_slice() else {
-            panic!("one Stats observation")
-        };
-        let Some(pb::command_output::Kind::Statistics(report)) = &output.kind else {
-            panic!("missing native statistics")
-        };
+        let report = &stats.detail;
         assert!(report.iterations.len() > previous_history);
         previous_history = report.iterations.len();
         assert_eq!(
@@ -1879,10 +1873,8 @@ fn typed_report_run_and_stats_keep_cumulative_native_work() -> Result<(), TypedE
                 .is_some_and(|index| (index as usize) < stats.rules.len())
                 && row.direction == Some(pb::NativeRuleDirection::Single as i32)
         }));
-        assert!(
-            output.run_report.is_none(),
-            "Stats is an observation, not a control companion"
-        );
+        // The high-level observation returns native detail directly. The wire
+        // envelope/control-companion distinction remains covered internally.
         assert!(stats.profile.as_ref().unwrap().complete);
         assert!(graph.check(RuleTerms::Copied(input))?);
     }
