@@ -5682,7 +5682,16 @@ fn formed_exact_values_roundtrip_signed_and_width_boundaries() {
     let authored = program.nodes.clone();
     let mut engine = Engine::default();
     let id = create(&mut engine);
-    for _ in 0..2 {
+    for extractor in [
+        pb::Extractor::Tree,
+        pb::Extractor::GreedyDag,
+        pb::Extractor::Tree,
+        pb::Extractor::GreedyDag,
+    ] {
+        let Some(pb::command::Kind::Extract(extract)) = &mut program.commands[0].kind else {
+            unreachable!()
+        };
+        extract.extractor = extractor.into();
         let response = run(&mut engine, id, program.clone());
         assert_eq!(response.error, None);
         let Some(pb::command_output::Kind::Extraction(extracted)) = &response.outputs[0].kind
@@ -15272,6 +15281,1073 @@ fn assigned_cost_fail_wrapper_keeps_the_enclosing_union_identity() {
     )));
 }
 
+#[test]
+fn python_greedy_and_keep_best_requests_execute_actual_bytes() {
+    let mut engine = Engine::default();
+    for bytes in [
+        include_bytes!("data/greedy-extract-request.pb").as_slice(),
+        include_bytes!("data/keep-best-request.pb").as_slice(),
+    ] {
+        let mut request = pb::RunProgramRequest::decode(bytes).unwrap();
+        request.egraph_id = create(&mut engine);
+        let greedy = matches!(
+            request.program.as_ref().unwrap().commands[0].kind,
+            Some(pb::command::Kind::Extract(_))
+        );
+        let response = pb::RunProgramResponse::decode(
+            engine.run(&request.encode_to_vec()).unwrap().as_slice(),
+        )
+        .unwrap();
+        assert_eq!(response.error, None);
+        assert!(response.profile.as_ref().unwrap().complete);
+        if greedy {
+            let Some(pb::command_output::Kind::Extraction(extracted)) = &response.outputs[0].kind
+            else {
+                panic!("captured Python greedy extraction")
+            };
+            assert_eq!(extracted.roots.len(), 1);
+            let result = &extracted.roots[0].variants[0];
+            assert_eq!(value(&response, result.term), "1");
+            assert_eq!(value(&response, result.cost.unwrap()), "1");
+        } else {
+            assert!(response.outputs.is_empty());
+        }
+    }
+}
+
+#[test]
+fn default_extraction_uses_assigned_costs_variants_and_ordered_shared_roots() {
+    for (extractor, shared_cost) in [(pb::Extractor::Tree, "3"), (pb::Extractor::GreedyDag, "2")] {
+        let mut engine = Engine::default();
+        let id = create(&mut engine);
+        let mut program = fixture();
+        program.rules.clear();
+        program.rulesets.clear();
+        program.commands.clear();
+        program.declarations.push(pb::Declaration {
+            kind: Some(pb::declaration::Kind::Constructor(pb::Constructor {
+                name: "SharedPair".into(),
+                inputs: vec![
+                    pb::Arg {
+                        name: "left".into(),
+                        sort: 1,
+                    },
+                    pb::Arg {
+                        name: "right".into(),
+                        sort: 1,
+                    },
+                ],
+                output: 1,
+                ..Default::default()
+            })),
+            ..Default::default()
+        });
+        program.nodes.extend([
+            pb::Node {
+                sort_id: 1,
+                kind: Some(pb::node::Kind::Call(pb::Call {
+                    func: "Num".into(),
+                    args: vec![0],
+                })),
+                ..Default::default()
+            }, // 14 Num10
+            pb::Node {
+                sort_id: 1,
+                kind: Some(pb::node::Kind::Union(pb::Union {
+                    members: vec![14, 12],
+                })),
+                ..Default::default()
+            }, // 15 Num10 = Num20
+            pb::Node {
+                sort_id: 0,
+                kind: Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
+                    value: Some(pb::primitive_value::Value::I64(0)),
+                })),
+                ..Default::default()
+            }, // 16 zero
+            pb::Node {
+                sort_id: 1,
+                kind: Some(pb::node::Kind::Call(pb::Call {
+                    func: "SharedPair".into(),
+                    args: vec![12, 12],
+                })),
+                ..Default::default()
+            }, // 17
+        ]);
+        program.commands.push(pb::Command {
+            kind: Some(pb::command::Kind::Action(pb::Action {
+                kind: Some(pb::action::Kind::Term(15)),
+                ..Default::default()
+            })),
+            ..Default::default()
+        });
+        for (arg, cost) in [(0, 2), (1, 16)] {
+            program.commands.push(pb::Command {
+                kind: Some(pb::command::Kind::Action(pb::Action {
+                    kind: Some(pb::action::Kind::SetCost(pb::SetCost {
+                        target: Some(pb::Call {
+                            func: "Num".into(),
+                            args: vec![arg],
+                        }),
+                        cost: Some(cost),
+                    })),
+                    ..Default::default()
+                })),
+                ..Default::default()
+            });
+        }
+        for (roots, variants) in [(vec![14, 0, 12, 14], 2), (vec![17, 12, 17], 1)] {
+            program.commands.push(pb::Command {
+                kind: Some(pb::command::Kind::Extract(pb::Extract {
+                    roots,
+                    variants,
+                    extractor: extractor.into(),
+                    ..Default::default()
+                })),
+                ..Default::default()
+            });
+        }
+        let response = run(&mut engine, id, program);
+        assert_eq!(response.error, None, "{extractor:?}");
+        let Some(pb::command_output::Kind::Extraction(extracted)) = &response.outputs[0].kind
+        else {
+            panic!("variants")
+        };
+        assert_eq!(extracted.roots.len(), 4);
+        for index in [0, 2, 3] {
+            let variants = &extracted.roots[index].variants;
+            assert_eq!(variants.len(), 2);
+            assert_eq!(value(&response, variants[0].term), "(Num 20)");
+            assert_eq!(value(&response, variants[0].cost.unwrap()), "1");
+            assert_eq!(value(&response, variants[1].term), "(Num 10)");
+            assert_eq!(value(&response, variants[1].cost.unwrap()), "31");
+            assert_eq!(variants[0].term, extracted.roots[0].variants[0].term);
+        }
+        assert_eq!(value(&response, extracted.roots[1].variants[0].term), "10");
+        let Some(pb::command_output::Kind::Extraction(shared)) = &response.outputs[1].kind else {
+            panic!("shared roots")
+        };
+        assert_eq!(shared.roots.len(), 3);
+        let pair = &shared.roots[0].variants[0];
+        assert_eq!(value(&response, pair.cost.unwrap()), shared_cost);
+        assert_eq!(pair.term, shared.roots[2].variants[0].term);
+        let Some(pb::node::Kind::Call(call)) = &response.nodes[pair.term as usize].kind else {
+            panic!("pair")
+        };
+        assert_eq!(call.args, [shared.roots[1].variants[0].term; 2]);
+    }
+}
+
+#[test]
+fn default_extraction_negative_compatibility_is_scoped_to_the_sort_domain() {
+    for extractor in [pb::Extractor::Tree, pb::Extractor::GreedyDag] {
+        for same_sort_root in [12, 18] {
+            let mut engine = Engine::default();
+            let id = create(&mut engine);
+            let mut program = fixture();
+            program.rules.clear();
+            program.rulesets.clear();
+            program.commands.clear();
+            program.sorts.push(pb::Sort {
+                kind: Some(pb::sort::Kind::Eq("Unrelated".into())),
+                ..Default::default()
+            });
+            program.declarations.extend([
+                pb::Declaration {
+                    kind: Some(pb::declaration::Kind::EqSort(pb::EqSort {
+                        name: "Unrelated".into(),
+                        ..Default::default()
+                    })),
+                    ..Default::default()
+                },
+                pb::Declaration {
+                    kind: Some(pb::declaration::Kind::Constructor(pb::Constructor {
+                        name: "UnrelatedNum".into(),
+                        inputs: vec![pb::Arg {
+                            name: "n".into(),
+                            sort: 0,
+                        }],
+                        output: 2,
+                        ..Default::default()
+                    })),
+                    ..Default::default()
+                },
+            ]);
+            let target = pb::Call {
+                func: "Num".into(),
+                args: vec![1],
+            };
+            program.nodes.extend([
+                pb::Node {
+                    sort_id: 0,
+                    kind: Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
+                        value: Some(pb::primitive_value::Value::I64(-7)),
+                    })),
+                    ..Default::default()
+                }, // 14
+                pb::Node {
+                    sort_id: 0,
+                    kind: Some(pb::node::Kind::GetCost(target.clone())),
+                    ..Default::default()
+                }, // 15
+                pb::Node {
+                    sort_id: 2,
+                    kind: Some(pb::node::Kind::Call(pb::Call {
+                        func: "UnrelatedNum".into(),
+                        args: vec![0],
+                    })),
+                    ..Default::default()
+                }, // 16
+                pb::Node {
+                    sort_id: 0,
+                    kind: Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
+                        value: Some(pb::primitive_value::Value::I64(1)),
+                    })),
+                    ..Default::default()
+                }, // 17
+                pb::Node {
+                    sort_id: 1,
+                    kind: Some(pb::node::Kind::Call(pb::Call {
+                        func: "Num".into(),
+                        args: vec![0],
+                    })),
+                    ..Default::default()
+                }, // 18 unrelated class, same sort
+            ]);
+            program.commands.push(pb::Command {
+                kind: Some(pb::command::Kind::Action(pb::Action {
+                    kind: Some(pb::action::Kind::SetCost(pb::SetCost {
+                        target: Some(target),
+                        cost: Some(14),
+                    })),
+                    ..Default::default()
+                })),
+                ..Default::default()
+            });
+            for root in [15, 16, same_sort_root] {
+                program.commands.push(pb::Command {
+                    kind: Some(pb::command::Kind::Extract(pb::Extract {
+                        roots: vec![root],
+                        variants: 1,
+                        extractor: extractor.into(),
+                        ..Default::default()
+                    })),
+                    ..Default::default()
+                });
+            }
+            let response = run(&mut engine, id, program);
+            let error = response.error.as_ref().unwrap();
+            assert_eq!(error.code, i32::from(pb::ErrorCode::ExtractionFailed));
+            assert!(error.message.contains("negative assigned costs"));
+            assert_eq!(error.location.as_ref().unwrap().path, [3]);
+            assert_eq!(
+                response.outputs.len(),
+                2,
+                "scalar and unrelated-sort extraction must finish first"
+            );
+            let Some(pb::command_output::Kind::Extraction(scalar)) = &response.outputs[0].kind
+            else {
+                panic!("scalar")
+            };
+            assert_eq!(value(&response, scalar.roots[0].variants[0].term), "-7");
+            assert_eq!(
+                value(&response, scalar.roots[0].variants[0].cost.unwrap()),
+                "1"
+            );
+            let Some(pb::command_output::Kind::Extraction(unrelated)) = &response.outputs[1].kind
+            else {
+                panic!("other sort")
+            };
+            assert_eq!(
+                value(&response, unrelated.roots[0].variants[0].term),
+                "(UnrelatedNum 10)"
+            );
+        }
+    }
+}
+
+#[test]
+fn default_extraction_reports_objective_overflow_without_losing_completed_output() {
+    for extractor in [pb::Extractor::Tree, pb::Extractor::GreedyDag] {
+        let mut engine = Engine::default();
+        let id = create(&mut engine);
+        let mut program = fixture();
+        program.rules.clear();
+        program.rulesets.clear();
+        program.commands.clear();
+        program.nodes.push(pb::Node {
+            sort_id: 0,
+            kind: Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
+                value: Some(pb::primitive_value::Value::I64(i64::MAX)),
+            })),
+            ..Default::default()
+        });
+        program.commands.extend([
+            pb::Command {
+                kind: Some(pb::command::Kind::Action(pb::Action {
+                    kind: Some(pb::action::Kind::SetCost(pb::SetCost {
+                        target: Some(pb::Call {
+                            func: "Num".into(),
+                            args: vec![1],
+                        }),
+                        cost: Some(14),
+                    })),
+                    ..Default::default()
+                })),
+                ..Default::default()
+            },
+            pb::Command {
+                kind: Some(pb::command::Kind::PrintSize(pb::PrintSize {
+                    tables: vec!["Num".into()],
+                })),
+                ..Default::default()
+            },
+            pb::Command {
+                kind: Some(pb::command::Kind::Extract(pb::Extract {
+                    roots: vec![12],
+                    variants: 1,
+                    extractor: extractor.into(),
+                    ..Default::default()
+                })),
+                ..Default::default()
+            },
+        ]);
+        let response = run(&mut engine, id, program);
+        let error = response.error.unwrap();
+        assert_eq!(error.code, i32::from(pb::ErrorCode::ExtractionFailed));
+        assert!(error.message.contains("declared i64 result domain"));
+        assert_eq!(error.location.unwrap().path, [2]);
+        assert_eq!(response.outputs.len(), 1);
+    }
+}
+
+#[test]
+fn keep_best_preserves_selected_annotations_and_request_union_frames() {
+    for extractor in [pb::Extractor::Tree, pb::Extractor::GreedyDag] {
+        let mut engine = Engine::default();
+        let id = create(&mut engine);
+        let mut program = fixture();
+        program.commands.clear();
+        for name in ["best", "discard", "after"] {
+            program.declarations.push(pb::Declaration {
+                kind: Some(pb::declaration::Kind::Function(pb::Function {
+                    name: name.into(),
+                    output: 1,
+                    ..Default::default()
+                })),
+                ..Default::default()
+            });
+        }
+        program.nodes.extend([
+            pb::Node {
+                sort_id: 1,
+                kind: Some(pb::node::Kind::Call(pb::Call {
+                    func: "Num".into(),
+                    args: vec![0],
+                })),
+                ..Default::default()
+            }, // 14
+            pb::Node {
+                sort_id: 1,
+                kind: Some(pb::node::Kind::Call(pb::Call {
+                    func: "Box".into(),
+                    args: vec![12],
+                })),
+                ..Default::default()
+            }, // 15
+            pb::Node {
+                sort_id: 1,
+                kind: Some(pb::node::Kind::Union(pb::Union {
+                    members: vec![14, 15],
+                })),
+                ..Default::default()
+            }, // 16
+            pb::Node {
+                sort_id: 0,
+                kind: Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
+                    value: Some(pb::primitive_value::Value::I64(0)),
+                })),
+                ..Default::default()
+            }, // 17
+            pb::Node {
+                sort_id: 1,
+                kind: Some(pb::node::Kind::Call(pb::Call {
+                    func: "best".into(),
+                    args: vec![],
+                })),
+                ..Default::default()
+            }, // 18
+            pb::Node {
+                sort_id: 1,
+                kind: Some(pb::node::Kind::Call(pb::Call {
+                    func: "discard".into(),
+                    args: vec![],
+                })),
+                ..Default::default()
+            }, // 19
+            pb::Node {
+                sort_id: 1,
+                kind: Some(pb::node::Kind::Call(pb::Call {
+                    func: "Num".into(),
+                    args: vec![2],
+                })),
+                ..Default::default()
+            }, // 20
+            pb::Node {
+                sort_id: 1,
+                kind: Some(pb::node::Kind::Union(pb::Union { members: vec![] })),
+                ..Default::default()
+            }, // 21
+            pb::Node {
+                sort_id: 1,
+                kind: Some(pb::node::Kind::Union(pb::Union { members: vec![] })),
+                ..Default::default()
+            }, // 22
+            pb::Node {
+                sort_id: 1,
+                kind: Some(pb::node::Kind::Union(pb::Union { members: vec![14] })),
+                ..Default::default()
+            }, // 23
+            pb::Node {
+                sort_id: 1,
+                kind: Some(pb::node::Kind::Call(pb::Call {
+                    func: "Box".into(),
+                    args: vec![21],
+                })),
+                ..Default::default()
+            }, // 24
+            pb::Node {
+                sort_id: 1,
+                kind: Some(pb::node::Kind::Call(pb::Call {
+                    func: "Box".into(),
+                    args: vec![22],
+                })),
+                ..Default::default()
+            }, // 25
+            pb::Node {
+                sort_id: 0,
+                kind: Some(pb::node::Kind::GetCost(pb::Call {
+                    func: "Num".into(),
+                    args: vec![1],
+                })),
+                ..Default::default()
+            }, // 26
+            pb::Node {
+                sort_id: 0,
+                kind: Some(pb::node::Kind::GetCost(pb::Call {
+                    func: "Box".into(),
+                    args: vec![12],
+                })),
+                ..Default::default()
+            }, // 27
+            pb::Node {
+                sort_id: 0,
+                kind: Some(pb::node::Kind::GetCost(pb::Call {
+                    func: "Num".into(),
+                    args: vec![0],
+                })),
+                ..Default::default()
+            }, // 28
+            pb::Node {
+                sort_id: 1,
+                kind: Some(pb::node::Kind::Call(pb::Call {
+                    func: "after".into(),
+                    args: vec![],
+                })),
+                ..Default::default()
+            }, // 29
+            pb::Node {
+                sort_id: 1,
+                kind: Some(pb::node::Kind::Union(pb::Union {
+                    members: vec![18, 29],
+                })),
+                ..Default::default()
+            }, // 30
+        ]);
+        program.commands.push(pb::Command {
+            kind: Some(pb::command::Kind::Action(pb::Action {
+                kind: Some(pb::action::Kind::Term(16)),
+                ..Default::default()
+            })),
+            ..Default::default()
+        });
+        for (func, arg, cost) in [("Num", 0, 2), ("Num", 1, 17), ("Box", 12, 0)] {
+            program.commands.push(pb::Command {
+                kind: Some(pb::command::Kind::Action(pb::Action {
+                    kind: Some(pb::action::Kind::SetCost(pb::SetCost {
+                        target: Some(pb::Call {
+                            func: func.into(),
+                            args: vec![arg],
+                        }),
+                        cost: Some(cost),
+                    })),
+                    ..Default::default()
+                })),
+                ..Default::default()
+            });
+        }
+        for (func, value) in [("best", 14), ("discard", 20)] {
+            program.commands.push(pb::Command {
+                kind: Some(pb::command::Kind::Action(pb::Action {
+                    kind: Some(pb::action::Kind::Set(pb::Set {
+                        target: Some(pb::Call {
+                            func: func.into(),
+                            args: vec![],
+                        }),
+                        value: Some(value),
+                    })),
+                    ..Default::default()
+                })),
+                ..Default::default()
+            });
+        }
+        for node in [23, 21, 22] {
+            program.commands.push(pb::Command {
+                kind: Some(pb::command::Kind::Action(pb::Action {
+                    kind: Some(pb::action::Kind::Term(node)),
+                    ..Default::default()
+                })),
+                ..Default::default()
+            });
+        }
+        program.commands.extend([
+            pb::Command {
+                kind: Some(pb::command::Kind::KeepBest(pb::KeepBest {
+                    tables: vec!["best".into()],
+                    extractor: extractor.into(),
+                    ..Default::default()
+                })),
+                ..Default::default()
+            },
+            pb::Command {
+                kind: Some(pb::command::Kind::Action(pb::Action {
+                    kind: Some(pb::action::Kind::Set(pb::Set {
+                        target: Some(pb::Call {
+                            func: "after".into(),
+                            args: vec![],
+                        }),
+                        value: Some(23),
+                    })),
+                    ..Default::default()
+                })),
+                ..Default::default()
+            },
+        ]);
+        for node in [24, 25] {
+            program.commands.push(pb::Command {
+                kind: Some(pb::command::Kind::Action(pb::Action {
+                    kind: Some(pb::action::Kind::Term(node)),
+                    ..Default::default()
+                })),
+                ..Default::default()
+            });
+        }
+        program.commands.extend([
+            pb::Command {
+                kind: Some(pb::command::Kind::Check(pb::Check { facts: vec![30] })),
+                ..Default::default()
+            },
+            pb::Command {
+                kind: Some(pb::command::Kind::Extract(pb::Extract {
+                    roots: vec![26, 27],
+                    variants: 1,
+                    extractor: extractor.into(),
+                    ..Default::default()
+                })),
+                ..Default::default()
+            },
+            pb::Command {
+                kind: Some(pb::command::Kind::Fail(Box::new(pb::Command {
+                    kind: Some(pb::command::Kind::Check(pb::Check { facts: vec![28] })),
+                    ..Default::default()
+                }))),
+                ..Default::default()
+            },
+            pb::Command {
+                kind: Some(pb::command::Kind::Freeze(pb::Freeze {})),
+                ..Default::default()
+            },
+            fixture().commands[5].clone(),
+        ]);
+        let response = run(&mut engine, id, program);
+        assert_eq!(response.error, None, "{extractor:?}");
+        let Some(pb::command_output::Kind::Extraction(costs)) = &response.outputs[0].kind else {
+            panic!("surviving C")
+        };
+        assert_eq!(value(&response, costs.roots[0].variants[0].term), "0");
+        assert_eq!(
+            value(&response, costs.roots[1].variants[0].term),
+            "10",
+            "not aggregate D=11"
+        );
+        let Some(pb::command_output::Kind::Snapshot(snapshot)) = &response.outputs[1].kind else {
+            panic!("compacted snapshot")
+        };
+        let saved = snapshot.program.as_ref().unwrap();
+        let mut assignments = Vec::new();
+        let mut selected_values = Vec::new();
+        for command in &saved.commands {
+            match &command.kind {
+                Some(pb::command::Kind::Action(pb::Action {
+                    kind: Some(pb::action::Kind::SetCost(cost)),
+                    ..
+                })) => assignments.push(cost),
+                Some(pb::command::Kind::Action(pb::Action {
+                    kind: Some(pb::action::Kind::Set(set)),
+                    ..
+                })) => {
+                    let table = &set.target.as_ref().unwrap().func;
+                    assert_ne!(table, "discard");
+                    if table == "best" || table == "after" {
+                        selected_values.push(set.value.unwrap());
+                    }
+                }
+                _ => (),
+            }
+        }
+        assert_eq!(assignments.len(), 2);
+        assert_eq!(selected_values.len(), 2);
+        assert_eq!(
+            selected_values[0], selected_values[1],
+            "finite Union capture stays connected"
+        );
+        // Rule/declaration syntax remains in this arena too. Inspect class
+        // producer membership, not unrelated Call nodes such as rule Box(x).
+        let producers: Vec<_> = saved
+            .nodes
+            .iter()
+            .filter_map(|node| match &node.kind {
+                Some(pb::node::Kind::Union(class)) => Some(&class.members),
+                _ => None,
+            })
+            .flatten()
+            .filter_map(|index| match &saved.nodes[*index as usize].kind {
+                Some(pb::node::Kind::Call(call)) => Some(call),
+                _ => None,
+            })
+            .collect();
+        let nums: Vec<_> = producers.iter().filter(|call| call.func == "Num").collect();
+        assert_eq!(nums.len(), 1, "discarded producers are not capture roots");
+        let boxes: Vec<_> = producers.iter().filter(|call| call.func == "Box").collect();
+        assert_eq!(
+            boxes.len(),
+            3,
+            "one selected producer and two distinct empty captures"
+        );
+        let empty_inputs: Vec<_> = boxes.iter().filter_map(|call| {
+            matches!(&saved.nodes[call.args[0] as usize].kind, Some(pb::node::Kind::Union(class)) if class.members.is_empty()).then_some(call.args[0])
+        }).collect();
+        assert_eq!(empty_inputs.len(), 2);
+        assert_ne!(empty_inputs[0], empty_inputs[1]);
+        assert!(
+            response.profile.unwrap().runs[0]
+                .rules
+                .iter()
+                .any(|rule| rule.matches.is_some_and(|n| n > 0)),
+            "installed rule still runs after clear"
+        );
+    }
+}
+
+#[test]
+fn keep_best_failure_precedes_clear_and_retains_completed_prefix() {
+    for extractor in [pb::Extractor::Tree, pb::Extractor::GreedyDag] {
+        let mut engine = Engine::default();
+        let id = create(&mut engine);
+        let mut program = fixture();
+        program.rules.clear();
+        program.rulesets.clear();
+        program.commands.clear();
+        for name in ["best", "empty"] {
+            program.declarations.push(pb::Declaration {
+                kind: Some(pb::declaration::Kind::Function(pb::Function {
+                    name: name.into(),
+                    output: 1,
+                    ..Default::default()
+                })),
+                ..Default::default()
+            });
+        }
+        program.nodes.push(pb::Node {
+            sort_id: 1,
+            kind: Some(pb::node::Kind::Union(pb::Union { members: vec![] })),
+            ..Default::default()
+        }); //14
+        for (table, value) in [("best", 12), ("empty", 14)] {
+            program.commands.push(pb::Command {
+                kind: Some(pb::command::Kind::Action(pb::Action {
+                    kind: Some(pb::action::Kind::Set(pb::Set {
+                        target: Some(pb::Call {
+                            func: table.into(),
+                            args: vec![],
+                        }),
+                        value: Some(value),
+                    })),
+                    ..Default::default()
+                })),
+                ..Default::default()
+            });
+        }
+        program.commands.extend([
+            pb::Command {
+                kind: Some(pb::command::Kind::Action(pb::Action {
+                    kind: Some(pb::action::Kind::SetCost(pb::SetCost {
+                        target: Some(pb::Call {
+                            func: "Num".into(),
+                            args: vec![1],
+                        }),
+                        cost: Some(0),
+                    })),
+                    ..Default::default()
+                })),
+                ..Default::default()
+            },
+            pb::Command {
+                kind: Some(pb::command::Kind::Freeze(pb::Freeze {})),
+                ..Default::default()
+            },
+            pb::Command {
+                kind: Some(pb::command::Kind::KeepBest(pb::KeepBest {
+                    tables: vec!["best".into(), "empty".into()],
+                    extractor: extractor.into(),
+                    ..Default::default()
+                })),
+                ..Default::default()
+            },
+        ]);
+        let response = run(&mut engine, id, program.clone());
+        let error = response.error.unwrap();
+        assert_eq!(error.code, i32::from(pb::ErrorCode::ExtractionFailed));
+        assert_eq!(error.location.unwrap().path, [4]);
+        assert_eq!(response.outputs.len(), 1);
+        program.commands = vec![pb::Command {
+            kind: Some(pb::command::Kind::Freeze(pb::Freeze {})),
+            ..Default::default()
+        }];
+        let after = run(&mut engine, id, program);
+        assert_eq!(after.error, None);
+        for output in [&response.outputs[0], &after.outputs[0]] {
+            let Some(pb::command_output::Kind::Snapshot(snapshot)) = &output.kind else {
+                panic!("failure snapshot")
+            };
+            let saved = snapshot.program.as_ref().unwrap();
+            let mut tables = Vec::new();
+            let mut costs = Vec::new();
+            for command in &saved.commands {
+                match &command.kind {
+                    Some(pb::command::Kind::Action(pb::Action {
+                        kind: Some(pb::action::Kind::Set(set)),
+                        ..
+                    })) => tables.push(set.target.as_ref().unwrap().func.as_str()),
+                    Some(pb::command::Kind::Action(pb::Action {
+                        kind: Some(pb::action::Kind::SetCost(set)),
+                        ..
+                    })) => costs.push(&saved.nodes[set.cost.unwrap() as usize].kind),
+                    _ => (),
+                }
+            }
+            tables.sort();
+            assert_eq!(tables, ["best", "empty"]);
+            assert_eq!(costs.len(), 1);
+            assert!(matches!(
+                costs[0],
+                Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
+                    value: Some(pb::primitive_value::Value::I64(10))
+                }))
+            ));
+        }
+    }
+}
+
+#[test]
+fn keep_best_named_constructor_preserves_subsumption_zero_and_absence() {
+    for extractor in [pb::Extractor::Tree, pb::Extractor::GreedyDag] {
+        let mut engine = Engine::default();
+        let id = create(&mut engine);
+        let mut program = fixture();
+        program.rules.clear();
+        program.rulesets.clear();
+        program.commands.clear();
+        for n in [0, -7] {
+            program.nodes.push(pb::Node {
+                sort_id: 0,
+                kind: Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
+                    value: Some(pb::primitive_value::Value::I64(n)),
+                })),
+                ..Default::default()
+            });
+        }
+        program.nodes.extend([
+            pb::Node {
+                sort_id: 1,
+                kind: Some(pb::node::Kind::Call(pb::Call {
+                    func: "Num".into(),
+                    args: vec![0],
+                })),
+                ..Default::default()
+            }, // 16
+            pb::Node {
+                sort_id: 1,
+                kind: Some(pb::node::Kind::Union(pb::Union {
+                    members: vec![16, 12],
+                })),
+                ..Default::default()
+            }, // 17
+            pb::Node {
+                sort_id: 1,
+                kind: Some(pb::node::Kind::Call(pb::Call {
+                    func: "Num".into(),
+                    args: vec![2],
+                })),
+                ..Default::default()
+            }, // 18
+        ]);
+        for arg in [0, 1, 2] {
+            program.nodes.push(pb::Node {
+                sort_id: 0,
+                kind: Some(pb::node::Kind::GetCost(pb::Call {
+                    func: "Num".into(),
+                    args: vec![arg],
+                })),
+                ..Default::default()
+            }); // 19,20,21
+        }
+        program.commands.push(pb::Command {
+            kind: Some(pb::command::Kind::Action(pb::Action {
+                kind: Some(pb::action::Kind::Term(17)),
+                ..Default::default()
+            })),
+            ..Default::default()
+        });
+        for (arg, cost) in [(0, 15), (1, 14)] {
+            program.commands.push(pb::Command {
+                kind: Some(pb::command::Kind::Action(pb::Action {
+                    kind: Some(pb::action::Kind::SetCost(pb::SetCost {
+                        target: Some(pb::Call {
+                            func: "Num".into(),
+                            args: vec![arg],
+                        }),
+                        cost: Some(cost),
+                    })),
+                    ..Default::default()
+                })),
+                ..Default::default()
+            });
+        }
+        program.commands.extend([
+            pb::Command {
+                kind: Some(pb::command::Kind::Action(pb::Action {
+                    kind: Some(pb::action::Kind::Subsume(pb::Call {
+                        func: "Num".into(),
+                        args: vec![0],
+                    })),
+                    ..Default::default()
+                })),
+                ..Default::default()
+            },
+            pb::Command {
+                kind: Some(pb::command::Kind::Action(pb::Action {
+                    kind: Some(pb::action::Kind::Term(18)),
+                    ..Default::default()
+                })),
+                ..Default::default()
+            },
+            pb::Command {
+                kind: Some(pb::command::Kind::KeepBest(pb::KeepBest {
+                    tables: vec!["Num".into()],
+                    extractor: extractor.into(),
+                    ..Default::default()
+                })),
+                ..Default::default()
+            },
+            pb::Command {
+                kind: Some(pb::command::Kind::Freeze(pb::Freeze {})),
+                ..Default::default()
+            },
+            pb::Command {
+                kind: Some(pb::command::Kind::Extract(pb::Extract {
+                    roots: vec![19, 20],
+                    variants: 1,
+                    extractor: extractor.into(),
+                    ..Default::default()
+                })),
+                ..Default::default()
+            },
+            pb::Command {
+                kind: Some(pb::command::Kind::Fail(Box::new(pb::Command {
+                    kind: Some(pb::command::Kind::Check(pb::Check { facts: vec![21] })),
+                    ..Default::default()
+                }))),
+                ..Default::default()
+            },
+        ]);
+        let response = run(&mut engine, id, program);
+        assert_eq!(response.error, None, "{extractor:?}");
+        let Some(pb::command_output::Kind::Snapshot(snapshot)) = &response.outputs[0].kind else {
+            panic!("named constructor")
+        };
+        let saved = snapshot.program.as_ref().unwrap();
+        let mut costs = Vec::new();
+        let mut subsumed = 0;
+        for command in &saved.commands {
+            match &command.kind {
+                Some(pb::command::Kind::Action(pb::Action {
+                    kind: Some(pb::action::Kind::SetCost(set)),
+                    ..
+                })) => {
+                    let target = set.target.as_ref().unwrap();
+                    assert_eq!(target.func, "Num");
+                    let Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
+                        value: Some(pb::primitive_value::Value::I64(arg)),
+                    })) = saved.nodes[target.args[0] as usize].kind
+                    else {
+                        panic!("primitive key")
+                    };
+                    let Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
+                        value: Some(pb::primitive_value::Value::I64(cost)),
+                    })) = saved.nodes[set.cost.unwrap() as usize].kind
+                    else {
+                        panic!("assigned C")
+                    };
+                    costs.push((arg, cost));
+                }
+                Some(pb::command::Kind::Action(pb::Action {
+                    kind: Some(pb::action::Kind::Subsume(call)),
+                    ..
+                })) => {
+                    assert_eq!(call.func, "Num");
+                    subsumed += 1;
+                }
+                _ => (),
+            }
+        }
+        costs.sort();
+        assert_eq!(
+            costs,
+            [(10, -7), (20, 0)],
+            "no annotation is invented for Num30"
+        );
+        assert_eq!(subsumed, 1);
+        assert_eq!(saved.nodes.iter().filter(|node| matches!(&node.kind, Some(pb::node::Kind::Call(call)) if call.func == "Num")).count(), 3);
+        let Some(pb::command_output::Kind::Extraction(read)) = &response.outputs[1].kind else {
+            panic!("retained costs")
+        };
+        assert_eq!(value(&response, read.roots[0].variants[0].term), "-7");
+        assert_eq!(value(&response, read.roots[1].variants[0].term), "0");
+    }
+}
+
+#[test]
+fn keep_best_objective_overflow_is_reported_before_clear() {
+    for extractor in [pb::Extractor::Tree, pb::Extractor::GreedyDag] {
+        let mut engine = Engine::default();
+        let id = create(&mut engine);
+        let mut program = fixture();
+        program.rules.clear();
+        program.rulesets.clear();
+        program.commands.clear();
+        program.declarations.push(pb::Declaration {
+            kind: Some(pb::declaration::Kind::Function(pb::Function {
+                name: "best".into(),
+                output: 1,
+                ..Default::default()
+            })),
+            ..Default::default()
+        });
+        program.nodes.extend([
+            pb::Node {
+                sort_id: 0,
+                kind: Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
+                    value: Some(pb::primitive_value::Value::I64(i64::MAX)),
+                })),
+                ..Default::default()
+            }, // 14
+            pb::Node {
+                sort_id: 0,
+                kind: Some(pb::node::Kind::GetCost(pb::Call {
+                    func: "Num".into(),
+                    args: vec![1],
+                })),
+                ..Default::default()
+            }, // 15
+        ]);
+        program.commands.extend([
+            pb::Command {
+                kind: Some(pb::command::Kind::Action(pb::Action {
+                    kind: Some(pb::action::Kind::Set(pb::Set {
+                        target: Some(pb::Call {
+                            func: "best".into(),
+                            args: vec![],
+                        }),
+                        value: Some(12),
+                    })),
+                    ..Default::default()
+                })),
+                ..Default::default()
+            },
+            pb::Command {
+                kind: Some(pb::command::Kind::Action(pb::Action {
+                    kind: Some(pb::action::Kind::SetCost(pb::SetCost {
+                        target: Some(pb::Call {
+                            func: "Num".into(),
+                            args: vec![1],
+                        }),
+                        cost: Some(14),
+                    })),
+                    ..Default::default()
+                })),
+                ..Default::default()
+            },
+            pb::Command {
+                kind: Some(pb::command::Kind::Freeze(pb::Freeze {})),
+                ..Default::default()
+            },
+            pb::Command {
+                kind: Some(pb::command::Kind::KeepBest(pb::KeepBest {
+                    tables: vec!["best".into()],
+                    extractor: extractor.into(),
+                    ..Default::default()
+                })),
+                ..Default::default()
+            },
+        ]);
+        let response = run(&mut engine, id, program.clone());
+        let error = response.error.unwrap();
+        assert_eq!(error.code, i32::from(pb::ErrorCode::ExtractionFailed));
+        assert!(error.message.contains("declared i64 result domain"));
+        assert_eq!(error.location.unwrap().path, [3]);
+        assert_eq!(response.outputs.len(), 1);
+        program.commands = vec![
+            pb::Command {
+                kind: Some(pb::command::Kind::Freeze(pb::Freeze {})),
+                ..Default::default()
+            },
+            pb::Command {
+                kind: Some(pb::command::Kind::Extract(pb::Extract {
+                    roots: vec![15],
+                    variants: 1,
+                    extractor: extractor.into(),
+                    ..Default::default()
+                })),
+                ..Default::default()
+            },
+        ];
+        let after = run(&mut engine, id, program);
+        assert_eq!(after.error, None);
+        let Some(pb::command_output::Kind::Snapshot(snapshot)) = &after.outputs[0].kind else {
+            panic!("rows after overflow")
+        };
+        assert!(snapshot.program.as_ref().unwrap().commands.iter().any(|command| matches!(&command.kind, Some(pb::command::Kind::Action(pb::Action { kind: Some(pb::action::Kind::Set(set)), .. })) if set.target.as_ref().unwrap().func == "best")));
+        let Some(pb::command_output::Kind::Extraction(cost)) = &after.outputs[1].kind else {
+            panic!("annotation after overflow")
+        };
+        assert_eq!(
+            value(&after, cost.roots[0].variants[0].term),
+            i64::MAX.to_string()
+        );
+    }
+}
+
 fn birewrite_fixture() -> pb::Program {
     let mut program = fixture();
     let mut other = program.declarations[2].clone();
@@ -17904,11 +18980,6 @@ fn extraction_configuration_errors_are_classified_without_execution() {
             pb::Extractor::Unspecified,
             "",
             pb::ErrorCode::InvalidProgram,
-        ),
-        (
-            pb::Extractor::GreedyDag,
-            "",
-            pb::ErrorCode::ExtractionFailed,
         ),
         (pb::Extractor::Tree, "missing", pb::ErrorCode::UnknownName),
     ] {

@@ -1581,14 +1581,6 @@ impl Session {
                         ..Default::default()
                     })));
                 }
-                if extract.extractor != i32::from(pb::Extractor::Tree) {
-                    return Err(PreparationError(Box::new(pb::Error {
-                        code: pb::ErrorCode::ExtractionFailed.into(),
-                        message: "this adapter currently supports only tree extraction".into(),
-                        span: command.span,
-                        ..Default::default()
-                    })));
-                }
                 return extract
                     .roots
                     .iter()
@@ -1599,6 +1591,53 @@ impl Session {
                         )))
                     })
                     .collect();
+            }
+            pb::command::Kind::KeepBest(keep) => {
+                if self.mode != pb::ExecutionMode::Normal {
+                    return Err("encoded-mode KeepBest is not supported".into());
+                }
+                if keep.tables.is_empty()
+                    || keep.tables.iter().any(String::is_empty)
+                    || !matches!(
+                        pb::Extractor::try_from(keep.extractor),
+                        Ok(pb::Extractor::Tree | pb::Extractor::GreedyDag)
+                    )
+                {
+                    return Err("KeepBest requires tables and a specified extractor".into());
+                }
+                if !keep.cost_model.is_empty() {
+                    return Err(PreparationError(Box::new(pb::Error {
+                        code: pb::ErrorCode::UnknownName.into(),
+                        message: format!("unknown cost model {}", keep.cost_model),
+                        span: command.span,
+                        ..Default::default()
+                    })));
+                }
+                for table in &keep.tables {
+                    let logical = self.names.callables.get(table);
+                    if !self.definitions.declarations.iter().any(|declaration| {
+                        match &declaration.kind {
+                            Some(pb::declaration::Kind::Constructor(row)) => {
+                                logical == Some(&row.name)
+                            }
+                            Some(pb::declaration::Kind::Function(row)) => {
+                                logical == Some(&row.name)
+                            }
+                            Some(pb::declaration::Kind::Relation(row)) => {
+                                logical == Some(&row.name)
+                            }
+                            _ => false,
+                        }
+                    }) {
+                        return Err(PreparationError(Box::new(pb::Error {
+                            code: pb::ErrorCode::UnknownName.into(),
+                            message: format!("unknown table {table}"),
+                            span: command.span,
+                            ..Default::default()
+                        })));
+                    }
+                }
+                return Ok(vec![]);
             }
             pb::command::Kind::PrintSize(print) => {
                 if print.tables.iter().any(String::is_empty) {
@@ -1795,30 +1834,53 @@ impl Session {
                     })
                     .collect::<Result<Vec<_>, _>>()?;
                 let mut encoded = HashMap::new();
-                let (extracted, nodes) = self.graph.extract_variants_with_cost_model_and_observer(
-                    roots,
-                    extract.variants as usize,
-                    egglog::extract::DEFAULT_COST_MODEL,
-                    |terms, term, sort, value, children| {
-                        encode_term(
-                            self,
-                            terms,
-                            term,
-                            sort,
-                            value,
-                            children,
-                            response,
-                            &mut encoded,
-                        )
-                    },
+                let model = crate::set_cost::CheckedDynamicCostModel::for_root_sorts(
+                    &self.graph,
+                    roots.iter().map(|(sort, _)| sort.clone()).collect(),
                 )?;
+                let observe = |terms: &TermDag,
+                               term: TermId,
+                               sort: &ArcSort,
+                               value: Value,
+                               children: &[u32]| {
+                    encode_term(
+                        self,
+                        terms,
+                        term,
+                        sort,
+                        value,
+                        children,
+                        response,
+                        &mut encoded,
+                    )
+                };
+                let variants = usize::try_from(extract.variants).map_err(|_| {
+                    egglog::Error::ExtractError("variant count exceeds native usize".into())
+                })?;
+                let (extracted, nodes) = if extract.extractor == i32::from(pb::Extractor::GreedyDag)
+                {
+                    crate::greedy_dag_extract::extract_variants_greedy_dag_with_observer(
+                        &self.graph,
+                        roots,
+                        variants,
+                        model,
+                        observe,
+                    )?
+                } else {
+                    self.graph.extract_variants_with_cost_model_and_observer(
+                        roots,
+                        variants,
+                        egglog::extract::TreeCostModelFromDag(model),
+                        observe,
+                    )?
+                };
                 let mut output = pb::ExtractResult::default();
                 for (variants, nodes) in extracted.variants.iter().zip(nodes) {
                     let mut root = pb::ExtractedRoot::default();
                     for (variant, term) in variants.iter().zip(nodes) {
-                        let cost = i64::try_from(variant.cost).map_err(|_| {
+                        let cost = i64::try_from(&variant.cost).map_err(|_| {
                             egglog::Error::ExtractError(
-                                "native u64 cost is outside this handle's i64 domain".into(),
+                                "default extraction objective is outside its declared i64 result domain".into(),
                             )
                         })?;
                         let cost_sort = encode_sort(
@@ -1843,6 +1905,27 @@ impl Session {
                     output.roots.push(root);
                 }
                 Some(pb::command_output::Kind::Extraction(output))
+            }
+            pb::command::Kind::KeepBest(keep) => {
+                crate::keep_best::keep_best_with_cost_model(
+                    &mut self.graph,
+                    &keep.tables,
+                    keep.extractor == i32::from(pb::Extractor::GreedyDag),
+                    |graph, roots| {
+                        crate::set_cost::CheckedDynamicCostModel::for_root_sorts(
+                            graph,
+                            roots.iter().map(|(sort, _)| sort.clone()).collect(),
+                        )
+                    },
+                    |cost| {
+                        i64::try_from(cost).map(|_| ()).map_err(|_| {
+                            egglog::Error::ExtractError(
+                                "default extraction objective is outside its declared i64 result domain".into(),
+                            )
+                        })
+                    },
+                )?;
+                None
             }
             pb::command::Kind::PrintFunction(print) => {
                 let function = self.graph.get_function(&print.table).unwrap();
@@ -2444,6 +2527,11 @@ fn project_names(program: &mut pb::Program, definitions: &pb::Program) -> Native
             Some(pb::command::Kind::Saturate(body)) => commands.extend(body.body.iter_mut()),
             Some(pb::command::Kind::Action(action)) => actions.push(action),
             Some(pb::command::Kind::PrintFunction(print)) => project_call(&mut print.table),
+            Some(pb::command::Kind::KeepBest(keep)) => {
+                for table in &mut keep.tables {
+                    project_call(table);
+                }
+            }
             Some(pb::command::Kind::ProveExists(prove)) => project_call(&mut prove.constructor),
             _ => (),
         }

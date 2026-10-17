@@ -28,6 +28,8 @@ use egglog::{
     util::FreshGen,
 };
 use egglog_ast::span::Span;
+use num::BigInt;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 /// Registers `with-dynamic-cost`, `set-cost`, and the dynamic-cost `extract`
@@ -238,6 +240,97 @@ impl DagCostModel<DefaultCost> for DynamicCostModel {
         } else {
             default_cost()
         }
+    }
+}
+
+/// Extraction-local default model for the encoded i64 boundary.
+///
+/// Storage accepts signed annotations, but this default model supports only
+/// nonnegative marginals in the native tree extractor's root-sort closure.
+/// Costs are validated and frozen before native extraction starts. Exact
+/// accumulation avoids saturation changing candidate ranking; consumers must
+/// still check that selected objectives fit their declared i64 result domain.
+#[derive(Clone)]
+pub(crate) struct CheckedDynamicCostModel {
+    assigned: HashMap<String, HashMap<Vec<Value>, BigInt>>,
+}
+
+impl CheckedDynamicCostModel {
+    pub(crate) fn for_root_sorts(
+        egraph: &EGraph,
+        mut pending: Vec<ArcSort>,
+    ) -> Result<Self, Error> {
+        let mut seen = HashSet::new();
+        let mut assigned = HashMap::new();
+        while let Some(sort) = pending.pop() {
+            if !seen.insert(sort.name().to_owned()) {
+                continue;
+            }
+            if sort.is_container_sort() {
+                pending.extend(sort.inner_sorts());
+            } else if sort.is_eq_sort() {
+                for (name, func) in egraph.functions_iter().filter(|(_, func)| {
+                    func.func_type().subtype == FunctionSubtype::Constructor
+                        && !func.is_hidden()
+                        && !func.is_unextractable()
+                        && func.func_type().output.name() == sort.name()
+                }) {
+                    pending.extend(func.func_type().input.iter().cloned());
+                    let table = get_cost_table_name(name);
+                    if egraph.get_function(&table).is_none() {
+                        continue;
+                    }
+                    let mut costs = HashMap::new();
+                    let mut keys = Vec::new();
+                    egraph.constructor_enodes(name, |row| {
+                        if !row.subsumed {
+                            keys.push(row.children.to_vec());
+                        }
+                    })?;
+                    for key in keys {
+                        if let Some(value) =
+                            egraph.read(|state| state.lookup(&table, RawValues(key.clone())))?
+                        {
+                            let cost = egraph.value_to_base::<i64>(value);
+                            if cost < 0 {
+                                return Err(Error::ExtractError(format!(
+                                    "the default i64 cost model does not support negative assigned costs ({cost}) in the extraction sort domain"
+                                )));
+                            }
+                            costs.insert(key, BigInt::from(cost));
+                        }
+                    }
+                    assigned.insert(name.to_owned(), costs);
+                }
+            }
+        }
+        Ok(Self { assigned })
+    }
+}
+
+impl DagCostModel<BigInt> for CheckedDynamicCostModel {
+    fn base_value_cost(&self, egraph: &EGraph, sort: &ArcSort, value: Value) -> BigInt {
+        BigInt::from(DagCostModel::base_value_cost(
+            &DEFAULT_COST_MODEL.0,
+            egraph,
+            sort,
+            value,
+        ))
+    }
+
+    fn enode_cost(&self, egraph: &EGraph, func: &egglog::Function, enode: &Enode<'_>) -> BigInt {
+        self.assigned
+            .get(func.name())
+            .and_then(|costs| costs.get(enode.children))
+            .cloned()
+            .unwrap_or_else(|| {
+                BigInt::from(DagCostModel::enode_cost(
+                    &DEFAULT_COST_MODEL.0,
+                    egraph,
+                    func,
+                    enode,
+                ))
+            })
     }
 }
 

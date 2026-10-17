@@ -146,12 +146,17 @@ struct GreedyDagProducerRow<'egraph, C> {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 struct ProducerRowId(usize);
 
+/// Selected-occurrence projection shared by reconstruction and its typed cache.
+type TermObserver<'a, N> =
+    dyn FnMut(&TermDag, TermId, &ArcSort, Value, &[N]) -> Result<N, Error> + 'a;
+
 /// Mutable state shared by one term reconstruction traversal.
-struct TermReconstructionState<'a, C: MonoidCost> {
+struct TermReconstructionState<'a, C: MonoidCost, N: Clone> {
     termdag: &'a mut TermDag,
     candidate: &'a DagCandidate<C>,
-    cache: HashMap<InternId<DagCostKey>, TermId>,
+    cache: HashMap<InternId<DagCostKey>, (TermId, N)>,
     visiting: SecondarySet<DagCostKey>,
+    observe: &'a mut TermObserver<'a, N>,
 }
 
 // These traversals are naturally recursive, which keeps their invariants local
@@ -814,31 +819,42 @@ impl<'egraph, C: MonoidCost> GreedyDagExtractor<'egraph, C> {
     }
 
     /// Reconstruct one selected producer plan into the shared term DAG.
-    fn reconstruct_termdag_node_helper(
+    fn reconstruct_termdag_node_helper<N: Clone>(
         &self,
         value: Value,
         sort: &ArcSort,
-        state: &mut TermReconstructionState<'_, C>,
-    ) -> Option<TermId> {
+        state: &mut TermReconstructionState<'_, C, N>,
+    ) -> Result<Option<(TermId, N)>, Error> {
         stacker::maybe_grow(STACK_RED_ZONE, STACK_SEGMENT_SIZE, || {
-            let key = self.reachable_cost_key(sort, value)?;
-            if let Some(term) = state.cache.get(&key) {
-                return Some(*term);
+            let Some(key) = self.reachable_cost_key(sort, value) else {
+                return Ok(None);
+            };
+            if let Some(result) = state.cache.get(&key) {
+                return Ok(Some(result.clone()));
             }
             if !state.visiting.insert(key) {
-                return None;
+                return Ok(None);
             }
 
+            let mut children = Vec::new();
             let term = if sort.is_container_sort() {
                 let elements = self.egraph.container_inner_values(sort, value);
                 let mut ch_terms: Vec<TermId> = Vec::new();
                 for ch in elements.iter() {
-                    ch_terms.push(self.reconstruct_termdag_node_helper(ch.1, &ch.0, state)?);
+                    let Some((term, node)) =
+                        self.reconstruct_termdag_node_helper(ch.1, &ch.0, state)?
+                    else {
+                        return Ok(None);
+                    };
+                    ch_terms.push(term);
+                    children.push(node);
                 }
                 self.egraph
                     .reconstruct_container_value(sort, value, state.termdag, ch_terms)
             } else if sort.is_eq_sort() {
-                let producer_row_id = state.candidate.producer_choices.get(&key)?;
+                let Some(producer_row_id) = state.candidate.producer_choices.get(&key) else {
+                    return Ok(None);
+                };
                 let producer_row = &self.producer_rows.rows[producer_row_id.0];
                 let mut child_terms = Vec::with_capacity(producer_row.children.len());
                 for (child, child_sort) in producer_row
@@ -846,8 +862,13 @@ impl<'egraph, C: MonoidCost> GreedyDagExtractor<'egraph, C> {
                     .iter()
                     .zip(producer_row.func.func_type().input.iter())
                 {
-                    child_terms
-                        .push(self.reconstruct_termdag_node_helper(*child, child_sort, state)?);
+                    let Some((term, node)) =
+                        self.reconstruct_termdag_node_helper(*child, child_sort, state)?
+                    else {
+                        return Ok(None);
+                    };
+                    child_terms.push(term);
+                    children.push(node);
                 }
                 state
                     .termdag
@@ -857,31 +878,42 @@ impl<'egraph, C: MonoidCost> GreedyDagExtractor<'egraph, C> {
                     .reconstruct_base_value(sort, value, state.termdag)
             };
 
+            let node = (state.observe)(state.termdag, term, sort, value, &children)?;
             state.visiting.remove(key);
-            state.cache.insert(key, term);
-            Some(term)
+            state.cache.insert(key, (term, node.clone()));
+            Ok(Some((term, node)))
         })
     }
 
     /// Extract the best greedy-DAG term of a value from a given sort.
-    fn extract_best_with_sort(
+    fn extract_best_with_sort<N: Clone>(
         &self,
         termdag: &mut TermDag,
         value: Value,
         sort: ArcSort,
-    ) -> Option<ExtractedTerm<C>> {
-        let candidate = self.compute_cost_node(value, &sort)?;
+        observe: &mut impl FnMut(&TermDag, TermId, &ArcSort, Value, &[N]) -> Result<N, Error>,
+    ) -> Result<Option<(ExtractedTerm<C>, N)>, Error> {
+        let Some(candidate) = self.compute_cost_node(value, &sort) else {
+            return Ok(None);
+        };
         let mut state = TermReconstructionState {
             termdag,
             candidate: &candidate,
             cache: Default::default(),
             visiting: self.key_ids.secondary_set(),
+            observe,
         };
-        let term = self.reconstruct_termdag_node_helper(value, &sort, &mut state)?;
-        Some(ExtractedTerm {
-            cost: candidate.paid_costs.total().clone(),
-            term,
-        })
+        let Some((term, node)) = self.reconstruct_termdag_node_helper(value, &sort, &mut state)?
+        else {
+            return Ok(None);
+        };
+        Ok(Some((
+            ExtractedTerm {
+                cost: candidate.paid_costs.total().clone(),
+                term,
+            },
+            node,
+        )))
     }
 
     /// Extract root variants of an e-class using greedy-DAG costs.
@@ -890,20 +922,21 @@ impl<'egraph, C: MonoidCost> GreedyDagExtractor<'egraph, C> {
     /// Each candidate starts from its children's best immutable snapshots;
     /// overlapping producer choices are reconciled and the resulting closed
     /// plan is rescored. This is not a full k-best DAG extractor.
-    fn extract_variants_with_sort(
+    fn extract_variants_with_sort<N: Clone>(
         &self,
         termdag: &mut TermDag,
         value: Value,
         nvariants: usize,
         sort: ArcSort,
-    ) -> Vec<ExtractedTerm<C>> {
+        observe: &mut impl FnMut(&TermDag, TermId, &ArcSort, Value, &[N]) -> Result<N, Error>,
+    ) -> Result<Vec<(ExtractedTerm<C>, N)>, Error> {
         if nvariants == 0 {
-            return vec![];
+            return Ok(vec![]);
         }
 
         if sort.is_eq_sort() {
             let Some(target_key) = self.reachable_cost_key(&sort, value) else {
-                return vec![];
+                return Ok(vec![]);
             };
             let best_candidate = self.best_candidates.get(target_key);
             let mut root_variants: Vec<(ProducerRowId, Arc<DagCandidate<C>>)> = Vec::new();
@@ -914,7 +947,7 @@ impl<'egraph, C: MonoidCost> GreedyDagExtractor<'egraph, C> {
                 .as_ref()
                 .expect("target index is built for variant extraction");
             let Some(producer_row_ids) = by_target.get(target_key) else {
-                return vec![];
+                return Ok(vec![]);
             };
             for &producer_row_id in producer_row_ids {
                 let candidate = best_candidate
@@ -928,7 +961,7 @@ impl<'egraph, C: MonoidCost> GreedyDagExtractor<'egraph, C> {
                 }
             }
 
-            let mut res: Vec<ExtractedTerm<C>> = Vec::new();
+            let mut res = Vec::new();
             root_variants.sort_by(|(left_id, left), (right_id, right)| {
                 left.paid_costs
                     .total()
@@ -942,24 +975,30 @@ impl<'egraph, C: MonoidCost> GreedyDagExtractor<'egraph, C> {
                     candidate: &candidate,
                     cache: Default::default(),
                     visiting: self.key_ids.secondary_set(),
+                    observe,
                 };
-                if let Some(term) = self.reconstruct_termdag_node_helper(value, &sort, &mut state) {
-                    res.push(ExtractedTerm {
-                        cost: candidate.paid_costs.total().clone(),
-                        term,
-                    });
+                if let Some((term, node)) =
+                    self.reconstruct_termdag_node_helper(value, &sort, &mut state)?
+                {
+                    res.push((
+                        ExtractedTerm {
+                            cost: candidate.paid_costs.total().clone(),
+                            term,
+                        },
+                        node,
+                    ));
                 }
             }
 
-            res
+            Ok(res)
         } else {
             log::warn!(
                 "extracting multiple greedy-DAG variants for containers or primitives is not implemented, returning a single variant."
             );
-            if let Some(res) = self.extract_best_with_sort(termdag, value, sort) {
-                vec![res]
+            if let Some(res) = self.extract_best_with_sort(termdag, value, sort, observe)? {
+                Ok(vec![res])
             } else {
-                vec![]
+                Ok(vec![])
             }
         }
     }
@@ -986,17 +1025,42 @@ pub fn extract_best_greedy_dag<C: MonoidCost, M: DagCostModel<C>>(
     roots: Vec<(ArcSort, Value)>,
     cost_model: M,
 ) -> Result<ExtractedTerms<C>, Error> {
+    extract_best_greedy_dag_with_observer(egraph, roots, cost_model, |_, _, _, _, _| Ok(()))
+        .map(|(extracted, _)| extracted)
+}
+
+/// Extracts best terms while observing their selected typed occurrences.
+///
+/// The observer receives semantic children in native container or constructor
+/// order. Each immutable candidate has its own reconstruction cache so roots
+/// with different producer plans cannot reuse each other's consumer results.
+/// The returned roots retain request order, duplicates and availability, and
+/// share one term DAG. Observer failures propagate without being suppressed.
+#[allow(clippy::type_complexity)]
+pub fn extract_best_greedy_dag_with_observer<C: MonoidCost, M: DagCostModel<C>, N: Clone>(
+    egraph: &EGraph,
+    roots: Vec<(ArcSort, Value)>,
+    cost_model: M,
+    mut observe: impl FnMut(&TermDag, TermId, &ArcSort, Value, &[N]) -> Result<N, Error>,
+) -> Result<(ExtractedTerms<C>, Vec<Option<N>>), Error> {
     let extractor = GreedyDagExtractor::prepare(egraph, &roots, cost_model, false);
     let mut termdag = TermDag::default();
-    let extracted_roots = roots
-        .into_iter()
-        .map(|(sort, value)| extractor.extract_best_with_sort(&mut termdag, value, sort))
-        .collect();
-
-    Ok(ExtractedTerms {
-        termdag,
-        terms: extracted_roots,
-    })
+    let mut terms = Vec::new();
+    let mut nodes = Vec::new();
+    for (sort, value) in roots {
+        let result = extractor.extract_best_with_sort(&mut termdag, value, sort, &mut observe)?;
+        match result {
+            Some((term, node)) => {
+                terms.push(Some(term));
+                nodes.push(Some(node));
+            }
+            None => {
+                terms.push(None);
+                nodes.push(None);
+            }
+        }
+    }
+    Ok((ExtractedTerms { termdag, terms }, nodes))
 }
 
 /// Extract up to `nvariants` greedy-DAG root variants for each requested root.
@@ -1019,21 +1083,141 @@ pub fn extract_variants_greedy_dag<C: MonoidCost, M: DagCostModel<C>>(
     nvariants: usize,
     cost_model: M,
 ) -> Result<ExtractedTermVariants<C>, Error> {
+    extract_variants_greedy_dag_with_observer(
+        egraph,
+        roots,
+        nvariants,
+        cost_model,
+        |_, _, _, _, _| Ok(()),
+    )
+    .map(|(extracted, _)| extracted)
+}
+
+/// Extracts root variants with the typed occurrence contract of
+/// [`extract_best_greedy_dag_with_observer`]. Each selected variant retains its
+/// own consumer result even when its syntax or typed root equals another.
+#[allow(clippy::type_complexity)]
+pub fn extract_variants_greedy_dag_with_observer<C: MonoidCost, M: DagCostModel<C>, N: Clone>(
+    egraph: &EGraph,
+    roots: Vec<(ArcSort, Value)>,
+    nvariants: usize,
+    cost_model: M,
+    mut observe: impl FnMut(&TermDag, TermId, &ArcSort, Value, &[N]) -> Result<N, Error>,
+) -> Result<(ExtractedTermVariants<C>, Vec<Vec<N>>), Error> {
     if nvariants == 0 {
-        return Ok(ExtractedTermVariants {
-            termdag: TermDag::default(),
-            variants: roots.iter().map(|_| Vec::new()).collect(),
-        });
+        return Ok((
+            ExtractedTermVariants {
+                termdag: TermDag::default(),
+                variants: roots.iter().map(|_| Vec::new()).collect(),
+            },
+            roots.iter().map(|_| Vec::new()).collect(),
+        ));
     }
 
     let extractor = GreedyDagExtractor::prepare(egraph, &roots, cost_model, true);
     let mut termdag = TermDag::default();
-    let variants = roots
+    let mut variants = Vec::new();
+    let mut nodes = Vec::new();
+    for (sort, value) in roots {
+        let (terms, observed) = extractor
+            .extract_variants_with_sort(&mut termdag, value, nvariants, sort, &mut observe)?
+            .into_iter()
+            .unzip();
+        variants.push(terms);
+        nodes.push(observed);
+    }
+    Ok((ExtractedTermVariants { termdag, variants }, nodes))
+}
+
+#[cfg(test)]
+mod observer_tests {
+    use super::*;
+    use egglog::extract::AdditiveCostModel;
+
+    #[test]
+    fn selected_occurrences_keep_semantic_sorts_children_and_root_order() {
+        let mut graph = crate::new_experimental_egraph();
+        graph
+            .parse_and_run_program(None, "(datatype E (N i64) (P E E)) (sort Values (Vec E))")
+            .unwrap();
+        let roots: Vec<_> = [
+            "(P (N 1) (N 1))",
+            "(vec-of (N 1) (N 1))",
+            "1",
+            "(P (N 1) (N 1))",
+        ]
         .into_iter()
-        .map(|(sort, value)| {
-            extractor.extract_variants_with_sort(&mut termdag, value, nvariants, sort)
+        .map(|source| {
+            let expr = graph.parser.get_expr_from_string(None, source).unwrap();
+            graph.eval_expr(&expr).unwrap()
         })
         .collect();
+        let mut observed = Vec::new();
+        let (extracted, nodes) = extract_best_greedy_dag_with_observer(
+            &graph,
+            roots.clone(),
+            AdditiveCostModel::default(),
+            |terms, term, sort, value, children: &[usize]| {
+                let index = observed.len();
+                observed.push((
+                    sort.name().to_owned(),
+                    value,
+                    children.to_vec(),
+                    terms.to_string(term),
+                ));
+                Ok(index)
+            },
+        )
+        .unwrap();
+        assert_eq!(extracted.terms.len(), 4);
+        assert_eq!(nodes.len(), 4);
+        for ((sort, value), node) in roots.iter().zip(&nodes) {
+            let node = &observed[node.unwrap()];
+            assert_eq!((&node.0, node.1), (&sort.name().to_owned(), *value));
+        }
+        for root in [0, 1, 3] {
+            let node = &observed[nodes[root].unwrap()];
+            assert_eq!(node.2.len(), 2);
+            assert_eq!(node.2[0], node.2[1], "candidate-local repeated child cache");
+            assert_eq!(observed[node.2[0]].0, "E");
+        }
+        assert_eq!(observed[nodes[2].unwrap()].0, "i64");
+        assert_eq!(
+            extracted.terms[0].as_ref().unwrap().term,
+            extracted.terms[3].as_ref().unwrap().term,
+            "shared forest storage"
+        );
+        assert_eq!(extracted.terms[0].as_ref().unwrap().cost, 3);
+        assert_eq!(extracted.terms[1].as_ref().unwrap().cost, 2);
 
-    Ok(ExtractedTermVariants { termdag, variants })
+        let error = extract_best_greedy_dag_with_observer(
+            &graph,
+            roots.clone(),
+            AdditiveCostModel::default(),
+            |_, _, _, _, _: &[()]| {
+                Err::<(), _>(Error::ExtractError("owned observer failure".into()))
+            },
+        )
+        .unwrap_err();
+        assert!(
+            matches!(error, Error::ExtractError(message) if message == "owned observer failure")
+        );
+
+        let mut calls = 0;
+        let (empty, nodes) = extract_variants_greedy_dag_with_observer(
+            &graph,
+            roots,
+            0,
+            AdditiveCostModel::default(),
+            |_, _, _, _, _: &[()]| {
+                calls += 1;
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(calls, 0);
+        assert_eq!(empty.variants.len(), 4);
+        assert!(empty.variants.iter().all(Vec::is_empty));
+        assert!(nodes.iter().all(Vec::is_empty));
+    }
 }
