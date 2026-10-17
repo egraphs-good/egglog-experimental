@@ -187,7 +187,7 @@ fn generate_cost_table_commands_from_variants(variants: &[Variant]) -> Vec<Comma
         .collect::<Vec<_>>()
 }
 
-fn get_cost_table_name(name: &str) -> String {
+pub(crate) fn get_cost_table_name(name: &str) -> String {
     format!("cost_table_{name}")
 }
 

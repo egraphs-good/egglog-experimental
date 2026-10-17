@@ -365,6 +365,15 @@ pub(super) fn export(session: &mut Session) -> Result<pb::EGraphSnapshot, egglog
             relation_sorts.insert(function.func_type().output.name().to_owned());
         }
         tables.insert(native);
+        if matches!(
+            declaration.kind,
+            Some(pb::declaration::Kind::Constructor(_))
+        ) {
+            let cost_table = crate::set_cost::get_cost_table_name(&native_name("call", name));
+            if session.graph.get_function(&cost_table).is_some() {
+                tables.insert(cost_table);
+            }
+        }
     }
     for (name, _) in session.graph.functions_iter() {
         if !tables.contains(name) {
@@ -404,6 +413,7 @@ pub(super) fn export(session: &mut Session) -> Result<pb::EGraphSnapshot, egglog
         });
     }
     let mut row_commands = vec![];
+    let mut assigned_costs = vec![];
     let mut subsumed = vec![];
     for declaration in &declarations {
         let (name, relation, constructor) = match &declaration.kind {
@@ -425,6 +435,18 @@ pub(super) fn export(session: &mut Session) -> Result<pb::EGraphSnapshot, egglog
             })?;
         }
         for (args, value, is_subsumed) in rows {
+            let assigned_cost = if constructor && !relation {
+                let cost_table = crate::set_cost::get_cost_table_name(&native);
+                if session.graph.get_function(&cost_table).is_some() {
+                    session.graph.read(|state| {
+                        egglog::Read::lookup(&state, &cost_table, egglog::RawValues(args.clone()))
+                    })?
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
             let args = signature
                 .input
                 .iter()
@@ -435,6 +457,13 @@ pub(super) fn export(session: &mut Session) -> Result<pb::EGraphSnapshot, egglog
                 func: name.clone(),
                 args,
             };
+            if let Some(cost) = assigned_cost {
+                let cost = export.value(session.graph.get_sort_by_name("i64").unwrap(), cost)?;
+                assigned_costs.push(pb::action::Kind::SetCost(pb::SetCost {
+                    target: Some(call.clone()),
+                    cost: Some(cost),
+                }));
+            }
             if constructor {
                 let sort = if relation {
                     session.graph.get_sort_by_name("Unit").unwrap()
@@ -480,21 +509,19 @@ pub(super) fn export(session: &mut Session) -> Result<pb::EGraphSnapshot, egglog
         }
     }
     export.close_values()?;
-    export
-        .program
-        .commands
-        .extend(
-            row_commands
-                .into_iter()
-                .chain(subsumed)
-                .map(|kind| pb::Command {
-                    kind: Some(pb::command::Kind::Action(pb::Action {
-                        kind: Some(kind),
-                        ..Default::default()
-                    })),
+    export.program.commands.extend(
+        row_commands
+            .into_iter()
+            .chain(assigned_costs)
+            .chain(subsumed)
+            .map(|kind| pb::Command {
+                kind: Some(pb::command::Kind::Action(pb::Action {
+                    kind: Some(kind),
                     ..Default::default()
-                }),
-        );
+                })),
+                ..Default::default()
+            }),
+    );
     let cost_sort = export.sort(session.graph.get_sort_by_name("i64").unwrap())?;
     Ok(pb::EGraphSnapshot {
         options: Some(pb::EGraphOptions {

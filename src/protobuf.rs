@@ -829,6 +829,16 @@ impl Session {
                 ))
             })
             .collect::<Result<_, String>>()?;
+        let constructor_targets: HashSet<_> = authored
+            .declarations
+            .iter()
+            .filter_map(|declaration| match &declaration.kind {
+                Some(pb::declaration::Kind::Constructor(constructor)) => {
+                    Some(constructor.name.clone())
+                }
+                _ => None,
+            })
+            .collect();
         for (declaration, added) in program.declarations.iter().zip(&added) {
             if !added {
                 continue;
@@ -946,9 +956,13 @@ impl Session {
         }
         validate_host_declarations(program, &mut staged.graph)?;
         validate_node_graph(program)?;
-        let scoped_actions = classify_union_actions(program)?;
+        let scoped_actions = classify_union_actions(
+            program,
+            &constructor_targets,
+            self.mode == pb::ExecutionMode::Normal,
+        )?;
         if !scoped_actions.is_empty() && self.mode != pb::ExecutionMode::Normal {
-            return Err("generalized Union actions require normal execution mode".into());
+            return Err("scoped actions require normal execution mode".into());
         }
         lower_builtin_calls(program, &staged.graph, &signatures)?;
         for index in declaration_order(program, &mut staged.graph)? {
@@ -1017,6 +1031,40 @@ impl Session {
                     .resolve_command_before_proofs(command.clone())
                     .map_err(|error| error.to_string())?;
             }
+            if self.mode == pb::ExecutionMode::Normal
+                && let Command::Constructor { name, schema, .. } = &command
+            {
+                let cost_table = crate::set_cost::get_cost_table_name(name);
+                if staged.graph.get_function(&cost_table).is_some()
+                    || staged.graph.type_info().is_primitive(&cost_table)
+                    || staged.graph.get_sort_by_name(&cost_table).is_some()
+                {
+                    return Err(
+                        format!("native cost table namespace collision: {cost_table}").into(),
+                    );
+                }
+                let cost_table = Command::Function {
+                    span: native_span(program, declaration.span.as_ref())?,
+                    name: cost_table,
+                    schema: ast::Schema::new(schema.input.clone(), "i64".into()),
+                    merge: Some(Expr::Var(span!(), "new".into())),
+                    hidden: true,
+                    let_binding: false,
+                    term_constructor: None,
+                    unextractable: true,
+                };
+                staged
+                    .graph
+                    .resolve_command_before_proofs(cost_table.clone())
+                    .map_err(|error| error.to_string())?;
+                installations.push(Installation {
+                    command: Some(cost_table),
+                    site: pb::maintenance_site::Target::Declaration(index as u32),
+                    span: declaration.span,
+                    declaration: None,
+                    ruleset: None,
+                });
+            }
             pending_declarations.insert(declaration_indices[index].unwrap());
             installations.push(Installation {
                 command: Some(command),
@@ -1026,7 +1074,28 @@ impl Session {
                 ruleset: None,
             });
         }
-        for node in &program.nodes {
+        for (index, node) in program.nodes.iter().enumerate() {
+            if let Some(pb::node::Kind::GetCost(call)) = &node.kind {
+                if self.mode != pb::ExecutionMode::Normal {
+                    return Err("cost reads currently require normal execution mode".into());
+                }
+                let (signature, _) = signatures
+                    .get(&call.func)
+                    .ok_or_else(|| format!("unknown cost target {}", call.func))?;
+                if !constructor_targets.contains(&call.func) {
+                    return Err("GetCost requires a constructor target".into());
+                }
+                if node_sort(program, index as u32)? != "i64"
+                    || signature.input.len() != call.args.len()
+                {
+                    return Err("GetCost signature mismatch".into());
+                }
+                for (argument, expected) in call.args.iter().zip(&signature.input) {
+                    if node_sort(program, *argument)? != *expected {
+                        return Err(format!("cost argument sort mismatch for {}", call.func).into());
+                    }
+                }
+            }
             if let Some(pb::node::Kind::Call(call)) = &node.kind
                 && let Some((signature, _)) = signatures.get(&call.func)
             {
@@ -1061,6 +1130,18 @@ impl Session {
                     Some(ast::FunctionSubtype::Custom),
                 ),
                 Some(pb::action::Kind::Delete(call)) => (call, None),
+                Some(pb::action::Kind::SetCost(set)) => {
+                    if self.mode != pb::ExecutionMode::Normal {
+                        return Err("cost writes currently require normal execution mode".into());
+                    }
+                    if node_sort(program, set.cost.ok_or("missing cost value")?)? != "i64" {
+                        return Err("assigned cost must have the handle's i64 cost sort".into());
+                    }
+                    (
+                        set.target.as_ref().ok_or("missing cost target")?,
+                        Some(ast::FunctionSubtype::Constructor),
+                    )
+                }
                 _ => continue,
             };
             let (_, subtype) = signatures.get(&call.func).ok_or_else(|| {
@@ -1073,6 +1154,11 @@ impl Session {
             })?;
             if subtype.is_none() || expected.is_some_and(|expected| *subtype != Some(expected)) {
                 return Err(format!("invalid action target subtype: {}", call.func).into());
+            }
+            if matches!(action.kind, Some(pb::action::Kind::SetCost(_)))
+                && !constructor_targets.contains(&call.func)
+            {
+                return Err("SetCost requires a constructor target".into());
             }
         }
         for rule in &program.rules {
@@ -1225,7 +1311,11 @@ impl Session {
                     });
                     let rule = &program.rules[local_rule];
                     installations.push(Installation {
-                        command: Some(lower_rule(program, rule, &holder, &name)?),
+                        command: Some(lower_rule_cost_deletes(
+                            lower_rule(program, rule, &holder, &name)?,
+                            &constructor_targets,
+                            self.mode,
+                        )),
                         site: site.clone(),
                         span: rule.span.or(span),
                         declaration: None,
@@ -1318,12 +1408,16 @@ impl Session {
             .collect();
         for (index, rule) in program.rules.iter().enumerate() {
             if !used.contains(&index) && occurrences.rules[index] >= self.rules.len() {
-                validation.push(lower_rule(
-                    program,
-                    rule,
-                    "",
-                    &format!("__protobuf_{}_unused_{index}", staged.request),
-                )?);
+                validation.push(lower_rule_cost_deletes(
+                    lower_rule(
+                        program,
+                        rule,
+                        "",
+                        &format!("__protobuf_{}_unused_{index}", staged.request),
+                    )?,
+                    &constructor_targets,
+                    self.mode,
+                ));
             }
         }
         for (index, command) in program.commands.iter().enumerate() {
@@ -1345,6 +1439,10 @@ impl Session {
         let mut values = HashMap::new();
         for (index, command) in program.commands.iter().enumerate() {
             if context.scoped_actions.contains(&index) {
+                let mut command = command;
+                while let Some(pb::command::Kind::Fail(child)) = &command.kind {
+                    command = child;
+                }
                 let Some(pb::command::Kind::Action(action)) = &command.kind else {
                     unreachable!("only direct actions have Union frames")
                 };
@@ -1653,6 +1751,21 @@ impl Session {
         failure_site: &mut Option<ExecutionFailureSite>,
     ) -> Result<(), egglog::Error> {
         let output = match command.kind.as_ref().unwrap() {
+            pb::command::Kind::Fail(child)
+                if context
+                    .scoped_actions
+                    .contains(&(location.path[0] as usize)) =>
+            {
+                let result =
+                    self.execute(program, child, context, location, response, failure_site);
+                *failure_site = None;
+                if result.is_ok() {
+                    return Err(egglog::Error::ExpectFail(
+                        native_span(program, command.span.as_ref()).expect("validated span"),
+                    ));
+                }
+                None
+            }
             pb::command::Kind::Freeze(_) => {
                 Some(pb::command_output::Kind::Snapshot(freeze::export(self)?))
             }
@@ -2313,7 +2426,7 @@ fn project_names(program: &mut pb::Program, definitions: &pb::Program) -> Native
         }
     }
     for node in &mut program.nodes {
-        if let Some(pb::node::Kind::Call(call)) = &mut node.kind {
+        if let Some(pb::node::Kind::Call(call) | pb::node::Kind::GetCost(call)) = &mut node.kind {
             project_call(&mut call.func);
         } else if let Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
             value: Some(pb::primitive_value::Value::PartialCall(call)),
@@ -2345,6 +2458,11 @@ fn project_names(program: &mut pb::Program, definitions: &pb::Program) -> Native
     {
         match &mut action.kind {
             Some(pb::action::Kind::Set(set)) => {
+                if let Some(call) = &mut set.target {
+                    project_call(&mut call.func);
+                }
+            }
+            Some(pb::action::Kind::SetCost(set)) => {
                 if let Some(call) = &mut set.target {
                     project_call(&mut call.func);
                 }
@@ -3142,6 +3260,14 @@ fn lower_expression(
                 .map(|argument| lower_expression(program, *argument, visiting, remaining))
                 .collect::<Result<_, _>>()?,
         ),
+        pb::node::Kind::GetCost(call) => Expr::Call(
+            span,
+            crate::set_cost::get_cost_table_name(&call.func),
+            call.args
+                .iter()
+                .map(|argument| lower_expression(program, *argument, visiting, remaining))
+                .collect::<Result<_, _>>()?,
+        ),
         pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
             value: Some(pb::primitive_value::Value::PartialCall(call)),
         }) => {
@@ -3384,6 +3510,10 @@ fn validate_relation_uses(program: &pb::Program, saved: &pb::Program) -> Result<
                 }
                 Some(call)
             }
+            Some(pb::action::Kind::SetCost(set)) => {
+                value(set.cost.ok_or("missing cost value")?)?;
+                Some(set.target.as_ref().ok_or("missing cost target")?)
+            }
             Some(pb::action::Kind::Subsume(call)) => {
                 if relations.contains(call.func.as_str()) {
                     return Err("relation rows cannot be Subsumed".into());
@@ -3480,7 +3610,7 @@ fn validate_node_graph(program: &pb::Program) -> Result<(), String> {
         let sort = node_sort(program, index as u32)?;
         native_span(program, node.span.as_ref())?;
         let children = match &node.kind {
-            Some(pb::node::Kind::Call(call)) => call.args.clone(),
+            Some(pb::node::Kind::Call(call) | pb::node::Kind::GetCost(call)) => call.args.clone(),
             Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
                 value: Some(pb::primitive_value::Value::PartialCall(call)),
             })) => {
@@ -3571,14 +3701,26 @@ fn action_roots(action: &pb::Action) -> Result<Vec<u32>, String> {
             .collect(),
         pb::action::Kind::Delete(call) | pb::action::Kind::Subsume(call) => call.args.clone(),
         pb::action::Kind::Panic(_) => vec![],
-        _ => return Err("SetCost is not supported yet".into()),
+        pb::action::Kind::SetCost(set) => set
+            .target
+            .as_ref()
+            .ok_or("missing cost target")?
+            .args
+            .iter()
+            .copied()
+            .chain([set.cost.ok_or("missing cost value")?])
+            .collect(),
     })
 }
 
 // Preclassify the whole request, not just the current command. A binary first
 // use must capture immediately if a later action reuses that same occurrence.
 // Rule heads and Fail/loop bodies retain their legacy independent boundaries.
-fn classify_union_actions(program: &pb::Program) -> Result<HashSet<usize>, String> {
+fn classify_union_actions(
+    program: &pb::Program,
+    constructor_targets: &HashSet<String>,
+    constructor_costs: bool,
+) -> Result<HashSet<usize>, String> {
     let unions = |action: &pb::Action| -> Result<HashSet<u32>, String> {
         let mut pending = action_roots(action)?;
         let mut seen = HashSet::new();
@@ -3598,7 +3740,7 @@ fn classify_union_actions(program: &pb::Program) -> Result<HashSet<usize>, Strin
                     unions.insert(index);
                     pending.extend(&union.members);
                 }
-                Some(pb::node::Kind::Call(call))
+                Some(pb::node::Kind::Call(call) | pb::node::Kind::GetCost(call))
                 | Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
                     value: Some(pb::primitive_value::Value::PartialCall(call)),
                 })) => pending.extend(&call.args),
@@ -3622,14 +3764,24 @@ fn classify_union_actions(program: &pb::Program) -> Result<HashSet<usize>, Strin
                 continue;
             };
             let reached = unions(action)?;
-            if reached.is_empty() {
+            let cost_action = matches!(action.kind, Some(pb::action::Kind::SetCost(_)))
+                || constructor_costs
+                    && matches!(&action.kind, Some(pb::action::Kind::Delete(call)) if constructor_targets.contains(&call.func));
+            if reached.is_empty() && !cost_action {
                 continue;
             }
-            let generalized = reached.iter().any(|union| uses[union] > 1)
+            let generalized = cost_action
+                || reached.iter().any(|union| uses[union] > 1)
                 || lower_action(program, action).is_err();
             if generalized {
                 if !std::ptr::eq(command, child) {
-                    return Err("generalized/reused Union identity retention under Fail or loops is not supported yet".into());
+                    let mut wrapped = command;
+                    while let Some(pb::command::Kind::Fail(child)) = &wrapped.kind {
+                        wrapped = child;
+                    }
+                    if !cost_action || !std::ptr::eq(wrapped, child) {
+                        return Err("generalized/reused Union identity retention under Fail or loops is not supported yet".into());
+                    }
                 }
                 check_variables(program, &action_roots(action)?, &mut HashMap::new(), false)?;
                 scoped.insert(index);
@@ -3690,9 +3842,17 @@ fn eval_union_action(
         Enter(u32),
         Call(u32, usize),
         Member(u32, usize),
+        CostTarget,
     }
     let error = egglog::Error::BackendError;
     let roots = action_roots(action).map_err(error)?;
+    let cost_table = match &action.kind {
+        Some(pb::action::Kind::Delete(call)) => {
+            let name = crate::set_cost::get_cost_table_name(&call.func);
+            graph.get_function(&name).is_some().then_some(name)
+        }
+        _ => None,
+    };
     let mut slots: HashMap<_, _> = values
         .keys()
         .map(|index| (*index, format!("__egglog_proto_union_{index}")))
@@ -3705,11 +3865,25 @@ fn eval_union_action(
         .map_err(error)?;
     inputs.sort_by(|a, b| a.0.cmp(&b.0));
     let (result, captured) = graph.eval_scoped_actions(&inputs, execute, |builder| {
-        let mut pending: Vec<_> = roots
-            .iter()
-            .rev()
-            .map(|index| Walk::Enter(*index))
-            .collect();
+        let mut pending = if let Some(pb::action::Kind::SetCost(set)) = &action.kind {
+            let mut pending = vec![Walk::Enter(set.cost.unwrap()), Walk::CostTarget];
+            pending.extend(
+                set.target
+                    .as_ref()
+                    .unwrap()
+                    .args
+                    .iter()
+                    .rev()
+                    .map(|index| Walk::Enter(*index)),
+            );
+            pending
+        } else {
+            roots
+                .iter()
+                .rev()
+                .map(|index| Walk::Enter(*index))
+                .collect()
+        };
         let mut results = Vec::<Expr>::new();
         let mut temporary = 0usize;
         let mut remaining = 65_536usize;
@@ -3763,6 +3937,7 @@ fn eval_union_action(
                             }
                         }
                         pb::node::Kind::Call(call)
+                        | pb::node::Kind::GetCost(call)
                         | pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
                             value: Some(pb::primitive_value::Value::PartialCall(call)),
                         }) => {
@@ -3792,6 +3967,9 @@ fn eval_union_action(
                     let mut args = results.split_off(results.len() - arity);
                     let function = match node.kind.as_ref().unwrap() {
                         pb::node::Kind::Call(call) => call.func.clone(),
+                        pb::node::Kind::GetCost(call) => {
+                            crate::set_cost::get_cost_table_name(&call.func)
+                        }
                         pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
                             value: Some(pb::primitive_value::Value::PartialCall(call)),
                         }) => {
@@ -3840,6 +4018,19 @@ fn eval_union_action(
                         results.push(Expr::Var(span, slots[&index].clone()));
                     }
                 }
+                Walk::CostTarget => {
+                    let Some(pb::action::Kind::SetCost(set)) = &action.kind else {
+                        unreachable!()
+                    };
+                    builder.action(Action::Expr(
+                        native_span(program, action.span.as_ref()).map_err(error)?,
+                        Expr::Call(
+                            native_span(program, action.span.as_ref()).map_err(error)?,
+                            set.target.as_ref().unwrap().func.clone(),
+                            results.clone(),
+                        ),
+                    ))?;
+                }
             }
         }
         let span = native_span(program, action.span.as_ref()).map_err(error)?;
@@ -3852,6 +4043,29 @@ fn eval_union_action(
                     set.target.as_ref().unwrap().func.clone(),
                     results,
                     value,
+                )
+            }
+            pb::action::Kind::SetCost(set) => {
+                let value = results.pop().unwrap();
+                Action::Set(
+                    span,
+                    crate::set_cost::get_cost_table_name(&set.target.as_ref().unwrap().func),
+                    results,
+                    value,
+                )
+            }
+            pb::action::Kind::Delete(call) if cost_table.is_some() => {
+                builder.action(Action::Change(
+                    span.clone(),
+                    ast::Change::Delete,
+                    call.func.clone(),
+                    results.clone(),
+                ))?;
+                Action::Change(
+                    span,
+                    ast::Change::Delete,
+                    cost_table.clone().unwrap(),
+                    results,
                 )
             }
             pb::action::Kind::Delete(call) | pb::action::Kind::Subsume(call) => Action::Change(
@@ -4011,6 +4225,49 @@ fn ruleset_selection(
     result
 }
 
+// Native local bindings preserve the addressed key across deleting the row and
+// its auxiliary annotation. This is the same ordinary action/compiler path;
+// functions and relation predicates have no constructor cost to remove.
+fn lower_rule_cost_deletes(
+    mut command: Command,
+    constructors: &HashSet<String>,
+    mode: pb::ExecutionMode,
+) -> Command {
+    if mode == pb::ExecutionMode::Normal
+        && let Command::Rule { rule } = &mut command
+    {
+        let mut head = Vec::new();
+        for (index, action) in std::mem::take(&mut rule.head.0).into_iter().enumerate() {
+            if let Action::Change(span, ast::Change::Delete, name, args) = &action
+                && constructors.contains(name)
+            {
+                let mut key = Vec::with_capacity(args.len());
+                for (argument, value) in args.iter().enumerate() {
+                    let local = format!("__egglog_proto_delete_{index}_{argument}");
+                    head.push(Action::Let(span.clone(), local.clone(), value.clone()));
+                    key.push(Expr::Var(span.clone(), local));
+                }
+                head.push(Action::Change(
+                    span.clone(),
+                    ast::Change::Delete,
+                    name.clone(),
+                    key.clone(),
+                ));
+                head.push(Action::Change(
+                    span.clone(),
+                    ast::Change::Delete,
+                    crate::set_cost::get_cost_table_name(name),
+                    key,
+                ));
+            } else {
+                head.push(action);
+            }
+        }
+        rule.head.0 = head;
+    }
+    command
+}
+
 fn lower_rule(
     program: &pb::Program,
     rule: &pb::RuleDecl,
@@ -4154,13 +4411,14 @@ fn check_variables(
                     _ => return Err(format!("unbound or inconsistently typed variable {name}")),
                 }
             }
-            pb::node::Kind::Call(call) => pending.extend(&call.args),
+            pb::node::Kind::Call(call) | pb::node::Kind::GetCost(call) => {
+                pending.extend(&call.args)
+            }
             pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
                 value: Some(pb::primitive_value::Value::PartialCall(call)),
             }) => pending.extend(&call.args),
             pb::node::Kind::Union(union) => pending.extend(&union.members),
             pb::node::Kind::PrimitiveValue(_) => (),
-            _ => return Err("unsupported variable-bearing node".into()),
         }
     }
     Ok(())
