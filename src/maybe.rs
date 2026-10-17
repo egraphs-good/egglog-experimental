@@ -53,8 +53,22 @@ impl Presort for MaybeSort {
         Some(TypeId::of::<MaybeContainer>())
     }
 
-    fn builtin_definitions() -> Vec<egglog::proto::Program> {
-        use egglog::proto as pb;
+    fn family_description() -> Option<egglog::builtin::FamilyDescription> {
+        Some(egglog::builtin::FamilyDescription {
+            name: "Maybe".into(),
+            arity: 1,
+        })
+    }
+
+    fn builtin_definitions() -> Vec<egglog::builtin::BuiltinDescription> {
+        use egglog::builtin::SortPattern;
+        let patterns = vec![
+            SortPattern::Param(0),
+            SortPattern::Family {
+                name: "Maybe".into(),
+                args: vec![SortPattern::Param(0)],
+            },
+        ];
         let mut definitions: Vec<_> = [
             ("none", "maybe-none", vec![], 1),
             ("some", "maybe-some", vec![("value", 0)], 1),
@@ -68,145 +82,28 @@ impl Presort for MaybeSort {
         ]
         .into_iter()
         .map(|(key, alias, inputs, output)| {
-            let receiver = matches!(key, "unwrap" | "unwrap_or");
-            let parameters = inputs.iter().enumerate().skip(usize::from(receiver));
-            pb::Program {
-                ir_version: 1,
-                sorts: vec![
-                    pb::Sort {
-                        kind: Some(pb::sort::Kind::Var(0)),
-                        ..Default::default()
-                    },
-                    pb::Sort {
-                        kind: Some(pb::sort::Kind::Family(pb::HostSort {
-                            name: "Maybe".into(),
-                            args: vec![0],
-                        })),
-                        ..Default::default()
-                    },
-                ],
-                declarations: vec![
-                    pb::Declaration {
-                        kind: Some(pb::declaration::Kind::HostSortFamily(pb::HostSortFamily {
-                            name: "Maybe".into(),
-                            arity: 1,
-                            bindings: Some(pb::SortBindings {
-                                python: Some(pb::TypeBinding {
-                                    path: vec!["egglog".into(), "builtins".into(), "Maybe".into()],
-                                    type_params: vec!["T".into()],
-                                }),
-                                rust: Some(pb::TypeBinding {
-                                    path: vec![
-                                        "egglog_experimental".into(),
-                                        "typed".into(),
-                                        "builtins".into(),
-                                        "Maybe".into(),
-                                    ],
-                                    type_params: vec!["T".into()],
-                                }),
-                                ..Default::default()
-                            }),
-                        })),
-                        ..Default::default()
-                    },
-                    pb::Declaration {
-                        kind: Some(pb::declaration::Kind::HostPrimitive(pb::HostPrimitive {
-                            name: format!("egglog.experimental.maybe.{key}"),
-                            typing: Some(pb::host_primitive::Typing::Signature(
-                                pb::GenericSignature {
-                                    type_params: vec!["T".into()],
-                                    inputs: inputs
-                                        .iter()
-                                        .map(|(name, sort)| pb::Arg {
-                                            name: (*name).into(),
-                                            sort: *sort,
-                                        })
-                                        .collect(),
-                                    output: Some(output),
-                                    ..Default::default()
-                                },
-                            )),
-                        })),
-                        bindings: Some(pb::CallableBindings {
-                            python: Some(pb::PythonBindings {
-                                views: vec![pb::PythonCallable {
-                                    kind: if receiver {
-                                        pb::PythonCallKind::Method
-                                    } else {
-                                        pb::PythonCallKind::ClassMethod
-                                    }
-                                    .into(),
-                                    path: vec![key.into()],
-                                    owner: Some(pb::BindingOwner {
-                                        kind: Some(pb::binding_owner::Kind::Sort(1)),
-                                    }),
-                                    receiver: receiver.then_some(0),
-                                    params: parameters
-                                        .clone()
-                                        .map(|(i, (name, _))| pb::PythonParameter {
-                                            core_input: Some(i as u32),
-                                            name: (*name).into(),
-                                            default_expr: None,
-                                        })
-                                        .collect(),
-                                    ..Default::default()
-                                }],
-                            }),
-                            rust: Some(pb::RustBindings {
-                                views: vec![pb::RustCallable {
-                                    path: vec![key.into()],
-                                    owner: Some(pb::BindingOwner {
-                                        kind: Some(pb::binding_owner::Kind::Sort(1)),
-                                    }),
-                                    receiver: receiver.then_some(pb::RustReceiver {
-                                        core_input: Some(0),
-                                        borrowed: true,
-                                    }),
-                                    params: parameters
-                                        .map(|(i, (name, _))| pb::RustParameter {
-                                            core_input: Some(i as u32),
-                                            name: (*name).into(),
-                                            borrowed: false,
-                                        })
-                                        .collect(),
-                                    ..Default::default()
-                                }],
-                            }),
-                            egglog: Some(pb::EgglogBindings {
-                                views: vec![pb::EgglogCallable {
-                                    symbol: alias.into(),
-                                    datatype_member: false,
-                                }],
-                            }),
-                        }),
-                        ..Default::default()
-                    },
-                ],
-                ..Default::default()
-            }
+            signature_definition(
+                &format!("egglog.experimental.maybe.{key}"),
+                alias,
+                patterns.clone(),
+                &["T"],
+                &inputs,
+                output,
+            )
         })
         .collect();
         definitions.push(signature_definition(
             "egglog.experimental.maybe.catch",
             "unstable-catch",
             vec![
-                pb::Sort {
-                    kind: Some(pb::sort::Kind::Var(0)),
-                    ..Default::default()
+                SortPattern::Param(0),
+                SortPattern::Family {
+                    name: "Maybe".into(),
+                    args: vec![SortPattern::Param(0)],
                 },
-                pb::Sort {
-                    kind: Some(pb::sort::Kind::Family(pb::HostSort {
-                        name: "Maybe".into(),
-                        args: vec![0],
-                    })),
-                    ..Default::default()
-                },
-                pb::Sort {
-                    kind: Some(pb::sort::Kind::Func(pb::FuncSort {
-                        params: vec![],
-                        result: 0,
-                    })),
-                    ..Default::default()
+                SortPattern::Function {
+                    inputs: vec![],
+                    output: Box::new(SortPattern::Param(0)),
                 },
             ],
             &["T"],
@@ -217,27 +114,15 @@ impl Presort for MaybeSort {
             "egglog.experimental.maybe.match",
             "unstable-maybe-match",
             vec![
-                pb::Sort {
-                    kind: Some(pb::sort::Kind::Var(0)),
-                    ..Default::default()
+                SortPattern::Param(0),
+                SortPattern::Param(1),
+                SortPattern::Family {
+                    name: "Maybe".into(),
+                    args: vec![SortPattern::Param(0)],
                 },
-                pb::Sort {
-                    kind: Some(pb::sort::Kind::Var(1)),
-                    ..Default::default()
-                },
-                pb::Sort {
-                    kind: Some(pb::sort::Kind::Family(pb::HostSort {
-                        name: "Maybe".into(),
-                        args: vec![0],
-                    })),
-                    ..Default::default()
-                },
-                pb::Sort {
-                    kind: Some(pb::sort::Kind::Func(pb::FuncSort {
-                        params: vec![0],
-                        result: 1,
-                    })),
-                    ..Default::default()
+                SortPattern::Function {
+                    inputs: vec![SortPattern::Param(0)],
+                    output: Box::new(SortPattern::Param(1)),
                 },
             ],
             &["T", "U"],

@@ -13,13 +13,14 @@
 //! state, with derived indexes for names and diagnostics. No source or previously
 //! supplied AST is accepted by this boundary.
 
+use crate::builtin::{PortableEGraph, PortablePrimitive, PortableTypeInfo};
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::sync::Arc;
 
+use crate::proto as pb;
 use egglog::ast::{self, Action, Command, Expr, Fact, Literal};
-use egglog::proto as pb;
 use egglog::{ArcSort, EGraph, Term, TermDag, TermId, Value, span};
 use egglog::{ExecutionEvent, ExecutionOrigin, NativeLoopStop};
 use egglog_ast::span::{EgglogSpan, SrcFile};
@@ -380,7 +381,7 @@ impl Engine {
         };
         let catalog = graph
             .type_info()
-            .builtin_catalog()
+            .portable_builtin_catalog()
             .map_err(TransportError)?
             .definitions;
         for (index, sort) in program.sorts.iter().enumerate() {
@@ -706,7 +707,7 @@ impl Session {
             .enumerate()
             .filter_map(|(index, d)| (!pending_declarations.contains(&index)).then_some(d))
             .collect();
-        let (retained_sets, retained_rules) = egglog::builtin::definitions::retain_rulesets(
+        let (retained_sets, retained_rules) = crate::builtin::definitions::retain_rulesets(
             &mut self.definitions,
             &published.into_iter().collect::<Vec<_>>(),
         )
@@ -751,15 +752,19 @@ impl Session {
             .request
             .checked_add(1)
             .ok_or("request identity space exhausted")?;
-        let catalog = staged.graph.type_info().builtin_catalog()?.definitions;
+        let catalog = staged
+            .graph
+            .type_info()
+            .portable_builtin_catalog()?
+            .definitions;
         if staged.definitions.ir_version == 0 {
             staged.definitions = catalog.clone();
         }
         let mut next_declaration = staged.definitions.declarations.len();
         let added =
-            egglog::builtin::definitions::reconcile_declarations(program, &mut staged.definitions)?;
+            crate::builtin::definitions::reconcile_declarations(program, &mut staged.definitions)?;
         let occurrences =
-            egglog::builtin::definitions::reconcile_rulesets(program, &mut staged.definitions)?;
+            crate::builtin::definitions::reconcile_rulesets(program, &mut staged.definitions)?;
         let declaration_indices: Vec<_> = added
             .iter()
             .map(|added| {
@@ -2639,7 +2644,7 @@ fn materialize_sorts(
         }
         if let Some(existing) = graph.get_sort_by_name(&name) {
             let mut expected = vec![];
-            let expected_id = egglog::builtin::import_sort(&program.sorts, index, &mut expected)?;
+            let expected_id = crate::builtin::import_sort(&program.sorts, index, &mut expected)?;
             if graph.export_sort(existing, &mut expected)? != expected_id {
                 return Err("private sort name collision".into());
             }
@@ -2832,9 +2837,12 @@ fn lower_container_values(program: &mut pb::Program) -> Result<Vec<u32>, String>
                 pb::primitive_value::Value::Set(values) => {
                     ("Set", 1, "egglog.core.set.of", values.items.clone())
                 }
-                pb::primitive_value::Value::Multiset(values) => {
-                    ("MultiSet", 1, "egglog.core.multiset.of", values.items.clone())
-                }
+                pb::primitive_value::Value::Multiset(values) => (
+                    "MultiSet",
+                    1,
+                    "egglog.core.multiset.of",
+                    values.items.clone(),
+                ),
                 pb::primitive_value::Value::Pair(pair) => (
                     "Pair",
                     2,
@@ -2910,9 +2918,8 @@ fn lower_container_values(program: &mut pb::Program) -> Result<Vec<u32>, String>
                 })),
                 ..Default::default()
             });
-            let pair_sort = egglog::builtin::import_sort(&sorts, pair_sort, &mut program.sorts)?;
-            let vector_sort =
-                egglog::builtin::import_sort(&sorts, vector_sort, &mut program.sorts)?;
+            let pair_sort = crate::builtin::import_sort(&sorts, pair_sort, &mut program.sorts)?;
+            let vector_sort = crate::builtin::import_sort(&sorts, vector_sort, &mut program.sorts)?;
             sites.resize(program.sorts.len(), program.nodes[index].sort_id);
             let mut pairs = vec![];
             for fields in args.chunks_exact(2) {
@@ -3007,18 +3014,19 @@ fn validate_host_declarations(program: &pb::Program, graph: &mut EGraph) -> Resu
             Some(pb::declaration::Kind::HostPrimitive(primitive)) => {
                 graph
                     .type_info()
-                    .check_builtin_signature(program, primitive)?;
+                    .check_portable_builtin_signature(program, primitive)?;
             }
             Some(pb::declaration::Kind::HostSortFamily(family)) => {
                 if matches!(
                     family.name.as_str(),
                     "Vec" | "Set" | "MultiSet" | "Pair" | "Map" | "Maybe"
                 ) {
-                    let arity = if matches!(family.name.as_str(), "Vec" | "Set" | "MultiSet" | "Maybe") {
-                        1
-                    } else {
-                        2
-                    };
+                    let arity =
+                        if matches!(family.name.as_str(), "Vec" | "Set" | "MultiSet" | "Maybe") {
+                            1
+                        } else {
+                            2
+                        };
                     if family.arity != arity || declaration.bindings.is_some() {
                         return Err(format!(
                             "unsupported or incompatible {} family descriptor",
@@ -4168,7 +4176,7 @@ fn encode_sort(
             *name = logical.clone();
         }
     }
-    egglog::builtin::import_sort(&sorts, index, &mut response.sorts)
+    crate::builtin::import_sort(&sorts, index, &mut response.sorts)
         .map_err(egglog::Error::ExtractError)
 }
 
@@ -4238,16 +4246,28 @@ fn encode_term(
                 || native_children.len() != children.len()
                 || sort.inner_sorts().len() != 1
             {
-                return Err(egglog::Error::ExtractError("MultiSet term/sort/arity mismatch".into()));
+                return Err(egglog::Error::ExtractError(
+                    "MultiSet term/sort/arity mismatch".into(),
+                ));
             }
-            let Some(pb::sort::Kind::Family(family)) = &response.sorts[sort_id as usize].kind else {
+            let Some(pb::sort::Kind::Family(family)) = &response.sorts[sort_id as usize].kind
+            else {
                 unreachable!("validated MultiSet family")
             };
-            if children.iter().any(|child| response.nodes.get(*child as usize).is_none_or(|node| node.sort_id != family.args[0])) {
-                return Err(egglog::Error::ExtractError("MultiSet child sort mismatch".into()));
+            if children.iter().any(|child| {
+                response
+                    .nodes
+                    .get(*child as usize)
+                    .is_none_or(|node| node.sort_id != family.args[0])
+            }) {
+                return Err(egglog::Error::ExtractError(
+                    "MultiSet child sort mismatch".into(),
+                ));
             }
             pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
-                value: Some(pb::primitive_value::Value::Multiset(pb::ValueList { items: children.to_vec() })),
+                value: Some(pb::primitive_value::Value::Multiset(pb::ValueList {
+                    items: children.to_vec(),
+                })),
             })
         }
         Term::App(name, _)
@@ -4795,7 +4815,7 @@ mod tests {
             .unwrap()
             .graph
             .type_info()
-            .builtin_catalog()
+            .portable_builtin_catalog()
             .unwrap()
             .definitions;
         let i64_sort = p.sorts.iter().position(|s| matches!(&s.kind, Some(pb::sort::Kind::Family(f)) if f.name == "i64" && f.args.is_empty())).unwrap() as u32;

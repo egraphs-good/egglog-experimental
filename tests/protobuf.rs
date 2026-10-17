@@ -1,4 +1,5 @@
 use egglog_experimental::proto as pb;
+use egglog_experimental::{PortableEGraph, PortableTypeInfo};
 use egglog_experimental::{new_experimental_egraph, protobuf::Engine};
 use prost::Message;
 
@@ -761,7 +762,11 @@ fn maybe_none_native_nominal_resolution_is_preserved() {
 fn maybe_catalog_none_preserves_nominal_resolution() {
     use egglog_experimental::{Context, ResolvedCall};
     let mut graph = new_experimental_egraph();
-    let before = graph.type_info().builtin_catalog().unwrap().definitions;
+    let before = graph
+        .type_info()
+        .portable_builtin_catalog()
+        .unwrap()
+        .definitions;
     for key in ["maybe-none", "egglog.experimental.maybe.none"] {
         assert!(
             graph
@@ -838,8 +843,11 @@ fn maybe_catalog_none_preserves_nominal_resolution() {
     });
     let mut destination = before.clone();
     assert!(
-        egglog::builtin::definitions::reconcile_declarations(&conflicting, &mut destination)
-            .is_err()
+        egglog_experimental::builtin::definitions::reconcile_declarations(
+            &conflicting,
+            &mut destination
+        )
+        .is_err()
     );
     assert_eq!(destination, before);
     graph
@@ -849,7 +857,11 @@ fn maybe_catalog_none_preserves_nominal_resolution() {
         )
         .unwrap();
     assert_eq!(
-        graph.type_info().builtin_catalog().unwrap().definitions,
+        graph
+            .type_info()
+            .portable_builtin_catalog()
+            .unwrap()
+            .definitions,
         before
     );
     let i = graph.get_sort_by_name("i64").unwrap().clone();
@@ -1486,7 +1498,8 @@ fn named_primitive_direct_bytes_and_capture_reingestion() {
         nodes: saved.nodes,
         ..Default::default()
     };
-    egglog::builtin::definitions::reconcile_declarations(&program, &mut restored).unwrap();
+    egglog_experimental::builtin::definitions::reconcile_declarations(&program, &mut restored)
+        .unwrap();
     let mut other = restored.declarations.iter().find(|d| matches!(&d.kind, Some(pb::declaration::Kind::Primitive(p)) if p.name == "sum_code")).unwrap().clone();
     let Some(pb::declaration::Kind::Primitive(primitive)) = &mut other.kind else {
         unreachable!()
@@ -1788,7 +1801,8 @@ fn named_primitive_source_identity_timing_and_fresh_replay() {
     let mut saved = None;
     for phase in Source::new(None, source).unwrap() {
         let phase = phase.unwrap();
-        egglog::builtin::definitions::reconcile_declarations(&phase, &mut definitions).unwrap();
+        egglog_experimental::builtin::definitions::reconcile_declarations(&phase, &mut definitions)
+            .unwrap();
         rendered.push_str(&renderer.render(&phase).unwrap());
         let response = run(&mut engine, id, phase);
         assert_eq!(response.error, None);
@@ -1850,7 +1864,8 @@ fn named_primitive_source_identity_timing_and_fresh_replay() {
         nodes: saved.nodes,
         ..Default::default()
     };
-    egglog::builtin::definitions::reconcile_declarations(&definitions, &mut program).unwrap();
+    egglog_experimental::builtin::definitions::reconcile_declarations(&definitions, &mut program)
+        .unwrap();
     let Some(pb::sort::Kind::Func(function_type)) =
         &program.sorts[program.nodes[function as usize].sort_id as usize].kind
     else {
@@ -1910,7 +1925,8 @@ fn named_primitive_container_dependencies_and_unsupported_cycles() {
     .unwrap()
     {
         let mut phase = phase.unwrap();
-        egglog::builtin::definitions::reconcile_declarations(&program, &mut phase).unwrap();
+        egglog_experimental::builtin::definitions::reconcile_declarations(&program, &mut phase)
+            .unwrap();
         program = phase;
     }
     // Exercise canonical structured payload edges, not only ordinary Call args.
@@ -2117,6 +2133,13 @@ fn named_primitive_preparation_is_inert_and_extensions_are_opt_in() {
         .parse_and_run_program(None, "(primitive compiled (i64) i64 (counted-body _0))")
         .unwrap();
     assert_eq!(BODIES.load(Ordering::SeqCst), 0);
+    let export_error = graph.type_info().portable_builtin_catalog().err().unwrap();
+    assert!(export_error.contains("counted-body"), "{export_error}");
+    assert_eq!(
+        BODIES.load(Ordering::SeqCst),
+        0,
+        "failed authored export stays inert"
+    );
     graph
         .parse_and_run_program(None, "(check (= (compiled 1) 1))")
         .unwrap();
@@ -2558,7 +2581,8 @@ fn function_value_nested_variants_keep_capture_types_and_shared_children() {
     let mut table = false;
     for phase in Source::new(None, source).unwrap() {
         let mut phase = phase.unwrap();
-        egglog::builtin::definitions::reconcile_declarations(&phase, &mut definitions).unwrap();
+        egglog_experimental::builtin::definitions::reconcile_declarations(&phase, &mut definitions)
+            .unwrap();
         if let Some(pb::command::Kind::Extract(extract)) = phase
             .commands
             .last_mut()
@@ -2677,7 +2701,8 @@ fn function_value_nested_variants_keep_capture_types_and_shared_children() {
         }],
         ..Default::default()
     };
-    egglog::builtin::definitions::reconcile_declarations(&definitions, &mut program).unwrap();
+    egglog_experimental::builtin::definitions::reconcile_declarations(&definitions, &mut program)
+        .unwrap();
     let mut fresh = Engine::default();
     let id = create(&mut fresh);
     let response = run(&mut fresh, id, program);
@@ -2988,7 +3013,11 @@ fn named_primitive_proof_encoding_rejects_the_declaration_before_execution() {
 fn remaining_scalar_experimental_catalog_preserves_providers() {
     use egglog::{Context, ResolvedCall};
     let mut graph = new_experimental_egraph();
-    let catalog = graph.type_info().builtin_catalog().unwrap().definitions;
+    let catalog = graph
+        .type_info()
+        .portable_builtin_catalog()
+        .unwrap()
+        .definitions;
     let cases: &[(&str, &str, &[&str], &str)] = &[
         (
             "rational.sub",
@@ -3110,7 +3139,7 @@ fn remaining_scalar_experimental_catalog_preserves_providers() {
             unreachable!()
         };
         assert_eq!(
-            egglog::builtin::signature_sorts(&catalog, primitive).unwrap(),
+            egglog_experimental::builtin::signature_sorts(&catalog, primitive).unwrap(),
             names
         );
         let Some(pb::host_primitive::Typing::Signature(signature)) = &primitive.typing else {
@@ -3194,7 +3223,7 @@ fn remaining_scalar_experimental_catalog_preserves_providers() {
             assert!(
                 graph
                     .type_info()
-                    .check_builtin_signature(&catalog, &wrong)
+                    .check_portable_builtin_signature(&catalog, &wrong)
                     .is_err(),
                 "{key}: {mutation}"
             );
@@ -3338,7 +3367,7 @@ fn remaining_scalar_boolean_source_bytes_and_proofs_match_native() {
 fn remaining_scalar_float_special_values_use_native_byte_providers() {
     let catalog = new_experimental_egraph()
         .type_info()
-        .builtin_catalog()
+        .portable_builtin_catalog()
         .unwrap()
         .definitions;
     let float = catalog.sorts.iter().position(|s| matches!(&s.kind, Some(pb::sort::Kind::Family(f)) if f.name == "f64" && f.args.is_empty())).unwrap() as u32;
@@ -5162,7 +5191,11 @@ fn reports_stats_composition_detail_off_fail_and_source() {
 fn rational_catalog_is_experimental_and_keeps_real_alias_contexts() {
     use egglog_experimental::{Context, ResolvedCall};
     let mut graph = new_experimental_egraph();
-    let catalog = graph.type_info().builtin_catalog().unwrap().definitions;
+    let catalog = graph
+        .type_info()
+        .portable_builtin_catalog()
+        .unwrap()
+        .definitions;
     let family = catalog
         .declarations
         .iter()
@@ -5267,7 +5300,7 @@ fn rational_calls_extract_exact_inert_values_and_reingest_without_float() {
     let huge = "123456789012345678901234567890123456789012345678901";
     let mut program = new_experimental_egraph()
         .type_info()
-        .builtin_catalog()
+        .portable_builtin_catalog()
         .unwrap()
         .definitions;
     let sort_ids = ["i64", "String", "Rational", "BigInt", "BigRat"].map(|name| program.sorts.iter().position(|s| matches!(&s.kind, Some(pb::sort::Kind::Family(f)) if f.name == name && f.args.is_empty())).unwrap() as u32);
@@ -5628,7 +5661,7 @@ fn formed_exact_values_roundtrip_signed_and_width_boundaries() {
     ];
     let mut program = new_experimental_egraph()
         .type_info()
-        .builtin_catalog()
+        .portable_builtin_catalog()
         .unwrap()
         .definitions;
     for (name, value) in &values {
@@ -5677,7 +5710,7 @@ fn formed_exact_values_roundtrip_signed_and_width_boundaries() {
 fn exact_numeric_signature_conflicts_reject_before_actions() {
     let catalog = new_experimental_egraph()
         .type_info()
-        .builtin_catalog()
+        .portable_builtin_catalog()
         .unwrap()
         .definitions;
     for key in [
@@ -6512,7 +6545,11 @@ fn core_source_renderer_keeps_unsupported_resupply_and_sharing_rejections() {
 fn size_and_subst_catalog_descriptors_preserve_native_contexts() {
     use egglog::{Context, ResolvedCall};
     let mut graph = new_experimental_egraph();
-    let catalog = graph.type_info().builtin_catalog().unwrap().definitions;
+    let catalog = graph
+        .type_info()
+        .portable_builtin_catalog()
+        .unwrap()
+        .definitions;
     for (key, alias, variadic) in [
         ("egglog.experimental.size.tables", "get-size!", true),
         ("egglog.experimental.size.nodes", "get-node-size!", false),
@@ -6641,12 +6678,12 @@ fn size_and_subst_catalog_descriptors_preserve_native_contexts() {
 fn native_catalog_snapshot_is_deterministic_and_installs_as_bytes() {
     let first = new_experimental_egraph()
         .type_info()
-        .builtin_catalog()
+        .portable_builtin_catalog()
         .unwrap()
         .definitions;
     let second = new_experimental_egraph()
         .type_info()
-        .builtin_catalog()
+        .portable_builtin_catalog()
         .unwrap()
         .definitions;
     assert_eq!(first.encode_to_vec(), second.encode_to_vec());
@@ -7020,11 +7057,12 @@ fn scalar_catalog_presence_survives_bytes_resupply_and_engine_clone() {
     use egglog_experimental::protobuf::source::Renderer;
     let catalog = new_experimental_egraph()
         .type_info()
-        .builtin_catalog()
+        .portable_builtin_catalog()
         .unwrap()
         .definitions;
     let mut program = constant_fixture(&["test", "CURRENT"], &["test", "EMPTY"]);
-    egglog::builtin::definitions::reconcile_declarations(&catalog, &mut program).unwrap();
+    egglog_experimental::builtin::definitions::reconcile_declarations(&catalog, &mut program)
+        .unwrap();
     let decoded = pb::Program::decode(program.encode_to_vec().as_slice()).unwrap();
     assert_eq!(decoded, program);
     for (key, expected) in [
@@ -7966,7 +8004,7 @@ fn wire_namespace_function_then_sort() {
 fn wire_namespace_host_aliases_unicode_and_nested_result_sorts() {
     let mut p = new_experimental_egraph()
         .type_info()
-        .builtin_catalog()
+        .portable_builtin_catalog()
         .unwrap()
         .definitions;
     let scalar = p
@@ -10129,23 +10167,25 @@ fn map_value_queries_require_grounded_children() {
                 if let Some(pb::node::Kind::Call(call)) = &program.nodes[index].kind
                     && call.func == "egglog.core.map.of"
                 {
-                    let Some(pb::node::Kind::Call(vector)) =
-                        &program.nodes[call.args[0] as usize].kind
+                    let Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
+                        value: Some(pb::primitive_value::Value::Vec(vector)),
+                    })) = &program.nodes[call.args[0] as usize].kind
                     else {
                         unreachable!()
                     };
                     let entries = vector
-                        .args
+                        .items
                         .iter()
                         .map(|pair| {
-                            let Some(pb::node::Kind::Call(pair)) =
-                                &program.nodes[*pair as usize].kind
+                            let Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
+                                value: Some(pb::primitive_value::Value::Pair(pair)),
+                            })) = &program.nodes[*pair as usize].kind
                             else {
                                 unreachable!()
                             };
                             pb::MapEntry {
-                                key: Some(pair.args[0]),
-                                value: Some(pair.args[1]),
+                                key: pair.first,
+                                value: pair.second,
                             }
                         })
                         .collect();
@@ -15592,7 +15632,7 @@ fn union_repeated_heads_reject_even_when_unused_or_resupplied() {
 fn builtin_i64_merges_execute_and_resupply() {
     let catalog = new_experimental_egraph()
         .type_info()
-        .builtin_catalog()
+        .portable_builtin_catalog()
         .unwrap()
         .definitions;
     let mut engine = Engine::default();
@@ -15618,8 +15658,11 @@ fn builtin_i64_merges_execute_and_resupply() {
                 matches!(&declaration.kind, Some(pb::declaration::Kind::HostPrimitive(primitive)) if primitive.name == callee)
             });
             assert_eq!(definition.declarations.len(), 1, "{case}: real descriptor");
-            egglog::builtin::definitions::reconcile_declarations(&definition, &mut program)
-                .unwrap();
+            egglog_experimental::builtin::definitions::reconcile_declarations(
+                &definition,
+                &mut program,
+            )
+            .unwrap();
             let old = program.nodes.len() as u32;
             program.nodes.push(pb::Node {
                 sort_id: 0,
@@ -15691,7 +15734,8 @@ fn builtin_i64_merges_execute_and_resupply() {
             nodes: vec![program.nodes[0].clone(); program.nodes.len() + 1],
             ..Default::default()
         };
-        egglog::builtin::definitions::reconcile_declarations(&program, &mut relocated).unwrap();
+        egglog_experimental::builtin::definitions::reconcile_declarations(&program, &mut relocated)
+            .unwrap();
         let original_merge = program.declarations.iter().find_map(|declaration| {
             if let Some(pb::declaration::Kind::Function(function)) = &declaration.kind {
                 function.merge
@@ -15797,7 +15841,8 @@ fn merge_table_reads_execute_and_resupply() {
         nodes: vec![program.nodes[0].clone(); program.nodes.len() + 1],
         ..Default::default()
     };
-    egglog::builtin::definitions::reconcile_declarations(&program, &mut relocated).unwrap();
+    egglog_experimental::builtin::definitions::reconcile_declarations(&program, &mut relocated)
+        .unwrap();
     let merges = [&program, &relocated].map(|program| {
         program
             .declarations

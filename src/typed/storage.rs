@@ -1099,7 +1099,7 @@ impl Packer {
             }
         }
         if kept.len() != self.program.declarations.len() {
-            egglog::builtin::definitions::reconcile_declarations(
+            crate::builtin::definitions::reconcile_declarations(
                 &self.program,
                 &mut pb::Program {
                     ir_version: 1,

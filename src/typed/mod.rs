@@ -1117,7 +1117,7 @@
 //!     var::<Ir>("input"), 17, 23, var::<DimExpr>("iters"), var::<DType>("dtype"), 31,
 //! );
 //! ```
-use egglog::proto as pb;
+use crate::proto as pb;
 pub mod builtins;
 mod close;
 mod decl;

@@ -590,44 +590,34 @@ impl Primitive for Subst {
         Box::new(SubstTypeConstraint { span: span.clone() })
     }
 
-    fn builtin_definition(&self) -> Option<(&str, &egglog::proto::Program)> {
-        use egglog::proto as pb;
-        static DEFINITION: std::sync::LazyLock<pb::Program> = std::sync::LazyLock::new(|| {
-            let mut definition = crate::type_constraints::signature_definition(
-                "egglog.experimental.subst",
-                SUBST,
-                vec![
-                    pb::Sort {
-                        kind: Some(pb::sort::Kind::Var(0)),
-                        ..Default::default()
-                    },
-                    pb::Sort {
-                        kind: Some(pb::sort::Kind::Var(1)),
-                        ..Default::default()
-                    },
-                    pb::Sort {
-                        kind: Some(pb::sort::Kind::Family(pb::HostSort {
+    fn builtin_description(&self) -> Option<&egglog::builtin::BuiltinDescription> {
+        use egglog::builtin::{BuiltinTyping, SortPattern};
+        static DEFINITION: std::sync::LazyLock<egglog::builtin::BuiltinDescription> =
+            std::sync::LazyLock::new(|| {
+                let mut definition = crate::type_constraints::signature_definition(
+                    "egglog.experimental.subst",
+                    SUBST,
+                    vec![
+                        SortPattern::Param(0),
+                        SortPattern::Param(1),
+                        SortPattern::Family {
                             name: "Map".into(),
-                            args: vec![1, 1],
-                        })),
-                        ..Default::default()
-                    },
-                ],
-                &["R", "K"],
-                &[("root", 0), ("map", 2)],
-                0,
-            );
-            let Some(pb::declaration::Kind::HostPrimitive(pb::HostPrimitive {
-                typing: Some(pb::host_primitive::Typing::Signature(signature)),
-                ..
-            })) = &mut definition.declarations[0].kind
-            else {
-                unreachable!("signature_definition owns one generic primitive")
-            };
-            signature.equality_type_params = vec![0, 1];
-            definition
-        });
-        Some(("egglog.experimental.subst", &DEFINITION))
+                            args: vec![SortPattern::Param(1), SortPattern::Param(1)],
+                        },
+                    ],
+                    &["R", "K"],
+                    &[("root", 0), ("map", 2)],
+                    0,
+                );
+                let BuiltinTyping::Signature(signature) = &mut definition.typing else {
+                    unreachable!("signature_definition owns one generic primitive")
+                };
+                for parameter in &mut signature.params {
+                    parameter.equality = true;
+                }
+                definition
+            });
+        Some(&DEFINITION)
     }
 }
 

@@ -31,7 +31,7 @@ impl<K: Eq + Hash, F: Fn(&ArcSort, Value) -> K> Export<'_, K, F> {
                 *name = logical.clone();
             }
         }
-        egglog::builtin::import_sort(&sorts, root, &mut self.program.sorts)
+        crate::builtin::import_sort(&sorts, root, &mut self.program.sorts)
             .map_err(egglog::Error::BackendError)
     }
 
@@ -267,7 +267,7 @@ pub(super) fn export(session: &mut Session) -> Result<pb::EGraphSnapshot, egglog
     let mut catalog = session
         .graph
         .type_info()
-        .builtin_catalog()
+        .portable_builtin_catalog()
         .map_err(egglog::Error::BackendError)?;
     // Native program-defined primitives retain native callable/sort names.
     // Reuse the session's exact projection receipts before reconciling their
@@ -336,7 +336,7 @@ pub(super) fn export(session: &mut Session) -> Result<pb::EGraphSnapshot, egglog
         )));
     }
     let mut definitions = session.definitions.clone();
-    egglog::builtin::definitions::reconcile_declarations(&catalog.definitions, &mut definitions)
+    crate::builtin::definitions::reconcile_declarations(&catalog.definitions, &mut definitions)
         .map_err(egglog::Error::BackendError)?;
     let mut export = Export {
         session,

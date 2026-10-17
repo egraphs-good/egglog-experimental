@@ -390,7 +390,7 @@ impl Source {
                     let definition =
                         crate::primitive::RegisterPrimitive::register(&mut self.graph, &args)
                             .map_err(|error| error.to_string())??;
-                    egglog::builtin::definitions::reconcile_declarations(
+                    crate::builtin::definitions::reconcile_declarations(
                         &definition,
                         &mut self.program,
                     )?;

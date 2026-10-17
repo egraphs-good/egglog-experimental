@@ -92,7 +92,10 @@ use egglog::prelude::add_base_sort;
 pub use egglog::*;
 use std::sync::Arc;
 
+pub mod builtin;
+pub use builtin::{PortableEGraph, PortablePrimitive, PortableTypeInfo};
 pub mod protobuf;
+pub use egglog_proto as proto;
 pub mod rational;
 #[cfg(feature = "typed")]
 pub mod typed;

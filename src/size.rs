@@ -37,8 +37,8 @@ impl Primitive for GetSizePrimitive {
             .into_box()
     }
 
-    fn builtin_definition(&self) -> Option<(&str, &egglog::proto::Program)> {
-        static DEFINITION: std::sync::LazyLock<egglog::proto::Program> =
+    fn builtin_description(&self) -> Option<&egglog::builtin::BuiltinDescription> {
+        static DEFINITION: std::sync::LazyLock<egglog::builtin::BuiltinDescription> =
             std::sync::LazyLock::new(|| {
                 egglog::builtin::closed_signature(
                     "egglog.experimental.size.tables",
@@ -49,7 +49,7 @@ impl Primitive for GetSizePrimitive {
                 )
                 .expect("valid table-size signature")
             });
-        Some(("egglog.experimental.size.tables", &DEFINITION))
+        Some(&DEFINITION)
     }
 }
 
@@ -96,8 +96,8 @@ impl Primitive for GetNodeSizePrimitive {
             .into_box()
     }
 
-    fn builtin_definition(&self) -> Option<(&str, &egglog::proto::Program)> {
-        static DEFINITION: std::sync::LazyLock<egglog::proto::Program> =
+    fn builtin_description(&self) -> Option<&egglog::builtin::BuiltinDescription> {
+        static DEFINITION: std::sync::LazyLock<egglog::builtin::BuiltinDescription> =
             std::sync::LazyLock::new(|| {
                 egglog::builtin::closed_signature(
                     "egglog.experimental.size.nodes",
@@ -108,7 +108,7 @@ impl Primitive for GetNodeSizePrimitive {
                 )
                 .expect("valid node-size signature")
             });
-        Some(("egglog.experimental.size.nodes", &DEFINITION))
+        Some(&DEFINITION)
     }
 }
 

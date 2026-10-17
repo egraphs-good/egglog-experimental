@@ -1,6 +1,7 @@
 //! Generate the Rust scalar and container surfaces from the actual native catalog.
 //! Run without `--features typed` to bootstrap the generated source/resource;
 //! use `--check` to detect either API or catalog drift. Nothing runs at import.
+use egglog_experimental::PortableTypeInfo;
 use egglog_experimental::proto as pb;
 use prost::Message;
 use std::{
@@ -19,7 +20,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     let catalog = egglog_experimental::new_experimental_egraph()
         .type_info()
-        .builtin_catalog()
+        .portable_builtin_catalog()
         .map_err(std::io::Error::other)?;
     let (source, deferred) = generate(&catalog.definitions).map_err(std::io::Error::other)?;
     let mut formatter = Command::new("rustfmt")
@@ -1780,7 +1781,7 @@ mod tests {
     fn generic_free_functions_follow_binders_slots_names_and_results() {
         let original = egglog_experimental::new_experimental_egraph()
             .type_info()
-            .builtin_catalog()
+            .portable_builtin_catalog()
             .unwrap()
             .definitions;
         let index = original
@@ -1964,7 +1965,7 @@ mod tests {
     fn generic_free_functions_reject_unsupported_or_ambiguous_views() {
         let original = egglog_experimental::new_experimental_egraph()
             .type_info()
-            .builtin_catalog()
+            .portable_builtin_catalog()
             .unwrap()
             .definitions;
         let index = original
@@ -2072,7 +2073,7 @@ mod tests {
     fn bignum_operator_traits_follow_actual_input_and_output_sorts() {
         let original = egglog_experimental::new_experimental_egraph()
             .type_info()
-            .builtin_catalog()
+            .portable_builtin_catalog()
             .unwrap()
             .definitions;
         let bytes = original.encode_to_vec();
@@ -2119,7 +2120,7 @@ mod tests {
     fn exact_number_codecs_leave_constructor_views_and_records_authoritative() {
         let original = egglog_experimental::new_experimental_egraph()
             .type_info()
-            .builtin_catalog()
+            .portable_builtin_catalog()
             .unwrap()
             .definitions;
         let bytes = original.encode_to_vec();
@@ -2211,7 +2212,7 @@ mod tests {
     fn map_codec_uses_actual_nested_records_and_presentation_metadata() {
         let original = egglog_experimental::new_experimental_egraph()
             .type_info()
-            .builtin_catalog()
+            .portable_builtin_catalog()
             .unwrap()
             .definitions;
         let map = original.declarations.iter().position(|d| matches!(&d.kind, Some(pb::declaration::Kind::HostSortFamily(f)) if f.name == "Map")).expect("actual native Map catalog required");
@@ -2375,7 +2376,7 @@ mod tests {
     fn maybe_codec_follows_catalog_identity_and_checks_optional_child_scheme() {
         let original = egglog_experimental::new_experimental_egraph()
             .type_info()
-            .builtin_catalog()
+            .portable_builtin_catalog()
             .unwrap()
             .definitions;
         let family = original.declarations.iter().position(|d| matches!(&d.kind, Some(pb::declaration::Kind::HostSortFamily(f)) if f.name == "Maybe")).unwrap();
@@ -2458,7 +2459,7 @@ mod tests {
     fn pair_codec_follows_catalog_identity_paths_and_two_binders() {
         let original = egglog_experimental::new_experimental_egraph()
             .type_info()
-            .builtin_catalog()
+            .portable_builtin_catalog()
             .unwrap()
             .definitions;
         let make = original.declarations.iter().position(|d| matches!(&d.kind, Some(pb::declaration::Kind::HostPrimitive(p)) if p.name == "egglog.core.pair.make")).unwrap();
@@ -2624,7 +2625,7 @@ mod tests {
     fn scalar_tail_views_derive_slots_and_trait_identity_from_actual_records() {
         let original = egglog_experimental::new_experimental_egraph()
             .type_info()
-            .builtin_catalog()
+            .portable_builtin_catalog()
             .unwrap()
             .definitions;
         let before = original.encode_to_vec();
@@ -2855,7 +2856,7 @@ mod tests {
     fn optional_documentation_renders_without_rewriting_records() {
         let original = egglog_experimental::new_experimental_egraph()
             .type_info()
-            .builtin_catalog()
+            .portable_builtin_catalog()
             .unwrap()
             .definitions;
         let index = original
@@ -2901,7 +2902,7 @@ mod tests {
     fn grouped_tail_views_are_explicitly_rejected_but_records_are_retained() {
         let original = egglog_experimental::new_experimental_egraph()
             .type_info()
-            .builtin_catalog()
+            .portable_builtin_catalog()
             .unwrap()
             .definitions;
         let (source, _) = generate(&original).unwrap();
@@ -2995,7 +2996,7 @@ mod tests {
     fn ordinary_metadata_names_cannot_capture_generated_support() {
         let original = egglog_experimental::new_experimental_egraph()
             .type_info()
-            .builtin_catalog()
+            .portable_builtin_catalog()
             .unwrap()
             .definitions;
         for (integer, float, parameter) in [
@@ -3046,7 +3047,7 @@ mod tests {
     fn i64_i32_inputs_follow_catalog_binding() {
         let original = egglog_experimental::new_experimental_egraph()
             .type_info()
-            .builtin_catalog()
+            .portable_builtin_catalog()
             .unwrap()
             .definitions;
         for name in ["I64", "RenamedI64"] {
@@ -3092,7 +3093,7 @@ mod tests {
     fn operand_metadata_names_never_become_rust_binding_patterns() {
         let original = egglog_experimental::new_experimental_egraph()
             .type_info()
-            .builtin_catalog()
+            .portable_builtin_catalog()
             .unwrap()
             .definitions;
         for parameter in ["Some", "None", "Ok", "Err", "__egglog_rhs"] {
@@ -3231,7 +3232,7 @@ mod tests {
     fn closed_i64_operator_views_preserve_slots_and_all_ownership_forms() {
         let original = egglog_experimental::new_experimental_egraph()
             .type_info()
-            .builtin_catalog()
+            .portable_builtin_catalog()
             .unwrap()
             .definitions;
         for (key, method) in [
@@ -3312,7 +3313,7 @@ mod tests {
     fn native_records_determine_paths_locations_and_argument_order() {
         let mut p = egglog_experimental::new_experimental_egraph()
             .type_info()
-            .builtin_catalog()
+            .portable_builtin_catalog()
             .unwrap()
             .definitions;
         let (source, deferred) = generate(&p).unwrap();
@@ -3454,7 +3455,7 @@ mod tests {
     fn malformed_mapping_and_generated_borrow_collisions_are_errors() {
         let original = egglog_experimental::new_experimental_egraph()
             .type_info()
-            .builtin_catalog()
+            .portable_builtin_catalog()
             .unwrap()
             .definitions;
         let index = original
@@ -3495,7 +3496,7 @@ mod tests {
     fn native_set_catalog_drives_every_method_and_rejects_invalid_views() {
         let original = egglog_experimental::new_experimental_egraph()
             .type_info()
-            .builtin_catalog()
+            .portable_builtin_catalog()
             .unwrap()
             .definitions;
         let before = original.encode_to_vec();
@@ -3649,7 +3650,7 @@ mod tests {
     fn native_vec_views_drive_generic_members_and_relocated_declarations() {
         let mut program = egglog_experimental::new_experimental_egraph()
             .type_info()
-            .builtin_catalog()
+            .portable_builtin_catalog()
             .unwrap()
             .definitions;
         let family = program

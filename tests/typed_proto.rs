@@ -1245,7 +1245,7 @@ mod lazy_rulesets {
         let mut graph = EGraph::default();
         assert!(
             matches!(graph.run(&rejected), Err(TypedError::Engine(error))
-            if error.code == egglog::proto::ErrorCode::InvalidProgram as i32)
+            if error.code == egglog_experimental::proto::ErrorCode::InvalidProgram as i32)
         );
         assert!(!graph.check(RuleTerms::Copied(126))?);
         let response = graph.run(&valid)?;
@@ -2030,7 +2030,7 @@ fn rejected_rule_preparation_does_not_poison_a_later_valid_group() -> Result<(),
     let mut graph = EGraph::default();
     let error = graph.run(&rejected).unwrap_err();
     assert!(matches!(error, TypedError::Engine(error)
-        if error.code == egglog::proto::ErrorCode::InvalidProgram as i32));
+        if error.code == egglog_experimental::proto::ErrorCode::InvalidProgram as i32));
     assert!(!graph.check(RuleTerms::Copied(123))?);
     graph.run(&valid)?;
     assert!(graph.check(RuleTerms::Copied(123))?);
@@ -2391,9 +2391,10 @@ mod function_values {
         let mut first = EGraph::new()?;
         let callback = first.extract(callback)?;
         let predicate = first.extract(predicate)?;
-        let applied = Function::<(I64,), I64>::with_captures(
-            (callback.clone(),), |(callback,), x| callback.call(x),
-        )?;
+        let applied =
+            Function::<(I64,), I64>::with_captures((callback.clone(),), |(callback,), x| {
+                callback.call(x)
+            })?;
         let applied = first.extract(applied)?;
         let callbacks = first.extract(EggVec::<Function<(I64,), I64>>::of([&callback]))?;
         let callbacks = std::vec::Vec::<Function<(I64,), I64>>::try_from(&callbacks)?;

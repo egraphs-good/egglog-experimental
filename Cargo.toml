@@ -23,6 +23,7 @@ serde = ["egglog/serde"]
 graphviz = ["egglog/graphviz"]
 
 [dependencies]
+egglog-proto = { path = "gen/rust" }
 prost = "0.14.4"
 egglog-experimental-typed-macros = { path = "typed-macros", version = "3.0.0", optional = true }
 egglog = { version = "3.0.0", git = "https://github.com/egraphs-good/egglog.git", rev = "bd7de1657a529dad3b731001edc78386874864fc", default-features = false }
@@ -38,6 +39,7 @@ fixedbitset = "0.5.7"
 hashbrown = "0.16.0"
 
 [dev-dependencies]
+egglog-bridge = { version = "3.0.0", git = "https://github.com/egraphs-good/egglog.git", rev = "bd7de1657a529dad3b731001edc78386874864fc", default-features = false }
 glob = "0.3.1"
 libtest-mimic = "0.8.1"
 

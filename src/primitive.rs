@@ -117,14 +117,14 @@ impl RegisterPrimitive {
 }
 
 #[derive(Clone)]
-struct DefinedPrimitive {
-    name: String,
+pub(crate) struct DefinedPrimitive {
+    pub(crate) name: String,
     input_vars: Vec<String>,
     input: Vec<ArcSort>,
     output: ArcSort,
     body: ResolvedExpr,
     hidden_bindings: Vec<(String, Value)>,
-    definition: Result<crate::proto::Program, String>,
+    pub(crate) definition: Result<crate::proto::Program, String>,
 }
 
 impl Primitive for DefinedPrimitive {
@@ -136,47 +136,6 @@ impl Primitive for DefinedPrimitive {
         let mut sorts = self.input.clone();
         sorts.push(self.output.clone());
         SimpleTypeConstraint::new(self.name(), sorts, span.clone()).into_box()
-    }
-
-    fn export_program_definition(
-        &self,
-        destination: &mut crate::proto::Program,
-    ) -> Result<Option<String>, String> {
-        let definition = self.definition.as_ref().map_err(Clone::clone)?;
-        egglog::builtin::definitions::reconcile_declarations(definition, destination)?;
-        Ok(Some(self.name.clone()))
-    }
-
-    fn lower_builtin_call(
-        &self,
-        _types: &egglog::TypeInfo,
-        native_sorts: (&[ArcSort], &ArcSort),
-        args: &[u32],
-        _output: u32,
-        _span: Option<crate::proto::Span>,
-        destination: &mut crate::proto::Program,
-    ) -> Result<Option<crate::proto::node::Kind>, String> {
-        if args.len() != self.input.len()
-            || !native_sorts
-                .0
-                .iter()
-                .chain([native_sorts.1])
-                .map(|sort| sort.name())
-                .eq(self
-                    .input
-                    .iter()
-                    .chain([&self.output])
-                    .map(|sort| sort.name()))
-        {
-            return Err(
-                "program primitive specialization differs from its native signature".into(),
-            );
-        }
-        self.export_program_definition(destination)?;
-        Ok(Some(crate::proto::node::Kind::Call(crate::proto::Call {
-            func: self.name.clone(),
-            args: args.to_vec(),
-        })))
     }
 }
 

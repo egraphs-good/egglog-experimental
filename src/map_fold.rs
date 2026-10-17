@@ -25,46 +25,36 @@ impl Primitive for MapFoldKv {
         Box::new(MapFoldKvTypeConstraint { span: span.clone() })
     }
 
-    fn builtin_definition(&self) -> Option<(&str, &egglog::proto::Program)> {
-        use egglog::proto as pb;
-        static DEFINITION: std::sync::LazyLock<pb::Program> = std::sync::LazyLock::new(|| {
-            signature_definition(
-                "egglog.experimental.map.fold_kv",
-                "map-fold-kv",
-                vec![
-                    pb::Sort {
-                        kind: Some(pb::sort::Kind::Var(0)),
-                        ..Default::default()
-                    },
-                    pb::Sort {
-                        kind: Some(pb::sort::Kind::Var(1)),
-                        ..Default::default()
-                    },
-                    pb::Sort {
-                        kind: Some(pb::sort::Kind::Var(2)),
-                        ..Default::default()
-                    },
-                    pb::Sort {
-                        kind: Some(pb::sort::Kind::Func(pb::FuncSort {
-                            params: vec![2, 0, 1],
-                            result: 2,
-                        })),
-                        ..Default::default()
-                    },
-                    pb::Sort {
-                        kind: Some(pb::sort::Kind::Family(pb::HostSort {
+    fn builtin_description(&self) -> Option<&egglog::builtin::BuiltinDescription> {
+        use egglog::builtin::SortPattern;
+        static DEFINITION: std::sync::LazyLock<egglog::builtin::BuiltinDescription> =
+            std::sync::LazyLock::new(|| {
+                signature_definition(
+                    "egglog.experimental.map.fold_kv",
+                    "map-fold-kv",
+                    vec![
+                        SortPattern::Param(0),
+                        SortPattern::Param(1),
+                        SortPattern::Param(2),
+                        SortPattern::Function {
+                            inputs: vec![
+                                SortPattern::Param(2),
+                                SortPattern::Param(0),
+                                SortPattern::Param(1),
+                            ],
+                            output: Box::new(SortPattern::Param(2)),
+                        },
+                        SortPattern::Family {
                             name: "Map".into(),
-                            args: vec![0, 1],
-                        })),
-                        ..Default::default()
-                    },
-                ],
-                &["K", "V", "A"],
-                &[("callback", 3), ("initial", 2), ("map", 4)],
-                2,
-            )
-        });
-        Some(("egglog.experimental.map.fold_kv", &DEFINITION))
+                            args: vec![SortPattern::Param(0), SortPattern::Param(1)],
+                        },
+                    ],
+                    &["K", "V", "A"],
+                    &[("callback", 3), ("initial", 2), ("map", 4)],
+                    2,
+                )
+            });
+        Some(&DEFINITION)
     }
 }
 
