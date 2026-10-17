@@ -1473,6 +1473,7 @@ pub struct BackOff {
 /// Extract each cell of the named tables, then clear ALL tables, including
 /// tables not named here. Reinstall the selected rows and any constructor rows
 /// needed to represent their extracted values. Produces no output.
+/// Rank candidates in the selected model's result sort D (see Extract).
 /// Preserve assigned costs, including absence versus zero, from selected source
 /// constructor rows onto corresponding reconstructed rows. This includes named
 /// table rows and nested extracted producers. Never substitute extraction totals
@@ -1489,7 +1490,7 @@ pub struct KeepBest {
     pub tables: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
     #[prost(enumeration = "Extractor", tag = "2")]
     pub extractor: i32,
-    /// Host-registered model name, subject to Extract's C/algorithm compatibility.
+    /// Host-registered model name, subject to Extract's C/D/algorithm contract.
     /// Empty requests the host default, which need not support every C.
     #[prost(string, tag = "3")]
     pub cost_model: ::prost::alloc::string::String,
@@ -1510,11 +1511,14 @@ pub struct Extract {
     #[prost(enumeration = "Extractor", tag = "3")]
     pub extractor: i32,
     /// Host-registered name, not serialized callback code. Empty selects the
-    /// host default. The model must support the handle's cost sort C and selected
-    /// algorithm, or Extract/KeepBest fails. The host defines arithmetic, order,
-    /// NaN and overflow policies; there is no automatic domain adapter or promise
-    /// of a default model for every C. A handle cannot switch to a model returning
-    /// a different sort; choose C at creation. No implicit numeric casts occur.
+    /// host default. A registration must accept the handle's stored-cost sort C
+    /// and selected algorithm, or Extract/KeepBest fails. It declares a supported,
+    /// recursively closed result sort D, which may differ from C. Selecting another
+    /// model may change D without changing stored annotations. The host defines
+    /// result codecs and arithmetic, order, NaN and overflow policies. No implicit
+    /// numeric casts or automatic domain adapters occur; a default model is not
+    /// promised for every C. The host default also specifies its accepted C,
+    /// result D and supported algorithms.
     #[prost(string, tag = "4")]
     pub cost_model: ::prost::alloc::string::String,
 }
@@ -1652,8 +1656,9 @@ pub struct Saturate {
 /// C may be any supported, acyclic, recursively closed sort, including a custom
 /// equality sort or a host-family/function type. Frontends may offer an i64
 /// default, but the wire always specifies C. No value codec or extraction model
-/// is required merely to select C. Costs in executed Programs and responses must
-/// agree with C structurally, never by comparing arena-local indices.
+/// is required merely to select C. Declared/assigned annotations and GetCost
+/// results must agree with C structurally, never by comparing arena-local indices.
+/// Extraction objectives use the selected model's result sort D (see Extract).
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct EGraphOptions {
     #[prost(uint32, optional, tag = "1")]
@@ -2517,9 +2522,10 @@ pub struct ExtractedTerm {
     #[prost(uint32, tag = "1")]
     pub term: u32,
     /// The cost as INERT VALUE DATA, using PrimitiveValue payloads,
-    /// never an expression to evaluate. Its sort is the handle's C;
-    /// there is no promotion from i64 to BigInt or other implicit domain change.
-    /// Select its representation/host codec by sort_id and RunProgramResponse.sorts.
+    /// never an expression to evaluate. Its sort_id identifies the selected model's
+    /// result sort D in RunProgramResponse.sorts; D need not equal stored C.
+    /// Select its representation/host codec from that sort. No implicit numeric
+    /// cast or promotion occurs.
     ///
     /// This field is the ENCODING only. The comparison, combination and identity
     /// of a cost domain belong to the host's `cost_model`, not this wire value.
