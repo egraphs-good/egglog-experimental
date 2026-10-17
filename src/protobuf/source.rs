@@ -749,25 +749,8 @@ impl Source {
                                 }
                             };
                         }
-                        let ast::GenericSchedule::Run(span, config) = schedule else {
-                            return Err(
-                                "source schedules currently require one ruleset step".into()
-                            );
-                        };
-                        if config.until.is_some() {
-                            return Err("source run-until is not supported yet".into());
-                        }
-                        self.publish_ruleset(&config.ruleset, &mut publish)?;
-                        let span = self.span(&span)?;
-                        self.program.commands.push(pb::Command {
-                            span,
-                            kind: Some(pb::command::Kind::Run(pb::Run {
-                                ruleset: Some(pb::RulesetRef {
-                                    kind: Some(pb::ruleset_ref::Kind::Name(config.ruleset)),
-                                }),
-                                ..Default::default()
-                            })),
-                        });
+                        let command = self.schedule(schedule, &mut publish)?;
+                        self.program.commands.push(command);
                     }
                     _ => return Err("source command is outside the initial producer slice".into()),
                 }
@@ -1489,6 +1472,18 @@ impl Renderer {
 
     /// Validates and renders one phase, retaining only type/definition state.
     pub fn render(&mut self, program: &pb::Program) -> Result<String, TransportError> {
+        if program.nodes.iter().any(|node| matches!(node.kind, Some(pb::node::Kind::GetCost(_))))
+            || super::command_tree(&program.commands).any(|command| matches!(
+                &command.kind,
+                Some(pb::command::Kind::Action(action)) if matches!(action.kind, Some(pb::action::Kind::SetCost(_)))
+            ))
+            || program.rules.iter().any(|rule| matches!(
+                &rule.kind,
+                Some(pb::rule_decl::Kind::Rule(rule)) if rule.head.iter().any(|action| matches!(action.kind, Some(pb::action::Kind::SetCost(_))))
+            ))
+        {
+            return Err(TransportError("assigned-cost source rendering is not supported".into()));
+        }
         // Core preserves literal names, which can collide with prepared private
         // holders. Keep its existing flat support boundary; Experimental aliases
         // nominal declarations and can reuse the adapter's installation plan.
@@ -1703,12 +1698,46 @@ impl Renderer {
                 call.func = logical.clone();
             }
         }
+        let mut constructor_cost_tables = HashMap::new();
+        if self.dialect == Dialect::Experimental {
+            // Retain the exact registration link, not a private-name heuristic.
+            // New helpers have a constructor declaration site; earlier phases
+            // have the canonical constructor and registered hidden function.
+            for installation in &prepared.installations {
+                if installation.declaration.is_none()
+                    && let pb::maintenance_site::Target::Declaration(index) = &installation.site
+                    && let Some(pb::declaration::Kind::Constructor(constructor)) =
+                        &lowered.declarations[*index as usize].kind
+                    && let Some(Command::Function {
+                        name, hidden: true, ..
+                    }) = &installation.command
+                    && *name == crate::set_cost::get_cost_table_name(&constructor.name)
+                {
+                    constructor_cost_tables.insert(name.clone(), constructor.name.clone());
+                }
+            }
+            for declaration in &prepared.definitions.declarations {
+                if let Some(pb::declaration::Kind::Constructor(constructor)) = &declaration.kind {
+                    let constructor = native_name("call", &constructor.name);
+                    let helper = crate::set_cost::get_cost_table_name(&constructor);
+                    if self
+                        .session
+                        .graph
+                        .get_function(&helper)
+                        .is_some_and(|function| function.is_hidden())
+                    {
+                        constructor_cost_tables.insert(helper, constructor);
+                    }
+                }
+            }
+        }
         let source = render_prepared(
             &lowered,
             &prepared,
             self.dialect,
             &authored,
             &declaration_order,
+            &constructor_cost_tables,
         )?;
         // The renderer's graph is always NORMAL and receives definitions only:
         // registration compiles rules/merges, but no action or helper runs.
@@ -1864,6 +1893,7 @@ fn render_prepared(
     dialect: Dialect,
     authored: &NativeNames,
     declaration_order: &[usize],
+    constructor_cost_tables: &HashMap<String, String>,
 ) -> Result<String, TransportError> {
     let result = (|| -> Result<Vec<Command>, String> {
         if program.ir_version != 1 {
@@ -1916,7 +1946,22 @@ fn render_prepared(
         }
         for command in super::command_tree(&program.commands) {
             if dialect == Dialect::Experimental && matches!(&command.kind, Some(pb::command::Kind::Repeat(_) | pb::command::Kind::Saturate(_))) {
-                return Err("composite schedule rendering is unsupported: run-schedule has distinct experimental source semantics".into());
+                let body = match &command.kind {
+                    Some(pb::command::Kind::Repeat(repeat))
+                        if repeat.times == Some(0) && repeat.until.is_empty() => Some(&repeat.body),
+                    Some(pb::command::Kind::Saturate(saturate))
+                        // Named legacy run bounds parse as u32. Bound 1 would
+                        // normalize to Run and erase the loop outcome shape.
+                        if saturate.until.is_empty() && saturate.max_iterations.is_some_and(|bound| (2..=u64::from(u32::MAX)).contains(&bound)) => Some(&saturate.body),
+                    _ => None,
+                };
+                // Legacy run is one plain step under a zero or bounded
+                // CanStop loop. Exact RepeatN and general bodies are different.
+                if !body.is_some_and(|body| matches!(body.as_slice(),
+                    [pb::Command { kind: Some(pb::command::Kind::Run(run)), .. }]
+                    if run.scheduler.is_empty())) {
+                    return Err("composite schedule rendering is unsupported: run-schedule has distinct experimental source semantics".into());
+                }
             }
             if let Some(pb::command::Kind::ProveExists(prove)) = &command.kind {
                 names.push(prove.constructor.as_str());
@@ -2032,6 +2077,24 @@ fn render_prepared(
                     continue;
                 }
                 let Some(mut command) = installation.command.clone() else { continue };
+                if let Command::Rule { rule } = &mut command {
+                    // Accepted source cannot read/write assigned costs. Omit
+                    // only adapter-added cleanup of those invisible tables;
+                    // preserve constructor deletion and captured argument order.
+                    let mut head = Vec::new();
+                    for action in std::mem::take(&mut rule.head.0) {
+                        if let Action::Change(_, ast::Change::Delete, name, args) = &action
+                            && let Some(constructor) = constructor_cost_tables.get(name)
+                        {
+                            if !matches!(head.last(), Some(Action::Change(_, ast::Change::Delete, target, key)) if target == constructor && key == args) {
+                                return Err("prepared constructor-cost cleanup lost its addressed deletion".into());
+                            }
+                            continue;
+                        }
+                        head.push(action);
+                    }
+                    rule.head.0 = head;
+                }
                 let name = match &mut command {
                     Command::Rule { rule } => Some(&mut rule.name),
                     Command::Rewrite(_, rewrite, _) | Command::BiRewrite(_, rewrite) => Some(&mut rewrite.name),
@@ -2272,11 +2335,35 @@ fn render_prepared(
                 command = *child;
             }
             // The experimental parser shadows run-schedule with a callback
-            // command, which cannot be proof-instrumented. The admitted flat
-            // native Run needs its unshadowed spelling even beneath Fail.
+            // command, which cannot be proof-instrumented. Admitted legacy
+            // runs need their unshadowed spelling even beneath Fail.
             let leaf = match command {
                 Command::RunSchedule(ast::Schedule::Run(_, config)) => {
                     format!("(run {} 1)", config.ruleset)
+                }
+                Command::RunSchedule(ast::Schedule::Repeat(span, bound, body))
+                    if dialect == Dialect::Experimental =>
+                {
+                    let ast::Schedule::Sequence(_, children) = body.as_ref() else {
+                        unreachable!("source_schedule supplies the loop body envelope")
+                    };
+                    let [ast::Schedule::Run(_, config)] = children.as_slice() else {
+                        unreachable!("only legacy single-Run loops were admitted")
+                    };
+                    // Legacy run is parser sugar, not a dedicated AST variant.
+                    // Use the native printer only; this AST is never executed.
+                    Command::UserDefined(
+                        span.clone(),
+                        "run".into(),
+                        vec![
+                            Expr::Var(span.clone(), config.ruleset.clone()),
+                            Expr::Lit(
+                                span,
+                                Literal::Int(i64::try_from(bound).expect("legacy bound checked")),
+                            ),
+                        ],
+                    )
+                    .to_string()
                 }
                 Command::RunSchedule(schedule) => {
                     format!("(run-schedule {})", render_schedule(&schedule))

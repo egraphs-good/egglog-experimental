@@ -3725,6 +3725,235 @@ fn core_source_rendered_declarations_reenter_bytes() {
 }
 
 #[test]
+fn experimental_source_legacy_run_bounds_execute_and_roundtrip() {
+    use egglog::{ExecutionEvent, ExecutionOrigin};
+    use egglog_experimental::protobuf::source::{Renderer, Source};
+    for (name, growing, count) in [
+        ("r", false, 0),
+        ("r", false, 1),
+        ("r", false, 3),
+        ("r", true, 3),
+        ("", false, 3),
+        ("", true, 0),
+        ("", true, 1),
+    ] {
+        let selection = if name.is_empty() {
+            String::new()
+        } else {
+            format!("{name} ")
+        };
+        let schedule = format!("(run {selection}{count})");
+        let declaration = if name.is_empty() {
+            String::new()
+        } else {
+            format!("(ruleset {name})")
+        };
+        let theory = if name.is_empty() {
+            String::new()
+        } else {
+            format!(":ruleset {name}")
+        };
+        let rule = if growing {
+            format!("(rule ((Seed x)) ((Seed (+ x 1))) {theory} :name \"advance\")")
+        } else {
+            String::new()
+        };
+        let last = if growing { count } else { 0 };
+        let text = format!(
+            "; λ legacy run\n(relation Seed (i64)) {declaration} {rule} (Seed 0) {schedule} \
+             (check (Seed {last})) (fail (check (Seed {})))",
+            last + 1
+        );
+        let mut native = new_experimental_egraph();
+        let parsed = native
+            .parse_program(Some("legacy-run.egg".into()), &text)
+            .unwrap();
+        let mut native_entries = 0;
+        native
+            .run_program_observed(parsed, &mut |_, _, _| (), &mut |_, event| {
+                if matches!(
+                    event,
+                    ExecutionEvent::RunStarted {
+                        origin: ExecutionOrigin::Requested,
+                        ..
+                    }
+                ) {
+                    native_entries += 1;
+                }
+            })
+            .unwrap();
+        assert_eq!(
+            native_entries,
+            if count == 0 {
+                0
+            } else if growing {
+                count
+            } else {
+                1
+            }
+        );
+        let mut renderer = Renderer::default();
+        let mut rendered = String::new();
+        let mut engine = Engine::default();
+        let id = create(&mut engine);
+        let mut observed = 0;
+        for phase in Source::new(Some("legacy-run.egg".into()), &text).unwrap() {
+            let phase = pb::Program::decode(phase.unwrap().encode_to_vec().as_slice()).unwrap();
+            rendered.push_str(&renderer.render(&phase).unwrap());
+            let response = run(&mut engine, id, phase.clone());
+            assert_eq!(response.error, None, "{schedule}: {response:?}");
+            let Some(command) = phase.commands.first() else {
+                continue;
+            };
+            let body = match command.kind.as_ref().unwrap() {
+                pb::command::Kind::Run(_) => {
+                    assert_eq!(count, 1);
+                    None
+                }
+                pb::command::Kind::Repeat(repeat) => {
+                    assert_eq!(repeat.times, Some(0));
+                    Some(&repeat.body)
+                }
+                pb::command::Kind::Saturate(saturate) => {
+                    assert_eq!(saturate.max_iterations, Some(count));
+                    Some(&saturate.body)
+                }
+                _ => continue,
+            };
+            observed += 1;
+            if let Some(body) = body {
+                assert!(matches!(
+                    body.as_slice(),
+                    [pb::Command {
+                        kind: Some(pb::command::Kind::Run(_)),
+                        ..
+                    }]
+                ));
+            }
+            let span = command.span.unwrap();
+            assert_eq!(&text[span.start as usize..span.end as usize], schedule);
+            let profile = response.profile.as_ref().unwrap();
+            assert_eq!(
+                profile.runs.iter().map(|run| run.invocations).sum::<u64>(),
+                native_entries
+            );
+            let output = response.outputs.first().unwrap();
+            if count == 1 {
+                assert!(matches!(
+                    output.kind,
+                    Some(pb::command_output::Kind::Run(_))
+                ));
+            } else {
+                let Some(pb::command_output::Kind::Loop(outcome)) = &output.kind else {
+                    panic!("legacy loop")
+                };
+                assert_eq!(outcome.iterations, native_entries);
+                assert_eq!(
+                    outcome.termination,
+                    Some(i32::from(if count == 0 {
+                        pb::TerminationReason::CountReached
+                    } else if growing {
+                        pb::TerminationReason::IterationLimit
+                    } else {
+                        pb::TerminationReason::Saturated
+                    }))
+                );
+            }
+        }
+        assert_eq!(observed, 1);
+        assert!(!rendered.contains("(run-schedule"));
+        new_experimental_egraph()
+            .parse_and_run_program(None, &rendered)
+            .unwrap();
+        let fresh = create(&mut engine);
+        for phase in Source::new(None, &rendered).unwrap() {
+            let phase = pb::Program::decode(phase.unwrap().encode_to_vec().as_slice()).unwrap();
+            assert_eq!(run(&mut engine, fresh, phase).error, None);
+        }
+    }
+}
+
+#[test]
+fn experimental_renderer_rejects_nonlegacy_loop_shapes() {
+    use egglog_experimental::protobuf::source::{Renderer, Source};
+    let run = pb::Command {
+        kind: Some(pb::command::Kind::Run(pb::Run {
+            ruleset: Some(pb::RulesetRef {
+                kind: Some(pb::ruleset_ref::Kind::Name("r".into())),
+            }),
+            ..Default::default()
+        })),
+        ..Default::default()
+    };
+    let bounded = pb::Saturate {
+        max_iterations: Some(3),
+        body: vec![run.clone()],
+        ..Default::default()
+    };
+    let program = pb::Program {
+        ir_version: 1,
+        rulesets: vec![pb::Ruleset {
+            name: Some("r".into()),
+            kind: Some(pb::ruleset::Kind::Rules(pb::RuleList::default())),
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    for kind in [
+        pb::command::Kind::Repeat(pb::Repeat {
+            times: Some(1),
+            body: vec![run.clone()],
+            ..Default::default()
+        }),
+        pb::command::Kind::Repeat(pb::Repeat {
+            times: Some(3),
+            body: vec![run.clone()],
+            ..Default::default()
+        }),
+        pb::command::Kind::Saturate(pb::Saturate {
+            max_iterations: Some(1),
+            ..bounded.clone()
+        }),
+        pb::command::Kind::Saturate(pb::Saturate {
+            max_iterations: None,
+            ..bounded.clone()
+        }),
+        pb::command::Kind::Saturate(pb::Saturate {
+            max_iterations: Some(u64::from(u32::MAX) + 1),
+            ..bounded.clone()
+        }),
+        pb::command::Kind::Saturate(pb::Saturate {
+            body: vec![run.clone(), run.clone()],
+            ..bounded.clone()
+        }),
+        pb::command::Kind::Saturate(pb::Saturate {
+            body: vec![pb::Command {
+                kind: Some(pb::command::Kind::Repeat(pb::Repeat {
+                    times: Some(1),
+                    body: vec![run],
+                    ..Default::default()
+                })),
+                ..Default::default()
+            }],
+            ..bounded
+        }),
+    ] {
+        let mut program = program.clone();
+        program.commands = vec![pb::Command {
+            kind: Some(kind),
+            ..Default::default()
+        }];
+        assert!(Renderer::default().render(&program).is_err());
+    }
+    for text in [
+        "(ruleset r) (run r 3 :until (= 1 1))",
+        "(ruleset r) (run-schedule (repeat 3 (run r)))",
+    ] {
+        assert!(Source::new(None, text).unwrap().any(|phase| phase.is_err()));
+    }
+}
+
+#[test]
 fn core_source_bounded_repeat_executes_and_reimports() {
     use egglog_experimental::protobuf::source::{Renderer, Source};
     let text = "(datatype Marker (Seed i64)) (ruleset r) \
@@ -12356,6 +12585,10 @@ fn fail_rejects_nested_invalid_and_non_native_commands_before_effects() {
             "loop" => pb::Command {
                 kind: Some(pb::command::Kind::Repeat(pb::Repeat {
                     times: Some(3),
+                    body: vec![pb::Command {
+                        kind: Some(pb::command::Kind::Check(pb::Check { facts: vec![999] })),
+                        ..Default::default()
+                    }],
                     ..Default::default()
                 })),
                 ..Default::default()
@@ -13094,7 +13327,9 @@ fn source_constructor_aliases_before_deletion_require_retained_value_lowering() 
 
 #[test]
 fn source_query_value_alias_survives_constructor_deletion() {
+    use egglog::ast::{Action, Change, Command};
     use egglog_experimental::protobuf::source::{Renderer, Source};
+    use std::collections::HashSet;
     let text = r#"
         (datatype E (A)) (relation R (E))
         (rule ((= x (A))) ((let held x) (delete (A)) (R held)))
@@ -13127,12 +13362,180 @@ fn source_query_value_alias_survives_constructor_deletion() {
         };
         let mut engine = Engine::default();
         let id = create(&mut engine);
+        let mut constructors = HashSet::new();
+        let mut cleanup_rules = 0;
         for phase in source {
             let phase = pb::Program::decode(phase.unwrap().encode_to_vec().as_slice()).unwrap();
-            replay
-                .parse_and_run_program(None, &renderer.render(&phase).unwrap())
-                .unwrap();
+            let rendered = renderer.render(&phase).unwrap();
+            let parsed = replay.parse_program(None, &rendered).unwrap();
+            for command in &parsed {
+                match command {
+                    Command::Constructor { name, .. } => {
+                        constructors.insert(name.clone());
+                    }
+                    Command::Function { .. } => {
+                        panic!("private cost helper leaked into source: {rendered}")
+                    }
+                    Command::Rule { rule } => {
+                        let deletes: Vec<_> = rule
+                            .head
+                            .0
+                            .iter()
+                            .filter_map(|action| match action {
+                                Action::Change(_, Change::Delete, name, _) => Some(name),
+                                _ => None,
+                            })
+                            .collect();
+                        assert_eq!(deletes.len(), 1);
+                        assert!(
+                            constructors.contains(deletes[0]),
+                            "authored constructor deletion was lost: {rendered}"
+                        );
+                        cleanup_rules += 1;
+                    }
+                    _ => (),
+                }
+            }
+            replay.run_program(parsed).unwrap();
             assert_eq!(run(&mut engine, id, phase).error, None);
+        }
+        assert_eq!(cleanup_rules, 1);
+        assert_eq!(constructors.len(), 1);
+    }
+}
+
+#[test]
+fn source_renderer_rejects_assigned_cost_reads_and_writes_without_state_changes() {
+    use egglog_experimental::protobuf::source::Renderer;
+    for core in [false, true] {
+        let expected = if core {
+            Renderer::core()
+        } else {
+            Renderer::default()
+        }
+        .render(&fixture())
+        .unwrap();
+        for case in [
+            "unused-read",
+            "read",
+            "merge-read",
+            "primitive-read",
+            "rule-read",
+            "write",
+            "nested-write",
+            "rule-write",
+        ] {
+            let mut program = fixture();
+            program.commands.truncate(1);
+            program.rules.clear();
+            program.rulesets.clear();
+            let target = pb::Call {
+                func: "Num".into(),
+                args: vec![1],
+            };
+            let write = pb::Action {
+                kind: Some(pb::action::Kind::SetCost(pb::SetCost {
+                    target: Some(target.clone()),
+                    cost: Some(0),
+                })),
+                ..Default::default()
+            };
+            let mut rule = None;
+            if case.ends_with("read") {
+                let read = program.nodes.len() as u32;
+                program.nodes.push(pb::Node {
+                    sort_id: 0,
+                    kind: Some(pb::node::Kind::GetCost(target)),
+                    ..Default::default()
+                });
+                match case {
+                    "read" => program.commands.push(pb::Command {
+                        kind: Some(pb::command::Kind::Action(pb::Action {
+                            kind: Some(pb::action::Kind::Term(read)),
+                            ..Default::default()
+                        })),
+                        ..Default::default()
+                    }),
+                    "merge-read" => {
+                        let Some(pb::declaration::Kind::Function(function)) =
+                            &mut program.declarations[3].kind
+                        else {
+                            unreachable!()
+                        };
+                        function.merge = Some(read);
+                    }
+                    "primitive-read" => program.declarations.push(pb::Declaration {
+                        kind: Some(pb::declaration::Kind::Primitive(pb::Primitive {
+                            name: "read_cost".into(),
+                            inputs: vec![],
+                            output: 0,
+                            body: Some(read),
+                        })),
+                        ..Default::default()
+                    }),
+                    "rule-read" => {
+                        rule = Some(pb::Rule {
+                            query: vec![read],
+                            head: vec![],
+                        })
+                    }
+                    "unused-read" => (),
+                    _ => unreachable!(),
+                }
+            } else if case == "rule-write" {
+                rule = Some(pb::Rule {
+                    query: vec![],
+                    head: vec![write],
+                });
+            } else {
+                let mut command = pb::Command {
+                    kind: Some(pb::command::Kind::Action(write)),
+                    ..Default::default()
+                };
+                if case == "nested-write" {
+                    command = pb::Command {
+                        kind: Some(pb::command::Kind::Repeat(pb::Repeat {
+                            times: Some(1),
+                            body: vec![command],
+                            ..Default::default()
+                        })),
+                        ..Default::default()
+                    };
+                    command = pb::Command {
+                        kind: Some(pb::command::Kind::Fail(Box::new(command))),
+                        ..Default::default()
+                    };
+                }
+                program.commands.push(command);
+            }
+            if let Some(rule) = rule {
+                program.rules.push(pb::RuleDecl {
+                    kind: Some(pb::rule_decl::Kind::Rule(rule)),
+                    name: Some("cost".into()),
+                    eval_mode: pb::RuleEvalMode::Naive.into(),
+                    ..Default::default()
+                });
+                program.rulesets.push(pb::Ruleset {
+                    name: Some("cost".into()),
+                    kind: Some(pb::ruleset::Kind::Rules(pb::RuleList { rules: vec![0] })),
+                    ..Default::default()
+                });
+            }
+            let mut renderer = if core {
+                Renderer::core()
+            } else {
+                Renderer::default()
+            };
+            let error = renderer.render(&program).unwrap_err();
+            assert!(
+                error.to_string().contains("assigned-cost source rendering"),
+                "core={core}/{case}: {error}"
+            );
+            assert_eq!(
+                renderer.render(&fixture()).unwrap(),
+                expected,
+                "core={core}/{case}"
+            );
         }
     }
 }
