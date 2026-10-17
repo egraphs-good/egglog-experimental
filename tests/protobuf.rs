@@ -12528,6 +12528,259 @@ fn fail_does_not_reset_union_admission_or_enable_profile_off() {
 }
 
 #[test]
+fn source_rule_head_globals_become_retained_query_bindings() {
+    use egglog_experimental::protobuf::source::{Renderer, Source};
+    let text = r#"
+        (datatype E (Num i64))
+        (relation Trigger ())
+        (function observed () E :merge new)
+        (let captured (Num 7))
+        (rule ((Trigger)) ((union captured (Num 8)) (set (observed) captured)) :name "capture")
+        (Trigger) (run 1)
+        (check (= (observed) captured) (= captured (Num 8)))
+    "#;
+    for core in [false, true] {
+        let mut native = if core {
+            egglog::EGraph::default()
+        } else {
+            new_experimental_egraph()
+        };
+        native.parse_and_run_program(None, text).unwrap();
+        let source = if core {
+            Source::new_core(None, text)
+        } else {
+            Source::new(None, text)
+        }
+        .unwrap();
+        let mut renderer = if core {
+            Renderer::core()
+        } else {
+            Renderer::default()
+        };
+        let mut replay = if core {
+            egglog::EGraph::default()
+        } else {
+            new_experimental_egraph()
+        };
+        let mut engine = Engine::default();
+        let id = create(&mut engine);
+        let mut saw_capture = false;
+        for phase in source {
+            let phase = pb::Program::decode(phase.unwrap().encode_to_vec().as_slice()).unwrap();
+            if let [rule] = phase.rules.as_slice() {
+                let Some(pb::rule_decl::Kind::Rule(rule)) = &rule.kind else {
+                    panic!("plain rule")
+                };
+                assert_eq!(rule.query.len(), 2); // Trigger plus one shared global capture.
+                let Some(pb::node::Kind::Union(capture)) =
+                    &phase.nodes[rule.query[1] as usize].kind
+                else {
+                    panic!("query equality")
+                };
+                assert!(
+                    matches!(&phase.nodes[capture.members[0] as usize].kind, Some(pb::node::Kind::Call(call)) if call.func == "captured" && call.args.is_empty())
+                );
+                assert!(matches!(
+                    &phase.nodes[capture.members[1] as usize].kind,
+                    Some(pb::node::Kind::Var(_))
+                ));
+                saw_capture = true;
+            }
+            replay
+                .parse_and_run_program(None, &renderer.render(&phase).unwrap())
+                .unwrap();
+            assert_eq!(run(&mut engine, id, phase).error, None);
+        }
+        assert!(saw_capture);
+    }
+}
+
+#[test]
+fn source_pure_local_aliases_share_nodes_and_retain_ordered_terms() {
+    use egglog_experimental::protobuf::source::{Renderer, Source};
+    let text = r#"
+        (datatype E (A) (B) (Pair E E) (Unused))
+        (relation Trigger ())
+        (relation Result (i64))
+        (rule ((Trigger))
+          ((union (A) (B))
+           (let first (Pair (A) (B)))
+           (let second (Pair first first))
+           (let unused (Unused))
+           (let n (+ 1 2))
+           (Pair second second)
+           (Result n)) :name "aliases")
+        (Trigger) (run 1)
+        (check (= (A) (B)) (Unused) (Result 3))
+    "#;
+    for core in [false, true] {
+        let mut native = if core {
+            egglog::EGraph::default()
+        } else {
+            new_experimental_egraph()
+        };
+        native.parse_and_run_program(None, text).unwrap();
+        let source = if core {
+            Source::new_core(None, text)
+        } else {
+            Source::new(None, text)
+        }
+        .unwrap();
+        let mut renderer = if core {
+            Renderer::core()
+        } else {
+            Renderer::default()
+        };
+        let mut replay = if core {
+            egglog::EGraph::default()
+        } else {
+            new_experimental_egraph()
+        };
+        let mut engine = Engine::default();
+        let id = create(&mut engine);
+        let mut saw_aliases = false;
+        for phase in source {
+            let phase = pb::Program::decode(phase.unwrap().encode_to_vec().as_slice()).unwrap();
+            if let [rule] = phase.rules.as_slice() {
+                let Some(pb::rule_decl::Kind::Rule(rule)) = &rule.kind else {
+                    panic!("plain rule")
+                };
+                assert_eq!(rule.head.len(), 7);
+                let roots: Vec<_> = rule
+                    .head
+                    .iter()
+                    .map(|action| {
+                        let Some(pb::action::Kind::Term(node)) = &action.kind else {
+                            panic!("ordered Term")
+                        };
+                        *node
+                    })
+                    .collect();
+                for (parent, child) in [(roots[2], roots[1]), (roots[5], roots[2])] {
+                    let Some(pb::node::Kind::Call(call)) = &phase.nodes[parent as usize].kind
+                    else {
+                        panic!("Pair")
+                    };
+                    assert_eq!(call.func, "Pair");
+                    assert_eq!(call.args, [child, child]);
+                }
+                let Some(pb::node::Kind::Call(call)) = &phase.nodes[roots[6] as usize].kind else {
+                    panic!("Result")
+                };
+                assert_eq!(call.args, [roots[4]]);
+                assert!(rule.head.iter().all(|action| action.span.is_some()));
+                saw_aliases = true;
+            }
+            replay
+                .parse_and_run_program(None, &renderer.render(&phase).unwrap())
+                .unwrap();
+            assert_eq!(run(&mut engine, id, phase).error, None);
+        }
+        assert!(saw_aliases);
+    }
+}
+
+#[test]
+fn source_unused_fallible_local_alias_keeps_its_authored_action() {
+    use egglog_experimental::protobuf::source::Source;
+    let text = r#"
+        (sort V (Vec i64))
+        (relation Before ()) (relation After ())
+        (rule () ((Before) (let unused (vec-get (vec-of 1) 2)) (After)))
+        (run 1)
+    "#;
+    let phases = Source::new(Some("unused-alias.egg".into()), text)
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    let phase = phases.iter().find(|phase| !phase.rules.is_empty()).unwrap();
+    let Some(pb::rule_decl::Kind::Rule(rule)) = &phase.rules[0].kind else {
+        panic!("plain rule")
+    };
+    assert_eq!(rule.head.len(), 3);
+    let Some(pb::action::Kind::Term(node)) = &rule.head[1].kind else {
+        panic!("fallible Term")
+    };
+    let Some(pb::node::Kind::Call(call)) = &phase.nodes[*node as usize].kind else {
+        panic!("vec-get")
+    };
+    assert_eq!(call.func, "egglog.core.vec.get");
+    let span = rule.head[1].span.unwrap();
+    assert_eq!(phase.files[span.file as usize].name, "unused-alias.egg");
+}
+
+#[test]
+fn source_constructor_aliases_before_deletion_require_retained_value_lowering() {
+    use egglog_experimental::protobuf::source::Source;
+    for head in [
+        "(let x (A)) (delete (A)) (R x)",
+        "(let xs (vec-of (A))) (delete (A)) (R (vec-get xs 0))",
+    ] {
+        let text = format!(
+            "(datatype E (A)) (sort V (Vec E)) (relation R (E)) (rule () ({head})) (run 1)"
+        );
+        for core in [false, true] {
+            let source = if core {
+                Source::new_core(None, &text)
+            } else {
+                Source::new(None, &text)
+            }
+            .unwrap();
+            let error = source.collect::<Result<Vec<_>, _>>().unwrap_err();
+            assert!(
+                error.to_string().contains("retained-value lowering"),
+                "{error}"
+            );
+        }
+    }
+}
+
+#[test]
+fn source_query_value_alias_survives_constructor_deletion() {
+    use egglog_experimental::protobuf::source::{Renderer, Source};
+    let text = r#"
+        (datatype E (A)) (relation R (E))
+        (rule ((= x (A))) ((let held x) (delete (A)) (R held)))
+        (A) (run 1) (fail (check (A))) (check (R x))
+    "#;
+    for core in [false, true] {
+        let mut native = if core {
+            egglog::EGraph::default()
+        } else {
+            new_experimental_egraph()
+        };
+        native.parse_and_run_program(None, text).unwrap();
+        assert_eq!(native.get_size("A"), 0);
+        assert_eq!(native.get_size("R"), 1);
+        let source = if core {
+            Source::new_core(None, text)
+        } else {
+            Source::new(None, text)
+        }
+        .unwrap();
+        let mut renderer = if core {
+            Renderer::core()
+        } else {
+            Renderer::default()
+        };
+        let mut replay = if core {
+            egglog::EGraph::default()
+        } else {
+            new_experimental_egraph()
+        };
+        let mut engine = Engine::default();
+        let id = create(&mut engine);
+        for phase in source {
+            let phase = pb::Program::decode(phase.unwrap().encode_to_vec().as_slice()).unwrap();
+            replay
+                .parse_and_run_program(None, &renderer.render(&phase).unwrap())
+                .unwrap();
+            assert_eq!(run(&mut engine, id, phase).error, None);
+        }
+    }
+}
+
+#[test]
 fn source_captures_before_later_writes() {
     use egglog_experimental::protobuf::source::Source;
     let mut engine = Engine::default();
@@ -13840,13 +14093,14 @@ fn source_renderer_preserves_expression_action_grammar() {
 fn birewrite_source_guards_and_roundtrip_keep_one_authored_rule() {
     use egglog_experimental::protobuf::source::{Renderer, Source};
     let text = r#"
-        (datatype E (Left i64) (Right i64) (Allow i64))
+        (datatype E (Left E i64) (Right E i64) (Num i64) (Allow i64))
+        (let left (Num 11)) (let right (Num 22))
         (ruleset r)
-        (birewrite (Left x) (Right y) :when ((= x y) (Allow y)) :ruleset r :name "both")
-        (Left 1) (Right 2) (Left 3) (Right 4) (Allow 1) (Allow 2)
+        (birewrite (Left left x) (Right right y) :when ((= x y) (Allow y)) :ruleset r :name "both")
+        (Left left 1) (Right right 2) (Left left 3) (Right right 4) (Allow 1) (Allow 2)
         (run r 1)
-        (check (= (Left 1) (Right 1)) (= (Left 2) (Right 2)))
-        (fail (check (Right 3))) (fail (check (Left 4)))
+        (check (= (Left left 1) (Right right 1)) (= (Left left 2) (Right right 2)))
+        (fail (check (Right right 3))) (fail (check (Left left 4)))
     "#;
     for core in [false, true] {
         let mut oracle = if core {
@@ -13910,7 +14164,8 @@ fn source_plain_rule_and_subsuming_rewrite_roundtrip() {
         ),
         (
             r#"(datatype E (Num i64) (Box E)) (ruleset r)
-            (rewrite (Box x) x :ruleset r :subsume)
+            (let captured (Num 1))
+            (rewrite (Box captured) captured :ruleset r :subsume)
             (Box (Num 1)) (run r 1) (extract (Box (Num 1)))"#,
             "(Num 1)",
         ),

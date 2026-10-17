@@ -6,7 +6,7 @@
 //! does not erase an executed prefix. Native syntax is never executed here.
 //! Scope-aware callers use [`Source::next_submission`] and the existing clone /
 //! return requests; the Program iterator deliberately rejects scope operations.
-//! Rulesets and their dependencies are fixed after first selection. Uncatalogued primitives, local lets,
+//! Rulesets and their dependencies are fixed after first selection. Uncatalogued primitives, effectful local lets,
 //! dynamic costs and general schedules remain unsupported. The explicit Core
 //! frontend also admits Run-only sequence/repeat/saturate controls. Proof requests keep
 //! their authored identity; execution mode belongs to the receiving engine.
@@ -106,7 +106,7 @@ pub(crate) fn primitive_definition(
         })
         .collect::<Result<Vec<_>, String>>()?;
     let output = source.sort(output.name())?;
-    let body = source.expr(body, false, 0)?;
+    let body = source.expr(body, None, 0)?;
     source.program.declarations.push(pb::Declaration {
         kind: Some(pb::declaration::Kind::Primitive(pb::Primitive {
             name: name.into(),
@@ -540,7 +540,7 @@ impl Source {
                             ast::FunctionSubtype::Constructor => {
                                 let cost = function.cost.map(|cost| {
                                     let cost = i64::try_from(cost).map_err(|_| "constructor cost exceeds this adapter's i64 domain")?;
-                                    self.expr(&ResolvedExpr::Lit(function.span.clone(), Literal::Int(cost)), false, 0)
+                                    self.expr(&ResolvedExpr::Lit(function.span.clone(), Literal::Int(cost)), None, 0)
                                 }).transpose()?;
                                 pb::declaration::Kind::Constructor(pb::Constructor {
                                     name: function.name,
@@ -557,7 +557,7 @@ impl Source {
                                 let merge = function
                                     .merge
                                     .as_ref()
-                                    .map(|expr| self.expr(expr, false, 0))
+                                    .map(|expr| self.expr(expr, None, 0))
                                     .transpose()?;
                                 pb::declaration::Kind::Function(pb::Function {
                                     name: function.name,
@@ -612,7 +612,7 @@ impl Source {
                     }
                     N::NormRule { rule } => self.rule(rule, rewrite)?,
                     N::CoreAction(ResolvedAction::Let(span, var, expr)) => {
-                        let value = self.expr(&expr, false, 0)?;
+                        let value = self.expr(&expr, None, 0)?;
                         let output = self.program.nodes[value as usize].sort_id;
                         let span = self.span(&span)?;
                         self.program.declarations.push(pb::Declaration {
@@ -639,7 +639,7 @@ impl Source {
                         });
                     }
                     N::CoreAction(action) => {
-                        let action = self.action(&action, false)?;
+                        let action = self.action(&action, None)?;
                         self.program.commands.push(pb::Command {
                             span: action.span,
                             kind: Some(pb::command::Kind::Action(action)),
@@ -702,7 +702,7 @@ impl Source {
                         let count = u32::try_from(count)
                             .map_err(|_| "source extraction variant count out of range")?
                             .max(1);
-                        let root = self.expr(&expr, false, 0)?;
+                        let root = self.expr(&expr, None, 0)?;
                         let span = self.span(&span)?;
                         self.program.commands.push(pb::Command {
                             span,
@@ -973,11 +973,11 @@ impl Source {
             return Err("source rule options are not supported yet".into());
         }
         // Native source-position shadowing checks have already run. Rename only
-        // resolved locals, consistently across query/head; global refs remain
-        // explicit capture calls. ResolvedVar equality ignores is_global_ref,
+        // resolved locals, consistently across query/head; globals are captured
+        // separately below. ResolvedVar equality ignores is_global_ref,
         // so it must not be used as the key for this derived lowering map.
         let mut locals = HashMap::new();
-        let rule = rule.map_symbols(&mut |call| call, &mut |mut var| {
+        let mut rule = rule.map_symbols(&mut |call| call, &mut |mut var| {
             if !var.is_global_ref {
                 let next = locals.len();
                 var.name = locals
@@ -989,6 +989,58 @@ impl Source {
             }
             var
         });
+        // Match Core's remove_globals pass: globals used by actions are query
+        // bindings, retained before any head writes. A bidirectional rewrite
+        // also uses its authored LHS as the reverse head.
+        let mut globals = HashMap::new();
+        let mut captures = Vec::new();
+        let mut capture = |expr: ResolvedExpr| {
+            if let ResolvedExpr::Var(span, var) = &expr
+                && var.is_global_ref
+                && !globals.contains_key(&var.name)
+            {
+                let local = ResolvedExpr::Var(
+                    span.clone(),
+                    ast::ResolvedVar {
+                        name: format!(
+                            "{}{}_{}",
+                            self.local_prefix,
+                            self.program.rules.len(),
+                            locals.len() + globals.len()
+                        ),
+                        sort: var.sort.clone(),
+                        is_global_ref: false,
+                    },
+                );
+                globals.insert(var.name.clone(), local.clone());
+                captures.push(ResolvedFact::Eq(span.clone(), expr.clone(), local));
+            }
+            expr
+        };
+        rule.head.clone().visit_exprs(&mut capture);
+        if matches!(rewrite, Some(RewriteKind::Bidirectional))
+            && let Some(fact) = rule.body.first()
+        {
+            fact.clone().visit_exprs(&mut capture);
+        }
+        let mut replace = |expr: ResolvedExpr| match &expr {
+            ResolvedExpr::Var(_, var) if var.is_global_ref => {
+                globals.get(&var.name).cloned().unwrap_or(expr)
+            }
+            _ => expr,
+        };
+        rule.head = rule.head.visit_exprs(&mut replace);
+        // Canonical rewrites reuse the LHS for a subsume action and for the
+        // reverse direction. Keep those occurrences aligned with the head.
+        if rewrite.is_some() {
+            rule.body = rule
+                .body
+                .into_iter()
+                .map(|fact| fact.visit_exprs(&mut replace))
+                .collect();
+        }
+        rule.body.extend(captures);
+        let mut aliases = HashMap::new();
         let kind = if let Some(rewrite) = rewrite {
             let subsume = matches!(rewrite, RewriteKind::Directional(true));
             let (
@@ -1017,8 +1069,8 @@ impl Source {
                     return Err("native rewrite desugaring changed: subsumption target".into());
                 }
             }
-            let lhs = self.expr(lhs, false, 0)?;
-            let rhs = self.expr(rhs, true, 0)?;
+            let lhs = self.expr(lhs, None, 0)?;
+            let rhs = self.expr(rhs, Some(&aliases), 0)?;
             let conditions = self.facts(&rule.body[1..])?;
             match rewrite {
                 RewriteKind::Directional(subsume) => pb::rule_decl::Kind::Rewrite(pb::Rewrite {
@@ -1034,15 +1086,48 @@ impl Source {
                 }),
             }
         } else {
-            pb::rule_decl::Kind::Rule(pb::Rule {
-                query: self.facts(&rule.body)?,
-                head: rule
-                    .head
-                    .0
-                    .iter()
-                    .map(|action| self.action(action, true))
-                    .collect::<Result<_, _>>()?,
-            })
+            let query = self.facts(&rule.body)?;
+            let mut head = Vec::with_capacity(rule.head.0.len());
+            // Ordinary Call sharing does not retain its result. Recreating a
+            // constructor is only safe while later actions cannot remove its
+            // row; this also applies under an otherwise pure primitive call.
+            let mut recreate_constructors = vec![true; rule.head.0.len()];
+            let mut destructive = false;
+            for (index, action) in rule.head.0.iter().enumerate().rev() {
+                recreate_constructors[index] = !destructive;
+                destructive |= matches!(action, ResolvedAction::Change(..));
+                action.clone().visit_exprs(&mut |expr| {
+                    if let ResolvedExpr::Call(_, ResolvedCall::Primitive(primitive), _) = &expr
+                        && !primitive
+                            .prim_with_id
+                            .is_valid_in_context(egglog::Context::Pure)
+                    {
+                        destructive = true;
+                    }
+                    expr
+                });
+            }
+            for (index, action) in rule.head.0.iter().enumerate() {
+                if let ResolvedAction::Let(span, var, expr) = action {
+                    let node = self.expr(expr, Some(&aliases), 0)?;
+                    if !pure_local_alias(expr, recreate_constructors[index]) {
+                        return Err("source local aliases with reads, stateful calls or constructors before destructive actions require retained-value lowering".into());
+                    }
+                    aliases.insert(var.name.clone(), node);
+                    // Calls still evaluate at the authored position, including
+                    // unused constructors and fallible pure primitives. A
+                    // literal or retained variable needs no evaluation action.
+                    if matches!(expr, ResolvedExpr::Call(..)) {
+                        head.push(pb::Action {
+                            kind: Some(pb::action::Kind::Term(node)),
+                            span: self.span(span)?,
+                        });
+                    }
+                } else {
+                    head.push(self.action(action, Some(&aliases))?);
+                }
+            }
+            pb::rule_decl::Kind::Rule(pb::Rule { query, head })
         };
         let span = self.span(&rule.span)?;
         let index = u32::try_from(self.program.rules.len()).map_err(|_| "too many source rules")?;
@@ -1064,10 +1149,10 @@ impl Source {
         facts
             .iter()
             .map(|fact| match fact {
-                ResolvedFact::Fact(expr) => self.expr(expr, false, 0),
+                ResolvedFact::Fact(expr) => self.expr(expr, None, 0),
                 ResolvedFact::Eq(span, lhs, rhs) => {
-                    let lhs = self.expr(lhs, false, 0)?;
-                    let rhs = self.expr(rhs, false, 0)?;
+                    let lhs = self.expr(lhs, None, 0)?;
+                    let rhs = self.expr(rhs, None, 0)?;
                     let span = self.span(span)?;
                     let index = u32::try_from(self.program.nodes.len())
                         .map_err(|_| "too many source nodes")?;
@@ -1087,15 +1172,15 @@ impl Source {
     fn action(
         &mut self,
         action: &ResolvedAction<ResolvedCall, ast::ResolvedVar>,
-        rule_head: bool,
+        aliases: Option<&HashMap<String, u32>>,
     ) -> Result<pb::Action, String> {
         let (span, kind) = match action {
             ResolvedAction::Expr(span, expr) => {
-                (span, pb::action::Kind::Term(self.expr(expr, rule_head, 0)?))
+                (span, pb::action::Kind::Term(self.expr(expr, aliases, 0)?))
             }
             ResolvedAction::Union(span, lhs, rhs) => {
-                let lhs = self.expr(lhs, rule_head, 0)?;
-                let rhs = self.expr(rhs, rule_head, 0)?;
+                let lhs = self.expr(lhs, aliases, 0)?;
+                let rhs = self.expr(rhs, aliases, 0)?;
                 let index =
                     u32::try_from(self.program.nodes.len()).map_err(|_| "too many source nodes")?;
                 let node_span = self.span(span)?;
@@ -1113,12 +1198,12 @@ impl Source {
             ResolvedAction::Set(span, function, args, value) => (
                 span,
                 pb::action::Kind::Set(pb::Set {
-                    target: Some(self.call(function, args, rule_head, 0, span)?),
-                    value: Some(self.expr(value, rule_head, 0)?),
+                    target: Some(self.call(function, args, aliases, 0, span)?),
+                    value: Some(self.expr(value, aliases, 0)?),
                 }),
             ),
             ResolvedAction::Change(span, change, function, args) => {
-                let call = self.call(function, args, rule_head, 0, span)?;
+                let call = self.call(function, args, aliases, 0, span)?;
                 (
                     span,
                     match change {
@@ -1127,7 +1212,7 @@ impl Source {
                     },
                 )
             }
-            ResolvedAction::Panic(span, message) if !rule_head => {
+            ResolvedAction::Panic(span, message) if aliases.is_none() => {
                 (span, pb::action::Kind::Panic(message.clone()))
             }
             _ => return Err("source local bindings and rule panics are not supported yet".into()),
@@ -1142,13 +1227,13 @@ impl Source {
         &mut self,
         function: &ResolvedCall,
         args: &[ResolvedExpr],
-        rule_head: bool,
+        aliases: Option<&HashMap<String, u32>>,
         depth: usize,
         span: &ast::Span,
     ) -> Result<pb::Call, String> {
         let mut children = Vec::with_capacity(args.len());
         for expr in args {
-            children.push(self.expr(expr, rule_head, depth + 1)?);
+            children.push(self.expr(expr, aliases, depth + 1)?);
         }
         match function {
             ResolvedCall::Func(function) => Ok(pb::Call {
@@ -1162,7 +1247,12 @@ impl Source {
         }
     }
 
-    fn expr(&mut self, expr: &ResolvedExpr, rule_head: bool, depth: usize) -> Result<u32, String> {
+    fn expr(
+        &mut self,
+        expr: &ResolvedExpr,
+        aliases: Option<&HashMap<String, u32>>,
+        depth: usize,
+    ) -> Result<u32, String> {
         if depth > 256 {
             return Err("source expression depth exceeds 256".into());
         }
@@ -1186,7 +1276,12 @@ impl Source {
                 )
             }
             ResolvedExpr::Var(_, var) => {
-                if var.is_global_ref && rule_head {
+                if !var.is_global_ref
+                    && let Some(node) = aliases.and_then(|aliases| aliases.get(&var.name))
+                {
+                    return Ok(*node);
+                }
+                if var.is_global_ref && aliases.is_some() {
                     return Err(
                         "source globals in rule heads require retained query bindings".into(),
                     );
@@ -1213,7 +1308,7 @@ impl Source {
                 if let ResolvedCall::Primitive(primitive) = function {
                     let children = args
                         .iter()
-                        .map(|expr| self.expr(expr, rule_head, depth + 1))
+                        .map(|expr| self.expr(expr, aliases, depth + 1))
                         .collect::<Result<Vec<_>, _>>()?;
                     let span = self.span(span)?;
                     primitive.export_builtin_node(
@@ -1223,7 +1318,7 @@ impl Source {
                         &mut self.program,
                     )?
                 } else {
-                    pb::node::Kind::Call(self.call(function, args, rule_head, depth, span)?)
+                    pb::node::Kind::Call(self.call(function, args, aliases, depth, span)?)
                 },
             ),
         };
@@ -1268,6 +1363,28 @@ impl Source {
             start: u32::try_from(span.i).map_err(|_| "source span exceeds u32")?,
             end: u32::try_from(span.j).map_err(|_| "source span exceeds u32")?,
         }))
+    }
+}
+
+// Pure registration excludes ambient reads/writes, but its arguments may still
+// construct equality values. Guard those recursively against later deletion or
+// other stateful calls. Query/global capture Vars already retain their values.
+fn pure_local_alias(expr: &ResolvedExpr, recreate_constructors: bool) -> bool {
+    match expr {
+        ResolvedExpr::Lit(..) | ResolvedExpr::Var(..) => true,
+        ResolvedExpr::Call(_, call, args) => {
+            let pure = match call {
+                ResolvedCall::Func(function) => {
+                    recreate_constructors && function.subtype == ast::FunctionSubtype::Constructor
+                }
+                ResolvedCall::Primitive(primitive) => primitive
+                    .prim_with_id
+                    .is_valid_in_context(egglog::Context::Pure),
+            };
+            pure && args
+                .iter()
+                .all(|arg| pure_local_alias(arg, recreate_constructors))
+        }
     }
 }
 
