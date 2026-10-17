@@ -243,6 +243,7 @@ fn execution_error(
         egglog::Error::CheckError(_, span)
         | egglog::Error::NoSuchRuleset(_, span)
         | egglog::Error::ExpectFail(span)
+        | egglog::Error::Panic { span, .. }
         | egglog::Error::ProofError { span, .. } => Some(span),
         _ => None,
     };
@@ -265,6 +266,7 @@ fn execution_error(
     let code = match &error {
         egglog::Error::CheckError(..) => pb::ErrorCode::CheckFailed,
         egglog::Error::ExtractError(..) => pb::ErrorCode::ExtractionFailed,
+        egglog::Error::Panic { .. } => pb::ErrorCode::Panic,
         egglog::Error::NoSuchRuleset(..)
         | egglog::Error::TypeError(egglog::TypeError::UnboundFunction(..)) => {
             pb::ErrorCode::UnknownName
@@ -620,14 +622,32 @@ impl Engine {
                         },
                     )
                 });
-                response.error = Some(execution_error(
+                let origin = match &error {
+                    egglog::Error::Panic {
+                        rule: Some(rule), ..
+                    } => context.origins.get(rule).map(|(origin, _)| origin.clone()),
+                    _ => None,
+                };
+                let mut error = execution_error(
                     error,
                     &session.names,
                     &response.files,
                     span,
                     Some(location),
                     panic,
-                ));
+                );
+                if let Some(origin) = origin {
+                    let index =
+                        *context
+                            .response_rules
+                            .entry(origin.clone())
+                            .or_insert_with(|| {
+                                response.rules.push(origin);
+                                (response.rules.len() - 1) as u32
+                            });
+                    error.rule = Some(index);
+                }
+                response.error = Some(error);
                 break;
             }
         }
@@ -4443,13 +4463,6 @@ fn lower_rule(
                     _ => return Err("SetCost is not supported yet".into()),
                 };
                 check_variables(program, &roots, &mut bindings, false)?;
-            }
-            if body
-                .head
-                .iter()
-                .any(|action| matches!(action.kind, Some(pb::action::Kind::Panic(_))))
-            {
-                return Err("rule panic attribution is not supported yet".into());
             }
             Ok(Command::Rule {
                 rule: ast::Rule {

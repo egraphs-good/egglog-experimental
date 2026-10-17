@@ -1215,10 +1215,10 @@ impl Source {
                     },
                 )
             }
-            ResolvedAction::Panic(span, message) if aliases.is_none() => {
+            ResolvedAction::Panic(span, message) => {
                 (span, pb::action::Kind::Panic(message.clone()))
             }
-            _ => return Err("source local bindings and rule panics are not supported yet".into()),
+            _ => return Err("source local binding requires rule-head lowering".into()),
         };
         Ok(pb::Action {
             kind: Some(kind),

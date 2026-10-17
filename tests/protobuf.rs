@@ -12517,6 +12517,151 @@ fn fail_does_not_reset_union_admission_or_enable_profile_off() {
 }
 
 #[test]
+fn source_rule_panics_keep_exact_span_and_occurrence_in_every_mode() {
+    use egglog_experimental::protobuf::source::{Renderer, Source};
+    let original = "; λ🌿 byte offsets\n(relation Trigger ()) (relation Missing ()) (relation Prefix ()) (relation Suffix ())\n(Trigger)\n(rule ((Missing)) ((panic \"same π\")) :name \"silent\")\n(rule ((Trigger)) ((Prefix) (panic \"same π\") (Suffix)) :name \"fired\")\n(run 1)";
+    let mut renderer = Renderer::default();
+    let mut rendered = String::new();
+    for phase in Source::new(Some("panic-origin.egg".into()), original).unwrap() {
+        rendered.push_str(&renderer.render(&phase.unwrap()).unwrap());
+    }
+    for mode in [
+        pb::ExecutionMode::Normal,
+        pb::ExecutionMode::TermEncoding,
+        pb::ExecutionMode::Proofs,
+        pb::ExecutionMode::ProofTesting,
+    ] {
+        for (filename, text) in [
+            ("panic-origin.egg", original),
+            ("panic-roundtrip.egg", rendered.as_str()),
+        ] {
+            let mut engine = Engine::default();
+            let bytes = engine
+                .create(
+                    &pb::CreateEGraphRequest {
+                        sorts: fixture().sorts[..1].to_vec(),
+                        options: Some(pb::EGraphOptions {
+                            cost_sort: Some(0),
+                            execution_mode: mode.into(),
+                        }),
+                        threads: Some(1),
+                        ..Default::default()
+                    }
+                    .encode_to_vec(),
+                )
+                .unwrap();
+            let id = pb::CreateEGraphResponse::decode(bytes.as_slice())
+                .unwrap()
+                .egraph_id;
+            let mut failed = None;
+            for phase in Source::new(Some(filename.into()), text).unwrap() {
+                let phase = pb::Program::decode(phase.unwrap().encode_to_vec().as_slice()).unwrap();
+                let response = run(&mut engine, id, phase.clone());
+                if let Some(error) = &response.error {
+                    assert_eq!(
+                        error.code,
+                        i32::from(pb::ErrorCode::Panic),
+                        "{mode:?}: {error:?}"
+                    );
+                    assert_eq!(error.message, "Panic: same π");
+                    assert_eq!(error.location.as_ref().unwrap().path, [0]);
+                    let span = error.span.unwrap();
+                    let file = &response.files[span.file as usize];
+                    assert_eq!(file.name, filename);
+                    let source = file.contents.as_ref().unwrap();
+                    assert_eq!(source, text);
+                    assert_eq!(
+                        &source[span.start as usize..span.end as usize],
+                        "(panic \"same π\")"
+                    );
+                    assert_eq!(
+                        span.start as usize,
+                        text.rfind("(panic \"same π\")").unwrap()
+                    );
+                    let origin = &response.rules[error.rule.unwrap() as usize];
+                    assert_eq!(origin.name.as_deref(), Some("fired"));
+                    let Some(pb::ruleset_ref::Kind::Name(root)) =
+                        origin.root.as_ref().and_then(|root| root.kind.as_ref())
+                    else {
+                        panic!("source ruleset name")
+                    };
+                    let mut selected = phase
+                        .rulesets
+                        .iter()
+                        .find(|ruleset| ruleset.name.as_ref() == Some(root))
+                        .unwrap();
+                    for child in &origin.children {
+                        let Some(pb::ruleset::Kind::Combined(combined)) = &selected.kind else {
+                            panic!("attributed ruleset path")
+                        };
+                        let Some(pb::ruleset_ref::Kind::Name(name)) =
+                            &combined.rulesets[*child as usize].kind
+                        else {
+                            panic!("source child ruleset name")
+                        };
+                        selected = phase
+                            .rulesets
+                            .iter()
+                            .find(|ruleset| ruleset.name.as_ref() == Some(name))
+                            .unwrap();
+                    }
+                    let Some(pb::ruleset::Kind::Rules(rules)) = &selected.kind else {
+                        panic!("attributed rule list")
+                    };
+                    // Attribution is any valid representative route, not the
+                    // active Run target or a global rule-arena ordinal.
+                    let authored = &phase.rules[rules.rules[origin.rule as usize] as usize];
+                    assert_eq!(authored.name.as_deref(), Some("fired"));
+                    assert_eq!(origin.span, authored.span);
+                    let span = origin.span.unwrap();
+                    assert!(
+                        source[span.start as usize..span.end as usize].contains(":name \"fired\"")
+                    );
+                    assert!(response.outputs.is_empty());
+                    assert!(!response.profile.as_ref().unwrap().complete);
+                    let Some(pb::rule_decl::Kind::Rule(fired)) = &authored.kind else {
+                        panic!("authored plain rule")
+                    };
+                    let facts = [0, 2].map(|index| {
+                        let Some(pb::action::Kind::Term(node)) = fired.head[index].kind else {
+                            panic!("prefix/suffix action")
+                        };
+                        node
+                    });
+                    failed = Some((phase, facts));
+                    break;
+                }
+            }
+            let (mut observation, facts) = failed.expect("authored panic reached execution");
+            observation.rules.clear();
+            observation.rulesets.clear();
+            // Nullary relation membership proves the exact [1, 0] row counts
+            // without requiring encoded-mode PrintFunction observation.
+            observation.commands = facts
+                .into_iter()
+                .enumerate()
+                .map(|(index, fact)| {
+                    let command = pb::Command {
+                        kind: Some(pb::command::Kind::Check(pb::Check { facts: vec![fact] })),
+                        ..Default::default()
+                    };
+                    if index == 0 {
+                        command
+                    } else {
+                        pb::Command {
+                            kind: Some(pb::command::Kind::Fail(Box::new(command))),
+                            ..Default::default()
+                        }
+                    }
+                })
+                .collect();
+            let response = run(&mut engine, id, observation);
+            assert_eq!(response.error, None, "completed prefix in {mode:?}");
+        }
+    }
+}
+
+#[test]
 fn source_rule_options_preserve_rematching_and_subsumed_queries() {
     use egglog_experimental::protobuf::source::{Renderer, Source};
     let mut cases = vec![];
