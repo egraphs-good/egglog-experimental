@@ -4570,10 +4570,27 @@ fn bounded_saturate_observes_native_early_stop_not_exact_repeat() {
         body,
         ..Default::default()
     }));
-    let rejected = run(&mut engine, fresh, exact);
-    assert!(rejected.error.is_some());
-    assert!(rejected.outputs.is_empty());
-    assert!(rejected.ruleset_publication.unwrap().names.is_empty());
+    let repeated = run(&mut engine, fresh, exact);
+    assert_eq!(repeated.error, None);
+    assert_eq!(repeated.ruleset_publication.unwrap().names, ["empty"]);
+    let [output] = repeated.outputs.as_slice() else {
+        panic!("exact Repeat must publish only its outer outcome");
+    };
+    let Some(pb::command_output::Kind::Loop(outcome)) = &output.kind else {
+        panic!("expected exact Repeat outcome");
+    };
+    assert_eq!(outcome.iterations, 3);
+    assert!(!outcome.updated);
+    assert_eq!(
+        outcome.termination,
+        Some(pb::TerminationReason::CountReached.into())
+    );
+    let profile = repeated.profile.unwrap();
+    let [run] = profile.runs.as_slice() else {
+        panic!("one static leaf site");
+    };
+    assert_eq!(run.command_path, [0, 0]);
+    assert_eq!(run.invocations, 3, "unchanged iterations still execute");
 }
 
 #[test]

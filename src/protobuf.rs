@@ -22,7 +22,7 @@ use std::sync::Arc;
 use crate::proto as pb;
 use egglog::ast::{self, Action, Command, Expr, Fact, Literal};
 use egglog::{ArcSort, EGraph, Term, TermDag, TermId, Value, span};
-use egglog::{ExecutionEvent, ExecutionOrigin, NativeLoopStop};
+use egglog::{ExecutionEvent, ExecutionOrigin, NativeLoopStop, RepeatContinuation};
 use egglog_ast::span::{EgglogSpan, SrcFile};
 use num::{BigInt, Integer, One, Zero};
 use prost::Message;
@@ -1600,8 +1600,8 @@ impl Session {
             }
             pb::command::Kind::Repeat(repeat) => {
                 let count = repeat.times.ok_or("missing Repeat count")?;
-                if count > 1 || !repeat.until.is_empty() {
-                    return Err("only Repeat0/1 without until is currently supported".into());
+                if !repeat.until.is_empty() {
+                    return Err("Repeat until conditions are not supported yet".into());
                 }
                 (&repeat.body, Some(count))
             }
@@ -1612,9 +1612,7 @@ impl Session {
                 (&saturate.body, saturate.max_iterations)
             }
             _ => {
-                return Err(
-                    "schedule bodies currently admit only Run, Repeat0/1 and Saturate".into(),
-                );
+                return Err("schedule bodies currently admit only Run, Repeat and Saturate".into());
             }
         };
         let limit = limit
@@ -1899,7 +1897,7 @@ impl Session {
         let measurements = RefCell::new(ScheduleMeasurements::default());
         let mut registered = false;
         let mut export_error = None;
-        let mut result = self.graph.run_program_observed(
+        let mut result = self.graph.run_program_observed_with_repeat_policy(
             commands,
             &mut |cause, origin, output| {
                 if origin != ExecutionOrigin::Requested {
@@ -2126,6 +2124,15 @@ impl Session {
                             termination: Some(termination.into()),
                         });
                     }
+                }
+            },
+            &|_, schedule| {
+                if sites.get(schedule.path).is_some_and(|(command, _)| {
+                    matches!(command.kind, Some(pb::command::Kind::Repeat(_)))
+                }) {
+                    RepeatContinuation::ExactCount
+                } else {
+                    RepeatContinuation::CanStop
                 }
             },
         );
