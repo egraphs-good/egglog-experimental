@@ -218,7 +218,7 @@
 //!
 //! `#[ruleset]` turns a monomorphic, safe Rust function into one lazily initialized
 //! immutable group. Its ordinary body and concrete or inferred output author
-//! rules through the existing callback, with up to 35 immutable borrowed inputs.
+//! rules through the existing callback, with up to 64 immutable borrowed inputs.
 //! The default native binding name is the module-qualified function name;
 //! `#[ruleset(name = expression)]` uses that exact name expression once, after
 //! the body and before root publication. Names are native bindings, not mutable

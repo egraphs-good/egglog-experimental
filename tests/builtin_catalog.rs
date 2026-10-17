@@ -530,19 +530,38 @@ mod rooted_default_context {
                 else {
                     unreachable!()
                 };
-                let presentation =
-                    builtin::scalar_member_bindings(signature, "method", "method", &[], None, None);
+                let owner = Some(proto::BindingOwner {
+                    kind: Some(proto::binding_owner::Kind::Sort(signature.inputs[0].sort)),
+                });
                 if python {
                     root.bindings.as_mut().unwrap().python = if empty_first {
                         Some(proto::PythonBindings::default())
                     } else {
-                        presentation.python
+                        Some(proto::PythonBindings {
+                            views: vec![proto::PythonCallable {
+                                kind: proto::PythonCallKind::Method.into(),
+                                path: vec!["method".into()],
+                                owner,
+                                receiver: Some(0),
+                                ..Default::default()
+                            }],
+                        })
                     };
                 } else {
                     root.bindings.as_mut().unwrap().rust = if empty_first {
                         Some(proto::RustBindings::default())
                     } else {
-                        presentation.rust
+                        Some(proto::RustBindings {
+                            views: vec![proto::RustCallable {
+                                path: vec!["method".into()],
+                                owner,
+                                receiver: Some(proto::RustReceiver {
+                                    core_input: Some(0),
+                                    borrowed: false,
+                                }),
+                                ..Default::default()
+                            }],
+                        })
                     };
                 }
                 let prepared = graph
@@ -3657,6 +3676,33 @@ fn scalar_catalog_has_authoritative_language_views() {
                 }],
             })
         );
+        for operation in ["lt", "gt"] {
+            let declaration = catalog
+                .declarations
+                .iter()
+                .find(|d| {
+                    matches!(&d.kind,
+                Some(proto::declaration::Kind::HostPrimitive(p))
+                    if p.name == format!("egglog.core.{scalar}.{operation}"))
+                })
+                .unwrap();
+            let rust = &declaration
+                .bindings
+                .as_ref()
+                .unwrap()
+                .rust
+                .as_ref()
+                .unwrap()
+                .views[0];
+            assert_eq!(
+                rust.receiver,
+                Some(proto::RustReceiver {
+                    core_input: Some(0),
+                    borrowed: true,
+                })
+            );
+            assert!(rust.trait_impl.is_none());
+        }
     }
 }
 

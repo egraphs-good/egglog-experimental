@@ -149,6 +149,9 @@ fn closed_scalar_family_preserves_symbolic_sorts_and_executes_as_bytes() -> Resu
     let y = F64::from(2.0);
     let r = Rational::new(3, 2);
     let s = Rational::new(1, 2);
+    let borrowed_a = &a;
+    let borrowed_x = &x;
+    let borrowed_r = &r;
     for expression in [
         &a | &b,
         &a ^ &b,
@@ -201,17 +204,17 @@ fn closed_scalar_family_preserves_symbolic_sorts_and_executes_as_bytes() -> Resu
         assert!(Rational64::try_from(&expression).is_err());
     }
     for predicate in [
-        a.clone().gt(&b),
-        a.clone().le(&b),
-        x.clone().lt(&y),
-        x.clone().gt(&y),
-        x.clone().le(&y),
-        x.clone().ge(&y),
-        x.clone().is_finite(),
-        r.clone().lt(&s),
-        r.clone().gt(&s),
-        r.clone().le(&s),
-        r.clone().ge(&s),
+        borrowed_a.gt(&b),
+        a.le(&b),
+        borrowed_x.lt(&y),
+        x.gt(&y),
+        x.le(&y),
+        x.ge(&y),
+        x.is_finite(),
+        borrowed_r.lt(&s),
+        r.gt(&s),
+        r.le(&s),
+        r.ge(&s),
     ] {
         assert!(<()>::try_from(&predicate).is_err());
     }
@@ -229,6 +232,7 @@ fn closed_scalar_family_preserves_symbolic_sorts_and_executes_as_bytes() -> Resu
     assert_ne!(&r - &s, &s - &r);
 
     let mut graph = EGraph::default();
+    assert!(graph.check((borrowed_a.gt(&b), a.gt(&b), borrowed_x.gt(&y), x.gt(&y)))?);
     for (left, right) in [(0, 1), (1, 1), (2, 1), (i64::MIN, i64::MAX)] {
         let left_expr = I64::from(left);
         for (predicate, expected) in [

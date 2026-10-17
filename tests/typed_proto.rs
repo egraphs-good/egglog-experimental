@@ -1116,6 +1116,19 @@ mod lazy_rulesets {
         rule((), RuleTerms::Copied(35))
     }
 
+    macro_rules! borrowed_limit {
+        ($name:ident, $count:literal; $($arg:ident),+ $(,)?) => {
+            #[ruleset]
+            fn $name($($arg: &I64),+) -> Rule {
+                let _ = ($($arg),+);
+                rule((), RuleTerms::Copied($count))
+            }
+        };
+    }
+
+    borrowed_limit!(borrowed_63, 63; named_ruleset, a01, a02, a03, a04, a05, a06, a07, a08, a09, a10, a11, a12, a13, a14, a15, a16, a17, a18, a19, a20, a21, a22, a23, a24, a25, a26, a27, a28, a29, a30, a31, a32, a33, a34, a35, a36, a37, a38, a39, a40, a41, a42, a43, a44, a45, a46, a47, a48, a49, a50, a51, a52, a53, a54, a55, a56, a57, a58, a59, a60, a61, a62);
+    borrowed_limit!(borrowed_64, 64; named_ruleset, a01, a02, a03, a04, a05, a06, a07, a08, a09, a10, a11, a12, a13, a14, a15, a16, a17, a18, a19, a20, a21, a22, a23, a24, a25, a26, a27, a28, a29, a30, a31, a32, a33, a34, a35, a36, a37, a38, a39, a40, a41, a42, a43, a44, a45, a46, a47, a48, a49, a50, a51, a52, a53, a54, a55, a56, a57, a58, a59, a60, a61, a62, a63);
+
     static SHARED: LazyLock<Rule> = LazyLock::new(|| rule((), RuleTerms::Copied(126)));
 
     #[ruleset(name = "lazy::rejected")]
@@ -1216,13 +1229,16 @@ mod lazy_rulesets {
     }
 
     #[test]
-    fn lazy_ruleset_exact_name_expression_empty_name_and_35_inputs() -> Result<(), TypedError> {
+    fn lazy_ruleset_exact_name_expression_empty_name_and_borrowed_input_limits()
+    -> Result<(), TypedError> {
         for mut graph in [EGraph::default(), EGraph::default()] {
             for (group, expected) in [
                 (&*exact, "exact::lazy-name"),
                 (&*empty_name, ""),
                 (&*private_looking_name, "__typed_ruleset_0"),
                 (&*borrowed_35, concat!(module_path!(), "::borrowed_35")),
+                (&*borrowed_63, concat!(module_path!(), "::borrowed_63")),
+                (&*borrowed_64, concat!(module_path!(), "::borrowed_64")),
             ] {
                 assert!(
                     graph
@@ -1233,7 +1249,12 @@ mod lazy_rulesets {
                         .contains(&expected.to_owned())
                 );
             }
-            assert!(graph.check((RuleTerms::Second(84), RuleTerms::Copied(35)))?);
+            assert!(graph.check((
+                RuleTerms::Second(84),
+                RuleTerms::Copied(35),
+                RuleTerms::Copied(63),
+                RuleTerms::Copied(64),
+            ))?);
         }
         assert_eq!(EXACT_BODIES.load(Ordering::SeqCst), 1);
         assert_eq!(NAMES.load(Ordering::SeqCst), 1);

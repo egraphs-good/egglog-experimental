@@ -978,10 +978,10 @@ fn ruleset_item(mut item: syn::ItemFn, opts: Vec<Meta>) -> syn::Result<Tokens> {
             "rulesets require monomorphic safe ordinary signatures",
         ));
     }
-    if sig.inputs.len() > 35 {
+    if sig.inputs.len() > 64 {
         return Err(syn::Error::new_spanned(
             &sig.inputs,
-            "rulesets support at most 35 borrowed arguments",
+            "rulesets support at most 64 borrowed arguments",
         ));
     }
     for input in &sig.inputs {
@@ -2157,18 +2157,18 @@ mod tests {
                 expected
             );
         }
-        for count in [35, 36] {
+        for count in [63, 64, 65] {
             let names = (0..count)
                 .map(|index| Ident::new(&format!("value_{index}"), proc_macro2::Span::call_site()))
                 .collect::<Vec<_>>();
             let item = syn::parse2(quote!(fn group(#(#names: &I64),*) {})).unwrap();
             let expanded = ruleset_item(item, vec![]);
-            if count == 35 {
+            if count <= 64 {
                 syn::parse2::<syn::ItemStatic>(expanded.unwrap()).unwrap();
             } else {
                 assert_eq!(
                     expanded.unwrap_err().to_string(),
-                    "rulesets support at most 35 borrowed arguments"
+                    "rulesets support at most 64 borrowed arguments"
                 );
             }
         }

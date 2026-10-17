@@ -747,12 +747,15 @@ macro_rules! arities {
         arities!(@[$($done:$j,)* $next:$i,]; $($tail:$k),*);
     };
 }
-// Includes the observed 13- and 35-argument Luminal binders. The same expansion
-// can be extended when another concrete authoring case needs a wider tuple.
+// Includes Luminal's observed binders up to 60 arguments, with a uniform
+// 64-argument boundary for callbacks and ordered heterogeneous collections.
 arities!(@[]; A0:0,A1:1,A2:2,A3:3,A4:4,A5:5,A6:6,A7:7,A8:8,A9:9,
     A10:10,A11:11,A12:12,A13:13,A14:14,A15:15,A16:16,A17:17,A18:18,A19:19,
     A20:20,A21:21,A22:22,A23:23,A24:24,A25:25,A26:26,A27:27,A28:28,A29:29,
-    A30:30,A31:31,A32:32,A33:33,A34:34);
+    A30:30,A31:31,A32:32,A33:33,A34:34,A35:35,A36:36,A37:37,A38:38,A39:39,
+    A40:40,A41:41,A42:42,A43:43,A44:44,A45:45,A46:46,A47:47,A48:48,A49:49,
+    A50:50,A51:51,A52:52,A53:53,A54:54,A55:55,A56:56,A57:57,A58:58,A59:59,
+    A60:60,A61:61,A62:62,A63:63);
 
 pub(super) fn ensure_sort<S: EgglogValue>(expr: Expr) -> Result<S, TypedError> {
     let node = &expr.0.owner.as_ref().unwrap().program.nodes[expr.0.index as usize];

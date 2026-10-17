@@ -1664,7 +1664,7 @@ impl ::core::ops::BitOr<&self::BigInt> for &self::BigInt {
 
 impl self::BigInt {
     /// Author a catalog-defined call without evaluating its arguments.
-    pub fn bits(self) -> self::BigInt {
+    pub fn bits(&self) -> self::BigInt {
         let __egglog_args = ::std::vec![::core::clone::Clone::clone(&self.0)];
 
         let mut __egglog_record =
@@ -1760,7 +1760,7 @@ impl ::core::ops::BitXor<&self::BigInt> for &self::BigInt {
 
 impl self::BigInt {
     /// Author a catalog-defined call without evaluating its arguments.
-    pub fn bool_eq(self, __egglog_arg_0: impl ::core::convert::Into<self::BigInt>) -> self::Bool {
+    pub fn bool_eq(&self, __egglog_arg_0: impl ::core::convert::Into<self::BigInt>) -> self::Bool {
         let __egglog_args = ::std::vec![::core::clone::Clone::clone(&self.0), {
             let __egglog_value: self::BigInt = ::core::convert::Into::into(__egglog_arg_0);
             ::core::clone::Clone::clone(&__egglog_value.0)
@@ -1782,7 +1782,7 @@ impl self::BigInt {
 }
 impl self::BigInt {
     /// Author a catalog-defined call without evaluating its arguments.
-    pub fn bool_ge(self, __egglog_arg_0: impl ::core::convert::Into<self::BigInt>) -> self::Bool {
+    pub fn bool_ge(&self, __egglog_arg_0: impl ::core::convert::Into<self::BigInt>) -> self::Bool {
         let __egglog_args = ::std::vec![::core::clone::Clone::clone(&self.0), {
             let __egglog_value: self::BigInt = ::core::convert::Into::into(__egglog_arg_0);
             ::core::clone::Clone::clone(&__egglog_value.0)
@@ -1804,7 +1804,7 @@ impl self::BigInt {
 }
 impl self::BigInt {
     /// Author a catalog-defined call without evaluating its arguments.
-    pub fn bool_gt(self, __egglog_arg_0: impl ::core::convert::Into<self::BigInt>) -> self::Bool {
+    pub fn bool_gt(&self, __egglog_arg_0: impl ::core::convert::Into<self::BigInt>) -> self::Bool {
         let __egglog_args = ::std::vec![::core::clone::Clone::clone(&self.0), {
             let __egglog_value: self::BigInt = ::core::convert::Into::into(__egglog_arg_0);
             ::core::clone::Clone::clone(&__egglog_value.0)
@@ -1826,7 +1826,7 @@ impl self::BigInt {
 }
 impl self::BigInt {
     /// Author a catalog-defined call without evaluating its arguments.
-    pub fn bool_le(self, __egglog_arg_0: impl ::core::convert::Into<self::BigInt>) -> self::Bool {
+    pub fn bool_le(&self, __egglog_arg_0: impl ::core::convert::Into<self::BigInt>) -> self::Bool {
         let __egglog_args = ::std::vec![::core::clone::Clone::clone(&self.0), {
             let __egglog_value: self::BigInt = ::core::convert::Into::into(__egglog_arg_0);
             ::core::clone::Clone::clone(&__egglog_value.0)
@@ -1848,7 +1848,7 @@ impl self::BigInt {
 }
 impl self::BigInt {
     /// Author a catalog-defined call without evaluating its arguments.
-    pub fn bool_lt(self, __egglog_arg_0: impl ::core::convert::Into<self::BigInt>) -> self::Bool {
+    pub fn bool_lt(&self, __egglog_arg_0: impl ::core::convert::Into<self::BigInt>) -> self::Bool {
         let __egglog_args = ::std::vec![::core::clone::Clone::clone(&self.0), {
             let __egglog_value: self::BigInt = ::core::convert::Into::into(__egglog_arg_0);
             ::core::clone::Clone::clone(&__egglog_value.0)
@@ -1991,7 +1991,7 @@ impl self::BigInt {
 }
 impl self::BigInt {
     /// Author a catalog-defined call without evaluating its arguments.
-    pub fn ge(self, __egglog_arg_0: impl ::core::convert::Into<self::BigInt>) -> self::Unit {
+    pub fn ge(&self, __egglog_arg_0: impl ::core::convert::Into<self::BigInt>) -> self::Unit {
         let __egglog_args = ::std::vec![::core::clone::Clone::clone(&self.0), {
             let __egglog_value: self::BigInt = ::core::convert::Into::into(__egglog_arg_0);
             ::core::clone::Clone::clone(&__egglog_value.0)
@@ -2013,7 +2013,7 @@ impl self::BigInt {
 }
 impl self::BigInt {
     /// Author a catalog-defined call without evaluating its arguments.
-    pub fn gt(self, __egglog_arg_0: impl ::core::convert::Into<self::BigInt>) -> self::Unit {
+    pub fn gt(&self, __egglog_arg_0: impl ::core::convert::Into<self::BigInt>) -> self::Unit {
         let __egglog_args = ::std::vec![::core::clone::Clone::clone(&self.0), {
             let __egglog_value: self::BigInt = ::core::convert::Into::into(__egglog_arg_0);
             ::core::clone::Clone::clone(&__egglog_value.0)
@@ -2035,7 +2035,7 @@ impl self::BigInt {
 }
 impl self::BigInt {
     /// Author a catalog-defined call without evaluating its arguments.
-    pub fn le(self, __egglog_arg_0: impl ::core::convert::Into<self::BigInt>) -> self::Unit {
+    pub fn le(&self, __egglog_arg_0: impl ::core::convert::Into<self::BigInt>) -> self::Unit {
         let __egglog_args = ::std::vec![::core::clone::Clone::clone(&self.0), {
             let __egglog_value: self::BigInt = ::core::convert::Into::into(__egglog_arg_0);
             ::core::clone::Clone::clone(&__egglog_value.0)
@@ -2057,7 +2057,7 @@ impl self::BigInt {
 }
 impl self::BigInt {
     /// Author a catalog-defined call without evaluating its arguments.
-    pub fn lt(self, __egglog_arg_0: impl ::core::convert::Into<self::BigInt>) -> self::Unit {
+    pub fn lt(&self, __egglog_arg_0: impl ::core::convert::Into<self::BigInt>) -> self::Unit {
         let __egglog_args = ::std::vec![::core::clone::Clone::clone(&self.0), {
             let __egglog_value: self::BigInt = ::core::convert::Into::into(__egglog_arg_0);
             ::core::clone::Clone::clone(&__egglog_value.0)
@@ -2079,7 +2079,7 @@ impl self::BigInt {
 }
 impl self::BigInt {
     /// Author a catalog-defined call without evaluating its arguments.
-    pub fn max(self, __egglog_arg_0: impl ::core::convert::Into<self::BigInt>) -> self::BigInt {
+    pub fn max(&self, __egglog_arg_0: impl ::core::convert::Into<self::BigInt>) -> self::BigInt {
         let __egglog_args = ::std::vec![::core::clone::Clone::clone(&self.0), {
             let __egglog_value: self::BigInt = ::core::convert::Into::into(__egglog_arg_0);
             ::core::clone::Clone::clone(&__egglog_value.0)
@@ -2101,7 +2101,7 @@ impl self::BigInt {
 }
 impl self::BigInt {
     /// Author a catalog-defined call without evaluating its arguments.
-    pub fn min(self, __egglog_arg_0: impl ::core::convert::Into<self::BigInt>) -> self::BigInt {
+    pub fn min(&self, __egglog_arg_0: impl ::core::convert::Into<self::BigInt>) -> self::BigInt {
         let __egglog_args = ::std::vec![::core::clone::Clone::clone(&self.0), {
             let __egglog_value: self::BigInt = ::core::convert::Into::into(__egglog_arg_0);
             ::core::clone::Clone::clone(&__egglog_value.0)
@@ -2540,7 +2540,7 @@ impl ::core::ops::Sub<&self::BigInt> for &self::BigInt {
 
 impl self::BigInt {
     /// Author a catalog-defined call without evaluating its arguments.
-    pub fn to_string(self) -> self::String {
+    pub fn to_string(&self) -> self::String {
         let __egglog_args = ::std::vec![::core::clone::Clone::clone(&self.0)];
 
         let mut __egglog_record =
@@ -2559,7 +2559,7 @@ impl self::BigInt {
 }
 impl self::BigRat {
     /// Author a catalog-defined call without evaluating its arguments.
-    pub fn abs(self) -> self::BigRat {
+    pub fn abs(&self) -> self::BigRat {
         let __egglog_args = ::std::vec![::core::clone::Clone::clone(&self.0)];
 
         let mut __egglog_record =
@@ -2655,7 +2655,7 @@ impl ::core::ops::Add<&self::BigRat> for &self::BigRat {
 
 impl self::BigRat {
     /// Author a catalog-defined call without evaluating its arguments.
-    pub fn cbrt(self) -> self::BigRat {
+    pub fn cbrt(&self) -> self::BigRat {
         let __egglog_args = ::std::vec![::core::clone::Clone::clone(&self.0)];
 
         let mut __egglog_record =
@@ -2674,7 +2674,7 @@ impl self::BigRat {
 }
 impl self::BigRat {
     /// Author a catalog-defined call without evaluating its arguments.
-    pub fn ceil(self) -> self::BigRat {
+    pub fn ceil(&self) -> self::BigRat {
         let __egglog_args = ::std::vec![::core::clone::Clone::clone(&self.0)];
 
         let mut __egglog_record =
@@ -2693,7 +2693,7 @@ impl self::BigRat {
 }
 impl self::BigRat {
     /// Author a catalog-defined call without evaluating its arguments.
-    pub fn denom(self) -> self::BigInt {
+    pub fn denom(&self) -> self::BigInt {
         let __egglog_args = ::std::vec![::core::clone::Clone::clone(&self.0)];
 
         let mut __egglog_record =
@@ -2789,7 +2789,7 @@ impl ::core::ops::Div<&self::BigRat> for &self::BigRat {
 
 impl self::BigRat {
     /// Author a catalog-defined call without evaluating its arguments.
-    pub fn floor(self) -> self::BigRat {
+    pub fn floor(&self) -> self::BigRat {
         let __egglog_args = ::std::vec![::core::clone::Clone::clone(&self.0)];
 
         let mut __egglog_record =
@@ -2808,7 +2808,7 @@ impl self::BigRat {
 }
 impl self::BigRat {
     /// Author a catalog-defined call without evaluating its arguments.
-    pub fn ge(self, __egglog_arg_0: impl ::core::convert::Into<self::BigRat>) -> self::Unit {
+    pub fn ge(&self, __egglog_arg_0: impl ::core::convert::Into<self::BigRat>) -> self::Unit {
         let __egglog_args = ::std::vec![::core::clone::Clone::clone(&self.0), {
             let __egglog_value: self::BigRat = ::core::convert::Into::into(__egglog_arg_0);
             ::core::clone::Clone::clone(&__egglog_value.0)
@@ -2830,7 +2830,7 @@ impl self::BigRat {
 }
 impl self::BigRat {
     /// Author a catalog-defined call without evaluating its arguments.
-    pub fn gt(self, __egglog_arg_0: impl ::core::convert::Into<self::BigRat>) -> self::Unit {
+    pub fn gt(&self, __egglog_arg_0: impl ::core::convert::Into<self::BigRat>) -> self::Unit {
         let __egglog_args = ::std::vec![::core::clone::Clone::clone(&self.0), {
             let __egglog_value: self::BigRat = ::core::convert::Into::into(__egglog_arg_0);
             ::core::clone::Clone::clone(&__egglog_value.0)
@@ -2852,7 +2852,7 @@ impl self::BigRat {
 }
 impl self::BigRat {
     /// Author a catalog-defined call without evaluating its arguments.
-    pub fn le(self, __egglog_arg_0: impl ::core::convert::Into<self::BigRat>) -> self::Unit {
+    pub fn le(&self, __egglog_arg_0: impl ::core::convert::Into<self::BigRat>) -> self::Unit {
         let __egglog_args = ::std::vec![::core::clone::Clone::clone(&self.0), {
             let __egglog_value: self::BigRat = ::core::convert::Into::into(__egglog_arg_0);
             ::core::clone::Clone::clone(&__egglog_value.0)
@@ -2874,7 +2874,7 @@ impl self::BigRat {
 }
 impl self::BigRat {
     /// Author a catalog-defined call without evaluating its arguments.
-    pub fn log(self) -> self::BigRat {
+    pub fn log(&self) -> self::BigRat {
         let __egglog_args = ::std::vec![::core::clone::Clone::clone(&self.0)];
 
         let mut __egglog_record =
@@ -2893,7 +2893,7 @@ impl self::BigRat {
 }
 impl self::BigRat {
     /// Author a catalog-defined call without evaluating its arguments.
-    pub fn lt(self, __egglog_arg_0: impl ::core::convert::Into<self::BigRat>) -> self::Unit {
+    pub fn lt(&self, __egglog_arg_0: impl ::core::convert::Into<self::BigRat>) -> self::Unit {
         let __egglog_args = ::std::vec![::core::clone::Clone::clone(&self.0), {
             let __egglog_value: self::BigRat = ::core::convert::Into::into(__egglog_arg_0);
             ::core::clone::Clone::clone(&__egglog_value.0)
@@ -2946,7 +2946,7 @@ impl self::BigRat {
 }
 impl self::BigRat {
     /// Author a catalog-defined call without evaluating its arguments.
-    pub fn max(self, __egglog_arg_0: impl ::core::convert::Into<self::BigRat>) -> self::BigRat {
+    pub fn max(&self, __egglog_arg_0: impl ::core::convert::Into<self::BigRat>) -> self::BigRat {
         let __egglog_args = ::std::vec![::core::clone::Clone::clone(&self.0), {
             let __egglog_value: self::BigRat = ::core::convert::Into::into(__egglog_arg_0);
             ::core::clone::Clone::clone(&__egglog_value.0)
@@ -2968,7 +2968,7 @@ impl self::BigRat {
 }
 impl self::BigRat {
     /// Author a catalog-defined call without evaluating its arguments.
-    pub fn min(self, __egglog_arg_0: impl ::core::convert::Into<self::BigRat>) -> self::BigRat {
+    pub fn min(&self, __egglog_arg_0: impl ::core::convert::Into<self::BigRat>) -> self::BigRat {
         let __egglog_args = ::std::vec![::core::clone::Clone::clone(&self.0), {
             let __egglog_value: self::BigRat = ::core::convert::Into::into(__egglog_arg_0);
             ::core::clone::Clone::clone(&__egglog_value.0)
@@ -3103,7 +3103,7 @@ impl ::core::ops::Neg for &self::BigRat {
 
 impl self::BigRat {
     /// Author a catalog-defined call without evaluating its arguments.
-    pub fn numer(self) -> self::BigInt {
+    pub fn numer(&self) -> self::BigInt {
         let __egglog_args = ::std::vec![::core::clone::Clone::clone(&self.0)];
 
         let mut __egglog_record =
@@ -3122,7 +3122,7 @@ impl self::BigRat {
 }
 impl self::BigRat {
     /// Author a catalog-defined call without evaluating its arguments.
-    pub fn pow(self, __egglog_arg_0: impl ::core::convert::Into<self::BigRat>) -> self::BigRat {
+    pub fn pow(&self, __egglog_arg_0: impl ::core::convert::Into<self::BigRat>) -> self::BigRat {
         let __egglog_args = ::std::vec![::core::clone::Clone::clone(&self.0), {
             let __egglog_value: self::BigRat = ::core::convert::Into::into(__egglog_arg_0);
             ::core::clone::Clone::clone(&__egglog_value.0)
@@ -3144,7 +3144,7 @@ impl self::BigRat {
 }
 impl self::BigRat {
     /// Author a catalog-defined call without evaluating its arguments.
-    pub fn round(self) -> self::BigRat {
+    pub fn round(&self) -> self::BigRat {
         let __egglog_args = ::std::vec![::core::clone::Clone::clone(&self.0)];
 
         let mut __egglog_record =
@@ -3163,7 +3163,7 @@ impl self::BigRat {
 }
 impl self::BigRat {
     /// Author a catalog-defined call without evaluating its arguments.
-    pub fn sqrt(self) -> self::BigRat {
+    pub fn sqrt(&self) -> self::BigRat {
         let __egglog_args = ::std::vec![::core::clone::Clone::clone(&self.0)];
 
         let mut __egglog_record =
@@ -3259,7 +3259,7 @@ impl ::core::ops::Sub<&self::BigRat> for &self::BigRat {
 
 impl self::BigRat {
     /// Author a catalog-defined call without evaluating its arguments.
-    pub fn to_f64(self) -> self::F64 {
+    pub fn to_f64(&self) -> self::F64 {
         let __egglog_args = ::std::vec![::core::clone::Clone::clone(&self.0)];
 
         let mut __egglog_record =
@@ -3278,7 +3278,7 @@ impl self::BigRat {
 }
 impl self::BigRat {
     /// Author a catalog-defined call without evaluating its arguments.
-    pub fn to_i64(self) -> self::I64 {
+    pub fn to_i64(&self) -> self::I64 {
         let __egglog_args = ::std::vec![::core::clone::Clone::clone(&self.0)];
 
         let mut __egglog_record =
@@ -3366,7 +3366,7 @@ impl ::core::ops::BitAnd<&self::Bool> for &self::Bool {
 
 impl self::Bool {
     /// Author a catalog-defined call without evaluating its arguments.
-    pub fn implies(self, __egglog_arg_0: impl ::core::convert::Into<self::Bool>) -> self::Bool {
+    pub fn implies(&self, __egglog_arg_0: impl ::core::convert::Into<self::Bool>) -> self::Bool {
         let __egglog_args = ::std::vec![::core::clone::Clone::clone(&self.0), {
             let __egglog_value: self::Bool = ::core::convert::Into::into(__egglog_arg_0);
             ::core::clone::Clone::clone(&__egglog_value.0)
@@ -3577,7 +3577,7 @@ impl ::core::ops::BitXor<&self::Bool> for &self::Bool {
 
 impl self::F64 {
     /// Author a catalog-defined call without evaluating its arguments.
-    pub fn abs(self) -> self::F64 {
+    pub fn abs(&self) -> self::F64 {
         let __egglog_args = ::std::vec![::core::clone::Clone::clone(&self.0)];
 
         let mut __egglog_record =
@@ -3733,7 +3733,7 @@ impl ::core::ops::Div<&self::F64> for &self::F64 {
 
 impl self::F64 {
     /// Author a catalog-defined call without evaluating its arguments.
-    pub fn exp(self) -> self::F64 {
+    pub fn exp(&self) -> self::F64 {
         let __egglog_args = ::std::vec![::core::clone::Clone::clone(&self.0)];
 
         let mut __egglog_record =
@@ -3774,7 +3774,7 @@ impl self::F64 {
 }
 impl self::F64 {
     /// Author a catalog-defined call without evaluating its arguments.
-    pub fn ge(self, __egglog_arg_0: impl ::core::convert::Into<self::F64>) -> self::Unit {
+    pub fn ge(&self, __egglog_arg_0: impl ::core::convert::Into<self::F64>) -> self::Unit {
         let __egglog_args = ::std::vec![::core::clone::Clone::clone(&self.0), {
             let __egglog_value: self::F64 = ::core::convert::Into::into(__egglog_arg_0);
             ::core::clone::Clone::clone(&__egglog_value.0)
@@ -3796,7 +3796,7 @@ impl self::F64 {
 }
 impl self::F64 {
     /// Author a catalog-defined call without evaluating its arguments.
-    pub fn gt(self, __egglog_arg_0: impl ::core::convert::Into<self::F64>) -> self::Unit {
+    pub fn gt(&self, __egglog_arg_0: impl ::core::convert::Into<self::F64>) -> self::Unit {
         let __egglog_args = ::std::vec![::core::clone::Clone::clone(&self.0), {
             let __egglog_value: self::F64 = ::core::convert::Into::into(__egglog_arg_0);
             ::core::clone::Clone::clone(&__egglog_value.0)
@@ -3818,7 +3818,7 @@ impl self::F64 {
 }
 impl self::F64 {
     /// Author a catalog-defined call without evaluating its arguments.
-    pub fn le(self, __egglog_arg_0: impl ::core::convert::Into<self::F64>) -> self::Unit {
+    pub fn le(&self, __egglog_arg_0: impl ::core::convert::Into<self::F64>) -> self::Unit {
         let __egglog_args = ::std::vec![::core::clone::Clone::clone(&self.0), {
             let __egglog_value: self::F64 = ::core::convert::Into::into(__egglog_arg_0);
             ::core::clone::Clone::clone(&__egglog_value.0)
@@ -3840,7 +3840,7 @@ impl self::F64 {
 }
 impl self::F64 {
     /// Author a catalog-defined call without evaluating its arguments.
-    pub fn log(self) -> self::F64 {
+    pub fn log(&self) -> self::F64 {
         let __egglog_args = ::std::vec![::core::clone::Clone::clone(&self.0)];
 
         let mut __egglog_record =
@@ -3859,7 +3859,7 @@ impl self::F64 {
 }
 impl self::F64 {
     /// Author a catalog-defined call without evaluating its arguments.
-    pub fn lt(self, __egglog_arg_0: impl ::core::convert::Into<self::F64>) -> self::Unit {
+    pub fn lt(&self, __egglog_arg_0: impl ::core::convert::Into<self::F64>) -> self::Unit {
         let __egglog_args = ::std::vec![::core::clone::Clone::clone(&self.0), {
             let __egglog_value: self::F64 = ::core::convert::Into::into(__egglog_arg_0);
             ::core::clone::Clone::clone(&__egglog_value.0)
@@ -3881,7 +3881,7 @@ impl self::F64 {
 }
 impl self::F64 {
     /// Author a catalog-defined call without evaluating its arguments.
-    pub fn max(self, __egglog_arg_0: impl ::core::convert::Into<self::F64>) -> self::F64 {
+    pub fn max(&self, __egglog_arg_0: impl ::core::convert::Into<self::F64>) -> self::F64 {
         let __egglog_args = ::std::vec![::core::clone::Clone::clone(&self.0), {
             let __egglog_value: self::F64 = ::core::convert::Into::into(__egglog_arg_0);
             ::core::clone::Clone::clone(&__egglog_value.0)
@@ -3903,7 +3903,7 @@ impl self::F64 {
 }
 impl self::F64 {
     /// Author a catalog-defined call without evaluating its arguments.
-    pub fn min(self, __egglog_arg_0: impl ::core::convert::Into<self::F64>) -> self::F64 {
+    pub fn min(&self, __egglog_arg_0: impl ::core::convert::Into<self::F64>) -> self::F64 {
         let __egglog_args = ::std::vec![::core::clone::Clone::clone(&self.0), {
             let __egglog_value: self::F64 = ::core::convert::Into::into(__egglog_arg_0);
             ::core::clone::Clone::clone(&__egglog_value.0)
@@ -4030,7 +4030,7 @@ impl ::core::ops::Neg for &self::F64 {
 
 impl self::F64 {
     /// Author a catalog-defined call without evaluating its arguments.
-    pub fn pow(self, __egglog_arg_0: impl ::core::convert::Into<self::F64>) -> self::F64 {
+    pub fn pow(&self, __egglog_arg_0: impl ::core::convert::Into<self::F64>) -> self::F64 {
         let __egglog_args = ::std::vec![::core::clone::Clone::clone(&self.0), {
             let __egglog_value: self::F64 = ::core::convert::Into::into(__egglog_arg_0);
             ::core::clone::Clone::clone(&__egglog_value.0)
@@ -4121,7 +4121,7 @@ impl ::core::ops::Rem<&self::F64> for &self::F64 {
 
 impl self::F64 {
     /// Author a catalog-defined call without evaluating its arguments.
-    pub fn sqrt(self) -> self::F64 {
+    pub fn sqrt(&self) -> self::F64 {
         let __egglog_args = ::std::vec![::core::clone::Clone::clone(&self.0)];
 
         let mut __egglog_record =
@@ -4209,7 +4209,7 @@ impl ::core::ops::Sub<&self::F64> for &self::F64 {
 
 impl self::F64 {
     /// Author a catalog-defined call without evaluating its arguments.
-    pub fn to_i64(self) -> self::I64 {
+    pub fn to_i64(&self) -> self::I64 {
         let __egglog_args = ::std::vec![::core::clone::Clone::clone(&self.0)];
 
         let mut __egglog_record =
@@ -4228,7 +4228,7 @@ impl self::F64 {
 }
 impl self::F64 {
     /// Author a catalog-defined call without evaluating its arguments.
-    pub fn to_string(self) -> self::String {
+    pub fn to_string(&self) -> self::String {
         let __egglog_args = ::std::vec![::core::clone::Clone::clone(&self.0)];
 
         let mut __egglog_record =
@@ -4248,7 +4248,7 @@ impl self::F64 {
 function_application!(call, 84);
 impl self::I64 {
     /// Author a catalog-defined call without evaluating its arguments.
-    pub fn abs(self) -> self::I64 {
+    pub fn abs(&self) -> self::I64 {
         let __egglog_args = ::std::vec![::core::clone::Clone::clone(&self.0)];
 
         let mut __egglog_record =
@@ -4540,7 +4540,7 @@ impl ::core::ops::BitXor<&self::I64> for &self::I64 {
 
 impl self::I64 {
     /// Author a catalog-defined call without evaluating its arguments.
-    pub fn bool_ge(self, __egglog_arg_0: impl ::core::convert::Into<self::I64>) -> self::Bool {
+    pub fn bool_ge(&self, __egglog_arg_0: impl ::core::convert::Into<self::I64>) -> self::Bool {
         let __egglog_args = ::std::vec![::core::clone::Clone::clone(&self.0), {
             let __egglog_value: self::I64 = ::core::convert::Into::into(__egglog_arg_0);
             ::core::clone::Clone::clone(&__egglog_value.0)
@@ -4562,7 +4562,7 @@ impl self::I64 {
 }
 impl self::I64 {
     /// Author a catalog-defined call without evaluating its arguments.
-    pub fn bool_gt(self, __egglog_arg_0: impl ::core::convert::Into<self::I64>) -> self::Bool {
+    pub fn bool_gt(&self, __egglog_arg_0: impl ::core::convert::Into<self::I64>) -> self::Bool {
         let __egglog_args = ::std::vec![::core::clone::Clone::clone(&self.0), {
             let __egglog_value: self::I64 = ::core::convert::Into::into(__egglog_arg_0);
             ::core::clone::Clone::clone(&__egglog_value.0)
@@ -4584,7 +4584,7 @@ impl self::I64 {
 }
 impl self::I64 {
     /// Author a catalog-defined call without evaluating its arguments.
-    pub fn bool_le(self, __egglog_arg_0: impl ::core::convert::Into<self::I64>) -> self::Bool {
+    pub fn bool_le(&self, __egglog_arg_0: impl ::core::convert::Into<self::I64>) -> self::Bool {
         let __egglog_args = ::std::vec![::core::clone::Clone::clone(&self.0), {
             let __egglog_value: self::I64 = ::core::convert::Into::into(__egglog_arg_0);
             ::core::clone::Clone::clone(&__egglog_value.0)
@@ -4606,7 +4606,7 @@ impl self::I64 {
 }
 impl self::I64 {
     /// Author a catalog-defined call without evaluating its arguments.
-    pub fn bool_lt(self, __egglog_arg_0: impl ::core::convert::Into<self::I64>) -> self::Bool {
+    pub fn bool_lt(&self, __egglog_arg_0: impl ::core::convert::Into<self::I64>) -> self::Bool {
         let __egglog_args = ::std::vec![::core::clone::Clone::clone(&self.0), {
             let __egglog_value: self::I64 = ::core::convert::Into::into(__egglog_arg_0);
             ::core::clone::Clone::clone(&__egglog_value.0)
@@ -4763,7 +4763,7 @@ impl self::I64 {
 }
 impl self::I64 {
     /// Author a catalog-defined call without evaluating its arguments.
-    pub fn log2(self) -> self::I64 {
+    pub fn log2(&self) -> self::I64 {
         let __egglog_args = ::std::vec![::core::clone::Clone::clone(&self.0)];
 
         let mut __egglog_record =
@@ -5225,7 +5225,7 @@ impl ::core::ops::Sub<&self::I64> for &self::I64 {
 
 impl self::I64 {
     /// Author a catalog-defined call without evaluating its arguments.
-    pub fn to_string(self) -> self::String {
+    pub fn to_string(&self) -> self::String {
         let __egglog_args = ::std::vec![::core::clone::Clone::clone(&self.0)];
 
         let mut __egglog_record =
@@ -6739,7 +6739,7 @@ pub fn count_matches(
 impl self::String {
     /// Author a catalog-defined call without evaluating its arguments.
     pub fn replace(
-        self,
+        &self,
         __egglog_arg_0: impl ::core::convert::Into<self::String>,
         __egglog_arg_1: impl ::core::convert::Into<self::String>,
     ) -> self::String {
@@ -7003,7 +7003,7 @@ impl<__EgglogType0: crate::typed::EgglogValue> self::Vec<__EgglogType0> {
 
 impl self::I64 {
     /// Author a catalog-defined call without evaluating its arguments.
-    pub fn range(self) -> self::Vec<self::I64> {
+    pub fn range(&self) -> self::Vec<self::I64> {
         let __egglog_args = ::std::vec![::core::clone::Clone::clone(&self.0)];
 
         let mut __egglog_record =
@@ -7120,7 +7120,7 @@ impl<__EgglogType0: crate::typed::EqualitySort> self::Vec<__EgglogType0> {
 
 impl self::F64 {
     /// Author a catalog-defined call without evaluating its arguments.
-    pub fn is_finite(self) -> self::Unit {
+    pub fn is_finite(&self) -> self::Unit {
         let __egglog_args = ::std::vec![::core::clone::Clone::clone(&self.0)];
 
         let mut __egglog_record =
@@ -7235,7 +7235,7 @@ impl<__EgglogType0: crate::typed::EgglogValue> self::Maybe<__EgglogType0> {
 
 impl self::Rational {
     /// Author a catalog-defined call without evaluating its arguments.
-    pub fn abs(self) -> self::Rational {
+    pub fn abs(&self) -> self::Rational {
         let __egglog_args = ::std::vec![::core::clone::Clone::clone(&self.0)];
 
         let mut __egglog_record =
@@ -7331,7 +7331,7 @@ impl ::core::ops::Add<&self::Rational> for &self::Rational {
 
 impl self::Rational {
     /// Author a catalog-defined call without evaluating its arguments.
-    pub fn cbrt(self) -> self::Rational {
+    pub fn cbrt(&self) -> self::Rational {
         let __egglog_args = ::std::vec![::core::clone::Clone::clone(&self.0)];
 
         let mut __egglog_record =
@@ -7350,7 +7350,7 @@ impl self::Rational {
 }
 impl self::Rational {
     /// Author a catalog-defined call without evaluating its arguments.
-    pub fn ceil(self) -> self::Rational {
+    pub fn ceil(&self) -> self::Rational {
         let __egglog_args = ::std::vec![::core::clone::Clone::clone(&self.0)];
 
         let mut __egglog_record =
@@ -7369,7 +7369,7 @@ impl self::Rational {
 }
 impl self::Rational {
     /// Author a catalog-defined call without evaluating its arguments.
-    pub fn denom(self) -> self::I64 {
+    pub fn denom(&self) -> self::I64 {
         let __egglog_args = ::std::vec![::core::clone::Clone::clone(&self.0)];
 
         let mut __egglog_record =
@@ -7465,7 +7465,7 @@ impl ::core::ops::Div<&self::Rational> for &self::Rational {
 
 impl self::Rational {
     /// Author a catalog-defined call without evaluating its arguments.
-    pub fn floor(self) -> self::Rational {
+    pub fn floor(&self) -> self::Rational {
         let __egglog_args = ::std::vec![::core::clone::Clone::clone(&self.0)];
 
         let mut __egglog_record =
@@ -7484,7 +7484,7 @@ impl self::Rational {
 }
 impl self::Rational {
     /// Author a catalog-defined call without evaluating its arguments.
-    pub fn ge(self, __egglog_arg_0: impl ::core::convert::Into<self::Rational>) -> self::Unit {
+    pub fn ge(&self, __egglog_arg_0: impl ::core::convert::Into<self::Rational>) -> self::Unit {
         let __egglog_args = ::std::vec![::core::clone::Clone::clone(&self.0), {
             let __egglog_value: self::Rational = ::core::convert::Into::into(__egglog_arg_0);
             ::core::clone::Clone::clone(&__egglog_value.0)
@@ -7506,7 +7506,7 @@ impl self::Rational {
 }
 impl self::Rational {
     /// Author a catalog-defined call without evaluating its arguments.
-    pub fn gt(self, __egglog_arg_0: impl ::core::convert::Into<self::Rational>) -> self::Unit {
+    pub fn gt(&self, __egglog_arg_0: impl ::core::convert::Into<self::Rational>) -> self::Unit {
         let __egglog_args = ::std::vec![::core::clone::Clone::clone(&self.0), {
             let __egglog_value: self::Rational = ::core::convert::Into::into(__egglog_arg_0);
             ::core::clone::Clone::clone(&__egglog_value.0)
@@ -7528,7 +7528,7 @@ impl self::Rational {
 }
 impl self::Rational {
     /// Author a catalog-defined call without evaluating its arguments.
-    pub fn le(self, __egglog_arg_0: impl ::core::convert::Into<self::Rational>) -> self::Unit {
+    pub fn le(&self, __egglog_arg_0: impl ::core::convert::Into<self::Rational>) -> self::Unit {
         let __egglog_args = ::std::vec![::core::clone::Clone::clone(&self.0), {
             let __egglog_value: self::Rational = ::core::convert::Into::into(__egglog_arg_0);
             ::core::clone::Clone::clone(&__egglog_value.0)
@@ -7550,7 +7550,7 @@ impl self::Rational {
 }
 impl self::Rational {
     /// Author a catalog-defined call without evaluating its arguments.
-    pub fn log(self) -> self::Rational {
+    pub fn log(&self) -> self::Rational {
         let __egglog_args = ::std::vec![::core::clone::Clone::clone(&self.0)];
 
         let mut __egglog_record =
@@ -7569,7 +7569,7 @@ impl self::Rational {
 }
 impl self::Rational {
     /// Author a catalog-defined call without evaluating its arguments.
-    pub fn lt(self, __egglog_arg_0: impl ::core::convert::Into<self::Rational>) -> self::Unit {
+    pub fn lt(&self, __egglog_arg_0: impl ::core::convert::Into<self::Rational>) -> self::Unit {
         let __egglog_args = ::std::vec![::core::clone::Clone::clone(&self.0), {
             let __egglog_value: self::Rational = ::core::convert::Into::into(__egglog_arg_0);
             ::core::clone::Clone::clone(&__egglog_value.0)
@@ -7622,7 +7622,10 @@ impl self::Rational {
 }
 impl self::Rational {
     /// Author a catalog-defined call without evaluating its arguments.
-    pub fn max(self, __egglog_arg_0: impl ::core::convert::Into<self::Rational>) -> self::Rational {
+    pub fn max(
+        &self,
+        __egglog_arg_0: impl ::core::convert::Into<self::Rational>,
+    ) -> self::Rational {
         let __egglog_args = ::std::vec![::core::clone::Clone::clone(&self.0), {
             let __egglog_value: self::Rational = ::core::convert::Into::into(__egglog_arg_0);
             ::core::clone::Clone::clone(&__egglog_value.0)
@@ -7644,7 +7647,10 @@ impl self::Rational {
 }
 impl self::Rational {
     /// Author a catalog-defined call without evaluating its arguments.
-    pub fn min(self, __egglog_arg_0: impl ::core::convert::Into<self::Rational>) -> self::Rational {
+    pub fn min(
+        &self,
+        __egglog_arg_0: impl ::core::convert::Into<self::Rational>,
+    ) -> self::Rational {
         let __egglog_args = ::std::vec![::core::clone::Clone::clone(&self.0), {
             let __egglog_value: self::Rational = ::core::convert::Into::into(__egglog_arg_0);
             ::core::clone::Clone::clone(&__egglog_value.0)
@@ -7779,7 +7785,7 @@ impl ::core::ops::Neg for &self::Rational {
 
 impl self::Rational {
     /// Author a catalog-defined call without evaluating its arguments.
-    pub fn numer(self) -> self::I64 {
+    pub fn numer(&self) -> self::I64 {
         let __egglog_args = ::std::vec![::core::clone::Clone::clone(&self.0)];
 
         let mut __egglog_record =
@@ -7798,7 +7804,10 @@ impl self::Rational {
 }
 impl self::Rational {
     /// Author a catalog-defined call without evaluating its arguments.
-    pub fn pow(self, __egglog_arg_0: impl ::core::convert::Into<self::Rational>) -> self::Rational {
+    pub fn pow(
+        &self,
+        __egglog_arg_0: impl ::core::convert::Into<self::Rational>,
+    ) -> self::Rational {
         let __egglog_args = ::std::vec![::core::clone::Clone::clone(&self.0), {
             let __egglog_value: self::Rational = ::core::convert::Into::into(__egglog_arg_0);
             ::core::clone::Clone::clone(&__egglog_value.0)
@@ -7820,7 +7829,7 @@ impl self::Rational {
 }
 impl self::Rational {
     /// Author a catalog-defined call without evaluating its arguments.
-    pub fn round(self) -> self::Rational {
+    pub fn round(&self) -> self::Rational {
         let __egglog_args = ::std::vec![::core::clone::Clone::clone(&self.0)];
 
         let mut __egglog_record =
@@ -7839,7 +7848,7 @@ impl self::Rational {
 }
 impl self::Rational {
     /// Author a catalog-defined call without evaluating its arguments.
-    pub fn sqrt(self) -> self::Rational {
+    pub fn sqrt(&self) -> self::Rational {
         let __egglog_args = ::std::vec![::core::clone::Clone::clone(&self.0)];
 
         let mut __egglog_record =
@@ -7935,7 +7944,7 @@ impl ::core::ops::Sub<&self::Rational> for &self::Rational {
 
 impl self::Rational {
     /// Author a catalog-defined call without evaluating its arguments.
-    pub fn to_f64(self) -> self::F64 {
+    pub fn to_f64(&self) -> self::F64 {
         let __egglog_args = ::std::vec![::core::clone::Clone::clone(&self.0)];
 
         let mut __egglog_record =
