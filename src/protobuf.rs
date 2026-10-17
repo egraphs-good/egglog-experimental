@@ -27,6 +27,7 @@ use egglog_ast::span::{EgglogSpan, SrcFile};
 use num::{BigInt, Integer, One, Zero};
 use prost::Message;
 
+pub mod cost_model;
 mod freeze;
 mod proof;
 mod report;
@@ -83,6 +84,7 @@ impl From<prost::DecodeError> for TransportError {
 #[derive(Default)]
 pub struct Engine {
     next_id: u64,
+    next_cost_model: u64,
     graphs: HashMap<u64, Session>,
     extension: Option<Arc<dyn NativeExtension>>,
 }
@@ -114,6 +116,17 @@ pub trait NativeExtension: Send + Sync {
         terms: &TermDag,
         term: TermId,
     ) -> Result<Option<pb::CustomValue>, String>;
+
+    /// Inspect a recognized native value without invoking arbitrary native
+    /// reconstruction. Used by owned callback observations and Freeze.
+    fn encode_observed_custom_value(
+        &self,
+        _graph: &EGraph,
+        _sort: &ArcSort,
+        _value: Value,
+    ) -> Result<Option<pb::CustomValue>, String> {
+        Ok(None)
+    }
 }
 
 #[derive(Clone)]
@@ -133,6 +146,7 @@ struct Session {
     // Successfully registered closed container aliases, including encoded modes
     // where physical TypeInfo is not the authoring type environment.
     sorts: HashSet<String>,
+    cost_models: HashMap<String, Arc<dyn cost_model::NativeCostModel>>,
 }
 
 struct Installation {
@@ -335,6 +349,40 @@ impl From<&str> for PreparationError {
 }
 
 impl Engine {
+    /// Provision an engine-local model name through the native host extension.
+    /// An in-flight extraction and cloned handles retain their own Arc owner.
+    pub fn register_cost_model(
+        &mut self,
+        handle: u64,
+        model: Arc<dyn cost_model::NativeCostModel>,
+    ) -> Result<String, TransportError> {
+        let session = self
+            .graphs
+            .get_mut(&handle)
+            .ok_or_else(|| TransportError("unknown egraph handle".into()))?;
+        self.next_cost_model = self
+            .next_cost_model
+            .checked_add(1)
+            .ok_or_else(|| TransportError("cost model name space exhausted".into()))?;
+        let name = format!("host-model-{}", self.next_cost_model);
+        session.cost_models.insert(name.clone(), model);
+        Ok(name)
+    }
+
+    /// Release only this handle's registration. A clone or active extraction
+    /// may still own the model; no borrowed callback frame is retained.
+    pub fn release_cost_model(&mut self, handle: u64, name: &str) -> Result<(), TransportError> {
+        let session = self
+            .graphs
+            .get_mut(&handle)
+            .ok_or_else(|| TransportError("unknown egraph handle".into()))?;
+        session
+            .cost_models
+            .remove(name)
+            .ok_or_else(|| TransportError(format!("unknown cost model {name}")))?;
+        Ok(())
+    }
+
     /// Uses the supplied registrar on fresh graphs; clones retain registered
     /// native state and the same capability without replaying registration.
     pub fn with_extension(extension: Arc<dyn NativeExtension>) -> Self {
@@ -427,6 +475,7 @@ impl Engine {
                 rulesets: Vec::new(),
                 rules: Vec::new(),
                 sorts: HashSet::new(),
+                cost_models: HashMap::new(),
             },
         );
         Ok(pb::CreateEGraphResponse {
@@ -1594,12 +1643,11 @@ impl Session {
                     return Err("extraction requires roots, a positive variant count, and a specified extractor".into());
                 }
                 if !extract.cost_model.is_empty() {
-                    return Err(PreparationError(Box::new(pb::Error {
-                        code: pb::ErrorCode::UnknownName.into(),
-                        message: format!("unknown cost model {}", extract.cost_model),
-                        span: command.span,
-                        ..Default::default()
-                    })));
+                    self.resolve_cost_model(&extract.cost_model, extract.extractor)
+                        .map_err(|mut error| {
+                            error.0.span = command.span;
+                            error
+                        })?;
                 }
                 return extract
                     .roots
@@ -1626,12 +1674,11 @@ impl Session {
                     return Err("KeepBest requires tables and a specified extractor".into());
                 }
                 if !keep.cost_model.is_empty() {
-                    return Err(PreparationError(Box::new(pb::Error {
-                        code: pb::ErrorCode::UnknownName.into(),
-                        message: format!("unknown cost model {}", keep.cost_model),
-                        span: command.span,
-                        ..Default::default()
-                    })));
+                    self.resolve_cost_model(&keep.cost_model, keep.extractor)
+                        .map_err(|mut error| {
+                            error.0.span = command.span;
+                            error
+                        })?;
                 }
                 for table in &keep.tables {
                     let logical = self.names.callables.get(table);
@@ -1842,6 +1889,11 @@ impl Session {
                 )?;
                 None
             }
+            pb::command::Kind::Extract(extract) if !extract.cost_model.is_empty() => {
+                Some(pb::command_output::Kind::Extraction(
+                    self.extract_host_model(program, extract, response)?,
+                ))
+            }
             pb::command::Kind::Extract(extract) => {
                 let roots = extract
                     .roots
@@ -1925,6 +1977,10 @@ impl Session {
                     output.roots.push(root);
                 }
                 Some(pb::command_output::Kind::Extraction(output))
+            }
+            pb::command::Kind::KeepBest(keep) if !keep.cost_model.is_empty() => {
+                self.keep_best_host_model(keep)?;
+                None
             }
             pb::command::Kind::KeepBest(keep) => {
                 crate::keep_best::keep_best_with_cost_model(
@@ -5881,6 +5937,7 @@ mod tests {
                     rulesets: Vec::new(),
                     rules: Vec::new(),
                     sorts: HashSet::new(),
+                    cost_models: HashMap::new(),
                 };
                 let mut program = pb::Program {
                     ir_version: 1,
@@ -6571,10 +6628,7 @@ mod tests {
             failed.ruleset_publication.unwrap().names,
             ["first", "parent"]
         );
-        assert_eq!(
-            failed.error.unwrap().code,
-            i32::from(pb::ErrorCode::EvaluationFailed)
-        );
+        assert_eq!(failed.error.unwrap().code, i32::from(pb::ErrorCode::Panic));
         let session = &engine.graphs[&id];
         assert!(
             session
@@ -6706,7 +6760,7 @@ mod tests {
         let failed = run_host_default(&mut engine, id, definitions.clone());
         assert_eq!(failed.ruleset_publication.unwrap().names, ["first"]);
         let error = failed.error.unwrap();
-        assert_eq!(error.code, i32::from(pb::ErrorCode::EvaluationFailed));
+        assert_eq!(error.code, i32::from(pb::ErrorCode::Panic));
         assert_eq!(error.location, None);
         assert_eq!(error.span, definitions.rulesets[0].span);
         assert!(failed.outputs.is_empty());
@@ -6951,7 +7005,14 @@ mod tests {
             }];
             let response = run_host_default(&mut engine, id, program);
             let error = response.error.unwrap();
-            assert_eq!(error.code, i32::from(pb::ErrorCode::EvaluationFailed));
+            assert_eq!(
+                error.code,
+                i32::from(if case == "successful-anchor" {
+                    pb::ErrorCode::EvaluationFailed
+                } else {
+                    pb::ErrorCode::Panic
+                })
+            );
             assert_eq!(error.location.as_ref().unwrap().path, [0]);
             assert!(response.outputs.is_empty());
             assert_eq!(

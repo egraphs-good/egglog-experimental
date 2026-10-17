@@ -1451,6 +1451,7 @@ impl Renderer {
                 rulesets: Vec::new(),
                 rules: Vec::new(),
                 sorts: HashSet::new(),
+                cost_models: HashMap::new(),
             },
         }
     }

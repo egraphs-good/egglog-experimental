@@ -72,7 +72,26 @@ impl<K: Eq + Hash, F: Fn(&ArcSort, Value) -> K> Export<'_, K, F> {
     fn close_values(&mut self) -> Result<(), egglog::Error> {
         use pb::primitive_value::Value as V;
         while let Some((sort, value, index)) = self.pending.pop() {
-            let payload = if sort.is_container_sort() {
+            let custom = self
+                .session
+                .extension
+                .as_ref()
+                .map(|extension| {
+                    extension.encode_observed_custom_value(&self.session.graph, &sort, value)
+                })
+                .transpose()
+                .map_err(egglog::Error::BackendError)?
+                .flatten();
+            let payload = if let Some(custom) = custom {
+                // Extension inspection is inert; no unknown reconstruction is
+                // invoked just to discover whether a value has a codec.
+                if !custom.args.is_empty() {
+                    return Err(egglog::Error::BackendError(
+                        "observed custom values currently require a leaf codec".into(),
+                    ));
+                }
+                V::Custom(custom)
+            } else if sort.is_container_sort() {
                 use std::any::TypeId;
                 let actual = sort.value_type();
                 let family = self.program.sorts
@@ -218,7 +237,13 @@ impl<K: Eq + Hash, F: Fn(&ArcSort, Value) -> K> Export<'_, K, F> {
                 };
                 if expected.is_none()
                     || expected != actual
-                    || !registered.is_some_and(|registered| Arc::ptr_eq(registered, &sort))
+                    || !registered.is_some_and(|registered| {
+                        // Literal resolution creates fresh immutable builtin
+                        // sort objects. Require the exact native implementation,
+                        // rather than the allocation used by the registry.
+                        registered.clone().as_arc_any().as_ref().type_id()
+                            == sort.clone().as_arc_any().as_ref().type_id()
+                    })
                 {
                     return Err(egglog::Error::BackendError(format!(
                         "Freeze has no inert value codec for {}",
@@ -258,7 +283,28 @@ impl<K: Eq + Hash, F: Fn(&ArcSort, Value) -> K> Export<'_, K, F> {
     }
 }
 
-pub(super) fn export(session: &mut Session) -> Result<pb::EGraphSnapshot, egglog::Error> {
+pub(super) fn export(session: &Session) -> Result<pb::EGraphSnapshot, egglog::Error> {
+    let mut observation = observation(session, &[])?;
+    let mut sorts = Vec::new();
+    let cost_sort = session
+        .graph
+        .export_sort(session.graph.get_sort_by_name("i64").unwrap(), &mut sorts)
+        .map_err(egglog::Error::BackendError)?;
+    let cost_sort = crate::builtin::import_sort(&sorts, cost_sort, &mut observation.program.sorts)
+        .map_err(egglog::Error::BackendError)?;
+    Ok(pb::EGraphSnapshot {
+        options: Some(pb::EGraphOptions {
+            cost_sort: Some(cost_sort),
+            execution_mode: session.mode.into(),
+        }),
+        program: Some(observation.program),
+    })
+}
+
+pub(super) fn observation(
+    session: &Session,
+    roots: &[(ArcSort, Value)],
+) -> Result<cost_model::Observation, egglog::Error> {
     if session.mode != pb::ExecutionMode::Normal {
         return Err(egglog::Error::BackendError(
             "Freeze currently requires normal execution mode".into(),
@@ -266,7 +312,7 @@ pub(super) fn export(session: &mut Session) -> Result<pb::EGraphSnapshot, egglog
     }
     let mut catalog = session
         .graph
-        .type_info()
+        .authoring_type_info()
         .portable_builtin_catalog()
         .map_err(egglog::Error::BackendError)?;
     // Native program-defined primitives retain native callable/sort names.
@@ -342,7 +388,7 @@ pub(super) fn export(session: &mut Session) -> Result<pb::EGraphSnapshot, egglog
         session,
         program: definitions,
         classes: HashMap::new(),
-        canonical: |sort: &ArcSort, value| session.graph.value_to_class_id(sort, value),
+        canonical: |sort: &ArcSort, value| session.graph.value_to_class_id(sort, value).to_string(),
         values: HashMap::new(),
         pending: vec![],
     };
@@ -508,6 +554,10 @@ pub(super) fn export(session: &mut Session) -> Result<pb::EGraphSnapshot, egglog
             }
         }
     }
+    // Evaluated literal/container roots need not occur in any stored row.
+    for (sort, value) in roots {
+        export.value(sort, *value)?;
+    }
     export.close_values()?;
     export.program.commands.extend(
         row_commands
@@ -522,13 +572,24 @@ pub(super) fn export(session: &mut Session) -> Result<pb::EGraphSnapshot, egglog
                 ..Default::default()
             }),
     );
-    let cost_sort = export.sort(session.graph.get_sort_by_name("i64").unwrap())?;
-    Ok(pb::EGraphSnapshot {
-        options: Some(pb::EGraphOptions {
-            cost_sort: Some(cost_sort),
-            execution_mode: session.mode.into(),
-        }),
-        program: Some(export.program),
+    let calls = export
+        .program
+        .nodes
+        .iter()
+        .enumerate()
+        .filter_map(|(index, node)| {
+            let Some(pb::node::Kind::Call(call)) = &node.kind else {
+                return None;
+            };
+            Some(((call.func.clone(), call.args.clone()), index as u32))
+        })
+        .collect();
+    Ok(cost_model::Observation {
+        program: export.program,
+        values: export.values,
+        classes: export.classes,
+        calls,
+        names: session.names.callables.clone(),
     })
 }
 
@@ -568,6 +629,35 @@ mod tests {
         };
         pb::RunProgramResponse::decode(engine.run(&request.encode_to_vec()).unwrap().as_slice())
             .unwrap()
+    }
+
+    #[test]
+    fn unstored_literal_roots_keep_inert_native_sort_identity() {
+        use pb::primitive_value::Value as V;
+
+        let mut engine = Engine::default();
+        let id = create(&mut engine, pb::ExecutionMode::Normal);
+        let session = engine.graphs.get_mut(&id).unwrap();
+        for (literal, expected) in [
+            (Literal::Int(7), V::I64(7)),
+            (Literal::Float(1.25.into()), V::F64Bits(1.25f64.to_bits())),
+            (Literal::String("root".into()), V::String("root".into())),
+            (Literal::Bool(true), V::Bool(true)),
+            (Literal::Unit, V::Unit(pb::Unit {})),
+        ] {
+            let root = session
+                .graph
+                .eval_expr(&Expr::Lit(span!(), literal))
+                .unwrap();
+            let observed = observation(session, std::slice::from_ref(&root)).unwrap();
+            let index = observed.values[&(root.0.name().to_owned(), root.1)];
+            assert_eq!(
+                observed.program.nodes[index as usize].kind,
+                Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
+                    value: Some(expected),
+                }))
+            );
+        }
     }
 
     // Two classes: one has three alternatives and a self-cycle; the other has

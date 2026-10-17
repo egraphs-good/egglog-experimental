@@ -82,6 +82,44 @@ pub(crate) fn keep_best_with_cost_model<C: MonoidCost, M: DagCostModel<C>>(
     make_model: impl FnOnce(&EGraph, &[(ArcSort, Value)]) -> Result<M, Error>,
     mut check_cost: impl FnMut(&C) -> Result<(), Error>,
 ) -> Result<(), Error> {
+    keep_best_with_selector(egraph, table_names, |graph, roots, observe| {
+        let model = make_model(graph, &roots)?;
+        let (extracted, _) = if use_greedy_dag {
+            extract_best_greedy_dag_with_observer(graph, roots, model, observe)?
+        } else {
+            graph.extract_best_with_cost_model_and_observer(
+                roots,
+                TreeCostModelFromDag(model),
+                observe,
+            )?
+        };
+        for root in extracted.terms {
+            let root = root.ok_or_else(|| {
+                Error::ExtractError("keep-best: could not extract a selected table cell".into())
+            })?;
+            check_cost(&root.cost)?;
+        }
+        Ok(())
+    })
+}
+
+/// The selection owns ranking only. This shared plan owns row preservation,
+/// assigned C annotations, native captured values, subsumption and clear/write.
+pub(crate) fn keep_best_with_selector(
+    egraph: &mut EGraph,
+    table_names: &[String],
+    select: impl FnOnce(
+        &EGraph,
+        Vec<(ArcSort, Value)>,
+        &mut dyn FnMut(
+            &egglog::TermDag,
+            egglog::TermId,
+            &ArcSort,
+            Value,
+            &[Value],
+        ) -> Result<Value, Error>,
+    ) -> Result<(), Error>,
+) -> Result<(), Error> {
     let mut rows = Vec::new();
     let mut roots = Vec::new();
     for table_name in table_names {
@@ -138,14 +176,13 @@ pub(crate) fn keep_best_with_cost_model<C: MonoidCost, M: DagCostModel<C>>(
             rows.push(row);
         }
     }
-    let model = make_model(egraph, &roots)?;
     let mut selected = Vec::new();
     let mut selected_keys = HashSet::new();
-    let observe = |terms: &egglog::TermDag,
-                   term: egglog::TermId,
-                   sort: &ArcSort,
-                   value: Value,
-                   children: &[Value]| {
+    let mut observe = |terms: &egglog::TermDag,
+                       term: egglog::TermId,
+                       sort: &ArcSort,
+                       value: Value,
+                       children: &[Value]| {
         if sort.is_eq_sort() {
             let Term::App(name, _) = terms.get(term) else {
                 return Err(Error::ExtractError(
@@ -171,21 +208,7 @@ pub(crate) fn keep_best_with_cost_model<C: MonoidCost, M: DagCostModel<C>>(
         }
         Ok(value)
     };
-    let (extracted, _) = if use_greedy_dag {
-        extract_best_greedy_dag_with_observer(egraph, roots, model, observe)?
-    } else {
-        egraph.extract_best_with_cost_model_and_observer(
-            roots,
-            TreeCostModelFromDag(model),
-            observe,
-        )?
-    };
-    for root in extracted.terms {
-        let root = root.ok_or_else(|| {
-            Error::ExtractError("keep-best: could not extract a selected table cell".into())
-        })?;
-        check_cost(&root.cost)?;
-    }
+    select(egraph, roots, &mut observe)?;
     rows.extend(selected);
 
     // Preparation and all model/selection failures precede the destructive
