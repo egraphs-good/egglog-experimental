@@ -390,19 +390,20 @@ class Node(Message[_NodeFields]):
     Rule heads, rewrite RHSs, top-level actions, and operations' evaluated inputs
     use the action context.
     - Queries share one binder across all facts. Rule heads and rewrite RHSs
-      may use names bound by that query; top-level evaluated inputs have no
-      free variables. Every variable must belong to its use's binder.
+     may use names bound by that query; top-level evaluated inputs have no
+     free variables. Every variable must belong to its use's binder.
     - Function merges, primitives, and lambda bodies use only their own binders
-      (see those messages). At every use, the body and its transitive callees
-      must be legal in that execution context. Hosts publish the capabilities
-      of ambient primitives; receivers check these obligations. A Union in an
-      evaluated body can write, even though the body contains only expressions.
+     (see those messages). At every use, the body and its transitive callees
+     must be legal in that execution context. Hosts publish the capabilities
+     of ambient primitives; receivers check these obligations. A Union in an
+     evaluated body can write, even though the body contains only expressions.
     - Presentation defaults are closed symbolic templates, not evaluated at
-      installation/export. Lambda bodies keep their own binders; every expanded
-      use must satisfy its ordinary execution context's typing/effect rules.
+     installation/export. Lambda bodies keep their own binders; every expanded
+     use must satisfy its ordinary execution context's typing/effect rules.
     - Inert values (declared costs and extracted data) contain no variables,
-      get_cost reads or Union and must be finite. Saved code bodies retain
-      their own binders, so these are use-site rules, not bans on an entire arena.
+     get_cost reads or Union and must be finite. Saved code bodies retain
+     their own binders, so these are use-site rules, not bans on an entire arena.
+
     Scalar values are inert. Child-bearing values follow the surrounding
     context; constructing a value does not grant inverse query matching or
     relax groundedness. Calls and host value materialization must obey their
