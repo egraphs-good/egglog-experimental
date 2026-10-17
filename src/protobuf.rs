@@ -4277,15 +4277,21 @@ fn lower_rule(
     if rule.name.as_ref().is_some_and(String::is_empty) {
         return Err("an explicit rule label must not be empty".into());
     }
-    if rule.eval_mode != i32::from(pb::RuleEvalMode::Seminaive)
-        || rule.no_decomp
-        || rule.include_subsumed
-    {
-        return Err("only default seminaive rule options execute in this slice".into());
-    }
+    let eval_mode = match pb::RuleEvalMode::try_from(rule.eval_mode) {
+        Ok(pb::RuleEvalMode::Seminaive) => ast::RuleEvalMode::Seminaive,
+        Ok(pb::RuleEvalMode::Naive) => ast::RuleEvalMode::Naive,
+        Ok(pb::RuleEvalMode::UnsafeSeminaive) => ast::RuleEvalMode::UnsafeSeminaive,
+        _ => return Err(format!("invalid rule evaluation mode {}", rule.eval_mode)),
+    };
     let span = native_span(program, rule.span.as_ref())?;
     match rule.kind.as_ref().ok_or("missing rule kind")? {
         kind @ (pb::rule_decl::Kind::Rewrite(_) | pb::rule_decl::Kind::Birewrite(_)) => {
+            // Native rewrite commands have no option fields. Keep this
+            // adapter limit explicit rather than silently losing wire options.
+            if eval_mode != ast::RuleEvalMode::Seminaive || rule.no_decomp || rule.include_subsumed
+            {
+                return Err("nondefault rewrite options require native rule expansion, which is not supported yet".into());
+            }
             let (lhs, rhs, conditions, subsume, bidirectional) = match kind {
                 pb::rule_decl::Kind::Rewrite(rewrite) => (
                     rewrite.lhs,
@@ -4373,9 +4379,9 @@ fn lower_rule(
                     body: facts(program, &body.query)?,
                     name: name.into(),
                     ruleset: ruleset.into(),
-                    eval_mode: ast::RuleEvalMode::Seminaive,
-                    no_decomp: false,
-                    include_subsumed: false,
+                    eval_mode,
+                    no_decomp: rule.no_decomp,
+                    include_subsumed: rule.include_subsumed,
                 },
             })
         }

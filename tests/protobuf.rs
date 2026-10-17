@@ -2872,33 +2872,12 @@ fn function_value_native_context_and_proof_limits_are_unchanged() {
                 let mut engine = Engine::default();
                 let id = create(&mut engine);
                 let mut error = None;
-                let mut unsupported = false;
                 for phase in Source::new(None, &source).unwrap() {
-                    let phase = match phase {
-                        Ok(phase) => phase,
-                        Err(error) if naive => {
-                            assert!(
-                                error
-                                    .to_string()
-                                    .contains("source rule options are not supported yet")
-                            );
-                            unsupported = true;
-                            break;
-                        }
-                        Err(error) => panic!("{error}"),
-                    };
-                    let response = run(&mut engine, id, phase);
+                    let response = run(&mut engine, id, phase.unwrap());
                     if response.error.is_some() {
                         error = response.error;
                         break;
                     }
-                }
-                if naive {
-                    assert!(
-                        unsupported && error.is_none(),
-                        "existing non-seminaive guard remains explicit"
-                    );
-                    continue;
                 }
                 assert_eq!(
                     error.is_none(),
@@ -12525,6 +12504,229 @@ fn fail_does_not_reset_union_admission_or_enable_profile_off() {
     assert!(response.outputs.is_empty());
     let error = response.error.unwrap();
     assert!(error.location.is_none() && error.message.contains("profile=false"));
+}
+
+#[test]
+fn source_rule_options_preserve_rematching_and_subsumed_queries() {
+    use egglog_experimental::protobuf::source::{Renderer, Source};
+    let mut cases = vec![];
+    for (mode, option, expected) in [
+        (pb::RuleEvalMode::Naive, ":naive", 2),
+        (pb::RuleEvalMode::UnsafeSeminaive, ":unsafe-seminaive", 1),
+    ] {
+        for no_decomp in [false, true] {
+            let text = format!(
+                r#"
+                (function current () i64 :merge new)
+                (function observed () i64 :merge new)
+                (relation Trigger ())
+                (set (current) 1) (Trigger)
+                (rule ((Trigger)) ((set (observed) (current))) {option} {})
+                (run 1) (check (= (observed) 1))
+                (set (current) 2) (run 1) (check (= (observed) {expected}))
+            "#,
+                if no_decomp { ":no-decomp" } else { "" }
+            );
+            cases.push((text, mode, no_decomp, false));
+        }
+    }
+    for include_subsumed in [false, true] {
+        let text = format!(
+            r#"
+            (datatype E (A i64)) (relation Seen (i64))
+            (rule ((A x)) ((Seen x)) :no-decomp {})
+            (A 1) (subsume (A 1)) (run 1)
+            {}
+        "#,
+            if include_subsumed {
+                ":internal-include-subsumed"
+            } else {
+                ""
+            },
+            if include_subsumed {
+                "(check (Seen 1))"
+            } else {
+                "(fail (check (Seen 1)))"
+            }
+        );
+        cases.push((text, pb::RuleEvalMode::Seminaive, true, include_subsumed));
+    }
+    for (text, mode, no_decomp, include_subsumed) in cases {
+        for core in [false, true] {
+            let mut native = if core {
+                egglog::EGraph::default()
+            } else {
+                new_experimental_egraph()
+            };
+            native.parse_and_run_program(None, &text).unwrap();
+            let source = if core {
+                Source::new_core(None, &text)
+            } else {
+                Source::new(None, &text)
+            }
+            .unwrap();
+            let mut renderer = if core {
+                Renderer::core()
+            } else {
+                Renderer::default()
+            };
+            let mut replay = if core {
+                egglog::EGraph::default()
+            } else {
+                new_experimental_egraph()
+            };
+            let mut rendered = String::new();
+            let mut engine = Engine::default();
+            let id = create(&mut engine);
+            // Source resubmits its cumulative arena. Repeated presentations
+            // must retain one unchanged occurrence, not count as new rules.
+            let mut occurrence = None;
+            for phase in source {
+                let phase = pb::Program::decode(phase.unwrap().encode_to_vec().as_slice()).unwrap();
+                assert!(phase.rules.len() <= 1);
+                for rule in &phase.rules {
+                    assert_eq!(rule.eval_mode, i32::from(mode));
+                    assert_eq!(rule.no_decomp, no_decomp);
+                    assert_eq!(rule.include_subsumed, include_subsumed);
+                    if let Some(previous) = &occurrence {
+                        assert_eq!(rule, previous);
+                    } else {
+                        occurrence = Some(rule.clone());
+                    }
+                }
+                let rendering = renderer.render(&phase).unwrap();
+                replay.parse_and_run_program(None, &rendering).unwrap();
+                rendered.push_str(&rendering);
+                assert_eq!(run(&mut engine, id, phase).error, None);
+            }
+            assert!(occurrence.is_some());
+            let source = if core {
+                Source::new_core(None, &rendered)
+            } else {
+                Source::new(None, &rendered)
+            }
+            .unwrap();
+            let mut occurrence = None;
+            for phase in source {
+                let phase = phase.unwrap();
+                assert!(phase.rules.len() <= 1);
+                for rule in phase.rules {
+                    assert_eq!(rule.eval_mode, i32::from(mode));
+                    assert_eq!(rule.no_decomp, no_decomp);
+                    assert_eq!(rule.include_subsumed, include_subsumed);
+                    if let Some(previous) = &occurrence {
+                        assert_eq!(&rule, previous);
+                    } else {
+                        occurrence = Some(rule);
+                    }
+                }
+            }
+            assert!(occurrence.is_some());
+        }
+    }
+}
+
+#[test]
+fn invalid_rule_modes_reject_unused_rules_before_command_effects() {
+    for mode in [0, -1, 99] {
+        for kind in ["rule", "rewrite", "birewrite"] {
+            for unused in [false, true] {
+                let mut program = fixture();
+                program.rules[0].kind = Some(match kind {
+                    "rule" => pb::rule_decl::Kind::Rule(pb::Rule {
+                        query: vec![12],
+                        head: vec![],
+                    }),
+                    "rewrite" => pb::rule_decl::Kind::Rewrite(pb::Rewrite {
+                        lhs: 9,
+                        rhs: 8,
+                        ..Default::default()
+                    }),
+                    "birewrite" => pb::rule_decl::Kind::Birewrite(pb::BiRewrite {
+                        lhs: 9,
+                        rhs: 8,
+                        ..Default::default()
+                    }),
+                    _ => unreachable!(),
+                });
+                program.rules[0].eval_mode = mode;
+                if unused {
+                    program.rulesets[0].kind =
+                        Some(pb::ruleset::Kind::Rules(pb::RuleList::default()));
+                }
+                program.commands.truncate(1); // Set current must not execute.
+                let mut engine = Engine::default();
+                let id = create(&mut engine);
+                let response = run(&mut engine, id, program);
+                let error = response.error.unwrap();
+                assert_eq!(error.code, i32::from(pb::ErrorCode::InvalidProgram));
+                assert!(
+                    error.message.contains("invalid rule evaluation mode"),
+                    "{error:?}"
+                );
+                assert!(response.outputs.is_empty());
+                let mut observation = fixture();
+                observation.rules.clear();
+                observation.rulesets.clear();
+                observation.commands = vec![observation.commands.pop().unwrap()];
+                let response = run(&mut engine, id, observation);
+                assert_eq!(response.error, None);
+                let Some(pb::command_output::Kind::PrintedFunction(table)) =
+                    &response.outputs[0].kind
+                else {
+                    panic!("current table")
+                };
+                assert!(table.rows.is_empty());
+            }
+        }
+    }
+}
+
+#[test]
+fn nondefault_rewrite_options_remain_an_explicit_adapter_limit() {
+    use egglog_experimental::protobuf::source::Renderer;
+    for bidirectional in [false, true] {
+        for (mode, no_decomp, include_subsumed) in [
+            (pb::RuleEvalMode::Naive, false, false),
+            (pb::RuleEvalMode::UnsafeSeminaive, false, false),
+            (pb::RuleEvalMode::Seminaive, true, false),
+            (pb::RuleEvalMode::Seminaive, false, true),
+        ] {
+            for unused in [false, true] {
+                let mut program = fixture();
+                if bidirectional {
+                    program.rules[0].kind = Some(pb::rule_decl::Kind::Birewrite(pb::BiRewrite {
+                        lhs: 9,
+                        rhs: 8,
+                        ..Default::default()
+                    }));
+                }
+                program.rules[0].eval_mode = mode.into();
+                program.rules[0].no_decomp = no_decomp;
+                program.rules[0].include_subsumed = include_subsumed;
+                if unused {
+                    program.rulesets[0].kind =
+                        Some(pb::ruleset::Kind::Rules(pb::RuleList::default()));
+                }
+                program.commands.truncate(1);
+                let error = Renderer::default().render(&program).unwrap_err();
+                assert!(
+                    error.to_string().contains("nondefault rewrite options"),
+                    "{error}"
+                );
+                let mut engine = Engine::default();
+                let id = create(&mut engine);
+                let response = run(&mut engine, id, program);
+                let error = response.error.unwrap();
+                assert_eq!(error.code, i32::from(pb::ErrorCode::InvalidProgram));
+                assert!(
+                    error.message.contains("nondefault rewrite options"),
+                    "{error:?}"
+                );
+                assert!(response.outputs.is_empty());
+            }
+        }
+    }
 }
 
 #[test]

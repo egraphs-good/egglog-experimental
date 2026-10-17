@@ -968,10 +968,6 @@ impl Source {
         }) {
             return Err(egglog::Error::RuleAlreadyExists(duplicate, rule.span).to_string());
         }
-        if rule.eval_mode != ast::RuleEvalMode::Seminaive || rule.no_decomp || rule.include_subsumed
-        {
-            return Err("source rule options are not supported yet".into());
-        }
         // Native source-position shadowing checks have already run. Rename only
         // resolved locals, consistently across query/head; globals are captured
         // separately below. ResolvedVar equality ignores is_global_ref,
@@ -1134,7 +1130,14 @@ impl Source {
         self.program.rules.push(pb::RuleDecl {
             kind: Some(kind),
             name: Some(rule.name),
-            eval_mode: pb::RuleEvalMode::Seminaive.into(),
+            eval_mode: match rule.eval_mode {
+                ast::RuleEvalMode::Seminaive => pb::RuleEvalMode::Seminaive,
+                ast::RuleEvalMode::Naive => pb::RuleEvalMode::Naive,
+                ast::RuleEvalMode::UnsafeSeminaive => pb::RuleEvalMode::UnsafeSeminaive,
+            }
+            .into(),
+            no_decomp: rule.no_decomp,
+            include_subsumed: rule.include_subsumed,
             span,
             ..Default::default()
         });
