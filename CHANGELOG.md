@@ -6,6 +6,10 @@ This file records notable user-facing changes to egglog-experimental.
 
 ### Added
 
+- Named protobuf `Primitive` bodies can be prepared, called, and captured as
+  function values through the Experimental provider. Saved values require their
+  compatible declaration closure; anonymous lambdas, recursive code, Union
+  bodies, and primitive proof validators remain unsupported.
 - A `Maybe[T]` sort with construction, partial unwrapping, defaulting,
   undefined-result capture, and higher-order branching. When more than one
   nominal `Maybe` alias is compatible, `maybe-none` requires type context.

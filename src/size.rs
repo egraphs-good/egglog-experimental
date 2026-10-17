@@ -36,6 +36,21 @@ impl Primitive for GetSizePrimitive {
             .with_all_arguments_sort(StringSort.to_arcsort())
             .into_box()
     }
+
+    fn builtin_definition(&self) -> Option<(&str, &egglog::proto::Program)> {
+        static DEFINITION: std::sync::LazyLock<egglog::proto::Program> =
+            std::sync::LazyLock::new(|| {
+                egglog::builtin::closed_signature(
+                    "egglog.experimental.size.tables",
+                    "get-size!",
+                    &[],
+                    &[("tables", StringSort.to_arcsort())],
+                    I64Sort.to_arcsort(),
+                )
+                .expect("valid table-size signature")
+            });
+        Some(("egglog.experimental.size.tables", &DEFINITION))
+    }
 }
 
 impl ReadPrim for GetSizePrimitive {
@@ -79,6 +94,21 @@ impl Primitive for GetNodeSizePrimitive {
             .with_output_sort(I64Sort.to_arcsort())
             .with_exact_length(1)
             .into_box()
+    }
+
+    fn builtin_definition(&self) -> Option<(&str, &egglog::proto::Program)> {
+        static DEFINITION: std::sync::LazyLock<egglog::proto::Program> =
+            std::sync::LazyLock::new(|| {
+                egglog::builtin::closed_signature(
+                    "egglog.experimental.size.nodes",
+                    "get-node-size!",
+                    &[],
+                    &[],
+                    I64Sort.to_arcsort(),
+                )
+                .expect("valid node-size signature")
+            });
+        Some(("egglog.experimental.size.nodes", &DEFINITION))
     }
 }
 

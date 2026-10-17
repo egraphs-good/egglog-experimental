@@ -463,6 +463,7 @@ version = "3.0.0"
 dependencies = [
  "egglog",
  "egglog-ast",
+ "egglog-experimental-typed-macros",
  "egglog-reports",
  "fixedbitset",
  "glob",
@@ -473,6 +474,15 @@ dependencies = [
  "num",
  "prost",
  "stacker",
+]
+
+[[package]]
+name = "egglog-experimental-typed-macros"
+version = "3.0.0"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
 ]
 
 [[package]]

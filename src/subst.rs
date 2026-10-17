@@ -589,6 +589,46 @@ impl Primitive for Subst {
     fn get_type_constraints(&self, span: &Span) -> Box<dyn TypeConstraint> {
         Box::new(SubstTypeConstraint { span: span.clone() })
     }
+
+    fn builtin_definition(&self) -> Option<(&str, &egglog::proto::Program)> {
+        use egglog::proto as pb;
+        static DEFINITION: std::sync::LazyLock<pb::Program> = std::sync::LazyLock::new(|| {
+            let mut definition = crate::type_constraints::signature_definition(
+                "egglog.experimental.subst",
+                SUBST,
+                vec![
+                    pb::Sort {
+                        kind: Some(pb::sort::Kind::Var(0)),
+                        ..Default::default()
+                    },
+                    pb::Sort {
+                        kind: Some(pb::sort::Kind::Var(1)),
+                        ..Default::default()
+                    },
+                    pb::Sort {
+                        kind: Some(pb::sort::Kind::Family(pb::HostSort {
+                            name: "Map".into(),
+                            args: vec![1, 1],
+                        })),
+                        ..Default::default()
+                    },
+                ],
+                &["R", "K"],
+                &[("root", 0), ("map", 2)],
+                0,
+            );
+            let Some(pb::declaration::Kind::HostPrimitive(pb::HostPrimitive {
+                typing: Some(pb::host_primitive::Typing::Signature(signature)),
+                ..
+            })) = &mut definition.declarations[0].kind
+            else {
+                unreachable!("signature_definition owns one generic primitive")
+            };
+            signature.equality_type_params = vec![0, 1];
+            definition
+        });
+        Some(("egglog.experimental.subst", &DEFINITION))
+    }
 }
 
 impl FullPrim for Subst {

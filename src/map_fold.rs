@@ -11,7 +11,7 @@ use egglog::prelude::Span;
 use egglog::sort::{FunctionContainer, FunctionSort, MapContainer};
 use egglog::{ArcSort, AtomTerm, Core, Primitive, PurePrim, PureState, TypeInfo, Value};
 
-use crate::type_constraints::exact_signatures;
+use crate::type_constraints::{exact_signatures, signature_definition};
 
 #[derive(Clone, Copy)]
 pub(crate) struct MapFoldKv;
@@ -23,6 +23,48 @@ impl Primitive for MapFoldKv {
 
     fn get_type_constraints(&self, span: &Span) -> Box<dyn TypeConstraint> {
         Box::new(MapFoldKvTypeConstraint { span: span.clone() })
+    }
+
+    fn builtin_definition(&self) -> Option<(&str, &egglog::proto::Program)> {
+        use egglog::proto as pb;
+        static DEFINITION: std::sync::LazyLock<pb::Program> = std::sync::LazyLock::new(|| {
+            signature_definition(
+                "egglog.experimental.map.fold_kv",
+                "map-fold-kv",
+                vec![
+                    pb::Sort {
+                        kind: Some(pb::sort::Kind::Var(0)),
+                        ..Default::default()
+                    },
+                    pb::Sort {
+                        kind: Some(pb::sort::Kind::Var(1)),
+                        ..Default::default()
+                    },
+                    pb::Sort {
+                        kind: Some(pb::sort::Kind::Var(2)),
+                        ..Default::default()
+                    },
+                    pb::Sort {
+                        kind: Some(pb::sort::Kind::Func(pb::FuncSort {
+                            params: vec![2, 0, 1],
+                            result: 2,
+                        })),
+                        ..Default::default()
+                    },
+                    pb::Sort {
+                        kind: Some(pb::sort::Kind::Family(pb::HostSort {
+                            name: "Map".into(),
+                            args: vec![0, 1],
+                        })),
+                        ..Default::default()
+                    },
+                ],
+                &["K", "V", "A"],
+                &[("callback", 3), ("initial", 2), ("map", 4)],
+                2,
+            )
+        });
+        Some(("egglog.experimental.map.fold_kv", &DEFINITION))
     }
 }
 

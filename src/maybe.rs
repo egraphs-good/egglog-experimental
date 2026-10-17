@@ -7,6 +7,7 @@
 use std::any::TypeId;
 
 use egglog::ast::Expr;
+use egglog::builtin::BuiltinInstance;
 use egglog::constraint::{Constraint, TypeConstraint};
 use egglog::prelude::{ContainerSort, Span};
 use egglog::sort::{ContainerValues, FunctionContainer, FunctionSort, Presort, ValueRebuilder};
@@ -15,7 +16,7 @@ use egglog::{
     TermId, TypeError, TypeInfo, Value, add_primitive,
 };
 
-use crate::type_constraints::exact_signatures;
+use crate::type_constraints::{exact_signatures, signature_definition};
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct MaybeContainer {
@@ -48,6 +49,204 @@ pub(crate) struct MaybeSort {
 }
 
 impl Presort for MaybeSort {
+    fn container_type() -> Option<TypeId> {
+        Some(TypeId::of::<MaybeContainer>())
+    }
+
+    fn builtin_definitions() -> Vec<egglog::proto::Program> {
+        use egglog::proto as pb;
+        let mut definitions: Vec<_> = [
+            ("none", "maybe-none", vec![], 1),
+            ("some", "maybe-some", vec![("value", 0)], 1),
+            ("unwrap", "maybe-unwrap", vec![("maybe", 1)], 0),
+            (
+                "unwrap_or",
+                "maybe-unwrap-or",
+                vec![("maybe", 1), ("default", 0)],
+                0,
+            ),
+        ]
+        .into_iter()
+        .map(|(key, alias, inputs, output)| {
+            let receiver = matches!(key, "unwrap" | "unwrap_or");
+            let parameters = inputs.iter().enumerate().skip(usize::from(receiver));
+            pb::Program {
+                ir_version: 1,
+                sorts: vec![
+                    pb::Sort {
+                        kind: Some(pb::sort::Kind::Var(0)),
+                        ..Default::default()
+                    },
+                    pb::Sort {
+                        kind: Some(pb::sort::Kind::Family(pb::HostSort {
+                            name: "Maybe".into(),
+                            args: vec![0],
+                        })),
+                        ..Default::default()
+                    },
+                ],
+                declarations: vec![
+                    pb::Declaration {
+                        kind: Some(pb::declaration::Kind::HostSortFamily(pb::HostSortFamily {
+                            name: "Maybe".into(),
+                            arity: 1,
+                            bindings: Some(pb::SortBindings {
+                                python: Some(pb::TypeBinding {
+                                    path: vec!["egglog".into(), "builtins".into(), "Maybe".into()],
+                                    type_params: vec!["T".into()],
+                                }),
+                                rust: Some(pb::TypeBinding {
+                                    path: vec![
+                                        "egglog_experimental".into(),
+                                        "typed".into(),
+                                        "builtins".into(),
+                                        "Maybe".into(),
+                                    ],
+                                    type_params: vec!["T".into()],
+                                }),
+                                ..Default::default()
+                            }),
+                        })),
+                        ..Default::default()
+                    },
+                    pb::Declaration {
+                        kind: Some(pb::declaration::Kind::HostPrimitive(pb::HostPrimitive {
+                            name: format!("egglog.experimental.maybe.{key}"),
+                            typing: Some(pb::host_primitive::Typing::Signature(
+                                pb::GenericSignature {
+                                    type_params: vec!["T".into()],
+                                    inputs: inputs
+                                        .iter()
+                                        .map(|(name, sort)| pb::Arg {
+                                            name: (*name).into(),
+                                            sort: *sort,
+                                        })
+                                        .collect(),
+                                    output: Some(output),
+                                    ..Default::default()
+                                },
+                            )),
+                        })),
+                        bindings: Some(pb::CallableBindings {
+                            python: Some(pb::PythonBindings {
+                                views: vec![pb::PythonCallable {
+                                    kind: if receiver {
+                                        pb::PythonCallKind::Method
+                                    } else {
+                                        pb::PythonCallKind::ClassMethod
+                                    }
+                                    .into(),
+                                    path: vec![key.into()],
+                                    owner: Some(pb::BindingOwner {
+                                        kind: Some(pb::binding_owner::Kind::Sort(1)),
+                                    }),
+                                    receiver: receiver.then_some(0),
+                                    params: parameters
+                                        .clone()
+                                        .map(|(i, (name, _))| pb::PythonParameter {
+                                            core_input: Some(i as u32),
+                                            name: (*name).into(),
+                                            default_expr: None,
+                                        })
+                                        .collect(),
+                                    ..Default::default()
+                                }],
+                            }),
+                            rust: Some(pb::RustBindings {
+                                views: vec![pb::RustCallable {
+                                    path: vec![key.into()],
+                                    owner: Some(pb::BindingOwner {
+                                        kind: Some(pb::binding_owner::Kind::Sort(1)),
+                                    }),
+                                    receiver: receiver.then_some(pb::RustReceiver {
+                                        core_input: Some(0),
+                                        borrowed: true,
+                                    }),
+                                    params: parameters
+                                        .map(|(i, (name, _))| pb::RustParameter {
+                                            core_input: Some(i as u32),
+                                            name: (*name).into(),
+                                            borrowed: false,
+                                        })
+                                        .collect(),
+                                    ..Default::default()
+                                }],
+                            }),
+                            egglog: Some(pb::EgglogBindings {
+                                views: vec![pb::EgglogCallable {
+                                    symbol: alias.into(),
+                                    datatype_member: false,
+                                }],
+                            }),
+                        }),
+                        ..Default::default()
+                    },
+                ],
+                ..Default::default()
+            }
+        })
+        .collect();
+        definitions.push(signature_definition(
+            "egglog.experimental.maybe.catch",
+            "unstable-catch",
+            vec![
+                pb::Sort {
+                    kind: Some(pb::sort::Kind::Var(0)),
+                    ..Default::default()
+                },
+                pb::Sort {
+                    kind: Some(pb::sort::Kind::Family(pb::HostSort {
+                        name: "Maybe".into(),
+                        args: vec![0],
+                    })),
+                    ..Default::default()
+                },
+                pb::Sort {
+                    kind: Some(pb::sort::Kind::Func(pb::FuncSort {
+                        params: vec![],
+                        result: 0,
+                    })),
+                    ..Default::default()
+                },
+            ],
+            &["T"],
+            &[("thunk", 2)],
+            1,
+        ));
+        definitions.push(signature_definition(
+            "egglog.experimental.maybe.match",
+            "unstable-maybe-match",
+            vec![
+                pb::Sort {
+                    kind: Some(pb::sort::Kind::Var(0)),
+                    ..Default::default()
+                },
+                pb::Sort {
+                    kind: Some(pb::sort::Kind::Var(1)),
+                    ..Default::default()
+                },
+                pb::Sort {
+                    kind: Some(pb::sort::Kind::Family(pb::HostSort {
+                        name: "Maybe".into(),
+                        args: vec![0],
+                    })),
+                    ..Default::default()
+                },
+                pb::Sort {
+                    kind: Some(pb::sort::Kind::Func(pb::FuncSort {
+                        params: vec![0],
+                        result: 1,
+                    })),
+                    ..Default::default()
+                },
+            ],
+            &["T", "U"],
+            &[("maybe", 2), ("on_some", 3), ("default", 1)],
+            1,
+        ));
+        definitions
+    }
+
     fn presort_name() -> &'static str {
         "Maybe"
     }
@@ -118,17 +317,38 @@ impl ContainerSort for MaybeSort {
 
     fn register_primitives(&self, egraph: &mut EGraph) {
         let maybe = self.clone().to_arcsort();
+        egraph
+            .type_info()
+            .register_builtin_sort("Maybe", maybe.clone(), vec![self.element.clone()])
+            .unwrap();
+        let none = egraph
+            .type_info()
+            .instantiate_builtin("egglog.experimental.maybe.none", &maybe)
+            .unwrap();
+        let some = egraph
+            .type_info()
+            .instantiate_builtin("egglog.experimental.maybe.some", &maybe)
+            .unwrap();
+        let unwrap = egraph
+            .type_info()
+            .instantiate_builtin("egglog.experimental.maybe.unwrap", &maybe)
+            .unwrap();
+        let unwrap_or = egraph
+            .type_info()
+            .instantiate_builtin("egglog.experimental.maybe.unwrap_or", &maybe)
+            .unwrap();
+        egraph.add_pure_primitive(MaybeNone { instance: none }, None);
 
-        add_primitive!(egraph, "maybe-some" = {self.clone(): MaybeSort} |value: # (self.element.clone())| -> @MaybeContainer (maybe) {
+        add_primitive!(egraph, "maybe-some" [instance = some] = {self.clone(): MaybeSort} |value: #| -> @MaybeContainer {
             MaybeContainer {
                 do_rebuild: self.ctx.is_eq_container_sort(),
                 data: Some(value),
             }
         });
-        add_primitive!(egraph, "maybe-unwrap" = |value: @MaybeContainer (maybe)| -?> # (self.element.clone()) {
+        add_primitive!(egraph, "maybe-unwrap" [instance = unwrap] = |value: @MaybeContainer| -?> # {
             value.data
         });
-        add_primitive!(egraph, "maybe-unwrap-or" = |value: @MaybeContainer (maybe), default: # (self.element.clone())| -> # (self.element.clone()) {
+        add_primitive!(egraph, "maybe-unwrap-or" [instance = unwrap_or] = |value: @MaybeContainer, default: #| -> # {
             value.data.unwrap_or(default)
         });
     }
@@ -161,8 +381,10 @@ impl ContainerSort for MaybeSort {
     }
 }
 
-#[derive(Clone, Copy)]
-struct MaybeNone;
+#[derive(Clone)]
+struct MaybeNone {
+    instance: BuiltinInstance,
+}
 
 impl Primitive for MaybeNone {
     fn name(&self) -> &str {
@@ -170,7 +392,11 @@ impl Primitive for MaybeNone {
     }
 
     fn get_type_constraints(&self, span: &Span) -> Box<dyn TypeConstraint> {
-        Box::new(MaybeNoneTypeConstraint { span: span.clone() })
+        self.instance.type_constraints(span)
+    }
+
+    fn builtin_instance(&self) -> Option<&BuiltinInstance> {
+        Some(&self.instance)
     }
 }
 
@@ -185,33 +411,12 @@ impl PurePrim for MaybeNone {
     }
 }
 
-struct MaybeNoneTypeConstraint {
-    span: Span,
-}
-
-impl TypeConstraint for MaybeNoneTypeConstraint {
-    fn get(
-        &self,
-        arguments: &[AtomTerm],
-        typeinfo: &TypeInfo,
-    ) -> Vec<Box<dyn Constraint<AtomTerm, ArcSort>>> {
-        let signatures = typeinfo
-            .get_arcsorts_by(|sort| sort.value_type() == Some(TypeId::of::<MaybeContainer>()))
-            .into_iter()
-            .map(|maybe| vec![maybe]);
-        // `none` has no input from which to infer its nominal Maybe alias. If
-        // multiple aliases remain compatible, surrounding context must select
-        // one; picking the first would make unrelated sort declarations change
-        // the meaning of a program.
-        exact_signatures("maybe-none", &self.span, arguments, 1, signatures)
-    }
-}
-
 /// `(unstable-catch thunk)` evaluates a zero-argument `UnstableFn`, returning
 /// `maybe-some` when the application is defined and `maybe-none` otherwise.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct Catch {
     do_rebuild: bool,
+    instance: BuiltinInstance,
 }
 
 impl Primitive for Catch {
@@ -224,6 +429,10 @@ impl Primitive for Catch {
             do_rebuild: self.do_rebuild,
             span: span.clone(),
         })
+    }
+
+    fn builtin_instance(&self) -> Option<&BuiltinInstance> {
+        Some(&self.instance)
     }
 }
 
@@ -273,8 +482,10 @@ impl TypeConstraint for CatchTypeConstraint {
     }
 }
 
-#[derive(Clone, Copy)]
-struct MaybeMatch;
+#[derive(Clone)]
+struct MaybeMatch {
+    instance: BuiltinInstance,
+}
 
 impl Primitive for MaybeMatch {
     fn name(&self) -> &str {
@@ -283,6 +494,10 @@ impl Primitive for MaybeMatch {
 
     fn get_type_constraints(&self, span: &Span) -> Box<dyn TypeConstraint> {
         Box::new(MaybeMatchTypeConstraint { span: span.clone() })
+    }
+
+    fn builtin_instance(&self) -> Option<&BuiltinInstance> {
+        Some(&self.instance)
     }
 }
 
@@ -342,8 +557,22 @@ pub(crate) fn add_maybe(egraph: &mut EGraph) {
         .type_info()
         .add_presort::<MaybeSort>(egglog::span!())
         .unwrap();
-    egraph.add_pure_primitive(MaybeNone, None);
-    egraph.add_pure_primitive(Catch { do_rebuild: false }, None);
-    egraph.add_pure_primitive(Catch { do_rebuild: true }, None);
-    egraph.add_pure_primitive(MaybeMatch, None);
+    let catch = egraph
+        .type_info()
+        .instantiate_builtin_open("egglog.experimental.maybe.catch")
+        .unwrap();
+    for do_rebuild in [false, true] {
+        egraph.add_pure_primitive(
+            Catch {
+                do_rebuild,
+                instance: catch.clone(),
+            },
+            None,
+        );
+    }
+    let instance = egraph
+        .type_info()
+        .instantiate_builtin_open("egglog.experimental.maybe.match")
+        .unwrap();
+    egraph.add_pure_primitive(MaybeMatch { instance }, None);
 }

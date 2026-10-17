@@ -12,6 +12,53 @@ use egglog::constraint::{self, Constraint, ImpossibleConstraint};
 use egglog::prelude::Span;
 use egglog::{ArcSort, Atom, AtomTerm};
 
+/// Owns a portable generic signature and its existing text spelling at the
+/// actual provider. Native overload selection remains checked against it.
+pub(crate) fn signature_definition(
+    key: &str,
+    alias: &str,
+    sorts: Vec<egglog::proto::Sort>,
+    parameters: &[&str],
+    inputs: &[(&str, u32)],
+    output: u32,
+) -> egglog::proto::Program {
+    use egglog::proto as pb;
+    pb::Program {
+        ir_version: 1,
+        sorts,
+        declarations: vec![pb::Declaration {
+            kind: Some(pb::declaration::Kind::HostPrimitive(pb::HostPrimitive {
+                name: key.into(),
+                typing: Some(pb::host_primitive::Typing::Signature(
+                    pb::GenericSignature {
+                        type_params: parameters.iter().map(|name| (*name).into()).collect(),
+                        inputs: inputs
+                            .iter()
+                            .map(|(name, sort)| pb::Arg {
+                                name: (*name).into(),
+                                sort: *sort,
+                            })
+                            .collect(),
+                        output: Some(output),
+                        ..Default::default()
+                    },
+                )),
+            })),
+            bindings: Some(pb::CallableBindings {
+                egglog: Some(pb::EgglogBindings {
+                    views: vec![pb::EgglogCallable {
+                        symbol: alias.into(),
+                        datatype_member: false,
+                    }],
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }],
+        ..Default::default()
+    }
+}
+
 /// Builds a constraint for an overloaded primitive whose valid types can be
 /// enumerated exactly.
 ///

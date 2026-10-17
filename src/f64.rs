@@ -13,7 +13,7 @@ pub(crate) fn add_f64_primitives(egraph: &mut EGraph) {
     };
     add_primitive_with_validator!(
         egraph,
-        "f64-is-finite" = |value: F| -?> () {
+        "f64-is-finite" [id = "egglog.experimental.f64.is_finite", bindings = |s| egglog::builtin::scalar_member_bindings(s, "is_finite", "is_finite", &[], None, None)] = |value: F| -?> () {
             value.0.is_finite().then_some(())
         },
         validator
