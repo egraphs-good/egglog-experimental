@@ -32,3 +32,7 @@ hashbrown = "0.16.0"
 [dev-dependencies]
 glob = "0.3.1"
 libtest-mimic = "0.8.1"
+
+[profile.dev]
+# Keep file/line backtraces with smaller dev and test build artifacts.
+debug = "line-tables-only"
