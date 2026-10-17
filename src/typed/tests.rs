@@ -727,6 +727,20 @@ fn typed_table_function_syntax_rejects_inert_data_and_incompatible_selectors() {
     );
     let key = I64::from(1);
     let actual = Expr::call(&function, vec![key.expression().clone()]);
+    let authored = I64::from_expression(actual.clone());
+    assert_eq!(authored.call_name(), Some("Same"));
+    assert_eq!(key.call_name(), None);
+    assert_eq!(super::var::<I64>("key").call_name(), None);
+    assert_eq!(super::let_("call", &authored).call_name(), None);
+    assert_eq!(
+        I64::from_expression(super::eq(&key, &key).0).call_name(),
+        None
+    );
+    let mut observed = Expr::call(&function, vec![key.expression().clone()]);
+    Arc::get_mut(observed.0.owner.as_mut().unwrap())
+        .unwrap()
+        .observed = true;
+    assert_eq!(I64::from_expression(observed).call_name(), None);
     assert!(actual.validate_inert().is_err());
     assert!(key.expression().validate_inert().is_ok());
     assert_eq!(

@@ -21,6 +21,21 @@ pub trait EgglogValue: Clone + Eq + Hash + std::fmt::Debug + Send + Sync + 'stat
     fn expression(&self) -> &Expr;
     #[doc(hidden)]
     fn from_expression(expr: Expr) -> Self;
+
+    /// Returns the authored root call's name for diagnostics.
+    /// Variables, captures, literals, and snapshot observations return `None`.
+    /// Use `get_args` for exact typed call inspection.
+    fn call_name(&self) -> Option<&str> {
+        let record = &self.expression().0;
+        let owner = record.owner.as_ref().unwrap();
+        if owner.observed || owner.capture.is_some_and(|(read, _)| record.index == read) {
+            return None;
+        }
+        match &owner.program.nodes[record.index as usize].kind {
+            Some(pb::node::Kind::Call(call)) => Some(&call.func),
+            _ => None,
+        }
+    }
 }
 /// A sort whose values may participate in equality-class unions.
 pub trait EqualitySort: EgglogValue {}
