@@ -1,4 +1,4 @@
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 
 use egglog::{
@@ -270,10 +270,24 @@ fn validate_extract_outputs(
             }
         }
         ExtractedExpressions::Frozen(response, terms) => {
+            let mut callables = HashMap::new();
+            for (physical, function) in egraph.functions_iter() {
+                if let Some(egglog::ast::TableName::Public(logical)) =
+                    &function.func_type().table_name
+                    && callables
+                        .insert(logical.clone(), physical.clone())
+                        .is_some()
+                {
+                    return Err(Error::ExtractError(format!(
+                        "extraction oracle ambiguous public callable {logical:?}"
+                    )));
+                }
+            }
             // One allowance covers every expanded variant, including repeated
             // DAG edges and synthesized reconstruction nodes.
             let mut decoder = FrozenDecoder {
                 response,
+                callables,
                 remaining: 65_536,
             };
             for term in terms {
@@ -668,6 +682,7 @@ fn next_native_command(
 // the independent oracle used to check the returned terms.
 struct FrozenDecoder<'a> {
     response: &'a pb::RunProgramResponse,
+    callables: HashMap<String, String>,
     remaining: usize,
 }
 
@@ -727,7 +742,15 @@ impl FrozenDecoder<'_> {
             .ok_or("extracted node index out of bounds")?;
         let result = match node.kind.as_ref() {
             Some(pb::node::Kind::Call(value)) => {
-                self.call(&value.func, &value.args, depth, annotations)
+                // Public table provenance is not a native expression alias.
+                // Only returned Call references cross that namespace boundary;
+                // generated builtin calls and ordinary String data stay native.
+                let name = self
+                    .callables
+                    .get(&value.func)
+                    .unwrap_or(&value.func)
+                    .clone();
+                self.call(&name, &value.args, depth, annotations)
             }
             Some(pb::node::Kind::PrimitiveValue(value)) => match value.value.as_ref() {
                 Some(V::I64(value)) => {
@@ -1282,7 +1305,7 @@ fn partial_call_oracle_trials() -> Vec<Trial> {
         validate_extract_outputs(&mut positive.native, &positive.extract, ExtractedExpressions::Frozen(&positive.response, positive.terms))
             .map_err(|error| error.to_string())?;
         let mut case = partial_call_oracle_case("(sort First (Vec i64)) (sort Second (Vec i64)) (sort Expected (UnstableFn () i64)) (function captured () First :merge old) (set (captured) (vec-of 1)) (function oracle_root () Expected :merge old) (set (oracle_root) (unstable-fn \"vec-length\" (captured)))")?;
-        let decoded = FrozenDecoder { response: &case.response, remaining: 65_536 }
+        let decoded = FrozenDecoder { response: &case.response, callables: HashMap::new(), remaining: 65_536 }
             .expression(case.terms[0], 0, &mut vec![])?;
         let root_sort = case.native.eval_expr(&case.extract.root).map_err(|error| error.to_string())?.0;
         let inference = case.native.typecheck_expr_with_bindings_and_output(&decoded, &[], root_sort, egglog::Context::Full).unwrap_err();
@@ -1326,6 +1349,7 @@ fn partial_call_oracle_trials() -> Vec<Trial> {
             };
             let mut decoder = FrozenDecoder {
                 response: &response,
+                callables: HashMap::new(),
                 remaining: 65_536,
             };
             let mut annotations = vec![];
@@ -1359,6 +1383,7 @@ fn partial_call_oracle_trials() -> Vec<Trial> {
             }
             let mut decoder = FrozenDecoder {
                 response: &response,
+                callables: HashMap::new(),
                 remaining: 65_536,
             };
             assert!(
@@ -1381,6 +1406,7 @@ fn partial_call_oracle_trials() -> Vec<Trial> {
             }
             let mut decoder = FrozenDecoder {
                 response: &response,
+                callables: HashMap::new(),
                 remaining: 65_536,
             };
             assert!(
@@ -1429,6 +1455,7 @@ fn partial_call_oracle_trials() -> Vec<Trial> {
             });
             let mut decoder = FrozenDecoder {
                 response: &map,
+                callables: HashMap::new(),
                 remaining: 65_536,
             };
             assert!(
@@ -1472,6 +1499,167 @@ fn partial_call_oracle_trials() -> Vec<Trial> {
         },
     ));
     trials
+}
+
+fn public_callable_oracle_trial() -> Trial {
+    Trial::test("oracle/call/public-table-provenance", || {
+        let authored = "(datatype E (Num i64) (Other i64)) (extract (Num (get-size! \"Num\")))";
+        let mut renderer = Renderer::default();
+        let mut rendered = String::new();
+        for phase in Source::new(None, authored).map_err(|error| error.to_string())? {
+            rendered.push_str(
+                &renderer
+                    .render(&phase.map_err(|error| error.to_string())?)
+                    .map_err(|error| error.to_string())?,
+            );
+        }
+        let mut native = new_experimental_egraph();
+        let mut commands = native
+            .parse_program(None, &rendered)
+            .map_err(|error| error.to_string())?
+            .into_iter();
+        let mut engine = Engine::default();
+        let created = engine
+            .create(
+                &pb::CreateEGraphRequest {
+                    sorts: vec![pb::Sort {
+                        kind: Some(pb::sort::Kind::Family(pb::HostSort {
+                            name: "i64".into(),
+                            args: vec![],
+                        })),
+                        ..Default::default()
+                    }],
+                    options: Some(pb::EGraphOptions {
+                        cost_sort: Some(0),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }
+                .encode_to_vec(),
+            )
+            .map_err(|error| error.to_string())?;
+        let id = pb::CreateEGraphResponse::decode(created.as_slice())
+            .map_err(|error| error.to_string())?
+            .egraph_id;
+        let mut saw_declaration = false;
+        let mut saw_extract = false;
+        for phase in Source::new(None, &rendered).map_err(|error| error.to_string())? {
+            let program = phase.map_err(|error| error.to_string())?;
+            for declaration in &program.declarations {
+                if let Some(pb::declaration::Kind::Constructor(constructor)) = &declaration.kind
+                    && constructor.name == "Num"
+                {
+                    assert_eq!(constructor.inputs.len(), 1);
+                    assert!(
+                        matches!(&program.sorts[constructor.inputs[0].sort as usize].kind,
+                        Some(pb::sort::Kind::Family(family)) if family.name == "i64" && family.args.is_empty())
+                    );
+                    assert!(matches!(
+                        &program.sorts[constructor.output as usize].kind,
+                        Some(pb::sort::Kind::Eq(_))
+                    ));
+                    saw_declaration = true;
+                }
+            }
+            let command = commands.next().ok_or("missing native canary command")?;
+            let extract = extract_command_parts(&command);
+            let validation = extract.as_ref().map(|_| native.clone());
+            native
+                .run_program(vec![command])
+                .map_err(|error| error.to_string())?;
+            let bytes = engine
+                .run(
+                    &pb::RunProgramRequest {
+                        egraph_id: id,
+                        program: Some(program),
+                        profile: true,
+                        include_run_reports: false,
+                    }
+                    .encode_to_vec(),
+                )
+                .map_err(|error| error.to_string())?;
+            let mut response = pb::RunProgramResponse::decode(bytes.as_slice())
+                .map_err(|error| error.to_string())?;
+            assert!(response.error.is_none(), "{response:?}");
+            let Some(extract) = extract else { continue };
+            assert!(!saw_extract);
+            saw_extract = true;
+            let validation = validation.unwrap();
+            let mut physical = vec![];
+            for logical in ["Num", "Other"] {
+                let matches = validation
+                    .functions_iter()
+                    .filter(|(_, function)| {
+                        matches!(&function.func_type().table_name,
+                        Some(egglog::ast::TableName::Public(name)) if name == logical)
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(matches.len(), 1);
+                let (name, function) = matches[0];
+                assert_ne!(name, logical);
+                assert!(validation.get_function(logical).is_none());
+                assert_eq!(function.func_type().input.len(), 1);
+                assert_eq!(function.func_type().input[0].name(), "i64");
+                assert!(function.func_type().output.is_eq_sort());
+                assert_eq!(validation.get_size(name), 0);
+                physical.push((name.clone(), function.func_type().output.name().to_string()));
+            }
+            assert_eq!(physical[0].1, physical[1].1);
+            let terms = response
+                .outputs
+                .iter()
+                .filter_map(|output| match &output.kind {
+                    Some(pb::command_output::Kind::Extraction(result)) => Some(result),
+                    _ => None,
+                })
+                .flat_map(|result| &result.roots)
+                .flat_map(|root| &root.variants)
+                .map(|variant| variant.term)
+                .collect::<Vec<_>>();
+            assert_eq!(terms.len(), 1);
+            let root = terms[0] as usize;
+            let Some(pb::node::Kind::Call(call)) = &response.nodes[root].kind else {
+                return Err("canary did not return a constructor Call".into());
+            };
+            assert_eq!(call.func, "Num");
+            assert_eq!(call.args.len(), 1);
+            assert!(matches!(
+                &response.nodes[call.args[0] as usize].kind,
+                Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
+                    value: Some(pb::primitive_value::Value::I64(0)),
+                }))
+            ));
+            assert!(
+                matches!(&response.sorts[response.nodes[root].sort_id as usize].kind,
+                Some(pb::sort::Kind::Eq(name)) if name == &physical[0].1)
+            );
+            validate_extract_outputs(
+                &mut validation.clone(),
+                &extract,
+                ExtractedExpressions::Frozen(&response, terms.clone()),
+            )
+            .map_err(|error| error.to_string())?;
+            for (target, expected_error) in [
+                ("Other", "term unequal to the requested root"),
+                ("missing-callable", "Unbound function missing-callable"),
+            ] {
+                let Some(pb::node::Kind::Call(call)) = &mut response.nodes[root].kind else {
+                    unreachable!()
+                };
+                call.func = target.into();
+                let error = validate_extract_outputs(
+                    &mut validation.clone(),
+                    &extract,
+                    ExtractedExpressions::Frozen(&response, terms.clone()),
+                )
+                .unwrap_err();
+                assert!(error.to_string().contains(expected_error), "{error}");
+            }
+        }
+        assert!(saw_declaration && saw_extract);
+        assert!(commands.next().is_none());
+        Ok(())
+    })
 }
 
 fn protobuf_trials(root: &std::path::Path, core: bool) -> Vec<Trial> {
@@ -1560,6 +1748,7 @@ fn main() {
     let args = libtest_mimic::Arguments::from_args();
     let mut tests = generate_tests("tests/**/*.egg");
     tests.extend(partial_call_oracle_trials());
+    tests.push(public_callable_oracle_trial());
     tests.extend(protobuf_trials(std::path::Path::new("tests"), false));
     if let Some(root) = std::env::var_os("EGGLOG_PROTO_CORE_TESTS") {
         tests.extend(protobuf_trials(std::path::Path::new(&root), true));
