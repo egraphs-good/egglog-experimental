@@ -1518,6 +1518,7 @@ impl Iterator for Source {
 /// for same-engine resupply. Execution names and structural-sort limits are unchanged.
 /// Use [`Self::render_submission`] for Source-managed scopes, and a fresh renderer
 /// after externally resetting or popping the text environment.
+#[derive(Clone)]
 pub struct Renderer {
     dialect: Dialect,
     session: Session,
