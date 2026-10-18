@@ -604,6 +604,55 @@ fn frozen_expression(
             Some(V::String(value)) => Ok(Expr::Lit(span!(), Literal::String(value.clone()))),
             Some(V::Bool(value)) => Ok(Expr::Lit(span!(), Literal::Bool(*value))),
             Some(V::Unit(_)) => Ok(Expr::Lit(span!(), Literal::Unit)),
+            // Reconstruct exact values from the structured payload using native
+            // builtin identities, without printing or parsing an expression.
+            Some(exact @ (V::BigInt(_) | V::BigRat(_) | V::Rational(_))) => {
+                let expected = match exact {
+                    V::BigInt(_) => "BigInt",
+                    V::BigRat(_) => "BigRat",
+                    _ => "Rational",
+                };
+                if !matches!(
+                    response
+                        .sorts
+                        .get(node.sort_id as usize)
+                        .and_then(|sort| sort.kind.as_ref()),
+                    Some(pb::sort::Kind::Family(family))
+                        if family.name == expected && family.args.is_empty()
+                ) {
+                    return Err("extraction oracle exact numeric payload/sort mismatch".into());
+                }
+                match exact {
+                    V::BigInt(value) => Ok(Expr::Call(
+                        span!(),
+                        "egglog.core.bigint.from_string".into(),
+                        vec![Expr::Lit(span!(), Literal::String(value.clone()))],
+                    )),
+                    V::BigRat(value) => Ok(Expr::Call(
+                        span!(),
+                        "egglog.core.bigrat.make".into(),
+                        [&value.numerator, &value.denominator]
+                            .into_iter()
+                            .map(|part| {
+                                Expr::Call(
+                                    span!(),
+                                    "egglog.core.bigint.from_string".into(),
+                                    vec![Expr::Lit(span!(), Literal::String(part.clone()))],
+                                )
+                            })
+                            .collect(),
+                    )),
+                    V::Rational(value) => Ok(Expr::Call(
+                        span!(),
+                        "egglog.experimental.rational.make".into(),
+                        vec![
+                            Expr::Lit(span!(), Literal::Int(value.numerator)),
+                            Expr::Lit(span!(), Literal::Int(value.denominator)),
+                        ],
+                    )),
+                    _ => unreachable!("matched exact numeric value"),
+                }
+            }
             Some(V::Vec(list)) => call("vec-of", &list.items),
             Some(V::Set(list)) => call("set-of", &list.items),
             Some(V::Multiset(list)) => call("multiset-of", &list.items),
