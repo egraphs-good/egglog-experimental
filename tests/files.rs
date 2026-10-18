@@ -163,7 +163,9 @@ fn run_program_with_extract_checks(
 
 struct ExtractCheck {
     root: Expr,
+    additional_roots: Vec<Expr>,
     variants: Option<Expr>,
+    count_first: bool,
     use_greedy_dag: bool,
 }
 
@@ -171,7 +173,9 @@ fn extract_command_parts(command: &Command) -> Option<ExtractCheck> {
     match command {
         Command::Extract(_, root, variants) => Some(ExtractCheck {
             root: root.clone(),
+            additional_roots: vec![],
             variants: Some(variants.clone()),
+            count_first: false,
             use_greedy_dag: false,
         }),
         Command::UserDefined(_, name, args) if name == "extract" => {
@@ -187,24 +191,39 @@ fn extract_command_parts(command: &Command) -> Option<ExtractCheck> {
             match positional {
                 [root] => Some(ExtractCheck {
                     root: root.clone(),
+                    additional_roots: vec![],
                     variants: None,
+                    count_first: false,
                     use_greedy_dag,
                 }),
                 [root, variants] => Some(ExtractCheck {
                     root: root.clone(),
+                    additional_roots: vec![],
                     variants: Some(variants.clone()),
+                    count_first: false,
                     use_greedy_dag,
                 }),
                 _ => None,
             }
+        }
+        Command::UserDefined(_, name, args) if name == "multi-extract" => {
+            let parsed = egglog_experimental::parse_multi_extract_args(args).ok()?;
+            Some(ExtractCheck {
+                root: parsed.roots[0].clone(),
+                additional_roots: parsed.roots[1..].to_vec(),
+                variants: Some(parsed.variants.clone()),
+                count_first: true,
+                use_greedy_dag: parsed.greedy,
+            })
         }
         _ => None,
     }
 }
 
 enum ExtractedExpressions<'a> {
-    Native(Vec<Expr>),
+    Native(Vec<Vec<Expr>>),
     Frozen(&'a pb::RunProgramResponse, Vec<u32>),
+    FrozenGroups(&'a pb::RunProgramResponse, Vec<Vec<u32>>),
 }
 
 fn validate_extract_outputs(
@@ -212,192 +231,272 @@ fn validate_extract_outputs(
     extract: &ExtractCheck,
     requested: ExtractedExpressions<'_>,
 ) -> Result<(), Error> {
-    // Evaluate the potentially stateful root exactly once, then invoke the
-    // opposite extractor directly so both algorithms see that same value.
-    let (root_sort, root_value) = egraph.eval_expr(&extract.root)?;
-    let nvariants = if let Some(variants) = &extract.variants {
-        let (_, value) = egraph.eval_expr(variants)?;
-        usize::try_from(egraph.value_to_base::<i64>(value)).map_err(|_| {
-            Error::ExtractError("extract variant count must be nonnegative".to_owned())
-        })?
-    } else {
-        0
+    let count = |egraph: &mut EGraph| -> Result<usize, Error> {
+        let Some(variants) = &extract.variants else {
+            return Ok(0);
+        };
+        let (sort, value) = egraph.eval_expr(variants)?;
+        if sort.name() != "i64" {
+            return Err(Error::ExtractError(
+                "extract variant count must have i64 sort".into(),
+            ));
+        }
+        let count = usize::try_from(egraph.value_to_base::<i64>(value))
+            .map_err(|_| Error::ExtractError("extract variant count must be nonnegative".into()))?;
+        if extract.count_first && count == 0 {
+            return Err(Error::ExtractError(
+                "multi-extract requires a positive number of variants".into(),
+            ));
+        }
+        Ok(count)
     };
-
-    let roots = vec![(root_sort.clone(), root_value)];
+    // Multi-extract evaluates its count before all roots. Single extract's
+    // existing root-before-count order is different and remains unchanged.
+    let nvariants = extract.count_first.then(|| count(egraph)).transpose()?;
+    let roots = std::iter::once(&extract.root)
+        .chain(&extract.additional_roots)
+        .map(|root| egraph.eval_expr(root))
+        .collect::<Result<Vec<_>, _>>()?;
+    let nvariants = match nvariants {
+        Some(count) => count,
+        None => count(egraph)?,
+    };
+    // Invoke the paired extractor once, after every stateful root was evaluated.
     let paired_exprs = if nvariants == 0 {
         let extracted = if extract.use_greedy_dag {
-            egraph.extract_best_with_cost_model(roots, TreeCostModelFromDag(DynamicCostModel))?
+            egraph.extract_best_with_cost_model(
+                roots.clone(),
+                TreeCostModelFromDag(DynamicCostModel),
+            )?
         } else {
-            extract_best_greedy_dag(egraph, roots, DynamicCostModel)?
+            extract_best_greedy_dag(egraph, roots.clone(), DynamicCostModel)?
         };
-        let root = extracted
+        extracted
             .terms
             .into_iter()
-            .next()
-            .expect("one root was requested")
-            .ok_or_else(|| Error::ExtractError("paired extractor returned no term".to_owned()))?;
-        vec![extracted.termdag.term_to_expr(&root.term, span!())]
+            .map(|root| {
+                let root = root.ok_or_else(|| {
+                    Error::ExtractError("paired extractor returned no term".into())
+                })?;
+                Ok(vec![extracted.termdag.term_to_expr(&root.term, span!())])
+            })
+            .collect::<Result<Vec<_>, Error>>()?
     } else {
         let extracted = if extract.use_greedy_dag {
             egraph.extract_variants_with_cost_model(
-                roots,
+                roots.clone(),
                 nvariants,
                 TreeCostModelFromDag(DynamicCostModel),
             )?
         } else {
-            extract_variants_greedy_dag(egraph, roots, nvariants, DynamicCostModel)?
+            extract_variants_greedy_dag(egraph, roots.clone(), nvariants, DynamicCostModel)?
         };
-        let variants = extracted
+        extracted
             .variants
             .into_iter()
-            .next()
-            .expect("one root was requested");
-        variants
-            .into_iter()
-            .map(|variant| extracted.termdag.term_to_expr(&variant.term, span!()))
-            .collect()
+            .map(|variants| {
+                variants
+                    .into_iter()
+                    .map(|variant| extracted.termdag.term_to_expr(&variant.term, span!()))
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>()
     };
-
-    let portable = matches!(&requested, ExtractedExpressions::Frozen(..));
-    let mut contextual_functions = false;
-    let mut requested_values = vec![];
-    match requested {
-        ExtractedExpressions::Native(expressions) => {
-            for expr in expressions {
-                let (sort, value) = egraph.eval_expr(&expr)?;
-                requested_values.push((expr, sort, value));
+    let requested = match requested {
+        ExtractedExpressions::Frozen(response, terms) => {
+            ExtractedExpressions::FrozenGroups(response, vec![terms])
+        }
+        other => other,
+    };
+    let groups = match &requested {
+        ExtractedExpressions::Native(groups) => groups.len(),
+        ExtractedExpressions::FrozenGroups(_, groups) => groups.len(),
+        ExtractedExpressions::Frozen(..) => unreachable!(),
+    };
+    if groups != roots.len() || paired_exprs.len() != roots.len() {
+        return Err(Error::ExtractError(
+            "extraction oracle root group count differs".into(),
+        ));
+    }
+    let portable = matches!(&requested, ExtractedExpressions::FrozenGroups(..));
+    let mut decoder = if let ExtractedExpressions::FrozenGroups(response, _) = &requested {
+        let mut callables = HashMap::new();
+        for (physical, function) in egraph.functions_iter() {
+            if let Some(egglog::ast::TableName::Public(logical)) = &function.func_type().table_name
+                && callables
+                    .insert(logical.clone(), physical.clone())
+                    .is_some()
+            {
+                return Err(Error::ExtractError(format!(
+                    "extraction oracle ambiguous public callable {logical:?}"
+                )));
             }
         }
-        ExtractedExpressions::Frozen(response, terms) => {
-            let mut callables = HashMap::new();
-            for (physical, function) in egraph.functions_iter() {
-                if let Some(egglog::ast::TableName::Public(logical)) =
-                    &function.func_type().table_name
-                    && callables
-                        .insert(logical.clone(), physical.clone())
-                        .is_some()
-                {
-                    return Err(Error::ExtractError(format!(
-                        "extraction oracle ambiguous public callable {logical:?}"
-                    )));
+        // One allowance covers all roots and variants, including repeated DAG
+        // edges and synthesized reconstruction nodes.
+        Some(FrozenDecoder {
+            response,
+            callables,
+            remaining: 65_536,
+        })
+    } else {
+        None
+    };
+    for (index, ((root_sort, root_value), paired_exprs)) in
+        roots.into_iter().zip(paired_exprs).enumerate()
+    {
+        let mut contextual_functions = false;
+        let mut requested_values = vec![];
+        match &requested {
+            ExtractedExpressions::Native(expressions) => {
+                if expressions[index].len() > nvariants.max(1) {
+                    return Err(Error::ExtractError(
+                        "extraction oracle variant count exceeds request".into(),
+                    ));
+                }
+                for expr in &expressions[index] {
+                    let (sort, value) = egraph.eval_expr(expr)?;
+                    requested_values.push((expr.clone(), sort, value));
                 }
             }
-            // One allowance covers every expanded variant, including repeated
-            // DAG edges and synthesized reconstruction nodes.
-            let mut decoder = FrozenDecoder {
-                response,
-                callables,
-                remaining: 65_536,
-            };
-            for term in terms {
-                let mut annotations = vec![];
-                let mut expr = decoder
-                    .expression(term, 0, &mut annotations)
-                    .map_err(Error::ExtractError)?;
-                let has_partial_call = annotations.iter().flatten().any(|index| {
-                    matches!(
-                        response.nodes[*index as usize].kind.as_ref(),
-                        Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
-                            value: Some(pb::primitive_value::Value::PartialCall(_)),
-                        }))
-                    )
-                });
-                let (sort, value) = if has_partial_call {
-                    contextual_functions = true;
-                    let resolved = egraph
-                        .typecheck_expr_with_bindings_and_output(
-                            &expr,
-                            &[],
-                            root_sort.clone(),
-                            egglog::Context::Full,
+            ExtractedExpressions::FrozenGroups(response, terms) => {
+                if terms[index].len() > nvariants.max(1) {
+                    return Err(Error::ExtractError(
+                        "extraction oracle variant count exceeds request".into(),
+                    ));
+                }
+                let decoder = decoder.as_mut().unwrap();
+                for term in &terms[index] {
+                    let mut annotations = vec![];
+                    let mut expr = decoder
+                        .expression(*term, 0, &mut annotations)
+                        .map_err(Error::ExtractError)?;
+                    let has_partial_call = annotations.iter().flatten().any(|index| {
+                        matches!(
+                            response.nodes[*index as usize].kind.as_ref(),
+                            Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
+                                value: Some(pb::primitive_value::Value::PartialCall(_)),
+                            }))
                         )
-                        .map_err(|error| {
-                            Error::ExtractError(format!(
-                                "contextual function-value extraction oracle: {error}"
-                            ))
-                        })?;
-                    let mut annotations = annotations.into_iter();
-                    specialize_frozen_expression(
-                        egraph,
-                        response,
-                        &mut expr,
-                        &resolved,
-                        &mut annotations,
-                    )
-                    .map_err(Error::ExtractError)?;
-                    if annotations.next().is_some() {
-                        return Err(Error::ExtractError(
+                    });
+                    let (sort, value) = if has_partial_call {
+                        contextual_functions = true;
+                        let resolved = egraph
+                            .typecheck_expr_with_bindings_and_output(
+                                &expr,
+                                &[],
+                                root_sort.clone(),
+                                egglog::Context::Full,
+                            )
+                            .map_err(|error| {
+                                Error::ExtractError(format!(
+                                    "contextual function-value extraction oracle: {error}"
+                                ))
+                            })?;
+                        let mut annotations = annotations.into_iter();
+                        specialize_frozen_expression(
+                            egraph,
+                            response,
+                            &mut expr,
+                            &resolved,
+                            &mut annotations,
+                        )
+                        .map_err(Error::ExtractError)?;
+                        if annotations.next().is_some() {
+                            return Err(Error::ExtractError(
                             "extraction oracle annotation traversal differs from native expression"
                                 .into(),
                         ));
-                    }
-                    egraph.eval_expr_with_output(&expr, root_sort.clone())?
-                } else {
-                    egraph.eval_expr(&expr)?
-                };
-                requested_values.push((expr, sort, value));
+                        }
+                        egraph.eval_expr_with_output(&expr, root_sort.clone())?
+                    } else {
+                        egraph.eval_expr(&expr)?
+                    };
+                    requested_values.push((expr, sort, value));
+                }
             }
+            ExtractedExpressions::Frozen(..) => unreachable!(),
         }
-    }
 
-    if requested_values.is_empty() != paired_exprs.is_empty() {
-        return Err(Error::ExtractError(
-            "only one extractor returned variants for the requested root".to_owned(),
-        ));
-    }
+        if requested_values.is_empty() != paired_exprs.is_empty() {
+            return Err(Error::ExtractError(
+                "only one extractor returned variants for the requested root".to_owned(),
+            ));
+        }
 
-    for expr in paired_exprs {
-        let (sort, value) = if contextual_functions {
-            egraph.eval_expr_with_output(&expr, root_sort.clone())?
-        } else {
-            egraph.eval_expr(&expr)?
-        };
-        requested_values.push((expr, sort, value));
-    }
-    let expected_shape = portable
-        .then(|| {
-            egraph
-                .authoring_type_info()
-                .native_sort_pattern(&root_sort)
-                .map_err(Error::ExtractError)
-        })
-        .transpose()?;
-    for (extracted_expr, extracted_sort, extracted_value) in requested_values {
-        let same_sort = if let Some(expected_shape) = &expected_shape {
-            *expected_shape
-                == egraph
+        for expr in paired_exprs {
+            let (sort, value) = if contextual_functions {
+                egraph.eval_expr_with_output(&expr, root_sort.clone())?
+            } else {
+                egraph.eval_expr(&expr)?
+            };
+            requested_values.push((expr, sort, value));
+        }
+        let expected_shape = portable
+            .then(|| {
+                egraph
                     .authoring_type_info()
-                    .native_sort_pattern(&extracted_sort)
-                    .map_err(Error::ExtractError)?
-        } else {
-            root_sort.name() == extracted_sort.name()
-        };
-        if !same_sort || root_value != extracted_value {
-            return Err(Error::ExtractError(format!(
-                "extractor returned a term unequal to the requested root: root {:?}, extracted {extracted_expr:?}",
-                extract.root
-            )));
+                    .native_sort_pattern(&root_sort)
+                    .map_err(Error::ExtractError)
+            })
+            .transpose()?;
+        for (extracted_expr, extracted_sort, extracted_value) in requested_values {
+            let same_sort = if let Some(expected_shape) = &expected_shape {
+                *expected_shape
+                    == egraph
+                        .authoring_type_info()
+                        .native_sort_pattern(&extracted_sort)
+                        .map_err(Error::ExtractError)?
+            } else {
+                root_sort.name() == extracted_sort.name()
+            };
+            if !same_sort || root_value != extracted_value {
+                return Err(Error::ExtractError(format!(
+                    "extractor returned a term unequal to the requested root: root {:?}, extracted {extracted_expr:?}",
+                    std::iter::once(&extract.root)
+                        .chain(&extract.additional_roots)
+                        .nth(index)
+                        .unwrap()
+                )));
+            }
         }
     }
 
     Ok(())
 }
 
-fn extracted_exprs(outputs: &[CommandOutput]) -> Result<Vec<Expr>, Error> {
+fn extracted_exprs(outputs: &[CommandOutput]) -> Result<Vec<Vec<Expr>>, Error> {
     let mut saw_extract = false;
     let mut extracted = Vec::new();
     for output in outputs {
         match output {
             CommandOutput::ExtractBest(termdag, _cost, term) => {
-                extracted.push(termdag.term_to_expr(term, span!()));
+                extracted.push(vec![termdag.term_to_expr(term, span!())]);
                 saw_extract = true;
             }
             CommandOutput::ExtractVariants(termdag, terms) => {
-                for term in terms {
-                    extracted.push(termdag.term_to_expr(term, span!()));
-                }
+                extracted.push(
+                    terms
+                        .iter()
+                        .map(|term| termdag.term_to_expr(term, span!()))
+                        .collect(),
+                );
                 saw_extract = true;
+            }
+            CommandOutput::UserDefined(output) => {
+                if let Some(output) = output
+                    .as_ref()
+                    .as_any()
+                    .downcast_ref::<egglog_experimental::MultiExtractOutput>()
+                {
+                    extracted.extend(output.terms.iter().map(|terms| {
+                        terms
+                            .iter()
+                            .map(|term| output.termdag.term_to_expr(term, span!()))
+                            .collect()
+                    }));
+                    saw_extract = true;
+                }
             }
             _ => {}
         }
@@ -588,11 +687,15 @@ impl ProtoRun {
                         for output in &response.outputs {
                             if let Some(pb::command_output::Kind::Extraction(result)) = &output.kind
                             {
+                                if saw_extract {
+                                    return Err(format!(
+                                        "command {index}: multiple protobuf extraction outputs"
+                                    ));
+                                }
                                 saw_extract = true;
                                 for root in &result.roots {
-                                    for term in &root.variants {
-                                        terms.push(term.term);
-                                    }
+                                    terms
+                                        .push(root.variants.iter().map(|term| term.term).collect());
                                 }
                             }
                         }
@@ -604,7 +707,7 @@ impl ProtoRun {
                         validate_extract_outputs(
                             validation.as_mut().unwrap(),
                             &extract,
-                            ExtractedExpressions::Frozen(&response, terms),
+                            ExtractedExpressions::FrozenGroups(&response, terms),
                         )
                         .map_err(|error| {
                             format!("command {index}: decoded extraction validation: {error}")
@@ -1169,6 +1272,8 @@ fn partial_call_oracle_case(setup: &str) -> Result<PartialCallOracleCase, String
         response,
         terms,
         extract: ExtractCheck {
+            additional_roots: vec![],
+            count_first: false,
             root,
             variants: None,
             use_greedy_dag: false,
@@ -1662,6 +1767,211 @@ fn public_callable_oracle_trial() -> Trial {
     })
 }
 
+fn multi_extract_oracle_trial() -> Trial {
+    Trial::test("oracle/multi-extract/ordered-groups", || {
+        let setup = "(datatype E (A) (B) (Hidden :unextractable)) (A) (B) (Hidden)";
+        let mut native = new_experimental_egraph();
+        native
+            .parse_and_run_program(None, setup)
+            .map_err(|e| e.to_string())?;
+        let command = native
+            .parse_program(None, "(multi-extract 1 (A) (B) (Hidden) 42 (A))")
+            .map_err(|e| e.to_string())?
+            .remove(0);
+        let extract = extract_command_parts(&command)
+            .ok_or("multi-extract oracle did not recognize command")?;
+        let outputs = native
+            .clone()
+            .run_program(vec![command])
+            .map_err(|e| e.to_string())?;
+        validate_extract_outputs(
+            &mut native.clone(),
+            &extract,
+            ExtractedExpressions::Native(extracted_exprs(&outputs).map_err(|e| e.to_string())?),
+        )
+        .map_err(|e| e.to_string())?;
+        let mut engine = Engine::default();
+        let created = engine
+            .create(
+                &pb::CreateEGraphRequest {
+                    sorts: vec![pb::Sort {
+                        kind: Some(pb::sort::Kind::Family(pb::HostSort {
+                            name: "i64".into(),
+                            args: vec![],
+                        })),
+                        ..Default::default()
+                    }],
+                    options: Some(pb::EGraphOptions {
+                        cost_sort: Some(0),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }
+                .encode_to_vec(),
+            )
+            .map_err(|e| e.to_string())?;
+        let id = pb::CreateEGraphResponse::decode(created.as_slice())
+            .map_err(|e| e.to_string())?
+            .egraph_id;
+        for phase in Source::new(None, setup).map_err(|e| e.to_string())? {
+            let bytes = engine
+                .run(
+                    &pb::RunProgramRequest {
+                        egraph_id: id,
+                        program: Some(phase.map_err(|e| e.to_string())?),
+                        profile: true,
+                        ..Default::default()
+                    }
+                    .encode_to_vec(),
+                )
+                .map_err(|e| e.to_string())?;
+            let response =
+                pb::RunProgramResponse::decode(bytes.as_slice()).map_err(|e| e.to_string())?;
+            assert!(response.error.is_none(), "{response:?}");
+        }
+        let program = pb::Program {
+            ir_version: 1,
+            sorts: vec![
+                pb::Sort {
+                    kind: Some(pb::sort::Kind::Eq("E".into())),
+                    ..Default::default()
+                },
+                pb::Sort {
+                    kind: Some(pb::sort::Kind::Family(pb::HostSort {
+                        name: "i64".into(),
+                        args: vec![],
+                    })),
+                    ..Default::default()
+                },
+            ],
+            nodes: ["A", "B", "Hidden"]
+                .into_iter()
+                .map(|name| pb::Node {
+                    kind: Some(pb::node::Kind::Call(pb::Call {
+                        func: name.into(),
+                        args: vec![],
+                    })),
+                    ..Default::default()
+                })
+                .chain([pb::Node {
+                    sort_id: 1,
+                    kind: Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
+                        value: Some(pb::primitive_value::Value::I64(42)),
+                    })),
+                    ..Default::default()
+                }])
+                .collect(),
+            commands: vec![pb::Command {
+                kind: Some(pb::command::Kind::Extract(pb::Extract {
+                    roots: vec![0, 1, 2, 3, 0],
+                    variants: 1,
+                    extractor: pb::Extractor::Tree.into(),
+                    ..Default::default()
+                })),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let bytes = engine
+            .run(
+                &pb::RunProgramRequest {
+                    egraph_id: id,
+                    program: Some(program),
+                    profile: true,
+                    ..Default::default()
+                }
+                .encode_to_vec(),
+            )
+            .map_err(|e| e.to_string())?;
+        let response =
+            pb::RunProgramResponse::decode(bytes.as_slice()).map_err(|e| e.to_string())?;
+        assert!(response.error.is_none(), "{response:?}");
+        let [output] = response.outputs.as_slice() else {
+            panic!("{response:?}")
+        };
+        let Some(pb::command_output::Kind::Extraction(result)) = &output.kind else {
+            panic!("{output:?}")
+        };
+        assert_eq!(
+            result
+                .roots
+                .iter()
+                .map(|root| root.variants.len())
+                .collect::<Vec<_>>(),
+            [1, 1, 0, 1, 1]
+        );
+        let groups = result
+            .roots
+            .iter()
+            .map(|root| {
+                root.variants
+                    .iter()
+                    .map(|term| term.term)
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        validate_extract_outputs(
+            &mut native.clone(),
+            &extract,
+            ExtractedExpressions::FrozenGroups(&response, groups.clone()),
+        )
+        .map_err(|e| e.to_string())?;
+        for mutation in 0..4 {
+            let mut changed = groups.clone();
+            match mutation {
+                0 => changed.swap(0, 1),
+                1 => {
+                    changed.remove(2);
+                }
+                2 => changed.swap(2, 3),
+                _ => changed.push(vec![]),
+            }
+            assert!(
+                validate_extract_outputs(
+                    &mut native.clone(),
+                    &extract,
+                    ExtractedExpressions::FrozenGroups(&response, changed)
+                )
+                .is_err(),
+                "group mutation {mutation}"
+            );
+        }
+        for target in ["B", "missing-callable"] {
+            let mut changed = response.clone();
+            let Some(pb::node::Kind::Call(call)) = &mut changed.nodes[groups[0][0] as usize].kind
+            else {
+                unreachable!()
+            };
+            call.func = target.into();
+            assert!(
+                validate_extract_outputs(
+                    &mut native.clone(),
+                    &extract,
+                    ExtractedExpressions::FrozenGroups(&changed, groups.clone())
+                )
+                .is_err(),
+                "target {target}"
+            );
+        }
+        let command = native
+            .parse_program(None, "(multi-extract 32769 (A) (A))")
+            .map_err(|e| e.to_string())?
+            .remove(0);
+        let budget = extract_command_parts(&command).unwrap();
+        let error = validate_extract_outputs(
+            &mut native,
+            &budget,
+            ExtractedExpressions::FrozenGroups(&response, vec![vec![groups[0][0]; 32769]; 2]),
+        )
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("exceeds 65536"),
+            "one budget across groups: {error}"
+        );
+        Ok(())
+    })
+}
+
 fn protobuf_trials(root: &std::path::Path, core: bool) -> Vec<Trial> {
     let mut trials = vec![];
     for entry in glob::glob(&format!("{}/**/*.egg", root.display())).unwrap() {
@@ -1751,6 +2061,7 @@ fn main() {
     let mut tests = generate_tests("tests/**/*.egg");
     tests.extend(partial_call_oracle_trials());
     tests.push(public_callable_oracle_trial());
+    tests.push(multi_extract_oracle_trial());
     tests.extend(protobuf_trials(std::path::Path::new("tests"), false));
     if let Some(root) = std::env::var_os("EGGLOG_PROTO_CORE_TESTS") {
         tests.extend(protobuf_trials(std::path::Path::new(&root), true));

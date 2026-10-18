@@ -885,6 +885,50 @@ impl Source {
                     };
                     Command::Extract(span, expr, variants)
                 }
+                Command::UserDefined(span, name, args) if name == "multi-extract" => {
+                    let parsed = crate::parse_multi_extract_args(&args)
+                        .map_err(|error| error.to_string())?;
+                    let Expr::Lit(_, Literal::Int(count)) = parsed.variants else {
+                        return Err(
+                            "source multi-extract requires a positive literal i64 count".into()
+                        );
+                    };
+                    let count = u32::try_from(*count)
+                        .ok()
+                        .filter(|count| *count > 0)
+                        .ok_or("source multi-extract count must be positive and fit wire u32")?;
+                    let mut roots = Vec::with_capacity(parsed.roots.len());
+                    for root in parsed.roots {
+                        let resolved = self
+                            .graph
+                            .resolve_command_preserving_globals(Command::Action(Action::Expr(
+                                root.span(),
+                                root.clone(),
+                            )))
+                            .map_err(|error| error.to_string())?;
+                        let [N::CoreAction(ResolvedAction::Expr(_, root))] = resolved.as_slice()
+                        else {
+                            return Err("source multi-extract root resolution shape changed".into());
+                        };
+                        roots.push(self.expr(root, None, 0)?);
+                    }
+                    let span = self.span(&span)?;
+                    self.program.commands.push(pb::Command {
+                        span,
+                        kind: Some(pb::command::Kind::Extract(pb::Extract {
+                            roots,
+                            variants: count,
+                            extractor: if parsed.greedy {
+                                pb::Extractor::GreedyDag
+                            } else {
+                                pb::Extractor::Tree
+                            }
+                            .into(),
+                            ..Default::default()
+                        })),
+                    });
+                    continue;
+                }
                 Command::UserDefined(span, name, args) if name == "keep-best" => {
                     let (args, greedy) = crate::greedy_dag_extract::split_trailing_extractor(&args)
                         .map_err(|error| error.to_string())?;
@@ -4003,6 +4047,25 @@ fn render_prepared(
                         && extract.cost_model.is_empty()
                         && extract.variants > 0 =>
                 {
+                    if extract.roots.len() > 1 {
+                        if dialect == Dialect::Core {
+                            return Err("Core source has no aggregate multi-extract syntax".into());
+                        }
+                        let mut args = vec![Expr::Lit(span.clone(), Literal::Int(i64::from(extract.variants)))];
+                        args.extend(extract.roots.iter().map(|root| {
+                            // Generic command traversal skips UserDefined args;
+                            // only these typed root positions contain callables.
+                            Ok(expression(program, *root, &mut HashSet::new())?.map_symbols(
+                                &mut |name: String| authored.callables.get(&name).cloned().unwrap_or(name),
+                                &mut |name| name,
+                            ))
+                        }).collect::<Result<Vec<_>, String>>()?);
+                        if extract.extractor == i32::from(pb::Extractor::GreedyDag) {
+                            args.extend([Expr::Var(span.clone(), ":extractor".into()), Expr::Var(span.clone(), "greedy-dag".into())]);
+                        }
+                        commands.push(Command::UserDefined(span, "multi-extract".into(), args));
+                        continue;
+                    }
                     for root in &extract.roots {
                         let root = expression(program, *root, &mut HashSet::new())?;
                         let variants = Expr::Lit(span.clone(), Literal::Int(if extract.variants == 1 { 0 } else { i64::from(extract.variants) }));

@@ -76,6 +76,45 @@ impl std::fmt::Display for MultiExtractOutput {
     }
 }
 
+/// Parsed syntax shared by native execution and inert producers.
+pub struct MultiExtractArgs<'a> {
+    /// Count expression, evaluated before any root by native execution.
+    pub variants: &'a Expr,
+    /// Requested roots in authored order.
+    pub roots: &'a [Expr],
+    /// Print shared subterms with lets; independent of extraction strategy.
+    pub dag: bool,
+    /// Select greedy-DAG rather than tree extraction.
+    pub greedy: bool,
+}
+
+/// Parse multi-extract options without evaluating the count or roots.
+pub fn parse_multi_extract_args(args: &[Expr]) -> Result<MultiExtractArgs<'_>, Error> {
+    let (args, greedy) = split_trailing_extractor(args)?;
+    let Some((variants, mut roots)) = args.split_first() else {
+        return Err(Error::ParseError(ParseError(
+            span!(),
+            "multi-extract expects at least a variant count and one expression".into(),
+        )));
+    };
+    let dag = matches!(roots.first(), Some(Expr::Var(_, option)) if option == ":dag");
+    if dag {
+        roots = &roots[1..];
+    }
+    if roots.is_empty() {
+        return Err(Error::ParseError(ParseError(
+            variants.span(),
+            "multi-extract expects at least a variant count and one expression".into(),
+        )));
+    }
+    Ok(MultiExtractArgs {
+        variants,
+        roots,
+        dag,
+        greedy,
+    })
+}
+
 /// User-defined command implementing
 /// `(multi-extract n [:dag] term... [:extractor greedy-dag])` with a
 /// caller-provided marginal cost model.
@@ -106,24 +145,12 @@ impl<C: MonoidCost, CM: DagCostModel<C> + Clone + Send + Sync + 'static> UserDef
     for MultiExtract<C, CM>
 {
     fn update(&self, egraph: &mut EGraph, args: &[Expr]) -> Result<Vec<CommandOutput>, Error> {
-        let (args, use_greedy_dag) = split_trailing_extractor(args)?;
-
-        let Some((variants_expr, mut terms)) = args.split_first() else {
-            return Err(Error::ParseError(ParseError(
-                span!(),
-                "multi-extract expects at least a variant count and one expression".into(),
-            )));
-        };
-        let dag = matches!(terms.first(), Some(Expr::Var(_, option)) if option == ":dag");
-        if dag {
-            terms = &terms[1..];
-        }
-        if terms.is_empty() {
-            return Err(Error::ParseError(ParseError(
-                variants_expr.span(),
-                "multi-extract expects at least a variant count and one expression".into(),
-            )));
-        }
+        let MultiExtractArgs {
+            variants: variants_expr,
+            roots: terms,
+            dag,
+            greedy: use_greedy_dag,
+        } = parse_multi_extract_args(args)?;
 
         let (variants_sort, variants_value) = egraph.eval_expr(variants_expr)?;
         if variants_sort.name() != "i64" {

@@ -684,6 +684,42 @@ fn test_multi_extract_two_variants_two_terms() {
 }
 
 #[test]
+fn test_multi_extract_evaluates_count_before_ordered_stateful_roots() {
+    let mut egraph = egglog_experimental::new_experimental_egraph();
+    egraph
+        .parse_and_run_program(None, "(datatype E (Num i64))")
+        .unwrap();
+    assert!(
+        egraph
+            .parse_and_run_program(None, "(multi-extract (get-size! \"Num\") (Num 1))")
+            .is_err()
+    );
+    assert_eq!(
+        egraph.get_size("Num"),
+        0,
+        "invalid count must not evaluate roots"
+    );
+    egraph.parse_and_run_program(None, "(Num 99)").unwrap();
+    let outputs = egraph.parse_and_run_program(None,
+        "(multi-extract (get-size! \"Num\") (Num (get-size! \"Num\")) (Num (get-size! \"Num\")))").unwrap();
+    let [CommandOutput::UserDefined(output)] = outputs.as_slice() else {
+        panic!("{outputs:?}")
+    };
+    let output = output
+        .as_ref()
+        .as_any()
+        .downcast_ref::<egglog_experimental::MultiExtractOutput>()
+        .unwrap();
+    assert_eq!(
+        output.terms.iter().map(Vec::len).collect::<Vec<_>>(),
+        [1, 1]
+    );
+    assert_eq!(output.termdag.to_string(output.terms[0][0]), "(Num 1)");
+    assert_eq!(output.termdag.to_string(output.terms[1][0]), "(Num 2)");
+    assert_eq!(egraph.get_size("Num"), 3);
+}
+
+#[test]
 fn test_multi_extract_returns_one_ordered_aggregate_including_empty_groups() {
     for extractor in ["", " :extractor greedy-dag"] {
         let mut egraph = egglog_experimental::new_experimental_egraph();

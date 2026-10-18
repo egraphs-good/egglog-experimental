@@ -3,6 +3,212 @@ use egglog_experimental::{PortableEGraph, PortableTypeInfo};
 use egglog_experimental::{new_experimental_egraph, protobuf::Engine};
 use prost::Message;
 
+#[test]
+fn source_multi_extract_preserves_one_ordered_batch_and_replays() {
+    use egglog_experimental::protobuf::source::{Renderer, Source};
+    for greedy in [false, true] {
+        let selector = if greedy { " :extractor greedy-dag" } else { "" };
+        let mut text = format!(
+            "(datatype E (A i64) (B i64) (Hidden :unextractable)) \
+            (union (A 1) (A 2)) (multi-extract 2 :dag (A 1) 42 (B 3) (A 1) (Hidden){selector})"
+        );
+        for _ in 0..2 {
+            let mut engine = Engine::default();
+            let id = create(&mut engine);
+            let mut renderer = Renderer::default();
+            let mut core = Renderer::core();
+            let mut rendered = String::new();
+            let mut batches = 0;
+            for phase in Source::new(None, &text).unwrap() {
+                let phase = phase.unwrap();
+                if let Some(pb::command::Kind::Extract(extract)) =
+                    phase.commands.first().and_then(|c| c.kind.as_ref())
+                {
+                    assert_eq!(
+                        phase.commands.len(),
+                        1,
+                        "no per-root executable normalization"
+                    );
+                    assert_eq!(extract.roots.len(), 5);
+                    assert_eq!(extract.variants, 2);
+                    assert_eq!(
+                        extract.extractor,
+                        i32::from(if greedy {
+                            pb::Extractor::GreedyDag
+                        } else {
+                            pb::Extractor::Tree
+                        })
+                    );
+                    assert!(
+                        core.render(&phase).is_err(),
+                        "Core must not split the batch"
+                    );
+                } else {
+                    // Tree-compatible prefix establishes the same declaration context.
+                    core.render(&phase).unwrap();
+                }
+                rendered.push_str(&renderer.render(&phase).unwrap());
+                let response = run(&mut engine, id, phase);
+                assert_eq!(response.error, None);
+                for output in &response.outputs {
+                    let Some(pb::command_output::Kind::Extraction(result)) = &output.kind else {
+                        panic!("{output:?}")
+                    };
+                    batches += 1;
+                    assert_eq!(result.roots.len(), 5);
+                    assert_eq!(
+                        result
+                            .roots
+                            .iter()
+                            .map(|root| root.variants.len())
+                            .collect::<Vec<_>>(),
+                        [2, 1, 1, 2, 0]
+                    );
+                    for (first, repeated) in result.roots[0]
+                        .variants
+                        .iter()
+                        .zip(&result.roots[3].variants)
+                    {
+                        assert_eq!(first.term, repeated.term);
+                        assert_eq!(
+                            value(&response, first.cost.unwrap()),
+                            value(&response, repeated.cost.unwrap())
+                        );
+                    }
+                    let terms = result.roots[0]
+                        .variants
+                        .iter()
+                        .map(|term| value(&response, term.term))
+                        .collect::<std::collections::HashSet<_>>();
+                    assert_eq!(
+                        terms,
+                        ["(A 1)".to_string(), "(A 2)".to_string()]
+                            .into_iter()
+                            .collect()
+                    );
+                    assert_eq!(value(&response, result.roots[1].variants[0].term), "42");
+                    assert_eq!(value(&response, result.roots[2].variants[0].term), "(B 3)");
+                    for term in result.roots.iter().flat_map(|root| &root.variants) {
+                        let cost = term.cost.unwrap() as usize;
+                        assert_eq!(
+                            value(&response, cost as u32),
+                            if value(&response, term.term) == "42" {
+                                "1"
+                            } else {
+                                "2"
+                            }
+                        );
+                        assert!(matches!(
+                            &response.nodes[cost].kind,
+                            Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
+                                value: Some(pb::primitive_value::Value::I64(_))
+                            }))
+                        ));
+                        assert!(
+                            matches!(&response.sorts[response.nodes[cost].sort_id as usize].kind,
+                            Some(pb::sort::Kind::Family(family)) if family.name == "i64")
+                        );
+                    }
+                }
+            }
+            assert_eq!(batches, 1);
+            assert_eq!(rendered.matches("(multi-extract ").count(), 1);
+            text = rendered;
+        }
+    }
+}
+
+#[test]
+fn source_multi_extract_evaluates_stateful_roots_once_before_extraction() {
+    use egglog_experimental::protobuf::source::{Renderer, Source};
+    let mut text = "(datatype E (Num i64)) (multi-extract 1 (Num (get-size! \"Num\")) (Num (get-size! \"Num\"))) (print-size Num)".to_string();
+    for _ in 0..2 {
+        let mut engine = Engine::default();
+        let id = create(&mut engine);
+        let mut renderer = Renderer::default();
+        let mut rendered = String::new();
+        let mut batches = 0;
+        let mut sizes = 0;
+        for phase in Source::new(None, &text).unwrap() {
+            let phase = phase.unwrap();
+            rendered.push_str(&renderer.render(&phase).unwrap());
+            let response = run(&mut engine, id, phase);
+            assert_eq!(response.error, None);
+            for output in &response.outputs {
+                match &output.kind {
+                    Some(pb::command_output::Kind::Extraction(result)) => {
+                        assert_eq!(result.roots.len(), 2);
+                        for (root, expected) in result.roots.iter().zip(["(Num 0)", "(Num 1)"]) {
+                            assert_eq!(root.variants.len(), 1);
+                            assert_eq!(value(&response, root.variants[0].term), expected);
+                        }
+                        batches += 1;
+                    }
+                    Some(pb::command_output::Kind::Sizes(result)) => {
+                        assert_eq!(result.sizes[0].rows, 2);
+                        sizes += 1;
+                    }
+                    _ => panic!("{output:?}"),
+                }
+            }
+        }
+        assert_eq!((batches, sizes), (1, 1));
+        text = rendered;
+    }
+}
+
+#[test]
+fn source_multi_extract_rejects_counts_and_later_roots_inertly() {
+    use egglog_experimental::protobuf::source::Source;
+    for command in [
+        "(multi-extract)",
+        "(multi-extract 1 :dag)",
+        "(multi-extract 0 (A 2))",
+        "(multi-extract -1 (A 2))",
+        "(multi-extract 4294967296 (A 2))",
+        "(multi-extract (+ 1 1) (A 2))",
+        "(multi-extract 1 (A 2) (Missing 3))",
+        "(multi-extract 1 (A 2) :extractor unknown)",
+    ] {
+        let text = format!("(datatype E (A i64)) (A 1) {command} (A 3)");
+        let mut engine = Engine::default();
+        let id = create(&mut engine);
+        let mut source = Source::new(None, &text).unwrap();
+        let mut rejected = false;
+        for phase in source.by_ref() {
+            match phase {
+                Ok(phase) => assert_eq!(run(&mut engine, id, phase).error, None),
+                Err(_) => {
+                    rejected = true;
+                    break;
+                }
+            }
+        }
+        assert!(rejected, "{command}");
+        assert!(source.next().is_none());
+        let response = run(
+            &mut engine,
+            id,
+            pb::Program {
+                ir_version: 1,
+                commands: vec![pb::Command {
+                    kind: Some(pb::command::Kind::PrintSize(pb::PrintSize {
+                        tables: vec!["A".into()],
+                    })),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        );
+        assert_eq!(response.error, None);
+        assert!(
+            matches!(&response.outputs[0].kind,
+            Some(pb::command_output::Kind::Sizes(sizes)) if sizes.sizes[0].rows == 1),
+            "{command}"
+        );
+    }
+}
+
 mod source_loop_header_tests {
     use super::*;
     use egglog_experimental::protobuf::source::{Renderer, Source};
@@ -6354,24 +6560,102 @@ fn function_value_zero_capture_ctor_selects_expected_shape_in_fresh_source() {
     for root in [&extraction.roots[1], &extraction.roots[3]] {
         assert_eq!(value(&response, root.variants[0].term), "()");
     }
-    for mut renderer in [Renderer::default(), Renderer::core()] {
-        let text = renderer.render(&program).unwrap();
-        drop(renderer);
-        let outputs = egglog::EGraph::default()
-            .parse_and_run_program(None, &text)
-            .unwrap();
-        assert_eq!(
-            outputs
+    let expected_values: Vec<_> = extraction
+        .roots
+        .iter()
+        .map(|root| response.nodes[root.variants[0].term as usize].kind.clone())
+        .collect();
+    assert!(
+        Renderer::core()
+            .render(&program)
+            .unwrap_err()
+            .to_string()
+            .contains("no aggregate multi-extract syntax")
+    );
+    for core in [false, true] {
+        let mut packet = program.clone();
+        if core {
+            // Independently authored single-root requests exercise Core's
+            // function-value syntax without claiming an aggregate spelling.
+            let Some(pb::command::Kind::Extract(extract)) = &program.commands[0].kind else {
+                unreachable!()
+            };
+            packet.commands = extract
+                .roots
                 .iter()
-                .filter(|output| matches!(output, egglog::CommandOutput::ExtractBest(..)))
-                .count(),
-            4
-        );
+                .map(|root| pb::Command {
+                    kind: Some(pb::command::Kind::Extract(pb::Extract {
+                        roots: vec![*root],
+                        ..extract.clone()
+                    })),
+                    ..Default::default()
+                })
+                .collect();
+        }
+        let text = if core {
+            Renderer::core()
+        } else {
+            Renderer::default()
+        }
+        .render(&packet)
+        .unwrap();
+        let outputs = if core {
+            egglog::EGraph::default()
+        } else {
+            new_experimental_egraph()
+        }
+        .parse_and_run_program(None, &text)
+        .unwrap();
+        if core {
+            let terms: Vec<_> = outputs
+                .iter()
+                .filter_map(|output| match output {
+                    egglog::CommandOutput::ExtractBest(dag, _, root) => Some(dag.to_string(*root)),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(terms.len(), 4);
+            assert_eq!(terms[1], "()");
+            assert_eq!(terms[3], "()");
+        } else {
+            let [egglog::CommandOutput::UserDefined(output)] = outputs.as_slice() else {
+                panic!("{outputs:?}")
+            };
+            let output = output
+                .as_ref()
+                .as_any()
+                .downcast_ref::<egglog_experimental::MultiExtractOutput>()
+                .unwrap();
+            assert_eq!(
+                output.terms.iter().map(Vec::len).collect::<Vec<_>>(),
+                [1; 4]
+            );
+            assert_eq!(output.termdag.to_string(output.terms[1][0]), "()");
+            assert_eq!(output.termdag.to_string(output.terms[3][0]), "()");
+        }
         let mut replay = Engine::default();
         let id = create(&mut replay);
-        for phase in Source::new(None, &text).unwrap() {
-            assert_eq!(run(&mut replay, id, phase.unwrap()).error, None);
+        let source = if core {
+            Source::new_core(None, &text)
+        } else {
+            Source::new(None, &text)
         }
+        .unwrap();
+        let mut replayed_values = vec![];
+        for phase in source {
+            let response = run(&mut replay, id, phase.unwrap());
+            assert_eq!(response.error, None);
+            for output in &response.outputs {
+                if let Some(pb::command_output::Kind::Extraction(extraction)) = &output.kind {
+                    replayed_values.extend(
+                        extraction.roots.iter().map(|root| {
+                            response.nodes[root.variants[0].term as usize].kind.clone()
+                        }),
+                    );
+                }
+            }
+        }
+        assert_eq!(replayed_values, expected_values, "core={core}");
     }
 }
 
@@ -8730,6 +9014,30 @@ fn core_renderer_keeps_callable_rule_ruleset_and_binder_namespaces_distinct() {
     for phase in Source::new(None, &experimental).unwrap() {
         assert_eq!(run(&mut replay, replay_id, phase.unwrap()).error, None);
     }
+    assert!(
+        Renderer::core()
+            .render(&program)
+            .unwrap_err()
+            .to_string()
+            .contains("no aggregate multi-extract syntax")
+    );
+    // Core namespace checks use independent single-root requests, not a
+    // purported rendering of the unsupported aggregate extraction.
+    let Some(pb::command::Kind::Extract(extract)) = &program.commands[7].kind else {
+        unreachable!()
+    };
+    let singles: Vec<_> = extract
+        .roots
+        .iter()
+        .map(|root| pb::Command {
+            kind: Some(pb::command::Kind::Extract(pb::Extract {
+                roots: vec![*root],
+                ..extract.clone()
+            })),
+            ..Default::default()
+        })
+        .collect();
+    program.commands.splice(7..8, singles);
     let text = Renderer::core().render(&program).unwrap();
     let core_commands = egglog::EGraph::default()
         .parse_program(None, &text)
@@ -12201,11 +12509,36 @@ fn constant_function_and_constructor_execute_as_bytes_and_resupply() {
             let outputs = native
                 .parse_and_run_program(None, &renderer.render(&program).unwrap())
                 .unwrap();
-            let egglog_experimental::CommandOutput::ExtractBest(dag, _, root) = &outputs[0] else {
-                panic!("native extraction")
+            let [egglog_experimental::CommandOutput::UserDefined(output)] = outputs.as_slice()
+            else {
+                panic!("{outputs:?}")
             };
-            assert_eq!(dag.to_string(*root), "20");
-            assert_eq!(outputs.len(), 2);
+            let output = output
+                .as_ref()
+                .as_any()
+                .downcast_ref::<egglog_experimental::MultiExtractOutput>()
+                .unwrap();
+            assert_eq!(
+                output.terms.iter().map(Vec::len).collect::<Vec<_>>(),
+                [1, 1]
+            );
+            assert_eq!(output.termdag.to_string(output.terms[0][0]), "20");
+            let empty_names: Vec<_> = native
+                .functions_iter()
+                .filter(|(_, function)| {
+                    matches!(&function.func_type().table_name,
+                        Some(egglog::ast::TableName::Public(name)) if name == "Empty")
+                })
+                .map(|(physical, _)| physical.clone())
+                .collect();
+            assert_eq!(empty_names.len(), 1);
+            let signature = native.get_function(&empty_names[0]).unwrap().func_type();
+            assert_eq!(signature.subtype, egglog::ast::FunctionSubtype::Constructor);
+            assert!(signature.input.is_empty());
+            assert_eq!(
+                output.termdag.to_string(output.terms[1][0]),
+                format!("({})", empty_names[0])
+            );
         }
         // Presentation survives byte ownership; rendering is executable semantics,
         // not a Python surface exporter or a retained native-AST execution path.
@@ -19267,13 +19600,36 @@ mod source_provider_context {
 #[test]
 fn source_core_renderer_rejects_assigned_cost_reads_and_writes_without_state_changes() {
     use egglog_experimental::protobuf::source::Renderer;
+    assert!(
+        Renderer::core()
+            .render(&fixture())
+            .unwrap_err()
+            .to_string()
+            .contains("no aggregate multi-extract syntax")
+    );
+    let mut baseline = fixture();
+    let Some(pb::command::Kind::Extract(extract)) = &baseline.commands[7].kind else {
+        unreachable!()
+    };
+    let singles: Vec<_> = extract
+        .roots
+        .iter()
+        .map(|root| pb::Command {
+            kind: Some(pb::command::Kind::Extract(pb::Extract {
+                roots: vec![*root],
+                ..extract.clone()
+            })),
+            ..Default::default()
+        })
+        .collect();
+    baseline.commands.splice(7..8, singles);
     for core in [true] {
         let expected = if core {
             Renderer::core()
         } else {
             Renderer::default()
         }
-        .render(&fixture())
+        .render(&baseline)
         .unwrap();
         for case in [
             "unused-read",
@@ -19392,7 +19748,7 @@ fn source_core_renderer_rejects_assigned_cost_reads_and_writes_without_state_cha
                 "core={core}/{case}: {error}"
             );
             assert_eq!(
-                renderer.render(&fixture()).unwrap(),
+                renderer.render(&baseline).unwrap(),
                 expected,
                 "core={core}/{case}"
             );
