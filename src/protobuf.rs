@@ -447,7 +447,7 @@ impl Engine {
             .map_err(TransportError)?
             .definitions;
         for (index, sort) in program.sorts.iter().enumerate() {
-            validate_nullary_family(&graph, &catalog, sort).map_err(TransportError)?;
+            validate_nullary_family(graph.type_info(), sort).map_err(TransportError)?;
             let name = sort_name(&program.sorts, index as u32).map_err(TransportError)?;
             let native = graph
                 .get_sort_by_name(&name)
@@ -480,7 +480,7 @@ impl Engine {
                 graph,
                 extension: self.extension.clone(),
                 mode,
-                definitions: pb::Program::default(),
+                definitions: catalog,
                 names: NativeNames::default(),
                 request: 0,
                 clone_parent: None,
@@ -847,13 +847,28 @@ impl Session {
             .request
             .checked_add(1)
             .ok_or("request identity space exhausted")?;
-        let catalog = staged
-            .graph
-            .type_info()
-            .portable_builtin_catalog()?
-            .definitions;
+        // These live guards also apply to empty requests. A native named
+        // Primitive can be executable while retaining a projection error.
+        let native = staged.graph.type_info().builtin_catalog()?;
         if staged.definitions.ir_version == 0 {
-            staged.definitions = catalog.clone();
+            staged.definitions = staged
+                .graph
+                .type_info()
+                .portable_builtin_catalog()?
+                .definitions;
+        } else {
+            for name in native.undescribed_primitives {
+                if let Some(primitives) = staged.graph.type_info().get_prims(&name) {
+                    for primitive in primitives {
+                        let any: &dyn std::any::Any = primitive.primitive.as_ref();
+                        if let Some(defined) =
+                            any.downcast_ref::<crate::primitive::DefinedPrimitive>()
+                        {
+                            defined.definition.as_ref().map_err(Clone::clone)?;
+                        }
+                    }
+                }
+            }
         }
         let mut next_declaration = staged.definitions.declarations.len();
         let added =
@@ -999,10 +1014,10 @@ impl Session {
             let native_sort = staged
                 .graph
                 .get_sort_by_name(&name)
+                .cloned()
                 .ok_or_else(|| format!("unknown custom value sort {name}"))?;
             validate_nullary_family(
-                &staged.graph,
-                &catalog,
+                staged.graph.type_info(),
                 &program.sorts[node.sort_id as usize],
             )?;
             let extension = staged
@@ -1011,7 +1026,7 @@ impl Session {
                 .ok_or("custom value provider unavailable")?;
             let (value, span) = (value.clone(), node.span);
             let call =
-                extension.lower_custom_value(&staged.graph, native_sort, &value, span, program)?;
+                extension.lower_custom_value(&staged.graph, &native_sort, &value, span, program)?;
             program.nodes[index].kind = Some(pb::node::Kind::Call(call));
         }
         // Container payloads may introduce the Pair/Vec sorts used to construct
@@ -1031,7 +1046,7 @@ impl Session {
             });
         }
         for (index, sort) in program.sorts.iter().enumerate() {
-            validate_nullary_family(&staged.graph, &catalog, sort)?;
+            validate_nullary_family(staged.graph.type_info(), sort)?;
             native_span(program, sort.span.as_ref())?;
             let Some(name) =
                 structural_sort_name(&program.sorts, index as u32, &mut HashSet::new())?
@@ -3241,25 +3256,27 @@ fn structural_sort_name(
 
 // A wire spelling alone cannot introduce a native host sort, or reinterpret a
 // native equality/container sort as a nullary host value.
-fn validate_nullary_family(
-    graph: &EGraph,
-    catalog: &pb::Program,
-    sort: &pb::Sort,
-) -> Result<(), String> {
+fn validate_nullary_family(types: &egglog::TypeInfo, sort: &pb::Sort) -> Result<(), String> {
     let Some(pb::sort::Kind::Family(family)) = &sort.kind else {
         return Ok(());
     };
     if !family.args.is_empty() {
         return Ok(());
     }
-    let native = graph
+    let native = types
         .get_sort_by_name(&family.name)
         .ok_or_else(|| format!("unknown host sort family {}", family.name))?;
-    if native.is_eq_sort() || native.is_container_sort() || native.value_type().is_none()
-        || !catalog.declarations.iter().any(|d|
-            matches!(&d.kind, Some(pb::declaration::Kind::HostSortFamily(f)) if f.name == family.name && f.arity == 0))
+    if native.is_eq_sort()
+        || native.is_container_sort()
+        || native.value_type().is_none()
+        || !types
+            .registered_builtin_family(&family.name)
+            .is_ok_and(|registered| registered.arity == 0)
     {
-        return Err(format!("incompatible nullary host sort family {}", family.name));
+        return Err(format!(
+            "incompatible nullary host sort family {}",
+            family.name
+        ));
     }
     Ok(())
 }
@@ -5493,6 +5510,188 @@ fn encode_exact_number(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn session_catalog_seed_survives_authored_primitives_and_empty_requests() {
+        let (mut engine, id) = host_default_engine();
+        assert_eq!(engine.graphs[&id].definitions.ir_version, 1);
+        let mut program = inventory_fixture(
+            "(primitive successor (i64) i64 (+ _0 1)) (check (= (successor 3) 4))",
+        );
+        let commands = std::mem::take(&mut program.commands);
+        assert_eq!(
+            run_host_default(&mut engine, id, program.clone()).error,
+            None
+        );
+        assert!(
+            engine
+                .graphs
+                .get_mut(&id)
+                .unwrap()
+                .graph
+                .type_info()
+                .portable_builtin_catalog()
+                .is_ok()
+        );
+        let definitions = engine.graphs[&id].definitions.clone();
+        let empty = run_host_default(
+            &mut engine,
+            id,
+            pb::Program {
+                ir_version: 1,
+                ..Default::default()
+            },
+        );
+        assert_eq!(empty.error, None);
+        assert!(empty.outputs.is_empty());
+        assert_eq!(engine.graphs[&id].definitions, definitions);
+        program.declarations.clear();
+        program.commands = commands;
+        assert_eq!(run_host_default(&mut engine, id, program).error, None);
+    }
+
+    #[test]
+    fn session_catalog_seed_keeps_live_errors_on_sort_free_requests() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static BODIES: AtomicUsize = AtomicUsize::new(0);
+
+        for corrupt in ["registry", "projection"] {
+            let (mut engine, id) = host_default_engine();
+            let initial = run_host_default(
+                &mut engine,
+                id,
+                pb::Program {
+                    ir_version: 1,
+                    ..Default::default()
+                },
+            );
+            assert_eq!(initial.error, None);
+            assert_eq!(engine.graphs[&id].definitions.ir_version, 1);
+            let graph = &mut engine.graphs.get_mut(&id).unwrap().graph;
+            if corrupt == "registry" {
+                graph.add_pure_primitive(ForeignPrimitive("egglog.core.i64.add".into()), None);
+            } else {
+                // Executable native bodies can retain a portable projection
+                // error. No body is evaluated by registration or preparation.
+                egglog::add_primitive!(
+                    graph,
+                    "unprojectable-body" = |value: i64| -> i64 {
+                        {
+                            BODIES.fetch_add(1, Ordering::SeqCst);
+                            value
+                        }
+                    }
+                );
+                graph
+                    .parse_and_run_program(
+                        None,
+                        "(primitive projection_missing (i64) i64 (unprojectable-body _0))",
+                    )
+                    .unwrap();
+            }
+            let expected = graph.type_info().portable_builtin_catalog().err().unwrap();
+            let tuples = graph.num_tuples();
+            let definitions = engine.graphs[&id].definitions.clone();
+            let request = engine.graphs[&id].request;
+            let response = run_host_default(
+                &mut engine,
+                id,
+                pb::Program {
+                    ir_version: 1,
+                    ..Default::default()
+                },
+            );
+            assert_eq!(response.error.unwrap().message, expected, "{corrupt}");
+            assert!(response.outputs.is_empty());
+            assert!(response.ruleset_publication.unwrap().names.is_empty());
+            let profile = response.profile.unwrap();
+            assert!(!profile.complete);
+            assert!(profile.maintenance.is_empty());
+            assert_eq!(engine.graphs[&id].request, request);
+            assert_eq!(engine.graphs[&id].definitions, definitions);
+            assert_eq!(engine.graphs[&id].graph.num_tuples(), tuples);
+            assert_eq!(BODIES.load(Ordering::SeqCst), 0);
+        }
+    }
+
+    #[test]
+    fn session_catalog_seed_checks_dependent_primitives_across_scope_returns() {
+        let (mut engine, id) = host_default_engine();
+        let empty = pb::Program {
+            ir_version: 1,
+            ..Default::default()
+        };
+        let consistent = |engine: &mut Engine, id| {
+            let session = engine.graphs.get_mut(&id).unwrap();
+            assert!(session.graph.type_info().portable_builtin_catalog().is_ok());
+            let definitions = session.definitions.clone();
+            let response = run_host_default(engine, id, empty.clone());
+            assert_eq!(response.error, None);
+            assert!(response.outputs.is_empty());
+            assert_eq!(engine.graphs[&id].definitions, definitions);
+        };
+        let base = "(primitive seed_a (i64) i64 (+ _0 1))
+                    (primitive seed_b (i64) i64 (seed_a _0))";
+        // Independent acknowledged installations retain the actual captured
+        // callee owners, rather than assuming stored wire bodies prove this.
+        for phase in source::Source::new(None, base).unwrap() {
+            assert_eq!(
+                run_host_default(&mut engine, id, phase.unwrap()).error,
+                None
+            );
+            consistent(&mut engine, id);
+        }
+        let definitions = engine.graphs[&id].definitions.clone();
+        let dependent = inventory_fixture(&format!(
+            "{base} (primitive seed_c (i64) i64 (seed_b _0)) (check (= (seed_c 4) 5))"
+        ));
+        let incompatible = inventory_fixture("(primitive seed_b (i64) i64 (+ _0 2))");
+        for _ in 0..2 {
+            let bytes = engine
+                .clone_egraph(&pb::CloneEGraphRequest { egraph_id: id }.encode_to_vec())
+                .unwrap();
+            let clone = pb::CloneEGraphResponse::decode(bytes.as_slice())
+                .unwrap()
+                .egraph_id;
+            assert_eq!(
+                run_host_default(&mut engine, clone, dependent.clone()).error,
+                None
+            );
+            consistent(&mut engine, clone);
+            let before = engine.graphs[&clone].definitions.clone();
+            let request = engine.graphs[&clone].request;
+            let response = run_host_default(&mut engine, clone, incompatible.clone());
+            let error = response.error.unwrap();
+            assert_eq!(error.code, i32::from(pb::ErrorCode::InvalidProgram));
+            assert!(error.message.contains("conflicting declaration seed_b"));
+            assert!(response.outputs.is_empty());
+            assert!(response.ruleset_publication.unwrap().names.is_empty());
+            assert_eq!(engine.graphs[&clone].request, request);
+            assert_eq!(engine.graphs[&clone].definitions, before);
+            consistent(&mut engine, clone);
+            engine
+                .return_to(
+                    &pb::ReturnToEGraphRequest {
+                        active_id: clone,
+                        saved_id: id,
+                    }
+                    .encode_to_vec(),
+                )
+                .unwrap();
+            assert_eq!(engine.graphs[&id].definitions, definitions);
+            assert!(
+                engine
+                    .graphs
+                    .get_mut(&id)
+                    .unwrap()
+                    .graph
+                    .type_info()
+                    .get_prims(&native_name("call", "seed_c"))
+                    .is_none()
+            );
+            consistent(&mut engine, id);
+        }
+    }
 
     #[test]
     fn constructor_dag_scoped_compilation_is_inert_and_drops_partial_builders() {
@@ -8046,6 +8245,14 @@ mod tests {
                 pb::ExecutionMode::ProofTesting => graph.with_proofs_enabled().with_proof_testing(),
             };
             session.mode = mode;
+            // This private fixture finishes ambient initialization after Create;
+            // real extensions initialize before the seed is captured.
+            session.definitions = session
+                .graph
+                .type_info()
+                .portable_builtin_catalog()
+                .unwrap()
+                .definitions;
             let mut program = pb::Program {
                 ir_version: 1,
                 sorts: vec![

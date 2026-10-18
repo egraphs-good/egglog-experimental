@@ -281,12 +281,10 @@ impl Session {
         {
             return Err("host model objectives currently require a registered leaf sort".into());
         }
-        let catalog = self
-            .graph
+        self.graph
             .authoring_type_info()
-            .portable_builtin_catalog()?
-            .definitions;
-        validate_nullary_family(&self.graph, &catalog, objective_sort)?;
+            .portable_builtin_catalog()?;
+        validate_nullary_family(self.graph.authoring_type_info(), objective_sort)?;
         Ok(model)
     }
 
