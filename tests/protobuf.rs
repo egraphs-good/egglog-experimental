@@ -15248,6 +15248,165 @@ fn nominal_pair_wrong_kind_names_reject_before_earlier_writes() {
 }
 
 #[test]
+fn source_grounding_corrections_execute_and_invalid_rules_are_atomic() {
+    use egglog_experimental::protobuf::source::Source;
+    let observation = Source::new_core(
+        None,
+        "(datatype GroundingSentinel (Written)) (fail (check (Written)))",
+    )
+    .unwrap()
+    .last()
+    .unwrap()
+    .unwrap();
+    // Original and corrected rule bodies remain adjacent for direct comparison.
+    let cases = [
+        (
+            "(sort S) (constructor S0 () S) (constructor S1 (S) S)",
+            "(birewrite (S1 x) x)",
+            "(birewrite (S1 x) x :when ((= x (S0))))",
+            "(S0) (run 10) (check (= (S1 (S0)) (S0)))",
+        ),
+        (
+            "(relation R (i64))",
+            "(rule ((= x y)) ((R x)))",
+            "(rule ((= x y) (= y 1)) ((R x)))",
+            "(run 1) (check (R 1))",
+        ),
+        (
+            "",
+            "(rule ((= 1 (+ x x))) ())",
+            r#"(rule ((= 2 (+ x x)) (= x 1)) () :name "grounded-arithmetic")"#,
+            "(run 1)",
+        ),
+        (
+            "(sort StringVec (Vec String)) (datatype E (F StringVec StringVec)) (relation R (String))",
+            r#"(rule ((= e1 (F (vec-of "a" "b") (vec-of a b)))) ((R a) (R b)))"#,
+            r#"(rule ((= e1 (F (vec-of "a" "b") (vec-of a b))) (= a "a") (= b "b")) ((R a) (R b)))"#,
+            r#"(F (vec-of "a" "b") (vec-of "a" "b")) (run 1) (check (R "a") (R "b"))"#,
+        ),
+        (
+            "(sort StringVec (Vec String)) (datatype E (F StringVec StringVec))",
+            r#"(rule
+                ((= e1 (F (vec-of "a" "b") (vec-of a b)))
+                 (= e2 (F (vec-of "a" "b") (vec-of a b)))
+                 (= e3 (F (vec-of "a" "b") (vec-of a c)))
+                 (= e4 (F (vec-of "a" "b") (vec-of b c))))
+                ((F (vec-of "a" "b" "c") (vec-of a b c))
+                 (F (vec-of "a" "b" "c") (vec-of a b c))))"#,
+            r#"(rule
+                ((= e1 (F (vec-of "a" "b") (vec-of a b)))
+                 (= e2 (F (vec-of "a" "b") (vec-of a b)))
+                 (= e3 (F (vec-of "a" "b") (vec-of a c)))
+                 (= e4 (F (vec-of "a" "b") (vec-of b c)))
+                 (= a "a") (= b "b") (= c "c"))
+                ((F (vec-of "a" "b" "c") (vec-of a b c))
+                 (F (vec-of "a" "b" "c") (vec-of a b c))))"#,
+            r#"(F (vec-of "a" "b") (vec-of "a" "b"))
+                (F (vec-of "a" "b") (vec-of "a" "c"))
+                (F (vec-of "a" "b") (vec-of "b" "c"))
+                (run 1)
+                (check (F (vec-of "a" "b" "c") (vec-of "a" "b" "c")))
+                (print-size F)"#,
+        ),
+    ];
+    for (case, (prefix, original, corrected, tail)) in cases.into_iter().enumerate() {
+        let mut engine = Engine::default();
+        let id = create(&mut engine);
+        let mut phases = Source::new_core(
+            None,
+            &format!("{prefix} (datatype GroundingSentinel (Written)) {original}"),
+        )
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+        let mut invalid = phases.pop().unwrap();
+        assert_eq!(invalid.rules.len(), 1);
+        for phase in phases {
+            assert_eq!(run(&mut engine, id, phase).error, None);
+        }
+        let sort = invalid.sorts.iter().position(|s|
+            matches!(&s.kind, Some(pb::sort::Kind::Eq(name)) if name == "GroundingSentinel")
+        ).unwrap() as u32;
+        let written = invalid.nodes.len() as u32;
+        invalid.nodes.push(pb::Node {
+            sort_id: sort,
+            kind: Some(pb::node::Kind::Call(pb::Call {
+                func: "Written".into(),
+                args: vec![],
+            })),
+            ..Default::default()
+        });
+        invalid.commands.insert(
+            0,
+            pb::Command {
+                kind: Some(pb::command::Kind::Action(pb::Action {
+                    kind: Some(pb::action::Kind::Term(written)),
+                    ..Default::default()
+                })),
+                ..Default::default()
+            },
+        );
+        let response = run(&mut engine, id, invalid);
+        let error = response.error.unwrap();
+        assert_eq!(
+            error.code,
+            i32::from(pb::ErrorCode::InvalidProgram),
+            "case {case}"
+        );
+        assert_eq!(error.location, None);
+        assert!(response.outputs.is_empty());
+        assert!(response.ruleset_publication.unwrap().names.is_empty());
+        assert_eq!(run(&mut engine, id, observation.clone()).error, None);
+
+        let mut saw_rule = false;
+        let mut matches = 0;
+        let mut rows = None;
+        for phase in Source::new_core(None, &format!("{prefix} {corrected} {tail}")).unwrap() {
+            let phase = phase.unwrap();
+            if !phase.rules.is_empty() {
+                saw_rule = true;
+                assert_eq!(phase.rules.len(), 1);
+                match &phase.rules[0].kind {
+                    Some(pb::rule_decl::Kind::Birewrite(rule)) if case == 0 => {
+                        assert_eq!(rule.conditions.len(), 1);
+                    }
+                    Some(pb::rule_decl::Kind::Rule(rule)) if case != 0 => {
+                        assert_eq!(
+                            (rule.query.len(), rule.head.len()),
+                            [(0, 0), (2, 1), (2, 0), (3, 2), (7, 2)][case]
+                        );
+                    }
+                    _ => panic!("corrected rule kind changed for case {case}"),
+                }
+            }
+            let response = run(&mut engine, id, phase);
+            assert_eq!(response.error, None, "case {case}");
+            if case == 2 {
+                matches += response
+                    .profile
+                    .iter()
+                    .flat_map(|p| &p.runs)
+                    .flat_map(|r| &r.rules)
+                    .map(|r| r.matches.expect("actual match count"))
+                    .sum::<u64>();
+            }
+            for output in response.outputs {
+                if let Some(pb::command_output::Kind::Sizes(sizes)) = output.kind {
+                    assert_eq!(sizes.sizes.len(), 1);
+                    assert_eq!(sizes.sizes[0].table, "F");
+                    rows = Some(sizes.sizes[0].rows);
+                }
+            }
+        }
+        assert!(saw_rule);
+        if case == 2 {
+            assert_eq!(matches, 1);
+        }
+        assert_eq!(rows, (case == 4).then_some(4));
+    }
+}
+
+#[test]
 fn pair_value_queries_require_grounded_children() {
     use egglog_experimental::protobuf::source::{Renderer, Source};
     let text = r#"

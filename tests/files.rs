@@ -561,6 +561,22 @@ impl ProtoRun {
             .path
             .components()
             .any(|part| part.as_os_str() == "fail-typecheck");
+        let grounding = self.core
+            && self.mode == pb::ExecutionMode::Normal
+            && self
+                .path
+                .parent()
+                .is_some_and(|p| p.ends_with("fail-typecheck"))
+            && matches!(
+                self.path.file_name().and_then(|name| name.to_str()),
+                Some(
+                    "ungrounded-0.egg"
+                        | "ungrounded-1.egg"
+                        | "ungrounded-2.egg"
+                        | "ungrounded-3.egg"
+                        | "ungrounded-4.egg"
+                )
+            );
         let parsed = native.parse_program(filename.clone(), &program);
         let source = if self.core {
             Source::new_core(filename, &program)
@@ -577,7 +593,7 @@ impl ProtoRun {
                 source,
             ),
             (Err(expected), Err(actual))
-                if negative && expected.to_string() == actual.to_string() =>
+                if negative && !grounding && expected.to_string() == actual.to_string() =>
             {
                 return Ok(());
             }
@@ -613,10 +629,18 @@ impl ProtoRun {
                 .ok_or("source emitted more phases than authored commands")?;
             let extract = command.as_ref().ok().and_then(extract_command_parts);
             let mut validation = extract.as_ref().map(|_| native.clone());
+            let rule_kind = command.as_ref().ok().and_then(|command| match command {
+                Command::Rule { .. } => Some(false),
+                Command::BiRewrite(..) => Some(true),
+                _ => None,
+            });
+            let mut native_ungrounded = false;
             let expected = command.and_then(|command| {
-                native
-                    .run_program(vec![command])
-                    .map_err(|error| error.to_string())
+                native.run_program(vec![command]).map_err(|error| {
+                    native_ungrounded =
+                        matches!(&error, Error::TypeError(egglog::TypeError::Ungrounded(..)));
+                    error.to_string()
+                })
             });
             let actual = phase
                 .map_err(|error| format!("source export: {error}"))
@@ -658,6 +682,22 @@ impl ProtoRun {
                             return Ok(pb::RunProgramResponse::default());
                         }
                     };
+                    let emits_rule = matches!(
+                        (rule_kind, phase.rules.as_slice()),
+                        (
+                            Some(false),
+                            [pb::RuleDecl {
+                                kind: Some(pb::rule_decl::Kind::Rule(_)),
+                                ..
+                            }]
+                        ) | (
+                            Some(true),
+                            [pb::RuleDecl {
+                                kind: Some(pb::rule_decl::Kind::Birewrite(_)),
+                                ..
+                            }]
+                        )
+                    );
                     let request = pb::RunProgramRequest {
                         egraph_id,
                         program: Some(phase),
@@ -669,6 +709,24 @@ impl ProtoRun {
                         .map_err(|error| format!("byte transport: {error}"))?;
                     let response = pb::RunProgramResponse::decode(bytes.as_slice())
                         .map_err(|error| format!("response decode: {error}"))?;
+                    if grounding && native_ungrounded {
+                        if !emits_rule
+                            || !response.outputs.is_empty()
+                            || !response
+                                .ruleset_publication
+                                .as_ref()
+                                .is_some_and(|p| p.names.is_empty())
+                            || !response.error.as_ref().is_some_and(|e| {
+                                e.code == i32::from(pb::ErrorCode::InvalidProgram)
+                                    && e.location.is_none()
+                            })
+                        {
+                            return Err(format!(
+                                "grounding rejection boundary differs: {response:?}"
+                            ));
+                        }
+                        return Ok(response);
+                    }
                     if let Some(error) = &response.error {
                         Err(format!(
                             "adapter {:?}: {}",
@@ -680,6 +738,11 @@ impl ProtoRun {
                     }
                 });
             match (expected, actual) {
+                (Err(_), Ok(response))
+                    if grounding && native_ungrounded && response.error.is_some() =>
+                {
+                    return Ok(());
+                }
                 (Ok(_), Ok(response)) => {
                     if let Some(extract) = extract {
                         let mut terms = vec![];
@@ -715,7 +778,7 @@ impl ProtoRun {
                     }
                 }
                 (Err(expected), Err(actual)) if negative => {
-                    if actual.contains(&expected.to_string()) {
+                    if !grounding && actual.contains(&expected.to_string()) {
                         return Ok(());
                     }
                     return Err(format!(
