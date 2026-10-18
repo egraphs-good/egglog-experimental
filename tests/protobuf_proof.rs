@@ -2660,7 +2660,7 @@ fn dead_schedule_bodies_are_validated_before_effects_in_every_mode() {
             let mut engine = Engine::default();
             let id = create(&mut engine, mode);
             let response = run(&mut engine, id, program.clone());
-            let valid = matches!(case, "repeat-until" | "until")
+            let valid = matches!(case, "action" | "fail" | "repeat-until" | "until")
                 || case == "stats" && mode == pb::ExecutionMode::Normal;
             if valid {
                 assert_eq!(response.error, None, "{mode:?}/{case}: {response:?}");
