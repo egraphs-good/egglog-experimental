@@ -558,14 +558,29 @@ mod tests {
                     ..Default::default()
                 };
                 let mut context = session.install(prepared, &mut response).unwrap();
-                let commands = session
-                    .lower_command(
-                        &program,
-                        &program.commands[0],
-                        &context,
-                        &mut std::collections::HashMap::new(),
+                // Independent native codec oracle for this known fixture shape,
+                // using the authoritative prepared selector rather than the
+                // adapter's former private control-tree lowering.
+                let leaf = egglog::ast::Schedule::Run(
+                    egglog::span!(),
+                    egglog::ast::RunConfig {
+                        ruleset: context.names["selected"].clone(),
+                        until: None,
+                    },
+                );
+                let schedule = if composite {
+                    egglog::ast::Schedule::Repeat(
+                        egglog::span!(),
+                        1,
+                        Box::new(egglog::ast::Schedule::Sequence(
+                            egglog::span!(),
+                            vec![leaf.clone(), leaf],
+                        )),
                     )
-                    .unwrap();
+                } else {
+                    leaf
+                };
+                let commands = vec![egglog::ast::Command::RunSchedule(schedule)];
                 let mut captured = None;
                 session
                     .graph

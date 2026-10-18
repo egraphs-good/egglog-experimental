@@ -20,9 +20,13 @@ use std::fmt;
 use std::sync::Arc;
 
 use crate::proto as pb;
+use crate::scheduling::{
+    self, Control, ControlContext, ControlReport, ControlStop, PermanentSchedulerState,
+    SchedulerBinding,
+};
 use egglog::ast::{self, Action, Command, Expr, Fact, Literal};
 use egglog::{ArcSort, EGraph, Term, TermDag, TermId, Value, span};
-use egglog::{ExecutionEvent, ExecutionOrigin, NativeLoopStop, RepeatContinuation};
+use egglog::{ExecutionEvent, ExecutionOrigin, RepeatContinuation};
 use egglog_ast::span::{EgglogSpan, SrcFile};
 use num::{BigInt, Integer, One, Zero};
 use prost::Message;
@@ -44,7 +48,6 @@ struct ScheduleMeasurements {
     maintenance: HashMap<Option<Vec<u32>>, LeafSummary>,
     selected: Vec<pb::RulesetRef>,
     failure: Option<ExecutionFailureSite>,
-    outcome: Option<pb::LoopOutcome>,
 }
 
 fn command_tree(commands: &[pb::Command]) -> impl Iterator<Item = &pb::Command> {
@@ -728,13 +731,18 @@ impl Session {
         let mut failure = None;
         for installation in installations {
             let (result, registered, _) = if let Some(command) = &installation.command {
-                self.run_observed(
+                NativeExecutor {
+                    graph: &mut self.graph,
+                    mode: self.mode,
+                    names: &self.names,
+                }
+                .run_observed(
                     vec![command.clone()],
                     installation.site,
                     None,
-                    &HashMap::new(),
                     &mut context,
                     response,
+                    None,
                 )
             } else {
                 (Ok(()), true, None)
@@ -1489,22 +1497,36 @@ impl Session {
                 ));
             }
         }
+        let mut schedulers: HashSet<_> = self
+            .graph
+            .extension_state::<PermanentSchedulerState>()
+            .into_iter()
+            .flat_map(|state| state.keys().cloned())
+            .collect();
+        let mut conditions = vec![];
         for (index, command) in program.commands.iter().enumerate() {
             native_span(program, command.span.as_ref())?;
             if context.scoped_actions.contains(&index) {
                 continue;
             }
-            validation.extend(staged.lower_command(
+            validation.extend(staged.validate_control(
                 program,
                 command,
                 &context,
-                &mut HashMap::new(),
+                &mut schedulers,
+                false,
+                &mut conditions,
             )?);
         }
         let mut compiler = self
             .graph
             .validate_program(validation)
             .map_err(|error| error.to_string())?;
+        for (span, facts) in conditions {
+            compiler
+                .validate_condition(span, facts)
+                .map_err(|error| error.to_string())?;
+        }
         let mut values = HashMap::new();
         for (index, command) in program.commands.iter().enumerate() {
             if context.scoped_actions.contains(&index) {
@@ -1564,6 +1586,17 @@ impl Session {
         context: &RequestOccurrences,
         sites: &mut ScheduleSites<'a>,
     ) -> Result<Vec<Command>, PreparationError> {
+        if matches!(
+            command.kind,
+            Some(
+                pb::command::Kind::Run(_)
+                    | pb::command::Kind::Check(_)
+                    | pb::command::Kind::Stats(_)
+                    | pb::command::Kind::PrintSize(_)
+            )
+        ) {
+            return lower_native_observation(program, command, context, sites);
+        }
         let span = native_span(program, command.span.as_ref())?;
         let command = match command.kind.as_ref().ok_or("missing command kind")? {
             pb::command::Kind::Fail(child) => {
@@ -1596,8 +1629,6 @@ impl Session {
                     .map(Command::Action)
                     .collect());
             }
-            pb::command::Kind::Check(check) => Command::Check(span, facts(program, &check.facts)?),
-            pb::command::Kind::Stats(_) => Command::PrintOverallStatistics(span, None),
             pb::command::Kind::Prove(prove) => Command::Prove(span, facts(program, &prove.facts)?),
             pb::command::Kind::ProveExists(prove) => {
                 let name = self
@@ -1617,16 +1648,6 @@ impl Session {
                 }
                 Command::ProveExists(span, prove.constructor.clone())
             }
-            pb::command::Kind::Run(_)
-            | pb::command::Kind::Repeat(_)
-            | pb::command::Kind::Saturate(_) => Command::RunSchedule(Self::lower_schedule(
-                program,
-                command,
-                context,
-                sites,
-                &mut vec![],
-                &mut vec![],
-            )?),
             pb::command::Kind::Extract(extract) => {
                 if self.mode != pb::ExecutionMode::Normal {
                     return Err(
@@ -1706,21 +1727,6 @@ impl Session {
                 }
                 return Ok(vec![]);
             }
-            pb::command::Kind::PrintSize(print) => {
-                if print.tables.iter().any(String::is_empty) {
-                    return Err("table name must not be empty".into());
-                }
-                if print.tables.is_empty() {
-                    return Ok(vec![Command::PrintSize(span, None)]);
-                }
-                // Keep authored names in the request for output/error attribution.
-                // Project even unknown names: they cannot address private tables.
-                return Ok(print
-                    .tables
-                    .iter()
-                    .map(|table| Command::PrintSize(span.clone(), Some(native_name("call", table))))
-                    .collect());
-            }
             pb::command::Kind::PrintFunction(print) => {
                 if self.mode != pb::ExecutionMode::Normal {
                     return Err(
@@ -1750,29 +1756,95 @@ impl Session {
         Ok(vec![command])
     }
 
-    fn lower_schedule<'a>(
+    // Compile every admitted descendant, even in Repeat0, without executing
+    // bindings, queries or scheduler state on a disposable compiler clone.
+    fn validate_control(
+        &self,
         program: &pb::Program,
-        command: &'a pb::Command,
+        command: &pb::Command,
         context: &RequestOccurrences,
-        sites: &mut ScheduleSites<'a>,
-        native_path: &mut Vec<usize>,
-        wire_path: &mut Vec<u32>,
-    ) -> Result<ast::Schedule, PreparationError> {
+        schedulers: &mut HashSet<String>,
+        in_loop: bool,
+        conditions: &mut Vec<(ast::Span, Vec<Fact>)>,
+    ) -> Result<Vec<Command>, PreparationError> {
         let span = native_span(program, command.span.as_ref())?;
-        sites.insert(native_path.clone(), (command, wire_path.clone()));
-        let (body, limit) = match command.kind.as_ref().ok_or("missing schedule command")? {
+        match command.kind.as_ref().ok_or("missing command kind")? {
+            pb::command::Kind::BindScheduler(bind) => {
+                wire_back_off(bind)?;
+                if !schedulers.insert(bind.name.clone()) {
+                    return Err(format!("scheduler {} already exists", bind.name).into());
+                }
+                Ok(vec![])
+            }
             pb::command::Kind::Run(run) => {
-                if !run.scheduler.is_empty() {
+                if !run.scheduler.is_empty() && !schedulers.contains(&run.scheduler) {
                     return Err(PreparationError(Box::new(pb::Error {
                         code: pb::ErrorCode::UnknownName.into(),
-                        message: format!(
-                            "unknown scheduler {} (scheduler bindings are not implemented)",
-                            run.scheduler
-                        ),
+                        message: format!("unknown scheduler {}", run.scheduler),
                         span: command.span,
                         ..Default::default()
                     })));
                 }
+                self.lower_command(program, command, context, &mut HashMap::new())
+            }
+            pb::command::Kind::Repeat(_) | pb::command::Kind::Saturate(_) => {
+                let (body, until) = match &command.kind {
+                    Some(pb::command::Kind::Repeat(repeat)) => {
+                        repeat.times.ok_or("missing Repeat count")?;
+                        (&repeat.body, &repeat.until)
+                    }
+                    Some(pb::command::Kind::Saturate(saturate)) => {
+                        if saturate.max_iterations == Some(0) {
+                            return Err("Saturate bound must be positive".into());
+                        }
+                        (&saturate.body, &saturate.until)
+                    }
+                    _ => unreachable!(),
+                };
+                let mut commands = vec![];
+                if !until.is_empty() {
+                    conditions.push((span, facts(program, until)?));
+                }
+                let mut nested = schedulers.clone();
+                for child in body {
+                    commands.extend(self.validate_control(
+                        program,
+                        child,
+                        context,
+                        &mut nested,
+                        true,
+                        conditions,
+                    )?);
+                }
+                Ok(commands)
+            }
+            pb::command::Kind::Fail(child) if !in_loop && control_command(child) => {
+                self.validate_control(program, child, context, schedulers, false, conditions)
+            }
+            pb::command::Kind::Check(_)
+            | pb::command::Kind::Stats(_)
+            | pb::command::Kind::PrintSize(_)
+                if !in_loop || self.mode == pb::ExecutionMode::Normal =>
+            {
+                self.lower_command(program, command, context, &mut HashMap::new())
+            }
+            _ if in_loop => {
+                Err("loop body command has no supported native mutation-progress witness".into())
+            }
+            _ => self.lower_command(program, command, context, &mut HashMap::new()),
+        }
+    }
+
+    fn lower_run<'a>(
+        program: &pb::Program,
+        command: &'a pb::Command,
+        context: &RequestOccurrences,
+        sites: &mut ScheduleSites<'a>,
+    ) -> Result<ast::Schedule, PreparationError> {
+        let span = native_span(program, command.span.as_ref())?;
+        sites.insert(vec![], (command, vec![]));
+        match command.kind.as_ref().ok_or("missing schedule command")? {
+            pb::command::Kind::Run(run) => {
                 let native = match run
                     .ruleset
                     .as_ref()
@@ -1794,57 +1866,16 @@ impl Session {
                         .get(*index as usize)
                         .ok_or("ruleset index out of bounds")?,
                 };
-                return Ok(ast::Schedule::Run(
+                Ok(ast::Schedule::Run(
                     span,
                     ast::RunConfig {
                         ruleset: native.clone(),
                         until: None,
                     },
-                ));
+                ))
             }
-            pb::command::Kind::Repeat(repeat) => {
-                let count = repeat.times.ok_or("missing Repeat count")?;
-                if !repeat.until.is_empty() {
-                    return Err("Repeat until conditions are not supported yet".into());
-                }
-                (&repeat.body, Some(count))
-            }
-            pb::command::Kind::Saturate(saturate) => {
-                if !saturate.until.is_empty() || saturate.max_iterations == Some(0) {
-                    return Err("Saturate requires no until and an absent or positive bound".into());
-                }
-                (&saturate.body, saturate.max_iterations)
-            }
-            _ => {
-                return Err("schedule bodies currently admit only Run, Repeat and Saturate".into());
-            }
-        };
-        let limit = limit
-            .map(usize::try_from)
-            .transpose()
-            .map_err(|_| "loop bound exceeds native usize")?;
-        native_path.push(0);
-        let mut children = Vec::with_capacity(body.len());
-        for (index, child) in body.iter().enumerate() {
-            native_path.push(index);
-            wire_path.push(u32::try_from(index).map_err(|_| "command path exceeds uint32")?);
-            children.push(Self::lower_schedule(
-                program,
-                child,
-                context,
-                sites,
-                native_path,
-                wire_path,
-            )?);
-            wire_path.pop();
-            native_path.pop();
+            _ => Err("expected Run leaf".into()),
         }
-        native_path.pop();
-        let body = Box::new(ast::Schedule::Sequence(span.clone(), children));
-        Ok(match limit {
-            Some(limit) => ast::Schedule::Repeat(span, limit, body),
-            None => ast::Schedule::Saturate(span, body),
-        })
     }
 
     fn execute(
@@ -1870,6 +1901,61 @@ impl Session {
                         native_span(program, command.span.as_ref()).expect("validated span"),
                     ));
                 }
+                None
+            }
+            kind if control_command(command)
+                || matches!(kind, pb::command::Kind::BindScheduler(_)) =>
+            {
+                let measurements = RefCell::new(ScheduleMeasurements::default());
+                let mut anchor = command;
+                let mut fail_spans = vec![];
+                while let Some(pb::command::Kind::Fail(child)) = &anchor.kind {
+                    fail_spans
+                        .push(native_span(program, anchor.span.as_ref()).expect("validated span"));
+                    anchor = child;
+                }
+                let mut envelope = WireEnvelope {
+                    mode: self.mode,
+                    names: &self.names,
+                    program,
+                    context,
+                    response,
+                    root: location,
+                    measurements: &measurements,
+                    outcome: None,
+                    export_error: None,
+                    suppressed: !fail_spans.is_empty(),
+                    anchor,
+                };
+                let result = if matches!(kind, pb::command::Kind::BindScheduler(_)) {
+                    envelope.execute(&mut self.graph).map(|_| ())
+                } else {
+                    self.graph.with_schedule_envelope(
+                        &fail_spans,
+                        &mut envelope,
+                        |graph, state| state.execute(graph),
+                        |state, report| state.complete(report),
+                        |state, event| {
+                            state.measurements.borrow_mut().observe(
+                                event,
+                                state.mode,
+                                Some(state.root),
+                                &HashMap::new(),
+                            )
+                        },
+                    )
+                };
+                let result = result.and_then(|()| envelope.export_error.take().map_or(Ok(()), Err));
+                let measurements = measurements.into_inner();
+                *failure_site = measurements.failure.clone();
+                measurements.publish(
+                    pb::maintenance_site::Target::Command(pb::StaticCommandPath {
+                        path: location.path.clone(),
+                    }),
+                    context,
+                    response,
+                );
+                result?;
                 None
             }
             pb::command::Kind::Freeze(_) => {
@@ -2119,15 +2205,24 @@ impl Session {
                 let commands = self
                     .lower_command(program, command, context, &mut sites)
                     .expect("validated command");
-                let (result, _, failure) = self.run_observed(
+                let (result, _, failure) = NativeExecutor {
+                    graph: &mut self.graph,
+                    mode: self.mode,
+                    names: &self.names,
+                }
+                .run_observed(
                     commands,
                     pb::maintenance_site::Target::Command(pb::StaticCommandPath {
                         path: location.path.clone(),
                     }),
-                    Some((command, location)),
-                    &sites,
+                    Some(RequestedObservation {
+                        command,
+                        location,
+                        sites: &sites,
+                    }),
                     context,
                     response,
+                    None,
                 );
                 *failure_site = failure;
                 result?;
@@ -2143,7 +2238,29 @@ impl Session {
         }
         Ok(())
     }
+}
 
+struct NativeExecutor<'a> {
+    graph: &'a mut EGraph,
+    mode: pb::ExecutionMode,
+    names: &'a NativeNames,
+}
+
+#[derive(Clone, Copy)]
+struct RequestedObservation<'a> {
+    command: &'a pb::Command,
+    location: &'a pb::CommandLocation,
+    sites: &'a ScheduleSites<'a>,
+}
+
+struct ScheduleCapture<'a> {
+    measurements: &'a RefCell<ScheduleMeasurements>,
+    scheduler: Option<egglog::scheduler::SchedulerId>,
+    report: &'a mut Option<egglog_reports::RunReport>,
+    emit_outputs: bool,
+}
+
+impl NativeExecutor<'_> {
     // Aggregate leaves synchronously, before native schedule union, and publish
     // each requested anchor immediately. No leaf-event history or outer timings
     // are synthesized; failure cannot erase a completed output or pretend to be zero.
@@ -2151,263 +2268,176 @@ impl Session {
         &mut self,
         commands: Vec<Command>,
         site: pb::maintenance_site::Target,
-        requested: Option<(&pb::Command, &pb::CommandLocation)>,
-        sites: &ScheduleSites<'_>,
+        requested: Option<RequestedObservation<'_>>,
         context: &mut RequestOccurrences,
         response: &mut pb::RunProgramResponse,
+        control: Option<ScheduleCapture<'_>>,
     ) -> (
         Result<(), egglog::Error>,
         bool,
         Option<ExecutionFailureSite>,
     ) {
-        let location = requested.map(|(_, location)| location);
-        let selected_sizes = requested.and_then(|(command, _)| match &command.kind {
+        let location = requested.map(|requested| requested.location);
+        let empty_sites = HashMap::new();
+        let sites = requested.map_or(&empty_sites, |requested| requested.sites);
+        let selected_sizes = requested.and_then(|requested| match &requested.command.kind {
             Some(pb::command::Kind::PrintSize(print)) => Some(print),
             _ => None,
         });
         let mut pending_sizes = vec![];
-        let measurements = RefCell::new(ScheduleMeasurements::default());
+        let owned_measurements = RefCell::new(ScheduleMeasurements::default());
+        let (measurements, scheduler, mut captured, emit_outputs) = match control {
+            Some(ScheduleCapture {
+                measurements,
+                scheduler,
+                report,
+                emit_outputs,
+            }) => (measurements, scheduler, Some(report), emit_outputs),
+            None => (&owned_measurements, None, None, true),
+        };
+        let embedded = captured.is_some();
         let mut registered = false;
         let mut export_error = None;
-        let mut result = self.graph.run_program_observed_with_repeat_policy(
-            commands,
-            &mut |cause, origin, output| {
-                if origin != ExecutionOrigin::Requested {
-                    return;
-                }
-                let Some(location) = location else {
-                    return;
-                };
-                let mut run_report = None;
-                let kind = match output {
-                    egglog::CommandOutput::RunSchedule(report) => {
-                        if context.include_run_reports {
-                            match report::export(
-                                &report,
-                                &measurements.borrow().selected,
-                                context,
-                                response,
-                            ) {
-                                Ok(detail) => run_report = Some(detail),
-                                Err(error) => {
-                                    export_error = Some(egglog::Error::BackendError(error));
-                                    return;
-                                }
-                            }
-                        }
-                        if let Some(outcome) = measurements.borrow_mut().outcome.take() {
-                            pb::command_output::Kind::Loop(outcome)
-                        } else {
-                            pb::command_output::Kind::Run(pb::RunOutcome {
-                                updated: report.updated,
-                                can_stop: report.can_stop,
-                            })
-                        }
+        let mut output = |cause: usize, origin, output| {
+            if origin != ExecutionOrigin::Requested {
+                return;
+            }
+            if !emit_outputs && !matches!(&output, egglog::CommandOutput::RunSchedule(_)) {
+                return;
+            }
+            let Some(location) = location else {
+                return;
+            };
+            let mut run_report = None;
+            let kind = match output {
+                egglog::CommandOutput::RunSchedule(report) => {
+                    if let Some(captured) = captured.as_mut() {
+                        **captured = Some(report);
+                        return;
                     }
-                    sizes @ (egglog::CommandOutput::PrintFunctionSize(_)
-                    | egglog::CommandOutput::PrintAllFunctionsSize(_)) => {
-                        let Some(print) = selected_sizes else {
-                            return;
-                        };
-                        let tables = match sizes {
-                            egglog::CommandOutput::PrintFunctionSize(rows) => {
-                                pending_sizes.push((print.tables[cause].clone(), rows));
-                                if cause + 1 != print.tables.len() {
-                                    return;
-                                }
-                                std::mem::take(&mut pending_sizes)
-                            }
-                            egglog::CommandOutput::PrintAllFunctionsSize(tables) => {
-                                let mut tables: Vec<_> = tables
-                                    .into_iter()
-                                    .filter_map(|(name, rows)| {
-                                        self.names
-                                            .callables
-                                            .get(&name)
-                                            .map(|name| (name.clone(), rows))
-                                    })
-                                    .collect();
-                                tables.sort_by(|(a, _), (b, _)| a.cmp(b));
-                                tables
-                            }
-                            _ => unreachable!(),
-                        };
-                        let sizes = tables
-                            .into_iter()
-                            .map(|(table, rows)| {
-                                Ok(pb::TableSize {
-                                    table,
-                                    rows: u64::try_from(rows)?,
-                                })
-                            })
-                            .collect::<Result<Vec<_>, std::num::TryFromIntError>>();
-                        match sizes {
-                            Ok(sizes) => pb::command_output::Kind::Sizes(pb::TableSizes { sizes }),
-                            Err(_) => {
-                                export_error = Some(egglog::Error::BackendError(
-                                    "native table size exceeds uint64".into(),
-                                ));
-                                return;
-                            }
-                        }
-                    }
-                    egglog::CommandOutput::OverallStatistics(report) => {
-                        match report::export(&report, &[], context, response) {
-                            Ok(detail) => pb::command_output::Kind::Statistics(detail),
+                    if context.include_run_reports {
+                        match report::export(
+                            &report,
+                            &measurements.borrow().selected,
+                            context,
+                            response,
+                        ) {
+                            Ok(detail) => run_report = Some(detail),
                             Err(error) => {
                                 export_error = Some(egglog::Error::BackendError(error));
                                 return;
                             }
                         }
                     }
-                    egglog::CommandOutput::ProveExists {
-                        proof_store,
-                        proof_id,
-                    } => match proof::export(&proof_store, proof_id) {
-                        Ok(proof) => pb::command_output::Kind::Proof(proof),
+                    pb::command_output::Kind::Run(pb::RunOutcome {
+                        updated: report.updated,
+                        can_stop: report.can_stop,
+                    })
+                }
+                sizes @ (egglog::CommandOutput::PrintFunctionSize(_)
+                | egglog::CommandOutput::PrintAllFunctionsSize(_)) => {
+                    let Some(print) = selected_sizes else {
+                        return;
+                    };
+                    let tables = match sizes {
+                        egglog::CommandOutput::PrintFunctionSize(rows) => {
+                            pending_sizes.push((print.tables[cause].clone(), rows));
+                            if cause + 1 != print.tables.len() {
+                                return;
+                            }
+                            std::mem::take(&mut pending_sizes)
+                        }
+                        egglog::CommandOutput::PrintAllFunctionsSize(tables) => {
+                            let mut tables: Vec<_> = tables
+                                .into_iter()
+                                .filter_map(|(name, rows)| {
+                                    self.names
+                                        .callables
+                                        .get(&name)
+                                        .map(|name| (name.clone(), rows))
+                                })
+                                .collect();
+                            tables.sort_by(|(a, _), (b, _)| a.cmp(b));
+                            tables
+                        }
+                        _ => unreachable!(),
+                    };
+                    let sizes = tables
+                        .into_iter()
+                        .map(|(table, rows)| {
+                            Ok(pb::TableSize {
+                                table,
+                                rows: u64::try_from(rows)?,
+                            })
+                        })
+                        .collect::<Result<Vec<_>, std::num::TryFromIntError>>();
+                    match sizes {
+                        Ok(sizes) => pb::command_output::Kind::Sizes(pb::TableSizes { sizes }),
+                        Err(_) => {
+                            export_error = Some(egglog::Error::BackendError(
+                                "native table size exceeds uint64".into(),
+                            ));
+                            return;
+                        }
+                    }
+                }
+                egglog::CommandOutput::OverallStatistics(report) => {
+                    match report::export(&report, &[], context, response) {
+                        Ok(detail) => pb::command_output::Kind::Statistics(detail),
                         Err(error) => {
                             export_error = Some(egglog::Error::BackendError(error));
                             return;
                         }
-                    },
-                    _ => return,
-                };
-                response.outputs.push(pb::CommandOutput {
-                    kind: Some(kind),
-                    location: Some(location.clone()),
-                    run_report,
-                });
-            },
-            &mut |_, event| match event {
+                    }
+                }
+                egglog::CommandOutput::ProveExists {
+                    proof_store,
+                    proof_id,
+                } => match proof::export(&proof_store, proof_id) {
+                    Ok(proof) => pb::command_output::Kind::Proof(proof),
+                    Err(error) => {
+                        export_error = Some(egglog::Error::BackendError(error));
+                        return;
+                    }
+                },
+                _ => return,
+            };
+            response.outputs.push(pb::CommandOutput {
+                kind: Some(kind),
+                location: Some(location.clone()),
+                run_report,
+            });
+        };
+        let mut observe = |_: usize, event: ExecutionEvent<'_>| {
+            if matches!(
+                event,
                 ExecutionEvent::CommandCompleted {
                     origin: ExecutionOrigin::Requested,
                     ..
-                } => {
-                    registered = true;
-                    measurements.borrow_mut().failure = None;
                 }
-                ExecutionEvent::CommandCompleted { .. } => (),
-                ExecutionEvent::CommandFailed { .. } => (),
-                ExecutionEvent::RunStarted { origin, schedule }
-                | ExecutionEvent::RunFinished {
-                    origin, schedule, ..
-                } => {
-                    let mut measurements = measurements.borrow_mut();
-                    let mapped = schedule.and_then(|schedule| {
-                        let (command, path) = sites.get(schedule.path)?;
-                        let mut nested = location.expect("schedule has command site").clone();
-                        nested.path.extend(path);
-                        nested
-                            .iterations
-                            .extend(schedule.iterations.iter().map(|i| *i as u64));
-                        Some((*command, nested))
-                    });
-                    let authored = origin == ExecutionOrigin::Requested;
-                    if matches!(event, ExecutionEvent::RunStarted { .. })
-                        && let Some((
-                            pb::Command {
-                                kind: Some(pb::command::Kind::Run(run)),
-                                ..
-                            },
-                            _,
-                        )) = &mapped
-                    {
-                        let selected = run.ruleset.as_ref().expect("validated Run");
-                        if !measurements.selected.contains(selected) {
-                            measurements.selected.push(selected.clone());
-                        }
-                    }
-                    if let ExecutionEvent::RunFinished { result: Err(_), .. } = event
-                        && measurements.failure.is_none()
-                    {
-                        measurements.failure = mapped
-                            .as_ref()
-                            .map(|(command, location)| (location.clone(), command.span));
-                    }
-                    let summary = if authored {
-                        measurements
-                            .requested
-                            .entry(mapped.as_ref().map_or_else(
-                                || {
-                                    location
-                                        .expect("authored run has a command site")
-                                        .path
-                                        .clone()
-                                },
-                                |(_, location)| location.path.clone(),
-                            ))
-                            .or_default()
-                    } else {
-                        measurements
-                            .maintenance
-                            .entry(mapped.as_ref().map(|(_, location)| location.path.clone()))
-                            .or_default()
-                    };
-                    match event {
-                        ExecutionEvent::RunStarted { .. } => summary.invocations += 1,
-                        ExecutionEvent::RunFinished { result, .. } => summary
-                            .finish(result, authored && self.mode == pb::ExecutionMode::Normal),
-                        _ => unreachable!(),
-                    }
-                }
-                ExecutionEvent::LoopFinished {
-                    schedule,
-                    completed,
-                    stop,
-                    result,
-                    ..
-                } => {
-                    let Some(schedule) = schedule else {
-                        return;
-                    };
-                    let Some((command, path)) = sites.get(schedule.path) else {
-                        return;
-                    };
-                    let mut measurements = measurements.borrow_mut();
-                    if result.is_err() && measurements.failure.is_none() {
-                        let mut nested = location.expect("schedule has command site").clone();
-                        nested.path.extend(path);
-                        nested
-                            .iterations
-                            .extend(schedule.iterations.iter().map(|i| *i as u64));
-                        measurements.failure = Some((nested, command.span));
-                    }
-                    if !schedule.path.is_empty() {
-                        return;
-                    }
-                    if let Ok(report) = result {
-                        let termination = match (&command.kind, stop) {
-                            (Some(pb::command::Kind::Repeat(_)), Some(_)) => {
-                                pb::TerminationReason::CountReached
-                            }
-                            (
-                                Some(pb::command::Kind::Saturate(_)),
-                                Some(NativeLoopStop::CanStop | NativeLoopStop::Unchanged),
-                            ) => pb::TerminationReason::Saturated,
-                            (
-                                Some(pb::command::Kind::Saturate(_)),
-                                Some(NativeLoopStop::CountReached),
-                            ) => pb::TerminationReason::IterationLimit,
-                            _ => unreachable!("validated loop correspondence"),
-                        };
-                        measurements.outcome = Some(pb::LoopOutcome {
-                            updated: report.updated,
-                            iterations: completed as u64,
-                            termination: Some(termination.into()),
-                        });
-                    }
-                }
-            },
-            &|_, schedule| {
-                if sites.get(schedule.path).is_some_and(|(command, _)| {
-                    matches!(command.kind, Some(pb::command::Kind::Repeat(_)))
-                }) {
-                    RepeatContinuation::ExactCount
-                } else {
-                    RepeatContinuation::CanStop
-                }
-            },
-        );
+            ) {
+                registered = true;
+            }
+            measurements
+                .borrow_mut()
+                .observe(event, self.mode, location, sites);
+        };
+        let mut result = if embedded {
+            self.graph.run_program_embedded_observed(
+                commands,
+                &mut output,
+                &mut observe,
+                &|_, _| scheduler,
+            )
+        } else {
+            self.graph.run_program_observed_with_policies(
+                commands,
+                &mut output,
+                &mut observe,
+                &|_, _| RepeatContinuation::CanStop,
+                &|_, _| scheduler,
+            )
+        };
         if let (
             Err(egglog::Error::TypeError(egglog::TypeError::UnboundFunction(name, _))),
             Some(print),
@@ -2419,10 +2449,101 @@ impl Session {
         {
             *name = authored.clone();
         }
-        let mut measurements = measurements.into_inner();
         if matches!(result, Err(egglog::Error::ExpectFail(_))) {
-            measurements.failure = None;
+            measurements.borrow_mut().failure = None;
         }
+        let failure = measurements.borrow().failure.clone();
+        if captured.is_none() {
+            owned_measurements
+                .into_inner()
+                .publish(site, context, response);
+        }
+        (
+            result.and_then(|()| export_error.map_or(Ok(()), Err)),
+            registered,
+            failure,
+        )
+    }
+}
+
+impl ScheduleMeasurements {
+    fn observe(
+        &mut self,
+        event: ExecutionEvent<'_>,
+        mode: pb::ExecutionMode,
+        location: Option<&pb::CommandLocation>,
+        sites: &ScheduleSites<'_>,
+    ) {
+        match event {
+            ExecutionEvent::CommandCompleted {
+                origin: ExecutionOrigin::Requested,
+                ..
+            } => self.failure = None,
+            ExecutionEvent::RunStarted { origin, schedule }
+            | ExecutionEvent::RunFinished {
+                origin, schedule, ..
+            } => {
+                let mapped = schedule.and_then(|schedule| {
+                    let (command, path) = sites.get(schedule.path)?;
+                    let mut nested = location.expect("schedule has command site").clone();
+                    nested.path.extend(path);
+                    nested
+                        .iterations
+                        .extend(schedule.iterations.iter().map(|i| *i as u64));
+                    Some((*command, nested))
+                });
+                let authored = origin == ExecutionOrigin::Requested;
+                if matches!(event, ExecutionEvent::RunStarted { .. })
+                    && let Some((
+                        pb::Command {
+                            kind: Some(pb::command::Kind::Run(run)),
+                            ..
+                        },
+                        _,
+                    )) = &mapped
+                {
+                    let selected = run.ruleset.as_ref().expect("validated Run");
+                    if !self.selected.contains(selected) {
+                        self.selected.push(selected.clone());
+                    }
+                }
+                if matches!(event, ExecutionEvent::RunFinished { result: Err(_), .. })
+                    && self.failure.is_none()
+                {
+                    self.failure = mapped
+                        .as_ref()
+                        .map(|(command, location)| (location.clone(), command.span));
+                }
+                let path = mapped
+                    .as_ref()
+                    .map(|(_, location)| location.path.clone())
+                    .or_else(|| location.map(|location| location.path.clone()));
+                let summary = if authored {
+                    self.requested
+                        .entry(path.expect("authored Run has command site"))
+                        .or_default()
+                } else {
+                    self.maintenance.entry(path).or_default()
+                };
+                match event {
+                    ExecutionEvent::RunStarted { .. } => summary.invocations += 1,
+                    ExecutionEvent::RunFinished { result, .. } => {
+                        summary.finish(result, authored && mode == pb::ExecutionMode::Normal)
+                    }
+                    _ => unreachable!(),
+                }
+            }
+            _ => (),
+        }
+    }
+
+    fn publish(
+        self,
+        site: pb::maintenance_site::Target,
+        context: &mut RequestOccurrences,
+        response: &mut pb::RunProgramResponse,
+    ) {
+        let measurements = self;
         let profile = response.profile.as_mut().expect("summary requested");
         let mut requested: Vec<_> = measurements.requested.into_iter().collect();
         requested.sort_unstable_by(|a, b| a.0.cmp(&b.0));
@@ -2496,11 +2617,346 @@ impl Session {
                 });
             }
         }
+    }
+}
+
+fn control_command(command: &pb::Command) -> bool {
+    match &command.kind {
+        Some(
+            pb::command::Kind::Run(_)
+            | pb::command::Kind::Repeat(_)
+            | pb::command::Kind::Saturate(_),
+        ) => true,
+        Some(pb::command::Kind::Fail(child)) => control_command(child),
+        _ => false,
+    }
+}
+
+fn lower_native_observation<'a>(
+    program: &pb::Program,
+    command: &'a pb::Command,
+    context: &RequestOccurrences,
+    sites: &mut ScheduleSites<'a>,
+) -> Result<Vec<Command>, PreparationError> {
+    let span = native_span(program, command.span.as_ref())?;
+    Ok(match command.kind.as_ref().ok_or("missing command kind")? {
+        pb::command::Kind::Run(_) => vec![Command::RunSchedule(Session::lower_run(
+            program, command, context, sites,
+        )?)],
+        pb::command::Kind::Check(check) => {
+            vec![Command::Check(span, facts(program, &check.facts)?)]
+        }
+        pb::command::Kind::Stats(_) => vec![Command::PrintOverallStatistics(span, None)],
+        pb::command::Kind::PrintSize(print) => {
+            if print.tables.iter().any(String::is_empty) {
+                return Err("table name must not be empty".into());
+            }
+            if print.tables.is_empty() {
+                vec![Command::PrintSize(span, None)]
+            } else {
+                print
+                    .tables
+                    .iter()
+                    .map(|table| Command::PrintSize(span.clone(), Some(native_name("call", table))))
+                    .collect()
+            }
+        }
+        _ => return Err("unsupported native observation leaf".into()),
+    })
+}
+
+fn wire_back_off(
+    bind: &pb::BindScheduler,
+) -> Result<(scheduling::BackOffScheduler, bool), PreparationError> {
+    if bind.name.is_empty() {
+        return Err("scheduler name must not be empty".into());
+    }
+    let Some(pb::scheduler::Kind::BackOff(options)) = bind
+        .scheduler
+        .as_ref()
+        .and_then(|scheduler| scheduler.kind.as_ref())
+    else {
+        return Err("missing scheduler configuration".into());
+    };
+    let [matches, bans, nodes] =
+        [options.match_limit, options.ban_length, options.node_limit].map(|limit| {
+            limit
+                .map(usize::try_from)
+                .transpose()
+                .map_err(|_| PreparationError::from("scheduler limit exceeds native usize"))
+        });
+    Ok((
+        scheduling::BackOffScheduler::new(matches?, bans?, nodes?),
+        // A zero ban can also permit stopping with deferred matches: native
+        // can_stop has no outstanding ban to distinguish that resource policy.
+        options.node_limit.is_some() || options.ban_length == Some(0),
+    ))
+}
+
+struct WireSchedule<'a> {
+    executor: NativeExecutor<'a>,
+    program: &'a pb::Program,
+    context: &'a mut RequestOccurrences,
+    response: &'a mut pb::RunProgramResponse,
+    root: &'a pb::CommandLocation,
+    measurements: &'a RefCell<ScheduleMeasurements>,
+    bindings: Vec<(String, SchedulerBinding)>,
+    outcome: &'a mut Option<pb::LoopOutcome>,
+    suppressed: bool,
+}
+
+struct WireEnvelope<'a> {
+    mode: pb::ExecutionMode,
+    names: &'a NativeNames,
+    program: &'a pb::Program,
+    context: &'a mut RequestOccurrences,
+    response: &'a mut pb::RunProgramResponse,
+    root: &'a pb::CommandLocation,
+    measurements: &'a RefCell<ScheduleMeasurements>,
+    outcome: Option<pb::LoopOutcome>,
+    export_error: Option<egglog::Error>,
+    suppressed: bool,
+    anchor: &'a pb::Command,
+}
+
+impl WireEnvelope<'_> {
+    fn execute(&mut self, graph: &mut EGraph) -> Result<egglog_reports::RunReport, egglog::Error> {
+        let mut control = WireSchedule {
+            executor: NativeExecutor {
+                graph,
+                mode: self.mode,
+                names: self.names,
+            },
+            program: self.program,
+            context: self.context,
+            response: self.response,
+            root: self.root,
+            measurements: self.measurements,
+            bindings: vec![],
+            outcome: &mut self.outcome,
+            suppressed: self.suppressed,
+        };
+        scheduling::fold_control(&mut control, self.anchor, &mut vec![], &mut vec![])
+            .map(|report| report.report)
+    }
+
+    fn complete(&mut self, report: Option<&egglog_reports::RunReport>) {
+        let Some(report) = report else {
+            self.measurements.borrow_mut().failure = None;
+            return;
+        };
+        let kind = if let Some(outcome) = self.outcome.take() {
+            pb::command_output::Kind::Loop(outcome)
+        } else {
+            pb::command_output::Kind::Run(pb::RunOutcome {
+                updated: report.updated,
+                can_stop: report.can_stop,
+            })
+        };
+        self.export_error = self.output(kind, report).err();
+    }
+
+    fn output(
+        &mut self,
+        kind: pb::command_output::Kind,
+        report: &egglog_reports::RunReport,
+    ) -> Result<(), egglog::Error> {
+        let run_report = self
+            .context
+            .include_run_reports
+            .then(|| {
+                report::export(
+                    report,
+                    &self.measurements.borrow().selected,
+                    self.context,
+                    self.response,
+                )
+            })
+            .transpose()
+            .map_err(egglog::Error::BackendError)?;
+        self.response.outputs.push(pb::CommandOutput {
+            kind: Some(kind),
+            location: Some(self.root.clone()),
+            run_report,
+        });
+        Ok(())
+    }
+}
+
+impl WireSchedule<'_> {
+    fn location(&self, path: &[usize], iterations: &[u64]) -> pb::CommandLocation {
+        let mut location = self.root.clone();
+        location.path.extend(path.iter().map(|index| *index as u32));
+        location.iterations.extend(iterations);
+        location
+    }
+}
+
+impl ControlContext for WireSchedule<'_> {
+    type Node = pb::Command;
+    type Error = egglog::Error;
+    type Scope = (usize, HashMap<u32, Value>);
+
+    fn view<'a>(&self, node: &'a pb::Command) -> Result<Control<'a, pb::Command>, egglog::Error> {
+        Ok(match node.kind.as_ref().expect("validated command") {
+            pb::command::Kind::Repeat(repeat) => {
+                Control::Repeat(&repeat.body, repeat.times.unwrap())
+            }
+            pb::command::Kind::Saturate(saturate) => {
+                Control::Saturate(&saturate.body, saturate.max_iterations)
+            }
+            _ => Control::Leaf,
+        })
+    }
+
+    fn enter_scope(&mut self) -> Self::Scope {
         (
-            result.and_then(|()| export_error.map_or(Ok(()), Err)),
-            registered,
-            measurements.failure,
+            self.bindings.len(),
+            std::mem::take(&mut self.context.union_values),
         )
+    }
+
+    fn leave_scope(&mut self, (mark, parent): Self::Scope) {
+        self.bindings.truncate(mark);
+        self.context.union_values = parent;
+    }
+
+    fn leaf(
+        &mut self,
+        node: &pb::Command,
+        path: &[usize],
+        iterations: &[u64],
+    ) -> Result<ControlReport, egglog::Error> {
+        if let Some(pb::command::Kind::BindScheduler(bind)) = &node.kind {
+            let (scheduler, resource_limited) = wire_back_off(bind).expect("validated scheduler");
+            let binding = SchedulerBinding {
+                id: self.executor.graph.add_scheduler(Box::new(scheduler)),
+                resource_limited,
+            };
+            if iterations.is_empty() {
+                self.executor
+                    .graph
+                    .extension_state_or_default::<PermanentSchedulerState>()
+                    .insert(bind.name.clone(), binding);
+            } else {
+                self.bindings.push((bind.name.clone(), binding));
+            }
+            return Ok(ControlReport::default());
+        }
+        let binding = match &node.kind {
+            Some(pb::command::Kind::Run(run)) if !run.scheduler.is_empty() => Some(
+                self.bindings
+                    .iter()
+                    .rfind(|(name, _)| name == &run.scheduler)
+                    .map(|(_, binding)| *binding)
+                    .or_else(|| {
+                        self.executor
+                            .graph
+                            .extension_state::<PermanentSchedulerState>()
+                            .and_then(|state| state.get(&run.scheduler).copied())
+                    })
+                    .expect("validated visible scheduler"),
+            ),
+            _ => None,
+        };
+        let location = self.location(path, iterations);
+        let mut sites = HashMap::new();
+        let commands = lower_native_observation(self.program, node, self.context, &mut sites)
+            .expect("validated leaf");
+        let mut report = None;
+        let (result, _, _) = self.executor.run_observed(
+            commands,
+            pb::maintenance_site::Target::Command(pb::StaticCommandPath {
+                path: location.path.clone(),
+            }),
+            Some(RequestedObservation {
+                command: node,
+                location: &location,
+                sites: &sites,
+            }),
+            self.context,
+            self.response,
+            Some(ScheduleCapture {
+                measurements: self.measurements,
+                scheduler: binding.map(|binding| binding.id),
+                report: &mut report,
+                emit_outputs: !self.suppressed,
+            }),
+        );
+        if result.is_err() && self.measurements.borrow().failure.is_none() {
+            self.measurements.borrow_mut().failure = Some((location, node.span));
+        }
+        result?;
+        Ok(ControlReport {
+            report: report.unwrap_or_default(),
+            resource_limited: binding.is_some_and(|binding| binding.resource_limited),
+        })
+    }
+
+    fn until(
+        &mut self,
+        node: &pb::Command,
+        path: &[usize],
+        iterations: &[u64],
+    ) -> Result<bool, egglog::Error> {
+        let until = match &node.kind {
+            Some(pb::command::Kind::Repeat(repeat)) => &repeat.until,
+            Some(pb::command::Kind::Saturate(saturate)) => &saturate.until,
+            _ => unreachable!(),
+        };
+        if until.is_empty() {
+            return Ok(false);
+        }
+        let location = self.location(path, iterations);
+        let result = self.executor.graph.check_condition_observed(
+            native_span(self.program, node.span.as_ref()).expect("validated span"),
+            facts(self.program, until).expect("validated until"),
+            &mut |event| {
+                self.measurements.borrow_mut().observe(
+                    event,
+                    self.executor.mode,
+                    Some(&location),
+                    &HashMap::new(),
+                )
+            },
+        );
+        match result {
+            Ok(()) => Ok(true),
+            Err(egglog::Error::CheckError(..)) => {
+                self.measurements.borrow_mut().failure = None;
+                Ok(false)
+            }
+            Err(error) => {
+                self.measurements.borrow_mut().failure = Some((location, node.span));
+                Err(error)
+            }
+        }
+    }
+
+    fn completed(
+        &mut self,
+        _: &pb::Command,
+        path: &[usize],
+        _: &[u64],
+        report: &ControlReport,
+        count: u64,
+        stop: ControlStop,
+    ) -> Result<(), egglog::Error> {
+        if path.is_empty() {
+            let termination = match stop {
+                ControlStop::Count => pb::TerminationReason::CountReached,
+                ControlStop::Bound => pb::TerminationReason::IterationLimit,
+                ControlStop::Saturated => pb::TerminationReason::Saturated,
+                ControlStop::Until => pb::TerminationReason::UntilMatched,
+                ControlStop::SchedulerLimit => pb::TerminationReason::SchedulerLimit,
+            };
+            *self.outcome = Some(pb::LoopOutcome {
+                updated: report.report.updated,
+                iterations: count,
+                termination: Some(termination.into()),
+            });
+        }
+        Ok(())
     }
 }
 

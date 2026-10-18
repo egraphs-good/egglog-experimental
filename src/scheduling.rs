@@ -55,14 +55,149 @@ use std::{collections::HashMap, sync::Mutex};
 use egglog::{
     CommandOutput, UserDefinedCommand,
     ast::{Command, Expr, Fact, Literal, ParseError},
-    prelude::{Span, run_ruleset},
+    prelude::Span,
     scheduler::{Scheduler, SchedulerId},
     span,
 };
 use egglog_reports::RunReport;
 use lazy_static::lazy_static;
 
-type PermanentSchedulerState = HashMap<String, SchedulerId>;
+#[derive(Clone, Copy)]
+pub(crate) struct SchedulerBinding {
+    pub id: SchedulerId,
+    // Unknown native factories are conservative, not proof of saturation.
+    pub resource_limited: bool,
+}
+
+pub(crate) type PermanentSchedulerState = HashMap<String, SchedulerBinding>;
+pub(crate) use schedulers::BackOffScheduler;
+
+// Shallow views borrow each frontend's existing nodes. The fold, not either
+// producer, owns continuation, pre-check placement and error-safe lexical scope.
+pub(crate) enum Control<'a, N> {
+    Leaf,
+    Sequence(&'a [N]),
+    Repeat(&'a [N], u64),
+    Saturate(&'a [N], Option<u64>),
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum ControlStop {
+    Count,
+    Bound,
+    Saturated,
+    Until,
+    SchedulerLimit,
+}
+
+#[derive(Default)]
+pub(crate) struct ControlReport {
+    pub report: RunReport,
+    pub resource_limited: bool,
+}
+
+pub(crate) trait ControlContext {
+    type Node;
+    type Error;
+    type Scope;
+
+    fn view<'a>(&self, node: &'a Self::Node) -> Result<Control<'a, Self::Node>, Self::Error>;
+    fn enter_scope(&mut self) -> Self::Scope;
+    fn leave_scope(&mut self, scope: Self::Scope);
+    fn leaf(
+        &mut self,
+        node: &Self::Node,
+        path: &[usize],
+        iterations: &[u64],
+    ) -> Result<ControlReport, Self::Error>;
+    fn until(
+        &mut self,
+        node: &Self::Node,
+        path: &[usize],
+        iterations: &[u64],
+    ) -> Result<bool, Self::Error>;
+    fn completed(
+        &mut self,
+        node: &Self::Node,
+        path: &[usize],
+        iterations: &[u64],
+        report: &ControlReport,
+        count: u64,
+        stop: ControlStop,
+    ) -> Result<(), Self::Error>;
+}
+
+pub(crate) fn fold_control<C: ControlContext>(
+    context: &mut C,
+    node: &C::Node,
+    path: &mut Vec<usize>,
+    iterations: &mut Vec<u64>,
+) -> Result<ControlReport, C::Error> {
+    let (body, bound, exact) = match context.view(node)? {
+        Control::Leaf => return context.leaf(node, path, iterations),
+        Control::Sequence(body) => {
+            let scope = context.enter_scope();
+            let result = fold_list(context, body, path, iterations);
+            context.leave_scope(scope);
+            return result;
+        }
+        Control::Repeat(body, count) => (body, Some(count), true),
+        Control::Saturate(body, bound) => (body, bound, false),
+    };
+    let mut total = ControlReport::default();
+    let mut count = 0;
+    let stop = loop {
+        if bound == Some(count) {
+            break if exact {
+                ControlStop::Count
+            } else {
+                ControlStop::Bound
+            };
+        }
+        if context.until(node, path, iterations)? {
+            break ControlStop::Until;
+        }
+        let scope = context.enter_scope();
+        iterations.push(count);
+        let result = fold_list(context, body, path, iterations);
+        iterations.pop();
+        context.leave_scope(scope);
+        let next = result?;
+        // Historical union retains earlier cannot-stop flags. Only this complete
+        // iteration decides whether an early-stopping loop can finish now.
+        let can_stop = next.report.can_stop;
+        total.resource_limited |= next.resource_limited;
+        total.report.union(next.report);
+        count += 1;
+        if !exact && can_stop {
+            break if total.resource_limited {
+                ControlStop::SchedulerLimit
+            } else {
+                ControlStop::Saturated
+            };
+        }
+    };
+    context.completed(node, path, iterations, &total, count, stop)?;
+    Ok(total)
+}
+
+fn fold_list<C: ControlContext>(
+    context: &mut C,
+    body: &[C::Node],
+    path: &mut Vec<usize>,
+    iterations: &mut Vec<u64>,
+) -> Result<ControlReport, C::Error> {
+    let mut total = ControlReport::default();
+    for (index, child) in body.iter().enumerate() {
+        path.push(index);
+        let result = fold_control(context, child, path, iterations);
+        path.pop();
+        let next = result?;
+        total.resource_limited |= next.resource_limited;
+        total.report.union(next.report);
+    }
+    Ok(total)
+}
 
 /// The `run-schedule` user-defined command.
 ///
@@ -150,6 +285,20 @@ impl ScheduleState {
         egraph: &mut egglog::EGraph,
         arg: &Expr,
     ) -> Result<(Vec<CommandOutput>, RunReport), egglog::Error> {
+        let mut context = NativeSchedule {
+            state: self,
+            egraph,
+            outputs: vec![],
+        };
+        let report = fold_control(&mut context, arg, &mut vec![], &mut vec![])?;
+        Ok((context.outputs, report.report))
+    }
+
+    fn run_leaf(
+        &mut self,
+        egraph: &mut egglog::EGraph,
+        arg: &Expr,
+    ) -> Result<(Vec<CommandOutput>, RunReport), egglog::Error> {
         let err = || {
             Err(egglog::Error::ParseError(ParseError(
                 arg.span(),
@@ -158,28 +307,12 @@ impl ScheduleState {
         };
 
         if let Expr::Var(_, ruleset) = arg {
-            let output = run_ruleset(egraph, ruleset.as_str())?;
-            if let [CommandOutput::RunSchedule(report)] = output.as_slice() {
-                return Ok((vec![], report.clone()));
-            }
-            return Err(egglog::Error::ParseError(ParseError(
-                arg.span(),
-                format!("Expected ruleset {ruleset} to produce one RunSchedule output"),
-            )));
+            return Ok((vec![], observed_run(egraph, arg.span(), ruleset, None)?));
         }
 
         let Expr::Call(span, head, exprs) = arg else {
             return err();
         };
-
-        macro_rules! new_scope {
-            ($f:expr) => {{
-                let curr_scope = self.schedulers.len();
-                let res: Result<(Vec<CommandOutput>, RunReport), egglog::Error> = $f();
-                self.schedulers.truncate(curr_scope);
-                res
-            }};
-        }
 
         match head.as_str() {
             "let-scheduler" => match exprs.as_slice() {
@@ -216,7 +349,7 @@ impl ScheduleState {
                             .or_else(|| {
                                 egraph
                                     .extension_state::<PermanentSchedulerState>()
-                                    .and_then(|state| state.get(scheduler_name).copied())
+                                    .and_then(|state| state.get(scheduler_name).map(|b| b.id))
                             })
                             .ok_or_else(|| {
                                 egglog::Error::ParseError(ParseError(
@@ -250,78 +383,20 @@ impl ScheduleState {
 
                 if let Some(until) = until {
                     let span = until.span();
-                    if egraph
-                        .run_program(vec![Command::Check(span, vec![Fact::Fact(until)])])
-                        .is_ok()
-                    {
-                        return Ok((vec![], RunReport::default()));
+                    match egraph.check_condition_observed(
+                        span,
+                        vec![Fact::Fact(until)],
+                        &mut |_| (),
+                    ) {
+                        Ok(()) => return Ok((vec![], RunReport::default())),
+                        Err(egglog::Error::CheckError(..)) => (),
+                        Err(error) => return Err(error),
                     }
                 }
 
-                let report = if let Some(scheduler) = scheduler {
-                    egraph.step_rules_with_scheduler(scheduler, ruleset)?
-                } else {
-                    egraph.step_rules(ruleset)?
-                };
+                let report = observed_run(egraph, span.clone(), ruleset, scheduler)?;
                 Ok((vec![], report))
             }
-            "saturate" => {
-                let mut all_outputs: Vec<CommandOutput> = vec![];
-                let mut report = RunReport::default();
-                loop {
-                    let (iter_outputs, iter_report) = new_scope!(|| {
-                        let mut iter_outputs: Vec<CommandOutput> = vec![];
-                        let mut iter_report = RunReport::default();
-                        for expr in exprs {
-                            let (step_outputs, step_report) = self.run(egraph, expr)?;
-                            iter_outputs.extend(step_outputs);
-                            iter_report.union(step_report);
-                        }
-                        Ok((iter_outputs, iter_report))
-                    })?;
-                    let should_stop = iter_report.can_stop;
-                    all_outputs.extend(iter_outputs);
-                    report.union(iter_report);
-                    if should_stop {
-                        break;
-                    }
-                }
-                Ok((all_outputs, report))
-            }
-            "seq" => {
-                new_scope!(|| {
-                    let mut all_outputs: Vec<CommandOutput> = vec![];
-                    let mut report = RunReport::default();
-                    for expr in exprs {
-                        let (step_outputs, step_report) = self.run(egraph, expr)?;
-                        all_outputs.extend(step_outputs);
-                        report.union(step_report);
-                    }
-                    Ok((all_outputs, report))
-                })
-            }
-            "repeat" => match exprs.as_slice() {
-                [Expr::Lit(_span, Literal::Int(n)), rest @ ..] => {
-                    let mut all_outputs: Vec<CommandOutput> = vec![];
-                    let mut report = RunReport::default();
-                    for _ in 0..*n {
-                        let (iter_outputs, iter_report) = new_scope!(|| {
-                            let mut iter_outputs: Vec<CommandOutput> = vec![];
-                            let mut iter_report = RunReport::default();
-                            for expr in rest {
-                                let (step_outputs, step_report) = self.run(egraph, expr)?;
-                                iter_outputs.extend(step_outputs);
-                                iter_report.union(step_report);
-                            }
-                            Ok((iter_outputs, iter_report))
-                        })?;
-                        all_outputs.extend(iter_outputs);
-                        report.union(iter_report);
-                    }
-                    Ok((all_outputs, report))
-                }
-                _ => err(),
-            },
             // (eval <expr> ...): evaluate each expression and add the resulting
             // terms to the e-graph — the schedule-step analogue of a top-level
             // expression such as `(Add (Num 1) (Num 2))`. Evaluation happens in
@@ -368,22 +443,130 @@ impl ScheduleState {
     }
 }
 
+struct NativeSchedule<'a> {
+    state: &'a mut ScheduleState,
+    egraph: &'a mut egglog::EGraph,
+    outputs: Vec<CommandOutput>,
+}
+
+impl ControlContext for NativeSchedule<'_> {
+    type Node = Expr;
+    type Error = egglog::Error;
+    type Scope = usize;
+
+    fn view<'a>(&self, node: &'a Expr) -> Result<Control<'a, Expr>, egglog::Error> {
+        Ok(match node {
+            Expr::Call(_, name, body) if name == "seq" => Control::Sequence(body),
+            Expr::Call(_, name, body) if name == "saturate" => Control::Saturate(body, None),
+            Expr::Call(_, name, body) if name == "repeat" => match body.as_slice() {
+                [Expr::Lit(_, Literal::Int(count)), body @ ..] => {
+                    Control::Repeat(body, (*count).max(0) as u64)
+                }
+                _ => {
+                    return Err(egglog::Error::ParseError(ParseError(
+                        node.span(),
+                        "Invalid schedule".into(),
+                    )));
+                }
+            },
+            _ => Control::Leaf,
+        })
+    }
+
+    fn enter_scope(&mut self) -> usize {
+        self.state.schedulers.len()
+    }
+    fn leave_scope(&mut self, mark: usize) {
+        self.state.schedulers.truncate(mark);
+    }
+
+    fn leaf(
+        &mut self,
+        node: &Expr,
+        _: &[usize],
+        _: &[u64],
+    ) -> Result<ControlReport, egglog::Error> {
+        let (outputs, report) = self.state.run_leaf(self.egraph, node)?;
+        self.outputs.extend(outputs);
+        Ok(ControlReport {
+            report,
+            resource_limited: false,
+        })
+    }
+
+    fn until(&mut self, _: &Expr, _: &[usize], _: &[u64]) -> Result<bool, egglog::Error> {
+        Ok(false)
+    }
+    fn completed(
+        &mut self,
+        _: &Expr,
+        _: &[usize],
+        _: &[u64],
+        _: &ControlReport,
+        _: u64,
+        _: ControlStop,
+    ) -> Result<(), egglog::Error> {
+        Ok(())
+    }
+}
+
+// Both schedule frontends enter the same native observed Run boundary. Policies
+// are call-local; scheduler instances and residual matches remain on the graph.
+fn observed_run(
+    egraph: &mut egglog::EGraph,
+    span: Span,
+    ruleset: &str,
+    scheduler: Option<SchedulerId>,
+) -> Result<RunReport, egglog::Error> {
+    let mut report = None;
+    egraph.run_program_embedded_observed(
+        vec![Command::RunSchedule(egglog::ast::Schedule::Run(
+            span,
+            egglog::ast::RunConfig {
+                ruleset: ruleset.into(),
+                until: None,
+            },
+        ))],
+        &mut |_, origin, output| {
+            if origin == egglog::ExecutionOrigin::Requested
+                && let CommandOutput::RunSchedule(next) = output
+            {
+                report = Some(next);
+            }
+        },
+        &mut |_, _| (),
+        &|_, _| scheduler,
+    )?;
+    Ok(report.expect("successful native Run emits a report"))
+}
+
 impl UserDefinedCommand for RunExtendedSchedule {
     fn update(
         &self,
         egraph: &mut egglog::EGraph,
         args: &[Expr],
     ) -> Result<Vec<CommandOutput>, egglog::Error> {
-        let mut schedule = ScheduleState::new();
-        let mut report = RunReport::default();
-        let mut outputs: Vec<CommandOutput> = Vec::new();
-        for arg in args {
-            let (step_outputs, step_report) = schedule.run(egraph, arg)?;
-            outputs.extend(step_outputs);
-            report.union(step_report);
-        }
-        outputs.push(CommandOutput::RunSchedule(report));
-        Ok(outputs)
+        let mut context = (ScheduleState::new(), Vec::new());
+        egraph.with_schedule_envelope(
+            &[],
+            &mut context,
+            |graph, (schedule, outputs)| {
+                let mut report = RunReport::default();
+                for arg in args {
+                    let (step_outputs, step_report) = schedule.run(graph, arg)?;
+                    outputs.extend(step_outputs);
+                    report.union(step_report);
+                }
+                Ok(report)
+            },
+            |(_, outputs), report| {
+                outputs.push(CommandOutput::RunSchedule(
+                    report.expect("unwrapped schedule completed").clone(),
+                ))
+            },
+            |_, _| (),
+        )?;
+        Ok(context.1)
     }
 }
 
@@ -414,7 +597,13 @@ impl UserDefinedCommand for LetSchedulerCommand {
                 let id = egraph.add_scheduler(scheduler);
                 egraph
                     .extension_state_or_default::<PermanentSchedulerState>()
-                    .insert(name.clone(), id);
+                    .insert(
+                        name.clone(),
+                        SchedulerBinding {
+                            id,
+                            resource_limited: true,
+                        },
+                    );
                 Ok(vec![])
             }
             invalid => Err(egglog::Error::ParseError(ParseError(
@@ -513,15 +702,14 @@ mod schedulers {
                 format!("Unknown back-off scheduler tag {tag}"),
             )));
         }
-        let default_match_limit = parse_usize_tag(&tags, ":match-limit", span)?.unwrap_or(1000);
-        let default_ban_length = parse_usize_tag(&tags, ":ban-length", span)?.unwrap_or(5);
+        let default_match_limit = parse_usize_tag(&tags, ":match-limit", span)?;
+        let default_ban_length = parse_usize_tag(&tags, ":ban-length", span)?;
         let node_limit = parse_usize_tag(&tags, ":node-limit", span)?;
-        Ok(Box::new(BackOffScheduler {
+        Ok(Box::new(BackOffScheduler::new(
             default_match_limit,
             default_ban_length,
             node_limit,
-            stats: HashMap::new(),
-        }))
+        )))
     }
 
     #[derive(Debug, Clone)]
@@ -547,6 +735,19 @@ mod schedulers {
     }
 
     impl BackOffScheduler {
+        pub(crate) fn new(
+            match_limit: Option<usize>,
+            ban_length: Option<usize>,
+            node_limit: Option<usize>,
+        ) -> Self {
+            Self {
+                default_match_limit: match_limit.unwrap_or(1000),
+                default_ban_length: ban_length.unwrap_or(5),
+                node_limit,
+                stats: HashMap::new(),
+            }
+        }
+
         fn get_stats(&mut self, rule: String) -> &mut RuleStats {
             self.stats.entry(rule).or_insert_with(|| RuleStats {
                 times_applied: 0,

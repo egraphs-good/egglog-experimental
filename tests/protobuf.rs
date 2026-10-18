@@ -245,6 +245,655 @@ mod relation_predicates {
     }
 
     #[test]
+    fn scheduler_deferred_work_matches_native_and_profiles_one_site_in_every_mode() {
+        for mode in [
+            pb::ExecutionMode::Normal,
+            pb::ExecutionMode::TermEncoding,
+            pb::ExecutionMode::Proofs,
+            pb::ExecutionMode::ProofTesting,
+        ] {
+            let mut native = match mode {
+                pb::ExecutionMode::Normal => new_experimental_egraph(),
+                pb::ExecutionMode::TermEncoding => {
+                    new_experimental_egraph().with_term_encoding_enabled()
+                }
+                pb::ExecutionMode::Proofs => new_experimental_egraph().with_proofs_enabled(),
+                _ => new_experimental_egraph()
+                    .with_proofs_enabled()
+                    .with_proof_testing(),
+            };
+            native.parse_and_run_program(None, "(relation R (i64)) (relation S (i64)) (ruleset copy) (rule ((R x)) ((S x)) :ruleset copy) (R 1) (R 2)").unwrap();
+            // Core deliberately rejects generic textual extension commands in
+            // encoded modes. Compare the actual existing extension API instead;
+            // its leaf still enters Core's observed compiler/interpreter.
+            let bind = native
+                .parse_program(
+                    None,
+                    "(let-scheduler bo (back-off :match-limit 1 :ban-length 1))",
+                )
+                .unwrap();
+            let [egglog::ast::Command::UserDefined(_, _, args)] = bind.as_slice() else {
+                panic!("{bind:?}")
+            };
+            egglog::UserDefinedCommand::update(
+                &egglog_experimental::scheduling::LetSchedulerCommand,
+                &mut native,
+                args,
+            )
+            .unwrap();
+            let schedule = native
+                .parse_program(None, "(run-schedule (run-with bo copy))")
+                .unwrap();
+            let [egglog::ast::Command::UserDefined(_, _, args)] = schedule.as_slice() else {
+                panic!("{schedule:?}")
+            };
+            let mut native_steps = vec![];
+            loop {
+                let outputs = egglog::UserDefinedCommand::update(
+                    &egglog_experimental::scheduling::RunExtendedSchedule,
+                    &mut native,
+                    args,
+                )
+                .unwrap();
+                let [egglog::CommandOutput::RunSchedule(report)] = outputs.as_slice() else {
+                    panic!("{outputs:?}")
+                };
+                native_steps.push(report.clone());
+                if report.can_stop {
+                    break;
+                }
+                assert!(native_steps.len() < 10);
+            }
+            assert!(!native_steps[0].updated && !native_steps[0].can_stop);
+            native
+                .parse_and_run_program(None, "(check (S 1) (S 2))")
+                .unwrap();
+
+            let mut engine = Engine::default();
+            let bytes = engine
+                .create(
+                    &pb::CreateEGraphRequest {
+                        sorts: fixture(false).sorts[..1].to_vec(),
+                        options: Some(pb::EGraphOptions {
+                            cost_sort: Some(0),
+                            execution_mode: mode.into(),
+                        }),
+                        ..Default::default()
+                    }
+                    .encode_to_vec(),
+                )
+                .unwrap();
+            let id = pb::CreateEGraphResponse::decode(bytes.as_slice())
+                .unwrap()
+                .egraph_id;
+            let mut program = scheduler_program();
+            assert_eq!(run(&mut engine, id, program.clone()).error, None);
+            program.commands = vec![pb::Command {
+                kind: Some(pb::command::Kind::BindScheduler(pb::BindScheduler {
+                    name: "bo".into(),
+                    scheduler: Some(pb::Scheduler {
+                        kind: Some(pb::scheduler::Kind::BackOff(pb::BackOff {
+                            match_limit: Some(1),
+                            ban_length: Some(1),
+                            node_limit: None,
+                        })),
+                    }),
+                })),
+                ..Default::default()
+            }];
+            let bound = run(&mut engine, id, program.clone());
+            assert_eq!(bound.error, None);
+            assert!(bound.outputs.is_empty());
+            program.commands = vec![pb::Command {
+                kind: Some(pb::command::Kind::Saturate(pb::Saturate {
+                    body: vec![pb::Command {
+                        kind: Some(pb::command::Kind::Run(pb::Run {
+                            ruleset: Some(pb::RulesetRef {
+                                kind: Some(pb::ruleset_ref::Kind::Name("wire_predicates".into())),
+                            }),
+                            scheduler: "bo".into(),
+                        })),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                })),
+                ..Default::default()
+            }];
+            let bytes = engine
+                .run(
+                    &pb::RunProgramRequest {
+                        egraph_id: id,
+                        program: Some(program.clone()),
+                        profile: true,
+                        include_run_reports: true,
+                    }
+                    .encode_to_vec(),
+                )
+                .unwrap();
+            let response = pb::RunProgramResponse::decode(bytes.as_slice()).unwrap();
+            assert_eq!(response.error, None, "{mode:?}");
+            let [output] = response.outputs.as_slice() else {
+                panic!("{response:?}")
+            };
+            let Some(pb::command_output::Kind::Loop(outcome)) = &output.kind else {
+                panic!("{output:?}")
+            };
+            assert!(outcome.updated);
+            assert_eq!(outcome.iterations, native_steps.len() as u64, "{mode:?}");
+            assert_eq!(
+                outcome.termination,
+                Some(pb::TerminationReason::Saturated.into())
+            );
+            assert!(output.run_report.is_some());
+            let profile = response.profile.unwrap();
+            assert!(profile.complete);
+            assert_eq!(profile.runs.len(), 1);
+            assert_eq!(profile.runs[0].command_path, [0, 0]);
+            assert_eq!(profile.runs[0].invocations, native_steps.len() as u64);
+            if mode == pb::ExecutionMode::Normal {
+                assert_eq!(
+                    profile.runs[0]
+                        .rules
+                        .iter()
+                        .map(|r| r.matches.unwrap())
+                        .sum::<u64>(),
+                    2
+                );
+            } else {
+                assert!(
+                    profile.runs[0].search_and_apply_nanos.is_some(),
+                    "actual exclusive native leaf timing is available"
+                );
+                assert!(
+                    profile.runs[0].rules.is_empty(),
+                    "encoded physical rules are not falsely attributed as authored rules"
+                );
+                assert!(
+                    !profile.maintenance.is_empty(),
+                    "actual encoding helper work remains separate"
+                );
+            }
+            program.commands = vec![pb::Command {
+                kind: Some(pb::command::Kind::Check(pb::Check {
+                    facts: vec![13, 14],
+                })),
+                ..Default::default()
+            }];
+            assert_eq!(run(&mut engine, id, program).error, None);
+        }
+    }
+
+    // Reuse the canonical relation oracle; two ground rows make deferred work
+    // distinguishable from a stable empty ruleset or a single selected match.
+    fn scheduler_program() -> pb::Program {
+        let mut program = fixture(false);
+        program.declarations.retain(|declaration| !matches!(&declaration.kind, Some(pb::declaration::Kind::Function(function)) if function.name == "relation_unit_value"));
+        for argument in [0, 1] {
+            program.nodes.push(pb::Node {
+                sort_id: 1,
+                kind: Some(pb::node::Kind::Call(pb::Call {
+                    func: "S".into(),
+                    args: vec![argument],
+                })),
+                ..Default::default()
+            });
+            program.commands.push(pb::Command {
+                kind: Some(pb::command::Kind::Action(pb::Action {
+                    kind: Some(pb::action::Kind::Term(argument + 2)),
+                    ..Default::default()
+                })),
+                ..Default::default()
+            });
+        }
+        program
+    }
+
+    #[test]
+    fn scheduler_until_is_an_internal_ordinary_query_in_every_mode() {
+        for mode in [
+            pb::ExecutionMode::Normal,
+            pb::ExecutionMode::TermEncoding,
+            pb::ExecutionMode::Proofs,
+            pb::ExecutionMode::ProofTesting,
+        ] {
+            for saturate in [false, true] {
+                let mut engine = Engine::default();
+                let created = engine
+                    .create(
+                        &pb::CreateEGraphRequest {
+                            sorts: fixture(false).sorts[..1].to_vec(),
+                            options: Some(pb::EGraphOptions {
+                                cost_sort: Some(0),
+                                execution_mode: mode.into(),
+                            }),
+                            ..Default::default()
+                        }
+                        .encode_to_vec(),
+                    )
+                    .unwrap();
+                let id = pb::CreateEGraphResponse::decode(created.as_slice())
+                    .unwrap()
+                    .egraph_id;
+                let mut program = scheduler_program();
+                assert_eq!(run(&mut engine, id, program.clone()).error, None);
+                for (until, completed) in [(vec![2, 3], 0), (vec![13, 14], 1)] {
+                    let body = vec![pb::Command {
+                        kind: Some(pb::command::Kind::Run(pb::Run {
+                            ruleset: Some(pb::RulesetRef {
+                                kind: Some(pb::ruleset_ref::Kind::Index(0)),
+                            }),
+                            ..Default::default()
+                        })),
+                        ..Default::default()
+                    }];
+                    program.commands = vec![pb::Command {
+                        kind: Some(if saturate {
+                            pb::command::Kind::Saturate(pb::Saturate {
+                                body,
+                                until,
+                                max_iterations: Some(5),
+                            })
+                        } else {
+                            pb::command::Kind::Repeat(pb::Repeat {
+                                body,
+                                until,
+                                times: Some(5),
+                            })
+                        }),
+                        ..Default::default()
+                    }];
+                    let response = run(&mut engine, id, program.clone());
+                    assert_eq!(response.error, None, "mode {mode:?}, Saturate {saturate}");
+                    let [output] = response.outputs.as_slice() else {
+                        panic!("until must not leak a proof: {response:?}")
+                    };
+                    let Some(pb::command_output::Kind::Loop(outcome)) = &output.kind else {
+                        panic!("{output:?}")
+                    };
+                    assert_eq!(outcome.iterations, completed);
+                    assert_eq!(
+                        outcome.termination,
+                        Some(pb::TerminationReason::UntilMatched.into())
+                    );
+                    let profile = response.profile.unwrap();
+                    assert_eq!(
+                        profile.runs.iter().map(|run| run.invocations).sum::<u64>(),
+                        completed
+                    );
+                    assert!(
+                        !profile.maintenance.is_empty(),
+                        "real condition queries remain observed"
+                    );
+                }
+            }
+        }
+        // This query is well typed but cannot plan forward addition without x.
+        // A planner error is not an ordinary query miss, even in a loop.
+        use egglog_experimental::protobuf::source::Source;
+        let mut engine = Engine::default();
+        let id = create(&mut engine);
+        let mut query = Source::new_core(None, "(check (= (+ x 1) 2))")
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap();
+        let Some(pb::command::Kind::Check(check)) = query.commands.pop().unwrap().kind else {
+            unreachable!()
+        };
+        query.commands = vec![pb::Command {
+            kind: Some(pb::command::Kind::Repeat(pb::Repeat {
+                times: Some(2),
+                until: check.facts,
+                body: vec![],
+            })),
+            ..Default::default()
+        }];
+        let response = run(&mut engine, id, query);
+        let error = response.error.expect("planning failure must propagate");
+        assert_ne!(error.code, pb::ErrorCode::CheckFailed as i32);
+        assert_eq!(error.location.unwrap().path, [0]);
+        assert!(response.outputs.is_empty());
+        assert!(response.profile.unwrap().runs.is_empty());
+    }
+
+    #[test]
+    fn scheduler_bounds_resource_policy_and_zero_options_are_not_saturation() {
+        for (limit, ban, count, expected) in [
+            (None, 1, Some(1), pb::TerminationReason::IterationLimit),
+            (Some(0), 0, None, pb::TerminationReason::SchedulerLimit),
+            (None, 0, None, pb::TerminationReason::SchedulerLimit),
+        ] {
+            let mut engine = Engine::default();
+            let id = create(&mut engine);
+            let mut program = scheduler_program();
+            program.commands.extend([
+                pb::Command {
+                    kind: Some(pb::command::Kind::BindScheduler(pb::BindScheduler {
+                        name: "b".into(),
+                        scheduler: Some(pb::Scheduler {
+                            kind: Some(pb::scheduler::Kind::BackOff(pb::BackOff {
+                                match_limit: Some(0),
+                                ban_length: Some(ban),
+                                node_limit: limit,
+                            })),
+                        }),
+                    })),
+                    ..Default::default()
+                },
+                pb::Command {
+                    kind: Some(pb::command::Kind::Saturate(pb::Saturate {
+                        max_iterations: count,
+                        body: vec![pb::Command {
+                            kind: Some(pb::command::Kind::Run(pb::Run {
+                                ruleset: Some(pb::RulesetRef {
+                                    kind: Some(pb::ruleset_ref::Kind::Index(0)),
+                                }),
+                                scheduler: "b".into(),
+                            })),
+                            ..Default::default()
+                        }],
+                        ..Default::default()
+                    })),
+                    ..Default::default()
+                },
+            ]);
+            let response = run(&mut engine, id, program);
+            assert_eq!(response.error, None);
+            let Some(pb::command_output::Kind::Loop(outcome)) = &response.outputs[0].kind else {
+                panic!("{response:?}")
+            };
+            assert_eq!(outcome.iterations, 1);
+            assert!(!outcome.updated);
+            assert_eq!(outcome.termination, Some(expected.into()));
+        }
+    }
+
+    #[test]
+    fn scheduler_iteration_bindings_expire_and_rejections_are_inert() {
+        let mut engine = Engine::default();
+        let id = create(&mut engine);
+        let mut program = scheduler_program();
+        let bind = pb::Command {
+            kind: Some(pb::command::Kind::BindScheduler(pb::BindScheduler {
+                name: "local".into(),
+                scheduler: Some(pb::Scheduler {
+                    kind: Some(pb::scheduler::Kind::BackOff(pb::BackOff {
+                        match_limit: Some(1),
+                        ban_length: Some(1),
+                        node_limit: None,
+                    })),
+                }),
+            })),
+            ..Default::default()
+        };
+        let step = pb::Command {
+            kind: Some(pb::command::Kind::Run(pb::Run {
+                ruleset: Some(pb::RulesetRef {
+                    kind: Some(pb::ruleset_ref::Kind::Index(0)),
+                }),
+                scheduler: "local".into(),
+            })),
+            ..Default::default()
+        };
+        program.commands.push(pb::Command {
+            kind: Some(pb::command::Kind::Repeat(pb::Repeat {
+                times: Some(3),
+                body: vec![bind.clone(), step.clone()],
+                ..Default::default()
+            })),
+            ..Default::default()
+        });
+        let response = run(&mut engine, id, program.clone());
+        assert_eq!(response.error, None);
+        let Some(pb::command_output::Kind::Loop(outcome)) = &response.outputs[0].kind else {
+            panic!("{response:?}")
+        };
+        assert_eq!(
+            (outcome.iterations, outcome.updated, outcome.termination),
+            (3, false, Some(pb::TerminationReason::CountReached.into()))
+        );
+        assert_eq!(response.profile.unwrap().runs[0].invocations, 3);
+        program.commands = vec![step];
+        assert_eq!(
+            run(&mut engine, id, program.clone()).error.unwrap().code,
+            pb::ErrorCode::UnknownName as i32
+        );
+        program.commands = vec![bind.clone(), bind.clone()];
+        let rejected = run(&mut engine, id, program.clone());
+        assert!(rejected.error.is_some());
+        assert!(rejected.outputs.is_empty());
+        program.commands = vec![bind.clone()];
+        assert_eq!(
+            run(&mut engine, id, program.clone()).error,
+            None,
+            "rejected prefix must not bind"
+        );
+        assert!(
+            run(&mut engine, id, program.clone()).error.is_some(),
+            "top-level binding persists"
+        );
+
+        // Bind a different local before a real failing Check. Cleanup must also
+        // run on error; a later top-level binding is still available.
+        let Some(pb::command::Kind::BindScheduler(binding)) = &mut program.commands[0].kind else {
+            unreachable!()
+        };
+        binding.name = "after_error".into();
+        let local = program.commands[0].clone();
+        program.commands = vec![pb::Command {
+            kind: Some(pb::command::Kind::Repeat(pb::Repeat {
+                times: Some(2),
+                body: vec![
+                    local.clone(),
+                    pb::Command {
+                        kind: Some(pb::command::Kind::Check(pb::Check { facts: vec![13] })),
+                        ..Default::default()
+                    },
+                ],
+                ..Default::default()
+            })),
+            ..Default::default()
+        }];
+        let failed = run(&mut engine, id, program.clone());
+        assert_eq!(
+            failed.error.unwrap().location.unwrap(),
+            pb::CommandLocation {
+                path: vec![0, 1],
+                iterations: vec![0]
+            }
+        );
+        program.commands = vec![local];
+        assert_eq!(run(&mut engine, id, program).error, None);
+    }
+
+    #[test]
+    fn scheduler_until_prechecks_conjunction_and_dead_validation() {
+        for (times, until, expected_count, reason) in [
+            (0, vec![13, 14], 0, pb::TerminationReason::CountReached),
+            (5, vec![2, 3], 0, pb::TerminationReason::UntilMatched),
+            (5, vec![13, 14], 1, pb::TerminationReason::UntilMatched),
+        ] {
+            let mut engine = Engine::default();
+            let id = create(&mut engine);
+            let mut program = scheduler_program();
+            program.commands.push(pb::Command {
+                kind: Some(pb::command::Kind::Repeat(pb::Repeat {
+                    times: Some(times),
+                    until,
+                    body: vec![pb::Command {
+                        kind: Some(pb::command::Kind::Run(pb::Run {
+                            ruleset: Some(pb::RulesetRef {
+                                kind: Some(pb::ruleset_ref::Kind::Index(0)),
+                            }),
+                            ..Default::default()
+                        })),
+                        ..Default::default()
+                    }],
+                })),
+                ..Default::default()
+            });
+            let response = run(&mut engine, id, program.clone());
+            assert_eq!(response.error, None, "{response:?}");
+            let Some(pb::command_output::Kind::Loop(outcome)) = &response.outputs[0].kind else {
+                panic!("{response:?}")
+            };
+            assert_eq!(outcome.iterations, expected_count);
+            assert_eq!(outcome.termination, Some(reason.into()));
+            assert_eq!(
+                response
+                    .profile
+                    .unwrap()
+                    .runs
+                    .iter()
+                    .map(|run| run.invocations)
+                    .sum::<u64>(),
+                expected_count
+            );
+            // Invalid descendants and until queries remain inert under Repeat0.
+            program.commands = vec![pb::Command {
+                kind: Some(pb::command::Kind::Repeat(pb::Repeat {
+                    times: Some(0),
+                    until: vec![999],
+                    body: vec![],
+                })),
+                ..Default::default()
+            }];
+            let rejected = run(&mut engine, id, program);
+            assert!(rejected.error.unwrap().location.is_none());
+            assert!(rejected.outputs.is_empty());
+        }
+    }
+
+    #[test]
+    fn scheduler_ordered_outputs_failure_prefix_and_unknown_progress_admission() {
+        let mut engine = Engine::default();
+        let id = create(&mut engine);
+        let mut program = scheduler_program();
+        let size = pb::Command {
+            kind: Some(pb::command::Kind::PrintSize(pb::PrintSize {
+                tables: vec!["S".into()],
+            })),
+            ..Default::default()
+        };
+        let step = pb::Command {
+            kind: Some(pb::command::Kind::Run(pb::Run {
+                ruleset: Some(pb::RulesetRef {
+                    kind: Some(pb::ruleset_ref::Kind::Index(0)),
+                }),
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+        program.commands.push(pb::Command {
+            kind: Some(pb::command::Kind::Repeat(pb::Repeat {
+                times: Some(2),
+                body: vec![size.clone(), step.clone()],
+                ..Default::default()
+            })),
+            ..Default::default()
+        });
+        let response = run(&mut engine, id, program.clone());
+        assert_eq!(response.error, None);
+        assert_eq!(response.outputs.len(), 3);
+        for (index, rows) in [0, 2].into_iter().enumerate() {
+            let output = &response.outputs[index];
+            assert_eq!(
+                output.location,
+                Some(pb::CommandLocation {
+                    path: vec![3, 0],
+                    iterations: vec![index as u64]
+                })
+            );
+            assert!(
+                matches!(&output.kind, Some(pb::command_output::Kind::Sizes(sizes)) if sizes.sizes[0].rows == rows)
+            );
+        }
+        assert_eq!(response.profile.unwrap().runs[0].invocations, 2);
+        // Even a dead body cannot infer progress from a default report for an
+        // action; the earlier valid marker write must remain unexecuted.
+        let action = program.commands[0].clone();
+        program.commands = vec![pb::Command {
+            kind: Some(pb::command::Kind::Repeat(pb::Repeat {
+                times: Some(0),
+                body: vec![action],
+                ..Default::default()
+            })),
+            ..Default::default()
+        }];
+        let rejected = run(&mut engine, id, program.clone());
+        assert!(
+            rejected
+                .error
+                .unwrap()
+                .message
+                .contains("mutation-progress")
+        );
+        assert!(rejected.outputs.is_empty());
+
+        program.files = vec![pb::SourceFile {
+            name: "loop.egg".into(),
+            contents: Some("é failing check".into()),
+        }];
+        let span = pb::Span {
+            file: 0,
+            start: 3,
+            end: 16,
+        };
+        // S(3) is absent, unlike the already-present S(1)/S(2).
+        let missing_key = program.nodes.len() as u32;
+        program.nodes.push(pb::Node {
+            sort_id: 0,
+            kind: Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
+                value: Some(pb::primitive_value::Value::I64(3)),
+            })),
+            ..Default::default()
+        });
+        let missing = program.nodes.len() as u32;
+        program.nodes.push(pb::Node {
+            sort_id: 1,
+            kind: Some(pb::node::Kind::Call(pb::Call {
+                func: "S".into(),
+                args: vec![missing_key],
+            })),
+            ..Default::default()
+        });
+        program.commands = vec![pb::Command {
+            kind: Some(pb::command::Kind::Repeat(pb::Repeat {
+                times: Some(2),
+                body: vec![
+                    size,
+                    step,
+                    pb::Command {
+                        kind: Some(pb::command::Kind::Check(pb::Check {
+                            facts: vec![missing],
+                        })),
+                        span: Some(span),
+                    },
+                ],
+                ..Default::default()
+            })),
+            ..Default::default()
+        }];
+        let failed = run(&mut engine, id, program);
+        assert_eq!(
+            failed.outputs.len(),
+            1,
+            "completed output survives failing loop"
+        );
+        assert!(!failed.profile.unwrap().complete);
+        let error = failed.error.unwrap();
+        assert_eq!(error.code, pb::ErrorCode::CheckFailed as i32);
+        assert_eq!(error.span, Some(span));
+        assert_eq!(
+            error.location,
+            Some(pb::CommandLocation {
+                path: vec![0, 2],
+                iterations: vec![0]
+            })
+        );
+    }
+
+    #[test]
     fn canonical_relation_rows_execute_query_head_delete_and_relocated_resupply() {
         let mut engine = Engine::default();
         let id = create(&mut engine);
