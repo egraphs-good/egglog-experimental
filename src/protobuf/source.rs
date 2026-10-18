@@ -507,6 +507,40 @@ impl Source {
         expanded: Vec<Command>,
         explicit_sort_alias: Option<String>,
     ) -> Result<pb::Program, String> {
+        // These single-command phases need real empty table backends for later
+        // literal function captures. Fail also retains a global Let's header.
+        // Compile before recording headers; preserving-globals export below
+        // still supplies all wire metadata.
+        let compiler = match expanded.as_slice() {
+            [command] => {
+                let mut header = command;
+                while let Command::Fail(_, child) = header {
+                    header = child;
+                }
+                if matches!(
+                    header,
+                    Command::Datatype { .. }
+                        | Command::Datatypes { .. }
+                        | Command::Relation { .. }
+                        | Command::Constructor { .. }
+                        | Command::Function { .. }
+                        | Command::Action(Action::Let(..))
+                ) {
+                    let mut graph = self.graph.clone();
+                    // Source already expanded this command. Suppress a second
+                    // provider transform only in the disposable compiler context.
+                    let macros = std::mem::take(graph.command_macros_mut());
+                    let mut compiler = graph
+                        .validate_program(vec![command.clone()])
+                        .map_err(|error| error.to_string())?;
+                    *compiler.command_macros_mut() = macros;
+                    Some(compiler)
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        };
         let mut publish = vec![];
         for mut command in expanded {
             let mut fail_spans = vec![];
@@ -1114,7 +1148,25 @@ impl Source {
                 self.program.commands.push(command);
             }
         }
-        self.phase(publish)
+        let program = self.phase(publish)?;
+        if let Some(mut compiler) = compiler {
+            // Export updates only these producer-owned name/role records.
+            // Keep them with the compiled context, never with a live Engine.
+            *compiler.extension_state_or_default::<SourceTableNames>() = self
+                .graph
+                .extension_state::<SourceTableNames>()
+                .cloned()
+                .unwrap_or_default();
+            if let Some(roles) = self
+                .graph
+                .extension_state::<crate::set_cost::SourceCostRoles>()
+            {
+                *compiler.extension_state_or_default::<crate::set_cost::SourceCostRoles>() =
+                    roles.clone();
+            }
+            self.graph = compiler;
+        }
+        Ok(program)
     }
 
     // One phase owns exactly its completed command prefix and new definitions;

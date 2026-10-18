@@ -581,13 +581,10 @@ mod source_reflection {
                 None
             );
         }
+        let error = source.next().unwrap().unwrap_err().to_string();
         assert!(
-            source
-                .next()
-                .unwrap()
-                .unwrap_err()
-                .to_string()
-                .contains("distinct source tables share logical name")
+            error.contains("Table selector C is already bound"),
+            "{error}"
         );
         let check = Source::new(None, r#"(check (= (get-size! "C") 1))"#)
             .unwrap()
@@ -736,7 +733,7 @@ mod source_fresh_macro {
     #[derive(Default)]
     struct Provider {
         evaluations: Arc<AtomicUsize>,
-        macro_probe: Option<Arc<MacroProbe>>,
+        macro_probe: Option<Arc<dyn egglog::CommandMacro>>,
     }
 
     impl NativeExtension for Provider {
@@ -805,6 +802,51 @@ mod source_fresh_macro {
                 return Ok(vec![prefix, command]);
             }
             Ok(vec![command])
+        }
+    }
+
+    #[test]
+    fn declaration_compile_context_does_not_reapply_provider_macros() {
+        struct Rename(Arc<AtomicUsize>);
+        impl egglog::CommandMacro for Rename {
+            fn transform(
+                &self,
+                mut command: egglog::ast::Command,
+                _: &mut egglog::util::SymbolGen,
+                _: &egglog::TypeInfo,
+            ) -> Result<Vec<egglog::ast::Command>, egglog::Error> {
+                if let egglog::ast::Command::Constructor { name, .. } = &mut command {
+                    self.0.fetch_add(1, Ordering::SeqCst);
+                    name.push_str("_m");
+                }
+                Ok(vec![command])
+            }
+        }
+        let calls = Arc::new(AtomicUsize::new(0));
+        let provider = Arc::new(Provider {
+            macro_probe: Some(Arc::new(Rename(calls.clone()))),
+            ..Default::default()
+        });
+        let phases = Source::with_extension(
+            None,
+            "(sort A) (constructor Target () A) (Target_m)",
+            provider.clone(),
+        )
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(provider.evaluations.load(Ordering::SeqCst), 0);
+        let Some(pb::declaration::Kind::Constructor(row)) = &phases[1].declarations[0].kind else {
+            panic!("expanded declaration")
+        };
+        assert_eq!(row.name, "Target_m");
+        // The selected name is an ordinary exact wire identity; its text macro
+        // is neither needed nor re-run by this independent byte consumer.
+        let mut engine = Engine::default();
+        let id = create(&mut engine);
+        for phase in phases {
+            assert_eq!(run(&mut engine, id, phase).error, None);
         }
     }
 
@@ -15084,8 +15126,12 @@ fn source_fail_global_let_preserves_prefix_binding_and_nested_expectations() {
                 "(check (C)) (fail (let $z $y))",
                 0,
             ),
-            ("(fail (let $x 1))", "(check (= $x 1))", 1),
-            ("(fail (fail (let $x 1)))", "(check (= $x 1))", 0),
+            ("(fail (let $x 1))", "(let $z $x) (check (= $z 1))", 1),
+            (
+                "(fail (fail (let $x 1)))",
+                "(let $z $x) (check (= $z 1))",
+                0,
+            ),
         ] {
             let mut native = if core {
                 egglog::EGraph::default()
@@ -16310,6 +16356,7 @@ mod source_provider_context {
         initializations: AtomicUsize,
         lowerings: AtomicUsize,
         evaluations: Arc<AtomicUsize>,
+        validations: Arc<AtomicUsize>,
         fail_initialize_at: AtomicUsize,
         fail_lower: AtomicBool,
         exception_latch: Mutex<Option<&'static str>>,
@@ -16324,6 +16371,17 @@ mod source_provider_context {
                 egglog::span!(),
             )
             .map_err(|error| error.to_string())?;
+            let evaluations = self.evaluations.clone();
+            let validations = self.validations.clone();
+            egglog::add_primitive_with_validator!(graph,
+            "test-counted"[id = "test.source.counted"] = {evaluations: Arc<AtomicUsize>}
+            |value: i64| -> i64 {{
+                self.ctx.fetch_add(1, Ordering::SeqCst);
+                value
+            }}, move |_: &mut egglog::TermDag, args: &[egglog::TermId]| -> Option<egglog::TermId> {
+                validations.fetch_add(1, Ordering::SeqCst);
+                args.first().copied()
+            });
             if self.fail_initialize_at.load(Ordering::SeqCst) == count {
                 return Err("provider initialization rejected".into());
             }
@@ -16455,6 +16513,182 @@ mod source_provider_context {
             ..Default::default()
         });
         program
+    }
+
+    #[test]
+    fn source_table_factories_close_before_reimport_without_inserting_rows() {
+        use egglog_experimental::protobuf::source::{Renderer, Source};
+        for target in [
+            "(constructor Target (i64 i64) A)",
+            "(function Target (i64 i64) A :no-merge)",
+            "(function Target (i64 i64) A :merge new)",
+        ] {
+            for captured in [false, true] {
+                let (inputs, parameters, capture, arguments) = if captured {
+                    ("(i64)", "(i64)", " _0", "3")
+                } else {
+                    ("()", "(i64 i64)", "", "2 3")
+                };
+                let call = if captured { "(factory 2)" } else { "(factory)" };
+                let effect = if target.starts_with("(constructor") {
+                    "(Target 2 3)"
+                } else {
+                    "(set (Target 2 3) (Item 9))"
+                };
+                let mut text = format!(
+                    "(sort A) (constructor Item (i64) A) {target}
+                    (sort F (UnstableFn {parameters} A))
+                    (primitive factory {inputs} F (unstable-fn \"Target\"{capture}))
+                    (function saved () F :no-merge) (set (saved) {call})
+                    (print-size Target) {effect}
+                    (extract (unstable-app (saved) {arguments})) (print-size Target)"
+                );
+                for cycle in 0..2 {
+                    let phases = Source::new(None, &text)
+                        .unwrap()
+                        .collect::<Result<Vec<_>, _>>()
+                        .unwrap_or_else(|error| {
+                            panic!("{target}, captured={captured}, cycle={cycle}: {error}")
+                        });
+                    let mut engine = Engine::default();
+                    let id = create(&mut engine);
+                    let mut renderer = Renderer::default();
+                    let mut rendered = String::new();
+                    let mut sizes = vec![];
+                    let mut extracted = false;
+                    for phase in phases {
+                        rendered.push_str(&renderer.render(&phase).unwrap());
+                        let response = run(&mut engine, id, phase);
+                        assert_eq!(response.error, None);
+                        for output in &response.outputs {
+                            match &output.kind {
+                                Some(pb::command_output::Kind::Sizes(rows)) => {
+                                    sizes.push(rows.sizes[0].rows)
+                                }
+                                Some(pb::command_output::Kind::Extraction(result)) => {
+                                    let root = result.roots[0].variants[0].term;
+                                    let Some(pb::node::Kind::Call(call)) =
+                                        &response.nodes[root as usize].kind
+                                    else {
+                                        panic!("applied table result")
+                                    };
+                                    assert_eq!(
+                                        call.func,
+                                        if target.starts_with("(constructor") {
+                                            "Target"
+                                        } else {
+                                            "Item"
+                                        }
+                                    );
+                                    extracted = true;
+                                }
+                                _ => (),
+                            }
+                        }
+                    }
+                    assert_eq!(sizes, [0, 1]);
+                    assert!(extracted);
+                    text = rendered;
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn source_global_compile_context_keeps_initializers_merges_and_validators_inert() {
+        use egglog_experimental::protobuf::source::{Renderer, Source, Submission};
+        let provider = Arc::new(Provider::default());
+        let text = "(let $captured (test-counted 7))
+            (primitive read_saved () i64 $captured)
+            (function merged () i64 :merge (test-counted (+ old new)))
+            (sort F (UnstableFn () i64))
+            (primitive factory () F (unstable-fn \"$captured\"))
+            (primitive body_factory () F (unstable-fn \"read_saved\"))
+            (function slot () F :no-merge) (set (slot) (factory))
+            (function body_slot () F :no-merge) (set (body_slot) (body_factory))
+            (set (merged) 1) (set (merged) 2)
+            (check (= (read_saved) 7)) (check (= (unstable-app (slot)) 7))
+            (check (= (unstable-app (body_slot)) 7))
+            (check (= (merged) 3))";
+        let phases = Source::with_extension(None, text, provider.clone())
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(provider.evaluations.load(Ordering::SeqCst), 0);
+        assert_eq!(provider.validations.load(Ordering::SeqCst), 0);
+        let mut renderer = Renderer::with_extension(provider.clone()).unwrap();
+        let mut rendered = String::new();
+        for phase in &phases {
+            rendered.push_str(&renderer.render(phase).unwrap());
+        }
+        assert_eq!(provider.evaluations.load(Ordering::SeqCst), 0);
+        assert_eq!(provider.validations.load(Ordering::SeqCst), 0);
+        let mut engine = Engine::with_extension(provider.clone());
+        let id = create(&mut engine);
+        for phase in phases {
+            assert_eq!(run(&mut engine, id, phase).error, None);
+        }
+        assert_eq!(provider.evaluations.load(Ordering::SeqCst), 2);
+        assert_eq!(provider.validations.load(Ordering::SeqCst), 0);
+        // Reimport uses the same provider, with captured globals still authored
+        // as Function+Set; no saved native value or initialized graph is copied.
+        let before = provider.evaluations.load(Ordering::SeqCst);
+        let phases = Source::with_extension(None, &rendered, provider.clone())
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(provider.evaluations.load(Ordering::SeqCst), before);
+        let id = create(&mut engine);
+        for phase in phases {
+            assert_eq!(run(&mut engine, id, phase).error, None);
+        }
+        assert_eq!(provider.evaluations.load(Ordering::SeqCst), before + 2);
+
+        let before = provider.evaluations.load(Ordering::SeqCst);
+        let phases = Source::with_extension(
+            None,
+            "(function missing () i64 :no-merge)
+             (let $unreached (test-counted (missing)))
+             (primitive read_unreached () i64 $unreached)
+             (sort F (UnstableFn () i64))
+             (primitive missing_factory () F (unstable-fn \"$unreached\"))",
+            provider.clone(),
+        )
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+        assert_eq!(provider.evaluations.load(Ordering::SeqCst), before);
+        let id = create(&mut engine);
+        assert_eq!(run(&mut engine, id, phases[0].clone()).error, None);
+        let response = run(&mut engine, id, phases[1].clone());
+        let error = response.error.unwrap();
+        assert_eq!(error.code, i32::from(pb::ErrorCode::EvaluationFailed));
+        assert_eq!(error.span, phases[1].commands[0].span);
+        assert_eq!(error.location.unwrap().path, [0]);
+        assert_eq!(provider.evaluations.load(Ordering::SeqCst), before);
+        assert_eq!(provider.validations.load(Ordering::SeqCst), 0);
+
+        let mut scoped = Source::with_extension(
+            None,
+            "(sort A) (constructor Target (i64) A) (sort F (UnstableFn (i64) A))
+             (push) (primitive factory () F (unstable-fn \"Target\")) (pop)
+             (primitive factory () F (unstable-fn \"Target\"))",
+            provider.clone(),
+        )
+        .unwrap();
+        let initialized = provider.initializations.load(Ordering::SeqCst);
+        let mut factories = 0;
+        while let Some(phase) = scoped.next_submission() {
+            match phase.unwrap() {
+                Submission::Program(program) => factories += program.declarations.iter().filter(|declaration|
+                    matches!(&declaration.kind, Some(pb::declaration::Kind::Primitive(row)) if row.name == "factory")).count(),
+                Submission::Push(1) | Submission::Pop { count: 1, .. } => (),
+                _ => panic!("unexpected scope operation"),
+            }
+        }
+        assert_eq!(factories, 2);
+        assert_eq!(provider.initializations.load(Ordering::SeqCst), initialized);
+        assert_eq!(provider.evaluations.load(Ordering::SeqCst), before);
     }
 
     #[test]

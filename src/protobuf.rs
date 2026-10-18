@@ -1138,12 +1138,9 @@ impl Session {
                 },
                 _ => return Err("only equality-sort, constructor, function, relation, and primitive declarations execute in this slice".into()),
             };
-            if let Command::UserDefined(_, name, args) = &command {
-                staged
-                    .graph
-                    .prepare_user_defined_command(name, args)
-                    .map_err(|error| error.to_string())?;
-            } else {
+            // Computed bodies close in the final compile-only pass, after
+            // preceding table declarations have actual disposable backends.
+            if !matches!(command, Command::Function { .. } | Command::UserDefined(..)) {
                 staged
                     .graph
                     .resolve_command_before_proofs(command.clone())
@@ -1593,6 +1590,26 @@ impl Session {
                 .map_err(|error| error.to_string())?;
             }
         }
+        // Model metadata must see the same fully compiled context, including
+        // authored Primitive projections. This graph never enters Prepared.
+        staged.graph = compiler;
+        for command in command_tree(&program.commands) {
+            let (model, extractor) = match &command.kind {
+                Some(pb::command::Kind::Extract(extract)) => {
+                    (&extract.cost_model, extract.extractor)
+                }
+                Some(pb::command::Kind::KeepBest(keep)) => (&keep.cost_model, keep.extractor),
+                _ => continue,
+            };
+            if !model.is_empty() {
+                staged
+                    .resolve_cost_model(model, extractor)
+                    .map_err(|mut error| {
+                        error.0.span = command.span;
+                        error
+                    })?;
+            }
+        }
         // Only rendering needs the filtered declaration view. All runtime sites
         // above were captured against the original submitted indices.
         program.declarations = std::mem::take(&mut program.declarations)
@@ -1715,13 +1732,6 @@ impl Session {
                 {
                     return Err("extraction requires roots, a positive variant count, and a specified extractor".into());
                 }
-                if !extract.cost_model.is_empty() {
-                    self.resolve_cost_model(&extract.cost_model, extract.extractor)
-                        .map_err(|mut error| {
-                            error.0.span = command.span;
-                            error
-                        })?;
-                }
                 return extract
                     .roots
                     .iter()
@@ -1745,13 +1755,6 @@ impl Session {
                     )
                 {
                     return Err("KeepBest requires tables and a specified extractor".into());
-                }
-                if !keep.cost_model.is_empty() {
-                    self.resolve_cost_model(&keep.cost_model, keep.extractor)
-                        .map_err(|mut error| {
-                            error.0.span = command.span;
-                            error
-                        })?;
                 }
                 for table in &keep.tables {
                     let logical = self.names.callables.get(table);
@@ -5510,6 +5513,602 @@ fn encode_exact_number(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    mod partial_call_staging {
+        use super::*;
+        use cost_model::{CostModelContract, CostModelRuntime, ModelSort, NativeCostModel};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct MetadataModel {
+            calls: Arc<AtomicUsize>,
+            annotation: &'static str,
+            objective: &'static str,
+            additive: bool,
+        }
+
+        impl NativeCostModel for MetadataModel {
+            fn contract(&self) -> CostModelContract {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                let sort = |name: &str| ModelSort {
+                    sorts: vec![pb::Sort {
+                        kind: Some(pb::sort::Kind::Family(pb::HostSort {
+                            name: name.into(),
+                            args: vec![],
+                        })),
+                        ..Default::default()
+                    }],
+                    root: 0,
+                };
+                CostModelContract {
+                    annotation: sort(self.annotation),
+                    objective: sort(self.objective),
+                    additive: self.additive,
+                }
+            }
+
+            fn start(&self, _: &pb::Program) -> Result<Arc<dyn CostModelRuntime>, egglog::Error> {
+                panic!("preparation must not start a cost model")
+            }
+        }
+
+        // Author the factory directly in protobuf so the adapter regression
+        // does not depend on Source's separate compiler context.
+        fn table_factory_fixture(target: &str) -> pb::Program {
+            let body = if target.starts_with("(constructor") {
+                "(Target 7) (check (= (Target 7) (Target 7)))"
+            } else {
+                "(set (Target 7) (Item 9)) (check (= (Target 7) (Item 9)))"
+            };
+            let mut program = inventory_fixture(&format!(
+                "(sort A) (constructor Item (i64) A) {target}
+                 (sort Other) (constructor Marker () Other)
+                 (sort F (UnstableFn (i64) A)) {body}"
+            ));
+            let function = program
+                .sorts
+                .iter()
+                .position(|sort| matches!(sort.kind, Some(pb::sort::Kind::Func(_))))
+                .unwrap() as u32;
+            let Some(pb::sort::Kind::Func(signature)) = &program.sorts[function as usize].kind
+            else {
+                unreachable!()
+            };
+            let output = signature.result;
+            let argument = program
+                .nodes
+                .iter()
+                .find_map(|node| match &node.kind {
+                    Some(pb::node::Kind::Call(call)) if call.func == "Target" => Some(call.args[0]),
+                    _ => None,
+                })
+                .unwrap();
+            let partial = program.nodes.len() as u32;
+            program.nodes.extend([
+                pb::Node {
+                    sort_id: function,
+                    kind: Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
+                        value: Some(pb::primitive_value::Value::PartialCall(pb::Call {
+                            func: "Target".into(),
+                            args: vec![],
+                        })),
+                    })),
+                    ..Default::default()
+                },
+                pb::Node {
+                    sort_id: function,
+                    kind: Some(pb::node::Kind::Call(pb::Call {
+                        func: "factory".into(),
+                        args: vec![],
+                    })),
+                    ..Default::default()
+                },
+                pb::Node {
+                    sort_id: output,
+                    kind: Some(pb::node::Kind::Call(pb::Call {
+                        func: "egglog.core.fn.apply".into(),
+                        args: vec![partial + 1, argument],
+                    })),
+                    ..Default::default()
+                },
+            ]);
+            program.declarations.push(pb::Declaration {
+                kind: Some(pb::declaration::Kind::Primitive(pb::Primitive {
+                    name: "factory".into(),
+                    inputs: vec![],
+                    output: function,
+                    body: Some(partial),
+                })),
+                ..Default::default()
+            });
+            // Creating a constructor function value needs Write, so evaluate
+            // the new factory in Full context rather than a Read-only Check.
+            program.commands.last_mut().unwrap().kind =
+                Some(pb::command::Kind::Extract(pb::Extract {
+                    roots: vec![partial + 2],
+                    variants: 1,
+                    extractor: pb::Extractor::Tree.into(),
+                    ..Default::default()
+                }));
+            program
+        }
+
+        #[test]
+        fn table_factories_close_in_one_request_without_creating_rows() {
+            for target in [
+                "(constructor Target (i64) A)",
+                "(function Target (i64) A :no-merge)",
+                "(function Target (i64) A :merge new)",
+            ] {
+                for reversed in [false, true] {
+                    let mut program = table_factory_fixture(target);
+                    if reversed {
+                        program.declarations.reverse();
+                    }
+                    let (mut engine, id) = host_default_engine();
+                    let session = &engine.graphs[&id];
+                    let definitions = session.definitions.clone();
+                    let request = session.request;
+                    let tuples = session.graph.num_tuples();
+                    session.prepare(&mut program.clone()).unwrap();
+                    assert_eq!(session.definitions, definitions);
+                    assert_eq!(session.request, request);
+                    assert_eq!(session.graph.num_tuples(), tuples);
+                    assert!(
+                        session
+                            .graph
+                            .get_function(&native_name("call", "Target"))
+                            .is_none()
+                    );
+                    let mut setup = program.clone();
+                    setup.commands.clear();
+                    assert_eq!(run_host_default(&mut engine, id, setup).error, None);
+                    assert_eq!(engine.graphs[&id].graph.num_tuples(), tuples);
+                    if !target.starts_with("(constructor") {
+                        // Creating a function value does not read its missing row.
+                        let mut missing = program.clone();
+                        missing.commands = vec![pb::Command {
+                            kind: Some(pb::command::Kind::Action(pb::Action {
+                                kind: Some(pb::action::Kind::Term(program.nodes.len() as u32 - 1)),
+                                ..Default::default()
+                            })),
+                            ..Default::default()
+                        }];
+                        let response = run_host_default(&mut engine, id, missing);
+                        assert_eq!(
+                            response.error.unwrap().code,
+                            i32::from(pb::ErrorCode::EvaluationFailed)
+                        );
+                        assert_eq!(engine.graphs[&id].graph.num_tuples(), tuples);
+                    }
+                    let text = source::Renderer::default().render(&program).unwrap();
+                    let response = run_host_default(&mut engine, id, program);
+                    assert_eq!(response.error, None);
+                    let Some(pb::command_output::Kind::Extraction(extraction)) =
+                        &response.outputs[0].kind
+                    else {
+                        panic!("applied factory result")
+                    };
+                    let term = extraction.roots[0].variants[0].term;
+                    let Some(pb::node::Kind::Call(call)) = &response.nodes[term as usize].kind
+                    else {
+                        panic!("table result")
+                    };
+                    assert_eq!(
+                        call.func,
+                        if target.starts_with("(constructor") {
+                            "Target"
+                        } else {
+                            "Item"
+                        }
+                    );
+                    assert_eq!(
+                        engine.graphs[&id]
+                            .graph
+                            .get_size(&native_name("call", "Target")),
+                        1
+                    );
+                    crate::new_experimental_egraph()
+                        .parse_and_run_program(None, &text)
+                        .unwrap();
+                }
+            }
+        }
+
+        #[test]
+        fn nonzero_capture_and_merge_compilation_do_not_run_bodies_or_validators() {
+            let bodies = Arc::new(AtomicUsize::new(0));
+            let validators = Arc::new(AtomicUsize::new(0));
+            let observed = bodies.clone();
+            let checked = validators.clone();
+            let (mut engine, id) = host_default_engine();
+            let session = engine.graphs.get_mut(&id).unwrap();
+            egglog::add_primitive_with_validator!(&mut session.graph,
+            "counted-stage"[id = "test.counted.stage"] = {observed: Arc<AtomicUsize>}
+            |left: i64, right: i64| -> i64 {{
+                self.ctx.fetch_add(1, Ordering::SeqCst);
+                left + right
+            }}, move |_: &mut TermDag, args: &[TermId]| -> Option<TermId> {
+                checked.fetch_add(1, Ordering::SeqCst);
+                args.first().copied()
+            });
+            // This private fixture completes ambient initialization after Create.
+            session.definitions = session
+                .graph
+                .type_info()
+                .portable_builtin_catalog()
+                .unwrap()
+                .definitions;
+            let mut program = inventory_fixture(
+                "(function Target (i64 i64) i64 :merge (+ old new))
+                 (sort F (UnstableFn (i64) i64))
+                 (primitive factory (i64) F (unstable-fn \"+\" (+ _0 1)))
+                 (set (Target 2 3) 4) (set (Target 2 3) 5)
+                 (check (= (unstable-app (factory 1) 3) 9))",
+            );
+            for node in &mut program.nodes {
+                if let Some(pb::node::Kind::Call(call)) = &mut node.kind
+                    && call.func == "egglog.core.i64.add"
+                {
+                    call.func = "test.counted.stage".into();
+                }
+                if let Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
+                    value: Some(pb::primitive_value::Value::PartialCall(call)),
+                })) = &mut node.kind
+                {
+                    call.func = "Target".into();
+                }
+            }
+            let session = &engine.graphs[&id];
+            let definitions = session.definitions.clone();
+            let request = session.request;
+            let tuples = session.graph.num_tuples();
+            session.prepare(&mut program.clone()).unwrap();
+            assert_eq!(bodies.load(Ordering::SeqCst), 0);
+            assert_eq!(validators.load(Ordering::SeqCst), 0);
+            assert_eq!(session.definitions, definitions);
+            assert_eq!(session.request, request);
+            assert_eq!(session.graph.num_tuples(), tuples);
+            assert_eq!(run_host_default(&mut engine, id, program).error, None);
+            assert!(bodies.load(Ordering::SeqCst) > 0);
+            assert_eq!(validators.load(Ordering::SeqCst), 0);
+        }
+
+        #[test]
+        fn malformed_factory_targets_reject_before_any_publication_or_effect() {
+            let program = table_factory_fixture("(constructor Target (i64) A)");
+            for invalid in ["unknown", "arity", "argument", "output"] {
+                let mut program = program.clone();
+                let capture = program.nodes.len() as u32;
+                let scalar = program.sorts.iter().position(|sort| matches!(&sort.kind, Some(pb::sort::Kind::Family(family)) if family.name == "i64")).unwrap() as u32;
+                program.nodes.push(pb::Node {
+                    sort_id: scalar,
+                    kind: Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
+                        value: Some(pb::primitive_value::Value::I64(1)),
+                    })),
+                    ..Default::default()
+                });
+                let function_sort = program
+                    .nodes
+                    .iter()
+                    .find_map(|node| {
+                        matches!(
+                            node.kind,
+                            Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
+                                value: Some(pb::primitive_value::Value::PartialCall(_)),
+                            }))
+                        )
+                        .then_some(node.sort_id)
+                    })
+                    .unwrap();
+                let other = program.sorts.iter().position(|sort| matches!(&sort.kind, Some(pb::sort::Kind::Eq(name)) if name == "Other")).unwrap() as u32;
+                let Some(pb::sort::Kind::Func(signature)) =
+                    &mut program.sorts[function_sort as usize].kind
+                else {
+                    unreachable!()
+                };
+                match invalid {
+                    "argument" => signature.params[0] = other,
+                    "output" => signature.result = other,
+                    _ => (),
+                }
+                for node in &mut program.nodes {
+                    if let Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
+                        value: Some(pb::primitive_value::Value::PartialCall(call)),
+                    })) = &mut node.kind
+                    {
+                        match invalid {
+                            "unknown" => call.func = "missing-target".into(),
+                            "arity" => {
+                                call.args.push(capture);
+                            }
+                            _ => (),
+                        }
+                    }
+                }
+                let (mut engine, id) = host_default_engine();
+                let definitions = engine.graphs[&id].definitions.clone();
+                let request = engine.graphs[&id].request;
+                let tuples = engine.graphs[&id].graph.num_tuples();
+                let response = run_host_default(&mut engine, id, program);
+                assert_eq!(
+                    response.error.unwrap().code,
+                    i32::from(pb::ErrorCode::InvalidProgram),
+                    "{invalid}"
+                );
+                assert!(response.outputs.is_empty());
+                assert!(response.ruleset_publication.unwrap().names.is_empty());
+                assert!(response.profile.unwrap().maintenance.is_empty());
+                assert_eq!(engine.graphs[&id].definitions, definitions);
+                assert_eq!(engine.graphs[&id].request, request);
+                assert_eq!(engine.graphs[&id].graph.num_tuples(), tuples);
+                assert!(
+                    engine.graphs[&id]
+                        .graph
+                        .get_function(&native_name("call", "Marker"))
+                        .is_none()
+                );
+            }
+        }
+
+        #[test]
+        fn model_metadata_uses_closed_context_without_starting_models() {
+            for keep in [false, true] {
+                for invalid in ["none", "unknown", "annotation", "objective", "greedy"] {
+                    let (mut engine, id) = host_default_engine();
+                    let calls = Arc::new(AtomicUsize::new(0));
+                    let name = engine
+                        .register_cost_model(
+                            id,
+                            Arc::new(MetadataModel {
+                                calls: calls.clone(),
+                                annotation: if invalid == "annotation" {
+                                    "bool"
+                                } else {
+                                    "i64"
+                                },
+                                objective: if invalid == "objective" {
+                                    "missing-objective"
+                                } else {
+                                    "i64"
+                                },
+                                additive: false,
+                            }),
+                        )
+                        .unwrap();
+                    let mut program = table_factory_fixture("(constructor Target (i64) A)");
+                    let mut command = program.commands.pop().unwrap();
+                    command.kind = Some(pb::command::Kind::Extract(pb::Extract {
+                        roots: vec![program.nodes.len() as u32 - 1],
+                        variants: 1,
+                        extractor: pb::Extractor::Tree.into(),
+                        ..Default::default()
+                    }));
+                    program.commands = vec![command];
+                    let span = program.commands[0].span;
+                    let model = if invalid == "unknown" {
+                        "missing-model".into()
+                    } else {
+                        name
+                    };
+                    let extractor = if invalid == "greedy" {
+                        pb::Extractor::GreedyDag
+                    } else {
+                        pb::Extractor::Tree
+                    } as i32;
+                    if keep {
+                        program.commands[0].kind =
+                            Some(pb::command::Kind::KeepBest(pb::KeepBest {
+                                tables: vec!["Target".into()],
+                                extractor,
+                                cost_model: model,
+                            }));
+                    } else {
+                        let Some(pb::command::Kind::Extract(extract)) =
+                            &mut program.commands[0].kind
+                        else {
+                            unreachable!()
+                        };
+                        extract.cost_model = model;
+                        extract.extractor = extractor;
+                    }
+                    let session = &engine.graphs[&id];
+                    let definitions = session.definitions.clone();
+                    let request = session.request;
+                    match session.prepare(&mut program) {
+                        Ok(_) => assert_eq!(invalid, "none"),
+                        Err(error) => {
+                            assert_ne!(invalid, "none", "{}", error.0.message);
+                            assert_eq!(error.0.span, span);
+                            let expected = match invalid {
+                                "unknown" => "unknown cost model",
+                                "annotation" => "stored annotation sort",
+                                "objective" => "missing-objective",
+                                "greedy" => "additive marginal cost model",
+                                _ => unreachable!(),
+                            };
+                            assert!(error.0.message.contains(expected), "{}", error.0.message);
+                        }
+                    }
+                    assert_eq!(
+                        calls.load(Ordering::SeqCst),
+                        usize::from(invalid != "unknown")
+                    );
+                    assert_eq!(session.definitions, definitions);
+                    assert_eq!(session.request, request);
+                    assert_eq!(session.graph.num_tuples(), 0);
+                    assert!(
+                        !session
+                            .graph
+                            .authoring_type_info()
+                            .is_primitive(&native_name("call", "factory"))
+                    );
+                }
+            }
+            // A genuine native projection Err may be retained despite successful
+            // compilation. Full metadata resolution must still reject it on a
+            // disposable compiler, not silently inspect only the live seed.
+            let (mut engine, id) = host_default_engine();
+            let calls = Arc::new(AtomicUsize::new(0));
+            let model = engine
+                .register_cost_model(
+                    id,
+                    Arc::new(MetadataModel {
+                        calls,
+                        annotation: "i64",
+                        objective: "i64",
+                        additive: true,
+                    }),
+                )
+                .unwrap();
+            let mut staged = engine.graphs[&id].clone();
+            let bodies = Arc::new(AtomicUsize::new(0));
+            let observed = bodies.clone();
+            egglog::add_primitive!(&mut staged.graph,
+            "unprojectable-stage" = {observed: Arc<AtomicUsize>} |value: i64| -> i64 {{
+                self.ctx.fetch_add(1, Ordering::SeqCst); value
+            }});
+            let commands = staged
+                .graph
+                .parse_program(
+                    None,
+                    "(primitive projection_missing (i64) i64 (unprojectable-stage _0))",
+                )
+                .unwrap();
+            staged.graph = staged.graph.validate_program(commands).unwrap();
+            let expected = staged
+                .graph
+                .type_info()
+                .portable_builtin_catalog()
+                .err()
+                .unwrap();
+            assert_eq!(
+                staged
+                    .resolve_cost_model(&model, pb::Extractor::Tree.into())
+                    .err()
+                    .unwrap()
+                    .0
+                    .message,
+                expected
+            );
+            assert_eq!(bodies.load(Ordering::SeqCst), 0);
+            assert!(
+                !engine.graphs[&id]
+                    .graph
+                    .authoring_type_info()
+                    .is_primitive("projection_missing")
+            );
+        }
+
+        #[test]
+        fn recursive_model_controls_keep_admission_and_original_spans() {
+            let (mut engine, id) = host_default_engine();
+            let calls = Arc::new(AtomicUsize::new(0));
+            let name = engine
+                .register_cost_model(
+                    id,
+                    Arc::new(MetadataModel {
+                        calls: calls.clone(),
+                        annotation: "i64",
+                        objective: "i64",
+                        additive: true,
+                    }),
+                )
+                .unwrap();
+            for keep in [false, true] {
+                for wrapper in ["fail", "zero", "repeat", "saturate"] {
+                    let mut program = inventory_fixture(
+                        "(sort A) (constructor Target () A) (Target) (extract (Target))",
+                    );
+                    let mut child = program.commands.pop().unwrap();
+                    let span = child.span;
+                    if keep {
+                        child.kind = Some(pb::command::Kind::KeepBest(pb::KeepBest {
+                            tables: vec!["Target".into()],
+                            extractor: pb::Extractor::Tree.into(),
+                            cost_model: name.clone(),
+                        }));
+                    } else {
+                        let Some(pb::command::Kind::Extract(extract)) = &mut child.kind else {
+                            unreachable!()
+                        };
+                        extract.cost_model = name.clone();
+                    }
+                    let kind = match wrapper {
+                        "fail" => pb::command::Kind::Fail(Box::new(child)),
+                        "zero" | "repeat" => pb::command::Kind::Repeat(pb::Repeat {
+                            times: Some(u64::from(wrapper == "repeat")),
+                            body: vec![child],
+                            until: vec![],
+                        }),
+                        "saturate" => pb::command::Kind::Saturate(pb::Saturate {
+                            body: vec![child],
+                            max_iterations: Some(1),
+                            until: vec![],
+                        }),
+                        _ => unreachable!(),
+                    };
+                    program.commands.push(pb::Command {
+                        kind: Some(kind),
+                        span,
+                    });
+                    let response = run_host_default(&mut engine, id, program);
+                    let error = response.error.unwrap();
+                    assert_eq!(error.code, i32::from(pb::ErrorCode::InvalidProgram));
+                    assert!(error.message.contains(if wrapper == "fail" {
+                        "observation wrappers are not implemented"
+                    } else {
+                        "mutation-progress witness"
+                    }));
+                    assert_eq!(calls.load(Ordering::SeqCst), 0);
+                    assert!(response.outputs.is_empty());
+                    assert!(response.ruleset_publication.unwrap().names.is_empty());
+                    assert_eq!(engine.graphs[&id].graph.num_tuples(), 0);
+                    assert!(
+                        engine.graphs[&id]
+                            .graph
+                            .get_function(&native_name("call", "Target"))
+                            .is_none()
+                    );
+                }
+            }
+            let spans: Vec<_> = (0..4)
+                .map(|start| {
+                    Some(pb::Span {
+                        file: 0,
+                        start,
+                        end: start + 1,
+                    })
+                })
+                .collect();
+            let commands = vec![pb::Command {
+                span: spans[0],
+                kind: Some(pb::command::Kind::Fail(Box::new(pb::Command {
+                    span: spans[1],
+                    kind: Some(pb::command::Kind::Repeat(pb::Repeat {
+                        times: Some(0),
+                        until: vec![],
+                        body: vec![pb::Command {
+                            span: spans[2],
+                            kind: Some(pb::command::Kind::Saturate(pb::Saturate {
+                                max_iterations: Some(1),
+                                until: vec![],
+                                body: vec![pb::Command {
+                                    span: spans[3],
+                                    kind: Some(pb::command::Kind::Extract(pb::Extract::default())),
+                                }],
+                            })),
+                        }],
+                    })),
+                }))),
+            }];
+            assert_eq!(
+                command_tree(&commands)
+                    .map(|command| command.span)
+                    .collect::<Vec<_>>(),
+                spans
+            );
+        }
+    }
 
     #[test]
     fn session_catalog_seed_survives_authored_primitives_and_empty_requests() {
