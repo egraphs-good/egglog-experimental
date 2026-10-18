@@ -14818,6 +14818,196 @@ fn source_query_value_alias_survives_constructor_deletion() {
 }
 
 #[test]
+fn source_nested_constructor_delete_survives_fresh_reimport() {
+    use egglog_experimental::protobuf::source::{Renderer, Source};
+    let text = r#"
+        (datatype E (A) (Box E)) (relation Trigger ())
+        (Box (A)) (Trigger)
+        (rule ((Trigger)) ((delete (Box (A)))) :name "nested-delete")
+        (run 1) (check (A)) (fail (check (Box x)))
+    "#;
+    for core in [false, true] {
+        let mut native = if core {
+            egglog::EGraph::default()
+        } else {
+            new_experimental_egraph()
+        };
+        native.parse_and_run_program(None, text).unwrap();
+        assert_eq!(native.get_size("A"), 1);
+        assert_eq!(native.get_size("Box"), 0);
+        let source = if core {
+            Source::new_core(None, text)
+        } else {
+            Source::new(None, text)
+        }
+        .unwrap();
+        let mut renderer = if core {
+            Renderer::core()
+        } else {
+            Renderer::default()
+        };
+        let mut engine = Engine::default();
+        let id = create(&mut engine);
+        let mut rendered = String::new();
+        for phase in source {
+            let phase = pb::Program::decode(phase.unwrap().encode_to_vec().as_slice()).unwrap();
+            rendered.push_str(&renderer.render(&phase).unwrap());
+            assert_eq!(run(&mut engine, id, phase).error, None);
+        }
+        let mut replay = if core {
+            egglog::EGraph::default()
+        } else {
+            new_experimental_egraph()
+        };
+        replay.parse_and_run_program(None, &rendered).unwrap();
+        let fresh = if core {
+            Source::new_core(None, &rendered)
+        } else {
+            Source::new(None, &rendered)
+        }
+        .unwrap();
+        let mut engine = Engine::default();
+        let id = create(&mut engine);
+        for phase in fresh {
+            let phase = phase
+                .unwrap_or_else(|error| panic!("core={core}: fresh Source: {error}\n{rendered}"));
+            assert_eq!(run(&mut engine, id, phase).error, None);
+        }
+    }
+}
+
+#[test]
+fn source_constructor_aliases_keep_identity_and_subsumption_after_use() {
+    use egglog_experimental::protobuf::source::{Renderer, Source};
+    let mut admission_errors = Vec::new();
+    for after_subsume in [true, false] {
+        let use_held = "(R held)";
+        let text = format!(
+            r#"
+            (datatype E (A) (B) (Box E))
+            (relation Trigger ()) (relation R (E))
+            (ruleset visible) (relation Visible ())
+            (rule ((A)) ((Visible)) :ruleset visible)
+            (A) (Trigger)
+            (rule ((Trigger))
+              ((let held (Box (A))) (union held (B))
+               {} (subsume (A)) {}))
+            (run 1) (check (R (B)))
+            (run visible 1) (fail (check (Visible)))
+            (print-function A)
+            "#,
+            if after_subsume { "" } else { use_held },
+            if after_subsume { use_held } else { "" },
+        );
+        for core in [false, true] {
+            let mut native = if core {
+                egglog::EGraph::default()
+            } else {
+                new_experimental_egraph()
+            };
+            native.parse_and_run_program(None, &text).unwrap();
+            assert_eq!(native.get_size("A"), 1);
+            assert_eq!(native.get_size("Box"), 1);
+            assert_eq!(native.get_size("R"), 1);
+            let source = if core {
+                Source::new_core(None, &text)
+            } else {
+                Source::new(None, &text)
+            }
+            .unwrap();
+            let phases = match source.collect::<Result<Vec<_>, _>>() {
+                Ok(phases) => phases,
+                Err(error) => {
+                    admission_errors.push(format!(
+                        "core={core}/after_subsume={after_subsume}: {error}"
+                    ));
+                    continue;
+                }
+            };
+            let mut renderer = if core {
+                Renderer::core()
+            } else {
+                Renderer::default()
+            };
+            let mut engine = Engine::default();
+            let id = create(&mut engine);
+            let mut rendered = String::new();
+            let mut printed = 0;
+            for phase in phases {
+                rendered.push_str(&renderer.render(&phase).unwrap());
+                let response = run(&mut engine, id, phase);
+                assert_eq!(response.error, None);
+                for output in response.outputs {
+                    if let Some(pb::command_output::Kind::PrintedFunction(table)) = output.kind {
+                        assert_eq!(table.rows.len(), 1);
+                        assert!(table.rows[0].subsumed);
+                        printed += 1;
+                    }
+                }
+            }
+            assert_eq!(printed, 1);
+            let mut replay = if core {
+                egglog::EGraph::default()
+            } else {
+                new_experimental_egraph()
+            };
+            replay.parse_and_run_program(None, &rendered).unwrap();
+            let fresh = if core {
+                Source::new_core(None, &rendered)
+            } else {
+                Source::new(None, &rendered)
+            }
+            .unwrap();
+            let mut engine = Engine::default();
+            let id = create(&mut engine);
+            let mut printed = 0;
+            for phase in fresh {
+                let response = run(&mut engine, id, phase.unwrap());
+                assert_eq!(response.error, None);
+                for output in response.outputs {
+                    if let Some(pb::command_output::Kind::PrintedFunction(table)) = output.kind {
+                        assert_eq!(table.rows.len(), 1);
+                        assert!(table.rows[0].subsumed);
+                        printed += 1;
+                    }
+                }
+            }
+            assert_eq!(printed, 1);
+        }
+    }
+    assert!(admission_errors.is_empty(), "{admission_errors:#?}");
+}
+
+#[test]
+fn source_base_read_aliases_remain_rejected_across_ordered_writes() {
+    use egglog_experimental::protobuf::source::Source;
+    let text = r#"
+        (function current () i64 :merge new) (relation R (i64))
+        (set (current) 1)
+        (rule () ((set (current) 3) (let held (current))
+                  (set (current) 9) (R held)) :naive)
+        ; Native ordinary lookups see committed data, not staged same-match Sets.
+        (run 1) (check (R 1)) (fail (check (R 3))) (fail (check (R 9)))
+    "#;
+    for core in [false, true] {
+        let mut native = if core {
+            egglog::EGraph::default()
+        } else {
+            new_experimental_egraph()
+        };
+        native.parse_and_run_program(None, text).unwrap();
+        let source = if core {
+            Source::new_core(None, text)
+        } else {
+            Source::new(None, text)
+        }
+        .unwrap();
+        let error = source.collect::<Result<Vec<_>, _>>().unwrap_err();
+        assert!(error.to_string().contains("retained-value lowering"));
+    }
+}
+
+#[test]
 fn source_core_renderer_rejects_assigned_cost_reads_and_writes_without_state_changes() {
     use egglog_experimental::protobuf::source::Renderer;
     for core in [true] {

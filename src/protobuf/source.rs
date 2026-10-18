@@ -1804,7 +1804,9 @@ impl Source {
             let mut destructive = false;
             for (index, action) in rule.head.0.iter().enumerate().rev() {
                 recreate_constructors[index] = !destructive;
-                destructive |= matches!(action, ResolvedAction::Change(..));
+                // Subsume keeps the row and its class; subsequent constructor
+                // lookup cannot clear its dominant subsumption flag.
+                destructive |= matches!(action, ResolvedAction::Change(_, ast::Change::Delete, ..));
                 action.clone().visit_exprs(&mut |expr| {
                     if let ResolvedExpr::Call(_, ResolvedCall::Primitive(primitive), _) = &expr
                         && !primitive
@@ -3244,33 +3246,24 @@ fn render_prepared(
                 }
                 let Some(mut command) = installation.command.clone() else { continue };
                 if let Command::Rule { rule } = &mut command {
-                    if dialect == Dialect::Experimental {
-                        let index = prepared.rules.iter().position(|name| name == &rule.name)
-                            .ok_or("missing prepared rule occurrence")?;
-                        if let Some(pb::rule_decl::Kind::Rule(body)) = &rule_program.rules[index].kind {
-                            let mut head = Vec::new();
-                            for (index, action) in body.head.iter().enumerate() {
+                    let index = prepared.rules.iter().position(|name| name == &rule.name)
+                        .ok_or("missing prepared rule occurrence")?;
+                    if let Some(pb::rule_decl::Kind::Rule(body)) = &rule_program.rules[index].kind {
+                        let mut head = Vec::new();
+                        for (index, action) in body.head.iter().enumerate() {
+                            if dialect == Dialect::Experimental {
                                 head.extend(source_cost_actions(&rule_program, action, index, prepared.request, true, constructor_cost_tables)?);
+                            } else {
+                                // Core has no assigned-cost storage to clean up.
+                                // Project the canonical action, not native
+                                // cleanup's temporary Lets after dropping only
+                                // its auxiliary Delete. Preserve the prepared
+                                // query, occurrence and all rule options.
+                                head.extend(ast::GenericActions(lower_action(&rule_program, action)?)
+                                    .map_symbols(&mut |name| name, &mut |name: String| native_name("var", &name)).0);
                             }
-                            rule.head.0 = head;
                         }
-                    } else {
-                    // Accepted source cannot read/write assigned costs. Omit
-                    // only adapter-added cleanup of those invisible tables;
-                    // preserve constructor deletion and captured argument order.
-                    let mut head = Vec::new();
-                    for action in std::mem::take(&mut rule.head.0) {
-                        if let Action::Change(_, ast::Change::Delete, name, args) = &action
-                            && let Some(constructor) = constructor_cost_tables.get(name)
-                        {
-                            if !matches!(head.last(), Some(Action::Change(_, ast::Change::Delete, target, key)) if target == constructor && key == args) {
-                                return Err("prepared constructor-cost cleanup lost its addressed deletion".into());
-                            }
-                            continue;
-                        }
-                        head.push(action);
-                    }
-                    rule.head.0 = head;
+                        rule.head.0 = head;
                     }
                 }
                 let name = match &mut command {
