@@ -4972,40 +4972,56 @@ fn lower_rule(
         pb::rule_decl::Kind::Rule(body) => {
             let mut bindings = HashMap::new();
             check_variables(program, &body.query, &mut bindings, true)?;
-            for action in &body.head {
-                let roots = match action.kind.as_ref().ok_or("missing action kind")? {
-                    pb::action::Kind::Term(index) => vec![*index],
-                    pb::action::Kind::Set(set) => {
-                        let mut roots = set
-                            .target
-                            .as_ref()
-                            .ok_or("missing set target")?
-                            .args
-                            .clone();
-                        roots.push(set.value.ok_or("missing set value")?);
-                        roots
+            let mut head = Vec::new();
+            for (index, action) in body.head.iter().enumerate() {
+                check_variables(program, &action_roots(action)?, &mut bindings, false)?;
+                if let Some(pb::action::Kind::SetCost(set)) = &action.kind {
+                    let span = native_span(program, action.span.as_ref())?;
+                    let target = set.target.as_ref().ok_or("missing cost target")?;
+                    let mut key = Vec::with_capacity(target.args.len());
+                    for (argument, value) in target.args.iter().enumerate() {
+                        // Authored variables are projected before these native
+                        // temporaries are introduced, so even adversarial wire
+                        // names cannot capture the retained row arguments.
+                        let local = format!("__egglog_proto_cost_{index}_{argument}");
+                        head.push(Action::Let(
+                            span.clone(),
+                            local.clone(),
+                            expression(program, *value, &mut HashSet::new())?
+                                .map_symbols(&mut |h| h, &mut |v: String| native_name("var", &v)),
+                        ));
+                        key.push(Expr::Var(span.clone(), local));
                     }
-                    pb::action::Kind::Delete(call) | pb::action::Kind::Subsume(call) => {
-                        call.args.clone()
-                    }
-                    pb::action::Kind::Panic(_) => vec![],
-                    _ => return Err("SetCost is not supported yet".into()),
-                };
-                check_variables(program, &roots, &mut bindings, false)?;
+                    // Native actions retain this order: capture each argument
+                    // once, materialize the constructor, then evaluate/write C.
+                    // A failing cost leaves the completed target prefix intact.
+                    head.push(Action::Expr(
+                        span.clone(),
+                        Expr::Call(span.clone(), target.func.clone(), key.clone()),
+                    ));
+                    head.push(Action::Set(
+                        span,
+                        crate::set_cost::get_cost_table_name(&target.func),
+                        key,
+                        expression(
+                            program,
+                            set.cost.ok_or("missing cost value")?,
+                            &mut HashSet::new(),
+                        )?
+                        .map_symbols(&mut |h| h, &mut |v: String| native_name("var", &v)),
+                    ));
+                } else {
+                    head.extend(
+                        ast::GenericActions(lower_action(program, action)?)
+                            .map_symbols(&mut |h| h, &mut |v: String| native_name("var", &v))
+                            .0,
+                    );
+                }
             }
             Ok(Command::Rule {
                 rule: ast::Rule {
                     span,
-                    head: ast::GenericActions(
-                        body.head
-                            .iter()
-                            .map(|action| lower_action(program, action))
-                            .collect::<Result<Vec<_>, _>>()?
-                            .into_iter()
-                            .flatten()
-                            .collect(),
-                    )
-                    .map_symbols(&mut |h| h, &mut |v: String| native_name("var", &v)),
+                    head: ast::GenericActions(head),
                     body: facts(program, &body.query)?,
                     name: name.into(),
                     ruleset: ruleset.into(),

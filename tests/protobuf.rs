@@ -17349,6 +17349,741 @@ fn assigned_costs_keep_zero_overwrites_deletion_and_freeze_restore() {
     );
 }
 
+mod rule_assigned_costs {
+    use super::*;
+
+    // The query mirrors jointree's size lookup; the second annotation must
+    // materialize a previously absent Box row. Authored names deliberately
+    // resemble native temporary names without sharing their namespace.
+    fn fixture() -> pb::Program {
+        let mut program = super::fixture();
+        program.nodes.extend([
+            pb::Node {
+                sort_id: 0,
+                kind: Some(pb::node::Kind::Var("__egglog_proto_cost_0_0".into())),
+                ..Default::default()
+            }, // 14 key
+            pb::Node {
+                sort_id: 1,
+                kind: Some(pb::node::Kind::Call(pb::Call {
+                    func: "Num".into(),
+                    args: vec![14],
+                })),
+                ..Default::default()
+            }, // 15
+            pb::Node {
+                sort_id: 0,
+                kind: Some(pb::node::Kind::Var("__expr_0".into())),
+                ..Default::default()
+            }, // 16 size
+            pb::Node {
+                sort_id: 0,
+                kind: Some(pb::node::Kind::Call(pb::Call {
+                    func: "size".into(),
+                    args: vec![15],
+                })),
+                ..Default::default()
+            }, // 17
+            pb::Node {
+                sort_id: 0,
+                kind: Some(pb::node::Kind::Union(pb::Union {
+                    members: vec![17, 16],
+                })),
+                ..Default::default()
+            }, // 18 query
+            pb::Node {
+                sort_id: 0,
+                kind: Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
+                    value: Some(pb::primitive_value::Value::I64(0)),
+                })),
+                ..Default::default()
+            }, // 19 zero
+            pb::Node {
+                sort_id: 0,
+                kind: Some(pb::node::Kind::GetCost(pb::Call {
+                    func: "Num".into(),
+                    args: vec![1],
+                })),
+                ..Default::default()
+            }, // 20
+            pb::Node {
+                sort_id: 0,
+                kind: Some(pb::node::Kind::GetCost(pb::Call {
+                    func: "Box".into(),
+                    args: vec![12],
+                })),
+                ..Default::default()
+            }, // 21
+        ]);
+        program.declarations.push(pb::Declaration {
+            kind: Some(pb::declaration::Kind::Function(pb::Function {
+                name: "size".into(),
+                inputs: vec![pb::Arg {
+                    sort: 1,
+                    ..Default::default()
+                }],
+                output: 0,
+                merge: Some(3),
+                ..Default::default()
+            })),
+            ..Default::default()
+        });
+        program.rules = vec![pb::RuleDecl {
+            kind: Some(pb::rule_decl::Kind::Rule(pb::Rule {
+                query: vec![18],
+                head: [
+                    ("Num", vec![14], 19),
+                    ("Num", vec![14], 16),
+                    ("Box", vec![15], 16),
+                ]
+                .into_iter()
+                .map(|(func, args, cost)| pb::Action {
+                    kind: Some(pb::action::Kind::SetCost(pb::SetCost {
+                        target: Some(pb::Call {
+                            func: func.into(),
+                            args,
+                        }),
+                        cost: Some(cost),
+                    })),
+                    ..Default::default()
+                })
+                .collect(),
+            })),
+            name: Some("jointree-cost".into()),
+            eval_mode: pb::RuleEvalMode::Seminaive.into(),
+            ..Default::default()
+        }];
+        program.rulesets = vec![pb::Ruleset {
+            name: Some("costs".into()),
+            kind: Some(pb::ruleset::Kind::Rules(pb::RuleList { rules: vec![0] })),
+            ..Default::default()
+        }];
+        program.commands = vec![
+            pb::Command {
+                kind: Some(pb::command::Kind::Action(pb::Action {
+                    kind: Some(pb::action::Kind::Set(pb::Set {
+                        target: Some(pb::Call {
+                            func: "size".into(),
+                            args: vec![12],
+                        }),
+                        value: Some(0),
+                    })),
+                    ..Default::default()
+                })),
+                ..Default::default()
+            },
+            pb::Command {
+                kind: Some(pb::command::Kind::Run(pb::Run {
+                    ruleset: Some(pb::RulesetRef {
+                        kind: Some(pb::ruleset_ref::Kind::Index(0)),
+                    }),
+                    ..Default::default()
+                })),
+                ..Default::default()
+            },
+            pb::Command {
+                kind: Some(pb::command::Kind::Extract(pb::Extract {
+                    roots: vec![20, 21],
+                    variants: 1,
+                    extractor: pb::Extractor::Tree.into(),
+                    ..Default::default()
+                })),
+                ..Default::default()
+            },
+            pb::Command {
+                kind: Some(pb::command::Kind::Freeze(pb::Freeze {})),
+                ..Default::default()
+            },
+        ];
+        program
+    }
+
+    #[test]
+    fn jointree_head_materializes_targets_and_overwrites_in_order() {
+        let mut engine = Engine::default();
+        let id = create(&mut engine);
+        let response = run(&mut engine, id, fixture());
+        assert_eq!(response.error, None, "{response:?}");
+        let Some(pb::command_output::Kind::Extraction(extracted)) = &response.outputs[1].kind
+        else {
+            panic!("assigned costs")
+        };
+        for root in &extracted.roots {
+            assert_eq!(value(&response, root.variants[0].term), "10");
+        }
+        let Some(pb::command_output::Kind::Snapshot(snapshot)) = &response.outputs[2].kind else {
+            panic!("materialized targets")
+        };
+        let saved = snapshot.program.as_ref().unwrap();
+        assert_eq!(saved.nodes.iter().filter(|node| matches!(&node.kind, Some(pb::node::Kind::Call(call)) if call.func == "Box")).count(), 1);
+        assert_eq!(
+            saved
+                .commands
+                .iter()
+                .filter(|command| matches!(
+                    &command.kind,
+                    Some(pb::command::Kind::Action(pb::Action {
+                        kind: Some(pb::action::Kind::SetCost(_)),
+                        ..
+                    }))
+                ))
+                .count(),
+            2
+        );
+    }
+    #[test]
+    fn zero_annotation_survives_keep_best_and_subsumption() {
+        for extractor in [pb::Extractor::Tree, pb::Extractor::GreedyDag] {
+            let mut engine = Engine::default();
+            let id = create(&mut engine);
+            let mut program = fixture();
+            let Some(pb::rule_decl::Kind::Rule(rule)) = &mut program.rules[0].kind else {
+                unreachable!()
+            };
+            for action in &mut rule.head {
+                let Some(pb::action::Kind::SetCost(set)) = &mut action.kind else {
+                    unreachable!()
+                };
+                set.cost = Some(19);
+            }
+            program.commands.splice(
+                2..2,
+                [
+                    pb::Command {
+                        kind: Some(pb::command::Kind::KeepBest(pb::KeepBest {
+                            tables: vec!["Num".into(), "Box".into()],
+                            extractor: extractor.into(),
+                            ..Default::default()
+                        })),
+                        ..Default::default()
+                    },
+                    pb::Command {
+                        kind: Some(pb::command::Kind::Action(pb::Action {
+                            kind: Some(pb::action::Kind::Subsume(pb::Call {
+                                func: "Box".into(),
+                                args: vec![12],
+                            })),
+                            ..Default::default()
+                        })),
+                        ..Default::default()
+                    },
+                ],
+            );
+            let response = run(&mut engine, id, program);
+            assert_eq!(response.error, None, "{extractor:?}: {response:?}");
+            let Some(pb::command_output::Kind::Extraction(extracted)) = &response.outputs[1].kind
+            else {
+                panic!("assigned zero")
+            };
+            for root in &extracted.roots {
+                assert_eq!(value(&response, root.variants[0].term), "0");
+            }
+            let Some(pb::command_output::Kind::Snapshot(snapshot)) = &response.outputs[2].kind
+            else {
+                panic!("retained annotations")
+            };
+            let saved = snapshot.program.as_ref().unwrap();
+            assert_eq!(
+                saved
+                    .commands
+                    .iter()
+                    .filter(|command| matches!(
+                        &command.kind,
+                        Some(pb::command::Kind::Action(pb::Action {
+                            kind: Some(pb::action::Kind::SetCost(_)),
+                            ..
+                        }))
+                    ))
+                    .count(),
+                2
+            );
+            assert!(saved.commands.iter().any(|command| matches!(&command.kind,
+                Some(pb::command::Kind::Action(pb::Action { kind: Some(pb::action::Kind::Subsume(call)), .. })) if call.func == "Box"
+            )));
+        }
+    }
+
+    #[test]
+    fn arguments_run_once_left_to_right_before_cost() {
+        use std::sync::Mutex;
+        static CALLS: Mutex<Vec<i64>> = Mutex::new(Vec::new());
+        struct Counted;
+        impl egglog_experimental::protobuf::NativeExtension for Counted {
+            fn initialize(&self, graph: &mut egglog::EGraph) -> Result<(), String> {
+                egglog::add_primitive!(
+                    graph,
+                    "rule-cost-order"[id = "test.rule_cost.order"] = |value: i64| -> i64 {
+                        {
+                            CALLS.lock().unwrap().push(value);
+                            value
+                        }
+                    }
+                );
+                Ok(())
+            }
+            fn lower_custom_value(
+                &self,
+                _: &egglog::EGraph,
+                _: &egglog::ArcSort,
+                _: &pb::CustomValue,
+                _: Option<pb::Span>,
+                _: &mut pb::Program,
+            ) -> Result<pb::Call, String> {
+                Err("this fixture has no custom values".into())
+            }
+            fn encode_custom_value(
+                &self,
+                _: &egglog::ArcSort,
+                _: &egglog::TermDag,
+                _: egglog::TermId,
+            ) -> Result<Option<pb::CustomValue>, String> {
+                Ok(None)
+            }
+        }
+        CALLS.lock().unwrap().clear();
+        let mut engine = Engine::with_extension(std::sync::Arc::new(Counted));
+        let id = create(&mut engine);
+        let mut program = fixture();
+        program.declarations.extend([
+            pb::Declaration {
+                kind: Some(pb::declaration::Kind::HostPrimitive(pb::HostPrimitive {
+                    name: "test.rule_cost.order".into(),
+                    typing: Some(pb::host_primitive::Typing::Signature(
+                        pb::GenericSignature {
+                            inputs: vec![pb::Arg {
+                                sort: 0,
+                                ..Default::default()
+                            }],
+                            output: Some(0),
+                            ..Default::default()
+                        },
+                    )),
+                    ..Default::default()
+                })),
+                ..Default::default()
+            },
+            pb::Declaration {
+                kind: Some(pb::declaration::Kind::Constructor(pb::Constructor {
+                    name: "TwoKeys".into(),
+                    inputs: vec![
+                        pb::Arg {
+                            sort: 0,
+                            ..Default::default()
+                        };
+                        2
+                    ],
+                    output: 1,
+                    ..Default::default()
+                })),
+                ..Default::default()
+            },
+        ]);
+        for arg in [0, 1, 2] {
+            program.nodes.push(pb::Node {
+                sort_id: 0,
+                kind: Some(pb::node::Kind::Call(pb::Call {
+                    func: "test.rule_cost.order".into(),
+                    args: vec![arg],
+                })),
+                ..Default::default()
+            }); // 22,23,24
+        }
+        program.nodes.push(pb::Node {
+            sort_id: 0,
+            kind: Some(pb::node::Kind::GetCost(pb::Call {
+                func: "TwoKeys".into(),
+                args: vec![0, 1],
+            })),
+            ..Default::default()
+        }); // 25
+        let Some(pb::rule_decl::Kind::Rule(rule)) = &mut program.rules[0].kind else {
+            unreachable!()
+        };
+        rule.query.clear();
+        rule.head = vec![pb::Action {
+            kind: Some(pb::action::Kind::SetCost(pb::SetCost {
+                target: Some(pb::Call {
+                    func: "TwoKeys".into(),
+                    args: vec![22, 23],
+                }),
+                cost: Some(24),
+            })),
+            ..Default::default()
+        }];
+        program.commands = vec![
+            program.commands[1].clone(),
+            pb::Command {
+                kind: Some(pb::command::Kind::Extract(pb::Extract {
+                    roots: vec![25],
+                    variants: 1,
+                    extractor: pb::Extractor::Tree.into(),
+                    ..Default::default()
+                })),
+                ..Default::default()
+            },
+        ];
+        assert!(
+            CALLS.lock().unwrap().is_empty(),
+            "preparation must not invoke the primitive"
+        );
+        let response = run(&mut engine, id, program);
+        assert_eq!(response.error, None, "{response:?}");
+        assert_eq!(*CALLS.lock().unwrap(), [10, 20, 30]);
+        let Some(pb::command_output::Kind::Extraction(extracted)) = &response.outputs[1].kind
+        else {
+            panic!("assigned C")
+        };
+        assert_eq!(value(&response, extracted.roots[0].variants[0].term), "30");
+    }
+
+    #[test]
+    fn reads_follow_native_rule_context_and_prior_cost_writes() {
+        // Native rule writes are staged: a later RHS lookup does not see a row
+        // first inserted by this match. Keep that native boundary explicit;
+        // the byte positive below reads a preexisting assigned annotation.
+        let native = r#"
+            (with-dynamic-cost (datatype Math (Num i64) (Box Math)))
+            (function size (Math) i64 :merge new)
+            (set (size (Num 20)) 10)
+            (rule ((= (size (Num key)) amount))
+                  ((set-cost (Num key) amount)
+                   (set-cost (Box (Num key)) (cost_table_Num 20))) :naive)
+            (run 1)
+        "#;
+        let error = new_experimental_egraph()
+            .parse_and_run_program(None, native)
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("lookup of function cost_table_Num failed"),
+            "{error}"
+        );
+        for mode in [
+            pb::RuleEvalMode::Seminaive,
+            pb::RuleEvalMode::Naive,
+            pb::RuleEvalMode::UnsafeSeminaive,
+        ] {
+            for read in [4, 20] {
+                let mut engine = Engine::default();
+                let id = create(&mut engine);
+                let mut program = fixture();
+                program.rules[0].eval_mode = mode.into();
+                let Some(pb::rule_decl::Kind::Rule(rule)) = &mut program.rules[0].kind else {
+                    unreachable!()
+                };
+                let Some(pb::action::Kind::SetCost(set)) = &mut rule.head[2].kind else {
+                    unreachable!()
+                };
+                set.cost = Some(read);
+                program
+                    .commands
+                    .insert(0, super::fixture().commands[2].clone());
+                if read == 20 {
+                    program.commands.insert(
+                        0,
+                        pb::Command {
+                            kind: Some(pb::command::Kind::Action(pb::Action {
+                                kind: Some(pb::action::Kind::SetCost(pb::SetCost {
+                                    target: Some(pb::Call {
+                                        func: "Num".into(),
+                                        args: vec![1],
+                                    }),
+                                    cost: Some(2),
+                                })),
+                                ..Default::default()
+                            })),
+                            ..Default::default()
+                        },
+                    );
+                }
+                let response = run(&mut engine, id, program.clone());
+                if mode == pb::RuleEvalMode::Seminaive {
+                    assert!(
+                        response
+                            .error
+                            .as_ref()
+                            .is_some_and(|error| error.location.is_none()),
+                        "{mode:?}/{read}: {response:?}"
+                    );
+                    assert!(response.outputs.is_empty());
+                    program.rules.clear();
+                    program.rulesets.clear();
+                    program.commands = vec![pb::Command {
+                        kind: Some(pb::command::Kind::PrintFunction(pb::PrintFunction {
+                            table: "Num".into(),
+                            ..Default::default()
+                        })),
+                        ..Default::default()
+                    }];
+                    let retry = run(&mut engine, id, program);
+                    assert_eq!(retry.error, None);
+                    let Some(pb::command_output::Kind::PrintedFunction(table)) =
+                        &retry.outputs[0].kind
+                    else {
+                        panic!("inert rejection")
+                    };
+                    assert!(table.rows.is_empty());
+                } else {
+                    assert_eq!(response.error, None, "{mode:?}/{read}: {response:?}");
+                    let Some(pb::command_output::Kind::Extraction(extracted)) =
+                        &response.outputs[1].kind
+                    else {
+                        panic!("read C")
+                    };
+                    assert_eq!(
+                        value(&response, extracted.roots[1].variants[0].term),
+                        if read == 4 { "20" } else { "30" }
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn failing_cost_keeps_constructor_prefix_without_annotation() {
+        let mut engine = Engine::default();
+        let id = create(&mut engine);
+        let mut program = fixture();
+        program.rules[0].eval_mode = pb::RuleEvalMode::Naive.into();
+        let Some(pb::rule_decl::Kind::Rule(rule)) = &mut program.rules[0].kind else {
+            unreachable!()
+        };
+        rule.head = vec![pb::Action {
+            kind: Some(pb::action::Kind::SetCost(pb::SetCost {
+                target: Some(pb::Call {
+                    func: "Box".into(),
+                    args: vec![15],
+                }),
+                cost: Some(4),
+            })),
+            ..Default::default()
+        }];
+        let response = run(&mut engine, id, program.clone());
+        let error = response
+            .error
+            .expect("missing current() must fail after constructing Box");
+        assert_eq!(
+            error.code,
+            i32::from(pb::ErrorCode::EvaluationFailed),
+            "{error:?}"
+        );
+        assert_eq!(error.location.unwrap().path, [1]);
+        program.rules.clear();
+        program.rulesets.clear();
+        program.commands = vec![
+            pb::Command {
+                kind: Some(pb::command::Kind::PrintFunction(pb::PrintFunction {
+                    table: "Box".into(),
+                    ..Default::default()
+                })),
+                ..Default::default()
+            },
+            pb::Command {
+                kind: Some(pb::command::Kind::Fail(Box::new(pb::Command {
+                    kind: Some(pb::command::Kind::Check(pb::Check { facts: vec![21] })),
+                    ..Default::default()
+                }))),
+                ..Default::default()
+            },
+        ];
+        let response = run(&mut engine, id, program);
+        assert_eq!(response.error, None);
+        let Some(pb::command_output::Kind::PrintedFunction(table)) = &response.outputs[0].kind
+        else {
+            panic!("target prefix")
+        };
+        assert_eq!(table.rows.len(), 1);
+    }
+
+    #[test]
+    fn invalid_targets_and_unbound_costs_reject_before_effects() {
+        for target in [
+            "size",
+            "egglog.core.i64.add",
+            "missing",
+            "cost_table_Num",
+            "unbound",
+        ] {
+            let mut engine = Engine::default();
+            let id = create(&mut engine);
+            let mut program = fixture();
+            if target == "egglog.core.i64.add" {
+                program.declarations.push(pb::Declaration {
+                    kind: Some(pb::declaration::Kind::HostPrimitive(pb::HostPrimitive {
+                        name: target.into(),
+                        typing: Some(pb::host_primitive::Typing::Signature(
+                            pb::GenericSignature {
+                                inputs: vec![
+                                    pb::Arg {
+                                        sort: 0,
+                                        ..Default::default()
+                                    };
+                                    2
+                                ],
+                                output: Some(0),
+                                ..Default::default()
+                            },
+                        )),
+                        ..Default::default()
+                    })),
+                    ..Default::default()
+                });
+            }
+            if target == "cost_table_Num" {
+                program.declarations.push(pb::Declaration {
+                    kind: Some(pb::declaration::Kind::Function(pb::Function {
+                        name: target.into(),
+                        inputs: vec![pb::Arg {
+                            sort: 0,
+                            ..Default::default()
+                        }],
+                        output: 0,
+                        ..Default::default()
+                    })),
+                    ..Default::default()
+                });
+            }
+            let unbound = program.nodes.len() as u32;
+            program.nodes.push(pb::Node {
+                sort_id: 0,
+                kind: Some(pb::node::Kind::Var("not_in_query".into())),
+                ..Default::default()
+            });
+            let Some(pb::rule_decl::Kind::Rule(rule)) = &mut program.rules[0].kind else {
+                unreachable!()
+            };
+            let Some(pb::action::Kind::SetCost(set)) = &mut rule.head[0].kind else {
+                unreachable!()
+            };
+            if target == "unbound" {
+                set.cost = Some(unbound);
+            } else {
+                set.target.as_mut().unwrap().func = target.into();
+                if target == "size" {
+                    set.target.as_mut().unwrap().args = vec![15];
+                }
+                if target == "egglog.core.i64.add" {
+                    set.target.as_mut().unwrap().args = vec![14, 16];
+                }
+            }
+            let response = run(&mut engine, id, program.clone());
+            assert!(
+                response
+                    .error
+                    .as_ref()
+                    .is_some_and(|error| error.location.is_none()),
+                "{target}: {response:?}"
+            );
+            assert!(response.outputs.is_empty());
+            program.rules.clear();
+            program.rulesets.clear();
+            program.commands = vec![pb::Command {
+                kind: Some(pb::command::Kind::PrintFunction(pb::PrintFunction {
+                    table: "Num".into(),
+                    ..Default::default()
+                })),
+                ..Default::default()
+            }];
+            let retry = run(&mut engine, id, program);
+            assert_eq!(retry.error, None, "{target}: {retry:?}");
+            let Some(pb::command_output::Kind::PrintedFunction(table)) = &retry.outputs[0].kind
+            else {
+                panic!("inert target rejection")
+            };
+            assert!(table.rows.is_empty());
+        }
+    }
+
+    #[test]
+    fn deleting_and_reinserting_rule_cost_target_does_not_reuse_annotation() {
+        let mut engine = Engine::default();
+        let id = create(&mut engine);
+        let mut program = fixture();
+        program.rules.push(pb::RuleDecl {
+            kind: Some(pb::rule_decl::Kind::Rule(pb::Rule {
+                query: vec![18],
+                head: vec![pb::Action {
+                    kind: Some(pb::action::Kind::Delete(pb::Call {
+                        func: "Box".into(),
+                        args: vec![15],
+                    })),
+                    ..Default::default()
+                }],
+            })),
+            eval_mode: pb::RuleEvalMode::Seminaive.into(),
+            ..Default::default()
+        });
+        program.rulesets.push(pb::Ruleset {
+            name: Some("remove-costed".into()),
+            kind: Some(pb::ruleset::Kind::Rules(pb::RuleList { rules: vec![1] })),
+            ..Default::default()
+        });
+        let reinsert = program.nodes.len() as u32;
+        program.nodes.push(pb::Node {
+            sort_id: 1,
+            kind: Some(pb::node::Kind::Call(pb::Call {
+                func: "Box".into(),
+                args: vec![12],
+            })),
+            ..Default::default()
+        });
+        program.commands.truncate(2);
+        program.commands.extend([
+            pb::Command {
+                kind: Some(pb::command::Kind::Run(pb::Run {
+                    ruleset: Some(pb::RulesetRef {
+                        kind: Some(pb::ruleset_ref::Kind::Index(1)),
+                    }),
+                    ..Default::default()
+                })),
+                ..Default::default()
+            },
+            pb::Command {
+                kind: Some(pb::command::Kind::Action(pb::Action {
+                    kind: Some(pb::action::Kind::Term(reinsert)),
+                    ..Default::default()
+                })),
+                ..Default::default()
+            },
+            pb::Command {
+                kind: Some(pb::command::Kind::Fail(Box::new(pb::Command {
+                    kind: Some(pb::command::Kind::Check(pb::Check { facts: vec![21] })),
+                    ..Default::default()
+                }))),
+                ..Default::default()
+            },
+            pb::Command {
+                kind: Some(pb::command::Kind::Freeze(pb::Freeze {})),
+                ..Default::default()
+            },
+        ]);
+        let response = run(&mut engine, id, program);
+        assert_eq!(response.error, None, "{response:?}");
+        let Some(pb::command_output::Kind::Snapshot(snapshot)) = &response.outputs[2].kind else {
+            panic!("retained rows")
+        };
+        let saved = snapshot.program.as_ref().unwrap();
+        assert_eq!(saved.nodes.iter().filter(|node| matches!(&node.kind, Some(pb::node::Kind::Call(call)) if call.func == "Box")).count(), 1);
+        let assignments: Vec<_> = saved
+            .commands
+            .iter()
+            .filter_map(|command| match &command.kind {
+                Some(pb::command::Kind::Action(pb::Action {
+                    kind: Some(pb::action::Kind::SetCost(set)),
+                    ..
+                })) => Some(set.target.as_ref().unwrap().func.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            assignments,
+            ["Num"],
+            "the reinserted Box must not inherit its deleted cost"
+        );
+    }
+}
+
 #[test]
 fn python_set_cost_request_executes_actual_encoded_constructor_assignment() {
     let mut engine = Engine::default();
