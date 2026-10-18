@@ -3288,6 +3288,57 @@ fn resolved_call_export_checks_direct_annotations_and_preserves_ordinary_calls()
 }
 
 #[test]
+fn vec_map_python_view_preserves_native_receiver_and_callback_order() {
+    let catalog = EGraph::default()
+        .type_info()
+        .portable_builtin_catalog()
+        .unwrap()
+        .definitions;
+    let declaration = catalog
+        .declarations
+        .iter()
+        .find(|d| {
+            matches!(&d.kind,
+                Some(proto::declaration::Kind::HostPrimitive(p)) if p.name == "egglog.core.vec.map"
+            )
+        })
+        .unwrap();
+    let Some(proto::declaration::Kind::HostPrimitive(primitive)) = &declaration.kind else {
+        unreachable!()
+    };
+    let Some(proto::host_primitive::Typing::Signature(signature)) = &primitive.typing else {
+        unreachable!()
+    };
+    let bindings = declaration.bindings.as_ref().unwrap();
+    let rust = &bindings.rust.as_ref().unwrap().views[0];
+    let python = &bindings.python.as_ref().unwrap().views[0];
+    assert_eq!(python.kind, proto::PythonCallKind::Method as i32);
+    assert_eq!(python.path, ["map"]);
+    assert_eq!(python.owner, rust.owner);
+    assert_eq!(python.receiver, rust.receiver.as_ref().unwrap().core_input);
+    assert_eq!(python.receiver, Some(1));
+    assert_eq!(
+        python.params,
+        [proto::PythonParameter {
+            core_input: rust.params[0].core_input,
+            name: signature.inputs[0].name.clone(),
+            default_expr: None,
+        }]
+    );
+    assert_eq!(python.params[0].core_input, Some(0));
+    assert!(python.mutates.is_none());
+    assert!(signature.varargs.is_empty());
+    assert!(matches!(
+        catalog.sorts[signature.inputs[0].sort as usize].kind,
+        Some(proto::sort::Kind::Func(_))
+    ));
+    assert_eq!(
+        python.owner.as_ref().unwrap().kind,
+        Some(proto::binding_owner::Kind::Sort(signature.inputs[1].sort))
+    );
+}
+
+#[test]
 fn vec_catalog_has_generic_and_closed_language_views() {
     let catalog = EGraph::default()
         .type_info()
@@ -3419,7 +3470,7 @@ fn vec_catalog_has_generic_and_closed_language_views() {
             "range" => (
                 Some(proto::RustReceiver {
                     core_input: Some(0),
-                    borrowed: false,
+                    borrowed: true,
                 }),
                 vec![],
             ),
