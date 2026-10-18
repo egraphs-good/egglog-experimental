@@ -870,8 +870,6 @@
 //! tuple iterator, preserving order and duplicate keys until native evaluation.
 //! `entries()` inspects direct construction or extracted data; it does not
 //! evaluate computed vectors or insert chains. Empty inputs need a type context.
-//! The current Map surface covers empty/from_pairs/get/insert and host codecs;
-//! remaining native Map operations await catalog migration.
 //!
 //! ```
 //! use egglog_experimental::typed::{builtins::{F64, I64, Map, Pair, Vec as EVec}, EgglogValue};

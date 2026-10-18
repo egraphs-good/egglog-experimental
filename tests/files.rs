@@ -1669,11 +1669,10 @@ fn protobuf_trials(root: &std::path::Path, core: bool) -> Vec<Trial> {
         if path
             .parent()
             .is_some_and(|parent| parent.ends_with("header"))
-            || path.ends_with("gemma.egg")
-            || path.ends_with("gemma4_moe.egg")
         {
             continue;
         }
+        let large = path.ends_with("gemma.egg") || path.ends_with("gemma4_moe.egg");
         let negative = path
             .components()
             .any(|part| part.as_os_str() == "fail-typecheck");
@@ -1713,7 +1712,10 @@ fn protobuf_trials(root: &std::path::Path, core: bool) -> Vec<Trial> {
                     ""
                 }
             );
-            trials.push(Trial::test(name, move || run.run().map_err(Into::into)));
+            // Large application fixtures remain selectable with --ignored.
+            trials.push(
+                Trial::test(name, move || run.run().map_err(Into::into)).with_ignored_flag(large),
+            );
         }
     }
     trials
