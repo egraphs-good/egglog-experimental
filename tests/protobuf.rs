@@ -14770,6 +14770,19 @@ fn source_query_value_alias_survives_constructor_deletion() {
                     Command::Constructor { name, .. } => {
                         constructors.insert(name.clone());
                     }
+                    Command::Function {
+                        name,
+                        hidden,
+                        unextractable,
+                        ..
+                    } if !core => {
+                        assert!(*hidden && *unextractable);
+                        assert!(
+                            constructors
+                                .iter()
+                                .any(|constructor| *name == format!("cost_table_{constructor}"))
+                        );
+                    }
                     Command::Function { .. } => {
                         panic!("private cost helper leaked into source: {rendered}")
                     }
@@ -14783,7 +14796,10 @@ fn source_query_value_alias_survives_constructor_deletion() {
                                 _ => None,
                             })
                             .collect();
-                        assert_eq!(deletes.len(), 1);
+                        assert_eq!(deletes.len(), if core { 1 } else { 2 });
+                        if !core {
+                            assert_eq!(*deletes[1], format!("cost_table_{}", deletes[0]));
+                        }
                         assert!(
                             constructors.contains(deletes[0]),
                             "authored constructor deletion was lost: {rendered}"
@@ -14802,9 +14818,9 @@ fn source_query_value_alias_survives_constructor_deletion() {
 }
 
 #[test]
-fn source_renderer_rejects_assigned_cost_reads_and_writes_without_state_changes() {
+fn source_core_renderer_rejects_assigned_cost_reads_and_writes_without_state_changes() {
     use egglog_experimental::protobuf::source::Renderer;
-    for core in [false, true] {
+    for core in [true] {
         let expected = if core {
             Renderer::core()
         } else {
@@ -17349,6 +17365,686 @@ fn assigned_costs_keep_zero_overwrites_deletion_and_freeze_restore() {
     );
 }
 
+#[test]
+fn source_assigned_cost_native_bytes_and_rendered_overwrites() {
+    use egglog_experimental::protobuf::source::{Renderer, Source};
+    let text = r#"
+        (with-dynamic-cost (datatype Cost (C i64)))
+        (set-cost (C 7) 0)
+        (check (= (cost_table_C 7) 0))
+        (set-cost (C 7) 9)
+        (check (= (cost_table_C 7) 9))
+        (C 8)
+        (fail (check (= (cost_table_C 8) 0)))
+        (delete (C 7)) (delete (cost_table_C 7))
+        (C 7)
+        (fail (check (= (cost_table_C 7) 9)))
+        (delete (C 8)) (delete (cost_table_C 8))
+        (C 8)
+        (print-size)
+    "#;
+    let mut native = new_experimental_egraph();
+    let original = native.parse_and_run_program(None, text).unwrap();
+    assert!(native.get_function("cost_table_C").unwrap().is_hidden());
+    let mut engine = Engine::default();
+    let id = create(&mut engine);
+    let mut renderer = Renderer::default();
+    let mut replay = new_experimental_egraph();
+    let mut recorded = String::new();
+    let mut assignments = 0;
+    for phase in Source::new(None, text).unwrap() {
+        let phase = pb::Program::decode(phase.unwrap().encode_to_vec().as_slice()).unwrap();
+        assert!(!phase.declarations.iter().any(|declaration| matches!(
+            &declaration.kind, Some(pb::declaration::Kind::Function(function))
+                if function.name == "cost_table_C"
+        )));
+        assignments += phase
+            .commands
+            .iter()
+            .filter(|command| {
+                matches!(
+                    &command.kind,
+                    Some(pb::command::Kind::Action(pb::Action {
+                        kind: Some(pb::action::Kind::SetCost(_)),
+                        ..
+                    }))
+                )
+            })
+            .count();
+        let rendered = renderer.render(&phase).unwrap();
+        let outputs = replay.parse_and_run_program(None, &rendered).unwrap();
+        for output in outputs {
+            if let egglog::CommandOutput::PrintAllFunctionsSize(tables) = output {
+                assert_eq!(tables.len(), 1, "private helpers changed visible tables");
+                assert_eq!(tables[0].1, 2);
+            }
+        }
+        recorded.push_str(&rendered);
+        let response = run(&mut engine, id, phase);
+        assert_eq!(response.error, None);
+        for output in &response.outputs {
+            if let Some(pb::command_output::Kind::Sizes(sizes)) = &output.kind {
+                assert_eq!(sizes.sizes.len(), 1);
+                assert_eq!(sizes.sizes[0].rows, 2);
+            }
+        }
+    }
+    assert_eq!(assignments, 2);
+    let mut fresh = Engine::default();
+    let fresh_id = create(&mut fresh);
+    for phase in Source::new(None, &recorded).unwrap() {
+        let response = run(&mut fresh, fresh_id, phase.unwrap());
+        assert_eq!(response.error, None);
+        for output in &response.outputs {
+            if let Some(pb::command_output::Kind::Sizes(sizes)) = &output.kind {
+                assert_eq!(
+                    sizes.sizes.len(),
+                    1,
+                    "fresh recorded replay leaked a capture table"
+                );
+                assert_eq!(sizes.sizes[0].rows, 2);
+            }
+        }
+    }
+    assert!(original.iter().any(|output| matches!(output, egglog::CommandOutput::PrintAllFunctionsSize(tables) if tables == &vec![("C".into(), 2)])));
+}
+
+#[test]
+fn source_assigned_cost_late_type_and_runtime_failures_keep_target_prefix() {
+    use egglog_experimental::protobuf::source::{Renderer, Source};
+    for (cost, typed) in [("\"wrong\"", true), ("(missing)", false)] {
+        let text = format!(
+            r#"
+            (with-dynamic-cost (datatype Cost (C i64)))
+            (function missing () i64 :merge new)
+            (set-cost (C 7) {cost})
+        "#
+        );
+        let mut native = new_experimental_egraph();
+        assert!(native.parse_and_run_program(None, &text).is_err());
+        assert_eq!(native.get_size("C"), 1, "native {cost}");
+        let mut engine = Engine::default();
+        let id = create(&mut engine);
+        let mut renderer = Renderer::default();
+        let mut replay = new_experimental_egraph();
+        let mut prefix = None;
+        let mut failed = false;
+        for phase in Source::new(None, &text).unwrap() {
+            let phase = match phase {
+                Ok(phase) => phase,
+                Err(error) => {
+                    assert!(typed, "unexpected producer error: {error}");
+                    failed = true;
+                    break;
+                }
+            };
+            let rendered = renderer.render(&phase).unwrap();
+            let native_result = replay.parse_and_run_program(None, &rendered);
+            let response = run(&mut engine, id, phase.clone());
+            prefix = Some(phase);
+            if let Some(error) = response.error {
+                assert!(!typed);
+                assert_eq!(error.code, i32::from(pb::ErrorCode::EvaluationFailed));
+                assert!(native_result.is_err());
+                failed = true;
+                break;
+            }
+            native_result.unwrap();
+        }
+        assert!(failed);
+        let mut prefix = prefix.unwrap();
+        prefix.commands = vec![pb::Command {
+            kind: Some(pb::command::Kind::PrintSize(pb::PrintSize {
+                tables: vec!["C".into()],
+            })),
+            ..Default::default()
+        }];
+        let response = run(&mut engine, id, prefix.clone());
+        assert_eq!(response.error, None);
+        assert!(
+            matches!(&response.outputs[0].kind, Some(pb::command_output::Kind::Sizes(sizes)) if sizes.sizes[0].rows == 1)
+        );
+        let arg = prefix
+            .nodes
+            .iter()
+            .position(|node| {
+                matches!(
+                    &node.kind,
+                    Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
+                        value: Some(pb::primitive_value::Value::I64(7))
+                    }))
+                )
+            })
+            .unwrap() as u32;
+        let read = prefix.nodes.len() as u32;
+        prefix.nodes.push(pb::Node {
+            sort_id: prefix.nodes[arg as usize].sort_id,
+            kind: Some(pb::node::Kind::GetCost(pb::Call {
+                func: "C".into(),
+                args: vec![arg],
+            })),
+            ..Default::default()
+        });
+        prefix.commands = vec![pb::Command {
+            kind: Some(pb::command::Kind::Action(pb::Action {
+                kind: Some(pb::action::Kind::Term(read)),
+                ..Default::default()
+            })),
+            ..Default::default()
+        }];
+        assert_eq!(
+            run(&mut engine, id, prefix).error.unwrap().code,
+            i32::from(pb::ErrorCode::EvaluationFailed)
+        );
+    }
+}
+
+#[test]
+fn source_assigned_cost_rule_primitive_cleanup_and_compaction_roundtrip() {
+    use egglog_experimental::protobuf::source::{Renderer, Source};
+    for extractor in ["", ":extractor greedy-dag"] {
+        let text = format!(
+            r#"
+            (with-dynamic-cost (datatype Cost (C i64) (Box Cost)))
+            (function size (Cost) i64 :merge new)
+            (function root () Cost :merge new)
+            (relation Drop (i64))
+            (primitive read_cost (i64) i64 (cost_table_C _0))
+            (set-cost (C 7) 0)
+            (set (size (C 7)) 9)
+            (ruleset assign)
+            (rule ((= (size (C key)) amount))
+                ((set-cost (C key) amount) (set-cost (Box (C key)) (read_cost key)))
+                :ruleset assign :naive)
+            (run assign 1)
+            (check (= (cost_table_C 7) 9) (= (cost_table_Box (C 7)) 0))
+            (set (root) (Box (C 7)))
+            (keep-best "root" {extractor})
+            (check (= (cost_table_C 7) 9) (= (cost_table_Box (C 7)) 0))
+            (extract (root) {extractor})
+            (subsume (C 7))
+            (check (= (cost_table_C 7) 9))
+            (ruleset cleanup)
+            (rule ((Drop key)) ((delete (C key)) (delete (cost_table_C key))) :ruleset cleanup)
+            (Drop 7)
+            (run cleanup 1)
+            (C 7)
+            (fail (check (= (cost_table_C 7) 9)))
+        "#
+        );
+        new_experimental_egraph()
+            .parse_and_run_program(None, &text)
+            .unwrap();
+        let mut engine = Engine::default();
+        let id = create(&mut engine);
+        let mut renderer = Renderer::default();
+        let mut native = new_experimental_egraph();
+        let mut recorded = String::new();
+        let mut primitive_read = false;
+        let mut rule_costs = false;
+        for phase in Source::new(None, &text).unwrap() {
+            let phase = phase.unwrap();
+            assert!(!phase.declarations.iter().any(|declaration| matches!(&declaration.kind,
+                Some(pb::declaration::Kind::Function(function)) if ["cost_table_C", "cost_table_Box"].contains(&function.name.as_str()))));
+            primitive_read |= phase.declarations.iter().any(|declaration| matches!(&declaration.kind,
+                Some(pb::declaration::Kind::Primitive(primitive)) if primitive.name == "read_cost"
+                    && matches!(phase.nodes[primitive.body.unwrap() as usize].kind, Some(pb::node::Kind::GetCost(_)))));
+            rule_costs |= phase.rules.iter().any(|rule| matches!(&rule.kind,
+                Some(pb::rule_decl::Kind::Rule(rule)) if rule.head.iter().filter(|action| matches!(action.kind, Some(pb::action::Kind::SetCost(_)))).count() == 2));
+            let rendered = renderer.render(&phase).unwrap();
+            native.parse_and_run_program(None, &rendered).unwrap();
+            recorded.push_str(&rendered);
+            assert_eq!(run(&mut engine, id, phase).error, None);
+        }
+        assert!(primitive_read && rule_costs);
+        let mut fresh = Engine::default();
+        let fresh_id = create(&mut fresh);
+        for phase in Source::new(None, &recorded).unwrap() {
+            assert_eq!(run(&mut fresh, fresh_id, phase.unwrap()).error, None);
+        }
+    }
+}
+
+#[test]
+fn source_assigned_cost_late_error_retains_read_before_later_argument_effect() {
+    use egglog_experimental::protobuf::source::{Renderer, Source};
+    // The first read must remain zero after the second argument inserts Leaf.
+    // Publishing separate argument Terms and reevaluating them at C gives one.
+    let text = r#"
+        (with-dynamic-cost (datatype Cost (Leaf i64) (C i64 Cost)))
+        (set-cost (C (get-node-size!) (Leaf 7)) "wrong")
+    "#;
+    let mut native = new_experimental_egraph();
+    assert!(native.parse_and_run_program(None, text).is_err());
+    native
+        .parse_and_run_program(None, "(check (C 0 (Leaf 7)))")
+        .unwrap();
+    let mut engine = Engine::default();
+    let id = create(&mut engine);
+    let mut renderer = Renderer::default();
+    let mut replay = new_experimental_egraph();
+    let mut prefix = None;
+    let mut late_error = false;
+    for phase in Source::new(None, text).unwrap() {
+        let phase = match phase {
+            Ok(phase) => phase,
+            Err(_) => {
+                late_error = true;
+                break;
+            }
+        };
+        if !phase.commands.is_empty() {
+            assert_eq!(
+                phase.commands.len(),
+                1,
+                "one target owns the evaluating prefix unit"
+            );
+        }
+        replay
+            .parse_and_run_program(None, &renderer.render(&phase).unwrap())
+            .unwrap();
+        assert_eq!(run(&mut engine, id, phase.clone()).error, None);
+        prefix = Some(phase);
+    }
+    assert!(late_error);
+    let mut prefix = prefix.unwrap();
+    let target = prefix
+        .nodes
+        .iter()
+        .position(|node| {
+            matches!(&node.kind,
+        Some(pb::node::Kind::Call(call)) if call.func == "C")
+        })
+        .unwrap();
+    let mut expected = prefix.nodes[target].clone();
+    let Some(pb::node::Kind::Call(call)) = &mut expected.kind else {
+        unreachable!()
+    };
+    let scalar = prefix.nodes[call.args[0] as usize].sort_id;
+    call.args[0] = prefix.nodes.len() as u32;
+    prefix.nodes.push(pb::Node {
+        sort_id: scalar,
+        kind: Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
+            value: Some(pb::primitive_value::Value::I64(0)),
+        })),
+        ..Default::default()
+    });
+    let root = prefix.nodes.len() as u32;
+    prefix.nodes.push(expected);
+    prefix.commands = vec![pb::Command {
+        kind: Some(pb::command::Kind::Check(pb::Check { facts: vec![root] })),
+        ..Default::default()
+    }];
+    assert_eq!(run(&mut engine, id, prefix.clone()).error, None);
+    replay
+        .parse_and_run_program(None, &renderer.render(&prefix).unwrap())
+        .unwrap();
+}
+
+#[test]
+fn source_assigned_cost_repeated_include_roles_follow_clone_and_pop() {
+    use egglog_experimental::protobuf::source::{Renderer, Source, Submission};
+    let directory = std::env::temp_dir().join(format!(
+        "egglog-source-cost-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir(&directory).unwrap();
+    std::fs::write(
+        directory.join("cost.egg"),
+        r#"
+        (with-dynamic-cost (datatype Cost (C i64)))
+        (set-cost (C 7) 0) (set-cost (C 7) 9)
+        (check (= (cost_table_C 7) 9)) (print-size)
+    "#,
+    )
+    .unwrap();
+    let mut source = Source::new(
+        None,
+        r#"
+        (push) (include "cost.egg") (pop)
+        (push) (include "cost.egg") (pop)
+    "#,
+    )
+    .unwrap()
+    .with_include_base(&directory)
+    .unwrap();
+    let mut renderer = Renderer::default();
+    let mut native = new_experimental_egraph();
+    let mut engine = Engine::default();
+    let mut id = create(&mut engine);
+    let mut saved = Vec::new();
+    let mut observations = 0;
+    while let Some(submission) = source.next_submission() {
+        let submission = submission.unwrap();
+        let outputs = native
+            .parse_and_run_program(None, &renderer.render_submission(&submission).unwrap())
+            .unwrap();
+        for output in outputs {
+            if let egglog::CommandOutput::PrintAllFunctionsSize(tables) = output {
+                assert_eq!(tables.len(), 1);
+                assert_eq!(tables[0].1, 1);
+            }
+        }
+        match submission {
+            Submission::Program(program) => {
+                let response = run(&mut engine, id, program);
+                assert_eq!(response.error, None);
+                for output in response.outputs {
+                    if let Some(pb::command_output::Kind::Sizes(sizes)) = output.kind {
+                        observations += 1;
+                        assert_eq!(sizes.sizes.len(), 1);
+                        assert_eq!(sizes.sizes[0].rows, 1);
+                    }
+                }
+            }
+            Submission::Push(count) => {
+                for _ in 0..count {
+                    saved.push(id);
+                    id = pb::CloneEGraphResponse::decode(
+                        engine
+                            .clone_egraph(&pb::CloneEGraphRequest { egraph_id: id }.encode_to_vec())
+                            .unwrap()
+                            .as_slice(),
+                    )
+                    .unwrap()
+                    .egraph_id;
+                }
+            }
+            Submission::Pop { count, .. } => {
+                for _ in 0..count {
+                    let parent = saved.pop().unwrap();
+                    engine
+                        .return_to(
+                            &pb::ReturnToEGraphRequest {
+                                active_id: id,
+                                saved_id: parent,
+                            }
+                            .encode_to_vec(),
+                        )
+                        .unwrap();
+                    id = parent;
+                }
+            }
+        }
+    }
+    assert!(saved.is_empty());
+    assert_eq!(observations, 2);
+    std::fs::remove_file(directory.join("cost.egg")).unwrap();
+    std::fs::remove_dir(directory).unwrap();
+}
+
+#[test]
+fn source_assigned_cost_delete_temps_do_not_capture_authored_binders() {
+    use egglog_experimental::protobuf::source::{Renderer, Source};
+    let integer = |value| pb::Node {
+        sort_id: 0,
+        kind: Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
+            value: Some(pb::primitive_value::Value::I64(value)),
+        })),
+        ..Default::default()
+    };
+    let call = |args| pb::Call {
+        func: "C".into(),
+        args,
+    };
+    let program = pb::Program {
+        ir_version: 1,
+        sorts: fixture().sorts,
+        nodes: vec![
+            integer(10),
+            integer(20),
+            integer(99),
+            pb::Node {
+                sort_id: 0,
+                kind: Some(pb::node::Kind::Var("z".into())),
+                ..Default::default()
+            },
+            pb::Node {
+                sort_id: 0,
+                kind: Some(pb::node::Kind::Var("__egglog_source_delete_1_0_0".into())),
+                ..Default::default()
+            },
+            pb::Node {
+                sort_id: 1,
+                kind: Some(pb::node::Kind::Call(call(vec![3, 4]))),
+                ..Default::default()
+            },
+            pb::Node {
+                sort_id: 1,
+                kind: Some(pb::node::Kind::Call(call(vec![0, 1]))),
+                ..Default::default()
+            },
+            pb::Node {
+                sort_id: 0,
+                kind: Some(pb::node::Kind::GetCost(call(vec![0, 1]))),
+                ..Default::default()
+            },
+            pb::Node {
+                sort_id: 0,
+                kind: Some(pb::node::Kind::Union(pb::Union {
+                    members: vec![7, 2],
+                })),
+                ..Default::default()
+            },
+        ],
+        declarations: vec![
+            fixture().declarations[0].clone(),
+            pb::Declaration {
+                kind: Some(pb::declaration::Kind::Constructor(pb::Constructor {
+                    name: "C".into(),
+                    inputs: vec![
+                        pb::Arg {
+                            sort: 0,
+                            name: String::new()
+                        };
+                        2
+                    ],
+                    output: 1,
+                    ..Default::default()
+                })),
+                ..Default::default()
+            },
+        ],
+        rules: vec![pb::RuleDecl {
+            kind: Some(pb::rule_decl::Kind::Rule(pb::Rule {
+                query: vec![5],
+                head: vec![pb::Action {
+                    kind: Some(pb::action::Kind::Delete(call(vec![3, 4]))),
+                    ..Default::default()
+                }],
+            })),
+            eval_mode: pb::RuleEvalMode::Seminaive.into(),
+            ..Default::default()
+        }],
+        rulesets: vec![pb::Ruleset {
+            name: Some("cleanup".into()),
+            kind: Some(pb::ruleset::Kind::Rules(pb::RuleList { rules: vec![0] })),
+            ..Default::default()
+        }],
+        commands: vec![
+            pb::Command {
+                kind: Some(pb::command::Kind::Action(pb::Action {
+                    kind: Some(pb::action::Kind::SetCost(pb::SetCost {
+                        target: Some(call(vec![0, 1])),
+                        cost: Some(2),
+                    })),
+                    ..Default::default()
+                })),
+                ..Default::default()
+            },
+            pb::Command {
+                kind: Some(pb::command::Kind::Run(pb::Run {
+                    ruleset: Some(pb::RulesetRef {
+                        kind: Some(pb::ruleset_ref::Kind::Index(0)),
+                    }),
+                    ..Default::default()
+                })),
+                ..Default::default()
+            },
+            pb::Command {
+                kind: Some(pb::command::Kind::Action(pb::Action {
+                    kind: Some(pb::action::Kind::Term(6)),
+                    ..Default::default()
+                })),
+                ..Default::default()
+            },
+            pb::Command {
+                kind: Some(pb::command::Kind::Fail(Box::new(pb::Command {
+                    kind: Some(pb::command::Kind::Check(pb::Check { facts: vec![8] })),
+                    ..Default::default()
+                }))),
+                ..Default::default()
+            },
+        ],
+        ..Default::default()
+    };
+    let mut direct = Engine::default();
+    let id = create(&mut direct);
+    assert_eq!(run(&mut direct, id, program.clone()).error, None);
+    let rendered = Renderer::default().render(&program).unwrap();
+    new_experimental_egraph()
+        .parse_and_run_program(None, &rendered)
+        .unwrap();
+    let mut fresh = Engine::default();
+    let fresh_id = create(&mut fresh);
+    for phase in Source::new(None, &rendered).unwrap() {
+        assert_eq!(run(&mut fresh, fresh_id, phase.unwrap()).error, None);
+    }
+}
+
+#[test]
+fn source_assigned_cost_admission_is_inert_and_scoped() {
+    use egglog_experimental::protobuf::source::{Renderer, Source, Submission};
+    for action in [
+        "(set (cost_table_C 1) 9)",
+        "(delete (C 1))",
+        "(delete (cost_table_C 1))",
+    ] {
+        let text = format!("(with-dynamic-cost (datatype Cost (C i64))) {action}");
+        assert!(
+            Source::new(None, &text)
+                .unwrap()
+                .any(|phase| phase.is_err()),
+            "{action}"
+        );
+    }
+    let expected = Renderer::default().render(&fixture()).unwrap();
+    for kind in ["read", "write", "delete"] {
+        let mut program = fixture();
+        program.commands.clear();
+        program.rules.clear();
+        program.rulesets.clear();
+        let constructor = program
+            .declarations
+            .iter_mut()
+            .find_map(|declaration| match &mut declaration.kind {
+                Some(pb::declaration::Kind::Constructor(constructor))
+                    if constructor.name == "Num" =>
+                {
+                    Some(constructor)
+                }
+                _ => None,
+            })
+            .unwrap();
+        constructor.unextractable = true;
+        let target = pb::Call {
+            func: "Num".into(),
+            args: vec![1],
+        };
+        let action = match kind {
+            "read" => {
+                let index = program.nodes.len() as u32;
+                program.nodes.push(pb::Node {
+                    sort_id: 0,
+                    kind: Some(pb::node::Kind::GetCost(target)),
+                    ..Default::default()
+                });
+                pb::action::Kind::Term(index)
+            }
+            "write" => pb::action::Kind::SetCost(pb::SetCost {
+                target: Some(target),
+                cost: Some(0),
+            }),
+            _ => pb::action::Kind::Delete(target),
+        };
+        program.commands.push(pb::Command {
+            kind: Some(pb::command::Kind::Action(pb::Action {
+                kind: Some(action),
+                ..Default::default()
+            })),
+            ..Default::default()
+        });
+        let mut renderer = Renderer::default();
+        assert!(
+            renderer
+                .render(&program)
+                .unwrap_err()
+                .to_string()
+                .contains("unextractable constructors")
+        );
+        assert_eq!(renderer.render(&fixture()).unwrap(), expected);
+    }
+    for depth in [1, 2] {
+        let mut program = fixture();
+        program.rules.clear();
+        program.rulesets.clear();
+        let mut command = pb::Command {
+            kind: Some(pb::command::Kind::Action(pb::Action {
+                kind: Some(pb::action::Kind::SetCost(pb::SetCost {
+                    target: Some(pb::Call {
+                        func: "Num".into(),
+                        args: vec![1],
+                    }),
+                    cost: Some(0),
+                })),
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+        for _ in 0..depth {
+            command = pb::Command {
+                kind: Some(pb::command::Kind::Fail(Box::new(command))),
+                ..Default::default()
+            };
+        }
+        program.commands = vec![command];
+        let mut renderer = Renderer::default();
+        assert!(
+            renderer
+                .render(&program)
+                .unwrap_err()
+                .to_string()
+                .contains("multi-command set-cost")
+        );
+        assert_eq!(renderer.render(&fixture()).unwrap(), expected);
+    }
+    let mut source = Source::new(
+        None,
+        r#"
+        (push) (with-dynamic-cost (datatype Scoped (C i64))) (pop)
+        (datatype Scoped (C i64)) (function cost_table_C (i64) i64 :merge new)
+        (set (cost_table_C 1) 9)
+    "#,
+    )
+    .unwrap();
+    let mut ordinary_write = false;
+    while let Some(submission) = source.next_submission() {
+        if let Submission::Program(program) = submission.unwrap() {
+            ordinary_write |= program.commands.iter().any(|command| matches!(&command.kind,
+                Some(pb::command::Kind::Action(pb::Action { kind: Some(pb::action::Kind::Set(set)), .. }))
+                    if set.target.as_ref().is_some_and(|target| target.func == "cost_table_C")));
+        }
+    }
+    assert!(
+        ordinary_write,
+        "popped macro role captured a raw same-looking function"
+    );
+}
+
 mod rule_assigned_costs {
     use super::*;
 
@@ -17424,7 +18120,6 @@ mod rule_assigned_costs {
                 }],
                 output: 0,
                 merge: Some(3),
-                ..Default::default()
             })),
             ..Default::default()
         });
@@ -17658,7 +18353,6 @@ mod rule_assigned_costs {
                             ..Default::default()
                         },
                     )),
-                    ..Default::default()
                 })),
                 ..Default::default()
             },
@@ -17925,7 +18619,6 @@ mod rule_assigned_costs {
                                 ..Default::default()
                             },
                         )),
-                        ..Default::default()
                     })),
                     ..Default::default()
                 });

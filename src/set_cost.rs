@@ -30,7 +30,30 @@ use egglog::{
 use egglog_ast::span::Span;
 use num::BigInt;
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+
+// Parsing expands these macros before Source typechecks its ordered phases.
+// Keep only their origin/role facts, never an executable copy of the expansion.
+#[derive(Default)]
+pub(crate) struct CostOrigins {
+    pub sets: HashMap<Span, (String, usize)>,
+    pub starts: HashMap<String, (Span, Vec<String>)>,
+    pub declarations: HashMap<(Span, String), String>,
+}
+
+#[derive(Clone, Default)]
+pub(crate) struct SourceCostRoles(pub HashMap<String, String>, pub HashSet<String>);
+
+pub(crate) fn record_cost_origins(graph: &mut EGraph) -> Arc<Mutex<CostOrigins>> {
+    let origins = Arc::new(Mutex::new(CostOrigins::default()));
+    graph
+        .parser
+        .add_action_macro(Arc::new(SetCost(Some(origins.clone()))));
+    graph
+        .parser
+        .add_command_macro(Arc::new(SetCostDeclarations(Some(origins.clone()))));
+    origins
+}
 
 /// Registers `with-dynamic-cost`, `set-cost`, and the dynamic-cost `extract`
 /// command on an e-graph.
@@ -40,14 +63,14 @@ use std::sync::Arc;
 pub fn add_set_cost(egraph: &mut EGraph) {
     egraph
         .parser
-        .add_command_macro(Arc::new(SetCostDeclarations));
-    egraph.parser.add_action_macro(Arc::new(SetCost));
+        .add_command_macro(Arc::new(SetCostDeclarations(None)));
+    egraph.parser.add_action_macro(Arc::new(SetCost(None)));
     egraph
         .add_command("extract".into(), Arc::new(CustomExtract))
         .unwrap();
 }
 
-struct SetCost;
+struct SetCost(Option<Arc<Mutex<CostOrigins>>>);
 
 impl Macro<Vec<Action>> for SetCost {
     fn name(&self) -> &str {
@@ -67,9 +90,24 @@ impl Macro<Vec<Action>> for SetCost {
                 let args = map_fallible(args, parser, Parser::parse_expr)?;
                 let value = parser.parse_expr(value)?;
 
+                if let Some(origins) = &self.0 {
+                    origins
+                        .lock()
+                        .unwrap()
+                        .sets
+                        .insert(span.clone(), (func.clone(), args.len()));
+                }
+
                 let vs = (0..args.len())
                     .map(|_| parser.symbol_gen.fresh("set_cost_var"))
                     .collect::<Vec<_>>();
+                if let (Some(origins), Some(first)) = (&self.0, vs.first()) {
+                    origins
+                        .lock()
+                        .unwrap()
+                        .starts
+                        .insert(first.clone(), (span.clone(), vs.clone()));
+                }
                 let (args, mut actions): (Vec<Expr>, Vec<Action>) = vs
                     .into_iter()
                     .zip(args)
@@ -95,7 +133,7 @@ impl Macro<Vec<Action>> for SetCost {
     }
 }
 
-struct SetCostDeclarations;
+struct SetCostDeclarations(Option<Arc<Mutex<CostOrigins>>>);
 
 impl Macro<Vec<Command>> for SetCostDeclarations {
     fn name(&self) -> &str {
@@ -146,11 +184,11 @@ impl Macro<Vec<Command>> for SetCostDeclarations {
                             span: span.clone(),
                             name: cost_table_name,
                             schema: cost_table_schema,
-                            merge: None,
-                            hidden: false,
+                            merge: Some(Expr::Var(span.clone(), "new".into())),
+                            hidden: true,
                             let_binding: false,
                             term_constructor: None,
-                            unextractable: false,
+                            unextractable: true,
                         });
                     }
                 }
@@ -159,6 +197,47 @@ impl Macro<Vec<Command>> for SetCostDeclarations {
                         span,
                         "Expect a datatype declaration".to_string(),
                     ));
+                }
+            }
+        }
+        if let Some(origins) = &self.0 {
+            let mut origins = origins.lock().unwrap();
+            for command in &cost_table_commands {
+                if let Command::Function { span, name, .. } = command {
+                    // This link is recorded where the constructor creates the
+                    // helper, not recovered by stripping a private prefix.
+                    let constructor = decls
+                        .iter()
+                        .find_map(|decl| match decl {
+                            Command::Constructor {
+                                name: constructor, ..
+                            } if get_cost_table_name(constructor) == *name => {
+                                Some(constructor.clone())
+                            }
+                            Command::Datatype { variants, .. } => variants
+                                .iter()
+                                .find(|variant| get_cost_table_name(&variant.name) == *name)
+                                .map(|variant| variant.name.clone()),
+                            Command::Datatypes { datatypes, .. } => {
+                                datatypes.iter().find_map(|(_, _, types)| {
+                                    if let Subdatatypes::Variants(variants) = types {
+                                        variants
+                                            .iter()
+                                            .find(|variant| {
+                                                get_cost_table_name(&variant.name) == *name
+                                            })
+                                            .map(|variant| variant.name.clone())
+                                    } else {
+                                        None
+                                    }
+                                })
+                            }
+                            _ => None,
+                        })
+                        .expect("generated helper has its constructor declaration");
+                    origins
+                        .declarations
+                        .insert((span.clone(), name.clone()), constructor);
                 }
             }
         }
@@ -179,11 +258,11 @@ fn generate_cost_table_commands_from_variants(variants: &[Variant]) -> Vec<Comma
                 span: v.span.clone(),
                 name: cost_table_name,
                 schema: cost_table_schema,
-                merge: None,
-                hidden: false,
+                merge: Some(Expr::Var(v.span.clone(), "new".into())),
+                hidden: true,
                 let_binding: false,
                 term_constructor: None,
-                unextractable: false,
+                unextractable: true,
             }
         })
         .collect::<Vec<_>>()

@@ -581,7 +581,7 @@ fn test_get_size_primitive() {
 }
 
 #[test]
-fn test_extract_set_cost_multiple_times_should_fail() {
+fn test_extract_set_cost_multiple_times_overwrites() {
     let mut egraph = egglog_experimental::new_experimental_egraph();
 
     egraph
@@ -597,9 +597,15 @@ fn test_extract_set_cost_multiple_times_should_fail() {
     egraph
         .parse_and_run_program(None, "(set-cost (Num 2) 1000)")
         .unwrap();
-
-    let result = egraph.parse_and_run_program(None, "(set-cost (Num 2) 1)");
-    assert!(result.is_err());
+    for assigned in [1000, 1, 0] {
+        let outputs = egraph.parse_and_run_program(None, &format!(
+            "(set-cost (Num 2) {assigned}) (check (= (cost_table_Num 2) {assigned})) (extract (Num 2))"
+        )).unwrap();
+        assert!(outputs.iter().any(|output| matches!(output,
+            egglog::CommandOutput::ExtractBest(_, cost, _) if *cost == assigned + 1)));
+        assert_eq!(egraph.get_size("Num"), 1);
+        assert_eq!(egraph.get_size("cost_table_Num"), 1);
+    }
 }
 
 #[test]

@@ -8,7 +8,8 @@
 //! return requests; the Program iterator deliberately rejects scope operations.
 //! Selected rulesets are immutable snapshots; later source additions publish
 //! occurrence-preserving prefix/delta versions. Uncatalogued primitives, effectful local lets,
-//! dynamic costs and mutating schedule bodies remain unsupported. The explicit Core
+//! named cost models remain unsupported. Experimental constructor annotations use
+//! the native cost macros with their actual provenance. The explicit Core
 //! frontend also admits Run-only sequence/repeat/saturate controls. Proof requests keep
 //! their authored identity; execution mode belongs to the receiving engine.
 
@@ -28,6 +29,23 @@ enum Dialect {
 enum RewriteKind {
     Directional(bool),
     Bidirectional,
+}
+
+// Cleanup must address the retained key, not reevaluate an equal-looking call
+// after deletion. The two source uses naturally have different spans.
+fn retained_cost_key<H, V: PartialEq>(
+    left: &[ast::GenericExpr<H, V>],
+    right: &[ast::GenericExpr<H, V>],
+) -> bool {
+    left.len() == right.len()
+        && left
+            .iter()
+            .zip(right)
+            .all(|(left, right)| match (left, right) {
+                (ast::GenericExpr::Var(_, left), ast::GenericExpr::Var(_, right)) => left == right,
+                (ast::GenericExpr::Lit(_, left), ast::GenericExpr::Lit(_, right)) => left == right,
+                _ => false,
+            })
 }
 
 /// An ordered source phase. Push saves the active handle and continues in a
@@ -80,6 +98,8 @@ pub struct Source {
     local_prefix: String,
     // Native fresh names survive Pop; never reuse a discarded version's name.
     next_ruleset: u64,
+    cost_origins: std::sync::Arc<std::sync::Mutex<crate::set_cost::CostOrigins>>,
+    pending_cost_error: Option<String>,
 }
 
 // Project the resolved body before unstable-fn target preparation replaces
@@ -107,6 +127,8 @@ pub(crate) fn primitive_definition(
         schedulers: HashSet::new(),
         local_prefix: String::new(),
         next_ruleset: 0,
+        cost_origins: Default::default(),
+        pending_cost_error: None,
     };
     let inputs = inputs
         .iter()
@@ -154,6 +176,11 @@ impl Source {
             Dialect::Experimental => crate::new_experimental_egraph(),
             Dialect::Core => EGraph::default(),
         };
+        let cost_origins = if dialect == Dialect::Experimental {
+            crate::set_cost::record_cost_origins(&mut graph)
+        } else {
+            Default::default()
+        };
         let commands: VecDeque<_> = graph
             .parse_program(filename, source)
             .map_err(|error| TransportError(error.to_string()))?
@@ -200,6 +227,8 @@ impl Source {
             schedulers: HashSet::new(),
             local_prefix,
             next_ruleset: 0,
+            cost_origins,
+            pending_cost_error: None,
         })
     }
 
@@ -227,6 +256,10 @@ impl Source {
     }
 
     fn advance(&mut self, scopes: bool) -> Option<Result<Submission, TransportError>> {
+        if let Some(error) = self.pending_cost_error.take() {
+            self.commands.clear();
+            return Some(Err(TransportError(error)));
+        }
         let result = loop {
             let (command, depth) = self.commands.pop_front()?;
             match command {
@@ -297,7 +330,95 @@ impl Source {
                         "source scopes require next_submission and clone/return requests".into(),
                     );
                 }
-                command => break self.compile(command).map(Submission::Program),
+                command => {
+                    let cost_start = match &command {
+                        Command::Action(Action::Let(_, name, _)) => {
+                            self.cost_origins.lock().unwrap().starts.get(name).cloned()
+                        }
+                        Command::Action(Action::Expr(span, _)) => self
+                            .cost_origins
+                            .lock()
+                            .unwrap()
+                            .sets
+                            .get(span)
+                            .filter(|(_, arity)| *arity == 0)
+                            .map(|_| (span.clone(), Vec::new())),
+                        _ => None,
+                    };
+                    if let Some((span, captures)) = cost_start {
+                        break self
+                            .cost_phase(command, span, captures, None)
+                            .map(Submission::Program);
+                    }
+                    if let Command::Action(Action::Let(_, first, _)) = &command {
+                        let mut captures = vec![first.clone()];
+                        for (command, _) in &self.commands {
+                            let Command::Action(Action::Let(_, name, _)) = command else {
+                                break;
+                            };
+                            captures.push(name.clone());
+                        }
+                        let next = captures.len() - 1;
+                        if let Some((
+                            Command::Action(Action::Change(
+                                span,
+                                ast::Change::Delete,
+                                constructor,
+                                key,
+                            )),
+                            _,
+                        )) = self.commands.get(next)
+                            && let Some((
+                                Command::Action(Action::Change(
+                                    _,
+                                    ast::Change::Delete,
+                                    helper,
+                                    helper_key,
+                                )),
+                                _,
+                            )) = self.commands.get(next + 1)
+                            && self
+                                .graph
+                                .extension_state::<crate::set_cost::SourceCostRoles>()
+                                .and_then(|roles| roles.0.get(helper))
+                                == Some(constructor)
+                            && retained_cost_key(key, helper_key)
+                            && key.len() == captures.len()
+                            && key.iter().zip(&captures).all(
+                                |(arg, name)| matches!(arg, Expr::Var(_, used) if used == name),
+                            )
+                        {
+                            let constructor = constructor.clone();
+                            let span = span.clone();
+                            break self
+                                .cost_phase(command, span, captures, Some(constructor))
+                                .map(Submission::Program);
+                        }
+                    }
+                    // A native dynamic helper is separate storage. Admit a
+                    // deletion only with the exact adjacent cleanup emitted by
+                    // Renderer; wire Delete performs that same paired cleanup.
+                    if let Command::Action(Action::Change(_, ast::Change::Delete, target, args)) =
+                        &command
+                        && let Some(helper) = self
+                            .graph
+                            .extension_state::<crate::set_cost::SourceCostRoles>()
+                            .and_then(|roles| {
+                                roles
+                                    .0
+                                    .iter()
+                                    .find(|(_, constructor)| *constructor == target)
+                                    .map(|(helper, _)| helper.clone())
+                            })
+                    {
+                        if !matches!(self.commands.front(), Some((Command::Action(Action::Change(_, ast::Change::Delete, name, key)), _)) if *name == helper && retained_cost_key(key, args))
+                        {
+                            break Err("dynamic-cost constructor deletion requires its exact adjacent helper cleanup".into());
+                        }
+                        self.commands.pop_front();
+                    }
+                    break self.compile(command).map(Submission::Program);
+                }
             }
         };
         if result.is_err() {
@@ -385,6 +506,7 @@ impl Source {
             // Normal desugaring expands Prove into a hidden helper program.
             // Resolve just its query here, then publish the authored command.
             let prove = matches!(command, Command::Prove(..));
+            let mut source_extractor = pb::Extractor::Tree;
             let command = match command {
                 Command::Prove(span, facts) => Command::Check(span, facts),
                 // The experimental parser deliberately shadows core extract.
@@ -392,7 +514,12 @@ impl Source {
                 // model agrees with static constructor costs. Do not execute the
                 // UserDefined command to discover/resolve its arguments.
                 Command::UserDefined(span, name, args) if name == "extract" => {
-                    let (expr, variants) = match args.as_slice() {
+                    let (args, greedy) = crate::greedy_dag_extract::split_trailing_extractor(&args)
+                        .map_err(|error| error.to_string())?;
+                    if greedy {
+                        source_extractor = pb::Extractor::GreedyDag;
+                    }
+                    let (expr, variants) = match args {
                         [expr] => (expr.clone(), Expr::Lit(span.clone(), Literal::Int(0))),
                         [expr, variants] => (expr.clone(), variants.clone()),
                         _ => {
@@ -403,6 +530,43 @@ impl Source {
                         }
                     };
                     Command::Extract(span, expr, variants)
+                }
+                Command::UserDefined(span, name, args) if name == "keep-best" => {
+                    let (args, greedy) = crate::greedy_dag_extract::split_trailing_extractor(&args)
+                        .map_err(|error| error.to_string())?;
+                    if args.is_empty() {
+                        return Err("source keep-best requires literal table names".into());
+                    }
+                    let tables = args
+                        .iter()
+                        .map(|arg| {
+                            let Expr::Lit(_, Literal::String(name)) = arg else {
+                                return Err(
+                                    "source keep-best requires literal table names".to_string()
+                                );
+                            };
+                            self.graph
+                                .type_info()
+                                .get_func_type(name)
+                                .ok_or_else(|| format!("unknown keep-best table {name}"))?;
+                            Ok(name.clone())
+                        })
+                        .collect::<Result<_, String>>()?;
+                    let span = self.span(&span)?;
+                    self.program.commands.push(pb::Command {
+                        span,
+                        kind: Some(pb::command::Kind::KeepBest(pb::KeepBest {
+                            tables,
+                            extractor: if greedy {
+                                pb::Extractor::GreedyDag
+                            } else {
+                                pb::Extractor::Tree
+                            }
+                            .into(),
+                            ..Default::default()
+                        })),
+                    });
+                    continue;
                 }
                 Command::UserDefined(_, name, args) if name == "primitive" => {
                     let definition =
@@ -536,6 +700,43 @@ impl Source {
                         });
                     }
                     N::Function(function) => {
+                        let constructor = self
+                            .cost_origins
+                            .lock()
+                            .unwrap()
+                            .declarations
+                            .get(&(function.span.clone(), function.name.clone()))
+                            .cloned();
+                        if let Some(constructor) = constructor {
+                            let target = self
+                                .graph
+                                .type_info()
+                                .get_func_type(&constructor)
+                                .ok_or("dynamic-cost constructor was not resolved")?;
+                            if target.subtype != ast::FunctionSubtype::Constructor
+                                || target
+                                    .input
+                                    .iter()
+                                    .map(|sort| sort.name())
+                                    .collect::<Vec<_>>()
+                                    != function
+                                        .schema
+                                        .input
+                                        .iter()
+                                        .map(String::as_str)
+                                        .collect::<Vec<_>>()
+                                || function.schema.output != "i64"
+                                || !function.internal_hidden
+                                || !function.unextractable
+                            {
+                                return Err("native dynamic-cost declaration shape changed".into());
+                            }
+                            self.graph
+                                .extension_state_or_default::<crate::set_cost::SourceCostRoles>()
+                                .0
+                                .insert(function.name, constructor);
+                            continue;
+                        }
                         if function.internal_hidden
                             || function.internal_let
                             || function.term_constructor.is_some()
@@ -737,7 +938,7 @@ impl Source {
                             kind: Some(pb::command::Kind::Extract(pb::Extract {
                                 roots: vec![root],
                                 variants: count,
-                                extractor: pb::Extractor::Tree.into(),
+                                extractor: source_extractor.into(),
                                 ..Default::default()
                             })),
                         });
@@ -850,6 +1051,12 @@ impl Source {
                 self.program.commands.push(command);
             }
         }
+        self.phase(publish)
+    }
+
+    // One phase owns exactly its completed command prefix and new definitions;
+    // immutable rule cursors remain publication-local, including failed macros.
+    fn phase(&mut self, publish: Vec<usize>) -> Result<pb::Program, String> {
         let local_rulesets: HashMap<usize, u32> = publish
             .iter()
             .enumerate()
@@ -888,6 +1095,191 @@ impl Source {
             rules: self.program.rules.clone(),
             rulesets,
         })
+    }
+
+    fn cost_phase(
+        &mut self,
+        first: Command,
+        span: ast::Span,
+        captures: Vec<String>,
+        deletion: Option<String>,
+    ) -> Result<pb::Program, String> {
+        let deleting = deletion.is_some();
+        let (constructor, arity) = if let Some(constructor) = deletion {
+            (constructor, captures.len())
+        } else {
+            self.cost_origins
+                .lock()
+                .unwrap()
+                .sets
+                .get(&span)
+                .cloned()
+                .ok_or("missing native set-cost origin")?
+        };
+        if captures.len() != arity {
+            return Err("native set-cost capture count changed".into());
+        }
+        let mut expansion = vec![first];
+        for _ in 0..arity + 1 {
+            expansion.push(
+                self.commands
+                    .pop_front()
+                    .ok_or("incomplete native set-cost expansion")?
+                    .0,
+            );
+        }
+        let target_args = captures
+            .iter()
+            .map(|name| Expr::Var(ast::Span::Panic, name.clone()))
+            .collect::<Vec<_>>();
+        let same_key = |args: &[Expr]| {
+            args.iter()
+                .map(ToString::to_string)
+                .eq(target_args.iter().map(ToString::to_string))
+        };
+        let target_matches = if deleting {
+            matches!(&expansion[arity], Command::Action(Action::Change(_, ast::Change::Delete, name, args)) if name == &constructor && same_key(args))
+        } else {
+            matches!(&expansion[arity], Command::Action(Action::Expr(target_span, Expr::Call(_, name, args))) if target_span == &span && name == &constructor && same_key(args))
+        };
+        let helper_matches = if deleting {
+            matches!(&expansion[arity + 1], Command::Action(Action::Change(_, ast::Change::Delete, name, args)) if *name == crate::set_cost::get_cost_table_name(&constructor) && same_key(args))
+        } else {
+            matches!(&expansion[arity + 1], Command::Action(Action::Set(write_span, name, args, _)) if write_span == &span && *name == crate::set_cost::get_cost_table_name(&constructor) && same_key(args))
+        };
+        if !target_matches || !helper_matches
+            || expansion[..arity].iter().zip(&captures).any(|(command, name)| !matches!(command, Command::Action(Action::Let(_, actual, _)) if actual == name))
+        { return Err("native top-level set-cost expansion shape changed".into()); }
+        let helper = crate::set_cost::get_cost_table_name(&constructor);
+        if self
+            .graph
+            .extension_state::<crate::set_cost::SourceCostRoles>()
+            .and_then(|roles| roles.0.get(&helper))
+            != Some(&constructor)
+        {
+            return Err("set-cost requires a declared dynamic-cost constructor".into());
+        }
+        let mut prefix = Vec::new();
+        let mut arguments = Vec::new();
+        let mut cost = None;
+        for (index, command) in expansion.into_iter().enumerate() {
+            let resolved = match self.graph.resolve_command_preserving_globals(command) {
+                Ok(resolved) => resolved,
+                Err(error) => {
+                    // Native executes each expanded command before typechecking
+                    // the next. Publish that same completed prefix first; a
+                    // failed prefix execution still wins over this later error.
+                    if prefix.is_empty() {
+                        return Err(error.to_string());
+                    }
+                    self.program.commands.extend(prefix);
+                    self.pending_cost_error = Some(error.to_string());
+                    return self.phase(Vec::new());
+                }
+            };
+            let [N::CoreAction(action)] = resolved.as_slice() else {
+                return Err("native set-cost resolution shape changed".into());
+            };
+            let (action_span, term) = match action {
+                ResolvedAction::Let(action_span, var, expr)
+                    if index < arity && var.name == captures[index] =>
+                {
+                    let value = self.expr(expr, None, 0)?;
+                    arguments.push(value);
+                    self.graph
+                        .extension_state_or_default::<crate::set_cost::SourceCostRoles>()
+                        .1
+                        .insert(var.name.clone());
+                    (action_span, Some(value))
+                }
+                ResolvedAction::Expr(
+                    action_span,
+                    ResolvedExpr::Call(_, ResolvedCall::Func(target), _),
+                ) if index == arity && target.name == constructor => {
+                    let sort_id = self.sort(target.output.name())?;
+                    let term = u32::try_from(self.program.nodes.len())
+                        .map_err(|_| "too many source nodes")?;
+                    let node_span = self.span(action_span)?;
+                    self.program.nodes.push(pb::Node {
+                        sort_id,
+                        kind: Some(pb::node::Kind::Call(pb::Call {
+                            func: constructor.clone(),
+                            args: arguments.clone(),
+                        })),
+                        span: node_span,
+                    });
+                    // One target evaluation includes the ordered captures. Do
+                    // not evaluate them once as prefix terms and again as args.
+                    prefix.clear();
+                    (action_span, Some(term))
+                }
+                ResolvedAction::Change(
+                    action_span,
+                    ast::Change::Delete,
+                    ResolvedCall::Func(target),
+                    _,
+                ) if deleting && index == arity && target.name == constructor => {
+                    prefix.clear();
+                    prefix.push(pb::Command {
+                        span: self.span(action_span)?,
+                        kind: Some(pb::command::Kind::Action(pb::Action {
+                            span: self.span(action_span)?,
+                            kind: Some(pb::action::Kind::Delete(pb::Call {
+                                func: constructor.clone(),
+                                args: arguments.clone(),
+                            })),
+                        })),
+                    });
+                    (action_span, None)
+                }
+                ResolvedAction::Change(
+                    action_span,
+                    ast::Change::Delete,
+                    ResolvedCall::Func(function),
+                    _,
+                ) if deleting && index == arity + 1 && function.name == helper => {
+                    (action_span, None)
+                }
+                ResolvedAction::Set(action_span, ResolvedCall::Func(function), _, value)
+                    if index == arity + 1 && function.name == helper =>
+                {
+                    cost = Some(self.expr(value, None, 0)?);
+                    (action_span, None)
+                }
+                _ => return Err("native set-cost resolved action order changed".into()),
+            };
+            if let Some(term) = term {
+                prefix.push(pb::Command {
+                    span: self.span(action_span)?,
+                    kind: Some(pb::command::Kind::Action(pb::Action {
+                        span: self.span(action_span)?,
+                        kind: Some(pb::action::Kind::Term(term)),
+                    })),
+                });
+            }
+        }
+        let span = self.span(&span)?;
+        self.program.commands.push(pb::Command {
+            span,
+            kind: Some(pb::command::Kind::Action(pb::Action {
+                span,
+                kind: Some(if deleting {
+                    pb::action::Kind::Delete(pb::Call {
+                        func: constructor,
+                        args: arguments,
+                    })
+                } else {
+                    pb::action::Kind::SetCost(pb::SetCost {
+                        target: Some(pb::Call {
+                            func: constructor,
+                            args: arguments,
+                        }),
+                        cost,
+                    })
+                }),
+            })),
+        });
+        self.phase(Vec::new())
     }
 
     // Resolve the current authored closure into immutable wire versions. A new
@@ -1424,7 +1816,184 @@ impl Source {
                     expr
                 });
             }
-            for (index, action) in rule.head.0.iter().enumerate() {
+            let mut index = 0;
+            while index < rule.head.0.len() {
+                // The native macro creates N captures, one materialization,
+                // and one helper write. Recognize the complete typed group
+                // before ordinary local-alias admission, never its name alone.
+                let mut group = None;
+                let captures = rule.head.0[index..]
+                    .iter()
+                    .take_while(|action| matches!(action, ResolvedAction::Let(..)))
+                    .count();
+                for (target_index, action) in rule
+                    .head
+                    .0
+                    .iter()
+                    .enumerate()
+                    .skip(index)
+                    .take(captures + 1)
+                {
+                    let ResolvedAction::Expr(
+                        span,
+                        ResolvedExpr::Call(_, ResolvedCall::Func(target), key),
+                    ) = action
+                    else {
+                        continue;
+                    };
+                    let origin = self.cost_origins.lock().unwrap().sets.get(span).cloned();
+                    let Some((constructor, arity)) = origin else {
+                        continue;
+                    };
+                    if target_index != index + arity {
+                        continue;
+                    }
+                    if target.name != constructor || key.len() != arity {
+                        return Err("native set-cost target shape changed".into());
+                    }
+                    let Some(
+                        write @ ResolvedAction::Set(
+                            write_span,
+                            ResolvedCall::Func(helper),
+                            written_key,
+                            cost,
+                        ),
+                    ) = rule.head.0.get(target_index + 1)
+                    else {
+                        return Err("native set-cost write shape changed".into());
+                    };
+                    if write_span != span
+                        || written_key != key
+                        || self
+                            .graph
+                            .extension_state::<crate::set_cost::SourceCostRoles>()
+                            .and_then(|roles| roles.0.get(&helper.name))
+                            != Some(&constructor)
+                    {
+                        return Err("native set-cost helper role changed".into());
+                    }
+                    let mut captured = aliases.clone();
+                    let mut generated = HashSet::new();
+                    for (capture, argument) in rule.head.0[index..target_index].iter().zip(key) {
+                        let (ResolvedAction::Let(_, var, value), ResolvedExpr::Var(_, use_var)) =
+                            (capture, argument)
+                        else {
+                            return Err("native set-cost argument capture shape changed".into());
+                        };
+                        if var != use_var {
+                            return Err("native set-cost capture order changed".into());
+                        }
+                        captured.insert(var.name.clone(), self.expr(value, Some(&aliases), 0)?);
+                        generated.insert(var.name.clone());
+                    }
+                    let mut escaped = false;
+                    cost.clone().visit_exprs(&mut |expr| {
+                        escaped |= matches!(&expr, ResolvedExpr::Var(_, var) if generated.contains(&var.name));
+                        expr
+                    });
+                    for action in &rule.head.0[target_index + 2..] {
+                        action.clone().visit_exprs(&mut |expr| {
+                            escaped |= matches!(&expr, ResolvedExpr::Var(_, var) if generated.contains(&var.name));
+                            expr
+                        });
+                    }
+                    if escaped {
+                        return Err("native set-cost capture escaped its group".into());
+                    }
+                    group = Some((self.action(write, Some(&captured))?, target_index + 2));
+                    break;
+                }
+                if let Some((action, next)) = group {
+                    head.push(action);
+                    index = next;
+                    continue;
+                }
+                if captures > 0
+                    && let Some(ResolvedAction::Change(
+                        _,
+                        ast::Change::Delete,
+                        ResolvedCall::Func(target),
+                        key,
+                    )) = rule.head.0.get(index + captures)
+                    && let Some(ResolvedAction::Change(
+                        _,
+                        ast::Change::Delete,
+                        ResolvedCall::Func(helper),
+                        helper_key,
+                    )) = rule.head.0.get(index + captures + 1)
+                    && self
+                        .graph
+                        .extension_state::<crate::set_cost::SourceCostRoles>()
+                        .and_then(|roles| roles.0.get(&helper.name))
+                        == Some(&target.name)
+                    && retained_cost_key(key, helper_key)
+                    && key.len() == captures
+                {
+                    let mut captured = aliases.clone();
+                    let mut generated = HashSet::new();
+                    for (capture, argument) in rule.head.0[index..index + captures].iter().zip(key)
+                    {
+                        let (ResolvedAction::Let(_, var, value), ResolvedExpr::Var(_, used)) =
+                            (capture, argument)
+                        else {
+                            return Err("constructor-cost deletion capture shape changed".into());
+                        };
+                        if var != used {
+                            return Err("constructor-cost deletion capture order changed".into());
+                        }
+                        let mut depends_on_capture = false;
+                        value.clone().visit_exprs(&mut |expr| {
+                            depends_on_capture |= matches!(&expr, ResolvedExpr::Var(_, var) if generated.contains(&var.name));
+                            expr
+                        });
+                        if depends_on_capture {
+                            return Err(
+                                "constructor-cost deletion captures must be independent".into()
+                            );
+                        }
+                        captured.insert(var.name.clone(), self.expr(value, Some(&aliases), 0)?);
+                        generated.insert(var.name.clone());
+                    }
+                    let mut escaped = false;
+                    for action in &rule.head.0[index + captures + 2..] {
+                        action.clone().visit_exprs(&mut |expr| {
+                            escaped |= matches!(&expr, ResolvedExpr::Var(_, var) if generated.contains(&var.name));
+                            expr
+                        });
+                    }
+                    if escaped {
+                        return Err("constructor-cost deletion capture escaped its group".into());
+                    }
+                    head.push(self.action(&rule.head.0[index + captures], Some(&captured))?);
+                    index += captures + 2;
+                    continue;
+                }
+                let action = &rule.head.0[index];
+                if let ResolvedAction::Change(
+                    _,
+                    ast::Change::Delete,
+                    ResolvedCall::Func(target),
+                    key,
+                ) = action
+                    && let Some(helper) = self
+                        .graph
+                        .extension_state::<crate::set_cost::SourceCostRoles>()
+                        .and_then(|roles| {
+                            roles
+                                .0
+                                .iter()
+                                .find(|(_, constructor)| **constructor == target.name)
+                                .map(|(helper, _)| helper.clone())
+                        })
+                {
+                    if !matches!(rule.head.0.get(index + 1), Some(ResolvedAction::Change(_, ast::Change::Delete, ResolvedCall::Func(changed), args)) if changed.name == helper && retained_cost_key(args, key))
+                    {
+                        return Err("dynamic-cost constructor deletion requires its exact adjacent helper cleanup".into());
+                    }
+                    head.push(self.action(action, Some(&aliases))?);
+                    index += 2;
+                    continue;
+                }
                 if let ResolvedAction::Let(span, var, expr) = action {
                     let node = self.expr(expr, Some(&aliases), 0)?;
                     if !pure_local_alias(expr, recreate_constructors[index]) {
@@ -1443,6 +2012,7 @@ impl Source {
                 } else {
                     head.push(self.action(action, Some(&aliases))?);
                 }
+                index += 1;
             }
             pb::rule_decl::Kind::Rule(pb::Rule { query, head })
         };
@@ -1501,6 +2071,11 @@ impl Source {
         action: &ResolvedAction<ResolvedCall, ast::ResolvedVar>,
         aliases: Option<&HashMap<String, u32>>,
     ) -> Result<pb::Action, String> {
+        let cost_origin = if let ResolvedAction::Set(span, ..) = action {
+            self.cost_origins.lock().unwrap().sets.get(span).cloned()
+        } else {
+            None
+        };
         let (span, kind) = match action {
             ResolvedAction::Expr(span, expr) => {
                 (span, pb::action::Kind::Term(self.expr(expr, aliases, 0)?))
@@ -1524,12 +2099,60 @@ impl Source {
             }
             ResolvedAction::Set(span, function, args, value) => (
                 span,
-                pb::action::Kind::Set(pb::Set {
-                    target: Some(self.call(function, args, aliases, 0, span)?),
-                    value: Some(self.expr(value, aliases, 0)?),
-                }),
+                if let Some((constructor, arity)) = cost_origin {
+                    let ResolvedCall::Func(helper) = function else {
+                        return Err("native set-cost helper is not a function".into());
+                    };
+                    if args.len() != arity
+                        || self
+                            .graph
+                            .extension_state::<crate::set_cost::SourceCostRoles>()
+                            .and_then(|roles| roles.0.get(&helper.name))
+                            != Some(&constructor)
+                    {
+                        return Err("set-cost requires a declared dynamic-cost constructor".into());
+                    }
+                    let args = args
+                        .iter()
+                        .map(|arg| self.expr(arg, aliases, 0))
+                        .collect::<Result<_, _>>()?;
+                    pb::action::Kind::SetCost(pb::SetCost {
+                        target: Some(pb::Call {
+                            func: constructor,
+                            args,
+                        }),
+                        cost: Some(self.expr(value, aliases, 0)?),
+                    })
+                } else {
+                    if let ResolvedCall::Func(function) = function
+                        && self
+                            .graph
+                            .extension_state::<crate::set_cost::SourceCostRoles>()
+                            .is_some_and(|roles| roles.0.contains_key(&function.name))
+                    {
+                        return Err(
+                            "raw assigned-cost helper writes are not portable source actions"
+                                .into(),
+                        );
+                    }
+                    pb::action::Kind::Set(pb::Set {
+                        target: Some(self.call(function, args, aliases, 0, span)?),
+                        value: Some(self.expr(value, aliases, 0)?),
+                    })
+                },
             ),
             ResolvedAction::Change(span, change, function, args) => {
+                if let ResolvedCall::Func(function) = function
+                    && self
+                        .graph
+                        .extension_state::<crate::set_cost::SourceCostRoles>()
+                        .is_some_and(|roles| roles.0.contains_key(&function.name))
+                {
+                    return Err(
+                        "unpaired assigned-cost helper changes are not portable source actions"
+                            .into(),
+                    );
+                }
                 let call = self.call(function, args, aliases, 0, span)?;
                 (
                     span,
@@ -1603,6 +2226,14 @@ impl Source {
                 )
             }
             ResolvedExpr::Var(_, var) => {
+                if var.is_global_ref
+                    && self
+                        .graph
+                        .extension_state::<crate::set_cost::SourceCostRoles>()
+                        .is_some_and(|roles| roles.1.contains(&var.name))
+                {
+                    return Err("native set-cost captures cannot escape their action".into());
+                }
                 if !var.is_global_ref
                     && let Some(node) = aliases.and_then(|aliases| aliases.get(&var.name))
                 {
@@ -1645,7 +2276,18 @@ impl Source {
                         &mut self.program,
                     )?
                 } else {
-                    pb::node::Kind::Call(self.call(function, args, aliases, depth, span)?)
+                    let mut call = self.call(function, args, aliases, depth, span)?;
+                    if let ResolvedCall::Func(function) = function
+                        && let Some(constructor) = self
+                            .graph
+                            .extension_state::<crate::set_cost::SourceCostRoles>()
+                            .and_then(|roles| roles.0.get(&function.name))
+                    {
+                        call.func = constructor.clone();
+                        pb::node::Kind::GetCost(call)
+                    } else {
+                        pb::node::Kind::Call(call)
+                    }
                 },
             ),
         };
@@ -1852,7 +2494,7 @@ impl Renderer {
 
     /// Validates and renders one phase, retaining only type/definition state.
     pub fn render(&mut self, program: &pb::Program) -> Result<String, TransportError> {
-        if program.nodes.iter().any(|node| matches!(node.kind, Some(pb::node::Kind::GetCost(_))))
+        if self.dialect == Dialect::Core && (program.nodes.iter().any(|node| matches!(node.kind, Some(pb::node::Kind::GetCost(_))))
             || super::command_tree(&program.commands).any(|command| matches!(
                 &command.kind,
                 Some(pb::command::Kind::Action(action)) if matches!(action.kind, Some(pb::action::Kind::SetCost(_)))
@@ -1860,7 +2502,7 @@ impl Renderer {
             || program.rules.iter().any(|rule| matches!(
                 &rule.kind,
                 Some(pb::rule_decl::Kind::Rule(rule)) if rule.head.iter().any(|action| matches!(action.kind, Some(pb::action::Kind::SetCost(_))))
-            ))
+            )))
         {
             return Err(TransportError("assigned-cost source rendering is not supported".into()));
         }
@@ -1869,6 +2511,32 @@ impl Renderer {
             .session
             .prepare(&mut lowered)
             .map_err(|e| TransportError(e.0.message))?;
+        if self.dialect == Dialect::Experimental {
+            let unextractable: HashSet<_> = prepared
+                .definitions
+                .declarations
+                .iter()
+                .filter_map(|declaration| match &declaration.kind {
+                    Some(pb::declaration::Kind::Constructor(constructor))
+                        if constructor.unextractable =>
+                    {
+                        Some(native_name("call", &constructor.name))
+                    }
+                    _ => None,
+                })
+                .collect();
+            if lowered.nodes.iter().any(|node| matches!(&node.kind, Some(pb::node::Kind::GetCost(call)) if unextractable.contains(&call.func)))
+                || super::command_tree(&lowered.commands).filter_map(|command| match &command.kind {
+                    Some(pb::command::Kind::Action(action)) => Some(action), _ => None,
+                }).chain(lowered.rules.iter().flat_map(|rule| match &rule.kind {
+                    Some(pb::rule_decl::Kind::Rule(rule)) => rule.head.as_slice(), _ => &[],
+                })).any(|action| match &action.kind {
+                    Some(pb::action::Kind::SetCost(set)) => set.target.as_ref().is_some_and(|call| unextractable.contains(&call.func)),
+                    Some(pb::action::Kind::Delete(call)) => unextractable.contains(&call.func),
+                    _ => false,
+                })
+            { return Err(TransportError("source dynamic-cost helpers do not exist for unextractable constructors".into())); }
+        }
         let mut authored = if self.dialect == Dialect::Core {
             // Preparation filters compatible resupply from `lowered`, so use
             // the complete canonical definitions, not just this phase's names.
@@ -2112,6 +2780,28 @@ impl Renderer {
                 }
             }
         }
+        if self.dialect == Dialect::Experimental {
+            for (helper, constructor) in &constructor_cost_tables {
+                let alias = crate::set_cost::get_cost_table_name(
+                    authored
+                        .callables
+                        .get(constructor)
+                        .ok_or_else(|| TransportError("missing source constructor alias".into()))?,
+                );
+                if occupied
+                    .insert(alias.clone(), helper.clone())
+                    .is_some_and(|old| old != *helper)
+                    || self.session.graph.get_sort_by_name(&alias).is_some()
+                    || self.session.graph.get_function(&alias).is_some()
+                    || self.session.graph.type_info().is_primitive(&alias)
+                {
+                    return Err(TransportError(format!(
+                        "dynamic-cost source alias {alias:?} collides with a native name"
+                    )));
+                }
+                authored.callables.insert(helper.clone(), alias);
+            }
+        }
         let source = render_prepared(
             &lowered,
             &prepared,
@@ -2288,6 +2978,98 @@ fn source_sort_names(command: &mut Command, authored: &NativeNames) {
     }
 }
 
+// Project canonical cost actions through the real native macros, retaining
+// addressed arguments across the paired storage cleanup. No helper name is
+// interpreted without its prepared constructor-registration link.
+fn source_cost_actions(
+    program: &pb::Program,
+    action: &pb::Action,
+    occurrence: usize,
+    request: u64,
+    in_rule: bool,
+    helpers: &HashMap<String, String>,
+) -> Result<Vec<Action>, String> {
+    let span = native_span(program, action.span.as_ref())?;
+    // Project authored binders before introducing any private capture name.
+    // Mapping the completed head would let an authored wire variable capture
+    // the generated Let, unlike the runtime's ordinary SSA lowering.
+    let expr = |index| -> Result<Expr, String> {
+        let expr = expression(program, index, &mut HashSet::new())?;
+        Ok(if in_rule {
+            expr.map_symbols(&mut |name| name, &mut |name: String| {
+                native_name("var", &name)
+            })
+        } else {
+            expr
+        })
+    };
+    match &action.kind {
+        Some(pb::action::Kind::SetCost(set)) => {
+            let target = set.target.as_ref().ok_or("missing cost target")?;
+            if !helpers.values().any(|name| *name == target.func) {
+                return Err("missing prepared constructor-cost helper".into());
+            }
+            Ok(vec![Action::Expr(
+                span.clone(),
+                Expr::Call(
+                    span.clone(),
+                    "set-cost".into(),
+                    vec![
+                        Expr::Call(
+                            span.clone(),
+                            target.func.clone(),
+                            target
+                                .args
+                                .iter()
+                                .map(|arg| expr(*arg))
+                                .collect::<Result<_, _>>()?,
+                        ),
+                        expr(set.cost.ok_or("missing cost value")?)?,
+                    ],
+                ),
+            )])
+        }
+        Some(pb::action::Kind::Delete(call)) if helpers.values().any(|name| *name == call.func) => {
+            let (helper, _) = helpers
+                .iter()
+                .find(|(_, name)| **name == call.func)
+                .expect("known helper role");
+            let mut actions = Vec::new();
+            let mut key = Vec::new();
+            for (index, argument) in call.args.iter().enumerate() {
+                let name = format!("__egglog_source_delete_{request}_{occurrence}_{index}");
+                actions.push(Action::Let(span.clone(), name.clone(), expr(*argument)?));
+                key.push(Expr::Var(span.clone(), name));
+            }
+            actions.push(Action::Change(
+                span.clone(),
+                ast::Change::Delete,
+                call.func.clone(),
+                key.clone(),
+            ));
+            actions.push(Action::Change(
+                span,
+                ast::Change::Delete,
+                helper.clone(),
+                key,
+            ));
+            Ok(actions)
+        }
+        _ => {
+            let actions = lower_action(program, action)?;
+            Ok(if in_rule {
+                ast::GenericActions(actions)
+                    .map_symbols(&mut |name| name, &mut |name: String| {
+                        native_name("var", &name)
+                    })
+                    .0
+            } else {
+                actions
+            })
+        }
+    }
+}
+
 fn render_prepared(
     program: &pb::Program,
     prepared: &Prepared,
@@ -2454,12 +3236,25 @@ fn render_prepared(
                 .map(|name| name
                     .map(|name| egglog::sort::FunctionSort::constructor_alias(&name)))
                 .collect::<Result<_, _>>()?;
+            let mut rule_program = prepared.definitions.clone();
+            project_names(&mut rule_program, &prepared.definitions);
             for installation in &prepared.installations {
                 if !matches!(installation.site, pb::maintenance_site::Target::Ruleset(_)) {
                     continue;
                 }
                 let Some(mut command) = installation.command.clone() else { continue };
                 if let Command::Rule { rule } = &mut command {
+                    if dialect == Dialect::Experimental {
+                        let index = prepared.rules.iter().position(|name| name == &rule.name)
+                            .ok_or("missing prepared rule occurrence")?;
+                        if let Some(pb::rule_decl::Kind::Rule(body)) = &rule_program.rules[index].kind {
+                            let mut head = Vec::new();
+                            for (index, action) in body.head.iter().enumerate() {
+                                head.extend(source_cost_actions(&rule_program, action, index, prepared.request, true, constructor_cost_tables)?);
+                            }
+                            rule.head.0 = head;
+                        }
+                    } else {
                     // Accepted source cannot read/write assigned costs. Omit
                     // only adapter-added cleanup of those invisible tables;
                     // preserve constructor deletion and captured argument order.
@@ -2476,6 +3271,7 @@ fn render_prepared(
                         head.push(action);
                     }
                     rule.head.0 = head;
+                    }
                 }
                 let name = match &mut command {
                     Command::Rule { rule } => Some(&mut rule.name),
@@ -2506,6 +3302,10 @@ fn render_prepared(
                 fail_spans.push(native_span(program, command.span.as_ref())?);
                 command = child;
             }
+            if !fail_spans.is_empty() && matches!(&command.kind,
+                Some(pb::command::Kind::Action(pb::Action { kind: Some(pb::action::Kind::SetCost(_)), .. }))) {
+                return Err("source Fail cannot wrap the native multi-command set-cost macro".into());
+            }
             if !(fail_spans.is_empty() || matches!(
                 &command.kind,
                 Some(pb::command::Kind::Action(_)
@@ -2525,7 +3325,9 @@ fn render_prepared(
             let span = native_span(program, command.span.as_ref())?;
             match command.kind.as_ref().ok_or("missing command kind")? {
                 pb::command::Kind::Action(action) => commands.extend(
-                    lower_action(program, action)?
+                    (if dialect == Dialect::Experimental {
+                        source_cost_actions(program, action, first_command, prepared.request, false, constructor_cost_tables)?
+                    } else { lower_action(program, action)? })
                         .into_iter()
                         .map(Command::Action),
                 ),
@@ -2564,24 +3366,34 @@ fn render_prepared(
                     ));
                 }
                 pb::command::Kind::Extract(extract)
-                    if extract.extractor == i32::from(pb::Extractor::Tree)
+                    if matches!(pb::Extractor::try_from(extract.extractor), Ok(pb::Extractor::Tree | pb::Extractor::GreedyDag))
+                        && (dialect == Dialect::Experimental || extract.extractor == i32::from(pb::Extractor::Tree))
                         && extract.cost_model.is_empty()
                         && extract.variants > 0 =>
                 {
                     for root in &extract.roots {
-                        commands.push(Command::Extract(
+                        let root = expression(program, *root, &mut HashSet::new())?;
+                        let variants = Expr::Lit(span.clone(), Literal::Int(if extract.variants == 1 { 0 } else { i64::from(extract.variants) }));
+                        commands.push(if extract.extractor == i32::from(pb::Extractor::GreedyDag) {
+                            Command::UserDefined(span.clone(), "extract".into(), vec![root, variants,
+                                Expr::Var(span.clone(), ":extractor".into()), Expr::Var(span.clone(), "greedy-dag".into())])
+                        } else { Command::Extract(
                             span.clone(),
-                            expression(program, *root, &mut HashSet::new())?,
-                            Expr::Lit(
-                                span.clone(),
-                                Literal::Int(if extract.variants == 1 {
-                                    0
-                                } else {
-                                    i64::from(extract.variants)
-                                }),
-                            ),
-                        ));
+                            root, variants,
+                        ) });
                     }
+                }
+                pb::command::Kind::KeepBest(keep) if dialect == Dialect::Experimental
+                    && keep.cost_model.is_empty()
+                    && matches!(pb::Extractor::try_from(keep.extractor), Ok(pb::Extractor::Tree | pb::Extractor::GreedyDag)) => {
+                    let mut args = keep.tables.iter().map(|name| {
+                        let alias = authored.callables.get(name).ok_or_else(|| format!("unknown keep-best table {name:?}"))?;
+                        Ok(Expr::Lit(span.clone(), Literal::String(alias.clone())))
+                    }).collect::<Result<Vec<_>, String>>()?;
+                    if keep.extractor == i32::from(pb::Extractor::GreedyDag) {
+                        args.extend([Expr::Var(span.clone(), ":extractor".into()), Expr::Var(span.clone(), "greedy-dag".into())]);
+                    }
+                    commands.push(Command::UserDefined(span, "keep-best".into(), args));
                 }
                 pb::command::Kind::Run(_)
                 | pb::command::Kind::Repeat(_)
@@ -2694,6 +3506,11 @@ fn render_prepared(
                         &mut |name| name,
                     );
                 }
+                Command::UserDefined(_, command, args) if command == "extract" => {
+                    if let Some(root) = args.first_mut() {
+                        *root = root.clone().map_symbols(&mut |name: String| authored.callables.get(&name).cloned().unwrap_or(name), &mut |name| name);
+                    }
+                }
                 Command::PrintFunction(_, name, ..) => {
                     if let Some(logical) = authored.callables.get(name) {
                         *name = logical.clone();
@@ -2722,6 +3539,9 @@ fn render_prepared(
             };
             for action in actions {
                 let Action::Expr(_, expected) = action else { continue };
+                if dialect == Dialect::Experimental
+                    && matches!(expected, Expr::Call(_, name, _) if name == "set-cost")
+                { continue; }
                 let text = if in_rule {
                     format!("(rule () ({action}))")
                 } else {
@@ -2789,6 +3609,9 @@ fn render_prepared(
                 }
                 Command::RunSchedule(schedule) => {
                     format!("(run-schedule {})", render_schedule(&schedule))
+                }
+                command @ Command::Constructor { .. } if dialect == Dialect::Experimental => {
+                    format!("(with-dynamic-cost {command})")
                 }
                 command => command.to_string(),
             };
