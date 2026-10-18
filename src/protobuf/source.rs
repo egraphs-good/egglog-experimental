@@ -2943,6 +2943,16 @@ impl Renderer {
                 .resolve_command_before_proofs(command)
                 .map_err(|error| TransportError(error.to_string()))?;
         }
+        // Rule heads are reprojected for native cost roles below. Normalize
+        // this private canonical copy just like the execution copy, using the
+        // initialized provider and nominal context, not raw Custom payloads.
+        lower_custom_values(
+            &mut definitions,
+            &mut native,
+            self.session.extension.as_deref(),
+        )
+        .map_err(TransportError)?;
+        lower_container_values(&mut definitions).map_err(TransportError)?;
         source_builtin_names(&lowered, &mut native, &mut text_native, &mut authored)
             .map_err(TransportError)?;
         // Target literals are callable references only in PartialCall.
@@ -3053,6 +3063,7 @@ impl Renderer {
         }
         let source = render_prepared(
             &lowered,
+            &definitions,
             &prepared,
             self.dialect,
             &authored,
@@ -3320,8 +3331,10 @@ fn source_cost_actions(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn render_prepared(
     program: &pb::Program,
+    rule_program: &pb::Program,
     prepared: &Prepared,
     dialect: Dialect,
     authored: &NativeNames,
@@ -3508,8 +3521,6 @@ fn render_prepared(
                 .map(|name| name
                     .map(|name| egglog::sort::FunctionSort::constructor_alias(&name)))
                 .collect::<Result<_, _>>()?;
-            let mut rule_program = prepared.definitions.clone();
-            project_names(&mut rule_program, &prepared.definitions);
             for installation in &prepared.installations {
                 if !matches!(installation.site, pb::maintenance_site::Target::Ruleset(_)) {
                     continue;
@@ -3522,14 +3533,14 @@ fn render_prepared(
                         let mut head = Vec::new();
                         for (index, action) in body.head.iter().enumerate() {
                             if dialect == Dialect::Experimental {
-                                head.extend(source_cost_actions(&rule_program, action, index, prepared.request, true, constructor_cost_tables)?);
+                                head.extend(source_cost_actions(rule_program, action, index, prepared.request, true, constructor_cost_tables)?);
                             } else {
                                 // Core has no assigned-cost storage to clean up.
                                 // Project the canonical action, not native
                                 // cleanup's temporary Lets after dropping only
                                 // its auxiliary Delete. Preserve the prepared
                                 // query, occurrence and all rule options.
-                                head.extend(ast::GenericActions(lower_action(&rule_program, action)?)
+                                head.extend(ast::GenericActions(lower_action(rule_program, action)?)
                                     .map_symbols(&mut |name| name, &mut |name: String| native_name("var", &name)).0);
                             }
                         }

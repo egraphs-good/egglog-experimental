@@ -1002,33 +1002,7 @@ impl Session {
         }
         // Canonical definitions above retain the submitted Custom records.
         // Only this execution copy receives provider-owned inert helper nodes.
-        for index in 0..program.nodes.len() {
-            let node = &program.nodes[index];
-            let Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
-                value: Some(pb::primitive_value::Value::Custom(value)),
-            })) = &node.kind
-            else {
-                continue;
-            };
-            let name = sort_name(&program.sorts, node.sort_id)?;
-            let native_sort = staged
-                .graph
-                .get_sort_by_name(&name)
-                .cloned()
-                .ok_or_else(|| format!("unknown custom value sort {name}"))?;
-            validate_nullary_family(
-                staged.graph.type_info(),
-                &program.sorts[node.sort_id as usize],
-            )?;
-            let extension = staged
-                .extension
-                .as_ref()
-                .ok_or("custom value provider unavailable")?;
-            let (value, span) = (value.clone(), node.span);
-            let call =
-                extension.lower_custom_value(&staged.graph, &native_sort, &value, span, program)?;
-            program.nodes[index].kind = Some(pb::node::Kind::Call(call));
-        }
+        lower_custom_values(program, &mut staged.graph, staged.extension.as_deref())?;
         // Container payloads may introduce the Pair/Vec sorts used to construct
         // a Map. Only this staged execution copy receives those helper records.
         let sort_sites = lower_container_values(program)?;
@@ -3613,6 +3587,36 @@ fn lower_builtin_calls(
             _ => unreachable!(),
         };
         call.func = name;
+    }
+    Ok(())
+}
+
+// Lower only an ephemeral projection: canonical definitions keep their opaque
+// payloads. The provider receives the validated native type context, never IDs
+// or values copied from a different graph.
+fn lower_custom_values(
+    program: &mut pb::Program,
+    graph: &mut EGraph,
+    extension: Option<&dyn NativeExtension>,
+) -> Result<(), String> {
+    for index in 0..program.nodes.len() {
+        let node = &program.nodes[index];
+        let Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
+            value: Some(pb::primitive_value::Value::Custom(value)),
+        })) = &node.kind
+        else {
+            continue;
+        };
+        let name = sort_name(&program.sorts, node.sort_id)?;
+        let native_sort = graph
+            .get_sort_by_name(&name)
+            .cloned()
+            .ok_or_else(|| format!("unknown custom value sort {name}"))?;
+        validate_nullary_family(graph.type_info(), &program.sorts[node.sort_id as usize])?;
+        let extension = extension.ok_or("custom value provider unavailable")?;
+        let (value, span) = (value.clone(), node.span);
+        let call = extension.lower_custom_value(graph, &native_sort, &value, span, program)?;
+        program.nodes[index].kind = Some(pb::node::Kind::Call(call));
     }
     Ok(())
 }

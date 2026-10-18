@@ -17172,6 +17172,13 @@ mod source_provider_context {
             destination: &mut pb::Program,
         ) -> Result<pb::Call, String> {
             self.lowerings.fetch_add(1, Ordering::SeqCst);
+            for sort in &destination.sorts {
+                if let Some(pb::sort::Kind::Eq(name)) = &sort.kind
+                    && graph.get_sort_by_name(name).is_none()
+                {
+                    return Err(format!("custom lowering lost nominal context {name}"));
+                }
+            }
             if native_sort.name() != "TestOpaque"
                 || native_sort.value_type() != Some(std::any::TypeId::of::<Boxed<Opaque>>())
             {
@@ -17288,6 +17295,251 @@ mod source_provider_context {
             ..Default::default()
         });
         program
+    }
+
+    #[test]
+    fn source_rule_custom_heads_keep_inert_lowering_and_cost_delete_order() {
+        use egglog_experimental::protobuf::source::{Renderer, Source};
+        for mixed in [false, true] {
+            for custom_first in [false, true] {
+                let provider = Arc::new(Provider::default());
+                let mut program = packet();
+                let Some(pb::command::Kind::Action(write)) = program.commands.remove(0).kind else {
+                    unreachable!()
+                };
+                let Some(pb::action::Kind::SetCost(set)) = &write.kind else {
+                    unreachable!()
+                };
+                let target = set.target.clone().unwrap();
+                let custom = target.args[0];
+                let mut head = vec![pb::Action {
+                    kind: Some(pb::action::Kind::Term(custom)),
+                    ..Default::default()
+                }];
+                if mixed {
+                    let vector = program.sorts.len() as u32;
+                    program.sorts.push(pb::Sort {
+                        kind: Some(pb::sort::Kind::Family(pb::HostSort {
+                            name: "Vec".into(),
+                            args: vec![program.nodes[custom as usize].sort_id],
+                        })),
+                        ..Default::default()
+                    });
+                    program.declarations.push(pb::Declaration {
+                        kind: Some(pb::declaration::Kind::Constructor(pb::Constructor {
+                            name: "WithVector".into(),
+                            inputs: vec![pb::Arg {
+                                sort: vector,
+                                ..Default::default()
+                            }],
+                            output: 1,
+                            ..Default::default()
+                        })),
+                        ..Default::default()
+                    });
+                    let contents = program.nodes.len() as u32;
+                    program.nodes.push(pb::Node {
+                        sort_id: vector,
+                        kind: Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
+                            value: Some(pb::primitive_value::Value::Vec(pb::ValueList {
+                                items: vec![custom],
+                            })),
+                        })),
+                        ..Default::default()
+                    });
+                    let wrapped = program.nodes.len() as u32;
+                    program.nodes.push(pb::Node {
+                        sort_id: 1,
+                        kind: Some(pb::node::Kind::Call(pb::Call {
+                            func: "WithVector".into(),
+                            args: vec![contents],
+                        })),
+                        ..Default::default()
+                    });
+                    head.extend([
+                        write,
+                        pb::Action {
+                            kind: Some(pb::action::Kind::Delete(target)),
+                            ..Default::default()
+                        },
+                    ]);
+                    if !custom_first {
+                        head.rotate_left(1);
+                    }
+                    head.push(pb::Action {
+                        kind: Some(pb::action::Kind::Term(wrapped)),
+                        ..Default::default()
+                    });
+                }
+                program.rules = vec![pb::RuleDecl {
+                    kind: Some(pb::rule_decl::Kind::Rule(pb::Rule {
+                        query: vec![],
+                        head,
+                    })),
+                    name: Some("opaque-head".into()),
+                    eval_mode: pb::RuleEvalMode::Seminaive.into(),
+                    ..Default::default()
+                }];
+                program.rulesets = vec![pb::Ruleset {
+                    name: Some("opaque-head".into()),
+                    kind: Some(pb::ruleset::Kind::Rules(pb::RuleList { rules: vec![0] })),
+                    ..Default::default()
+                }];
+                program.commands.clear();
+                let authored = program.encode_to_vec();
+                let mut observe = pb::Program {
+                    ir_version: 1,
+                    commands: vec![
+                        pb::Command {
+                            kind: Some(pb::command::Kind::Run(pb::Run {
+                                ruleset: Some(pb::RulesetRef {
+                                    kind: Some(pb::ruleset_ref::Kind::Name("opaque-head".into())),
+                                }),
+                                ..Default::default()
+                            })),
+                            ..Default::default()
+                        },
+                        pb::Command {
+                            kind: Some(pb::command::Kind::PrintSize(pb::PrintSize {
+                                tables: vec!["HostCost".into()],
+                            })),
+                            ..Default::default()
+                        },
+                    ],
+                    ..Default::default()
+                };
+                if mixed {
+                    observe.commands.push(pb::Command {
+                        kind: Some(pb::command::Kind::PrintSize(pb::PrintSize {
+                            tables: vec!["WithVector".into()],
+                        })),
+                        ..Default::default()
+                    });
+                }
+                let mut renderer = Renderer::with_extension(provider.clone()).unwrap();
+                let text = renderer.render(&program).unwrap()
+                    + &renderer.render(&program).unwrap()
+                    + &renderer.render(&observe).unwrap();
+                assert_eq!(program.encode_to_vec(), authored);
+                assert_eq!(provider.evaluations.load(Ordering::SeqCst), 0);
+                assert_eq!(provider.validations.load(Ordering::SeqCst), 0);
+                let phases = Source::with_extension(None, &text, provider.clone())
+                    .unwrap()
+                    .collect::<Result<Vec<_>, _>>()
+                    .unwrap();
+                assert_eq!(provider.evaluations.load(Ordering::SeqCst), 0);
+                assert_eq!(provider.validations.load(Ordering::SeqCst), 0);
+                assert_eq!(phases.iter().map(|phase| phase.rules.len()).max(), Some(1));
+
+                let mut engine = Engine::with_extension(provider.clone());
+                let id = create(&mut engine);
+                let mut custom_node = program.nodes[custom as usize].clone();
+                let mut read_cost = pb::Program {
+                    ir_version: 1,
+                    sorts: vec![
+                        program.sorts[custom_node.sort_id as usize].clone(),
+                        program.sorts[0].clone(),
+                    ],
+                    ..Default::default()
+                };
+                custom_node.sort_id = 0;
+                read_cost.nodes = vec![
+                    custom_node,
+                    pb::Node {
+                        sort_id: 1,
+                        kind: Some(pb::node::Kind::GetCost(pb::Call {
+                            func: "HostCost".into(),
+                            args: vec![0],
+                        })),
+                        ..Default::default()
+                    },
+                    pb::Node {
+                        sort_id: 1,
+                        kind: Some(pb::node::Kind::Var("assigned".into())),
+                        ..Default::default()
+                    },
+                    pb::Node {
+                        sort_id: 1,
+                        kind: Some(pb::node::Kind::Union(pb::Union {
+                            members: vec![1, 2],
+                        })),
+                        ..Default::default()
+                    },
+                    pb::Node {
+                        sort_id: 1,
+                        kind: Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
+                            value: Some(pb::primitive_value::Value::I64(9)),
+                        })),
+                        ..Default::default()
+                    },
+                    pb::Node {
+                        sort_id: 1,
+                        kind: Some(pb::node::Kind::Union(pb::Union {
+                            members: vec![1, 4],
+                        })),
+                        ..Default::default()
+                    },
+                ];
+                read_cost.commands = [3, 5]
+                    .into_iter()
+                    .map(|fact| pb::Command {
+                        kind: Some(pb::command::Kind::Check(pb::Check { facts: vec![fact] })),
+                        ..Default::default()
+                    })
+                    .collect();
+                assert_eq!(run(&mut engine, id, program).error, None);
+                assert_eq!(provider.evaluations.load(Ordering::SeqCst), 0);
+                let direct = run(&mut engine, id, observe);
+                assert_eq!(direct.error, None);
+                let evaluations = provider.evaluations.load(Ordering::SeqCst);
+                assert!(evaluations > 0);
+                let before = evaluations;
+                let fresh = create(&mut engine);
+                let mut replay_sizes = Vec::new();
+                for phase in phases {
+                    let response = run(&mut engine, fresh, phase);
+                    assert_eq!(response.error, None);
+                    for output in response.outputs {
+                        if let Some(pb::command_output::Kind::Sizes(sizes)) = output.kind {
+                            replay_sizes.extend(sizes.sizes);
+                        }
+                    }
+                }
+                let expected: Vec<_> = direct
+                    .outputs
+                    .iter()
+                    .filter_map(|output| match &output.kind {
+                        Some(pb::command_output::Kind::Sizes(sizes)) => Some(sizes.sizes.clone()),
+                        _ => None,
+                    })
+                    .flatten()
+                    .collect();
+                assert_eq!(replay_sizes, expected);
+                // Native RHS writes are staged; deleting an as-yet absent row
+                // does not cancel this match's pending insertion/annotation.
+                assert_eq!(
+                    expected.iter().map(|row| row.rows).collect::<Vec<_>>(),
+                    if mixed { vec![1, 1] } else { vec![0] }
+                );
+                assert_eq!(
+                    provider.evaluations.load(Ordering::SeqCst) - before,
+                    evaluations
+                );
+                for handle in [id, fresh] {
+                    let response = run(&mut engine, handle, read_cost.clone());
+                    assert!(response.outputs.is_empty());
+                    if mixed {
+                        // Both the existence query and exact assigned-C=9 check
+                        // succeeded in the direct native baseline and replay.
+                        assert_eq!(response.error, None);
+                    } else {
+                        let error = response.error.unwrap();
+                        assert_eq!(error.code, i32::from(pb::ErrorCode::CheckFailed));
+                        assert_eq!(error.location.unwrap().path, [0]);
+                    }
+                }
+            }
+        }
     }
 
     #[test]
@@ -17592,6 +17844,7 @@ mod source_provider_context {
             "lower",
             "forged",
             "malformed",
+            "children",
             "freeze",
         ] {
             let provider = Arc::new(Provider::default());
@@ -17627,13 +17880,17 @@ mod source_provider_context {
                     bad.sorts[custom as usize] = bad.sorts[0].clone();
                     "requires the actual TestOpaque sort"
                 }
-                "malformed" => {
+                "malformed" | "children" => {
                     for node in &mut bad.nodes {
                         if let Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
                             value: Some(pb::primitive_value::Value::Custom(value)),
                         })) = &mut node.kind
                         {
-                            value.payload.clear();
+                            if failure == "children" {
+                                value.args.push(0);
+                            } else {
+                                value.payload.clear();
+                            }
                         }
                     }
                     "malformed TestOpaque payload"
