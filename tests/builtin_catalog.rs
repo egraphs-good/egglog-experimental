@@ -5406,7 +5406,9 @@ fn vec_tail_receiver_and_equality_restriction_are_exact() {
 }
 
 #[test]
-fn closed_maybe_defaults_preserve_optional_zero_and_reject_wrong_children() {
+fn closed_defaults_preserve_optional_zero_and_opaque_children() {
+    use prost::Message as _;
+
     // This exercises declaration validation only, not a substitute provider.
     let base = proto::Program {
         ir_version: 1,
@@ -5429,6 +5431,20 @@ fn closed_maybe_defaults_preserve_optional_zero_and_reject_wrong_children() {
                 kind: Some(proto::sort::Kind::Family(proto::HostSort {
                     name: "Maybe".into(),
                     args: vec![1],
+                })),
+                ..Default::default()
+            },
+            proto::Sort {
+                kind: Some(proto::sort::Kind::Family(proto::HostSort {
+                    name: "PyObject".into(),
+                    args: vec![],
+                })),
+                ..Default::default()
+            },
+            proto::Sort {
+                kind: Some(proto::sort::Kind::Family(proto::HostSort {
+                    name: "Opaque".into(),
+                    args: vec![0],
                 })),
                 ..Default::default()
             },
@@ -5468,6 +5484,37 @@ fn closed_maybe_defaults_preserve_optional_zero_and_reject_wrong_children() {
                 })),
                 ..Default::default()
             },
+            proto::Node {
+                sort_id: 3,
+                kind: Some(proto::node::Kind::PrimitiveValue(proto::PrimitiveValue {
+                    value: Some(proto::primitive_value::Value::Custom(proto::CustomValue {
+                        payload: b"\x80\x05N.".to_vec(),
+                        args: vec![],
+                    })),
+                })),
+                ..Default::default()
+            },
+            // Value children are independent of the family's type arguments.
+            proto::Node {
+                sort_id: 3,
+                kind: Some(proto::node::Kind::PrimitiveValue(proto::PrimitiveValue {
+                    value: Some(proto::primitive_value::Value::Custom(proto::CustomValue {
+                        payload: b"\xff\x00opaque".to_vec(),
+                        args: vec![0, 2, 0],
+                    })),
+                })),
+                ..Default::default()
+            },
+            proto::Node {
+                sort_id: 4,
+                kind: Some(proto::node::Kind::PrimitiveValue(proto::PrimitiveValue {
+                    value: Some(proto::primitive_value::Value::Custom(proto::CustomValue {
+                        payload: b"not a pickle".to_vec(),
+                        args: vec![5, 0, 5],
+                    })),
+                })),
+                ..Default::default()
+            },
         ],
         declarations: vec![proto::Declaration {
             kind: Some(proto::declaration::Kind::Function(proto::Function {
@@ -5498,7 +5545,7 @@ fn closed_maybe_defaults_preserve_optional_zero_and_reject_wrong_children() {
         }],
         ..Default::default()
     };
-    for root in 1..=3 {
+    for root in 1..base.nodes.len() {
         let mut program = base.clone();
         let Some(proto::declaration::Kind::Function(function)) = &mut program.declarations[0].kind
         else {
@@ -5520,6 +5567,165 @@ fn closed_maybe_defaults_preserve_optional_zero_and_reject_wrong_children() {
         let frozen = installed.clone();
         builtin::definitions::reconcile_declarations(&program, &mut installed).unwrap();
         assert_eq!(installed, frozen);
+        // Existing arena entries force relocation; binary inspection and
+        // compatible resupply preserve opaque payloads and ordered references.
+        let mut relocated = proto::Program {
+            sorts: base.sorts.clone(),
+            nodes: vec![base.nodes[0].clone()],
+            ..Default::default()
+        };
+        builtin::definitions::reconcile_declarations(&program, &mut relocated).unwrap();
+        let encoded = relocated.encode_to_vec();
+        let decoded = proto::Program::decode(encoded.as_slice()).unwrap();
+        assert_eq!(decoded, relocated);
+        builtin::definitions::reconcile_declarations(&decoded, &mut installed).unwrap();
+        assert_eq!(installed, frozen);
+        if let Some(proto::node::Kind::PrimitiveValue(proto::PrimitiveValue {
+            value: Some(proto::primitive_value::Value::Custom(expected)),
+        })) = &program.nodes[root].kind
+        {
+            let default = decoded.declarations[0]
+                .bindings
+                .as_ref()
+                .unwrap()
+                .python
+                .as_ref()
+                .unwrap()
+                .views[0]
+                .params[0]
+                .default_expr
+                .unwrap();
+            let Some(proto::node::Kind::PrimitiveValue(proto::PrimitiveValue {
+                value: Some(proto::primitive_value::Value::Custom(actual)),
+            })) = &decoded.nodes[default as usize].kind
+            else {
+                panic!()
+            };
+            assert_eq!(actual.payload, expected.payload);
+            assert_eq!(actual.args.len(), expected.args.len());
+            if !actual.args.is_empty() {
+                assert_eq!(actual.args[0], actual.args[2]);
+                assert_ne!(actual.args[0], actual.args[1]);
+                for (actual, expected) in actual.args.iter().zip(&expected.args) {
+                    let Some(proto::node::Kind::PrimitiveValue(actual)) =
+                        &decoded.nodes[*actual as usize].kind
+                    else {
+                        panic!()
+                    };
+                    let Some(proto::node::Kind::PrimitiveValue(expected)) =
+                        &program.nodes[*expected as usize].kind
+                    else {
+                        panic!()
+                    };
+                    assert_eq!(
+                        std::mem::discriminant(actual.value.as_ref().unwrap()),
+                        std::mem::discriminant(expected.value.as_ref().unwrap())
+                    );
+                }
+            }
+        }
+        if root >= 4 {
+            for mutation in 0..9 {
+                let mut malformed = program.clone();
+                match mutation {
+                    2 => {
+                        malformed.sorts[program.nodes[root].sort_id as usize].kind =
+                            Some(proto::sort::Kind::Eq("NotHost".into()))
+                    }
+                    3 => {
+                        malformed.sorts[program.nodes[root].sort_id as usize].kind =
+                            Some(proto::sort::Kind::Func(proto::FuncSort {
+                                params: vec![],
+                                result: 0,
+                            }))
+                    }
+                    4 => malformed.nodes[root].kind = Some(proto::node::Kind::Var("free".into())),
+                    5 => {
+                        let Some(proto::declaration::Kind::Function(function)) =
+                            &mut malformed.declarations[0].kind
+                        else {
+                            panic!()
+                        };
+                        function.inputs[0].sort = 0;
+                    }
+                    _ => {
+                        let child = match mutation {
+                            0 => 99,
+                            1 => root as u32,
+                            _ => {
+                                let child = malformed.nodes.len() as u32;
+                                let (sort_id, kind) = match mutation {
+                                    6 => (0, proto::node::Kind::Var("query".into())),
+                                    7 => {
+                                        let sort = malformed.sorts.len() as u32;
+                                        malformed.sorts.push(proto::Sort {
+                                            kind: Some(proto::sort::Kind::Family(
+                                                proto::HostSort {
+                                                    name: "Unit".into(),
+                                                    args: vec![],
+                                                },
+                                            )),
+                                            ..Default::default()
+                                        });
+                                        malformed.declarations.push(proto::Declaration {
+                                            kind: Some(proto::declaration::Kind::Relation(
+                                                proto::Relation {
+                                                    name: "predicate".into(),
+                                                    inputs: vec![],
+                                                },
+                                            )),
+                                            ..Default::default()
+                                        });
+                                        (
+                                            sort,
+                                            proto::node::Kind::Call(proto::Call {
+                                                func: "predicate".into(),
+                                                args: vec![],
+                                            }),
+                                        )
+                                    }
+                                    _ => (
+                                        0,
+                                        proto::node::Kind::Call(proto::Call {
+                                            func: "take_maybe".into(),
+                                            args: vec![0],
+                                        }),
+                                    ),
+                                };
+                                malformed.nodes.push(proto::Node {
+                                    sort_id,
+                                    kind: Some(kind),
+                                    ..Default::default()
+                                });
+                                child
+                            }
+                        };
+                        let Some(proto::node::Kind::PrimitiveValue(proto::PrimitiveValue {
+                            value: Some(proto::primitive_value::Value::Custom(value)),
+                        })) = &mut malformed.nodes[root].kind
+                        else {
+                            panic!()
+                        };
+                        value.args = vec![child];
+                    }
+                }
+                assert!(
+                    builtin::definitions::reconcile_declarations(
+                        &malformed,
+                        &mut proto::Program::default()
+                    )
+                    .is_err(),
+                    "custom root {root}, mutation {mutation}"
+                );
+                assert!(
+                    builtin::definitions::reconcile_declarations(&malformed, &mut installed)
+                        .is_err(),
+                    "custom resupply root {root}, mutation {mutation}"
+                );
+                assert_eq!(installed, frozen);
+            }
+            continue;
+        }
         for mutation in 0..5 {
             let mut malformed = program.clone();
             match mutation {

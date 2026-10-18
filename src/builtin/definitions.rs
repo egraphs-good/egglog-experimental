@@ -1709,6 +1709,21 @@ fn closed_default(p: &pb::Program, root: u32) -> Result<(), String> {
                         })?;
                         continue;
                     }
+                    V::Custom(_) => {
+                        if !matches!(
+                            &p.sorts[n.sort_id as usize].kind,
+                            Some(pb::sort::Kind::Family(_))
+                        ) {
+                            return Err("default Custom sort mismatch".into());
+                        }
+                        // Codec-specific payload/child validation belongs to
+                        // the emitted use, not portable metadata inspection.
+                        node_edges(&mut kind, |i| {
+                            pending.push(*i);
+                            Ok(())
+                        })?;
+                        continue;
+                    }
                     _ => return Err("unsupported default value template".into()),
                 };
                 if !matches!(&p.sorts[n.sort_id as usize].kind, Some(pb::sort::Kind::Family(f)) if f.name == expected && f.args.is_empty())
