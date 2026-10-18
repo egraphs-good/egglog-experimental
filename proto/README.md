@@ -17,13 +17,13 @@ and comments are the specification. The main pieces are:
 - Existing proof requests and structured results from the current proof engine,
   with proof enablement selected in `EGraphOptions`.
 
-An initial in-process bytes adapter lives in
-[`src/protobuf.rs`](../src/protobuf.rs); its supported slice is described below.
-It is not frontend conformance or a complete service implementation. CEL checks
+An experimental in-process bytes adapter lives in
+[`src/protobuf.rs`](../src/protobuf.rs); current limits are described below.
+It is not a complete service implementation. CEL checks
 directly expressible constraints, not full typing, binding, effects, or cycle
 validity. The remaining requirements are normative comments. CEL can exhaust
 its evaluation budget on large valid inputs; that is inconclusive, not proof
-that a program is invalid. Frontend parity has not been demonstrated end to end.
+that a program is invalid. Complete frontend parity is not yet established.
 
 ## Design decisions and open questions
 
@@ -127,8 +127,7 @@ signatures must be recursively closed. Creation and ordinary response sort
 arenas contain no variables; a nested exported `Program` may include signature
 patterns. CEL checks direct bounds, variable roots, and declared family uses.
 Recursive closedness, binder scope, signature matching, family resolution, and
-compatible descriptor resends are semantic checks. The executable subset below
-implements these for its supported scalar/Vec/Pair/Map signatures and declarations.
+compatible descriptor resends are semantic checks.
 
 **Decided:** each wire callable has one unique name across user and host
 definitions; the wire IR does not select from same-name overloads. Frontends lower
@@ -156,8 +155,6 @@ catalog. Definitions-only filtering is deferred. Saved catalogs can support
 binding generation, but native implementation, codec, and execution-capability
 compatibility must be established by the host; matching descriptors alone cannot
 establish it.
-The initial engine-owned scalar catalog path below is implemented; complete
-catalog export, generic families and generated high-level bindings are not.
 
 ### High-level language bindings
 
@@ -218,8 +215,7 @@ rejects malformed individual bindings and conflicting resupply of one declaratio
 fixed language block. These defaults are derived output, not supplied bindings:
 they install or freeze no block, so later explicit bindings
 remain that language's first supply. The exact naming/normalization algorithm
-is undecided; high-level generation remains frontend work. Runtime checks for
-the bounded executable declaration/default subset are implemented below.
+is undecided; high-level generation remains frontend work.
 
 Python views distinguish free functions, initializers, methods, class methods,
 properties, class variables, and ownerless constants. Free functions and constants
@@ -228,8 +224,7 @@ components stay nonempty. A `CONSTANT` view names a nullary concrete expression
 (`C`), with no owner, receiver, parameters or mutated input.
 It does not evaluate a body during installation or
 export. A nullary `FUNCTION` remains callable (`C()`); arity never implies a
-constant view. The bounded runtime acceptance below does not establish frontend
-generation.
+constant view.
 Ordered parameter records give core-input
 positions, names, and optional default expressions. Initializers derive `__init__`
 without storing a path. Receivers are mapped inputs; initializers/class methods
@@ -286,8 +281,8 @@ existing output equality sort, without new datatype or text-overload semantics.
 `Freeze` retains supplied blocks and their bindings-only dependencies, remapping
 arenas without executing defaults or freezing derived wrapper choices. CEL checks
 direct shapes, positions and bounds. Recursive default closure, owner/receiver
-typing, bindings compatibility, and target-language generation remain normative
-requirements, not implemented semantic checks.
+typing, bindings compatibility, and target-language generation are additional
+semantic requirements.
 
 **Decided:** initially generate the symbolic declarations and expression-building
 API. Host methods such as `Map.value` and host conversions remain ordinary
@@ -325,8 +320,7 @@ fails this draft's new response contract. This observation is not a state export
   retained occurrence everywhere it is referenced.
   Other anonymous entries are fresh per submission, even when their bodies
   are equal. Repeated references and loop iterations within one submission
-  share state. Composition cycles are invalid. These contracts are specified
-  in the schema; runtime enforcement remains unimplemented.
+  share state. Composition cycles are invalid.
 
   ```text
   request 1: rulesets[0] = unnamed rule list
@@ -358,8 +352,7 @@ fails this draft's new response contract. This observation is not a state export
   named root is reused even in a newly added leaf that references its index.
   A wholly unanchored resubmission remains fresh. References share the rule and
   its rule-owned state across groups/Run sites; distinct scheduler instances and
-  their scheduler-owned state remain separate. CEL checks direct indices;
-  matching and execution are unimplemented.
+  their scheduler-owned state remain separate. CEL checks direct indices.
   Only named roots retain rules across requests; unretained entries are omitted
   from `Freeze`, and arena membership alone never executes a rule.
 - **Declaration reuse — decided:** programs may refer to definitions already
@@ -371,12 +364,10 @@ fails this draft's new response contract. This observation is not a state export
   optional compatibility checks: identical definitions are no-ops, conflicts
   are errors. User definitions have no signature-only imports; host descriptors
   are complete compatibility assertions about external implementations.
-  This is specified in the schema comments; runtime enforcement remains
-  unimplemented. Each payload still includes every referenced node/sort arena
+  Each payload still includes every referenced node/sort arena
   entry; indices are local to that message. Equality sorts are defined by
   `Declaration.eq_sort`, not by arena references. Standalone
-  exports retain all installed definitions and their dependencies. Host binding
-  remains unimplemented.
+  exports retain all installed definitions and their dependencies.
 
 ### Current-state export and optional recording
 
@@ -454,9 +445,7 @@ Rules start with fresh execution state. Against an existing handle the Program
 still uses ordinary action semantics; callers must check options for any
 restoration-equivalence guarantee.
 
-This contract is not implemented. `HostSortFamily` and `HostPrimitive` provide
-the generic catalog layout; host binding, semantic validation, and full export
-still need implementation. Custom value reconstruction requires trusted codecs.
+Custom value reconstruction requires trusted codecs.
 No ordinary native pure non-equality self-cycle has been established; arbitrary host-codec
 cycles remain unproven. `Freeze` must fail when required state cannot be
 represented, not silently omit it or claim a complete export.
@@ -613,308 +602,108 @@ checker; rule context and compatible host validators remain external. The
 schema tests establish wire/CEL behavior only. The bounded native/adapter proof
 fixtures do not establish full frontend or desugar/proof-checker-context conformance.
 
-### Remaining review work
+### Conformance work
 
-- **Host binding:** implement catalog discovery and compatibility checks for
-  native implementations, execution capabilities, value codecs, and cost models.
-  Descriptions do not transport executable host code. Include custom values
-  with explicit e-class children in encoding/remapping/rebuild tests; generic
-  inspection stays inert.
-- **Semantic conformance:** implement and test the checks beyond CEL: types,
-  binding, contexts/effects, cycles, and declaration equivalence. In particular,
-  equivalent resends may change ordinary syntax sharing but must preserve
-  `Union` identity topology. The contract is specified; enforcement is not yet
-  implemented. This does not propose another Python-only validator.
-- **Frontend boundaries:** datatype/include/operator/default syntax lowers in
-  the producer. Frontend CSV input decodes to ordinary declarations/actions;
-  file and pretty output render structured observations. `function_size` and
-  `function_values` use `PrintSize` and `PrintFunction` results respectively.
-  Standalone `Check` responses support `check_bool`: distinguish success from
-  `CHECK_FAILED` and propagate other failures. `check_fail` authors
-  `Command.fail(Check)`; recursive `Command.fail` preserves native expected
-  failure, including nesting, before proof expansion. It catches only the
-  native execution anchor, suppresses that anchor's outputs on either outcome,
-  and retains completed effects and earlier outputs. Unexpected success is
-  `EVALUATION_FAILED`; preparation and helper failures outside the anchor still
-  propagate. Requested Check planning remains in its native execution phase.
-  Fail adds no binding, command-list, Union, or iteration scope. Its wrappers
-  are transparent to command paths, including wrapped loops and profiled Runs.
-  This schema addition does not establish adapter execution support: unsupported
-  wrapped operations must reject before effects. Declarations/rules are not
-  Commands, so expected failure around installation remains a representation gap.
-  Frontend `push`/`pop` can use a `CloneEGraph` handle stack. Native extraction's
-  best-count zero lowers to `variants = 1`; this IR accepts literal counts only.
-  Exact graph-owned `lookup_function_value` results and values passed to custom
-  cost callbacks are not `PrintFunction`'s extracted representatives; those
-  remain host-adapter work, not a new RPC or a claim of full Python parity.
-  These adapters and shared text/Python/Rust producer conformance tests remain
-  unimplemented.
-- Current-state export/restoration and optional recording are specified above
-  but have no runtime implementation.
+The schema is the contract; the current-engine adapters are experiments for
+finding missing semantics and unnecessary concepts. Text, Python and Rust/Luminal
+tests exercise encoded requests and responses. Complete source, application and
+cross-mode conformance is still in progress; a wire roundtrip alone establishes
+none of these.
 
-A small next experiment: describe `Vec`/`Map` and the signatures above once,
-generate Python and Rust expression APIs, and compare their resolved IR and
-type errors. Treat function application and the Luminal roundtrip as additional
-coverage, not evidence already established by wire roundtrip tests.
+Host implementations, codecs and cost models remain registered outside the
+messages. Native capability checks still apply. Declarations are not Commands:
+arbitrary expected-failure wrappers around declaration installation remain a
+separate boundary, not permission to erase successful installation effects.
 
-## Generated previews and checks
+## Generated messages and checks
 
 [Python](../gen/python/egglog/v1/egglog_pb.py) and
-[Rust](../gen/rust/egglog/v1/egglog.v1.rs) message sources are checked in for
-inspection. The Rust messages are also the reusable `egglog-proto` crate at
-`gen/rust`; its handwritten `Cargo.toml` and `lib.rs` include the generated
-message file directly. Core pins a published revision of this leaf and exposes
-it as `egglog::proto`; experimental consumes that re-export, not a second local
-leaf dependency. Schema updates require a coherent schema/leaf S → core C
-→ experimental E dependency graph, preserving one Rust message package identity.
-Local experiments can use a task-owned Cargo `--config` file that patches all
-core workspace packages to one checkout. Use that configuration and its matching
-lockfile for every build, test and catalog export; keep the immutable schema leaf
-unchanged. This local wiring does not require publishing integration revisions.
-Python packaging remains a later migration step.
-Python uses `protobuf-py`, with `protovalidate` for validation; versions are
-locked in `uv.lock`. The Rust messages use `prost` (tested with 0.14.4).
-Imported Rust validation definitions also require `prost-types`. No gRPC
-transport is generated or required.
+[Rust](../gen/rust/egglog/v1/egglog.v1.rs) message sources are checked in. The Rust
+SDK is the `egglog-proto` crate in `gen/rust`, consumed and re-exported by
+Experimental as `egglog_experimental::proto`. Core has no protobuf dependency:
+it supplies the native descriptions, checking and execution facilities that
+Experimental projects into these messages. Keep the schema, generated SDKs and
+selected native provider revisions coherent when running integration tests.
 
-### Initial executable Rust slice
+Python uses `protobuf-py` and `protovalidate`; the compiled Rust SDK uses `prost`.
+Separately generated imported validation definitions also need `prost-types`.
+No gRPC transport is generated or required.
 
-`egglog_experimental::protobuf::Engine` exposes `create`, `clone_egraph`,
-`destroy`, `configure_resources`, and `run`. Every method accepts encoded request
-bytes and returns encoded response bytes. Decode failures and unknown handles are transport
-errors; program failures are `RunProgramResponse.error`. Whole-program
-validation occurs before installation, while runtime errors preserve completed
-effects and observations. Native ASTs are transient lowering products.
+### Byte adapter
 
-The current executable subset is deliberately limited:
+[`protobuf::Engine`](../src/protobuf.rs) accepts encoded requests for creation,
+cloning, destruction, scope return, resource configuration and program execution.
+Decode failures and unknown handles are transport errors; program failures are
+returned in `RunProgramResponse.error`. Preparation validates on disposable
+native state without running user actions. Installation and execution retain
+their actual completed prefix on failure, not an atomic rollback guarantee.
+All supplied rules, including unused rules, are compile-validated.
 
-- Equality sorts, the five scalar host sorts and nested Vec/Pair/Map applications; explicit constructor/function
-  declarations with scalar static costs and merge bodies using values,
-  old/new variables, and constructors.
-- Ordered actions and persistent captures expressed as nullary function sets.
-- Query equality groups, flat named seminaive rulesets, rewrites, and checks.
-- Tree extraction with costs, duplicate roots and shared result nodes; extracted
-  table rows; native e-graph clone and destruction.
-- Profile-enabled execution with command locations and compact run summaries.
-- NORMAL, TERM_ENCODING, PROOFS and PROOF_TESTING; flat Prove/ProveExists,
-  requested-only outputs, and exclusive maintenance summaries. Preparation
-  compiles on disposable native state without running actions or helpers;
-  live definition installation retains its actual prefix on failure.
-- Catalog-backed i64/f64 addition through distinct host definition keys.
-- Generic Vec empty/of/get, ordered Vec value payloads and extracted Vec data.
-- Generic Pair construction/first/second, ordered Pair value payloads and
-  extracted/table Pair data, including nested Vec/Pair and equality-sort children.
-- Generic Map empty/from-pairs/get/insert, ordered Map value payloads and
-  extracted/table Map data, including nested containers and equality-sort keys.
-- Compatible EqSort/Constructor/Function resupply, with canonical protobuf
-  declaration/default closures retained across requests and clones. Each
-  language block is fixed on its first supply; absent later blocks do not erase
-  it. References compare structurally, including shared Union default topology.
-- Python/Rust scalar type and addition views and Vec type/empty/of/get
-  views supplied by native registration; intact user sort/callable views,
-  including ownerless Python CONSTANT views on nullary constructors/functions
-  and closed scalar/Vec/Pair/Map initializer defaults.
-  Default calls are checked, never evaluated during installation/export. Actual
-  omitted-argument expansion remains the frontend's responsibility.
+Canonical records retain logical identities and optional metadata. Compatible
+resupply asserts the installed definition; it does not replace a host
+implementation. Defaults are checked without evaluation; omitted-argument
+expansion belongs to the frontend.
 
-Unsupported forms fail explicitly. These include profile-off (the native engine
-still collects timing data), action/nested/empty Union identities, other complex values
-and codecs, other primitive catalog mappings, relations, ruleset
-resupply, anonymous/combined/shared rulesets, nondefault rule modes, schedulers,
-loops, snapshots, encoded-mode extraction/table observations, merge table reads,
-and custom cost models.
-Expressions deeper than 256 nodes or requiring more than 65,536 native tree
-nodes are currently rejected. This is a checkpoint, not a narrowing of
-the conformance goal. Full source coverage, generated frontend APIs, exact
-snapshots, and Python/Rust/Luminal migration remain unimplemented.
+Current limits include requests requiring `profile=true`, Normal-only
+Extract/PrintFunction/Freeze, native proof-mode restrictions on non-global
+no-merge functions, and context-specific lowering/expansion budgets. Closed
+Normal constructor actions use a bounded DAG path rather than the tree path.
+Unsupported modes, values and codecs fail explicitly. These are adapter limits,
+not changes to the schema contract.
 
-The focused regression is `cargo test --test protobuf`. It compares the native
-fixture with decoded results and checks invalid-byte controls and post-failure
-state. No frontend suite is counted as migrated by these tests.
+### Source production and rendering
 
-`cargo run --example export_builtin_catalog -- catalog.pb` constructs the normal
-provider-registered native engine at generation time and writes its canonical
-`Program` bytes. It prints the existing incomplete-registration inventory to
-stderr. Frontend packages can ship that resource and decode it without creating
-an EGraph during authoring. Pin the generating core/experimental/leaf revisions;
-the resource can be checked against the runtime provider by submitting its
-declarations in an empty-command request. This is a partial catalog, not Freeze.
-Lambda/partial-call defaults, other value codecs and unsupported execution forms
-remain explicit gaps; scalar/Vec/Pair/Map default checking does not establish their
-compatibility. Native text rendering preserves executable semantics, not Python
-or Rust presentation metadata.
+[`protobuf::source::Source`](../src/protobuf/source.rs) resolves native source
+into ordered submissions before global removal or proof instrumentation.
+Includes are parsed when reached. Use `next_submission`, submit its Program or
+scope operation, and decode a successful response **before advancing**. Stop on
+source, transport or execution errors. Earlier completed phases remain visible;
+source/AST execution is never a fallback. The producer requires a fresh,
+compatible target handle.
 
-### Initial source producer
+Captures keep their ordered write positions. Rules retain labels and spans;
+publication uses immutable versions without hoisting future rules into earlier
+runs. Query locals remain distinct from persistent captures and later
+declarations. Proof requests retain the authored facts, leaving proof execution
+to the receiving mode. Source extraction counts are literal and bounded;
+aggregate extraction preserves its ordered result groups.
 
-`protobuf::source::Source` parses once and yields ordered protobuf `Program`
-phases using the existing native desugarer and typechecker, before global removal
-or proof instrumentation. Submit each phase through `Engine::run` using encoded
-requests and decode its response **before advancing the iterator**. Stop on any
-transport, source-resolution, or decoded execution error. This preserves effects
-of earlier successful phases when a later source command fails. The producer
-executes no user actions; previously submitted source/AST is never an execution
-fallback. Start with a fresh, compatible handle; importing an existing handle's
-authoring catalog is not implemented.
+Reuse one stateful `Renderer` across the stream; `render_submission` handles
+scope submissions too. Compatible declarations are not emitted twice. Core and
+Experimental renderings have different native naming constraints and reject
+unrepresentable forms explicitly. Reparsed text is an execution comparison, not
+an export of the original logical keys or language presentation metadata.
+Derived native aliases are reversed through exact owned mappings, never by
+recognizing a prefix. Private-looking spellings remain valid logical names;
+free-form diagnostic prose may still expose implementation names.
 
-The first source slice supports datatypes, scalar/equality-sort functions,
-ordered top-level lets, ordinary rules and directional rewrites, fixed named
-theories, one-step runs, checks, Prove/ProveExists, and static tree extraction.
-Prove keeps its authored facts instead of publishing the generated helper
-program; Check remains Check so the receiving mode controls proof testing.
-Lets become nullary
-function sets at their source positions. Rulesets are emitted when first run;
-adding rules afterward is explicitly rejected until occurrence-preserving
-immutable versions are implemented. Future rules are never hoisted into earlier
-runs. Rewrite provenance is retained through native resolution so its typed
-components can populate the existing `Rewrite` message, without treating an
-arbitrary union rule as a rewrite.
+### Native builtin registry
 
-Rules retain their source labels and spans. Query-local variables are renamed
-after native source-position validation into a namespace disjoint from parsed
-declarations/bindings, so later declarations cannot change delayed rule
-publication. Global references remain distinct captured-function calls.
+Core owns each primitive's signature, implementation, contexts and validator.
+`TypeInfo::builtin_catalog()` describes those registrations; Experimental's
+`portable_builtin_catalog()` projects them without a second signature table.
+Generic instances select the same native implementation after checking exact
+argument/result sorts. Optional Python/Rust presentation records describe
+wrappers, not executable host code or proof certificates.
 
-Experimental `extract` is an extension command. This producer explicitly
-resolves only its static tree form; dynamic costs and extractor options remain
-unsupported. Relations, program-defined primitives and uncatalogued primitive
-calls, local lets,
-globals in rule heads, bidirectional rewrites, general unions/schedules,
-includes, multi-command command macros and other extension commands are separate
-gates.
+Surface overloads are resolved before protobuf: i64 and f64 addition select
+distinct keys such as `egglog.core.i64.add` and `egglog.core.f64.add`. Today's
+text adapter may render overloaded spellings; the protocol does not require
+native overloads. Provider export recipes also lower legacy forms such as flat
+`map-of` into the canonical `Vec<Pair<K,V>>` constructor without recognizing
+arbitrary user calls by spelling. Canonical records stay intact; the adapter
+adds no sorting or deduplication policy.
 
-`protobuf::source::render` converts the producer's decoded Programs back to
-native source, reusing the adapter's expression/action/rule lowering. User sorts
-and callables use deterministic private native symbols, so a logical callable
-named `panic` is still rendered as a call rather than a native Panic action.
-Identifiers outside the projected namespaces (such as ruleset names) must still
-be valid native source atoms. Rendering preserves execution semantics, not
-logical declaration names or presentation metadata when the text is reimported.
-The tests execute that rendered source after reparsing and compare observations with
-the byte-adapter path. They also cover ordered captures, failure prefixes and
-mutated/corrupt byte controls. Run `cargo test --test protobuf source_`; this is a
-small semantic roundtrip checkpoint, not migration of the source corpus.
+`cargo run --example export_builtin_catalog -- catalog.pb` exports the configured
+native provider's canonical definitions and reports any undescribed
+registrations. Frontends can ship that resource for offline authoring and check
+it against the runtime provider. Pin its provider revisions; it is not Freeze.
 
-Container phases use `protobuf::source::Renderer::default()` and its `render`
-method, retaining the type/definition state across phases. Compatible declaration
-resupplies are checked but not emitted as duplicate native declarations. It emits each closed
-structural container sort once, including children before parents; rendering executes
-no user actions. The stateless `render` entrypoint retains the scalar subset
-and explicitly rejects container phases. Native source resolution remains
-nominal, so two source aliases for Vec<i64> do not become interchangeable before
-export; after resolution both map to one structural wire sort.
+Focused checks are `cargo test --test protobuf` and
+`cargo test --test builtin_catalog`. Source-corpus trials live in `tests/files.rs`;
+these focused checks are not a complete frontend/application acceptance run.
 
-Pair uses the same stateful path, preserving its two ordered child sorts.
-Native `(sort Pair) (constructor P () Pair)` now coexists with the host family,
-including actual `Pair<Pair,i64>` values through source, bytes, extraction and
-stateful rendering. Nominal `Sort.eq("Pair")` and structural `Sort.family("Pair", ...)`
-retain their exact logical names and distinct kinds. User constructors named
-`pair` remain user calls, not Pair payloads. An existing validation gap concerns
-unreferenced rules: preparation typechecks them, but native groundedness checking
-runs only when a ruleset installs them. An unreferenced query equating a stored
-Pair with `PairValue(Var(x), "x")` can therefore pass preparation without a
-binding for `x`; installing that rule rejects it. Payload children do not gain
-inverse matching. That unused-rule validation gap remains unresolved.
-
-The adapter separates nominal sort, host-family and callable names even for the
-same logical name and across requests. All user equality sorts and constructor/function names
-are projected with distinct namespace tags and UTF-8 hex encoding; host
-definition keys retain exact-key dispatch. Query variables are renamed at their
-binder use, independently of merge `old`/`new`. Canonical declarations and binding
-defaults retain their logical names. Extraction, nested returned sorts and table
-results reverse only adapter-owned names before wire interning. Foreign occupied
-native symbols reject preparation instead of being reused or overwritten.
-
-The adapter currently reserves `__egglog_proto_` and `__egglog_instance_` for
-derived native sort/callable/variable/instance names. Authored equality-sort and callable
-declarations using those prefixes fail before installation or effects. This is
-a temporary valid-name conformance gap, not a final naming policy; removing this
-restriction remains required. Native diagnostic prose may expose private names;
-structured diagnostic name translation is also unfinished. Do not rely on an
-unlikely prefix to avoid collisions. Reordered wire sort arenas, declaration
-arrival order and cloned sessions do not change derived native identity.
-
-### Initial engine-owned builtin definitions
-
-Core's primitive macro accepts an optional `[id = "provider.definition"]` next
-to the existing source alias. The same type annotations produce a schema-neutral
-signature used by native constraints and Experimental's protobuf projection,
-not separate signature tables. The native body, validator and allowed-context
-entrypoints are unchanged. i64 `+` uses `egglog.core.i64.add`, while f64 `+` uses
-`egglog.core.f64.add`. Source still uses the overloaded `+`; source resolution
-selects the registration before exporting its exact wire key. A decoded call
-cannot substitute a source alias or switch overloads through inference.
-
-`TypeInfo::builtin_catalog()` returns native descriptors; Experimental's
-`portable_builtin_catalog()` projects them to protobuf. Both retain
-explicit lists of undescribed primitive registrations, presort factories and
-installed non-equality sorts. Reserved but undescribed family operations are
-also inventoried before any instances exist. Export performs no application or validation of
-values. Conflicting registration keys fail catalog export/lookup while existing
-unrelated native aliases keep their behavior. Compatible host descriptor resends
-are assertions, not implementation replacement. Rendering retains exact keys,
-which the native registry recognizes as the same registration identities.
-
-Vec's three canonical generic definitions are registered with its presort before
-instantiation. The `[instance = binding]` primitive macro derives constraints
-from those same native patterns and checks runtime conversion/arity agreement;
-there is no handwritten native signature beside the record. Native nominal
-instances share one wire definition key. Decoded calls validate all argument
-and result sorts before selecting a derived native instance lookup key, pointing
-to the same implementation, validator and context IDs. This preserves output-only
-typing of an empty Vec even with several concrete shapes installed. These
-compiler lookup keys never become wire declarations or exported sort names.
-Rust presentation names the family `egglog_experimental::typed::builtins::Vec<T>`:
-`empty`/`of` are associated views, `of` maps the variadic tail, and `get` borrows
-its receiver. Python names `egglog.builtins.Vec<T>` with a variadic initializer,
-an `empty` class method and `__getitem__`; neither language's frontend generation
-is inferred from registration alone.
-
-Pair similarly registers one arity-two family and exact
-`egglog.core.pair.make`/`first`/`second` definitions before instances exist.
-They retain native aliases `pair`/`pair-first`/`pair-second`, implementation
-identities and proof validators. Pair payloads lower only in the temporary
-execution/rendering copy; canonical saved declarations/defaults stay intact.
-Pair's family presentation names `egglog.builtins.Pair<L, R>` in Python and
-`egglog_experimental::typed::builtins::Pair<L, R>` in Rust. Python has an
-initializer with ordered `left`/`right` parameters and `left`/`right` properties;
-Rust has `new` and borrowed `first`/`second` views. These are native-derived
-presentation records, not a claim that frontend generation is complete.
-Python `.value` and Rust `fields()` remain language-side inspection contracts,
-not additional engine primitives.
-
-Map registers `egglog.core.map.empty`/`of`/`get`/`insert` before instances exist.
-The sole canonical `of` signature takes one `Vec<Pair<K,V>>`, including computed
-vectors; its direct native alias is `map-from-pairs`. Legacy flat `map-of`
-remains a native compatibility facade, not another wire callable. The source
-producer lowers children first, then invokes the actual resolved primitive's
-export recipe to preserve ordered references and spans while packing Pair/Vec
-calls. It does not recognize arbitrary user calls by their spelling.
-
-`MapValue` payloads similarly lower only in the temporary execution/rendering
-copy. Missing, out-of-range, cyclic and mistyped children, including unused
-payloads, reject before request actions. Canonical saved defaults retain their
-ordered entries and shared references without accumulating helper nodes.
-Native construction supplies duplicate-key last-write-wins; output uses the
-existing flat native term, actual Map sort provenance and shared encode cache.
-The adapter adds no sorting or deduplication policy. Same-headed user calls in
-the wire callable namespace remain Calls, even where native source would reject
-the name collision. Equality-key rebuild retains the native policy.
-
-Map's Python/Rust family views are `egglog.builtins.Map<K,V>` and
-`egglog_experimental::typed::builtins::Map<K,V>`, with `empty`, `from_pairs`,
-lookup (`__getitem__`/`get`) and immutable `insert`. These registration records
-do not establish frontend execution or proof-mode conformance.
-
-This checkpoint does not implement complete `Freeze`, other Vec operations,
-other Map operations, generic Fn definitions, wrapper generation, custom
-codecs or capability/proof metadata export. The generic signature/family records
-remain the compiler input; opaque constraints are never scraped into a
-second signature registry. In core, run
-`cargo test --no-default-features --test builtin_catalog`; in this repository,
-run `cargo test --test protobuf`.
-
-To regenerate, install Buf (tested with 1.73.0), uv, and Rust/Cargo, then run
-from the repository root:
+To regenerate, install Buf, uv and Rust/Cargo, then run from the repository root:
 
 ```sh
 cargo install --locked protoc-gen-prost --version 0.5.0
@@ -923,13 +712,11 @@ make proto-lint
 make proto-test
 ```
 
-These use local generator plugins. Initial tool/dependency downloads may need
-network access. Commit generated sources together with schema changes.
-On a clean checkout, `make proto-drift` regenerates and detects tracked changes.
-`make proto-test` runs focused presentation/proof/resource wire validation with
-the generated Python messages; it does not run Egglog or independently check a proof.
+Commit generated sources with schema changes. `make proto-drift` detects
+regeneration drift. `make proto-test` checks wire constraints with the generated
+Python messages; it does not execute Egglog or independently check proofs.
 
-A Python wire/validation smoke check, after `uv sync --locked`:
+A wire/validation smoke check, after `uv sync --locked`:
 
 ```sh
 uv run python - <<'PY'
@@ -948,8 +735,7 @@ assert ir.Program.from_binary(program.to_binary()) == program
 PY
 ```
 
-This checks encoding and annotated constraints, not Egglog execution. With no
-commands, the example does not request any evaluation.
+With no commands, this example requests no evaluation.
 
 The imported `buf.validate` sources are generated from Protovalidate, pinned in
 `buf.lock`. Copyright 2023–2026 Buf Technologies, Inc.; distributed under the
