@@ -253,6 +253,439 @@ mod constructor_action_dags {
     }
 
     #[test]
+    fn source_scopes_preserve_constructor_dag_sharing_and_one_action() {
+        use egglog_experimental::protobuf::source::{Renderer, Source};
+
+        for core in [false, true] {
+            for set in [false, true] {
+                let mut original = if set {
+                    set_program(28, true)
+                } else {
+                    program(28, 1)
+                };
+                original.commands.truncate(1);
+                let mut renderer = if core {
+                    Renderer::core()
+                } else {
+                    Renderer::default()
+                };
+                let text = renderer.render(&original).unwrap();
+                assert_eq!(text.matches("(action-scope ").count(), 1);
+                assert!(text.len() < 20_000, "{} bytes", text.len());
+                let source = if core {
+                    Source::new_core(None, &text)
+                } else {
+                    Source::new(None, &text)
+                }
+                .unwrap();
+                let mut engine = Engine::default();
+                let id = create(&mut engine);
+                let mut saw_action = false;
+                for phase in source {
+                    let phase = phase.unwrap();
+                    assert!(phase.rules.is_empty());
+                    if let [command] = phase.commands.as_slice() {
+                        let Some(pb::command::Kind::Action(action)) = &command.kind else {
+                            panic!("one original action")
+                        };
+                        assert!(!saw_action);
+                        saw_action = true;
+                        assert_eq!(phase.nodes.len(), original.nodes.len());
+                        let root = match action.kind.as_ref().unwrap() {
+                            pb::action::Kind::Set(set) => {
+                                assert_eq!(set.target.as_ref().unwrap().args, [set.value.unwrap()]);
+                                set.value.unwrap()
+                            }
+                            pb::action::Kind::Term(root) => *root,
+                            _ => panic!("Term or Set"),
+                        };
+                        let Some(pb::node::Kind::Call(call)) = &phase.nodes[root as usize].kind
+                        else {
+                            panic!("constructor")
+                        };
+                        assert_eq!(call.args[0], call.args[1]);
+                    }
+                    assert_eq!(run(&mut engine, id, phase).error, None);
+                }
+                assert!(saw_action);
+                // Experimental text uses new nominal aliases, not original
+                // keys for same-engine resupply. Observations need no definitions.
+                let mut inspect = pb::Program {
+                    ir_version: 1,
+                    commands: program(0, 0).commands[1..].to_vec(),
+                    ..Default::default()
+                };
+                if set {
+                    let Some(pb::command::Kind::PrintSize(print)) = &mut inspect.commands[0].kind
+                    else {
+                        unreachable!()
+                    };
+                    print.tables.push("Saved".into());
+                }
+                let response = run(&mut engine, id, inspect);
+                assert_eq!(response.error, None);
+                let Some(pb::command_output::Kind::Sizes(sizes)) = &response.outputs[0].kind else {
+                    panic!("sizes")
+                };
+                let rows: Vec<_> = sizes.sizes.iter().map(|table| table.rows).collect();
+                assert_eq!(&rows[..3], [28, 28, 1]);
+                if set {
+                    assert_eq!(rows[3], 1);
+                }
+                let Some(pb::command_output::Kind::Snapshot(snapshot)) = &response.outputs[1].kind
+                else {
+                    panic!("snapshot")
+                };
+                let functions: Vec<_> = snapshot
+                    .program
+                    .as_ref()
+                    .unwrap()
+                    .declarations
+                    .iter()
+                    .filter_map(|decl| {
+                        if let Some(pb::declaration::Kind::Function(function)) = &decl.kind {
+                            Some(function.name.as_str())
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+                assert_eq!(functions, if set { vec!["Saved"] } else { vec![] });
+            }
+        }
+    }
+
+    #[test]
+    fn source_scopes_reject_nonprojectable_locals_without_publishing_actions() {
+        use egglog_experimental::protobuf::source::Source;
+
+        for body in [
+            "(let dead (A)) (A)",
+            "(let x (read)) x",
+            "(let x (+ 1 2)) x",
+            "(let x (A)) (union x x)",
+            "(let x (A)) (delete (Pair x x))",
+            "(let x $captured) x",
+        ] {
+            let text = format!(
+                "(datatype E (A) (Pair E E)) (function read () E :no-merge) (let $captured (A)) (action-scope ({body}))"
+            );
+            let mut source = Source::new(None, &text).unwrap();
+            let mut prefix = Vec::new();
+            let error = loop {
+                match source.next().expect("scope result") {
+                    Ok(phase) => prefix.push(phase),
+                    Err(error) => break error,
+                }
+            };
+            assert!(error.to_string().contains("scope"), "{body}: {error}");
+            assert_eq!(
+                prefix
+                    .iter()
+                    .map(|phase| phase.commands.len())
+                    .sum::<usize>(),
+                1
+            );
+            assert!(source.next().is_none());
+        }
+    }
+
+    #[test]
+    fn source_scopes_preserve_reserved_heads_and_public_name_metadata() {
+        use egglog_experimental::protobuf::source::{Renderer, Source};
+        let mut original = set_program(28, false);
+        original.commands.truncate(1);
+        let Some(pb::declaration::Kind::Constructor(constructor)) =
+            &mut original.declarations[2].kind
+        else {
+            unreachable!()
+        };
+        constructor.name = "set".into();
+        for node in &mut original.nodes {
+            if let Some(pb::node::Kind::Call(call)) = &mut node.kind
+                && call.func == "Wrap"
+            {
+                call.func = "set".into();
+            }
+        }
+        original.declarations.push(pb::Declaration {
+            kind: Some(pb::declaration::Kind::Function(pb::Function {
+                name: "$__egglog_proto_action_0".into(),
+                output: 1,
+                ..Default::default()
+            })),
+            ..Default::default()
+        });
+        let text = Renderer::default().render(&original).unwrap();
+        assert!(text.contains("(action-scope "));
+        let mut engine = Engine::default();
+        let id = create(&mut engine);
+        let mut saw_reserved_head = false;
+        let mut saw_public_name = false;
+        for phase in Source::new(None, &text).unwrap() {
+            let phase = phase.unwrap();
+            saw_reserved_head |= phase.nodes.iter().any(
+                |node| matches!(&node.kind, Some(pb::node::Kind::Call(call)) if call.func == "set"),
+            );
+            saw_public_name |= phase.declarations.iter().any(|declaration| matches!(&declaration.kind, Some(pb::declaration::Kind::Function(function)) if function.name == "$__egglog_proto_action_0"));
+            assert_eq!(run(&mut engine, id, phase).error, None);
+        }
+        assert!(saw_reserved_head && saw_public_name);
+    }
+
+    #[test]
+    fn source_scope_locals_avoid_unused_provider_names() {
+        use egglog_experimental::protobuf::{
+            NativeExtension,
+            source::{Renderer, Source},
+        };
+        struct AmbientName;
+        impl NativeExtension for AmbientName {
+            fn initialize(&self, graph: &mut egglog::EGraph) -> Result<(), String> {
+                let command = graph
+                    .parse_program(
+                        Some("ambient-provider.egg".into()),
+                        "(sort __egglog_proto_action_0)",
+                    )
+                    .map_err(|error| error.to_string())?
+                    .pop()
+                    .unwrap();
+                graph
+                    .resolve_command_preserving_globals(command)
+                    .map_err(|error| error.to_string())?;
+                Ok(())
+            }
+            fn lower_custom_value(
+                &self,
+                _: &egglog::EGraph,
+                _: &egglog::ArcSort,
+                _: &pb::CustomValue,
+                _: Option<pb::Span>,
+                _: &mut pb::Program,
+            ) -> Result<pb::Call, String> {
+                Err("this provider registers only an inert sort".into())
+            }
+            fn encode_custom_value(
+                &self,
+                _: &egglog::ArcSort,
+                _: &egglog::TermDag,
+                _: egglog::TermId,
+            ) -> Result<Option<pb::CustomValue>, String> {
+                Ok(None)
+            }
+        }
+        let provider = std::sync::Arc::new(AmbientName);
+        let mut original = set_program(28, false);
+        original.commands.truncate(1);
+        let text = Renderer::with_extension(provider.clone())
+            .unwrap()
+            .render(&original)
+            .unwrap();
+        let mut engine = Engine::with_extension(provider.clone());
+        let id = create(&mut engine);
+        for phase in Source::with_extension(None, &text, provider).unwrap() {
+            assert_eq!(run(&mut engine, id, phase.unwrap()).error, None);
+        }
+        assert!(!text.contains("(let __egglog_proto_action_0 "));
+    }
+
+    #[test]
+    fn scoped_byte_evaluation_keeps_f64_payload_bits_without_text() {
+        use egglog_experimental::protobuf::source::Renderer;
+        for bits in [
+            (-0.0_f64).to_bits(),
+            1.25_f64.to_bits(),
+            0x7ff8_0000_0000_0123,
+        ] {
+            let mut original = set_program(28, false);
+            original.commands.truncate(1);
+            let float = original.sorts.len() as u32;
+            original.sorts.push(pb::Sort {
+                kind: Some(pb::sort::Kind::Family(pb::HostSort {
+                    name: "f64".into(),
+                    args: vec![],
+                })),
+                ..Default::default()
+            });
+            let input = original.nodes.len() as u32;
+            original.nodes.push(pb::Node {
+                sort_id: float,
+                kind: Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
+                    value: Some(pb::primitive_value::Value::F64Bits(bits)),
+                })),
+                ..Default::default()
+            });
+            let Some(pb::declaration::Kind::Constructor(leaf)) = &mut original.declarations[1].kind
+            else {
+                unreachable!()
+            };
+            leaf.inputs.push(pb::Arg {
+                sort: float,
+                name: "x".into(),
+            });
+            let Some(pb::node::Kind::Call(leaf)) = &mut original.nodes[0].kind else {
+                unreachable!()
+            };
+            leaf.args.push(input);
+            if f64::from_bits(bits).is_nan() {
+                let error = Renderer::default().render(&original).unwrap_err();
+                assert!(!error.to_string().is_empty());
+            }
+            original.commands.push(pb::Command {
+                kind: Some(pb::command::Kind::Extract(pb::Extract {
+                    roots: vec![0],
+                    variants: 1,
+                    extractor: pb::Extractor::Tree.into(),
+                    ..Default::default()
+                })),
+                ..Default::default()
+            });
+            let mut engine = Engine::default();
+            let id = create(&mut engine);
+            let response = run(&mut engine, id, original);
+            assert_eq!(response.error, None);
+            assert!(response.nodes.iter().any(|node| matches!(&node.kind,
+                Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
+                    value: Some(pb::primitive_value::Value::F64Bits(actual))
+                })) if *actual == bits)));
+        }
+    }
+
+    #[test]
+    fn source_scope_failure_keeps_the_set_prefix_and_catch_boundary() {
+        use egglog_experimental::protobuf::source::{Renderer, Source};
+        for caught in [false, true] {
+            let mut initial = set_program(28, false);
+            initial.commands.truncate(1);
+            let Some(pb::command::Kind::Action(pb::Action {
+                kind: Some(pb::action::Kind::Set(set)),
+                ..
+            })) = &mut initial.commands[0].kind
+            else {
+                unreachable!()
+            };
+            set.value = Some(0);
+            let mut conflict = set_program(28, false);
+            conflict.commands.truncate(1);
+            if caught {
+                conflict.commands[0] = pb::Command {
+                    kind: Some(pb::command::Kind::Fail(Box::new(
+                        conflict.commands[0].clone(),
+                    ))),
+                    ..Default::default()
+                };
+            }
+            let mut renderer = Renderer::default();
+            let text = renderer.render(&initial).unwrap() + &renderer.render(&conflict).unwrap();
+            assert_eq!(text.matches("(action-scope ").count(), 1);
+            let mut native = new_experimental_egraph();
+            assert_eq!(native.parse_and_run_program(None, &text).is_err(), !caught);
+            let mut check = initial.clone();
+            check.declarations.clear();
+            let saved = check.nodes.len() as u32;
+            check.nodes.push(pb::Node {
+                sort_id: 1,
+                kind: Some(pb::node::Kind::Call(pb::Call {
+                    func: "Saved".into(),
+                    args: vec![],
+                })),
+                ..Default::default()
+            });
+            check.nodes.push(pb::Node {
+                sort_id: 1,
+                kind: Some(pb::node::Kind::Union(pb::Union {
+                    members: vec![saved, 0],
+                })),
+                ..Default::default()
+            });
+            check.commands = vec![pb::Command {
+                kind: Some(pb::command::Kind::Check(pb::Check {
+                    facts: vec![saved + 1],
+                })),
+                ..Default::default()
+            }];
+            native
+                .parse_and_run_program(None, &renderer.render(&check).unwrap())
+                .unwrap();
+            let mut engine = Engine::default();
+            let id = create(&mut engine);
+            let mut failed = false;
+            let mut inspect = pb::Program {
+                ir_version: 1,
+                commands: program(0, 0).commands[1..].to_vec(),
+                ..Default::default()
+            };
+            let mut saved_sort = None;
+            for phase in Source::new(Some("scope-conflict.egg".into()), &text).unwrap() {
+                let phase = phase.unwrap();
+                inspect.sorts = phase.sorts.clone();
+                for command in &phase.commands {
+                    let mut command = command;
+                    while let Some(pb::command::Kind::Fail(child)) = &command.kind {
+                        command = child;
+                    }
+                    if let Some(pb::command::Kind::Action(pb::Action {
+                        kind: Some(pb::action::Kind::Set(set)),
+                        ..
+                    })) = &command.kind
+                    {
+                        saved_sort = Some(phase.nodes[set.value.unwrap() as usize].sort_id);
+                    }
+                }
+                let response = run(&mut engine, id, phase);
+                if let Some(error) = response.error {
+                    assert!(!caught);
+                    assert_eq!(error.code, i32::from(pb::ErrorCode::EvaluationFailed));
+                    assert_eq!(error.location.unwrap().path, [0]);
+                    assert!(response.outputs.is_empty());
+                    failed = true;
+                    break;
+                }
+            }
+            assert_eq!(failed, !caught);
+            let saved = inspect.nodes.len() as u32;
+            inspect.nodes.push(pb::Node {
+                sort_id: saved_sort.unwrap(),
+                kind: Some(pb::node::Kind::Call(pb::Call {
+                    func: "Saved".into(),
+                    args: vec![],
+                })),
+                ..Default::default()
+            });
+            inspect.commands.push(pb::Command {
+                kind: Some(pb::command::Kind::Extract(pb::Extract {
+                    roots: vec![saved],
+                    variants: 1,
+                    extractor: pb::Extractor::Tree.into(),
+                    ..Default::default()
+                })),
+                ..Default::default()
+            });
+            let response = run(&mut engine, id, inspect);
+            assert_eq!(response.error, None);
+            let Some(pb::command_output::Kind::Sizes(sizes)) = &response.outputs[0].kind else {
+                panic!("sizes")
+            };
+            assert_eq!(
+                sizes
+                    .sizes
+                    .iter()
+                    .map(|table| table.rows)
+                    .collect::<Vec<_>>(),
+                [28, 28, 1]
+            );
+            let Some(pb::command_output::Kind::Extraction(extraction)) = &response.outputs[2].kind
+            else {
+                panic!("extraction")
+            };
+            assert_eq!(
+                value(&response, extraction.roots[0].variants[0].term),
+                "(Leaf)"
+            );
+        }
+    }
+
+    #[test]
     fn set_dags_keep_root_aliases_order_and_action_local_memos() {
         for root_first in [false, true] {
             let mut program = set_program(28, true);
@@ -632,9 +1065,8 @@ mod constructor_action_dags {
         assert!(
             renderer
                 .render(&deep_source)
-                .unwrap_err()
-                .to_string()
-                .contains("depth exceeds")
+                .unwrap()
+                .contains("(action-scope ")
         );
         let mut shallow_source = program(5, 0);
         shallow_source.commands.truncate(1);

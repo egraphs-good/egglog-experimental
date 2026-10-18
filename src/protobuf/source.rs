@@ -555,6 +555,7 @@ impl Source {
                         | Command::Prove(..)
                         | Command::ProveExists(..)
                         | Command::Action(..)
+                        | Command::ActionScope(..)
                         | Command::RunSchedule(..)
                         | Command::PrintOverallStatistics(_, None)
                 )
@@ -968,6 +969,14 @@ impl Source {
                         let action = self.action(&action, None)?;
                         self.program.commands.push(pb::Command {
                             span: action.span,
+                            kind: Some(pb::command::Kind::Action(action)),
+                        });
+                    }
+                    N::ActionScope(span, actions) => {
+                        let action = self.action_scope(&actions)?;
+                        let span = self.span(&span)?;
+                        self.program.commands.push(pb::Command {
+                            span,
                             kind: Some(pb::command::Kind::Action(action)),
                         });
                     }
@@ -2225,6 +2234,73 @@ impl Source {
             .collect()
     }
 
+    // Local bindings may disappear only when every evaluation is closed,
+    // constructor/scalar-only and reachable from the one terminal action.
+    // Reusing alias NodeIds preserves sharing without introducing wire scope.
+    fn action_scope(
+        &mut self,
+        actions: &ast::GenericActions<ResolvedCall, ast::ResolvedVar>,
+    ) -> Result<pb::Action, String> {
+        let (terminal, prefix) = actions
+            .0
+            .split_last()
+            .ok_or("source action scope is empty")?;
+        if !matches!(terminal, ResolvedAction::Expr(..) | ResolvedAction::Set(..)) {
+            return Err("source action scope requires a Term or Set terminal".into());
+        }
+        let mut aliases = HashMap::new();
+        let mut dependencies = HashMap::new();
+        let mut reached = HashSet::new();
+        for (position, action) in actions.0.iter().enumerate() {
+            let mut pending = match action {
+                ResolvedAction::Let(_, _, expr) if position < prefix.len() => vec![expr],
+                ResolvedAction::Expr(_, expr) if position == prefix.len() => vec![expr],
+                ResolvedAction::Set(_, _, args, value) if position == prefix.len() => {
+                    args.iter().chain([value]).collect()
+                }
+                _ => return Err("source action scope requires local Lets and one terminal".into()),
+            };
+            let mut used = HashSet::new();
+            while let Some(expr) = pending.pop() {
+                match expr {
+                    ResolvedExpr::Lit(..) => (),
+                    ResolvedExpr::Var(_, var) if !var.is_global_ref && aliases.contains_key(&var.name) => {
+                        used.insert(var.name.clone());
+                    }
+                    ResolvedExpr::Call(_, ResolvedCall::Func(function), args)
+                        if function.subtype == ast::FunctionSubtype::Constructor
+                            && !self.relations.contains(&function.name) => pending.extend(args),
+                    _ => return Err("source action scope requires closed constructor/scalar locals, without reads, primitives or globals".into()),
+                }
+            }
+            if let ResolvedAction::Let(_, var, expr) = action {
+                let node = self.expr(expr, Some(&aliases), 0)?;
+                if aliases.insert(var.name.clone(), node).is_some() {
+                    return Err("source action scope has a duplicate local".into());
+                }
+                dependencies.insert(var.name.clone(), used);
+            } else {
+                let mut pending: Vec<_> = used.into_iter().collect();
+                while let Some(name) = pending.pop() {
+                    if reached.insert(name.clone()) {
+                        pending.extend(dependencies[&name].iter().cloned());
+                    }
+                }
+            }
+        }
+        if reached.len() != prefix.len() {
+            return Err("source action scope has an unreachable local evaluation".into());
+        }
+        let action = self.action(terminal, Some(&aliases))?;
+        if !matches!(
+            action.kind,
+            Some(pb::action::Kind::Term(_) | pb::action::Kind::Set(_))
+        ) {
+            return Err("source action scope terminal is not a plain Term or Set".into());
+        }
+        Ok(action)
+    }
+
     fn action(
         &mut self,
         action: &ResolvedAction<ResolvedCall, ast::ResolvedVar>,
@@ -3327,7 +3403,10 @@ fn render_prepared(
                 _ => (),
             }
         }
-        let mut parser = native.parser;
+        let mut occupied: HashSet<_> = names.iter().map(|name| (*name).to_string()).collect();
+        // Logical ruleset names are relocated, not interpolated as atoms.
+        occupied.extend(program.rulesets.iter().filter_map(|ruleset| ruleset.name.clone()));
+        let mut parser = std::mem::take(&mut native.parser);
         for name in names {
             if !matches!(parser.get_expr_from_string(None, name), Ok(Expr::Var(_, parsed)) if parsed == name) {
                 return Err(format!("identifier {name:?} cannot be rendered as one native source atom"));
@@ -3480,7 +3559,7 @@ fn render_prepared(
                 commands.push(command);
             }
         }
-        for mut command in &program.commands {
+        for (position, mut command) in program.commands.iter().enumerate() {
             let mut fail_spans = vec![];
             while let Some(pb::command::Kind::Fail(child)) = &command.kind {
                 fail_spans.push(native_span(program, command.span.as_ref())?);
@@ -3508,13 +3587,24 @@ fn render_prepared(
             let first_command = commands.len();
             let span = native_span(program, command.span.as_ref())?;
             match command.kind.as_ref().ok_or("missing command kind")? {
-                pb::command::Kind::Action(action) => commands.extend(
-                    (if dialect == Dialect::Experimental {
-                        source_cost_actions(program, action, first_command, prepared.request, false, constructor_cost_tables)?
-                    } else { lower_action(program, action)? })
-                        .into_iter()
-                        .map(Command::Action),
-                ),
+                pb::command::Kind::Action(action) => {
+                    if prepared.context.constructor_dags.contains(&position) {
+                        commands.push(Command::ActionScope(span, ast::GenericActions(
+                            constructor_dag_actions(program, action, |name| occupied.contains(name)
+                                || native.get_sort_by_name(name).is_some()
+                                || native.type_info().get_func_type(name).is_some()
+                                || native.type_info().is_primitive(name))?,
+                        )));
+                    } else {
+                        commands.extend(
+                            (if dialect == Dialect::Experimental {
+                                source_cost_actions(program, action, first_command, prepared.request, false, constructor_cost_tables)?
+                            } else { lower_action(program, action)? })
+                                .into_iter()
+                                .map(Command::Action),
+                        );
+                    }
+                }
                 pb::command::Kind::Check(check) => {
                     commands.push(Command::Check(span, facts(program, &check.facts)?))
                 }
@@ -3715,6 +3805,34 @@ fn render_prepared(
         for mut command in &commands {
             while let Command::Fail(_, child) = command {
                 command = child;
+            }
+            if let Command::ActionScope(_, expected) = command {
+                let parsed = parser.get_program_from_string(None, &command.to_string()).map_err(|error| error.to_string())?;
+                let [Command::ActionScope(_, actual)] = parsed.as_slice() else {
+                    return Err("action scope changes meaning when parsed as source".into());
+                };
+                // Display alone cannot distinguish literal kinds or NaN payloads.
+                // Parse the whole lexical context, then compare exact literals.
+                let literals = |actions: &ast::Actions| {
+                    let mut values = Vec::new();
+                    actions.clone().visit_exprs(&mut |expr| {
+                        if let Expr::Lit(_, value) = &expr { values.push(value.clone()); }
+                        expr
+                    });
+                    values
+                };
+                let left = literals(expected);
+                let right = literals(actual);
+                if command.to_string() != parsed[0].to_string()
+                    || left.len() != right.len()
+                    || !left.iter().zip(&right).all(|(left, right)| match (left, right) {
+                        (Literal::Float(left), Literal::Float(right)) => left.0.to_bits() == right.0.to_bits(),
+                        _ => left == right,
+                    })
+                {
+                    return Err("action scope or scalar payload changes meaning when parsed as source".into());
+                }
+                continue;
             }
             let (actions, in_rule) = match command {
                 Command::Action(action) => (std::slice::from_ref(action), false),

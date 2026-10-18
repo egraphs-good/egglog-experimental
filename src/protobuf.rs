@@ -4398,6 +4398,10 @@ fn classify_constructor_dags(
 ) -> Result<HashSet<usize>, String> {
     let mut selected = HashSet::new();
     for (position, command) in program.commands.iter().enumerate() {
+        let mut command = command;
+        while let Some(pb::command::Kind::Fail(child)) = &command.kind {
+            command = child;
+        }
         let Some(pb::command::Kind::Action(action)) = &command.kind else {
             continue;
         };
@@ -4615,6 +4619,102 @@ fn validate_union_occurrences(program: &pb::Program) -> Result<(), String> {
     Ok(())
 }
 
+// A pure plan for an already admitted closed constructor/scalar action. Both
+// byte execution and Source rendering use these same first-demand local lets;
+// no native values, table handles or compiler state enter the plan.
+fn constructor_dag_actions(
+    program: &pb::Program,
+    action: &pb::Action,
+    mut occupied: impl FnMut(&str) -> bool,
+) -> Result<Vec<Action>, String> {
+    enum Walk {
+        Enter(u32),
+        Call(u32, usize),
+    }
+    let mut pending: Vec<_> = action_roots(action)?
+        .into_iter()
+        .rev()
+        .map(Walk::Enter)
+        .collect();
+    let mut results = Vec::new();
+    let mut actions = Vec::new();
+    let mut memo = HashMap::<u32, String>::new();
+    let mut next = 0usize;
+    let mut remaining = 65_536usize;
+    while let Some(step) = pending.pop() {
+        remaining = remaining
+            .checked_sub(1)
+            .ok_or("native action expansion exceeds 65536 steps")?;
+        match step {
+            Walk::Enter(index) => {
+                let node = &program.nodes[index as usize];
+                let span = native_span(program, node.span.as_ref())?;
+                if let Some(name) = memo.get(&index) {
+                    results.push(Expr::Var(span, name.clone()));
+                    continue;
+                }
+                match node.kind.as_ref().expect("validated node") {
+                    pb::node::Kind::Call(call) => {
+                        pending.push(Walk::Call(index, call.args.len()));
+                        pending.extend(call.args.iter().rev().map(|child| Walk::Enter(*child)));
+                    }
+                    pb::node::Kind::PrimitiveValue(_) => {
+                        // Preserve native scalar payloads, including exact f64
+                        // bits. Evaluation never takes a textual roundtrip.
+                        let literal = expression(program, index, &mut HashSet::new())?;
+                        if !matches!(literal, Expr::Lit(..)) {
+                            return Err("constructor action scope requires scalar literals".into());
+                        }
+                        results.push(literal);
+                    }
+                    _ => {
+                        return Err(
+                            "constructor action scope requires closed constructor syntax".into(),
+                        );
+                    }
+                }
+            }
+            Walk::Call(index, arity) => {
+                let node = &program.nodes[index as usize];
+                let pb::node::Kind::Call(call) = node.kind.as_ref().unwrap() else {
+                    unreachable!()
+                };
+                let span = native_span(program, node.span.as_ref())?;
+                let name = loop {
+                    let candidate = format!("__egglog_proto_action_{next}");
+                    next += 1;
+                    if !occupied(&candidate) && !occupied(&format!("${candidate}")) {
+                        break candidate;
+                    }
+                };
+                let args = results.split_off(results.len() - arity);
+                actions.push(Action::Let(
+                    span.clone(),
+                    name.clone(),
+                    Expr::Call(span.clone(), call.func.clone(), args),
+                ));
+                memo.insert(index, name.clone());
+                results.push(Expr::Var(span, name));
+            }
+        }
+    }
+    let span = native_span(program, action.span.as_ref())?;
+    actions.push(match action.kind.as_ref().unwrap() {
+        pb::action::Kind::Term(_) => Action::Expr(span, results.pop().unwrap()),
+        pb::action::Kind::Set(set) => {
+            let value = results.pop().unwrap();
+            Action::Set(
+                span,
+                set.target.as_ref().unwrap().func.clone(),
+                results,
+                value,
+            )
+        }
+        _ => return Err("constructor action scope requires Term or Set".into()),
+    });
+    Ok(actions)
+}
+
 // Only Union locations are retained across direct commands. An admitted closed
 // constructor DAG shares local results within this action only; other Calls
 // are lowered anew on every demand. All effects retain one native rule boundary.
@@ -4626,6 +4726,18 @@ fn eval_scoped_action(
     execute: bool,
     share_constructors: bool,
 ) -> Result<(), egglog::Error> {
+    if share_constructors {
+        let actions =
+            constructor_dag_actions(program, action, |name| graph.type_info().is_global(name))
+                .map_err(egglog::Error::BackendError)?;
+        let (result, _) = graph.eval_scoped_actions(&[], execute, |builder| {
+            for action in actions {
+                builder.action(action)?;
+            }
+            Ok(())
+        });
+        return result;
+    }
     enum Walk {
         Enter(u32),
         Call(u32, usize),
@@ -4673,7 +4785,6 @@ fn eval_scoped_action(
                 .collect()
         };
         let mut results = Vec::<Expr>::new();
-        let mut memo = HashMap::<u32, String>::new();
         let mut temporary = 0usize;
         let mut remaining = 65_536usize;
         while let Some(step) = pending.pop() {
@@ -4684,10 +4795,6 @@ fn eval_scoped_action(
                 Walk::Enter(index) => {
                     let node = &program.nodes[index as usize];
                     let span = native_span(program, node.span.as_ref()).map_err(error)?;
-                    if share_constructors && let Some(name) = memo.get(&index) {
-                        results.push(Expr::Var(span, name.clone()));
-                        continue;
-                    }
                     match node.kind.as_ref().expect("validated node") {
                         pb::node::Kind::Union(union) => {
                             if !matches!(
@@ -4783,9 +4890,6 @@ fn eval_scoped_action(
                         name.clone(),
                         Expr::Call(span.clone(), function, args),
                     ))?;
-                    if share_constructors {
-                        memo.insert(index, name.clone());
-                    }
                     results.push(Expr::Var(span, name));
                 }
                 Walk::Member(index, position) => {
