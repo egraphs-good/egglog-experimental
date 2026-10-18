@@ -807,6 +807,11 @@ message SetCost {
 // host obligations; descriptor equality alone does not establish them.
 message Declaration {
   option (buf.validate.message).cel = {
+    id: "declaration.hidden_tables"
+    message: "only constructors and functions may be hidden"
+    expression: "!this.hidden || has(this.constructor) || has(this.function)"
+  };
+  option (buf.validate.message).cel = {
     id: "declaration.callable_bindings"
     message: "sort bindings belong on EqSort or HostSortFamily"
     expression: "!(has(this.eq_sort) || has(this.host_sort_family)) || !has(this.bindings)"
@@ -905,6 +910,12 @@ message Declaration {
   // Optional documentation; excluded from semantic identity. Absent and
   // explicitly empty documentation remain distinct.
   optional string doc = 9;
+
+  // Semantic table visibility, valid only for Constructor and Function.
+  // Hidden tables are excluded from PrintSize and visible aggregate counts;
+  // hidden constructors are also excluded from extraction candidates.
+  // Definitions and rows remain present in queries, observations and Freeze.
+  bool hidden = 11;
 }
 
 // An argument's sort and optional label. Calls are positional; labels are not

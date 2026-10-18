@@ -28,6 +28,25 @@ def table_response(rows):
 
 
 class TableSchemaTests(unittest.TestCase):
+    def test_hidden_is_semantic_table_metadata_only(self):
+        for tag, table in (
+            ("constructor", ir.Constructor(name="C", output=0)),
+            ("function", ir.Function(name="f", output=0)),
+        ):
+            declaration = ir.Declaration(kind=Oneof(tag, table), hidden=True)
+            validate(declaration)
+            self.assertTrue(ir.Declaration.from_binary(declaration.to_binary()).hidden)
+            self.assertTrue(ir.Declaration.from_json(declaration.to_json()).hidden)
+        for tag, value in (
+            ("eq_sort", ir.EqSort(name="E")),
+            ("relation", ir.Relation(name="R")),
+            ("primitive", ir.Primitive(name="p", body=0)),
+            ("host_sort_family", ir.HostSortFamily(name="F")),
+            ("host_primitive", ir.HostPrimitive(name="h", typing=Oneof("signature", ir.GenericSignature(output=0)))),
+        ):
+            with self.subTest(tag=tag), self.assertRaises(ValidationError):
+                validate(ir.Declaration(kind=Oneof(tag, value), hidden=True))
+
     def test_limit_presence_distinguishes_all_zero_and_positive(self):
         for limit, encoded in (
             (None, "4a030a0143"),

@@ -14,6 +14,14 @@ enum Namespace {
 
 /// Existing declaration tags select three namespaces; spellings may coincide.
 fn declaration_identity(d: &pb::Declaration) -> Result<(Namespace, &str), String> {
+    if d.hidden
+        && !matches!(
+            d.kind,
+            Some(pb::declaration::Kind::Constructor(_) | pb::declaration::Kind::Function(_))
+        )
+    {
+        return Err("only constructors and functions may be hidden".into());
+    }
     let identity = match d.kind.as_ref().ok_or("missing declaration kind")? {
         pb::declaration::Kind::EqSort(s) => (Namespace::EqSort, s.name.as_str()),
         pb::declaration::Kind::HostSortFamily(s) => (Namespace::HostSortFamily, s.name.as_str()),

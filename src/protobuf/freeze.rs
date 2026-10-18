@@ -634,6 +634,40 @@ mod tests {
     }
 
     #[test]
+    fn hidden_tables_remain_in_custom_cost_observation() {
+        let mut engine = Engine::default();
+        let id = create(&mut engine, pb::ExecutionMode::Normal);
+        for phase in source::Source::new(
+            None,
+            "(sort E) (constructor Hidden () E :internal-hidden)
+             (function hidden-f () i64 :no-merge :internal-hidden)
+             (Hidden) (set (hidden-f) 9)",
+        )
+        .unwrap()
+        {
+            assert_eq!(run(&mut engine, id, phase.unwrap()).error, None);
+        }
+        // This is the same complete, inert Program supplied to NativeCostModel::start.
+        let observed = observation(&engine.graphs[&id], &[]).unwrap();
+        let program = &observed.program;
+        assert_eq!(
+            program
+                .declarations
+                .iter()
+                .filter(|declaration| declaration.hidden)
+                .count(),
+            2
+        );
+        assert!(program.nodes.iter().any(|node| matches!(&node.kind,
+            Some(pb::node::Kind::Call(call)) if call.func == "Hidden" && call.args.is_empty())));
+        assert!(program.commands.iter().any(|command| matches!(&command.kind,
+            Some(pb::command::Kind::Action(pb::Action { kind: Some(pb::action::Kind::Set(set)), .. }))
+            if set.target.as_ref().is_some_and(|call| call.func == "hidden-f")
+                && matches!(program.nodes[set.value.unwrap() as usize].kind,
+                    Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue { value: Some(pb::primitive_value::Value::I64(9)) }))))));
+    }
+
+    #[test]
     fn unstored_literal_roots_keep_inert_native_sort_identity() {
         use pb::primitive_value::Value as V;
 

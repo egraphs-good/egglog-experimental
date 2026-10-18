@@ -679,6 +679,12 @@ pub struct Declaration {
     /// explicitly empty documentation remain distinct.
     #[prost(string, optional, tag = "9")]
     pub doc: ::core::option::Option<::prost::alloc::string::String>,
+    /// Semantic table visibility, valid only for Constructor and Function.
+    /// Hidden tables are excluded from PrintSize and visible aggregate counts;
+    /// hidden constructors are also excluded from extraction candidates.
+    /// Definitions and rows remain present in queries, observations and Freeze.
+    #[prost(bool, tag = "11")]
+    pub hidden: bool,
     #[prost(oneof = "declaration::Kind", tags = "1, 2, 3, 4, 5, 6, 10")]
     pub kind: ::core::option::Option<declaration::Kind>,
 }

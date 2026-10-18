@@ -1119,7 +1119,7 @@ impl Session {
                             _ => Err("constructor costs currently require a nonnegative inert i64".into()),
                         }
                     }).transpose()?;
-                    Command::Constructor { span, name: constructor.name.clone(), table_name: Some(ast::TableName::Public(staged.names.callables[&constructor.name].clone())), schema: signature(program, &constructor.inputs, constructor.output)?, cost, unextractable: constructor.unextractable, hidden: false, let_binding: false, term_constructor: None }
+                    Command::Constructor { span, name: constructor.name.clone(), table_name: Some(ast::TableName::Public(staged.names.callables[&constructor.name].clone())), schema: signature(program, &constructor.inputs, constructor.output)?, cost, unextractable: constructor.unextractable, hidden: declaration.hidden, let_binding: false, term_constructor: None }
                 }
                 pb::declaration::Kind::Function(function) => {
                     if function.name.is_empty() { return Err("function name must not be empty".into()); }
@@ -1134,7 +1134,7 @@ impl Session {
                         // in Context::Write: builtin calls retain their actual
                         // capabilities, and callable backends are installed first.
                     }
-                    Command::Function { span, name: function.name.clone(), table_name: Some(ast::TableName::Public(staged.names.callables[&function.name].clone())), schema, merge: function.merge.map(|index| expression(program, index, &mut HashSet::new())).transpose()?, hidden: false, let_binding: false, term_constructor: None, unextractable: true }
+                    Command::Function { span, name: function.name.clone(), table_name: Some(ast::TableName::Public(staged.names.callables[&function.name].clone())), schema, merge: function.merge.map(|index| expression(program, index, &mut HashSet::new())).transpose()?, hidden: declaration.hidden, let_binding: false, term_constructor: None, unextractable: true }
                 },
                 pb::declaration::Kind::Primitive(primitive) => primitive_command(program, primitive, span)?,
                 pb::declaration::Kind::Relation(relation) => Command::Relation {

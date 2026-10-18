@@ -1091,10 +1091,7 @@ impl Source {
                                 .insert(function.name, constructor);
                             continue;
                         }
-                        if function.internal_hidden
-                            || function.internal_let
-                            || function.term_constructor.is_some()
-                        {
+                        if function.internal_let || function.term_constructor.is_some() {
                             return Err(
                                 "internal function annotations require separate source lowering"
                                     .into(),
@@ -1112,6 +1109,7 @@ impl Source {
                             })
                             .collect::<Result<_, String>>()?;
                         let output = self.sort(&function.schema.output)?;
+                        let hidden = function.internal_hidden;
                         let kind = match function.subtype {
                             ast::FunctionSubtype::Constructor => {
                                 let cost = function.cost.map(|cost| {
@@ -1146,6 +1144,7 @@ impl Source {
                         let span = self.span(&function.span)?;
                         self.program.declarations.push(pb::Declaration {
                             kind: Some(kind),
+                            hidden,
                             span,
                             ..Default::default()
                         });
@@ -3781,7 +3780,7 @@ fn render_prepared(
                             })
                             .transpose()?,
                         unextractable: constructor.unextractable,
-                        hidden: false,
+                        hidden: declaration.hidden,
                         let_binding: false,
                         term_constructor: None,
                     },
@@ -3794,7 +3793,7 @@ fn render_prepared(
                             .merge
                             .map(|index| expression(program, index, &mut HashSet::new()))
                             .transpose()?,
-                        hidden: false,
+                        hidden: declaration.hidden,
                         let_binding: false,
                         term_constructor: None,
                         unextractable: true,

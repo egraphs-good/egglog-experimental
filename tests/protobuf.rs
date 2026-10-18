@@ -4,6 +4,308 @@ use egglog_experimental::{new_experimental_egraph, protobuf::Engine};
 use prost::Message;
 
 #[test]
+fn hidden_tables_source_native_and_snapshot_replay() {
+    use egglog_experimental::protobuf::source::{Renderer, Source};
+    let text = "(sort Expr)
+        (constructor Visible () Expr)
+        (constructor Hidden () Expr :internal-hidden)
+        (function visible-f () i64 :no-merge)
+        (function hidden-f () i64 :no-merge :internal-hidden)
+        (Visible) (Hidden) (set (visible-f) 1) (set (hidden-f) 2)
+        (print-size)";
+    let expected = vec![("Visible".to_string(), 1), ("visible-f".to_string(), 1)];
+    for core in [false, true] {
+        let mut rendered = String::new();
+        for replay in [false, true] {
+            let text = if replay { &rendered } else { text };
+            let mut native = if core {
+                egglog::EGraph::default()
+            } else {
+                new_experimental_egraph()
+            };
+            let outputs = native.parse_and_run_program(None, text).unwrap();
+            let native_sizes = outputs
+                .into_iter()
+                .filter_map(|output| match output {
+                    egglog::CommandOutput::PrintAllFunctionsSize(sizes) => Some(
+                        sizes
+                            .into_iter()
+                            .map(|(name, rows)| {
+                                let function = native.get_function(&name).unwrap();
+                                let logical = match &function.func_type().table_name {
+                                    Some(egglog::ast::TableName::Public(logical)) => {
+                                        logical.clone()
+                                    }
+                                    _ => name,
+                                };
+                                (logical, rows)
+                            })
+                            .collect::<Vec<_>>(),
+                    ),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(native_sizes.as_slice(), std::slice::from_ref(&expected));
+            let mut engine = Engine::default();
+            let id = create(&mut engine);
+            let source = if core {
+                Source::new_core(None, text)
+            } else {
+                Source::new(None, text)
+            }
+            .unwrap();
+            let mut renderer = if core {
+                Renderer::core()
+            } else {
+                Renderer::default()
+            };
+            let mut next_rendered = String::new();
+            let mut sizes = vec![];
+            let mut supplied = vec![];
+            for phase in source {
+                let phase = phase.unwrap();
+                for declaration in &phase.declarations {
+                    let name = match &declaration.kind {
+                        Some(pb::declaration::Kind::Constructor(table)) => &table.name,
+                        Some(pb::declaration::Kind::Function(table)) => &table.name,
+                        _ => continue,
+                    };
+                    assert_eq!(declaration.hidden, name == "Hidden" || name == "hidden-f");
+                    supplied.push(phase.clone());
+                }
+                next_rendered.push_str(&renderer.render(&phase).unwrap());
+                let response = run(&mut engine, id, phase);
+                assert_eq!(response.error, None);
+                for output in response.outputs {
+                    if let Some(pb::command_output::Kind::Sizes(result)) = output.kind {
+                        sizes.push(
+                            result
+                                .sizes
+                                .into_iter()
+                                .map(|size| (size.table, size.rows as usize))
+                                .collect::<Vec<_>>(),
+                        );
+                    }
+                }
+            }
+            assert_eq!(sizes.as_slice(), std::slice::from_ref(&expected));
+            for mut changed in supplied {
+                for declaration in &mut changed.declarations {
+                    declaration.hidden = !declaration.hidden;
+                }
+                let response = run(&mut engine, id, changed);
+                assert!(
+                    response
+                        .error
+                        .unwrap()
+                        .message
+                        .contains("conflicting declaration")
+                );
+            }
+            let frozen = run(
+                &mut engine,
+                id,
+                pb::Program {
+                    ir_version: 1,
+                    commands: vec![pb::Command {
+                        kind: Some(pb::command::Kind::Freeze(pb::Freeze {})),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                },
+            );
+            assert_eq!(frozen.error, None);
+            let Some(pb::command_output::Kind::Snapshot(snapshot)) = &frozen.outputs[0].kind else {
+                panic!("missing snapshot")
+            };
+            let saved = snapshot.program.as_ref().unwrap();
+            let hidden = saved
+                .declarations
+                .iter()
+                .filter(|declaration| declaration.hidden)
+                .map(|declaration| match &declaration.kind {
+                    Some(pb::declaration::Kind::Constructor(table)) => table.name.clone(),
+                    Some(pb::declaration::Kind::Function(table)) => table.name.clone(),
+                    _ => panic!("hidden on unsupported kind"),
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(hidden, ["Hidden", "hidden-f"]);
+            assert!(saved.nodes.iter().any(|node| matches!(&node.kind, Some(pb::node::Kind::Call(call)) if call.func == "Hidden")));
+            assert!(saved.commands.iter().any(|command| matches!(&command.kind,
+                Some(pb::command::Kind::Action(pb::Action { kind: Some(pb::action::Kind::Set(set)), .. }))
+                if set.target.as_ref().is_some_and(|call| call.func == "hidden-f"))));
+            let restored = create(&mut engine);
+            assert_eq!(run(&mut engine, restored, saved.clone()).error, None);
+            let mut observe = saved.clone();
+            observe.declarations.clear();
+            observe.commands = vec![pb::Command {
+                kind: Some(pb::command::Kind::PrintSize(pb::PrintSize {
+                    tables: vec![],
+                })),
+                ..Default::default()
+            }];
+            let response = run(&mut engine, restored, observe);
+            assert_eq!(response.error, None);
+            let Some(pb::command_output::Kind::Sizes(sizes)) = &response.outputs[0].kind else {
+                panic!("missing sizes")
+            };
+            assert_eq!(
+                sizes
+                    .sizes
+                    .iter()
+                    .map(|size| (size.table.clone(), size.rows as usize))
+                    .collect::<Vec<_>>(),
+                expected
+            );
+            for table in ["Hidden", "hidden-f"] {
+                let response = run(
+                    &mut engine,
+                    restored,
+                    pb::Program {
+                        ir_version: 1,
+                        commands: vec![pb::Command {
+                            kind: Some(pb::command::Kind::PrintSize(pb::PrintSize {
+                                tables: vec![table.into()],
+                            })),
+                            ..Default::default()
+                        }],
+                        ..Default::default()
+                    },
+                );
+                assert_eq!(
+                    response.error.unwrap().code,
+                    i32::from(pb::ErrorCode::UnknownName)
+                );
+            }
+            rendered = next_rendered;
+        }
+    }
+}
+
+#[test]
+fn hidden_tables_preserve_extraction_and_visible_unextractable_counts() {
+    use egglog_experimental::protobuf::source::Source;
+    let text = "(sort E)
+        (constructor Visible () E :cost 9)
+        (constructor Hidden () E :cost 0 :internal-hidden)
+        (constructor Never () E :unextractable)
+        (union (Visible) (Hidden)) (Never)
+        (print-size) (extract (Visible)) (extract (get-node-size!))";
+    let mut native = new_experimental_egraph();
+    native.parse_and_run_program(None, text).unwrap();
+    assert_eq!(native.get_size("Hidden"), 1);
+    assert_eq!(native.total_size(), 2);
+    assert_eq!(native.num_nodes(), 2);
+    for extractor in [pb::Extractor::Tree, pb::Extractor::GreedyDag] {
+        let mut engine = Engine::default();
+        let id = create(&mut engine);
+        let mut extracted = vec![];
+        let mut sizes = vec![];
+        for phase in Source::new(None, text).unwrap() {
+            let mut phase = phase.unwrap();
+            for command in &mut phase.commands {
+                if let Some(pb::command::Kind::Extract(extract)) = &mut command.kind {
+                    extract.extractor = extractor.into();
+                }
+            }
+            let response = run(&mut engine, id, phase);
+            assert_eq!(response.error, None);
+            for output in &response.outputs {
+                match &output.kind {
+                    Some(pb::command_output::Kind::Sizes(result)) => {
+                        sizes.push(
+                            result
+                                .sizes
+                                .iter()
+                                .map(|size| (size.table.clone(), size.rows))
+                                .collect::<Vec<_>>(),
+                        );
+                    }
+                    Some(pb::command_output::Kind::Extraction(result)) => {
+                        assert_eq!(result.roots.len(), 1);
+                        assert_eq!(result.roots[0].variants.len(), 1);
+                        extracted.push(
+                            response.nodes[result.roots[0].variants[0].term as usize]
+                                .kind
+                                .clone()
+                                .unwrap(),
+                        );
+                    }
+                    _ => (),
+                }
+            }
+        }
+        assert_eq!(
+            sizes,
+            [vec![("Never".to_string(), 1), ("Visible".to_string(), 1)]]
+        );
+        assert_eq!(
+            extracted,
+            [
+                pb::node::Kind::Call(pb::Call {
+                    func: "Visible".into(),
+                    args: vec![]
+                }),
+                pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
+                    value: Some(pb::primitive_value::Value::I64(2))
+                }),
+            ]
+        );
+    }
+}
+
+#[test]
+fn hidden_is_rejected_on_non_table_declarations() {
+    for kind in [
+        pb::declaration::Kind::EqSort(pb::EqSort {
+            name: "E".into(),
+            ..Default::default()
+        }),
+        pb::declaration::Kind::Relation(pb::Relation {
+            name: "R".into(),
+            inputs: vec![],
+        }),
+        pb::declaration::Kind::Primitive(pb::Primitive {
+            name: "p".into(),
+            output: 0,
+            body: Some(0),
+            ..Default::default()
+        }),
+        pb::declaration::Kind::HostSortFamily(pb::HostSortFamily {
+            name: "F".into(),
+            ..Default::default()
+        }),
+        pb::declaration::Kind::HostPrimitive(pb::HostPrimitive {
+            name: "h".into(),
+            ..Default::default()
+        }),
+    ] {
+        let mut engine = Engine::default();
+        let id = create(&mut engine);
+        let response = run(
+            &mut engine,
+            id,
+            pb::Program {
+                ir_version: 1,
+                declarations: vec![pb::Declaration {
+                    kind: Some(kind),
+                    hidden: true,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        );
+        assert!(
+            response
+                .error
+                .unwrap()
+                .message
+                .contains("only constructors and functions may be hidden")
+        );
+    }
+}
+
+#[test]
 fn action_controls_source_native_and_replay() {
     use egglog_experimental::protobuf::source::{Renderer, Source};
     let text = "(function f () i64 :merge new) (function g () i64 :merge new)
@@ -26022,8 +26324,7 @@ fn print_size_native_counts_modes_names_and_stats() {
                 .with_proof_testing(),
         };
         native.parse_and_run_program(None, setup).unwrap();
-        // Native-only annotations remain outside the wire declaration slice.
-        // They demonstrate what the native all-table observation excludes.
+        // These native tables demonstrate what all-table size observation excludes.
         native
             .parse_and_run_program(
                 None,
