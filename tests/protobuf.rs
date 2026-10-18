@@ -4075,7 +4075,11 @@ fn core_source_nominal_and_nested_families_reimport_across_phases() {
 #[test]
 fn core_source_control_topology_and_spans_roundtrip() {
     use egglog_experimental::protobuf::source::{Renderer, Source};
-    fn shape(command: &pb::Command, files: &[pb::SourceFile]) -> String {
+    fn shape(
+        command: &pb::Command,
+        files: &[pb::SourceFile],
+        aliases: &std::collections::HashMap<String, String>,
+    ) -> String {
         let span = command.span.as_ref().expect("authored control span");
         let text = files[span.file as usize].contents.as_ref().unwrap();
         assert!(!text[span.start as usize..span.end as usize].is_empty());
@@ -4085,7 +4089,7 @@ fn core_source_control_topology_and_spans_roundtrip() {
                 else {
                     panic!("source uses named rulesets");
                 };
-                return name.clone();
+                return aliases.get(name).unwrap_or(name).clone();
             }
             pb::command::Kind::Repeat(repeat) => {
                 (format!("exact{}", repeat.times.unwrap()), &repeat.body)
@@ -4098,7 +4102,7 @@ fn core_source_control_topology_and_spans_roundtrip() {
         format!(
             "{head}[{}]",
             body.iter()
-                .map(|c| shape(c, files))
+                .map(|c| shape(c, files, aliases))
                 .collect::<Vec<_>>()
                 .join(",")
         )
@@ -4127,15 +4131,35 @@ fn core_source_control_topology_and_spans_roundtrip() {
             .unwrap();
         let mut renderer = Renderer::core();
         let mut rendered = String::new();
+        let mut aliases = std::collections::HashMap::new();
         let mut engine = Engine::default();
         let id = create(&mut engine);
         for phase in Source::new_core(Some("controls.egg".into()), &text).unwrap() {
             let phase = phase.unwrap();
             if let Some(command) = phase.commands.first() {
                 assert_eq!(phase.commands.len(), 1);
-                assert_eq!(shape(command, &phase.files), expected, "{schedule}");
+                assert_eq!(
+                    shape(command, &phase.files, &aliases),
+                    expected,
+                    "{schedule}"
+                );
             }
-            rendered.push_str(&renderer.render(&phase).unwrap());
+            let text = renderer.render(&phase).unwrap();
+            let parsed = egglog::EGraph::default()
+                .parse_program(None, &text)
+                .unwrap();
+            let selections: Vec<_> = parsed
+                .iter()
+                .filter_map(|command| match command {
+                    egglog::ast::Command::UnstableCombinedRuleset(_, name, _) => Some(name),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(selections.len(), phase.rulesets.len());
+            for (name, ruleset) in selections.into_iter().zip(&phase.rulesets) {
+                aliases.insert(name.clone(), ruleset.name.clone().unwrap());
+            }
+            rendered.push_str(&text);
             assert_eq!(run(&mut engine, id, phase).error, None, "{schedule}");
         }
         egglog::EGraph::default()
@@ -4145,7 +4169,11 @@ fn core_source_control_topology_and_spans_roundtrip() {
         for phase in Source::new_core(None, &rendered).unwrap() {
             let phase = phase.unwrap();
             if let Some(command) = phase.commands.first() {
-                assert_eq!(shape(command, &phase.files), expected, "{rendered}");
+                assert_eq!(
+                    shape(command, &phase.files, &aliases),
+                    expected,
+                    "{rendered}"
+                );
             }
             assert_eq!(run(&mut engine, fresh, phase).error, None);
         }
@@ -4198,7 +4226,13 @@ fn core_renderer_keeps_callable_rule_ruleset_and_binder_namespaces_distinct() {
         assert_eq!(run(&mut replay, replay_id, phase.unwrap()).error, None);
     }
     let text = Renderer::core().render(&program).unwrap();
-    assert!(text.contains(&format!("(ruleset {physical})")));
+    let core_commands = egglog::EGraph::default()
+        .parse_program(None, &text)
+        .unwrap();
+    assert!(core_commands.iter().any(|command| matches!(command,
+        egglog::ast::Command::UnstableCombinedRuleset(_, _, children) if children.len() == 1)));
+    // Core preserves callable/label strings, not literal ruleset attachments:
+    // private selectors must share one installed occurrence without rebinding.
     assert!(text.contains(&format!(":name \"{physical}\"")), "{text}");
     assert!(text.contains("(function current () i64 :merge new :unextractable)"));
     assert!(text.contains("(print-function current"));
@@ -4635,12 +4669,21 @@ fn core_renderer_rejects_unrepresentable_names_before_publication() {
     let error = renderer.render(&program).unwrap_err();
     assert!(error.to_string().contains("changes meaning"), "{error}");
     program.commands.clear();
-    assert!(
-        renderer
-            .render(&program)
-            .unwrap()
-            .contains("(ruleset fresh)")
+    let expected = Renderer::core().render(&program).unwrap();
+    let retried = renderer.render(&program).unwrap();
+    assert_eq!(retried, expected, "failed rendering must retain no prefix");
+    let commands = egglog::EGraph::default()
+        .parse_program(None, &retried)
+        .unwrap();
+    assert_eq!(
+        commands
+            .iter()
+            .filter(|command| matches!(command,
+        egglog::ast::Command::UnstableCombinedRuleset(_, _, children) if children.is_empty()))
+            .count(),
+        1
     );
+    assert!(renderer.render(&program).unwrap().is_empty());
 }
 
 #[test]
@@ -6748,31 +6791,77 @@ fn experimental_renderer_failure_retry_is_inert() {
 }
 
 #[test]
-fn core_source_renderer_keeps_unsupported_resupply_and_sharing_rejections() {
-    use egglog_experimental::protobuf::source::Renderer;
+fn core_renderer_resupply_and_sharing_preserve_cursors_and_failed_prefixes() {
+    use egglog_experimental::protobuf::source::{Renderer, Source};
     let mut program = shared_rules_fixture();
     program.rulesets.truncate(1);
     program.rulesets[0].name = Some("first".into());
     program.commands.clear();
     let mut renderer = Renderer::core();
-    assert!(renderer.render(&program).is_ok());
-    assert!(
-        renderer.render(&program).is_err(),
-        "resupply must not emit duplicate native declarations"
-    );
+    let mut pristine = Renderer::core();
+    let prefix = renderer.render(&program).unwrap();
+    assert_eq!(pristine.render(&program).unwrap(), prefix);
+    assert_eq!(prefix.matches("(rule ").count(), 1);
+    assert!(renderer.render(&program).unwrap().is_empty());
+    assert!(pristine.render(&program).unwrap().is_empty());
     let mut duplicate = program.clone();
     duplicate.rulesets.push(duplicate.rulesets[0].clone());
-    assert!(Renderer::core().render(&duplicate).is_err());
+    let compatible = Renderer::core().render(&duplicate).unwrap();
+    assert_eq!(compatible.matches("(rule ").count(), 1);
+    let mut incompatible_duplicate = duplicate.clone();
+    incompatible_duplicate.rulesets[1].kind =
+        Some(pb::ruleset::Kind::Rules(pb::RuleList::default()));
+    assert!(Renderer::core().render(&incompatible_duplicate).is_err());
     duplicate.rulesets[1].name = Some("second".into());
-    assert!(
-        Renderer::core().render(&duplicate).is_err(),
-        "cross-leaf sharing cannot be represented by copying a rule"
-    );
-    // Rejection must not install an earlier new name from the same request.
+    duplicate.commands = shared_rules_fixture().commands[..2].to_vec();
+    let mut fresh = Renderer::core();
+    let first = fresh.render(&duplicate).unwrap();
+    let replay = fresh.render(&duplicate).unwrap();
+    assert_eq!(first.matches("(rule ").count(), 1);
+    assert_eq!(replay.matches("(rule ").count(), 0);
+    let text = format!("{first}{replay}");
+    let expected = [1, 0, 0, 0];
+    let actual: Vec<_> = egglog::EGraph::default()
+        .parse_and_run_program(None, &text)
+        .unwrap()
+        .into_iter()
+        .filter_map(|output| match output {
+            egglog::CommandOutput::RunSchedule(report) => {
+                Some(report.num_matches_per_rule.values().sum::<usize>() as u64)
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(actual, expected);
+    let mut engine = Engine::default();
+    let id = create(&mut engine);
+    let mut actual = vec![];
+    for phase in Source::new_core(None, &text).unwrap() {
+        let response = run(&mut engine, id, phase.unwrap());
+        assert_eq!(response.error, None);
+        actual.extend(response.profile.unwrap().runs.iter().map(|run| {
+            run.rules
+                .iter()
+                .map(|rule| rule.matches.unwrap())
+                .sum::<u64>()
+        }));
+    }
+    assert_eq!(actual, expected);
+
+    // Rejection must not install the earlier new second name or consume its
+    // private stamp when the retained first definition is incompatible.
+    duplicate.commands.clear();
     duplicate.rulesets.swap(0, 1);
-    assert!(renderer.render(&duplicate).is_err());
-    duplicate.rulesets.truncate(1);
-    assert!(renderer.render(&duplicate).is_ok());
+    let mut incompatible = duplicate.clone();
+    incompatible.rulesets[1].kind = Some(pb::ruleset::Kind::Rules(pb::RuleList::default()));
+    let expected = renderer.render(&program).unwrap();
+    assert!(expected.is_empty());
+    assert!(pristine.render(&program).unwrap().is_empty());
+    assert!(renderer.render(&incompatible).is_err());
+    let retried = renderer.render(&duplicate).unwrap();
+    assert_eq!(retried, pristine.render(&duplicate).unwrap());
+    assert_eq!(retried.matches("(rule ").count(), 0);
+    assert!(renderer.render(&duplicate).unwrap().is_empty());
 }
 
 #[test]
@@ -11758,6 +11847,20 @@ fn source_scope_submissions_restore_definitions_captures_and_publication() {
         (check (= (cell) 11) (= saved 10))
         (temporary-row true)
         (check (temporary-row true))
+        (relation growth-seed (i64))
+        (function growth-count () i64 :merge (+ old new))
+        (set (growth-count) 0)
+        (ruleset growth)
+        (rule ((growth-seed x)) ((set (growth-count) 1)) :ruleset growth :name "a")
+        (growth-seed 1) (run growth 1) (check (= (growth-count) 1))
+        (push)
+        (rule ((growth-seed x)) ((set (growth-count) 1)) :ruleset growth :name "b")
+        (run growth 1) (check (= (growth-count) 2))
+        (pop)
+        (check (= (growth-count) 1))
+        (rule ((growth-seed x)) ((set (growth-count) 1)) :ruleset growth :name "c")
+        (run growth 1) (check (= (growth-count) 2))
+        (run growth 1) (check (= (growth-count) 2))
     "#;
     for core in [false, true] {
         let mut source = if core {
@@ -11781,6 +11884,7 @@ fn source_scope_submissions_restore_definitions_captures_and_publication() {
         let mut engine = Engine::default();
         let mut id = create(&mut engine);
         let mut saved = vec![];
+        let mut growth_versions = std::collections::HashSet::new();
         while let Some(phase) = source.next_submission() {
             let phase = phase.unwrap();
             native.run_program(vec![commands.next().unwrap()]).unwrap();
@@ -11790,6 +11894,16 @@ fn source_scope_submissions_restore_definitions_captures_and_publication() {
             match phase {
                 Submission::Program(program) => {
                     let program = pb::Program::decode(program.encode_to_vec().as_slice()).unwrap();
+                    for set in &program.rulesets {
+                        if let Some(pb::ruleset::Kind::Combined(combined)) = &set.kind
+                            && matches!(combined.rulesets.first().and_then(|reference| reference.kind.as_ref()), Some(pb::ruleset_ref::Kind::Name(name)) if name == "growth")
+                        {
+                            assert!(
+                                growth_versions.insert(set.name.clone().unwrap()),
+                                "Pop reused a private version name"
+                            );
+                        }
+                    }
                     assert_eq!(run(&mut engine, id, program).error, None, "core={core}");
                 }
                 Submission::Push(count) => {
@@ -11823,6 +11937,7 @@ fn source_scope_submissions_restore_definitions_captures_and_publication() {
         }
         assert!(commands.next().is_none());
         assert!(saved.is_empty());
+        assert_eq!(growth_versions.len(), 2);
     }
 }
 
@@ -14351,12 +14466,8 @@ fn source_combined_errors_preserve_the_submitted_prefix() {
             "Shadowing is not allowed",
         ),
         (
-            "(ruleset leaf) (unstable-combined-ruleset parent leaf) (run parent 1) (rule ((Seed x)) ((Out x)) :ruleset leaf)",
-            "after its first run",
-        ),
-        (
-            "(ruleset leaf) (unstable-combined-ruleset child leaf) (unstable-combined-ruleset parent child) (run parent 1) (rewrite (Seed x) (Out x) :ruleset leaf)",
-            "after its first run",
+            "(ruleset leaf) (rule ((Seed x)) ((Out x)) :ruleset leaf :name \"same\") (run leaf 1) (rule ((Seed x)) ((Out x)) :ruleset leaf :name \"same\")",
+            "already exists",
         ),
     ] {
         let text = format!(
@@ -14425,21 +14536,481 @@ fn source_combined_errors_preserve_the_submitted_prefix() {
 }
 
 #[test]
-fn source_rejects_late_rule_growth_and_unimplemented_provenance() {
-    use egglog_experimental::protobuf::source::Source;
-    let mut source = Source::new(None, "(datatype M (Num i64) (Box M)) (ruleset r) (Box (Num 1)) (run r 1) (rewrite (Box x) x :ruleset r)").unwrap();
-    for _ in 0..4 {
-        assert!(source.next().unwrap().is_ok());
+fn source_rule_growth_preserves_old_versions_occurrences_and_cursors() {
+    use egglog_experimental::protobuf::source::{Renderer, Source};
+    use std::collections::HashSet;
+    for core in [false, true] {
+        for root in ["", "r", "root"] {
+            let leaf = if root.is_empty() { "" } else { "r" };
+            let declaration = if leaf.is_empty() { "" } else { "(ruleset r)" };
+            let option = if leaf.is_empty() { "" } else { ":ruleset r" };
+            let combined = if root == "root" {
+                "(unstable-combined-ruleset child r) (unstable-combined-ruleset root child child)"
+            } else {
+                ""
+            };
+            let text = format!(
+                r#"
+                (relation Seed (i64))
+                (function count () i64 :merge (+ old new)) (set (count) 0)
+                {declaration}
+                (rule ((Seed x)) ((set (count) 1)) {option} :name "a")
+                {combined}
+                (Seed 1) (run {root} 1) (check (= (count) 1))
+                (rule ((Seed x)) ((set (count) 1)) {option} :name "b")
+                (run {root} 1) (check (= (count) 2))
+                (run {root} 1) (check (= (count) 2))
+                (Seed 2) (run {root} 1) (check (= (count) 4))
+            "#
+            );
+            let mut native = if core {
+                egglog::EGraph::default()
+            } else {
+                new_experimental_egraph()
+            };
+            let expected: Vec<_> = native
+                .parse_and_run_program(None, &text)
+                .unwrap()
+                .into_iter()
+                .filter_map(|output| match output {
+                    egglog::CommandOutput::RunSchedule(report) => {
+                        Some(report.num_matches_per_rule.values().sum::<usize>() as u64)
+                    }
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(expected, [1, 1, 0, 2]);
+            let source = if core {
+                Source::new_core(None, &text)
+            } else {
+                Source::new(None, &text)
+            }
+            .unwrap();
+            let mut renderer = if core {
+                Renderer::core()
+            } else {
+                Renderer::default()
+            };
+            let mut engine = Engine::default();
+            let id = create(&mut engine);
+            let mut rendered = String::new();
+            let mut actual = vec![];
+            let mut first_key = None;
+            for phase in source {
+                let phase = pb::Program::decode(phase.unwrap().encode_to_vec().as_slice()).unwrap();
+                let is_run = matches!(
+                    phase
+                        .commands
+                        .first()
+                        .and_then(|command| command.kind.as_ref()),
+                    Some(pb::command::Kind::Run(_))
+                );
+                if is_run && actual.len() == 1 {
+                    let (delta, suffix) = phase
+                        .rulesets
+                        .iter()
+                        .enumerate()
+                        .find_map(|(index, set)| match &set.kind {
+                            Some(pb::ruleset::Kind::Rules(list)) if set.name.is_none() => {
+                                Some((index, list))
+                            }
+                            _ => None,
+                        })
+                        .expect("growth publishes a fresh anonymous suffix");
+                    assert_eq!(suffix.rules, [1]);
+                    assert!(phase.rulesets.iter().any(|set| matches!(&set.kind,
+                        Some(pb::ruleset::Kind::Combined(combined)) if combined.rulesets.len() == 2
+                            && matches!(&combined.rulesets[0].kind, Some(pb::ruleset_ref::Kind::Name(name)) if name == leaf)
+                            && matches!(&combined.rulesets[1].kind, Some(pb::ruleset_ref::Kind::Index(index)) if *index as usize == delta))));
+                }
+                if is_run && actual.len() >= 2 {
+                    assert!(
+                        phase.rulesets.is_empty(),
+                        "unchanged child versions republished a selector"
+                    );
+                }
+                rendered.push_str(&renderer.render(&phase).unwrap());
+                let current_run = pb::Program {
+                    ir_version: 1,
+                    files: phase.files.clone(),
+                    commands: phase.commands.clone(),
+                    ..Default::default()
+                };
+                let response = run(&mut engine, id, phase);
+                assert_eq!(response.error, None, "core={core}/root={root}");
+                if !is_run {
+                    continue;
+                }
+                actual.push(
+                    response
+                        .profile
+                        .as_ref()
+                        .unwrap()
+                        .runs
+                        .iter()
+                        .flat_map(|run| &run.rules)
+                        .map(|rule| rule.matches.unwrap())
+                        .sum::<u64>(),
+                );
+                let statistics = run(
+                    &mut engine,
+                    id,
+                    pb::Program {
+                        ir_version: 1,
+                        commands: vec![pb::Command {
+                            kind: Some(pb::command::Kind::Stats(pb::Unit {})),
+                            ..Default::default()
+                        }],
+                        ..Default::default()
+                    },
+                );
+                assert_eq!(statistics.error, None);
+                let Some(pb::command_output::Kind::Statistics(report)) =
+                    &statistics.outputs[0].kind
+                else {
+                    panic!("native rule keys")
+                };
+                let keys: HashSet<_> = report
+                    .num_matches_per_rule
+                    .iter()
+                    .map(|entry| entry.native_name.clone())
+                    .collect();
+                assert_eq!(
+                    keys.len(),
+                    if actual.len() == 1 { 1 } else { 2 },
+                    "old occurrences were reinstalled"
+                );
+                if let Some(key) = &first_key {
+                    assert!(keys.contains(key));
+                } else {
+                    first_key = keys.into_iter().next();
+                }
+                if actual.len() == 2 {
+                    // Raw named V0 remains selectable after the logical source
+                    // name moves to V1, sharing the old advanced match cursor.
+                    let old = pb::Program {
+                        ir_version: 1,
+                        commands: vec![pb::Command {
+                            kind: Some(pb::command::Kind::Run(pb::Run {
+                                ruleset: Some(pb::RulesetRef {
+                                    kind: Some(pb::ruleset_ref::Kind::Name(root.into())),
+                                }),
+                                ..Default::default()
+                            })),
+                            ..Default::default()
+                        }],
+                        ..Default::default()
+                    };
+                    rendered.push_str(&renderer.render(&old).unwrap());
+                    let response = run(&mut engine, id, old.clone());
+                    assert_eq!(response.error, None);
+                    let profile = response.profile.unwrap();
+                    assert!(profile.complete);
+                    assert_eq!(profile.runs.len(), 1);
+                    assert_eq!(profile.runs[0].invocations, 1);
+                    assert_eq!(
+                        profile.runs[0]
+                            .rules
+                            .iter()
+                            .map(|rule| rule.matches.unwrap())
+                            .sum::<u64>(),
+                        0
+                    );
+                    // An unchanged native run may omit per-rule rows entirely.
+                    // A fresh-input clone distinguishes old V0's membership
+                    // from an empty selector without changing the main counts.
+                    let branch = pb::CloneEGraphResponse::decode(
+                        engine
+                            .clone_egraph(&pb::CloneEGraphRequest { egraph_id: id }.encode_to_vec())
+                            .unwrap()
+                            .as_slice(),
+                    )
+                    .unwrap()
+                    .egraph_id;
+                    for phase in Source::new(None, "(relation Seed (i64)) (Seed 2)").unwrap() {
+                        assert_eq!(run(&mut engine, branch, phase.unwrap()).error, None);
+                    }
+                    for (program, label, matches, count) in [
+                        (old.clone(), Some("a"), 1, 3),
+                        (current_run, Some("b"), 1, 4),
+                        (old, None, 0, 4),
+                    ] {
+                        let response = run(&mut engine, branch, program);
+                        assert_eq!(response.error, None, "core={core}/root={root}");
+                        let profile = response.profile.unwrap();
+                        assert_eq!(profile.runs.len(), 1);
+                        assert_eq!(profile.runs[0].invocations, 1);
+                        assert_eq!(
+                            profile.runs[0]
+                                .rules
+                                .iter()
+                                .map(|rule| rule.matches.unwrap())
+                                .sum::<u64>(),
+                            matches
+                        );
+                        if let Some(label) = label {
+                            assert_eq!(response.rules.len(), 1);
+                            assert_eq!(response.rules[0].name.as_deref(), Some(label));
+                        }
+                        for phase in Source::new(
+                            None,
+                            &format!(
+                                "(function count () i64 :merge (+ old new)) (check (= (count) {count}))"
+                            ),
+                        )
+                        .unwrap()
+                        {
+                            assert_eq!(run(&mut engine, branch, phase.unwrap()).error, None);
+                        }
+                    }
+                }
+            }
+            assert_eq!(actual, expected);
+            let mut replay = if core {
+                egglog::EGraph::default()
+            } else {
+                new_experimental_egraph()
+            };
+            let commands = replay.parse_program(None, &rendered).unwrap();
+            let labels: Vec<_> = commands
+                .iter()
+                .filter_map(|command| match command {
+                    egglog::ast::Command::Rule { rule } => Some(rule.name.as_str()),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(labels, ["a", "b"]);
+            for command in &commands {
+                if let egglog::ast::Command::UnstableCombinedRuleset(_, _, children) = command {
+                    assert_eq!(
+                        children.iter().collect::<HashSet<_>>().len(),
+                        children.len(),
+                        "native text must use the prepared unique occurrence list"
+                    );
+                }
+            }
+            let replayed: Vec<_> = replay
+                .run_program(commands)
+                .unwrap()
+                .into_iter()
+                .filter_map(|output| match output {
+                    egglog::CommandOutput::RunSchedule(report) => {
+                        Some(report.num_matches_per_rule.values().sum::<usize>() as u64)
+                    }
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(replayed, [1, 1, 0, 0, 2]);
+            let fresh = create(&mut engine);
+            let source = if core {
+                Source::new_core(None, &rendered)
+            } else {
+                Source::new(None, &rendered)
+            }
+            .unwrap();
+            let mut replayed = vec![];
+            for phase in source {
+                let response = run(&mut engine, fresh, phase.unwrap());
+                assert_eq!(response.error, None);
+                for site in &response.profile.unwrap().runs {
+                    replayed.push(
+                        site.rules
+                            .iter()
+                            .map(|rule| rule.matches.unwrap())
+                            .sum::<u64>(),
+                    );
+                }
+            }
+            assert_eq!(replayed, [1, 1, 0, 0, 2]);
+        }
     }
-    assert!(
-        source
-            .next()
+}
+
+#[test]
+fn core_renderer_private_selectors_reject_literal_global_collisions_inertly() {
+    use egglog_experimental::protobuf::source::{Renderer, Source};
+    let mut renderer = Renderer::core();
+    let mut text = String::new();
+    let mut repeat = None;
+    for phase in Source::new_core(None, "(relation Seed (i64)) (ruleset r) (rule ((Seed x)) ((Seed x)) :ruleset r :name \"a\") (Seed 1) (run r 1)").unwrap() {
+        let phase = phase.unwrap();
+        if !phase.commands.is_empty() { repeat = Some(phase.clone()); }
+        text.push_str(&renderer.render(&phase).unwrap());
+    }
+    let parsed = egglog::EGraph::default()
+        .parse_program(None, &text)
+        .unwrap();
+    let private = parsed
+        .iter()
+        .find_map(|command| match command {
+            egglog::ast::Command::AddRuleset(_, name) => Some(name.clone()),
+            _ => None,
+        })
+        .unwrap();
+    let repeat = repeat.unwrap();
+    let expected = renderer.render(&repeat).unwrap();
+    for kind in ["sort", "function", "let"] {
+        let mut conflict = pb::Program {
+            ir_version: 1,
+            ..Default::default()
+        };
+        if kind == "sort" {
+            conflict.sorts.push(pb::Sort {
+                kind: Some(pb::sort::Kind::Eq(private.clone())),
+                ..Default::default()
+            });
+            conflict.declarations.push(pb::Declaration {
+                kind: Some(pb::declaration::Kind::EqSort(pb::EqSort {
+                    name: private.clone(),
+                    ..Default::default()
+                })),
+                ..Default::default()
+            });
+        } else {
+            conflict.sorts.push(pb::Sort {
+                kind: Some(pb::sort::Kind::Family(pb::HostSort {
+                    name: "i64".into(),
+                    args: vec![],
+                })),
+                ..Default::default()
+            });
+            conflict.declarations.push(pb::Declaration {
+                kind: Some(pb::declaration::Kind::Function(pb::Function {
+                    name: private.clone(),
+                    output: 0,
+                    ..Default::default()
+                })),
+                ..Default::default()
+            });
+            if kind == "let" {
+                conflict.nodes.push(pb::Node {
+                    sort_id: 0,
+                    kind: Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
+                        value: Some(pb::primitive_value::Value::I64(1)),
+                    })),
+                    ..Default::default()
+                });
+                conflict.commands.push(pb::Command {
+                    kind: Some(pb::command::Kind::Action(pb::Action {
+                        kind: Some(pb::action::Kind::Set(pb::Set {
+                            target: Some(pb::Call {
+                                func: private.clone(),
+                                args: vec![],
+                            }),
+                            value: Some(0),
+                        })),
+                        ..Default::default()
+                    })),
+                    ..Default::default()
+                });
+            }
+        }
+        assert!(
+            renderer
+                .render(&conflict)
+                .unwrap_err()
+                .to_string()
+                .contains("private source ruleset"),
+            "{kind}"
+        );
+        assert_eq!(
+            renderer.render(&repeat).unwrap(),
+            expected,
+            "{kind} consumed renderer state"
+        );
+    }
+}
+
+#[test]
+fn source_growth_rejects_an_included_private_version_collision() {
+    use egglog_experimental::protobuf::source::Source;
+    let directory = std::env::temp_dir().join(format!(
+        "egglog-source-version-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
-            .unwrap_err()
-            .to_string()
-            .contains("after its first run")
-    );
-    assert!(source.next().is_none());
+            .as_nanos()
+    ));
+    std::fs::create_dir(&directory).unwrap();
+    for core in [false, true] {
+        let text = "(ruleset r) (run r 1) (rule () () :ruleset r :name \"late\") (run r 1) (include \"late.egg\") (panic \"unexecuted suffix\")";
+        let mut source = if core {
+            Source::new_core(None, text)
+        } else {
+            Source::new(None, text)
+        }
+        .unwrap()
+        .with_include_base(&directory)
+        .unwrap();
+        let mut private = None;
+        for _ in 0..4 {
+            let phase = source.next().unwrap().unwrap();
+            for ruleset in phase.rulesets {
+                if matches!(ruleset.kind, Some(pb::ruleset::Kind::Combined(_))) {
+                    private = ruleset.name;
+                }
+            }
+        }
+        let private = private.unwrap();
+        std::fs::write(directory.join("late.egg"), format!("(ruleset {private})")).unwrap();
+        assert!(
+            source
+                .next()
+                .unwrap()
+                .unwrap_err()
+                .to_string()
+                .contains("already declared")
+        );
+        assert!(source.next().is_none());
+    }
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn source_late_rewrite_growth_and_primitive_provenance() {
+    use egglog_experimental::protobuf::source::{Renderer, Source};
+    let text = "(datatype M (Num i64) (Box M)) (ruleset r) (Box (Num 1)) (run r 1) (rewrite (Box x) x :ruleset r) (run r 1) (check (= (Box (Num 1)) (Num 1)))";
+    for core in [false, true] {
+        let source = if core {
+            Source::new_core(None, text)
+        } else {
+            Source::new(None, text)
+        }
+        .unwrap();
+        let mut renderer = if core {
+            Renderer::core()
+        } else {
+            Renderer::default()
+        };
+        let mut native = if core {
+            egglog::EGraph::default()
+        } else {
+            new_experimental_egraph()
+        };
+        native.parse_and_run_program(None, text).unwrap();
+        let mut replay = if core {
+            egglog::EGraph::default()
+        } else {
+            new_experimental_egraph()
+        };
+        let mut engine = Engine::default();
+        let id = create(&mut engine);
+        let mut versions = 0;
+        for phase in source {
+            let phase = pb::Program::decode(phase.unwrap().encode_to_vec().as_slice()).unwrap();
+            versions += phase
+                .rulesets
+                .iter()
+                .filter(|set| set.name.is_some())
+                .count();
+            replay
+                .parse_and_run_program(None, &renderer.render(&phase).unwrap())
+                .unwrap();
+            assert_eq!(run(&mut engine, id, phase).error, None);
+        }
+        assert_eq!(versions, 2);
+    }
     let primitive = Source::new(None, "(primitive p (i64) i64 _0)")
         .unwrap()
         .next()
@@ -14642,7 +15213,6 @@ fn source_renderer_prevents_identifier_injection() {
                     })),
                     ..Default::default()
                 });
-                assert!(Renderer::core().render(&program).is_err());
             }
             4 => {
                 let Some(pb::command::Kind::Action(pb::Action {
@@ -14659,15 +15229,37 @@ fn source_renderer_prevents_identifier_injection() {
         if matches!(target, 2 | 4) {
             assert!(Renderer::default().render(&program).is_err());
         } else {
-            let source = Renderer::default().render(&program).unwrap();
-            assert!(!source.contains("(panic \"injected\")"));
-            new_experimental_egraph()
-                .parse_and_run_program(None, &source)
+            // Logical ruleset names use private selectors in both dialects.
+            // Core still rejects unrepresentable literal nominal/callable names.
+            for core in [false, true]
+                .into_iter()
+                .filter(|core| !*core || target == 3)
+            {
+                let source = if core {
+                    Renderer::core()
+                } else {
+                    Renderer::default()
+                }
+                .render(&program)
                 .unwrap();
-            let mut engine = Engine::default();
-            let id = create(&mut engine);
-            for phase in Source::new(None, &source).unwrap() {
-                assert_eq!(run(&mut engine, id, phase.unwrap()).error, None);
+                assert!(!source.contains("(panic \"injected\")"));
+                let mut native = if core {
+                    egglog::EGraph::default()
+                } else {
+                    new_experimental_egraph()
+                };
+                native.parse_and_run_program(None, &source).unwrap();
+                let mut engine = Engine::default();
+                let id = create(&mut engine);
+                let phases = if core {
+                    Source::new_core(None, &source)
+                } else {
+                    Source::new(None, &source)
+                }
+                .unwrap();
+                for phase in phases {
+                    assert_eq!(run(&mut engine, id, phase.unwrap()).error, None);
+                }
             }
         }
     }

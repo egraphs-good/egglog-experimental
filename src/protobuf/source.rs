@@ -6,7 +6,8 @@
 //! does not erase an executed prefix. Native syntax is never executed here.
 //! Scope-aware callers use [`Source::next_submission`] and the existing clone /
 //! return requests; the Program iterator deliberately rejects scope operations.
-//! Rulesets and their dependencies are fixed after first selection. Uncatalogued primitives, effectful local lets,
+//! Selected rulesets are immutable snapshots; later source additions publish
+//! occurrence-preserving prefix/delta versions. Uncatalogued primitives, effectful local lets,
 //! dynamic costs and general schedules remain unsupported. The explicit Core
 //! frontend also admits Run-only sequence/repeat/saturate controls. Proof requests keep
 //! their authored identity; execution mode belongs to the receiving engine.
@@ -46,11 +47,18 @@ pub enum Submission {
     },
 }
 
+#[derive(Clone)]
+struct SourceRuleset {
+    kind: pb::ruleset::Kind,
+    span: Option<pb::Span>,
+    version: Option<usize>,
+    published_rules: usize,
+}
+
 struct SourceScope {
     graph: EGraph,
     program: pb::Program,
-    rulesets: HashMap<String, usize>,
-    installed: HashSet<String>,
+    rulesets: HashMap<String, SourceRuleset>,
     relations: HashSet<String>,
     local_prefix: String,
 }
@@ -64,10 +72,11 @@ pub struct Source {
     include_base: PathBuf,
     scopes: Vec<SourceScope>,
     program: pb::Program,
-    rulesets: HashMap<String, usize>,
-    installed: HashSet<String>,
+    rulesets: HashMap<String, SourceRuleset>,
     relations: HashSet<String>,
     local_prefix: String,
+    // Native fresh names survive Pop; never reuse a discarded version's name.
+    next_ruleset: u64,
 }
 
 // Project the resolved body before unstable-fn target preparation replaces
@@ -91,9 +100,9 @@ pub(crate) fn primitive_definition(
             ..Default::default()
         },
         rulesets: HashMap::new(),
-        installed: HashSet::new(),
         relations: HashSet::new(),
         local_prefix: String::new(),
+        next_ruleset: 0,
     };
     let inputs = inputs
         .iter()
@@ -172,17 +181,20 @@ impl Source {
             scopes: Vec::new(),
             program: pb::Program {
                 ir_version: 1,
-                rulesets: vec![pb::Ruleset {
-                    name: Some(String::new()),
-                    kind: Some(pb::ruleset::Kind::Rules(pb::RuleList::default())),
-                    ..Default::default()
-                }],
                 ..Default::default()
             },
-            rulesets: HashMap::from([(String::new(), 0)]),
-            installed: HashSet::new(),
+            rulesets: HashMap::from([(
+                String::new(),
+                SourceRuleset {
+                    kind: pb::ruleset::Kind::Rules(pb::RuleList::default()),
+                    span: None,
+                    version: None,
+                    published_rules: 0,
+                },
+            )]),
             relations: HashSet::new(),
             local_prefix,
+            next_ruleset: 0,
         })
     }
 
@@ -251,7 +263,6 @@ impl Source {
                             graph: self.graph.clone(),
                             program: self.program.clone(),
                             rulesets: self.rulesets.clone(),
-                            installed: self.installed.clone(),
                             relations: self.relations.clone(),
                             local_prefix: self.local_prefix.clone(),
                         });
@@ -269,7 +280,6 @@ impl Source {
                         self.graph.restore_from(saved.graph);
                         self.program = saved.program;
                         self.rulesets = saved.rulesets;
-                        self.installed = saved.installed;
                         self.relations = saved.relations;
                         self.local_prefix = saved.local_prefix;
                     }
@@ -597,18 +607,25 @@ impl Source {
                             ),
                             _ => unreachable!(),
                         };
-                        if self.rulesets.contains_key(&name) {
+                        if self.rulesets.contains_key(&name)
+                            || self
+                                .program
+                                .rulesets
+                                .iter()
+                                .any(|set| set.name.as_ref() == Some(&name))
+                        {
                             return Err(format!("ruleset {name} is already declared"));
                         }
                         let span = self.span(&span)?;
-                        self.rulesets
-                            .insert(name.clone(), self.program.rulesets.len());
-                        self.program.rulesets.push(pb::Ruleset {
-                            name: Some(name),
-                            span,
-                            kind: Some(kind),
-                            ..Default::default()
-                        });
+                        self.rulesets.insert(
+                            name,
+                            SourceRuleset {
+                                kind,
+                                span,
+                                version: None,
+                                published_rules: 0,
+                            },
+                        );
                     }
                     N::NormRule { rule } => self.rule(rule, rewrite)?,
                     N::CoreAction(ResolvedAction::Let(span, var, expr)) => {
@@ -769,6 +786,32 @@ impl Source {
                 self.program.commands.push(command);
             }
         }
+        let local_rulesets: HashMap<usize, u32> = publish
+            .iter()
+            .enumerate()
+            .map(|(local, global)| {
+                Ok((
+                    *global,
+                    u32::try_from(local).map_err(|_| "too many source rulesets")?,
+                ))
+            })
+            .collect::<Result<_, String>>()?;
+        let rulesets = publish
+            .into_iter()
+            .map(|index| {
+                let mut ruleset = self.program.rulesets[index].clone();
+                if let Some(pb::ruleset::Kind::Combined(combined)) = &mut ruleset.kind {
+                    for child in &mut combined.rulesets {
+                        if let Some(pb::ruleset_ref::Kind::Index(index)) = &mut child.kind {
+                            *index = *local_rulesets
+                                .get(&(*index as usize))
+                                .expect("new anonymous deltas are published with their version");
+                        }
+                    }
+                }
+                ruleset
+            })
+            .collect();
         Ok(pb::Program {
             ir_version: 1,
             sorts: self.program.sorts.clone(),
@@ -779,60 +822,138 @@ impl Source {
             // Unused rules are still validated at their source position. Only
             // binding/publication waits until the first run of the theory.
             rules: self.program.rules.clone(),
-            rulesets: publish
-                .into_iter()
-                .map(|index| self.program.rulesets[index].clone())
-                .collect(),
+            rulesets,
         })
     }
 
-    // Publish/freeze the newly selected named closure without compacting the
-    // command-bearing arenas or duplicating shared rule occurrences. Names may
-    // resolve forward at this point; all emitted edges remain named references.
-    fn publish_ruleset(&mut self, name: &str, publish: &mut Vec<usize>) -> Result<(), String> {
-        let root = *self
-            .rulesets
-            .get(name)
-            .ok_or_else(|| format!("unknown ruleset {name}"))?;
-        let mut pending = vec![(root, false)];
+    // Resolve the current authored closure into immutable wire versions. A new
+    // leaf suffix references its old named prefix, never reinstalls old rules.
+    fn publish_ruleset(&mut self, name: &str, publish: &mut Vec<usize>) -> Result<usize, String> {
+        let mut pending = vec![(name.to_owned(), false)];
         let mut active = HashSet::new();
-        let mut completed = HashSet::new();
-        let mut order = vec![];
-        while let Some((index, leaving)) = pending.pop() {
-            let ruleset = &self.program.rulesets[index];
-            let name = ruleset.name.as_ref().expect("source rulesets are named");
-            if self.installed.contains(name) || completed.contains(&index) {
+        let mut completed: HashMap<String, usize> = HashMap::new();
+        while let Some((logical, leaving)) = pending.pop() {
+            if completed.contains_key(&logical) {
                 continue;
             }
-            if leaving {
-                active.remove(&index);
-                completed.insert(index);
-                order.push(index);
-                continue;
-            }
-            if !active.insert(index) {
-                return Err(format!("cyclic source ruleset {name}"));
-            }
-            pending.push((index, true));
-            if let Some(pb::ruleset::Kind::Combined(combined)) = &ruleset.kind {
-                for child in combined.rulesets.iter().rev() {
-                    let Some(pb::ruleset_ref::Kind::Name(name)) = &child.kind else {
-                        unreachable!("source ruleset dependencies are named")
-                    };
-                    let child = *self
-                        .rulesets
-                        .get(name)
-                        .ok_or_else(|| format!("unknown ruleset {name}"))?;
-                    pending.push((child, false));
+            let ruleset = self
+                .rulesets
+                .get(&logical)
+                .ok_or_else(|| format!("unknown ruleset {logical}"))?
+                .clone();
+            if !leaving {
+                if !active.insert(logical.clone()) {
+                    return Err(format!("cyclic source ruleset {logical}"));
                 }
+                pending.push((logical.clone(), true));
+                if let pb::ruleset::Kind::Combined(combined) = ruleset.kind {
+                    for child in combined.rulesets.into_iter().rev() {
+                        let Some(pb::ruleset_ref::Kind::Name(name)) = child.kind else {
+                            unreachable!("authored dependencies retain logical names")
+                        };
+                        pending.push((name, false));
+                    }
+                }
+                continue;
             }
+            active.remove(&logical);
+            let mut published_rules = ruleset.published_rules;
+            let kind = match ruleset.kind {
+                pb::ruleset::Kind::Rules(list) => {
+                    if let Some(version) = ruleset.version
+                        && ruleset.published_rules == list.rules.len()
+                    {
+                        completed.insert(logical, version);
+                        continue;
+                    }
+                    published_rules = list.rules.len();
+                    if let Some(previous) = ruleset.version {
+                        let delta = u32::try_from(self.program.rulesets.len())
+                            .map_err(|_| "too many source rulesets")?;
+                        self.program.rulesets.push(pb::Ruleset {
+                            kind: Some(pb::ruleset::Kind::Rules(pb::RuleList {
+                                rules: list.rules[ruleset.published_rules..].to_vec(),
+                            })),
+                            span: ruleset.span,
+                            ..Default::default()
+                        });
+                        publish.push(delta as usize);
+                        pb::ruleset::Kind::Combined(pb::CombinedRuleset {
+                            rulesets: vec![
+                                pb::RulesetRef {
+                                    kind: Some(pb::ruleset_ref::Kind::Name(
+                                        self.program.rulesets[previous].name.clone().unwrap(),
+                                    )),
+                                },
+                                pb::RulesetRef {
+                                    kind: Some(pb::ruleset_ref::Kind::Index(delta)),
+                                },
+                            ],
+                        })
+                    } else {
+                        pb::ruleset::Kind::Rules(list)
+                    }
+                }
+                pb::ruleset::Kind::Combined(combined) => {
+                    pb::ruleset::Kind::Combined(pb::CombinedRuleset {
+                        rulesets: combined
+                            .rulesets
+                            .into_iter()
+                            .map(|child| {
+                                let Some(pb::ruleset_ref::Kind::Name(name)) = child.kind else {
+                                    unreachable!()
+                                };
+                                let version = completed[&name];
+                                pb::RulesetRef {
+                                    kind: Some(pb::ruleset_ref::Kind::Name(
+                                        self.program.rulesets[version].name.clone().unwrap(),
+                                    )),
+                                }
+                            })
+                            .collect(),
+                    })
+                }
+            };
+            if let Some(version) = ruleset.version
+                && self.program.rulesets[version].kind.as_ref() == Some(&kind)
+            {
+                completed.insert(logical, version);
+                continue;
+            }
+            let physical = if ruleset.version.is_none() {
+                logical.clone()
+            } else {
+                loop {
+                    let candidate = format!("{}ruleset_{}", self.local_prefix, self.next_ruleset);
+                    self.next_ruleset = self
+                        .next_ruleset
+                        .checked_add(1)
+                        .ok_or("source ruleset version identity space exhausted")?;
+                    if !self.rulesets.contains_key(&candidate)
+                        && !self
+                            .program
+                            .rulesets
+                            .iter()
+                            .any(|set| set.name.as_ref() == Some(&candidate))
+                    {
+                        break candidate;
+                    }
+                }
+            };
+            let version = self.program.rulesets.len();
+            self.program.rulesets.push(pb::Ruleset {
+                name: Some(physical),
+                kind: Some(kind),
+                span: ruleset.span,
+                ..Default::default()
+            });
+            let authored = self.rulesets.get_mut(&logical).unwrap();
+            authored.version = Some(version);
+            authored.published_rules = published_rules;
+            completed.insert(logical, version);
+            publish.push(version);
         }
-        for index in order {
-            self.installed
-                .insert(self.program.rulesets[index].name.clone().unwrap());
-            publish.push(index);
-        }
-        Ok(())
+        Ok(completed[name])
     }
 
     fn schedule(
@@ -846,12 +967,14 @@ impl Source {
                 if config.until.is_some() {
                     return Err("source run-until is not supported yet".into());
                 }
-                self.publish_ruleset(&config.ruleset, publish)?;
+                let version = self.publish_ruleset(&config.ruleset, publish)?;
                 (
                     span,
                     pb::command::Kind::Run(pb::Run {
                         ruleset: Some(pb::RulesetRef {
-                            kind: Some(pb::ruleset_ref::Kind::Name(config.ruleset)),
+                            kind: Some(pb::ruleset_ref::Kind::Name(
+                                self.program.rulesets[version].name.clone().unwrap(),
+                            )),
                         }),
                         ..Default::default()
                     }),
@@ -916,19 +1039,13 @@ impl Source {
         rule: ast::GenericRule<ResolvedCall, ast::ResolvedVar>,
         rewrite: Option<RewriteKind>,
     ) -> Result<(), String> {
-        let ruleset = *self
+        let ruleset = self
             .rulesets
             .get(&rule.ruleset)
             .ok_or_else(|| format!("unknown ruleset {}", rule.ruleset))?;
-        let Some(pb::ruleset::Kind::Rules(list)) = &self.program.rulesets[ruleset].kind else {
+        let pb::ruleset::Kind::Rules(list) = &ruleset.kind else {
             return Err(egglog::Error::CombinedRulesetError(rule.ruleset, rule.span).to_string());
         };
-        if self.installed.contains(&rule.ruleset) {
-            return Err(format!(
-                "cannot add a rule to {} after its first run; occurrence-preserving versions are not implemented",
-                rule.ruleset
-            ));
-        }
         let names = if matches!(rewrite, Some(RewriteKind::Bidirectional)) {
             vec![format!("{}=>", rule.name), format!("{}<=", rule.name)]
         } else {
@@ -1110,6 +1227,7 @@ impl Source {
         };
         let span = self.span(&rule.span)?;
         let index = u32::try_from(self.program.rules.len()).map_err(|_| "too many source rules")?;
+        let ruleset_name = rule.ruleset.clone();
         self.program.rules.push(pb::RuleDecl {
             kind: Some(kind),
             name: Some(rule.name),
@@ -1124,7 +1242,9 @@ impl Source {
             span,
             ..Default::default()
         });
-        let Some(pb::ruleset::Kind::Rules(list)) = &mut self.program.rulesets[ruleset].kind else {
+        let pb::ruleset::Kind::Rules(list) =
+            &mut self.rulesets.get_mut(&ruleset_name).unwrap().kind
+        else {
             unreachable!()
         };
         list.rules.push(index);
@@ -1391,8 +1511,10 @@ impl Iterator for Source {
 /// across phases; callers submit each result in order and stop on an error.
 /// Experimental output can be reparsed by [`Source`] into a fresh engine, with
 /// bounded aliases for nominal declarations and prepared ruleset selections.
-/// Core retains its flat, named ruleset support boundary. Reuse one renderer for
-/// the whole stream: aliases are stable across phases, but do not recover original keys
+/// Core keeps literal sort/callable names; rule holders and selectors have
+/// private presentation aliases, preserving shared occurrences rather than
+/// literal `:ruleset`/default spellings. Reuse one renderer for the whole stream:
+/// aliases are stable across phases, but do not recover original keys
 /// for same-engine resupply. Execution names and structural-sort limits are unchanged.
 /// Use [`Self::render_submission`] for Source-managed scopes, and a fresh renderer
 /// after externally resetting or popping the text environment.
@@ -1483,45 +1605,6 @@ impl Renderer {
             ))
         {
             return Err(TransportError("assigned-cost source rendering is not supported".into()));
-        }
-        // Core preserves literal names, which can collide with prepared private
-        // holders. Keep its existing flat support boundary; Experimental aliases
-        // nominal declarations and can reuse the adapter's installation plan.
-        if self.dialect == Dialect::Core {
-            let mut names: HashSet<_> = self
-                .session
-                .definitions
-                .rulesets
-                .iter()
-                .filter_map(|ruleset| ruleset.name.as_deref())
-                .collect();
-            let mut rules = HashMap::new();
-            for (index, ruleset) in program.rulesets.iter().enumerate() {
-                let name = ruleset
-                    .name
-                    .as_deref()
-                    .ok_or_else(|| TransportError("anonymous source ruleset".into()))?;
-                if !names.insert(name) {
-                    return Err(TransportError(
-                        "source ruleset resupply is not supported yet".into(),
-                    ));
-                }
-                let Some(pb::ruleset::Kind::Rules(leaf)) = &ruleset.kind else {
-                    return Err(TransportError(
-                        "unsupported source ruleset composition".into(),
-                    ));
-                };
-                for rule in &leaf.rules {
-                    if rules
-                        .insert(*rule, index)
-                        .is_some_and(|previous| previous != index)
-                    {
-                        return Err(TransportError(
-                            "sharing a rule between source rulesets is not supported yet".into(),
-                        ));
-                    }
-                }
-            }
         }
         let mut lowered = program.clone();
         let prepared = self
@@ -1698,22 +1781,62 @@ impl Renderer {
                 call.func = logical.clone();
             }
         }
+        if self.dialect == Dialect::Core {
+            // Native shadowing includes sorts, functions and global lets. Do
+            // not silently capture a literal authored name with a private
+            // selector from this or an earlier phase. No new identity registry:
+            // aliases are derived only from the existing prepared handles.
+            let private: HashSet<_> = prepared
+                .rulesets
+                .iter()
+                .filter(|name| !name.is_empty())
+                .cloned()
+                .chain(
+                    prepared
+                        .rules
+                        .iter()
+                        .filter(|name| !name.is_empty())
+                        .map(|name| format!("{name}_holder")),
+                )
+                .map(|name| native_name("source_ruleset", &name))
+                .collect();
+            for name in authored.sorts.values().chain(authored.callables.values()) {
+                if private.contains(name) {
+                    return Err(TransportError(format!(
+                        "authored Core name {name:?} collides with a private source ruleset"
+                    )));
+                }
+            }
+        }
         let mut constructor_cost_tables = HashMap::new();
-        if self.dialect == Dialect::Experimental {
+        {
             // Retain the exact registration link, not a private-name heuristic.
-            // New helpers have a constructor declaration site; earlier phases
-            // have the canonical constructor and registered hidden function.
+            // Sites retain original request indices, whereas `lowered` has
+            // already filtered compatible resupply. Pair prepared commands at
+            // their common site instead of indexing that filtered view.
+            let constructors: HashMap<_, _> = prepared
+                .installations
+                .iter()
+                .filter_map(
+                    |installation| match (&installation.site, &installation.command) {
+                        (
+                            pb::maintenance_site::Target::Declaration(index),
+                            Some(Command::Constructor { name, .. }),
+                        ) => Some((*index, name.clone())),
+                        _ => None,
+                    },
+                )
+                .collect();
             for installation in &prepared.installations {
                 if installation.declaration.is_none()
                     && let pb::maintenance_site::Target::Declaration(index) = &installation.site
-                    && let Some(pb::declaration::Kind::Constructor(constructor)) =
-                        &lowered.declarations[*index as usize].kind
+                    && let Some(constructor) = constructors.get(index)
                     && let Some(Command::Function {
                         name, hidden: true, ..
                     }) = &installation.command
-                    && *name == crate::set_cost::get_cost_table_name(&constructor.name)
+                    && *name == crate::set_cost::get_cost_table_name(constructor)
                 {
-                    constructor_cost_tables.insert(name.clone(), constructor.name.clone());
+                    constructor_cost_tables.insert(name.clone(), constructor.clone());
                 }
             }
             for declaration in &prepared.definitions.declarations {
@@ -1939,11 +2062,6 @@ fn render_prepared(
         // equal a physical callable key without denoting that callable.
         names.extend(authored.sorts.values().map(String::as_str));
         names.extend(authored.callables.values().map(String::as_str));
-        if dialect == Dialect::Core {
-            for ruleset in &program.rulesets {
-                if let Some(name) = &ruleset.name && !name.is_empty() { names.push(name.as_str()); }
-            }
-        }
         for command in super::command_tree(&program.commands) {
             if dialect == Dialect::Experimental && matches!(&command.kind, Some(pb::command::Kind::Repeat(_) | pb::command::Kind::Saturate(_))) {
                 let body = match &command.kind {
@@ -1966,11 +2084,6 @@ fn render_prepared(
             if let Some(pb::command::Kind::ProveExists(prove)) = &command.kind {
                 names.push(prove.constructor.as_str());
             }
-            if dialect == Dialect::Core
-                && let Some(pb::command::Kind::Run(run)) = &command.kind
-                && let Some(pb::ruleset_ref::Kind::Name(name)) = run.ruleset.as_ref().and_then(|reference| reference.kind.as_ref())
-                && !name.is_empty()
-            { names.push(name.as_str()); }
         }
         for action in super::command_tree(&program.commands).filter_map(|command| match &command.kind {
             Some(pb::command::Kind::Action(action)) => Some(action), _ => None,
@@ -2058,7 +2171,7 @@ fn render_prepared(
                 },
             );
         }
-        if dialect == Dialect::Experimental {
+        {
             // Native handles and canonical rules are aligned by occurrence, not
             // label/body equality. Change presentation only, never Prepared.
             let labels: HashMap<_, _> = prepared.rules.iter().zip(&prepared.definitions.rules)
@@ -2116,31 +2229,6 @@ fn render_prepared(
                     expr
                 });
                 commands.push(command);
-            }
-        } else {
-            for ruleset in &program.rulesets {
-                let name = ruleset.name.as_ref().ok_or("anonymous source ruleset")?;
-                if !name.is_empty() {
-                    commands.push(Command::AddRuleset(
-                        native_span(program, ruleset.span.as_ref())?,
-                        name.clone(),
-                    ));
-                }
-                let Some(pb::ruleset::Kind::Rules(rules)) = &ruleset.kind else {
-                    return Err("unsupported source ruleset composition".into());
-                };
-                for index in &rules.rules {
-                    let rule = program
-                        .rules
-                        .get(*index as usize)
-                        .ok_or("source rule index out of bounds")?;
-                    commands.push(lower_rule(
-                        program,
-                        rule,
-                        name,
-                        rule.name.as_deref().unwrap_or(""),
-                    )?);
-                }
             }
         }
         for mut command in &program.commands {
@@ -2215,7 +2303,7 @@ fn render_prepared(
                 | pb::command::Kind::Repeat(_)
                 | pb::command::Kind::Saturate(_) => {
                     commands.push(Command::RunSchedule(source_schedule(
-                        program, command, (dialect == Dialect::Experimental).then_some(&prepared.context),
+                        program, command, Some(&prepared.context),
                     )?));
                 }
                 _ => return Err("unsupported source command".into()),
@@ -2239,6 +2327,31 @@ fn render_prepared(
             let mut leaf = command;
             while let Command::Fail(_, child) = leaf {
                 leaf = child;
+            }
+            if dialect == Dialect::Core {
+                // Ruleset positions are separate from callable heads, rule
+                // labels and binders. Keep each occurrence in its prepared
+                // holder and use the flattened unique selector for every root.
+                match &mut *leaf {
+                    Command::AddRuleset(_, name) => *name = native_name("source_ruleset", name),
+                    Command::UnstableCombinedRuleset(_, name, children) => {
+                        *name = native_name("source_ruleset", name);
+                        for child in children { *child = native_name("source_ruleset", child); }
+                    }
+                    Command::Rule { rule } => rule.ruleset = native_name("source_ruleset", &rule.ruleset),
+                    Command::Rewrite(name, _, _) | Command::BiRewrite(name, _) => *name = native_name("source_ruleset", name),
+                    Command::RunSchedule(schedule) => {
+                        let mut pending = vec![schedule];
+                        while let Some(schedule) = pending.pop() {
+                            match schedule {
+                                ast::Schedule::Run(_, config) => config.ruleset = native_name("source_ruleset", &config.ruleset),
+                                ast::Schedule::Repeat(_, _, child) | ast::Schedule::Saturate(_, child) => pending.push(child),
+                                ast::Schedule::Sequence(_, children) => pending.extend(children),
+                            }
+                        }
+                    }
+                    _ => (),
+                }
             }
             source_sort_names(leaf, authored);
             match leaf {
