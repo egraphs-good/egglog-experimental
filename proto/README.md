@@ -130,8 +130,8 @@ Recursive closedness, binder scope, signature matching, family resolution, and
 compatible descriptor resends are semantic checks. The executable subset below
 implements these for its supported scalar/Vec/Pair/Map signatures and declarations.
 
-**Decided:** each core callable has one unique name across user and host
-definitions; the core does not select from same-name overloads. Frontends lower
+**Decided:** each wire callable has one unique name across user and host
+definitions; the wire IR does not select from same-name overloads. Frontends lower
 overloaded syntax such as `+` to the appropriate unique callable name and make
 conversions explicit before this boundary. Generics remain: a call instantiates
 one named generic definition, rather than choosing an overload. No concrete
@@ -836,15 +836,16 @@ arrival order and cloned sessions do not change derived native identity.
 ### Initial engine-owned builtin definitions
 
 Core's primitive macro accepts an optional `[id = "provider.definition"]` next
-to the existing source alias. The same type annotations produce a canonical
-protobuf signature; migrated native constraints are compiled from that record,
-not another signature table. The native body, validator and allowed-context
+to the existing source alias. The same type annotations produce a schema-neutral
+signature used by native constraints and Experimental's protobuf projection,
+not separate signature tables. The native body, validator and allowed-context
 entrypoints are unchanged. i64 `+` uses `egglog.core.i64.add`, while f64 `+` uses
 `egglog.core.f64.add`. Source still uses the overloaded `+`; source resolution
 selects the registration before exporting its exact wire key. A decoded call
 cannot substitute a source alias or switch overloads through inference.
 
-`TypeInfo::builtin_catalog()` returns the migrated protobuf definitions and
+`TypeInfo::builtin_catalog()` returns native descriptors; Experimental's
+`portable_builtin_catalog()` projects them to protobuf. Both retain
 explicit lists of undescribed primitive registrations, presort factories and
 installed non-equality sorts. Reserved but undescribed family operations are
 also inventoried before any instances exist. Export performs no application or validation of
@@ -855,7 +856,7 @@ which the native registry recognizes as the same registration identities.
 
 Vec's three canonical generic definitions are registered with its presort before
 instantiation. The `[instance = binding]` primitive macro derives constraints
-from those same protobuf patterns and checks runtime conversion/arity agreement;
+from those same native patterns and checks runtime conversion/arity agreement;
 there is no handwritten native signature beside the record. Native nominal
 instances share one wire definition key. Decoded calls validate all argument
 and result sorts before selecting a derived native instance lookup key, pointing
