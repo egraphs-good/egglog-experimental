@@ -15007,6 +15007,422 @@ fn source_base_read_aliases_remain_rejected_across_ordered_writes() {
     }
 }
 
+mod source_provider_context {
+    use super::*;
+    use egglog::prelude::BaseSort;
+    use egglog::sort::Boxed;
+    use egglog_experimental::protobuf::NativeExtension;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Clone, Debug, Eq, Hash, PartialEq)]
+    struct Opaque(i64);
+
+    #[derive(Debug)]
+    struct OpaqueSort(Arc<AtomicUsize>);
+
+    impl BaseSort for OpaqueSort {
+        type Base = Boxed<Opaque>;
+
+        fn name(&self) -> &str {
+            "TestOpaque"
+        }
+
+        fn register_primitives(&self, graph: &mut egglog::EGraph) {
+            graph
+                .type_info()
+                .register_builtin_family(egglog::builtin::FamilyDescription {
+                    name: "TestOpaque".into(),
+                    arity: 0,
+                })
+                .unwrap();
+            type Calls = Arc<AtomicUsize>;
+            egglog::add_primitive!(graph,
+                "test-opaque"[id = "test.source.opaque"] = {self.0.clone(): Calls}
+                |value: i64| -> Boxed<Opaque> {
+                    {
+                        self.ctx.fetch_add(1, Ordering::SeqCst);
+                        Boxed::new(Opaque(value))
+                    }
+                }
+            );
+        }
+
+        fn reconstruct_termdag(
+            &self,
+            _: &egglog::sort::BaseValues,
+            _: egglog::Value,
+            _: &mut egglog::TermDag,
+        ) -> egglog::TermId {
+            panic!("metadata validation must not reconstruct TestOpaque")
+        }
+    }
+
+    #[derive(Default)]
+    struct Provider {
+        initializations: AtomicUsize,
+        lowerings: AtomicUsize,
+        evaluations: Arc<AtomicUsize>,
+        fail_initialize_at: AtomicUsize,
+        fail_lower: AtomicBool,
+        exception_latch: Mutex<Option<&'static str>>,
+    }
+
+    impl NativeExtension for Provider {
+        fn initialize(&self, graph: &mut egglog::EGraph) -> Result<(), String> {
+            let count = self.initializations.fetch_add(1, Ordering::SeqCst) + 1;
+            egglog::prelude::add_base_sort(
+                graph,
+                OpaqueSort(self.evaluations.clone()),
+                egglog::span!(),
+            )
+            .map_err(|error| error.to_string())?;
+            if self.fail_initialize_at.load(Ordering::SeqCst) == count {
+                return Err("provider initialization rejected".into());
+            }
+            Ok(())
+        }
+
+        fn lower_custom_value(
+            &self,
+            graph: &egglog::EGraph,
+            native_sort: &egglog::ArcSort,
+            value: &pb::CustomValue,
+            span: Option<pb::Span>,
+            destination: &mut pb::Program,
+        ) -> Result<pb::Call, String> {
+            self.lowerings.fetch_add(1, Ordering::SeqCst);
+            if native_sort.name() != "TestOpaque"
+                || native_sort.value_type() != Some(std::any::TypeId::of::<Boxed<Opaque>>())
+            {
+                return Err("requires the actual TestOpaque sort".into());
+            }
+            if !value.args.is_empty() || value.payload.len() != 1 {
+                return Err("malformed TestOpaque payload".into());
+            }
+            let sort_id = graph.export_sort(
+                graph.get_sort_by_name("i64").unwrap(),
+                &mut destination.sorts,
+            )?;
+            let index = destination.nodes.len() as u32;
+            destination.nodes.push(pb::Node {
+                sort_id,
+                span,
+                kind: Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
+                    value: Some(pb::primitive_value::Value::I64(i64::from(value.payload[0]))),
+                })),
+            });
+            if self.fail_lower.load(Ordering::SeqCst) {
+                return Err("provider lowering rejected after helper append".into());
+            }
+            Ok(pb::Call {
+                func: "test.source.opaque".into(),
+                args: vec![index],
+            })
+        }
+
+        fn encode_custom_value(
+            &self,
+            _: &egglog::ArcSort,
+            _: &egglog::TermDag,
+            _: egglog::TermId,
+        ) -> Result<Option<pb::CustomValue>, String> {
+            Err("metadata validation must not reconstruct TestOpaque".into())
+        }
+    }
+
+    fn packet() -> pb::Program {
+        let mut program = fixture();
+        program.rules.clear();
+        program.rulesets.clear();
+        program.commands.clear();
+        program.sorts.push(pb::Sort {
+            kind: Some(pb::sort::Kind::Family(pb::HostSort {
+                name: "TestOpaque".into(),
+                args: vec![],
+            })),
+            ..Default::default()
+        });
+        let custom_sort = program.sorts.len() as u32 - 1;
+        program.declarations.push(pb::Declaration {
+            kind: Some(pb::declaration::Kind::Constructor(pb::Constructor {
+                name: "HostCost".into(),
+                inputs: vec![pb::Arg {
+                    sort: custom_sort,
+                    ..Default::default()
+                }],
+                output: 1,
+                ..Default::default()
+            })),
+            ..Default::default()
+        });
+        let custom = program.nodes.len() as u32;
+        program.nodes.push(pb::Node {
+            sort_id: custom_sort,
+            kind: Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
+                value: Some(pb::primitive_value::Value::Custom(pb::CustomValue {
+                    payload: vec![7],
+                    args: vec![],
+                })),
+            })),
+            ..Default::default()
+        });
+        let cost = program.nodes.len() as u32;
+        program.nodes.push(pb::Node {
+            sort_id: 0,
+            kind: Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
+                value: Some(pb::primitive_value::Value::I64(9)),
+            })),
+            ..Default::default()
+        });
+        let target = pb::Call {
+            func: "HostCost".into(),
+            args: vec![custom],
+        };
+        program.commands.push(pb::Command {
+            kind: Some(pb::command::Kind::Action(pb::Action {
+                kind: Some(pb::action::Kind::SetCost(pb::SetCost {
+                    target: Some(target.clone()),
+                    cost: Some(cost),
+                })),
+                ..Default::default()
+            })),
+            ..Default::default()
+        });
+        let read = program.nodes.len() as u32;
+        program.nodes.push(pb::Node {
+            sort_id: 0,
+            kind: Some(pb::node::Kind::GetCost(target)),
+            ..Default::default()
+        });
+        let fact = program.nodes.len() as u32;
+        program.nodes.push(pb::Node {
+            sort_id: 0,
+            kind: Some(pb::node::Kind::Union(pb::Union {
+                members: vec![read, cost],
+            })),
+            ..Default::default()
+        });
+        program.commands.push(pb::Command {
+            kind: Some(pb::command::Kind::Check(pb::Check { facts: vec![fact] })),
+            ..Default::default()
+        });
+        program
+    }
+
+    #[test]
+    fn fresh_graphs_lower_inertly_and_replay_with_the_same_provider() {
+        use egglog_experimental::protobuf::source::{Renderer, Source};
+        let provider = Arc::new(Provider::default());
+        let program = packet();
+        let authored = program.encode_to_vec();
+        let error = Renderer::default().render(&program).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("unknown custom value sort TestOpaque")
+        );
+        assert!(
+            Renderer::core()
+                .render(&program)
+                .unwrap_err()
+                .to_string()
+                .contains("assigned-cost")
+        );
+        let missing = Source::new(None, "(datatype E (Box TestOpaque))")
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap_err();
+        assert!(missing.to_string().contains("TestOpaque"));
+        assert_eq!(provider.initializations.load(Ordering::SeqCst), 0);
+        let mut renderer = Renderer::with_extension(provider.clone()).unwrap();
+        assert_eq!(provider.initializations.load(Ordering::SeqCst), 1);
+        let rendered = renderer.render(&program).unwrap();
+        // The session plus two truly fresh metadata graphs. text_native clones
+        // an already initialized temporary rather than registering twice.
+        assert_eq!(provider.initializations.load(Ordering::SeqCst), 3);
+        assert_eq!(provider.lowerings.load(Ordering::SeqCst), 1);
+        assert_eq!(provider.evaluations.load(Ordering::SeqCst), 0);
+        assert_eq!(program.encode_to_vec(), authored);
+        let phases = Source::with_extension(None, &rendered, provider.clone())
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(provider.initializations.load(Ordering::SeqCst), 4);
+        assert_eq!(provider.evaluations.load(Ordering::SeqCst), 0);
+
+        // Both actual Custom bytes and freshly produced bytes check assigned C=9.
+        let mut engine = Engine::with_extension(provider.clone());
+        let id = create(&mut engine);
+        let response = run(&mut engine, id, packet());
+        assert_eq!(response.error, None);
+        assert!(provider.evaluations.load(Ordering::SeqCst) > 0);
+        let id = create(&mut engine);
+        for phase in phases {
+            assert_eq!(run(&mut engine, id, phase).error, None);
+        }
+    }
+
+    #[test]
+    fn clones_and_source_scopes_retain_context_without_initializing() {
+        use egglog_experimental::protobuf::source::{Renderer, Source, Submission};
+        let provider = Arc::new(Provider::default());
+        let mut renderer = Renderer::with_extension(provider.clone()).unwrap();
+        let mut cloned = renderer.clone();
+        renderer.render_submission(&Submission::Push(2)).unwrap();
+        renderer
+            .render_submission(&Submission::Pop {
+                count: 2,
+                span: egglog::span!(),
+            })
+            .unwrap();
+        assert_eq!(provider.initializations.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            renderer.render(&packet()).unwrap(),
+            cloned.render(&packet()).unwrap()
+        );
+        assert_eq!(provider.initializations.load(Ordering::SeqCst), 5);
+        assert_eq!(provider.evaluations.load(Ordering::SeqCst), 0);
+
+        let owner = Arc::new(Provider::default());
+        let weak = Arc::downgrade(&owner);
+        let mut source = Source::with_extension(None,
+            "(sort E) (push) (constructor Scoped (TestOpaque) E) (pop) (constructor Scoped (TestOpaque) E)",
+            owner.clone()).unwrap();
+        drop(owner);
+        while let Some(phase) = source.next_submission() {
+            phase.unwrap();
+            assert_eq!(
+                weak.upgrade()
+                    .unwrap()
+                    .initializations
+                    .load(Ordering::SeqCst),
+                1
+            );
+        }
+        drop(source);
+        assert!(weak.upgrade().is_none());
+    }
+
+    #[test]
+    fn provider_errors_are_inert_and_render_retries_publish_nothing() {
+        use egglog_experimental::protobuf::source::{Renderer, Source};
+        for producer in [false, true] {
+            let provider = Arc::new(Provider::default());
+            *provider.exception_latch.lock().unwrap() = Some("original provider exception");
+            provider.fail_initialize_at.store(1, Ordering::SeqCst);
+            let error = if producer {
+                // Initialization must fail before even malformed source parsing.
+                Source::with_extension(None, "(", provider.clone())
+                    .err()
+                    .unwrap()
+            } else {
+                Renderer::with_extension(provider.clone()).err().unwrap()
+            };
+            assert!(
+                error
+                    .to_string()
+                    .contains("provider initialization rejected")
+            );
+            assert_eq!(
+                *provider.exception_latch.lock().unwrap(),
+                Some("original provider exception")
+            );
+            assert_eq!(provider.evaluations.load(Ordering::SeqCst), 0);
+        }
+        for failure in [
+            "temporary-init",
+            "validation-init",
+            "lower",
+            "forged",
+            "malformed",
+            "freeze",
+        ] {
+            let provider = Arc::new(Provider::default());
+            *provider.exception_latch.lock().unwrap() = Some("original provider exception");
+            let mut renderer = Renderer::with_extension(provider.clone()).unwrap();
+            let mut bad = packet();
+            let expected = match failure {
+                "temporary-init" | "validation-init" => {
+                    provider.fail_initialize_at.store(
+                        if failure == "temporary-init" { 2 } else { 3 },
+                        Ordering::SeqCst,
+                    );
+                    "provider initialization rejected"
+                }
+                "lower" => {
+                    provider.fail_lower.store(true, Ordering::SeqCst);
+                    "provider lowering rejected after helper append"
+                }
+                "forged" => {
+                    let custom = bad
+                        .nodes
+                        .iter()
+                        .find(|node| {
+                            matches!(
+                                &node.kind,
+                                Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
+                                    value: Some(pb::primitive_value::Value::Custom(_))
+                                }))
+                            )
+                        })
+                        .unwrap()
+                        .sort_id;
+                    bad.sorts[custom as usize] = bad.sorts[0].clone();
+                    "requires the actual TestOpaque sort"
+                }
+                "malformed" => {
+                    for node in &mut bad.nodes {
+                        if let Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
+                            value: Some(pb::primitive_value::Value::Custom(value)),
+                        })) = &mut node.kind
+                        {
+                            value.payload.clear();
+                        }
+                    }
+                    "malformed TestOpaque payload"
+                }
+                "freeze" => {
+                    bad.commands = vec![pb::Command {
+                        kind: Some(pb::command::Kind::Freeze(pb::Freeze {})),
+                        ..Default::default()
+                    }];
+                    "unsupported source command"
+                }
+                _ => unreachable!(),
+            };
+            let authored = bad.encode_to_vec();
+            let error = renderer.render(&bad).unwrap_err();
+            assert!(error.to_string().contains(expected), "{failure}: {error}");
+            assert_eq!(bad.encode_to_vec(), authored);
+            assert_eq!(provider.evaluations.load(Ordering::SeqCst), 0);
+            assert_eq!(
+                *provider.exception_latch.lock().unwrap(),
+                Some("original provider exception")
+            );
+            if failure.ends_with("init") {
+                assert_eq!(
+                    provider.initializations.load(Ordering::SeqCst),
+                    if failure == "temporary-init" { 2 } else { 3 }
+                );
+            }
+            provider.fail_initialize_at.store(0, Ordering::SeqCst);
+            provider.fail_lower.store(false, Ordering::SeqCst);
+            let actual = renderer.render(&packet()).unwrap();
+            let expected = Renderer::with_extension(provider.clone())
+                .unwrap()
+                .render(&packet())
+                .unwrap();
+            assert_eq!(actual, expected, "{failure}: failed render published state");
+            assert_eq!(provider.evaluations.load(Ordering::SeqCst), 0);
+            assert_eq!(
+                *provider.exception_latch.lock().unwrap(),
+                Some("original provider exception")
+            );
+        }
+    }
+}
+
 #[test]
 fn source_core_renderer_rejects_assigned_cost_reads_and_writes_without_state_changes() {
     use egglog_experimental::protobuf::source::Renderer;

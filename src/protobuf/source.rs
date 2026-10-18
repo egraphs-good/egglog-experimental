@@ -87,6 +87,9 @@ struct SourceScope {
 pub struct Source {
     dialect: Dialect,
     graph: EGraph,
+    // Keep the explicit provider alive for this type environment and its scopes.
+    // Scope graphs inherit registrations; they never initialize it again.
+    _extension: Option<Arc<dyn NativeExtension>>,
     commands: VecDeque<(Command, usize)>,
     include_base: PathBuf,
     scopes: Vec<SourceScope>,
@@ -115,6 +118,7 @@ pub(crate) fn primitive_definition(
     let mut source = Source {
         dialect: Dialect::Experimental,
         graph: graph.clone(),
+        _extension: None,
         commands: VecDeque::new(),
         include_base: PathBuf::new(),
         scopes: Vec::new(),
@@ -158,24 +162,38 @@ impl Source {
     /// Parses source without executing it. Each iterator item is one ordered
     /// submission phase; callers must stop after a failed decoded response.
     pub fn new(filename: Option<String>, source: &str) -> Result<Self, TransportError> {
-        Self::with_dialect(filename, source, Dialect::Experimental)
+        Self::with_dialect(filename, source, Dialect::Experimental, None)
+    }
+
+    /// Parses Experimental source with explicit native provider definitions.
+    /// Registration is inert and precedes parsing; no source/payload executes.
+    pub fn with_extension(
+        filename: Option<String>,
+        source: &str,
+        extension: Arc<dyn NativeExtension>,
+    ) -> Result<Self, TransportError> {
+        Self::with_dialect(filename, source, Dialect::Experimental, Some(extension))
     }
 
     /// Parses Core source, including Run-only controls without custom schedulers.
     /// This is an explicit frontend choice, not a wire execution setting.
     pub fn new_core(filename: Option<String>, source: &str) -> Result<Self, TransportError> {
-        Self::with_dialect(filename, source, Dialect::Core)
+        Self::with_dialect(filename, source, Dialect::Core, None)
     }
 
     fn with_dialect(
         filename: Option<String>,
         source: &str,
         dialect: Dialect,
+        extension: Option<Arc<dyn NativeExtension>>,
     ) -> Result<Self, TransportError> {
         let mut graph = match dialect {
             Dialect::Experimental => crate::new_experimental_egraph(),
             Dialect::Core => EGraph::default(),
         };
+        if let Some(extension) = &extension {
+            extension.initialize(&mut graph).map_err(TransportError)?;
+        }
         let cost_origins = if dialect == Dialect::Experimental {
             crate::set_cost::record_cost_origins(&mut graph)
         } else {
@@ -207,6 +225,7 @@ impl Source {
         Ok(Self {
             dialect,
             graph,
+            _extension: extension,
             commands,
             include_base: PathBuf::new(),
             scopes: Vec::new(),
@@ -2434,6 +2453,17 @@ impl Default for Renderer {
 }
 
 impl Renderer {
+    /// Render Experimental text using explicit inert native provider definitions.
+    /// Clones and scope snapshots retain this same provider without reinitializing.
+    pub fn with_extension(extension: Arc<dyn NativeExtension>) -> Result<Self, TransportError> {
+        let mut renderer = Self::default();
+        extension
+            .initialize(&mut renderer.session.graph)
+            .map_err(TransportError)?;
+        renderer.session.extension = Some(extension);
+        Ok(renderer)
+    }
+
     /// Render Core text, including the admitted Run-only control trees.
     pub fn core() -> Self {
         Self::with_dialect(Dialect::Core)
@@ -2666,6 +2696,9 @@ impl Renderer {
             Dialect::Experimental => crate::new_experimental_egraph(),
             Dialect::Core => EGraph::default(),
         };
+        if let Some(extension) = &self.session.extension {
+            extension.initialize(&mut native).map_err(TransportError)?;
+        }
         let mut text_native = native.clone();
         for declaration in &definitions.declarations {
             if let Some(pb::declaration::Kind::EqSort(sort)) = &declaration.kind {
@@ -2811,6 +2844,7 @@ impl Renderer {
             &authored,
             &declaration_order,
             &constructor_cost_tables,
+            self.session.extension.as_deref(),
         )?;
         // The renderer's graph is always NORMAL and receives inert definitions
         // only: registration compiles rules/merges, but no action/helper runs.
@@ -3079,6 +3113,7 @@ fn render_prepared(
     authored: &NativeNames,
     declaration_order: &[usize],
     constructor_cost_tables: &HashMap<String, String>,
+    extension: Option<&dyn NativeExtension>,
 ) -> Result<String, TransportError> {
     let result = (|| -> Result<Vec<Command>, String> {
         if program.ir_version != 1 {
@@ -3089,6 +3124,9 @@ fn render_prepared(
             Dialect::Experimental => crate::new_experimental_egraph(),
             Dialect::Core => EGraph::default(),
         };
+        if let Some(extension) = extension {
+            extension.initialize(&mut native)?;
+        }
         validate_host_declarations(program, &mut native)?;
         // Native AST Display assumes symbols are source atoms; protobuf names
         // need not be. Validate every interpolated identifier before formatting,
