@@ -293,6 +293,7 @@ impl Session {
         program: &pb::Program,
         extract: &pb::Extract,
         response: &mut pb::RunProgramResponse,
+        native_spans: &NativeSpans,
     ) -> Result<pb::ExtractResult, egglog::Error> {
         let registration = self
             .resolve_cost_model(&extract.cost_model, extract.extractor)
@@ -303,7 +304,7 @@ impl Session {
             .iter()
             .map(|index| {
                 self.graph.eval_expr(
-                    &expression(program, *index, &mut HashSet::new())
+                    &expression(program, *index, &mut HashSet::new(), native_spans)
                         .expect("validated expression"),
                 )
             })

@@ -272,11 +272,12 @@ pub fn produce_input(
         start: 0,
         end: 0,
     });
+    let native_spans = NativeSpans::default();
     let rows = egglog::parse_input_file(
         &signature,
         path,
         fact_directory,
-        native_span(&program, span.as_ref()).map_err(TransportError)?,
+        native_span(&program, span.as_ref(), &native_spans).map_err(TransportError)?,
     )
     .map_err(|error| TransportError(error.to_string()))?;
     let mut declaration = declaration;
@@ -3326,8 +3327,13 @@ impl Renderer {
                     .map_err(|error| TransportError(error.to_string()))?;
             }
         }
-        for (_, mut command) in
-            materialize_sorts(&lowered, &mut native, &mut HashSet::new()).map_err(TransportError)?
+        for (_, mut command) in materialize_sorts(
+            &lowered,
+            &mut native,
+            &mut HashSet::new(),
+            &prepared.context.native_spans,
+        )
+        .map_err(TransportError)?
         {
             source_sort_names(&mut command, &authored);
             text_native
@@ -3640,13 +3646,14 @@ fn source_cost_actions(
     request: u64,
     in_rule: bool,
     helpers: &HashMap<String, String>,
+    native_spans: &NativeSpans,
 ) -> Result<Vec<Action>, String> {
-    let span = native_span(program, action.span.as_ref())?;
+    let span = native_span(program, action.span.as_ref(), native_spans)?;
     // Project authored binders before introducing any private capture name.
     // Mapping the completed head would let an authored wire variable capture
     // the generated Let, unlike the runtime's ordinary SSA lowering.
     let expr = |index| -> Result<Expr, String> {
-        let expr = expression(program, index, &mut HashSet::new())?;
+        let expr = expression(program, index, &mut HashSet::new(), native_spans)?;
         Ok(if in_rule {
             expr.map_symbols(&mut |name| name, &mut |name: String| {
                 native_name("var", &name)
@@ -3708,7 +3715,7 @@ fn source_cost_actions(
             Ok(actions)
         }
         _ => {
-            let actions = lower_action(program, action)?;
+            let actions = lower_action(program, action, native_spans)?;
             Ok(if in_rule {
                 ast::GenericActions(actions)
                     .map_symbols(&mut |name| name, &mut |name: String| {
@@ -3733,6 +3740,9 @@ fn render_prepared(
     constructor_cost_tables: &HashMap<String, String>,
     extension: Option<&dyn NativeExtension>,
 ) -> Result<String, TransportError> {
+    let native_spans = &prepared.context.native_spans;
+    // Canonical rules and the submitted program have independent file indices.
+    let rule_spans = NativeSpans::default();
     let result = (|| -> Result<Vec<Command>, String> {
         if program.ir_version != 1 {
             return Err("unsupported source IR version".into());
@@ -3820,7 +3830,7 @@ fn render_prepared(
         for declaration in &program.declarations {
             if let Some(pb::declaration::Kind::EqSort(sort)) = &declaration.kind {
                 commands.push(Command::Sort {
-                    span: native_span(program, declaration.span.as_ref())?, name: sort.name.clone(), presort_and_args: None,
+                    span: native_span(program, declaration.span.as_ref(), native_spans)?, name: sort.name.clone(), presort_and_args: None,
                     uf: None, proof_func: None, container_rebuild: None, proof_constructors: None, unionable: true,
                 });
             }
@@ -3829,7 +3839,7 @@ fn render_prepared(
         let table_names = project_names(&mut pb::Program::default(), &prepared.definitions).callables;
         for &index in declaration_order {
             let declaration = &program.declarations[index];
-            let span = native_span(program, declaration.span.as_ref())?;
+            let span = native_span(program, declaration.span.as_ref(), native_spans)?;
             let table_name = if dialect == Dialect::Experimental {
                 let name = match &declaration.kind {
                     Some(pb::declaration::Kind::Constructor(table)) => Some(&table.name),
@@ -3856,7 +3866,7 @@ fn render_prepared(
                         cost: constructor
                             .cost
                             .map(|index| -> Result<u64, String> {
-                                match expression(program, index, &mut HashSet::new())? {
+                                match expression(program, index, &mut HashSet::new(), native_spans)? {
                                     Expr::Lit(_, Literal::Int(cost)) => u64::try_from(cost)
                                         .map_err(|_| "negative constructor cost".into()),
                                     _ => Err("source constructor cost must be an inert i64".into()),
@@ -3875,7 +3885,7 @@ fn render_prepared(
                         schema: signature(program, &function.inputs, function.output)?,
                         merge: function
                             .merge
-                            .map(|index| expression(program, index, &mut HashSet::new()))
+                            .map(|index| expression(program, index, &mut HashSet::new(), native_spans))
                             .transpose()?,
                         hidden: declaration.hidden,
                         let_binding: false,
@@ -3886,7 +3896,7 @@ fn render_prepared(
                         if dialect == Dialect::Core {
                             return Err("program-defined primitive source requires the Experimental provider".into());
                         }
-                        primitive_command(program, primitive, span)?
+                        primitive_command(program, primitive, span, native_spans)?
                     },
                     pb::declaration::Kind::Relation(relation) => Command::Relation {
                         span,
@@ -3924,14 +3934,14 @@ fn render_prepared(
                         let mut head = Vec::new();
                         for (index, action) in body.head.iter().enumerate() {
                             if dialect == Dialect::Experimental {
-                                head.extend(source_cost_actions(rule_program, action, index, prepared.request, true, constructor_cost_tables)?);
+                                head.extend(source_cost_actions(rule_program, action, index, prepared.request, true, constructor_cost_tables, &rule_spans)?);
                             } else {
                                 // Core has no assigned-cost storage to clean up.
                                 // Project the canonical action, not native
                                 // cleanup's temporary Lets after dropping only
                                 // its auxiliary Delete. Preserve the prepared
                                 // query, occurrence and all rule options.
-                                head.extend(ast::GenericActions(lower_action(rule_program, action)?)
+                                head.extend(ast::GenericActions(lower_action(rule_program, action, &rule_spans)?)
                                     .map_symbols(&mut |name| name, &mut |name: String| native_name("var", &name)).0);
                             }
                         }
@@ -3964,7 +3974,7 @@ fn render_prepared(
         for (position, mut command) in program.commands.iter().enumerate() {
             let mut fail_spans = vec![];
             while let Some(pb::command::Kind::Fail(child)) = &command.kind {
-                fail_spans.push(native_span(program, command.span.as_ref())?);
+                fail_spans.push(native_span(program, command.span.as_ref(), native_spans)?);
                 command = child;
             }
             if !fail_spans.is_empty() && matches!(&command.kind,
@@ -3987,7 +3997,7 @@ fn render_prepared(
                 return Err("Fail requires a supported native command; observation and loop wrappers are not implemented".into());
             }
             let first_command = commands.len();
-            let span = native_span(program, command.span.as_ref())?;
+            let span = native_span(program, command.span.as_ref(), native_spans)?;
             match command.kind.as_ref().ok_or("missing command kind")? {
                 pb::command::Kind::Action(action) => {
                     if prepared.context.constructor_dags.contains(&vec![position as u32]) {
@@ -3995,20 +4005,20 @@ fn render_prepared(
                             constructor_dag_actions(program, action, |name| occupied.contains(name)
                                 || native.get_sort_by_name(name).is_some()
                                 || native.type_info().get_func_type(name).is_some()
-                                || native.type_info().is_primitive(name))?,
+                                || native.type_info().is_primitive(name), native_spans)?,
                         )));
                     } else {
                         commands.extend(
                             (if dialect == Dialect::Experimental {
-                                source_cost_actions(program, action, first_command, prepared.request, false, constructor_cost_tables)?
-                            } else { lower_action(program, action)? })
+                                source_cost_actions(program, action, first_command, prepared.request, false, constructor_cost_tables, native_spans)?
+                            } else { lower_action(program, action, native_spans)? })
                                 .into_iter()
                                 .map(Command::Action),
                         );
                     }
                 }
                 pb::command::Kind::Check(check) => {
-                    commands.push(Command::Check(span, facts(program, &check.facts)?))
+                    commands.push(Command::Check(span, facts(program, &check.facts, native_spans)?))
                 }
                 pb::command::Kind::Stats(_) => {
                     commands.push(Command::PrintOverallStatistics(span, None));
@@ -4029,7 +4039,7 @@ fn render_prepared(
                     commands.push(Command::UserDefined(span, name, args));
                 }
                 pb::command::Kind::Prove(prove) => {
-                    commands.push(Command::Prove(span, facts(program, &prove.facts)?))
+                    commands.push(Command::Prove(span, facts(program, &prove.facts, native_spans)?))
                 }
                 pb::command::Kind::ProveExists(prove) => {
                     commands.push(Command::ProveExists(span, prove.constructor.clone()))
@@ -4055,7 +4065,7 @@ fn render_prepared(
                         args.extend(extract.roots.iter().map(|root| {
                             // Generic command traversal skips UserDefined args;
                             // only these typed root positions contain callables.
-                            Ok(expression(program, *root, &mut HashSet::new())?.map_symbols(
+                            Ok(expression(program, *root, &mut HashSet::new(), native_spans)?.map_symbols(
                                 &mut |name: String| authored.callables.get(&name).cloned().unwrap_or(name),
                                 &mut |name| name,
                             ))
@@ -4067,7 +4077,7 @@ fn render_prepared(
                         continue;
                     }
                     for root in &extract.roots {
-                        let root = expression(program, *root, &mut HashSet::new())?;
+                        let root = expression(program, *root, &mut HashSet::new(), native_spans)?;
                         let variants = Expr::Lit(span.clone(), Literal::Int(if extract.variants == 1 { 0 } else { i64::from(extract.variants) }));
                         commands.push(if extract.extractor == i32::from(pb::Extractor::GreedyDag) {
                             Command::UserDefined(span.clone(), "extract".into(), vec![root, variants,
@@ -4109,7 +4119,7 @@ fn render_prepared(
                         ]));
                     } else {
                         commands.push(Command::RunSchedule(source_schedule(
-                            program, command, Some(&prepared.context),
+                            program, command, Some(&prepared.context), native_spans,
                         )?));
                     }
                 }
@@ -4360,7 +4370,7 @@ fn source_extended_schedule(
     if depth > 256 {
         return Err("source schedule nesting exceeds 256".into());
     }
-    let span = native_span(program, command.span.as_ref())?;
+    let span = native_span(program, command.span.as_ref(), &context.native_spans)?;
     let header = match &command.kind {
         Some(pb::command::Kind::Repeat(repeat)) if !repeat.until.is_empty() => {
             Some(("repeat", repeat.times, &repeat.until, &repeat.body))
@@ -4398,7 +4408,7 @@ fn source_extended_schedule(
             ));
         }
         if !until.is_empty() {
-            let conditions = facts(program, until)?
+            let conditions = facts(program, until, &context.native_spans)?
                 .into_iter()
                 .map(|fact| {
                     let expr = match fact {
@@ -4436,7 +4446,7 @@ fn source_extended_schedule(
             )?],
         ),
         pb::command::Kind::Action(action) => {
-            let [action]: [Action; 1] = lower_action(program, action)?
+            let [action]: [Action; 1] = lower_action(program, action, &context.native_spans)?
                 .try_into()
                 .map_err(|_| "source schedule action requires one native action")?;
             let action = action.map_symbols(
@@ -4586,8 +4596,9 @@ fn source_schedule(
     program: &pb::Program,
     command: &pb::Command,
     context: Option<&RequestOccurrences>,
+    native_spans: &NativeSpans,
 ) -> Result<ast::Schedule, String> {
-    let span = native_span(program, command.span.as_ref())?;
+    let span = native_span(program, command.span.as_ref(), native_spans)?;
     if let Some(pb::command::Kind::Repeat(repeat)) = &command.kind
         && repeat.times == Some(1)
         && !repeat.until.is_empty()
@@ -4598,10 +4609,12 @@ fn source_schedule(
         if !matches!(&child.kind, Some(pb::command::Kind::Run(run)) if run.scheduler.is_empty()) {
             return Err("source loop-until requires one conditional Run without scheduler".into());
         }
-        let ast::Schedule::Run(_, mut config) = source_schedule(program, child, context)? else {
+        let ast::Schedule::Run(_, mut config) =
+            source_schedule(program, child, context, native_spans)?
+        else {
             unreachable!("conditional child is a Run")
         };
-        config.until = Some(facts(program, &repeat.until)?);
+        config.until = Some(facts(program, &repeat.until, native_spans)?);
         return Ok(ast::Schedule::Run(span, config));
     }
     let (body, bound, sequence) = match command.kind.as_ref().ok_or("missing schedule")? {
@@ -4654,7 +4667,7 @@ fn source_schedule(
     };
     let children = body
         .iter()
-        .map(|child| source_schedule(program, child, context))
+        .map(|child| source_schedule(program, child, context, native_spans))
         .collect::<Result<_, _>>()?;
     let body = ast::Schedule::Sequence(span.clone(), children);
     Ok(if sequence {

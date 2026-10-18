@@ -209,12 +209,17 @@ struct Prepared {
 }
 
 #[derive(Default)]
+struct NativeSpans(RefCell<Vec<Option<Arc<SrcFile>>>>);
+
+#[derive(Default)]
 struct RequestOccurrences {
     rulesets: Vec<String>,
     names: HashMap<String, String>,
     origins: HashMap<String, (pb::RuleAttribution, pb::NativeRuleDirection)>,
     response_rules: HashMap<pb::RuleAttribution, u32>,
     files: Vec<pb::SourceFile>,
+    // Indexed by the execution arena, not the response's merged source files.
+    native_spans: NativeSpans,
     include_run_reports: bool,
     scoped_actions: HashSet<Vec<u32>>,
     constructor_dags: HashSet<Vec<u32>>,
@@ -462,6 +467,7 @@ impl Engine {
             files: request.files,
             ..Default::default()
         };
+        let native_spans = NativeSpans::default();
         let mut graph = crate::new_experimental_egraph();
         graph.seminaive = seminaive;
         graph.no_decomp = no_decomp;
@@ -490,7 +496,7 @@ impl Engine {
                     "creation sort kind mismatch for {name}"
                 )));
             }
-            native_span(&program, sort.span.as_ref()).map_err(TransportError)?;
+            native_span(&program, sort.span.as_ref(), &native_spans).map_err(TransportError)?;
         }
         if let Some(threads) = request.threads {
             if cfg!(target_family = "wasm") && threads > 1 {
@@ -869,6 +875,7 @@ impl Session {
         if program.ir_version != 1 {
             return Err(format!("unsupported IR version {}", program.ir_version).into());
         }
+        let native_spans = NativeSpans::default();
         validate_relation_uses(program, &self.definitions)?;
         for rule in &program.rules {
             if let Some(pb::rule_decl::Kind::Rule(rule)) = &rule.kind {
@@ -1010,7 +1017,7 @@ impl Session {
                     return Err("equality sort name must not be empty".into());
                 }
                 let command = Command::Sort {
-                    span: native_span(program, declaration.span.as_ref())?,
+                    span: native_span(program, declaration.span.as_ref(), &native_spans)?,
                     name: sort.name.clone(),
                     presort_and_args: None,
                     uf: None,
@@ -1039,7 +1046,8 @@ impl Session {
         // Container payloads may introduce the Pair/Vec sorts used to construct
         // a Map. Only this staged execution copy receives those helper records.
         let sort_sites = lower_container_values(program)?;
-        let materialized_sorts = materialize_sorts(program, &mut staged.graph, &mut staged.sorts)?;
+        let materialized_sorts =
+            materialize_sorts(program, &mut staged.graph, &mut staged.sorts, &native_spans)?;
         let mut materialized = vec![];
         for (index, command) in materialized_sorts {
             materialized.push(command.clone());
@@ -1054,7 +1062,7 @@ impl Session {
         }
         for (index, sort) in program.sorts.iter().enumerate() {
             validate_nullary_family(staged.graph.type_info(), sort)?;
-            native_span(program, sort.span.as_ref())?;
+            native_span(program, sort.span.as_ref(), &native_spans)?;
             let Some(name) =
                 structural_sort_name(&program.sorts, index as u32, &mut HashSet::new())?
             else {
@@ -1072,7 +1080,7 @@ impl Session {
             }
         }
         validate_host_declarations(program, &mut staged.graph)?;
-        let (depths, expansions) = validate_node_graph(program)?;
+        let (depths, expansions) = validate_node_graph(program, &native_spans)?;
         let constructor_dags = if self.mode == pb::ExecutionMode::Normal {
             classify_constructor_dags(program, &constructor_targets, &depths, &expansions)?
         } else {
@@ -1083,6 +1091,7 @@ impl Session {
             &constructor_targets,
             self.mode == pb::ExecutionMode::Normal,
             &depths,
+            &native_spans,
         )?;
         if !scoped_actions.is_empty() && self.mode != pb::ExecutionMode::Normal {
             return Err("scoped actions require normal execution mode".into());
@@ -1103,7 +1112,7 @@ impl Session {
             ) {
                 continue; // Already checked against the native catalog above.
             }
-            let span = native_span(program, declaration.span.as_ref())?;
+            let span = native_span(program, declaration.span.as_ref(), &native_spans)?;
             let command = match declaration.kind.as_ref().ok_or("missing declaration kind")? {
                 pb::declaration::Kind::EqSort(_) => continue,
                 pb::declaration::Kind::Constructor(constructor) => {
@@ -1134,9 +1143,9 @@ impl Session {
                         // in Context::Write: builtin calls retain their actual
                         // capabilities, and callable backends are installed first.
                     }
-                    Command::Function { span, name: function.name.clone(), table_name: Some(ast::TableName::Public(staged.names.callables[&function.name].clone())), schema, merge: function.merge.map(|index| expression(program, index, &mut HashSet::new())).transpose()?, hidden: declaration.hidden, let_binding: false, term_constructor: None, unextractable: true }
+                    Command::Function { span, name: function.name.clone(), table_name: Some(ast::TableName::Public(staged.names.callables[&function.name].clone())), schema, merge: function.merge.map(|index| expression(program, index, &mut HashSet::new(), &native_spans)).transpose()?, hidden: declaration.hidden, let_binding: false, term_constructor: None, unextractable: true }
                 },
-                pb::declaration::Kind::Primitive(primitive) => primitive_command(program, primitive, span)?,
+                pb::declaration::Kind::Primitive(primitive) => primitive_command(program, primitive, span, &native_spans)?,
                 pb::declaration::Kind::Relation(relation) => Command::Relation {
                     span,
                     name: relation.name.clone(),
@@ -1166,7 +1175,7 @@ impl Session {
                     );
                 }
                 let cost_table = Command::Function {
-                    span: native_span(program, declaration.span.as_ref())?,
+                    span: native_span(program, declaration.span.as_ref(), &native_spans)?,
                     name: cost_table,
                     table_name: Some(ast::TableName::Internal(
                         crate::set_cost::get_cost_table_name(&staged.names.callables[name]),
@@ -1425,7 +1434,7 @@ impl Session {
                     let holder = format!("{name}_holder");
                     installations.push(Installation {
                         command: Some(Command::AddRuleset(
-                            native_span(program, span.as_ref())?,
+                            native_span(program, span.as_ref(), &native_spans)?,
                             holder.clone(),
                         )),
                         site: site.clone(),
@@ -1436,7 +1445,7 @@ impl Session {
                     let rule = &program.rules[local_rule];
                     installations.push(Installation {
                         command: Some(lower_rule_cost_deletes(
-                            lower_rule(program, rule, &holder, &name)?,
+                            lower_rule(program, rule, &holder, &name, &native_spans)?,
                             &constructor_targets,
                             self.mode,
                         )),
@@ -1452,7 +1461,7 @@ impl Session {
             let name = format!("__protobuf_{}_{}", staged.request, local);
             installations.push(Installation {
                 command: Some(Command::UnstableCombinedRuleset(
-                    native_span(program, span.as_ref())?,
+                    native_span(program, span.as_ref(), &native_spans)?,
                     name.clone(),
                     holders,
                 )),
@@ -1467,6 +1476,7 @@ impl Session {
             rulesets[index] = name;
         }
         let mut context = RequestOccurrences {
+            native_spans,
             scoped_actions,
             constructor_dags,
             rulesets: occurrences
@@ -1539,6 +1549,7 @@ impl Session {
                         rule,
                         "",
                         &format!("__protobuf_{}_unused_{index}", staged.request),
+                        &context.native_spans,
                     )?,
                     &constructor_targets,
                     self.mode,
@@ -1553,7 +1564,7 @@ impl Session {
             .collect();
         let mut conditions = vec![];
         for (index, command) in program.commands.iter().enumerate() {
-            native_span(program, command.span.as_ref())?;
+            native_span(program, command.span.as_ref(), &context.native_spans)?;
             validation.extend(staged.validate_control(
                 program,
                 command,
@@ -1584,6 +1595,7 @@ impl Session {
                     false,
                     context.constructor_dags.contains(&path),
                     &mut |_| {},
+                    &context.native_spans,
                 )
                 .map_err(|error| error.to_string())?;
             }
@@ -1664,7 +1676,7 @@ impl Session {
         ) {
             return lower_native_observation(program, command, context, sites);
         }
-        let span = native_span(program, command.span.as_ref())?;
+        let span = native_span(program, command.span.as_ref(), &context.native_spans)?;
         let command = match command.kind.as_ref().ok_or("missing command kind")? {
             pb::command::Kind::Fail(child) => {
                 if !matches!(
@@ -1691,12 +1703,14 @@ impl Session {
                 Command::Fail(span, Box::new(child))
             }
             pb::command::Kind::Action(action) => {
-                return Ok(lower_action(program, action)?
+                return Ok(lower_action(program, action, &context.native_spans)?
                     .into_iter()
                     .map(Command::Action)
                     .collect());
             }
-            pb::command::Kind::Prove(prove) => Command::Prove(span, facts(program, &prove.facts)?),
+            pb::command::Kind::Prove(prove) => {
+                Command::Prove(span, facts(program, &prove.facts, &context.native_spans)?)
+            }
             pb::command::Kind::ProveExists(prove) => {
                 let name = self
                     .names
@@ -1736,7 +1750,12 @@ impl Session {
                     .map(|index| {
                         Ok(Command::Action(Action::Expr(
                             span.clone(),
-                            expression(program, *index, &mut HashSet::new())?,
+                            expression(
+                                program,
+                                *index,
+                                &mut HashSet::new(),
+                                &context.native_spans,
+                            )?,
                         )))
                     })
                     .collect();
@@ -1822,7 +1841,7 @@ impl Session {
         conditions: &mut Vec<(ast::Span, Vec<Fact>)>,
         path: &[u32],
     ) -> Result<Vec<Command>, PreparationError> {
-        let span = native_span(program, command.span.as_ref())?;
+        let span = native_span(program, command.span.as_ref(), &context.native_spans)?;
         match command.kind.as_ref().ok_or("missing command kind")? {
             pb::command::Kind::BindScheduler(bind) => {
                 wire_back_off(bind)?;
@@ -1858,7 +1877,7 @@ impl Session {
                 };
                 let mut commands = vec![];
                 if !until.is_empty() {
-                    conditions.push((span, facts(program, until)?));
+                    conditions.push((span, facts(program, until, &context.native_spans)?));
                 }
                 let mut nested = schedulers.clone();
                 for (index, child) in body.iter().enumerate() {
@@ -1919,7 +1938,7 @@ impl Session {
         context: &RequestOccurrences,
         sites: &mut ScheduleSites<'a>,
     ) -> Result<ast::Schedule, PreparationError> {
-        let span = native_span(program, command.span.as_ref())?;
+        let span = native_span(program, command.span.as_ref(), &context.native_spans)?;
         sites.insert(vec![], (command, vec![]));
         match command.kind.as_ref().ok_or("missing schedule command")? {
             pb::command::Kind::Run(run) => {
@@ -1972,7 +1991,8 @@ impl Session {
                 *failure_site = None;
                 if result.is_ok() {
                     return Err(egglog::Error::ExpectFail(
-                        native_span(program, command.span.as_ref()).expect("validated span"),
+                        native_span(program, command.span.as_ref(), &context.native_spans)
+                            .expect("validated span"),
                     ));
                 }
                 None
@@ -1984,8 +2004,10 @@ impl Session {
                 let mut anchor = command;
                 let mut fail_spans = vec![];
                 while let Some(pb::command::Kind::Fail(child)) = &anchor.kind {
-                    fail_spans
-                        .push(native_span(program, anchor.span.as_ref()).expect("validated span"));
+                    fail_spans.push(
+                        native_span(program, anchor.span.as_ref(), &context.native_spans)
+                            .expect("validated span"),
+                    );
                     anchor = child;
                 }
                 let mut envelope = WireEnvelope {
@@ -2048,12 +2070,13 @@ impl Session {
                     true,
                     context.constructor_dags.contains(&location.path),
                     &mut |_| {},
+                    &context.native_spans,
                 )?;
                 None
             }
             pb::command::Kind::Extract(extract) if !extract.cost_model.is_empty() => {
                 Some(pb::command_output::Kind::Extraction(
-                    self.extract_host_model(program, extract, response)?,
+                    self.extract_host_model(program, extract, response, &context.native_spans)?,
                 ))
             }
             pb::command::Kind::Extract(extract) => {
@@ -2062,8 +2085,13 @@ impl Session {
                     .iter()
                     .map(|index| {
                         self.graph.eval_expr(
-                            &expression(program, *index, &mut HashSet::new())
-                                .expect("validated expression"),
+                            &expression(
+                                program,
+                                *index,
+                                &mut HashSet::new(),
+                                &context.native_spans,
+                            )
+                            .expect("validated expression"),
                         )
                     })
                     .collect::<Result<Vec<_>, _>>()?;
@@ -2732,13 +2760,16 @@ fn lower_native_observation<'a>(
     context: &RequestOccurrences,
     sites: &mut ScheduleSites<'a>,
 ) -> Result<Vec<Command>, PreparationError> {
-    let span = native_span(program, command.span.as_ref())?;
+    let span = native_span(program, command.span.as_ref(), &context.native_spans)?;
     Ok(match command.kind.as_ref().ok_or("missing command kind")? {
         pb::command::Kind::Run(_) => vec![Command::RunSchedule(Session::lower_run(
             program, command, context, sites,
         )?)],
         pb::command::Kind::Check(check) => {
-            vec![Command::Check(span, facts(program, &check.facts)?)]
+            vec![Command::Check(
+                span,
+                facts(program, &check.facts, &context.native_spans)?,
+            )]
         }
         pb::command::Kind::Stats(_) => vec![Command::PrintOverallStatistics(span, None)],
         pb::command::Kind::PrintSize(print) => {
@@ -2930,8 +2961,14 @@ impl ControlContext for WireSchedule<'_> {
             let mut anchor = node;
             let mut fail_spans = vec![];
             while let Some(pb::command::Kind::Fail(child)) = &anchor.kind {
-                fail_spans
-                    .push(native_span(self.program, anchor.span.as_ref()).expect("validated span"));
+                fail_spans.push(
+                    native_span(
+                        self.program,
+                        anchor.span.as_ref(),
+                        &self.context.native_spans,
+                    )
+                    .expect("validated span"),
+                );
                 anchor = child;
             }
             let previous = std::mem::take(&mut self.measurements.borrow_mut().changed);
@@ -3031,6 +3068,7 @@ impl ControlContext for WireSchedule<'_> {
                         &HashMap::new(),
                     );
                 },
+                &self.context.native_spans,
             );
             if result.is_err() {
                 self.measurements.borrow_mut().failure =
@@ -3050,7 +3088,7 @@ impl ControlContext for WireSchedule<'_> {
         }
         let mut sites = HashMap::new();
         let commands = if let Some(pb::command::Kind::Action(action)) = &node.kind {
-            lower_action(self.program, action)
+            lower_action(self.program, action, &self.context.native_spans)
                 .expect("validated action")
                 .into_iter()
                 .map(Command::Action)
@@ -3113,8 +3151,9 @@ impl ControlContext for WireSchedule<'_> {
         }
         let location = self.location(path, iterations);
         let result = self.executor.graph.check_condition_observed(
-            native_span(self.program, node.span.as_ref()).expect("validated span"),
-            facts(self.program, until).expect("validated until"),
+            native_span(self.program, node.span.as_ref(), &self.context.native_spans)
+                .expect("validated span"),
+            facts(self.program, until, &self.context.native_spans).expect("validated until"),
             &mut |event| {
                 self.measurements.borrow_mut().observe(
                     event,
@@ -3534,6 +3573,7 @@ fn primitive_command(
     program: &pb::Program,
     primitive: &pb::Primitive,
     span: ast::Span,
+    native_spans: &NativeSpans,
 ) -> Result<Command, String> {
     let schema = signature(program, &primitive.inputs, primitive.output)?;
     let body = primitive.body.ok_or("missing primitive body")?;
@@ -3565,7 +3605,7 @@ fn primitive_command(
             Expr::Var(span.clone(), primitive.name.clone()),
             inputs,
             Expr::Var(span, schema.output),
-            expression(program, body, &mut HashSet::new())?,
+            expression(program, body, &mut HashSet::new(), native_spans)?,
         ],
     ))
 }
@@ -3576,6 +3616,7 @@ fn materialize_sorts(
     program: &pb::Program,
     graph: &mut EGraph,
     known: &mut HashSet<String>,
+    native_spans: &NativeSpans,
 ) -> Result<Vec<(u32, Command)>, String> {
     fn visit(
         program: &pb::Program,
@@ -3584,6 +3625,7 @@ fn materialize_sorts(
         commands: &mut Vec<(u32, Command)>,
         seen: &mut HashSet<u32>,
         known: &mut HashSet<String>,
+        native_spans: &NativeSpans,
     ) -> Result<(), String> {
         if !seen.insert(index) {
             return Ok(());
@@ -3608,7 +3650,7 @@ fn materialize_sorts(
             _ => return Ok(()),
         };
         for child in &children {
-            visit(program, *child, graph, commands, seen, known)?;
+            visit(program, *child, graph, commands, seen, known, native_spans)?;
         }
         if known.contains(&name) {
             return Ok(());
@@ -3645,7 +3687,11 @@ fn materialize_sorts(
                 .collect::<Result<_, _>>()?
         };
         let command = Command::Sort {
-            span: native_span(program, program.sorts[index as usize].span.as_ref())?,
+            span: native_span(
+                program,
+                program.sorts[index as usize].span.as_ref(),
+                native_spans,
+            )?,
             name,
             presort_and_args: Some((presort.into(), args)),
             uf: None,
@@ -3670,6 +3716,7 @@ fn materialize_sorts(
             &mut commands,
             &mut seen,
             known,
+            native_spans,
         )?;
     }
     Ok(commands)
@@ -3961,7 +4008,11 @@ fn node_sort(program: &pb::Program, index: u32) -> Result<String, String> {
     sort_name(&program.sorts, node.sort_id)
 }
 
-fn native_span(program: &pb::Program, span: Option<&pb::Span>) -> Result<ast::Span, String> {
+fn native_span(
+    program: &pb::Program,
+    span: Option<&pb::Span>,
+    native_spans: &NativeSpans,
+) -> Result<ast::Span, String> {
     let Some(span) = span else {
         return Ok(span!());
     };
@@ -3978,11 +4029,20 @@ fn native_span(program: &pb::Program, span: Option<&pb::Span>) -> Result<ast::Sp
         {
             return Err("span must lie within UTF-8 character boundaries".into());
         }
-        return Ok(ast::Span::Egglog(Arc::new(EgglogSpan {
-            file: Arc::new(SrcFile {
+        // Each table belongs to one append-only file arena, never a session.
+        let mut files = native_spans.0.borrow_mut();
+        if files.len() < program.files.len() {
+            files.resize_with(program.files.len(), || None);
+        }
+        let file = Arc::clone(files[span.file as usize].get_or_insert_with(|| {
+            Arc::new(SrcFile {
                 name: Some(file.name.clone()),
                 contents: contents.clone(),
-            }),
+            })
+        }));
+        drop(files);
+        return Ok(ast::Span::Egglog(Arc::new(EgglogSpan {
+            file,
             i: span.start as usize,
             j: span.end as usize,
         })));
@@ -4060,10 +4120,11 @@ fn expression(
     program: &pb::Program,
     index: u32,
     visiting: &mut HashSet<u32>,
+    native_spans: &NativeSpans,
 ) -> Result<Expr, String> {
     // The compatibility AST is a tree. Bound expansion of a compact shared DAG
     // before it can allocate exponentially; a later native-IR path can lift this.
-    lower_expression(program, index, visiting, &mut 65_536)
+    lower_expression(program, index, visiting, &mut 65_536, native_spans)
 }
 
 // These checks never normalize malformed wire data. Native constructors remain
@@ -4110,6 +4171,7 @@ fn lower_expression(
     index: u32,
     visiting: &mut HashSet<u32>,
     remaining: &mut usize,
+    native_spans: &NativeSpans,
 ) -> Result<Expr, String> {
     *remaining = remaining
         .checked_sub(1)
@@ -4125,7 +4187,7 @@ fn lower_expression(
         .get(index as usize)
         .ok_or("node index out of bounds")?;
     let sort = node_sort(program, index)?;
-    let span = native_span(program, node.span.as_ref())?;
+    let span = native_span(program, node.span.as_ref(), native_spans)?;
     let result = match node.kind.as_ref().ok_or("missing node kind")? {
         pb::node::Kind::Var(name) if !name.is_empty() => Expr::Var(span, name.clone()),
         pb::node::Kind::Call(call) => Expr::Call(
@@ -4133,7 +4195,9 @@ fn lower_expression(
             call.func.clone(),
             call.args
                 .iter()
-                .map(|argument| lower_expression(program, *argument, visiting, remaining))
+                .map(|argument| {
+                    lower_expression(program, *argument, visiting, remaining, native_spans)
+                })
                 .collect::<Result<_, _>>()?,
         ),
         pb::node::Kind::GetCost(call) => Expr::Call(
@@ -4141,7 +4205,9 @@ fn lower_expression(
             crate::set_cost::get_cost_table_name(&call.func),
             call.args
                 .iter()
-                .map(|argument| lower_expression(program, *argument, visiting, remaining))
+                .map(|argument| {
+                    lower_expression(program, *argument, visiting, remaining, native_spans)
+                })
                 .collect::<Result<_, _>>()?,
         ),
         pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
@@ -4158,7 +4224,13 @@ fn lower_expression(
                 .ok_or("native expression expansion exceeds 65536 nodes")?;
             let mut args = vec![Expr::Lit(span.clone(), Literal::String(call.func.clone()))];
             for argument in &call.args {
-                args.push(lower_expression(program, *argument, visiting, remaining)?);
+                args.push(lower_expression(
+                    program,
+                    *argument,
+                    visiting,
+                    remaining,
+                    native_spans,
+                )?);
             }
             Expr::Call(
                 span,
@@ -4235,7 +4307,11 @@ fn lower_expression(
     Ok(result)
 }
 
-fn facts(program: &pb::Program, indices: &[u32]) -> Result<Vec<Fact>, String> {
+fn facts(
+    program: &pb::Program,
+    indices: &[u32],
+    native_spans: &NativeSpans,
+) -> Result<Vec<Fact>, String> {
     let mut result = vec![];
     for index in indices {
         let node = program
@@ -4249,9 +4325,9 @@ fn facts(program: &pb::Program, indices: &[u32]) -> Result<Vec<Fact>, String> {
             let first = *union.members.first().ok_or("empty equality fact")?;
             for other in union.members.iter().skip(1) {
                 result.push(Fact::Eq(
-                    native_span(program, node.span.as_ref())?,
-                    expression(program, first, &mut HashSet::new())?,
-                    expression(program, *other, &mut HashSet::new())?,
+                    native_span(program, node.span.as_ref(), native_spans)?,
+                    expression(program, first, &mut HashSet::new(), native_spans)?,
+                    expression(program, *other, &mut HashSet::new(), native_spans)?,
                 ));
             }
         } else {
@@ -4259,6 +4335,7 @@ fn facts(program: &pb::Program, indices: &[u32]) -> Result<Vec<Fact>, String> {
                 program,
                 *index,
                 &mut HashSet::new(),
+                native_spans,
             )?));
         }
     }
@@ -4480,11 +4557,14 @@ fn validate_relation_uses(program: &pb::Program, saved: &pb::Program) -> Result<
 // Validate the entire arena, including unused entries, without interpreting it.
 // Removing Union outgoing edges must leave a DAG: every permitted cycle crosses
 // an identity boundary. Value lowering still validates each actual use's context.
-fn validate_node_graph(program: &pb::Program) -> Result<(Vec<usize>, Vec<usize>), String> {
+fn validate_node_graph(
+    program: &pb::Program,
+    native_spans: &NativeSpans,
+) -> Result<(Vec<usize>, Vec<usize>), String> {
     let mut edges = Vec::with_capacity(program.nodes.len());
     for (index, node) in program.nodes.iter().enumerate() {
         let sort = node_sort(program, index as u32)?;
-        native_span(program, node.span.as_ref())?;
+        native_span(program, node.span.as_ref(), native_spans)?;
         let children = match &node.kind {
             Some(pb::node::Kind::Call(call) | pb::node::Kind::GetCost(call)) => call.args.clone(),
             Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
@@ -4515,7 +4595,7 @@ fn validate_node_graph(program: &pb::Program) -> Result<(Vec<usize>, Vec<usize>)
                 vec![]
             }
             _ => {
-                expression(program, index as u32, &mut HashSet::new())?;
+                expression(program, index as u32, &mut HashSet::new(), native_spans)?;
                 vec![]
             }
         };
@@ -4670,6 +4750,7 @@ fn classify_union_actions(
     constructor_targets: &HashSet<String>,
     constructor_costs: bool,
     depths: &[usize],
+    native_spans: &NativeSpans,
 ) -> Result<HashSet<Vec<u32>>, String> {
     let unions = |action: &pb::Action| -> Result<(HashSet<u32>, usize), String> {
         let mut pending = action_roots(action)?;
@@ -4729,7 +4810,7 @@ fn classify_union_actions(
         }
         let generalized = cost_action
             || reached.iter().any(|union| uses[union] > 1)
-            || lower_action(program, action).is_err();
+            || lower_action(program, action, native_spans).is_err();
         if generalized {
             check_variables(program, &action_roots(action)?, &mut HashMap::new(), false)?;
             scoped.insert(path);
@@ -4782,6 +4863,7 @@ fn constructor_dag_actions(
     program: &pb::Program,
     action: &pb::Action,
     mut occupied: impl FnMut(&str) -> bool,
+    native_spans: &NativeSpans,
 ) -> Result<Vec<Action>, String> {
     enum Walk {
         Enter(u32),
@@ -4804,7 +4886,7 @@ fn constructor_dag_actions(
         match step {
             Walk::Enter(index) => {
                 let node = &program.nodes[index as usize];
-                let span = native_span(program, node.span.as_ref())?;
+                let span = native_span(program, node.span.as_ref(), native_spans)?;
                 if let Some(name) = memo.get(&index) {
                     results.push(Expr::Var(span, name.clone()));
                     continue;
@@ -4817,7 +4899,8 @@ fn constructor_dag_actions(
                     pb::node::Kind::PrimitiveValue(_) => {
                         // Preserve native scalar payloads, including exact f64
                         // bits. Evaluation never takes a textual roundtrip.
-                        let literal = expression(program, index, &mut HashSet::new())?;
+                        let literal =
+                            expression(program, index, &mut HashSet::new(), native_spans)?;
                         if !matches!(literal, Expr::Lit(..)) {
                             return Err("constructor action scope requires scalar literals".into());
                         }
@@ -4835,7 +4918,7 @@ fn constructor_dag_actions(
                 let pb::node::Kind::Call(call) = node.kind.as_ref().unwrap() else {
                     unreachable!()
                 };
-                let span = native_span(program, node.span.as_ref())?;
+                let span = native_span(program, node.span.as_ref(), native_spans)?;
                 let name = loop {
                     let candidate = format!("__egglog_proto_action_{next}");
                     next += 1;
@@ -4854,7 +4937,7 @@ fn constructor_dag_actions(
             }
         }
     }
-    let span = native_span(program, action.span.as_ref())?;
+    let span = native_span(program, action.span.as_ref(), native_spans)?;
     actions.push(match action.kind.as_ref().unwrap() {
         pb::action::Kind::Term(_) => Action::Expr(span, results.pop().unwrap()),
         pb::action::Kind::Set(set) => {
@@ -4874,6 +4957,7 @@ fn constructor_dag_actions(
 // Only Union locations are retained across direct commands. An admitted closed
 // constructor DAG shares local results within this action only; other Calls
 // are lowered anew on every demand. All effects retain one native rule boundary.
+#[allow(clippy::too_many_arguments)]
 fn eval_scoped_action(
     graph: &mut EGraph,
     program: &pb::Program,
@@ -4882,11 +4966,16 @@ fn eval_scoped_action(
     execute: bool,
     share_constructors: bool,
     observer: &mut dyn FnMut(ExecutionEvent<'_>),
+    native_spans: &NativeSpans,
 ) -> Result<(), egglog::Error> {
     if share_constructors {
-        let actions =
-            constructor_dag_actions(program, action, |name| graph.type_info().is_global(name))
-                .map_err(egglog::Error::BackendError)?;
+        let actions = constructor_dag_actions(
+            program,
+            action,
+            |name| graph.type_info().is_global(name),
+            native_spans,
+        )
+        .map_err(egglog::Error::BackendError)?;
         let (result, _) = graph.eval_scoped_actions_observed(
             &[],
             execute,
@@ -4956,7 +5045,8 @@ fn eval_scoped_action(
             match step {
                 Walk::Enter(index) => {
                     let node = &program.nodes[index as usize];
-                    let span = native_span(program, node.span.as_ref()).map_err(error)?;
+                    let span =
+                        native_span(program, node.span.as_ref(), native_spans).map_err(error)?;
                     match node.kind.as_ref().expect("validated node") {
                         pb::node::Kind::Union(union) => {
                             if !matches!(
@@ -5008,7 +5098,8 @@ fn eval_scoped_action(
                         }
                         _ => {
                             let value =
-                                expression(program, index, &mut HashSet::new()).map_err(error)?;
+                                expression(program, index, &mut HashSet::new(), native_spans)
+                                    .map_err(error)?;
                             if matches!(value, Expr::Lit(..)) {
                                 // Native syntax-sensitive primitives (notably
                                 // function targets) require genuine literals.
@@ -5025,7 +5116,8 @@ fn eval_scoped_action(
                 }
                 Walk::Call(index, arity) => {
                     let node = &program.nodes[index as usize];
-                    let span = native_span(program, node.span.as_ref()).map_err(error)?;
+                    let span =
+                        native_span(program, node.span.as_ref(), native_spans).map_err(error)?;
                     let mut args = results.split_off(results.len() - arity);
                     let function = match node.kind.as_ref().unwrap() {
                         pb::node::Kind::Call(call) => call.func.clone(),
@@ -5059,7 +5151,8 @@ fn eval_scoped_action(
                     let pb::node::Kind::Union(union) = node.kind.as_ref().unwrap() else {
                         unreachable!()
                     };
-                    let span = native_span(program, node.span.as_ref()).map_err(error)?;
+                    let span =
+                        native_span(program, node.span.as_ref(), native_spans).map_err(error)?;
                     let value = results.pop().unwrap();
                     if materialized.insert(index) {
                         builder.action(Action::Let(span.clone(), slots[&index].clone(), value))?;
@@ -5085,9 +5178,10 @@ fn eval_scoped_action(
                         unreachable!()
                     };
                     builder.action(Action::Expr(
-                        native_span(program, action.span.as_ref()).map_err(error)?,
+                        native_span(program, action.span.as_ref(), native_spans).map_err(error)?,
                         Expr::Call(
-                            native_span(program, action.span.as_ref()).map_err(error)?,
+                            native_span(program, action.span.as_ref(), native_spans)
+                                .map_err(error)?,
                             set.target.as_ref().unwrap().func.clone(),
                             results.clone(),
                         ),
@@ -5095,7 +5189,7 @@ fn eval_scoped_action(
                 }
             }
         }
-        let span = native_span(program, action.span.as_ref()).map_err(error)?;
+        let span = native_span(program, action.span.as_ref(), native_spans).map_err(error)?;
         let action = match action.kind.as_ref().unwrap() {
             pb::action::Kind::Term(_) => Action::Expr(span, results.pop().unwrap()),
             pb::action::Kind::Set(set) => {
@@ -5163,8 +5257,12 @@ fn eval_scoped_action(
     result
 }
 
-fn lower_action(program: &pb::Program, action: &pb::Action) -> Result<Vec<Action>, String> {
-    let span = native_span(program, action.span.as_ref())?;
+fn lower_action(
+    program: &pb::Program,
+    action: &pb::Action,
+    native_spans: &NativeSpans,
+) -> Result<Vec<Action>, String> {
+    let span = native_span(program, action.span.as_ref(), native_spans)?;
     let lowered = match action.kind.as_ref().ok_or("missing action kind")? {
         pb::action::Kind::Term(index) => {
             let node = program
@@ -5191,11 +5289,14 @@ fn lower_action(program: &pb::Program, action: &pb::Action) -> Result<Vec<Action
                 }
                 Action::Union(
                     span,
-                    expression(program, *lhs, &mut HashSet::new())?,
-                    expression(program, *rhs, &mut HashSet::new())?,
+                    expression(program, *lhs, &mut HashSet::new(), native_spans)?,
+                    expression(program, *rhs, &mut HashSet::new(), native_spans)?,
                 )
             } else {
-                Action::Expr(span, expression(program, *index, &mut HashSet::new())?)
+                Action::Expr(
+                    span,
+                    expression(program, *index, &mut HashSet::new(), native_spans)?,
+                )
             }
         }
         pb::action::Kind::Set(set) => {
@@ -5206,12 +5307,13 @@ fn lower_action(program: &pb::Program, action: &pb::Action) -> Result<Vec<Action
                 target
                     .args
                     .iter()
-                    .map(|index| expression(program, *index, &mut HashSet::new()))
+                    .map(|index| expression(program, *index, &mut HashSet::new(), native_spans))
                     .collect::<Result<_, _>>()?,
                 expression(
                     program,
                     set.value.ok_or("missing set value")?,
                     &mut HashSet::new(),
+                    native_spans,
                 )?,
             )
         }
@@ -5225,7 +5327,7 @@ fn lower_action(program: &pb::Program, action: &pb::Action) -> Result<Vec<Action
             call.func.clone(),
             call.args
                 .iter()
-                .map(|index| expression(program, *index, &mut HashSet::new()))
+                .map(|index| expression(program, *index, &mut HashSet::new(), native_spans))
                 .collect::<Result<_, _>>()?,
         ),
         pb::action::Kind::Panic(message) => Action::Panic(span, message.clone()),
@@ -5338,6 +5440,7 @@ fn lower_rule(
     rule: &pb::RuleDecl,
     ruleset: &str,
     name: &str,
+    native_spans: &NativeSpans,
 ) -> Result<Command, String> {
     if rule.name.as_ref().is_some_and(String::is_empty) {
         return Err("an explicit rule label must not be empty".into());
@@ -5348,7 +5451,7 @@ fn lower_rule(
         Ok(pb::RuleEvalMode::UnsafeSeminaive) => ast::RuleEvalMode::UnsafeSeminaive,
         _ => return Err(format!("invalid rule evaluation mode {}", rule.eval_mode)),
     };
-    let span = native_span(program, rule.span.as_ref())?;
+    let span = native_span(program, rule.span.as_ref(), native_spans)?;
     match rule.kind.as_ref().ok_or("missing rule kind")? {
         kind @ (pb::rule_decl::Kind::Rewrite(_) | pb::rule_decl::Kind::Birewrite(_)) => {
             // Native rewrite commands have no option fields. Keep this
@@ -5384,11 +5487,11 @@ fn lower_rule(
             }
             let rewrite = ast::Rewrite {
                 span,
-                lhs: expression(program, lhs, &mut HashSet::new())?
+                lhs: expression(program, lhs, &mut HashSet::new(), native_spans)?
                     .map_symbols(&mut |h| h, &mut |v: String| native_name("var", &v)),
-                rhs: expression(program, rhs, &mut HashSet::new())?
+                rhs: expression(program, rhs, &mut HashSet::new(), native_spans)?
                     .map_symbols(&mut |h| h, &mut |v: String| native_name("var", &v)),
-                conditions: facts(program, conditions)?,
+                conditions: facts(program, conditions, native_spans)?,
                 name: name.into(),
             };
             Ok(if bidirectional {
@@ -5404,7 +5507,7 @@ fn lower_rule(
             for (index, action) in body.head.iter().enumerate() {
                 check_variables(program, &action_roots(action)?, &mut bindings, false)?;
                 if let Some(pb::action::Kind::SetCost(set)) = &action.kind {
-                    let span = native_span(program, action.span.as_ref())?;
+                    let span = native_span(program, action.span.as_ref(), native_spans)?;
                     let target = set.target.as_ref().ok_or("missing cost target")?;
                     let mut key = Vec::with_capacity(target.args.len());
                     for (argument, value) in target.args.iter().enumerate() {
@@ -5415,7 +5518,7 @@ fn lower_rule(
                         head.push(Action::Let(
                             span.clone(),
                             local.clone(),
-                            expression(program, *value, &mut HashSet::new())?
+                            expression(program, *value, &mut HashSet::new(), native_spans)?
                                 .map_symbols(&mut |h| h, &mut |v: String| native_name("var", &v)),
                         ));
                         key.push(Expr::Var(span.clone(), local));
@@ -5435,12 +5538,13 @@ fn lower_rule(
                             program,
                             set.cost.ok_or("missing cost value")?,
                             &mut HashSet::new(),
+                            native_spans,
                         )?
                         .map_symbols(&mut |h| h, &mut |v: String| native_name("var", &v)),
                     ));
                 } else {
                     head.extend(
-                        ast::GenericActions(lower_action(program, action)?)
+                        ast::GenericActions(lower_action(program, action, native_spans)?)
                             .map_symbols(&mut |h| h, &mut |v: String| native_name("var", &v))
                             .0,
                     );
@@ -5450,7 +5554,7 @@ fn lower_rule(
                 rule: ast::Rule {
                     span,
                     head: ast::GenericActions(head),
-                    body: facts(program, &body.query)?,
+                    body: facts(program, &body.query, native_spans)?,
                     name: name.into(),
                     ruleset: ruleset.into(),
                     eval_mode,
@@ -5792,6 +5896,153 @@ fn encode_exact_number(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_spans_share_files_and_preserve_validation_boundaries() {
+        let mut program = pb::Program {
+            files: [
+                ("same.egg", Some("aλ")),
+                ("same.egg", Some("other")),
+                ("unused.egg", Some("unused")),
+                ("omitted.egg", None),
+                ("empty.egg", Some("")),
+            ]
+            .into_iter()
+            .map(|(name, contents)| pb::SourceFile {
+                name: name.into(),
+                contents: contents.map(str::to_owned),
+            })
+            .collect(),
+            ..Default::default()
+        };
+        let native_spans = NativeSpans::default();
+        for (file, start, end) in [
+            (99, 0, 0),
+            (0, 2, 0),
+            (0, 2, 3),
+            (0, 0, 2),
+            (0, 4, 4),
+            (3, 2, 1),
+            (4, 0, 1),
+        ] {
+            let span = pb::Span { file, start, end };
+            assert!(native_span(&program, Some(&span), &native_spans).is_err());
+        }
+        assert!(native_spans.0.borrow().is_empty());
+        let mut spans = vec![];
+        for (file, start, end) in [
+            (0, 0, 1),
+            (0, 1, 3),
+            (1, 0, 5),
+            (0, 3, 3),
+            (4, 0, 0),
+            (3, 100, 101),
+        ] {
+            let span = pb::Span { file, start, end };
+            spans.push(native_span(&program, Some(&span), &native_spans).unwrap());
+        }
+        let [
+            ast::Span::Egglog(first),
+            ast::Span::Egglog(second),
+            ast::Span::Egglog(other),
+            ..,
+        ] = spans.as_slice()
+        else {
+            panic!("contents-backed spans")
+        };
+        assert!(Arc::ptr_eq(&first.file, &second.file));
+        assert!(!Arc::ptr_eq(&first.file, &other.file));
+        assert_eq!(
+            spans[..5].iter().map(ast::Span::string).collect::<Vec<_>>(),
+            ["a", "λ", "other", "", ""]
+        );
+        assert!(matches!(&spans[5], ast::Span::Rust(_)));
+        assert!(matches!(
+            native_span(&program, None, &native_spans).unwrap(),
+            ast::Span::Rust(_)
+        ));
+        assert!(native_spans.0.borrow()[2].is_none());
+        assert!(native_spans.0.borrow()[3].is_none());
+        // Providers may append files without replacing the authored arena.
+        program.files.push(pb::SourceFile {
+            name: "helper.egg".into(),
+            contents: Some("helper".into()),
+        });
+        let helper_span = pb::Span {
+            file: 5,
+            start: 0,
+            end: 6,
+        };
+        assert_eq!(
+            native_span(&program, Some(&helper_span), &native_spans)
+                .unwrap()
+                .string(),
+            "helper"
+        );
+        assert!(Arc::ptr_eq(
+            native_spans.0.borrow()[0].as_ref().unwrap(),
+            &first.file
+        ));
+        drop(native_spans);
+        drop(program);
+        assert_eq!(spans[0].to_string(), "In 1:1-1 of same.egg: a");
+    }
+
+    #[test]
+    fn native_spans_follow_preparation_into_action_lowering_not_later_requests() {
+        let (engine, id) = host_default_engine();
+        let mut program = inventory_fixture("(datatype E (N i64)) (N 1)");
+        let prepared = engine.graphs[&id].prepare(&mut program).unwrap();
+        let file = prepared.context.native_spans.0.borrow()[0].clone().unwrap();
+        let declaration = prepared
+            .installations
+            .iter()
+            .find_map(|installation| match &installation.command {
+                Some(Command::Constructor {
+                    span: ast::Span::Egglog(span),
+                    ..
+                }) => Some(span),
+                _ => None,
+            })
+            .unwrap();
+        assert!(Arc::ptr_eq(&file, &declaration.file));
+        let Some(pb::command::Kind::Action(action)) = &program.commands[0].kind else {
+            panic!("action fixture")
+        };
+        let actions = lower_action(&program, action, &prepared.context.native_spans).unwrap();
+        let [Action::Expr(ast::Span::Egglog(span), expr)] = actions.as_slice() else {
+            panic!("ordinary constructor action")
+        };
+        let ast::Span::Egglog(expression_span) = expr.span() else {
+            panic!("expression span")
+        };
+        assert!(Arc::ptr_eq(&file, &span.file));
+        assert!(Arc::ptr_eq(&file, &expression_span.file));
+        let mut later = pb::Program {
+            ir_version: 1,
+            files: vec![pb::SourceFile {
+                name: "fixture.egg".into(),
+                contents: Some("other".into()),
+            }],
+            ..Default::default()
+        };
+        let next = engine.graphs[&id].prepare(&mut later).unwrap();
+        let origin = pb::Span {
+            file: 0,
+            start: 0,
+            end: 5,
+        };
+        let ast::Span::Egglog(next_span) =
+            native_span(&later, Some(&origin), &next.context.native_spans).unwrap()
+        else {
+            panic!("next request")
+        };
+        assert!(!Arc::ptr_eq(&file, &next_span.file));
+        assert_eq!(next_span.file.contents, "other");
+        drop(prepared);
+        drop(program);
+        assert_eq!(expr.span().string(), "(N 1)");
+    }
 
     mod partial_call_staging {
         use super::*;
@@ -6573,6 +6824,7 @@ mod tests {
 
     #[test]
     fn constructor_dag_scoped_compilation_is_inert_and_drops_partial_builders() {
+        let native_spans = NativeSpans::default();
         let mut graph = crate::new_experimental_egraph();
         graph
             .parse_and_run_program(None, "(datatype A (Leaf) (Wrap A))")
@@ -6611,6 +6863,7 @@ mod tests {
             false,
             true,
             &mut |_| {},
+            &native_spans,
         )
         .unwrap();
         assert_eq!(graph.num_tuples(), 0);
@@ -6640,7 +6893,8 @@ mod tests {
                 &mut values,
                 false,
                 true,
-                &mut |_| {}
+                &mut |_| {},
+                &native_spans,
             )
             .is_err()
         );
@@ -6655,6 +6909,7 @@ mod tests {
             true,
             true,
             &mut |_| {},
+            &native_spans,
         )
         .unwrap();
         assert_eq!(graph.get_size("Wrap"), 1050);
