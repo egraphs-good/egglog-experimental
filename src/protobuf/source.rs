@@ -102,7 +102,7 @@ pub struct Source {
     // Native fresh names survive Pop; never reuse a discarded version's name.
     next_ruleset: u64,
     cost_origins: std::sync::Arc<std::sync::Mutex<crate::set_cost::CostOrigins>>,
-    pending_cost_error: Option<String>,
+    pending_error: Option<String>,
 }
 
 // Project the resolved body before unstable-fn target preparation replaces
@@ -132,7 +132,7 @@ pub(crate) fn primitive_definition(
         local_prefix: String::new(),
         next_ruleset: 0,
         cost_origins: Default::default(),
-        pending_cost_error: None,
+        pending_error: None,
     };
     let inputs = inputs
         .iter()
@@ -247,7 +247,7 @@ impl Source {
             local_prefix,
             next_ruleset: 0,
             cost_origins,
-            pending_cost_error: None,
+            pending_error: None,
         })
     }
 
@@ -275,7 +275,7 @@ impl Source {
     }
 
     fn advance(&mut self, scopes: bool) -> Option<Result<Submission, TransportError>> {
-        if let Some(error) = self.pending_cost_error.take() {
+        if let Some(error) = self.pending_error.take() {
             self.commands.clear();
             return Some(Err(TransportError(error)));
         }
@@ -457,14 +457,50 @@ impl Source {
         };
         let macros = self.graph.command_macros().clone();
         let types = self.graph.type_info().clone();
-        let expanded = macros
+        let mut expanded = macros
             .apply(command, &mut self.graph.parser.symbol_gen, &types)
             .map_err(|error| error.to_string())?;
-        if expanded.len() != 1 {
+        if expanded.len() == 1 {
+            return self.compile_expanded(expanded, explicit_sort_alias);
+        }
+        // Native fresh expansion declares its keyed constructor, then installs
+        // the rewritten rule. Both fit one authored phase. Arbitrary vectors
+        // cannot be combined: Program declarations precede runtime commands.
+        if !matches!(
+            expanded.as_slice(),
+            [Command::Constructor { .. }, Command::Rule { .. }]
+        ) {
             return Err(
                 "multi-command source macros require separate ordered submission phases".into(),
             );
         }
+        let rule = expanded.pop().unwrap();
+        let mut prefix = self.compile_expanded(expanded, None)?;
+        let program = self.program.clone();
+        let rulesets = self.rulesets.clone();
+        match self.compile_expanded(vec![rule], None) {
+            Ok(mut complete) => {
+                prefix.declarations.append(&mut complete.declarations);
+                complete.declarations = prefix.declarations;
+                Ok(complete)
+            }
+            Err(error) => {
+                // Native retains the constructor if its later rule fails. Do
+                // not export any nodes or publication state from that child.
+                self.program = program;
+                self.rulesets = rulesets;
+                self.pending_error = Some(error);
+                Ok(prefix)
+            }
+        }
+    }
+
+    // Lower already expanded commands without applying user macros again.
+    fn compile_expanded(
+        &mut self,
+        expanded: Vec<Command>,
+        explicit_sort_alias: Option<String>,
+    ) -> Result<pb::Program, String> {
         let mut publish = vec![];
         for mut command in expanded {
             let mut fail_spans = vec![];
@@ -1192,7 +1228,7 @@ impl Source {
                         return Err(error.to_string());
                     }
                     self.program.commands.extend(prefix);
-                    self.pending_cost_error = Some(error.to_string());
+                    self.pending_error = Some(error.to_string());
                     return self.phase(Vec::new());
                 }
             };

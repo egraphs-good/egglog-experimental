@@ -3,6 +3,526 @@ use egglog_experimental::{PortableEGraph, PortableTypeInfo};
 use egglog_experimental::{new_experimental_egraph, protobuf::Engine};
 use prost::Message;
 
+mod source_fresh_macro {
+    use super::*;
+    use egglog_experimental::protobuf::{
+        NativeExtension,
+        source::{Renderer, Source, Submission},
+    };
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    // Compare one phase per authored command, actual native execution, byte
+    // transport, rendered native execution, and a fresh import of that text.
+    fn compare(text: &str) -> Vec<pb::Program> {
+        let mut native = new_experimental_egraph();
+        let mut commands = native.parse_program(None, text).unwrap().into_iter();
+        let mut engine = Engine::default();
+        let id = create(&mut engine);
+        let mut renderer = Renderer::default();
+        let mut replay = new_experimental_egraph();
+        let mut recorded = String::new();
+        let mut phases = Vec::new();
+        for phase in Source::new(None, text).unwrap() {
+            let phase = phase.unwrap();
+            native.run_program(vec![commands.next().unwrap()]).unwrap();
+            let phase = pb::Program::decode(phase.encode_to_vec().as_slice()).unwrap();
+            assert_eq!(run(&mut engine, id, phase.clone()).error, None);
+            let rendered = renderer.render(&phase).unwrap();
+            replay.parse_and_run_program(None, &rendered).unwrap();
+            recorded.push_str(&rendered);
+            phases.push(phase);
+        }
+        assert!(commands.next().is_none());
+        let mut fresh = Engine::default();
+        let id = create(&mut fresh);
+        for phase in Source::new(None, &recorded).unwrap() {
+            assert_eq!(run(&mut fresh, id, phase.unwrap()).error, None);
+        }
+        phases
+    }
+
+    #[test]
+    fn existing_fixtures_keep_one_phase_and_fresh_distinctness() {
+        for text in [
+            include_str!("test_fresh.egg"),
+            include_str!("test_simple_fresh.egg"),
+            include_str!("test_working_fresh.egg"),
+        ] {
+            let text =
+                format!("{text}\n(check (Let ?x (Var \"y\")) (Let ?y (Var \"y\")) (!= ?x ?y))");
+            let phases = compare(&text);
+            let expansion = &phases[1];
+            assert_eq!(expansion.declarations.len(), 1);
+            assert!(matches!(
+                expansion.declarations[0].kind,
+                Some(pb::declaration::Kind::Constructor(_))
+            ));
+            assert_eq!(expansion.rules.len(), 1);
+            assert!(expansion.commands.is_empty());
+            assert!(
+                expansion.rulesets.is_empty(),
+                "fresh rule published before Run"
+            );
+        }
+    }
+
+    #[test]
+    fn generated_schema_sites_and_rule_options_come_from_native_expansion() {
+        let phases = compare(
+            r#"
+            (datatype FreshValue (Pair FreshValue FreshValue))
+            (relation seed (i64 String))
+            (ruleset generated)
+            (rule ((seed n label))
+                ((Pair (unstable-fresh! FreshValue :cost 17 :unextractable)
+                       (unstable-fresh! FreshValue)))
+                :ruleset generated :name "fresh options" :naive :no-decomp :internal-include-subsumed)
+            (seed 7 "key")
+            (run generated 1)
+            (check (Pair x y) (!= x y))
+        "#,
+        );
+        let expansion = &phases[3];
+        let Some(pb::declaration::Kind::Constructor(constructor)) = &expansion.declarations[0].kind
+        else {
+            panic!("fresh constructor missing")
+        };
+        let inputs: Vec<_> = constructor
+            .inputs
+            .iter()
+            .map(|arg| {
+                let Some(pb::sort::Kind::Family(family)) = &expansion.sorts[arg.sort as usize].kind
+                else {
+                    panic!("fresh query input is not scalar")
+                };
+                family.name.as_str()
+            })
+            .collect();
+        assert_eq!(inputs, ["i64", "String", "i64"]);
+        assert!(constructor.unextractable);
+        assert!(matches!(
+            &expansion.nodes[constructor.cost.unwrap() as usize].kind,
+            Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
+                value: Some(pb::primitive_value::Value::I64(17))
+            }))
+        ));
+        let mut sites: Vec<_> = expansion
+            .nodes
+            .iter()
+            .filter_map(|node| {
+                let Some(pb::node::Kind::Call(call)) = &node.kind else {
+                    return None;
+                };
+                if call.func != constructor.name {
+                    return None;
+                }
+                let Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
+                    value: Some(pb::primitive_value::Value::I64(site)),
+                })) = &expansion.nodes[*call.args.last().unwrap() as usize].kind
+                else {
+                    panic!("fresh site index missing")
+                };
+                Some(*site)
+            })
+            .collect();
+        sites.sort_unstable();
+        assert_eq!(sites, [0, 1]);
+        let rule = &expansion.rules[0];
+        assert_eq!(rule.name.as_deref(), Some("fresh options"));
+        assert_eq!(rule.eval_mode, i32::from(pb::RuleEvalMode::Naive));
+        assert!(rule.no_decomp && rule.include_subsumed);
+        assert!(expansion.rulesets.is_empty());
+        assert!(!phases[5].rulesets.is_empty());
+    }
+
+    #[derive(Default)]
+    struct Provider {
+        evaluations: Arc<AtomicUsize>,
+        macro_probe: Option<Arc<MacroProbe>>,
+    }
+
+    impl NativeExtension for Provider {
+        fn initialize(&self, graph: &mut egglog::EGraph) -> Result<(), String> {
+            type Calls = Arc<AtomicUsize>;
+            egglog::add_primitive!(graph,
+                "fresh-probe"[id = "test.source.fresh-probe"] = {self.evaluations.clone(): Calls}
+                || -> i64 { { self.ctx.fetch_add(1, Ordering::SeqCst); 17 } }
+            );
+            if let Some(probe) = &self.macro_probe {
+                graph.command_macros_mut().register(probe.clone());
+            }
+            Ok(())
+        }
+
+        fn lower_custom_value(
+            &self,
+            _: &egglog::EGraph,
+            _: &egglog::ArcSort,
+            _: &pb::CustomValue,
+            _: Option<pb::Span>,
+            _: &mut pb::Program,
+        ) -> Result<pb::Call, String> {
+            Err("fresh-macro test has no custom values".into())
+        }
+
+        fn encode_custom_value(
+            &self,
+            _: &egglog::ArcSort,
+            _: &egglog::TermDag,
+            _: egglog::TermId,
+        ) -> Result<Option<pb::CustomValue>, String> {
+            Ok(None)
+        }
+    }
+
+    struct MacroProbe {
+        rules: AtomicUsize,
+        // Check expansion deliberately contains either a scope or a runtime
+        // action. Neither may be admitted by the constructor/rule exception.
+        check_prefix: Option<bool>,
+    }
+
+    impl egglog::CommandMacro for MacroProbe {
+        fn transform(
+            &self,
+            command: egglog::ast::Command,
+            _: &mut egglog::util::SymbolGen,
+            _: &egglog::TypeInfo,
+        ) -> Result<Vec<egglog::ast::Command>, egglog::Error> {
+            use egglog::ast::{Action, Command, Expr, Span};
+            if matches!(command, Command::Rule { .. }) {
+                self.rules.fetch_add(1, Ordering::SeqCst);
+            }
+            if let Some(scope) = self.check_prefix
+                && matches!(command, Command::Check(..))
+            {
+                let prefix = if scope {
+                    Command::Push(1)
+                } else {
+                    Command::Action(Action::Expr(
+                        Span::Panic,
+                        Expr::Call(Span::Panic, "fresh-probe".into(), vec![]),
+                    ))
+                };
+                return Ok(vec![prefix, command]);
+            }
+            Ok(vec![command])
+        }
+    }
+
+    #[test]
+    fn registry_runs_once_and_arbitrary_vectors_stay_unsupported() {
+        let text = "(datatype FreshValue (Seed)) (rule ((Seed)) ((unstable-fresh! FreshValue)))";
+        let probe = Arc::new(MacroProbe {
+            rules: AtomicUsize::new(0),
+            check_prefix: None,
+        });
+        let provider = Arc::new(Provider {
+            macro_probe: Some(probe.clone()),
+            ..Default::default()
+        });
+        let phases = Source::with_extension(None, text, provider.clone())
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(phases.len(), 2);
+        assert_eq!(
+            probe.rules.load(Ordering::SeqCst),
+            1,
+            "expanded rule was sent through the registry twice"
+        );
+        assert_eq!(provider.evaluations.load(Ordering::SeqCst), 0);
+        for scope in [false, true] {
+            let provider = Arc::new(Provider {
+                macro_probe: Some(Arc::new(MacroProbe {
+                    rules: AtomicUsize::new(0),
+                    check_prefix: Some(scope),
+                })),
+                ..Default::default()
+            });
+            let text = "(check (= 1 1))";
+            let mut native = new_experimental_egraph();
+            provider.initialize(&mut native).unwrap();
+            native.parse_and_run_program(None, text).unwrap();
+            let completed = provider.evaluations.load(Ordering::SeqCst);
+            assert_eq!(completed, usize::from(!scope));
+            let mut source = Source::with_extension(None, text, provider.clone()).unwrap();
+            assert!(
+                source
+                    .next()
+                    .unwrap()
+                    .unwrap_err()
+                    .to_string()
+                    .contains("multi-command source macros")
+            );
+            assert!(source.next().is_none());
+            assert_eq!(provider.evaluations.load(Ordering::SeqCst), completed);
+        }
+    }
+
+    #[test]
+    fn later_rule_errors_keep_clean_constructor_and_runtime_prefixes() {
+        // First case is an actual native type error after constructor creation.
+        // Second is native-valid but hits the existing retained-value guard
+        // after Source appended query/head nodes: those nodes must not escape.
+        for (head, native_error) in [
+            ("(fresh-probe) (missing (unstable-fresh! Math))", true),
+            (
+                "(let held (unstable-fresh! Math)) (delete (Leaf)) (Leaf)",
+                false,
+            ),
+        ] {
+            let setup = "(datatype Math (Leaf)) (function cell () i64 :merge new) (set (cell) (fresh-probe))";
+            let authored = format!("(rule ((= x (Leaf))) ({head}))");
+            let text = format!("{setup} {authored} (panic \"unreached suffix\")");
+            let native_provider = Provider::default();
+            let mut native = new_experimental_egraph();
+            native_provider.initialize(&mut native).unwrap();
+            native.parse_and_run_program(None, setup).unwrap();
+            let before = native.get_function_names();
+            let result = native.parse_and_run_program(None, &authored);
+            assert_eq!(result.is_err(), native_error);
+            if let Err(error) = result {
+                assert!(error.to_string().contains("missing"), "{error}");
+            }
+            let added: Vec<_> = native
+                .get_function_names()
+                .into_iter()
+                .filter(|name| !before.contains(name))
+                .collect();
+            assert_eq!(added.len(), 1, "native constructor prefix was not retained");
+            assert!(native.type_info().is_constructor(&added[0]));
+            assert_eq!(native.get_size(&added[0]), 0);
+            assert_eq!(native_provider.evaluations.load(Ordering::SeqCst), 1);
+
+            let provider = Arc::new(Provider::default());
+            let mut source = Source::with_extension(None, &text, provider.clone()).unwrap();
+            let mut phases = Vec::new();
+            let error = loop {
+                match source.next().expect("missing deferred error") {
+                    Ok(phase) => phases.push(phase),
+                    Err(error) => break error.to_string(),
+                }
+            };
+            assert!(
+                error.contains(if native_error {
+                    "missing"
+                } else {
+                    "retained-value lowering"
+                }),
+                "{error}"
+            );
+            assert!(source.next().is_none());
+            assert_eq!(
+                provider.evaluations.load(Ordering::SeqCst),
+                0,
+                "Source executed a runtime primitive"
+            );
+            assert_eq!(phases.len(), 4);
+            let prefix = phases.last().unwrap();
+            assert_eq!(
+                prefix.nodes.len(),
+                phases[2].nodes.len() + 1,
+                "failed rule leaked arena nodes"
+            );
+            assert!(
+                prefix.rules.is_empty() && prefix.rulesets.is_empty() && prefix.commands.is_empty()
+            );
+            let Some(pb::declaration::Kind::Constructor(constructor)) =
+                &prefix.declarations[0].kind
+            else {
+                panic!("completed constructor prefix missing")
+            };
+            let mut engine = Engine::with_extension(provider.clone());
+            let id = create(&mut engine);
+            let mut renderer = Renderer::with_extension(provider.clone()).unwrap();
+            let mut recorded = String::new();
+            for phase in &phases {
+                assert_eq!(run(&mut engine, id, phase.clone()).error, None);
+                recorded.push_str(&renderer.render(phase).unwrap());
+            }
+            assert_eq!(provider.evaluations.load(Ordering::SeqCst), 1);
+            let mut observation = prefix.clone();
+            observation.declarations.clear();
+            observation.commands = vec![
+                pb::Command {
+                    kind: Some(pb::command::Kind::PrintFunction(pb::PrintFunction {
+                        table: "cell".into(),
+                        ..Default::default()
+                    })),
+                    ..Default::default()
+                },
+                pb::Command {
+                    kind: Some(pb::command::Kind::PrintSize(pb::PrintSize {
+                        tables: vec![constructor.name.clone()],
+                    })),
+                    ..Default::default()
+                },
+            ];
+            let response = run(&mut engine, id, observation.clone());
+            assert_eq!(response.error, None);
+            let Some(pb::command_output::Kind::PrintedFunction(table)) = &response.outputs[0].kind
+            else {
+                panic!("retained cell missing")
+            };
+            assert_eq!(
+                available_table_value(&response, table.rows[0].output.as_ref().unwrap()),
+                "17"
+            );
+            assert!(
+                matches!(&response.outputs[1].kind, Some(pb::command_output::Kind::Sizes(sizes)) if sizes.sizes[0].rows == 0)
+            );
+            recorded.push_str(&renderer.render(&observation).unwrap());
+            let mut fresh = Engine::with_extension(provider.clone());
+            let id = create(&mut fresh);
+            let before = provider.evaluations.load(Ordering::SeqCst);
+            let fresh_phases = Source::with_extension(None, &recorded, provider.clone())
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            assert_eq!(provider.evaluations.load(Ordering::SeqCst), before);
+            for phase in fresh_phases {
+                let response = run(&mut fresh, id, phase);
+                assert_eq!(response.error, None);
+                for output in &response.outputs {
+                    match &output.kind {
+                        Some(pb::command_output::Kind::PrintedFunction(table)) => assert_eq!(
+                            available_table_value(
+                                &response,
+                                table.rows[0].output.as_ref().unwrap()
+                            ),
+                            "17"
+                        ),
+                        Some(pb::command_output::Kind::Sizes(sizes)) => {
+                            assert_eq!(sizes.sizes[0].rows, 0)
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            assert_eq!(provider.evaluations.load(Ordering::SeqCst), before + 1);
+        }
+    }
+
+    #[test]
+    fn popped_fresh_definitions_do_not_reuse_names_or_rule_occurrences() {
+        let mut text = r#"
+            (datatype FreshValue (Seed))
+            (relation Seen (FreshValue))
+            (ruleset work)
+            (push)
+            (rule ((Seed)) ((Seen (unstable-fresh! FreshValue))) :ruleset work :name "same")
+            (Seed) (run work 1) (check (Seen x)) (print-size Seen)
+            (pop)
+            (fail (check (Seen x))) (print-size Seen)
+            (rule ((Seed)) ((Seen (unstable-fresh! FreshValue))) :ruleset work :name "same")
+            (Seed) (run work 1) (check (Seen x)) (print-size Seen)
+        "#
+        .to_owned();
+        for cycle in 0..2 {
+            let mut source = Source::new(None, &text).unwrap();
+            let mut native = new_experimental_egraph();
+            let mut commands = native.parse_program(None, &text).unwrap().into_iter();
+            let mut replay = new_experimental_egraph();
+            let mut renderer = Renderer::default();
+            let mut recorded = String::new();
+            let mut engine = Engine::default();
+            let mut id = create(&mut engine);
+            let mut saved = Vec::new();
+            let mut generated = std::collections::HashSet::new();
+            let mut declarations = 0;
+            let mut native_sizes = Vec::new();
+            let mut replay_sizes = Vec::new();
+            let mut byte_sizes = Vec::new();
+            while let Some(phase) = source.next_submission() {
+                let phase = phase.unwrap();
+                for output in native.run_program(vec![commands.next().unwrap()]).unwrap() {
+                    if let egglog::CommandOutput::PrintFunctionSize(size) = output {
+                        native_sizes.push(size);
+                    }
+                }
+                let rendered = renderer.render_submission(&phase).unwrap();
+                for output in replay.parse_and_run_program(None, &rendered).unwrap() {
+                    if let egglog::CommandOutput::PrintFunctionSize(size) = output {
+                        replay_sizes.push(size);
+                    }
+                }
+                recorded.push_str(&rendered);
+                match phase {
+                    Submission::Program(program) => {
+                        for declaration in &program.declarations {
+                            if let Some(pb::declaration::Kind::Constructor(constructor)) =
+                                &declaration.kind
+                                && constructor.inputs.len() == 1
+                            {
+                                declarations += 1;
+                                // Native fresh symbols must never be reused.
+                                // Rendered explicit aliases may legally recur
+                                // after Pop; their state is checked below.
+                                if cycle == 0 {
+                                    assert!(
+                                        generated.insert(constructor.name.clone()),
+                                        "Pop reused native fresh constructor {:?}",
+                                        constructor.name
+                                    );
+                                }
+                            }
+                        }
+                        let response = run(&mut engine, id, program);
+                        assert_eq!(response.error, None);
+                        for output in response.outputs {
+                            if let Some(pb::command_output::Kind::Sizes(sizes)) = output.kind {
+                                assert_eq!(sizes.sizes.len(), 1);
+                                byte_sizes.push(sizes.sizes[0].rows);
+                            }
+                        }
+                    }
+                    Submission::Push(count) => {
+                        for _ in 0..count {
+                            let response = engine
+                                .clone_egraph(
+                                    &pb::CloneEGraphRequest { egraph_id: id }.encode_to_vec(),
+                                )
+                                .unwrap();
+                            saved.push(id);
+                            id = pb::CloneEGraphResponse::decode(response.as_slice())
+                                .unwrap()
+                                .egraph_id;
+                        }
+                    }
+                    Submission::Pop { count, .. } => {
+                        for _ in 0..count {
+                            let prior = saved.pop().unwrap();
+                            engine
+                                .return_to(
+                                    &pb::ReturnToEGraphRequest {
+                                        active_id: id,
+                                        saved_id: prior,
+                                    }
+                                    .encode_to_vec(),
+                                )
+                                .unwrap();
+                            id = prior;
+                        }
+                    }
+                }
+            }
+            assert!(commands.next().is_none() && saved.is_empty());
+            assert_eq!(declarations, 2);
+            if cycle == 0 {
+                assert_eq!(generated.len(), 2);
+            }
+            assert_eq!(native_sizes, [1, 0, 1], "cycle {cycle}");
+            assert_eq!(replay_sizes, [1, 0, 1], "cycle {cycle}");
+            assert_eq!(byte_sizes, [1, 0, 1], "cycle {cycle}");
+            text = recorded;
+        }
+    }
+}
+
 mod relation_predicates {
     use super::*;
 
