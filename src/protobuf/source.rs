@@ -8,7 +8,7 @@
 //! return requests; the Program iterator deliberately rejects scope operations.
 //! Selected rulesets are immutable snapshots; later source additions publish
 //! occurrence-preserving prefix/delta versions. Uncatalogued primitives, effectful local lets,
-//! dynamic costs and general schedules remain unsupported. The explicit Core
+//! dynamic costs and mutating schedule bodies remain unsupported. The explicit Core
 //! frontend also admits Run-only sequence/repeat/saturate controls. Proof requests keep
 //! their authored identity; execution mode belongs to the receiving engine.
 
@@ -60,6 +60,7 @@ struct SourceScope {
     program: pb::Program,
     rulesets: HashMap<String, SourceRuleset>,
     relations: HashSet<String>,
+    schedulers: HashSet<String>,
     local_prefix: String,
 }
 
@@ -74,6 +75,8 @@ pub struct Source {
     program: pb::Program,
     rulesets: HashMap<String, SourceRuleset>,
     relations: HashSet<String>,
+    // Names only: the producer must never instantiate or run a scheduler.
+    schedulers: HashSet<String>,
     local_prefix: String,
     // Native fresh names survive Pop; never reuse a discarded version's name.
     next_ruleset: u64,
@@ -101,6 +104,7 @@ pub(crate) fn primitive_definition(
         },
         rulesets: HashMap::new(),
         relations: HashSet::new(),
+        schedulers: HashSet::new(),
         local_prefix: String::new(),
         next_ruleset: 0,
     };
@@ -193,6 +197,7 @@ impl Source {
                 },
             )]),
             relations: HashSet::new(),
+            schedulers: HashSet::new(),
             local_prefix,
             next_ruleset: 0,
         })
@@ -264,6 +269,7 @@ impl Source {
                             program: self.program.clone(),
                             rulesets: self.rulesets.clone(),
                             relations: self.relations.clone(),
+                            schedulers: self.schedulers.clone(),
                             local_prefix: self.local_prefix.clone(),
                         });
                     }
@@ -281,6 +287,7 @@ impl Source {
                         self.program = saved.program;
                         self.rulesets = saved.rulesets;
                         self.relations = saved.relations;
+                        self.schedulers = saved.schedulers;
                         self.local_prefix = saved.local_prefix;
                     }
                     break Ok(Submission::Pop { count, span });
@@ -334,7 +341,8 @@ impl Source {
                         | Command::Action(..)
                         | Command::RunSchedule(..)
                         | Command::PrintOverallStatistics(_, None)
-                ) || matches!(&command, Command::Action(Action::Let(..))))
+                ) && !matches!(&command, Command::UserDefined(_, name, _) if name == "run-schedule")
+                    || matches!(&command, Command::Action(Action::Let(..))))
             {
                 return Err("source Fail requires a supported native command; declarations and observations are not implemented".into());
             }
@@ -405,6 +413,9 @@ impl Source {
                         &mut self.program,
                     )?;
                     continue;
+                }
+                command @ Command::UserDefined(..) if matches!(&command, Command::UserDefined(_, name, _) if matches!(name.as_str(), "let-scheduler" | "run-schedule")) => {
+                    command
                 }
                 Command::UserDefined(_, name, _) => {
                     return Err(format!(
@@ -769,6 +780,59 @@ impl Source {
                         let command = self.schedule(schedule, &mut publish)?;
                         self.program.commands.push(command);
                     }
+                    N::UserDefined(span, name, args) if name == "let-scheduler" => {
+                        let bind = source_scheduler_binding(&span, &args)?;
+                        if !self.schedulers.insert(bind.name.clone()) {
+                            return Err(format!("scheduler {} already exists", bind.name));
+                        }
+                        let span = self.span(&span)?;
+                        self.program.commands.push(pb::Command {
+                            span,
+                            kind: Some(pb::command::Kind::BindScheduler(bind)),
+                        });
+                    }
+                    N::UserDefined(span, name, args) if name == "run-schedule" => {
+                        let mut locals = HashSet::new();
+                        let body = args
+                            .iter()
+                            .map(|arg| self.extended_schedule(arg, &mut locals, &mut publish, 0))
+                            .collect::<Result<Vec<_>, _>>()?;
+                        let command = match body.as_slice() {
+                            // Only control roots can lose the implicit list.
+                            // Bind/observation leaves must remain local and keep
+                            // their schedule report and mode admission boundary.
+                            [command]
+                                if matches!(
+                                    command.kind,
+                                    Some(
+                                        pb::command::Kind::Run(_)
+                                            | pb::command::Kind::Repeat(_)
+                                            | pb::command::Kind::Saturate(_)
+                                    )
+                                ) =>
+                            {
+                                command.clone()
+                            }
+                            _ => pb::Command {
+                                span: self.span(&span)?,
+                                kind: Some(pb::command::Kind::Repeat(pb::Repeat {
+                                    times: Some(1),
+                                    body,
+                                    ..Default::default()
+                                })),
+                            },
+                        };
+                        self.program.commands.push(command);
+                    }
+                    N::PrintSize(span, table) => {
+                        let span = self.span(&span)?;
+                        self.program.commands.push(pb::Command {
+                            span,
+                            kind: Some(pb::command::Kind::PrintSize(pb::PrintSize {
+                                tables: table.into_iter().collect(),
+                            })),
+                        });
+                    }
                     _ => return Err("source command is outside the initial producer slice".into()),
                 }
             }
@@ -964,21 +1028,37 @@ impl Source {
         use ast::GenericSchedule as S;
         let (span, kind) = match schedule {
             S::Run(span, config) => {
-                if config.until.is_some() {
-                    return Err("source run-until is not supported yet".into());
-                }
                 let version = self.publish_ruleset(&config.ruleset, publish)?;
-                (
-                    span,
-                    pb::command::Kind::Run(pb::Run {
-                        ruleset: Some(pb::RulesetRef {
-                            kind: Some(pb::ruleset_ref::Kind::Name(
-                                self.program.rulesets[version].name.clone().unwrap(),
-                            )),
-                        }),
-                        ..Default::default()
+                let kind = pb::command::Kind::Run(pb::Run {
+                    ruleset: Some(pb::RulesetRef {
+                        kind: Some(pb::ruleset_ref::Kind::Name(
+                            self.program.rulesets[version].name.clone().unwrap(),
+                        )),
                     }),
-                )
+                    ..Default::default()
+                });
+                if let Some(until) = config.until {
+                    // An explicitly empty native conjunction is true; wire's
+                    // empty list instead means there is no precondition.
+                    let until = if until.is_empty() {
+                        vec![self.expr(&ResolvedExpr::Lit(span.clone(), Literal::Unit), None, 0)?]
+                    } else {
+                        self.facts(&until)?
+                    };
+                    (
+                        span.clone(),
+                        pb::command::Kind::Repeat(pb::Repeat {
+                            times: Some(1),
+                            until,
+                            body: vec![pb::Command {
+                                span: self.span(&span)?,
+                                kind: Some(kind),
+                            }],
+                        }),
+                    )
+                } else {
+                    (span, kind)
+                }
             }
             S::Sequence(span, children) => {
                 let body = children
@@ -1032,6 +1112,147 @@ impl Source {
             span: self.span(&span)?,
             kind: Some(kind),
         })
+    }
+
+    // Project the actual experimental extension syntax, without invoking its
+    // callback. Each body is validated even when an enclosing count is zero.
+    fn extended_schedule(
+        &mut self,
+        expr: &Expr,
+        locals: &mut HashSet<String>,
+        publish: &mut Vec<usize>,
+        depth: usize,
+    ) -> Result<pb::Command, String> {
+        if depth > 256 {
+            return Err("source schedule nesting exceeds 256".into());
+        }
+        let span = expr.span();
+        let (ruleset, scheduler, until) = match expr {
+            Expr::Var(_, ruleset) => (ruleset.as_str(), "", None),
+            Expr::Call(_, head, args) if matches!(head.as_str(), "run" | "run-with") => {
+                let (scheduler, args) = if head == "run-with" {
+                    let [Expr::Var(_, name), rest @ ..] = args.as_slice() else {
+                        return Err("source run-with requires a scheduler name".into());
+                    };
+                    if !locals.contains(name) && !self.schedulers.contains(name) {
+                        return Err(format!("unknown scheduler {name}"));
+                    }
+                    (name.as_str(), rest)
+                } else {
+                    ("", args.as_slice())
+                };
+                let (ruleset, rest) = match args {
+                    [Expr::Var(_, name), rest @ ..] if name != ":until" => (name.as_str(), rest),
+                    _ => ("", args),
+                };
+                let until = match rest {
+                    [] => None,
+                    [Expr::Var(_, option), condition] if option == ":until" => Some(condition),
+                    _ => {
+                        return Err(
+                            "source run requires a ruleset and optional :until expression".into(),
+                        );
+                    }
+                };
+                (ruleset, scheduler, until)
+            }
+            Expr::Call(_, head, args) if head == "let-scheduler" => {
+                let bind = source_scheduler_binding(&span, args)?;
+                if self.schedulers.contains(&bind.name) {
+                    return Err(
+                        "source local scheduler shadowing a permanent binding is unsupported"
+                            .into(),
+                    );
+                }
+                if !locals.insert(bind.name.clone()) {
+                    return Err(format!("scheduler {} already exists", bind.name));
+                }
+                return Ok(pb::Command {
+                    span: self.span(&span)?,
+                    kind: Some(pb::command::Kind::BindScheduler(bind)),
+                });
+            }
+            Expr::Call(_, head, args) if matches!(head.as_str(), "seq" | "repeat" | "saturate") => {
+                let (times, args) = if head == "repeat" {
+                    let [Expr::Lit(_, Literal::Int(count)), rest @ ..] = args.as_slice() else {
+                        return Err("source repeat requires an integer count".into());
+                    };
+                    (Some((*count).max(0) as u64), rest)
+                } else {
+                    (None, args.as_slice())
+                };
+                let mut nested = locals.clone();
+                let body = args
+                    .iter()
+                    .map(|child| self.extended_schedule(child, &mut nested, publish, depth + 1))
+                    .collect::<Result<Vec<_>, _>>()?;
+                let kind = if head == "saturate" {
+                    pb::command::Kind::Saturate(pb::Saturate {
+                        body,
+                        ..Default::default()
+                    })
+                } else {
+                    pb::command::Kind::Repeat(pb::Repeat {
+                        body,
+                        times: times.or(Some(1)),
+                        ..Default::default()
+                    })
+                };
+                return Ok(pb::Command {
+                    span: self.span(&span)?,
+                    kind: Some(kind),
+                });
+            }
+            Expr::Call(_, head, args) if head == "print-size" => {
+                let tables = match args.as_slice() {
+                    [] => vec![],
+                    [Expr::Var(_, table)] => vec![table.clone()],
+                    _ => return Err("source print-size requires at most one table".into()),
+                };
+                return Ok(pb::Command {
+                    span: self.span(&span)?,
+                    kind: Some(pb::command::Kind::PrintSize(pb::PrintSize { tables })),
+                });
+            }
+            _ => return Err("source schedule body has no supported native projection".into()),
+        };
+        let version = self.publish_ruleset(ruleset, publish)?;
+        let run = pb::Command {
+            span: self.span(&span)?,
+            kind: Some(pb::command::Kind::Run(pb::Run {
+                ruleset: Some(pb::RulesetRef {
+                    kind: Some(pb::ruleset_ref::Kind::Name(
+                        self.program.rulesets[version].name.clone().unwrap(),
+                    )),
+                }),
+                scheduler: scheduler.into(),
+            })),
+        };
+        if let Some(condition) = until {
+            // Match the extension's Fact::Fact construction exactly; Core's
+            // parser has a different equality-fact syntax.
+            let resolved = self
+                .graph
+                .resolve_command_preserving_globals(Command::Check(
+                    condition.span(),
+                    vec![Fact::Fact(condition.clone())],
+                ))
+                .map_err(|error| error.to_string())?;
+            let [N::Check(_, facts)] = resolved.as_slice() else {
+                return Err("source until resolution changed its native query".into());
+            };
+            let until = self.facts(facts)?;
+            Ok(pb::Command {
+                span: self.span(&span)?,
+                kind: Some(pb::command::Kind::Repeat(pb::Repeat {
+                    times: Some(1),
+                    until,
+                    body: vec![run],
+                })),
+            })
+        } else {
+            Ok(run)
+        }
     }
 
     fn rule(
@@ -1494,6 +1715,42 @@ fn pure_local_alias(expr: &ResolvedExpr, recreate_constructors: bool) -> bool {
     }
 }
 
+// Parse configuration only. Unlike the native extension's builder, this must
+// not allocate a scheduler instance in the producer's type environment.
+fn source_scheduler_binding(span: &ast::Span, args: &[Expr]) -> Result<pb::BindScheduler, String> {
+    let [Expr::Var(_, name), Expr::Call(config_span, kind, args)] = args else {
+        return Err("source let-scheduler requires a name and scheduler configuration".into());
+    };
+    if kind != "back-off" {
+        return Err(format!("source scheduler kind {kind} is unsupported"));
+    }
+    let tags =
+        crate::scheduling::parse_tags(config_span, args).map_err(|error| error.to_string())?;
+    let mut options = pb::BackOff::default();
+    for (tag, value) in tags {
+        let target = match tag.as_str() {
+            ":match-limit" => &mut options.match_limit,
+            ":ban-length" => &mut options.ban_length,
+            ":node-limit" => &mut options.node_limit,
+            _ => return Err(format!("unknown back-off scheduler tag {tag} at {span:?}")),
+        };
+        let Literal::Int(value) = value else {
+            return Err(format!("scheduler {tag} must be a non-negative integer"));
+        };
+        usize::try_from(value)
+            .map_err(|_| format!("scheduler {tag} exceeds native non-negative usize"))?;
+        *target = Some(
+            u64::try_from(value).map_err(|_| format!("scheduler {tag} must be non-negative"))?,
+        );
+    }
+    Ok(pb::BindScheduler {
+        name: name.clone(),
+        scheduler: Some(pb::Scheduler {
+            kind: Some(pb::scheduler::Kind::BackOff(options)),
+        }),
+    })
+}
+
 impl Iterator for Source {
     type Item = Result<pb::Program, TransportError>;
 
@@ -1863,8 +2120,8 @@ impl Renderer {
             &declaration_order,
             &constructor_cost_tables,
         )?;
-        // The renderer's graph is always NORMAL and receives definitions only:
-        // registration compiles rules/merges, but no action or helper runs.
+        // The renderer's graph is always NORMAL and receives inert definitions
+        // only: registration compiles rules/merges, but no action/helper runs.
         // Installation can partially register definitions before an error.
         // Adopt neither that state nor its private-name stamp on failed render.
         let mut session = self.session.clone();
@@ -1877,6 +2134,26 @@ impl Renderer {
                 },
             )
             .map_err(|error| TransportError(error.message))?;
+        // Retain inert definitions only, never scheduler work. Preparation of
+        // the next phase reads this same native binding metadata. The cloned
+        // Session is adopted only after text and all registrations succeeded.
+        for command in &lowered.commands {
+            if let Some(pb::command::Kind::BindScheduler(bind)) = &command.kind {
+                let (scheduler, resource_limited) =
+                    wire_back_off(bind).map_err(|error| TransportError(error.0.message))?;
+                let id = session.graph.add_scheduler(Box::new(scheduler));
+                session
+                    .graph
+                    .extension_state_or_default::<PermanentSchedulerState>()
+                    .insert(
+                        bind.name.clone(),
+                        SchedulerBinding {
+                            id,
+                            resource_limited,
+                        },
+                    );
+            }
+        }
         self.session = session;
         self.sort_names = sort_names;
         Ok(source)
@@ -2064,23 +2341,14 @@ fn render_prepared(
         names.extend(authored.sorts.values().map(String::as_str));
         names.extend(authored.callables.values().map(String::as_str));
         for command in super::command_tree(&program.commands) {
-            if dialect == Dialect::Experimental && matches!(&command.kind, Some(pb::command::Kind::Repeat(_) | pb::command::Kind::Saturate(_))) {
-                let body = match &command.kind {
-                    Some(pb::command::Kind::Repeat(repeat))
-                        if repeat.times == Some(0) && repeat.until.is_empty() => Some(&repeat.body),
-                    Some(pb::command::Kind::Saturate(saturate))
-                        // Named legacy run bounds parse as u32. Bound 1 would
-                        // normalize to Run and erase the loop outcome shape.
-                        if saturate.until.is_empty() && saturate.max_iterations.is_some_and(|bound| (2..=u64::from(u32::MAX)).contains(&bound)) => Some(&saturate.body),
-                    _ => None,
-                };
-                // Legacy run is one plain step under a zero or bounded
-                // CanStop loop. Exact RepeatN and general bodies are different.
-                if !body.is_some_and(|body| matches!(body.as_slice(),
-                    [pb::Command { kind: Some(pb::command::Kind::Run(run)), .. }]
-                    if run.scheduler.is_empty())) {
-                    return Err("composite schedule rendering is unsupported: run-schedule has distinct experimental source semantics".into());
-                }
+            match &command.kind {
+                Some(pb::command::Kind::BindScheduler(_)) if dialect == Dialect::Core =>
+                    return Err("Core source has no named scheduler syntax".into()),
+                Some(pb::command::Kind::Run(run)) if dialect == Dialect::Core && !run.scheduler.is_empty() =>
+                    return Err("Core source has no named scheduler syntax".into()),
+                Some(pb::command::Kind::BindScheduler(bind)) => names.push(&bind.name),
+                Some(pb::command::Kind::Run(run)) if !run.scheduler.is_empty() => names.push(&run.scheduler),
+                _ => (),
             }
             if let Some(pb::command::Kind::ProveExists(prove)) = &command.kind {
                 names.push(prove.constructor.as_str());
@@ -2246,7 +2514,7 @@ fn render_prepared(
                     | pb::command::Kind::ProveExists(_)
                     | pb::command::Kind::Run(_)
                     | pb::command::Kind::Stats(_))
-            ) || dialect == Dialect::Core && matches!(
+            ) || matches!(
                 &command.kind,
                 Some(pb::command::Kind::Repeat(_) | pb::command::Kind::Saturate(_))
             ))
@@ -2266,6 +2534,21 @@ fn render_prepared(
                 }
                 pb::command::Kind::Stats(_) => {
                     commands.push(Command::PrintOverallStatistics(span, None));
+                }
+                pb::command::Kind::PrintSize(print) => {
+                    if print.tables.len() > 1 {
+                        return Err("source print-size supports at most one table".into());
+                    }
+                    commands.push(Command::PrintSize(span, print.tables.first().cloned()));
+                }
+                pb::command::Kind::BindScheduler(_) => {
+                    if dialect == Dialect::Core {
+                        return Err("Core source has no named scheduler syntax".into());
+                    }
+                    let Expr::Call(_, name, args) = source_extended_schedule(
+                        program, command, &prepared.context, authored, 0,
+                    )? else { unreachable!("a binding projects to a native command") };
+                    commands.push(Command::UserDefined(span, name, args));
                 }
                 pb::command::Kind::Prove(prove) => {
                     commands.push(Command::Prove(span, facts(program, &prove.facts)?))
@@ -2303,9 +2586,25 @@ fn render_prepared(
                 pb::command::Kind::Run(_)
                 | pb::command::Kind::Repeat(_)
                 | pb::command::Kind::Saturate(_) => {
-                    commands.push(Command::RunSchedule(source_schedule(
-                        program, command, Some(&prepared.context),
-                    )?));
+                    let legacy_body = match &command.kind {
+                        Some(pb::command::Kind::Repeat(repeat))
+                            if repeat.times == Some(0) && repeat.until.is_empty() => Some(&repeat.body),
+                        Some(pb::command::Kind::Saturate(saturate))
+                            if saturate.until.is_empty() && saturate.max_iterations.is_some_and(|bound| (2..=u64::from(u32::MAX)).contains(&bound)) => Some(&saturate.body),
+                        _ => None,
+                    };
+                    let legacy = matches!(&command.kind, Some(pb::command::Kind::Run(run)) if run.scheduler.is_empty())
+                        || legacy_body.is_some_and(|body| matches!(body.as_slice(),
+                            [pb::Command { kind: Some(pb::command::Kind::Run(run)), .. }] if run.scheduler.is_empty()));
+                    if dialect == Dialect::Experimental && !legacy {
+                        commands.push(Command::UserDefined(span, "run-schedule".into(), vec![
+                            source_extended_schedule(program, command, &prepared.context, authored, 0)?,
+                        ]));
+                    } else {
+                        commands.push(Command::RunSchedule(source_schedule(
+                            program, command, Some(&prepared.context),
+                        )?));
+                    }
                 }
                 _ => return Err("unsupported source command".into()),
             }
@@ -2400,6 +2699,11 @@ fn render_prepared(
                         *name = logical.clone();
                     }
                 }
+                Command::PrintSize(_, Some(name)) => {
+                    let physical = native_name("call", name);
+                    *name = authored.callables.get(&physical)
+                        .ok_or_else(|| format!("unknown PrintSize selector {name:?}"))?.clone();
+                }
                 _ => (),
             }
         }
@@ -2453,7 +2757,11 @@ fn render_prepared(
             // runs need their unshadowed spelling even beneath Fail.
             let leaf = match command {
                 Command::RunSchedule(ast::Schedule::Run(_, config)) => {
-                    format!("(run {} 1)", config.ruleset)
+                    if config.until.is_some() {
+                        format!("(run-schedule {config})")
+                    } else {
+                        format!("(run {} 1)", config.ruleset)
+                    }
                 }
                 Command::RunSchedule(ast::Schedule::Repeat(span, bound, body))
                     if dialect == Dialect::Experimental =>
@@ -2493,6 +2801,169 @@ fn render_prepared(
         .collect())
 }
 
+// Print only the existing experimental extension language. Callable names in
+// condition expressions must be mapped here: native generic AST mapping skips
+// UserDefined arguments, and scheduler/ruleset positions are not callables.
+fn source_extended_schedule(
+    program: &pb::Program,
+    command: &pb::Command,
+    context: &RequestOccurrences,
+    authored: &NativeNames,
+    depth: usize,
+) -> Result<Expr, String> {
+    if depth > 256 {
+        return Err("source schedule nesting exceeds 256".into());
+    }
+    let span = native_span(program, command.span.as_ref())?;
+    let mut until = None;
+    let mut leaf = command;
+    if let Some(pb::command::Kind::Repeat(repeat)) = &command.kind
+        && !repeat.until.is_empty()
+    {
+        let [child] = repeat.body.as_slice() else {
+            return Err("experimental source loop-until requires one conditional Run".into());
+        };
+        if repeat.times != Some(1) || !matches!(child.kind, Some(pb::command::Kind::Run(_))) {
+            return Err("experimental source loop-until requires Repeat1 of one Run".into());
+        }
+        let conditions = facts(program, &repeat.until)?;
+        let [Fact::Fact(condition)] = conditions.as_slice() else {
+            return Err(
+                "experimental run-until requires one expression condition, not a fact conjunction"
+                    .into(),
+            );
+        };
+        until = Some(condition.clone().map_symbols(
+            &mut |name: String| authored.callables.get(&name).cloned().unwrap_or(name),
+            &mut |name| name,
+        ));
+        leaf = child;
+    }
+    let (head, args) = match leaf.kind.as_ref().ok_or("missing schedule kind")? {
+        pb::command::Kind::Run(run) => {
+            let name = match run
+                .ruleset
+                .as_ref()
+                .and_then(|r| r.kind.as_ref())
+                .ok_or("missing ruleset reference")?
+            {
+                pb::ruleset_ref::Kind::Name(name) => context.names.get(name),
+                pb::ruleset_ref::Kind::Index(index) => context.rulesets.get(*index as usize),
+            }
+            .ok_or("invalid source ruleset reference")?;
+            if name == ":until" {
+                return Err("experimental run cannot spell a ruleset named :until".into());
+            }
+            let mut args = vec![];
+            let head = if run.scheduler.is_empty() {
+                "run"
+            } else {
+                args.push(Expr::Var(span.clone(), run.scheduler.clone()));
+                "run-with"
+            };
+            args.push(Expr::Var(span.clone(), name.clone()));
+            if let Some(condition) = until {
+                args.extend([Expr::Var(span.clone(), ":until".into()), condition]);
+            }
+            (head, args)
+        }
+        pb::command::Kind::BindScheduler(bind) => {
+            let Some(pb::scheduler::Kind::BackOff(options)) =
+                bind.scheduler.as_ref().and_then(|s| s.kind.as_ref())
+            else {
+                return Err("source scheduler kind is unsupported".into());
+            };
+            let mut args = vec![];
+            for (tag, value) in [
+                (":match-limit", options.match_limit),
+                (":ban-length", options.ban_length),
+                (":node-limit", options.node_limit),
+            ] {
+                if let Some(value) = value {
+                    args.extend([
+                        Expr::Var(span.clone(), tag.into()),
+                        Expr::Lit(
+                            span.clone(),
+                            Literal::Int(
+                                i64::try_from(value).map_err(
+                                    |_| "scheduler option exceeds native source integer",
+                                )?,
+                            ),
+                        ),
+                    ]);
+                }
+            }
+            (
+                "let-scheduler",
+                vec![
+                    Expr::Var(span.clone(), bind.name.clone()),
+                    Expr::Call(span.clone(), "back-off".into(), args),
+                ],
+            )
+        }
+        pb::command::Kind::Repeat(repeat) if repeat.until.is_empty() => {
+            let count = repeat.times.ok_or("missing Repeat count")?;
+            let mut args = vec![];
+            let head = if count == 1 {
+                "seq"
+            } else {
+                args.push(Expr::Lit(
+                    span.clone(),
+                    Literal::Int(
+                        i64::try_from(count)
+                            .map_err(|_| "Repeat count exceeds native source integer")?,
+                    ),
+                ));
+                "repeat"
+            };
+            for child in &repeat.body {
+                args.push(source_extended_schedule(
+                    program,
+                    child,
+                    context,
+                    authored,
+                    depth + 1,
+                )?);
+            }
+            (head, args)
+        }
+        pb::command::Kind::Saturate(saturate) => {
+            if saturate.max_iterations.is_some() || !saturate.until.is_empty() {
+                return Err(
+                    "experimental source has no general bounded Saturate or loop-until spelling"
+                        .into(),
+                );
+            }
+            let args = saturate
+                .body
+                .iter()
+                .map(|child| source_extended_schedule(program, child, context, authored, depth + 1))
+                .collect::<Result<Vec<_>, _>>()?;
+            ("saturate", args)
+        }
+        pb::command::Kind::PrintSize(print) if print.tables.len() <= 1 => {
+            let args = print
+                .tables
+                .iter()
+                .map(|name| {
+                    let physical = native_name("call", name);
+                    Ok(Expr::Var(
+                        span.clone(),
+                        authored
+                            .callables
+                            .get(&physical)
+                            .ok_or_else(|| format!("unknown PrintSize selector {name:?}"))?
+                            .clone(),
+                    ))
+                })
+                .collect::<Result<Vec<_>, String>>()?;
+            ("print-size", args)
+        }
+        _ => return Err("source schedule body has no supported native projection".into()),
+    };
+    Ok(Expr::Call(span, head.into(), args))
+}
+
 // Preserve the wire distinction between exact Repeat1 (an explicit seq) and
 // bounded Saturate1 (a native repeat). The executor's normalization deliberately
 // erases that syntactic distinction, so it is not the source inverse.
@@ -2502,6 +2973,22 @@ fn source_schedule(
     context: Option<&RequestOccurrences>,
 ) -> Result<ast::Schedule, String> {
     let span = native_span(program, command.span.as_ref())?;
+    if let Some(pb::command::Kind::Repeat(repeat)) = &command.kind
+        && repeat.times == Some(1)
+        && !repeat.until.is_empty()
+    {
+        let [child] = repeat.body.as_slice() else {
+            return Err("source loop-until requires one conditional Run".into());
+        };
+        if !matches!(&child.kind, Some(pb::command::Kind::Run(run)) if run.scheduler.is_empty()) {
+            return Err("source loop-until requires one conditional Run without scheduler".into());
+        }
+        let ast::Schedule::Run(_, mut config) = source_schedule(program, child, context)? else {
+            unreachable!("conditional child is a Run")
+        };
+        config.until = Some(facts(program, &repeat.until)?);
+        return Ok(ast::Schedule::Run(span, config));
+    }
     let (body, bound, sequence) = match command.kind.as_ref().ok_or("missing schedule")? {
         pb::command::Kind::Run(run) if run.scheduler.is_empty() => {
             let reference = run
@@ -2573,7 +3060,7 @@ fn source_schedule(
 // insert another canonical Repeat1 when Source reimports the text.
 fn render_schedule(schedule: &ast::Schedule) -> String {
     let (head, children) = match schedule {
-        ast::Schedule::Run(_, config) => return format!("(run {})", config.ruleset),
+        ast::Schedule::Run(_, config) => return config.to_string(),
         ast::Schedule::Sequence(_, children) => ("seq".to_owned(), children.as_slice()),
         ast::Schedule::Repeat(_, _, body) | ast::Schedule::Saturate(_, body) => {
             let head = match schedule {
