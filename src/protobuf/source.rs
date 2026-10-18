@@ -259,31 +259,32 @@ pub fn produce_input(
             _ => None,
         })
         .ok_or_else(|| TransportError("input requires a table-backed callable".into()))?;
-    let rows = egglog::parse_input_file(&signature, path, fact_directory, ast::Span::Panic)
-        .map_err(|error| TransportError(error.to_string()))?;
     let mut program = descriptor.clone();
+    let file = u32::try_from(program.files.len())
+        .map_err(|_| TransportError("too many input source files".into()))?;
+    program.files.push(pb::SourceFile {
+        name: path.into(),
+        // A displayable empty diagnostic excerpt, not the CSV contents.
+        contents: Some(String::new()),
+    });
+    let span = Some(pb::Span {
+        file,
+        start: 0,
+        end: 0,
+    });
+    let rows = egglog::parse_input_file(
+        &signature,
+        path,
+        fact_directory,
+        native_span(&program, span.as_ref()).map_err(TransportError)?,
+    )
+    .map_err(|error| TransportError(error.to_string()))?;
     let mut declaration = declaration;
     if descriptor.declarations.iter().any(|row| matches!(&row.kind, Some(pb::declaration::Kind::Relation(relation)) if relation.name == table)) {
         let unit = compiler.session.graph.get_sort_by_name("Unit").unwrap();
         declaration.output = compiler.session.graph.export_sort(unit, &mut program.sorts).map_err(TransportError)?;
     }
-    let file = u32::try_from(program.files.len())
-        .map_err(|_| TransportError("too many input source files".into()))?;
-    program.files.push(pb::SourceFile {
-        name: path.into(),
-        contents: None,
-    });
-    append_input_rows(
-        &mut program,
-        declaration,
-        rows,
-        Some(pb::Span {
-            file,
-            start: 0,
-            end: 0,
-        }),
-    )
-    .map_err(TransportError)?;
+    append_input_rows(&mut program, declaration, rows, span).map_err(TransportError)?;
     Ok(program)
 }
 

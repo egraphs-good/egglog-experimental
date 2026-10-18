@@ -349,6 +349,40 @@ fn action_controls_failure_locations_preserve_prefix_and_recovery() {
 }
 
 #[test]
+fn action_controls_csv_input_errors_have_displayable_origins() {
+    use egglog_experimental::protobuf::source::{Source, produce_input};
+    let path = std::env::temp_dir().join(format!(
+        "egglog-csv-missing-{}-{}.tsv",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    assert!(!path.exists());
+    let name = path.to_str().unwrap();
+    for (setup, unsupported) in [
+        ("(function loaded (bool) i64 :no-merge)", true),
+        ("(function loaded (i64) bool :no-merge)", true),
+        ("(function loaded (i64) i64 :no-merge)", false),
+    ] {
+        let descriptor = Source::new(None, setup).unwrap().next().unwrap().unwrap();
+        let error = produce_input(&descriptor, "loaded", name, None, None).unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains(name), "{message}");
+        if unsupported {
+            assert!(
+                message.contains("Unsupported type bool for input"),
+                "{message}"
+            );
+            assert!(!message.contains("IO error"), "{message}");
+        } else {
+            assert!(message.contains("IO error"), "{message}");
+        }
+    }
+}
+
+#[test]
 fn action_controls_csv_parse_and_detached_replay() {
     use egglog_experimental::protobuf::source::{Renderer, Source, produce_input};
     let directory = std::env::temp_dir().join(format!(
