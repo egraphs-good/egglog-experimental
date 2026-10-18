@@ -6,6 +6,45 @@ use prost::Message;
 mod constructor_action_dags {
     use super::*;
 
+    fn set_program(wraps: usize, keyed: bool) -> pb::Program {
+        let mut program = program(wraps, 1);
+        let Some(pb::command::Kind::Action(pb::Action {
+            kind: Some(pb::action::Kind::Term(root)),
+            ..
+        })) = program.commands[0].kind.as_ref()
+        else {
+            unreachable!()
+        };
+        let root = *root;
+        program.declarations.push(pb::Declaration {
+            kind: Some(pb::declaration::Kind::Function(pb::Function {
+                name: "Saved".into(),
+                inputs: if keyed {
+                    vec![pb::Arg {
+                        sort: 1,
+                        name: "key".into(),
+                    }]
+                } else {
+                    vec![]
+                },
+                output: 1,
+                ..Default::default()
+            })),
+            ..Default::default()
+        });
+        program.commands[0].kind = Some(pb::command::Kind::Action(pb::Action {
+            kind: Some(pb::action::Kind::Set(pb::Set {
+                target: Some(pb::Call {
+                    func: "Saved".into(),
+                    args: if keyed { vec![root] } else { vec![] },
+                }),
+                value: Some(root),
+            })),
+            ..Default::default()
+        }));
+        program
+    }
+
     fn program(wraps: usize, share_every: usize) -> pb::Program {
         let mut program = pb::Program {
             ir_version: 1,
@@ -162,6 +201,310 @@ mod constructor_action_dags {
                         _ => true,
                     })
             );
+        }
+    }
+
+    #[test]
+    fn closed_set_packets_execute_without_auxiliary_definitions() {
+        let mut program = set_program(28, false);
+        program.commands.truncate(1);
+        assert_eq!(program.commands.len(), 1);
+        let mut expected: Vec<_> = program
+            .declarations
+            .iter()
+            .filter_map(|declaration| match &declaration.kind {
+                Some(pb::declaration::Kind::Function(function)) => Some(function.name.clone()),
+                _ => None,
+            })
+            .collect();
+        expected.sort();
+        assert_eq!(expected.len(), 1);
+        let mut engine = Engine::default();
+        let id = create(&mut engine);
+        let response = run(&mut engine, id, program);
+        assert_eq!(response.error, None);
+        assert!(response.outputs.is_empty());
+        let mut inspect = pb::Program {
+            ir_version: 1,
+            ..Default::default()
+        };
+        inspect.commands.push(pb::Command {
+            kind: Some(pb::command::Kind::Freeze(pb::Freeze {})),
+            ..Default::default()
+        });
+        let response = run(&mut engine, id, inspect);
+        assert_eq!(response.error, None);
+        let Some(pb::command_output::Kind::Snapshot(snapshot)) = &response.outputs[0].kind else {
+            panic!("snapshot")
+        };
+        let mut actual: Vec<_> = snapshot
+            .program
+            .as_ref()
+            .unwrap()
+            .declarations
+            .iter()
+            .filter_map(|declaration| match &declaration.kind {
+                Some(pb::declaration::Kind::Function(function)) => Some(function.name.clone()),
+                _ => None,
+            })
+            .collect();
+        actual.sort();
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn set_dags_keep_root_aliases_order_and_action_local_memos() {
+        for root_first in [false, true] {
+            let mut program = set_program(28, true);
+            if root_first {
+                let last = program.nodes.len() as u32 - 1;
+                program.nodes.reverse();
+                for node in &mut program.nodes {
+                    let Some(pb::node::Kind::Call(call)) = &mut node.kind else {
+                        unreachable!()
+                    };
+                    for child in &mut call.args {
+                        *child = last - *child;
+                    }
+                }
+                let Some(pb::command::Kind::Action(pb::Action {
+                    kind: Some(pb::action::Kind::Set(set)),
+                    ..
+                })) = &mut program.commands[0].kind
+                else {
+                    unreachable!()
+                };
+                for child in &mut set.target.as_mut().unwrap().args {
+                    *child = last - *child;
+                }
+                set.value = Some(last - set.value.unwrap());
+                assert_eq!(set.value, Some(0));
+            }
+            let first = program.commands[0].clone();
+            program.commands.insert(
+                1,
+                pb::Command {
+                    kind: Some(pb::command::Kind::Action(pb::Action {
+                        kind: Some(pb::action::Kind::Delete(pb::Call {
+                            func: "Leaf".into(),
+                            args: vec![],
+                        })),
+                        ..Default::default()
+                    })),
+                    ..Default::default()
+                },
+            );
+            // Deleting the producer forces the next action to recompute its
+            // locals. A request-wide memo would silently reuse the old class.
+            program.commands.insert(2, first);
+            let Some(pb::command::Kind::PrintSize(print)) = &mut program.commands[3].kind else {
+                unreachable!()
+            };
+            print.tables.push("Saved".into());
+            let mut engine = Engine::default();
+            let id = create(&mut engine);
+            let response = run(&mut engine, id, program);
+            assert_eq!(response.error, None, "root_first={root_first}");
+            let Some(pb::command_output::Kind::Sizes(sizes)) = &response.outputs[0].kind else {
+                panic!("sizes")
+            };
+            let rows: Vec<_> = sizes
+                .sizes
+                .iter()
+                .map(|table| (table.table.as_str(), table.rows))
+                .collect();
+            assert_eq!(
+                rows,
+                [("Wrap", 56), ("Pair", 56), ("Leaf", 1), ("Saved", 2)]
+            );
+        }
+    }
+
+    #[test]
+    fn malformed_or_nonconstructor_set_roots_reject_before_effects() {
+        for invalid in ["root", "target", "sort", "read", "primitive", "union"] {
+            // Union keeps its existing depth boundary, rather than exercising
+            // the unchanged generalized evaluator's exponential expansion.
+            let mut program = set_program(if invalid == "union" { 300 } else { 28 }, false);
+            program.commands.truncate(1);
+            match invalid {
+                "root" => {
+                    let Some(pb::command::Kind::Action(pb::Action {
+                        kind: Some(pb::action::Kind::Set(set)),
+                        ..
+                    })) = &mut program.commands[0].kind
+                    else {
+                        unreachable!()
+                    };
+                    set.value = Some(u32::MAX);
+                }
+                "target" => {
+                    let Some(pb::command::Kind::Action(pb::Action {
+                        kind: Some(pb::action::Kind::Set(set)),
+                        ..
+                    })) = &mut program.commands[0].kind
+                    else {
+                        unreachable!()
+                    };
+                    set.target.as_mut().unwrap().func = "missing-target".into();
+                }
+                "sort" => {
+                    let Some(pb::declaration::Kind::Function(function)) =
+                        &mut program.declarations.last_mut().unwrap().kind
+                    else {
+                        unreachable!()
+                    };
+                    function.output = 0;
+                }
+                "read" => {
+                    program.declarations.push(pb::Declaration {
+                        kind: Some(pb::declaration::Kind::Function(pb::Function {
+                            name: "Read".into(),
+                            output: 1,
+                            ..Default::default()
+                        })),
+                        ..Default::default()
+                    });
+                    program.nodes[0].kind = Some(pb::node::Kind::Call(pb::Call {
+                        func: "Read".into(),
+                        args: vec![],
+                    }));
+                }
+                "primitive" => {
+                    let literal = program.nodes.len() as u32;
+                    program.nodes.push(pb::Node {
+                        sort_id: 0,
+                        kind: Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
+                            value: Some(pb::primitive_value::Value::I64(1)),
+                        })),
+                        ..Default::default()
+                    });
+                    let primitive = program.nodes.len() as u32;
+                    program.nodes.push(pb::Node {
+                        sort_id: 0,
+                        kind: Some(pb::node::Kind::Call(pb::Call {
+                            func: "egglog.core.i64.add".into(),
+                            args: vec![literal, literal],
+                        })),
+                        ..Default::default()
+                    });
+                    let Some(pb::declaration::Kind::Constructor(leaf)) =
+                        &mut program.declarations[1].kind
+                    else {
+                        unreachable!()
+                    };
+                    leaf.inputs.push(pb::Arg {
+                        sort: 0,
+                        name: "value".into(),
+                    });
+                    let Some(pb::node::Kind::Call(call)) = &mut program.nodes[0].kind else {
+                        unreachable!()
+                    };
+                    call.args.push(primitive);
+                }
+                "union" => {
+                    program.nodes[0].kind =
+                        Some(pb::node::Kind::Union(pb::Union { members: vec![] }))
+                }
+                _ => unreachable!(),
+            }
+            program.commands.insert(
+                0,
+                pb::Command {
+                    kind: Some(pb::command::Kind::Action(pb::Action {
+                        kind: Some(pb::action::Kind::Term(0)),
+                        ..Default::default()
+                    })),
+                    ..Default::default()
+                },
+            );
+            let freeze = pb::Program {
+                ir_version: 1,
+                commands: vec![pb::Command {
+                    kind: Some(pb::command::Kind::Freeze(pb::Freeze {})),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            };
+            let mut engine = Engine::default();
+            let id = create(&mut engine);
+            let before = run(&mut engine, id, freeze.clone()).outputs;
+            let response = run(&mut engine, id, program);
+            assert!(response.outputs.is_empty(), "{invalid}");
+            let error = response.error.unwrap();
+            assert_eq!(
+                error.code,
+                i32::from(if invalid == "target" {
+                    pb::ErrorCode::UnknownName
+                } else {
+                    pb::ErrorCode::InvalidProgram
+                }),
+                "{invalid}"
+            );
+            if invalid == "union" {
+                assert!(error.message.contains("depth exceeds"), "{error:?}");
+            }
+            assert!(response.ruleset_publication.unwrap().names.is_empty());
+            assert_eq!(run(&mut engine, id, freeze).outputs, before, "{invalid}");
+        }
+    }
+
+    #[test]
+    fn set_dag_conflict_keeps_the_ordinary_action_prefix() {
+        for wraps in [3, 28] {
+            let mut program = set_program(wraps, false);
+            program.commands.truncate(1);
+            let mut initial = program.clone();
+            let Some(pb::command::Kind::Action(pb::Action {
+                kind: Some(pb::action::Kind::Set(set)),
+                ..
+            })) = &mut initial.commands[0].kind
+            else {
+                unreachable!()
+            };
+            set.value = Some(0);
+            let mut engine = Engine::default();
+            let id = create(&mut engine);
+            assert_eq!(run(&mut engine, id, initial).error, None);
+            let response = run(&mut engine, id, program);
+            let error = response.error.unwrap();
+            assert_eq!(error.code, i32::from(pb::ErrorCode::EvaluationFailed));
+            assert_eq!(error.location.unwrap().path, [0]);
+            assert!(response.outputs.is_empty());
+            assert!(response.ruleset_publication.unwrap().names.is_empty());
+            let mut inspect = set_program(wraps, false);
+            inspect.commands.remove(0);
+            let saved = inspect.nodes.len() as u32;
+            inspect.nodes.push(pb::Node {
+                sort_id: 1,
+                kind: Some(pb::node::Kind::Call(pb::Call {
+                    func: "Saved".into(),
+                    args: vec![],
+                })),
+                ..Default::default()
+            });
+            let equal = inspect.nodes.len() as u32;
+            inspect.nodes.push(pb::Node {
+                sort_id: 1,
+                kind: Some(pb::node::Kind::Union(pb::Union {
+                    members: vec![saved, 0],
+                })),
+                ..Default::default()
+            });
+            inspect.commands.insert(
+                0,
+                pb::Command {
+                    kind: Some(pb::command::Kind::Check(pb::Check { facts: vec![equal] })),
+                    ..Default::default()
+                },
+            );
+            let response = run(&mut engine, id, inspect);
+            assert_eq!(response.error, None);
+            let Some(pb::command_output::Kind::Sizes(sizes)) = &response.outputs[0].kind else {
+                panic!("sizes")
+            };
+            let rows: Vec<_> = sizes.sizes.iter().map(|table| table.rows).collect();
+            assert_eq!(rows, [wraps as u64, wraps as u64, 1]);
         }
     }
 

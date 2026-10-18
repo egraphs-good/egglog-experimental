@@ -4398,24 +4398,34 @@ fn classify_constructor_dags(
 ) -> Result<HashSet<usize>, String> {
     let mut selected = HashSet::new();
     for (position, command) in program.commands.iter().enumerate() {
-        let Some(pb::command::Kind::Action(pb::Action {
-            kind: Some(pb::action::Kind::Term(root)),
-            ..
-        })) = &command.kind
-        else {
+        let Some(pb::command::Kind::Action(action)) = &command.kind else {
             continue;
         };
-        let depth = depths
-            .get(*root as usize)
-            .ok_or("action node out of bounds")?;
-        if *depth <= 256 && expansions[*root as usize] <= 65_536 {
+        if !matches!(
+            action.kind,
+            Some(pb::action::Kind::Term(_) | pb::action::Kind::Set(_))
+        ) {
             continue;
         }
-        let mut pending = vec![*root];
+        let roots = action_roots(action)?;
+        let mut needs_scoping = false;
+        for root in &roots {
+            let depth = depths
+                .get(*root as usize)
+                .ok_or("action node out of bounds")?;
+            needs_scoping |= *depth > 256 || expansions[*root as usize] > 65_536;
+        }
+        if !needs_scoping {
+            continue;
+        }
+        // Set keys precede its value in the existing scoped action compiler.
+        let mut pending = roots;
         let mut seen = HashSet::new();
-        // The evaluator spends one Enter per edge plus the root, and at most
-        // one Call exit per unique node. Reserve the root step here.
-        let mut remaining = 65_535usize;
+        // The evaluator spends one Enter per edge plus each root, and at most
+        // one Call exit per unique node. Reserve the root steps here.
+        let mut remaining = 65_536usize
+            .checked_sub(pending.len())
+            .ok_or("constructor action DAG exceeds 65536 nodes and edges")?;
         let mut eligible = true;
         while let Some(index) = pending.pop() {
             if !seen.insert(index) {
