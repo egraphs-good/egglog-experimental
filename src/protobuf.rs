@@ -48,6 +48,39 @@ struct ScheduleMeasurements {
     maintenance: HashMap<Option<Vec<u32>>, LeafSummary>,
     selected: Vec<pb::RulesetRef>,
     failure: Option<ExecutionFailureSite>,
+    changed: bool,
+}
+
+// Fail is path-transparent; only ordered command lists add a path component.
+// These static sites also address Actions nested in controls, whose runtime
+// Union value frame is independently renewed for each iteration.
+fn action_sites(commands: &[pb::Command]) -> impl Iterator<Item = (Vec<u32>, &pb::Action)> {
+    let mut pending: Vec<_> = commands
+        .iter()
+        .enumerate()
+        .rev()
+        .map(|(index, command)| (vec![index as u32], command))
+        .collect();
+    std::iter::from_fn(move || {
+        loop {
+            let (path, command) = pending.pop()?;
+            match &command.kind {
+                Some(pb::command::Kind::Action(action)) => return Some((path, action)),
+                Some(pb::command::Kind::Fail(child)) => pending.push((path, child)),
+                Some(
+                    pb::command::Kind::Repeat(pb::Repeat { body, .. })
+                    | pb::command::Kind::Saturate(pb::Saturate { body, .. }),
+                ) => {
+                    pending.extend(body.iter().enumerate().rev().map(|(index, child)| {
+                        let mut child_path = path.clone();
+                        child_path.push(index as u32);
+                        (child_path, child)
+                    }));
+                }
+                _ => (),
+            }
+        }
+    })
 }
 
 fn command_tree(commands: &[pb::Command]) -> impl Iterator<Item = &pb::Command> {
@@ -183,8 +216,8 @@ struct RequestOccurrences {
     response_rules: HashMap<pb::RuleAttribution, u32>,
     files: Vec<pb::SourceFile>,
     include_run_reports: bool,
-    scoped_actions: HashSet<usize>,
-    constructor_dags: HashSet<usize>,
+    scoped_actions: HashSet<Vec<u32>>,
+    constructor_dags: HashSet<Vec<u32>>,
     union_values: HashMap<u32, Value>,
 }
 
@@ -1054,7 +1087,7 @@ impl Session {
         if !scoped_actions.is_empty() && self.mode != pb::ExecutionMode::Normal {
             return Err("scoped actions require normal execution mode".into());
         }
-        scoped_actions.extend(&constructor_dags);
+        scoped_actions.extend(constructor_dags.iter().cloned());
         lower_builtin_calls(program, &staged.graph, &signatures)?;
         for index in declaration_order(program, &mut staged.graph)? {
             let declaration = &program.declarations[index];
@@ -1522,9 +1555,6 @@ impl Session {
         let mut conditions = vec![];
         for (index, command) in program.commands.iter().enumerate() {
             native_span(program, command.span.as_ref())?;
-            if context.scoped_actions.contains(&index) {
-                continue;
-            }
             validation.extend(staged.validate_control(
                 program,
                 command,
@@ -1532,6 +1562,7 @@ impl Session {
                 &mut schedulers,
                 false,
                 &mut conditions,
+                &[index as u32],
             )?);
         }
         let mut compiler = self
@@ -1544,22 +1575,16 @@ impl Session {
                 .map_err(|error| error.to_string())?;
         }
         let mut values = HashMap::new();
-        for (index, command) in program.commands.iter().enumerate() {
-            if context.scoped_actions.contains(&index) {
-                let mut command = command;
-                while let Some(pb::command::Kind::Fail(child)) = &command.kind {
-                    command = child;
-                }
-                let Some(pb::command::Kind::Action(action)) = &command.kind else {
-                    unreachable!("only direct actions have Union frames")
-                };
+        for (path, action) in action_sites(&program.commands) {
+            if context.scoped_actions.contains(&path) {
                 eval_scoped_action(
                     &mut compiler,
                     program,
                     action,
                     &mut values,
                     false,
-                    context.constructor_dags.contains(&index),
+                    context.constructor_dags.contains(&path),
+                    &mut |_| {},
                 )
                 .map_err(|error| error.to_string())?;
             }
@@ -1787,6 +1812,7 @@ impl Session {
 
     // Compile every admitted descendant, even in Repeat0, without executing
     // bindings, queries or scheduler state on a disposable compiler clone.
+    #[allow(clippy::too_many_arguments)]
     fn validate_control(
         &self,
         program: &pb::Program,
@@ -1795,6 +1821,7 @@ impl Session {
         schedulers: &mut HashSet<String>,
         in_loop: bool,
         conditions: &mut Vec<(ast::Span, Vec<Fact>)>,
+        path: &[u32],
     ) -> Result<Vec<Command>, PreparationError> {
         let span = native_span(program, command.span.as_ref())?;
         match command.kind.as_ref().ok_or("missing command kind")? {
@@ -1835,7 +1862,9 @@ impl Session {
                     conditions.push((span, facts(program, until)?));
                 }
                 let mut nested = schedulers.clone();
-                for child in body {
+                for (index, child) in body.iter().enumerate() {
+                    let mut child_path = path.to_vec();
+                    child_path.push(index as u32);
                     commands.extend(self.validate_control(
                         program,
                         child,
@@ -1843,12 +1872,33 @@ impl Session {
                         &mut nested,
                         true,
                         conditions,
+                        &child_path,
                     )?);
                 }
                 Ok(commands)
             }
-            pb::command::Kind::Fail(child) if !in_loop && control_command(child) => {
-                self.validate_control(program, child, context, schedulers, false, conditions)
+            pb::command::Kind::Fail(child)
+                if control_command(child)
+                    || context.scoped_actions.contains(path)
+                    || in_loop
+                        && matches!(
+                            &child.kind,
+                            Some(
+                                pb::command::Kind::Action(_)
+                                    | pb::command::Kind::Fail(_)
+                                    | pb::command::Kind::Check(_)
+                                    | pb::command::Kind::Stats(_)
+                                    | pb::command::Kind::PrintSize(_)
+                            )
+                        ) =>
+            {
+                self.validate_control(
+                    program, child, context, schedulers, in_loop, conditions, path,
+                )
+            }
+            pb::command::Kind::Action(_) if context.scoped_actions.contains(path) => Ok(vec![]),
+            pb::command::Kind::Action(_) => {
+                self.lower_command(program, command, context, &mut HashMap::new())
             }
             pb::command::Kind::Check(_)
             | pb::command::Kind::Stats(_)
@@ -1917,11 +1967,7 @@ impl Session {
         failure_site: &mut Option<ExecutionFailureSite>,
     ) -> Result<(), egglog::Error> {
         let output = match command.kind.as_ref().unwrap() {
-            pb::command::Kind::Fail(child)
-                if context
-                    .scoped_actions
-                    .contains(&(location.path[0] as usize)) =>
-            {
+            pb::command::Kind::Fail(child) if context.scoped_actions.contains(&location.path) => {
                 let result =
                     self.execute(program, child, context, location, response, failure_site);
                 *failure_site = None;
@@ -1955,6 +2001,8 @@ impl Session {
                     export_error: None,
                     suppressed: !fail_spans.is_empty(),
                     anchor,
+                    bindings: vec![],
+                    partial: ControlReport::default(),
                 };
                 let result = if matches!(kind, pb::command::Kind::BindScheduler(_)) {
                     envelope.execute(&mut self.graph).map(|_| ())
@@ -1991,9 +2039,7 @@ impl Session {
                 Some(pb::command_output::Kind::Snapshot(freeze::export(self)?))
             }
             pb::command::Kind::Action(action)
-                if context
-                    .scoped_actions
-                    .contains(&(location.path[0] as usize)) =>
+                if context.scoped_actions.contains(&location.path) =>
             {
                 eval_scoped_action(
                     &mut self.graph,
@@ -2001,9 +2047,8 @@ impl Session {
                     action,
                     &mut context.union_values,
                     true,
-                    context
-                        .constructor_dags
-                        .contains(&(location.path[0] as usize)),
+                    context.constructor_dags.contains(&location.path),
+                    &mut |_| {},
                 )?;
                 None
             }
@@ -2329,6 +2374,8 @@ impl NativeExecutor<'_> {
         };
         let embedded = captured.is_some();
         let mut registered = false;
+        let mut actions_observed = false;
+        let mut actions_changed = false;
         let mut export_error = None;
         let mut output = |cause: usize, origin, output| {
             if origin != ExecutionOrigin::Requested {
@@ -2441,6 +2488,10 @@ impl NativeExecutor<'_> {
             });
         };
         let mut observe = |_: usize, event: ExecutionEvent<'_>| {
+            if let ExecutionEvent::ActionsFinished { changed, .. } = event {
+                actions_observed = true;
+                actions_changed |= changed;
+            }
             if matches!(
                 event,
                 ExecutionEvent::CommandCompleted {
@@ -2485,6 +2536,11 @@ impl NativeExecutor<'_> {
             measurements.borrow_mut().failure = None;
         }
         let failure = measurements.borrow().failure.clone();
+        if actions_observed && let Some(captured) = captured.as_mut() {
+            let report = captured.get_or_insert_with(Default::default);
+            report.updated |= actions_changed;
+            report.can_stop &= !actions_changed;
+        }
         if captured.is_none() {
             owned_measurements
                 .into_inner()
@@ -2506,6 +2562,13 @@ impl ScheduleMeasurements {
         location: Option<&pb::CommandLocation>,
         sites: &ScheduleSites<'_>,
     ) {
+        match event {
+            ExecutionEvent::ActionsFinished { changed, .. } => self.changed |= changed,
+            ExecutionEvent::RunFinished {
+                result: Ok(report), ..
+            } => self.changed |= report.updated,
+            _ => (),
+        }
         match event {
             ExecutionEvent::CommandCompleted {
                 origin: ExecutionOrigin::Requested,
@@ -2735,6 +2798,7 @@ struct WireSchedule<'a> {
     bindings: Vec<(String, SchedulerBinding)>,
     outcome: &'a mut Option<pb::LoopOutcome>,
     suppressed: bool,
+    partial: &'a mut ControlReport,
 }
 
 struct WireEnvelope<'a> {
@@ -2749,6 +2813,8 @@ struct WireEnvelope<'a> {
     export_error: Option<egglog::Error>,
     suppressed: bool,
     anchor: &'a pb::Command,
+    bindings: Vec<(String, SchedulerBinding)>,
+    partial: ControlReport,
 }
 
 impl WireEnvelope<'_> {
@@ -2764,9 +2830,10 @@ impl WireEnvelope<'_> {
             response: self.response,
             root: self.root,
             measurements: self.measurements,
-            bindings: vec![],
+            bindings: self.bindings.clone(),
             outcome: &mut self.outcome,
             suppressed: self.suppressed,
+            partial: &mut self.partial,
         };
         scheduling::fold_control(&mut control, self.anchor, &mut vec![], &mut vec![])
             .map(|report| report.report)
@@ -2859,13 +2926,65 @@ impl ControlContext for WireSchedule<'_> {
         path: &[usize],
         iterations: &[u64],
     ) -> Result<ControlReport, egglog::Error> {
+        let location = self.location(path, iterations);
+        if let Some(pb::command::Kind::Fail(_)) = &node.kind {
+            let mut anchor = node;
+            let mut fail_spans = vec![];
+            while let Some(pb::command::Kind::Fail(child)) = &anchor.kind {
+                fail_spans
+                    .push(native_span(self.program, anchor.span.as_ref()).expect("validated span"));
+                anchor = child;
+            }
+            let previous = std::mem::take(&mut self.measurements.borrow_mut().changed);
+            let mut envelope = WireEnvelope {
+                mode: self.executor.mode,
+                names: self.executor.names,
+                program: self.program,
+                context: self.context,
+                response: self.response,
+                root: &location,
+                measurements: self.measurements,
+                outcome: None,
+                export_error: None,
+                suppressed: true,
+                anchor,
+                bindings: self.bindings.clone(),
+                partial: ControlReport::default(),
+            };
+            let result = self.executor.graph.with_schedule_envelope(
+                &fail_spans,
+                &mut envelope,
+                |graph, state| state.execute(graph),
+                |state, report| state.complete(report),
+                |state, event| {
+                    state.measurements.borrow_mut().observe(
+                        event,
+                        state.mode,
+                        Some(state.root),
+                        &HashMap::new(),
+                    )
+                },
+            );
+            let changed = self.measurements.borrow().changed;
+            self.measurements.borrow_mut().changed |= previous;
+            let mut partial = std::mem::take(&mut envelope.partial);
+            partial.report.updated |= changed;
+            partial.report.can_stop &= !changed;
+            self.partial.report.union(partial.report.clone());
+            self.partial.resource_limited |= partial.resource_limited;
+            if result.is_err() && self.measurements.borrow().failure.is_none() {
+                self.measurements.borrow_mut().failure = Some((location, node.span));
+            }
+            result?;
+            return Ok(partial);
+        }
         if let Some(pb::command::Kind::BindScheduler(bind)) = &node.kind {
             let (scheduler, resource_limited) = wire_back_off(bind).expect("validated scheduler");
             let binding = SchedulerBinding {
                 id: self.executor.graph.add_scheduler(Box::new(scheduler)),
                 resource_limited,
             };
-            if iterations.is_empty() {
+            if self.root.iterations.is_empty() && iterations.is_empty() {
                 self.executor
                     .graph
                     .extension_state_or_default::<PermanentSchedulerState>()
@@ -2891,10 +3010,56 @@ impl ControlContext for WireSchedule<'_> {
             ),
             _ => None,
         };
-        let location = self.location(path, iterations);
+        if let Some(pb::command::Kind::Action(action)) = &node.kind
+            && self.context.scoped_actions.contains(&location.path)
+        {
+            let mut changed = false;
+            let result = eval_scoped_action(
+                self.executor.graph,
+                self.program,
+                action,
+                &mut self.context.union_values,
+                true,
+                self.context.constructor_dags.contains(&location.path),
+                &mut |event| {
+                    if let ExecutionEvent::ActionsFinished { changed: next, .. } = event {
+                        changed |= next;
+                    }
+                    self.measurements.borrow_mut().observe(
+                        event,
+                        self.executor.mode,
+                        Some(&location),
+                        &HashMap::new(),
+                    );
+                },
+            );
+            if result.is_err() {
+                self.measurements.borrow_mut().failure =
+                    Some((location, action.span.or(node.span)));
+            }
+            result?;
+            let report = egglog_reports::RunReport {
+                updated: changed,
+                can_stop: !changed,
+                ..Default::default()
+            };
+            self.partial.report.union(report.clone());
+            return Ok(ControlReport {
+                report,
+                resource_limited: false,
+            });
+        }
         let mut sites = HashMap::new();
-        let commands = lower_native_observation(self.program, node, self.context, &mut sites)
-            .expect("validated leaf");
+        let commands = if let Some(pb::command::Kind::Action(action)) = &node.kind {
+            lower_action(self.program, action)
+                .expect("validated action")
+                .into_iter()
+                .map(Command::Action)
+                .collect()
+        } else {
+            lower_native_observation(self.program, node, self.context, &mut sites)
+                .expect("validated leaf")
+        };
         let mut report = None;
         let (result, _, _) = self.executor.run_observed(
             commands,
@@ -2916,12 +3081,20 @@ impl ControlContext for WireSchedule<'_> {
             }),
         );
         if result.is_err() && self.measurements.borrow().failure.is_none() {
-            self.measurements.borrow_mut().failure = Some((location, node.span));
+            let span = match &node.kind {
+                Some(pb::command::Kind::Action(action)) => action.span.or(node.span),
+                _ => node.span,
+            };
+            self.measurements.borrow_mut().failure = Some((location, span));
         }
         result?;
+        let report = report.unwrap_or_default();
+        let resource_limited = binding.is_some_and(|binding| binding.resource_limited);
+        self.partial.report.union(report.clone());
+        self.partial.resource_limited |= resource_limited;
         Ok(ControlReport {
-            report: report.unwrap_or_default(),
-            resource_limited: binding.is_some_and(|binding| binding.resource_limited),
+            report,
+            resource_limited,
         })
     }
 
@@ -4399,16 +4572,9 @@ fn classify_constructor_dags(
     constructors: &HashSet<String>,
     depths: &[usize],
     expansions: &[usize],
-) -> Result<HashSet<usize>, String> {
+) -> Result<HashSet<Vec<u32>>, String> {
     let mut selected = HashSet::new();
-    for (position, command) in program.commands.iter().enumerate() {
-        let mut command = command;
-        while let Some(pb::command::Kind::Fail(child)) = &command.kind {
-            command = child;
-        }
-        let Some(pb::command::Kind::Action(action)) = &command.kind else {
-            continue;
-        };
+    for (path, action) in action_sites(&program.commands) {
         if !matches!(
             action.kind,
             Some(pb::action::Kind::Term(_) | pb::action::Kind::Set(_))
@@ -4462,7 +4628,7 @@ fn classify_constructor_dags(
             pending.extend(children);
         }
         if eligible {
-            selected.insert(position);
+            selected.insert(path);
         }
     }
     Ok(selected)
@@ -4498,13 +4664,14 @@ fn action_roots(action: &pb::Action) -> Result<Vec<u32>, String> {
 
 // Preclassify the whole request, not just the current command. A binary first
 // use must capture immediately if a later action reuses that same occurrence.
-// Rule heads and Fail/loop bodies retain their legacy independent boundaries.
+// Rule heads retain their independent boundary; Fail is transparent and loop
+// bodies get a fresh evaluated-value frame on every iteration.
 fn classify_union_actions(
     program: &pb::Program,
     constructor_targets: &HashSet<String>,
     constructor_costs: bool,
     depths: &[usize],
-) -> Result<HashSet<usize>, String> {
+) -> Result<HashSet<Vec<u32>>, String> {
     let unions = |action: &pb::Action| -> Result<(HashSet<u32>, usize), String> {
         let mut pending = action_roots(action)?;
         let mut seen = HashSet::new();
@@ -4548,39 +4715,25 @@ fn classify_union_actions(
         }
     }
     let mut scoped = HashSet::new();
-    for (index, command) in program.commands.iter().enumerate() {
-        for child in command_tree(std::slice::from_ref(command)) {
-            let Some(pb::command::Kind::Action(action)) = &child.kind else {
-                continue;
-            };
-            let (reached, depth) = unions(action)?;
-            let cost_action = matches!(action.kind, Some(pb::action::Kind::SetCost(_)))
-                || constructor_costs
-                    && matches!(&action.kind, Some(pb::action::Kind::Delete(call)) if constructor_targets.contains(&call.func));
-            if reached.is_empty() && !cost_action {
-                continue;
-            }
-            // Moving the arena-wide tree limit must not broaden the existing
-            // Union/cost path's admission beyond this constructor-only slice.
-            if depth > 256 {
-                return Err("expression depth exceeds this adapter's current limit of 256".into());
-            }
-            let generalized = cost_action
-                || reached.iter().any(|union| uses[union] > 1)
-                || lower_action(program, action).is_err();
-            if generalized {
-                if !std::ptr::eq(command, child) {
-                    let mut wrapped = command;
-                    while let Some(pb::command::Kind::Fail(child)) = &wrapped.kind {
-                        wrapped = child;
-                    }
-                    if !cost_action || !std::ptr::eq(wrapped, child) {
-                        return Err("generalized/reused Union identity retention under Fail or loops is not supported yet".into());
-                    }
-                }
-                check_variables(program, &action_roots(action)?, &mut HashMap::new(), false)?;
-                scoped.insert(index);
-            }
+    for (path, action) in action_sites(&program.commands) {
+        let (reached, depth) = unions(action)?;
+        let cost_action = matches!(action.kind, Some(pb::action::Kind::SetCost(_)))
+            || constructor_costs
+                && matches!(&action.kind, Some(pb::action::Kind::Delete(call)) if constructor_targets.contains(&call.func));
+        if reached.is_empty() && !cost_action {
+            continue;
+        }
+        // Moving the arena-wide tree limit must not broaden the existing
+        // Union/cost path's admission beyond this constructor-only slice.
+        if depth > 256 {
+            return Err("expression depth exceeds this adapter's current limit of 256".into());
+        }
+        let generalized = cost_action
+            || reached.iter().any(|union| uses[union] > 1)
+            || lower_action(program, action).is_err();
+        if generalized {
+            check_variables(program, &action_roots(action)?, &mut HashMap::new(), false)?;
+            scoped.insert(path);
         }
     }
     Ok(scoped)
@@ -4729,17 +4882,23 @@ fn eval_scoped_action(
     values: &mut HashMap<u32, Value>,
     execute: bool,
     share_constructors: bool,
+    observer: &mut dyn FnMut(ExecutionEvent<'_>),
 ) -> Result<(), egglog::Error> {
     if share_constructors {
         let actions =
             constructor_dag_actions(program, action, |name| graph.type_info().is_global(name))
                 .map_err(egglog::Error::BackendError)?;
-        let (result, _) = graph.eval_scoped_actions(&[], execute, |builder| {
-            for action in actions {
-                builder.action(action)?;
-            }
-            Ok(())
-        });
+        let (result, _) = graph.eval_scoped_actions_observed(
+            &[],
+            execute,
+            |builder| {
+                for action in actions {
+                    builder.action(action)?;
+                }
+                Ok(())
+            },
+            observer,
+        );
         return result;
     }
     enum Walk {
@@ -4768,7 +4927,7 @@ fn eval_scoped_action(
         .collect::<Result<Vec<_>, String>>()
         .map_err(error)?;
     inputs.sort_by(|a, b| a.0.cmp(&b.0));
-    let (result, captured) = graph.eval_scoped_actions(&inputs, execute, |builder| {
+    let compile = |builder: &mut egglog::ScopedActionBuilder<'_>| {
         let mut pending = if let Some(pb::action::Kind::SetCost(set)) = &action.kind {
             let mut pending = vec![Walk::Enter(set.cost.unwrap()), Walk::CostTarget];
             pending.extend(
@@ -4985,7 +5144,9 @@ fn eval_scoped_action(
             _ => unreachable!("only scoped action kinds use this compiler"),
         };
         builder.action(action)
-    });
+    };
+    let (result, captured) =
+        graph.eval_scoped_actions_observed(&inputs, execute, compile, observer);
     if execute {
         let captured_indices: HashMap<_, _> = slots
             .into_iter()
@@ -6442,7 +6603,16 @@ mod tests {
             ..Default::default()
         };
         let mut values = HashMap::new();
-        eval_scoped_action(&mut graph, &program, &action, &mut values, false, true).unwrap();
+        eval_scoped_action(
+            &mut graph,
+            &program,
+            &action,
+            &mut values,
+            false,
+            true,
+            &mut |_| {},
+        )
+        .unwrap();
         assert_eq!(graph.num_tuples(), 0);
         assert!(graph.materialized_eq_classes().is_empty());
         assert!(values.is_empty());
@@ -6463,12 +6633,30 @@ mod tests {
             ..Default::default()
         };
         assert!(
-            eval_scoped_action(&mut graph, &program, &invalid, &mut values, false, true).is_err()
+            eval_scoped_action(
+                &mut graph,
+                &program,
+                &invalid,
+                &mut values,
+                false,
+                true,
+                &mut |_| {}
+            )
+            .is_err()
         );
         assert_eq!(graph.num_tuples(), 0);
         assert!(graph.materialized_eq_classes().is_empty());
         program.nodes.pop();
-        eval_scoped_action(&mut graph, &program, &action, &mut values, true, true).unwrap();
+        eval_scoped_action(
+            &mut graph,
+            &program,
+            &action,
+            &mut values,
+            true,
+            true,
+            &mut |_| {},
+        )
+        .unwrap();
         assert_eq!(graph.get_size("Wrap"), 1050);
         assert_eq!(graph.get_size("Leaf"), 1);
         assert_eq!(graph.materialized_eq_classes().len(), 1051);
@@ -9327,6 +9515,59 @@ mod tests {
         program
     }
 
+    #[test]
+    fn action_controls_union_frames_are_fresh_per_iteration() {
+        let (mut engine, id) = host_default_engine();
+        let mut program = inventory_fixture("(sort A)");
+        let sort_id = program.sorts.len() as u32;
+        program.sorts.push(pb::Sort {
+            kind: Some(pb::sort::Kind::Eq("A".into())),
+            ..Default::default()
+        });
+        program.nodes.push(pb::Node {
+            sort_id,
+            kind: Some(pb::node::Kind::Union(pb::Union { members: vec![] })),
+            ..Default::default()
+        });
+        let action = pb::Command {
+            kind: Some(pb::command::Kind::Action(pb::Action {
+                kind: Some(pb::action::Kind::Term(0)),
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+        program.commands.push(pb::Command {
+            kind: Some(pb::command::Kind::Repeat(pb::Repeat {
+                times: Some(3),
+                until: vec![],
+                body: vec![pb::Command {
+                    kind: Some(pb::command::Kind::Repeat(pb::Repeat {
+                        times: Some(2),
+                        until: vec![],
+                        body: vec![action.clone(), action],
+                    })),
+                    ..Default::default()
+                }],
+            })),
+            ..Default::default()
+        });
+        let response = run_host_default(&mut engine, id, program);
+        assert_eq!(response.error, None);
+        assert!(
+            matches!(&response.outputs[0].kind, Some(pb::command_output::Kind::Loop(outcome)) if outcome.iterations == 3 && outcome.updated)
+        );
+        assert_eq!(
+            engine.graphs[&id]
+                .graph
+                .materialized_eq_classes()
+                .iter()
+                .filter(|(name, _)| name.as_ref() == native_name("sort", "A"))
+                .count(),
+            6,
+            "two uses retain one Union identity inside each body; six body executions mint six classes"
+        );
+    }
+
     // Native class inventory: execution enters only through encoded requests.
     #[test]
     fn byte_actions_preserve_orphan_class_inventory() {
@@ -10007,8 +10248,8 @@ mod tests {
     }
 
     #[test]
-    fn byte_union_rejects_new_contexts_and_invalid_unused_graphs_before_effects() {
-        for case in 0..10 {
+    fn byte_union_control_contexts_and_invalid_unused_graphs_preserve_effect_boundaries() {
+        for case in 0..11 {
             let (mut engine, id) = host_default_engine();
             let mut program = inventory_fixture("(datatype A (Atom i64) (Box A)) (Atom 1)");
             let Some(pb::command::Kind::Action(pb::Action {
@@ -10099,20 +10340,41 @@ mod tests {
                 _ => program.commands.push(pb::Command {
                     kind: Some(pb::command::Kind::Repeat(pb::Repeat {
                         body: vec![action],
-                        times: Some(1),
+                        times: Some(u64::from(case == 9)),
                         until: vec![],
                     })),
                     ..Default::default()
                 }),
             }
             let response = run_host_default(&mut engine, id, program);
+            let graph = &engine.graphs[&id].graph;
+            if matches!(case, 0 | 9 | 10) {
+                if case == 0 {
+                    assert_eq!(
+                        response.error.unwrap().code,
+                        i32::from(pb::ErrorCode::EvaluationFailed)
+                    );
+                    assert!(response.outputs.is_empty());
+                } else {
+                    assert_eq!(response.error, None);
+                    assert!(
+                        matches!(&response.outputs[0].kind, Some(pb::command_output::Kind::Loop(outcome)) if outcome.iterations == u64::from(case == 9) && outcome.updated == (case == 9))
+                    );
+                }
+                assert_eq!(graph.get_size(&native_name("call", "Atom")), 1);
+                assert_eq!(
+                    graph.materialized_eq_classes().len(),
+                    if case == 10 { 1 } else { 2 },
+                    "case {case}: Fail retains its successful prefix; Repeat0 does not mint a Union identity"
+                );
+                continue;
+            }
             assert_eq!(
                 response.error.unwrap().code,
                 i32::from(pb::ErrorCode::InvalidProgram),
                 "case {case}"
             );
             assert!(response.outputs.is_empty());
-            let graph = &engine.graphs[&id].graph;
             assert_eq!(graph.num_tuples(), 0, "case {case}");
             assert!(graph.materialized_eq_classes().is_empty(), "case {case}");
         }

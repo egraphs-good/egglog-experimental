@@ -3,6 +3,452 @@ use egglog_experimental::{PortableEGraph, PortableTypeInfo};
 use egglog_experimental::{new_experimental_egraph, protobuf::Engine};
 use prost::Message;
 
+#[test]
+fn action_controls_source_native_and_replay() {
+    use egglog_experimental::protobuf::source::{Renderer, Source};
+    let text = "(function f () i64 :merge new) (function g () i64 :merge new)
+        (datatype Token (Mark))
+        (set (g) 0)
+        (run-schedule (repeat 0 (set (f) 9)))
+        (run-schedule (saturate (set (f) 1) (print-size f)))
+        (run-schedule (saturate (delete (f)) (print-size f)))
+        (run-schedule (repeat 3 (set (g) (+ (g) 1))))
+        (run-schedule (saturate (fail (fail (eval (Mark)))) (print-size Mark)))
+        (check (= (g) 3))";
+    let mut native = new_experimental_egraph();
+    let outputs = native.parse_and_run_program(None, text).unwrap();
+    assert_eq!(
+        outputs
+            .iter()
+            .filter(|output| matches!(
+                output,
+                egglog_experimental::CommandOutput::PrintFunctionSize(_)
+            ))
+            .count(),
+        6
+    );
+    let mut engine = Engine::default();
+    let id = create(&mut engine);
+    let mut renderer = Renderer::default();
+    let mut rendered = String::new();
+    let mut counts = vec![];
+    for phase in Source::new(None, text).unwrap() {
+        let program = phase.unwrap();
+        rendered.push_str(&renderer.render(&program).unwrap());
+        let response = run(&mut engine, id, program);
+        assert_eq!(response.error, None);
+        for output in response.outputs {
+            if let Some(pb::command_output::Kind::Loop(outcome)) = output.kind {
+                counts.push(outcome.iterations);
+            }
+        }
+    }
+    assert_eq!(counts, [0, 2, 2, 3, 2]);
+    let mut replay = new_experimental_egraph();
+    let outputs = replay.parse_and_run_program(None, &rendered).unwrap();
+    assert_eq!(
+        outputs
+            .iter()
+            .filter(|output| matches!(
+                output,
+                egglog_experimental::CommandOutput::PrintFunctionSize(_)
+            ))
+            .count(),
+        6
+    );
+    let replay_id = create(&mut engine);
+    for phase in Source::new(None, &rendered).unwrap() {
+        assert_eq!(run(&mut engine, replay_id, phase.unwrap()).error, None);
+    }
+}
+
+#[test]
+fn action_controls_caught_prefix_progress_and_nested_counts() {
+    use egglog_experimental::protobuf::source::{Renderer, Source};
+    let text = "(datatype A (N i64) (Wrap A)) (function f (A) A :no-merge)
+        (function counter () i64 :merge new) (set (counter) 0)
+        (set (f (N 0)) (N 1))
+        (run-schedule (saturate (fail (set (f (N 0)) (Wrap (N 3)))) (print-size Wrap)))
+        (run-schedule (saturate (fail (seq (set (f (N 0)) (Wrap (N 4))))) (print-size Wrap)))
+        (run-schedule (saturate (fail (panic \"inert\")) (print-size Wrap)))
+        (run-schedule (repeat 3 (repeat 2 (set (counter) (+ (counter) 1)))))
+        (check (= (counter) 6) (Wrap (N 3)) (= (f (N 0)) (N 1)))";
+    let mut native = new_experimental_egraph();
+    let outputs = native.parse_and_run_program(None, text).unwrap();
+    assert_eq!(
+        outputs
+            .iter()
+            .filter(|output| matches!(
+                output,
+                egglog_experimental::CommandOutput::PrintFunctionSize(_)
+            ))
+            .count(),
+        5
+    );
+    let mut engine = Engine::default();
+    let id = create(&mut engine);
+    let mut renderer = Renderer::default();
+    let mut rendered = String::new();
+    let mut counts = vec![];
+    for phase in Source::new(None, text).unwrap() {
+        let phase = phase.unwrap();
+        rendered.push_str(&renderer.render(&phase).unwrap());
+        let response = run(&mut engine, id, phase);
+        assert_eq!(response.error, None);
+        for output in response.outputs {
+            if let Some(pb::command_output::Kind::Loop(outcome)) = output.kind {
+                counts.push(outcome.iterations);
+            }
+        }
+    }
+    assert_eq!(counts, [2, 2, 1, 3]);
+    new_experimental_egraph()
+        .parse_and_run_program(None, &rendered)
+        .unwrap();
+}
+
+#[test]
+fn action_controls_exact_counts_and_dead_validation_every_mode() {
+    use egglog_experimental::protobuf::source::Source;
+    // Count actual Run invocations as well as checking the Action's result.
+    // Non-idempotent merge arithmetic is not an encoded-mode iteration oracle.
+    let text = "(function counter () i64 :merge new) (set (counter) 0) (ruleset empty)
+        (run-schedule (repeat 0 (set (counter) 100)))
+        (run-schedule (repeat 3 (repeat 2 (set (counter) 7) (run empty))))
+        (check (= (counter) 7))";
+    for mode in [
+        pb::ExecutionMode::Normal,
+        pb::ExecutionMode::TermEncoding,
+        pb::ExecutionMode::Proofs,
+        pb::ExecutionMode::ProofTesting,
+    ] {
+        let mut native = match mode {
+            pb::ExecutionMode::Normal => egglog::EGraph::default(),
+            pb::ExecutionMode::TermEncoding => egglog::EGraph::new_with_term_encoding(),
+            pb::ExecutionMode::Proofs => egglog::EGraph::new_with_proofs(),
+            _ => egglog::EGraph::new_with_proofs().with_proof_testing(),
+        };
+        native
+            .add_command(
+                "run-schedule".into(),
+                std::sync::Arc::new(egglog_experimental::scheduling::RunExtendedSchedule),
+            )
+            .unwrap();
+        let ordinary = format!(
+            "(function counter () i64 :merge new) (set (counter) 0) {} (check (= (counter) 7))",
+            "(set (counter) 7) ".repeat(6)
+        );
+        native
+            .parse_and_run_program(
+                None,
+                if mode == pb::ExecutionMode::Normal {
+                    text
+                } else {
+                    &ordinary
+                },
+            )
+            .unwrap_or_else(|error| panic!("native {mode:?}: {error}"));
+        let mut engine = Engine::default();
+        let request = pb::CreateEGraphRequest {
+            sorts: fixture().sorts[..1].to_vec(),
+            options: Some(pb::EGraphOptions {
+                execution_mode: mode.into(),
+                cost_sort: Some(0),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let created = pb::CreateEGraphResponse::decode(
+            engine.create(&request.encode_to_vec()).unwrap().as_slice(),
+        )
+        .unwrap();
+        let mut counts = vec![];
+        let mut runs = 0;
+        for phase in Source::new(None, text).unwrap() {
+            let response = run(&mut engine, created.egraph_id, phase.unwrap());
+            assert_eq!(response.error, None, "{mode:?}");
+            runs += response
+                .profile
+                .as_ref()
+                .unwrap()
+                .runs
+                .iter()
+                .map(|run| run.invocations)
+                .sum::<u64>();
+            for output in response.outputs {
+                if let Some(pb::command_output::Kind::Loop(outcome)) = output.kind {
+                    counts.push(outcome.iterations);
+                }
+            }
+        }
+        assert_eq!(counts, [0, 3], "{mode:?}");
+        assert_eq!(
+            runs, 6,
+            "{mode:?}: only the six authored empty Runs are reported"
+        );
+        let mut producer =
+            Source::new(None, "(run-schedule (repeat 0 (set (missing) 1)))").unwrap();
+        assert!(producer.next().unwrap().is_err());
+    }
+    assert!(
+        new_experimental_egraph()
+            .parse_and_run_program(None, "(run-schedule (repeat 0 (set (missing) 1)))")
+            .is_err()
+    );
+}
+
+#[test]
+fn action_controls_caught_deferred_work_retains_continuation() {
+    use egglog_experimental::protobuf::source::Source;
+    let text = "(relation R (i64)) (relation S (i64)) (ruleset copy)
+        (rule ((R x)) ((S x)) :ruleset copy) (R 1) (R 2)
+        (let-scheduler bo (back-off :match-limit 1 :ban-length 1))
+        (run-schedule (saturate (fail (seq (run-with bo copy) (panic \"caught\")))))
+        (check (S 1) (S 2))";
+    new_experimental_egraph()
+        .parse_and_run_program(None, text)
+        .unwrap();
+    let mut engine = Engine::default();
+    let id = create(&mut engine);
+    let mut completed = false;
+    for phase in Source::new(None, text).unwrap() {
+        let response = run(&mut engine, id, phase.unwrap());
+        assert_eq!(response.error, None);
+        if let Some(pb::command_output::Kind::Loop(outcome)) = response
+            .outputs
+            .first()
+            .and_then(|output| output.kind.as_ref())
+        {
+            assert!(outcome.iterations > 1);
+            assert_eq!(
+                outcome.termination,
+                Some(pb::TerminationReason::Saturated.into())
+            );
+            assert_eq!(
+                response
+                    .profile
+                    .unwrap()
+                    .runs
+                    .iter()
+                    .map(|run| run.invocations)
+                    .sum::<u64>(),
+                outcome.iterations
+            );
+            completed = true;
+        }
+    }
+    assert!(completed);
+}
+
+#[test]
+fn action_controls_native_primitive_preparation_is_ordered_and_inert() {
+    for steps in [
+        "(primitive step (i64) i64 (+ _0 1)) (eval (step 2))",
+        "(seq (primitive step (i64) i64 (+ _0 1)) (eval (step 2)))",
+        "(push) (primitive step (i64) i64 (+ _0 1)) (eval (step 2)) (pop) (primitive step (i64) i64 (+ _0 1)) (eval (step 2))",
+    ] {
+        new_experimental_egraph()
+            .parse_and_run_program(
+                None,
+                &format!("(run-schedule {steps}) (check (= (step 2) 3))"),
+            )
+            .unwrap();
+    }
+    // Preparing a primitive must not execute its body, including dead actions.
+    new_experimental_egraph()
+        .parse_and_run_program(
+            None,
+            "(run-schedule (repeat 0 (primitive dead () i64 (/ 1 0)) (eval (dead))))",
+        )
+        .unwrap();
+}
+
+#[test]
+fn action_controls_failure_locations_preserve_prefix_and_recovery() {
+    use egglog_experimental::protobuf::source::Source;
+    let setup = "(function f (i64) i64 :merge new)";
+    for (body, path, iterations) in [
+        (
+            "(seq (set (f 0) 1) (panic \"row two\") (set (f 1) 3))",
+            vec![0, 0, 1],
+            vec![0, 0],
+        ),
+        ("(fail (set (f 0) 1))", vec![0, 0], vec![0]),
+    ] {
+        let mut engine = Engine::default();
+        let id = create(&mut engine);
+        let text = format!("{setup} (run-schedule (repeat 2 {body}))");
+        let mut failed = false;
+        for phase in Source::new(None, &text).unwrap() {
+            let response = run(&mut engine, id, phase.unwrap());
+            if let Some(error) = response.error {
+                assert_eq!(
+                    error.location,
+                    Some(pb::CommandLocation {
+                        path: path.clone(),
+                        iterations: iterations.clone()
+                    })
+                );
+                assert!(error.span.is_some());
+                failed = true;
+                break;
+            }
+        }
+        assert!(failed);
+        let recovery = format!(
+            "{setup} (check (= (f 0) 1)) (fail (check (= (f 1) 3))) (set (f 8) 8) (check (= (f 8) 8))"
+        );
+        for phase in Source::new(None, &recovery).unwrap() {
+            assert_eq!(run(&mut engine, id, phase.unwrap()).error, None);
+        }
+    }
+    let mut engine = Engine::default();
+    let id = create(&mut engine);
+    let text = "(function conflict () i64 :no-merge) (set (conflict) 1)
+        (run-schedule (repeat 2 (set (conflict) 2)))";
+    let mut failed = false;
+    for phase in Source::new(None, text).unwrap() {
+        let mut program = phase.unwrap();
+        let mut authored = None;
+        if let Some(pb::command::Kind::Repeat(repeat)) = program
+            .commands
+            .first_mut()
+            .and_then(|command| command.kind.as_mut())
+        {
+            let leaf = &mut repeat.body[0];
+            let Some(pb::command::Kind::Action(action)) = &leaf.kind else {
+                panic!("fixture")
+            };
+            authored = action.span;
+            assert!(authored.is_some());
+            leaf.span = None;
+        }
+        let response = run(&mut engine, id, program);
+        if let Some(error) = response.error {
+            assert_eq!(error.span, authored);
+            assert_eq!(
+                error.location,
+                Some(pb::CommandLocation {
+                    path: vec![0, 0],
+                    iterations: vec![0]
+                })
+            );
+            for phase in Source::new(
+                None,
+                "(function conflict () i64 :no-merge) (check (= (conflict) 1))",
+            )
+            .unwrap()
+            {
+                assert_eq!(run(&mut engine, id, phase.unwrap()).error, None);
+            }
+            failed = true;
+            break;
+        }
+    }
+    assert!(failed);
+}
+
+#[test]
+fn action_controls_csv_parse_and_detached_replay() {
+    use egglog_experimental::protobuf::source::{Renderer, Source, produce_input};
+    let directory = std::env::temp_dir().join(format!(
+        "egglog-csv-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir(&directory).unwrap();
+    let path = directory.join("rows\r\"\\\u{300}.tsv");
+    let name = path.to_str().unwrap();
+    let setup = "(function f (i64) i64 :merge (+ (* old 10) new))";
+    let descriptor = Source::new(None, setup).unwrap().next().unwrap().unwrap();
+    std::fs::write(&path, "0\t2\n0\t3\n").unwrap();
+    let rows = produce_input(&descriptor, "f", name, None, None).unwrap();
+    assert_eq!(rows.commands.len(), 2);
+    assert!(rows.files.iter().any(|file| file.name == name));
+    assert_eq!(&rows.nodes[..descriptor.nodes.len()], descriptor.nodes);
+    std::fs::remove_file(&path).unwrap();
+    let mut engine = Engine::default();
+    let id = create(&mut engine);
+    assert_eq!(run(&mut engine, id, rows.clone()).error, None);
+    let mut renderer = Renderer::default();
+    let rendered = renderer.render(&rows).unwrap();
+    assert!(!rendered.contains("(input "));
+    let check = Source::new(None, &format!("{setup} (check (= (f 0) 23))"))
+        .unwrap()
+        .last()
+        .unwrap()
+        .unwrap();
+    let rendered_check = renderer.render(&check).unwrap();
+    assert_eq!(run(&mut engine, id, check).error, None);
+    new_experimental_egraph()
+        .parse_and_run_program(None, &format!("{rendered}{rendered_check}"))
+        .unwrap();
+    for (contents, expected_rows) in [
+        ("0\t2\ninvalid\t3\n", 0),
+        ("", 0),
+        ("0\t2\n0\t3\n1\t4\n", 3),
+    ] {
+        std::fs::write(&path, contents).unwrap();
+        for wrappers in 0..3 {
+            let input = format!("(input f {})", egglog::ast::Literal::String(name.into()));
+            let input = format!(
+                "{}{input}{}",
+                "(fail ".repeat(wrappers),
+                ")".repeat(wrappers)
+            );
+            let text = format!("{setup} {input}");
+            let mut producer = Source::new(None, &text).unwrap();
+            let mut engine = Engine::default();
+            let id = create(&mut engine);
+            let mut producer_failed = false;
+            let mut execution_failed = false;
+            for phase in &mut producer {
+                match phase {
+                    Err(_) => {
+                        producer_failed = true;
+                        break;
+                    }
+                    Ok(phase) => {
+                        let response = run(&mut engine, id, phase);
+                        if response.error.is_some() {
+                            execution_failed = true;
+                            break;
+                        }
+                    }
+                }
+            }
+            if contents.contains("invalid") {
+                assert_eq!(producer_failed, wrappers % 2 == 0);
+                assert!(!execution_failed);
+            } else {
+                assert!(!producer_failed);
+                assert_eq!(execution_failed, wrappers % 2 == 1);
+            }
+            let mut observe = descriptor.clone();
+            observe.commands.push(pb::Command {
+                kind: Some(pb::command::Kind::PrintSize(pb::PrintSize {
+                    tables: vec!["f".into()],
+                })),
+                ..Default::default()
+            });
+            let response = run(&mut engine, id, observe);
+            assert_eq!(response.error, None);
+            let Some(pb::command_output::Kind::Sizes(sizes)) = &response.outputs[0].kind else {
+                panic!("missing rows");
+            };
+            assert_eq!(
+                sizes.sizes[0].rows,
+                if expected_rows == 3 { 2 } else { expected_rows }
+            );
+        }
+    }
+    std::fs::remove_file(path).unwrap();
+    std::fs::remove_dir(directory).unwrap();
+}
+
 mod constructor_action_dags {
     use super::*;
 
@@ -2178,12 +2624,15 @@ mod relation_predicates {
 
     #[test]
     fn scheduler_deferred_work_matches_native_and_profiles_one_site_in_every_mode() {
-        for mode in [
+        for (mode, fail_depth) in [
             pb::ExecutionMode::Normal,
             pb::ExecutionMode::TermEncoding,
             pb::ExecutionMode::Proofs,
             pb::ExecutionMode::ProofTesting,
-        ] {
+        ]
+        .into_iter()
+        .flat_map(|mode| [0, 2].map(|depth| (mode, depth)))
+        {
             let mut native = match mode {
                 pb::ExecutionMode::Normal => new_experimental_egraph(),
                 pb::ExecutionMode::TermEncoding => {
@@ -2214,7 +2663,14 @@ mod relation_predicates {
             )
             .unwrap();
             let schedule = native
-                .parse_program(None, "(run-schedule (run-with bo copy))")
+                .parse_program(
+                    None,
+                    if fail_depth == 0 {
+                        "(run-schedule (run-with bo copy))"
+                    } else {
+                        "(run-schedule (fail (fail (run-with bo copy))))"
+                    },
+                )
                 .unwrap();
             let [egglog::ast::Command::UserDefined(_, _, args)] = schedule.as_slice() else {
                 panic!("{schedule:?}")
@@ -2277,17 +2733,24 @@ mod relation_predicates {
             let bound = run(&mut engine, id, program.clone());
             assert_eq!(bound.error, None);
             assert!(bound.outputs.is_empty());
+            let mut step = pb::Command {
+                kind: Some(pb::command::Kind::Run(pb::Run {
+                    ruleset: Some(pb::RulesetRef {
+                        kind: Some(pb::ruleset_ref::Kind::Name("wire_predicates".into())),
+                    }),
+                    scheduler: "bo".into(),
+                })),
+                ..Default::default()
+            };
+            for _ in 0..fail_depth {
+                step = pb::Command {
+                    kind: Some(pb::command::Kind::Fail(Box::new(step))),
+                    ..Default::default()
+                };
+            }
             program.commands = vec![pb::Command {
                 kind: Some(pb::command::Kind::Saturate(pb::Saturate {
-                    body: vec![pb::Command {
-                        kind: Some(pb::command::Kind::Run(pb::Run {
-                            ruleset: Some(pb::RulesetRef {
-                                kind: Some(pb::ruleset_ref::Kind::Name("wire_predicates".into())),
-                            }),
-                            scheduler: "bo".into(),
-                        })),
-                        ..Default::default()
-                    }],
+                    body: vec![step],
                     ..Default::default()
                 })),
                 ..Default::default()
@@ -2492,14 +2955,32 @@ mod relation_predicates {
 
     #[test]
     fn scheduler_bounds_resource_policy_and_zero_options_are_not_saturation() {
-        for (limit, ban, count, expected) in [
+        for ((limit, ban, count, expected), fail_depth) in [
             (None, 1, Some(1), pb::TerminationReason::IterationLimit),
             (Some(0), 0, None, pb::TerminationReason::SchedulerLimit),
             (None, 0, None, pb::TerminationReason::SchedulerLimit),
-        ] {
+        ]
+        .into_iter()
+        .flat_map(|case| [0, 2].map(|depth| (case, depth)))
+        {
             let mut engine = Engine::default();
             let id = create(&mut engine);
             let mut program = scheduler_program();
+            let mut step = pb::Command {
+                kind: Some(pb::command::Kind::Run(pb::Run {
+                    ruleset: Some(pb::RulesetRef {
+                        kind: Some(pb::ruleset_ref::Kind::Index(0)),
+                    }),
+                    scheduler: "b".into(),
+                })),
+                ..Default::default()
+            };
+            for _ in 0..fail_depth {
+                step = pb::Command {
+                    kind: Some(pb::command::Kind::Fail(Box::new(step))),
+                    ..Default::default()
+                };
+            }
             program.commands.extend([
                 pb::Command {
                     kind: Some(pb::command::Kind::BindScheduler(pb::BindScheduler {
@@ -2517,15 +2998,7 @@ mod relation_predicates {
                 pb::Command {
                     kind: Some(pb::command::Kind::Saturate(pb::Saturate {
                         max_iterations: count,
-                        body: vec![pb::Command {
-                            kind: Some(pb::command::Kind::Run(pb::Run {
-                                ruleset: Some(pb::RulesetRef {
-                                    kind: Some(pb::ruleset_ref::Kind::Index(0)),
-                                }),
-                                scheduler: "b".into(),
-                            })),
-                            ..Default::default()
-                        }],
+                        body: vec![step],
                         ..Default::default()
                     })),
                     ..Default::default()
@@ -2743,9 +3216,20 @@ mod relation_predicates {
             );
         }
         assert_eq!(response.profile.unwrap().runs[0].invocations, 2);
-        // Even a dead body cannot infer progress from a default report for an
-        // action; the earlier valid marker write must remain unexecuted.
-        let action = program.commands[0].clone();
+        // Dead bodies still validate ordinary action targets before execution.
+        let action = pb::Command {
+            kind: Some(pb::command::Kind::Action(pb::Action {
+                kind: Some(pb::action::Kind::Set(pb::Set {
+                    target: Some(pb::Call {
+                        func: "missing_table".into(),
+                        args: vec![],
+                    }),
+                    value: Some(0),
+                })),
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
         program.commands = vec![pb::Command {
             kind: Some(pb::command::Kind::Repeat(pb::Repeat {
                 times: Some(0),
@@ -2760,7 +3244,7 @@ mod relation_predicates {
                 .error
                 .unwrap()
                 .message
-                .contains("mutation-progress")
+                .contains("unknown action target")
         );
         assert!(rejected.outputs.is_empty());
 
@@ -6519,11 +7003,30 @@ fn experimental_renderer_rejects_unrepresentable_loop_shapes() {
         assert!(Renderer::default().render(&program).is_err());
     }
     for text in [
-        "(ruleset r) (run-schedule (repeat 3 (eval 1)))",
+        "(ruleset r) (run-schedule (repeat 3 (eval (Missing 1))))",
         "(ruleset r) (run-schedule (repeat 0 (let-scheduler b (back-off :ban-length -1))))",
     ] {
         assert!(Source::new(None, text).unwrap().any(|phase| phase.is_err()));
     }
+    let mut engine = Engine::default();
+    let id = create(&mut engine);
+    let mut observed = false;
+    for phase in Source::new(None, "(run-schedule (repeat 3 (eval 1)))").unwrap() {
+        let phase = phase.unwrap();
+        Renderer::default().render(&phase).unwrap();
+        let response = crate::run(&mut engine, id, phase);
+        assert_eq!(response.error, None);
+        if let Some(pb::command_output::Kind::Loop(outcome)) = response
+            .outputs
+            .first()
+            .and_then(|output| output.kind.as_ref())
+        {
+            assert_eq!(outcome.iterations, 3);
+            assert!(!outcome.updated);
+            observed = true;
+        }
+    }
+    assert!(observed);
 }
 
 #[test]
@@ -6929,10 +7432,7 @@ fn source_scheduler_scope_and_rejection_preserve_submitted_prefix() {
             "(run-schedule (let-scheduler local (back-off))) (run-schedule (run-with local r))",
             "unknown scheduler",
         ),
-        (
-            "(run-schedule (repeat 0 (eval 1)))",
-            "no supported native projection",
-        ),
+        ("(run-schedule (repeat 0 (eval (Missing 1))))", "Missing"),
     ] {
         let text = format!("(relation Marker (i64)) (Marker 1) (ruleset r) {tail} (Marker 2)");
         let mut engine = Engine::default();
@@ -16175,7 +16675,7 @@ fn fail_unexpected_success_uses_wrapper_span_and_keeps_prefix() {
 }
 
 #[test]
-fn fail_does_not_reset_union_admission_or_enable_profile_off() {
+fn fail_preserves_union_identity_and_does_not_enable_profile_off() {
     let mut program = union_read_fixture();
     program.commands[5] = pb::Command {
         kind: Some(pb::command::Kind::Fail(Box::new(
@@ -16187,9 +16687,35 @@ fn fail_does_not_reset_union_admission_or_enable_profile_off() {
     let id = create(&mut engine);
     let response = run(&mut engine, id, program.clone());
     let error = response.error.unwrap();
-    assert_eq!(error.code, i32::from(pb::ErrorCode::InvalidProgram));
-    assert!(error.message.contains("identity retention"));
-    assert!(error.location.is_none());
+    assert_eq!(error.code, i32::from(pb::ErrorCode::EvaluationFailed));
+    assert_eq!(error.location.unwrap().path, [5]);
+    assert!(matches!(
+        response.outputs.as_slice(),
+        [pb::CommandOutput {
+            kind: Some(pb::command_output::Kind::Run(_)),
+            ..
+        }]
+    ));
+    // Fail's successful child retains its earlier Union value; it must not
+    // reread current=20 and merge Num(20) into the old Num(10)|Num(0) class.
+    let mut retained = program.clone();
+    retained.commands = vec![program.commands[7].clone()];
+    let response = run(&mut engine, id, retained);
+    assert_eq!(response.error, None);
+    let Some(pb::command_output::Kind::PrintedFunction(table)) = &response.outputs[0].kind else {
+        panic!("current table")
+    };
+    assert_eq!(table.rows.len(), 1);
+    assert_eq!(
+        available_table_value(&response, table.rows[0].output.as_ref().unwrap()),
+        "20"
+    );
+    let mut query = program.clone();
+    query.commands = vec![program.commands[6].clone()];
+    assert_eq!(
+        run(&mut engine, id, query).error.unwrap().code,
+        i32::from(pb::ErrorCode::CheckFailed)
+    );
     assert!(
         egglog_experimental::protobuf::source::Renderer::default()
             .render(&program)

@@ -53,8 +53,8 @@
 use std::{collections::HashMap, sync::Mutex};
 
 use egglog::{
-    CommandOutput, UserDefinedCommand,
-    ast::{Command, Expr, Fact, Literal, ParseError},
+    CommandOutput, ExecutionEvent, UserDefinedCommand,
+    ast::{Action, Command, Expr, Fact, Literal, ParseError},
     prelude::Span,
     scheduler::{Scheduler, SchedulerId},
     span,
@@ -234,6 +234,37 @@ type SchedulerBuilder = Box<
 
 struct ScheduleState {
     schedulers: Vec<(String, SchedulerId)>,
+    changed: bool,
+    partial: RunReport,
+}
+
+// Compile every ordinary action descendant before invoking a schedule anchor,
+// including dead Repeat0 bodies. The ordered clone retains declaration/stack
+// context across root arguments without executing actions or primitive bodies.
+fn validate_action_steps(egraph: &mut egglog::EGraph, roots: &[Expr]) -> Result<(), egglog::Error> {
+    let mut pending: Vec<_> = roots.iter().rev().collect();
+    let mut commands = vec![];
+    while let Some(expr) = pending.pop() {
+        let Expr::Call(_, head, args) = expr else {
+            continue;
+        };
+        match head.as_str() {
+            "seq" | "saturate" | "fail" => pending.extend(args.iter().rev()),
+            "repeat" => pending.extend(args.iter().skip(1).rev()),
+            "eval" => commands.extend(
+                args.iter()
+                    .map(|expr| Command::Action(Action::Expr(expr.span(), expr.clone()))),
+            ),
+            // This declaration's prepare hook registers only on the disposable
+            // compiler, so subsequent actions see it without executing its body.
+            "primitive" | "push" | "pop" | "set" | "delete" | "subsume" | "union" | "panic" => {
+                commands.extend(egraph.parse_program(None, &expr.to_string())?)
+            }
+            _ => (),
+        }
+    }
+    egraph.validate_program(commands)?;
+    Ok(())
 }
 
 lazy_static! {
@@ -272,7 +303,11 @@ fn build_scheduler(
 
 impl ScheduleState {
     fn new() -> Self {
-        Self { schedulers: vec![] }
+        Self {
+            schedulers: vec![],
+            changed: false,
+            partial: RunReport::default(),
+        }
     }
 
     // Current limitation: because it relies on the publicly available Rust APIs to access
@@ -313,6 +348,50 @@ impl ScheduleState {
         let Expr::Call(span, head, exprs) = arg else {
             return err();
         };
+
+        if head == "fail" {
+            let mut child = arg;
+            let mut spans = vec![];
+            while let Expr::Call(span, head, args) = child {
+                if head != "fail" {
+                    break;
+                }
+                let [next] = args.as_slice() else {
+                    return err();
+                };
+                spans.push(span.clone());
+                child = next;
+            }
+            if matches!(child, Expr::Call(_, head, _) if matches!(head.as_str(), "seq" | "repeat" | "saturate" | "run" | "run-with" | "eval"))
+            {
+                let previous = std::mem::take(&mut self.changed);
+                let previous_report = std::mem::take(&mut self.partial);
+                let mut context = (self, child);
+                let result = egraph.with_schedule_envelope(
+                    &spans,
+                    &mut context,
+                    |graph, (state, child)| state.run(graph, child).map(|(_, report)| report),
+                    |_, _| {},
+                    |(state, _), event| {
+                        if let ExecutionEvent::ActionsFinished { changed, .. } = event {
+                            state.changed |= changed;
+                        }
+                    },
+                );
+                let changed = context.0.changed;
+                context.0.changed |= previous;
+                let mut report = std::mem::replace(&mut context.0.partial, previous_report);
+                // An enclosing Fail may catch this error. Retain the actual
+                // completed prefix's continuation even when no full report exists.
+                if result.is_err() {
+                    context.0.partial.union(report.clone());
+                }
+                result?;
+                report.updated |= changed;
+                report.can_stop &= !changed;
+                return Ok((vec![], report));
+            }
+        }
 
         match head.as_str() {
             "let-scheduler" => match exprs.as_slice() {
@@ -404,10 +483,27 @@ impl ScheduleState {
             // also call reading primitives like `(get-size!)` that are not
             // admissible from an ordinary action context.
             "eval" => {
+                let mut changed = false;
                 for expr in exprs {
-                    egraph.eval_expr(expr)?;
+                    egraph.run_program_observed(
+                        vec![Command::Action(Action::Expr(expr.span(), expr.clone()))],
+                        &mut |_, _, _| {},
+                        &mut |_, event| {
+                            if let ExecutionEvent::ActionsFinished { changed: next, .. } = event {
+                                changed |= next;
+                                self.changed |= next;
+                            }
+                        },
+                    )?;
                 }
-                Ok((vec![], RunReport::default()))
+                Ok((
+                    vec![],
+                    RunReport {
+                        updated: changed,
+                        can_stop: !changed,
+                        ..Default::default()
+                    },
+                ))
             }
             // Allowlisted commands forwarded via parse roundtrip.
             // User-defined commands are also allowed (run-schedule, multi-extract, keep-best, ...).
@@ -424,18 +520,32 @@ impl ScheduleState {
                     | "delete"
                     | "subsume"
                     | "panic"
+                    | "fail"
             ) || egraph.has_command(head) =>
             {
-                let outputs = egraph.parse_and_run_program(None, &format!("{}", arg))?;
+                let commands = egraph.parse_program(None, &arg.to_string())?;
                 let mut report = RunReport::default();
                 let mut cmd_outputs = Vec::new();
-                for output in outputs {
-                    if let CommandOutput::RunSchedule(r) = output {
-                        report.union(r);
-                    } else {
-                        cmd_outputs.push(output);
-                    }
-                }
+                let mut changed = false;
+                let result = egraph.run_program_observed(
+                    commands,
+                    &mut |_, _, output| {
+                        if let CommandOutput::RunSchedule(r) = output {
+                            report.union(r);
+                        } else {
+                            cmd_outputs.push(output);
+                        }
+                    },
+                    &mut |_, event| {
+                        if let ExecutionEvent::ActionsFinished { changed: next, .. } = event {
+                            changed |= next;
+                        }
+                    },
+                );
+                self.changed |= changed;
+                result?;
+                report.updated |= changed;
+                report.can_stop &= !changed;
                 Ok((cmd_outputs, report))
             }
             _ => err(),
@@ -487,6 +597,8 @@ impl ControlContext for NativeSchedule<'_> {
         _: &[u64],
     ) -> Result<ControlReport, egglog::Error> {
         let (outputs, report) = self.state.run_leaf(self.egraph, node)?;
+        self.state.changed |= report.updated;
+        self.state.partial.union(report.clone());
         self.outputs.extend(outputs);
         Ok(ControlReport {
             report,
@@ -546,6 +658,7 @@ impl UserDefinedCommand for RunExtendedSchedule {
         egraph: &mut egglog::EGraph,
         args: &[Expr],
     ) -> Result<Vec<CommandOutput>, egglog::Error> {
+        validate_action_steps(egraph, args)?;
         let mut context = (ScheduleState::new(), Vec::new());
         egraph.with_schedule_envelope(
             &[],

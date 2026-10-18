@@ -111,6 +111,182 @@ pub struct Source {
     pending_error: Option<String>,
 }
 
+struct InputSignature {
+    table: String,
+    inputs: Vec<u32>,
+    output: u32,
+    custom: bool,
+}
+
+// The rows are already completely parsed. Publishing only here prevents a
+// malformed later row from leaving any CSV-derived commands behind.
+fn append_input_rows(
+    program: &mut pb::Program,
+    target: InputSignature,
+    rows: Vec<Vec<Literal>>,
+    span: Option<pb::Span>,
+) -> Result<(), String> {
+    for row in rows {
+        let mut values = Vec::with_capacity(row.len());
+        for (literal, sort_id) in row.into_iter().zip(
+            target
+                .inputs
+                .iter()
+                .copied()
+                .chain(target.custom.then_some(target.output)),
+        ) {
+            let value = match literal {
+                Literal::Int(value) => pb::primitive_value::Value::I64(value),
+                Literal::Float(value) => pb::primitive_value::Value::F64Bits(value.0.to_bits()),
+                Literal::String(value) => pb::primitive_value::Value::String(value),
+                Literal::Bool(value) => pb::primitive_value::Value::Bool(value),
+                Literal::Unit => pb::primitive_value::Value::Unit(pb::Unit {}),
+            };
+            values.push(u32::try_from(program.nodes.len()).map_err(|_| "too many input nodes")?);
+            program.nodes.push(pb::Node {
+                sort_id,
+                span,
+                kind: Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
+                    value: Some(value),
+                })),
+            });
+        }
+        let value = target
+            .custom
+            .then(|| values.pop().expect("parsed output column"));
+        let call = pb::Call {
+            func: target.table.clone(),
+            args: values,
+        };
+        let kind = if let Some(value) = value {
+            pb::action::Kind::Set(pb::Set {
+                target: Some(call),
+                value: Some(value),
+            })
+        } else {
+            let root = u32::try_from(program.nodes.len()).map_err(|_| "too many input nodes")?;
+            program.nodes.push(pb::Node {
+                sort_id: target.output,
+                span,
+                kind: Some(pb::node::Kind::Call(call)),
+            });
+            pb::action::Kind::Term(root)
+        };
+        program.commands.push(pb::Command {
+            span,
+            kind: Some(pb::command::Kind::Action(pb::Action {
+                span,
+                kind: Some(kind),
+            })),
+        });
+    }
+    Ok(())
+}
+
+/// Resolve an exact declaration-only descriptor and decode a complete native
+/// tab-separated input file into ordinary ordered actions. No live graph or
+/// filesystem dependency is retained in the returned, self-contained Program.
+pub fn produce_input(
+    descriptor: &pb::Program,
+    table: &str,
+    path: &str,
+    fact_directory: Option<&Path>,
+    extension: Option<Arc<dyn NativeExtension>>,
+) -> Result<pb::Program, TransportError> {
+    if !descriptor.commands.is_empty()
+        || !descriptor.rulesets.is_empty()
+        || !descriptor.rules.is_empty()
+    {
+        return Err(TransportError(
+            "input descriptor must contain declarations only".into(),
+        ));
+    }
+    let mut compiler = if let Some(extension) = extension {
+        Renderer::with_extension(extension)?
+    } else {
+        Renderer::default()
+    };
+    let mut lowered = descriptor.clone();
+    let prepared = compiler
+        .session
+        .prepare(&mut lowered)
+        .map_err(|error| TransportError(error.0.message))?;
+    compiler
+        .session
+        .install(
+            prepared,
+            &mut pb::RunProgramResponse {
+                profile: Some(pb::ProfileSummary::default()),
+                ..Default::default()
+            },
+        )
+        .map_err(|error| TransportError(error.message))?;
+    let signature = compiler
+        .session
+        .graph
+        .type_info()
+        .get_func_type(&native_name("call", table))
+        .cloned()
+        .ok_or_else(|| TransportError(format!("unknown input table {table}")))?;
+    let declaration = descriptor
+        .declarations
+        .iter()
+        .find_map(|declaration| match &declaration.kind {
+            Some(pb::declaration::Kind::Function(function)) if function.name == table => {
+                Some(InputSignature {
+                    table: table.into(),
+                    inputs: function.inputs.iter().map(|arg| arg.sort).collect(),
+                    output: function.output,
+                    custom: true,
+                })
+            }
+            Some(pb::declaration::Kind::Constructor(constructor)) if constructor.name == table => {
+                Some(InputSignature {
+                    table: table.into(),
+                    inputs: constructor.inputs.iter().map(|arg| arg.sort).collect(),
+                    output: constructor.output,
+                    custom: false,
+                })
+            }
+            Some(pb::declaration::Kind::Relation(relation)) if relation.name == table => {
+                Some(InputSignature {
+                    table: table.into(),
+                    inputs: relation.inputs.iter().map(|arg| arg.sort).collect(),
+                    output: 0,
+                    custom: false,
+                })
+            }
+            _ => None,
+        })
+        .ok_or_else(|| TransportError("input requires a table-backed callable".into()))?;
+    let rows = egglog::parse_input_file(&signature, path, fact_directory, ast::Span::Panic)
+        .map_err(|error| TransportError(error.to_string()))?;
+    let mut program = descriptor.clone();
+    let mut declaration = declaration;
+    if descriptor.declarations.iter().any(|row| matches!(&row.kind, Some(pb::declaration::Kind::Relation(relation)) if relation.name == table)) {
+        let unit = compiler.session.graph.get_sort_by_name("Unit").unwrap();
+        declaration.output = compiler.session.graph.export_sort(unit, &mut program.sorts).map_err(TransportError)?;
+    }
+    let file = u32::try_from(program.files.len())
+        .map_err(|_| TransportError("too many input source files".into()))?;
+    program.files.push(pb::SourceFile {
+        name: path.into(),
+        contents: None,
+    });
+    append_input_rows(
+        &mut program,
+        declaration,
+        rows,
+        Some(pb::Span {
+            file,
+            start: 0,
+            end: 0,
+        }),
+    )
+    .map_err(TransportError)?;
+    Ok(program)
+}
+
 // Project the resolved body before unstable-fn target preparation replaces
 // source target literals with backend-only bindings. The clone is read-only
 // compiler provenance; no runtime ID is installed into another graph.
@@ -547,6 +723,85 @@ impl Source {
             while let Command::Fail(span, child) = command {
                 fail_spans.push(span);
                 command = *child;
+            }
+            if let Command::Input { span, name, file } = &command {
+                let parsed = (|| {
+                    let signature = self
+                        .graph
+                        .type_info()
+                        .get_func_type(name)
+                        .cloned()
+                        .ok_or_else(|| {
+                            egglog::Error::TypeError(egglog::TypeError::UnboundFunction(
+                                name.clone(),
+                                span.clone(),
+                            ))
+                        })?;
+                    let rows = egglog::parse_input_file(
+                        &signature,
+                        file,
+                        self.graph.fact_directory.as_deref(),
+                        span.clone(),
+                    )?;
+                    Ok::<_, egglog::Error>((signature, rows))
+                })();
+                let (signature, rows) = match parsed {
+                    Ok(parsed) => parsed,
+                    Err(error) => {
+                        let mut result = Err(error);
+                        for span in fail_spans.into_iter().rev() {
+                            result = if result.is_err() {
+                                Ok(())
+                            } else {
+                                Err(egglog::Error::ExpectFail(span))
+                            };
+                        }
+                        result.map_err(|error| error.to_string())?;
+                        continue;
+                    }
+                };
+                let inputs = signature
+                    .input
+                    .iter()
+                    .map(|sort| self.sort(sort.name()))
+                    .collect::<Result<Vec<_>, _>>()?;
+                let output = self.sort(if self.relations.contains(name) {
+                    "Unit"
+                } else {
+                    signature.output.name()
+                })?;
+                let first = self.program.commands.len();
+                let located = self.span(span)?;
+                append_input_rows(
+                    &mut self.program,
+                    InputSignature {
+                        table: name.clone(),
+                        inputs,
+                        output,
+                        custom: signature.subtype == ast::FunctionSubtype::Custom,
+                    },
+                    rows,
+                    located,
+                )?;
+                if !fail_spans.is_empty() {
+                    let body = self.program.commands.drain(first..).collect();
+                    let mut command = pb::Command {
+                        span: located,
+                        kind: Some(pb::command::Kind::Repeat(pb::Repeat {
+                            times: Some(1),
+                            body,
+                            until: vec![],
+                        })),
+                    };
+                    for span in fail_spans.into_iter().rev() {
+                        command = pb::Command {
+                            span: self.span(&span)?,
+                            kind: Some(pb::command::Kind::Fail(Box::new(command))),
+                        };
+                    }
+                    self.program.commands.push(command);
+                }
+                continue;
             }
             if !fail_spans.is_empty()
                 && !matches!(
@@ -1686,6 +1941,58 @@ impl Source {
         }
         let span = expr.span();
         let (ruleset, scheduler, until) = match expr {
+            Expr::Call(_, head, args) if head == "fail" => {
+                let [child] = args.as_slice() else {
+                    return Err("source fail requires one schedule step".into());
+                };
+                let child = self.extended_schedule(child, locals, publish, depth + 1)?;
+                return Ok(pb::Command {
+                    span: self.span(&span)?,
+                    kind: Some(pb::command::Kind::Fail(Box::new(child))),
+                });
+            }
+            Expr::Call(_, head, args)
+                if matches!(
+                    head.as_str(),
+                    "eval" | "set" | "delete" | "subsume" | "union" | "panic"
+                ) =>
+            {
+                let action = match (head.as_str(), args.as_slice()) {
+                    ("eval", [expr]) => Action::Expr(span.clone(), expr.clone()),
+                    ("set", [Expr::Call(_, name, args), value]) => {
+                        Action::Set(span.clone(), name.clone(), args.clone(), value.clone())
+                    }
+                    ("delete" | "subsume", [Expr::Call(_, name, args)]) => Action::Change(
+                        span.clone(),
+                        if head == "delete" {
+                            ast::Change::Delete
+                        } else {
+                            ast::Change::Subsume
+                        },
+                        name.clone(),
+                        args.clone(),
+                    ),
+                    ("union", [left, right]) => {
+                        Action::Union(span.clone(), left.clone(), right.clone())
+                    }
+                    ("panic", [Expr::Lit(_, Literal::String(message))]) => {
+                        Action::Panic(span.clone(), message.clone())
+                    }
+                    _ => return Err("source action schedule step has invalid arguments".into()),
+                };
+                let resolved = self
+                    .graph
+                    .resolve_command_preserving_globals(Command::Action(action))
+                    .map_err(|error| error.to_string())?;
+                let [N::CoreAction(action)] = resolved.as_slice() else {
+                    return Err("source action schedule step requires one ordinary action".into());
+                };
+                let action = self.action(action, None)?;
+                return Ok(pb::Command {
+                    span: self.span(&span)?,
+                    kind: Some(pb::command::Kind::Action(action)),
+                });
+            }
             Expr::Var(_, ruleset) => (ruleset.as_str(), "", None),
             Expr::Call(_, head, args) if matches!(head.as_str(), "run" | "run-with") => {
                 let (scheduler, args) = if head == "run-with" {
@@ -3599,7 +3906,7 @@ fn render_prepared(
             let span = native_span(program, command.span.as_ref())?;
             match command.kind.as_ref().ok_or("missing command kind")? {
                 pb::command::Kind::Action(action) => {
-                    if prepared.context.constructor_dags.contains(&position) {
+                    if prepared.context.constructor_dags.contains(&vec![position as u32]) {
                         commands.push(Command::ActionScope(span, ast::GenericActions(
                             constructor_dag_actions(program, action, |name| occupied.contains(name)
                                 || native.get_sort_by_name(name).is_some()
@@ -3976,6 +4283,45 @@ fn source_extended_schedule(
         leaf = child;
     }
     let (head, args) = match leaf.kind.as_ref().ok_or("missing schedule kind")? {
+        pb::command::Kind::Fail(child) => (
+            "fail",
+            vec![source_extended_schedule(
+                program,
+                child,
+                context,
+                authored,
+                depth + 1,
+            )?],
+        ),
+        pb::command::Kind::Action(action) => {
+            let [action]: [Action; 1] = lower_action(program, action)?
+                .try_into()
+                .map_err(|_| "source schedule action requires one native action")?;
+            let action = action.map_symbols(
+                &mut |name: String| authored.callables.get(&name).cloned().unwrap_or(name),
+                &mut |name| name,
+            );
+            match action {
+                Action::Expr(_, expr) => ("eval", vec![expr]),
+                Action::Set(_, name, args, value) => {
+                    ("set", vec![Expr::Call(span.clone(), name, args), value])
+                }
+                Action::Change(_, change, name, args) => (
+                    if change == ast::Change::Delete {
+                        "delete"
+                    } else {
+                        "subsume"
+                    },
+                    vec![Expr::Call(span.clone(), name, args)],
+                ),
+                Action::Union(_, left, right) => ("union", vec![left, right]),
+                Action::Panic(_, message) => (
+                    "panic",
+                    vec![Expr::Lit(span.clone(), Literal::String(message))],
+                ),
+                Action::Let(..) => return Err("source schedule has no global Let action".into()),
+            }
+        }
         pb::command::Kind::Run(run) => {
             let name = match run
                 .ruleset
