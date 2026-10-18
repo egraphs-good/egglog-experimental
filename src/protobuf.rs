@@ -1089,7 +1089,7 @@ impl Session {
                             _ => Err("constructor costs currently require a nonnegative inert i64".into()),
                         }
                     }).transpose()?;
-                    Command::Constructor { span, name: constructor.name.clone(), schema: signature(program, &constructor.inputs, constructor.output)?, cost, unextractable: constructor.unextractable, hidden: false, let_binding: false, term_constructor: None }
+                    Command::Constructor { span, name: constructor.name.clone(), table_name: Some(ast::TableName::Public(staged.names.callables[&constructor.name].clone())), schema: signature(program, &constructor.inputs, constructor.output)?, cost, unextractable: constructor.unextractable, hidden: false, let_binding: false, term_constructor: None }
                 }
                 pb::declaration::Kind::Function(function) => {
                     if function.name.is_empty() { return Err("function name must not be empty".into()); }
@@ -1104,12 +1104,13 @@ impl Session {
                         // in Context::Write: builtin calls retain their actual
                         // capabilities, and callable backends are installed first.
                     }
-                    Command::Function { span, name: function.name.clone(), schema, merge: function.merge.map(|index| expression(program, index, &mut HashSet::new())).transpose()?, hidden: false, let_binding: false, term_constructor: None, unextractable: true }
+                    Command::Function { span, name: function.name.clone(), table_name: Some(ast::TableName::Public(staged.names.callables[&function.name].clone())), schema, merge: function.merge.map(|index| expression(program, index, &mut HashSet::new())).transpose()?, hidden: false, let_binding: false, term_constructor: None, unextractable: true }
                 },
                 pb::declaration::Kind::Primitive(primitive) => primitive_command(program, primitive, span)?,
                 pb::declaration::Kind::Relation(relation) => Command::Relation {
                     span,
                     name: relation.name.clone(),
+                    table_name: Some(ast::TableName::Public(staged.names.callables[&relation.name].clone())),
                     inputs: relation.inputs.iter().map(|arg| sort_name(&program.sorts, arg.sort)).collect::<Result<_, _>>()?,
                 },
                 _ => return Err("only equality-sort, constructor, function, relation, and primitive declarations execute in this slice".into()),
@@ -1140,6 +1141,9 @@ impl Session {
                 let cost_table = Command::Function {
                     span: native_span(program, declaration.span.as_ref())?,
                     name: cost_table,
+                    table_name: Some(ast::TableName::Internal(
+                        crate::set_cost::get_cost_table_name(&staged.names.callables[name]),
+                    )),
                     schema: ast::Schema::new(schema.input.clone(), "i64".into()),
                     merge: Some(Expr::Var(span!(), "new".into())),
                     hidden: true,
@@ -3048,12 +3052,28 @@ fn project_names(program: &mut pb::Program, definitions: &pb::Program) -> Native
         }
     }
     for declaration in &mut program.declarations {
+        if let Some(pb::declaration::Kind::EqSort(sort)) = &mut declaration.kind {
+            sort.name = native_name("sort", &sort.name);
+        }
+    }
+    // PrintSize selects logical tables until lower_native_observation projects
+    // them. Source relocation, in contrast, must relocate those selectors too.
+    map_callable_names(program, project_call, |_| {});
+    names
+}
+
+// Relocate structural callable references only. Strings remain ordinary data.
+fn map_callable_names(
+    program: &mut pb::Program,
+    mut project_call: impl FnMut(&mut String),
+    mut project_size: impl FnMut(&mut String),
+) {
+    for declaration in &mut program.declarations {
         match &mut declaration.kind {
-            Some(pb::declaration::Kind::EqSort(s)) => s.name = native_name("sort", &s.name),
-            Some(pb::declaration::Kind::Constructor(f)) => f.name = native_name("call", &f.name),
-            Some(pb::declaration::Kind::Function(f)) => f.name = native_name("call", &f.name),
-            Some(pb::declaration::Kind::Relation(r)) => r.name = native_name("call", &r.name),
-            Some(pb::declaration::Kind::Primitive(p)) => p.name = native_name("call", &p.name),
+            Some(pb::declaration::Kind::Constructor(f)) => project_call(&mut f.name),
+            Some(pb::declaration::Kind::Function(f)) => project_call(&mut f.name),
+            Some(pb::declaration::Kind::Relation(r)) => project_call(&mut r.name),
+            Some(pb::declaration::Kind::Primitive(p)) => project_call(&mut p.name),
             _ => (),
         }
     }
@@ -3075,6 +3095,11 @@ fn project_names(program: &mut pb::Program, definitions: &pb::Program) -> Native
             Some(pb::command::Kind::Repeat(body)) => commands.extend(body.body.iter_mut()),
             Some(pb::command::Kind::Saturate(body)) => commands.extend(body.body.iter_mut()),
             Some(pb::command::Kind::Action(action)) => actions.push(action),
+            Some(pb::command::Kind::PrintSize(print)) => {
+                for table in &mut print.tables {
+                    project_size(table);
+                }
+            }
             Some(pb::command::Kind::PrintFunction(print)) => project_call(&mut print.table),
             Some(pb::command::Kind::KeepBest(keep)) => {
                 for table in &mut keep.tables {
@@ -3110,7 +3135,6 @@ fn project_names(program: &mut pb::Program, definitions: &pb::Program) -> Native
             _ => (),
         }
     }
-    names
 }
 
 fn structural_sort_name(

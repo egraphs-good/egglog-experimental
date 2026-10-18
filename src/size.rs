@@ -57,16 +57,16 @@ impl ReadPrim for GetSizePrimitive {
     fn apply<'a, 'db>(&self, state: ReadState<'a, 'db>, args: &[Value]) -> Option<Value> {
         let size: usize = match args {
             [] => state
-                .table_sizes()
+                .named_table_sizes()
                 .into_iter()
-                .filter_map(|(name, size)| {
+                .filter_map(|(_, name, size)| {
                     (!name.starts_with(INTERNAL_SYMBOL_PREFIX)).then_some(size)
                 })
                 .sum(),
             tables => tables
                 .iter()
                 .map(|value| state.base_values().unwrap::<S>(*value).0)
-                .filter_map(|name| state.table_size(&name))
+                .filter_map(|name| state.named_table_size(&name))
                 .sum(),
         };
         let size = i64::try_from(size).ok()?;
@@ -118,16 +118,16 @@ impl ReadPrim for GetNodeSizePrimitive {
             return None;
         }
         let size: usize = state
-            .table_sizes()
+            .named_table_sizes()
             .into_iter()
-            .filter_map(|(name, size)| {
+            .filter_map(|(physical, name, size)| {
                 if name.starts_with(INTERNAL_SYMBOL_PREFIX)
-                    || state.is_table_hidden(name)?
-                    || state.table_subtype(name)? != FunctionSubtype::Constructor
+                    || state.is_table_hidden(physical)?
+                    || state.table_subtype(physical)? != FunctionSubtype::Constructor
                 {
                     return None;
                 }
-                let output = &state.constructor_schema(name).ok()?.output;
+                let output = &state.constructor_schema(physical).ok()?.output;
                 state.is_sort_unionable(output)?.then_some(size)
             })
             .sum();

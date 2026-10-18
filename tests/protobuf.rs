@@ -3,6 +3,235 @@ use egglog_experimental::{PortableEGraph, PortableTypeInfo};
 use egglog_experimental::{new_experimental_egraph, protobuf::Engine};
 use prost::Message;
 
+mod source_reflection {
+    use super::*;
+    use egglog_experimental::protobuf::source::{Renderer, Source, Submission};
+
+    // Every cycle starts with native source, then executes actual encoded
+    // requests and standalone rendered text. The second cycle reimports that
+    // text, including the same scope/handle lifecycle.
+    fn compare(text: &str) {
+        let mut text = text.to_owned();
+        for cycle in 0..2 {
+            new_experimental_egraph()
+                .parse_and_run_program(None, &text)
+                .unwrap();
+            let mut engine = Engine::default();
+            let mut id = create(&mut engine);
+            let mut saved = Vec::new();
+            let mut renderer = Renderer::default();
+            let mut rendered = String::new();
+            let mut source = Source::new(None, &text).unwrap();
+            while let Some(phase) = source.next_submission() {
+                let phase = phase.unwrap();
+                rendered.push_str(&renderer.render_submission(&phase).unwrap());
+                match phase {
+                    Submission::Program(program) => {
+                        let request = pb::RunProgramRequest {
+                            egraph_id: id,
+                            program: Some(program),
+                            profile: true,
+                            include_run_reports: false,
+                        }
+                        .encode_to_vec();
+                        let response = engine.run(&request).unwrap();
+                        eprintln!("reflection cycle {cycle} input: {request:02x?}");
+                        eprintln!("reflection cycle {cycle} output: {response:02x?}");
+                        assert_eq!(
+                            pb::RunProgramResponse::decode(response.as_slice())
+                                .unwrap()
+                                .error,
+                            None
+                        );
+                    }
+                    Submission::Push(count) => {
+                        for _ in 0..count {
+                            saved.push(id);
+                            let response = engine
+                                .clone_egraph(
+                                    &pb::CloneEGraphRequest { egraph_id: id }.encode_to_vec(),
+                                )
+                                .unwrap();
+                            id = pb::CloneEGraphResponse::decode(response.as_slice())
+                                .unwrap()
+                                .egraph_id;
+                        }
+                    }
+                    Submission::Pop { count, .. } => {
+                        for _ in 0..count {
+                            let parent = saved.pop().unwrap();
+                            engine
+                                .return_to(
+                                    &pb::ReturnToEGraphRequest {
+                                        active_id: id,
+                                        saved_id: parent,
+                                    }
+                                    .encode_to_vec(),
+                                )
+                                .unwrap();
+                            id = parent;
+                        }
+                    }
+                }
+            }
+            assert!(saved.is_empty());
+            eprintln!("reflection cycle {cycle} rendered:\n{rendered}");
+            text = rendered;
+        }
+        new_experimental_egraph()
+            .parse_and_run_program(None, &text)
+            .unwrap();
+    }
+
+    #[test]
+    fn runtime_table_selectors_preserve_strings_and_deferred_reads() {
+        let text = r#"
+            (primitive named-size (String) i64 (get-size! _0))
+            (check (= (named-size "C") 0))
+            (datatype T (C i64))
+            (C 7)
+            (check (= (named-size (+ "C" "")) 1))
+            (check (= (+ "C" "") "C"))
+            (check (= (get-size! "C" "C" "Unknown") 2))
+            (relation seen (i64))
+            (seen 7)
+            (check (= (named-size "seen") 1))
+            (function measure () i64 :merge old)
+            (set (measure) 9)
+            (check (= (named-size "measure") 1))
+        "#;
+        compare(text);
+    }
+
+    #[test]
+    fn public_selectors_and_aggregate_counts_keep_private_helper_provenance() {
+        compare(
+            r#"
+            (sort T)
+            (with-dynamic-cost (constructor C (i64) T))
+            (constructor private-name () T :table-name "@logical")
+            (function public-storage (i64) i64 :merge old :table-name "cost_table_C")
+            (function prefix-storage () i64 :merge old :table-name "__egglog_proto_call_43")
+            (C 7)
+            (set-cost (C 7) 13)
+            (private-name)
+            (set (public-storage 0) 9)
+            (set (public-storage 1) 9)
+            (set (prefix-storage) 11)
+            (check (= (get-size! "cost_table_C") 2))
+            (check (= (get-size! "@logical") 1))
+            (check (= (get-size! (+ "__egglog_proto_call_" "43")) 1))
+            (check (= (get-size!) 5))
+            (check (= (get-node-size!) 1))
+            (check (= (+ "cost_table_" "C") "cost_table_C"))
+        "#,
+        );
+    }
+
+    #[test]
+    fn table_metadata_is_relocated_once_even_when_names_form_a_chain() {
+        compare(
+            r#"
+            (sort T)
+            (constructor A (i64) T :table-name "B")
+            (constructor B (i64) T :table-name "C")
+            (primitive build () T (A 7))
+            (build)
+            (check (= (get-size! "B") 1))
+            (check (= (get-size! "C") 0))
+            (print-size A)
+        "#,
+        );
+    }
+
+    #[test]
+    fn reflective_views_follow_clone_return_and_scoped_redeclarations() {
+        compare(
+            r#"
+            (primitive named-size (String) i64 (get-size! _0))
+            (datatype T (C i64))
+            (C 1)
+            (push)
+            (C 2)
+            (constructor local-physical () T :table-name "local")
+            (local-physical)
+            (check (= (named-size "C") 2))
+            (check (= (named-size "local") 1))
+            (pop)
+            (check (= (named-size "C") 1))
+            (check (= (named-size "local") 0))
+            (push)
+            (constructor other-physical () T :table-name "local")
+            (check (= (named-size "local") 0))
+            (pop)
+            (check (= (get-size!) 1))
+        "#,
+        );
+    }
+
+    #[test]
+    fn a_later_execution_failure_retains_completed_table_metadata() {
+        let mut engine = Engine::default();
+        let id = create(&mut engine);
+        let mut source = Source::new(None, "(datatype T (C i64)) (C 7) (panic \"later\")").unwrap();
+        assert_eq!(
+            run(&mut engine, id, source.next().unwrap().unwrap()).error,
+            None
+        );
+        assert_eq!(
+            run(&mut engine, id, source.next().unwrap().unwrap()).error,
+            None
+        );
+        assert!(
+            run(&mut engine, id, source.next().unwrap().unwrap())
+                .error
+                .is_some()
+        );
+        let check = Source::new(None, r#"(check (= (get-size! "C") 1))"#)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap();
+        assert_eq!(run(&mut engine, id, check).error, None);
+    }
+
+    #[test]
+    fn distinct_native_aliases_cannot_coalesce_as_wire_resupply() {
+        let mut engine = Engine::default();
+        let id = create(&mut engine);
+        let mut source = Source::new(
+            None,
+            r#"
+            (sort T)
+            (constructor physical (i64) T :table-name "C")
+            (physical 7)
+            (constructor another (i64) T :table-name "C")
+        "#,
+        )
+        .unwrap();
+        for _ in 0..3 {
+            assert_eq!(
+                run(&mut engine, id, source.next().unwrap().unwrap()).error,
+                None
+            );
+        }
+        assert!(
+            source
+                .next()
+                .unwrap()
+                .unwrap_err()
+                .to_string()
+                .contains("distinct source tables share logical name")
+        );
+        let check = Source::new(None, r#"(check (= (get-size! "C") 1))"#)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap();
+        assert_eq!(run(&mut engine, id, check).error, None);
+    }
+}
+
 mod source_fresh_macro {
     use super::*;
     use egglog_experimental::protobuf::{

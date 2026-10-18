@@ -86,6 +86,7 @@ fn desugar_fresh_rule(
     let constructor_command = Command::Constructor {
         span: rule_span.clone(),
         name: constructor_name.clone(),
+        table_name: None,
         schema: Schema {
             input: schema,
             output: output_sort,

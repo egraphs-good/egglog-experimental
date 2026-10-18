@@ -73,6 +73,12 @@ struct SourceRuleset {
     published_rules: usize,
 }
 
+// Source aliases may have different physical spellings. Retain authored table
+// provenance so two native tables cannot silently become compatible resupply of
+// one wire declaration. Graph snapshots restore this index with its scope.
+#[derive(Clone, Default)]
+struct SourceTableNames(HashMap<String, String>);
+
 struct SourceScope {
     graph: EGraph,
     program: pb::Program,
@@ -528,7 +534,9 @@ impl Source {
             let rewrite = match &command {
                 Command::Rewrite(_, _, subsume) => Some(RewriteKind::Directional(*subsume)),
                 Command::BiRewrite(..) => Some(RewriteKind::Bidirectional),
-                Command::Relation { span, name, inputs } => {
+                Command::Relation {
+                    span, name, inputs, ..
+                } => {
                     // Resolve the authored declaration in the producer's type
                     // environment, but do not export its desugared private row
                     // sort/constructor. The wire relation has only inputs.
@@ -1112,6 +1120,37 @@ impl Source {
     // One phase owns exactly its completed command prefix and new definitions;
     // immutable rule cursors remain publication-local, including failed macros.
     fn phase(&mut self, publish: Vec<usize>) -> Result<pb::Program, String> {
+        let mut tables = self
+            .graph
+            .extension_state::<SourceTableNames>()
+            .cloned()
+            .unwrap_or_default();
+        for declaration in &self.program.declarations {
+            let physical = match &declaration.kind {
+                Some(pb::declaration::Kind::Constructor(table)) => &table.name,
+                Some(pb::declaration::Kind::Function(table)) => &table.name,
+                Some(pb::declaration::Kind::Relation(table)) => &table.name,
+                _ => continue,
+            };
+            let logical = self
+                .graph
+                .type_info()
+                .get_func_type(physical)
+                .and_then(|table| match &table.table_name {
+                    Some(ast::TableName::Public(name)) => Some(name.clone()),
+                    _ => None,
+                })
+                .unwrap_or_else(|| physical.clone());
+            if tables
+                .0
+                .insert(logical.clone(), physical.clone())
+                .is_some_and(|previous| previous != *physical)
+            {
+                return Err(format!(
+                    "distinct source tables share logical name {logical:?}"
+                ));
+            }
+        }
         let local_rulesets: HashMap<usize, u32> = publish
             .iter()
             .enumerate()
@@ -1138,7 +1177,7 @@ impl Source {
                 ruleset
             })
             .collect();
-        Ok(pb::Program {
+        let mut program = pb::Program {
             ir_version: 1,
             sorts: self.program.sorts.clone(),
             nodes: self.program.nodes.clone(),
@@ -1149,7 +1188,18 @@ impl Source {
             // binding/publication waits until the first run of the theory.
             rules: self.program.rules.clone(),
             rulesets,
-        })
+        };
+        let types: &egglog::TypeInfo = self.graph.type_info();
+        let logical_name = |name: &mut String| {
+            if let Some(function) = types.get_func_type(name)
+                && let Some(ast::TableName::Public(logical)) = &function.table_name
+            {
+                *name = logical.clone();
+            }
+        };
+        map_callable_names(&mut program, logical_name, logical_name);
+        *self.graph.extension_state_or_default::<SourceTableNames>() = tables;
+        Ok(program)
     }
 
     fn cost_phase(
@@ -3241,9 +3291,21 @@ fn render_prepared(
             }
         }
         commands.extend(prepared.materialized.iter().cloned());
+        let table_names = project_names(&mut pb::Program::default(), &prepared.definitions).callables;
         for &index in declaration_order {
             let declaration = &program.declarations[index];
             let span = native_span(program, declaration.span.as_ref())?;
+            let table_name = if dialect == Dialect::Experimental {
+                let name = match &declaration.kind {
+                    Some(pb::declaration::Kind::Constructor(table)) => Some(&table.name),
+                    Some(pb::declaration::Kind::Function(table)) => Some(&table.name),
+                    Some(pb::declaration::Kind::Relation(table)) => Some(&table.name),
+                    _ => None,
+                };
+                name.map(|name| ast::TableName::Public(table_names[name].clone()))
+            } else {
+                None
+            };
             commands.push(
                 match declaration
                     .kind
@@ -3254,6 +3316,7 @@ fn render_prepared(
                     pb::declaration::Kind::Constructor(constructor) => Command::Constructor {
                         span,
                         name: constructor.name.clone(),
+                        table_name,
                         schema: signature(program, &constructor.inputs, constructor.output)?,
                         cost: constructor
                             .cost
@@ -3273,6 +3336,7 @@ fn render_prepared(
                     pb::declaration::Kind::Function(function) => Command::Function {
                         span,
                         name: function.name.clone(),
+                        table_name,
                         schema: signature(program, &function.inputs, function.output)?,
                         merge: function
                             .merge
@@ -3292,6 +3356,7 @@ fn render_prepared(
                     pb::declaration::Kind::Relation(relation) => Command::Relation {
                         span,
                         name: relation.name.clone(),
+                        table_name,
                         inputs: relation.inputs.iter().map(|arg| sort_name(&program.sorts, arg.sort)).collect::<Result<_, _>>()?,
                     },
                     pb::declaration::Kind::HostPrimitive(_) | pb::declaration::Kind::HostSortFamily(_) => continue,

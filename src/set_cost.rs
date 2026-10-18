@@ -171,6 +171,7 @@ impl Macro<Vec<Command>> for SetCostDeclarations {
                 }
                 Command::Constructor {
                     name,
+                    table_name,
                     schema,
                     span,
                     unextractable,
@@ -183,6 +184,11 @@ impl Macro<Vec<Command>> for SetCostDeclarations {
                         cost_table_commands.push(Command::Function {
                             span: span.clone(),
                             name: cost_table_name,
+                            table_name: table_name.as_ref().map(|table_name| {
+                                let (egglog::ast::TableName::Public(name)
+                                | egglog::ast::TableName::Internal(name)) = table_name;
+                                egglog::ast::TableName::Internal(get_cost_table_name(name))
+                            }),
                             schema: cost_table_schema,
                             merge: Some(Expr::Var(span.clone(), "new".into())),
                             hidden: true,
@@ -257,6 +263,7 @@ fn generate_cost_table_commands_from_variants(variants: &[Variant]) -> Vec<Comma
             Command::Function {
                 span: v.span.clone(),
                 name: cost_table_name,
+                table_name: None,
                 schema: cost_table_schema,
                 merge: Some(Expr::Var(v.span.clone(), "new".into())),
                 hidden: true,
