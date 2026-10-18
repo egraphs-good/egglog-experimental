@@ -1708,30 +1708,28 @@ fn test_backoff_run_schedule_should_not_report_progress_without_egraph_updates()
 
 #[test]
 fn test_saturate_continues_until_scheduler_can_stop_after_no_progress_ban() {
-    let mut egraph = egglog_experimental::new_experimental_egraph();
-    add_copy_backoff_program(&mut egraph);
-
-    let outputs = egraph
-        .parse_and_run_program(
-            None,
-            r#"
-        (run-schedule
-          (let-scheduler bo (back-off :match-limit 1 :ban-length 3))
-          (saturate (run-with bo copy)))
-        "#,
-        )
-        .unwrap();
-
-    let report = only_run_report(&outputs);
-    assert_eq!(
-        egraph.get_size("S"),
-        4,
-        "saturate should keep running while the scheduler reports deferred work"
-    );
-    assert!(
-        report.updated,
-        "the eventual copy applications should be reported as database progress"
-    );
+    for control in [
+        "(saturate (run-with bo copy))",
+        "(saturate () (max-iterations 100) (body (run-with bo copy)))",
+        "(saturate () (until (= 1 2)) (body (run-with bo copy)))",
+        "(saturate () (max-iterations 100) (body (fail (fail (run-with bo copy)))))",
+    ] {
+        let mut egraph = egglog_experimental::new_experimental_egraph();
+        add_copy_backoff_program(&mut egraph);
+        let outputs = egraph.parse_and_run_program(None, &format!(
+            "(run-schedule (let-scheduler bo (back-off :match-limit 1 :ban-length 3)) {control})"
+        )).unwrap();
+        let report = only_run_report(&outputs);
+        assert_eq!(
+            egraph.get_size("S"),
+            4,
+            "saturate should keep running while the scheduler reports deferred work: {control}"
+        );
+        assert!(
+            report.updated,
+            "the eventual copy applications should be reported as database progress: {control}"
+        );
+    }
 }
 
 #[test]
@@ -1780,6 +1778,150 @@ fn test_schedule_expr_eval() {
         before + 1,
         "(eval ...) should add the new Add term to the e-graph"
     );
+}
+
+#[test]
+fn test_schedule_loop_header_preserves_complete_body_guard_boundary() {
+    let mut egraph = egglog_experimental::new_experimental_egraph();
+    let outputs = egraph
+        .parse_and_run_program(
+            None,
+            r#"
+        (relation Done ()) (relation ReachedB ())
+        (ruleset a) (rule () ((Done)) :ruleset a)
+        (ruleset b) (rule ((Done)) ((ReachedB)) :ruleset b)
+        (run-schedule (saturate () (max-iterations 5)
+            (until (Done) (= 1 1)) (body (run a) (run b))))
+        (check (ReachedB))
+    "#,
+        )
+        .unwrap();
+    assert!(only_run_report(&outputs).updated);
+    assert_eq!(egraph.get_size("ReachedB"), 1);
+    assert!(
+        egraph
+            .parse_and_run_program(
+                None,
+                "(run-schedule (repeat () (times 0) (until (Missing 1)) (body (run a))))"
+            )
+            .is_err()
+    );
+}
+
+#[test]
+fn test_schedule_loop_headers_validate_dead_descendants_before_effects() {
+    for control in [
+        "(repeat () (times 0) (until (Missing 1)) (body))",
+        "(repeat () (times 0) (body (eval (Missing 1))))",
+        "(repeat () (times 0) (body (run missing)))",
+        "(repeat () (times 0) (body (run-with missing r)))",
+        "(repeat () (times 0) (body (let-scheduler local (back-off)) (seq) (run-with missing r)))",
+    ] {
+        let mut egraph = egglog_experimental::new_experimental_egraph();
+        egraph
+            .parse_and_run_program(None, "(datatype E (Seed i64)) (Seed 1) (ruleset r)")
+            .unwrap();
+        let error = egraph
+            .parse_and_run_program(None, &format!("(run-schedule (eval (Seed 2)) {control})"));
+        assert!(error.is_err(), "{control}");
+        assert_eq!(egraph.get_size("Seed"), 1, "{control}");
+    }
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let constructed = Arc::new(AtomicUsize::new(0));
+    let observed = constructed.clone();
+    egglog_experimental::scheduling::add_scheduler_builder(
+        "header-never-build".into(),
+        Box::new(move |_, _, _| {
+            observed.fetch_add(1, Ordering::SeqCst);
+            Err(egglog::Error::BackendError(
+                "must not construct during validation".into(),
+            ))
+        }),
+    );
+    let mut egraph = egglog_experimental::new_experimental_egraph();
+    assert!(egraph.parse_and_run_program(None, "(run-schedule (let-scheduler local (header-never-build)) (repeat () (times 0) (until (Missing 1)) (body)))").is_err());
+    assert_eq!(constructed.load(Ordering::SeqCst), 0);
+
+    for times in [0, 1] {
+        let mut egraph = egglog_experimental::new_experimental_egraph();
+        egraph
+            .parse_and_run_program(
+                None,
+                "(datatype E (Seed i64)) (Seed 1) (ruleset r) \
+                 (push) (Seed 2) (let-scheduler s (back-off))",
+            )
+            .unwrap();
+        let error = egraph.parse_and_run_program(
+            None,
+            &format!("(run-schedule (pop) (repeat () (times {times}) (body (run-with s r))))"),
+        );
+        assert!(error.is_err(), "removed scheduler in Repeat{times}");
+        assert_eq!(egraph.get_size("Seed"), 2, "Pop must not execute");
+        egraph
+            .parse_and_run_program(None, "(run-schedule (run-with s r))")
+            .unwrap();
+    }
+    for skipped in [
+        "(repeat () (times 0) (body (pop)))",
+        "(repeat 0 (pop))",
+        "(repeat -1 (pop))",
+        "(repeat () (times 1) (until) (body (pop)))",
+        "(saturate () (until) (body (pop)))",
+        "(repeat () (times 0) (body (repeat 0 (pop)) (pop)))",
+    ] {
+        let mut egraph = egglog_experimental::new_experimental_egraph();
+        egraph
+            .parse_and_run_program(
+                None,
+                "(datatype E (Seed i64)) (Seed 1) (ruleset r) \
+                 (push) (Seed 2) (let-scheduler s (back-off))",
+            )
+            .unwrap();
+        egraph
+            .parse_and_run_program(
+                None,
+                &format!("(run-schedule {skipped} (repeat () (times 1) (body (run-with s r))))"),
+            )
+            .unwrap_or_else(|error| panic!("{skipped}: {error}"));
+        assert_eq!(egraph.get_size("Seed"), 2, "{skipped}");
+        egraph
+            .parse_and_run_program(None, "(run-schedule (run-with s r))")
+            .unwrap();
+    }
+}
+
+#[test]
+fn test_schedule_loop_header_does_not_steal_legacy_names_or_callbacks() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    struct HeaderWord(Arc<AtomicUsize>);
+    impl egglog::UserDefinedCommand for HeaderWord {
+        fn update(
+            &self,
+            _: &mut egglog::EGraph,
+            _: &[Expr],
+        ) -> Result<Vec<CommandOutput>, egglog::Error> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(vec![])
+        }
+    }
+    let called = Arc::new(AtomicUsize::new(0));
+    let mut egraph = egglog_experimental::new_experimental_egraph();
+    for name in ["body", "until", "max-iterations"] {
+        egraph
+            .add_command(name.into(), Arc::new(HeaderWord(called.clone())))
+            .unwrap();
+    }
+    egraph
+        .parse_and_run_program(
+            None,
+            r#"
+        (ruleset :until)
+        (run-schedule (saturate :until (body) (until) (max-iterations)))
+        (run-schedule (repeat () (times 1) (body (body) (until) (max-iterations))))
+    "#,
+        )
+        .unwrap();
+    assert_eq!(called.load(Ordering::SeqCst), 6);
 }
 
 #[test]

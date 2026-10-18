@@ -2367,33 +2367,21 @@ fn schedule_controls_match_native_counts_sites_and_stopping_in_every_mode() {
                 );
             }
             assert_eq!(profile.runs.is_empty(), case == 0 || case == 5);
-            if case == 2 {
-                assert_eq!(
-                    Renderer::default()
-                        .render(&program)
-                        .unwrap_err()
-                        .to_string(),
-                    "experimental source has no general bounded Saturate or loop-until spelling"
-                );
-                continue;
-            }
             if case == 3 {
-                let mut unsupported = program.clone();
-                let Some(pb::command::Kind::Saturate(saturate)) = &mut unsupported.commands[1].kind
+                let mut whole_body = program.clone();
+                let Some(pb::command::Kind::Saturate(saturate)) = &mut whole_body.commands[1].kind
                 else {
                     unreachable!()
                 };
                 saturate.body.push(saturate.body[0].clone());
-                assert_eq!(
-                    Renderer::default()
-                        .render(&unsupported)
-                        .unwrap_err()
-                        .to_string(),
-                    "experimental source has no general bounded Saturate or loop-until spelling"
+                let rendered = Renderer::default().render(&whole_body).unwrap();
+                assert!(
+                    Source::new(None, &rendered)
+                        .unwrap()
+                        .all(|phase| phase.is_ok())
                 );
             }
-            // Exact Repeat, unbounded Saturate and the legacy single-Run
-            // bounded form are now representable. Reparse actual text and
+            // Exact Repeat and general Saturate are representable. Reparse text and
             // retain the independent native count/report oracle above.
             let mut replay_program = program.clone();
             replay_program.commands.push(pb::Command {

@@ -3,6 +3,427 @@ use egglog_experimental::{PortableEGraph, PortableTypeInfo};
 use egglog_experimental::{new_experimental_egraph, protobuf::Engine};
 use prost::Message;
 
+mod source_loop_header_tests {
+    use super::*;
+    use egglog_experimental::protobuf::source::{Renderer, Source};
+
+    type ObservedRuns = Vec<(Vec<u32>, u64)>;
+
+    // Exercise the actual bytes boundary and collect only real loop/profile
+    // observations while retaining the source inverse for a second fresh graph.
+    fn execute(
+        text: &str,
+        mode: pb::ExecutionMode,
+    ) -> (Vec<pb::LoopOutcome>, ObservedRuns, String) {
+        let mut engine = Engine::default();
+        let id = pb::CreateEGraphResponse::decode(
+            engine
+                .create(
+                    &pb::CreateEGraphRequest {
+                        sorts: fixture().sorts[..1].to_vec(),
+                        options: Some(pb::EGraphOptions {
+                            execution_mode: mode.into(),
+                            cost_sort: Some(0),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    }
+                    .encode_to_vec(),
+                )
+                .unwrap()
+                .as_slice(),
+        )
+        .unwrap()
+        .egraph_id;
+        let mut renderer = Renderer::default();
+        let mut rendered = String::new();
+        let mut outcomes = vec![];
+        let mut runs = vec![];
+        for phase in Source::new(Some("loop-header.egg".into()), text).unwrap() {
+            let phase = phase.unwrap();
+            rendered.push_str(&renderer.render(&phase).unwrap());
+            let response = pb::RunProgramResponse::decode(
+                engine
+                    .run(
+                        &pb::RunProgramRequest {
+                            egraph_id: id,
+                            program: Some(phase),
+                            profile: true,
+                            include_run_reports: true,
+                        }
+                        .encode_to_vec(),
+                    )
+                    .unwrap()
+                    .as_slice(),
+            )
+            .unwrap();
+            assert_eq!(response.error, None, "{mode:?}: {text}");
+            let profile = response.profile.unwrap();
+            assert!(profile.complete);
+            runs.extend(
+                profile
+                    .runs
+                    .into_iter()
+                    .map(|run| (run.command_path, run.invocations)),
+            );
+            for output in response.outputs {
+                if let Some(pb::command_output::Kind::Loop(outcome)) = output.kind {
+                    assert!(output.run_report.is_some());
+                    outcomes.push(outcome);
+                }
+            }
+        }
+        (outcomes, runs, rendered)
+    }
+
+    #[test]
+    fn source_loop_headers_roundtrip_counts_guards_and_real_runs_in_every_mode() {
+        for mode in [
+            pb::ExecutionMode::Normal,
+            pb::ExecutionMode::TermEncoding,
+            pb::ExecutionMode::Proofs,
+            pb::ExecutionMode::ProofTesting,
+        ] {
+            for (control, iterations, reason, invocations) in [
+                (
+                    "(repeat () (times 0) (body (run r)))",
+                    0,
+                    pb::TerminationReason::CountReached,
+                    0,
+                ),
+                (
+                    "(repeat () (times 1) (body (run r)))",
+                    1,
+                    pb::TerminationReason::CountReached,
+                    1,
+                ),
+                (
+                    "(repeat () (times 3) (body (run r)))",
+                    3,
+                    pb::TerminationReason::CountReached,
+                    3,
+                ),
+                (
+                    "(saturate () (max-iterations 1) (body (run r)))",
+                    1,
+                    pb::TerminationReason::Saturated,
+                    1,
+                ),
+                (
+                    "(saturate () (max-iterations 3) (body (run r)))",
+                    1,
+                    pb::TerminationReason::Saturated,
+                    1,
+                ),
+                (
+                    "(saturate () (body))",
+                    1,
+                    pb::TerminationReason::Saturated,
+                    0,
+                ),
+                (
+                    "(repeat () (times 3) (body))",
+                    3,
+                    pb::TerminationReason::CountReached,
+                    0,
+                ),
+                (
+                    "(repeat () (times 3) (until (= 1 1)) (body (run r)))",
+                    0,
+                    pb::TerminationReason::UntilMatched,
+                    0,
+                ),
+                (
+                    "(repeat () (times 3) (until (= 1 2)) (body (run r)))",
+                    3,
+                    pb::TerminationReason::CountReached,
+                    3,
+                ),
+                (
+                    "(saturate () (max-iterations 3) (until) (body (run r)))",
+                    0,
+                    pb::TerminationReason::UntilMatched,
+                    0,
+                ),
+                (
+                    "(repeat () (times 0) (until) (body (run r)))",
+                    0,
+                    pb::TerminationReason::CountReached,
+                    0,
+                ),
+                (
+                    "(repeat () (times 3) (body (repeat () (times 2) (body (run r)))))",
+                    3,
+                    pb::TerminationReason::CountReached,
+                    6,
+                ),
+            ] {
+                let text = format!("(ruleset r) (run-schedule {control})");
+                let (first, runs, rendered) = execute(&text, mode);
+                let (again, replay_runs, _) = execute(&rendered, mode);
+                assert_eq!(first, again, "{mode:?}/{control}");
+                assert_eq!(runs, replay_runs, "{mode:?}/{control}");
+                assert_eq!(
+                    runs.iter().map(|(_, count)| count).sum::<u64>(),
+                    invocations
+                );
+                let [outcome] = first.as_slice() else {
+                    panic!("{first:?}")
+                };
+                assert_eq!(outcome.iterations, iterations);
+                assert_eq!(outcome.termination, Some(reason.into()));
+            }
+        }
+    }
+
+    #[test]
+    fn source_loop_headers_check_until_only_between_complete_bodies() {
+        for bound in [None, Some(1), Some(5)] {
+            let limit = bound.map_or_else(String::new, |n| format!("(max-iterations {n})"));
+            let text = format!(
+                r#"
+                (relation Done ()) (relation ReachedB ())
+                (ruleset a) (rule () ((Done)) :ruleset a :name "a\"b\\c")
+                (ruleset b) (rule ((Done)) ((ReachedB)) :ruleset b)
+                (run-schedule (saturate () {limit} (until (Done) (= 1 1))
+                    (body (run a) (run b))))
+                (check (ReachedB))
+            "#
+            );
+            for mode in [
+                pb::ExecutionMode::Normal,
+                pb::ExecutionMode::TermEncoding,
+                pb::ExecutionMode::Proofs,
+                pb::ExecutionMode::ProofTesting,
+            ] {
+                let (outcomes, runs, rendered) = execute(&text, mode);
+                let (replayed, replay_runs, _) = execute(&rendered, mode);
+                assert_eq!(outcomes, replayed);
+                assert_eq!(runs, replay_runs);
+                assert_eq!(runs.iter().map(|(_, count)| count).sum::<u64>(), 2);
+                assert_eq!(outcomes[0].iterations, 1);
+                assert_eq!(
+                    outcomes[0].termination,
+                    Some(
+                        if bound == Some(1) {
+                            pb::TerminationReason::IterationLimit
+                        } else {
+                            pb::TerminationReason::UntilMatched
+                        }
+                        .into()
+                    )
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn source_loop_headers_reject_dead_invalid_queries_without_erasing_prefix() {
+        for control in [
+            "(repeat () (times 0) (until (Missing 1)) (body (run r)))",
+            "(repeat () (times 0) (body (eval (Missing 1))))",
+            "(repeat () (times 0) (body (run-with missing r)))",
+            "(repeat () (times 0) (until (= 1)) (body))",
+            "(repeat () (times -1) (body))",
+            "(repeat () (times 0) (times 1) (body))",
+            "(repeat () (times 0) (body) (body))",
+            "(repeat () (times 0) (unknown 1) (body))",
+            "(repeat () (body))",
+            "(repeat () (times 0))",
+            "(saturate () (max-iterations 0) (body))",
+            "(saturate () (max-iterations 9223372036854775808) (body))",
+            "(saturate () (times 1) (body))",
+        ] {
+            let text = format!("(relation Seed ()) (Seed) (ruleset r) (run-schedule {control})");
+            let mut engine = Engine::default();
+            let id = create(&mut engine);
+            let mut seed = None;
+            let mut error = None;
+            let mut source = Source::new(Some("dead-header.egg".into()), &text).unwrap();
+            for phase in source.by_ref() {
+                let phase = match phase {
+                    Ok(phase) => phase,
+                    Err(found) => {
+                        error = Some(found);
+                        break;
+                    }
+                };
+                for command in &phase.commands {
+                    if let Some(pb::command::Kind::Action(pb::Action {
+                        kind: Some(pb::action::Kind::Term(root)),
+                        ..
+                    })) = &command.kind
+                    {
+                        seed = Some((phase.clone(), *root));
+                    }
+                }
+                assert_eq!(run(&mut engine, id, phase).error, None);
+            }
+            assert!(error.is_some(), "{control}");
+            assert!(source.next().is_none());
+            let (mut check, root) = seed.expect("the completed source prefix");
+            check.commands = vec![pb::Command {
+                kind: Some(pb::command::Kind::Check(pb::Check { facts: vec![root] })),
+                ..Default::default()
+            }];
+            assert_eq!(run(&mut engine, id, check).error, None, "{control}");
+        }
+    }
+
+    #[test]
+    fn source_loop_headers_do_not_turn_guard_planner_errors_into_false() {
+        let text = "(run-schedule (repeat () (times 2) (until (= (+ x 1) 2)) (body)))";
+        let mut source = Source::new(Some("guard-planner.egg".into()), text).unwrap();
+        let mut engine = Engine::default();
+        let id = create(&mut engine);
+        let mut failed = false;
+        for phase in source.by_ref() {
+            let response = run(&mut engine, id, phase.unwrap());
+            if let Some(error) = response.error {
+                assert_ne!(error.code, pb::ErrorCode::CheckFailed as i32);
+                assert_eq!(error.location.unwrap().path, [0]);
+                assert!(error.span.is_some());
+                assert!(response.outputs.is_empty());
+                assert!(!response.profile.unwrap().complete);
+                failed = true;
+                break;
+            }
+        }
+        assert!(failed);
+    }
+
+    #[test]
+    fn source_loop_headers_replay_deferred_scheduler_and_local_frames() {
+        let text = r#"
+            (relation R (i64)) (relation S (i64))
+            (ruleset copy) (rule ((R x)) ((S x)) :ruleset copy)
+            (R 1) (R 2)
+            (let-scheduler bo (back-off :match-limit 1 :ban-length 1))
+            (run-schedule (saturate () (max-iterations 100) (until (= 1 2))
+                (body (fail (fail (run-with bo copy))))))
+            (check (S 1) (S 2))
+            (ruleset empty)
+            (run-schedule (repeat () (times 2) (body
+                (let-scheduler local (back-off :match-limit 1))
+                (run-with local empty))))
+        "#;
+        for mode in [
+            pb::ExecutionMode::Normal,
+            pb::ExecutionMode::TermEncoding,
+            pb::ExecutionMode::Proofs,
+            pb::ExecutionMode::ProofTesting,
+        ] {
+            let (outcomes, runs, rendered) = execute(text, mode);
+            let (again, replay_runs, _) = execute(&rendered, mode);
+            assert_eq!(outcomes, again);
+            assert_eq!(runs, replay_runs);
+            assert!(outcomes[0].iterations > 1);
+            assert_eq!(
+                outcomes[0].termination,
+                Some(pb::TerminationReason::Saturated.into())
+            );
+            assert_eq!(outcomes[1].iterations, 2);
+            assert_eq!(
+                outcomes[1].termination,
+                Some(pb::TerminationReason::CountReached.into())
+            );
+        }
+    }
+
+    #[test]
+    fn source_loop_headers_retain_caught_action_prefix_progress() {
+        let text = r#"
+            (datatype N (N0) (N1) (N3) (Wrap N))
+            (function f (N) N :no-merge) (set (f (N0)) (N1))
+            (ruleset empty)
+            (run-schedule (saturate () (max-iterations 5) (body
+                (fail (set (f (N0)) (Wrap (N3)))) (run empty))))
+            (check (Wrap (N3)) (= (f (N0)) (N1)))
+        "#;
+        let (outcomes, runs, rendered) = execute(text, pb::ExecutionMode::Normal);
+        let (again, replay_runs, _) = execute(&rendered, pb::ExecutionMode::Normal);
+        assert_eq!(outcomes, again);
+        assert_eq!(runs, replay_runs);
+        assert_eq!(outcomes[0].iterations, 2);
+        assert!(outcomes[0].updated);
+        assert_eq!(
+            outcomes[0].termination,
+            Some(pb::TerminationReason::Saturated.into())
+        );
+        assert_eq!(runs.iter().map(|(_, count)| count).sum::<u64>(), 2);
+    }
+
+    #[test]
+    fn source_loop_headers_uncaught_failure_retains_prefix_location_and_recovery() {
+        for mode in [
+            pb::ExecutionMode::Normal,
+            pb::ExecutionMode::TermEncoding,
+            pb::ExecutionMode::Proofs,
+            pb::ExecutionMode::ProofTesting,
+        ] {
+            let mut text = "(datatype E (Seed i64)) (run-schedule (repeat () (times 2) (body (eval (Seed 1)) (panic \"header-stop\"))))".to_owned();
+            for replay in [false, true] {
+                let mut engine = Engine::default();
+                let id = pb::CreateEGraphResponse::decode(
+                    engine
+                        .create(
+                            &pb::CreateEGraphRequest {
+                                sorts: fixture().sorts[..1].to_vec(),
+                                options: Some(pb::EGraphOptions {
+                                    execution_mode: mode.into(),
+                                    cost_sort: Some(0),
+                                    ..Default::default()
+                                }),
+                                ..Default::default()
+                            }
+                            .encode_to_vec(),
+                        )
+                        .unwrap()
+                        .as_slice(),
+                )
+                .unwrap()
+                .egraph_id;
+                let mut renderer = Renderer::default();
+                let mut rendered = String::new();
+                let mut failed = false;
+                for phase in Source::new(Some("header-failure.egg".into()), &text).unwrap() {
+                    let mut phase = phase.unwrap();
+                    rendered.push_str(&renderer.render(&phase).unwrap());
+                    let response = run(&mut engine, id, phase.clone());
+                    if let Some(error) = response.error {
+                        assert_eq!(error.code, pb::ErrorCode::Panic as i32);
+                        let location = error.location.unwrap();
+                        assert_eq!(location.path, [0, 1]);
+                        assert_eq!(location.iterations, [0]);
+                        let span = error.span.unwrap();
+                        let source = phase.files[span.file as usize].contents.as_deref().unwrap();
+                        assert!(source[span.start as usize..span.end as usize].contains("panic"));
+                        assert!(response.outputs.is_empty());
+                        assert!(!response.profile.unwrap().complete);
+                        let seed = phase
+                            .nodes
+                            .iter()
+                            .position(|node| {
+                                matches!(&node.kind,
+                            Some(pb::node::Kind::Call(call)) if call.func == "Seed")
+                            })
+                            .unwrap() as u32;
+                        phase.commands = vec![pb::Command {
+                            kind: Some(pb::command::Kind::Check(pb::Check { facts: vec![seed] })),
+                            ..Default::default()
+                        }];
+                        assert_eq!(run(&mut engine, id, phase).error, None, "{mode:?}/{replay}");
+                        failed = true;
+                        break;
+                    }
+                }
+                assert!(failed);
+                text = rendered;
+            }
+        }
+    }
+}
+
 #[test]
 fn hidden_tables_source_native_and_snapshot_replay() {
     use egglog_experimental::protobuf::source::{Renderer, Source};
@@ -7281,7 +7702,7 @@ fn experimental_source_legacy_run_bounds_execute_and_roundtrip() {
 }
 
 #[test]
-fn experimental_renderer_rejects_unrepresentable_loop_shapes() {
+fn experimental_renderer_roundtrips_general_loop_shapes_and_rejects_source_count_overflow() {
     use egglog_experimental::protobuf::source::{Renderer, Source};
     let run = pb::Command {
         kind: Some(pb::command::Kind::Run(pb::Run {
@@ -7336,8 +7757,38 @@ fn experimental_renderer_rejects_unrepresentable_loop_shapes() {
             kind: Some(kind),
             ..Default::default()
         }];
-        assert!(Renderer::default().render(&program).is_err());
+        let rendered = Renderer::default().render(&program).unwrap();
+        let mut engine = Engine::default();
+        let id = create(&mut engine);
+        let mut loops = 0;
+        for phase in Source::new(None, &rendered).unwrap() {
+            let response = crate::run(&mut engine, id, phase.unwrap());
+            assert_eq!(response.error, None);
+            for output in response.outputs {
+                if let Some(pb::command_output::Kind::Loop(outcome)) = output.kind {
+                    assert_eq!(outcome.iterations, 1);
+                    assert!(!outcome.updated);
+                    loops += 1;
+                }
+            }
+        }
+        assert_eq!(loops, 1);
     }
+    let mut overflow = program;
+    overflow.commands = vec![pb::Command {
+        kind: Some(pb::command::Kind::Saturate(pb::Saturate {
+            max_iterations: Some(i64::MAX as u64 + 1),
+            ..Default::default()
+        })),
+        ..Default::default()
+    }];
+    assert!(
+        Renderer::default()
+            .render(&overflow)
+            .unwrap_err()
+            .to_string()
+            .contains("loop bound exceeds native source integer")
+    );
     for text in [
         "(ruleset r) (run-schedule (repeat 3 (eval (Missing 1))))",
         "(ruleset r) (run-schedule (repeat 0 (let-scheduler b (back-off :ban-length -1))))",
@@ -7604,10 +8055,16 @@ fn source_scheduler_until_preserves_queries_and_has_no_internal_proof_output() {
                         unreachable!()
                     };
                     repeat.body.push(repeat.body[0].clone());
-                    assert!(
-                        renderer.render(&rejected).is_err(),
-                        "no general body-until spelling may be invented"
-                    );
+                    if core {
+                        assert!(renderer.render(&rejected).is_err());
+                    } else {
+                        let modified = renderer.clone().render(&rejected).unwrap();
+                        assert!(
+                            Source::new(None, &format!("{rendered}{modified}"))
+                                .unwrap()
+                                .all(|phase| phase.is_ok())
+                        );
+                    }
                 }
                 rendered.push_str(&renderer.render(&phase).unwrap());
                 let response = run(&mut engine, id, phase);
@@ -7693,14 +8150,19 @@ fn source_scheduler_renderer_stages_only_successful_top_level_bindings() {
     named.scheduler = "bo".into();
     rejected.commands.push(pb::Command {
         kind: Some(pb::command::Kind::Saturate(pb::Saturate {
-            max_iterations: Some(2),
+            max_iterations: Some(i64::MAX as u64 + 1),
             body: vec![run],
             ..Default::default()
         })),
         ..Default::default()
     });
     let error = renderer.render(&rejected).unwrap_err();
-    assert!(error.to_string().contains("bounded Saturate"), "{error}");
+    assert!(
+        error
+            .to_string()
+            .contains("loop bound exceeds native source integer"),
+        "{error}"
+    );
     assert_eq!(
         renderer.render(&phases[1]).unwrap(),
         fresh.render(&phases[1]).unwrap(),
@@ -10808,17 +11270,21 @@ fn experimental_renderer_failure_retry_is_inert() {
     next.rulesets[2].name = Some("later".into());
     let mut invalid = next.clone();
     invalid.commands = vec![pb::Command {
-        // Exact Repeat1 is now representable. General bounded Saturate still
-        // has no native experimental spelling, even though its body is valid.
+        // The wire admits larger bounds than the native i64 source grammar.
         kind: Some(pb::command::Kind::Saturate(pb::Saturate {
             body: next.commands.clone(),
-            max_iterations: Some(2),
+            max_iterations: Some(i64::MAX as u64 + 1),
             ..Default::default()
         })),
         ..Default::default()
     }];
     let error = retry.render(&invalid).unwrap_err();
-    assert!(error.to_string().contains("bounded Saturate"), "{error}");
+    assert!(
+        error
+            .to_string()
+            .contains("loop bound exceeds native source integer"),
+        "{error}"
+    );
     assert_eq!(
         retry.render(&next).unwrap(),
         pristine.render(&next).unwrap()

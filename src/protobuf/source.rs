@@ -1940,6 +1940,46 @@ impl Source {
             return Err("source schedule nesting exceeds 256".into());
         }
         let span = expr.span();
+        if let Some(header) = scheduling::loop_header(expr).map_err(|error| error.to_string())? {
+            let until = if let Some(until) = header.until {
+                if until.is_empty() {
+                    vec![self.expr(&ResolvedExpr::Lit(span.clone(), Literal::Unit), None, 0)?]
+                } else {
+                    let resolved = self
+                        .graph
+                        .resolve_command_preserving_globals(Command::Check(span.clone(), until))
+                        .map_err(|error| error.to_string())?;
+                    let [N::Check(_, facts)] = resolved.as_slice() else {
+                        return Err("source until resolution changed its native query".into());
+                    };
+                    self.facts(facts)?
+                }
+            } else {
+                vec![]
+            };
+            let mut nested = locals.clone();
+            let body = header
+                .body
+                .iter()
+                .map(|child| self.extended_schedule(child, &mut nested, publish, depth + 1))
+                .collect::<Result<Vec<_>, _>>()?;
+            return Ok(pb::Command {
+                span: self.span(&span)?,
+                kind: Some(if header.exact {
+                    pb::command::Kind::Repeat(pb::Repeat {
+                        times: header.bound,
+                        until,
+                        body,
+                    })
+                } else {
+                    pb::command::Kind::Saturate(pb::Saturate {
+                        max_iterations: header.bound,
+                        until,
+                        body,
+                    })
+                }),
+            });
+        }
         let (ruleset, scheduler, until) = match expr {
             Expr::Call(_, head, args) if head == "fail" => {
                 let [child] = args.as_slice() else {
@@ -4258,31 +4298,70 @@ fn source_extended_schedule(
         return Err("source schedule nesting exceeds 256".into());
     }
     let span = native_span(program, command.span.as_ref())?;
-    let mut until = None;
-    let mut leaf = command;
-    if let Some(pb::command::Kind::Repeat(repeat)) = &command.kind
-        && !repeat.until.is_empty()
-    {
-        let [child] = repeat.body.as_slice() else {
-            return Err("experimental source loop-until requires one conditional Run".into());
-        };
-        if repeat.times != Some(1) || !matches!(child.kind, Some(pb::command::Kind::Run(_))) {
-            return Err("experimental source loop-until requires Repeat1 of one Run".into());
+    let header = match &command.kind {
+        Some(pb::command::Kind::Repeat(repeat)) if !repeat.until.is_empty() => {
+            Some(("repeat", repeat.times, &repeat.until, &repeat.body))
         }
-        let conditions = facts(program, &repeat.until)?;
-        let [Fact::Fact(condition)] = conditions.as_slice() else {
-            return Err(
-                "experimental run-until requires one expression condition, not a fact conjunction"
-                    .into(),
-            );
-        };
-        until = Some(condition.clone().map_symbols(
-            &mut |name: String| authored.callables.get(&name).cloned().unwrap_or(name),
-            &mut |name| name,
+        Some(pb::command::Kind::Saturate(saturate))
+            if saturate.max_iterations.is_some() || !saturate.until.is_empty() =>
+        {
+            Some((
+                "saturate",
+                saturate.max_iterations,
+                &saturate.until,
+                &saturate.body,
+            ))
+        }
+        _ => None,
+    };
+    if let Some((head, bound, until, body)) = header {
+        let mut args = vec![Expr::Lit(span.clone(), Literal::Unit)];
+        if let Some(bound) = bound {
+            args.push(Expr::Call(
+                span.clone(),
+                if head == "repeat" {
+                    "times"
+                } else {
+                    "max-iterations"
+                }
+                .into(),
+                vec![Expr::Lit(
+                    span.clone(),
+                    Literal::Int(
+                        i64::try_from(bound)
+                            .map_err(|_| "loop bound exceeds native source integer")?,
+                    ),
+                )],
+            ));
+        }
+        if !until.is_empty() {
+            let conditions = facts(program, until)?
+                .into_iter()
+                .map(|fact| {
+                    let expr = match fact {
+                        Fact::Fact(expr) => expr,
+                        Fact::Eq(span, left, right) => {
+                            Expr::Call(span, "=".into(), vec![left, right])
+                        }
+                    };
+                    expr.map_symbols(
+                        &mut |name: String| authored.callables.get(&name).cloned().unwrap_or(name),
+                        &mut |name| name,
+                    )
+                })
+                .collect();
+            args.push(Expr::Call(span.clone(), "until".into(), conditions));
+        }
+        args.push(Expr::Call(
+            span.clone(),
+            "body".into(),
+            body.iter()
+                .map(|child| source_extended_schedule(program, child, context, authored, depth + 1))
+                .collect::<Result<Vec<_>, _>>()?,
         ));
-        leaf = child;
+        return Ok(Expr::Call(span, head.into(), args));
     }
-    let (head, args) = match leaf.kind.as_ref().ok_or("missing schedule kind")? {
+    let (head, args) = match command.kind.as_ref().ok_or("missing schedule kind")? {
         pb::command::Kind::Fail(child) => (
             "fail",
             vec![source_extended_schedule(
@@ -4344,9 +4423,6 @@ fn source_extended_schedule(
                 "run-with"
             };
             args.push(Expr::Var(span.clone(), name.clone()));
-            if let Some(condition) = until {
-                args.extend([Expr::Var(span.clone(), ":until".into()), condition]);
-            }
             (head, args)
         }
         pb::command::Kind::BindScheduler(bind) => {
@@ -4410,12 +4486,6 @@ fn source_extended_schedule(
             (head, args)
         }
         pb::command::Kind::Saturate(saturate) => {
-            if saturate.max_iterations.is_some() || !saturate.until.is_empty() {
-                return Err(
-                    "experimental source has no general bounded Saturate or loop-until spelling"
-                        .into(),
-                );
-            }
             let args = saturate
                 .body
                 .iter()

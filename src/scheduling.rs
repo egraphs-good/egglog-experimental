@@ -25,6 +25,9 @@
 //! - **`(saturate step...)`** — repeatedly run the body until it makes no further
 //!   progress (the accumulated report's `can_stop` is set).
 //! - **`(repeat n step...)`** — run the body `n` times.
+//! - **`(saturate () (max-iterations n) (until fact...) (body step...))`** —
+//!   explicit loop options; the bound and guard are optional. Exact repetition
+//!   uses `(repeat () (times n) (until fact...) (body step...))`.
 //! - **`(eval expr...)`** — evaluate each `expr` in the full read/write
 //!   (FullState) context and add the resulting terms to the e-graph, the
 //!   schedule-step analogue of a top-level expression like `(Add (Num 1) (Num 2))`.
@@ -71,6 +74,76 @@ pub(crate) struct SchedulerBinding {
 
 pub(crate) type PermanentSchedulerState = HashMap<String, SchedulerBinding>;
 pub(crate) use schedulers::BackOffScheduler;
+
+pub(crate) struct LoopHeader<'a> {
+    pub exact: bool,
+    pub bound: Option<u64>,
+    pub until: Option<Vec<Fact>>,
+    pub body: &'a [Expr],
+}
+
+// Unit was never an executable schedule step or an integer Repeat count.
+// Decode this opt-in grammar once for native validation, execution and Source.
+pub(crate) fn loop_header(expr: &Expr) -> Result<Option<LoopHeader<'_>>, egglog::Error> {
+    let Expr::Call(span, head, args) = expr else {
+        return Ok(None);
+    };
+    if !matches!(head.as_str(), "repeat" | "saturate")
+        || !matches!(args.first(), Some(Expr::Lit(_, Literal::Unit)))
+    {
+        return Ok(None);
+    }
+    let invalid =
+        || egglog::Error::ParseError(ParseError(span.clone(), "Invalid loop header".into()));
+    let exact = head == "repeat";
+    let mut bound = None;
+    let mut until = None;
+    let mut body = None;
+    for field in &args[1..] {
+        let Expr::Call(_, name, values) = field else {
+            return Err(invalid());
+        };
+        match name.as_str() {
+            "times" | "max-iterations" if bound.is_none() && (name == "times") == exact => {
+                let [Expr::Lit(_, Literal::Int(count))] = values.as_slice() else {
+                    return Err(invalid());
+                };
+                let count = u64::try_from(*count).map_err(|_| invalid())?;
+                if !exact && count == 0 {
+                    return Err(invalid());
+                }
+                bound = Some(count);
+            }
+            "until" if until.is_none() => {
+                until = Some(
+                    values
+                        .iter()
+                        .map(|expr| match expr {
+                            Expr::Call(span, name, args) if name == "=" => {
+                                let [left, right] = args.as_slice() else {
+                                    return Err(invalid());
+                                };
+                                Ok(Fact::Eq(span.clone(), left.clone(), right.clone()))
+                            }
+                            _ => Ok(Fact::Fact(expr.clone())),
+                        })
+                        .collect::<Result<Vec<_>, _>>()?,
+                );
+            }
+            "body" if body.is_none() => body = Some(values.as_slice()),
+            _ => return Err(invalid()),
+        }
+    }
+    if exact && bound.is_none() {
+        return Err(invalid());
+    }
+    Ok(Some(LoopHeader {
+        exact,
+        bound,
+        until,
+        body: body.ok_or_else(invalid)?,
+    }))
+}
 
 // Shallow views borrow each frontend's existing nodes. The fold, not either
 // producer, owns continuation, pre-check placement and error-safe lexical scope.
@@ -238,19 +311,159 @@ struct ScheduleState {
     partial: RunReport,
 }
 
-// Compile every ordinary action descendant before invoking a schedule anchor,
+// Compile actions and opt-in header descendants before a schedule anchor,
 // including dead Repeat0 bodies. The ordered clone retains declaration/stack
-// context across root arguments without executing actions or primitive bodies.
+// context without executing bodies or constructing schedulers.
 fn validate_action_steps(egraph: &mut egglog::EGraph, roots: &[Expr]) -> Result<(), egglog::Error> {
-    let mut pending: Vec<_> = roots.iter().rev().collect();
+    enum Pending<'a> {
+        Step(&'a Expr, bool),
+        Leave(usize),
+        Restore(Box<egglog::EGraph>),
+    }
+    let mut pending: Vec<_> = roots
+        .iter()
+        .rev()
+        .map(|expr| Pending::Step(expr, false))
+        .collect();
     let mut commands = vec![];
-    while let Some(expr) = pending.pop() {
+    let mut bindings = vec![];
+    let mut compiler = egraph.clone();
+    while let Some(next) = pending.pop() {
+        let (expr, strict) = match next {
+            Pending::Step(expr, strict) => (expr, strict),
+            Pending::Leave(mark) => {
+                bindings.truncate(mark);
+                continue;
+            }
+            Pending::Restore(outer) => {
+                compiler.validate_program(std::mem::take(&mut commands))?;
+                compiler = *outer;
+                continue;
+            }
+        };
+        let invalid =
+            || egglog::Error::ParseError(ParseError(expr.span(), "Invalid schedule".into()));
+        let header = loop_header(expr)?;
+        let skipped = header.as_ref().is_some_and(|header| {
+            header.exact && header.bound == Some(0)
+                || header.until.as_ref().is_some_and(Vec::is_empty)
+        }) || matches!(expr, Expr::Call(_, head, args) if head == "repeat"
+            && matches!(args.first(), Some(Expr::Lit(_, Literal::Int(count))) if *count <= 0));
+        if skipped {
+            // Validate dead descendants without leaking their stack/declaration
+            // metadata into subsequent steps.
+            compiler = compiler.validate_program(std::mem::take(&mut commands))?;
+            pending.push(Pending::Restore(Box::new(compiler.clone())));
+        }
+        if let Some(header) = header {
+            if let Some(until) = header.until {
+                commands.push(Command::Check(expr.span(), until));
+            }
+            pending.push(Pending::Leave(bindings.len()));
+            pending.extend(
+                header
+                    .body
+                    .iter()
+                    .rev()
+                    .map(|expr| Pending::Step(expr, true)),
+            );
+            continue;
+        }
+        if let Expr::Var(_, ruleset) = expr {
+            if strict {
+                commands.push(Command::RunSchedule(egglog::ast::Schedule::Run(
+                    expr.span(),
+                    egglog::ast::RunConfig {
+                        ruleset: ruleset.clone(),
+                        until: None,
+                    },
+                )));
+            }
+            continue;
+        }
         let Expr::Call(_, head, args) = expr else {
+            if strict {
+                return Err(invalid());
+            }
             continue;
         };
         match head.as_str() {
-            "seq" | "saturate" | "fail" => pending.extend(args.iter().rev()),
-            "repeat" => pending.extend(args.iter().skip(1).rev()),
+            "seq" | "saturate" => {
+                pending.push(Pending::Leave(bindings.len()));
+                pending.extend(args.iter().rev().map(|expr| Pending::Step(expr, strict)));
+            }
+            "repeat" => {
+                if strict && !matches!(args.first(), Some(Expr::Lit(_, Literal::Int(_)))) {
+                    return Err(invalid());
+                }
+                pending.push(Pending::Leave(bindings.len()));
+                pending.extend(
+                    args.iter()
+                        .skip(1)
+                        .rev()
+                        .map(|expr| Pending::Step(expr, strict)),
+                );
+            }
+            "fail" => {
+                if strict && args.len() != 1 {
+                    return Err(invalid());
+                }
+                pending.extend(args.iter().rev().map(|expr| Pending::Step(expr, strict)));
+            }
+            "let-scheduler" => {
+                let [Expr::Var(_, name), Expr::Call(_, factory, _)] = args.as_slice() else {
+                    if strict {
+                        return Err(invalid());
+                    }
+                    continue;
+                };
+                if strict
+                    && (bindings.contains(name)
+                        || !scheduler_libs.lock().unwrap().contains_key(factory))
+                {
+                    return Err(invalid());
+                }
+                bindings.push(name.clone());
+            }
+            "run" | "run-with" if strict => {
+                let rest = if head == "run-with" {
+                    let [Expr::Var(_, scheduler), rest @ ..] = args.as_slice() else {
+                        return Err(invalid());
+                    };
+                    compiler = compiler.validate_program(std::mem::take(&mut commands))?;
+                    if !bindings.contains(scheduler)
+                        && !compiler
+                            .extension_state::<PermanentSchedulerState>()
+                            .is_some_and(|state| state.contains_key(scheduler))
+                    {
+                        return Err(egglog::Error::ParseError(ParseError(
+                            expr.span(),
+                            format!("Unknown scheduler: {scheduler}"),
+                        )));
+                    }
+                    rest
+                } else {
+                    args.as_slice()
+                };
+                let (ruleset, rest) = match rest {
+                    [Expr::Var(_, name), rest @ ..] if name != ":until" => (name.as_str(), rest),
+                    _ => ("", rest),
+                };
+                let until = match rest {
+                    [] => None,
+                    [Expr::Var(_, option), condition] if option == ":until" => {
+                        Some(vec![Fact::Fact(condition.clone())])
+                    }
+                    _ => return Err(invalid()),
+                };
+                commands.push(Command::RunSchedule(egglog::ast::Schedule::Run(
+                    expr.span(),
+                    egglog::ast::RunConfig {
+                        ruleset: ruleset.into(),
+                        until,
+                    },
+                )));
+            }
             "eval" => commands.extend(
                 args.iter()
                     .map(|expr| Command::Action(Action::Expr(expr.span(), expr.clone()))),
@@ -260,10 +473,20 @@ fn validate_action_steps(egraph: &mut egglog::EGraph, roots: &[Expr]) -> Result<
             "primitive" | "push" | "pop" | "set" | "delete" | "subsume" | "union" | "panic" => {
                 commands.extend(egraph.parse_program(None, &expr.to_string())?)
             }
+            _ if strict => {
+                if egraph.has_command(head) {
+                    // Preserve opaque native forwarding; never execute a
+                    // callback merely to validate a dead body.
+                } else if matches!(head.as_str(), "print-size" | "print-function" | "extract") {
+                    commands.extend(egraph.parse_program(None, &expr.to_string())?);
+                } else {
+                    return Err(invalid());
+                }
+            }
             _ => (),
         }
     }
-    egraph.validate_program(commands)?;
+    compiler.validate_program(commands)?;
     Ok(())
 }
 
@@ -565,6 +788,13 @@ impl ControlContext for NativeSchedule<'_> {
     type Scope = usize;
 
     fn view<'a>(&self, node: &'a Expr) -> Result<Control<'a, Expr>, egglog::Error> {
+        if let Some(header) = loop_header(node)? {
+            return Ok(if header.exact {
+                Control::Repeat(header.body, header.bound.expect("required count"))
+            } else {
+                Control::Saturate(header.body, header.bound)
+            });
+        }
         Ok(match node {
             Expr::Call(_, name, body) if name == "seq" => Control::Sequence(body),
             Expr::Call(_, name, body) if name == "saturate" => Control::Saturate(body, None),
@@ -606,8 +836,21 @@ impl ControlContext for NativeSchedule<'_> {
         })
     }
 
-    fn until(&mut self, _: &Expr, _: &[usize], _: &[u64]) -> Result<bool, egglog::Error> {
-        Ok(false)
+    fn until(&mut self, node: &Expr, _: &[usize], _: &[u64]) -> Result<bool, egglog::Error> {
+        let Some(until) = loop_header(node)?.and_then(|header| header.until) else {
+            return Ok(false);
+        };
+        match self
+            .egraph
+            .check_condition_observed(node.span(), until, &mut |event| {
+                if let ExecutionEvent::ActionsFinished { changed, .. } = event {
+                    self.state.changed |= changed;
+                }
+            }) {
+            Ok(()) => Ok(true),
+            Err(egglog::Error::CheckError(..)) => Ok(false),
+            Err(error) => Err(error),
+        }
     }
     fn completed(
         &mut self,
