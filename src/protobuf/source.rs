@@ -2626,9 +2626,8 @@ impl Source {
             .collect()
     }
 
-    // Local bindings may disappear only when every evaluation is closed,
-    // constructor/scalar-only and reachable from the one terminal action.
-    // Reusing alias NodeIds preserves sharing without introducing wire scope.
+    // Constructor aliases are closed. Mixed scopes must be the exact ordered
+    // local plan of an admitted DAG; observable alias reuse is not portable.
     fn action_scope(
         &mut self,
         actions: &ast::GenericActions<ResolvedCall, ast::ResolvedVar>,
@@ -2643,6 +2642,8 @@ impl Source {
         let mut aliases = HashMap::new();
         let mut dependencies = HashMap::new();
         let mut reached = HashSet::new();
+        let mut constructor_only = true;
+        let mut evaluations = Vec::new();
         for (position, action) in actions.0.iter().enumerate() {
             let mut pending = match action {
                 ResolvedAction::Let(_, _, expr) if position < prefix.len() => vec![expr],
@@ -2659,9 +2660,12 @@ impl Source {
                     ResolvedExpr::Var(_, var) if !var.is_global_ref && aliases.contains_key(&var.name) => {
                         used.insert(var.name.clone());
                     }
-                    ResolvedExpr::Call(_, ResolvedCall::Func(function), args)
-                        if function.subtype == ast::FunctionSubtype::Constructor
-                            && !self.relations.contains(&function.name) => pending.extend(args),
+                    ResolvedExpr::Call(_, call, args) => {
+                        constructor_only &= matches!(call, ResolvedCall::Func(function)
+                            if function.subtype == ast::FunctionSubtype::Constructor
+                                && !self.relations.contains(&function.name));
+                        pending.extend(args);
+                    }
                     _ => return Err("source action scope requires closed constructor/scalar locals, without reads, primitives or globals".into()),
                 }
             }
@@ -2671,6 +2675,7 @@ impl Source {
                     return Err("source action scope has a duplicate local".into());
                 }
                 dependencies.insert(var.name.clone(), used);
+                evaluations.push(node);
             } else {
                 let mut pending: Vec<_> = used.into_iter().collect();
                 while let Some(name) = pending.pop() {
@@ -2689,6 +2694,60 @@ impl Source {
             Some(pb::action::Kind::Term(_) | pb::action::Kind::Set(_))
         ) {
             return Err("source action scope terminal is not a plain Term or Set".into());
+        }
+        if !constructor_only {
+            let native_spans = NativeSpans::default();
+            let (depths, expansions) = validate_node_graph(&self.program, &native_spans)?;
+            // Source can know only an authored alias for a structural sort.
+            // Match execution's canonical sort context without changing it.
+            let mut graph = self.graph.clone();
+            materialize_sorts(
+                &self.program,
+                &mut graph,
+                &mut HashSet::new(),
+                &native_spans,
+            )?;
+            let constructors = self
+                .program
+                .nodes
+                .iter()
+                .filter_map(|node| match &node.kind {
+                    Some(pb::node::Kind::Call(call))
+                        if self.graph.authoring_type_info().is_constructor(&call.func)
+                            && !self.relations.contains(&call.func) =>
+                    {
+                        Some(call.func.clone())
+                    }
+                    _ => None,
+                })
+                .collect();
+            // Reuse admission and first-demand lowering, including opaque Call
+            // barriers. Inlining locals must reproduce their actual order once.
+            let position = self.program.commands.len() as u32;
+            self.program.commands.push(pb::Command {
+                kind: Some(pb::command::Kind::Action(action.clone())),
+                ..Default::default()
+            });
+            let selected = classify_constructor_dags(
+                &self.program,
+                &constructors,
+                &depths,
+                &expansions,
+                &graph,
+            );
+            self.program.commands.pop();
+            let selected = selected?;
+            let closed = selected
+                .get(&vec![position])
+                .ok_or("source action scope is not an admitted ordered constructor DAG")?;
+            let (_, expected) =
+                constructor_dag_actions(&self.program, &action, |_| false, &native_spans, closed)?;
+            if expected != evaluations {
+                return Err(
+                    "source action scope changes first-demand evaluation order or alias reuse"
+                        .into(),
+                );
+            }
         }
         Ok(action)
     }
@@ -4000,12 +4059,12 @@ fn render_prepared(
             let span = native_span(program, command.span.as_ref(), native_spans)?;
             match command.kind.as_ref().ok_or("missing command kind")? {
                 pb::command::Kind::Action(action) => {
-                    if prepared.context.constructor_dags.contains(&vec![position as u32]) {
+                    if let Some(closed) = prepared.context.constructor_dags.get(&vec![position as u32]) {
                         commands.push(Command::ActionScope(span, ast::GenericActions(
                             constructor_dag_actions(program, action, |name| occupied.contains(name)
                                 || native.get_sort_by_name(name).is_some()
                                 || native.type_info().get_func_type(name).is_some()
-                                || native.type_info().is_primitive(name), native_spans)?,
+                                || native.type_info().is_primitive(name), native_spans, closed)?.0,
                         )));
                     } else {
                         commands.extend(

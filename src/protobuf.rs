@@ -222,7 +222,7 @@ struct RequestOccurrences {
     native_spans: NativeSpans,
     include_run_reports: bool,
     scoped_actions: HashSet<Vec<u32>>,
-    constructor_dags: HashSet<Vec<u32>>,
+    constructor_dags: HashMap<Vec<u32>, HashSet<u32>>,
     union_values: HashMap<u32, Value>,
 }
 
@@ -1082,9 +1082,15 @@ impl Session {
         validate_host_declarations(program, &mut staged.graph)?;
         let (depths, expansions) = validate_node_graph(program, &native_spans)?;
         let constructor_dags = if self.mode == pb::ExecutionMode::Normal {
-            classify_constructor_dags(program, &constructor_targets, &depths, &expansions)?
+            classify_constructor_dags(
+                program,
+                &constructor_targets,
+                &depths,
+                &expansions,
+                &staged.graph,
+            )?
         } else {
-            HashSet::new()
+            HashMap::new()
         };
         let mut scoped_actions = classify_union_actions(
             program,
@@ -1096,7 +1102,7 @@ impl Session {
         if !scoped_actions.is_empty() && self.mode != pb::ExecutionMode::Normal {
             return Err("scoped actions require normal execution mode".into());
         }
-        scoped_actions.extend(constructor_dags.iter().cloned());
+        scoped_actions.extend(constructor_dags.keys().cloned());
         lower_builtin_calls(program, &staged.graph, &signatures)?;
         for index in declaration_order(program, &mut staged.graph)? {
             let declaration = &program.declarations[index];
@@ -1593,7 +1599,7 @@ impl Session {
                     action,
                     &mut values,
                     false,
-                    context.constructor_dags.contains(&path),
+                    context.constructor_dags.get(&path),
                     &mut |_| {},
                     &context.native_spans,
                 )
@@ -2068,7 +2074,7 @@ impl Session {
                     action,
                     &mut context.union_values,
                     true,
-                    context.constructor_dags.contains(&location.path),
+                    context.constructor_dags.get(&location.path),
                     &mut |_| {},
                     &context.native_spans,
                 )?;
@@ -3056,7 +3062,7 @@ impl ControlContext for WireSchedule<'_> {
                 action,
                 &mut self.context.union_values,
                 true,
-                self.context.constructor_dags.contains(&location.path),
+                self.context.constructor_dags.get(&location.path),
                 &mut |event| {
                     if let ExecutionEvent::ActionsFinished { changed: next, .. } = event {
                         changed |= next;
@@ -4643,16 +4649,16 @@ fn validate_node_graph(
     Ok((depths, expansions))
 }
 
-// Only closed constructor/scalar syntax may be shared by this optimization.
-// Reads, effects, Union identities and saved/query code retain their existing
-// lowering. The native local memo lasts exactly one direct Action.
+// Only transitively closed constructors/scalars and four native value builders
+// may be shared. Other Calls are ordered barriers, never memoized ancestors.
 fn classify_constructor_dags(
     program: &pb::Program,
     constructors: &HashSet<String>,
     depths: &[usize],
     expansions: &[usize],
-) -> Result<HashSet<Vec<u32>>, String> {
-    let mut selected = HashSet::new();
+    graph: &EGraph,
+) -> Result<HashMap<Vec<u32>, HashSet<u32>>, String> {
+    let mut candidates = vec![];
     for (path, action) in action_sites(&program.commands) {
         if !matches!(
             action.kind,
@@ -4668,14 +4674,77 @@ fn classify_constructor_dags(
                 .ok_or("action node out of bounds")?;
             needs_scoping |= *depth > 256 || expansions[*root as usize] > 65_536;
         }
-        if !needs_scoping {
+        if needs_scoping {
+            candidates.push((path, roots));
+        }
+    }
+    if candidates.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let mut closed = HashSet::new();
+    let mut order: Vec<_> = (0..program.nodes.len()).collect();
+    order.sort_unstable_by_key(|index| depths[*index]);
+    for index in order {
+        let eligible = match program.nodes[index].kind.as_ref().unwrap() {
+            pb::node::Kind::Call(call) => {
+                let value_builder = if matches!(
+                    call.func.as_str(),
+                    "egglog.core.vec.of"
+                        | "egglog.core.vec.empty"
+                        | "egglog.core.bigint.from_string"
+                        | "egglog.core.bigrat.make"
+                ) {
+                    let types = graph.authoring_type_info();
+                    let sorts = call
+                        .args
+                        .iter()
+                        .copied()
+                        .chain([index as u32])
+                        .map(|node| {
+                            let name = node_sort(program, node)?;
+                            types
+                                .get_sort_by_name(&name)
+                                .cloned()
+                                .ok_or_else(|| format!("unknown value-builder sort {name}"))
+                        })
+                        .collect::<Result<Vec<_>, String>>()?;
+                    types
+                        .resolve_builtin(&call.func, &sorts)?
+                        .is_valid_in_context(egglog::Context::Pure)
+                } else {
+                    false
+                };
+                (constructors.contains(&call.func) || value_builder)
+                    && call.args.iter().all(|child| closed.contains(child))
+            }
+            pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
+                value:
+                    Some(
+                        pb::primitive_value::Value::I64(_)
+                        | pb::primitive_value::Value::F64Bits(_)
+                        | pb::primitive_value::Value::String(_)
+                        | pb::primitive_value::Value::Bool(_)
+                        | pb::primitive_value::Value::Unit(_),
+                    ),
+            }) => true,
+            _ => false,
+        };
+        if eligible {
+            closed.insert(index as u32);
+        }
+    }
+    let mut selected = HashMap::new();
+    for (path, roots) in candidates {
+        if roots
+            .iter()
+            .any(|root| !closed.contains(root) && depths[*root as usize] > 256)
+        {
             continue;
         }
         // Set keys precede its value in the existing scoped action compiler.
         let mut pending = roots;
         let mut seen = HashSet::new();
-        // The evaluator spends one Enter per edge plus each root, and at most
-        // one Call exit per unique node. Reserve the root steps here.
+        // Bound compact nodes/edges first; the planner also counts rereads.
         let mut remaining = 65_536usize
             .checked_sub(pending.len())
             .ok_or("constructor action DAG exceeds 65536 nodes and edges")?;
@@ -4685,7 +4754,7 @@ fn classify_constructor_dags(
                 continue;
             }
             let children = match program.nodes[index as usize].kind.as_ref().unwrap() {
-                pb::node::Kind::Call(call) if constructors.contains(&call.func) => &call.args[..],
+                pb::node::Kind::Call(call) => &call.args[..],
                 pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
                     value:
                         Some(
@@ -4706,8 +4775,16 @@ fn classify_constructor_dags(
                 .ok_or("constructor action DAG exceeds 65536 nodes and edges")?;
             pending.extend(children);
         }
-        if eligible {
-            selected.insert(path);
+        if eligible
+            && seen.iter().any(|index| {
+                closed.contains(index)
+                    && matches!(
+                        program.nodes[*index as usize].kind,
+                        Some(pb::node::Kind::Call(_))
+                    )
+            })
+        {
+            selected.insert(path, closed.intersection(&seen).copied().collect());
         }
     }
     Ok(selected)
@@ -4856,15 +4933,15 @@ fn validate_union_occurrences(program: &pb::Program) -> Result<(), String> {
     Ok(())
 }
 
-// A pure plan for an already admitted closed constructor/scalar action. Both
-// byte execution and Source rendering use these same first-demand local lets;
-// no native values, table handles or compiler state enter the plan.
+// Both byte execution and Source rendering use this first-demand local plan.
+// Nonclosed Calls are evaluated afresh and end the fragment memo's lifetime.
 fn constructor_dag_actions(
     program: &pb::Program,
     action: &pb::Action,
     mut occupied: impl FnMut(&str) -> bool,
     native_spans: &NativeSpans,
-) -> Result<Vec<Action>, String> {
+    closed: &HashSet<u32>,
+) -> Result<(Vec<Action>, Vec<u32>), String> {
     enum Walk {
         Enter(u32),
         Call(u32, usize),
@@ -4876,6 +4953,7 @@ fn constructor_dag_actions(
         .collect();
     let mut results = Vec::new();
     let mut actions = Vec::new();
+    let mut evaluations = Vec::new();
     let mut memo = HashMap::<u32, String>::new();
     let mut next = 0usize;
     let mut remaining = 65_536usize;
@@ -4932,7 +5010,12 @@ fn constructor_dag_actions(
                     name.clone(),
                     Expr::Call(span.clone(), call.func.clone(), args),
                 ));
-                memo.insert(index, name.clone());
+                evaluations.push(index);
+                if closed.contains(&index) {
+                    memo.insert(index, name.clone());
+                } else {
+                    memo.clear();
+                }
                 results.push(Expr::Var(span, name));
             }
         }
@@ -4951,7 +5034,7 @@ fn constructor_dag_actions(
         }
         _ => return Err("constructor action scope requires Term or Set".into()),
     });
-    Ok(actions)
+    Ok((actions, evaluations))
 }
 
 // Only Union locations are retained across direct commands. An admitted closed
@@ -4964,16 +5047,17 @@ fn eval_scoped_action(
     action: &pb::Action,
     values: &mut HashMap<u32, Value>,
     execute: bool,
-    share_constructors: bool,
+    closed: Option<&HashSet<u32>>,
     observer: &mut dyn FnMut(ExecutionEvent<'_>),
     native_spans: &NativeSpans,
 ) -> Result<(), egglog::Error> {
-    if share_constructors {
-        let actions = constructor_dag_actions(
+    if let Some(closed) = closed {
+        let (actions, _) = constructor_dag_actions(
             program,
             action,
             |name| graph.type_info().is_global(name),
             native_spans,
+            closed,
         )
         .map_err(egglog::Error::BackendError)?;
         let (result, _) = graph.eval_scoped_actions_observed(
@@ -6855,13 +6939,14 @@ mod tests {
             ..Default::default()
         };
         let mut values = HashMap::new();
+        let closed = (0..=root).collect();
         eval_scoped_action(
             &mut graph,
             &program,
             &action,
             &mut values,
             false,
-            true,
+            Some(&closed),
             &mut |_| {},
             &native_spans,
         )
@@ -6892,7 +6977,7 @@ mod tests {
                 &invalid,
                 &mut values,
                 false,
-                true,
+                Some(&closed),
                 &mut |_| {},
                 &native_spans,
             )
@@ -6907,7 +6992,7 @@ mod tests {
             &action,
             &mut values,
             true,
-            true,
+            Some(&closed),
             &mut |_| {},
             &native_spans,
         )
@@ -6917,6 +7002,251 @@ mod tests {
         assert_eq!(graph.materialized_eq_classes().len(), 1051);
         assert_eq!(graph.get_function_names(), functions);
         assert!(values.is_empty());
+    }
+
+    fn closed_value_dag(terminal: &str) -> (pb::Program, u32) {
+        let mut program = inventory_fixture(&format!(
+            "(sort A) (sort As (Vec A))
+             (constructor Leaf (As BigRat) A) (constructor Branch (As) A) {terminal}"
+        ));
+        let mut root = program.nodes.iter().position(|node|
+            matches!(&node.kind, Some(pb::node::Kind::Call(call)) if call.func == "Leaf")
+        ).unwrap() as u32;
+        let sort_id = program.nodes[root as usize].sort_id;
+        let vector = program.sorts.iter().position(|sort|
+            matches!(&sort.kind, Some(pb::sort::Kind::Family(family)) if family.name == "Vec")
+        ).unwrap() as u32;
+        for _ in 0..16 {
+            let children = program.nodes.len() as u32;
+            program.nodes.push(pb::Node {
+                sort_id: vector,
+                kind: Some(pb::node::Kind::Call(pb::Call {
+                    func: "egglog.core.vec.of".into(),
+                    args: vec![root, root],
+                })),
+                ..Default::default()
+            });
+            root = program.nodes.len() as u32;
+            program.nodes.push(pb::Node {
+                sort_id,
+                kind: Some(pb::node::Kind::Call(pb::Call {
+                    func: "Branch".into(),
+                    args: vec![children],
+                })),
+                ..Default::default()
+            });
+        }
+        let Some(pb::command::Kind::Action(pb::Action {
+            kind: Some(pb::action::Kind::Term(terminal)),
+            ..
+        })) = &program.commands[0].kind
+        else {
+            panic!("terminal")
+        };
+        let pb::node::Kind::Call(call) = program.nodes[*terminal as usize].kind.clone().unwrap()
+        else {
+            panic!("call")
+        };
+        let args = call
+            .args
+            .into_iter()
+            .map(|arg| {
+                if matches!(&program.nodes[arg as usize].kind,
+                Some(pb::node::Kind::Call(call)) if call.func == "Leaf")
+                {
+                    root
+                } else {
+                    arg
+                }
+            })
+            .collect();
+        program.nodes[*terminal as usize].kind =
+            Some(pb::node::Kind::Call(pb::Call { args, ..call }));
+        (program, root)
+    }
+
+    #[test]
+    fn closed_value_fragments_preserve_read_barriers_and_source_replay() {
+        // Native size reads exclude this action block's pending inserts.
+        let (mut program, root) = closed_value_dag(
+            "(constructor Demand (A i64 A i64) A)
+             (Demand (Leaf (vec-empty) (bigrat (from-string \"7\") (from-string \"2\")))
+                     (get-node-size!)
+                     (Leaf (vec-empty) (bigrat (from-string \"7\") (from-string \"2\")))
+                     (get-node-size!))
+             (check (Demand a 0 b 0)
+                    (Leaf (vec-empty) (bigrat (from-string \"7\") (from-string \"2\"))))",
+        );
+        let demand = program
+            .nodes
+            .iter_mut()
+            .find_map(|node| match &mut node.kind {
+                Some(pb::node::Kind::Call(call)) if call.func == "Demand" => Some(call),
+                _ => None,
+            })
+            .unwrap();
+        // The same ordinary Call node is demanded twice, separated by a fresh
+        // demand of the closed fragment. Neither the read nor its parent is CSE.
+        demand.args[3] = demand.args[1];
+        let (mut engine, id) = host_default_engine();
+        let mut execution = program.clone();
+        let prepared = engine.graphs[&id].prepare(&mut execution).unwrap();
+        let closed = &prepared.context.constructor_dags[&vec![0]];
+        assert!(closed.contains(&root));
+        let Some(pb::command::Kind::Action(action)) = &execution.commands[0].kind else {
+            unreachable!()
+        };
+        let (_, evaluations) = constructor_dag_actions(
+            &execution,
+            action,
+            |_| false,
+            &prepared.context.native_spans,
+            closed,
+        )
+        .unwrap();
+        for (name, expected) in [
+            ("Branch", 32),
+            ("egglog.experimental.size.nodes", 2),
+            ("Demand", 1),
+        ] {
+            let nodes: HashSet<_> = program
+                .nodes
+                .iter()
+                .enumerate()
+                .filter_map(|(index, node)| {
+                    matches!(&node.kind, Some(pb::node::Kind::Call(call)) if call.func == name)
+                        .then_some(index as u32)
+                })
+                .collect();
+            assert_eq!(
+                evaluations
+                    .iter()
+                    .filter(|index| nodes.contains(index))
+                    .count(),
+                expected
+            );
+            if name != "Branch" {
+                assert!(nodes.is_disjoint(closed));
+            }
+        }
+        assert_eq!(engine.graphs[&id].graph.num_tuples(), 0);
+        assert_eq!(
+            run_host_default(&mut engine, id, program.clone()).error,
+            None
+        );
+        assert_eq!(
+            engine.graphs[&id]
+                .graph
+                .get_size(&native_name("call", "Branch")),
+            16
+        );
+
+        let text = source::Renderer::default().render(&program).unwrap();
+        assert_eq!(text.matches("(action-scope ").count(), 1);
+        let (mut replay, replay_id) = host_default_engine();
+        for phase in source::Source::new(None, &text).unwrap() {
+            assert_eq!(
+                run_host_default(&mut replay, replay_id, phase.unwrap()).error,
+                None
+            );
+        }
+        // The generated mixed scope is invertible, not a public license to
+        // retain reads or move them before their first demand.
+        let parsed = crate::new_experimental_egraph()
+            .parse_program(None, &text)
+            .unwrap();
+        for cache_read in [false, true] {
+            let mut commands = parsed.clone();
+            let actions = commands
+                .iter_mut()
+                .find_map(|command| match command {
+                    Command::ActionScope(_, actions) => Some(&mut actions.0),
+                    _ => None,
+                })
+                .unwrap();
+            let demand = actions.len() - 2;
+            let Action::Let(_, _, Expr::Call(_, _, args)) = &mut actions[demand] else {
+                panic!("flat terminal call")
+            };
+            let (Expr::Var(_, first), Expr::Var(_, second)) = (&args[1], &args[3]) else {
+                panic!("read aliases")
+            };
+            let (first, second) = (first.clone(), second.clone());
+            if cache_read {
+                args[3] = args[1].clone();
+            }
+            let index = actions.iter().position(|action|
+                matches!(action, Action::Let(_, name, _) if name == if cache_read { &second } else { &first })
+            ).unwrap();
+            let read = actions.remove(index);
+            if !cache_read {
+                actions.insert(0, read);
+            }
+            let changed = commands
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join("\n");
+            let error = source::Source::new(None, &changed)
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap_err();
+            assert!(error.to_string().contains("scope"), "{error}");
+        }
+    }
+
+    #[test]
+    fn closed_value_fragments_keep_partial_failure_at_first_demand() {
+        for first in [false, true] {
+            let (signature, args) = if first {
+                (
+                    "BigRat A A",
+                    "(bigrat (from-string \"bad\") (from-string \"2\"))
+                  (Leaf (vec-empty) (bigrat (from-string \"7\") (from-string \"2\"))) (Late)",
+                )
+            } else {
+                (
+                    "A BigRat A",
+                    "(Leaf (vec-empty) (bigrat (from-string \"7\") (from-string \"2\")))
+                  (bigrat (from-string \"bad\") (from-string \"2\")) (Late)",
+                )
+            };
+            let (program, _) = closed_value_dag(&format!(
+                "(constructor Late () A) (constructor Demand ({signature}) A) (Demand {args})"
+            ));
+            let text = source::Renderer::default().render(&program).unwrap();
+            let (mut engine, id) = host_default_engine();
+            let response = run_host_default(&mut engine, id, program);
+            let error = response.error.unwrap();
+            assert_eq!(error.code, i32::from(pb::ErrorCode::EvaluationFailed));
+            assert_eq!(error.location.unwrap().path, [0]);
+            assert!(response.outputs.is_empty());
+            let graph = &engine.graphs[&id].graph;
+            assert_eq!(
+                graph.get_size(&native_name("call", "Branch")),
+                if first { 0 } else { 16 }
+            );
+            assert_eq!(graph.get_size(&native_name("call", "Late")), 0);
+            assert_eq!(graph.get_size(&native_name("call", "Demand")), 0);
+            let (mut replay, replay_id) = host_default_engine();
+            let mut failed = false;
+            for phase in source::Source::new(None, &text).unwrap() {
+                let response = run_host_default(&mut replay, replay_id, phase.unwrap());
+                if let Some(error) = response.error {
+                    assert_eq!(error.code, i32::from(pb::ErrorCode::EvaluationFailed));
+                    failed = true;
+                    break;
+                }
+            }
+            assert!(failed);
+            assert_eq!(
+                replay.graphs[&replay_id]
+                    .graph
+                    .materialized_eq_classes()
+                    .len(),
+                if first { 0 } else { 17 }
+            );
+        }
     }
 
     #[test]
