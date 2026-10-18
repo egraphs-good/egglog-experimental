@@ -14709,6 +14709,139 @@ fn recursive_fail_keeps_native_run_effects_and_source_shape() {
 }
 
 #[test]
+fn source_fail_global_let_preserves_prefix_binding_and_nested_expectations() {
+    use egglog_experimental::protobuf::source::{Renderer, Source};
+    for core in [false, true] {
+        for (prefix, tail, errors) in [
+            (
+                "(sort T) (constructor C () T) (function g (T) i64 :no-merge) (fail (let $y (g (C))))",
+                "(check (C)) (fail (let $z $y))",
+                0,
+            ),
+            ("(fail (let $x 1))", "(check (= $x 1))", 1),
+            ("(fail (fail (let $x 1)))", "(check (= $x 1))", 0),
+        ] {
+            let mut native = if core {
+                egglog::EGraph::default()
+            } else {
+                new_experimental_egraph()
+            };
+            let result = native.parse_and_run_program(None, prefix);
+            assert_eq!(result.is_err(), errors != 0, "core={core}: {prefix}");
+            if let Err(error) = result {
+                assert!(matches!(error, egglog::Error::ExpectFail(_)));
+            }
+            // Explicitly continue the same session after an unexpected success:
+            // its binding survives, just as earlier argument effects do on failure.
+            native.parse_and_run_program(None, tail).unwrap();
+
+            let mut text = format!("{prefix} {tail}");
+            for cycle in 0..2 {
+                let source = if core {
+                    Source::new_core(None, &text)
+                } else {
+                    Source::new(None, &text)
+                }
+                .unwrap();
+                let mut renderer = if core {
+                    Renderer::core()
+                } else {
+                    Renderer::default()
+                };
+                let mut replay = if core {
+                    egglog::EGraph::default()
+                } else {
+                    new_experimental_egraph()
+                };
+                let mut engine = Engine::default();
+                let id = create(&mut engine);
+                let mut rendered = String::new();
+                let mut failures = 0;
+                for phase in source {
+                    let phase = phase.unwrap();
+                    if cycle == 0
+                        && let Some(pb::Command {
+                            kind: Some(pb::command::Kind::Fail(_)),
+                            ..
+                        }) = phase.commands.first()
+                    {
+                        assert_eq!(phase.commands.len(), 1);
+                        let [declaration] = phase.declarations.as_slice() else {
+                            panic!("global declaration must be outside Fail")
+                        };
+                        let Some(pb::declaration::Kind::Function(function)) = &declaration.kind
+                        else {
+                            panic!("expected global function")
+                        };
+                        assert!(function.inputs.is_empty());
+                        let mut anchor = &phase.commands[0];
+                        while let Some(pb::command::Kind::Fail(child)) = &anchor.kind {
+                            anchor = child;
+                        }
+                        let Some(pb::command::Kind::Action(pb::Action {
+                            kind: Some(pb::action::Kind::Set(set)),
+                            ..
+                        })) = &anchor.kind
+                        else {
+                            panic!("only the global assignment belongs inside Fail")
+                        };
+                        assert_eq!(set.target.as_ref().unwrap().func, function.name);
+                    }
+                    let part = renderer.render(&phase).unwrap();
+                    let expected = replay.parse_and_run_program(None, &part);
+                    rendered.push_str(&part);
+                    // The existing helper encodes the request and decodes the
+                    // actual response; cycle two reimports standalone text.
+                    let response = run(&mut engine, id, phase);
+                    assert_eq!(response.error.is_some(), expected.is_err(), "{part}");
+                    assert!(response.outputs.is_empty(), "Fail must suppress outputs");
+                    if let Some(error) = response.error {
+                        assert_eq!(error.code, i32::from(pb::ErrorCode::EvaluationFailed));
+                        assert!(matches!(expected, Err(egglog::Error::ExpectFail(_))));
+                        failures += 1;
+                    }
+                }
+                assert_eq!(failures, errors, "core={core}, cycle={cycle}: {text}");
+                text = rendered;
+            }
+        }
+    }
+}
+
+#[test]
+fn source_fail_global_let_does_not_catch_preparation_errors() {
+    use egglog_experimental::protobuf::source::Source;
+    for core in [false, true] {
+        for (prefix, child, phases) in [
+            ("", "(fail (let $x (unknown)))", 0),
+            ("", "(fail (let $x (+ 1 \"wrong\")))", 0),
+            ("(let $x 1)", "(fail (let $x 2))", 1),
+        ] {
+            let text = format!("{prefix} {child} (check (= 1 1))");
+            let mut native = if core {
+                egglog::EGraph::default()
+            } else {
+                new_experimental_egraph()
+            };
+            let error = native.parse_and_run_program(None, &text).unwrap_err();
+            assert!(!matches!(error, egglog::Error::ExpectFail(_)));
+            let mut source = if core {
+                Source::new_core(None, &text)
+            } else {
+                Source::new(None, &text)
+            }
+            .unwrap();
+            for _ in 0..phases {
+                source.next().unwrap().unwrap();
+            }
+            let error = source.next().unwrap().unwrap_err();
+            assert!(!error.to_string().contains("source Fail requires"));
+            assert!(source.next().is_none());
+        }
+    }
+}
+
+#[test]
 fn fail_rejects_nested_invalid_and_non_native_commands_before_effects() {
     use egglog_experimental::protobuf::source::{Renderer, Source};
     for case in [
@@ -14794,7 +14927,6 @@ fn fail_rejects_nested_invalid_and_non_native_commands_before_effects() {
     }
     for source in [
         "(fail (sort X))",
-        "(fail (let x 1))",
         "(fail (extract 1))",
         "(fail (print-size))",
     ] {

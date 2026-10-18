@@ -515,7 +515,7 @@ impl Source {
                 command = *child;
             }
             if !fail_spans.is_empty()
-                && (!matches!(
+                && !matches!(
                     &command,
                     Command::Check(..)
                         | Command::Prove(..)
@@ -523,8 +523,8 @@ impl Source {
                         | Command::Action(..)
                         | Command::RunSchedule(..)
                         | Command::PrintOverallStatistics(_, None)
-                ) && !matches!(&command, Command::UserDefined(_, name, _) if name == "run-schedule")
-                    || matches!(&command, Command::Action(Action::Let(..))))
+                )
+                && !matches!(&command, Command::UserDefined(_, name, _) if name == "run-schedule")
             {
                 return Err("source Fail requires a supported native command; declarations and observations are not implemented".into());
             }
