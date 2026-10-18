@@ -455,6 +455,7 @@ impl EGraph {
             options: Some(pb::EGraphOptions {
                 cost_sort: Some(0),
                 execution_mode: pb::ExecutionMode::Normal as i32,
+                ..Default::default()
             }),
             ..Default::default()
         };

@@ -975,6 +975,7 @@ pub struct PythonBindings {
     pub views: ::prost::alloc::vec::Vec<PythonCallable>,
 }
 /// Free functions and CONSTANT use a qualified path; members use one name on owner.
+/// Function/constant paths are nonempty; final names may be empty, qualifiers may not.
 /// INITIALIZER instead omits path and derives __init__.
 /// METHOD/PROPERTY map a real core input as receiver. INITIALIZER/CLASS_METHOD
 /// have no core self/cls input. Only INITIALIZER requires result = owner;
@@ -983,7 +984,6 @@ pub struct PythonBindings {
 /// PROPERTY has only a receiver; CLASS_VARIABLE is a nullary expression view.
 /// CONSTANT is an ownerless named expression (C, not C()), backed by a nullary
 /// concrete core signature. It has no receiver, parameters or mutated input.
-/// Its path is nonempty, but its final name may be empty; qualifiers stay nonempty.
 /// It does not change declaration semantics or evaluate a body at installation
 /// or export. FUNCTION stays callable even when its core signature is nullary.
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -1668,6 +1668,10 @@ pub struct EGraphOptions {
     /// before term encoding captures their typechecking/validation environment.
     #[prost(enumeration = "ExecutionMode", tag = "2")]
     pub execution_mode: i32,
+    /// Absent retains the native default true. False selects native global naive
+    /// evaluation, including internally generated rules, not only authored rules.
+    #[prost(bool, optional, tag = "3")]
+    pub seminaive: ::core::option::Option<bool>,
 }
 /// Create an empty e-graph without executing a Program. Resolve the sort-only
 /// declarations against ambient host definitions, then validate options and this
@@ -1693,6 +1697,12 @@ pub struct CreateEGraphRequest {
     /// thread count. Reject unsupported requests rather than silently ignoring.
     #[prost(uint32, optional, tag = "5")]
     pub threads: ::core::option::Option<u32>,
+    /// Runtime query-planning policy, false by default. True skips tree
+    /// decomposition for future compiled rules; it does not recompile installed
+    /// rules or change typing/admission. Not part of logical snapshots or source
+    /// replay. Local rule no_decomp=true still applies when this global is false.
+    #[prost(bool, tag = "6")]
+    pub no_decomp: bool,
 }
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct CreateEGraphResponse {
@@ -1705,7 +1715,9 @@ pub struct CreateEGraphResponse {
 /// Restore by remapping C's closed sort graph and needed sort declarations into
 /// a CreateEGraphRequest, selecting receiver resource settings, then executing
 /// program normally on the fresh compatible handle. No creation-time commands
-/// or resumed scheduler/seminaive state are implied. Executing program against
+/// or resumed scheduler/delta state are implied. Options preserve global
+/// seminaive admission, not query plans or runtime resource/planner settings.
+/// Executing program against
 /// an existing handle still has ordinary Program semantics; callers must check
 /// option compatibility for any restoration equivalence claim.
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -1715,7 +1727,8 @@ pub struct EGraphSnapshot {
     #[prost(message, optional, tag = "2")]
     pub program: ::core::option::Option<Program>,
 }
-/// Clone the addressed e-graph, retaining C, execution mode and proof state.
+/// Clone the addressed e-graph, retaining C, logical options, resources and
+/// proof state.
 /// No complexity guarantee.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct CloneEGraphRequest {
@@ -1756,7 +1769,7 @@ pub struct ReturnToEGraphRequest {
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ReturnToEGraphResponse {
 }
-/// Query thread resources or update runtime/collection settings on a handle, never logical
+/// Query thread/planner resources or update runtime/collection settings on a handle, never logical
 /// settings or Program state. Completed updates affect subsequent calls; they
 /// do not reconfigure an in-flight Run. Clone inherits effective resources and
 /// later updates are handle-local. Resources are not part of a frozen snapshot.
@@ -1770,14 +1783,14 @@ pub struct ReturnToEGraphResponse {
 pub struct ConfigureEGraphResourcesRequest {
     #[prost(uint64, tag = "1")]
     pub egraph_id: u64,
-    #[prost(oneof = "configure_e_graph_resources_request::Operation", tags = "2, 3, 4")]
+    #[prost(oneof = "configure_e_graph_resources_request::Operation", tags = "2, 3, 4, 5")]
     pub operation: ::core::option::Option<configure_e_graph_resources_request::Operation>,
 }
 /// Nested message and enum types in `ConfigureEGraphResourcesRequest`.
 pub mod configure_e_graph_resources_request {
     #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Oneof)]
     pub enum Operation {
-        /// Observe the current effective thread count without changing settings.
+        /// Observe current thread count and global no_decomp without changing settings.
         #[prost(message, tag = "2")]
         Query(super::Unit),
         /// Zero requests automatic parallelism resolved at this update; positive
@@ -1788,9 +1801,16 @@ pub mod configure_e_graph_resources_request {
         Threads(u32),
         /// Set future native report detail. Does not disable collection or retrofit
         /// existing statistics. Clone inherits this setting; updates are handle-local.
-        /// Query remains a thread-count query, not a report-level getter.
+        /// Query does not observe report level.
         #[prost(enumeration = "super::ReportLevel", tag = "4")]
         ReportLevel(i32),
+        /// Change only the native global default for future query planning. This
+        /// affects neither typing/admission nor already compiled rules/plans. An
+        /// explicit false is an update, not an absent operation. No cursor/report
+        /// reset, cloning or definition reinstall is implied. Planning policy may
+        /// change match ordering, work and profiling; logical replay does not retain it.
+        #[prost(bool, tag = "5")]
+        NoDecomp(bool),
     }
 }
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
@@ -1800,6 +1820,9 @@ pub struct ConfigureEGraphResourcesResponse {
     /// without narrowing to the uint32 request domain.
     #[prost(uint64, tag = "1")]
     pub threads: u64,
+    /// Actual current native planning default after query/update, not an estimate.
+    #[prost(bool, tag = "2")]
+    pub no_decomp: bool,
 }
 /// Execute a program against an existing e-graph.
 #[derive(Clone, PartialEq, ::prost::Message)]

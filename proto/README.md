@@ -222,10 +222,10 @@ is undecided; high-level generation remains frontend work. Runtime checks for
 the bounded executable declaration/default subset are implemented below.
 
 Python views distinguish free functions, initializers, methods, class methods,
-properties, class variables, and ownerless constants. A `CONSTANT` view names a
-nullary concrete expression (`C`), with a qualified path and no owner, receiver,
-parameters or mutated input. Its path is nonempty, but the final component may
-be empty to preserve an empty constant name; preceding components stay nonempty.
+properties, class variables, and ownerless constants. Free functions and constants
+have nonempty qualified paths whose final component may be empty; preceding
+components stay nonempty. A `CONSTANT` view names a nullary concrete expression
+(`C`), with no owner, receiver, parameters or mutated input.
 It does not evaluate a body during installation or
 export. A nullary `FUNCTION` remains callable (`C()`); arity never implies a
 constant view. The bounded runtime acceptance below does not establish frontend

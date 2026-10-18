@@ -483,6 +483,7 @@ impl ProtoRun {
             options: Some(pb::EGraphOptions {
                 cost_sort: Some(0),
                 execution_mode: self.mode.into(),
+                ..Default::default()
             }),
             ..Default::default()
         };
@@ -1076,6 +1077,7 @@ fn partial_call_oracle_case(setup: &str) -> Result<PartialCallOracleCase, String
                 options: Some(pb::EGraphOptions {
                     cost_sort: Some(0),
                     execution_mode: pb::ExecutionMode::Normal.into(),
+                    ..Default::default()
                 }),
                 ..Default::default()
             }

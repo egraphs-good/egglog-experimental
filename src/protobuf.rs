@@ -401,6 +401,12 @@ impl Engine {
         let mode =
             pb::ExecutionMode::try_from(request.options.as_ref().map_or(0, |o| o.execution_mode))
                 .map_err(|_| TransportError("unknown execution mode".into()))?;
+        let seminaive = request
+            .options
+            .as_ref()
+            .and_then(|options| options.seminaive)
+            .unwrap_or(true);
+        let no_decomp = request.no_decomp;
         if !request.declarations.is_empty() {
             return Err(TransportError(
                 "creation declarations are not supported yet".into(),
@@ -423,6 +429,8 @@ impl Engine {
             ..Default::default()
         };
         let mut graph = crate::new_experimental_egraph();
+        graph.seminaive = seminaive;
+        graph.no_decomp = no_decomp;
         if let Some(extension) = &self.extension {
             extension.initialize(&mut graph).map_err(TransportError)?;
         }
@@ -591,10 +599,19 @@ impl Engine {
                 session.graph.set_report_level(level);
                 session.request = stamp;
             }
+            pb::configure_e_graph_resources_request::Operation::NoDecomp(enabled) => {
+                let stamp = session
+                    .request
+                    .checked_add(1)
+                    .ok_or_else(|| TransportError("request identity space exhausted".into()))?;
+                session.graph.no_decomp = enabled;
+                session.request = stamp;
+            }
         }
         Ok(pb::ConfigureEGraphResourcesResponse {
             threads: u64::try_from(session.graph.num_threads())
                 .map_err(|_| TransportError("native thread count exceeds uint64".into()))?,
+            no_decomp: session.graph.no_decomp,
         }
         .encode_to_vec())
     }
@@ -5333,6 +5350,305 @@ mod tests {
     use super::*;
 
     #[test]
+    fn creation_global_flags_preserve_native_defaults_and_no_rule_prove_admission() {
+        for mode in [
+            pb::ExecutionMode::Normal,
+            pb::ExecutionMode::TermEncoding,
+            pb::ExecutionMode::Proofs,
+            pb::ExecutionMode::ProofTesting,
+        ] {
+            for seminaive in [None, Some(false), Some(true)] {
+                for no_decomp in [false, true] {
+                    let mut engine = Engine::default();
+                    let request = pb::CreateEGraphRequest {
+                        sorts: vec![pb::Sort {
+                            kind: Some(pb::sort::Kind::Family(pb::HostSort {
+                                name: "i64".into(),
+                                args: vec![],
+                            })),
+                            ..Default::default()
+                        }],
+                        options: Some(pb::EGraphOptions {
+                            cost_sort: Some(0),
+                            execution_mode: mode.into(),
+                            seminaive,
+                        }),
+                        no_decomp,
+                        ..Default::default()
+                    };
+                    let id = pb::CreateEGraphResponse::decode(
+                        engine.create(&request.encode_to_vec()).unwrap().as_slice(),
+                    )
+                    .unwrap()
+                    .egraph_id;
+                    let session = &engine.graphs[&id];
+                    assert_eq!(session.graph.seminaive, seminaive.unwrap_or(true));
+                    assert_eq!(session.graph.no_decomp, no_decomp);
+                    assert_eq!(session.mode, mode);
+                    if mode != pb::ExecutionMode::Normal {
+                        continue;
+                    }
+                    let frozen = run_host_default(
+                        &mut engine,
+                        id,
+                        pb::Program {
+                            ir_version: 1,
+                            commands: vec![pb::Command {
+                                kind: Some(pb::command::Kind::Freeze(pb::Freeze::default())),
+                                ..Default::default()
+                            }],
+                            ..Default::default()
+                        },
+                    );
+                    assert_eq!(frozen.error, None);
+                    let Some(pb::command_output::Kind::Snapshot(snapshot)) =
+                        &frozen.outputs[0].kind
+                    else {
+                        panic!("expected actual frozen options");
+                    };
+                    let options = snapshot.options.as_ref().unwrap();
+                    assert_eq!(options.seminaive, Some(seminaive.unwrap_or(true)));
+                    // Logical snapshots retain admission, not planner resources.
+                    let restored_id = pb::CreateEGraphResponse::decode(
+                        engine
+                            .create(
+                                &pb::CreateEGraphRequest {
+                                    sorts: request.sorts.clone(),
+                                    options: Some(pb::EGraphOptions {
+                                        cost_sort: Some(0),
+                                        ..*options
+                                    }),
+                                    ..Default::default()
+                                }
+                                .encode_to_vec(),
+                            )
+                            .unwrap()
+                            .as_slice(),
+                    )
+                    .unwrap()
+                    .egraph_id;
+                    assert_eq!(
+                        engine.graphs[&restored_id].graph.seminaive,
+                        seminaive.unwrap_or(true)
+                    );
+                    assert!(!engine.graphs[&restored_id].graph.no_decomp);
+                    let program = pb::Program {
+                        ir_version: 1,
+                        sorts: request.sorts,
+                        nodes: vec![
+                            pb::Node {
+                                kind: Some(pb::node::Kind::Call(pb::Call {
+                                    func: "egglog.experimental.size.tables".into(),
+                                    args: vec![],
+                                })),
+                                ..Default::default()
+                            },
+                            pb::Node {
+                                kind: Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
+                                    value: Some(pb::primitive_value::Value::I64(0)),
+                                })),
+                                ..Default::default()
+                            },
+                            pb::Node {
+                                kind: Some(pb::node::Kind::Union(pb::Union {
+                                    members: vec![0, 1],
+                                })),
+                                ..Default::default()
+                            },
+                        ],
+                        commands: vec![pb::Command {
+                            kind: Some(pb::command::Kind::Prove(pb::Prove { facts: vec![2] })),
+                            ..Default::default()
+                        }],
+                        ..Default::default()
+                    };
+                    assert!(program.rules.is_empty());
+                    let prepared = engine.graphs[&id].prepare(&mut program.clone());
+                    assert_eq!(prepared.is_ok(), seminaive == Some(false));
+                    let response = run_host_default(&mut engine, id, program);
+                    let error = response.error.unwrap();
+                    if seminaive == Some(false) {
+                        // Compile admission above is independent of this later
+                        // normal-mode proof extraction failure, not proof success.
+                        assert_eq!(error.code, pb::ErrorCode::ProofFailed as i32);
+                        assert_eq!(error.location.unwrap().path, vec![0]);
+                        assert_eq!(
+                            error.proof_failure.unwrap().reason,
+                            pb::ProofFailureReason::ProofsNotEnabled as i32
+                        );
+                    } else {
+                        assert_eq!(error.code, pb::ErrorCode::InvalidProgram as i32);
+                        assert!(error.message.contains("egglog.experimental.size.tables"));
+                        assert!(error.location.is_none());
+                        assert!(error.proof_failure.is_none());
+                        assert!(response.profile.unwrap().maintenance.is_empty());
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn no_decomp_resources_use_live_state_and_scope_stamps() {
+        use pb::configure_e_graph_resources_request::Operation;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        #[derive(Default)]
+        struct CloneWitness(Arc<AtomicUsize>);
+        impl Clone for CloneWitness {
+            fn clone(&self) -> Self {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Self(self.0.clone())
+            }
+        }
+        let (mut engine, id) = host_default_engine();
+        let clones = engine
+            .graphs
+            .get_mut(&id)
+            .unwrap()
+            .graph
+            .extension_state_or_default::<CloneWitness>()
+            .0
+            .clone();
+        let symbols = engine.graphs[&id].graph.parser.symbol_gen.clone();
+        let threads = engine.graphs[&id].graph.num_threads();
+        let mut stamp = engine.graphs[&id].request;
+        for operation in [
+            Operation::Query(pb::Unit {}),
+            Operation::NoDecomp(true),
+            Operation::NoDecomp(true),
+            Operation::Query(pb::Unit {}),
+            Operation::NoDecomp(false),
+        ] {
+            let response = pb::ConfigureEGraphResourcesResponse::decode(
+                engine
+                    .configure_resources(
+                        &pb::ConfigureEGraphResourcesRequest {
+                            egraph_id: id,
+                            operation: Some(operation),
+                        }
+                        .encode_to_vec(),
+                    )
+                    .unwrap()
+                    .as_slice(),
+            )
+            .unwrap();
+            if let Operation::NoDecomp(enabled) = operation {
+                stamp += 1;
+                assert_eq!(response.no_decomp, enabled);
+            }
+            assert_eq!(response.no_decomp, engine.graphs[&id].graph.no_decomp);
+            assert_eq!(engine.graphs[&id].request, stamp);
+            assert!(engine.graphs[&id].graph.seminaive);
+            assert_eq!(engine.graphs[&id].graph.num_threads(), threads);
+            assert_eq!(engine.graphs[&id].graph.parser.symbol_gen, symbols);
+            assert_eq!(clones.load(Ordering::SeqCst), 0);
+        }
+        let mut unknown = pb::ConfigureEGraphResourcesRequest {
+            egraph_id: id,
+            operation: None,
+        }
+        .encode_to_vec();
+        unknown.extend([0x30, 0x01]); // Unknown operation field6, never a query.
+        for bytes in [
+            vec![0xff],
+            unknown,
+            pb::ConfigureEGraphResourcesRequest {
+                egraph_id: id,
+                operation: None,
+            }
+            .encode_to_vec(),
+            pb::ConfigureEGraphResourcesRequest {
+                egraph_id: u64::MAX,
+                operation: Some(Operation::NoDecomp(true)),
+            }
+            .encode_to_vec(),
+        ] {
+            assert!(engine.configure_resources(&bytes).is_err());
+            assert!(!engine.graphs[&id].graph.no_decomp);
+            assert_eq!(engine.graphs[&id].request, stamp);
+            assert_eq!(clones.load(Ordering::SeqCst), 0);
+        }
+        for mutate_saved in [false, true] {
+            let active = pb::CloneEGraphResponse::decode(
+                engine
+                    .clone_egraph(&pb::CloneEGraphRequest { egraph_id: id }.encode_to_vec())
+                    .unwrap()
+                    .as_slice(),
+            )
+            .unwrap()
+            .egraph_id;
+            let target = if mutate_saved { id } else { active };
+            engine
+                .configure_resources(
+                    &pb::ConfigureEGraphResourcesRequest {
+                        egraph_id: target,
+                        // Saved false->false still makes the saved pair stale.
+                        operation: Some(Operation::NoDecomp(!mutate_saved)),
+                    }
+                    .encode_to_vec(),
+                )
+                .unwrap();
+            assert_eq!(engine.graphs[&active].graph.no_decomp, !mutate_saved);
+            let before = engine.graphs[&id].request;
+            engine
+                .configure_resources(
+                    &pb::ConfigureEGraphResourcesRequest {
+                        egraph_id: id,
+                        operation: Some(Operation::Query(pb::Unit {})),
+                    }
+                    .encode_to_vec(),
+                )
+                .unwrap();
+            assert_eq!(engine.graphs[&id].request, before);
+            let returned = engine.return_to(
+                &pb::ReturnToEGraphRequest {
+                    active_id: active,
+                    saved_id: id,
+                }
+                .encode_to_vec(),
+            );
+            assert_eq!(returned.is_err(), mutate_saved);
+            assert!(!engine.graphs[&id].graph.no_decomp);
+            assert_eq!(engine.graphs.contains_key(&active), mutate_saved);
+            if mutate_saved {
+                engine
+                    .destroy(&pb::DestroyEGraphRequest { egraph_id: active }.encode_to_vec())
+                    .unwrap();
+            }
+        }
+        engine.graphs.get_mut(&id).unwrap().request = u64::MAX;
+        for enabled in [false, true] {
+            assert!(
+                engine
+                    .configure_resources(
+                        &pb::ConfigureEGraphResourcesRequest {
+                            egraph_id: id,
+                            operation: Some(Operation::NoDecomp(enabled)),
+                        }
+                        .encode_to_vec(),
+                    )
+                    .is_err()
+            );
+            assert!(!engine.graphs[&id].graph.no_decomp);
+            assert_eq!(engine.graphs[&id].request, u64::MAX);
+        }
+        let response = pb::ConfigureEGraphResourcesResponse::decode(
+            engine
+                .configure_resources(
+                    &pb::ConfigureEGraphResourcesRequest {
+                        egraph_id: id,
+                        operation: Some(Operation::Query(pb::Unit {})),
+                    }
+                    .encode_to_vec(),
+                )
+                .unwrap()
+                .as_slice(),
+        )
+        .unwrap();
+        assert!(!response.no_decomp);
+    }
+
+    #[test]
     fn scope_return_resource_stamps_and_overflow_are_pre_mutation() {
         use pb::configure_e_graph_resources_request::Operation;
         let mut engine = Engine::default();
@@ -6329,6 +6645,7 @@ mod tests {
                 options: Some(pb::EGraphOptions {
                     cost_sort: Some(0),
                     execution_mode,
+                    ..Default::default()
                 }),
                 ..Default::default()
             };

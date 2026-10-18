@@ -72,6 +72,35 @@ def tail_view_program(language, *, repetitions=2, prefix=(), tail=(0,), slots=(0
 
 
 class BindingSchemaTests(unittest.TestCase):
+    def test_global_compilation_options_and_explicit_no_decomp_operations(self):
+        for seminaive in (None, False, True):
+            for no_decomp in (False, True):
+                options = ir.EGraphOptions(cost_sort=0, seminaive=seminaive)
+                validate(options)
+                restored = ir.EGraphOptions.from_binary(options.to_binary())
+                self.assertEqual(restored, options)
+                self.assertEqual(restored.has_field("seminaive"), seminaive is not None)
+                self.assertIs(restored.seminaive, False if seminaive is None else seminaive)
+                creation = ir.CreateEGraphRequest(
+                    sorts=[ir.Sort(kind=Oneof("family", ir.HostSort(name="i64")))],
+                    options=options, no_decomp=no_decomp,
+                )
+                validate(creation)
+                self.assertEqual(ir.CreateEGraphRequest.from_binary(creation.to_binary()), creation)
+        query = ir.ConfigureEGraphResourcesRequest(egraph_id=1, operation=Oneof("query", ir.Unit()))
+        disabled = ir.ConfigureEGraphResourcesRequest(egraph_id=1, operation=Oneof("no_decomp", False))
+        enabled = ir.ConfigureEGraphResourcesRequest(egraph_id=1, operation=Oneof("no_decomp", True))
+        self.assertEqual(len({item.to_binary() for item in (query, disabled, enabled)}), 3)
+        for request in (query, disabled, enabled):
+            validate(request)
+            self.assertEqual(ir.ConfigureEGraphResourcesRequest.from_binary(request.to_binary()), request)
+        for request in (
+            ir.ConfigureEGraphResourcesRequest(egraph_id=1),
+            ir.ConfigureEGraphResourcesRequest.from_binary(bytes.fromhex("08013001")),
+        ):
+            with self.assertRaises(ValidationError):
+                validate(request)
+
     def test_structural_sort_text_aliases_are_optional_wire_metadata(self):
         for symbols in ([], ["A"], ["A", "Z"]):
             program = ir.Program(ir_version=1, sorts=[
@@ -410,35 +439,44 @@ class BindingSchemaTests(unittest.TestCase):
 
     def test_nullary_function_is_not_inferred_to_be_a_constant(self):
         core = Oneof("function", ir.Function(name="C", output=0))
-        function = constant_program(core, kind=ir.PythonCallKind.FUNCTION)
-        constant = constant_program(core)
-        for program in (function, constant):
-            validate(program)
-            self.assertEqual(ir.Program.from_binary(program.to_binary()), program)
-        self.assertNotEqual(function, constant)
-        self.assertNotEqual(function.to_binary(), constant.to_binary())
-
-    def test_constant_preserves_an_empty_final_name(self):
-        for path in [[""], ["example", ""]]:
+        for path in [["example", "C"], [""], ["example", ""]]:
             with self.subTest(path=path):
-                program = constant_program(Oneof("function", ir.Function(name="C", output=0)), path=path)
-                validate(program)
-                decoded = ir.Program.from_binary(program.to_binary())
-                self.assertEqual(decoded, program)
-                self.assertEqual(decoded.declarations[1].bindings.python.views[0].path, path)
+                function = constant_program(core, kind=ir.PythonCallKind.FUNCTION, path=path)
+                constant = constant_program(core, path=path)
+                for program in (function, constant):
+                    validate(program)
+                    self.assertEqual(ir.Program.from_binary(program.to_binary()), program)
+                self.assertNotEqual(function, constant)
+                self.assertNotEqual(function.to_binary(), constant.to_binary())
 
-    def test_other_python_forms_keep_nonempty_path_components(self):
+    def test_free_python_views_preserve_exact_final_names(self):
+        for kind in (ir.PythonCallKind.FUNCTION, ir.PythonCallKind.CONSTANT):
+            for path in [[""], ["example", ""], ["+"], ["example", "@internal"]]:
+                with self.subTest(kind=kind, path=path):
+                    program = constant_program(
+                        Oneof("function", ir.Function(name="C", output=0)), kind=kind, path=path,
+                    )
+                    validate(program)
+                    decoded = ir.Program.from_binary(program.to_binary())
+                    self.assertEqual(decoded, program)
+                    self.assertEqual(decoded.declarations[1].bindings.python.views[0].path, path)
+                    self.assertEqual(decoded.declarations[1].kind.value.name, "C")
+
+    def test_python_types_and_members_keep_nonempty_path_components(self):
         views = [
-            ir.PythonCallable(kind=ir.PythonCallKind.FUNCTION, path=[""]),
-            ir.PythonCallable(kind=ir.PythonCallKind.FUNCTION, path=["example", ""]),
-            ir.PythonCallable(
-                kind=ir.PythonCallKind.CLASS_VARIABLE, path=[""],
-                owner=ir.BindingOwner(kind=Oneof("sort", 1)),
-            ),
-            ir.PythonCallable(
-                kind=ir.PythonCallKind.METHOD, path=[""], receiver=0,
-                owner=ir.BindingOwner(kind=Oneof("sort", 1)),
-            ),
+            ir.TypeBinding(path=[""]),
+            ir.TypeBinding(path=["example", ""]),
+            *[
+                ir.PythonCallable(
+                    kind=kind, path=[""],
+                    owner=ir.BindingOwner(kind=Oneof("sort", 1)),
+                    receiver=0 if kind in (ir.PythonCallKind.METHOD, ir.PythonCallKind.PROPERTY) else None,
+                )
+                for kind in (
+                    ir.PythonCallKind.METHOD, ir.PythonCallKind.CLASS_METHOD,
+                    ir.PythonCallKind.PROPERTY, ir.PythonCallKind.CLASS_VARIABLE,
+                )
+            ],
         ]
         for view in views:
             with self.subTest(view=view), self.assertRaises(ValidationError):
@@ -449,10 +487,16 @@ class BindingSchemaTests(unittest.TestCase):
             owner=ir.BindingOwner(kind=Oneof("sort", 1)),
         ))
 
-    def test_constant_has_a_nonempty_path_and_nonempty_qualifiers(self):
+    def test_free_python_views_have_nonempty_paths_and_qualifiers(self):
+        for kind in (ir.PythonCallKind.FUNCTION, ir.PythonCallKind.CONSTANT):
+            for path in [[], ["", "C"], ["", ""], ["example", "", "C"], ["example", "", ""]]:
+                with self.subTest(kind=kind, path=path), self.assertRaises(ValidationError):
+                    validate(constant_program(
+                        Oneof("function", ir.Function(name="C", output=0)), kind=kind, path=path,
+                    ))
+
+    def test_constant_keeps_ownerless_nullary_form_restrictions(self):
         invalid = [
-            {"path": []}, {"path": ["", "C"]}, {"path": ["", ""]},
-            {"path": ["example", "", "C"]}, {"path": ["example", "", ""]},
             {"owner": ir.BindingOwner(kind=Oneof("sort", 1))},
             {"receiver": 0},
             {"params": [ir.PythonParameter(core_input=0, name="unused")]},

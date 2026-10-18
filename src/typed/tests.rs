@@ -571,6 +571,7 @@ fn typed_table_actions_preserve_exact_wire_operands_and_real_execution() {
                 options: Some(pb::EGraphOptions {
                     cost_sort: Some(0),
                     execution_mode: pb::ExecutionMode::Normal.into(),
+                    ..Default::default()
                 }),
                 ..Default::default()
             }

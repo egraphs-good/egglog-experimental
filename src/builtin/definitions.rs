@@ -1890,7 +1890,8 @@ fn validate_bindings(p: &pb::Program) -> Result<(), String> {
                 || matches!(kind, K::Function | K::Constant) == v.owner.is_some()
                 || matches!(kind, K::Method | K::Property) != v.receiver.is_some()
                 || v.path.iter().enumerate().any(|(i, component)| {
-                    component.is_empty() && (kind != K::Constant || i + 1 != v.path.len())
+                    component.is_empty()
+                        && (!matches!(kind, K::Function | K::Constant) || i + 1 != v.path.len())
                 })
                 || match kind {
                     K::Initializer => !v.path.is_empty(),

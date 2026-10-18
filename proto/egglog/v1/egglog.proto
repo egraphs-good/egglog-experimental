@@ -1144,6 +1144,7 @@ message PythonBindings {
 }
 
 // Free functions and CONSTANT use a qualified path; members use one name on owner.
+// Function/constant paths are nonempty; final names may be empty, qualifiers may not.
 // INITIALIZER instead omits path and derives __init__.
 // METHOD/PROPERTY map a real core input as receiver. INITIALIZER/CLASS_METHOD
 // have no core self/cls input. Only INITIALIZER requires result = owner;
@@ -1152,16 +1153,15 @@ message PythonBindings {
 // PROPERTY has only a receiver; CLASS_VARIABLE is a nullary expression view.
 // CONSTANT is an ownerless named expression (C, not C()), backed by a nullary
 // concrete core signature. It has no receiver, parameters or mutated input.
-// Its path is nonempty, but its final name may be empty; qualifiers stay nonempty.
 // It does not change declaration semantics or evaluate a body at installation
 // or export. FUNCTION stays callable even when its core signature is nullary.
 message PythonCallable {
   option (buf.validate.message).cel = {
     id: "python_callable.path_components"
-    message: "only a constant's final name may be an empty path component"
+    message: "only a function's or constant's final name may be an empty path component"
     expression:
       "this.path.filter(p, p == '').size() == "
-      "(this.kind == 7 && size(this.path) > 0 && this.path[size(this.path)-1] == '' ? 1 : 0)"
+      "(this.kind in [1, 7] && size(this.path) > 0 && this.path[size(this.path)-1] == '' ? 1 : 0)"
   };
   option (buf.validate.message).cel = {
     id: "python_callable.owner_and_receiver"
@@ -1858,6 +1858,10 @@ message EGraphOptions {
   // Select before executing user declarations. Host providers must be installed
   // before term encoding captures their typechecking/validation environment.
   ExecutionMode execution_mode = 2 [(buf.validate.field).enum.defined_only = true];
+
+  // Absent retains the native default true. False selects native global naive
+  // evaluation, including internally generated rules, not only authored rules.
+  optional bool seminaive = 3;
 }
 
 // Existing engine treatments; NORMAL is the default when the field is absent.
@@ -1933,6 +1937,12 @@ message CreateEGraphRequest {
   // the receiver; zero requests automatic parallelism; positive requests that
   // thread count. Reject unsupported requests rather than silently ignoring.
   optional uint32 threads = 5;
+
+  // Runtime query-planning policy, false by default. True skips tree
+  // decomposition for future compiled rules; it does not recompile installed
+  // rules or change typing/admission. Not part of logical snapshots or source
+  // replay. Local rule no_decomp=true still applies when this global is false.
+  bool no_decomp = 6;
 }
 
 message CreateEGraphResponse {
@@ -1945,7 +1955,9 @@ message CreateEGraphResponse {
 // Restore by remapping C's closed sort graph and needed sort declarations into
 // a CreateEGraphRequest, selecting receiver resource settings, then executing
 // program normally on the fresh compatible handle. No creation-time commands
-// or resumed scheduler/seminaive state are implied. Executing program against
+// or resumed scheduler/delta state are implied. Options preserve global
+// seminaive admission, not query plans or runtime resource/planner settings.
+// Executing program against
 // an existing handle still has ordinary Program semantics; callers must check
 // option compatibility for any restoration equivalence claim.
 message EGraphSnapshot {
@@ -1961,7 +1973,8 @@ message EGraphSnapshot {
   Program program = 2 [(buf.validate.field).required = true];
 }
 
-// Clone the addressed e-graph, retaining C, execution mode and proof state.
+// Clone the addressed e-graph, retaining C, logical options, resources and
+// proof state.
 // No complexity guarantee.
 message CloneEGraphRequest {
   uint64 egraph_id = 1;
@@ -2000,7 +2013,7 @@ message ReturnToEGraphRequest {
 
 message ReturnToEGraphResponse {}
 
-// Query thread resources or update runtime/collection settings on a handle, never logical
+// Query thread/planner resources or update runtime/collection settings on a handle, never logical
 // settings or Program state. Completed updates affect subsequent calls; they
 // do not reconfigure an in-flight Run. Clone inherits effective resources and
 // later updates are handle-local. Resources are not part of a frozen snapshot.
@@ -2016,7 +2029,7 @@ message ConfigureEGraphResourcesRequest {
   oneof operation {
     option (buf.validate.oneof).required = true;
 
-    // Observe the current effective thread count without changing settings.
+    // Observe current thread count and global no_decomp without changing settings.
     Unit query = 2;
     // Zero requests automatic parallelism resolved at this update; positive
     // requests that exact count. Unsupported requests fail, never clamp or
@@ -2026,11 +2039,18 @@ message ConfigureEGraphResourcesRequest {
 
     // Set future native report detail. Does not disable collection or retrofit
     // existing statistics. Clone inherits this setting; updates are handle-local.
-    // Query remains a thread-count query, not a report-level getter.
+    // Query does not observe report level.
     ReportLevel report_level = 4 [(buf.validate.field).enum = {
       defined_only: true
       not_in: [0]
     }];
+
+    // Change only the native global default for future query planning. This
+    // affects neither typing/admission nor already compiled rules/plans. An
+    // explicit false is an update, not an absent operation. No cursor/report
+    // reset, cloning or definition reinstall is implied. Planning policy may
+    // change match ordering, work and profiling; logical replay does not retain it.
+    bool no_decomp = 5;
   }
 }
 
@@ -2039,6 +2059,9 @@ message ConfigureEGraphResourcesResponse {
   // or a frontend estimate. uint64 accommodates the receiver's native count
   // without narrowing to the uint32 request domain.
   uint64 threads = 1 [(buf.validate.field).uint64.gte = 1];
+
+  // Actual current native planning default after query/update, not an estimate.
+  bool no_decomp = 2;
 }
 
 // Native collection detail, independent of optional report serialization.

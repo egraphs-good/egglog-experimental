@@ -317,6 +317,7 @@ mod relation_predicates {
                         options: Some(pb::EGraphOptions {
                             cost_sort: Some(0),
                             execution_mode: mode.into(),
+                            ..Default::default()
                         }),
                         ..Default::default()
                     }
@@ -465,6 +466,7 @@ mod relation_predicates {
                             options: Some(pb::EGraphOptions {
                                 cost_sort: Some(0),
                                 execution_mode: mode.into(),
+                                ..Default::default()
                             }),
                             ..Default::default()
                         }
@@ -3566,6 +3568,7 @@ fn function_value_native_context_and_proof_limits_are_unchanged() {
             options: Some(pb::EGraphOptions {
                 cost_sort: Some(0),
                 execution_mode: mode.into(),
+                ..Default::default()
             }),
             ..Default::default()
         };
@@ -3617,6 +3620,7 @@ fn named_primitive_proof_encoding_rejects_the_declaration_before_execution() {
             options: Some(pb::EGraphOptions {
                 cost_sort: Some(0),
                 execution_mode: mode.into(),
+                ..Default::default()
             }),
             ..Default::default()
         };
@@ -3939,6 +3943,7 @@ fn remaining_scalar_boolean_source_bytes_and_proofs_match_native() {
                     options: Some(pb::EGraphOptions {
                         cost_sort: Some(0),
                         execution_mode: mode.into(),
+                        ..Default::default()
                     }),
                     threads: Some(1),
                     ..Default::default()
@@ -4126,6 +4131,7 @@ fn inequality_generic_catalog_and_proof_use_bytes() {
                     options: Some(pb::EGraphOptions {
                         cost_sort: Some(0),
                         execution_mode: mode.into(),
+                        ..Default::default()
                     }),
                     threads: Some(1),
                     ..Default::default()
@@ -4669,6 +4675,7 @@ fn source_scheduler_projection_executes_and_roundtrips_in_every_mode() {
                 options: Some(pb::EGraphOptions {
                     cost_sort: Some(0),
                     execution_mode: mode.into(),
+                    ..Default::default()
                 }),
                 ..Default::default()
             };
@@ -4789,6 +4796,7 @@ fn source_scheduler_until_preserves_queries_and_has_no_internal_proof_output() {
                 options: Some(pb::EGraphOptions {
                     cost_sort: Some(0),
                     execution_mode: mode.into(),
+                    ..Default::default()
                 }),
                 ..Default::default()
             };
@@ -5224,6 +5232,7 @@ fn source_print_size_projection_preserves_selected_table_in_both_dialects() {
                     options: Some(pb::EGraphOptions {
                         cost_sort: Some(0),
                         execution_mode: mode.into(),
+                        ..Default::default()
                     }),
                     ..Default::default()
                 }
@@ -12595,6 +12604,7 @@ fn vec_range_preserves_native_proof_limit_and_prefix() {
                     options: Some(pb::EGraphOptions {
                         cost_sort: Some(0),
                         execution_mode: mode.into(),
+                        ..Default::default()
                     }),
                     threads: Some(1),
                     ..Default::default()
@@ -14162,6 +14172,7 @@ fn source_rule_panics_keep_exact_span_and_occurrence_in_every_mode() {
                         options: Some(pb::EGraphOptions {
                             cost_sort: Some(0),
                             execution_mode: mode.into(),
+                            ..Default::default()
                         }),
                         threads: Some(1),
                         ..Default::default()
@@ -19084,6 +19095,7 @@ fn birewrite_proofs_execute_both_directions_through_bytes() {
                         options: Some(pb::EGraphOptions {
                             cost_sort: Some(0),
                             execution_mode: mode.into(),
+                            ..Default::default()
                         }),
                         threads: Some(1),
                         ..Default::default()
@@ -20980,6 +20992,7 @@ fn print_size_native_counts_modes_names_and_stats() {
                     options: Some(pb::EGraphOptions {
                         cost_sort: Some(0),
                         execution_mode: mode.into(),
+                        ..Default::default()
                     }),
                     ..Default::default()
                 }

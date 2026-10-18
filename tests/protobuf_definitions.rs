@@ -2084,18 +2084,30 @@ fn constant_views_install_resupply_and_freeze_without_evaluation() {
 }
 
 #[test]
-fn empty_constant_names_preserve_exact_metadata_and_freeze_transactionally() {
-    for path in [vec!["".to_string()], vec!["example".into(), "".into()]] {
+fn empty_free_python_names_preserve_exact_metadata_and_freeze_transactionally() {
+    for (kind, path) in [
+        (pb::PythonCallKind::Constant, vec!["".to_string()]),
+        (
+            pb::PythonCallKind::Constant,
+            vec!["example".into(), "".into()],
+        ),
+        (pb::PythonCallKind::Function, vec!["".to_string()]),
+        (
+            pb::PythonCallKind::Function,
+            vec!["example".into(), "".into()],
+        ),
+    ] {
         let mut source = constant_definition();
-        source.declarations[2]
+        let view = &mut source.declarations[2]
             .bindings
             .as_mut()
             .unwrap()
             .python
             .as_mut()
             .unwrap()
-            .views[0]
-            .path = path;
+            .views[0];
+        view.kind = kind.into();
+        view.path = path;
         let mut absent = source.clone();
         absent.declarations[2].bindings = None;
         let mut destination = pb::Program::default();
@@ -2105,6 +2117,10 @@ fn empty_constant_names_preserve_exact_metadata_and_freeze_transactionally() {
         assert_eq!(
             destination.declarations[2].bindings,
             source.declarations[2].bindings
+        );
+        assert_eq!(
+            destination.declarations[2].kind,
+            source.declarations[2].kind
         );
         let frozen = destination.clone();
         reconcile_declarations(&source, &mut destination).unwrap();
@@ -2137,8 +2153,8 @@ fn empty_constant_names_preserve_exact_metadata_and_freeze_transactionally() {
             "clone freezes its own first supply"
         );
 
-        let mut function = source.clone();
-        function.declarations[2]
+        let mut other_form = source.clone();
+        other_form.declarations[2]
             .bindings
             .as_mut()
             .unwrap()
@@ -2146,14 +2162,18 @@ fn empty_constant_names_preserve_exact_metadata_and_freeze_transactionally() {
             .as_mut()
             .unwrap()
             .views[0]
-            .kind = pb::PythonCallKind::Function.into();
+            .kind = if kind == pb::PythonCallKind::Constant {
+            pb::PythonCallKind::Function
+        } else {
+            pb::PythonCallKind::Constant
+        }
+        .into();
         let mut fresh = pb::Program::default();
-        assert!(reconcile_declarations(&function, &mut fresh).is_err());
-        assert_eq!(
-            fresh,
-            pb::Program::default(),
-            "FUNCTION does not admit an empty final name"
-        );
+        reconcile_declarations(&other_form, &mut fresh).unwrap();
+        assert_ne!(fresh, frozen, "nullary FUNCTION is not CONSTANT");
+        assert!(reconcile_declarations(&other_form, &mut destination).is_err());
+        assert_eq!(destination, frozen, "call kind is part of frozen metadata");
+        fresh = pb::Program::default();
         for bad in [
             vec![],
             vec!["", ""],

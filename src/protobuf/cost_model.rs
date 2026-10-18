@@ -529,6 +529,7 @@ mod tests {
                     options: Some(pb::EGraphOptions {
                         cost_sort: Some(0),
                         execution_mode: pb::ExecutionMode::Normal.into(),
+                        ..Default::default()
                     }),
                     ..Default::default()
                 }

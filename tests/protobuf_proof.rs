@@ -1082,6 +1082,7 @@ fn create(engine: &mut Engine, mode: pb::ExecutionMode) -> u64 {
                 options: Some(pb::EGraphOptions {
                     cost_sort: Some(0),
                     execution_mode: mode.into(),
+                    ..Default::default()
                 }),
                 threads: Some(1),
                 ..Default::default()
@@ -2167,6 +2168,22 @@ fn schedule_controls_match_native_counts_sites_and_stopping_in_every_mode() {
                     .with_proof_testing(),
             };
             native.parse_and_run_program(None, "(datatype Num (N i64) (Goal i64) (Absent i64)) (ruleset r) (rule ((N x)) ((Goal x)) :ruleset r) (N 1)").unwrap();
+            if case == 0 {
+                let outputs = native
+                    .clone()
+                    .parse_and_run_program(None, "(check (N 1))")
+                    .unwrap();
+                let proofs = outputs
+                    .iter()
+                    .filter(|output| matches!(output, egglog::CommandOutput::ProveExists { .. }))
+                    .count();
+                assert_eq!(proofs, usize::from(mode == pb::ExecutionMode::ProofTesting));
+                assert!(outputs.iter().all(|output| matches!(
+                    output,
+                    egglog::CommandOutput::ProveExists { .. }
+                        | egglog::CommandOutput::RunSchedule(_)
+                )));
+            }
             let leaf = Schedule::Run(
                 egglog::span!(),
                 RunConfig {
@@ -2350,13 +2367,127 @@ fn schedule_controls_match_native_counts_sites_and_stopping_in_every_mode() {
                 );
             }
             assert_eq!(profile.runs.is_empty(), case == 0 || case == 5);
-            // Composite source remains explicitly unrenderable, even though
-            // the native and byte execution paths now accept this subtree.
-            assert!(
-                egglog_experimental::protobuf::source::Renderer::default()
-                    .render(&program)
-                    .is_err()
+            if case == 2 {
+                assert_eq!(
+                    Renderer::default()
+                        .render(&program)
+                        .unwrap_err()
+                        .to_string(),
+                    "experimental source has no general bounded Saturate or loop-until spelling"
+                );
+                continue;
+            }
+            if case == 3 {
+                let mut unsupported = program.clone();
+                let Some(pb::command::Kind::Saturate(saturate)) = &mut unsupported.commands[1].kind
+                else {
+                    unreachable!()
+                };
+                saturate.body.push(saturate.body[0].clone());
+                assert_eq!(
+                    Renderer::default()
+                        .render(&unsupported)
+                        .unwrap_err()
+                        .to_string(),
+                    "experimental source has no general bounded Saturate or loop-until spelling"
+                );
+            }
+            // Exact Repeat, unbounded Saturate and the legacy single-Run
+            // bounded form are now representable. Reparse actual text and
+            // retain the independent native count/report oracle above.
+            let mut replay_program = program.clone();
+            replay_program.commands.push(pb::Command {
+                kind: Some(pb::command::Kind::Check(pb::Check { facts: vec![2] })),
+                ..Default::default()
+            });
+            let goal = pb::Command {
+                kind: Some(pb::command::Kind::Check(pb::Check { facts: vec![5] })),
+                ..Default::default()
+            };
+            replay_program.commands.push(if matches!(case, 0 | 5) {
+                pb::Command {
+                    kind: Some(pb::command::Kind::Fail(Box::new(goal))),
+                    ..Default::default()
+                }
+            } else {
+                goal
+            });
+            let rendered = Renderer::default().render(&replay_program).unwrap();
+            let replay_id = create(&mut engine, mode);
+            let mut loops = 0;
+            let mut proofs = 0;
+            let mut replay_runs = 0;
+            for phase in Source::new(Some("rendered-control.egg".into()), &rendered).unwrap() {
+                let phase = phase.unwrap();
+                let check_phase = matches!(
+                    phase.commands.as_slice(),
+                    [pb::Command {
+                        kind: Some(pb::command::Kind::Check(_)),
+                        ..
+                    }]
+                );
+                let replay = pb::RunProgramResponse::decode(
+                    engine
+                        .run(
+                            &pb::RunProgramRequest {
+                                egraph_id: replay_id,
+                                program: Some(phase),
+                                profile: true,
+                                include_run_reports: true,
+                            }
+                            .encode_to_vec(),
+                        )
+                        .unwrap()
+                        .as_slice(),
+                )
+                .unwrap();
+                assert_eq!(replay.error, None, "{mode:?}/{case}: {rendered}");
+                for output in &replay.outputs {
+                    if let Some(pb::command_output::Kind::Proof(proof)) = &output.kind {
+                        assert!(check_phase);
+                        assert_eq!(mode, pb::ExecutionMode::ProofTesting);
+                        assert!(!proof.terms.is_empty());
+                        assert!((proof.root.unwrap() as usize) < proof.proofs.len());
+                        assert!(output.run_report.is_none());
+                        proofs += 1;
+                        continue;
+                    }
+                    let Some(pb::command_output::Kind::Loop(outcome)) = &output.kind else {
+                        panic!("unexpected replay output: {output:?}")
+                    };
+                    loops += 1;
+                    assert_eq!(output.location.as_ref().unwrap().path, [0]);
+                    assert_eq!(
+                        (outcome.iterations, outcome.termination, outcome.updated),
+                        (completed as u64, Some(reason.into()), updated)
+                    );
+                    let report = output.run_report.as_ref().unwrap();
+                    assert_eq!(report.updated, expected_report.updated);
+                    assert_eq!(report.can_stop, expected_report.can_stop);
+                    assert_eq!(report.iterations.len(), expected_report.iterations.len());
+                }
+                let profile = replay.profile.unwrap();
+                assert!(profile.complete);
+                replay_runs += profile.runs.iter().map(|run| run.invocations).sum::<u64>();
+                for run in &profile.runs {
+                    assert!(
+                        run.command_path == [0, 0]
+                            || case == 6 && run.command_path == [0, 1, 0]
+                            || case == 8 && run.command_path == [0, 0, 0]
+                    );
+                }
+            }
+            assert_eq!(loops, 1);
+            assert_eq!(
+                proofs,
+                if mode == pb::ExecutionMode::ProofTesting {
+                    if matches!(case, 0 | 5) { 1 } else { 2 }
+                } else {
+                    0
+                },
+                "{mode:?}/{case}"
             );
+            assert_eq!(replay_runs, native_runs);
         }
     }
 }
@@ -2451,7 +2582,7 @@ fn composite_reports_use_only_entered_exact_aliases() {
 }
 
 #[test]
-fn dead_schedule_bodies_still_reject_before_effects_in_every_mode() {
+fn dead_schedule_bodies_are_validated_before_effects_in_every_mode() {
     for mode in [
         pb::ExecutionMode::Normal,
         pb::ExecutionMode::TermEncoding,
@@ -2529,26 +2660,81 @@ fn dead_schedule_bodies_still_reject_before_effects_in_every_mode() {
             let mut engine = Engine::default();
             let id = create(&mut engine, mode);
             let response = run(&mut engine, id, program.clone());
-            assert!(
-                response.error.as_ref().unwrap().location.is_none(),
-                "{mode:?}/{case}: {response:?}"
-            );
-            assert!(response.outputs.is_empty());
-            assert!(response.ruleset_publication.unwrap().names.is_empty());
+            let valid = matches!(case, "repeat-until" | "until")
+                || case == "stats" && mode == pb::ExecutionMode::Normal;
+            if valid {
+                assert_eq!(response.error, None, "{mode:?}/{case}: {response:?}");
+                assert_eq!(response.outputs.len(), 1);
+                let output = &response.outputs[0];
+                assert_eq!(output.location.as_ref().unwrap().path, [1]);
+                assert!(output.location.as_ref().unwrap().iterations.is_empty());
+                assert!(output.run_report.is_none());
+                let Some(pb::command_output::Kind::Loop(outcome)) = &output.kind else {
+                    panic!("{mode:?}/{case}: {output:?}")
+                };
+                assert_eq!(
+                    (outcome.iterations, outcome.termination, outcome.updated),
+                    (0, Some(pb::TerminationReason::CountReached.into()), false)
+                );
+                assert_eq!(
+                    response.ruleset_publication.as_ref().unwrap().names,
+                    ["rebuilding_ruleset"]
+                );
+            } else {
+                assert!(
+                    response.error.as_ref().unwrap().location.is_none(),
+                    "{mode:?}/{case}: {response:?}"
+                );
+                assert!(response.outputs.is_empty());
+                assert!(
+                    response
+                        .ruleset_publication
+                        .as_ref()
+                        .unwrap()
+                        .names
+                        .is_empty()
+                );
+            }
             let profile = response.profile.unwrap();
-            assert!(profile.runs.is_empty() && profile.maintenance.is_empty());
+            assert_eq!(profile.complete, valid);
+            assert!(profile.runs.is_empty(), "{mode:?}/{case}: {profile:?}");
+            if !valid || mode == pb::ExecutionMode::Normal {
+                assert!(
+                    profile.maintenance.is_empty(),
+                    "{mode:?}/{case}: {profile:?}"
+                );
+            } else {
+                // Native encoded normalization still surrounds the ruleset,
+                // seed action and outer zero loop. No nested body is entered.
+                use pb::maintenance_site::Target;
+                assert_eq!(profile.maintenance.len(), 3, "{mode:?}/{case}: {profile:?}");
+                for (maintenance, target) in profile.maintenance.iter().zip([
+                    Target::Ruleset(0),
+                    Target::Command(pb::StaticCommandPath { path: vec![0] }),
+                    Target::Command(pb::StaticCommandPath { path: vec![1] }),
+                ]) {
+                    assert_eq!(maintenance.site.as_ref().unwrap().target, Some(target));
+                    assert!(maintenance.invocations > 0);
+                }
+            }
             assert!(
                 Renderer::core().render(&program).is_err(),
                 "dead Core source body {case}"
             );
-            // A following independent check must not find the earlier authored
-            // seed; a dead branch did not turn preparation into partial execution.
+            // Valid dead controls retain the authored seed prefix, but neither
+            // execute their bodies nor derive Goal. Invalid dead bodies reject
+            // during preparation, before even that seed can have effects.
             program.commands = vec![pb::Command {
                 kind: Some(pb::command::Kind::Check(pb::Check { facts: vec![2] })),
                 ..Default::default()
             }];
-            let checked = run(&mut engine, id, program);
-            assert!(checked.error.is_some());
+            let checked = run(&mut engine, id, program.clone());
+            assert_eq!(checked.error.is_none(), valid, "{mode:?}/{case}");
+            program.commands = vec![pb::Command {
+                kind: Some(pb::command::Kind::Check(pb::Check { facts: vec![5] })),
+                ..Default::default()
+            }];
+            assert!(run(&mut engine, id, program).error.is_some());
         }
     }
 }

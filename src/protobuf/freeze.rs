@@ -296,6 +296,7 @@ pub(super) fn export(session: &Session) -> Result<pb::EGraphSnapshot, egglog::Er
         options: Some(pb::EGraphOptions {
             cost_sort: Some(cost_sort),
             execution_mode: session.mode.into(),
+            seminaive: Some(session.graph.seminaive),
         }),
         program: Some(observation.program),
     })
@@ -609,6 +610,7 @@ mod tests {
             options: Some(pb::EGraphOptions {
                 cost_sort: Some(0),
                 execution_mode: mode.into(),
+                ..Default::default()
             }),
             threads: Some(1),
             ..Default::default()
