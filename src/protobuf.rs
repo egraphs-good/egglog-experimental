@@ -1410,8 +1410,7 @@ impl Session {
             let span = program.rulesets[local].span;
             let selection = ruleset_selection(
                 &staged.definitions,
-                index,
-                pb::ruleset_ref::Kind::Index(local as u32),
+                [(index, pb::ruleset_ref::Kind::Index(local as u32))],
             );
             let mut holders = Vec::new();
             for (rule_index, _) in selection {
@@ -1494,38 +1493,38 @@ impl Session {
                 .enumerate()
                 .map(|(local, index)| (*index, pb::ruleset_ref::Kind::Index(local as u32))),
         );
-        for (index, root) in routes {
-            if rulesets[index].is_empty() {
-                continue;
-            }
-            for (rule, mut origin) in ruleset_selection(&staged.definitions, index, root) {
-                if let Some(span) = &mut origin.span {
-                    let file = &staged.definitions.files[span.file as usize];
-                    span.file = match context.files.iter().position(|old| old == file) {
-                        Some(index) => index as u32,
-                        None => {
-                            context.files.push(file.clone());
-                            (context.files.len() - 1) as u32
-                        }
-                    };
-                }
-                let directions: &[(_, _)] = if matches!(
-                    staged.definitions.rules[rule].kind,
-                    Some(pb::rule_decl::Kind::Birewrite(_))
-                ) {
-                    &[
-                        ("=>", pb::NativeRuleDirection::Forward),
-                        ("<=", pb::NativeRuleDirection::Reverse),
-                    ]
-                } else {
-                    &[("", pb::NativeRuleDirection::Single)]
+        for (rule, mut origin) in ruleset_selection(
+            &staged.definitions,
+            routes
+                .into_iter()
+                .filter(|(index, _)| !rulesets[*index].is_empty()),
+        ) {
+            if let Some(span) = &mut origin.span {
+                let file = &staged.definitions.files[span.file as usize];
+                span.file = match context.files.iter().position(|old| old == file) {
+                    Some(index) => index as u32,
+                    None => {
+                        context.files.push(file.clone());
+                        (context.files.len() - 1) as u32
+                    }
                 };
-                for (suffix, direction) in directions {
-                    context
-                        .origins
-                        .entry(format!("{}{suffix}", rules[rule]))
-                        .or_insert((origin.clone(), *direction));
-                }
+            }
+            let directions: &[(_, _)] = if matches!(
+                staged.definitions.rules[rule].kind,
+                Some(pb::rule_decl::Kind::Birewrite(_))
+            ) {
+                &[
+                    ("=>", pb::NativeRuleDirection::Forward),
+                    ("<=", pb::NativeRuleDirection::Reverse),
+                ]
+            } else {
+                &[("", pb::NativeRuleDirection::Single)]
+            };
+            for (suffix, direction) in directions {
+                context
+                    .origins
+                    .entry(format!("{}{suffix}", rules[rule]))
+                    .or_insert((origin.clone(), *direction));
             }
         }
         let mut validation: Vec<_> = installations
@@ -5239,50 +5238,51 @@ fn lower_action(program: &pb::Program, action: &pb::Action) -> Result<Vec<Action
 // share this ordered traversal, deduplicating by rule occurrence, not label.
 fn ruleset_selection(
     definitions: &pb::Program,
-    root: usize,
-    reference: pb::ruleset_ref::Kind,
+    roots: impl IntoIterator<Item = (usize, pb::ruleset_ref::Kind)>,
 ) -> Vec<(usize, pb::RuleAttribution)> {
-    let mut pending = vec![(root, Vec::new())];
     let mut seen_sets = HashSet::new();
     let mut seen_rules = HashSet::new();
     let mut result = Vec::new();
-    while let Some((index, children)) = pending.pop() {
-        if !seen_sets.insert(index) {
-            continue;
-        }
-        match definitions.rulesets[index]
-            .kind
-            .as_ref()
-            .expect("validated ruleset")
-        {
-            pb::ruleset::Kind::Rules(list) => {
-                for (ordinal, &rule) in list.rules.iter().enumerate() {
-                    if !seen_rules.insert(rule) {
-                        continue;
-                    }
-                    let authored = &definitions.rules[rule as usize];
-                    result.push((
-                        rule as usize,
-                        pb::RuleAttribution {
-                            root: Some(pb::RulesetRef {
-                                kind: Some(reference.clone()),
-                            }),
-                            children: children.clone(),
-                            rule: ordinal as u32,
-                            name: authored.name.clone(),
-                            span: authored.span,
-                        },
-                    ));
-                }
+    for (root, reference) in roots {
+        let mut pending = vec![(root, Vec::new())];
+        while let Some((index, children)) = pending.pop() {
+            if !seen_sets.insert(index) {
+                continue;
             }
-            pb::ruleset::Kind::Combined(combined) => {
-                for (position, child) in combined.rulesets.iter().enumerate().rev() {
-                    let Some(pb::ruleset_ref::Kind::Index(child)) = child.kind else {
-                        unreachable!("canonical reference")
-                    };
-                    let mut path = children.clone();
-                    path.push(position as u32);
-                    pending.push((child as usize, path));
+            match definitions.rulesets[index]
+                .kind
+                .as_ref()
+                .expect("validated ruleset")
+            {
+                pb::ruleset::Kind::Rules(list) => {
+                    for (ordinal, &rule) in list.rules.iter().enumerate() {
+                        if !seen_rules.insert(rule) {
+                            continue;
+                        }
+                        let authored = &definitions.rules[rule as usize];
+                        result.push((
+                            rule as usize,
+                            pb::RuleAttribution {
+                                root: Some(pb::RulesetRef {
+                                    kind: Some(reference.clone()),
+                                }),
+                                children: children.clone(),
+                                rule: ordinal as u32,
+                                name: authored.name.clone(),
+                                span: authored.span,
+                            },
+                        ));
+                    }
+                }
+                pb::ruleset::Kind::Combined(combined) => {
+                    for (position, child) in combined.rulesets.iter().enumerate().rev() {
+                        let Some(pb::ruleset_ref::Kind::Index(child)) = child.kind else {
+                            unreachable!("canonical reference")
+                        };
+                        let mut path = children.clone();
+                        path.push(position as u32);
+                        pending.push((child as usize, path));
+                    }
                 }
             }
         }
@@ -8070,6 +8070,257 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn attribution_forest_preserves_first_routes_files_directions_and_request_locality() {
+        let (mut engine, id) = host_default_engine();
+        let mut program = inventory_fixture("(datatype E (A) (B)) (birewrite (A) (B))");
+        program.commands.clear();
+        program.rules[0].name = Some("both".into());
+        for file in ["one.egg", "two.egg"] {
+            program.files.push(pb::SourceFile {
+                name: file.into(),
+                contents: Some("x".into()),
+            });
+        }
+        for file in [1, 2, 1] {
+            program.rules.push(pb::RuleDecl {
+                name: Some("same label".into()),
+                span: Some(pb::Span {
+                    file,
+                    start: 0,
+                    end: 1,
+                }),
+                eval_mode: pb::RuleEvalMode::Seminaive.into(),
+                kind: Some(pb::rule_decl::Kind::Rule(pb::Rule::default())),
+                ..Default::default()
+            });
+        }
+        // A=[L,R], L=[D], R=[D,E], B=[E,F]; only A/B/empty are named.
+        program.rulesets = [
+            (Some("A"), true, vec![1, 2]),
+            (None, true, vec![3]),
+            (None, true, vec![3, 4]),
+            (None, false, vec![1, 0]),
+            (None, false, vec![0, 2]),
+            (Some("B"), true, vec![4, 7]),
+            (Some("empty"), false, vec![]),
+            (None, false, vec![3]),
+        ]
+        .into_iter()
+        .map(|(name, combined, entries)| pb::Ruleset {
+            name: name.map(str::to_owned),
+            kind: Some(if combined {
+                pb::ruleset::Kind::Combined(pb::CombinedRuleset {
+                    rulesets: entries
+                        .into_iter()
+                        .map(|index| pb::RulesetRef {
+                            kind: Some(pb::ruleset_ref::Kind::Index(index)),
+                        })
+                        .collect(),
+                })
+            } else {
+                pb::ruleset::Kind::Rules(pb::RuleList { rules: entries })
+            }),
+            ..Default::default()
+        })
+        .collect();
+        program.rulesets.push(program.rulesets[0].clone());
+        let routes: Vec<_> = [(0, "A"), (5, "B"), (6, "empty")]
+            .into_iter()
+            .map(|(index, name)| (index, pb::ruleset_ref::Kind::Name(name.into())))
+            .chain(
+                (0..program.rulesets.len())
+                    .map(|index| (index, pb::ruleset_ref::Kind::Index(index as u32))),
+            )
+            .collect();
+        let mut singleton_firsts = HashMap::new();
+        for route in &routes {
+            for (rule, origin) in ruleset_selection(&program, [route.clone()]) {
+                singleton_firsts.entry(rule).or_insert(origin);
+            }
+        }
+        let forest = ruleset_selection(&program, routes);
+        assert_eq!(
+            forest.iter().map(|(rule, _)| *rule).collect::<Vec<_>>(),
+            [1, 0, 2, 3]
+        );
+        assert_eq!(
+            forest.into_iter().collect::<HashMap<_, _>>(),
+            singleton_firsts
+        );
+        let prepared = engine.graphs[&id].prepare(&mut program.clone()).unwrap();
+        let mut expected = HashMap::new();
+        for (rule, root, children, ordinal) in [
+            (1, "A", vec![0, 0], 0),
+            (0, "A", vec![0, 0], 1),
+            (2, "A", vec![1, 1], 1),
+            (3, "B", vec![1], 0),
+        ] {
+            let origin = pb::RuleAttribution {
+                root: Some(pb::RulesetRef {
+                    kind: Some(pb::ruleset_ref::Kind::Name(root.into())),
+                }),
+                children,
+                rule: ordinal,
+                name: program.rules[rule].name.clone(),
+                span: program.rules[rule].span,
+            };
+            let directions: &[(_, _)] = if rule == 0 {
+                &[
+                    ("=>", pb::NativeRuleDirection::Forward),
+                    ("<=", pb::NativeRuleDirection::Reverse),
+                ]
+            } else {
+                &[("", pb::NativeRuleDirection::Single)]
+            };
+            for (suffix, direction) in directions {
+                expected.insert(
+                    format!("{}{suffix}", prepared.rules[rule]),
+                    (origin.clone(), *direction),
+                );
+            }
+        }
+        assert_eq!(prepared.context.origins, expected);
+        assert_eq!(prepared.context.files, program.files);
+        // Every installation still needs its entire independent selector.
+        let selectors: HashMap<_, _> = prepared
+            .installations
+            .iter()
+            .filter_map(|installation| match &installation.command {
+                Some(Command::UnstableCombinedRuleset(_, name, children)) => {
+                    Some((name.clone(), children.clone()))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            selectors[&prepared.rulesets[0]],
+            [1, 0, 2].map(|rule| format!("{}_holder", prepared.rules[rule]))
+        );
+        assert_eq!(
+            selectors[&prepared.rulesets[5]],
+            [0, 2, 3].map(|rule| format!("{}_holder", prepared.rules[rule]))
+        );
+        assert_eq!(
+            run_host_default(&mut engine, id, program.clone()).error,
+            None
+        );
+
+        let current = pb::SourceFile {
+            name: "current.egg".into(),
+            contents: Some("current".into()),
+        };
+        let prepared = engine.graphs[&id]
+            .prepare(&mut pb::Program {
+                ir_version: 1,
+                files: vec![current.clone()],
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(prepared.installations.is_empty());
+        for (origin, _) in expected.values_mut() {
+            if let Some(span) = &mut origin.span {
+                span.file = match span.file {
+                    0 => 2,
+                    1 => 1,
+                    2 => 3,
+                    _ => unreachable!(),
+                };
+            }
+        }
+        assert_eq!(prepared.context.origins, expected);
+        assert_eq!(
+            prepared.context.files,
+            [
+                current,
+                program.files[1].clone(),
+                program.files[0].clone(),
+                program.files[2].clone()
+            ]
+        );
+    }
+
+    #[test]
+    fn attribution_forest_keeps_deep_shared_traversal_iterative() {
+        let mut program = pb::Program {
+            rules: vec![pb::RuleDecl::default()],
+            rulesets: vec![pb::Ruleset {
+                kind: Some(pb::ruleset::Kind::Rules(pb::RuleList { rules: vec![0] })),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        for child in 0..1024 {
+            program.rulesets.push(pb::Ruleset {
+                kind: Some(pb::ruleset::Kind::Combined(pb::CombinedRuleset {
+                    rulesets: vec![
+                        pb::RulesetRef {
+                            kind: Some(pb::ruleset_ref::Kind::Index(child))
+                        };
+                        2
+                    ],
+                })),
+                ..Default::default()
+            });
+        }
+        let selection = ruleset_selection(
+            &program,
+            (0..=1024)
+                .rev()
+                .map(|root| (root, pb::ruleset_ref::Kind::Index(root as u32))),
+        );
+        let [(rule, origin)] = selection.as_slice() else {
+            panic!("{selection:?}")
+        };
+        assert_eq!(*rule, 0);
+        assert_eq!(
+            origin.root.as_ref().unwrap().kind,
+            Some(pb::ruleset_ref::Kind::Index(1024))
+        );
+        assert_eq!(origin.children, vec![0; 1024]);
+    }
+
+    #[test]
+    fn attribution_routes_skip_uninstalled_occurrences() {
+        let (engine, id) = host_default_engine();
+        let program = pb::Program {
+            ir_version: 1,
+            rules: vec![pb::RuleDecl {
+                name: Some("shared".into()),
+                kind: Some(pb::rule_decl::Kind::Rule(pb::Rule::default())),
+                eval_mode: pb::RuleEvalMode::Seminaive.into(),
+                ..Default::default()
+            }],
+            rulesets: (0..2)
+                .map(|_| pb::Ruleset {
+                    kind: Some(pb::ruleset::Kind::Rules(pb::RuleList { rules: vec![0] })),
+                    ..Default::default()
+                })
+                .collect(),
+            commands: vec![pb::Command {
+                kind: Some(pb::command::Kind::Run(pb::Run {
+                    ruleset: Some(pb::RulesetRef {
+                        kind: Some(pb::ruleset_ref::Kind::Index(1)),
+                    }),
+                    ..Default::default()
+                })),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let prepared = engine.graphs[&id].prepare(&mut program.clone()).unwrap();
+        assert!(prepared.rulesets[0].is_empty());
+        assert!(!prepared.rulesets[1].is_empty());
+        let (origin, direction) = &prepared.context.origins[&prepared.rules[0]];
+        assert_eq!(
+            origin.root.as_ref().unwrap().kind,
+            Some(pb::ruleset_ref::Kind::Index(1))
+        );
+        assert!(origin.children.is_empty());
+        assert_eq!(origin.rule, 0);
+        assert_eq!(*direction, pb::NativeRuleDirection::Single);
     }
 
     #[test]
