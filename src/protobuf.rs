@@ -184,6 +184,7 @@ struct RequestOccurrences {
     files: Vec<pb::SourceFile>,
     include_run_reports: bool,
     scoped_actions: HashSet<usize>,
+    constructor_dags: HashSet<usize>,
     union_values: HashMap<u32, Value>,
 }
 
@@ -1049,15 +1050,22 @@ impl Session {
             }
         }
         validate_host_declarations(program, &mut staged.graph)?;
-        validate_node_graph(program)?;
-        let scoped_actions = classify_union_actions(
+        let (depths, expansions) = validate_node_graph(program)?;
+        let constructor_dags = if self.mode == pb::ExecutionMode::Normal {
+            classify_constructor_dags(program, &constructor_targets, &depths, &expansions)?
+        } else {
+            HashSet::new()
+        };
+        let mut scoped_actions = classify_union_actions(
             program,
             &constructor_targets,
             self.mode == pb::ExecutionMode::Normal,
+            &depths,
         )?;
         if !scoped_actions.is_empty() && self.mode != pb::ExecutionMode::Normal {
             return Err("scoped actions require normal execution mode".into());
         }
+        scoped_actions.extend(&constructor_dags);
         lower_builtin_calls(program, &staged.graph, &signatures)?;
         for index in declaration_order(program, &mut staged.graph)? {
             let declaration = &program.declarations[index];
@@ -1442,6 +1450,7 @@ impl Session {
         }
         let mut context = RequestOccurrences {
             scoped_actions,
+            constructor_dags,
             rulesets: occurrences
                 .rulesets
                 .iter()
@@ -1558,8 +1567,15 @@ impl Session {
                 let Some(pb::command::Kind::Action(action)) = &command.kind else {
                     unreachable!("only direct actions have Union frames")
                 };
-                eval_union_action(&mut compiler, program, action, &mut values, false)
-                    .map_err(|error| error.to_string())?;
+                eval_scoped_action(
+                    &mut compiler,
+                    program,
+                    action,
+                    &mut values,
+                    false,
+                    context.constructor_dags.contains(&index),
+                )
+                .map_err(|error| error.to_string())?;
             }
         }
         // Only rendering needs the filtered declaration view. All runtime sites
@@ -1987,12 +2003,15 @@ impl Session {
                     .scoped_actions
                     .contains(&(location.path[0] as usize)) =>
             {
-                eval_union_action(
+                eval_scoped_action(
                     &mut self.graph,
                     program,
                     action,
                     &mut context.union_values,
                     true,
+                    context
+                        .constructor_dags
+                        .contains(&(location.path[0] as usize)),
                 )?;
                 None
             }
@@ -4265,7 +4284,7 @@ fn validate_relation_uses(program: &pb::Program, saved: &pb::Program) -> Result<
 // Validate the entire arena, including unused entries, without interpreting it.
 // Removing Union outgoing edges must leave a DAG: every permitted cycle crosses
 // an identity boundary. Value lowering still validates each actual use's context.
-fn validate_node_graph(program: &pb::Program) -> Result<(), String> {
+fn validate_node_graph(program: &pb::Program) -> Result<(Vec<usize>, Vec<usize>), String> {
     let mut edges = Vec::with_capacity(program.nodes.len());
     for (index, node) in program.nodes.iter().enumerate() {
         let sort = node_sort(program, index as u32)?;
@@ -4311,6 +4330,7 @@ fn validate_node_graph(program: &pb::Program) -> Result<(), String> {
     }
     let mut state = vec![0u8; edges.len()];
     let mut depths = vec![0usize; edges.len()];
+    let mut expansions = vec![0usize; edges.len()];
     for start in 0..edges.len() {
         let mut pending = vec![(start, false)];
         while let Some((index, exit)) = pending.pop() {
@@ -4320,11 +4340,12 @@ fn validate_node_graph(program: &pb::Program) -> Result<(), String> {
                     .map(|child| depths[*child as usize])
                     .max()
                     .unwrap_or(0);
-                if depths[index] > 256 {
-                    return Err(
-                        "expression depth exceeds this adapter's current limit of 256".into(),
-                    );
-                }
+                // Structural validation is independent of the tree adapter.
+                // Saturating expansion sizes select the action DAG path without
+                // constructing (or overflowing the size of) an expanded tree.
+                expansions[index] = edges[index].iter().fold(1usize, |size, child| {
+                    size.saturating_add(expansions[*child as usize]).min(65_537)
+                });
                 state[index] = 2;
                 continue;
             }
@@ -4343,7 +4364,70 @@ fn validate_node_graph(program: &pb::Program) -> Result<(), String> {
             );
         }
     }
-    Ok(())
+    Ok((depths, expansions))
+}
+
+// Only closed constructor/scalar syntax may be shared by this optimization.
+// Reads, effects, Union identities and saved/query code retain their existing
+// lowering. The native local memo lasts exactly one direct Action.
+fn classify_constructor_dags(
+    program: &pb::Program,
+    constructors: &HashSet<String>,
+    depths: &[usize],
+    expansions: &[usize],
+) -> Result<HashSet<usize>, String> {
+    let mut selected = HashSet::new();
+    for (position, command) in program.commands.iter().enumerate() {
+        let Some(pb::command::Kind::Action(pb::Action {
+            kind: Some(pb::action::Kind::Term(root)),
+            ..
+        })) = &command.kind
+        else {
+            continue;
+        };
+        let depth = depths
+            .get(*root as usize)
+            .ok_or("action node out of bounds")?;
+        if *depth <= 256 && expansions[*root as usize] <= 65_536 {
+            continue;
+        }
+        let mut pending = vec![*root];
+        let mut seen = HashSet::new();
+        // The evaluator spends one Enter per edge plus the root, and at most
+        // one Call exit per unique node. Reserve the root step here.
+        let mut remaining = 65_535usize;
+        let mut eligible = true;
+        while let Some(index) = pending.pop() {
+            if !seen.insert(index) {
+                continue;
+            }
+            let children = match program.nodes[index as usize].kind.as_ref().unwrap() {
+                pb::node::Kind::Call(call) if constructors.contains(&call.func) => &call.args[..],
+                pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
+                    value:
+                        Some(
+                            pb::primitive_value::Value::I64(_)
+                            | pb::primitive_value::Value::F64Bits(_)
+                            | pb::primitive_value::Value::String(_)
+                            | pb::primitive_value::Value::Bool(_)
+                            | pb::primitive_value::Value::Unit(_),
+                        ),
+                }) => &[],
+                _ => {
+                    eligible = false;
+                    break;
+                }
+            };
+            remaining = remaining
+                .checked_sub(1 + children.len())
+                .ok_or("constructor action DAG exceeds 65536 nodes and edges")?;
+            pending.extend(children);
+        }
+        if eligible {
+            selected.insert(position);
+        }
+    }
+    Ok(selected)
 }
 
 // The ordered evaluated roots of an action: Set's row-address arguments precede
@@ -4381,15 +4465,22 @@ fn classify_union_actions(
     program: &pb::Program,
     constructor_targets: &HashSet<String>,
     constructor_costs: bool,
+    depths: &[usize],
 ) -> Result<HashSet<usize>, String> {
-    let unions = |action: &pb::Action| -> Result<HashSet<u32>, String> {
+    let unions = |action: &pb::Action| -> Result<(HashSet<u32>, usize), String> {
         let mut pending = action_roots(action)?;
         let mut seen = HashSet::new();
         let mut unions = HashSet::new();
+        let mut depth = 0;
         while let Some(index) = pending.pop() {
             if !seen.insert(index) {
                 continue;
             }
+            depth = depth.max(
+                *depths
+                    .get(index as usize)
+                    .ok_or("action node out of bounds")?,
+            );
             match program
                 .nodes
                 .get(index as usize)
@@ -4408,12 +4499,12 @@ fn classify_union_actions(
                 _ => (),
             }
         }
-        Ok(unions)
+        Ok((unions, depth))
     };
     let mut uses = HashMap::<u32, usize>::new();
     for command in command_tree(&program.commands) {
         if let Some(pb::command::Kind::Action(action)) = &command.kind {
-            for union in unions(action)? {
+            for union in unions(action)?.0 {
                 *uses.entry(union).or_default() += 1;
             }
         }
@@ -4424,12 +4515,17 @@ fn classify_union_actions(
             let Some(pb::command::Kind::Action(action)) = &child.kind else {
                 continue;
             };
-            let reached = unions(action)?;
+            let (reached, depth) = unions(action)?;
             let cost_action = matches!(action.kind, Some(pb::action::Kind::SetCost(_)))
                 || constructor_costs
                     && matches!(&action.kind, Some(pb::action::Kind::Delete(call)) if constructor_targets.contains(&call.func));
             if reached.is_empty() && !cost_action {
                 continue;
+            }
+            // Moving the arena-wide tree limit must not broaden the existing
+            // Union/cost path's admission beyond this constructor-only slice.
+            if depth > 256 {
+                return Err("expression depth exceeds this adapter's current limit of 256".into());
             }
             let generalized = cost_action
                 || reached.iter().any(|union| uses[union] > 1)
@@ -4489,15 +4585,16 @@ fn validate_union_occurrences(program: &pb::Program) -> Result<(), String> {
     Ok(())
 }
 
-// Only Union locations are retained across direct commands. Calls are lowered
-// anew on every demand. The stack is a transient compiler walk, not a second
-// semantic graph, and all effects execute together in one native action rule.
-fn eval_union_action(
+// Only Union locations are retained across direct commands. An admitted closed
+// constructor DAG shares local results within this action only; other Calls
+// are lowered anew on every demand. All effects retain one native rule boundary.
+fn eval_scoped_action(
     graph: &mut EGraph,
     program: &pb::Program,
     action: &pb::Action,
     values: &mut HashMap<u32, Value>,
     execute: bool,
+    share_constructors: bool,
 ) -> Result<(), egglog::Error> {
     enum Walk {
         Enter(u32),
@@ -4546,6 +4643,7 @@ fn eval_union_action(
                 .collect()
         };
         let mut results = Vec::<Expr>::new();
+        let mut memo = HashMap::<u32, String>::new();
         let mut temporary = 0usize;
         let mut remaining = 65_536usize;
         while let Some(step) = pending.pop() {
@@ -4556,6 +4654,10 @@ fn eval_union_action(
                 Walk::Enter(index) => {
                     let node = &program.nodes[index as usize];
                     let span = native_span(program, node.span.as_ref()).map_err(error)?;
+                    if share_constructors && let Some(name) = memo.get(&index) {
+                        results.push(Expr::Var(span, name.clone()));
+                        continue;
+                    }
                     match node.kind.as_ref().expect("validated node") {
                         pb::node::Kind::Union(union) => {
                             if !matches!(
@@ -4651,6 +4753,9 @@ fn eval_union_action(
                         name.clone(),
                         Expr::Call(span.clone(), function, args),
                     ))?;
+                    if share_constructors {
+                        memo.insert(index, name.clone());
+                    }
                     results.push(Expr::Var(span, name));
                 }
                 Walk::Member(index, position) => {
@@ -4739,7 +4844,7 @@ fn eval_union_action(
                 call.func.clone(),
                 results,
             ),
-            _ => unreachable!("only Union-bearing actions use this compiler"),
+            _ => unreachable!("only scoped action kinds use this compiler"),
         };
         builder.action(action)
     });
@@ -5388,6 +5493,72 @@ fn encode_exact_number(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn constructor_dag_scoped_compilation_is_inert_and_drops_partial_builders() {
+        let mut graph = crate::new_experimental_egraph();
+        graph
+            .parse_and_run_program(None, "(datatype A (Leaf) (Wrap A))")
+            .unwrap();
+        let functions = graph.get_function_names();
+        let mut program = inventory_fixture("(datatype A (Leaf) (Wrap A)) (Leaf)");
+        let Some(pb::command::Kind::Action(pb::Action {
+            kind: Some(pb::action::Kind::Term(mut root)),
+            ..
+        })) = program.commands.pop().unwrap().kind
+        else {
+            panic!("fixture")
+        };
+        let sort_id = program.nodes[root as usize].sort_id;
+        for _ in 0..1050 {
+            program.nodes.push(pb::Node {
+                sort_id,
+                kind: Some(pb::node::Kind::Call(pb::Call {
+                    func: "Wrap".into(),
+                    args: vec![root],
+                })),
+                ..Default::default()
+            });
+            root = program.nodes.len() as u32 - 1;
+        }
+        let action = pb::Action {
+            kind: Some(pb::action::Kind::Term(root)),
+            ..Default::default()
+        };
+        let mut values = HashMap::new();
+        eval_scoped_action(&mut graph, &program, &action, &mut values, false, true).unwrap();
+        assert_eq!(graph.num_tuples(), 0);
+        assert!(graph.materialized_eq_classes().is_empty());
+        assert!(values.is_empty());
+
+        // Force a native compile error only after the shallow locals for the
+        // complete deep child have been emitted. No nested native AST exists
+        // on this partial-builder destruction path either.
+        program.nodes.push(pb::Node {
+            sort_id,
+            kind: Some(pb::node::Kind::Call(pb::Call {
+                func: "missing-after-locals".into(),
+                args: vec![root],
+            })),
+            ..Default::default()
+        });
+        let invalid = pb::Action {
+            kind: Some(pb::action::Kind::Term(root + 1)),
+            ..Default::default()
+        };
+        assert!(
+            eval_scoped_action(&mut graph, &program, &invalid, &mut values, false, true).is_err()
+        );
+        assert_eq!(graph.num_tuples(), 0);
+        assert!(graph.materialized_eq_classes().is_empty());
+        program.nodes.pop();
+        eval_scoped_action(&mut graph, &program, &action, &mut values, true, true).unwrap();
+        assert_eq!(graph.get_size("Wrap"), 1050);
+        assert_eq!(graph.get_size("Leaf"), 1);
+        assert_eq!(graph.materialized_eq_classes().len(), 1051);
+        assert_eq!(graph.get_function_names(), functions);
+        assert!(values.is_empty());
+    }
 
     #[test]
     fn creation_global_flags_preserve_native_defaults_and_no_rule_prove_admission() {

@@ -3,6 +3,372 @@ use egglog_experimental::{PortableEGraph, PortableTypeInfo};
 use egglog_experimental::{new_experimental_egraph, protobuf::Engine};
 use prost::Message;
 
+mod constructor_action_dags {
+    use super::*;
+
+    fn program(wraps: usize, share_every: usize) -> pb::Program {
+        let mut program = pb::Program {
+            ir_version: 1,
+            sorts: fixture().sorts,
+            declarations: vec![pb::Declaration {
+                kind: Some(pb::declaration::Kind::EqSort(pb::EqSort {
+                    name: "Math".into(),
+                    ..Default::default()
+                })),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        for (name, arity) in [("Leaf", 0), ("Wrap", 1), ("Pair", 2)] {
+            program.declarations.push(pb::Declaration {
+                kind: Some(pb::declaration::Kind::Constructor(pb::Constructor {
+                    name: name.into(),
+                    inputs: (0..arity)
+                        .map(|_| pb::Arg {
+                            sort: 1,
+                            name: String::new(),
+                        })
+                        .collect(),
+                    output: 1,
+                    ..Default::default()
+                })),
+                ..Default::default()
+            });
+        }
+        program.nodes.push(pb::Node {
+            sort_id: 1,
+            kind: Some(pb::node::Kind::Call(pb::Call {
+                func: "Leaf".into(),
+                args: vec![],
+            })),
+            ..Default::default()
+        });
+        let mut root = 0;
+        for index in 0..wraps {
+            program.nodes.push(pb::Node {
+                sort_id: 1,
+                kind: Some(pb::node::Kind::Call(pb::Call {
+                    func: "Wrap".into(),
+                    args: vec![root],
+                })),
+                ..Default::default()
+            });
+            root = program.nodes.len() as u32 - 1;
+            if share_every != 0 && index % share_every == share_every - 1 {
+                program.nodes.push(pb::Node {
+                    sort_id: 1,
+                    kind: Some(pb::node::Kind::Call(pb::Call {
+                        func: "Pair".into(),
+                        args: vec![root, root],
+                    })),
+                    ..Default::default()
+                });
+                root = program.nodes.len() as u32 - 1;
+            }
+        }
+        program.commands = vec![
+            pb::Command {
+                kind: Some(pb::command::Kind::Action(pb::Action {
+                    kind: Some(pb::action::Kind::Term(root)),
+                    ..Default::default()
+                })),
+                ..Default::default()
+            },
+            pb::Command {
+                kind: Some(pb::command::Kind::PrintSize(pb::PrintSize {
+                    tables: vec!["Wrap".into(), "Pair".into(), "Leaf".into()],
+                })),
+                ..Default::default()
+            },
+            pb::Command {
+                kind: Some(pb::command::Kind::Freeze(pb::Freeze {})),
+                ..Default::default()
+            },
+        ];
+        program
+    }
+
+    #[test]
+    fn deep_and_exponentially_shared_actions_execute_without_global_temporaries() {
+        for (wraps, share_every) in [(5, 0), (300, 0), (1050, 100), (28, 1)] {
+            let mut engine = Engine::default();
+            let id = create(&mut engine);
+            let mut program = program(wraps, share_every);
+            if wraps == 1050 {
+                // Match the real Python packer's root-first/forward-edge arena,
+                // not just this helper's convenient child-first construction.
+                assert_eq!(program.nodes.len(), 1061);
+                let last = program.nodes.len() as u32 - 1;
+                program.nodes.reverse();
+                for node in &mut program.nodes {
+                    let Some(pb::node::Kind::Call(call)) = &mut node.kind else {
+                        unreachable!()
+                    };
+                    for child in &mut call.args {
+                        *child = last - *child;
+                    }
+                }
+                let Some(pb::command::Kind::Action(pb::Action {
+                    kind: Some(pb::action::Kind::Term(root)),
+                    ..
+                })) = &mut program.commands[0].kind
+                else {
+                    unreachable!()
+                };
+                *root = last - *root;
+                assert_eq!(*root, 0);
+            }
+            // A second action must have a fresh compiler-local memo.
+            program.commands.insert(1, program.commands[0].clone());
+            let response = run(&mut engine, id, program);
+            assert_eq!(response.error, None, "{wraps}/{share_every}");
+            let Some(pb::command_output::Kind::Sizes(sizes)) = &response.outputs[0].kind else {
+                panic!("sizes")
+            };
+            let rows: Vec<_> = sizes
+                .sizes
+                .iter()
+                .map(|table| (table.table.as_str(), table.rows))
+                .collect();
+            assert_eq!(
+                rows,
+                [
+                    ("Wrap", wraps as u64),
+                    (
+                        "Pair",
+                        if share_every == 0 {
+                            0
+                        } else {
+                            (wraps / share_every) as u64
+                        }
+                    ),
+                    ("Leaf", 1)
+                ]
+            );
+            let Some(pb::command_output::Kind::Snapshot(snapshot)) = &response.outputs[1].kind
+            else {
+                panic!("snapshot")
+            };
+            let snapshot = snapshot.program.as_ref().unwrap();
+            assert!(
+                snapshot
+                    .declarations
+                    .iter()
+                    .all(|declaration| match &declaration.kind {
+                        Some(pb::declaration::Kind::Constructor(table)) =>
+                            !table.name.starts_with("__egglog_proto_action_"),
+                        Some(pb::declaration::Kind::Function(table)) =>
+                            !table.name.starts_with("__egglog_proto_action_"),
+                        _ => true,
+                    })
+            );
+        }
+    }
+
+    #[test]
+    fn validation_and_unsupported_contexts_are_inert() {
+        use egglog_experimental::protobuf::source::Renderer;
+
+        let mut engine = Engine::default();
+        let id = create(&mut engine);
+        let mut unused = program(1050, 100);
+        unused.commands.remove(0);
+        let response = run(&mut engine, id, unused);
+        assert_eq!(response.error, None);
+        let Some(pb::command_output::Kind::Sizes(sizes)) = &response.outputs[0].kind else {
+            panic!("sizes")
+        };
+        assert!(sizes.sizes.iter().all(|table| table.rows == 0));
+
+        for invalid in [
+            "name", "sort", "root", "cycle", "budget", "query", "body", "head", "read", "union",
+        ] {
+            let mut invalid_program = program(if invalid == "budget" { 32_768 } else { 300 }, 0);
+            let root = invalid_program.nodes.len() as u32 - 1;
+            match invalid {
+                "name" => {
+                    invalid_program.nodes.push(pb::Node {
+                        sort_id: 1,
+                        kind: Some(pb::node::Kind::Call(pb::Call {
+                            func: "missing-late".into(),
+                            args: vec![],
+                        })),
+                        ..Default::default()
+                    });
+                    invalid_program.commands.push(pb::Command {
+                        kind: Some(pb::command::Kind::Action(pb::Action {
+                            kind: Some(pb::action::Kind::Term(root + 1)),
+                            ..Default::default()
+                        })),
+                        ..Default::default()
+                    });
+                }
+                "sort" => invalid_program.nodes[root as usize].sort_id = 0,
+                "root" => {
+                    invalid_program.commands[0].kind = Some(pb::command::Kind::Action(pb::Action {
+                        kind: Some(pb::action::Kind::Term(u32::MAX)),
+                        ..Default::default()
+                    }))
+                }
+                "cycle" => {
+                    invalid_program.nodes[root as usize].kind =
+                        Some(pb::node::Kind::Call(pb::Call {
+                            func: "Wrap".into(),
+                            args: vec![root],
+                        }))
+                }
+                "budget" => (),
+                "query" => invalid_program.commands.push(pb::Command {
+                    kind: Some(pb::command::Kind::Check(pb::Check { facts: vec![root] })),
+                    ..Default::default()
+                }),
+                "body" => invalid_program.declarations.push(pb::Declaration {
+                    kind: Some(pb::declaration::Kind::Primitive(pb::Primitive {
+                        name: "deep-body".into(),
+                        inputs: vec![],
+                        output: 1,
+                        body: Some(root),
+                    })),
+                    ..Default::default()
+                }),
+                "head" => invalid_program.rules.push(pb::RuleDecl {
+                    kind: Some(pb::rule_decl::Kind::Rule(pb::Rule {
+                        head: vec![pb::Action {
+                            kind: Some(pb::action::Kind::Term(root)),
+                            ..Default::default()
+                        }],
+                        ..Default::default()
+                    })),
+                    eval_mode: pb::RuleEvalMode::Seminaive.into(),
+                    ..Default::default()
+                }),
+                "read" => {
+                    invalid_program.declarations.push(pb::Declaration {
+                        kind: Some(pb::declaration::Kind::Function(pb::Function {
+                            name: "deep-read".into(),
+                            output: 1,
+                            ..Default::default()
+                        })),
+                        ..Default::default()
+                    });
+                    invalid_program.nodes[0].kind = Some(pb::node::Kind::Call(pb::Call {
+                        func: "deep-read".into(),
+                        args: vec![],
+                    }));
+                }
+                "union" => {
+                    invalid_program.nodes[0].kind =
+                        Some(pb::node::Kind::Union(pb::Union { members: vec![] }))
+                }
+                _ => unreachable!(),
+            }
+            let response = run(&mut engine, id, invalid_program);
+            assert!(response.outputs.is_empty(), "{invalid}");
+            let error = response.error.unwrap_or_else(|| panic!("{invalid}"));
+            if matches!(invalid, "query" | "body" | "head" | "read" | "union") {
+                assert!(
+                    error.message.contains("depth exceeds") || error.message.contains("too-deep"),
+                    "{invalid}: {error:?}"
+                );
+            } else if invalid == "budget" {
+                assert!(error.message.contains("nodes and edges"), "{error:?}");
+            }
+            let mut inspect = program(0, 0);
+            inspect.commands.remove(0);
+            let response = run(&mut engine, id, inspect);
+            assert_eq!(response.error, None, "{invalid}");
+            let Some(pb::command_output::Kind::Sizes(sizes)) = &response.outputs[0].kind else {
+                panic!("sizes")
+            };
+            assert!(sizes.sizes.iter().all(|table| table.rows == 0), "{invalid}");
+        }
+
+        let mut renderer = Renderer::default();
+        let mut deep_source = program(300, 0);
+        deep_source.commands.truncate(1);
+        assert!(
+            renderer
+                .render(&deep_source)
+                .unwrap_err()
+                .to_string()
+                .contains("depth exceeds")
+        );
+        let mut shallow_source = program(5, 0);
+        shallow_source.commands.truncate(1);
+        renderer.render(&shallow_source).unwrap();
+    }
+
+    #[test]
+    fn encoded_modes_keep_their_tree_limits_and_shallow_support() {
+        for mode in [
+            pb::ExecutionMode::TermEncoding,
+            pb::ExecutionMode::Proofs,
+            pb::ExecutionMode::ProofTesting,
+        ] {
+            let mut engine = Engine::default();
+            let request = pb::CreateEGraphRequest {
+                sorts: fixture().sorts[..1].to_vec(),
+                options: Some(pb::EGraphOptions {
+                    cost_sort: Some(0),
+                    execution_mode: mode.into(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            let bytes = engine.create(&request.encode_to_vec()).unwrap();
+            let id = pb::CreateEGraphResponse::decode(bytes.as_slice())
+                .unwrap()
+                .egraph_id;
+            let mut deep = program(300, 0);
+            deep.commands.truncate(1);
+            let response = run(&mut engine, id, deep);
+            assert!(response.outputs.is_empty());
+            assert!(
+                response.error.unwrap().message.contains("depth exceeds"),
+                "{mode:?}"
+            );
+            let mut shallow = program(5, 0);
+            shallow.commands.truncate(1);
+            assert_eq!(run(&mut engine, id, shallow).error, None, "{mode:?}");
+        }
+    }
+
+    #[test]
+    fn runtime_errors_keep_the_deep_action_prefix_and_drop_cleanly() {
+        let mut engine = Engine::default();
+        let id = create(&mut engine);
+        let mut input = program(300, 0);
+        input.commands.insert(
+            1,
+            pb::Command {
+                kind: Some(pb::command::Kind::Action(pb::Action {
+                    kind: Some(pb::action::Kind::Panic("after deep prefix".into())),
+                    ..Default::default()
+                })),
+                ..Default::default()
+            },
+        );
+        let response = run(&mut engine, id, input);
+        assert!(response.outputs.is_empty());
+        let error = response.error.unwrap();
+        assert_eq!(error.code, i32::from(pb::ErrorCode::Panic));
+        assert_eq!(error.location.unwrap().path, [1]);
+        let mut inspect = program(0, 0);
+        inspect.commands.remove(0);
+        let response = run(&mut engine, id, inspect);
+        assert_eq!(response.error, None);
+        let Some(pb::command_output::Kind::Sizes(sizes)) = &response.outputs[0].kind else {
+            panic!("sizes")
+        };
+        assert_eq!(sizes.sizes[0].rows, 300);
+        drop(engine);
+        assert_eq!(
+            pb::RunProgramResponse::decode(response.encode_to_vec().as_slice()).unwrap(),
+            response
+        );
+    }
+}
+
 mod source_reflection {
     use super::*;
     use egglog_experimental::protobuf::source::{Renderer, Source, Submission};
@@ -23769,7 +24135,8 @@ fn shared_syntax_expansion_has_a_bounded_failure() {
     for setup in &phases[..2] {
         assert_eq!(run(&mut engine, id, setup.clone()).error, None);
     }
-    // The same root, when demanded, rejects before an earlier sentinel write.
+    // Query roots still use the bounded tree adapter, and reject before an
+    // earlier sentinel write. Direct closed constructor actions are DAG-lowered.
     program.commands.insert(
         0,
         pb::Command {
@@ -23787,10 +24154,7 @@ fn shared_syntax_expansion_has_a_bounded_failure() {
         },
     );
     program.commands.push(pb::Command {
-        kind: Some(pb::command::Kind::Action(pb::Action {
-            kind: Some(pb::action::Kind::Term(child)),
-            ..Default::default()
-        })),
+        kind: Some(pb::command::Kind::Check(pb::Check { facts: vec![child] })),
         ..Default::default()
     });
     let response = run(&mut engine, id, program);
