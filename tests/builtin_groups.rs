@@ -129,7 +129,7 @@ mod native_signature {
             definitions
         }
         fn make_sort(
-            _: &mut TypeInfo,
+            _: &TypeInfo,
             _: String,
             _: &[ast::Expr],
             span: ast::Span,
@@ -963,19 +963,28 @@ mod native_signature {
 // Reuse actual Map storage without installing Map's own provenance/primitives
 // for these distinct test providers. Their canonical signatures stay independent.
 #[derive(Debug)]
-struct FixtureMap(ArcSort);
+struct FixtureMap {
+    native: ArcSort,
+    family: &'static str,
+}
 impl sort::Sort for FixtureMap {
     fn name(&self) -> &str {
-        self.0.name()
+        self.native.name()
+    }
+    fn family_instance(&self) -> Option<egglog::builtin::NativeFamilyInstance> {
+        Some(egglog::builtin::NativeFamilyInstance {
+            family: self.family.into(),
+            parameters: self.native.inner_sorts(),
+        })
     }
     fn column_ty(&self, backend: &egglog_bridge::EGraph) -> sort::ColumnTy {
-        self.0.column_ty(backend)
+        self.native.column_ty(backend)
     }
     fn inner_sorts(&self) -> Vec<ArcSort> {
-        self.0.inner_sorts()
+        self.native.inner_sorts()
     }
     fn register_type(&self, backend: &mut egglog_bridge::EGraph) {
-        self.0.register_type(backend)
+        self.native.register_type(backend)
     }
     fn as_arc_any(self: std::sync::Arc<Self>) -> std::sync::Arc<dyn std::any::Any + Send + Sync> {
         self
@@ -984,7 +993,7 @@ impl sort::Sort for FixtureMap {
         true
     }
     fn value_type(&self) -> Option<TypeId> {
-        self.0.value_type()
+        self.native.value_type()
     }
 }
 
@@ -1098,17 +1107,15 @@ impl Presort for Grouped {
             .collect()
     }
     fn make_sort(
-        types: &mut TypeInfo,
+        types: &TypeInfo,
         name: String,
         args: &[ast::Expr],
         span: ast::Span,
     ) -> Result<ArcSort, TypeError> {
-        let native: ArcSort =
-            std::sync::Arc::new(FixtureMap(MapSort::make_sort(types, name, args, span)?));
-        types
-            .register_builtin_sort(Self::presort_name(), native.clone(), native.inner_sorts())
-            .unwrap();
-        Ok(native)
+        Ok(std::sync::Arc::new(FixtureMap {
+            native: MapSort::make_sort(types, name, args, span)?,
+            family: Self::presort_name(),
+        }))
     }
 }
 
@@ -1197,17 +1204,15 @@ impl<const INPUT: u32, const SWAP: bool> Presort for Foreign<INPUT, SWAP> {
             .collect()
     }
     fn make_sort(
-        types: &mut TypeInfo,
+        types: &TypeInfo,
         name: String,
         args: &[ast::Expr],
         span: ast::Span,
     ) -> Result<ArcSort, TypeError> {
-        let native: ArcSort =
-            std::sync::Arc::new(FixtureMap(MapSort::make_sort(types, name, args, span)?));
-        types
-            .register_builtin_sort(Self::presort_name(), native.clone(), native.inner_sorts())
-            .unwrap();
-        Ok(native)
+        Ok(std::sync::Arc::new(FixtureMap {
+            native: MapSort::make_sort(types, name, args, span)?,
+            family: Self::presort_name(),
+        }))
     }
 }
 
@@ -2142,7 +2147,7 @@ mod manual_root_context {
                 .collect()
         }
         fn make_sort(
-            _: &mut TypeInfo,
+            _: &TypeInfo,
             _: String,
             _: &[ast::Expr],
             _: ast::Span,

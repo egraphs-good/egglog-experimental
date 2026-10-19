@@ -119,6 +119,84 @@ fn source_multi_extract_preserves_one_ordered_batch_and_replays() {
 }
 
 #[test]
+fn source_definition_and_global_let_intake_does_not_clone_accumulated_native_bodies() {
+    use egglog_experimental::protobuf::{NativeExtension, source::Source};
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    #[derive(Default)]
+    struct CloneProbe(Arc<AtomicUsize>);
+    impl Clone for CloneProbe {
+        fn clone(&self) -> Self {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Self(self.0.clone())
+        }
+    }
+    struct Provider(Arc<AtomicUsize>);
+    impl NativeExtension for Provider {
+        fn initialize(&self, graph: &mut egglog::EGraph) -> Result<(), String> {
+            *graph.extension_state_or_default::<CloneProbe>() = CloneProbe(self.0.clone());
+            *graph.type_info().extension_state_or_default::<CloneProbe>() =
+                CloneProbe(self.0.clone());
+            Ok(())
+        }
+        fn lower_custom_value(
+            &self,
+            _: &egglog::EGraph,
+            _: &egglog::ArcSort,
+            _: &pb::CustomValue,
+            _: Option<pb::Span>,
+            _: &mut pb::Program,
+        ) -> Result<pb::Call, String> {
+            Err("no custom values".into())
+        }
+        fn encode_custom_value(
+            &self,
+            _: &egglog::ArcSort,
+            _: &egglog::TermDag,
+            _: egglog::TermId,
+        ) -> Result<Option<pb::CustomValue>, String> {
+            Ok(None)
+        }
+    }
+    for count in [8, 32] {
+        let mut text = "(datatype E (N i64)) (ruleset r)".to_owned();
+        let payload = "retained-body".repeat(128);
+        for index in 0..count {
+            use std::fmt::Write;
+            write!(
+                text,
+                "(rule ((N x)) ((panic \"{payload}\")) :ruleset r :name \"rule{index}\")"
+            )
+            .unwrap();
+        }
+        text.push_str(
+            "(sort A (Vec i64)) (sort Z (Vec i64))
+             (let $held (N 1)) (primitive held_value () E $held)
+                       (function later () E :merge new)",
+        );
+        let clones = Arc::new(AtomicUsize::new(0));
+        let source =
+            Source::with_extension(None, &text, Arc::new(Provider(clones.clone()))).unwrap();
+        clones.store(0, Ordering::SeqCst);
+        let phases = source.collect::<Result<Vec<_>, _>>().unwrap();
+        assert_eq!(
+            clones.load(Ordering::SeqCst),
+            0,
+            "{count} definitions copied native context"
+        );
+        assert!(phases.iter().any(|phase| phase.rules.len() == count));
+        assert!(phases.iter().any(|phase| {
+            phase
+                .commands
+                .iter()
+                .any(|command| matches!(command.kind, Some(pb::command::Kind::Action(_))))
+        }));
+    }
+}
+
+#[test]
 fn source_multi_extract_evaluates_stateful_roots_once_before_extraction() {
     use egglog_experimental::protobuf::source::{Renderer, Source};
     let mut text = "(datatype E (Num i64)) (multi-extract 1 (Num (get-size! \"Num\")) (Num (get-size! \"Num\"))) (print-size Num)".to_string();

@@ -148,7 +148,7 @@ impl Presort for MaybeSort {
     }
 
     fn make_sort(
-        typeinfo: &mut TypeInfo,
+        typeinfo: &TypeInfo,
         name: String,
         args: &[Expr],
         span: Span,
@@ -173,6 +173,13 @@ impl Presort for MaybeSort {
 
 impl ContainerSort for MaybeSort {
     type Container = MaybeContainer;
+
+    fn family_instance(&self) -> Option<egglog::builtin::NativeFamilyInstance> {
+        Some(egglog::builtin::NativeFamilyInstance {
+            family: "Maybe".into(),
+            parameters: vec![self.element.clone()],
+        })
+    }
 
     fn name(&self) -> &str {
         &self.name
@@ -202,10 +209,6 @@ impl ContainerSort for MaybeSort {
 
     fn register_primitives(&self, egraph: &mut EGraph) {
         let maybe = self.clone().to_arcsort();
-        egraph
-            .type_info()
-            .register_builtin_sort("Maybe", maybe.clone(), vec![self.element.clone()])
-            .unwrap();
         let none = egraph
             .type_info()
             .instantiate_builtin("egglog.experimental.maybe.none", &maybe)

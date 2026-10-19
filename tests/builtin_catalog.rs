@@ -4132,7 +4132,7 @@ fn authoritative_family_exports_without_a_described_callable() {
             vec![]
         }
         fn make_sort(
-            _: &mut TypeInfo,
+            _: &TypeInfo,
             _: String,
             _: &[ast::Expr],
             _: ast::Span,

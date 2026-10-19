@@ -303,36 +303,52 @@ pub fn produce_input(
 }
 
 // Project the resolved body before unstable-fn target preparation replaces
-// source target literals with backend-only bindings. The clone is read-only
-// compiler provenance; no runtime ID is installed into another graph.
+// source target literals with backend-only bindings. Projection borrows the
+// existing native context by ownership transfer; no graph snapshot is needed.
 pub(crate) fn primitive_definition(
-    graph: &EGraph,
+    graph: &mut EGraph,
     name: &str,
     inputs: &[ArcSort],
     output: &ArcSort,
     body: &ResolvedExpr,
 ) -> Result<pb::Program, String> {
-    let mut source = Source {
-        dialect: Dialect::Experimental,
-        mode: None,
-        started: false,
-        graph: graph.clone(),
-        _extension: None,
-        commands: VecDeque::new(),
-        include_base: PathBuf::new(),
-        scopes: Vec::new(),
-        program: pb::Program {
-            ir_version: 1,
-            ..Default::default()
+    // Reuse the existing projection implementation without cloning accumulated
+    // native rules. Restore the caller's context even when a provider exporter
+    // returns an error or unwinds; the default graph is only a temporary slot.
+    struct ProjectionGraph<'a> {
+        source: Source,
+        destination: &'a mut EGraph,
+    }
+    impl Drop for ProjectionGraph<'_> {
+        fn drop(&mut self) {
+            std::mem::swap(self.destination, &mut self.source.graph);
+        }
+    }
+    let mut projection = ProjectionGraph {
+        source: Source {
+            dialect: Dialect::Experimental,
+            mode: None,
+            started: false,
+            graph: std::mem::take(graph),
+            _extension: None,
+            commands: VecDeque::new(),
+            include_base: PathBuf::new(),
+            scopes: Vec::new(),
+            program: pb::Program {
+                ir_version: 1,
+                ..Default::default()
+            },
+            rulesets: HashMap::new(),
+            relations: HashSet::new(),
+            schedulers: HashSet::new(),
+            local_prefix: String::new(),
+            next_ruleset: 0,
+            cost_origins: Default::default(),
+            pending_error: None,
         },
-        rulesets: HashMap::new(),
-        relations: HashSet::new(),
-        schedulers: HashSet::new(),
-        local_prefix: String::new(),
-        next_ruleset: 0,
-        cost_origins: Default::default(),
-        pending_error: None,
+        destination: graph,
     };
+    let source = &mut projection.source;
     let inputs = inputs
         .iter()
         .enumerate()
@@ -354,7 +370,7 @@ pub(crate) fn primitive_definition(
         })),
         ..Default::default()
     });
-    Ok(source.program)
+    Ok(std::mem::take(&mut source.program))
 }
 
 impl Source {
@@ -678,10 +694,9 @@ impl Source {
             } => Some(name.clone()),
             _ => None,
         };
-        let macros = self.graph.command_macros().clone();
-        let types = self.graph.authoring_type_info().clone();
-        let mut expanded = macros
-            .apply(command, &mut self.graph.parser.symbol_gen, &types)
+        let mut expanded = self
+            .graph
+            .expand_command_macros(command)
             .map_err(|error| error.to_string())?;
         if expanded.len() == 1 {
             return self.compile_expanded(expanded, explicit_sort_alias);
@@ -729,102 +744,117 @@ impl Source {
             .is_some_and(|mode| mode != pb::ExecutionMode::Normal);
         let mut installed = None;
         let mut definition_error = None;
+        let mut registered_commands = None;
         // Definition registration keeps the native destination context current
         // and supplies empty table backends for later literal function captures.
         // Runtime Fail also retains a global Let's header.
-        // Compile before recording headers; preserving-globals export below
-        // still supplies all wire metadata.
-        let mut compiler = match expanded.as_slice() {
-            [command] => {
-                let mut header = command;
-                while let Command::Fail(_, child) = header {
-                    header = child;
-                }
-                let definition = matches!(
-                    header,
-                    Command::Datatype { .. }
-                        | Command::Datatypes { .. }
-                        | Command::Relation { .. }
-                        | Command::Constructor { .. }
-                        | Command::Function { .. }
-                        | Command::Sort { .. }
-                        | Command::AddRuleset(..)
-                        | Command::UnstableCombinedRuleset(..)
-                        | Command::Rule { .. }
-                        | Command::Rewrite(..)
-                        | Command::BiRewrite(..)
-                );
-                if definition || matches!(header, Command::Action(Action::Let(..))) {
-                    let mut graph = self.graph.clone();
-                    // Source already expanded this command. Suppress a second
-                    // provider transform only in the disposable compiler context.
-                    let macros = std::mem::take(graph.command_macros_mut());
-                    if definition {
-                        // Only authored definitions enter this interpreter.
-                        // Native registration preserves Fail's precise expansion,
-                        // admission and prefix boundaries, including proof helpers.
-                        let mut completed = HashSet::new();
-                        let result = graph.run_program_observed(
-                            vec![command.clone()],
-                            &mut |_, _, _| {},
-                            &mut |_, event| {
-                                let (mut success, mut command) = match event {
-                                    egglog::ExecutionEvent::CommandCompleted {
-                                        command, ..
-                                    } => (true, command),
-                                    egglog::ExecutionEvent::CommandFailed { command, .. } => {
-                                        (false, command)
-                                    }
-                                    _ => return,
-                                };
-                                while let N::Fail(_, child) = command {
-                                    success = !success;
-                                    command = child;
-                                }
-                                if success {
-                                    let key = match command {
-                                        N::Sort { name, .. } => {
-                                            InstalledDefinition::Sort(name.clone())
-                                        }
-                                        N::Function(function) => {
-                                            InstalledDefinition::Function(function.name.clone())
-                                        }
-                                        N::AddRuleset(_, name)
-                                        | N::UnstableCombinedRuleset(_, name, _) => {
-                                            InstalledDefinition::Ruleset(name.clone())
-                                        }
-                                        N::NormRule { rule } => InstalledDefinition::Rule(
-                                            rule.ruleset.clone(),
-                                            rule.name.clone(),
-                                        ),
-                                        _ => return,
-                                    };
-                                    completed.insert(key);
-                                }
-                            },
-                        );
-                        if let Err(error) = result {
-                            if completed.is_empty() {
-                                return Err(error.to_string());
-                            }
-                            definition_error = Some(error.to_string());
-                        }
-                        installed = Some(completed);
-                        *graph.command_macros_mut() = macros;
-                        Some(graph)
-                    } else {
-                        let mut compiler = graph
-                            .validate_program(vec![command.clone()])
-                            .map_err(|error| error.to_string())?;
-                        *compiler.command_macros_mut() = macros;
-                        Some(compiler)
-                    }
-                } else {
-                    None
-                }
+        // Export the original resolved commands from this same registration;
+        // resolving again would repeat provider work and require another graph.
+        if let [command] = expanded.as_slice() {
+            let mut header = command;
+            while let Command::Fail(_, child) = header {
+                header = child;
             }
-            _ => None,
-        };
+            let definition = matches!(
+                header,
+                Command::Datatype { .. }
+                    | Command::Datatypes { .. }
+                    | Command::Relation { .. }
+                    | Command::Constructor { .. }
+                    | Command::Function { .. }
+                    | Command::Sort { .. }
+                    | Command::AddRuleset(..)
+                    | Command::UnstableCombinedRuleset(..)
+                    | Command::Rule { .. }
+                    | Command::Rewrite(..)
+                    | Command::BiRewrite(..)
+            );
+            if definition || matches!(header, Command::Action(Action::Let(..))) {
+                let graph = &mut self.graph;
+                // Source already expanded this command. Suppress a second
+                // provider transform only while registering this expansion.
+                let macros = std::mem::take(graph.command_macros_mut());
+                let mut original = Vec::new();
+                let mut completed = HashSet::new();
+                let mut observe = |_: usize, event: egglog::ExecutionEvent<'_>| {
+                    if let egglog::ExecutionEvent::CommandResolved { commands } = event {
+                        original.extend(commands.iter().map(|(command, _)| command.clone()));
+                        return;
+                    }
+                    let (mut success, mut command) = match event {
+                        egglog::ExecutionEvent::CommandCompleted { command, .. } => (true, command),
+                        egglog::ExecutionEvent::CommandFailed { command, .. } => (false, command),
+                        _ => return,
+                    };
+                    while let N::Fail(_, child) = command {
+                        success = !success;
+                        command = child;
+                    }
+                    if success {
+                        let key = match command {
+                            N::Sort { name, .. } => InstalledDefinition::Sort(name.clone()),
+                            N::Function(function) => {
+                                InstalledDefinition::Function(function.name.clone())
+                            }
+                            N::AddRuleset(_, name) | N::UnstableCombinedRuleset(_, name, _) => {
+                                InstalledDefinition::Ruleset(name.clone())
+                            }
+                            N::NormRule { rule } => {
+                                InstalledDefinition::Rule(rule.ruleset.clone(), rule.name.clone())
+                            }
+                            _ => return,
+                        };
+                        completed.insert(key);
+                    }
+                };
+                let result = if definition {
+                    // Only authored definitions enter this interpreter.
+                    // Native registration preserves Fail's precise expansion,
+                    // admission and prefix boundaries, including proof helpers.
+                    graph.run_program_observed_with_sort_selection(
+                        vec![command.clone()],
+                        &mut |_, _, _| {},
+                        &mut observe,
+                        &mut |types, prepared| {
+                            let pattern = types.prepared_sort_pattern(prepared).ok()?;
+                            let mut existing = types.get_arcsorts_by(|sort| !sort.is_eq_sort());
+                            existing.sort_by(|left, right| left.name().cmp(right.name()));
+                            existing
+                                .into_iter()
+                                .find(|sort| {
+                                    types.native_sort_pattern(sort).ok().as_ref() == Some(&pattern)
+                                })
+                                .map(|sort| sort.name().to_owned())
+                        },
+                    )
+                } else {
+                    graph.compile_program_observed(vec![command.clone()], &mut observe)
+                };
+                *graph.command_macros_mut() = macros;
+                if definition {
+                    if let Err(error) = result {
+                        if completed.is_empty() {
+                            return Err(error.to_string());
+                        }
+                        definition_error = Some(error.to_string());
+                    }
+                    installed = Some(completed);
+                } else {
+                    result.map_err(|error| error.to_string())?;
+                }
+                registered_commands = Some(
+                    original
+                        .into_iter()
+                        .map(|mut command| {
+                            while let N::Fail(_, inner) = command {
+                                command = *inner;
+                            }
+                            command
+                        })
+                        .collect::<Vec<_>>(),
+                );
+            }
+        }
         let mut publish = vec![];
         for mut command in expanded {
             let mut fail_spans = vec![];
@@ -940,9 +970,11 @@ impl Source {
                     // Resolve the authored declaration in the producer's type
                     // environment, but do not export its desugared private row
                     // sort/constructor. The wire relation has only inputs.
-                    self.graph
-                        .resolve_command_preserving_globals(command.clone())
-                        .map_err(|error| error.to_string())?;
+                    if registered_commands.is_none() {
+                        self.graph
+                            .resolve_command_preserving_globals(command.clone())
+                            .map_err(|error| error.to_string())?;
+                    }
                     if installed.as_ref().is_some_and(|completed| {
                         !completed.contains(&InstalledDefinition::Function(name.clone()))
                     }) {
@@ -1100,7 +1132,7 @@ impl Source {
                 }
                 command => command,
             };
-            let mut resolved = if let Command::Sort {
+            if let Command::Sort {
                 span,
                 name,
                 presort_and_args: Some(_),
@@ -1111,36 +1143,14 @@ impl Source {
                 unionable: true,
             } = &command
             {
-                // Ask the actual provider to resolve the application on a disposable
-                // type graph, then reuse an existing structural instance if present.
-                let mut graph = self.graph.clone();
-                let resolved = graph
-                    .resolve_command_preserving_globals(command.clone())
-                    .map_err(|error| error.to_string())?;
-                let native = graph
+                let native = self
+                    .graph
                     .authoring_type_info()
                     .get_sort_by_name(name)
                     .ok_or("missing resolved source sort")?
                     .clone();
                 let mut sorts = self.program.sorts.clone();
-                let index = graph.export_sort(&native, &mut sorts)?;
-                let mut existing = self
-                    .graph
-                    .authoring_type_info()
-                    .get_arcsorts_by(|sort| !sort.is_eq_sort());
-                existing.sort_by(|a, b| a.name().cmp(b.name()));
-                let canonical = existing.into_iter().find(|sort| {
-                    self.graph.export_sort(sort, &mut sorts.clone()).ok() == Some(index)
-                });
-                if let Some(canonical) = canonical {
-                    self.graph
-                        .bind_source_sort_alias(name, canonical.name(), span.clone())?;
-                    // An alias registers no new sort in either environment.
-                    // Do not restore the disposable, separately compiled header.
-                    compiler = None;
-                } else {
-                    self.graph = graph;
-                }
+                let index = self.graph.export_sort(&native, &mut sorts)?;
                 if explicit_sort_alias.as_ref() == Some(name) {
                     let alias = pb::EgglogTypeBinding {
                         symbol: name.clone(),
@@ -1153,6 +1163,8 @@ impl Source {
                     }
                 }
                 self.program.sorts = sorts;
+            }
+            let mut resolved = if let Some(resolved) = registered_commands.take() {
                 resolved
             } else {
                 self.graph
@@ -1653,23 +1665,6 @@ impl Source {
         }
         self.pending_error = definition_error;
         let program = self.phase(publish)?;
-        if let Some(mut compiler) = compiler {
-            // Export updates only these producer-owned name/role records.
-            // Keep them with the compiled context, never with a live Engine.
-            *compiler.extension_state_or_default::<SourceTableNames>() = self
-                .graph
-                .extension_state::<SourceTableNames>()
-                .cloned()
-                .unwrap_or_default();
-            if let Some(roles) = self
-                .graph
-                .extension_state::<crate::set_cost::SourceCostRoles>()
-            {
-                *compiler.extension_state_or_default::<crate::set_cost::SourceCostRoles>() =
-                    roles.clone();
-            }
-            self.graph = compiler;
-        }
         Ok(program)
     }
 
