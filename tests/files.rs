@@ -948,6 +948,33 @@ impl ProtoRun {
                 .and_then(|phase| {
                     let phase = match phase {
                         Submission::Program(program) => program,
+                        Submission::PrintFunction(print) => {
+                            let (response, text) = print
+                                .run(|program| {
+                                    let bytes = engine.run(
+                                        &pb::RunProgramRequest {
+                                            egraph_id,
+                                            program: Some(program.clone()),
+                                            profile: true,
+                                            include_run_reports: false,
+                                        }
+                                        .encode_to_vec(),
+                                    )?;
+                                    Ok(pb::RunProgramResponse::decode(bytes.as_slice())?)
+                                })
+                                .map_err(|error| format!("source table presentation: {error}"))?;
+                            if let Some(error) = &response.error {
+                                return Err(format!(
+                                    "adapter {:?}: {}",
+                                    pb::ErrorCode::try_from(error.code),
+                                    error.message
+                                ));
+                            }
+                            if let Some(text) = text {
+                                print!("{text}");
+                            }
+                            return Ok(response);
+                        }
                         Submission::Push(count) => {
                             for _ in 0..count {
                                 let bytes = engine

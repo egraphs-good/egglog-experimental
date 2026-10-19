@@ -683,6 +683,14 @@ source, transport or execution errors. Earlier completed phases remain visible;
 source/AST execution is never a fallback. The producer requires a fresh,
 compatible target handle.
 
+File/CSV prints are host-only `Submission::PrintFunction` values. Call their
+`run` method with the ordinary Program submission callback: it opens the file
+before submission, formats structured rows, and writes or returns host stdout.
+Stop on presentation errors too. The flat Program iterator rejects these
+submissions; filenames never enter protobuf. Predicate rows have inputs only;
+ordinary Unit-valued functions retain their output. Cells use the existing
+bounded Source renderer and fail explicitly for unsupported values.
+
 Captures keep their ordered write positions. Rules retain labels and spans;
 publication uses immutable versions without hoisting future rules into earlier
 runs. Query locals remain distinct from persistent captures and later

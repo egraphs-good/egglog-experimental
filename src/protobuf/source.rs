@@ -64,6 +64,8 @@ fn retained_cost_key<H, V: PartialEq>(
 pub enum Submission {
     /// Install definitions and execute commands through RunProgram.
     Program(pb::Program),
+    /// Execute an ordinary table observation with host-side file/CSV presentation.
+    PrintFunction(PrintFunction),
     /// Save the active handle and continue in a clone this many times.
     Push(usize),
     /// Return to saved handles in order, retaining completed returns on error.
@@ -73,6 +75,139 @@ pub enum Submission {
         /// Authored location for reporting an exhausted scope stack.
         span: ast::Span,
     },
+}
+
+/// A host presentation boundary, not a wire command or permission for receiver IO.
+/// Predicate rows have inputs only; ordinary functions retain their output,
+/// including Unit. Cells use the existing bounded Source expression renderer;
+/// unsupported container/custom payloads fail explicitly without materialization.
+pub struct PrintFunction {
+    // Keep the table and predicate presentation metadata inseparable. The
+    // submit callback receives this ordinary one-command request by reference.
+    program: pb::Program,
+    file: Option<String>,
+    mode: ast::PrintFunctionMode,
+    predicate: bool,
+    span: ast::Span,
+}
+
+impl PrintFunction {
+    /// Open/truncate a destination before submitting, as native source does.
+    /// A decoded execution error is returned unchanged, without presentation.
+    /// On success the text is written to the file, or returned for host stdout;
+    /// never advance Source after any transport, execution or presentation error.
+    pub fn run(
+        &self,
+        submit: impl FnOnce(&pb::Program) -> Result<pb::RunProgramResponse, TransportError>,
+    ) -> Result<(pb::RunProgramResponse, Option<String>), TransportError> {
+        use std::io::Write;
+        let mut file = self
+            .file
+            .as_ref()
+            .map(|path| {
+                std::fs::File::create(path).map_err(|error| {
+                    TransportError(
+                        egglog::Error::IoError(path.into(), error, self.span.clone()).to_string(),
+                    )
+                })
+            })
+            .transpose()?;
+        let mut response = submit(&self.program)?;
+        if response.error.is_some() {
+            return Ok((response, None));
+        }
+        let [
+            pb::CommandOutput {
+                kind: Some(pb::command_output::Kind::PrintedFunction(table)),
+                ..
+            },
+        ] = response.outputs.as_slice()
+        else {
+            return Err(TransportError(
+                "source table presentation requires one PrintedFunction output".into(),
+            ));
+        };
+        // Borrow the actual response arenas by ownership transfer, not a copy
+        // of the Source graph or a second execution/materialization of cells.
+        let program = pb::Program {
+            sorts: std::mem::take(&mut response.sorts),
+            nodes: std::mem::take(&mut response.nodes),
+            files: std::mem::take(&mut response.files),
+            ..Default::default()
+        };
+        let native_spans = NativeSpans::default();
+        let cell = |cell: &pb::TableCell| -> Result<String, TransportError> {
+            match cell.kind {
+                Some(pb::table_cell::Kind::Term(index)) => {
+                    expression(&program, index, &mut HashSet::new(), &native_spans)
+                        .map(|expr| expr.to_string())
+                        .map_err(TransportError)
+                }
+                Some(pb::table_cell::Kind::UnavailableSort(_)) => Ok("Unextractable".into()),
+                None => Err(TransportError("missing printed table cell".into())),
+            }
+        };
+        let mut text = String::new();
+        let mut csv = csv::Writer::from_writer(Vec::new());
+        if self.mode == ast::PrintFunctionMode::Default {
+            text.push_str("(\n");
+        }
+        for row in &table.rows {
+            let args = row.args.iter().map(cell).collect::<Result<Vec<_>, _>>()?;
+            let output = if self.predicate {
+                None
+            } else {
+                Some(cell(row.output.as_ref().ok_or_else(|| {
+                    TransportError("missing printed table output".into())
+                })?)?)
+            };
+            if self.mode == ast::PrintFunctionMode::CSV {
+                csv.write_record(
+                    std::iter::once(table.table.as_str())
+                        .chain(args.iter().map(String::as_str))
+                        .chain(output.as_deref()),
+                )
+                .map_err(|error| TransportError(format!("source table CSV: {error}")))?;
+            } else {
+                text.push_str(&format!(
+                    "   ({}{})",
+                    table.table,
+                    args.iter().map(|arg| format!(" {arg}")).collect::<String>()
+                ));
+                if let Some(output) = output {
+                    text.push_str(&format!(" -> {output}"));
+                }
+                text.push('\n');
+            }
+        }
+        if self.mode == ast::PrintFunctionMode::CSV {
+            text = String::from_utf8(
+                csv.into_inner()
+                    .map_err(|error| TransportError(error.to_string()))?,
+            )
+            .map_err(|error| TransportError(error.to_string()))?;
+        } else {
+            text.push_str(")\n");
+        }
+        response.sorts = program.sorts;
+        response.nodes = program.nodes;
+        response.files = program.files;
+        if let Some(file) = &mut file {
+            file.write_all(text.as_bytes()).map_err(|error| {
+                TransportError(
+                    egglog::Error::IoError(
+                        self.file.as_ref().unwrap().into(),
+                        error,
+                        self.span.clone(),
+                    )
+                    .to_string(),
+                )
+            })?;
+            Ok((response, None))
+        } else {
+            Ok((response, Some(text)))
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -858,6 +993,30 @@ impl Source {
                         "source scopes require next_submission and clone/return requests".into(),
                     );
                 }
+                Command::PrintFunction(span, table, limit, file, mode)
+                    if file.is_some() || mode != ast::PrintFunctionMode::Default =>
+                {
+                    if !scopes {
+                        break Err("source table presentation requires next_submission".into());
+                    }
+                    let predicate = self.relations.contains(&table);
+                    let program = self.compile(Command::PrintFunction(
+                        span.clone(),
+                        table,
+                        limit,
+                        None,
+                        ast::PrintFunctionMode::Default,
+                    ));
+                    break program.map(|program| {
+                        Submission::PrintFunction(PrintFunction {
+                            program,
+                            file,
+                            mode,
+                            predicate,
+                            span,
+                        })
+                    });
+                }
                 command => {
                     let cost_start = match &command {
                         Command::Action(Action::Let(_, name, _)) => {
@@ -950,7 +1109,9 @@ impl Source {
             }
         };
         let result = result.and_then(|mut submission| {
-            if let Submission::Program(program) = &mut submission {
+            if let Submission::Program(program)
+            | Submission::PrintFunction(PrintFunction { program, .. }) = &mut submission
+            {
                 project_source_nodes(&self.program.nodes, first_node, program)?;
                 let types = self.graph.authoring_type_info();
                 let logical_name = |name: &mut String| {
@@ -3515,7 +3676,9 @@ impl Iterator for Source {
         self.advance(false).map(|result| {
             result.map(|submission| match submission {
                 Submission::Program(program) => program,
-                Submission::Push(_) | Submission::Pop { .. } => unreachable!(),
+                Submission::PrintFunction(_) | Submission::Push(_) | Submission::Pop { .. } => {
+                    unreachable!()
+                }
             })
         })
     }
@@ -3595,6 +3758,23 @@ impl Renderer {
     pub fn render_submission(&mut self, submission: &Submission) -> Result<String, TransportError> {
         match submission {
             Submission::Program(program) => self.render(program),
+            Submission::PrintFunction(print) => {
+                let rendered = self.render(&print.program)?;
+                let prefix = rendered.strip_suffix(")\n").ok_or_else(|| {
+                    TransportError("source table presentation lost its final command".into())
+                })?;
+                let file = print
+                    .file
+                    .as_ref()
+                    .map(|file| format!(" :file {}", Literal::String(file.clone())))
+                    .unwrap_or_default();
+                let mode = if print.mode == ast::PrintFunctionMode::CSV {
+                    " :mode csv"
+                } else {
+                    ""
+                };
+                Ok(format!("{prefix}{file}{mode})\n"))
+            }
             Submission::Push(count) => {
                 for _ in 0..*count {
                     self.scopes

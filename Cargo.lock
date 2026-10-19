@@ -461,6 +461,7 @@ dependencies = [
 name = "egglog-experimental"
 version = "3.0.0"
 dependencies = [
+ "csv",
  "egglog",
  "egglog-ast",
  "egglog-experimental-typed-macros",

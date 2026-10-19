@@ -3189,6 +3189,7 @@ mod source_reflection {
                             None
                         );
                     }
+                    Submission::PrintFunction(_) => panic!("unexpected host table presentation"),
                     Submission::Push(count) => {
                         for _ in 0..count {
                             saved.push(id);
@@ -3917,6 +3918,7 @@ mod source_fresh_macro {
                             }
                         }
                     }
+                    Submission::PrintFunction(_) => panic!("unexpected host table presentation"),
                     Submission::Push(count) => {
                         for _ in 0..count {
                             let response = engine
@@ -9881,11 +9883,11 @@ fn source_table_observation_boundaries_keep_submitted_prefix() {
             ("(print-function missing 0)", None),
             (
                 "(print-function current :mode csv)",
-                Some("default mode without a file"),
+                Some("source table presentation requires next_submission"),
             ),
             (
                 "(print-function current :file \"not-created.csv\")",
-                Some("default mode without a file"),
+                Some("source table presentation requires next_submission"),
             ),
             (
                 "(fail (print-function current))",
@@ -9972,6 +9974,263 @@ fn source_table_observation_boundaries_keep_submitted_prefix() {
             );
         }
     }
+}
+
+#[test]
+fn source_host_print_files_csv_and_renderer_preserve_typed_rows() {
+    use egglog_experimental::protobuf::source::{Renderer, Source, Submission};
+    let directory = std::env::temp_dir().join(format!(
+        "egglog-source-print-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir(&directory).unwrap();
+    for core in [false, true] {
+        let paths = ["rows.csv", "unit.csv", "missing.txt", "unit.txt"]
+            .map(|name| directory.join(format!("{core}-{name}")));
+        let quoted = "a,\"b\nc";
+        let text = format!(
+            r#"
+            (relation Rows (String)) (Rows {}) (Rows "second")
+            (function unit (i64) Unit :no-merge) (set (unit 7) ())
+            (sort E) (constructor Hidden () E :unextractable)
+            (relation Unavailable (E)) (Unavailable (Hidden))
+            (print-function Rows 1 :file {} :mode csv)
+            (print-function unit :file {} :mode csv)
+            (print-function Unavailable :file {})
+            (print-function unit :file {})
+            (print-function unit :mode csv)
+        "#,
+            egglog::ast::Literal::String(quoted.into()),
+            egglog::ast::Literal::String(paths[0].to_string_lossy().into()),
+            egglog::ast::Literal::String(paths[1].to_string_lossy().into()),
+            egglog::ast::Literal::String(paths[2].to_string_lossy().into()),
+            egglog::ast::Literal::String(paths[3].to_string_lossy().into())
+        );
+        let mut source = if core {
+            Source::new_core(None, &text)
+        } else {
+            Source::new(None, &text)
+        }
+        .unwrap();
+        let mut renderer = if core {
+            Renderer::core()
+        } else {
+            Renderer::default()
+        };
+        let mut rendered = String::new();
+        let mut engine = Engine::default();
+        let id = create(&mut engine);
+        let mut presentations = 0;
+        while let Some(submission) = source.next_submission() {
+            let submission = submission.unwrap();
+            rendered.push_str(&renderer.render_submission(&submission).unwrap());
+            match submission {
+                Submission::Program(program) => {
+                    assert_eq!(run(&mut engine, id, program).error, None)
+                }
+                Submission::PrintFunction(print) => {
+                    let (response, stdout) = print
+                        .run(|program| {
+                            assert!(
+                                program.nodes.is_empty(),
+                                "old source nodes must not leak into the host phase"
+                            );
+                            Ok(run(&mut engine, id, program.clone()))
+                        })
+                        .unwrap();
+                    assert_eq!(response.error, None);
+                    presentations += 1;
+                    if presentations == 1 {
+                        let Some(pb::command_output::Kind::PrintedFunction(table)) =
+                            &response.outputs[0].kind
+                        else {
+                            panic!("wire table response")
+                        };
+                        assert_eq!(table.rows.len(), 1);
+                        let Some(pb::table_cell::Kind::Term(index)) = table.rows[0].args[0].kind
+                        else {
+                            panic!("String must be available")
+                        };
+                        assert!(
+                            matches!(&response.nodes[index as usize].kind, Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue { value: Some(pb::primitive_value::Value::String(value)) })) if value == quoted),
+                            "preserve the actual typed String, not debug/source escaping"
+                        );
+                    }
+                    assert_eq!(
+                        stdout,
+                        (presentations == 5).then(|| "unit,7,()\n".into()),
+                        "file presentation must suppress stdout"
+                    );
+                }
+                _ => panic!("unexpected scope"),
+            }
+        }
+        assert_eq!(presentations, 5);
+        let rows = csv::ReaderBuilder::new()
+            .has_headers(false)
+            .from_path(&paths[0])
+            .unwrap()
+            .records()
+            .map(|record| {
+                record
+                    .unwrap()
+                    .iter()
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            rows,
+            [vec![
+                "Rows".to_owned(),
+                egglog::ast::Literal::String(quoted.into()).to_string()
+            ]],
+            "CSV escaping, predicate columns and row limit"
+        );
+        assert_eq!(std::fs::read(&paths[1]).unwrap(), b"unit,7,()\n");
+        assert_eq!(
+            std::fs::read(&paths[2]).unwrap(),
+            b"(\n   (Unavailable Unextractable)\n)\n"
+        );
+        assert_eq!(
+            std::fs::read(&paths[3]).unwrap(),
+            b"(\n   (unit 7) -> ()\n)\n"
+        );
+        let mut parser = egglog::EGraph::default();
+        let prints = parser
+            .parse_program(None, &rendered)
+            .unwrap()
+            .into_iter()
+            .filter_map(|command| {
+                if let egglog::ast::Command::PrintFunction(_, _, limit, file, mode) = command {
+                    Some((limit, file, mode))
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(prints.len(), 5);
+        assert_eq!(prints[0].0, Some(1));
+        assert_eq!(
+            prints.iter().filter(|(_, file, _)| file.is_some()).count(),
+            4
+        );
+        assert_eq!(
+            prints
+                .iter()
+                .filter(|(_, _, mode)| *mode == egglog::ast::PrintFunctionMode::CSV)
+                .count(),
+            3
+        );
+        assert_eq!(prints[0].1.as_deref(), paths[0].to_str());
+        // The flat API must not open a destination or erase a presentation.
+        let never = directory.join(format!("{core}-never-created"));
+        let text = format!(
+            "(print-function missing :file {})",
+            egglog::ast::Literal::String(never.to_string_lossy().into())
+        );
+        let mut flat = Source::new(None, &text).unwrap();
+        assert!(
+            flat.next()
+                .unwrap()
+                .unwrap_err()
+                .to_string()
+                .contains("next_submission")
+        );
+        assert!(flat.next().is_none());
+        assert!(!never.exists());
+    }
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn source_host_print_open_and_receiver_errors_preserve_prefix() {
+    use egglog_experimental::protobuf::source::{Source, Submission};
+    let directory = std::env::temp_dir().join(format!(
+        "egglog-source-print-failure-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir(&directory).unwrap();
+    for open_fails in [false, true] {
+        let path = if open_fails {
+            std::path::PathBuf::from(format!(
+                "absent-host-print-{}/out.csv",
+                directory.file_name().unwrap().to_string_lossy()
+            ))
+        } else {
+            directory.join("opened.csv")
+        };
+        if !open_fails {
+            std::fs::write(&path, "old contents").unwrap();
+        }
+        let text = format!(
+            "(function marker () i64 :merge new) (set (marker) 1) (print-function missing :file {} :mode csv) (set (marker) 2)",
+            egglog::ast::Literal::String(path.to_string_lossy().into())
+        );
+        let mut source = Source::new_core(Some("host-print.egg".into()), &text).unwrap();
+        let mut engine = Engine::default();
+        let id = create(&mut engine);
+        let mut submitted = false;
+        while let Some(submission) = source.next_submission() {
+            match submission.unwrap() {
+                Submission::Program(program) => {
+                    assert_eq!(run(&mut engine, id, program).error, None)
+                }
+                Submission::PrintFunction(print) => {
+                    let result = print.run(|program| {
+                        submitted = true;
+                        Ok(run(&mut engine, id, program.clone()))
+                    });
+                    if open_fails {
+                        let error = result.unwrap_err().to_string();
+                        assert!(
+                            error.contains(path.to_str().unwrap())
+                                && error.contains("host-print.egg"),
+                            "{error}"
+                        );
+                        let native = egglog::EGraph::default()
+                            .parse_and_run_program(Some("host-print.egg".into()), &text)
+                            .unwrap_err();
+                        assert_eq!(
+                            error,
+                            native.to_string(),
+                            "keep relative path and authored IoError span"
+                        );
+                        assert!(!submitted);
+                    } else {
+                        let (response, stdout) = result.unwrap();
+                        assert_eq!(
+                            response.error.unwrap().code,
+                            i32::from(pb::ErrorCode::UnknownName)
+                        );
+                        assert_eq!(stdout, None);
+                        assert!(response.outputs.is_empty());
+                        assert!(submitted);
+                        assert_eq!(std::fs::read(&path).unwrap(), b"");
+                    }
+                    break; // A failed host operation must not submit the suffix.
+                }
+                _ => panic!("unexpected scope"),
+            }
+        }
+        for program in Source::new(
+            None,
+            "(function marker () i64 :merge new) (check (= (marker) 1))",
+        )
+        .unwrap()
+        {
+            assert_eq!(run(&mut engine, id, program.unwrap()).error, None);
+        }
+    }
+    std::fs::remove_dir_all(directory).unwrap();
 }
 
 #[test]
@@ -17656,6 +17915,7 @@ fn source_scope_submissions_restore_definitions_captures_and_publication() {
                     }
                     assert_eq!(run(&mut engine, id, program).error, None, "core={core}");
                 }
+                Submission::PrintFunction(_) => panic!("unexpected host table presentation"),
                 Submission::Push(count) => {
                     for _ in 0..count {
                         let bytes = engine
@@ -17716,6 +17976,7 @@ fn source_scope_underflow_keeps_completed_returns_and_stops_the_queue() {
                 renderer.render(&program).unwrap();
                 assert_eq!(run(&mut engine, id, program).error, None);
             }
+            Submission::PrintFunction(_) => panic!("unexpected host table presentation"),
             Submission::Push(count) => {
                 renderer
                     .render_submission(&Submission::Push(count))
@@ -20216,6 +20477,64 @@ mod source_provider_context {
         ) -> Result<Option<pb::CustomValue>, String> {
             Err("metadata validation must not reconstruct TestOpaque".into())
         }
+    }
+
+    #[test]
+    fn host_print_codec_failure_keeps_opened_file_empty_and_stops_suffix() {
+        use egglog_experimental::protobuf::source::{Source, Submission};
+        let path = std::env::temp_dir().join(format!(
+            "egglog-host-print-codec-{}-{}.csv",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::write(&path, "old contents").unwrap();
+        // Reuse the provider's real encoding rejection; no fabricated response
+        // or extra native action stands in for a failed table observation.
+        let provider = Arc::new(Provider::default());
+        let text = format!(
+            "(function marker () i64 :merge new) (set (marker) 1) (print-function marker :file {} :mode csv) (set (marker) 2)",
+            egglog::ast::Literal::String(path.to_string_lossy().into())
+        );
+        let mut source =
+            Source::with_extension(Some("print-codec.egg".into()), &text, provider.clone())
+                .unwrap();
+        let mut engine = Engine::with_extension(provider);
+        let id = create(&mut engine);
+        let mut rejected = false;
+        while let Some(submission) = source.next_submission() {
+            match submission.unwrap() {
+                Submission::Program(program) => {
+                    assert_eq!(run(&mut engine, id, program).error, None)
+                }
+                Submission::PrintFunction(print) => {
+                    let (response, stdout) = print
+                        .run(|program| Ok(run(&mut engine, id, program.clone())))
+                        .unwrap();
+                    let error = response.error.unwrap();
+                    assert_eq!(error.code, i32::from(pb::ErrorCode::ExtractionFailed));
+                    assert!(error.message.contains("must not reconstruct TestOpaque"));
+                    assert!(response.outputs.is_empty());
+                    assert_eq!(stdout, None);
+                    assert_eq!(std::fs::read(&path).unwrap(), b"");
+                    rejected = true;
+                    break;
+                }
+                _ => panic!("unexpected scope"),
+            }
+        }
+        assert!(rejected);
+        for phase in Source::new(
+            None,
+            "(function marker () i64 :merge new) (check (= (marker) 1))",
+        )
+        .unwrap()
+        {
+            assert_eq!(run(&mut engine, id, phase.unwrap()).error, None);
+        }
+        std::fs::remove_file(path).unwrap();
     }
 
     fn packet() -> pb::Program {
@@ -23909,6 +24228,7 @@ fn source_assigned_cost_repeated_include_roles_follow_clone_and_pop() {
                     }
                 }
             }
+            Submission::PrintFunction(_) => panic!("unexpected host table presentation"),
             Submission::Push(count) => {
                 for _ in 0..count {
                     saved.push(id);
