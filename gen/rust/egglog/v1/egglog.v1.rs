@@ -50,10 +50,11 @@ pub struct Program {
     /// decoding and re-emitting them; the field constraint only rejects zero.
     #[prost(uint32, tag = "1")]
     pub ir_version: u32,
-    /// Expression arena. Ordinary expression nodes are shared syntax, not cached
-    /// values: reusing their indices neither binds a value nor constrains how often
-    /// they are evaluated. Their sharing is optional. `Union` locations instead
-    /// identify class groups; see `Union`.
+    /// Expression arena. Evaluate shared ordinary nodes lazily at first demand,
+    /// retaining their results within one top-level Action or one rule firing's
+    /// ordered head. Start a fresh ordinary memo for each such evaluation; results
+    /// never persist between top-level commands. Query patterns do not use this
+    /// evaluation memo. `Union` locations have separate identity scopes; see `Union`.
     #[prost(message, repeated, tag = "2")]
     pub nodes: ::prost::alloc::vec::Vec<Node>,
     /// Sort arena, separate from expression nodes.
@@ -559,14 +560,15 @@ pub struct Unit {
 // ACTIONS — mutations, usable in a rule head or as a command.
 // ---------------------------------------------------------------------------
 
-/// An ordered mutation or expression evaluation. Sharing syntax does not bind
-/// or retain its result; there is no rule-local let form. Persistent top-level
-/// captures lower to nullary functions plus sets.
+/// An ordered mutation or expression evaluation. Shared ordinary nodes retain
+/// their first-demand result within this Action or the enclosing rule firing's
+/// ordered head. No evaluation moves before its first demand. Persistent
+/// top-level captures lower to nullary functions plus sets.
 /// Set, delete, subsume and SetCost are standalone actions, not value expressions.
 /// Execute action lists in order; each Set uses the function's conflict policy
 /// if that write conflicts. Rule matches and rebuilds have no global order here.
-/// Deliberate coverage limit: a read cannot be retained across later writes by
-/// node sharing; this draft has no local-let operation to express that sequence.
+/// Ordinary memos reset between top-level commands, whose writes commit before
+/// the next command. This does not change Union's separate identity lifetime.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct Action {
     /// Optional origin; omit for an unlocated program. When present, this is the

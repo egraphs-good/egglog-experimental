@@ -223,7 +223,7 @@ struct RequestOccurrences {
     native_spans: NativeSpans,
     include_run_reports: bool,
     scoped_actions: HashSet<Vec<u32>>,
-    constructor_dags: HashMap<Vec<u32>, HashSet<u32>>,
+    action_dags: HashMap<Vec<u32>, HashSet<u32>>,
     extraction_dags: HashMap<u32, HashSet<u32>>,
     union_values: HashMap<u32, Value>,
 }
@@ -1082,23 +1082,8 @@ impl Session {
             }
         }
         validate_host_declarations(program, &mut staged.graph)?;
-        let NodeGraphMetrics {
-            depths,
-            expansions,
-            order,
-        } = validate_node_graph(program, &native_spans)?;
-        let constructor_dags = if self.mode == pb::ExecutionMode::Normal {
-            classify_constructor_dags(
-                program,
-                &constructor_targets,
-                &depths,
-                &expansions,
-                &order,
-                &staged.graph,
-            )?
-        } else {
-            HashMap::new()
-        };
+        validate_node_graph(program, &native_spans)?;
+        let mut action_dags = classify_action_dags(program)?;
         let extraction_dags = if self.mode == pb::ExecutionMode::Normal {
             let roots = command_tree(&program.commands)
                 .filter_map(|command| match &command.kind {
@@ -1106,21 +1091,8 @@ impl Session {
                     _ => None,
                 })
                 .flatten()
-                .filter(|root| {
-                    depths
-                        .get(**root as usize)
-                        .is_none_or(|depth| *depth <= 256)
-                })
                 .map(|root| (*root, vec![*root]));
-            classify_closed_dags(
-                program,
-                &constructor_targets,
-                &depths,
-                &expansions,
-                &order,
-                &staged.graph,
-                roots,
-            )?
+            classify_value_dags(program, roots)?
         } else {
             HashMap::new()
         };
@@ -1128,13 +1100,12 @@ impl Session {
             program,
             &constructor_targets,
             self.mode == pb::ExecutionMode::Normal,
-            &depths,
-            &native_spans,
         )?;
         if !scoped_actions.is_empty() && self.mode != pb::ExecutionMode::Normal {
             return Err("scoped actions require normal execution mode".into());
         }
-        scoped_actions.extend(constructor_dags.keys().cloned());
+        action_dags.retain(|path, _| !scoped_actions.contains(path));
+        scoped_actions.extend(action_dags.keys().cloned());
         lower_builtin_calls(program, &staged.graph, &signatures)?;
         for index in declaration_order(program, &mut staged.graph)? {
             let declaration = &program.declarations[index];
@@ -1481,17 +1452,19 @@ impl Session {
                         ruleset: None,
                     });
                     let rule = &program.rules[local_rule];
-                    installations.push(Installation {
-                        command: Some(lower_rule_cost_deletes(
-                            lower_rule(program, rule, &holder, &name, &native_spans)?,
-                            &constructor_targets,
-                            self.mode,
-                        )),
-                        site: site.clone(),
-                        span: rule.span.or(span),
-                        declaration: None,
-                        ruleset: None,
-                    });
+                    for command in lower_rule(program, rule, &holder, &name, &native_spans)? {
+                        installations.push(Installation {
+                            command: Some(lower_rule_cost_deletes(
+                                command,
+                                &constructor_targets,
+                                self.mode,
+                            )),
+                            site: site.clone(),
+                            span: rule.span.or(span),
+                            declaration: None,
+                            ruleset: None,
+                        });
+                    }
                     rules[rule_index] = name;
                 }
                 holders.push(format!("{}_holder", rules[rule_index]));
@@ -1516,7 +1489,7 @@ impl Session {
         let mut context = RequestOccurrences {
             native_spans,
             scoped_actions,
-            constructor_dags,
+            action_dags,
             extraction_dags,
             rulesets: occurrences
                 .rulesets
@@ -1582,17 +1555,19 @@ impl Session {
             .collect();
         for (index, rule) in program.rules.iter().enumerate() {
             if !used.contains(&index) && occurrences.rules[index] >= self.rules.len() {
-                validation.push(lower_rule_cost_deletes(
-                    lower_rule(
-                        program,
-                        rule,
-                        "",
-                        &format!("__protobuf_{}_unused_{index}", staged.request),
-                        &context.native_spans,
-                    )?,
-                    &constructor_targets,
-                    self.mode,
-                ));
+                for command in lower_rule(
+                    program,
+                    rule,
+                    "",
+                    &format!("__protobuf_{}_unused_{index}", staged.request),
+                    &context.native_spans,
+                )? {
+                    validation.push(lower_rule_cost_deletes(
+                        command,
+                        &constructor_targets,
+                        self.mode,
+                    ));
+                }
             }
         }
         let mut schedulers: HashSet<_> = self
@@ -1625,14 +1600,14 @@ impl Session {
         }
         let mut values = HashMap::new();
         for (path, action) in action_sites(&program.commands) {
-            if context.scoped_actions.contains(&path) {
+            if context.scoped_actions.contains(&path) && !context.action_dags.contains_key(&path) {
                 eval_scoped_action(
                     &mut compiler,
                     program,
                     action,
                     &mut values,
                     false,
-                    context.constructor_dags.get(&path),
+                    context.action_dags.get(&path),
                     &mut |_| {},
                     &context.native_spans,
                 )
@@ -1885,7 +1860,7 @@ impl Session {
     // bindings, queries or scheduler state on a disposable compiler clone.
     #[allow(clippy::too_many_arguments)]
     fn validate_control(
-        &self,
+        &mut self,
         program: &pb::Program,
         command: &pb::Command,
         context: &RequestOccurrences,
@@ -1966,6 +1941,27 @@ impl Session {
                 self.validate_control(
                     program, child, context, schedulers, in_loop, conditions, path,
                 )
+            }
+            pb::command::Kind::Action(action) if context.action_dags.contains_key(path) => {
+                Ok(vec![Command::ActionScope(
+                    span,
+                    ast::GenericActions(
+                        action_dag_actions(
+                            program,
+                            action,
+                            |name| {
+                                self.graph.type_info().is_global(name)
+                                    || self.graph.get_sort_by_name(name).is_some()
+                                    || self.graph.type_info().get_func_type(name).is_some()
+                                    || self.graph.type_info().is_primitive(name)
+                            },
+                            &context.native_spans,
+                            &mut HashMap::new(),
+                            &mut 0,
+                        )?
+                        .0,
+                    ),
+                )])
             }
             pb::command::Kind::Action(_) if context.scoped_actions.contains(path) => Ok(vec![]),
             pb::command::Kind::Action(_) => {
@@ -2121,7 +2117,7 @@ impl Session {
                     action,
                     &mut context.union_values,
                     true,
-                    context.constructor_dags.get(&location.path),
+                    context.action_dags.get(&location.path),
                     &mut |_| {},
                     &context.native_spans,
                 )?;
@@ -3176,7 +3172,7 @@ impl ControlContext for WireSchedule<'_> {
                 action,
                 &mut self.context.union_values,
                 true,
-                self.context.constructor_dags.get(&location.path),
+                self.context.action_dags.get(&location.path),
                 &mut |event| {
                     if let ExecutionEvent::ActionsFinished { changed: next, .. } = event {
                         changed |= next;
@@ -4706,16 +4702,7 @@ fn validate_relation_uses(program: &pb::Program, saved: &pb::Program) -> Result<
 // Validate the entire arena, including unused entries, without interpreting it.
 // Removing Union outgoing edges must leave a DAG: every permitted cycle crosses
 // an identity boundary. Value lowering still validates each actual use's context.
-struct NodeGraphMetrics {
-    depths: Vec<usize>,
-    expansions: Vec<usize>,
-    order: Vec<usize>,
-}
-
-fn validate_node_graph(
-    program: &pb::Program,
-    native_spans: &NativeSpans,
-) -> Result<NodeGraphMetrics, String> {
+fn validate_node_graph(program: &pb::Program, native_spans: &NativeSpans) -> Result<(), String> {
     let mut edges = Vec::with_capacity(program.nodes.len());
     for (index, node) in program.nodes.iter().enumerate() {
         let sort = node_sort(program, index as u32)?;
@@ -4760,26 +4747,11 @@ fn validate_node_graph(
         edges.push(children);
     }
     let mut state = vec![0u8; edges.len()];
-    let mut depths = vec![0usize; edges.len()];
-    let mut expansions = vec![0usize; edges.len()];
-    let mut order = Vec::with_capacity(edges.len());
     for start in 0..edges.len() {
         let mut pending = vec![(start, false)];
         while let Some((index, exit)) = pending.pop() {
             if exit {
-                depths[index] = 1 + edges[index]
-                    .iter()
-                    .map(|child| depths[*child as usize])
-                    .max()
-                    .unwrap_or(0);
-                // Structural validation is independent of the tree adapter.
-                // Saturating expansion sizes select the action DAG path without
-                // constructing (or overflowing the size of) an expanded tree.
-                expansions[index] = edges[index].iter().fold(1usize, |size, child| {
-                    size.saturating_add(expansions[*child as usize]).min(65_537)
-                });
                 state[index] = 2;
-                order.push(index);
                 continue;
             }
             match state[index] {
@@ -4797,147 +4769,64 @@ fn validate_node_graph(
             );
         }
     }
-    Ok(NodeGraphMetrics {
-        depths,
-        expansions,
-        order,
-    })
+    Ok(())
 }
 
-// Only transitively closed constructors/scalars and fixed native value builders
-// may be shared. Other Calls are ordered barriers, never memoized ancestors.
-fn classify_constructor_dags(
-    program: &pb::Program,
-    constructors: &HashSet<String>,
-    depths: &[usize],
-    expansions: &[usize],
-    order: &[usize],
-    graph: &EGraph,
-) -> Result<HashMap<Vec<u32>, HashSet<u32>>, String> {
+// Each evaluated action owns an ordinary value memo. Union identity frames are
+// classified separately and can outlive this one action.
+fn classify_action_dags(program: &pb::Program) -> Result<HashMap<Vec<u32>, HashSet<u32>>, String> {
     let mut candidates = vec![];
     for (path, action) in action_sites(&program.commands) {
-        if !matches!(
-            action.kind,
-            Some(pb::action::Kind::Term(_) | pb::action::Kind::Set(_))
-        ) {
-            continue;
-        }
         candidates.push((path, action_roots(action)?));
     }
-    classify_closed_dags(
-        program,
-        constructors,
-        depths,
-        expansions,
-        order,
-        graph,
-        candidates,
-    )
+    classify_value_dags(program, candidates)
 }
 
 // Eligibility is independent of the operation; only evaluated values are local
 // to an action or one ordered extraction root.
-fn classify_closed_dags<K: Eq + std::hash::Hash>(
+fn classify_value_dags<K: Eq + std::hash::Hash>(
     program: &pb::Program,
-    constructors: &HashSet<String>,
-    depths: &[usize],
-    expansions: &[usize],
-    order: &[usize],
-    graph: &EGraph,
     sites: impl IntoIterator<Item = (K, Vec<u32>)>,
 ) -> Result<HashMap<K, HashSet<u32>>, String> {
-    let mut candidates = vec![];
-    for (path, roots) in sites {
-        let mut needs_scoping = false;
-        for root in &roots {
-            let depth = depths
-                .get(*root as usize)
-                .ok_or("action node out of bounds")?;
-            needs_scoping |= *depth > 256 || expansions[*root as usize] > 65_536;
-        }
-        if needs_scoping {
-            candidates.push((path, roots));
-        }
-    }
-    if candidates.is_empty() {
-        return Ok(HashMap::new());
-    }
-    let mut closed = HashSet::new();
-    for &index in order {
-        let eligible = match program.nodes[index].kind.as_ref().unwrap() {
-            pb::node::Kind::Call(call) => {
-                let value_builder = if matches!(
-                    call.func.as_str(),
-                    "egglog.core.vec.of"
-                        | "egglog.core.vec.empty"
-                        | "egglog.core.bigint.from_string"
-                        | "egglog.core.bigrat.make"
-                        | "egglog.experimental.rational.make"
-                ) {
-                    let types = graph.authoring_type_info();
-                    let sorts = call
-                        .args
-                        .iter()
-                        .copied()
-                        .chain([index as u32])
-                        .map(|node| {
-                            let name = node_sort(program, node)?;
-                            types
-                                .get_sort_by_name(&name)
-                                .cloned()
-                                .ok_or_else(|| format!("unknown value-builder sort {name}"))
-                        })
-                        .collect::<Result<Vec<_>, String>>()?;
-                    types
-                        .resolve_builtin(&call.func, &sorts)?
-                        .is_valid_in_context(egglog::Context::Pure)
-                } else {
-                    false
-                };
-                (constructors.contains(&call.func) || value_builder)
-                    && call.args.iter().all(|child| closed.contains(child))
-            }
-            pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
-                value:
-                    Some(
-                        pb::primitive_value::Value::I64(_)
-                        | pb::primitive_value::Value::F64Bits(_)
-                        | pb::primitive_value::Value::String(_)
-                        | pb::primitive_value::Value::Bool(_)
-                        | pb::primitive_value::Value::Unit(_)
-                        | pb::primitive_value::Value::BigInt(_)
-                        | pb::primitive_value::Value::BigRat(_)
-                        | pb::primitive_value::Value::Rational(_),
-                    ),
-            }) => true,
-            _ => false,
-        };
-        if eligible {
-            closed.insert(index as u32);
-        }
-    }
     let mut selected = HashMap::new();
-    for (path, roots) in candidates {
-        if roots
-            .iter()
-            .any(|root| !closed.contains(root) && depths[*root as usize] > 256)
-        {
-            continue;
-        }
+    for (path, roots) in sites {
+        let root_union = if let [index] = roots.as_slice() {
+            let node = program
+                .nodes
+                .get(*index as usize)
+                .ok_or("action node out of bounds")?;
+            matches!(&node.kind, Some(pb::node::Kind::Union(union)) if union.members.len() == 2)
+                .then_some(*index)
+        } else {
+            None
+        };
         // Set keys precede its value in the existing scoped action compiler.
         let mut pending = roots;
         let mut seen = HashSet::new();
         // Bound compact nodes/edges first; the planner also counts rereads.
         let mut remaining = 65_536usize
             .checked_sub(pending.len())
-            .ok_or("constructor action DAG exceeds 65536 nodes and edges")?;
+            .ok_or("action DAG exceeds 65536 nodes and edges")?;
         let mut eligible = true;
         while let Some(index) = pending.pop() {
             if !seen.insert(index) {
                 continue;
             }
-            let children = match program.nodes[index as usize].kind.as_ref().unwrap() {
-                pb::node::Kind::Call(call) => &call.args[..],
+            let children = match program
+                .nodes
+                .get(index as usize)
+                .ok_or("action node out of bounds")?
+                .kind
+                .as_ref()
+                .unwrap()
+            {
+                pb::node::Kind::Call(call)
+                | pb::node::Kind::GetCost(call)
+                | pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
+                    value: Some(pb::primitive_value::Value::PartialCall(call)),
+                }) => &call.args[..],
+                pb::node::Kind::Union(union) if root_union == Some(index) => &union.members[..],
+                pb::node::Kind::Var(_) => &[],
                 pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
                     value:
                         Some(
@@ -4958,19 +4847,11 @@ fn classify_closed_dags<K: Eq + std::hash::Hash>(
             };
             remaining = remaining
                 .checked_sub(1 + children.len())
-                .ok_or("constructor action DAG exceeds 65536 nodes and edges")?;
+                .ok_or("action DAG exceeds 65536 nodes and edges")?;
             pending.extend(children);
         }
-        if eligible
-            && seen.iter().any(|index| {
-                closed.contains(index)
-                    && matches!(
-                        program.nodes[*index as usize].kind,
-                        Some(pb::node::Kind::Call(_))
-                    )
-            })
-        {
-            selected.insert(path, closed.intersection(&seen).copied().collect());
+        if eligible {
+            selected.insert(path, seen);
         }
     }
     Ok(selected)
@@ -5012,23 +4893,21 @@ fn classify_union_actions(
     program: &pb::Program,
     constructor_targets: &HashSet<String>,
     constructor_costs: bool,
-    depths: &[usize],
-    native_spans: &NativeSpans,
 ) -> Result<HashSet<Vec<u32>>, String> {
-    let unions = |action: &pb::Action| -> Result<(HashSet<u32>, usize), String> {
+    let unions = |action: &pb::Action| -> Result<(HashSet<u32>, bool), String> {
         let mut pending = action_roots(action)?;
+        let root = match action.kind {
+            Some(pb::action::Kind::Term(index)) => Some(index),
+            _ => None,
+        };
         let mut seen = HashSet::new();
         let mut unions = HashSet::new();
-        let mut depth = 0;
+        let mut root_cycle = false;
         while let Some(index) = pending.pop() {
             if !seen.insert(index) {
+                root_cycle |= Some(index) == root;
                 continue;
             }
-            depth = depth.max(
-                *depths
-                    .get(index as usize)
-                    .ok_or("action node out of bounds")?,
-            );
             match program
                 .nodes
                 .get(index as usize)
@@ -5037,6 +4916,12 @@ fn classify_union_actions(
                 .as_ref()
             {
                 Some(pb::node::Kind::Union(union)) => {
+                    if !matches!(
+                        program.sorts[program.nodes[index as usize].sort_id as usize].kind,
+                        Some(pb::sort::Kind::Eq(_))
+                    ) {
+                        return Err("action Union requires an equality sort".into());
+                    }
                     unions.insert(index);
                     pending.extend(&union.members);
                 }
@@ -5047,7 +4932,7 @@ fn classify_union_actions(
                 _ => (),
             }
         }
-        Ok((unions, depth))
+        Ok((unions, root_cycle))
     };
     let mut uses = HashMap::<u32, usize>::new();
     for command in command_tree(&program.commands) {
@@ -5059,21 +4944,19 @@ fn classify_union_actions(
     }
     let mut scoped = HashSet::new();
     for (path, action) in action_sites(&program.commands) {
-        let (reached, depth) = unions(action)?;
+        let (reached, root_cycle) = unions(action)?;
         let cost_action = matches!(action.kind, Some(pb::action::Kind::SetCost(_)))
             || constructor_costs
                 && matches!(&action.kind, Some(pb::action::Kind::Delete(call)) if constructor_targets.contains(&call.func));
         if reached.is_empty() && !cost_action {
             continue;
         }
-        // Moving the arena-wide tree limit must not broaden the existing
-        // Union/cost path's admission beyond this constructor-only slice.
-        if depth > 256 {
-            return Err("expression depth exceeds this adapter's current limit of 256".into());
-        }
         let generalized = cost_action
+            || root_cycle
             || reached.iter().any(|union| uses[union] > 1)
-            || lower_action(program, action, native_spans).is_err();
+            || !matches!(&action.kind, Some(pb::action::Kind::Term(index))
+                if reached.len() == 1 && matches!(&program.nodes[*index as usize].kind,
+                    Some(pb::node::Kind::Union(union)) if union.members.len() == 2));
         if generalized {
             check_variables(program, &action_roots(action)?, &mut HashMap::new(), false)?;
             scoped.insert(path);
@@ -5120,28 +5003,70 @@ fn validate_union_occurrences(program: &pb::Program) -> Result<(), String> {
 }
 
 // Both byte execution and Source rendering use this first-demand local plan.
-// Nonclosed Calls are evaluated afresh and end the fragment memo's lifetime.
-fn constructor_dag_actions(
+// The caller owns one memo per top-level action or ordered rule head.
+fn action_dag_actions(
     program: &pb::Program,
     action: &pb::Action,
     mut occupied: impl FnMut(&str) -> bool,
     native_spans: &NativeSpans,
-    closed: &HashSet<u32>,
+    memo: &mut HashMap<u32, Expr>,
+    next: &mut usize,
 ) -> Result<(Vec<Action>, Vec<u32>), String> {
     enum Walk {
         Enter(u32),
         Call(u32, usize),
+        CostTarget,
     }
-    let mut pending: Vec<_> = action_roots(action)?
-        .into_iter()
-        .rev()
-        .map(Walk::Enter)
-        .collect();
+    let union = match &action.kind {
+        Some(pb::action::Kind::Term(index)) => match &program.nodes[*index as usize].kind {
+            Some(pb::node::Kind::Union(union)) => {
+                if !matches!(
+                    program.sorts[program.nodes[*index as usize].sort_id as usize].kind,
+                    Some(pb::sort::Kind::Eq(_))
+                ) {
+                    return Err("action Union requires an equality sort".into());
+                }
+                if let Some(value) = memo.get(index) {
+                    return Ok((
+                        vec![Action::Expr(
+                            native_span(program, action.span.as_ref(), native_spans)?,
+                            value.clone(),
+                        )],
+                        vec![],
+                    ));
+                }
+                if union.members.len() != 2 {
+                    return Err("rule/action Union currently requires exactly two members".into());
+                }
+                Some((*index, union.members.clone()))
+            }
+            _ => None,
+        },
+        _ => None,
+    };
+    let roots = match &union {
+        Some((_, members)) => members.clone(),
+        None => action_roots(action)?,
+    };
+    let mut pending: Vec<_> = roots.into_iter().rev().map(Walk::Enter).collect();
     let mut results = Vec::new();
     let mut actions = Vec::new();
     let mut evaluations = Vec::new();
-    let mut memo = HashMap::<u32, String>::new();
-    let mut next = 0usize;
+    if let Some(pb::action::Kind::SetCost(set)) = &action.kind {
+        pending = vec![
+            Walk::Enter(set.cost.ok_or("missing cost value")?),
+            Walk::CostTarget,
+        ];
+        pending.extend(
+            set.target
+                .as_ref()
+                .ok_or("missing cost target")?
+                .args
+                .iter()
+                .rev()
+                .map(|index| Walk::Enter(*index)),
+        );
+    }
     let mut remaining = 65_536usize;
     let mut bind_value = |index: u32, value: Expr| -> Result<(String, Expr), String> {
         let span = native_span(
@@ -5151,7 +5076,7 @@ fn constructor_dag_actions(
         )?;
         let name = loop {
             let candidate = format!("__egglog_proto_action_{next}");
-            next += 1;
+            *next += 1;
             if !occupied(&candidate) && !occupied(&format!("${candidate}")) {
                 break candidate;
             }
@@ -5167,18 +5092,22 @@ fn constructor_dag_actions(
         let (index, value) = match step {
             Walk::Enter(index) => {
                 let node = &program.nodes[index as usize];
-                let span = native_span(program, node.span.as_ref(), native_spans)?;
-                if let Some(name) = memo.get(&index) {
-                    results.push(Expr::Var(span, name.clone()));
+                if let Some(value) = memo.get(&index) {
+                    results.push(value.clone());
                     continue;
                 }
                 match node.kind.as_ref().expect("validated node") {
-                    pb::node::Kind::Call(call) => {
+                    pb::node::Kind::Call(call)
+                    | pb::node::Kind::GetCost(call)
+                    | pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
+                        value: Some(pb::primitive_value::Value::PartialCall(call)),
+                    }) => {
                         pending.push(Walk::Call(index, call.args.len()));
                         pending.extend(call.args.iter().rev().map(|child| Walk::Enter(*child)));
                         continue;
                     }
-                    pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
+                    pb::node::Kind::Var(_)
+                    | pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
                         value:
                             Some(
                                 pb::primitive_value::Value::I64(_)
@@ -5202,59 +5131,96 @@ fn constructor_dag_actions(
                                 for argument in arguments {
                                     let argument = match argument {
                                         Expr::Call(span, target, literals) => {
-                                            let mut args = Vec::with_capacity(literals.len());
-                                            for literal in literals {
-                                                remaining = remaining.checked_sub(1).ok_or(
-                                                    "native action expansion exceeds 65536 steps",
-                                                )?;
-                                                args.push(bind_value(index, literal)?.1);
-                                            }
-                                            Expr::Call(span, target, args)
+                                            let literals = literals
+                                                .into_iter()
+                                                .map(|literal| {
+                                                    bind_value(index, literal)
+                                                        .map(|(_, value)| value)
+                                                })
+                                                .collect::<Result<_, _>>()?;
+                                            let value = Expr::Call(span, target, literals);
+                                            bind_value(index, value)?.1
                                         }
-                                        literal => literal,
+                                        Expr::Lit(span, literal) => {
+                                            bind_value(index, Expr::Lit(span, literal))?.1
+                                        }
+                                        value => value,
                                     };
-                                    remaining = remaining
-                                        .checked_sub(1)
-                                        .ok_or("native action expansion exceeds 65536 steps")?;
-                                    bound.push(bind_value(index, argument)?.1);
+                                    bound.push(argument);
                                 }
                                 Expr::Call(span, target, bound)
                             }
                             literal => literal,
                         };
+                        if matches!(value, Expr::Var(..)) {
+                            memo.insert(index, value.clone());
+                            results.push(value);
+                            continue;
+                        }
                         (index, value)
                     }
                     _ => {
-                        return Err(
-                            "constructor action scope requires closed constructor syntax".into(),
-                        );
+                        return Err("unsupported action DAG node".into());
                     }
                 }
             }
             Walk::Call(index, arity) => {
                 let node = &program.nodes[index as usize];
-                let pb::node::Kind::Call(call) = node.kind.as_ref().unwrap() else {
+                let mut args = results.split_off(results.len() - arity);
+                let target = match node.kind.as_ref().unwrap() {
+                    pb::node::Kind::Call(call) => call.func.clone(),
+                    pb::node::Kind::GetCost(call) => {
+                        crate::set_cost::get_cost_table_name(&call.func)
+                    }
+                    pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
+                        value: Some(pb::primitive_value::Value::PartialCall(call)),
+                    }) => {
+                        args.insert(
+                            0,
+                            Expr::Lit(
+                                native_span(program, node.span.as_ref(), native_spans)?,
+                                Literal::String(call.func.clone()),
+                            ),
+                        );
+                        egglog::sort::FunctionSort::constructor_alias(&node_sort(program, index)?)
+                    }
+                    _ => unreachable!(),
+                };
+                let span = native_span(program, node.span.as_ref(), native_spans)?;
+                (index, Expr::Call(span, target, args))
+            }
+            Walk::CostTarget => {
+                let Some(pb::action::Kind::SetCost(set)) = &action.kind else {
                     unreachable!()
                 };
-                let args = results.split_off(results.len() - arity);
-                let span = native_span(program, node.span.as_ref(), native_spans)?;
-                (index, Expr::Call(span, call.func.clone(), args))
+                let target = set.target.as_ref().unwrap();
+                bind_value(
+                    set.cost.unwrap(),
+                    Expr::Call(
+                        native_span(program, action.span.as_ref(), native_spans)?,
+                        target.func.clone(),
+                        results.clone(),
+                    ),
+                )?;
+                continue;
             }
         };
-        // Bind inert payloads at first demand too: shared String/compound-number
-        // leaves must not be copied once per incoming edge. Existing nonclosed
-        // Calls still end this memo's lifetime, so no reads cross a barrier.
-        let (name, value) = bind_value(index, value)?;
-        if closed.contains(&index) {
-            memo.insert(index, name);
-        } else {
-            memo.clear();
-        }
+        let (_, value) = bind_value(index, value)?;
+        memo.insert(index, value.clone());
         results.push(value);
     }
     let span = native_span(program, action.span.as_ref(), native_spans)?;
     actions.push(match action.kind.as_ref().unwrap() {
-        pb::action::Kind::Term(_) => Action::Expr(span, results.pop().unwrap()),
+        pb::action::Kind::Term(_) => {
+            if let Some((index, _)) = union {
+                let rhs = results.pop().unwrap();
+                let lhs = results.pop().unwrap();
+                memo.insert(index, lhs.clone());
+                Action::Union(span, lhs, rhs)
+            } else {
+                Action::Expr(span, results.pop().unwrap())
+            }
+        }
         pb::action::Kind::Set(set) => {
             let value = results.pop().unwrap();
             Action::Set(
@@ -5264,7 +5230,26 @@ fn constructor_dag_actions(
                 value,
             )
         }
-        _ => return Err("constructor action scope requires Term or Set".into()),
+        pb::action::Kind::Delete(call) | pb::action::Kind::Subsume(call) => Action::Change(
+            span,
+            if matches!(action.kind, Some(pb::action::Kind::Delete(_))) {
+                ast::Change::Delete
+            } else {
+                ast::Change::Subsume
+            },
+            call.func.clone(),
+            results,
+        ),
+        pb::action::Kind::Panic(message) => Action::Panic(span, message.clone()),
+        pb::action::Kind::SetCost(set) => {
+            let cost = results.pop().unwrap();
+            Action::Set(
+                span,
+                crate::set_cost::get_cost_table_name(&set.target.as_ref().unwrap().func),
+                results,
+                cost,
+            )
+        }
     });
     Ok((actions, evaluations))
 }
@@ -5275,7 +5260,7 @@ fn eval_extract_root(
     graph: &mut EGraph,
     program: &pb::Program,
     index: u32,
-    closed: Option<&HashSet<u32>>,
+    dag: Option<&HashSet<u32>>,
     execute: bool,
     native_spans: &NativeSpans,
 ) -> Result<Option<(ArcSort, Value)>, egglog::Error> {
@@ -5285,39 +5270,45 @@ fn eval_extract_root(
         .get_sort_by_name(&sort_name)
         .cloned()
         .ok_or_else(|| error(format!("unknown extraction root sort {sort_name}")))?;
-    let Some(closed) = closed else {
+    if dag.is_none() {
         let expr = expression(program, index, &mut HashSet::new(), native_spans).map_err(error)?;
         if execute {
             return graph.eval_expr(&expr).map(Some);
         }
         graph.typecheck_expr_with_bindings_and_output(&expr, &[], sort, egglog::Context::Full)?;
         return Ok(None);
-    };
+    }
     let action = pb::Action {
         kind: Some(pb::action::Kind::Term(index)),
         span: program.nodes[index as usize].span,
     };
-    let (mut actions, _) = constructor_dag_actions(
+    let mut next = 0;
+    let (mut actions, _) = action_dag_actions(
         program,
         &action,
-        |name| graph.type_info().is_global(name),
+        |name| {
+            graph.type_info().is_global(name)
+                || graph.get_sort_by_name(name).is_some()
+                || graph.type_info().get_func_type(name).is_some()
+                || graph.type_info().is_primitive(name)
+        },
         native_spans,
-        closed,
+        &mut HashMap::new(),
+        &mut next,
     )
     .map_err(error)?;
     let Action::Expr(span, terminal) = actions.pop().expect("planned terminal") else {
         unreachable!("root plan has a Term terminal")
     };
-    // Avoid both globals and the planner's local bindings.
-    let mut next = actions.len();
+    // Continue the planner's monotonic allocator; no retained-prefix scan.
     let name = loop {
         let candidate = format!("__egglog_proto_action_{next}");
         next += 1;
         if !graph.type_info().is_global(&candidate)
             && !graph.type_info().is_global(&format!("${candidate}"))
-            && !actions
-                .iter()
-                .any(|action| matches!(action, Action::Let(_, name, _) if name == &candidate))
+            && graph.get_sort_by_name(&candidate).is_none()
+            && graph.type_info().get_func_type(&candidate).is_none()
+            && !graph.type_info().is_primitive(&candidate)
         {
             break candidate;
         }
@@ -5337,9 +5328,8 @@ fn eval_extract_root(
     Ok(execute.then(|| (sort, captured.pop().expect("executed root capture").1)))
 }
 
-// Only Union locations are retained across direct commands. An admitted closed
-// constructor DAG shares local results within this action only; other Calls
-// are lowered anew on every demand. All effects retain one native rule boundary.
+// Only Union locations are retained across direct commands. Ordinary results
+// share first-demand locals inside this action, in one native action boundary.
 #[allow(clippy::too_many_arguments)]
 fn eval_scoped_action(
     graph: &mut EGraph,
@@ -5347,31 +5337,39 @@ fn eval_scoped_action(
     action: &pb::Action,
     values: &mut HashMap<u32, Value>,
     execute: bool,
-    closed: Option<&HashSet<u32>>,
+    dag: Option<&HashSet<u32>>,
     observer: &mut dyn FnMut(ExecutionEvent<'_>),
     native_spans: &NativeSpans,
 ) -> Result<(), egglog::Error> {
-    if let Some(closed) = closed {
-        let (actions, _) = constructor_dag_actions(
+    if dag.is_some() {
+        let (actions, _) = action_dag_actions(
             program,
             action,
-            |name| graph.type_info().is_global(name),
+            |name| {
+                graph.type_info().is_global(name)
+                    || graph.get_sort_by_name(name).is_some()
+                    || graph.type_info().get_func_type(name).is_some()
+                    || graph.type_info().is_primitive(name)
+            },
             native_spans,
-            closed,
+            &mut HashMap::new(),
+            &mut 0,
         )
         .map_err(egglog::Error::BackendError)?;
-        let (result, _) = graph.eval_scoped_actions_observed(
-            &[],
-            execute,
-            |builder| {
-                for action in actions {
-                    builder.action(action)?;
-                }
-                Ok(())
-            },
-            observer,
+        let command = Command::ActionScope(
+            native_span(program, action.span.as_ref(), native_spans)
+                .map_err(egglog::Error::BackendError)?,
+            ast::GenericActions(actions),
         );
-        return result;
+        return if execute {
+            graph
+                .run_program_observed(vec![command], &mut |_, _, _| {}, &mut |_, event| {
+                    observer(event)
+                })
+                .map(|_| ())
+        } else {
+            graph.validate_program(vec![command]).map(|_| ())
+        };
     }
     enum Walk {
         Enter(u32),
@@ -5388,17 +5386,40 @@ fn eval_scoped_action(
         }
         _ => None,
     };
-    let mut slots: HashMap<_, _> = values
-        .keys()
-        .map(|index| (*index, format!("__egglog_proto_union_{index}")))
-        .collect();
-    let mut materialized: HashSet<_> = values.keys().copied().collect();
-    let mut inputs = values
-        .iter()
-        .map(|(index, value)| Ok((slots[index].clone(), node_sort(program, *index)?, *value)))
-        .collect::<Result<Vec<_>, String>>()
-        .map_err(error)?;
-    inputs.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut slots = HashMap::new();
+    let mut materialized = HashSet::new();
+    let mut memo = HashMap::<u32, Expr>::new();
+    let mut inputs = Vec::new();
+    let mut pending: Vec<_> = roots.iter().rev().copied().collect();
+    let mut seen = HashSet::new();
+    while let Some(index) = pending.pop() {
+        if !seen.insert(index) {
+            continue;
+        }
+        let children = match program.nodes[index as usize].kind.as_ref().unwrap() {
+            pb::node::Kind::Union(union) => {
+                if let Some(value) = values.get(&index) {
+                    let name = format!("__egglog_proto_union_{index}");
+                    inputs.push((
+                        name.clone(),
+                        node_sort(program, index).map_err(error)?,
+                        *value,
+                    ));
+                    slots.insert(index, name);
+                    materialized.insert(index);
+                    continue;
+                }
+                &union.members
+            }
+            pb::node::Kind::Call(call)
+            | pb::node::Kind::GetCost(call)
+            | pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
+                value: Some(pb::primitive_value::Value::PartialCall(call)),
+            }) => &call.args,
+            _ => continue,
+        };
+        pending.extend(children.iter().rev().copied());
+    }
     let compile = |builder: &mut egglog::ScopedActionBuilder<'_>| {
         let mut pending = if let Some(pb::action::Kind::SetCost(set)) = &action.kind {
             let mut pending = vec![Walk::Enter(set.cost.unwrap()), Walk::CostTarget];
@@ -5431,6 +5452,10 @@ fn eval_scoped_action(
                     let node = &program.nodes[index as usize];
                     let span =
                         native_span(program, node.span.as_ref(), native_spans).map_err(error)?;
+                    if let Some(value) = memo.get(&index) {
+                        results.push(value.clone());
+                        continue;
+                    }
                     match node.kind.as_ref().expect("validated node") {
                         pb::node::Kind::Union(union) => {
                             if !matches!(
@@ -5484,17 +5509,17 @@ fn eval_scoped_action(
                             let value =
                                 expression(program, index, &mut HashSet::new(), native_spans)
                                     .map_err(error)?;
-                            if matches!(value, Expr::Lit(..)) {
-                                // Native syntax-sensitive primitives (notably
-                                // function targets) require genuine literals.
-                                // Inert literals have no evaluation to reorder.
+                            if matches!(value, Expr::Var(..)) {
+                                memo.insert(index, value.clone());
                                 results.push(value);
                                 continue;
                             }
                             let name = format!("__egglog_proto_action_{temporary}");
                             temporary += 1;
                             builder.action(Action::Let(span.clone(), name.clone(), value))?;
-                            results.push(Expr::Var(span, name));
+                            let value = Expr::Var(span, name);
+                            memo.insert(index, value.clone());
+                            results.push(value);
                         }
                     }
                 }
@@ -5528,7 +5553,9 @@ fn eval_scoped_action(
                         name.clone(),
                         Expr::Call(span.clone(), function, args),
                     ))?;
-                    results.push(Expr::Var(span, name));
+                    let value = Expr::Var(span, name);
+                    memo.insert(index, value.clone());
+                    results.push(value);
                 }
                 Walk::Member(index, position) => {
                     let node = &program.nodes[index as usize];
@@ -5825,7 +5852,7 @@ fn lower_rule(
     ruleset: &str,
     name: &str,
     native_spans: &NativeSpans,
-) -> Result<Command, String> {
+) -> Result<Vec<Command>, String> {
     if rule.name.as_ref().is_some_and(String::is_empty) {
         return Err("an explicit rule label must not be empty".into());
     }
@@ -5869,72 +5896,111 @@ fn lower_rule(
                 check_variables(program, conditions, &mut bindings, true)?;
                 check_variables(program, &[head], &mut bindings, false)?;
             }
-            let rewrite = ast::Rewrite {
-                span,
-                lhs: expression(program, lhs, &mut HashSet::new(), native_spans)?
-                    .map_symbols(&mut |h| h, &mut |v: String| native_name("var", &v)),
-                rhs: expression(program, rhs, &mut HashSet::new(), native_spans)?
-                    .map_symbols(&mut |h| h, &mut |v: String| native_name("var", &v)),
-                conditions: facts(program, conditions, native_spans)?,
-                name: name.into(),
-            };
-            Ok(if bidirectional {
-                Command::BiRewrite(ruleset.into(), rewrite)
-            } else {
-                Command::Rewrite(ruleset.into(), rewrite, subsume)
-            })
+            let mut commands = Vec::new();
+            for (direction, query, rhs) in [("=>", lhs, rhs), ("<=", rhs, lhs)]
+                .into_iter()
+                .take(1 + usize::from(bidirectional))
+            {
+                let matched = "__egglog_proto_rewrite_match".to_owned();
+                let mut bindings = HashMap::new();
+                check_variables(program, &[query], &mut bindings, true)?;
+                check_variables(program, conditions, &mut bindings, true)?;
+                let action = pb::Action {
+                    kind: Some(pb::action::Kind::Term(rhs)),
+                    span: rule.span,
+                };
+                let mut memo = HashMap::new();
+                let (mut head, _) = action_dag_actions(
+                    program,
+                    &action,
+                    |name| bindings.contains_key(name),
+                    native_spans,
+                    &mut memo,
+                    &mut 0,
+                )?;
+                if matches!(head.last(), Some(Action::Expr(..))) {
+                    head.pop();
+                }
+                let mut head = ast::GenericActions(head)
+                    .map_symbols(&mut |h| h, &mut |v: String| native_name("var", &v))
+                    .0;
+                let value = memo
+                    .remove(&rhs)
+                    .ok_or("missing rewrite result")?
+                    .map_symbols(&mut |h| h, &mut |v: String| native_name("var", &v));
+                head.push(Action::Union(
+                    span.clone(),
+                    Expr::Var(span.clone(), matched.clone()),
+                    value,
+                ));
+                let lhs = expression(program, query, &mut HashSet::new(), native_spans)?
+                    .map_symbols(&mut |h| h, &mut |v: String| native_name("var", &v));
+                if subsume {
+                    let Expr::Call(_, function, args) = &lhs else {
+                        return Err("subsumed rewrite must have a function call on the lhs".into());
+                    };
+                    head.push(Action::Change(
+                        span.clone(),
+                        ast::Change::Subsume,
+                        function.clone(),
+                        args.clone(),
+                    ));
+                }
+                let mut body = vec![Fact::Eq(
+                    span.clone(),
+                    Expr::Var(span.clone(), matched.clone()),
+                    lhs,
+                )];
+                body.extend(facts(program, conditions, native_spans)?);
+                let native = ast::Rule {
+                    span: span.clone(),
+                    head: ast::GenericActions(head),
+                    body,
+                    name: if bidirectional {
+                        format!("{name}{direction}")
+                    } else {
+                        name.to_owned()
+                    },
+                    ruleset: ruleset.into(),
+                    eval_mode,
+                    no_decomp: false,
+                    include_subsumed: false,
+                };
+                commands.push(Command::Rule { rule: native });
+            }
+            Ok(commands)
         }
         pb::rule_decl::Kind::Rule(body) => {
             let mut bindings = HashMap::new();
             check_variables(program, &body.query, &mut bindings, true)?;
+            let roots = body
+                .head
+                .iter()
+                .map(action_roots)
+                .collect::<Result<Vec<_>, _>>()?
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>();
+            check_variables(program, &roots, &mut bindings, false)?;
             let mut head = Vec::new();
-            for (index, action) in body.head.iter().enumerate() {
-                check_variables(program, &action_roots(action)?, &mut bindings, false)?;
-                if let Some(pb::action::Kind::SetCost(set)) = &action.kind {
-                    let span = native_span(program, action.span.as_ref(), native_spans)?;
-                    let target = set.target.as_ref().ok_or("missing cost target")?;
-                    let mut key = Vec::with_capacity(target.args.len());
-                    for (argument, value) in target.args.iter().enumerate() {
-                        // Authored variables are projected before these native
-                        // temporaries are introduced, so even adversarial wire
-                        // names cannot capture the retained row arguments.
-                        let local = format!("__egglog_proto_cost_{index}_{argument}");
-                        head.push(Action::Let(
-                            span.clone(),
-                            local.clone(),
-                            expression(program, *value, &mut HashSet::new(), native_spans)?
-                                .map_symbols(&mut |h| h, &mut |v: String| native_name("var", &v)),
-                        ));
-                        key.push(Expr::Var(span.clone(), local));
-                    }
-                    // Native actions retain this order: capture each argument
-                    // once, materialize the constructor, then evaluate/write C.
-                    // A failing cost leaves the completed target prefix intact.
-                    head.push(Action::Expr(
-                        span.clone(),
-                        Expr::Call(span.clone(), target.func.clone(), key.clone()),
-                    ));
-                    head.push(Action::Set(
-                        span,
-                        crate::set_cost::get_cost_table_name(&target.func),
-                        key,
-                        expression(
-                            program,
-                            set.cost.ok_or("missing cost value")?,
-                            &mut HashSet::new(),
-                            native_spans,
-                        )?
-                        .map_symbols(&mut |h| h, &mut |v: String| native_name("var", &v)),
-                    ));
-                } else {
-                    head.extend(
-                        ast::GenericActions(lower_action(program, action, native_spans)?)
-                            .map_symbols(&mut |h| h, &mut |v: String| native_name("var", &v))
-                            .0,
-                    );
-                }
+            let mut memo = HashMap::new();
+            let mut next = 0;
+            for action in &body.head {
+                let (actions, _) = action_dag_actions(
+                    program,
+                    action,
+                    |name| bindings.contains_key(name),
+                    native_spans,
+                    &mut memo,
+                    &mut next,
+                )?;
+                head.extend(
+                    ast::GenericActions(actions)
+                        .map_symbols(&mut |h| h, &mut |v: String| native_name("var", &v))
+                        .0,
+                );
             }
-            Ok(Command::Rule {
+            Ok(vec![Command::Rule {
                 rule: ast::Rule {
                     span,
                     head: ast::GenericActions(head),
@@ -5945,7 +6011,7 @@ fn lower_rule(
                     no_decomp: rule.no_decomp,
                     include_subsumed: rule.include_subsumed,
                 },
-            })
+            }])
         }
     }
 }
@@ -7363,12 +7429,13 @@ mod tests {
             kind: Some(pb::action::Kind::Term(2)),
             ..Default::default()
         };
-        let (actions, evaluated) = constructor_dag_actions(
+        let (actions, evaluated) = action_dag_actions(
             &program,
             &action,
             |_| false,
             &NativeSpans::default(),
-            &[0, 1, 2].into_iter().collect(),
+            &mut HashMap::new(),
+            &mut 0,
         )
         .unwrap();
         assert_eq!(evaluated, [1, 1, 1, 1, 1, 0, 2]);
@@ -7385,24 +7452,19 @@ mod tests {
             panic!("one compound-number binding")
         };
         assert_eq!(target, "egglog.core.bigrat.make");
-        let Action::Let(_, string, Expr::Lit(_, Literal::String(actual))) = &actions[5] else {
-            panic!("one string binding")
+        let Action::Let(_, text_binding, Expr::Lit(_, Literal::String(actual))) = &actions[5]
+        else {
+            panic!("one shared string payload")
         };
         assert_eq!(actual, &text);
         let Action::Let(_, _, Expr::Call(_, target, arguments)) = &actions[6] else {
             panic!("constructor binding")
         };
         assert_eq!(target, "Leaf");
-        let variables: Vec<_> = arguments
-            .iter()
-            .map(|argument| {
-                let Expr::Var(_, name) = argument else {
-                    panic!("shared payloads use only local references")
-                };
-                name
-            })
-            .collect();
-        assert_eq!(variables, [number, string, number, string]);
+        assert!(matches!(&arguments[0], Expr::Var(_, name) if name == number));
+        assert_eq!(arguments[0], arguments[2]);
+        assert!(matches!(&arguments[1], Expr::Var(_, name) if name == text_binding));
+        assert_eq!(arguments[1], arguments[3]);
     }
 
     fn closed_value_dag(terminal: &str) -> (pb::Program, u32) {
@@ -7467,6 +7529,217 @@ mod tests {
     }
 
     #[test]
+    fn action_and_rule_diamonds_share_lazy_locals_in_all_modes() {
+        for in_rule in [false, true] {
+            let mut program =
+                inventory_fixture("(datatype E (Leaf) (Pair E E)) (relation Trigger ()) (Trigger)");
+            let trigger = match &program.commands[0].kind {
+                Some(pb::command::Kind::Action(pb::Action {
+                    kind: Some(pb::action::Kind::Term(index)),
+                    ..
+                })) => *index,
+                _ => panic!("trigger"),
+            };
+            let sort_id = program
+                .sorts
+                .iter()
+                .position(
+                    |sort| matches!(&sort.kind, Some(pb::sort::Kind::Eq(name)) if name == "E"),
+                )
+                .unwrap() as u32;
+            let mut root = program.nodes.len() as u32;
+            program.nodes.push(pb::Node {
+                sort_id,
+                kind: Some(pb::node::Kind::Call(pb::Call {
+                    func: "Leaf".into(),
+                    args: vec![],
+                })),
+                ..Default::default()
+            });
+            for _ in 0..28 {
+                let parent = program.nodes.len() as u32;
+                program.nodes.push(pb::Node {
+                    sort_id,
+                    kind: Some(pb::node::Kind::Call(pb::Call {
+                        func: "Pair".into(),
+                        args: vec![root, root],
+                    })),
+                    ..Default::default()
+                });
+                root = parent;
+            }
+            let action = pb::Action {
+                kind: Some(pb::action::Kind::Term(root)),
+                ..Default::default()
+            };
+            if in_rule {
+                program.rules = vec![pb::RuleDecl {
+                    name: Some("diamond".into()),
+                    eval_mode: pb::RuleEvalMode::Seminaive.into(),
+                    kind: Some(pb::rule_decl::Kind::Rule(pb::Rule {
+                        query: vec![trigger],
+                        head: vec![action.clone(), action],
+                    })),
+                    ..Default::default()
+                }];
+                program.rulesets = vec![pb::Ruleset {
+                    name: Some("dag".into()),
+                    kind: Some(pb::ruleset::Kind::Rules(pb::RuleList { rules: vec![0] })),
+                    ..Default::default()
+                }];
+                program.commands.push(pb::Command {
+                    kind: Some(pb::command::Kind::Run(pb::Run {
+                        ruleset: Some(pb::RulesetRef {
+                            kind: Some(pb::ruleset_ref::Kind::Index(0)),
+                        }),
+                        ..Default::default()
+                    })),
+                    ..Default::default()
+                });
+                let lowered = lower_rule(
+                    &program,
+                    &program.rules[0],
+                    "dag",
+                    "diamond",
+                    &NativeSpans::default(),
+                )
+                .unwrap();
+                let [Command::Rule { rule }] = lowered.as_slice() else {
+                    panic!("one native rule")
+                };
+                assert_eq!(
+                    rule.head
+                        .0
+                        .iter()
+                        .filter(|action| matches!(action, Action::Let(..)))
+                        .count(),
+                    29
+                );
+                assert_eq!(rule.head.0.len(), 31); // duplicate root remains an ordered action
+            } else {
+                program.commands = vec![pb::Command {
+                    kind: Some(pb::command::Kind::Action(action)),
+                    ..Default::default()
+                }];
+            }
+            let text = source::Renderer::default().render(&program).unwrap();
+            assert!(
+                text.matches("Pair").count() < 100,
+                "no expanded presentation tree"
+            );
+            let phases = source::Source::new(None, &text)
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            for mode in [
+                pb::ExecutionMode::Normal,
+                pb::ExecutionMode::TermEncoding,
+                pb::ExecutionMode::Proofs,
+                pb::ExecutionMode::ProofTesting,
+            ] {
+                for replay in [false, true] {
+                    let (mut engine, id) = host_default_engine();
+                    let session = engine.graphs.get_mut(&id).unwrap();
+                    let graph = std::mem::take(&mut session.graph);
+                    session.graph = match mode {
+                        pb::ExecutionMode::Normal => graph,
+                        pb::ExecutionMode::TermEncoding => graph.with_term_encoding_enabled(),
+                        pb::ExecutionMode::Proofs => graph.with_proofs_enabled(),
+                        pb::ExecutionMode::ProofTesting => {
+                            graph.with_proofs_enabled().with_proof_testing()
+                        }
+                    };
+                    session.mode = mode;
+                    for phase in if replay {
+                        phases.clone()
+                    } else {
+                        vec![program.clone()]
+                    } {
+                        assert_eq!(
+                            run_host_default(&mut engine, id, phase).error,
+                            None,
+                            "{in_rule}/{mode:?}/{replay}"
+                        );
+                    }
+                    if matches!(
+                        mode,
+                        pb::ExecutionMode::Proofs | pb::ExecutionMode::ProofTesting
+                    ) {
+                        // Experimental text deliberately alpha-renames public
+                        // declarations. Use this session's exported handles,
+                        // not the original program's pre-render names.
+                        let definitions = &engine.graphs[&id].definitions;
+                        let pair = definitions
+                            .declarations
+                            .iter()
+                            .find_map(|declaration| match &declaration.kind {
+                                Some(pb::declaration::Kind::Constructor(constructor))
+                                    if constructor.inputs.len() == 2
+                                        && constructor
+                                            .inputs
+                                            .iter()
+                                            .all(|arg| arg.sort == constructor.output) =>
+                                {
+                                    Some(constructor)
+                                }
+                                _ => None,
+                            })
+                            .unwrap();
+                        let proof_sort = definitions.sorts[pair.output as usize].clone();
+                        let pair_name = pair.name.clone();
+                        // Direct construction has a Fiat justification; native
+                        // ProveExists expects a rule justification. The shallow
+                        // existential Prove query checks that same Pair witness
+                        // without expanding its shared children into a query tree.
+                        let proof_command = if in_rule {
+                            pb::command::Kind::ProveExists(pb::ProveExists {
+                                constructor: pair_name.clone(),
+                            })
+                        } else {
+                            pb::command::Kind::Prove(pb::Prove { facts: vec![1] })
+                        };
+                        let response = run_host_default(
+                            &mut engine,
+                            id,
+                            pb::Program {
+                                ir_version: 1,
+                                sorts: vec![proof_sort],
+                                nodes: vec![
+                                    pb::Node {
+                                        sort_id: 0,
+                                        kind: Some(pb::node::Kind::Var("witness".into())),
+                                        ..Default::default()
+                                    },
+                                    pb::Node {
+                                        sort_id: 0,
+                                        kind: Some(pb::node::Kind::Call(pb::Call {
+                                            func: pair_name,
+                                            args: vec![0, 0],
+                                        })),
+                                        ..Default::default()
+                                    },
+                                ],
+                                commands: vec![pb::Command {
+                                    kind: Some(proof_command),
+                                    ..Default::default()
+                                }],
+                                ..Default::default()
+                            },
+                        );
+                        assert_eq!(response.error, None, "{in_rule}/{mode:?}/{replay}");
+                        let Some(pb::command_output::Kind::Proof(proof)) =
+                            &response.outputs[0].kind
+                        else {
+                            panic!("proof output")
+                        };
+                        proof::validate(proof).unwrap();
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn closed_value_fragments_preserve_read_barriers_and_source_replay() {
         // Native size reads exclude this action block's pending inserts.
         let (mut program, root) = closed_value_dag(
@@ -7486,28 +7759,28 @@ mod tests {
                 _ => None,
             })
             .unwrap();
-        // The same ordinary Call node is demanded twice, separated by a fresh
-        // demand of the closed fragment. Neither the read nor its parent is CSE.
+        // Shared ordinary nodes retain their first demand inside one action.
         demand.args[3] = demand.args[1];
         let (mut engine, id) = host_default_engine();
         let mut execution = program.clone();
         let prepared = engine.graphs[&id].prepare(&mut execution).unwrap();
-        let closed = &prepared.context.constructor_dags[&vec![0]];
+        let closed = &prepared.context.action_dags[&vec![0]];
         assert!(closed.contains(&root));
         let Some(pb::command::Kind::Action(action)) = &execution.commands[0].kind else {
             unreachable!()
         };
-        let (_, evaluations) = constructor_dag_actions(
+        let (_, evaluations) = action_dag_actions(
             &execution,
             action,
             |_| false,
             &prepared.context.native_spans,
-            closed,
+            &mut HashMap::new(),
+            &mut 0,
         )
         .unwrap();
         for (name, expected) in [
-            ("Branch", 32),
-            ("egglog.experimental.size.nodes", 2),
+            ("Branch", 16),
+            ("egglog.experimental.size.nodes", 1),
             ("Demand", 1),
         ] {
             let nodes: HashSet<_> = program
@@ -7526,10 +7799,13 @@ mod tests {
                     .count(),
                 expected
             );
-            if name != "Branch" {
-                assert!(nodes.is_disjoint(closed));
-            }
         }
+        assert!(evaluations.iter().all(|node| closed.contains(node)));
+        assert_eq!(
+            evaluations.iter().collect::<HashSet<_>>().len(),
+            evaluations.len(),
+            "shared nodes are demanded once, not unused same-named arena nodes"
+        );
         assert_eq!(engine.graphs[&id].graph.num_tuples(), 0);
         assert_eq!(
             run_host_default(&mut engine, id, program.clone()).error,
@@ -7550,49 +7826,6 @@ mod tests {
                 run_host_default(&mut replay, replay_id, phase.unwrap()).error,
                 None
             );
-        }
-        // The generated mixed scope is invertible, not a public license to
-        // retain reads or move them before their first demand.
-        let parsed = crate::new_experimental_egraph()
-            .parse_program(None, &text)
-            .unwrap();
-        for cache_read in [false, true] {
-            let mut commands = parsed.clone();
-            let actions = commands
-                .iter_mut()
-                .find_map(|command| match command {
-                    Command::ActionScope(_, actions) => Some(&mut actions.0),
-                    _ => None,
-                })
-                .unwrap();
-            let demand = actions.len() - 2;
-            let Action::Let(_, _, Expr::Call(_, _, args)) = &mut actions[demand] else {
-                panic!("flat terminal call")
-            };
-            let (Expr::Var(_, first), Expr::Var(_, second)) = (&args[1], &args[3]) else {
-                panic!("read aliases")
-            };
-            let (first, second) = (first.clone(), second.clone());
-            if cache_read {
-                args[3] = args[1].clone();
-            }
-            let index = actions.iter().position(|action|
-                matches!(action, Action::Let(_, name, _) if name == if cache_read { &second } else { &first })
-            ).unwrap();
-            let read = actions.remove(index);
-            if !cache_read {
-                actions.insert(0, read);
-            }
-            let changed = commands
-                .iter()
-                .map(ToString::to_string)
-                .collect::<Vec<_>>()
-                .join("\n");
-            let error = source::Source::new(None, &changed)
-                .unwrap()
-                .collect::<Result<Vec<_>, _>>()
-                .unwrap_err();
-            assert!(error.to_string().contains("scope"), "{error}");
         }
     }
 

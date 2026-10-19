@@ -66,6 +66,15 @@ frontend pins. Old validators reject it, and old name-only indexes may conflate
 the definitions; mixed-epoch readers are not supported. CEL checks local family
 arity, not complete installed-name resolution or resupply compatibility.
 
+Evaluated ordinary expression nodes retain their lazy first-demand result within
+one top-level Action or one rule firing's ordered head. The memo is fresh for
+each firing/evaluation and resets between top-level commands, whose writes
+commit in order. No evaluation is hoisted before its first demand, and failed
+evaluations preserve the completed mutation prefix. Query patterns and Union's
+separate identity scopes are unchanged. Host callback invocation counts are
+not a protocol guarantee. This is a coordinated draft semantic change; older
+readers that reevaluate shared action nodes are not interchangeable consumers.
+
 `Declaration.doc` preserves absence, explicitly empty text, and nonempty text,
 matching existing Python callable/class documentation readers. It remains
 excluded from semantic identity; compatible resupply retains the first stored
@@ -400,8 +409,10 @@ or other commands. Each loop-body iteration has its own mapping; nested lists
 do not inherit the outer mapping, which resumes afterward. Each rule firing,
 primitive/lambda invocation, and other command's evaluated inputs has its own
 scope. Retained references follow canonical identity through intervening unions,
-rebuilds, and runs. Queries neither read nor populate this mapping. Ordinary call
-nodes remain shared syntax, not memoized values.
+rebuilds, and runs. Queries neither read nor populate this identity mapping.
+Ordinary call results instead use the shorter first-demand memo of one
+top-level Action or one rule firing's ordered head; they never persist between
+top-level commands.
 
 ```text
 nodes[0] = E: Union[]
@@ -648,11 +659,11 @@ expansion belongs to the frontend.
 
 Current limits include requests requiring `profile=true`, Normal-only
 Extract/Freeze, native proof-mode restrictions on non-global
-no-merge functions, and context-specific lowering/expansion budgets. Normal
-Term/Set actions and extraction roots have a bounded DAG path for closed
-constructor fragments, including native Vec `of`/`empty`, BigInt `from_string`
-and BigRat `make`.
-Other calls are ordered memo barriers; extraction roots evaluate independently.
+no-merge functions, and context-specific lowering/expansion budgets. Evaluated
+action graphs use lazy first-demand native locals, including ordinary primitive
+calls and exact numeric values, in all four modes. Ordered rule heads share one
+memo per firing; extraction roots evaluate independently in Normal mode.
+Query patterns and rewrite left-hand sides still use bounded tree lowering.
 Rendering oversized extraction roots to Source remains tree-limited.
 Unsupported modes, values and codecs fail explicitly. These are adapter limits,
 not changes to the schema contract.

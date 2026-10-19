@@ -793,36 +793,56 @@ struct NodeImport<'a> {
 
 impl NodeImport<'_> {
     fn import(&mut self, index: u32) -> Result<u32, String> {
-        if let Some(i) = self.imported.get(&index) {
-            return Ok(*i);
+        enum Visit {
+            Enter(u32),
+            Finish(u32, pb::Node),
         }
-        if self.active.len() >= 256 || !self.active.insert(index) {
-            return Err("cyclic or too-deep declaration template".into());
+        let mut pending = vec![Visit::Enter(index)];
+        while let Some(visit) = pending.pop() {
+            match visit {
+                Visit::Enter(index) => {
+                    if self.imported.contains_key(&index) {
+                        continue;
+                    }
+                    if !self.active.insert(index) {
+                        return Err("cyclic declaration template".into());
+                    }
+                    let mut node = self
+                        .source
+                        .nodes
+                        .get(index as usize)
+                        .ok_or("declaration node out of bounds")?
+                        .clone();
+                    node.sort_id = *self
+                        .sorts
+                        .get(node.sort_id as usize)
+                        .ok_or("node sort out of bounds")?;
+                    relocate_span(&mut node.span, self.source, self.files)?;
+                    let mut children = Vec::new();
+                    node_edges(node.kind.as_mut().ok_or("missing node kind")?, |child| {
+                        children.push(*child);
+                        Ok(())
+                    })?;
+                    pending.push(Visit::Finish(index, node));
+                    pending.extend(children.into_iter().rev().map(Visit::Enter));
+                }
+                Visit::Finish(index, mut node) => {
+                    node_edges(node.kind.as_mut().unwrap(), |child| {
+                        *child = self.imported[child];
+                        Ok(())
+                    })?;
+                    self.active.remove(&index);
+                    let result = self
+                        .nodes
+                        .len()
+                        .try_into()
+                        .map_err(|_| "too many declaration nodes")?;
+                    self.nodes.push(node);
+                    self.imported.insert(index, result);
+                }
+            }
         }
-        let mut n = self
-            .source
-            .nodes
-            .get(index as usize)
-            .ok_or("declaration node out of bounds")?
-            .clone();
-        n.sort_id = *self
-            .sorts
-            .get(n.sort_id as usize)
-            .ok_or("node sort out of bounds")?;
-        relocate_span(&mut n.span, self.source, self.files)?;
-        node_edges(n.kind.as_mut().ok_or("missing node kind")?, |i| {
-            *i = self.import(*i)?;
-            Ok(())
-        })?;
-        self.active.remove(&index);
-        let result = self
-            .nodes
-            .len()
-            .try_into()
-            .map_err(|_| "too many declaration nodes")?;
-        self.nodes.push(n);
-        self.imported.insert(index, result);
-        Ok(result)
+        Ok(self.imported[&index])
     }
 }
 

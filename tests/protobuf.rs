@@ -1770,11 +1770,8 @@ mod constructor_action_dags {
 
         for body in [
             "(let dead (A)) (A)",
-            "(let x (read)) x",
-            "(let x (+ 1 2)) x",
-            "(let x (A)) (union x x)",
-            "(let x (A)) (delete (Pair x x))",
             "(let x $captured) x",
+            "(let x (read)) (let y (A)) (Pair y x)",
         ] {
             let text = format!(
                 "(datatype E (A) (Pair E E)) (function read () E :no-merge) (let $captured (A)) (action-scope ({body}))"
@@ -1796,6 +1793,43 @@ mod constructor_action_dags {
                 1
             );
             assert!(source.next().is_none());
+        }
+        for (body, fails) in [
+            ("(let x (read)) x", true),
+            ("(let x (+ 1 2)) x", false),
+            ("(let x (A)) (union x x)", false),
+            ("(let x (A)) (delete (Pair x x))", false),
+        ] {
+            let text = format!(
+                "(datatype E (A) (Pair E E)) (function read () E :no-merge) (action-scope ({body}))"
+            );
+            assert_eq!(
+                new_experimental_egraph()
+                    .parse_and_run_program(None, &text)
+                    .is_err(),
+                fails,
+                "{body}"
+            );
+            let mut engine = Engine::default();
+            let id = create(&mut engine);
+            let mut renderer = egglog_experimental::protobuf::source::Renderer::default();
+            let mut replay = new_experimental_egraph();
+            let mut failed = false;
+            for phase in Source::new(None, &text).unwrap() {
+                let phase = phase.unwrap();
+                let rendered = renderer.render(&phase).unwrap();
+                let native = replay.parse_and_run_program(None, &rendered);
+                let response = run(&mut engine, id, phase);
+                if let Some(error) = response.error {
+                    assert!(fails, "{body}: {error:?}");
+                    assert_eq!(error.code, i32::from(pb::ErrorCode::EvaluationFailed));
+                    assert!(native.is_err());
+                    failed = true;
+                    break;
+                }
+                native.unwrap();
+            }
+            assert_eq!(failed, fails, "{body}");
         }
     }
 
@@ -1892,6 +1926,9 @@ mod constructor_action_dags {
             .unwrap();
         let mut engine = Engine::with_extension(provider.clone());
         let id = create(&mut engine);
+        assert_eq!(run(&mut engine, id, original).error, None);
+        let mut engine = Engine::with_extension(provider.clone());
+        let id = create(&mut engine);
         for phase in Source::with_extension(None, &text, provider).unwrap() {
             assert_eq!(run(&mut engine, id, phase.unwrap()).error, None);
         }
@@ -1986,7 +2023,7 @@ mod constructor_action_dags {
             }
             let mut renderer = Renderer::default();
             let text = renderer.render(&initial).unwrap() + &renderer.render(&conflict).unwrap();
-            assert_eq!(text.matches("(action-scope ").count(), 1);
+            assert_eq!(text.matches("(action-scope ").count(), 2);
             let mut native = new_experimental_egraph();
             assert_eq!(native.parse_and_run_program(None, &text).is_err(), !caught);
             let mut check = initial.clone();
@@ -2025,9 +2062,17 @@ mod constructor_action_dags {
                 ..Default::default()
             };
             let mut saved_sort = None;
+            let mut saved_name = None;
+            let mut constructors = std::collections::HashMap::new();
             for phase in Source::new(Some("scope-conflict.egg".into()), &text).unwrap() {
                 let phase = phase.unwrap();
                 inspect.sorts = phase.sorts.clone();
+                for declaration in &phase.declarations {
+                    if let Some(pb::declaration::Kind::Constructor(constructor)) = &declaration.kind
+                    {
+                        constructors.insert(constructor.inputs.len(), constructor.name.clone());
+                    }
+                }
                 for command in &phase.commands {
                     let mut command = command;
                     while let Some(pb::command::Kind::Fail(child)) = &command.kind {
@@ -2039,6 +2084,7 @@ mod constructor_action_dags {
                     })) = &command.kind
                     {
                         saved_sort = Some(phase.nodes[set.value.unwrap() as usize].sort_id);
+                        saved_name = Some(set.target.as_ref().unwrap().func.clone());
                     }
                 }
                 let response = run(&mut engine, id, phase);
@@ -2052,11 +2098,15 @@ mod constructor_action_dags {
                 }
             }
             assert_eq!(failed, !caught);
+            let Some(pb::command::Kind::PrintSize(print)) = &mut inspect.commands[0].kind else {
+                panic!("sizes")
+            };
+            print.tables = [1, 2, 0].map(|arity| constructors[&arity].clone()).to_vec();
             let saved = inspect.nodes.len() as u32;
             inspect.nodes.push(pb::Node {
                 sort_id: saved_sort.unwrap(),
                 kind: Some(pb::node::Kind::Call(pb::Call {
-                    func: "Saved".into(),
+                    func: saved_name.unwrap(),
                     args: vec![],
                 })),
                 ..Default::default()
@@ -2089,7 +2139,7 @@ mod constructor_action_dags {
             };
             assert_eq!(
                 value(&response, extraction.roots[0].variants[0].term),
-                "(Leaf)"
+                format!("({})", constructors[&0])
             );
         }
     }
@@ -2163,10 +2213,8 @@ mod constructor_action_dags {
     }
 
     #[test]
-    fn malformed_or_nonconstructor_set_roots_reject_before_effects() {
+    fn set_roots_validate_malformed_inputs_and_execute_newly_supported_values() {
         for invalid in ["root", "target", "sort", "read", "primitive", "union"] {
-            // Union keeps its existing depth boundary, rather than exercising
-            // the unchanged generalized evaluator's exponential expansion.
             let mut program = set_program(if invalid == "union" { 300 } else { 28 }, false);
             program.commands.truncate(1);
             match invalid {
@@ -2246,7 +2294,8 @@ mod constructor_action_dags {
                 }
                 "union" => {
                     program.nodes[0].kind =
-                        Some(pb::node::Kind::Union(pb::Union { members: vec![] }))
+                        Some(pb::node::Kind::Union(pb::Union { members: vec![] }));
+                    program.nodes[0].sort_id = 0;
                 }
                 _ => unreachable!(),
             }
@@ -2273,7 +2322,53 @@ mod constructor_action_dags {
             let before = run(&mut engine, id, freeze.clone()).outputs;
             let response = run(&mut engine, id, program);
             assert!(response.outputs.is_empty(), "{invalid}");
+            if invalid == "primitive" {
+                assert_eq!(response.error, None);
+                let response = run(
+                    &mut engine,
+                    id,
+                    pb::Program {
+                        ir_version: 1,
+                        commands: vec![pb::Command {
+                            kind: Some(pb::command::Kind::PrintSize(pb::PrintSize {
+                                tables: vec![
+                                    "Wrap".into(),
+                                    "Pair".into(),
+                                    "Leaf".into(),
+                                    "Saved".into(),
+                                ],
+                            })),
+                            ..Default::default()
+                        }],
+                        ..Default::default()
+                    },
+                );
+                assert_eq!(response.error, None);
+                let Some(pb::command_output::Kind::Sizes(sizes)) = &response.outputs[0].kind else {
+                    panic!("sizes")
+                };
+                assert_eq!(
+                    sizes
+                        .sizes
+                        .iter()
+                        .map(|table| table.rows)
+                        .collect::<Vec<_>>(),
+                    [28, 28, 1, 1]
+                );
+                continue;
+            }
             let error = response.error.unwrap();
+            if invalid == "read" {
+                assert_eq!(error.code, i32::from(pb::ErrorCode::EvaluationFailed));
+                assert!(error.message.contains("lookup of function"), "{error:?}");
+                assert_eq!(error.location.unwrap().path, [0]);
+                assert_ne!(
+                    run(&mut engine, id, freeze).outputs,
+                    before,
+                    "registered definition prefix is retained"
+                );
+                continue;
+            }
             assert_eq!(
                 error.code,
                 i32::from(if invalid == "target" {
@@ -2284,7 +2379,7 @@ mod constructor_action_dags {
                 "{invalid}"
             );
             if invalid == "union" {
-                assert!(error.message.contains("depth exceeds"), "{error:?}");
+                assert!(error.message.contains("equality sort"), "{error:?}");
             }
             assert!(response.ruleset_publication.unwrap().names.is_empty());
             assert_eq!(run(&mut engine, id, freeze).outputs, before, "{invalid}");
@@ -2416,17 +2511,20 @@ mod constructor_action_dags {
                     })),
                     ..Default::default()
                 }),
-                "head" => invalid_program.rules.push(pb::RuleDecl {
-                    kind: Some(pb::rule_decl::Kind::Rule(pb::Rule {
-                        head: vec![pb::Action {
-                            kind: Some(pb::action::Kind::Term(root)),
+                "head" => {
+                    invalid_program.commands.clear();
+                    invalid_program.rules.push(pb::RuleDecl {
+                        kind: Some(pb::rule_decl::Kind::Rule(pb::Rule {
+                            head: vec![pb::Action {
+                                kind: Some(pb::action::Kind::Term(root)),
+                                ..Default::default()
+                            }],
                             ..Default::default()
-                        }],
+                        })),
+                        eval_mode: pb::RuleEvalMode::Seminaive.into(),
                         ..Default::default()
-                    })),
-                    eval_mode: pb::RuleEvalMode::Seminaive.into(),
-                    ..Default::default()
-                }),
+                    });
+                }
                 "read" => {
                     invalid_program.declarations.push(pb::Declaration {
                         kind: Some(pb::declaration::Kind::Function(pb::Function {
@@ -2443,20 +2541,34 @@ mod constructor_action_dags {
                 }
                 "union" => {
                     invalid_program.nodes[0].kind =
-                        Some(pb::node::Kind::Union(pb::Union { members: vec![] }))
+                        Some(pb::node::Kind::Union(pb::Union { members: vec![] }));
+                    invalid_program.nodes[0].sort_id = 0;
                 }
                 _ => unreachable!(),
             }
             let response = run(&mut engine, id, invalid_program);
             assert!(response.outputs.is_empty(), "{invalid}");
-            let error = response.error.unwrap_or_else(|| panic!("{invalid}"));
-            if matches!(invalid, "query" | "body" | "head" | "read" | "union") {
-                assert!(
-                    error.message.contains("depth exceeds") || error.message.contains("too-deep"),
-                    "{invalid}: {error:?}"
+            if invalid == "head" {
+                assert_eq!(
+                    response.error, None,
+                    "unused shared head is compiled, not executed"
                 );
-            } else if invalid == "budget" {
-                assert!(error.message.contains("nodes and edges"), "{error:?}");
+            } else {
+                let error = response.error.unwrap_or_else(|| panic!("{invalid}"));
+                if matches!(invalid, "query" | "body") {
+                    assert!(
+                        error.message.contains("depth exceeds")
+                            || error.message.contains("too-deep"),
+                        "{invalid}: {error:?}"
+                    );
+                } else if invalid == "budget" {
+                    assert!(error.message.contains("nodes and edges"), "{error:?}");
+                } else if invalid == "read" {
+                    assert_eq!(error.code, i32::from(pb::ErrorCode::EvaluationFailed));
+                    assert!(error.message.contains("lookup of function"), "{error:?}");
+                } else if invalid == "union" {
+                    assert!(error.message.contains("equality sort"), "{error:?}");
+                }
             }
             let mut inspect = program(0, 0);
             inspect.commands.remove(0);
@@ -2483,7 +2595,7 @@ mod constructor_action_dags {
     }
 
     #[test]
-    fn encoded_modes_keep_their_tree_limits_and_shallow_support() {
+    fn encoded_modes_execute_deep_action_graphs_and_keep_shallow_queries() {
         for mode in [
             pb::ExecutionMode::TermEncoding,
             pb::ExecutionMode::Proofs,
@@ -2505,11 +2617,14 @@ mod constructor_action_dags {
                 .egraph_id;
             let mut deep = program(300, 0);
             deep.commands.truncate(1);
+            deep.commands.push(pb::Command {
+                kind: Some(pb::command::Kind::Check(pb::Check { facts: vec![1] })),
+                ..Default::default()
+            });
             let response = run(&mut engine, id, deep);
-            assert!(response.outputs.is_empty());
-            assert!(
-                response.error.unwrap().message.contains("depth exceeds"),
-                "{mode:?}"
+            assert_eq!(
+                response.error, None,
+                "deep action and actual shallow witness in {mode:?}"
             );
             let mut shallow = program(5, 0);
             shallow.commands.truncate(1);
@@ -3087,8 +3202,8 @@ mod source_fresh_macro {
     #[test]
     fn later_rule_errors_keep_clean_constructor_and_runtime_prefixes() {
         // First case is an actual native type error after constructor creation.
-        // Second is native-valid but hits the existing retained-value guard
-        // after Source appended query/head nodes: those nodes must not escape.
+        // Second has a retained local that is representable by head sharing;
+        // its explicit later Panic must reach the receiver, not fail projection.
         for (head, native_error) in [
             ("(fresh-probe) (missing (unstable-fresh! Math))", true),
             (
@@ -3122,36 +3237,49 @@ mod source_fresh_macro {
             let provider = Arc::new(Provider::default());
             let mut source = Source::with_extension(None, &text, provider.clone()).unwrap();
             let mut phases = Vec::new();
-            let error = loop {
-                match source.next().expect("missing deferred error") {
+            let mut projection_error = None;
+            for phase in source.by_ref() {
+                match phase {
                     Ok(phase) => phases.push(phase),
-                    Err(error) => break error.to_string(),
+                    Err(error) => {
+                        projection_error = Some(error.to_string());
+                        break;
+                    }
                 }
-            };
-            assert!(
-                error.contains(if native_error {
-                    "missing"
-                } else {
-                    "retained-value lowering"
-                }),
-                "{error}"
-            );
+            }
+            if native_error {
+                assert!(projection_error.unwrap().contains("missing"));
+            } else {
+                assert!(projection_error.is_none());
+                assert!(phases.iter().any(|phase| !phase.rules.is_empty()));
+                assert!(
+                    matches!(&phases.last().unwrap().commands[0].kind, Some(pb::command::Kind::Action(pb::Action { kind: Some(pb::action::Kind::Panic(message)), .. })) if message == "unreached suffix")
+                );
+            }
             assert!(source.next().is_none());
             assert_eq!(
                 provider.evaluations.load(Ordering::SeqCst),
                 0,
                 "Source executed a runtime primitive"
             );
-            assert_eq!(phases.len(), 4);
-            let prefix = phases.last().unwrap();
-            assert_eq!(
-                prefix.nodes.len(),
-                phases[2].nodes.len() + 1,
-                "failed rule leaked arena nodes"
-            );
-            assert!(
-                prefix.rules.is_empty() && prefix.rulesets.is_empty() && prefix.commands.is_empty()
-            );
+            let prefix = phases
+                .iter()
+                .rev()
+                .find(|phase| !phase.declarations.is_empty())
+                .unwrap();
+            if native_error {
+                assert_eq!(phases.len(), 4);
+                assert_eq!(
+                    prefix.nodes.len(),
+                    phases[2].nodes.len() + 1,
+                    "failed rule leaked arena nodes"
+                );
+                assert!(
+                    prefix.rules.is_empty()
+                        && prefix.rulesets.is_empty()
+                        && prefix.commands.is_empty()
+                );
+            }
             let Some(pb::declaration::Kind::Constructor(constructor)) =
                 &prefix.declarations[0].kind
             else {
@@ -3162,8 +3290,15 @@ mod source_fresh_macro {
             let mut renderer = Renderer::with_extension(provider.clone()).unwrap();
             let mut recorded = String::new();
             for phase in &phases {
-                assert_eq!(run(&mut engine, id, phase.clone()).error, None);
                 recorded.push_str(&renderer.render(phase).unwrap());
+                let response = run(&mut engine, id, phase.clone());
+                if !native_error && phase == phases.last().unwrap() {
+                    let error = response.error.unwrap();
+                    assert_eq!(error.code, i32::from(pb::ErrorCode::Panic));
+                    assert!(error.message.contains("unreached suffix"));
+                } else {
+                    assert_eq!(response.error, None);
+                }
             }
             assert_eq!(provider.evaluations.load(Ordering::SeqCst), 1);
             let mut observation = prefix.clone();
@@ -3207,7 +3342,12 @@ mod source_fresh_macro {
             assert_eq!(provider.evaluations.load(Ordering::SeqCst), before);
             for phase in fresh_phases {
                 let response = run(&mut fresh, id, phase);
-                assert_eq!(response.error, None);
+                if let Some(error) = &response.error {
+                    assert!(!native_error);
+                    assert_eq!(error.code, i32::from(pb::ErrorCode::Panic));
+                    assert!(error.message.contains("unreached suffix"));
+                    continue;
+                }
                 for output in &response.outputs {
                     match &output.kind {
                         Some(pb::command_output::Kind::PrintedFunction(table)) => assert_eq!(
@@ -9455,8 +9595,8 @@ fn core_renderer_rejects_unrepresentable_names_before_publication() {
         assert!(renderer.render(&phases[0]).unwrap().is_empty());
         assert!(renderer.render(&base).unwrap().is_empty());
     }
-    // Atom validity alone is insufficient: the restored head would be parsed
-    // as a Panic action. A failed phase must not consume even its ruleset.
+    // SSA places a callable named panic inside a Let initializer, where it is
+    // an expression rather than a Panic action. Verify actual semantic replay.
     let mut bad =
         Source::new_core(None, "(datatype T (panic String)) (extract (panic \"x\"))").unwrap();
     let mut program = bad.next().unwrap().unwrap();
@@ -9479,14 +9619,17 @@ fn core_renderer_rejects_unrepresentable_names_before_publication() {
         ..Default::default()
     }];
     let mut renderer = Renderer::core();
-    let error = renderer.render(&program).unwrap_err();
-    assert!(error.to_string().contains("changes meaning"), "{error}");
-    program.commands.clear();
-    let expected = Renderer::core().render(&program).unwrap();
-    let retried = renderer.render(&program).unwrap();
-    assert_eq!(retried, expected, "failed rendering must retain no prefix");
+    let rendered = renderer.render(&program).unwrap();
+    let mut native = egglog::EGraph::default();
+    native.parse_and_run_program(None, &rendered).unwrap();
+    assert_eq!(native.get_size("panic"), 1);
+    let mut engine = Engine::default();
+    let id = create(&mut engine);
+    for phase in Source::new_core(None, &rendered).unwrap() {
+        assert_eq!(run(&mut engine, id, phase.unwrap()).error, None);
+    }
     let commands = egglog::EGraph::default()
-        .parse_program(None, &retried)
+        .parse_program(None, &rendered)
         .unwrap();
     assert_eq!(
         commands
@@ -9496,6 +9639,7 @@ fn core_renderer_rejects_unrepresentable_names_before_publication() {
             .count(),
         1
     );
+    program.commands.clear();
     assert!(renderer.render(&program).unwrap().is_empty());
 }
 
@@ -18539,12 +18683,25 @@ fn source_rule_panics_keep_exact_span_and_occurrence_in_every_mode() {
                     let Some(pb::rule_decl::Kind::Rule(fired)) = &authored.kind else {
                         panic!("authored plain rule")
                     };
-                    let facts = [0, 2].map(|index| {
-                        let Some(pb::action::Kind::Term(node)) = fired.head[index].kind else {
-                            panic!("prefix/suffix action")
-                        };
-                        node
-                    });
+                    let panic = fired
+                        .head
+                        .iter()
+                        .position(|action| matches!(action.kind, Some(pb::action::Kind::Panic(_))))
+                        .unwrap();
+                    let term = |action: &pb::Action| match action.kind {
+                        Some(pb::action::Kind::Term(node)) => Some(node),
+                        _ => None,
+                    };
+                    let facts = [
+                        fired.head[..panic]
+                            .iter()
+                            .find_map(term)
+                            .expect("prefix action"),
+                        fired.head[panic + 1..]
+                            .iter()
+                            .find_map(term)
+                            .expect("suffix action"),
+                    ];
                     failed = Some((phase, facts));
                     break;
                 }
@@ -18984,27 +19141,47 @@ fn source_unused_fallible_local_alias_keeps_its_authored_action() {
 }
 
 #[test]
-fn source_constructor_aliases_before_deletion_require_retained_value_lowering() {
-    use egglog_experimental::protobuf::source::Source;
+fn source_constructor_aliases_retain_values_across_deletion() {
+    use egglog_experimental::protobuf::source::{Renderer, Source};
     for head in [
         "(let x (A)) (delete (A)) (R x)",
         "(let xs (vec-of (A))) (delete (A)) (R (vec-get xs 0))",
     ] {
         let text = format!(
-            "(datatype E (A)) (sort V (Vec E)) (relation R (E)) (rule () ({head})) (run 1)"
+            "(datatype E (A)) (sort V (Vec E)) (relation R (E)) (A) (rule () ({head})) (run 1) (fail (check (A))) (check (R x))"
         );
         for core in [false, true] {
+            let mut native = if core {
+                egglog::EGraph::default()
+            } else {
+                new_experimental_egraph()
+            };
+            native.parse_and_run_program(None, &text).unwrap();
             let source = if core {
                 Source::new_core(None, &text)
             } else {
                 Source::new(None, &text)
             }
             .unwrap();
-            let error = source.collect::<Result<Vec<_>, _>>().unwrap_err();
-            assert!(
-                error.to_string().contains("retained-value lowering"),
-                "{error}"
-            );
+            let mut renderer = if core {
+                Renderer::core()
+            } else {
+                Renderer::default()
+            };
+            let mut replay = if core {
+                egglog::EGraph::default()
+            } else {
+                new_experimental_egraph()
+            };
+            let mut engine = Engine::default();
+            let id = create(&mut engine);
+            for phase in source {
+                let phase = phase.unwrap();
+                replay
+                    .parse_and_run_program(None, &renderer.render(&phase).unwrap())
+                    .unwrap();
+                assert_eq!(run(&mut engine, id, phase).error, None);
+            }
         }
     }
 }
@@ -19266,8 +19443,8 @@ fn source_constructor_aliases_keep_identity_and_subsumption_after_use() {
 }
 
 #[test]
-fn source_base_read_aliases_remain_rejected_across_ordered_writes() {
-    use egglog_experimental::protobuf::source::Source;
+fn source_base_read_aliases_retain_staged_snapshot_across_ordered_writes() {
+    use egglog_experimental::protobuf::source::{Renderer, Source};
     let text = r#"
         (function current () i64 :merge new) (relation R (i64))
         (set (current) 1)
@@ -19289,8 +19466,25 @@ fn source_base_read_aliases_remain_rejected_across_ordered_writes() {
             Source::new(None, text)
         }
         .unwrap();
-        let error = source.collect::<Result<Vec<_>, _>>().unwrap_err();
-        assert!(error.to_string().contains("retained-value lowering"));
+        let mut renderer = if core {
+            Renderer::core()
+        } else {
+            Renderer::default()
+        };
+        let mut replay = if core {
+            egglog::EGraph::default()
+        } else {
+            new_experimental_egraph()
+        };
+        let mut engine = Engine::default();
+        let id = create(&mut engine);
+        for phase in source {
+            let phase = phase.unwrap();
+            replay
+                .parse_and_run_program(None, &renderer.render(&phase).unwrap())
+                .unwrap();
+            assert_eq!(run(&mut engine, id, phase).error, None);
+        }
     }
 }
 

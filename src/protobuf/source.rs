@@ -2550,26 +2550,11 @@ impl Source {
         } else {
             let query = self.facts(&rule.body)?;
             let mut head = Vec::with_capacity(rule.head.0.len());
-            // Ordinary Call sharing does not retain its result. Recreating a
-            // constructor is only safe while later actions cannot remove its
-            // row; this also applies under an otherwise pure primitive call.
-            let mut recreate_constructors = vec![true; rule.head.0.len()];
-            let mut destructive = false;
+            let mut consecutive_lets = vec![0; rule.head.0.len() + 1];
             for (index, action) in rule.head.0.iter().enumerate().rev() {
-                recreate_constructors[index] = !destructive;
-                // Subsume keeps the row and its class; subsequent constructor
-                // lookup cannot clear its dominant subsumption flag.
-                destructive |= matches!(action, ResolvedAction::Change(_, ast::Change::Delete, ..));
-                action.clone().visit_exprs(&mut |expr| {
-                    if let ResolvedExpr::Call(_, ResolvedCall::Primitive(primitive), _) = &expr
-                        && !primitive
-                            .prim_with_id
-                            .is_valid_in_context(egglog::Context::Pure)
-                    {
-                        destructive = true;
-                    }
-                    expr
-                });
+                if matches!(action, ResolvedAction::Let(..)) {
+                    consecutive_lets[index] = 1 + consecutive_lets[index + 1];
+                }
             }
             let mut index = 0;
             while index < rule.head.0.len() {
@@ -2577,32 +2562,22 @@ impl Source {
                 // and one helper write. Recognize the complete typed group
                 // before ordinary local-alias admission, never its name alone.
                 let mut group = None;
-                let captures = rule.head.0[index..]
-                    .iter()
-                    .take_while(|action| matches!(action, ResolvedAction::Let(..)))
-                    .count();
-                for (target_index, action) in rule
-                    .head
-                    .0
-                    .iter()
-                    .enumerate()
-                    .skip(index)
-                    .take(captures + 1)
-                {
-                    let ResolvedAction::Expr(
+                let captures = consecutive_lets[index];
+                let target_index = index + captures;
+                let cost_target = match rule.head.0.get(target_index) {
+                    Some(ResolvedAction::Expr(
                         span,
                         ResolvedExpr::Call(_, ResolvedCall::Func(target), key),
-                    ) = action
-                    else {
-                        continue;
-                    };
-                    let origin = self.cost_origins.lock().unwrap().sets.get(span).cloned();
-                    let Some((constructor, arity)) = origin else {
-                        continue;
-                    };
-                    if target_index != index + arity {
-                        continue;
-                    }
+                    )) => Some((span, target, key)),
+                    _ => None,
+                };
+                let origin = cost_target.and_then(|(span, _, _)| {
+                    self.cost_origins.lock().unwrap().sets.get(span).cloned()
+                });
+                if let Some((span, target, key)) = cost_target
+                    && let Some((constructor, arity)) = origin
+                    && target_index == index + arity
+                {
                     if target.name != constructor || key.len() != arity {
                         return Err("native set-cost target shape changed".into());
                     }
@@ -2656,7 +2631,6 @@ impl Source {
                         return Err("native set-cost capture escaped its group".into());
                     }
                     group = Some((self.action(write, Some(&captured))?, target_index + 2));
-                    break;
                 }
                 if let Some((action, next)) = group {
                     head.push(action);
@@ -2751,19 +2725,13 @@ impl Source {
                 }
                 if let ResolvedAction::Let(span, var, expr) = action {
                     let node = self.expr(expr, Some(&aliases), 0)?;
-                    if !pure_local_alias(expr, recreate_constructors[index]) {
-                        return Err("source local aliases with reads, stateful calls or constructors before destructive actions require retained-value lowering".into());
-                    }
                     aliases.insert(var.name.clone(), node);
-                    // Calls still evaluate at the authored position, including
-                    // unused constructors and fallible pure primitives. A
-                    // literal or retained variable needs no evaluation action.
-                    if matches!(expr, ResolvedExpr::Call(..)) {
-                        head.push(pb::Action {
-                            kind: Some(pb::action::Kind::Term(node)),
-                            span: self.span(span)?,
-                        });
-                    }
+                    // Preserve every authored first-demand position, including
+                    // unused/fallible calls and duplicate retained roots.
+                    head.push(pb::Action {
+                        kind: Some(pb::action::Kind::Term(node)),
+                        span: self.span(span)?,
+                    });
                 } else {
                     head.push(self.action(action, Some(&aliases))?);
                 }
@@ -2821,8 +2789,8 @@ impl Source {
             .collect()
     }
 
-    // Constructor aliases are closed. Mixed scopes must be the exact ordered
-    // local plan of an admitted DAG; observable alias reuse is not portable.
+    // Reconstruct the generated first-demand action plan without searching for
+    // equivalent expressions or retaining an ordinary value across commands.
     fn action_scope(
         &mut self,
         actions: &ast::GenericActions<ResolvedCall, ast::ResolvedVar>,
@@ -2831,9 +2799,6 @@ impl Source {
             .0
             .split_last()
             .ok_or("source action scope is empty")?;
-        if !matches!(terminal, ResolvedAction::Expr(..) | ResolvedAction::Set(..)) {
-            return Err("source action scope requires a Term or Set terminal".into());
-        }
         let mut aliases = HashMap::new();
         let mut dependencies = HashMap::new();
         let mut reached = HashSet::new();
@@ -2846,6 +2811,13 @@ impl Source {
                 ResolvedAction::Set(_, _, args, value) if position == prefix.len() => {
                     args.iter().chain([value]).collect()
                 }
+                ResolvedAction::Change(_, _, _, args) if position == prefix.len() => {
+                    args.iter().collect()
+                }
+                ResolvedAction::Union(_, lhs, rhs) if position == prefix.len() => {
+                    vec![lhs, rhs]
+                }
+                ResolvedAction::Panic(..) if position == prefix.len() => vec![],
                 _ => return Err("source action scope requires local Lets and one terminal".into()),
             };
             let mut used = HashSet::new();
@@ -2884,65 +2856,37 @@ impl Source {
             return Err("source action scope has an unreachable local evaluation".into());
         }
         let action = self.action(terminal, Some(&aliases))?;
-        if !matches!(
-            action.kind,
-            Some(pb::action::Kind::Term(_) | pb::action::Kind::Set(_))
-        ) {
-            return Err("source action scope terminal is not a plain Term or Set".into());
-        }
         if !constructor_only {
             let native_spans = NativeSpans::default();
-            let NodeGraphMetrics {
-                depths,
-                expansions,
-                order,
-            } = validate_node_graph(&self.program, &native_spans)?;
-            // Source can know only an authored alias for a structural sort.
-            // Match execution's canonical sort context without changing it.
-            let mut graph = self.graph.clone();
-            materialize_sorts(
-                &self.program,
-                &mut graph,
-                &mut HashSet::new(),
-                &native_spans,
-            )?;
-            let constructors = self
-                .program
-                .nodes
-                .iter()
-                .filter_map(|node| match &node.kind {
-                    Some(pb::node::Kind::Call(call))
-                        if self.graph.authoring_type_info().is_constructor(&call.func)
-                            && !self.relations.contains(&call.func) =>
-                    {
-                        Some(call.func.clone())
-                    }
-                    _ => None,
-                })
-                .collect();
-            // Reuse admission and first-demand lowering, including opaque Call
-            // barriers. Inlining locals must reproduce their actual order once.
+            validate_node_graph(&self.program, &native_spans)?;
+            // Reuse admission and first-demand lowering. Inlining locals must
+            // reproduce their actual order once.
             let position = self.program.commands.len() as u32;
             self.program.commands.push(pb::Command {
                 kind: Some(pb::command::Kind::Action(action.clone())),
                 ..Default::default()
             });
-            let selected = classify_constructor_dags(
-                &self.program,
-                &constructors,
-                &depths,
-                &expansions,
-                &order,
-                &graph,
-            );
+            let selected = classify_action_dags(&self.program);
             self.program.commands.pop();
             let selected = selected?;
-            let closed = selected
+            let _reachable = selected
                 .get(&vec![position])
                 .ok_or("source action scope is not an admitted ordered constructor DAG")?;
-            let (_, expected) =
-                constructor_dag_actions(&self.program, &action, |_| false, &native_spans, closed)?;
-            if expected != evaluations {
+            let (_, expected) = action_dag_actions(
+                &self.program,
+                &action,
+                |_| false,
+                &native_spans,
+                &mut HashMap::new(),
+                &mut 0,
+            )?;
+            let locals: HashSet<_> = evaluations.iter().copied().collect();
+            if expected
+                .into_iter()
+                .filter(|node| locals.contains(node))
+                .collect::<Vec<_>>()
+                != evaluations
+            {
                 return Err(
                     "source action scope changes first-demand evaluation order or alias reuse"
                         .into(),
@@ -3219,28 +3163,6 @@ impl Source {
             start: u32::try_from(span.i).map_err(|_| "source span exceeds u32")?,
             end: u32::try_from(span.j).map_err(|_| "source span exceeds u32")?,
         }))
-    }
-}
-
-// Pure registration excludes ambient reads/writes, but its arguments may still
-// construct equality values. Guard those recursively against later deletion or
-// other stateful calls. Query/global capture Vars already retain their values.
-fn pure_local_alias(expr: &ResolvedExpr, recreate_constructors: bool) -> bool {
-    match expr {
-        ResolvedExpr::Lit(..) | ResolvedExpr::Var(..) => true,
-        ResolvedExpr::Call(_, call, args) => {
-            let pure = match call {
-                ResolvedCall::Func(function) => {
-                    recreate_constructors && function.subtype == ast::FunctionSubtype::Constructor
-                }
-                ResolvedCall::Primitive(primitive) => primitive
-                    .prim_with_id
-                    .is_valid_in_context(egglog::Context::Pure),
-            };
-            pure && args
-                .iter()
-                .all(|arg| pure_local_alias(arg, recreate_constructors))
-        }
     }
 }
 
@@ -4174,6 +4096,15 @@ fn render_prepared(
             let labels: HashMap<_, _> = prepared.rules.iter().zip(&prepared.definitions.rules)
                 .map(|(native, rule)| (native.as_str(), rule.name.as_deref().unwrap_or("")))
                 .collect();
+            let mut rule_indices = HashMap::new();
+            for (index, name) in prepared.rules.iter().enumerate() {
+                rule_indices.insert(name.clone(), index);
+                if matches!(rule_program.rules[index].kind, Some(pb::rule_decl::Kind::Birewrite(_))) {
+                    rule_indices.insert(format!("{name}=>"), index);
+                    rule_indices.insert(format!("{name}<="), index);
+                }
+            }
+            let mut rendered_sugar = HashSet::new();
             let function_constructors: HashSet<_> = program.sorts.iter().enumerate()
                 .filter(|(_, sort)| matches!(sort.kind, Some(pb::sort::Kind::Func(_))))
                 // Signature patterns have no native constructor. Only closed
@@ -4188,24 +4119,66 @@ fn render_prepared(
                 }
                 let Some(mut command) = installation.command.clone() else { continue };
                 if let Command::Rule { rule } = &mut command {
-                    let index = prepared.rules.iter().position(|name| name == &rule.name)
-                        .ok_or("missing prepared rule occurrence")?;
+                    let index = *rule_indices.get(&rule.name).ok_or("missing prepared rule occurrence")?;
+                    let rewrite = match &rule_program.rules[index].kind {
+                        Some(pb::rule_decl::Kind::Rewrite(rewrite)) => Some((rewrite.lhs, rewrite.rhs, &rewrite.conditions, Some(rewrite.subsume))),
+                        Some(pb::rule_decl::Kind::Birewrite(rewrite)) => Some((rewrite.lhs, rewrite.rhs, &rewrite.conditions, None)),
+                        _ => None,
+                    };
+                    if let Some((lhs, rhs, conditions, subsume)) = rewrite {
+                        // Keep small authored rewrites readable. This bounded
+                        // presentation-only walk never expands a large RHS;
+                        // those use the already-flat native Rule instead.
+                        let mut pending = vec![(lhs, 0), (rhs, 0)];
+                        let mut remaining = 1024usize;
+                        let mut readable = true;
+                        while let Some((index, depth)) = pending.pop() {
+                            if remaining == 0 || depth >= 64 { readable = false; break; }
+                            remaining -= 1;
+                            let children = match &rule_program.nodes[index as usize].kind {
+                                Some(pb::node::Kind::Call(call) | pb::node::Kind::GetCost(call)) => &call.args,
+                                Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue { value: Some(pb::primitive_value::Value::PartialCall(call)) })) => &call.args,
+                                _ => continue,
+                            };
+                            pending.extend(children.iter().map(|child| (*child, depth + 1)));
+                        }
+                        if readable {
+                            if !rendered_sugar.insert(index) { continue; }
+                            let rewrite = ast::Rewrite { span: rule.span.clone(), lhs: expression(rule_program, lhs, &mut HashSet::new(), &rule_spans)?.map_symbols(&mut |h| h, &mut |v: String| native_name("var", &v)), rhs: expression(rule_program, rhs, &mut HashSet::new(), &rule_spans)?.map_symbols(&mut |h| h, &mut |v: String| native_name("var", &v)), conditions: facts(rule_program, conditions, &rule_spans)?, name: prepared.rules[index].clone() };
+                            command = if let Some(subsume) = subsume { Command::Rewrite(rule.ruleset.clone(), rewrite, subsume) } else { Command::BiRewrite(rule.ruleset.clone(), rewrite) };
+                        }
+                    }
+                }
+                if let Command::Rule { rule } = &mut command {
+                    let index = *rule_indices.get(&rule.name).ok_or("missing prepared rule occurrence")?;
                     if let Some(pb::rule_decl::Kind::Rule(body)) = &rule_program.rules[index].kind {
                         let mut head = Vec::new();
-                        for (index, action) in body.head.iter().enumerate() {
-                            if dialect == Dialect::Experimental {
-                                head.extend(source_cost_actions(rule_program, action, index, prepared.request, true, constructor_cost_tables, &rule_spans)?);
-                            } else {
-                                // Core has no assigned-cost storage to clean up.
-                                // Project the canonical action, not native
-                                // cleanup's temporary Lets after dropping only
-                                // its auxiliary Delete. Preserve the prepared
-                                // query, occurrence and all rule options.
-                                head.extend(ast::GenericActions(lower_action(rule_program, action, &rule_spans)?)
-                                    .map_symbols(&mut |name| name, &mut |name: String| native_name("var", &name)).0);
+                        let mut memo = HashMap::new();
+                        let mut next = 0;
+                        let mut bindings = HashMap::new();
+                        check_variables(rule_program, &body.query, &mut bindings, true)?;
+                        for action in &body.head {
+                            let (mut actions, _) = action_dag_actions(rule_program, action, |name| bindings.contains_key(name), &rule_spans, &mut memo, &mut next)?;
+                            if let Some(pb::action::Kind::SetCost(set)) = &action.kind {
+                                if dialect == Dialect::Core { return Err("Core source has no assigned-cost storage".into()); }
+                                let Action::Set(span, _, args, cost) = actions.pop().unwrap() else { unreachable!() };
+                                actions.push(Action::Expr(span.clone(), Expr::Call(span.clone(), "set-cost".into(), vec![Expr::Call(span, set.target.as_ref().unwrap().func.clone(), args), cost])));
+                            } else if dialect == Dialect::Experimental
+                                && let Some(Action::Change(span, ast::Change::Delete, target, args)) = actions.last()
+                                && let Some((helper, _)) = constructor_cost_tables.iter().find(|(_, constructor)| *constructor == target)
+                            {
+                                actions.push(Action::Change(span.clone(), ast::Change::Delete, helper.clone(), args.clone()));
                             }
+                            head.extend(ast::GenericActions(actions).map_symbols(&mut |name| name, &mut |name: String| native_name("var", &name)).0);
                         }
                         rule.head.0 = head;
+                    }
+                    for (index, action) in rule.head.0.iter_mut().enumerate() {
+                        if let Action::Expr(span, expr) = action
+                            && !matches!(expr, Expr::Call(..))
+                        {
+                            *action = Action::Let(span.clone(), format!("__egglog_proto_term_{index}"), expr.clone());
+                        }
                     }
                 }
                 let name = match &mut command {
@@ -4214,7 +4187,7 @@ fn render_prepared(
                     _ => None,
                 };
                 if let Some(name) = name {
-                    *name = labels.get(name.as_str()).ok_or("missing prepared rule label")?.to_string();
+                    *name = if let Some(label) = labels.get(name.as_str()) { label.to_string() } else if let Some((base, suffix)) = name.strip_suffix("=>").map(|base| (base, "=>")).or_else(|| name.strip_suffix("<=").map(|base| (base, "<="))) { format!("{}{suffix}", labels.get(base).ok_or("missing prepared rule label")?) } else { return Err("missing prepared rule label".into()); };
                 }
                 // PartialCall's first String is a typed callable reference.
                 // Other String literals, including identical spellings, are data.
@@ -4260,12 +4233,12 @@ fn render_prepared(
             let span = native_span(program, command.span.as_ref(), native_spans)?;
             match command.kind.as_ref().ok_or("missing command kind")? {
                 pb::command::Kind::Action(action) => {
-                    if let Some(closed) = prepared.context.constructor_dags.get(&vec![position as u32]) {
+                    if prepared.context.action_dags.contains_key(&vec![position as u32]) {
                         commands.push(Command::ActionScope(span, ast::GenericActions(
-                            constructor_dag_actions(program, action, |name| occupied.contains(name)
+                            action_dag_actions(program, action, |name| occupied.contains(name)
                                 || native.get_sort_by_name(name).is_some()
                                 || native.type_info().get_func_type(name).is_some()
-                                || native.type_info().is_primitive(name), native_spans, closed)?.0,
+                                || native.type_info().is_primitive(name), native_spans, &mut HashMap::new(), &mut 0)?.0,
                         )));
                     } else {
                         commands.extend(
