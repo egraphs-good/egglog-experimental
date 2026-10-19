@@ -186,13 +186,94 @@ fn source_definition_and_global_let_intake_does_not_clone_accumulated_native_bod
             0,
             "{count} definitions copied native context"
         );
-        assert!(phases.iter().any(|phase| phase.rules.len() == count));
+        assert_eq!(
+            phases.iter().map(|phase| phase.rules.len()).sum::<usize>(),
+            count
+        );
+        assert!(phases.iter().all(|phase| phase.rules.len() <= 1));
+        assert!(
+            phases
+                .iter()
+                .filter(|phase| !phase.commands.is_empty())
+                .all(|phase| phase.rules.is_empty())
+        );
         assert!(phases.iter().any(|phase| {
             phase
                 .commands
                 .iter()
                 .any(|command| matches!(command.kind, Some(pb::command::Kind::Action(_))))
         }));
+    }
+}
+
+#[test]
+fn source_rule_packets_keep_only_new_or_published_occurrences() {
+    use egglog_experimental::protobuf::source::Source;
+    let text = r#"
+        (datatype E (N i64)) (ruleset unused) (ruleset r)
+        (rule ((N x)) ((N x)) :ruleset unused :name "unused")
+        (rule ((N x)) ((N x)) :ruleset r :name "selected")
+        (let $first (N 1)) (run r 1)
+        (rule ((N x)) ((N x)) :ruleset r :name "later")
+        (let $second (N 2)) (run r 1) (run r 1)
+    "#;
+    for core in [false, true] {
+        for mode in [
+            pb::ExecutionMode::Normal,
+            pb::ExecutionMode::TermEncoding,
+            pb::ExecutionMode::Proofs,
+            pb::ExecutionMode::ProofTesting,
+        ] {
+            let source = if core {
+                Source::new_core(None, text)
+            } else {
+                Source::new(None, text)
+            }
+            .unwrap()
+            .with_execution_mode(mode)
+            .unwrap();
+            let mut records = std::collections::HashMap::new();
+            let mut labels = Vec::new();
+            let mut captures = 0;
+            let mut runs = 0;
+            for phase in source {
+                let phase = phase.unwrap();
+                assert!(phase.rules.len() <= 1);
+                for rule in &phase.rules {
+                    let name = rule.name.clone().unwrap();
+                    labels.push(name.clone());
+                    if let Some(previous) = records.insert(name, rule.clone()) {
+                        assert_eq!(previous, *rule, "publication changed an occurrence");
+                    }
+                }
+                for set in &phase.rulesets {
+                    if let Some(pb::ruleset::Kind::Rules(list)) = &set.kind {
+                        assert_eq!(list.rules, [0], "global rule index was not localized");
+                    }
+                }
+                match phase
+                    .commands
+                    .first()
+                    .and_then(|command| command.kind.as_ref())
+                {
+                    Some(pb::command::Kind::Action(_)) => {
+                        captures += 1;
+                        assert!(phase.rules.is_empty(), "capture repeated unused rules");
+                    }
+                    Some(pb::command::Kind::Run(_)) => {
+                        let expected = [Some("selected"), Some("later"), None][runs];
+                        assert_eq!(
+                            phase.rules.first().and_then(|rule| rule.name.as_deref()),
+                            expected
+                        );
+                        runs += 1;
+                    }
+                    _ => (),
+                }
+            }
+            assert_eq!(labels, ["unused", "selected", "selected", "later", "later"]);
+            assert_eq!((captures, runs), (2, 3));
+        }
     }
 }
 
@@ -19179,8 +19260,8 @@ fn source_rule_options_preserve_rematching_and_subsumed_queries() {
             let mut rendered = String::new();
             let mut engine = Engine::default();
             let id = create(&mut engine);
-            // Source resubmits its cumulative arena. Repeated presentations
-            // must retain one unchanged occurrence, not count as new rules.
+            // First-position validation and later publication retain one
+            // unchanged occurrence, not distinct rules with equal bodies.
             let mut occurrence = None;
             for phase in source {
                 let phase = pb::Program::decode(phase.unwrap().encode_to_vec().as_slice()).unwrap();
@@ -21442,6 +21523,8 @@ fn source_combined_rulesets_preserve_shared_occurrences_and_cursors() {
                 names,
                 HashSet::from_iter(["fresh", "later"].map(String::from))
             );
+            assert_eq!(phase.rules.len(), 1);
+            assert_eq!(phase.rules[0].name.as_deref(), Some("fresh"));
         }
         let response = pb::RunProgramResponse::decode(
             engine
@@ -21842,13 +21925,19 @@ fn source_rule_growth_preserves_old_versions_occurrences_and_cursors() {
                             _ => None,
                         })
                         .expect("growth publishes a fresh anonymous suffix");
-                    assert_eq!(suffix.rules, [1]);
+                    assert_eq!(phase.rules.len(), 1);
+                    assert_eq!(phase.rules[0].name.as_deref(), Some("b"));
+                    assert_eq!(suffix.rules, [0]);
                     assert!(phase.rulesets.iter().any(|set| matches!(&set.kind,
                         Some(pb::ruleset::Kind::Combined(combined)) if combined.rulesets.len() == 2
                             && matches!(&combined.rulesets[0].kind, Some(pb::ruleset_ref::Kind::Name(name)) if name == leaf)
                             && matches!(&combined.rulesets[1].kind, Some(pb::ruleset_ref::Kind::Index(index)) if *index as usize == delta))));
                 }
                 if is_run && actual.len() >= 2 {
+                    assert!(
+                        phase.rules.is_empty(),
+                        "unchanged runs repeated rule bodies"
+                    );
                     assert!(
                         phase.rulesets.is_empty(),
                         "unchanged child versions republished a selector"

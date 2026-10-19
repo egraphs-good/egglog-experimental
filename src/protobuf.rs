@@ -11771,6 +11771,16 @@ mod tests {
 
         let (mut engine, id) = host_default_engine();
         let mut program = inventory_fixture(&source);
+        // The bundle needs the published body, not the final action phase's
+        // now-empty rule list. Its cumulative node arena still retains roots.
+        let publication = source::Source::new(Some("fixture.egg".into()), &source)
+            .unwrap()
+            .map(Result::unwrap)
+            .find(|phase| !phase.rulesets.is_empty())
+            .unwrap();
+        assert_eq!(publication.rulesets, program.rulesets);
+        assert_eq!(publication.rules.len(), 1);
+        program.rules = publication.rules;
         let mut definitions = program.clone();
         definitions.commands.clear();
         assert_eq!(run_host_default(&mut engine, id, definitions).error, None);

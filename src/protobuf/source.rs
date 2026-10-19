@@ -739,6 +739,7 @@ impl Source {
         expanded: Vec<Command>,
         explicit_sort_alias: Option<String>,
     ) -> Result<pb::Program, String> {
+        let first_rule = self.program.rules.len();
         let encoded = self
             .mode
             .is_some_and(|mode| mode != pb::ExecutionMode::Normal);
@@ -1664,13 +1665,13 @@ impl Source {
             }
         }
         self.pending_error = definition_error;
-        let program = self.phase(publish)?;
+        let program = self.phase(publish, first_rule)?;
         Ok(program)
     }
 
     // One phase owns exactly its completed command prefix and new definitions;
     // immutable rule cursors remain publication-local, including failed macros.
-    fn phase(&mut self, publish: Vec<usize>) -> Result<pb::Program, String> {
+    fn phase(&mut self, publish: Vec<usize>, first_rule: usize) -> Result<pb::Program, String> {
         let mut tables = self
             .graph
             .extension_state::<SourceTableNames>()
@@ -1702,6 +1703,31 @@ impl Source {
                 ));
             }
         }
+        // The private arena retains every authored occurrence for later
+        // publication. A packet needs only its new validation obligations and
+        // occurrences referenced by the versions being published now.
+        let mut rule_indices: Vec<_> = (first_rule..self.program.rules.len()).collect();
+        for &index in &publish {
+            if let Some(pb::ruleset::Kind::Rules(list)) = &self.program.rulesets[index].kind {
+                rule_indices.extend(list.rules.iter().map(|index| *index as usize));
+            }
+        }
+        rule_indices.sort_unstable();
+        rule_indices.dedup();
+        let local_rules: HashMap<usize, u32> = rule_indices
+            .iter()
+            .enumerate()
+            .map(|(local, global)| {
+                Ok((
+                    *global,
+                    u32::try_from(local).map_err(|_| "too many source rules")?,
+                ))
+            })
+            .collect::<Result<_, String>>()?;
+        let rules = rule_indices
+            .into_iter()
+            .map(|index| self.program.rules[index].clone())
+            .collect();
         let local_rulesets: HashMap<usize, u32> = publish
             .iter()
             .enumerate()
@@ -1716,14 +1742,22 @@ impl Source {
             .into_iter()
             .map(|index| {
                 let mut ruleset = self.program.rulesets[index].clone();
-                if let Some(pb::ruleset::Kind::Combined(combined)) = &mut ruleset.kind {
-                    for child in &mut combined.rulesets {
-                        if let Some(pb::ruleset_ref::Kind::Index(index)) = &mut child.kind {
-                            *index = *local_rulesets
-                                .get(&(*index as usize))
-                                .expect("new anonymous deltas are published with their version");
+                match &mut ruleset.kind {
+                    Some(pb::ruleset::Kind::Rules(list)) => {
+                        for index in &mut list.rules {
+                            *index = local_rules[&(*index as usize)];
                         }
                     }
+                    Some(pb::ruleset::Kind::Combined(combined)) => {
+                        for child in &mut combined.rulesets {
+                            if let Some(pb::ruleset_ref::Kind::Index(index)) = &mut child.kind {
+                                *index = *local_rulesets.get(&(*index as usize)).expect(
+                                    "new anonymous deltas are published with their version",
+                                );
+                            }
+                        }
+                    }
+                    None => unreachable!("source versions always have a kind"),
                 }
                 ruleset
             })
@@ -1735,9 +1769,7 @@ impl Source {
             files: self.program.files.clone(),
             declarations: std::mem::take(&mut self.program.declarations),
             commands: std::mem::take(&mut self.program.commands),
-            // Unused rules are still validated at their source position. Only
-            // binding/publication waits until the first run of the theory.
-            rules: self.program.rules.clone(),
+            rules,
             rulesets,
         };
         let types: &egglog::TypeInfo = self.graph.authoring_type_info();
@@ -1760,6 +1792,7 @@ impl Source {
         captures: Vec<String>,
         deletion: Option<String>,
     ) -> Result<pb::Program, String> {
+        let first_rule = self.program.rules.len();
         let deleting = deletion.is_some();
         let (constructor, arity) = if let Some(constructor) = deletion {
             (constructor, captures.len())
@@ -1830,7 +1863,7 @@ impl Source {
                     }
                     self.program.commands.extend(prefix);
                     self.pending_error = Some(error.to_string());
-                    return self.phase(Vec::new());
+                    return self.phase(Vec::new(), first_rule);
                 }
             };
             let [N::CoreAction(action)] = resolved.as_slice() else {
@@ -1935,7 +1968,7 @@ impl Source {
                 }),
             })),
         });
-        self.phase(Vec::new())
+        self.phase(Vec::new(), first_rule)
     }
 
     // Resolve the current authored closure into immutable wire versions. A new
