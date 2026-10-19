@@ -502,10 +502,10 @@ but FunctionRow's old integer references and new cell messages are not compatibl
 reader layouts. Omitted max_rows bytes retain the all-rows meaning; explicit
 zero now means zero. Rust generates `Option<u64>`; Python readers must use
 `has_field("max_rows")`, since its scalar getter returns zero even when absent.
-This schema change does not establish adapter/source execution parity. The
-next finite adapter checkpoint covers only admitted Constructor/Function
-tables; a Unit-output Function is a cell-codec control, not Relation support.
-Real Relation admission, CSV/file output, encoded table observation and
+The byte adapter observes admitted Constructor, Function and Relation tables in
+all four execution modes. Encoded observations return logical live rows; native
+raw term-table dumps can retain historical or deleted rows and therefore differ.
+This does not establish full Source text parity. CSV/file output and
 Fail-observation remain separate required conformance gates.
 
 Opt-in `ProfileSummary.runs` aggregates by static authored `Run` site and
@@ -645,7 +645,7 @@ implementation. Defaults are checked without evaluation; omitted-argument
 expansion belongs to the frontend.
 
 Current limits include requests requiring `profile=true`, Normal-only
-Extract/PrintFunction/Freeze, native proof-mode restrictions on non-global
+Extract/Freeze, native proof-mode restrictions on non-global
 no-merge functions, and context-specific lowering/expansion budgets. Normal
 Term/Set actions and extraction roots have a bounded DAG path for closed
 constructor fragments, including native Vec `of`/`empty`, BigInt `from_string`
@@ -658,7 +658,11 @@ not changes to the schema contract.
 ### Source production and rendering
 
 [`protobuf::source::Source`](../src/protobuf/source.rs) resolves native source
-into ordered submissions before global removal or proof instrumentation.
+into ordered submissions. Before producing the first submission, use
+`with_execution_mode` once to select the target handle's execution mode; the
+selection is immutable. Omission uses Normal lowering. Native source admission
+and capture semantics follow the selected mode; this does not broaden ordinary
+wire Function admission or enable encoded-mode Extract.
 Includes are parsed when reached. Use `next_submission`, submit its Program or
 scope operation, and decode a successful response **before advancing**. Stop on
 source, transport or execution errors. Earlier completed phases remain visible;

@@ -528,6 +528,7 @@ impl ProtoRun {
             } else {
                 Source::new(filename.clone(), &program)
             }
+            .and_then(|source| source.with_execution_mode(self.mode))
             .and_then(|source| source.with_include_base(&self.include_base))
             .map_err(|error| format!("source admission before resugaring: {error}"))?;
             let mut renderer = if self.core {
@@ -583,6 +584,7 @@ impl ProtoRun {
         } else {
             Source::new(filename, &program)
         }
+        .and_then(|source| source.with_execution_mode(self.mode))
         .and_then(|source| source.with_include_base(&self.include_base));
         let (mut commands, mut source) = match (parsed, source) {
             (Ok(commands), Ok(source)) => (

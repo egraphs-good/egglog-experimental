@@ -92,6 +92,8 @@ struct SourceScope {
 /// protobuf records. The native graph holds only the producer's type environment.
 pub struct Source {
     dialect: Dialect,
+    mode: Option<pb::ExecutionMode>,
+    started: bool,
     graph: EGraph,
     // Keep the explicit provider alive for this type environment and its scopes.
     // Scope graphs inherit registrations; they never initialize it again.
@@ -224,7 +226,7 @@ pub fn produce_input(
     let signature = compiler
         .session
         .graph
-        .type_info()
+        .authoring_type_info()
         .get_func_type(&native_name("call", table))
         .cloned()
         .ok_or_else(|| TransportError(format!("unknown input table {table}")))?;
@@ -282,7 +284,7 @@ pub fn produce_input(
     .map_err(|error| TransportError(error.to_string()))?;
     let mut declaration = declaration;
     if descriptor.declarations.iter().any(|row| matches!(&row.kind, Some(pb::declaration::Kind::Relation(relation)) if relation.name == table)) {
-        let unit = compiler.session.graph.get_sort_by_name("Unit").unwrap();
+        let unit = compiler.session.graph.authoring_type_info().get_sort_by_name("Unit").unwrap();
         declaration.output = compiler.session.graph.export_sort(unit, &mut program.sorts).map_err(TransportError)?;
     }
     append_input_rows(&mut program, declaration, rows, span).map_err(TransportError)?;
@@ -301,6 +303,8 @@ pub(crate) fn primitive_definition(
 ) -> Result<pb::Program, String> {
     let mut source = Source {
         dialect: Dialect::Experimental,
+        mode: None,
+        started: false,
         graph: graph.clone(),
         _extension: None,
         commands: VecDeque::new(),
@@ -408,6 +412,8 @@ impl Source {
         }
         Ok(Self {
             dialect,
+            mode: None,
+            started: false,
             graph,
             _extension: extension,
             commands,
@@ -435,6 +441,27 @@ impl Source {
         })
     }
 
+    /// Select the immutable receiving mode before producing any submission.
+    /// This follows native source admission and global lowering in that mode;
+    /// it does not change the meaning of an ordinary wire Function.
+    pub fn with_execution_mode(mut self, mode: pb::ExecutionMode) -> Result<Self, TransportError> {
+        if self.started || self.mode.is_some() {
+            return Err(TransportError(
+                "source execution mode is already fixed".into(),
+            ));
+        }
+        self.graph = match mode {
+            pb::ExecutionMode::Normal => self.graph,
+            pb::ExecutionMode::TermEncoding => self.graph.with_term_encoding_enabled(),
+            pb::ExecutionMode::Proofs => self.graph.with_proofs_enabled(),
+            // Preserve authored Check commands; the receiving engine owns
+            // ProofTesting's conversion into proof requests.
+            pb::ExecutionMode::ProofTesting => self.graph.with_proofs_enabled(),
+        };
+        self.mode = Some(mode);
+        Ok(self)
+    }
+
     /// Resolve authored include paths against an explicit directory rather than
     /// the process working directory. Nested includes use this same base, as in
     /// native execution; source filenames remain the authored include paths.
@@ -459,6 +486,7 @@ impl Source {
     }
 
     fn advance(&mut self, scopes: bool) -> Option<Result<Submission, TransportError>> {
+        self.started = true;
         if let Some(error) = self.pending_error.take() {
             self.commands.clear();
             return Some(Err(TransportError(error)));
@@ -640,7 +668,7 @@ impl Source {
             _ => None,
         };
         let macros = self.graph.command_macros().clone();
-        let types = self.graph.type_info().clone();
+        let types = self.graph.authoring_type_info().clone();
         let mut expanded = macros
             .apply(command, &mut self.graph.parser.symbol_gen, &types)
             .map_err(|error| error.to_string())?;
@@ -685,11 +713,14 @@ impl Source {
         expanded: Vec<Command>,
         explicit_sort_alias: Option<String>,
     ) -> Result<pb::Program, String> {
+        let encoded = self
+            .mode
+            .is_some_and(|mode| mode != pb::ExecutionMode::Normal);
         // These single-command phases need real empty table backends for later
         // literal function captures. Fail also retains a global Let's header.
         // Compile before recording headers; preserving-globals export below
         // still supplies all wire metadata.
-        let compiler = match expanded.as_slice() {
+        let mut compiler = match expanded.as_slice() {
             [command] => {
                 let mut header = command;
                 while let Command::Fail(_, child) = header {
@@ -703,7 +734,8 @@ impl Source {
                         | Command::Constructor { .. }
                         | Command::Function { .. }
                         | Command::Action(Action::Let(..))
-                ) {
+                ) || (encoded && matches!(header, Command::Sort { .. }))
+                {
                     let mut graph = self.graph.clone();
                     // Source already expanded this command. Suppress a second
                     // provider transform only in the disposable compiler context.
@@ -730,7 +762,7 @@ impl Source {
                 let parsed = (|| {
                     let signature = self
                         .graph
-                        .type_info()
+                        .authoring_type_info()
                         .get_func_type(name)
                         .cloned()
                         .ok_or_else(|| {
@@ -945,7 +977,7 @@ impl Source {
                                 );
                             };
                             self.graph
-                                .type_info()
+                                .authoring_type_info()
                                 .get_func_type(name)
                                 .ok_or_else(|| format!("unknown keep-best table {name}"))?;
                             Ok(name.clone())
@@ -1005,6 +1037,7 @@ impl Source {
                     .resolve_command_preserving_globals(command.clone())
                     .map_err(|error| error.to_string())?;
                 let native = graph
+                    .authoring_type_info()
                     .get_sort_by_name(name)
                     .ok_or("missing resolved source sort")?
                     .clone();
@@ -1012,7 +1045,7 @@ impl Source {
                 let index = graph.export_sort(&native, &mut sorts)?;
                 let mut existing = self
                     .graph
-                    .type_info()
+                    .authoring_type_info()
                     .get_arcsorts_by(|sort| !sort.is_eq_sort());
                 existing.sort_by(|a, b| a.name().cmp(b.name()));
                 let canonical = existing.into_iter().find(|sort| {
@@ -1021,6 +1054,9 @@ impl Source {
                 if let Some(canonical) = canonical {
                     self.graph
                         .bind_source_sort_alias(name, canonical.name(), span.clone())?;
+                    // An alias registers no new sort in either environment.
+                    // Do not restore the disposable, separately compiled header.
+                    compiler = None;
                 } else {
                     self.graph = graph;
                 }
@@ -1109,7 +1145,7 @@ impl Source {
                         if let Some(constructor) = constructor {
                             let target = self
                                 .graph
-                                .type_info()
+                                .authoring_type_info()
                                 .get_func_type(&constructor)
                                 .ok_or("dynamic-cost constructor was not resolved")?;
                             if target.subtype != ast::FunctionSubtype::Constructor
@@ -1242,6 +1278,48 @@ impl Source {
                         let value = self.expr(&expr, None, 0)?;
                         let output = self.program.nodes[value as usize].sort_id;
                         let span = self.span(&span)?;
+                        if encoded {
+                            // Follow native proof_global_remover for an actual Let.
+                            // Native compiler validation above admits only Eq globals.
+                            self.program.declarations.push(pb::Declaration {
+                                kind: Some(pb::declaration::Kind::Constructor(pb::Constructor {
+                                    name: var.name.clone(),
+                                    output,
+                                    unextractable: true,
+                                    ..Default::default()
+                                })),
+                                hidden: true,
+                                span,
+                                ..Default::default()
+                            });
+                            let anchor = u32::try_from(self.program.nodes.len())
+                                .map_err(|_| "too many source nodes")?;
+                            self.program.nodes.push(pb::Node {
+                                sort_id: output,
+                                kind: Some(pb::node::Kind::Call(pb::Call {
+                                    func: var.name,
+                                    args: vec![],
+                                })),
+                                span,
+                            });
+                            let union = u32::try_from(self.program.nodes.len())
+                                .map_err(|_| "too many source nodes")?;
+                            self.program.nodes.push(pb::Node {
+                                sort_id: output,
+                                kind: Some(pb::node::Kind::Union(pb::Union {
+                                    members: vec![anchor, value],
+                                })),
+                                span,
+                            });
+                            self.program.commands.push(pb::Command {
+                                kind: Some(pb::command::Kind::Action(pb::Action {
+                                    kind: Some(pb::action::Kind::Term(union)),
+                                    span,
+                                })),
+                                span,
+                            });
+                            continue;
+                        }
                         self.program.declarations.push(pb::Declaration {
                             kind: Some(pb::declaration::Kind::Function(pb::Function {
                                 name: var.name.clone(),
@@ -1495,7 +1573,7 @@ impl Source {
             };
             let logical = self
                 .graph
-                .type_info()
+                .authoring_type_info()
                 .get_func_type(physical)
                 .and_then(|table| match &table.table_name {
                     Some(ast::TableName::Public(name)) => Some(name.clone()),
@@ -1550,7 +1628,7 @@ impl Source {
             rules: self.program.rules.clone(),
             rulesets,
         };
-        let types: &egglog::TypeInfo = self.graph.type_info();
+        let types: &egglog::TypeInfo = self.graph.authoring_type_info();
         let logical_name = |name: &mut String| {
             if let Some(function) = types.get_func_type(name)
                 && let Some(ast::TableName::Public(logical)) = &function.table_name
@@ -2991,6 +3069,7 @@ impl Source {
     fn sort(&mut self, name: &str) -> Result<u32, String> {
         let native = self
             .graph
+            .authoring_type_info()
             .get_sort_by_name(name)
             .ok_or_else(|| format!("unknown sort {name}"))?;
         self.graph.export_sort(native, &mut self.program.sorts)

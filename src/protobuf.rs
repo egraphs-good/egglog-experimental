@@ -2,8 +2,9 @@
 //!
 //! This executable slice supports concrete equality/scalar/Vec/Pair/Map/Maybe sorts,
 //! constructors, functions, Unit-annotated relation predicates, ordered actions,
-//! shared immutable rulesets, checks, requested proofs and table sizes in all four modes. Extraction and table rows remain
-//! ordinary-mode only. Unsupported forms fail explicitly before installation.
+//! shared immutable rulesets, checks, requested proofs, table sizes and logical
+//! table rows in all four modes. Extraction remains ordinary-mode only.
+//! Unsupported forms fail explicitly before installation.
 //! Explicit native extensions may additionally supply inert host-value codecs.
 //! In particular, profiling must currently be requested: the
 //! native engine cannot yet disable its optional timing collection.
@@ -1850,22 +1851,18 @@ impl Session {
                 return Ok(vec![]);
             }
             pb::command::Kind::PrintFunction(print) => {
-                if self.mode != pb::ExecutionMode::Normal {
-                    return Err(
-                        "encoded-mode table observation requires native observation support".into(),
-                    );
-                }
                 if print.table.is_empty() {
                     return Err("table name must not be empty".into());
                 }
-                if !self.names.callables.contains_key(&print.table) {
-                    return Err(PreparationError(Box::new(pb::Error {
+                let logical = self.names.callables.get(&print.table).ok_or_else(|| {
+                    PreparationError(Box::new(pb::Error {
                         code: pb::ErrorCode::UnknownName.into(),
                         message: format!("unknown table {}", print.table),
                         span: command.span,
                         ..Default::default()
-                    })));
-                }
+                    }))
+                })?;
+                stored_table_signature(&self.definitions, logical)?;
                 return Ok(vec![]);
             }
             pb::command::Kind::Freeze(_) => return Ok(vec![]),
@@ -2244,26 +2241,94 @@ impl Session {
                 None
             }
             pb::command::Kind::PrintFunction(print) => {
-                let function = self.graph.get_function(&print.table).unwrap();
-                let signature = function.func_type().clone();
                 let logical = self
                     .names
                     .callables
                     .get(&print.table)
                     .unwrap_or(&print.table);
-                let relation = self.definitions.declarations.iter().any(|declaration| {
-                    matches!(&declaration.kind, Some(pb::declaration::Kind::Relation(row)) if &row.name == logical)
-                });
+                let (expected_inputs, expected_output) =
+                    stored_table_signature(&self.definitions, logical)
+                        .map_err(egglog::Error::ExtractError)?;
+                let relation = expected_output.is_none();
                 let mut rows: Vec<(Vec<Value>, Value, bool)> = vec![];
-                if crate::table_rows::is_constructor(&self.graph, &print.table)? {
-                    self.graph.constructor_enodes(&print.table, |row| {
-                        rows.push((row.children.to_vec(), row.eclass, row.subsumed))
-                    })?;
+                let (input_sorts, output_sort) = if self.mode == pb::ExecutionMode::Normal {
+                    let function = self.graph.get_function(&print.table).unwrap();
+                    if crate::table_rows::is_constructor(&self.graph, &print.table)? {
+                        self.graph.constructor_enodes(&print.table, |row| {
+                            rows.push((row.children.to_vec(), row.eclass, row.subsumed))
+                        })?;
+                    } else {
+                        self.graph.function_entries(&print.table, |row| {
+                            rows.push((row.inputs.to_vec(), row.output, row.subsumed))
+                        })?;
+                    }
+                    (
+                        function.func_type().input.clone(),
+                        function.func_type().output.clone(),
+                    )
                 } else {
-                    self.graph.function_entries(&print.table, |row| {
-                        rows.push((row.inputs.to_vec(), row.output, row.subsumed))
+                    // Encoded term tables retain history and can have private
+                    // result columns. Only their metadata-linked live views
+                    // contain the logical rows requested by this command.
+                    let mut views = self.graph.functions_iter().filter(|(_, function)| {
+                        function.term_constructor() == Some(print.table.as_str())
+                    });
+                    let (_, view) = views.next().ok_or_else(|| {
+                        egglog::Error::ExtractError("encoded table has no native view".into())
                     })?;
-                }
+                    if views.next().is_some()
+                        || view.func_type().input.len() != expected_inputs.len() + 1
+                    {
+                        return Err(egglog::Error::ExtractError(
+                            "encoded table view signature is incompatible".into(),
+                        ));
+                    }
+                    let input_sorts = view.func_type().input[..expected_inputs.len()].to_vec();
+                    let output_sort = view.func_type().input.last().unwrap().clone();
+                    let mut checked_sorts = vec![];
+                    let mut exported = pb::RunProgramResponse::default();
+                    for (sort, expected) in input_sorts
+                        .iter()
+                        .chain(expected_output.map(|_| &output_sort))
+                        .zip(
+                            expected_inputs
+                                .iter()
+                                .map(|arg| arg.sort)
+                                .chain(expected_output),
+                        )
+                    {
+                        let expected = crate::builtin::import_sort(
+                            &self.definitions.sorts,
+                            expected,
+                            &mut checked_sorts,
+                        )
+                        .map_err(egglog::Error::ExtractError)?;
+                        let actual = encode_sort(&self.graph, &self.names, sort, &mut exported)?;
+                        let actual = crate::builtin::import_sort(
+                            &exported.sorts,
+                            actual,
+                            &mut checked_sorts,
+                        )
+                        .map_err(egglog::Error::ExtractError)?;
+                        if actual != expected {
+                            return Err(egglog::Error::ExtractError(
+                                "encoded table view column sort mismatch".into(),
+                            ));
+                        }
+                    }
+                    let limit = print.max_rows.map_or(usize::MAX, |limit| {
+                        usize::try_from(limit).unwrap_or(usize::MAX)
+                    });
+                    if limit != 0 {
+                        self.graph.function_entries_while(view.name(), |row| {
+                            let (value, args) =
+                                row.inputs.split_last().expect("validated view signature");
+                            rows.push((args.to_vec(), *value, row.subsumed));
+                            rows.len() < limit
+                        })?;
+                    }
+                    (input_sorts, output_sort)
+                };
                 if let Some(max_rows) = print.max_rows {
                     rows.truncate(usize::try_from(max_rows).unwrap_or(usize::MAX));
                 }
@@ -2271,12 +2336,12 @@ impl Session {
                     .iter()
                     .flat_map(|(args, value, _)| {
                         args.iter()
-                            .zip(&signature.input)
+                            .zip(&input_sorts)
                             .map(|(value, sort)| (sort.clone(), *value))
                             // A relation's native row class is not a value in
                             // the public IR. Observe inputs only, never extract
                             // or encode that hidden class or its private sort.
-                            .chain((!relation).then(|| (signature.output.clone(), *value)))
+                            .chain((!relation).then(|| (output_sort.clone(), *value)))
                     })
                     .collect();
                 let mut encoded = HashMap::new();
@@ -2325,10 +2390,9 @@ impl Session {
                 };
                 for (_, _, subsumed) in rows {
                     let mut cells = vec![];
-                    for sort in signature
-                        .input
+                    for sort in input_sorts
                         .iter()
-                        .chain((!relation).then_some(&signature.output))
+                        .chain((!relation).then_some(&output_sort))
                     {
                         let kind = match terms.next().unwrap() {
                             Some(term) => pb::table_cell::Kind::Term(*term),
@@ -3522,6 +3586,35 @@ fn validate_nullary_family(types: &egglog::TypeInfo, sort: &pb::Sort) -> Result<
 fn sort_name(sorts: &[pb::Sort], index: u32) -> Result<String, String> {
     structural_sort_name(sorts, index, &mut HashSet::new())?
         .ok_or_else(|| "runtime sort contains an open type parameter".into())
+}
+
+// Observation requires a concrete stored signature, even when its row limit
+// is zero. This check uses authored records only: preparation must not scan or
+// require native views that pending declarations have not installed yet.
+fn stored_table_signature<'a>(
+    definitions: &'a pb::Program,
+    name: &str,
+) -> Result<(&'a [pb::Arg], Option<u32>), String> {
+    let (inputs, output) = definitions
+        .declarations
+        .iter()
+        .find_map(|declaration| match &declaration.kind {
+            Some(pb::declaration::Kind::Constructor(row)) if row.name == name => {
+                Some((row.inputs.as_slice(), Some(row.output)))
+            }
+            Some(pb::declaration::Kind::Function(row)) if row.name == name => {
+                Some((row.inputs.as_slice(), Some(row.output)))
+            }
+            Some(pb::declaration::Kind::Relation(row)) if row.name == name => {
+                Some((row.inputs.as_slice(), None))
+            }
+            _ => None,
+        })
+        .ok_or_else(|| format!("{name} is not a stored table"))?;
+    for sort in inputs.iter().map(|arg| arg.sort).chain(output) {
+        sort_name(&definitions.sorts, sort)?;
+    }
+    Ok((inputs, output))
 }
 
 // Declarations install before use. Named computed bodies need their native

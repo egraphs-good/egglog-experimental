@@ -6,6 +6,599 @@ use egglog_experimental::protobuf::{
 use prost::Message;
 
 #[test]
+fn source_receiving_mode_preserves_actual_global_proof_requests() {
+    // Keep these small original Core fixtures local: dependency packages need
+    // not ship their test directories, and no sibling checkout is required.
+    let fixtures = [
+        (
+            "commute-collapse",
+            r#"
+(datatype Math
+  (Add i64 i64)
+  (Num i64))
+
+;; Commutativity
+(rule ((Add a b)) ((union (Add a b) (Add b a))) :name "rw1")
+
+;; Constant folding with an extra condition, forcing commute first
+(rule ((Add a b)
+       (> a b))
+      ((union (Add a b) (Num (+ a b)))) :name "rw2")
+
+;; 2 + 3
+(let start (Add 2 3))
+
+(run 2)
+
+;; 2 + 3 = 5 by
+;; 2 + 3 = 3 + 2 (commute)
+;; 3 + 2 = 5 (constant fold)
+(prove (= (Add 2 3) (Num 5)))"#,
+        ),
+        (
+            "eqsat-basic-proof",
+            r#"(datatype Math
+  (Num i64)
+  (Var String)
+  (Add Math Math)
+  (Mul Math Math))
+
+;; expr1 = 2 * (x + 3)
+(let $expr1 (Mul (Num 2) (Add (Var "x") (Num 3))))
+;; expr2 = 6 + 2 * x
+(let $expr2 (Add (Num 6) (Mul (Num 2) (Var "x"))))
+
+;; (rule ((= __root (Add a b)))
+;;       ((union __root (Add b a)))
+(rewrite (Add a b)
+         (Add b a))
+(rewrite (Mul a (Add b c))
+         (Add (Mul a b) (Mul a c)))
+(rewrite (Add (Num a) (Num b))
+         (Num (+ a b)))
+(rewrite (Mul (Num a) (Num b))
+         (Num (* a b)))
+
+(run 10)
+(prove (= $expr1 $expr2))
+"#,
+        ),
+    ];
+    for mode in [pb::ExecutionMode::Proofs, pb::ExecutionMode::ProofTesting] {
+        for (fixture, authored) in fixtures {
+            let graph = egglog::EGraph::default().with_proofs_enabled();
+            let mut native = if mode == pb::ExecutionMode::ProofTesting {
+                graph.with_proof_testing()
+            } else {
+                graph
+            };
+            let native_outputs = native.parse_and_run_program(None, authored).unwrap();
+            assert_eq!(
+                native_outputs
+                    .iter()
+                    .filter(|output| matches!(output, egglog::CommandOutput::ProveExists { .. }))
+                    .count(),
+                1
+            );
+            let mut text = authored.to_owned();
+            for replay in 0..2 {
+                let mut source = Source::new_core(None, &text)
+                    .unwrap()
+                    .with_execution_mode(mode)
+                    .unwrap();
+                let mut renderer = Renderer::core();
+                let mut rendered = String::new();
+                let mut engine = Engine::default();
+                let id = create(&mut engine, mode);
+                let mut proofs = 0;
+                while let Some(submission) = source.next_submission() {
+                    let egglog_experimental::protobuf::source::Submission::Program(program) =
+                        submission.unwrap()
+                    else {
+                        panic!("unexpected scope")
+                    };
+                    rendered.push_str(&renderer.render(&program).unwrap());
+                    let response = run(&mut engine, id, program);
+                    assert_eq!(response.error, None, "{fixture}/{mode:?}/replay{replay}");
+                    assert!(response.profile.unwrap().complete);
+                    for output in response.outputs {
+                        if let Some(pb::command_output::Kind::Proof(proof)) = output.kind {
+                            assert!(
+                                proof
+                                    .root
+                                    .is_some_and(|root| root < proof.proofs.len() as u32)
+                            );
+                            assert!(!proof.terms.is_empty());
+                            proofs += 1;
+                        }
+                    }
+                }
+                assert_eq!(proofs, 1, "{fixture}/{mode:?}/replay{replay}");
+                text = rendered;
+            }
+        }
+    }
+}
+
+#[test]
+fn source_receiving_mode_preserves_native_global_boundaries() {
+    for mode in [
+        pb::ExecutionMode::TermEncoding,
+        pb::ExecutionMode::Proofs,
+        pb::ExecutionMode::ProofTesting,
+    ] {
+        for (case, tail) in [
+            ("sizes", "(let $cap (N 1)) (print-size)"),
+            ("explicit-size", "(let $cap (N 1)) (print-size $cap)"),
+            (
+                "explicit-function",
+                "(let $cap (N 1)) (print-function $cap)",
+            ),
+            ("set", "(let $cap (N 1)) (set ($cap) (N 2))"),
+            ("delete", "(let $cap (N 1)) (delete ($cap))"),
+            ("repeated-let", "(let $cap (N 1)) (let $cap (N 2))"),
+            ("failed-init", "(fail (let $cap (N (/ 1 0)))) (print-size)"),
+            (
+                "failed-init-function",
+                "(fail (let $cap (N (/ 1 0)))) (print-function $cap)",
+            ),
+            ("ordinary-function", "(function f () E :no-merge)"),
+            ("primitive-let", "(let $base 1)"),
+            ("presort-alias", "(sort V (Vec i64)) (sort W (Vec i64))"),
+            (
+                "different-shapes",
+                "(sort V (Vec i64)) (sort W (Vec String)) (datatype X (XV V) (XW W)) (XW (vec-of \"one\")) (print-size) (rule ((XW xs)) ((XV xs)))",
+            ),
+            (
+                "sort-header",
+                "(sort S) (constructor A () S) (let $s (A)) (check (= $s (A)))",
+            ),
+            ("aggregate-size", "(let $cap (N 1)) (N (get-size!))"),
+            ("aggregate-nodes", "(let $cap (N 1)) (N (get-node-size!))"),
+            (
+                "scope",
+                "(push 1) (let $cap (N 1)) (check (= $cap (N 1))) (pop 1) (print-size)",
+            ),
+        ] {
+            let text = format!("(datatype E (N i64)) {tail}");
+            let graph = egglog_experimental::new_experimental_egraph();
+            let mut native = match mode {
+                pb::ExecutionMode::TermEncoding => graph.with_term_encoding_enabled(),
+                pb::ExecutionMode::Proofs => graph.with_proofs_enabled(),
+                _ => graph.with_proofs_enabled().with_proof_testing(),
+            };
+            let commands = native.parse_program(None, &text).unwrap();
+            let mut native_outputs = vec![];
+            let mut native_result = Ok(());
+            let mut native_boundary = None;
+            for (position, command) in commands.into_iter().enumerate() {
+                if let Err(error) =
+                    native.run_program_with_outputs(vec![command], &mut native_outputs)
+                {
+                    native_boundary = Some(position);
+                    native_result = Err(error);
+                    break;
+                }
+            }
+            let mut source = Source::new(None, &text)
+                .unwrap()
+                .with_execution_mode(mode)
+                .unwrap();
+            let mut engine = Engine::default();
+            let mut id = create(&mut engine, mode);
+            let mut saved = vec![];
+            let mut byte_sizes = vec![];
+            let mut byte_error = None;
+            let mut byte_boundary = None;
+            let mut position = 0;
+            while let Some(submission) = source.next_submission() {
+                use egglog_experimental::protobuf::source::Submission;
+                let current_position = position;
+                position += 1;
+                match submission {
+                    Err(error) => {
+                        byte_error = Some(error.to_string());
+                        byte_boundary = Some(current_position);
+                        break;
+                    }
+                    Ok(Submission::Program(program)) => {
+                        let response = run(&mut engine, id, program);
+                        for output in response.outputs {
+                            if let Some(pb::command_output::Kind::Sizes(sizes)) = output.kind {
+                                byte_sizes.push(
+                                    sizes
+                                        .sizes
+                                        .into_iter()
+                                        .map(|row| (row.table, row.rows))
+                                        .collect::<Vec<_>>(),
+                                );
+                            }
+                        }
+                        if let Some(error) = response.error {
+                            byte_error = Some(error.message);
+                            byte_boundary = Some(current_position);
+                            break;
+                        }
+                    }
+                    Ok(Submission::Push(count)) => {
+                        for _ in 0..count {
+                            let bytes = engine
+                                .clone_egraph(
+                                    &pb::CloneEGraphRequest { egraph_id: id }.encode_to_vec(),
+                                )
+                                .unwrap();
+                            saved.push(id);
+                            id = pb::CloneEGraphResponse::decode(bytes.as_slice())
+                                .unwrap()
+                                .egraph_id;
+                        }
+                    }
+                    Ok(Submission::Pop { count, .. }) => {
+                        for _ in 0..count {
+                            let parent = saved.pop().unwrap();
+                            engine
+                                .return_to(
+                                    &pb::ReturnToEGraphRequest {
+                                        active_id: id,
+                                        saved_id: parent,
+                                    }
+                                    .encode_to_vec(),
+                                )
+                                .unwrap();
+                            id = parent;
+                        }
+                    }
+                }
+            }
+            let native_sizes = native_outputs
+                .into_iter()
+                .filter_map(|output| match output {
+                    egglog::CommandOutput::PrintAllFunctionsSize(rows) => Some(
+                        rows.into_iter()
+                            .map(|(name, rows)| (name, rows as u64))
+                            .collect::<Vec<_>>(),
+                    ),
+                    egglog::CommandOutput::PrintFunctionSize(rows) => {
+                        Some(vec![("$cap".into(), rows as u64)])
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            eprintln!(
+                "{case}/{mode:?}: native={:?}; bytes={byte_error:?}; sizes={byte_sizes:?}",
+                native_result.as_ref().err().map(ToString::to_string)
+            );
+            assert_eq!(
+                byte_error.is_some(),
+                native_result.is_err(),
+                "{case}/{mode:?}"
+            );
+            assert_eq!(byte_boundary, native_boundary, "{case}/{mode:?}");
+            assert_eq!(byte_sizes, native_sizes, "{case}/{mode:?}");
+            // Observe the surviving operand table after failure/recovery without
+            // materializing a term or reading a hidden global by default.
+            let egglog::CommandOutput::PrintFunctionSize(native_n) =
+                native.print_size(Some("N")).unwrap()
+            else {
+                panic!("native N observation")
+            };
+            let response = run(
+                &mut engine,
+                id,
+                pb::Program {
+                    ir_version: 1,
+                    commands: vec![pb::Command {
+                        kind: Some(pb::command::Kind::PrintSize(pb::PrintSize {
+                            tables: vec!["N".into()],
+                        })),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                },
+            );
+            assert_eq!(response.error, None, "recovery {case}/{mode:?}");
+            let Some(pb::command_output::Kind::Sizes(sizes)) = &response.outputs[0].kind else {
+                panic!("wire N observation")
+            };
+            assert_eq!(
+                sizes.sizes[0].rows, native_n as u64,
+                "prefix {case}/{mode:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn source_receiving_modes_preserve_canonical_sort_alias_uses() {
+    let text = r#"
+        (sort V (Vec i64)) (sort W (Vec i64))
+        (sort NestedV (Vec V)) (sort NestedW (Vec W))
+        (datatype X (XV V) (XW W) (Nested NestedW) (Value))
+        (function f (V) X :merge old)
+        (XW (vec-of 2)) (XW (vec-of 1))
+        (rule ((XW xs)) ((XV xs) (set (f xs) (Value))))
+        (run 1)
+        (check (XV (vec-of 2)) (XV (vec-of 1)) (= (f (vec-of 1)) (Value)))
+        (Nested (vec-of (vec-of 1)))
+        (check (Nested (vec-of (vec-of 1))))
+        (print-size)
+    "#;
+    // Source compound sorts are structural. Its independent native reference
+    // uses the one canonical sort, not native's intentionally distinct V/W.
+    let canonical = r#"
+        (sort V (Vec i64)) (sort NestedV (Vec V))
+        (datatype X (XV V) (XW V) (Nested NestedV) (Value))
+        (function f (V) X :merge old)
+        (XW (vec-of 2)) (XW (vec-of 1))
+        (rule ((XW xs)) ((XV xs) (set (f xs) (Value))))
+        (run 1)
+        (check (XV (vec-of 2)) (XV (vec-of 1)) (= (f (vec-of 1)) (Value)))
+        (Nested (vec-of (vec-of 1)))
+        (check (Nested (vec-of (vec-of 1))))
+        (print-size)
+    "#;
+    for mode in [
+        pb::ExecutionMode::Normal,
+        pb::ExecutionMode::TermEncoding,
+        pb::ExecutionMode::Proofs,
+        pb::ExecutionMode::ProofTesting,
+    ] {
+        let graph = egglog_experimental::new_experimental_egraph();
+        let mut native = match mode {
+            pb::ExecutionMode::Normal => graph,
+            pb::ExecutionMode::TermEncoding => graph.with_term_encoding_enabled(),
+            pb::ExecutionMode::Proofs => graph.with_proofs_enabled(),
+            _ => graph.with_proofs_enabled().with_proof_testing(),
+        };
+        let outputs = native
+            .parse_and_run_program(None, canonical)
+            .unwrap_or_else(|error| panic!("canonical native/{mode:?}: {error}"));
+        let native_proofs = outputs
+            .iter()
+            .filter(|output| matches!(output, egglog::CommandOutput::ProveExists { .. }))
+            .count();
+        let native_sizes = outputs
+            .into_iter()
+            .find_map(|output| match output {
+                egglog::CommandOutput::PrintAllFunctionsSize(rows) => Some(
+                    rows.into_iter()
+                        .map(|(name, rows)| (name, rows as u64))
+                        .collect::<Vec<_>>(),
+                ),
+                _ => None,
+            })
+            .unwrap();
+        let source = Source::new(None, text)
+            .unwrap()
+            .with_execution_mode(mode)
+            .unwrap();
+        let mut engine = Engine::default();
+        let id = create(&mut engine, mode);
+        let mut proofs = 0;
+        let mut sizes = None;
+        let mut aliases = (false, false);
+        for phase in source {
+            let phase = phase.unwrap();
+            for sort in &phase.sorts {
+                let names = sort
+                    .egglog_aliases
+                    .iter()
+                    .map(|alias| alias.symbol.as_str())
+                    .collect::<Vec<_>>();
+                aliases.0 |= names == ["V", "W"];
+                aliases.1 |= names == ["NestedV", "NestedW"];
+            }
+            let response = run(&mut engine, id, phase);
+            assert_eq!(response.error, None, "canonical aliases/{mode:?}");
+            for output in response.outputs {
+                match output.kind {
+                    Some(pb::command_output::Kind::Proof(proof)) => {
+                        assert!(
+                            proof
+                                .root
+                                .is_some_and(|root| root < proof.proofs.len() as u32)
+                        );
+                        proofs += 1;
+                    }
+                    Some(pb::command_output::Kind::Sizes(rows)) => {
+                        sizes = Some(
+                            rows.sizes
+                                .into_iter()
+                                .map(|row| (row.table, row.rows))
+                                .collect::<Vec<_>>(),
+                        );
+                    }
+                    _ => {}
+                }
+            }
+        }
+        assert!(aliases.0 && aliases.1, "canonical alias metadata/{mode:?}");
+        assert_eq!(sizes.unwrap(), native_sizes, "canonical aliases/{mode:?}");
+        assert_eq!(proofs, native_proofs, "canonical aliases/{mode:?}");
+    }
+}
+
+#[test]
+fn source_receiving_modes_preserve_native_multi_vec_empty_failure_boundary() {
+    let canonical = "(sort V (Vec i64)) (sort NestedV (Vec V)) (datatype X (XV V) (XW V) (Nested NestedV) (Value)) (function f (V) X :merge old) (XW (vec-empty))";
+    let text = "(sort V (Vec i64)) (sort W (Vec i64)) (sort NestedV (Vec V)) (sort NestedW (Vec W)) (datatype X (XV V) (XW W) (Nested NestedW) (Value)) (function f (V) X :merge old) (XW (vec-empty))";
+    for mode in [
+        pb::ExecutionMode::TermEncoding,
+        pb::ExecutionMode::Proofs,
+        pb::ExecutionMode::ProofTesting,
+    ] {
+        let graph = egglog_experimental::new_experimental_egraph();
+        let mut native = match mode {
+            pb::ExecutionMode::TermEncoding => graph.with_term_encoding_enabled(),
+            pb::ExecutionMode::Proofs => graph.with_proofs_enabled(),
+            _ => graph.with_proofs_enabled().with_proof_testing(),
+        };
+        let commands = native.parse_program(None, canonical).unwrap();
+        let mut native_failure = None;
+        for (position, command) in commands.into_iter().enumerate() {
+            if let Err(error) = native.run_program(vec![command]) {
+                native_failure = Some((position, error.to_string()));
+                break;
+            }
+        }
+        let (position, message) = native_failure.expect("native ambiguity must remain visible");
+        assert_eq!(position, 4, "native/{mode:?}");
+        assert!(message.contains("Failed to infer a type for: @vec-empty"));
+        let source = Source::new(None, text)
+            .unwrap()
+            .with_execution_mode(mode)
+            .unwrap();
+        let mut engine = Engine::default();
+        let id = create(&mut engine, mode);
+        let mut byte_failure = None;
+        for (position, phase) in source.enumerate() {
+            let response = run(
+                &mut engine,
+                id,
+                phase.expect("producer must preserve valid aliases"),
+            );
+            if let Some(error) = response.error {
+                byte_failure = Some((position, error));
+                break;
+            }
+        }
+        let (position, error) = byte_failure.expect("receiver must preserve native ambiguity");
+        assert_eq!(position, 6, "receiver/{mode:?}");
+        assert_eq!(error.code, i32::from(pb::ErrorCode::InvalidProgram));
+        assert_eq!(error.message, message, "same native failure/{mode:?}");
+        assert!(matches!(
+            native.print_size(Some("XW")).unwrap(),
+            egglog::CommandOutput::PrintFunctionSize(0)
+        ));
+        let response = run(
+            &mut engine,
+            id,
+            pb::Program {
+                ir_version: 1,
+                commands: vec![pb::Command {
+                    kind: Some(pb::command::Kind::PrintSize(pb::PrintSize {
+                        tables: vec!["XW".into()],
+                    })),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        );
+        assert_eq!(response.error, None);
+        let Some(pb::command_output::Kind::Sizes(sizes)) = &response.outputs[0].kind else {
+            panic!("typed XW size")
+        };
+        assert_eq!(
+            sizes.sizes[0].rows, 0,
+            "no failed empty publication/{mode:?}"
+        );
+    }
+}
+
+#[test]
+fn source_receiving_mode_aggregate_values_match_native_exactly() {
+    // Capture both reads in inert i64 relation inputs before any observation.
+    // Normal supports these primitives; encoded modes reject their missing
+    // validators; the native-global test retains those rejection cases.
+    let text = "(datatype E (N i64)) (let $cap (N 1)) (relation Observed (i64 i64)) (Observed (get-size!) (get-node-size!)) (print-function Observed)";
+    let mut native = egglog_experimental::new_experimental_egraph();
+    let mut native_values = vec![];
+    for output in native.parse_and_run_program(None, text).unwrap() {
+        if let egglog::CommandOutput::PrintFunction(_, dag, rows, _) = output {
+            for (term, _) in rows {
+                let egglog::Term::App(_, args) = dag.get(term) else {
+                    panic!("native relation row must be an application")
+                };
+                native_values.push(
+                    args.iter()
+                        .map(|term| match dag.get(*term) {
+                            egglog::Term::Lit(egglog::ast::Literal::Int(value)) => *value,
+                            other => panic!("native size input must be i64: {other:?}"),
+                        })
+                        .collect::<Vec<_>>(),
+                );
+            }
+        }
+    }
+    let source = Source::new(None, text)
+        .unwrap()
+        .with_execution_mode(pb::ExecutionMode::Normal)
+        .unwrap();
+    let mut engine = Engine::default();
+    let id = create(&mut engine, pb::ExecutionMode::Normal);
+    let mut byte_values = vec![];
+    for phase in source {
+        let response = run(&mut engine, id, phase.unwrap());
+        assert_eq!(response.error, None);
+        for output in &response.outputs {
+            if let Some(pb::command_output::Kind::PrintedFunction(table)) = &output.kind {
+                assert_eq!(table.table, "Observed");
+                for row in &table.rows {
+                    byte_values.push(
+                        row.args
+                            .iter()
+                            .map(|cell| {
+                                let Some(pb::table_cell::Kind::Term(term)) = &cell.kind else {
+                                    panic!("encoded size input must be available")
+                                };
+                                match &response.nodes[*term as usize].kind {
+                                    Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
+                                        value: Some(pb::primitive_value::Value::I64(value)),
+                                    })) => *value,
+                                    other => panic!("encoded size input must be i64: {other:?}"),
+                                }
+                            })
+                            .collect::<Vec<_>>(),
+                    );
+                }
+            }
+        }
+    }
+    assert_eq!(native_values.len(), 1);
+    assert_eq!(native_values[0].len(), 2);
+    assert_eq!(
+        byte_values, native_values,
+        "exact captured aggregate values"
+    );
+}
+
+#[test]
+fn source_receiving_mode_is_fixed_before_first_submission_and_normal_stays_function_set() {
+    let text = "(datatype E (N i64)) (let $cap (N 1))";
+    let mut source = Source::new(None, text).unwrap();
+    source.next_submission().unwrap().unwrap();
+    assert!(
+        source
+            .with_execution_mode(pb::ExecutionMode::Proofs)
+            .is_err()
+    );
+    let source = Source::new(None, text)
+        .unwrap()
+        .with_execution_mode(pb::ExecutionMode::Normal)
+        .unwrap();
+    assert!(
+        source
+            .with_execution_mode(pb::ExecutionMode::Proofs)
+            .is_err()
+    );
+    let programs = Source::new(None, text)
+        .unwrap()
+        .with_execution_mode(pb::ExecutionMode::Normal)
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert!(programs.iter().flat_map(|program| &program.declarations).any(|declaration|
+        matches!(&declaration.kind, Some(pb::declaration::Kind::Function(function))
+            if function.name == "$cap" && function.inputs.is_empty() && function.merge.is_none())
+    ));
+    assert!(programs.iter().flat_map(|program| &program.commands).any(
+        |command| matches!(&command.kind, Some(pb::command::Kind::Action(action))
+            if matches!(&action.kind, Some(pb::action::Kind::Set(set))
+                if set.target.as_ref().is_some_and(|target| target.func == "$cap")))
+    ));
+}
+
+#[test]
 fn core_source_controls_keep_native_stopping_reports_and_modes() {
     use egglog::{ExecutionEvent, ExecutionOrigin, NativeLoopStop};
     for mode in [
@@ -293,7 +886,7 @@ fn core_source_failed_control_and_fail_wrappers_keep_prefixes_in_every_mode() {
                         ..Default::default()
                     },
                 );
-                if mode == pb::ExecutionMode::Normal {
+                {
                     assert_eq!(table.error, None);
                     let Some(pb::command_output::Kind::PrintedFunction(rows)) =
                         &table.outputs[0].kind
@@ -321,14 +914,6 @@ fn core_source_failed_control_and_fail_wrappers_keep_prefixes_in_every_mode() {
                         expected.insert(0, 20);
                     }
                     assert_eq!(values, expected, "{mode:?}/{depth}/reimport={roundtrip}");
-                } else {
-                    assert!(
-                        table
-                            .error
-                            .unwrap()
-                            .message
-                            .contains("encoded-mode table observation")
-                    );
                 }
                 let suffix = pb::Command {
                     kind: Some(pb::command::Kind::Check(pb::Check { facts: vec![3] })),
@@ -1065,6 +1650,470 @@ fn set_collapse_proof_and_get_validator_boundary_survive_bytes() {
             error.message.contains("set-get") && error.message.contains("validator"),
             "{error:?}"
         );
+    }
+}
+
+#[test]
+fn logical_table_rows_match_native_views_in_every_mode() {
+    use egglog_experimental::builtin::PortableEGraph;
+    type ObservedRows = Vec<(Vec<(String, Option<String>)>, bool)>;
+
+    fn sort_shape(sorts: &[pb::Sort], index: u32) -> String {
+        match sorts[index as usize].kind.as_ref().unwrap() {
+            pb::sort::Kind::Eq(name) => format!("Eq({name})"),
+            pb::sort::Kind::Family(family) => format!(
+                "{}({})",
+                family.name,
+                family
+                    .args
+                    .iter()
+                    .map(|arg| sort_shape(sorts, *arg))
+                    .collect::<Vec<_>>()
+                    .join(",")
+            ),
+            other => panic!("unexpected observation sort {other:?}"),
+        }
+    }
+
+    fn wire_term(response: &pb::RunProgramResponse, index: u32) -> String {
+        match response.nodes[index as usize].kind.as_ref().unwrap() {
+            pb::node::Kind::Call(call) => format!(
+                "({}{})",
+                call.func,
+                call.args
+                    .iter()
+                    .map(|arg| format!(" {}", wire_term(response, *arg)))
+                    .collect::<String>()
+            ),
+            pb::node::Kind::PrimitiveValue(value) => match value.value.as_ref().unwrap() {
+                pb::primitive_value::Value::I64(value) => value.to_string(),
+                pb::primitive_value::Value::Unit(_) => "()".into(),
+                pb::primitive_value::Value::Vec(values) => format!(
+                    "(vec-of{})",
+                    values
+                        .items
+                        .iter()
+                        .map(|arg| format!(" {}", wire_term(response, *arg)))
+                        .collect::<String>()
+                ),
+                other => panic!("unexpected observation value {other:?}"),
+            },
+            other => panic!("unexpected observation node {other:?}"),
+        }
+    }
+
+    fn wire_rows(response: &pb::RunProgramResponse, table: &pb::PrintedFunction) -> ObservedRows {
+        table
+            .rows
+            .iter()
+            .map(|row| {
+                let cells = row
+                    .args
+                    .iter()
+                    .chain(row.output.iter())
+                    .map(|cell| match cell.kind.unwrap() {
+                        pb::table_cell::Kind::Term(term) => (
+                            sort_shape(&response.sorts, response.nodes[term as usize].sort_id),
+                            Some(wire_term(response, term)),
+                        ),
+                        pb::table_cell::Kind::UnavailableSort(sort) => {
+                            (sort_shape(&response.sorts, sort), None)
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                (cells, row.subsumed)
+            })
+            .collect()
+    }
+
+    // Each cell retains both its exact public type and representative, when
+    // one exists. Compare scan order and flags without sorting/deduplicating.
+    fn native_rows(
+        graph: &egglog::EGraph,
+        table: &str,
+        relation: bool,
+        limit: Option<u64>,
+    ) -> ObservedRows {
+        let mut rows = vec![];
+        let input_sorts;
+        let output_sort;
+        if let Some((name, view)) = graph
+            .functions_iter()
+            .find(|(_, function)| function.term_constructor() == Some(table))
+        {
+            let (output, inputs) = view.func_type().input.split_last().unwrap();
+            input_sorts = inputs.to_vec();
+            output_sort = output.clone();
+            graph
+                .function_entries(name, |row| {
+                    let (output, inputs) = row.inputs.split_last().unwrap();
+                    rows.push((inputs.to_vec(), *output, row.subsumed));
+                })
+                .unwrap();
+        } else {
+            let function = graph.get_function(table).unwrap();
+            input_sorts = function.func_type().input.clone();
+            output_sort = function.func_type().output.clone();
+            match graph.constructor_enodes(table, |row| {
+                rows.push((row.children.to_vec(), row.eclass, row.subsumed))
+            }) {
+                Ok(()) => (),
+                Err(egglog::Error::ApiError(egglog::ApiError::WrongSubtype { .. })) => {
+                    graph
+                        .function_entries(table, |row| {
+                            rows.push((row.inputs.to_vec(), row.output, row.subsumed))
+                        })
+                        .unwrap();
+                }
+                Err(error) => panic!("native scan: {error}"),
+            }
+        }
+        rows.truncate(limit.map_or(usize::MAX, |limit| limit as usize));
+        rows.into_iter()
+            .map(|(args, output, subsumed)| {
+                let roots = args
+                    .into_iter()
+                    .zip(input_sorts.iter().cloned())
+                    .map(|(value, sort)| (sort, value))
+                    .chain((!relation).then(|| (output_sort.clone(), output)))
+                    .collect::<Vec<_>>();
+                let extracted = graph.extract_best(roots.clone()).unwrap();
+                let mut cells = roots
+                    .iter()
+                    .zip(extracted.terms)
+                    .map(|((sort, _), term)| {
+                        let mut sorts = vec![];
+                        let index = graph.export_sort(sort, &mut sorts).unwrap();
+                        (
+                            sort_shape(&sorts, index),
+                            term.map(|term| extracted.termdag.to_string(term.term)),
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                if relation {
+                    cells.push(("Unit()".into(), Some("()".into())));
+                }
+                (cells, subsumed)
+            })
+            .collect()
+    }
+
+    let setup = "(sort E) (constructor Hidden () E :unextractable) \
+        (constructor Visible () E) (constructor Row (i64) E) \
+        (sort VI (Vec i64)) (constructor Container (VI E) E) \
+        (relation Rel (i64 E VI)) (relation Empty (i64)) (relation Nullary ()) \
+        (relation Gone (i64)) (Gone 9) (delete (Gone 9)) \
+        (function f (E i64 E) E :merge new) \
+        (function numbers (i64) VI :merge new) (function scalar () i64 :merge new) \
+        (set (f (Hidden) 1 (Hidden)) (Visible)) \
+        (set (f (Visible) 2 (Hidden)) (Hidden)) \
+        (set (numbers 1) (vec-of 8 9)) (set (scalar) 10) (set (scalar) 20) \
+        (Container (vec-of 3 4) (Visible)) (Row 3) (Row 4) \
+        (subsume (Row 3)) (Rel 5 (Hidden) (vec-of 6 7)) (Nullary) \
+        (let $cap (Visible))";
+    let tables = [
+        "f",
+        "Hidden",
+        "Row",
+        "Container",
+        "numbers",
+        "scalar",
+        "Rel",
+        "Empty",
+        "Nullary",
+        "Gone",
+        "$cap",
+    ];
+    for mode in [
+        pb::ExecutionMode::Normal,
+        pb::ExecutionMode::TermEncoding,
+        pb::ExecutionMode::Proofs,
+        pb::ExecutionMode::ProofTesting,
+    ] {
+        let graph = egglog_experimental::new_experimental_egraph();
+        let mut native = match mode {
+            pb::ExecutionMode::Normal => graph,
+            pb::ExecutionMode::TermEncoding => graph.with_term_encoding_enabled(),
+            pb::ExecutionMode::Proofs => graph.with_proofs_enabled(),
+            _ => graph.with_proofs_enabled().with_proof_testing(),
+        };
+        for command in native.parse_program(None, setup).unwrap() {
+            native
+                .run_program(vec![command])
+                .unwrap_or_else(|error| panic!("native setup/{mode:?}: {error}"));
+        }
+        let capture_dump = native
+            .parse_and_run_program(None, "(print-function $cap)")
+            .unwrap();
+        let captures = capture_dump
+            .iter()
+            .filter_map(|output| match output {
+                egglog::CommandOutput::PrintFunction(_, dag, rows, _) => Some((dag, rows)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            captures.len(),
+            1,
+            "native explicit hidden capture dump/{mode:?}"
+        );
+        let (dag, capture) = captures[0];
+        assert_eq!(capture.len(), 1);
+        let capture_value = dag.to_string(capture[0].1);
+        let mut engine = Engine::default();
+        let id = create(&mut engine, mode);
+        let mut text = setup.to_owned();
+        for table in tables {
+            for limit in [None, Some(0), Some(1)] {
+                text.push_str(&format!(
+                    " (print-function {table}{})",
+                    limit.map(|n| format!(" {n}")).unwrap_or_default()
+                ));
+            }
+        }
+        // Observe live changes separately from immutable term-table history.
+        let mutations = "(delete (Row 4)) (delete (Rel 5 (Hidden) (vec-of 6 7))) (Rel 6 (Visible) (vec-of 1 2)) (set (scalar) 30) (delete (numbers 1))";
+        text.push_str(mutations);
+        text.push_str(" (print-function Row) (print-function Rel) (print-function scalar) (print-function numbers)");
+        let mut observations = 0;
+        for phase in Source::new(None, &text)
+            .unwrap()
+            .with_execution_mode(mode)
+            .unwrap()
+        {
+            let phase = phase.unwrap();
+            let requests = phase
+                .commands
+                .iter()
+                .filter_map(|command| match &command.kind {
+                    Some(pb::command::Kind::PrintFunction(print)) => Some(print.clone()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            if observations == tables.len() * 3 && !requests.is_empty() {
+                // Advance the independent native state through the same
+                // mutations once, before the first post-mutation observation.
+                native.parse_and_run_program(None, mutations).unwrap();
+            }
+            let response = run(&mut engine, id, phase);
+            assert_eq!(response.error, None, "{mode:?}");
+            assert_eq!(response.outputs.len(), requests.len());
+            for (output, request) in response.outputs.iter().zip(requests) {
+                let Some(pb::command_output::Kind::PrintedFunction(table)) = &output.kind else {
+                    panic!("table observation")
+                };
+                let actual = wire_rows(&response, table);
+                assert_eq!(table.table, request.table);
+                assert_eq!(
+                    actual,
+                    native_rows(
+                        &native,
+                        &table.table,
+                        ["Rel", "Empty", "Nullary", "Gone"].contains(&table.table.as_str()),
+                        request.max_rows
+                    ),
+                    "{mode:?}/{} limit {:?}",
+                    table.table,
+                    request.max_rows
+                );
+                if table.table == "$cap" && request.max_rows != Some(0) {
+                    assert_eq!(actual[0].0, [("Eq(E)".into(), Some(capture_value.clone()))]);
+                }
+                assert!(
+                    response.sorts.iter().all(
+                        |sort| !matches!(&sort.kind, Some(pb::sort::Kind::Eq(name)) if name != "E")
+                    ),
+                    "private classes/witnesses must stay private"
+                );
+                observations += 1;
+            }
+        }
+        assert_eq!(observations, tables.len() * 3 + 4);
+        if mode != pb::ExecutionMode::Normal {
+            // Raw native text dumps retained term-table history. This is an
+            // explicit boundary, not a universal Source text dump parity claim.
+            let history_dump = native
+                .parse_and_run_program(None, "(print-function Row)")
+                .unwrap();
+            let histories = history_dump
+                .iter()
+                .filter_map(|output| match output {
+                    egglog::CommandOutput::PrintFunction(_, _, rows, _) => Some(rows),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(histories.len(), 1, "native historical term dump/{mode:?}");
+            let historical = histories[0];
+            let live = native_rows(&native, "Row", false, None);
+            assert_eq!(historical.len(), 2);
+            assert_eq!(live.len(), 1);
+            assert!(live[0].1, "the remaining Row(3) is subsumed");
+        }
+
+        // Encoded initialization can allocate its nullary row before failing.
+        // Preserve that native prefix and exact unavailable public type. Stop
+        // its Source stream at the error; observe with a fresh request.
+        assert!(
+            native
+                .parse_and_run_program(None, "(let $bad (Row (/ 1 0)))")
+                .is_err()
+        );
+        let expected = native_rows(&native, "$bad", false, None);
+        let mut failed = false;
+        for phase in Source::new(None, &format!("{setup} (let $bad (Row (/ 1 0)))"))
+            .unwrap()
+            .with_execution_mode(mode)
+            .unwrap()
+        {
+            let response = run(&mut engine, id, phase.unwrap());
+            if response.error.is_some() {
+                failed = true;
+                break;
+            }
+        }
+        assert!(failed, "failed initializer/{mode:?}");
+        let response = run(
+            &mut engine,
+            id,
+            pb::Program {
+                ir_version: 1,
+                commands: vec![pb::Command {
+                    kind: Some(pb::command::Kind::PrintFunction(pb::PrintFunction {
+                        table: "$bad".into(),
+                        max_rows: None,
+                    })),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        );
+        assert_eq!(response.error, None, "failed initializer table/{mode:?}");
+        assert_eq!(response.outputs.len(), 1);
+        let Some(pb::command_output::Kind::PrintedFunction(table)) = &response.outputs[0].kind
+        else {
+            panic!("failed initializer observation")
+        };
+        assert_eq!(
+            wire_rows(&response, table),
+            expected,
+            "failed initializer prefix/{mode:?}"
+        );
+    }
+}
+
+#[test]
+fn table_observation_keeps_completed_prefix_and_encoding_errors_are_not_unavailability() {
+    use egglog_experimental::protobuf::NativeExtension;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    #[derive(Default)]
+    struct RejectEncoding {
+        initializations: AtomicUsize,
+        encodings: AtomicUsize,
+    }
+    impl NativeExtension for RejectEncoding {
+        fn initialize(&self, _: &mut egglog::EGraph) -> Result<(), String> {
+            self.initializations.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+        fn lower_custom_value(
+            &self,
+            _: &egglog::EGraph,
+            _: &egglog::ArcSort,
+            _: &pb::CustomValue,
+            _: Option<pb::Span>,
+            _: &mut pb::Program,
+        ) -> Result<pb::Call, String> {
+            Err("unused custom lowering".into())
+        }
+        fn encode_custom_value(
+            &self,
+            _: &egglog::ArcSort,
+            _: &egglog::TermDag,
+            _: egglog::TermId,
+        ) -> Result<Option<pb::CustomValue>, String> {
+            self.encodings.fetch_add(1, Ordering::SeqCst);
+            Err("deliberate table encoding failure".into())
+        }
+    }
+    for mode in [
+        pb::ExecutionMode::Normal,
+        pb::ExecutionMode::TermEncoding,
+        pb::ExecutionMode::Proofs,
+        pb::ExecutionMode::ProofTesting,
+    ] {
+        let mut engine = Engine::default();
+        let id = create(&mut engine, mode);
+        let mut program = fixture();
+        program.commands.truncate(1);
+        assert_eq!(run(&mut engine, id, program.clone()).error, None);
+        program.commands = vec![
+            pb::Command {
+                kind: Some(pb::command::Kind::PrintFunction(pb::PrintFunction {
+                    table: "N".into(),
+                    max_rows: None,
+                })),
+                ..Default::default()
+            },
+            fixture().commands[2].clone(),
+        ];
+        let response = run(&mut engine, id, program);
+        assert!(response.error.is_some());
+        assert!(
+            matches!(&response.outputs[..], [output] if matches!(&output.kind, Some(pb::command_output::Kind::PrintedFunction(table)) if table.rows.len() == 1))
+        );
+
+        let provider = Arc::new(RejectEncoding::default());
+        let mut engine = Engine::with_extension(provider.clone());
+        let id = create(&mut engine, mode);
+        let initialized = provider.initializations.load(Ordering::SeqCst);
+        let mut program = fixture();
+        program.commands.truncate(1);
+        assert_eq!(run(&mut engine, id, program.clone()).error, None);
+        program.commands = vec![
+            pb::Command {
+                kind: Some(pb::command::Kind::PrintSize(pb::PrintSize {
+                    tables: vec!["N".into()],
+                })),
+                ..Default::default()
+            },
+            pb::Command {
+                kind: Some(pb::command::Kind::PrintFunction(pb::PrintFunction {
+                    table: "N".into(),
+                    max_rows: None,
+                })),
+                ..Default::default()
+            },
+        ];
+        let response = run(&mut engine, id, program.clone());
+        assert!(
+            response
+                .error
+                .unwrap()
+                .message
+                .contains("deliberate table encoding failure")
+        );
+        assert!(
+            matches!(&response.outputs[..], [output] if matches!(output.kind, Some(pb::command_output::Kind::Sizes(_))))
+        );
+        assert!(provider.encodings.load(Ordering::SeqCst) > 0);
+        let encoded = provider.encodings.load(Ordering::SeqCst);
+        program.commands.remove(0);
+        let Some(pb::command::Kind::PrintFunction(print)) = &mut program.commands[0].kind else {
+            unreachable!()
+        };
+        print.max_rows = Some(0);
+        let response = run(&mut engine, id, program);
+        assert_eq!(response.error, None);
+        assert!(
+            matches!(&response.outputs[..], [output] if matches!(&output.kind, Some(pb::command_output::Kind::PrintedFunction(table)) if table.rows.is_empty()))
+        );
+        assert!(response.nodes.is_empty() && response.sorts.is_empty());
+        assert_eq!(provider.encodings.load(Ordering::SeqCst), encoded);
+        assert_eq!(provider.initializations.load(Ordering::SeqCst), initialized);
     }
 }
 
@@ -1811,15 +2860,15 @@ fn proof_failure_preserves_owned_prefix_clone_mode_and_native_error_order() {
 }
 
 #[test]
-fn malformed_later_commands_unused_rules_and_encoded_observations_are_atomic_preparation() {
+fn malformed_later_commands_unused_rules_and_observations_are_atomic_preparation() {
     for mode in [
         pb::ExecutionMode::Normal,
         pb::ExecutionMode::TermEncoding,
         pb::ExecutionMode::Proofs,
         pb::ExecutionMode::ProofTesting,
     ] {
-        for invalid in 0..5 {
-            if invalid >= 3 && mode == pb::ExecutionMode::Normal {
+        for invalid in 0..7 {
+            if invalid == 3 && mode == pb::ExecutionMode::Normal {
                 continue;
             }
             let mut engine = Engine::default();
@@ -1853,16 +2902,61 @@ fn malformed_later_commands_unused_rules_and_encoded_observations_are_atomic_pre
                     })),
                     ..Default::default()
                 }),
-                _ => program.commands.push(pb::Command {
-                    kind: Some(pb::command::Kind::PrintFunction(pb::PrintFunction {
-                        table: "N".into(),
-                        max_rows: None,
-                    })),
-                    ..Default::default()
-                }),
+                4 | 5 => {
+                    if invalid == 5 {
+                        program.declarations.push(pb::Declaration {
+                            kind: Some(pb::declaration::Kind::Primitive(pb::Primitive {
+                                name: "computed".into(),
+                                inputs: vec![],
+                                output: 0,
+                                body: Some(0),
+                            })),
+                            ..Default::default()
+                        });
+                    }
+                    program.commands.push(pb::Command {
+                        kind: Some(pb::command::Kind::PrintFunction(pb::PrintFunction {
+                            table: if invalid == 5 { "computed" } else { "missing" }.into(),
+                            max_rows: Some(0),
+                        })),
+                        ..Default::default()
+                    });
+                }
+                _ => {
+                    program.declarations.push(pb::Declaration {
+                        kind: Some(pb::declaration::Kind::Relation(pb::Relation {
+                            name: "Predicate".into(),
+                            inputs: vec![pb::Arg {
+                                name: "x".into(),
+                                sort: 0,
+                            }],
+                        })),
+                        ..Default::default()
+                    });
+                    program.commands.push(pb::Command {
+                        kind: Some(pb::command::Kind::Action(pb::Action {
+                            kind: Some(pb::action::Kind::Subsume(pb::Call {
+                                func: "Predicate".into(),
+                                args: vec![0],
+                            })),
+                            ..Default::default()
+                        })),
+                        ..Default::default()
+                    });
+                }
             }
             let failed = run(&mut engine, id, program);
             assert!(failed.error.is_some());
+            if invalid == 6 {
+                assert!(
+                    failed
+                        .error
+                        .as_ref()
+                        .unwrap()
+                        .message
+                        .contains("relation rows cannot be Subsumed")
+                );
+            }
             assert!(failed.outputs.is_empty());
             let profile = failed.profile.unwrap();
             assert!(!profile.complete);
