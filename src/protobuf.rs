@@ -1082,13 +1082,18 @@ impl Session {
             }
         }
         validate_host_declarations(program, &mut staged.graph)?;
-        let (depths, expansions) = validate_node_graph(program, &native_spans)?;
+        let NodeGraphMetrics {
+            depths,
+            expansions,
+            order,
+        } = validate_node_graph(program, &native_spans)?;
         let constructor_dags = if self.mode == pb::ExecutionMode::Normal {
             classify_constructor_dags(
                 program,
                 &constructor_targets,
                 &depths,
                 &expansions,
+                &order,
                 &staged.graph,
             )?
         } else {
@@ -1112,6 +1117,7 @@ impl Session {
                 &constructor_targets,
                 &depths,
                 &expansions,
+                &order,
                 &staged.graph,
                 roots,
             )?
@@ -4700,10 +4706,16 @@ fn validate_relation_uses(program: &pb::Program, saved: &pb::Program) -> Result<
 // Validate the entire arena, including unused entries, without interpreting it.
 // Removing Union outgoing edges must leave a DAG: every permitted cycle crosses
 // an identity boundary. Value lowering still validates each actual use's context.
+struct NodeGraphMetrics {
+    depths: Vec<usize>,
+    expansions: Vec<usize>,
+    order: Vec<usize>,
+}
+
 fn validate_node_graph(
     program: &pb::Program,
     native_spans: &NativeSpans,
-) -> Result<(Vec<usize>, Vec<usize>), String> {
+) -> Result<NodeGraphMetrics, String> {
     let mut edges = Vec::with_capacity(program.nodes.len());
     for (index, node) in program.nodes.iter().enumerate() {
         let sort = node_sort(program, index as u32)?;
@@ -4750,6 +4762,7 @@ fn validate_node_graph(
     let mut state = vec![0u8; edges.len()];
     let mut depths = vec![0usize; edges.len()];
     let mut expansions = vec![0usize; edges.len()];
+    let mut order = Vec::with_capacity(edges.len());
     for start in 0..edges.len() {
         let mut pending = vec![(start, false)];
         while let Some((index, exit)) = pending.pop() {
@@ -4766,6 +4779,7 @@ fn validate_node_graph(
                     size.saturating_add(expansions[*child as usize]).min(65_537)
                 });
                 state[index] = 2;
+                order.push(index);
                 continue;
             }
             match state[index] {
@@ -4783,16 +4797,21 @@ fn validate_node_graph(
             );
         }
     }
-    Ok((depths, expansions))
+    Ok(NodeGraphMetrics {
+        depths,
+        expansions,
+        order,
+    })
 }
 
-// Only transitively closed constructors/scalars and four native value builders
+// Only transitively closed constructors/scalars and fixed native value builders
 // may be shared. Other Calls are ordered barriers, never memoized ancestors.
 fn classify_constructor_dags(
     program: &pb::Program,
     constructors: &HashSet<String>,
     depths: &[usize],
     expansions: &[usize],
+    order: &[usize],
     graph: &EGraph,
 ) -> Result<HashMap<Vec<u32>, HashSet<u32>>, String> {
     let mut candidates = vec![];
@@ -4805,7 +4824,15 @@ fn classify_constructor_dags(
         }
         candidates.push((path, action_roots(action)?));
     }
-    classify_closed_dags(program, constructors, depths, expansions, graph, candidates)
+    classify_closed_dags(
+        program,
+        constructors,
+        depths,
+        expansions,
+        order,
+        graph,
+        candidates,
+    )
 }
 
 // Eligibility is independent of the operation; only evaluated values are local
@@ -4815,6 +4842,7 @@ fn classify_closed_dags<K: Eq + std::hash::Hash>(
     constructors: &HashSet<String>,
     depths: &[usize],
     expansions: &[usize],
+    order: &[usize],
     graph: &EGraph,
     sites: impl IntoIterator<Item = (K, Vec<u32>)>,
 ) -> Result<HashMap<K, HashSet<u32>>, String> {
@@ -4835,9 +4863,7 @@ fn classify_closed_dags<K: Eq + std::hash::Hash>(
         return Ok(HashMap::new());
     }
     let mut closed = HashSet::new();
-    let mut order: Vec<_> = (0..program.nodes.len()).collect();
-    order.sort_unstable_by_key(|index| depths[*index]);
-    for index in order {
+    for &index in order {
         let eligible = match program.nodes[index].kind.as_ref().unwrap() {
             pb::node::Kind::Call(call) => {
                 let value_builder = if matches!(
@@ -4846,6 +4872,7 @@ fn classify_closed_dags<K: Eq + std::hash::Hash>(
                         | "egglog.core.vec.empty"
                         | "egglog.core.bigint.from_string"
                         | "egglog.core.bigrat.make"
+                        | "egglog.experimental.rational.make"
                 ) {
                     let types = graph.authoring_type_info();
                     let sorts = call
@@ -4877,7 +4904,10 @@ fn classify_closed_dags<K: Eq + std::hash::Hash>(
                         | pb::primitive_value::Value::F64Bits(_)
                         | pb::primitive_value::Value::String(_)
                         | pb::primitive_value::Value::Bool(_)
-                        | pb::primitive_value::Value::Unit(_),
+                        | pb::primitive_value::Value::Unit(_)
+                        | pb::primitive_value::Value::BigInt(_)
+                        | pb::primitive_value::Value::BigRat(_)
+                        | pb::primitive_value::Value::Rational(_),
                     ),
             }) => true,
             _ => false,
@@ -4915,7 +4945,10 @@ fn classify_closed_dags<K: Eq + std::hash::Hash>(
                             | pb::primitive_value::Value::F64Bits(_)
                             | pb::primitive_value::Value::String(_)
                             | pb::primitive_value::Value::Bool(_)
-                            | pb::primitive_value::Value::Unit(_),
+                            | pb::primitive_value::Value::Unit(_)
+                            | pb::primitive_value::Value::BigInt(_)
+                            | pb::primitive_value::Value::BigRat(_)
+                            | pb::primitive_value::Value::Rational(_),
                         ),
                 }) => &[],
                 _ => {
@@ -5110,11 +5143,28 @@ fn constructor_dag_actions(
     let mut memo = HashMap::<u32, String>::new();
     let mut next = 0usize;
     let mut remaining = 65_536usize;
+    let mut bind_value = |index: u32, value: Expr| -> Result<(String, Expr), String> {
+        let span = native_span(
+            program,
+            program.nodes[index as usize].span.as_ref(),
+            native_spans,
+        )?;
+        let name = loop {
+            let candidate = format!("__egglog_proto_action_{next}");
+            next += 1;
+            if !occupied(&candidate) && !occupied(&format!("${candidate}")) {
+                break candidate;
+            }
+        };
+        actions.push(Action::Let(span.clone(), name.clone(), value));
+        evaluations.push(index);
+        Ok((name.clone(), Expr::Var(span, name)))
+    };
     while let Some(step) = pending.pop() {
         remaining = remaining
             .checked_sub(1)
             .ok_or("native action expansion exceeds 65536 steps")?;
-        match step {
+        let (index, value) = match step {
             Walk::Enter(index) => {
                 let node = &program.nodes[index as usize];
                 let span = native_span(program, node.span.as_ref(), native_spans)?;
@@ -5126,16 +5176,53 @@ fn constructor_dag_actions(
                     pb::node::Kind::Call(call) => {
                         pending.push(Walk::Call(index, call.args.len()));
                         pending.extend(call.args.iter().rev().map(|child| Walk::Enter(*child)));
+                        continue;
                     }
-                    pb::node::Kind::PrimitiveValue(_) => {
-                        // Preserve native scalar payloads, including exact f64
-                        // bits. Evaluation never takes a textual roundtrip.
-                        let literal =
-                            expression(program, index, &mut HashSet::new(), native_spans)?;
-                        if !matches!(literal, Expr::Lit(..)) {
-                            return Err("constructor action scope requires scalar literals".into());
-                        }
-                        results.push(literal);
+                    pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
+                        value:
+                            Some(
+                                pb::primitive_value::Value::I64(_)
+                                | pb::primitive_value::Value::F64Bits(_)
+                                | pb::primitive_value::Value::String(_)
+                                | pb::primitive_value::Value::Bool(_)
+                                | pb::primitive_value::Value::Unit(_)
+                                | pb::primitive_value::Value::BigInt(_)
+                                | pb::primitive_value::Value::BigRat(_)
+                                | pb::primitive_value::Value::Rational(_),
+                            ),
+                    }) => {
+                        let value = expression(program, index, &mut HashSet::new(), native_spans)?;
+                        // Exact-number leaves have a fixed native construction:
+                        // literals, or BigRat's two one-argument BigInt builders.
+                        // Bind those components too so Source scope replay sees
+                        // the same first-demand locals, without nested payloads.
+                        let value = match value {
+                            Expr::Call(span, target, arguments) => {
+                                let mut bound = Vec::with_capacity(arguments.len());
+                                for argument in arguments {
+                                    let argument = match argument {
+                                        Expr::Call(span, target, literals) => {
+                                            let mut args = Vec::with_capacity(literals.len());
+                                            for literal in literals {
+                                                remaining = remaining.checked_sub(1).ok_or(
+                                                    "native action expansion exceeds 65536 steps",
+                                                )?;
+                                                args.push(bind_value(index, literal)?.1);
+                                            }
+                                            Expr::Call(span, target, args)
+                                        }
+                                        literal => literal,
+                                    };
+                                    remaining = remaining
+                                        .checked_sub(1)
+                                        .ok_or("native action expansion exceeds 65536 steps")?;
+                                    bound.push(bind_value(index, argument)?.1);
+                                }
+                                Expr::Call(span, target, bound)
+                            }
+                            literal => literal,
+                        };
+                        (index, value)
                     }
                     _ => {
                         return Err(
@@ -5149,29 +5236,21 @@ fn constructor_dag_actions(
                 let pb::node::Kind::Call(call) = node.kind.as_ref().unwrap() else {
                     unreachable!()
                 };
-                let span = native_span(program, node.span.as_ref(), native_spans)?;
-                let name = loop {
-                    let candidate = format!("__egglog_proto_action_{next}");
-                    next += 1;
-                    if !occupied(&candidate) && !occupied(&format!("${candidate}")) {
-                        break candidate;
-                    }
-                };
                 let args = results.split_off(results.len() - arity);
-                actions.push(Action::Let(
-                    span.clone(),
-                    name.clone(),
-                    Expr::Call(span.clone(), call.func.clone(), args),
-                ));
-                evaluations.push(index);
-                if closed.contains(&index) {
-                    memo.insert(index, name.clone());
-                } else {
-                    memo.clear();
-                }
-                results.push(Expr::Var(span, name));
+                let span = native_span(program, node.span.as_ref(), native_spans)?;
+                (index, Expr::Call(span, call.func.clone(), args))
             }
+        };
+        // Bind inert payloads at first demand too: shared String/compound-number
+        // leaves must not be copied once per incoming edge. Existing nonclosed
+        // Calls still end this memo's lifetime, so no reads cross a barrier.
+        let (name, value) = bind_value(index, value)?;
+        if closed.contains(&index) {
+            memo.insert(index, name);
+        } else {
+            memo.clear();
         }
+        results.push(value);
     }
     let span = native_span(program, action.span.as_ref(), native_spans)?;
     actions.push(match action.kind.as_ref().unwrap() {
@@ -7223,6 +7302,107 @@ mod tests {
         assert_eq!(graph.materialized_eq_classes().len(), 1051);
         assert_eq!(graph.get_function_names(), functions);
         assert!(values.is_empty());
+    }
+
+    #[test]
+    fn inert_payload_dag_bindings_keep_first_demand_and_single_payload_ownership() {
+        use pb::primitive_value::Value as V;
+        let text = "shared payload".repeat(4096);
+        let program = pb::Program {
+            ir_version: 1,
+            sorts: vec![
+                pb::Sort {
+                    kind: Some(pb::sort::Kind::Family(pb::HostSort {
+                        name: "String".into(),
+                        args: vec![],
+                    })),
+                    ..Default::default()
+                },
+                pb::Sort {
+                    kind: Some(pb::sort::Kind::Family(pb::HostSort {
+                        name: "BigRat".into(),
+                        args: vec![],
+                    })),
+                    ..Default::default()
+                },
+                pb::Sort {
+                    kind: Some(pb::sort::Kind::Eq("A".into())),
+                    ..Default::default()
+                },
+            ],
+            nodes: vec![
+                pb::Node {
+                    sort_id: 0,
+                    kind: Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
+                        value: Some(V::String(text.clone())),
+                    })),
+                    ..Default::default()
+                },
+                pb::Node {
+                    sort_id: 1,
+                    kind: Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
+                        value: Some(V::BigRat(pb::BigRat {
+                            numerator: "7".into(),
+                            denominator: "2".into(),
+                        })),
+                    })),
+                    ..Default::default()
+                },
+                pb::Node {
+                    sort_id: 2,
+                    kind: Some(pb::node::Kind::Call(pb::Call {
+                        func: "Leaf".into(),
+                        args: vec![1, 0, 1, 0],
+                    })),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        let action = pb::Action {
+            kind: Some(pb::action::Kind::Term(2)),
+            ..Default::default()
+        };
+        let (actions, evaluated) = constructor_dag_actions(
+            &program,
+            &action,
+            |_| false,
+            &NativeSpans::default(),
+            &[0, 1, 2].into_iter().collect(),
+        )
+        .unwrap();
+        assert_eq!(evaluated, [1, 1, 1, 1, 1, 0, 2]);
+        assert_eq!(actions.len(), 8);
+        let Action::Let(_, _, Expr::Lit(_, Literal::String(numerator))) = &actions[0] else {
+            panic!("numerator payload is bound once before its builder")
+        };
+        assert_eq!(numerator, "7");
+        let Action::Let(_, _, Expr::Lit(_, Literal::String(denominator))) = &actions[2] else {
+            panic!("denominator follows the numerator builder")
+        };
+        assert_eq!(denominator, "2");
+        let Action::Let(_, number, Expr::Call(_, target, _)) = &actions[4] else {
+            panic!("one compound-number binding")
+        };
+        assert_eq!(target, "egglog.core.bigrat.make");
+        let Action::Let(_, string, Expr::Lit(_, Literal::String(actual))) = &actions[5] else {
+            panic!("one string binding")
+        };
+        assert_eq!(actual, &text);
+        let Action::Let(_, _, Expr::Call(_, target, arguments)) = &actions[6] else {
+            panic!("constructor binding")
+        };
+        assert_eq!(target, "Leaf");
+        let variables: Vec<_> = arguments
+            .iter()
+            .map(|argument| {
+                let Expr::Var(_, name) = argument else {
+                    panic!("shared payloads use only local references")
+                };
+                name
+            })
+            .collect();
+        assert_eq!(variables, [number, string, number, string]);
     }
 
     fn closed_value_dag(terminal: &str) -> (pb::Program, u32) {

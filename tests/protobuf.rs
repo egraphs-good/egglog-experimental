@@ -27192,6 +27192,173 @@ fn merge_constructor_declarations_are_order_independent() {
 }
 
 #[test]
+fn inert_exact_number_payloads_use_closed_action_and_extract_dags() {
+    use pb::primitive_value::Value as V;
+    for (family, payload) in [
+        (
+            "BigInt",
+            V::BigInt("12345678901234567890123456789012345678901".into()),
+        ),
+        (
+            "BigRat",
+            V::BigRat(pb::BigRat {
+                numerator: "12345678901234567890123456789012345678901".into(),
+                denominator: "2".into(),
+            }),
+        ),
+        (
+            "Rational",
+            V::Rational(pb::Rational {
+                numerator: -7,
+                denominator: 2,
+            }),
+        ),
+    ] {
+        let mut program = pb::Program {
+            ir_version: 1,
+            sorts: [family, "String"]
+                .map(|name| pb::Sort {
+                    kind: Some(pb::sort::Kind::Family(pb::HostSort {
+                        name: name.into(),
+                        args: vec![],
+                    })),
+                    ..Default::default()
+                })
+                .into(),
+            ..Default::default()
+        };
+        let [number, string] = [0, 1];
+        let equality = program.sorts.len() as u32;
+        program.sorts.push(pb::Sort {
+            kind: Some(pb::sort::Kind::Eq("ExactNode".into())),
+            ..Default::default()
+        });
+        program.declarations.extend([
+            pb::Declaration {
+                kind: Some(pb::declaration::Kind::EqSort(pb::EqSort {
+                    name: "ExactNode".into(),
+                    ..Default::default()
+                })),
+                ..Default::default()
+            },
+            pb::Declaration {
+                kind: Some(pb::declaration::Kind::Constructor(pb::Constructor {
+                    name: "ExactLeaf".into(),
+                    inputs: vec![
+                        pb::Arg {
+                            sort: number,
+                            name: "number".into(),
+                        },
+                        pb::Arg {
+                            sort: string,
+                            name: "text".into(),
+                        },
+                    ],
+                    output: equality,
+                    ..Default::default()
+                })),
+                ..Default::default()
+            },
+            pb::Declaration {
+                kind: Some(pb::declaration::Kind::Constructor(pb::Constructor {
+                    name: "ExactPair".into(),
+                    inputs: vec![
+                        pb::Arg {
+                            sort: equality,
+                            name: "left".into(),
+                        },
+                        pb::Arg {
+                            sort: equality,
+                            name: "right".into(),
+                        },
+                    ],
+                    output: equality,
+                    ..Default::default()
+                })),
+                ..Default::default()
+            },
+        ]);
+        // Forward references require child completion order, not arena order.
+        // Each shared edge denotes the same inert number/string payload.
+        for index in 0..18 {
+            program.nodes.push(pb::Node {
+                sort_id: equality,
+                kind: Some(pb::node::Kind::Call(pb::Call {
+                    func: "ExactPair".into(),
+                    args: vec![index + 1, index + 1],
+                })),
+                ..Default::default()
+            });
+        }
+        program.nodes.extend([
+            pb::Node {
+                sort_id: equality,
+                kind: Some(pb::node::Kind::Call(pb::Call {
+                    func: "ExactLeaf".into(),
+                    args: vec![19, 20],
+                })),
+                ..Default::default()
+            },
+            pb::Node {
+                sort_id: number,
+                kind: Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
+                    value: Some(payload.clone()),
+                })),
+                ..Default::default()
+            },
+            pb::Node {
+                sort_id: string,
+                kind: Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
+                    value: Some(V::String("shared payload".repeat(128))),
+                })),
+                ..Default::default()
+            },
+        ]);
+        program.commands = vec![
+            pb::Command {
+                kind: Some(pb::command::Kind::Action(pb::Action {
+                    kind: Some(pb::action::Kind::Term(0)),
+                    ..Default::default()
+                })),
+                ..Default::default()
+            },
+            pb::Command {
+                kind: Some(pb::command::Kind::Extract(pb::Extract {
+                    roots: vec![0],
+                    variants: 1,
+                    extractor: pb::Extractor::Tree.into(),
+                    ..Default::default()
+                })),
+                ..Default::default()
+            },
+        ];
+        let mut engine = Engine::default();
+        let id = create(&mut engine);
+        let response = run(&mut engine, id, program.clone());
+        assert_eq!(response.error, None, "{family}");
+        assert_eq!(response.outputs.len(), 1);
+        assert!(response.nodes.iter().any(|node|
+            matches!(&node.kind, Some(pb::node::Kind::PrimitiveValue(value)) if value.value.as_ref() == Some(&payload))
+        ), "{family}: exact payload survives extraction");
+        // Oversized Extract text remains tree-limited; replay the admitted
+        // action plan itself without changing that separate boundary.
+        program.commands.truncate(1);
+        let text = egglog_experimental::protobuf::source::Renderer::default()
+            .render(&program)
+            .unwrap();
+        let mut replay = Engine::default();
+        let replay_id = create(&mut replay);
+        for phase in egglog_experimental::protobuf::source::Source::new(None, &text).unwrap() {
+            assert_eq!(
+                run(&mut replay, replay_id, phase.unwrap()).error,
+                None,
+                "{family}: Source action replay"
+            );
+        }
+    }
+}
+
+#[test]
 fn shared_syntax_expansion_has_a_bounded_failure() {
     let mut engine = Engine::default();
     let id = create(&mut engine);

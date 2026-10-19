@@ -2775,7 +2775,11 @@ impl Source {
         }
         if !constructor_only {
             let native_spans = NativeSpans::default();
-            let (depths, expansions) = validate_node_graph(&self.program, &native_spans)?;
+            let NodeGraphMetrics {
+                depths,
+                expansions,
+                order,
+            } = validate_node_graph(&self.program, &native_spans)?;
             // Source can know only an authored alias for a structural sort.
             // Match execution's canonical sort context without changing it.
             let mut graph = self.graph.clone();
@@ -2811,6 +2815,7 @@ impl Source {
                 &constructors,
                 &depths,
                 &expansions,
+                &order,
                 &graph,
             );
             self.program.commands.pop();
