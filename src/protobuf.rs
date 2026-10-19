@@ -11511,22 +11511,69 @@ mod tests {
         }
     }
 
-    // Compose compile-only Source phases into one request without rebasing their
-    // cumulative node/sort arenas or changing command batching.
+    // These inventory controls deliberately bind all definitions before their
+    // combined command list; they do not model Source's submission boundaries.
+    // Concatenation preserves each packet's node/Union occurrences, while the
+    // producer's monotone sort/file arenas remain cumulative in this flat input.
     fn inventory_fixture(source: &str) -> pb::Program {
-        let mut declarations = vec![];
-        let mut commands = vec![];
-        let mut rulesets = vec![];
         let mut program = pb::Program::default();
         for phase in source::Source::new(Some("fixture.egg".into()), source).unwrap() {
-            program = phase.unwrap();
-            declarations.append(&mut program.declarations);
-            commands.append(&mut program.commands);
-            rulesets.append(&mut program.rulesets);
+            let mut phase = phase.unwrap();
+            let node_offset = program.nodes.len() as u32;
+            let rule_offset = program.rules.len() as u32;
+            let set_offset = program.rulesets.len() as u32;
+            let relocate = |index: &mut u32| {
+                *index += node_offset;
+                Ok(())
+            };
+            source::source_phase_refs(&mut phase, relocate).unwrap();
+            for node in &mut phase.nodes {
+                source::source_node_refs(node, relocate).unwrap();
+            }
+            for set in &mut phase.rulesets {
+                match &mut set.kind {
+                    Some(pb::ruleset::Kind::Rules(list)) => {
+                        for index in &mut list.rules {
+                            *index += rule_offset;
+                        }
+                    }
+                    Some(pb::ruleset::Kind::Combined(combined)) => {
+                        for child in &mut combined.rulesets {
+                            if let Some(pb::ruleset_ref::Kind::Index(index)) = &mut child.kind {
+                                *index += set_offset;
+                            }
+                        }
+                    }
+                    None => (),
+                }
+            }
+            let mut pending: Vec<_> = phase.commands.iter_mut().collect();
+            while let Some(command) = pending.pop() {
+                match &mut command.kind {
+                    Some(pb::command::Kind::Run(run)) => {
+                        if let Some(pb::ruleset_ref::Kind::Index(index)) = run
+                            .ruleset
+                            .as_mut()
+                            .and_then(|reference| reference.kind.as_mut())
+                        {
+                            *index += set_offset;
+                        }
+                    }
+                    Some(pb::command::Kind::Repeat(body)) => pending.extend(&mut body.body),
+                    Some(pb::command::Kind::Saturate(body)) => pending.extend(&mut body.body),
+                    Some(pb::command::Kind::Fail(child)) => pending.push(child),
+                    _ => (),
+                }
+            }
+            program.ir_version = phase.ir_version;
+            program.sorts = phase.sorts;
+            program.files = phase.files;
+            program.nodes.append(&mut phase.nodes);
+            program.declarations.append(&mut phase.declarations);
+            program.commands.append(&mut phase.commands);
+            program.rules.append(&mut phase.rules);
+            program.rulesets.append(&mut phase.rulesets);
         }
-        program.declarations = declarations;
-        program.commands = commands;
-        program.rulesets = rulesets;
         program
     }
 
@@ -11771,16 +11818,6 @@ mod tests {
 
         let (mut engine, id) = host_default_engine();
         let mut program = inventory_fixture(&source);
-        // The bundle needs the published body, not the final action phase's
-        // now-empty rule list. Its cumulative node arena still retains roots.
-        let publication = source::Source::new(Some("fixture.egg".into()), &source)
-            .unwrap()
-            .map(Result::unwrap)
-            .find(|phase| !phase.rulesets.is_empty())
-            .unwrap();
-        assert_eq!(publication.rulesets, program.rulesets);
-        assert_eq!(publication.rules.len(), 1);
-        program.rules = publication.rules;
         let mut definitions = program.clone();
         definitions.commands.clear();
         assert_eq!(run_host_default(&mut engine, id, definitions).error, None);

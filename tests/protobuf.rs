@@ -3,6 +3,29 @@ use egglog_experimental::{PortableEGraph, PortableTypeInfo};
 use egglog_experimental::{new_experimental_egraph, protobuf::Engine};
 use prost::Message;
 
+// Arena indices are packet-local. Normalize only this saved occurrence's
+// reachable graph before comparing first-position and publication records.
+fn canonical_rule_occurrence(
+    program: &pb::Program,
+    rule: &pb::RuleDecl,
+) -> (pb::RuleDecl, Vec<pb::Node>) {
+    let mut canonical = pb::Program::default();
+    egglog_experimental::builtin::definitions::reconcile_rulesets(
+        &pb::Program {
+            ir_version: program.ir_version,
+            sorts: program.sorts.clone(),
+            files: program.files.clone(),
+            nodes: program.nodes.clone(),
+            rules: vec![rule.clone()],
+            ..Default::default()
+        },
+        &mut canonical,
+    )
+    .unwrap();
+    assert_eq!(canonical.rules.len(), 1);
+    (canonical.rules.remove(0), canonical.nodes)
+}
+
 #[test]
 fn source_multi_extract_preserves_one_ordered_batch_and_replays() {
     use egglog_experimental::protobuf::source::{Renderer, Source};
@@ -192,10 +215,14 @@ fn source_definition_and_global_let_intake_does_not_clone_accumulated_native_bod
         );
         assert!(phases.iter().all(|phase| phase.rules.len() <= 1));
         assert!(
+            phases.iter().map(|phase| phase.nodes.len()).sum::<usize>() <= 4 * count + 16,
+            "phases copied accumulated rule nodes"
+        );
+        assert!(
             phases
                 .iter()
                 .filter(|phase| !phase.commands.is_empty())
-                .all(|phase| phase.rules.is_empty())
+                .all(|phase| phase.rules.is_empty() && phase.nodes.len() <= 3)
         );
         assert!(phases.iter().any(|phase| {
             phase
@@ -242,8 +269,11 @@ fn source_rule_packets_keep_only_new_or_published_occurrences() {
                 for rule in &phase.rules {
                     let name = rule.name.clone().unwrap();
                     labels.push(name.clone());
-                    if let Some(previous) = records.insert(name, rule.clone()) {
-                        assert_eq!(previous, *rule, "publication changed an occurrence");
+                    // Packet-local node indices may change at publication.
+                    // Compare the occurrence's canonically relocated body.
+                    let canonical = canonical_rule_occurrence(&phase, rule);
+                    if let Some(previous) = records.insert(name, canonical.clone()) {
+                        assert_eq!(previous, canonical, "publication changed an occurrence");
                     }
                 }
                 for set in &phase.rulesets {
@@ -3722,11 +3752,7 @@ mod source_fresh_macro {
                 .unwrap();
             if native_error {
                 assert_eq!(phases.len(), 4);
-                assert_eq!(
-                    prefix.nodes.len(),
-                    phases[2].nodes.len() + 1,
-                    "failed rule leaked arena nodes"
-                );
+                assert_eq!(prefix.nodes.len(), 1, "failed rule leaked arena nodes");
                 assert!(
                     prefix.rules.is_empty()
                         && prefix.rulesets.is_empty()
@@ -6632,22 +6658,13 @@ fn named_primitive_container_dependencies_and_unsupported_cycles() {
             let Some(pb::declaration::Kind::Primitive(inc)) = &mut invalid.declarations.iter_mut().find(|d| matches!(&d.kind, Some(pb::declaration::Kind::Primitive(p)) if p.name == "inc")).unwrap().kind else { unreachable!() };
             inc.body = Some(root);
         } else {
-            // Source's first cumulative-arena PartialCall is not bundle's body child.
-            let first_partial = invalid
-                .nodes
-                .iter()
-                .position(|node| {
-                    matches!(
-                        &node.kind,
-                        Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
-                            value: Some(pb::primitive_value::Value::PartialCall(_))
-                        }))
-                    )
-                })
-                .unwrap();
-            assert_ne!(first_partial, reached_partial);
             let partial = if mutation == "unused-union" {
-                first_partial
+                // Supply an explicit unused occurrence; packet projection no
+                // longer leaves an unrelated old PartialCall in this arena.
+                let unused = invalid.nodes.len();
+                invalid.nodes.push(invalid.nodes[reached_partial].clone());
+                assert_ne!(unused, reached_partial);
+                unused
             } else {
                 reached_partial
             };
@@ -8255,7 +8272,9 @@ fn inequality_generic_catalog_and_proof_use_bytes() {
                 .filter(|output| matches!(&output.kind, Some(pb::command_output::Kind::Proof(_))))
                 .count();
         }
-        assert!(calls >= 11);
+        // Every authored inequality survives; rule publication may additionally
+        // repeat its saved body, but unrelated earlier nodes need not travel.
+        assert!(calls >= source.matches("(!=").count());
         assert_eq!(proofs, expected_proofs, "{mode:?}");
         roundtrip.parse_and_run_program(None, &rendered).unwrap();
     }
@@ -11494,8 +11513,25 @@ fn exact_numeric_partial_calls_preserve_native_failure_and_prefix_effects() {
                 None
             );
         }
-        let prefix = source.next().unwrap().unwrap();
+        let mut prefix = source.next().unwrap().unwrap();
         let mut failing = source.next().unwrap().unwrap();
+        // The preceding nullary action owns a different node arena. Preserve
+        // its actual Fired root when combining the two execution boundaries.
+        assert_eq!(prefix.nodes.len(), 1);
+        let root = failing.nodes.len() as u32;
+        failing.nodes.append(&mut prefix.nodes);
+        let Some(pb::command::Kind::Action(pb::Action {
+            kind: Some(pb::action::Kind::Term(index)),
+            ..
+        })) = &mut prefix.commands[0].kind
+        else {
+            panic!("Fired prefix")
+        };
+        assert_eq!(*index, 0);
+        *index = root;
+        assert!(
+            matches!(&failing.nodes[*index as usize].kind, Some(pb::node::Kind::Call(call)) if call.func == "Fired" && call.args.is_empty())
+        );
         failing.commands.splice(0..0, prefix.commands);
         let response = run(&mut engine, id, failing);
         assert!(
@@ -12776,8 +12812,23 @@ fn set_partial_operations_preserve_completed_prefixes() {
                 None
             );
         }
-        let prefix = source.next().unwrap().unwrap();
+        let mut prefix = source.next().unwrap().unwrap();
         let mut failure = source.next().unwrap().unwrap();
+        assert_eq!(prefix.nodes.len(), 1);
+        let root = failure.nodes.len() as u32;
+        failure.nodes.append(&mut prefix.nodes);
+        let Some(pb::command::Kind::Action(pb::Action {
+            kind: Some(pb::action::Kind::Term(index)),
+            ..
+        })) = &mut prefix.commands[0].kind
+        else {
+            panic!("Fired prefix")
+        };
+        assert_eq!(*index, 0);
+        *index = root;
+        assert!(
+            matches!(&failure.nodes[*index as usize].kind, Some(pb::node::Kind::Call(call)) if call.func == "Fired" && call.args.is_empty())
+        );
         failure.commands.splice(0..0, prefix.commands);
         let response = run(&mut engine, id, failure);
         assert!(
@@ -14508,19 +14559,17 @@ fn map_flat_and_computed_source_calls_execute_through_bytes() {
     let id = create(&mut engine);
     let mut renderer = Renderer::default();
     let mut native = new_experimental_egraph();
-    let mut final_arena_map_calls = 0;
+    let mut map_calls = 0;
     let mut saw_bitor = false;
     for phase in Source::new(None, text).unwrap() {
         let program = pb::Program::decode(phase.unwrap().encode_to_vec().as_slice()).unwrap();
-        // Source retains a cumulative node arena, so count only the latest
-        // arena rather than interpreting indices across different Programs.
-        final_arena_map_calls = 0;
+        // These action-local packets now carry each authored call once.
         for node in &program.nodes {
             if let Some(pb::node::Kind::Call(call)) = &node.kind {
                 assert!(!matches!(call.func.as_str(), "map-of" | "map-from-pairs"));
                 if call.func == "egglog.core.map.of" {
                     assert_eq!(call.args.len(), 1);
-                    final_arena_map_calls += 1;
+                    map_calls += 1;
                 }
                 saw_bitor |= call.func == "egglog.core.i64.bitor";
             }
@@ -14530,7 +14579,7 @@ fn map_flat_and_computed_source_calls_execute_through_bytes() {
             .parse_and_run_program(None, &renderer.render(&program).unwrap())
             .unwrap();
     }
-    assert_eq!(final_arena_map_calls, 3);
+    assert_eq!(map_calls, 3);
     assert!(saw_bitor);
 }
 
@@ -19270,10 +19319,11 @@ fn source_rule_options_preserve_rematching_and_subsumed_queries() {
                     assert_eq!(rule.eval_mode, i32::from(mode));
                     assert_eq!(rule.no_decomp, no_decomp);
                     assert_eq!(rule.include_subsumed, include_subsumed);
+                    let canonical = canonical_rule_occurrence(&phase, rule);
                     if let Some(previous) = &occurrence {
-                        assert_eq!(rule, previous);
+                        assert_eq!(&canonical, previous);
                     } else {
-                        occurrence = Some(rule.clone());
+                        occurrence = Some(canonical);
                     }
                 }
                 let rendering = renderer.render(&phase).unwrap();
@@ -19292,14 +19342,15 @@ fn source_rule_options_preserve_rematching_and_subsumed_queries() {
             for phase in source {
                 let phase = phase.unwrap();
                 assert!(phase.rules.len() <= 1);
-                for rule in phase.rules {
+                for rule in &phase.rules {
                     assert_eq!(rule.eval_mode, i32::from(mode));
                     assert_eq!(rule.no_decomp, no_decomp);
                     assert_eq!(rule.include_subsumed, include_subsumed);
+                    let canonical = canonical_rule_occurrence(&phase, rule);
                     if let Some(previous) = &occurrence {
-                        assert_eq!(&rule, previous);
+                        assert_eq!(&canonical, previous);
                     } else {
-                        occurrence = Some(rule);
+                        occurrence = Some(canonical);
                     }
                 }
             }
@@ -21152,7 +21203,10 @@ fn source_binary_unions_are_fresh_and_preserve_prefixes_before_errors() {
                     phase.nodes[*index as usize].kind,
                     Some(pb::node::Kind::Union(_))
                 ));
-                occurrences.push(*index);
+                // Across Programs, occurrence identity includes the owning
+                // arena; local numeric indices may be reused. Preserve the
+                // distinct authored origins instead of comparing bare IDs.
+                occurrences.push((phase.nodes[*index as usize].span, *index));
                 let mut check = phase.clone();
                 check.commands[0].kind = Some(pb::command::Kind::Check(pb::Check {
                     facts: vec![*index],

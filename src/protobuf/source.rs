@@ -124,6 +124,275 @@ pub struct Source {
     pending_error: Option<String>,
 }
 
+// Relocation only, not admission: retain missing fields and out-of-bounds
+// references for the receiving validator to reject at its existing boundary.
+pub(super) fn source_node_refs(
+    node: &mut pb::Node,
+    mut visit: impl FnMut(&mut u32) -> Result<(), String>,
+) -> Result<(), String> {
+    use pb::{node::Kind as N, primitive_value::Value as V};
+    match &mut node.kind {
+        Some(N::Call(call) | N::GetCost(call)) => {
+            for index in &mut call.args {
+                visit(index)?;
+            }
+        }
+        Some(N::Union(union)) => {
+            for index in &mut union.members {
+                visit(index)?;
+            }
+        }
+        Some(N::PrimitiveValue(value)) => match &mut value.value {
+            Some(V::Vec(list) | V::Set(list) | V::Multiset(list)) => {
+                for index in &mut list.items {
+                    visit(index)?;
+                }
+            }
+            Some(V::Map(map)) => {
+                for entry in &mut map.entries {
+                    for index in entry.key.iter_mut().chain(&mut entry.value) {
+                        visit(index)?;
+                    }
+                }
+            }
+            Some(V::Pair(pair)) => {
+                for index in pair.first.iter_mut().chain(&mut pair.second) {
+                    visit(index)?;
+                }
+            }
+            Some(V::Maybe(maybe)) => {
+                if let Some(index) = &mut maybe.value {
+                    visit(index)?;
+                }
+            }
+            Some(V::Custom(custom)) => {
+                for index in &mut custom.args {
+                    visit(index)?;
+                }
+            }
+            Some(V::PartialCall(call)) => {
+                for index in &mut call.args {
+                    visit(index)?;
+                }
+            }
+            Some(V::Lambda(lambda)) => {
+                // Moving a template does not make it supported: its original
+                // kind and binder survive for native admission to reject.
+                for index in &mut lambda.captures {
+                    visit(index)?;
+                }
+                visit(&mut lambda.body)?;
+            }
+            Some(
+                V::I64(_)
+                | V::F64Bits(_)
+                | V::String(_)
+                | V::Bool(_)
+                | V::Unit(_)
+                | V::BigInt(_)
+                | V::BigRat(_)
+                | V::Rational(_),
+            )
+            | None => (),
+        },
+        Some(N::Var(_)) | None => (),
+    }
+    Ok(())
+}
+
+// Every emitted record is a root, including unused newly authored rules and
+// binding defaults. Commands are not roots in definition reconciliation's
+// closure-retention visitor, so Source must also relocate its ordered controls.
+pub(super) fn source_phase_refs(
+    program: &mut pb::Program,
+    mut visit: impl FnMut(&mut u32) -> Result<(), String>,
+) -> Result<(), String> {
+    fn action(
+        action: &mut pb::Action,
+        visit: &mut impl FnMut(&mut u32) -> Result<(), String>,
+    ) -> Result<(), String> {
+        let call = match &mut action.kind {
+            Some(pb::action::Kind::Term(index)) => {
+                visit(index)?;
+                None
+            }
+            Some(pb::action::Kind::Set(set)) => {
+                if let Some(index) = &mut set.value {
+                    visit(index)?;
+                }
+                set.target.as_mut()
+            }
+            Some(pb::action::Kind::SetCost(set)) => {
+                if let Some(index) = &mut set.cost {
+                    visit(index)?;
+                }
+                set.target.as_mut()
+            }
+            Some(pb::action::Kind::Delete(call) | pb::action::Kind::Subsume(call)) => Some(call),
+            Some(pb::action::Kind::Panic(_)) | None => None,
+        };
+        if let Some(call) = call {
+            for index in &mut call.args {
+                visit(index)?;
+            }
+        }
+        Ok(())
+    }
+    for declaration in &mut program.declarations {
+        let root = match &mut declaration.kind {
+            Some(pb::declaration::Kind::Constructor(constructor)) => constructor.cost.as_mut(),
+            Some(pb::declaration::Kind::Function(function)) => function.merge.as_mut(),
+            Some(pb::declaration::Kind::Primitive(primitive)) => primitive.body.as_mut(),
+            Some(
+                pb::declaration::Kind::EqSort(_)
+                | pb::declaration::Kind::HostSortFamily(_)
+                | pb::declaration::Kind::HostPrimitive(_)
+                | pb::declaration::Kind::Relation(_),
+            )
+            | None => None,
+        };
+        if let Some(index) = root {
+            visit(index)?;
+        }
+        if let Some(bindings) = &mut declaration.bindings {
+            for index in bindings
+                .python
+                .iter_mut()
+                .flat_map(|binding| &mut binding.views)
+                .flat_map(|view| &mut view.params)
+                .filter_map(|parameter| parameter.default_expr.as_mut())
+            {
+                visit(index)?;
+            }
+        }
+    }
+    for rule in &mut program.rules {
+        match &mut rule.kind {
+            Some(pb::rule_decl::Kind::Rule(rule)) => {
+                for index in &mut rule.query {
+                    visit(index)?;
+                }
+                for head in &mut rule.head {
+                    action(head, &mut visit)?;
+                }
+            }
+            Some(pb::rule_decl::Kind::Rewrite(rule)) => {
+                for index in [&mut rule.lhs, &mut rule.rhs]
+                    .into_iter()
+                    .chain(&mut rule.conditions)
+                {
+                    visit(index)?;
+                }
+            }
+            Some(pb::rule_decl::Kind::Birewrite(rule)) => {
+                for index in [&mut rule.lhs, &mut rule.rhs]
+                    .into_iter()
+                    .chain(&mut rule.conditions)
+                {
+                    visit(index)?;
+                }
+            }
+            None => (),
+        }
+    }
+    let mut pending: Vec<_> = program.commands.iter_mut().collect();
+    while let Some(command) = pending.pop() {
+        match &mut command.kind {
+            Some(pb::command::Kind::Action(value)) => action(value, &mut visit)?,
+            Some(pb::command::Kind::Check(check)) => {
+                for index in &mut check.facts {
+                    visit(index)?;
+                }
+            }
+            Some(pb::command::Kind::Prove(prove)) => {
+                for index in &mut prove.facts {
+                    visit(index)?;
+                }
+            }
+            Some(pb::command::Kind::Extract(extract)) => {
+                for index in &mut extract.roots {
+                    visit(index)?;
+                }
+            }
+            Some(pb::command::Kind::Fail(child)) => pending.push(child),
+            Some(pb::command::Kind::Repeat(body)) => {
+                for index in &mut body.until {
+                    visit(index)?;
+                }
+                pending.extend(&mut body.body);
+            }
+            Some(pb::command::Kind::Saturate(body)) => {
+                for index in &mut body.until {
+                    visit(index)?;
+                }
+                pending.extend(&mut body.body);
+            }
+            Some(
+                pb::command::Kind::Run(_)
+                | pb::command::Kind::BindScheduler(_)
+                | pb::command::Kind::KeepBest(_)
+                | pb::command::Kind::Freeze(_)
+                | pb::command::Kind::PrintSize(_)
+                | pb::command::Kind::PrintFunction(_)
+                | pb::command::Kind::PrintTableStats(_)
+                | pb::command::Kind::ProveExists(_)
+                | pb::command::Kind::Stats(_),
+            )
+            | None => (),
+        }
+    }
+    Ok(())
+}
+
+// Keep the private arena for later rule publication, but copy only this phase's
+// fresh validation obligations and reachable occurrences. Allocate an identity
+// before following edges: shared and distinct Unions, including cycles, survive.
+fn project_source_nodes(
+    arena: &[pb::Node],
+    first_node: usize,
+    program: &mut pb::Program,
+) -> Result<(), String> {
+    struct Projection<'a> {
+        arena: &'a [pb::Node],
+        indices: HashMap<u32, u32>,
+        nodes: Vec<pb::Node>,
+    }
+    impl Projection<'_> {
+        fn relocate(&mut self, index: &mut u32) -> Result<(), String> {
+            if let Some(local) = self.indices.get(index) {
+                *index = *local;
+            } else if let Some(node) = self.arena.get(*index as usize) {
+                let local = u32::try_from(self.nodes.len()).map_err(|_| "too many source nodes")?;
+                self.indices.insert(*index, local);
+                self.nodes.push(node.clone());
+                *index = local;
+            }
+            // An originally dangling reference is still out of bounds because
+            // this projection has no more nodes than the original arena.
+            Ok(())
+        }
+    }
+    debug_assert!(program.nodes.is_empty());
+    let mut projection = Projection {
+        arena,
+        indices: HashMap::new(),
+        nodes: Vec::new(),
+    };
+    for index in first_node..arena.len() {
+        projection.relocate(&mut u32::try_from(index).map_err(|_| "too many source nodes")?)?;
+    }
+    source_phase_refs(program, |index| projection.relocate(index))?;
+    let mut cursor = 0;
+    while cursor < projection.nodes.len() {
+        let mut node = std::mem::take(&mut projection.nodes[cursor]);
+        source_node_refs(&mut node, |index| projection.relocate(index))?;
+        projection.nodes[cursor] = node;
+        cursor += 1;
+    }
+    program.nodes = projection.nodes;
+    Ok(())
+}
+
 struct InputSignature {
     table: String,
     inputs: Vec<u32>,
@@ -518,6 +787,7 @@ impl Source {
             self.commands.clear();
             return Some(Err(TransportError(error)));
         }
+        let first_node = self.program.nodes.len();
         let result = loop {
             let (command, depth) = self.commands.pop_front()?;
             match command {
@@ -679,6 +949,21 @@ impl Source {
                 }
             }
         };
+        let result = result.and_then(|mut submission| {
+            if let Submission::Program(program) = &mut submission {
+                project_source_nodes(&self.program.nodes, first_node, program)?;
+                let types = self.graph.authoring_type_info();
+                let logical_name = |name: &mut String| {
+                    if let Some(function) = types.get_func_type(name)
+                        && let Some(ast::TableName::Public(logical)) = &function.table_name
+                    {
+                        *name = logical.clone();
+                    }
+                };
+                map_callable_names(program, logical_name, logical_name);
+            }
+            Ok(submission)
+        });
         if result.is_err() {
             self.commands.clear();
         }
@@ -1762,25 +2047,18 @@ impl Source {
                 ruleset
             })
             .collect();
-        let mut program = pb::Program {
+        let program = pb::Program {
             ir_version: 1,
             sorts: self.program.sorts.clone(),
-            nodes: self.program.nodes.clone(),
+            // Node references stay private until advance joins any successful
+            // macro prefix, then projects the complete authored phase once.
+            nodes: Vec::new(),
             files: self.program.files.clone(),
             declarations: std::mem::take(&mut self.program.declarations),
             commands: std::mem::take(&mut self.program.commands),
             rules,
             rulesets,
         };
-        let types: &egglog::TypeInfo = self.graph.authoring_type_info();
-        let logical_name = |name: &mut String| {
-            if let Some(function) = types.get_func_type(name)
-                && let Some(ast::TableName::Public(logical)) = &function.table_name
-            {
-                *name = logical.clone();
-            }
-        };
-        map_callable_names(&mut program, logical_name, logical_name);
         *self.graph.extension_state_or_default::<SourceTableNames>() = tables;
         Ok(program)
     }
@@ -4995,4 +5273,295 @@ fn render_schedule(schedule: &ast::Schedule) -> String {
     }
     text.push(')');
     text
+}
+
+#[cfg(test)]
+mod node_projection_tests {
+    use super::*;
+
+    #[test]
+    fn projection_preserves_cycles_distinct_unions_and_fresh_invalid_records() {
+        use pb::{node::Kind as N, primitive_value::Value as V};
+        let mut arena: Vec<_> = [
+            N::PrimitiveValue(pb::PrimitiveValue {
+                value: Some(V::I64(99)),
+            }),
+            N::PrimitiveValue(pb::PrimitiveValue {
+                value: Some(V::I64(7)),
+            }),
+            N::Union(pb::Union { members: vec![3] }),
+            N::Call(pb::Call {
+                func: "Next".into(),
+                args: vec![2],
+            }),
+            N::Union(pb::Union { members: vec![] }),
+            N::Union(pb::Union { members: vec![] }),
+            N::PrimitiveValue(pb::PrimitiveValue {
+                value: Some(V::Lambda(pb::Lambda {
+                    captures: vec![2],
+                    body: 1,
+                })),
+            }),
+            N::Call(pb::Call {
+                func: "Missing".into(),
+                args: vec![999],
+            }),
+        ]
+        .into_iter()
+        .map(|kind| pb::Node {
+            kind: Some(kind),
+            ..Default::default()
+        })
+        .collect();
+        arena[7].sort_id = 999;
+        let mut program = pb::Program {
+            commands: [2, 4, 5]
+                .into_iter()
+                .map(|index| pb::Command {
+                    kind: Some(pb::command::Kind::Action(pb::Action {
+                        kind: Some(pb::action::Kind::Term(index)),
+                        ..Default::default()
+                    })),
+                    ..Default::default()
+                })
+                .collect(),
+            files: vec![pb::SourceFile {
+                name: "source.egg".into(),
+                contents: Some("unchanged".into()),
+            }],
+            sorts: vec![pb::Sort::default()],
+            ..Default::default()
+        };
+        let files = program.files.clone();
+        let sorts = program.sorts.clone();
+        project_source_nodes(&arena, 6, &mut program).unwrap();
+        assert_eq!(program.nodes.len(), 7);
+        assert_eq!(
+            (program.files.clone(), program.sorts.clone()),
+            (files, sorts)
+        );
+        assert!(!program.nodes.iter().any(|node| matches!(
+            &node.kind,
+            Some(N::PrimitiveValue(pb::PrimitiveValue {
+                value: Some(V::I64(99))
+            }))
+        )));
+        // Neither an unsupported template nor an unreferenced invalid fresh
+        // annotation disappears before the receiver's normal admission.
+        assert!(matches!(
+            &program.nodes[0].kind,
+            Some(N::PrimitiveValue(pb::PrimitiveValue {
+                value: Some(V::Lambda(_))
+            }))
+        ));
+        assert_eq!(program.nodes[1].sort_id, 999);
+        assert!(matches!(&program.nodes[1].kind, Some(N::Call(call)) if call.args == [999]));
+        let roots: Vec<_> = program
+            .commands
+            .iter()
+            .map(|command| {
+                let Some(pb::command::Kind::Action(pb::Action {
+                    kind: Some(pb::action::Kind::Term(index)),
+                    ..
+                })) = &command.kind
+                else {
+                    unreachable!()
+                };
+                *index
+            })
+            .collect();
+        assert_ne!(roots[1], roots[2]);
+        assert_eq!(
+            program.nodes[roots[1] as usize],
+            program.nodes[roots[2] as usize]
+        );
+        let Some(N::Union(union)) = &program.nodes[roots[0] as usize].kind else {
+            panic!("cycle root")
+        };
+        let Some(N::Call(call)) = &program.nodes[union.members[0] as usize].kind else {
+            panic!("cycle member")
+        };
+        assert_eq!(call.args, [roots[0]]);
+        assert_eq!(arena.len(), 8, "private arena was not compacted");
+    }
+
+    #[test]
+    fn projection_roots_include_saved_code_defaults_rules_and_nested_controls() {
+        let mut program = pb::Program {
+            declarations: vec![
+                pb::Declaration {
+                    kind: Some(pb::declaration::Kind::Constructor(pb::Constructor {
+                        cost: Some(1),
+                        ..Default::default()
+                    })),
+                    ..Default::default()
+                },
+                pb::Declaration {
+                    kind: Some(pb::declaration::Kind::Function(pb::Function {
+                        merge: Some(2),
+                        ..Default::default()
+                    })),
+                    ..Default::default()
+                },
+                pb::Declaration {
+                    kind: Some(pb::declaration::Kind::Primitive(pb::Primitive {
+                        body: Some(3),
+                        ..Default::default()
+                    })),
+                    bindings: Some(pb::CallableBindings {
+                        python: Some(pb::PythonBindings {
+                            views: vec![pb::PythonCallable {
+                                params: vec![pb::PythonParameter {
+                                    default_expr: Some(4),
+                                    ..Default::default()
+                                }],
+                                ..Default::default()
+                            }],
+                        }),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+            ],
+            rules: vec![
+                pb::RuleDecl {
+                    kind: Some(pb::rule_decl::Kind::Rule(pb::Rule {
+                        query: vec![5],
+                        head: vec![
+                            pb::Action {
+                                kind: Some(pb::action::Kind::Set(pb::Set {
+                                    target: Some(pb::Call {
+                                        args: vec![6],
+                                        ..Default::default()
+                                    }),
+                                    value: Some(7),
+                                })),
+                                ..Default::default()
+                            },
+                            pb::Action {
+                                kind: Some(pb::action::Kind::SetCost(pb::SetCost {
+                                    target: Some(pb::Call {
+                                        args: vec![8],
+                                        ..Default::default()
+                                    }),
+                                    cost: Some(9),
+                                })),
+                                ..Default::default()
+                            },
+                            pb::Action {
+                                kind: Some(pb::action::Kind::Delete(pb::Call {
+                                    args: vec![10],
+                                    ..Default::default()
+                                })),
+                                ..Default::default()
+                            },
+                            pb::Action {
+                                kind: Some(pb::action::Kind::Subsume(pb::Call {
+                                    args: vec![11],
+                                    ..Default::default()
+                                })),
+                                ..Default::default()
+                            },
+                            pb::Action {
+                                kind: Some(pb::action::Kind::Term(12)),
+                                ..Default::default()
+                            },
+                        ],
+                    })),
+                    ..Default::default()
+                },
+                pb::RuleDecl {
+                    kind: Some(pb::rule_decl::Kind::Rewrite(pb::Rewrite {
+                        lhs: 13,
+                        rhs: 14,
+                        conditions: vec![15],
+                        ..Default::default()
+                    })),
+                    ..Default::default()
+                },
+                pb::RuleDecl {
+                    kind: Some(pb::rule_decl::Kind::Birewrite(pb::BiRewrite {
+                        lhs: 16,
+                        rhs: 17,
+                        conditions: vec![18],
+                    })),
+                    ..Default::default()
+                },
+            ],
+            commands: vec![pb::Command {
+                kind: Some(pb::command::Kind::Fail(Box::new(pb::Command {
+                    kind: Some(pb::command::Kind::Repeat(pb::Repeat {
+                        until: vec![19],
+                        body: vec![pb::Command {
+                            kind: Some(pb::command::Kind::Saturate(pb::Saturate {
+                                until: vec![20],
+                                body: vec![
+                                    pb::Command {
+                                        kind: Some(pb::command::Kind::Check(pb::Check {
+                                            facts: vec![21],
+                                        })),
+                                        ..Default::default()
+                                    },
+                                    pb::Command {
+                                        kind: Some(pb::command::Kind::Prove(pb::Prove {
+                                            facts: vec![22],
+                                        })),
+                                        ..Default::default()
+                                    },
+                                    pb::Command {
+                                        kind: Some(pb::command::Kind::Extract(pb::Extract {
+                                            roots: vec![23],
+                                            ..Default::default()
+                                        })),
+                                        ..Default::default()
+                                    },
+                                    pb::Command {
+                                        kind: Some(pb::command::Kind::Action(pb::Action {
+                                            kind: Some(pb::action::Kind::Set(pb::Set {
+                                                target: Some(pb::Call {
+                                                    args: vec![24],
+                                                    ..Default::default()
+                                                }),
+                                                value: Some(25),
+                                            })),
+                                            ..Default::default()
+                                        })),
+                                        ..Default::default()
+                                    },
+                                ],
+                                ..Default::default()
+                            })),
+                            ..Default::default()
+                        }],
+                        ..Default::default()
+                    })),
+                    ..Default::default()
+                }))),
+                ..Default::default()
+            }],
+            rulesets: vec![pb::Ruleset {
+                kind: Some(pb::ruleset::Kind::Rules(pb::RuleList { rules: vec![26] })),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let sets = program.rulesets.clone();
+        let mut visited = HashSet::new();
+        source_phase_refs(&mut program, |index| {
+            assert!(visited.insert(*index));
+            *index += 1000;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(visited, (1..=25).collect());
+        assert_eq!(
+            program.rulesets, sets,
+            "rule occurrence indices are not node references"
+        );
+        source_phase_refs(&mut program, |index| {
+            assert!(*index >= 1000);
+            Ok(())
+        })
+        .unwrap();
+    }
 }
