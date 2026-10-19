@@ -2156,16 +2156,28 @@ impl Session {
             pb::command::Kind::Action(action)
                 if context.scoped_actions.contains(&location.path) =>
             {
-                eval_scoped_action(
+                let mut measurements = ScheduleMeasurements::default();
+                let result = eval_scoped_action(
                     &mut self.graph,
                     program,
                     action,
                     &mut context.union_values,
                     true,
                     context.action_dags.get(&location.path),
-                    &mut |_| {},
+                    &mut |event| {
+                        measurements.observe(event, self.mode, Some(location), &HashMap::new())
+                    },
                     &context.native_spans,
-                )?;
+                );
+                *failure_site = measurements.failure.clone();
+                measurements.publish(
+                    pb::maintenance_site::Target::Command(pb::StaticCommandPath {
+                        path: location.path.clone(),
+                    }),
+                    context,
+                    response,
+                );
+                result?;
                 None
             }
             pb::command::Kind::Extract(extract) if !extract.cost_model.is_empty() => {

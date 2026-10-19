@@ -419,9 +419,10 @@ fn source_receiving_modes_preserve_canonical_sort_alias_uses() {
 }
 
 #[test]
-fn source_receiving_modes_preserve_native_multi_vec_empty_failure_boundary() {
-    let canonical = "(sort V (Vec i64)) (sort NestedV (Vec V)) (datatype X (XV V) (XW V) (Nested NestedV) (Value)) (function f (V) X :merge old) (XW (vec-empty))";
-    let text = "(sort V (Vec i64)) (sort W (Vec i64)) (sort NestedV (Vec V)) (sort NestedW (Vec W)) (datatype X (XV V) (XW W) (Nested NestedW) (Value)) (function f (V) X :merge old) (XW (vec-empty))";
+fn source_receiving_modes_preserve_typed_multi_vec_empty_context() {
+    let header = "(sort V (Vec i64)) (sort NestedV (Vec V)) (datatype X (XV V) (XW V) (Nested NestedV) (Value)) (function f (V) X :merge old)";
+    let canonical = format!("{header} (XW (vec-empty))");
+    let text = "(sort V (Vec i64)) (sort W (Vec i64)) (sort NestedV (Vec V)) (sort NestedW (Vec W)) (datatype X (XV V) (XW W) (Nested NestedW) (Value)) (function f (V) X :merge old) (XW (vec-empty)) (check (XW xs) (= (vec-length xs) 0))";
     for mode in [
         pb::ExecutionMode::TermEncoding,
         pb::ExecutionMode::Proofs,
@@ -433,7 +434,7 @@ fn source_receiving_modes_preserve_native_multi_vec_empty_failure_boundary() {
             pb::ExecutionMode::Proofs => graph.with_proofs_enabled(),
             _ => graph.with_proofs_enabled().with_proof_testing(),
         };
-        let commands = native.parse_program(None, canonical).unwrap();
+        let commands = native.parse_program(None, &canonical).unwrap();
         let mut native_failure = None;
         for (position, command) in commands.into_iter().enumerate() {
             if let Err(error) = native.run_program(vec![command]) {
@@ -444,32 +445,56 @@ fn source_receiving_modes_preserve_native_multi_vec_empty_failure_boundary() {
         let (position, message) = native_failure.expect("native ambiguity must remain visible");
         assert_eq!(position, 4, "native/{mode:?}");
         assert!(message.contains("Failed to infer a type for: @vec-empty"));
+        assert!(matches!(
+            native.print_size(Some("XW")).unwrap(),
+            egglog::CommandOutput::PrintFunctionSize(0)
+        ));
+
+        // Legacy action instrumentation loses the enclosing XW type context
+        // when it emits an isolated vec-empty Let. Typed wire actions retain
+        // that context in a native ActionScope; compare independently against
+        // the same native scoped boundary, not the erased legacy expression.
+        let graph = egglog_experimental::new_experimental_egraph();
+        let mut contextual = match mode {
+            pb::ExecutionMode::TermEncoding => graph.with_term_encoding_enabled(),
+            pb::ExecutionMode::Proofs => graph.with_proofs_enabled(),
+            _ => graph.with_proofs_enabled().with_proof_testing(),
+        };
+        contextual.parse_and_run_program(None, header).unwrap();
+        let egglog::ast::Command::Action(action) = contextual
+            .parse_program(None, "(XW (vec-empty))")
+            .unwrap()
+            .remove(0)
+        else {
+            panic!("native contextual action")
+        };
+        contextual
+            .run_program(vec![egglog::ast::Command::ActionScope(
+                egglog::span!(),
+                egglog::ast::GenericActions::new(vec![action]),
+            )])
+            .unwrap();
+        contextual
+            .parse_and_run_program(None, "(check (XW xs) (= (vec-length xs) 0))")
+            .unwrap();
+        assert!(matches!(
+            contextual.print_size(Some("XW")).unwrap(),
+            egglog::CommandOutput::PrintFunctionSize(1)
+        ));
         let source = Source::new(None, text)
             .unwrap()
             .with_execution_mode(mode)
             .unwrap();
         let mut engine = Engine::default();
         let id = create(&mut engine, mode);
-        let mut byte_failure = None;
         for (position, phase) in source.enumerate() {
             let response = run(
                 &mut engine,
                 id,
                 phase.expect("producer must preserve valid aliases"),
             );
-            if let Some(error) = response.error {
-                byte_failure = Some((position, error));
-                break;
-            }
+            assert_eq!(response.error, None, "typed phase {position}/{mode:?}");
         }
-        let (position, error) = byte_failure.expect("receiver must preserve native ambiguity");
-        assert_eq!(position, 6, "receiver/{mode:?}");
-        assert_eq!(error.code, i32::from(pb::ErrorCode::InvalidProgram));
-        assert_eq!(error.message, message, "same native failure/{mode:?}");
-        assert!(matches!(
-            native.print_size(Some("XW")).unwrap(),
-            egglog::CommandOutput::PrintFunctionSize(0)
-        ));
         let response = run(
             &mut engine,
             id,
@@ -489,8 +514,8 @@ fn source_receiving_modes_preserve_native_multi_vec_empty_failure_boundary() {
             panic!("typed XW size")
         };
         assert_eq!(
-            sizes.sizes[0].rows, 0,
-            "no failed empty publication/{mode:?}"
+            sizes.sizes[0].rows, 1,
+            "contextual empty publication/{mode:?}"
         );
     }
 }
