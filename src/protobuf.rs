@@ -5047,10 +5047,6 @@ fn classify_value_dags<K: Eq + std::hash::Hash>(
         // Set keys precede its value in the existing scoped action compiler.
         let mut pending = roots;
         let mut seen = HashSet::new();
-        // Bound compact nodes/edges first; the planner also counts rereads.
-        let mut remaining = 65_536usize
-            .checked_sub(pending.len())
-            .ok_or("action DAG exceeds 65536 nodes and edges")?;
         let mut eligible = true;
         while let Some(index) = pending.pop() {
             if !seen.insert(index) {
@@ -5089,9 +5085,6 @@ fn classify_value_dags<K: Eq + std::hash::Hash>(
                     break;
                 }
             };
-            remaining = remaining
-                .checked_sub(1 + children.len())
-                .ok_or("action DAG exceeds 65536 nodes and edges")?;
             pending.extend(children);
         }
         if eligible {
@@ -5311,7 +5304,6 @@ fn action_dag_actions(
                 .map(|index| Walk::Enter(*index)),
         );
     }
-    let mut remaining = 65_536usize;
     let mut bind_value = |index: u32, value: Expr| -> Result<(String, Expr), String> {
         let span = native_span(
             program,
@@ -5330,9 +5322,6 @@ fn action_dag_actions(
         Ok((name.clone(), Expr::Var(span, name)))
     };
     while let Some(step) = pending.pop() {
-        remaining = remaining
-            .checked_sub(1)
-            .ok_or("native action expansion exceeds 65536 steps")?;
         let (index, value) = match step {
             Walk::Enter(index) => {
                 let node = &program.nodes[index as usize];
@@ -7618,6 +7607,86 @@ mod tests {
         assert_eq!(graph.materialized_eq_classes().len(), 1051);
         assert_eq!(graph.get_function_names(), functions);
         assert!(values.is_empty());
+    }
+
+    #[test]
+    fn ordinary_action_dag_size_tracks_shared_representation_not_a_fixed_budget() {
+        let mut program = inventory_fixture("(datatype A (Leaf) (Pair A A)) (Leaf)");
+        let Some(pb::command::Kind::Action(action)) = &mut program.commands[0].kind else {
+            panic!("Leaf action")
+        };
+        let Some(pb::action::Kind::Term(mut root)) = action.kind else {
+            panic!("Leaf root")
+        };
+        assert_eq!(program.nodes.len(), 1);
+        let sort_id = program.nodes[root as usize].sort_id;
+        for _ in 0..22_000 {
+            program.nodes.push(pb::Node {
+                sort_id,
+                kind: Some(pb::node::Kind::Call(pb::Call {
+                    func: "Pair".into(),
+                    args: vec![root, root],
+                })),
+                ..Default::default()
+            });
+            root = program.nodes.len() as u32 - 1;
+        }
+        action.kind = Some(pb::action::Kind::Term(root));
+        program.commands.push(pb::Command {
+            kind: Some(pb::command::Kind::PrintSize(pb::PrintSize {
+                tables: vec!["Leaf".into(), "Pair".into()],
+            })),
+            ..Default::default()
+        });
+
+        // R=1, V=C=22,001, E=44,000: both former ordinary traversal
+        // counters charged 66,002 steps to this compact, acyclic graph.
+        let native_spans = NativeSpans::default();
+        validate_node_graph(&program, &native_spans).unwrap();
+        let closed = classify_action_dags(&program).unwrap();
+        assert_eq!(closed[&vec![0]].len(), 22_001);
+        let Some(pb::command::Kind::Action(action)) = &program.commands[0].kind else {
+            unreachable!()
+        };
+        let mut memo = HashMap::new();
+        let (actions, evaluated) = action_dag_actions(
+            &program,
+            action,
+            |_| false,
+            &native_spans,
+            &mut memo,
+            &mut 0,
+        )
+        .unwrap();
+        assert_eq!(memo.len(), 22_001);
+        assert!(evaluated.into_iter().eq(0..=root));
+        assert_eq!(actions.len(), 22_002);
+        for action in &actions[..22_001] {
+            let Action::Let(_, _, Expr::Call(_, _, children)) = action else {
+                panic!("one shallow local per call")
+            };
+            assert!(children.iter().all(|child| matches!(child, Expr::Var(..))));
+        }
+        assert!(matches!(
+            actions.last(),
+            Some(Action::Expr(_, Expr::Var(..)))
+        ));
+
+        let (mut engine, id) = host_default_engine();
+        let response = run_host_default(&mut engine, id, program);
+        assert_eq!(response.error, None);
+        assert!(response.profile.unwrap().complete);
+        let Some(pb::command_output::Kind::Sizes(sizes)) = &response.outputs[0].kind else {
+            panic!("observable tables, not unfolded extraction")
+        };
+        assert_eq!(
+            sizes
+                .sizes
+                .iter()
+                .map(|size| (size.table.as_str(), size.rows))
+                .collect::<Vec<_>>(),
+            [("Leaf", 1), ("Pair", 22_000)]
+        );
     }
 
     #[test]

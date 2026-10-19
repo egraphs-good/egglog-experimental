@@ -2657,9 +2657,9 @@ mod constructor_action_dags {
         assert!(sizes.sizes.iter().all(|table| table.rows == 0));
 
         for invalid in [
-            "name", "sort", "root", "cycle", "budget", "body", "head", "read", "union",
+            "name", "sort", "root", "cycle", "body", "head", "read", "union",
         ] {
-            let mut invalid_program = program(if invalid == "budget" { 32_768 } else { 300 }, 0);
+            let mut invalid_program = program(300, 0);
             let root = invalid_program.nodes.len() as u32 - 1;
             match invalid {
                 "name" => {
@@ -2693,7 +2693,6 @@ mod constructor_action_dags {
                             args: vec![root],
                         }))
                 }
-                "budget" => (),
                 "body" => invalid_program.declarations.push(pb::Declaration {
                     kind: Some(pb::declaration::Kind::Primitive(pb::Primitive {
                         name: "deep-body".into(),
@@ -2753,8 +2752,6 @@ mod constructor_action_dags {
                             || error.message.contains("too-deep"),
                         "{invalid}: {error:?}"
                     );
-                } else if invalid == "budget" {
-                    assert!(error.message.contains("nodes and edges"), "{error:?}");
                 } else if invalid == "read" {
                     assert_eq!(error.code, i32::from(pb::ErrorCode::EvaluationFailed));
                     assert!(error.message.contains("lookup of function"), "{error:?}");
