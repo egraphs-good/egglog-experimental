@@ -820,6 +820,22 @@ impl ProtoRun {
     fn run(&self) -> Result<(), String> {
         let mut program = std::fs::read_to_string(&self.path).map_err(|error| error.to_string())?;
         let filename = Some(self.path.to_string_lossy().into_owned());
+        let relation_subsumption = self.core
+            && self.mode == pb::ExecutionMode::Normal
+            && self.path.ends_with("subsume-relation.egg");
+        let relation_subsumption_error = "relation rows cannot be Subsumed";
+        let is_relation_subsumption = |phase: &Submission| {
+            matches!(phase, Submission::Program(program) if matches!(
+                program.commands.as_slice(),
+                [pb::Command {
+                    kind: Some(pb::command::Kind::Action(pb::Action {
+                        kind: Some(pb::action::Kind::Subsume(call)),
+                        ..
+                    })),
+                    ..
+                }] if call.func == "R" && call.args.len() == 2
+            ))
+        };
         if self.roundtrip {
             let mut source = if self.core {
                 Source::new_core(filename.clone(), &program)
@@ -835,14 +851,26 @@ impl ProtoRun {
                 Renderer::default()
             };
             program.clear();
+            let mut index = 0;
             while let Some(phase) = source.next_submission() {
                 let phase =
                     phase.map_err(|error| format!("source export before resugaring: {error}"))?;
-                program.push_str(
-                    &renderer
-                        .render_submission(&phase)
-                        .map_err(|error| format!("source rendering: {error}"))?,
-                );
+                if relation_subsumption && index == 5 && !is_relation_subsumption(&phase) {
+                    return Err("relation subsumption phase differs before resugaring".into());
+                }
+                let rendered = renderer.render_submission(&phase);
+                if relation_subsumption && index == 5 {
+                    return match rendered {
+                        Err(error) if error.to_string() == relation_subsumption_error => Ok(()),
+                        Err(error) => Err(format!("source rendering: {error}")),
+                        Ok(_) => Err("relation subsumption unexpectedly rendered".into()),
+                    };
+                }
+                program.push_str(&rendered.map_err(|error| format!("source rendering: {error}"))?);
+                index += 1;
+            }
+            if relation_subsumption {
+                return Err("relation subsumption phase missing before resugaring".into());
             }
         }
         let mut native = if self.core {
@@ -943,9 +971,13 @@ impl ProtoRun {
                 })
             });
             let source_error = phase.is_err();
+            let mut relation_subsumption_rejected = false;
             let actual = phase
                 .map_err(|error| format!("source export: {error}"))
                 .and_then(|phase| {
+                    if relation_subsumption && index == 5 && !is_relation_subsumption(&phase) {
+                        return Err("relation subsumption phase differs before execution".into());
+                    }
                     let phase = match phase {
                         Submission::Program(program) => program,
                         Submission::PrintFunction(print) => {
@@ -1052,6 +1084,17 @@ impl ProtoRun {
                         return Ok(response);
                     }
                     if let Some(error) = &response.error {
+                        if relation_subsumption && index == 5 {
+                            if error.code != pb::ErrorCode::InvalidProgram as i32
+                                || error.message != relation_subsumption_error
+                                || !response.outputs.is_empty()
+                            {
+                                return Err(format!(
+                                    "relation subsumption rejection differs: {response:?}"
+                                ));
+                            }
+                            relation_subsumption_rejected = true;
+                        }
                         Err(format!(
                             "adapter {:?}: {}",
                             pb::ErrorCode::try_from(error.code),
@@ -1062,6 +1105,7 @@ impl ProtoRun {
                     }
                 });
             match (expected, actual) {
+                (Ok(_), Err(_)) if relation_subsumption_rejected => return Ok(()),
                 (Err(expected), Ok(_)) if grounding && native_ungrounded => {
                     let Some(Err(error)) = source.next_submission() else {
                         return Err(format!(
@@ -1081,6 +1125,9 @@ impl ProtoRun {
                     return Ok(());
                 }
                 (Ok(_), Ok(response)) => {
+                    if relation_subsumption && index == 5 {
+                        return Err("relation subsumption unexpectedly executed".into());
+                    }
                     if let Some(extract) = extract {
                         let mut terms = vec![];
                         let mut saw_extract = false;
@@ -1150,6 +1197,9 @@ impl ProtoRun {
         }
         if self.path.ends_with("relation-query-allowed.egg") {
             return Err("legacy relation-value equality unexpectedly succeeded".into());
+        }
+        if relation_subsumption {
+            return Err("relation subsumption rejection was not observed".into());
         }
         Ok(())
     }
@@ -2529,6 +2579,8 @@ fn protobuf_trials(root: &std::path::Path, core: bool) -> Vec<Trial> {
                 if roundtrip { "/resugar" } else { "" },
                 if path.ends_with("relation-query-allowed.egg") {
                     "/rejects_relation_values"
+                } else if core && !requires_proofs && path.ends_with("subsume-relation.egg") {
+                    "/rejects_relation_subsumption"
                 } else {
                     ""
                 }
