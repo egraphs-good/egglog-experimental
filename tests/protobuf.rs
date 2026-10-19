@@ -1963,17 +1963,17 @@ mod constructor_action_dags {
         struct AmbientName;
         impl NativeExtension for AmbientName {
             fn initialize(&self, graph: &mut egglog::EGraph) -> Result<(), String> {
-                let command = graph
+                let commands = graph
                     .parse_program(
                         Some("ambient-provider.egg".into()),
-                        "(sort __egglog_proto_action_0)",
+                        "(sort __egglog_proto_action_0) (sort __egglog_proto_query_0)",
                     )
-                    .map_err(|error| error.to_string())?
-                    .pop()
-                    .unwrap();
-                graph
-                    .resolve_command_preserving_globals(command)
                     .map_err(|error| error.to_string())?;
+                for command in commands {
+                    graph
+                        .resolve_command_preserving_globals(command)
+                        .map_err(|error| error.to_string())?;
+                }
                 Ok(())
             }
             fn lower_custom_value(
@@ -1998,6 +1998,12 @@ mod constructor_action_dags {
         let provider = std::sync::Arc::new(AmbientName);
         let mut original = set_program(28, false);
         original.commands.truncate(1);
+        original.commands.push(pb::Command {
+            kind: Some(pb::command::Kind::Check(pb::Check {
+                facts: vec![original.nodes.len() as u32 - 1],
+            })),
+            ..Default::default()
+        });
         let text = Renderer::with_extension(provider.clone())
             .unwrap()
             .render(&original)
@@ -2011,6 +2017,7 @@ mod constructor_action_dags {
             assert_eq!(run(&mut engine, id, phase.unwrap()).error, None);
         }
         assert!(!text.contains("(let __egglog_proto_action_0 "));
+        assert!(!text.contains(" __egglog_proto_query_0)"));
     }
 
     #[test]
@@ -2539,7 +2546,7 @@ mod constructor_action_dags {
         assert!(sizes.sizes.iter().all(|table| table.rows == 0));
 
         for invalid in [
-            "name", "sort", "root", "cycle", "budget", "query", "body", "head", "read", "union",
+            "name", "sort", "root", "cycle", "budget", "body", "head", "read", "union",
         ] {
             let mut invalid_program = program(if invalid == "budget" { 32_768 } else { 300 }, 0);
             let root = invalid_program.nodes.len() as u32 - 1;
@@ -2576,10 +2583,6 @@ mod constructor_action_dags {
                         }))
                 }
                 "budget" => (),
-                "query" => invalid_program.commands.push(pb::Command {
-                    kind: Some(pb::command::Kind::Check(pb::Check { facts: vec![root] })),
-                    ..Default::default()
-                }),
                 "body" => invalid_program.declarations.push(pb::Declaration {
                     kind: Some(pb::declaration::Kind::Primitive(pb::Primitive {
                         name: "deep-body".into(),
@@ -2633,7 +2636,7 @@ mod constructor_action_dags {
                 );
             } else {
                 let error = response.error.unwrap_or_else(|| panic!("{invalid}"));
-                if matches!(invalid, "query" | "body") {
+                if invalid == "body" {
                     assert!(
                         error.message.contains("depth exceeds")
                             || error.message.contains("too-deep"),
@@ -2673,8 +2676,9 @@ mod constructor_action_dags {
     }
 
     #[test]
-    fn encoded_modes_execute_deep_action_graphs_and_keep_shallow_queries() {
+    fn query_graphs_match_deep_and_shared_terms_in_all_modes() {
         for mode in [
+            pb::ExecutionMode::Normal,
             pb::ExecutionMode::TermEncoding,
             pb::ExecutionMode::Proofs,
             pb::ExecutionMode::ProofTesting,
@@ -2693,20 +2697,310 @@ mod constructor_action_dags {
             let id = pb::CreateEGraphResponse::decode(bytes.as_slice())
                 .unwrap()
                 .egraph_id;
-            let mut deep = program(300, 0);
-            deep.commands.truncate(1);
-            deep.commands.push(pb::Command {
-                kind: Some(pb::command::Kind::Check(pb::Check { facts: vec![1] })),
+            for (wraps, share_every) in [(300, 0), (28, 1)] {
+                let mut input = program(wraps, share_every);
+                let root = input.nodes.len() as u32 - 1;
+                input.commands.truncate(1);
+                input.commands.push(pb::Command {
+                    kind: Some(pb::command::Kind::Check(pb::Check {
+                        facts: vec![root, root],
+                    })),
+                    ..Default::default()
+                });
+                let response = run(&mut engine, id, input);
+                assert_eq!(response.error, None, "{wraps}/{share_every}/{mode:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn query_graphs_drive_rules_rewrite_directions_and_source_replay() {
+        use egglog_experimental::protobuf::source::{Renderer, Source};
+
+        for kind in ["rule", "rewrite", "birewrite"] {
+            let mut input = program(28, 1);
+            let root = input.nodes.len() as u32 - 1;
+            input.declarations.push(pb::Declaration {
+                kind: Some(pb::declaration::Kind::Constructor(pb::Constructor {
+                    name: "Seen".into(),
+                    output: 1,
+                    ..Default::default()
+                })),
                 ..Default::default()
             });
-            let response = run(&mut engine, id, deep);
-            assert_eq!(
-                response.error, None,
-                "deep action and actual shallow witness in {mode:?}"
+            let seen = input.nodes.len() as u32;
+            input.nodes.push(pb::Node {
+                sort_id: 1,
+                kind: Some(pb::node::Kind::Call(pb::Call {
+                    func: "Seen".into(),
+                    args: vec![],
+                })),
+                ..Default::default()
+            });
+            input.rules.push(pb::RuleDecl {
+                name: Some("query-witness".into()),
+                eval_mode: pb::RuleEvalMode::Seminaive.into(),
+                kind: Some(pb::rule_decl::Kind::Rule(pb::Rule {
+                    query: vec![root, root],
+                    head: vec![pb::Action {
+                        kind: Some(pb::action::Kind::Term(seen)),
+                        ..Default::default()
+                    }],
+                })),
+                ..Default::default()
+            });
+            if kind != "rule" {
+                input.rules.push(pb::RuleDecl {
+                    name: Some("query-rewrite".into()),
+                    eval_mode: pb::RuleEvalMode::Seminaive.into(),
+                    kind: Some(if kind == "rewrite" {
+                        pb::rule_decl::Kind::Rewrite(pb::Rewrite {
+                            lhs: root,
+                            rhs: 0,
+                            conditions: vec![root],
+                            subsume: false,
+                        })
+                    } else {
+                        pb::rule_decl::Kind::Birewrite(pb::BiRewrite {
+                            lhs: root,
+                            rhs: 0,
+                            conditions: vec![root],
+                        })
+                    }),
+                    ..Default::default()
+                });
+            }
+            input.rulesets.push(pb::Ruleset {
+                name: Some("queries".into()),
+                kind: Some(pb::ruleset::Kind::Rules(pb::RuleList {
+                    rules: (0..input.rules.len() as u32).collect(),
+                })),
+                ..Default::default()
+            });
+            input.commands.truncate(1);
+            input.commands.push(pb::Command {
+                kind: Some(pb::command::Kind::Run(pb::Run {
+                    ruleset: Some(pb::RulesetRef {
+                        kind: Some(pb::ruleset_ref::Kind::Index(0)),
+                    }),
+                    ..Default::default()
+                })),
+                ..Default::default()
+            });
+            let mut checks = vec![seen];
+            if kind != "rule" {
+                checks.push(input.nodes.len() as u32);
+                input.nodes.push(pb::Node {
+                    sort_id: 1,
+                    kind: Some(pb::node::Kind::Union(pb::Union {
+                        members: vec![root, 0],
+                    })),
+                    ..Default::default()
+                });
+            }
+            input.commands.push(pb::Command {
+                kind: Some(pb::command::Kind::Check(pb::Check { facts: checks })),
+                ..Default::default()
+            });
+            let rendered = Renderer::default().render(&input).unwrap();
+            assert!(
+                rendered.len() < 100_000,
+                "shared query must not become a tree"
             );
-            let mut shallow = program(5, 0);
-            shallow.commands.truncate(1);
-            assert_eq!(run(&mut engine, id, shallow).error, None, "{mode:?}");
+            let replay = Source::new(None, &rendered)
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            for mode in [
+                pb::ExecutionMode::Normal,
+                pb::ExecutionMode::TermEncoding,
+                pb::ExecutionMode::Proofs,
+                pb::ExecutionMode::ProofTesting,
+            ] {
+                for source in [false, true] {
+                    let mut engine = Engine::default();
+                    let bytes = engine
+                        .create(
+                            &pb::CreateEGraphRequest {
+                                sorts: fixture().sorts[..1].to_vec(),
+                                options: Some(pb::EGraphOptions {
+                                    cost_sort: Some(0),
+                                    execution_mode: mode.into(),
+                                    ..Default::default()
+                                }),
+                                ..Default::default()
+                            }
+                            .encode_to_vec(),
+                        )
+                        .unwrap();
+                    let id = pb::CreateEGraphResponse::decode(bytes.as_slice())
+                        .unwrap()
+                        .egraph_id;
+                    for phase in if source {
+                        replay.clone()
+                    } else {
+                        vec![input.clone()]
+                    } {
+                        assert_eq!(
+                            run(&mut engine, id, phase).error,
+                            None,
+                            "{kind}/{mode:?}/{source}"
+                        );
+                    }
+                    if !source
+                        && matches!(
+                            mode,
+                            pb::ExecutionMode::Proofs | pb::ExecutionMode::ProofTesting
+                        )
+                    {
+                        let mut proof = program(0, 0);
+                        proof.commands = vec![pb::Command {
+                            kind: Some(pb::command::Kind::ProveExists(pb::ProveExists {
+                                constructor: "Seen".into(),
+                            })),
+                            ..Default::default()
+                        }];
+                        let response = run(&mut engine, id, proof);
+                        assert_eq!(response.error, None, "{kind}/{mode:?}");
+                        assert!(matches!(
+                            &response.outputs[0].kind,
+                            Some(pb::command_output::Kind::Proof(_))
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn query_graphs_keep_generic_inference_and_partial_target_literals() {
+        use egglog_experimental::protobuf::source::{Renderer, Source};
+        let text = r#"
+            (sort VI (Vec i64)) (sort VS (Vec String))
+            (datatype E (Hold VI)) (Hold (vec-empty))
+            (check (Hold (vec-empty)))
+            (check (= 1 1)) (fail (check (= 1 2)))
+        "#;
+        let partial = r#"(sort F (UnstableFn (i64) i64))
+            (check (= (unstable-app (unstable-fn "+" 10) 2) 12))"#;
+        let partial_phases = Source::new(None, partial)
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        let mut phases = Source::new(None, text)
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        // A nested, singleton base-sort Union is matching equality, never a
+        // fresh class or a constructor. Keep the native nullary Vec context.
+        for phase in &mut phases {
+            let Some(pb::command::Kind::Check(check)) = phase
+                .commands
+                .first()
+                .and_then(|command| command.kind.as_ref())
+            else {
+                continue;
+            };
+            let hold = check.facts[0] as usize;
+            if matches!(&phase.nodes[hold].kind, Some(pb::node::Kind::Call(call)) if call.func == "Hold")
+            {
+                let Some(pb::node::Kind::Call(call)) = &phase.nodes[hold].kind else {
+                    unreachable!()
+                };
+                let member = call.args[0];
+                let union = phase.nodes.len() as u32;
+                phase.nodes.push(pb::Node {
+                    sort_id: phase.nodes[member as usize].sort_id,
+                    kind: Some(pb::node::Kind::Union(pb::Union {
+                        members: vec![member],
+                    })),
+                    ..Default::default()
+                });
+                let Some(pb::node::Kind::Call(call)) = &mut phase.nodes[hold].kind else {
+                    unreachable!()
+                };
+                call.args[0] = union;
+            }
+        }
+        let mut renderer = Renderer::default();
+        let mut rendered = String::new();
+        for phase in &phases {
+            rendered.push_str(&renderer.render(phase).unwrap());
+        }
+        let replay = Source::new(None, &rendered)
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        for mode in [
+            pb::ExecutionMode::Normal,
+            pb::ExecutionMode::TermEncoding,
+            pb::ExecutionMode::Proofs,
+            pb::ExecutionMode::ProofTesting,
+        ] {
+            let native = new_experimental_egraph();
+            let mut native = match mode {
+                pb::ExecutionMode::Normal => native,
+                pb::ExecutionMode::TermEncoding => native.with_term_encoding_enabled(),
+                pb::ExecutionMode::Proofs => native.with_proofs_enabled(),
+                _ => native.with_proofs_enabled().with_proof_testing(),
+            };
+            let native = native.parse_and_run_program(None, partial);
+            if mode == pb::ExecutionMode::Normal {
+                native.unwrap();
+            } else {
+                assert!(
+                    native
+                        .unwrap_err()
+                        .to_string()
+                        .contains("primitive operation lacks a validator function")
+                );
+            }
+            for source in [false, true] {
+                let mut engine = Engine::default();
+                let created = engine
+                    .create(
+                        &pb::CreateEGraphRequest {
+                            sorts: fixture().sorts[..1].to_vec(),
+                            options: Some(pb::EGraphOptions {
+                                cost_sort: Some(0),
+                                execution_mode: mode.into(),
+                                ..Default::default()
+                            }),
+                            ..Default::default()
+                        }
+                        .encode_to_vec(),
+                    )
+                    .unwrap();
+                let id = pb::CreateEGraphResponse::decode(created.as_slice())
+                    .unwrap()
+                    .egraph_id;
+                for phase in if source { &replay } else { &phases } {
+                    assert_eq!(
+                        run(&mut engine, id, phase.clone()).error,
+                        None,
+                        "{mode:?}/{source}"
+                    );
+                }
+                let mut error = None;
+                for phase in &partial_phases {
+                    error = run(&mut engine, id, phase.clone()).error;
+                    if error.is_some() {
+                        break;
+                    }
+                }
+                if mode == pb::ExecutionMode::Normal {
+                    assert_eq!(error, None);
+                } else {
+                    let error = error.unwrap();
+                    assert_eq!(error.code, i32::from(pb::ErrorCode::InvalidProgram));
+                    assert!(
+                        error
+                            .message
+                            .contains("primitive operation lacks a validator function"),
+                        "{mode:?}/{source}: {error:?}"
+                    );
+                }
+            }
         }
     }
 
@@ -28045,7 +28339,7 @@ fn inert_exact_number_payloads_use_closed_action_and_extract_dags() {
 }
 
 #[test]
-fn shared_syntax_expansion_has_a_bounded_failure() {
+fn shared_syntax_queries_execute_without_tree_expansion() {
     let mut engine = Engine::default();
     let id = create(&mut engine);
     let mut program = fixture();
@@ -28097,8 +28391,8 @@ fn shared_syntax_expansion_has_a_bounded_failure() {
     for setup in &phases[..2] {
         assert_eq!(run(&mut engine, id, setup.clone()).error, None);
     }
-    // Query roots still use the bounded tree adapter, and reject before an
-    // earlier sentinel write. Direct closed constructor actions are DAG-lowered.
+    // Demand the compact shared graph in both an action and its query. The
+    // earlier sentinel write and observation prefix must now complete normally.
     program.commands.insert(
         0,
         pb::Command {
@@ -28116,19 +28410,57 @@ fn shared_syntax_expansion_has_a_bounded_failure() {
         },
     );
     program.commands.push(pb::Command {
+        kind: Some(pb::command::Kind::Action(pb::Action {
+            kind: Some(pb::action::Kind::Term(child)),
+            ..Default::default()
+        })),
+        ..Default::default()
+    });
+    program.commands.push(pb::Command {
         kind: Some(pb::command::Kind::Check(pb::Check { facts: vec![child] })),
         ..Default::default()
     });
     let response = run(&mut engine, id, program);
-    assert!(response.outputs.is_empty());
-    let error = response.error.unwrap();
-    assert_eq!(error.code, i32::from(pb::ErrorCode::InvalidProgram));
-    assert!(
-        error
-            .message
-            .contains("native expression expansion exceeds 65536 nodes")
+    assert_eq!(response.error, None);
+    assert_eq!(
+        response
+            .outputs
+            .iter()
+            .filter(|output| !matches!(&output.kind, Some(pb::command_output::Kind::Run(_))))
+            .map(|output| &output.kind)
+            .collect::<Vec<_>>(),
+        expected
+            .outputs
+            .iter()
+            .filter(|output| !matches!(&output.kind, Some(pb::command_output::Kind::Run(_))))
+            .map(|output| &output.kind)
+            .collect::<Vec<_>>()
     );
-    assert_eq!(run(&mut engine, id, phases[2].clone()).error, None);
+    let runs: Vec<_> = response
+        .outputs
+        .iter()
+        .filter_map(|output| match &output.kind {
+            Some(pb::command_output::Kind::Run(outcome)) => {
+                Some((outcome.updated, outcome.can_stop))
+            }
+            _ => None,
+        })
+        .collect();
+    // This graph was already installed above: its rule has no new update,
+    // unlike the fresh baseline's first run. Observed values still agree.
+    assert_eq!(runs, vec![(false, true)]);
+    assert_eq!(
+        run(&mut engine, id, phases[2].clone()).error.unwrap().code,
+        i32::from(pb::ErrorCode::CheckFailed)
+    );
+    for phase in egglog_experimental::protobuf::source::Source::new(
+        None,
+        "(function budget-sentinel () i64 :merge new) (check (= (budget-sentinel) 10))",
+    )
+    .unwrap()
+    {
+        assert_eq!(run(&mut engine, id, phase.unwrap()).error, None);
+    }
     assert_eq!(run(&mut engine, id, fixture()).error, None);
 }
 

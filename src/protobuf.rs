@@ -1452,7 +1452,18 @@ impl Session {
                         ruleset: None,
                     });
                     let rule = &program.rules[local_rule];
-                    for command in lower_rule(program, rule, &holder, &name, &native_spans)? {
+                    for command in
+                        lower_rule(program, rule, &holder, &name, &native_spans, |name| {
+                            staged.graph.authoring_type_info().is_global(name)
+                                || staged.graph.get_sort_by_name(name).is_some()
+                                || staged
+                                    .graph
+                                    .authoring_type_info()
+                                    .get_func_type(name)
+                                    .is_some()
+                                || staged.graph.authoring_type_info().is_primitive(name)
+                        })?
+                    {
                         installations.push(Installation {
                             command: Some(lower_rule_cost_deletes(
                                 command,
@@ -1561,6 +1572,16 @@ impl Session {
                     "",
                     &format!("__protobuf_{}_unused_{index}", staged.request),
                     &context.native_spans,
+                    |name| {
+                        staged.graph.authoring_type_info().is_global(name)
+                            || staged.graph.get_sort_by_name(name).is_some()
+                            || staged
+                                .graph
+                                .authoring_type_info()
+                                .get_func_type(name)
+                                .is_some()
+                            || staged.graph.authoring_type_info().is_primitive(name)
+                    },
                 )? {
                     validation.push(lower_rule_cost_deletes(
                         command,
@@ -1705,7 +1726,7 @@ impl Session {
                     | pb::command::Kind::PrintSize(_)
             )
         ) {
-            return lower_native_observation(program, command, context, sites);
+            return lower_native_observation(&self.graph, program, command, context, sites);
         }
         let span = native_span(program, command.span.as_ref(), &context.native_spans)?;
         let command = match command.kind.as_ref().ok_or("missing command kind")? {
@@ -1739,9 +1760,20 @@ impl Session {
                     .map(Command::Action)
                     .collect());
             }
-            pb::command::Kind::Prove(prove) => {
-                Command::Prove(span, facts(program, &prove.facts, &context.native_spans)?)
-            }
+            pb::command::Kind::Prove(prove) => Command::Prove(
+                span,
+                facts(program, &prove.facts, &context.native_spans, None, |name| {
+                    self.graph.authoring_type_info().is_global(name)
+                        || self.graph.get_sort_by_name(name).is_some()
+                        || self
+                            .graph
+                            .authoring_type_info()
+                            .get_func_type(name)
+                            .is_some()
+                        || self.graph.authoring_type_info().is_primitive(name)
+                })?
+                .0,
+            ),
             pb::command::Kind::ProveExists(prove) => {
                 let name = self
                     .names
@@ -1905,7 +1937,20 @@ impl Session {
                 };
                 let mut commands = vec![];
                 if !until.is_empty() {
-                    conditions.push((span, facts(program, until, &context.native_spans)?));
+                    conditions.push((
+                        span,
+                        facts(program, until, &context.native_spans, None, |name| {
+                            self.graph.authoring_type_info().is_global(name)
+                                || self.graph.get_sort_by_name(name).is_some()
+                                || self
+                                    .graph
+                                    .authoring_type_info()
+                                    .get_func_type(name)
+                                    .is_some()
+                                || self.graph.authoring_type_info().is_primitive(name)
+                        })?
+                        .0,
+                    ));
                 }
                 let mut nested = schedulers.clone();
                 for (index, child) in body.iter().enumerate() {
@@ -2871,6 +2916,7 @@ fn control_command(command: &pb::Command) -> bool {
 }
 
 fn lower_native_observation<'a>(
+    graph: &EGraph,
     program: &pb::Program,
     command: &'a pb::Command,
     context: &RequestOccurrences,
@@ -2884,7 +2930,13 @@ fn lower_native_observation<'a>(
         pb::command::Kind::Check(check) => {
             vec![Command::Check(
                 span,
-                facts(program, &check.facts, &context.native_spans)?,
+                facts(program, &check.facts, &context.native_spans, None, |name| {
+                    graph.authoring_type_info().is_global(name)
+                        || graph.get_sort_by_name(name).is_some()
+                        || graph.authoring_type_info().get_func_type(name).is_some()
+                        || graph.authoring_type_info().is_primitive(name)
+                })?
+                .0,
             )]
         }
         pb::command::Kind::Stats(_) => vec![Command::PrintOverallStatistics(span, None)],
@@ -3210,8 +3262,14 @@ impl ControlContext for WireSchedule<'_> {
                 .map(Command::Action)
                 .collect()
         } else {
-            lower_native_observation(self.program, node, self.context, &mut sites)
-                .expect("validated leaf")
+            lower_native_observation(
+                self.executor.graph,
+                self.program,
+                node,
+                self.context,
+                &mut sites,
+            )
+            .expect("validated leaf")
         };
         let mut report = None;
         let (result, _, _) = self.executor.run_observed(
@@ -3266,10 +3324,29 @@ impl ControlContext for WireSchedule<'_> {
             return Ok(false);
         }
         let location = self.location(path, iterations);
+        let conditions = facts(
+            self.program,
+            until,
+            &self.context.native_spans,
+            None,
+            |name| {
+                self.executor.graph.authoring_type_info().is_global(name)
+                    || self.executor.graph.get_sort_by_name(name).is_some()
+                    || self
+                        .executor
+                        .graph
+                        .authoring_type_info()
+                        .get_func_type(name)
+                        .is_some()
+                    || self.executor.graph.authoring_type_info().is_primitive(name)
+            },
+        )
+        .expect("validated until")
+        .0;
         let result = self.executor.graph.check_condition_observed(
             native_span(self.program, node.span.as_ref(), &self.context.native_spans)
                 .expect("validated span"),
-            facts(self.program, until, &self.context.native_spans).expect("validated until"),
+            conditions,
             &mut |event| {
                 self.measurements.borrow_mut().observe(
                     event,
@@ -4267,8 +4344,8 @@ fn expression(
     visiting: &mut HashSet<u32>,
     native_spans: &NativeSpans,
 ) -> Result<Expr, String> {
-    // The compatibility AST is a tree. Bound expansion of a compact shared DAG
-    // before it can allocate exponentially; a later native-IR path can lift this.
+    // Remaining tree-only contexts bound expansion here. Action/query graph
+    // planners use this adapter only for fixed-size literal payloads.
     lower_expression(program, index, visiting, &mut 65_536, native_spans)
 }
 
@@ -4456,44 +4533,199 @@ fn facts(
     program: &pb::Program,
     indices: &[u32],
     native_spans: &NativeSpans,
-) -> Result<Vec<Fact>, String> {
-    let mut result = vec![];
-    for index in indices {
+    capture: Option<u32>,
+    mut occupied: impl FnMut(&str) -> bool,
+) -> Result<(Vec<Fact>, HashMap<u32, Expr>), String> {
+    // Query references are logical binders, not evaluated action locals. A
+    // first pass classifies value edges so a standalone relation predicate is
+    // never bound as a value of its private native row sort. The second pass
+    // emits each node once, with shallow edges, even across Union backedges.
+    let roots: HashSet<_> = indices.iter().copied().collect();
+    let mut pending: Vec<_> = indices.iter().rev().copied().collect();
+    if let Some(index) = capture {
+        pending.push(index);
+    }
+    let mut values: HashSet<_> = capture.into_iter().collect();
+    let mut seen = HashSet::new();
+    let mut order = Vec::new();
+    let mut names = HashSet::new();
+    while let Some(index) = pending.pop() {
+        if !seen.insert(index) {
+            continue;
+        }
         let node = program
             .nodes
-            .get(*index as usize)
+            .get(index as usize)
             .ok_or("fact index out of bounds")?;
-        if let Some(pb::node::Kind::Union(union)) = &node.kind {
-            if union.members.len() < 2 {
-                return Err("empty/single-member query Unions are not supported yet".into());
+        order.push(index);
+        let children = match node.kind.as_ref().ok_or("missing node kind")? {
+            pb::node::Kind::Var(name) if !name.is_empty() => {
+                names.insert(native_name("var", name));
+                continue;
             }
-            let first = *union.members.first().ok_or("empty equality fact")?;
-            for other in union.members.iter().skip(1) {
-                result.push(Fact::Eq(
-                    native_span(program, node.span.as_ref(), native_spans)?,
-                    expression(program, first, &mut HashSet::new(), native_spans)?,
-                    expression(program, *other, &mut HashSet::new(), native_spans)?,
-                ));
+            pb::node::Kind::Call(call)
+            | pb::node::Kind::GetCost(call)
+            | pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
+                value: Some(pb::primitive_value::Value::PartialCall(call)),
+            }) => &call.args,
+            pb::node::Kind::Union(union) => {
+                if union.members.is_empty() {
+                    return Err("empty query Union is invalid".into());
+                }
+                values.insert(index);
+                &union.members
             }
-        } else {
-            result.push(Fact::Fact(expression(
-                program,
-                *index,
-                &mut HashSet::new(),
-                native_spans,
-            )?));
+            pb::node::Kind::PrimitiveValue(_) => continue,
+            _ => return Err("unsupported query graph node".into()),
+        };
+        values.extend(children.iter().copied());
+        pending.extend(children.iter().rev().copied());
+    }
+    let mut next = 0usize;
+    let mut fresh = |span: ast::Span| {
+        let name = loop {
+            let name = format!("__egglog_proto_query_{next}");
+            next += 1;
+            if !names.contains(&name) && !occupied(&name) && !occupied(&format!("${name}")) {
+                break name;
+            }
+        };
+        Expr::Var(span, name)
+    };
+    let mut references = HashMap::new();
+    for &index in &order {
+        let node = &program.nodes[index as usize];
+        let span = native_span(program, node.span.as_ref(), native_spans)?;
+        if let Some(pb::node::Kind::Var(name)) = &node.kind {
+            // Rename at this use, never in the arena: the same Var may be a
+            // deferred merge's special `old`/`new` in another binder.
+            references.insert(index, Expr::Var(span, native_name("var", name)));
+        } else if values.contains(&index) {
+            references.insert(index, fresh(span));
         }
     }
-    // Facts introduce query binders. Rename at this use, not in the arena:
-    // the same Var node may also be the special `old`/`new` of a merge.
-    Ok(result
-        .into_iter()
-        .map(|fact| {
-            fact.map_symbols(&mut |head| head, &mut |leaf: String| {
-                native_name("var", &leaf)
-            })
-        })
-        .collect())
+    let mut result = Vec::new();
+    let mut pending: Vec<_> = order.iter().rev().map(|index| (*index, false)).collect();
+    let mut seen = HashSet::new();
+    while let Some((index, exit)) = pending.pop() {
+        let node = &program.nodes[index as usize];
+        if !exit {
+            if !seen.insert(index) {
+                continue;
+            }
+            pending.push((index, true));
+            let children = match node.kind.as_ref().unwrap() {
+                pb::node::Kind::Call(call)
+                | pb::node::Kind::GetCost(call)
+                | pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
+                    value: Some(pb::primitive_value::Value::PartialCall(call)),
+                }) => &call.args,
+                pb::node::Kind::Union(union) => &union.members,
+                _ => continue,
+            };
+            pending.extend(children.iter().rev().map(|child| (*child, false)));
+            continue;
+        }
+        let span = native_span(program, node.span.as_ref(), native_spans)?;
+        let value = match node.kind.as_ref().unwrap() {
+            pb::node::Kind::Union(union) => {
+                let value = references[&index].clone();
+                for member in &union.members {
+                    result.push(Fact::Eq(
+                        span.clone(),
+                        value.clone(),
+                        references[member].clone(),
+                    ));
+                }
+                continue;
+            }
+            pb::node::Kind::Var(_) => references[&index].clone(),
+            pb::node::Kind::Call(call)
+            | pb::node::Kind::GetCost(call)
+            | pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
+                value: Some(pb::primitive_value::Value::PartialCall(call)),
+            }) => {
+                let mut args: Vec<_> = call
+                    .args
+                    .iter()
+                    .map(|child| references[child].clone())
+                    .collect();
+                let target = match &node.kind {
+                    Some(pb::node::Kind::Call(_)) => call.func.clone(),
+                    Some(pb::node::Kind::GetCost(_)) => {
+                        crate::set_cost::get_cost_table_name(&call.func)
+                    }
+                    _ => {
+                        if !matches!(
+                            program.sorts[node.sort_id as usize].kind,
+                            Some(pb::sort::Kind::Func(_))
+                        ) {
+                            return Err("partial call requires a function sort".into());
+                        }
+                        // Native FunctionCtor's target must remain syntactically
+                        // literal; captured graph operands still use references.
+                        args.insert(
+                            0,
+                            Expr::Lit(span.clone(), Literal::String(call.func.clone())),
+                        );
+                        egglog::sort::FunctionSort::constructor_alias(&node_sort(program, index)?)
+                    }
+                };
+                Expr::Call(span.clone(), target, args)
+            }
+            pb::node::Kind::PrimitiveValue(_) => {
+                // This adapter is fixed-size for a concrete payload, not a walk
+                // of graph children. Consume it into shallow definitions so a
+                // shared large String/exact value occurs only once in the AST.
+                let literal = expression(program, index, &mut HashSet::new(), native_spans)?;
+                if let Some(target) = references.get(&index) {
+                    enum Leaf {
+                        Enter(Expr, Option<Expr>),
+                        Call(ast::Span, String, usize, Expr),
+                    }
+                    let mut pending = vec![Leaf::Enter(literal, Some(target.clone()))];
+                    let mut operands = Vec::new();
+                    while let Some(step) = pending.pop() {
+                        match step {
+                            Leaf::Enter(Expr::Call(span, name, args), target) => {
+                                let target = target.unwrap_or_else(|| fresh(span.clone()));
+                                pending.push(Leaf::Call(span, name, args.len(), target));
+                                pending.extend(
+                                    args.into_iter().rev().map(|arg| Leaf::Enter(arg, None)),
+                                );
+                            }
+                            Leaf::Enter(value, target) => {
+                                let target = target.unwrap_or_else(|| fresh(value.span().clone()));
+                                result.push(Fact::Eq(value.span().clone(), value, target.clone()));
+                                operands.push(target);
+                            }
+                            Leaf::Call(span, name, arity, target) => {
+                                let args = operands.split_off(operands.len() - arity);
+                                result.push(Fact::Eq(
+                                    span.clone(),
+                                    Expr::Call(span, name, args),
+                                    target.clone(),
+                                ));
+                                operands.push(target);
+                            }
+                        }
+                    }
+                    continue;
+                }
+                literal
+            }
+        };
+        if let Some(target) = references.get(&index)
+            && !matches!(&node.kind, Some(pb::node::Kind::Var(_)))
+        {
+            result.push(Fact::Eq(span, value, target.clone()));
+        } else if roots.contains(&index) {
+            // A predicate root is required to match, but its output is not a
+            // wire value. In particular, keep relation row sorts private.
+            result.push(Fact::Fact(value));
+        }
+    }
+    Ok((result, references))
 }
 
 // Unit marks the predicate-use surface, not a value of the native relation's
@@ -5852,6 +6084,7 @@ fn lower_rule(
     ruleset: &str,
     name: &str,
     native_spans: &NativeSpans,
+    mut occupied: impl FnMut(&str) -> bool,
 ) -> Result<Vec<Command>, String> {
     if rule.name.as_ref().is_some_and(String::is_empty) {
         return Err("an explicit rule label must not be empty".into());
@@ -5901,7 +6134,6 @@ fn lower_rule(
                 .into_iter()
                 .take(1 + usize::from(bidirectional))
             {
-                let matched = "__egglog_proto_rewrite_match".to_owned();
                 let mut bindings = HashMap::new();
                 check_variables(program, &[query], &mut bindings, true)?;
                 check_variables(program, conditions, &mut bindings, true)?;
@@ -5928,30 +6160,36 @@ fn lower_rule(
                     .remove(&rhs)
                     .ok_or("missing rewrite result")?
                     .map_symbols(&mut |h| h, &mut |v: String| native_name("var", &v));
+                let mut query_roots = Vec::with_capacity(conditions.len() + 1);
+                query_roots.push(query);
+                query_roots.extend(conditions.iter().copied());
+                let (body, references) = facts(
+                    program,
+                    &query_roots,
+                    native_spans,
+                    Some(query),
+                    &mut occupied,
+                )?;
                 head.push(Action::Union(
                     span.clone(),
-                    Expr::Var(span.clone(), matched.clone()),
+                    references[&query].clone(),
                     value,
                 ));
-                let lhs = expression(program, query, &mut HashSet::new(), native_spans)?
-                    .map_symbols(&mut |h| h, &mut |v: String| native_name("var", &v));
                 if subsume {
-                    let Expr::Call(_, function, args) = &lhs else {
+                    let Some(pb::node::Kind::Call(call)) = &program.nodes[query as usize].kind
+                    else {
                         return Err("subsumed rewrite must have a function call on the lhs".into());
                     };
                     head.push(Action::Change(
                         span.clone(),
                         ast::Change::Subsume,
-                        function.clone(),
-                        args.clone(),
+                        call.func.clone(),
+                        call.args
+                            .iter()
+                            .map(|index| references[index].clone())
+                            .collect(),
                     ));
                 }
-                let mut body = vec![Fact::Eq(
-                    span.clone(),
-                    Expr::Var(span.clone(), matched.clone()),
-                    lhs,
-                )];
-                body.extend(facts(program, conditions, native_spans)?);
                 let native = ast::Rule {
                     span: span.clone(),
                     head: ast::GenericActions(head),
@@ -6004,7 +6242,7 @@ fn lower_rule(
                 rule: ast::Rule {
                     span,
                     head: ast::GenericActions(head),
-                    body: facts(program, &body.query, native_spans)?,
+                    body: facts(program, &body.query, native_spans, None, &mut occupied)?.0,
                     name: name.into(),
                     ruleset: ruleset.into(),
                     eval_mode,
@@ -7465,6 +7703,129 @@ mod tests {
         assert_eq!(arguments[0], arguments[2]);
         assert!(matches!(&arguments[1], Expr::Var(_, name) if name == text_binding));
         assert_eq!(arguments[1], arguments[3]);
+
+        let (query, references) = facts(&program, &[2, 2], &NativeSpans::default(), None, |name| {
+            name == "__egglog_proto_query_0"
+        })
+        .unwrap();
+        assert_eq!(query.len(), 7);
+        let mut payloads = Vec::new();
+        for fact in &query {
+            let expressions = match fact {
+                Fact::Eq(_, lhs, rhs) => vec![lhs, rhs],
+                Fact::Fact(value) => vec![value],
+            };
+            for expression in expressions {
+                if let Expr::Lit(_, Literal::String(value)) = expression {
+                    payloads.push(value.as_str());
+                }
+                if let Expr::Call(_, _, args) = expression {
+                    assert!(args.iter().all(|arg| !matches!(arg, Expr::Call(..))));
+                }
+            }
+        }
+        assert_eq!(payloads.iter().filter(|value| **value == text).count(), 1);
+        assert!(matches!(&references[&0], Expr::Var(_, name) if name != "__egglog_proto_query_0"));
+        let Fact::Fact(Expr::Call(_, name, args)) = query.last().unwrap() else {
+            panic!("root remains a predicate")
+        };
+        assert_eq!(name, "Leaf");
+        assert_eq!(
+            args,
+            &[
+                references[&1].clone(),
+                references[&0].clone(),
+                references[&1].clone(),
+                references[&0].clone()
+            ]
+        );
+    }
+
+    #[test]
+    fn query_graphs_have_linear_native_syntax_in_both_rewrite_directions() {
+        let mut program = inventory_fixture("(datatype E (Leaf) (Pair E E))");
+        let sort_id = program
+            .sorts
+            .iter()
+            .position(|sort| matches!(&sort.kind, Some(pb::sort::Kind::Eq(name)) if name == "E"))
+            .unwrap() as u32;
+        let leaf = program.nodes.len() as u32;
+        program.nodes.push(pb::Node {
+            sort_id,
+            kind: Some(pb::node::Kind::Call(pb::Call {
+                func: "Leaf".into(),
+                args: vec![],
+            })),
+            ..Default::default()
+        });
+        let mut root = leaf;
+        for _ in 0..28 {
+            let index = program.nodes.len() as u32;
+            program.nodes.push(pb::Node {
+                sort_id,
+                kind: Some(pb::node::Kind::Call(pb::Call {
+                    func: "Pair".into(),
+                    args: vec![root, root],
+                })),
+                ..Default::default()
+            });
+            root = index;
+        }
+        let spans = NativeSpans::default();
+        let (query, _) = facts(&program, &[root, root], &spans, None, |_| false).unwrap();
+        assert_eq!(query.len(), 29);
+        for kind in [
+            pb::rule_decl::Kind::Rule(pb::Rule {
+                query: vec![root],
+                head: vec![],
+            }),
+            pb::rule_decl::Kind::Rewrite(pb::Rewrite {
+                lhs: root,
+                rhs: leaf,
+                conditions: vec![root],
+                subsume: true,
+            }),
+            pb::rule_decl::Kind::Birewrite(pb::BiRewrite {
+                lhs: root,
+                rhs: leaf,
+                conditions: vec![root],
+            }),
+        ] {
+            let commands = lower_rule(
+                &program,
+                &pb::RuleDecl {
+                    kind: Some(kind),
+                    eval_mode: pb::RuleEvalMode::Seminaive.into(),
+                    ..Default::default()
+                },
+                "r",
+                "diamond",
+                &spans,
+                |_| false,
+            )
+            .unwrap();
+            for command in commands {
+                let Command::Rule { rule } = command else {
+                    panic!("flat native rule")
+                };
+                assert_eq!(rule.body.len(), 29);
+                let mut size = 0;
+                for fact in rule.body {
+                    let mut pending = match fact {
+                        Fact::Fact(expr) => vec![expr],
+                        Fact::Eq(_, lhs, rhs) => vec![lhs, rhs],
+                    };
+                    while let Some(expr) = pending.pop() {
+                        size += 1;
+                        if let Expr::Call(_, _, args) = expr {
+                            assert!(args.iter().all(|arg| !matches!(arg, Expr::Call(..))));
+                            pending.extend(args);
+                        }
+                    }
+                }
+                assert!(size <= 29 * 4);
+            }
+        }
     }
 
     fn closed_value_dag(terminal: &str) -> (pb::Program, u32) {
@@ -7602,6 +7963,7 @@ mod tests {
                     "dag",
                     "diamond",
                     &NativeSpans::default(),
+                    |_| false,
                 )
                 .unwrap();
                 let [Command::Rule { rule }] = lowered.as_slice() else {
@@ -11662,6 +12024,12 @@ mod tests {
                 ..Default::default()
             });
         }
+        program.commands.push(pb::Command {
+            kind: Some(pb::command::Kind::Check(pb::Check {
+                facts: vec![start, start + 2, start + 4, start + 7],
+            })),
+            ..Default::default()
+        });
         let response = run_host_default(&mut engine, id, program);
         assert_eq!(response.error, None);
         assert!(response.outputs.is_empty());

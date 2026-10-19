@@ -663,7 +663,8 @@ no-merge functions, and context-specific lowering/expansion budgets. Evaluated
 action graphs use lazy first-demand native locals, including ordinary primitive
 calls and exact numeric values, in all four modes. Ordered rule heads share one
 memo per firing; extraction roots evaluate independently in Normal mode.
-Query patterns and rewrite left-hand sides still use bounded tree lowering.
+Query patterns and rewrite left-hand sides use shallow facts with shared query
+binders; native query normalization and matching retain their own costs.
 Rendering oversized extraction roots to Source remains tree-limited.
 Unsupported modes, values and codecs fail explicitly. These are adapter limits,
 not changes to the schema contract.

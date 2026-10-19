@@ -3997,12 +3997,19 @@ fn render_prepared(
         let mut occupied: HashSet<_> = names.iter().map(|name| (*name).to_string()).collect();
         // Logical ruleset names are relocated, not interpolated as atoms.
         occupied.extend(program.rulesets.iter().filter_map(|ruleset| ruleset.name.clone()));
+        occupied.extend(authored.sorts.values().cloned());
+        occupied.extend(authored.callables.values().cloned());
         let mut parser = std::mem::take(&mut native.parser);
         for name in names {
             if !matches!(parser.get_expr_from_string(None, name), Ok(Expr::Var(_, parsed)) if parsed == name) {
                 return Err(format!("identifier {name:?} cannot be rendered as one native source atom"));
             }
         }
+        let query_occupied = |name: &str| occupied.contains(name)
+            || native.authoring_type_info().is_global(name)
+            || native.get_sort_by_name(name).is_some()
+            || native.authoring_type_info().get_func_type(name).is_some()
+            || native.authoring_type_info().is_primitive(name);
         let mut commands = vec![];
         for declaration in &program.declarations {
             if let Some(pb::declaration::Kind::EqSort(sort)) = &declaration.kind {
@@ -4113,6 +4120,17 @@ fn render_prepared(
                     continue;
                 }
                 let Some(mut command) = installation.command.clone() else { continue };
+                if let Command::Rule { rule } = &command {
+                    let index = *rule_indices.get(&rule.name).ok_or("missing prepared rule occurrence")?;
+                    // Execution plans use physical symbols. Reuse the same
+                    // planner with text aliases occupied before presentation,
+                    // keeping the rewrite witness and head references aligned.
+                    command = lower_rule(rule_program, &rule_program.rules[index], &rule.ruleset,
+                        &prepared.rules[index], &rule_spans, &query_occupied)?
+                        .into_iter().find(|candidate| matches!(candidate,
+                            Command::Rule { rule: candidate } if candidate.name == rule.name))
+                        .ok_or("missing prepared rule direction")?;
+                }
                 if let Command::Rule { rule } = &mut command {
                     let index = *rule_indices.get(&rule.name).ok_or("missing prepared rule occurrence")?;
                     let rewrite = match &rule_program.rules[index].kind {
@@ -4133,13 +4151,14 @@ fn render_prepared(
                             let children = match &rule_program.nodes[index as usize].kind {
                                 Some(pb::node::Kind::Call(call) | pb::node::Kind::GetCost(call)) => &call.args,
                                 Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue { value: Some(pb::primitive_value::Value::PartialCall(call)) })) => &call.args,
+                                Some(pb::node::Kind::Union(_)) => { readable = false; break; }
                                 _ => continue,
                             };
                             pending.extend(children.iter().map(|child| (*child, depth + 1)));
                         }
                         if readable {
                             if !rendered_sugar.insert(index) { continue; }
-                            let rewrite = ast::Rewrite { span: rule.span.clone(), lhs: expression(rule_program, lhs, &mut HashSet::new(), &rule_spans)?.map_symbols(&mut |h| h, &mut |v: String| native_name("var", &v)), rhs: expression(rule_program, rhs, &mut HashSet::new(), &rule_spans)?.map_symbols(&mut |h| h, &mut |v: String| native_name("var", &v)), conditions: facts(rule_program, conditions, &rule_spans)?, name: prepared.rules[index].clone() };
+                            let rewrite = ast::Rewrite { span: rule.span.clone(), lhs: expression(rule_program, lhs, &mut HashSet::new(), &rule_spans)?.map_symbols(&mut |h| h, &mut |v: String| native_name("var", &v)), rhs: expression(rule_program, rhs, &mut HashSet::new(), &rule_spans)?.map_symbols(&mut |h| h, &mut |v: String| native_name("var", &v)), conditions: facts(rule_program, conditions, &rule_spans, None, &query_occupied)?.0, name: prepared.rules[index].clone() };
                             command = if let Some(subsume) = subsume { Command::Rewrite(rule.ruleset.clone(), rewrite, subsume) } else { Command::BiRewrite(rule.ruleset.clone(), rewrite) };
                         }
                     }
@@ -4230,10 +4249,8 @@ fn render_prepared(
                 pb::command::Kind::Action(action) => {
                     if prepared.context.action_dags.contains_key(&vec![position as u32]) {
                         commands.push(Command::ActionScope(span, ast::GenericActions(
-                            action_dag_actions(program, action, |name| occupied.contains(name)
-                                || native.get_sort_by_name(name).is_some()
-                                || native.type_info().get_func_type(name).is_some()
-                                || native.type_info().is_primitive(name), native_spans, &mut HashMap::new(), &mut 0)?.0,
+                            action_dag_actions(program, action, &query_occupied,
+                                native_spans, &mut HashMap::new(), &mut 0)?.0,
                         )));
                     } else {
                         commands.extend(
@@ -4246,7 +4263,7 @@ fn render_prepared(
                     }
                 }
                 pb::command::Kind::Check(check) => {
-                    commands.push(Command::Check(span, facts(program, &check.facts, native_spans)?))
+                    commands.push(Command::Check(span, facts(program, &check.facts, native_spans, None, &query_occupied)?.0))
                 }
                 pb::command::Kind::Stats(_) => {
                     commands.push(Command::PrintOverallStatistics(span, None));
@@ -4262,12 +4279,12 @@ fn render_prepared(
                         return Err("Core source has no named scheduler syntax".into());
                     }
                     let Expr::Call(_, name, args) = source_extended_schedule(
-                        program, command, &prepared.context, authored, 0,
+                        program, command, &prepared.context, authored, 0, &query_occupied,
                     )? else { unreachable!("a binding projects to a native command") };
                     commands.push(Command::UserDefined(span, name, args));
                 }
                 pb::command::Kind::Prove(prove) => {
-                    commands.push(Command::Prove(span, facts(program, &prove.facts, native_spans)?))
+                    commands.push(Command::Prove(span, facts(program, &prove.facts, native_spans, None, &query_occupied)?.0))
                 }
                 pb::command::Kind::ProveExists(prove) => {
                     commands.push(Command::ProveExists(span, prove.constructor.clone()))
@@ -4343,11 +4360,11 @@ fn render_prepared(
                             [pb::Command { kind: Some(pb::command::Kind::Run(run)), .. }] if run.scheduler.is_empty()));
                     if dialect == Dialect::Experimental && !legacy {
                         commands.push(Command::UserDefined(span, "run-schedule".into(), vec![
-                            source_extended_schedule(program, command, &prepared.context, authored, 0)?,
+                            source_extended_schedule(program, command, &prepared.context, authored, 0, &query_occupied)?,
                         ]));
                     } else {
                         commands.push(Command::RunSchedule(source_schedule(
-                            program, command, Some(&prepared.context), native_spans,
+                            program, command, Some(&prepared.context), native_spans, &query_occupied,
                         )?));
                     }
                 }
@@ -4594,6 +4611,7 @@ fn source_extended_schedule(
     context: &RequestOccurrences,
     authored: &NativeNames,
     depth: usize,
+    occupied: &dyn Fn(&str) -> bool,
 ) -> Result<Expr, String> {
     if depth > 256 {
         return Err("source schedule nesting exceeds 256".into());
@@ -4636,7 +4654,8 @@ fn source_extended_schedule(
             ));
         }
         if !until.is_empty() {
-            let conditions = facts(program, until, &context.native_spans)?
+            let conditions = facts(program, until, &context.native_spans, None, occupied)?
+                .0
                 .into_iter()
                 .map(|fact| {
                     let expr = match fact {
@@ -4657,7 +4676,9 @@ fn source_extended_schedule(
             span.clone(),
             "body".into(),
             body.iter()
-                .map(|child| source_extended_schedule(program, child, context, authored, depth + 1))
+                .map(|child| {
+                    source_extended_schedule(program, child, context, authored, depth + 1, occupied)
+                })
                 .collect::<Result<Vec<_>, _>>()?,
         ));
         return Ok(Expr::Call(span, head.into(), args));
@@ -4671,6 +4692,7 @@ fn source_extended_schedule(
                 context,
                 authored,
                 depth + 1,
+                occupied,
             )?],
         ),
         pb::command::Kind::Action(action) => {
@@ -4782,6 +4804,7 @@ fn source_extended_schedule(
                     context,
                     authored,
                     depth + 1,
+                    occupied,
                 )?);
             }
             (head, args)
@@ -4790,7 +4813,9 @@ fn source_extended_schedule(
             let args = saturate
                 .body
                 .iter()
-                .map(|child| source_extended_schedule(program, child, context, authored, depth + 1))
+                .map(|child| {
+                    source_extended_schedule(program, child, context, authored, depth + 1, occupied)
+                })
                 .collect::<Result<Vec<_>, _>>()?;
             ("saturate", args)
         }
@@ -4825,6 +4850,7 @@ fn source_schedule(
     command: &pb::Command,
     context: Option<&RequestOccurrences>,
     native_spans: &NativeSpans,
+    occupied: &dyn Fn(&str) -> bool,
 ) -> Result<ast::Schedule, String> {
     let span = native_span(program, command.span.as_ref(), native_spans)?;
     if let Some(pb::command::Kind::Repeat(repeat)) = &command.kind
@@ -4838,11 +4864,11 @@ fn source_schedule(
             return Err("source loop-until requires one conditional Run without scheduler".into());
         }
         let ast::Schedule::Run(_, mut config) =
-            source_schedule(program, child, context, native_spans)?
+            source_schedule(program, child, context, native_spans, occupied)?
         else {
             unreachable!("conditional child is a Run")
         };
-        config.until = Some(facts(program, &repeat.until, native_spans)?);
+        config.until = Some(facts(program, &repeat.until, native_spans, None, occupied)?.0);
         return Ok(ast::Schedule::Run(span, config));
     }
     let (body, bound, sequence) = match command.kind.as_ref().ok_or("missing schedule")? {
@@ -4895,7 +4921,7 @@ fn source_schedule(
     };
     let children = body
         .iter()
-        .map(|child| source_schedule(program, child, context, native_spans))
+        .map(|child| source_schedule(program, child, context, native_spans, occupied))
         .collect::<Result<_, _>>()?;
     let body = ast::Schedule::Sequence(span.clone(), children);
     Ok(if sequence {
