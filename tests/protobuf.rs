@@ -15894,6 +15894,92 @@ fn nominal_pair_wrong_kind_names_reject_before_earlier_writes() {
 }
 
 #[test]
+fn source_ungrounded_birewrite_keeps_forward_prefix_and_stops() {
+    use egglog_experimental::protobuf::source::Source;
+    let header = "(sort S) (constructor S0 () S) (constructor S1 (S) S)";
+    let text = format!("{header} (birewrite (S1 x) x) (run 10)");
+    let mut native = egglog::EGraph::default();
+    let expected = native.parse_and_run_program(None, &text).unwrap_err();
+    assert!(matches!(
+        &expected,
+        egglog::Error::TypeError(egglog::TypeError::Ungrounded(..))
+    ));
+    let mut source = Source::new_core(None, &text).unwrap();
+    let mut engine = Engine::default();
+    let id = create(&mut engine);
+    for _ in 0..3 {
+        assert_eq!(
+            run(&mut engine, id, source.next().unwrap().unwrap()).error,
+            None
+        );
+    }
+    let prefix = source.next().unwrap().unwrap();
+    assert!(prefix.commands.is_empty());
+    assert!(matches!(
+        prefix.rules.as_slice(),
+        [pb::RuleDecl {
+            kind: Some(pb::rule_decl::Kind::Rewrite(_)),
+            name: Some(name),
+            ..
+        }] if name.ends_with("=>")
+    ));
+    let response = run(&mut engine, id, prefix);
+    assert_eq!(response.error, None);
+    assert!(response.outputs.is_empty());
+    assert_eq!(response.ruleset_publication.unwrap().names, [""]);
+    assert_eq!(
+        source.next().unwrap().unwrap_err().to_string(),
+        expected.to_string()
+    );
+    assert!(
+        source.next().is_none(),
+        "the authored run must not be emitted"
+    );
+
+    // Both actual receivers retain the forward rule after the reverse fails;
+    // without that rule this equality is false. This is independent of the
+    // invalid-wire atomicity checks immediately below.
+    let retained = "(S1 (S0)) (run 1) (check (= (S1 (S0)) (S0)))";
+    native.parse_and_run_program(None, retained).unwrap();
+    // A separate Source does not own the installed rule body: its empty default
+    // ruleset would conflict. Bind the witness step to the existing session
+    // ruleset by name, between genuine Source-authored seed and Check packets.
+    let witness = format!("{header} (S1 (S0)) (check (= (S1 (S0)) (S0)))");
+    let mut stepped = false;
+    for phase in Source::new_core(None, &witness).unwrap() {
+        let phase = phase.unwrap();
+        if phase
+            .commands
+            .iter()
+            .any(|command| matches!(command.kind, Some(pb::command::Kind::Check(_))))
+        {
+            assert!(!stepped);
+            let response = run(
+                &mut engine,
+                id,
+                pb::Program {
+                    ir_version: 1,
+                    commands: vec![pb::Command {
+                        kind: Some(pb::command::Kind::Run(pb::Run {
+                            ruleset: Some(pb::RulesetRef {
+                                kind: Some(pb::ruleset_ref::Kind::Name(String::new())),
+                            }),
+                            ..Default::default()
+                        })),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                },
+            );
+            assert_eq!(response.error, None);
+            stepped = true;
+        }
+        assert_eq!(run(&mut engine, id, phase).error, None);
+    }
+    assert!(stepped);
+}
+
+#[test]
 fn source_grounding_corrections_execute_and_invalid_rules_are_atomic() {
     use egglog_experimental::protobuf::source::Source;
     let observation = Source::new_core(

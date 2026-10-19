@@ -107,7 +107,10 @@ mod fresh_macro;
 
 mod greedy_dag_extract;
 mod secondary_map;
-pub use greedy_dag_extract::{extract_best_greedy_dag, extract_variants_greedy_dag};
+pub use greedy_dag_extract::{
+    extract_best_greedy_dag, extract_best_greedy_dag_with_observer, extract_variants_greedy_dag,
+    extract_variants_greedy_dag_with_observer,
+};
 mod set_cost;
 pub use set_cost::*;
 mod multi_extract;
