@@ -611,9 +611,11 @@ cross-mode conformance is still in progress; a wire roundtrip alone establishes
 none of these.
 
 Host implementations, codecs and cost models remain registered outside the
-messages. Native capability checks still apply. Declarations are not Commands:
-arbitrary expected-failure wrappers around declaration installation remain a
-separate boundary, not permission to erase successful installation effects.
+messages. Native capability checks still apply. Declarations are not Commands.
+Source handles expected declaration/rule-installation failures during authoring,
+preserving successful definition prefixes. These assertions and rejected bodies
+produce no protobuf operations or validation obligations; replay in another
+namespace or mode does not repeat the assertions.
 
 ## Generated messages and checks
 

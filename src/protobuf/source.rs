@@ -3,7 +3,9 @@
 //! Submit each yielded program through the byte adapter before requesting the
 //! next one, and stop on a transport or decoded execution error. Parsing is eager
 //! (like native source execution); resolution is sequential so a later type error
-//! does not erase an executed prefix. Native syntax is never executed here.
+//! does not erase an executed prefix. Authored data actions and schedules are
+//! never executed here. Declaration-installation expectations are checked during
+//! authoring and are absent from protobuf, retaining successful definitions.
 //! Scope-aware callers use [`Source::next_submission`] and the existing clone /
 //! return requests; the Program iterator deliberately rejects scope operations.
 //! Selected rulesets are immutable snapshots; later source additions publish
@@ -29,6 +31,14 @@ enum Dialect {
 enum RewriteKind {
     Directional(bool),
     Bidirectional,
+}
+
+#[derive(PartialEq, Eq, Hash)]
+enum InstalledDefinition {
+    Sort(String),
+    Function(String),
+    Ruleset(String),
+    Rule(String, String),
 }
 
 // Cleanup must address the retained key, not reevaluate an equal-looking call
@@ -89,7 +99,8 @@ struct SourceScope {
 }
 
 /// A source stream whose authored declarations, expressions and rules become
-/// protobuf records. The native graph holds only the producer's type environment.
+/// protobuf records. The native graph registers definitions for authoring checks;
+/// application data actions and schedules execute only in the receiving engine.
 pub struct Source {
     dialect: Dialect,
     mode: Option<pb::ExecutionMode>,
@@ -347,7 +358,7 @@ pub(crate) fn primitive_definition(
 }
 
 impl Source {
-    /// Parses source without executing it. Each iterator item is one ordered
+    /// Parses source without executing data actions or schedules. Each item is one ordered
     /// submission phase; callers must stop after a failed decoded response.
     pub fn new(filename: Option<String>, source: &str) -> Result<Self, TransportError> {
         Self::with_dialect(filename, source, Dialect::Experimental, None)
@@ -716,8 +727,11 @@ impl Source {
         let encoded = self
             .mode
             .is_some_and(|mode| mode != pb::ExecutionMode::Normal);
-        // These single-command phases need real empty table backends for later
-        // literal function captures. Fail also retains a global Let's header.
+        let mut installed = None;
+        let mut definition_error = None;
+        // Definition registration keeps the native destination context current
+        // and supplies empty table backends for later literal function captures.
+        // Runtime Fail also retains a global Let's header.
         // Compile before recording headers; preserving-globals export below
         // still supplies all wire metadata.
         let mut compiler = match expanded.as_slice() {
@@ -726,25 +740,85 @@ impl Source {
                 while let Command::Fail(_, child) = header {
                     header = child;
                 }
-                if matches!(
+                let definition = matches!(
                     header,
                     Command::Datatype { .. }
                         | Command::Datatypes { .. }
                         | Command::Relation { .. }
                         | Command::Constructor { .. }
                         | Command::Function { .. }
-                        | Command::Action(Action::Let(..))
-                ) || (encoded && matches!(header, Command::Sort { .. }))
-                {
+                        | Command::Sort { .. }
+                        | Command::AddRuleset(..)
+                        | Command::UnstableCombinedRuleset(..)
+                        | Command::Rule { .. }
+                        | Command::Rewrite(..)
+                        | Command::BiRewrite(..)
+                );
+                if definition || matches!(header, Command::Action(Action::Let(..))) {
                     let mut graph = self.graph.clone();
                     // Source already expanded this command. Suppress a second
                     // provider transform only in the disposable compiler context.
                     let macros = std::mem::take(graph.command_macros_mut());
-                    let mut compiler = graph
-                        .validate_program(vec![command.clone()])
-                        .map_err(|error| error.to_string())?;
-                    *compiler.command_macros_mut() = macros;
-                    Some(compiler)
+                    if definition {
+                        // Only authored definitions enter this interpreter.
+                        // Native registration preserves Fail's precise expansion,
+                        // admission and prefix boundaries, including proof helpers.
+                        let mut completed = HashSet::new();
+                        let result = graph.run_program_observed(
+                            vec![command.clone()],
+                            &mut |_, _, _| {},
+                            &mut |_, event| {
+                                let (mut success, mut command) = match event {
+                                    egglog::ExecutionEvent::CommandCompleted {
+                                        command, ..
+                                    } => (true, command),
+                                    egglog::ExecutionEvent::CommandFailed { command, .. } => {
+                                        (false, command)
+                                    }
+                                    _ => return,
+                                };
+                                while let N::Fail(_, child) = command {
+                                    success = !success;
+                                    command = child;
+                                }
+                                if success {
+                                    let key = match command {
+                                        N::Sort { name, .. } => {
+                                            InstalledDefinition::Sort(name.clone())
+                                        }
+                                        N::Function(function) => {
+                                            InstalledDefinition::Function(function.name.clone())
+                                        }
+                                        N::AddRuleset(_, name)
+                                        | N::UnstableCombinedRuleset(_, name, _) => {
+                                            InstalledDefinition::Ruleset(name.clone())
+                                        }
+                                        N::NormRule { rule } => InstalledDefinition::Rule(
+                                            rule.ruleset.clone(),
+                                            rule.name.clone(),
+                                        ),
+                                        _ => return,
+                                    };
+                                    completed.insert(key);
+                                }
+                            },
+                        );
+                        if let Err(error) = result {
+                            if completed.is_empty() {
+                                return Err(error.to_string());
+                            }
+                            definition_error = Some(error.to_string());
+                        }
+                        installed = Some(completed);
+                        *graph.command_macros_mut() = macros;
+                        Some(graph)
+                    } else {
+                        let mut compiler = graph
+                            .validate_program(vec![command.clone()])
+                            .map_err(|error| error.to_string())?;
+                        *compiler.command_macros_mut() = macros;
+                        Some(compiler)
+                    }
                 } else {
                     None
                 }
@@ -758,6 +832,7 @@ impl Source {
                 fail_spans.push(span);
                 command = *child;
             }
+            let frontend_fail = !fail_spans.is_empty() && installed.is_some();
             if let Command::Input { span, name, file } = &command {
                 let parsed = (|| {
                     let signature = self
@@ -838,6 +913,7 @@ impl Source {
                 continue;
             }
             if !fail_spans.is_empty()
+                && !frontend_fail
                 && !matches!(
                     &command,
                     Command::Check(..)
@@ -850,12 +926,12 @@ impl Source {
                 )
                 && !matches!(&command, Command::UserDefined(_, name, _) if name == "run-schedule")
             {
-                return Err("source Fail requires a supported native command; declarations and observations are not implemented".into());
+                return Err("source Fail requires a supported native command; observations are not implemented".into());
             }
             let first_command = self.program.commands.len();
             // Keep provenance until export: desugaring alone cannot distinguish
             // a relation's generated constructor or an authored rewrite.
-            let rewrite = match &command {
+            let mut rewrite = match &command {
                 Command::Rewrite(_, _, subsume) => Some(RewriteKind::Directional(*subsume)),
                 Command::BiRewrite(..) => Some(RewriteKind::Bidirectional),
                 Command::Relation {
@@ -867,6 +943,11 @@ impl Source {
                     self.graph
                         .resolve_command_preserving_globals(command.clone())
                         .map_err(|error| error.to_string())?;
+                    if installed.as_ref().is_some_and(|completed| {
+                        !completed.contains(&InstalledDefinition::Function(name.clone()))
+                    }) {
+                        continue;
+                    }
                     let inputs = inputs
                         .iter()
                         .map(|name| {
@@ -1078,6 +1159,32 @@ impl Source {
                     .resolve_command_preserving_globals(command)
                     .map_err(|error| error.to_string())?
             };
+            if let Some(completed) = &installed {
+                resolved.retain(|command| {
+                    let key = match command {
+                        N::Sort { name, .. } => InstalledDefinition::Sort(name.clone()),
+                        N::Function(function) => {
+                            InstalledDefinition::Function(function.name.clone())
+                        }
+                        N::AddRuleset(_, name) | N::UnstableCombinedRuleset(_, name, _) => {
+                            InstalledDefinition::Ruleset(name.clone())
+                        }
+                        N::NormRule { rule } => {
+                            InstalledDefinition::Rule(rule.ruleset.clone(), rule.name.clone())
+                        }
+                        _ => return true,
+                    };
+                    completed.contains(&key)
+                });
+                if resolved.is_empty() {
+                    continue;
+                }
+            }
+            if matches!(rewrite, Some(RewriteKind::Bidirectional)) && resolved.len() == 1 {
+                // Fail wraps only the backward installation. A completed forward
+                // direction remains a real rule if that last installation fails.
+                rewrite = Some(RewriteKind::Directional(false));
+            }
             if matches!(rewrite, Some(RewriteKind::Bidirectional)) {
                 // Resolve/typecheck both native binders before retaining the
                 // authored forward body as one canonical bidirectional rule.
@@ -1264,7 +1371,7 @@ impl Source {
                         }
                         let span = self.span(&span)?;
                         self.rulesets.insert(
-                            name,
+                            name.clone(),
                             SourceRuleset {
                                 kind,
                                 span,
@@ -1272,8 +1379,17 @@ impl Source {
                                 published_rules: 0,
                             },
                         );
+                        if frontend_fail || definition_error.is_some() {
+                            self.publish_ruleset(&name, &mut publish)?;
+                        }
                     }
-                    N::NormRule { rule } => self.rule(rule, rewrite)?,
+                    N::NormRule { rule } => {
+                        let target = rule.ruleset.clone();
+                        self.rule(rule, rewrite)?;
+                        if frontend_fail || definition_error.is_some() {
+                            self.publish_ruleset(&target, &mut publish)?;
+                        }
+                    }
                     N::CoreAction(ResolvedAction::Let(span, var, expr)) => {
                         let value = self.expr(&expr, None, 0)?;
                         let output = self.program.nodes[value as usize].sort_id;
@@ -1521,7 +1637,7 @@ impl Source {
                     _ => return Err("source command is outside the initial producer slice".into()),
                 }
             }
-            if !fail_spans.is_empty() {
+            if !fail_spans.is_empty() && !frontend_fail {
                 if self.program.commands.len() != first_command + 1 {
                     return Err("source Fail requires exactly one authored command".into());
                 }
@@ -1535,6 +1651,7 @@ impl Source {
                 self.program.commands.push(command);
             }
         }
+        self.pending_error = definition_error;
         let program = self.phase(publish)?;
         if let Some(mut compiler) = compiler {
             // Export updates only these producer-owned name/role records.

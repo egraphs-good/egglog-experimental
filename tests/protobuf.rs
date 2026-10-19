@@ -15310,17 +15310,31 @@ fn source_grounding_corrections_execute_and_invalid_rules_are_atomic() {
         ),
     ];
     for (case, (prefix, original, corrected, tail)) in cases.into_iter().enumerate() {
+        assert!(
+            Source::new_core(None, &format!("{prefix} {original}"))
+                .unwrap()
+                .find_map(Result::err)
+                .is_some(),
+            "Source rejects ungrounded authoring: case {case}"
+        );
         let mut engine = Engine::default();
         let id = create(&mut engine);
         let mut phases = Source::new_core(
             None,
-            &format!("{prefix} (datatype GroundingSentinel (Written)) {original}"),
+            &format!("{prefix} (datatype GroundingSentinel (Written)) {corrected}"),
         )
         .unwrap()
         .collect::<Result<Vec<_>, _>>()
         .unwrap();
         let mut invalid = phases.pop().unwrap();
         assert_eq!(invalid.rules.len(), 1);
+        // Preserve the independent adapter-atomicity oracle: construct invalid
+        // wire input by removing the corrected body's grounding conditions.
+        match invalid.rules[0].kind.as_mut().unwrap() {
+            pb::rule_decl::Kind::Birewrite(rule) => rule.conditions.clear(),
+            pb::rule_decl::Kind::Rule(rule) => rule.query.truncate([0, 1, 1, 1, 4][case]),
+            _ => unreachable!(),
+        }
         for phase in phases {
             assert_eq!(run(&mut engine, id, phase).error, None);
         }
@@ -17790,6 +17804,395 @@ fn source_fail_global_let_preserves_prefix_binding_and_nested_expectations() {
 }
 
 #[test]
+fn source_fail_definition_native_observation() {
+    for mode in 0..4 {
+        for child in [
+            "(sort X)",
+            "(datatype X (A) (B))",
+            "(rule () ((Seen)) :ruleset missing)",
+            "(rule () ((Seen)) :ruleset existing)",
+            "(rule () ((Seen)) :ruleset combined)",
+            "(rule ((= x y)) ((Pair x y)) :ruleset existing)",
+            "(rule () ((Unknown)) :ruleset missing)",
+        ] {
+            for depth in 1..=3 {
+                let mut graph = match mode {
+                    0 => egglog::EGraph::default(),
+                    1 => egglog::EGraph::default().with_term_encoding_enabled(),
+                    2 => egglog::EGraph::default().with_proofs_enabled(),
+                    _ => egglog::EGraph::default()
+                        .with_proofs_enabled()
+                        .with_proof_testing(),
+                };
+                graph
+                    .parse_and_run_program(None, "(relation Seen ()) (relation Pair (i64 i64)) (ruleset existing) (unstable-combined-ruleset combined existing)")
+                    .unwrap();
+                let mut text = child.to_string();
+                for _ in 0..depth {
+                    text = format!("(fail {text})");
+                }
+                let commands = graph.parse_program(None, &text).unwrap();
+                let mut reached_anchor = false;
+                let result =
+                    graph.run_program_observed(commands, &mut |_, _, _| {}, &mut |_, event| {
+                        reached_anchor |= matches!(
+                            event,
+                            egglog::ExecutionEvent::CommandCompleted { .. }
+                                | egglog::ExecutionEvent::CommandFailed { .. }
+                        );
+                    });
+                let text = format!(
+                    "(relation Seen ()) (relation Pair (i64 i64)) (ruleset existing) (unstable-combined-ruleset combined existing) {text}"
+                );
+                let mut source =
+                    egglog_experimental::protobuf::source::Source::new_core(None, &text)
+                        .unwrap()
+                        .with_execution_mode(match mode {
+                            0 => pb::ExecutionMode::Normal,
+                            1 => pb::ExecutionMode::TermEncoding,
+                            2 => pb::ExecutionMode::Proofs,
+                            _ => pb::ExecutionMode::ProofTesting,
+                        })
+                        .unwrap();
+                let mut source_failed = false;
+                for phase in &mut source {
+                    match phase {
+                        Ok(phase) => assert!(
+                            phase.commands.is_empty(),
+                            "no authoring assertion on the wire: {text}"
+                        ),
+                        Err(_) => {
+                            source_failed = true;
+                            break;
+                        }
+                    }
+                }
+                assert_eq!(source_failed, result.is_err(), "mode={mode}: {text}");
+                if child.contains("Unknown") {
+                    assert!(result.is_err());
+                    assert!(!reached_anchor, "admission precedes the anchor");
+                } else {
+                    assert!(reached_anchor, "installation reached its anchor");
+                }
+                if child.starts_with("(datatype") {
+                    assert!(graph.get_function("A").is_some());
+                    assert!(graph.get_function("B").is_some());
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn source_fail_definitions_are_frontend_only_and_keep_installed_prefixes() {
+    use egglog_experimental::protobuf::source::Source;
+    for core in [false, true] {
+        for (child, succeeds) in [
+            ("(sort X)", true),
+            ("(datatype E (A) (B))", true),
+            ("(rule () ((Installed)) :ruleset missing)", false),
+            ("(rule () ((Installed)) :ruleset r)", true),
+            ("(rule () ((Installed)) :ruleset combined)", false),
+            ("(rule ((= x y)) ((Pair x y)) :ruleset r)", false),
+        ] {
+            for depth in 1..=3 {
+                let mut wrapped = child.to_string();
+                for _ in 0..depth {
+                    wrapped = format!("(fail {wrapped})");
+                }
+                let text = format!(
+                    "(relation Installed ()) (relation Earlier ()) (Earlier) (relation Later ()) (relation Pair (i64 i64)) \
+                    (ruleset r) (unstable-combined-ruleset combined r) {wrapped} (Later)"
+                );
+                let mut native = if core {
+                    egglog::EGraph::default()
+                } else {
+                    new_experimental_egraph()
+                };
+                let expected = native.parse_and_run_program(None, &text);
+                let failed = succeeds == (depth % 2 == 1);
+                assert_eq!(expected.is_err(), failed, "{text}");
+                let mut source = if core {
+                    Source::new_core(None, &text)
+                } else {
+                    Source::new(None, &text)
+                }
+                .unwrap();
+                let mut engine = Engine::default();
+                let id = create(&mut engine);
+                let mut error = None;
+                let mut rules = 0;
+                let mut definitions = Vec::new();
+                for phase in source.by_ref() {
+                    let phase = match phase {
+                        Ok(phase) => phase,
+                        Err(failure) => {
+                            error = Some(failure);
+                            break;
+                        }
+                    };
+                    assert!(
+                        phase.commands.iter().all(|command| !matches!(
+                            command.kind,
+                            Some(pb::command::Kind::Fail(_))
+                        ))
+                    );
+                    rules += phase.rules.len();
+                    definitions.extend(phase.declarations.iter().filter_map(|declaration| {
+                        match &declaration.kind {
+                            Some(pb::declaration::Kind::EqSort(sort)) => Some(sort.name.clone()),
+                            Some(pb::declaration::Kind::Constructor(function)) => {
+                                Some(function.name.clone())
+                            }
+                            _ => None,
+                        }
+                    }));
+                    assert_eq!(run(&mut engine, id, phase).error, None, "{text}");
+                }
+                assert_eq!(error.is_some(), failed, "{text}: {error:?}");
+                assert!(source.next().is_none());
+                assert_eq!(
+                    rules != 0,
+                    succeeds && child.starts_with("(rule"),
+                    "rejected bodies are absent: {text}"
+                );
+                if child.starts_with("(sort") {
+                    assert!(definitions.contains(&"X".into()));
+                }
+                if child.starts_with("(datatype") {
+                    for name in ["E", "A", "B"] {
+                        assert!(definitions.contains(&name.into()));
+                    }
+                }
+                let mut observation = pb::Program {
+                    ir_version: 1,
+                    ..Default::default()
+                };
+                if succeeds && child.starts_with("(rule") {
+                    native.parse_and_run_program(None, "(run r 1)").unwrap();
+                    observation.commands.push(pb::Command {
+                        kind: Some(pb::command::Kind::Run(pb::Run {
+                            ruleset: Some(pb::RulesetRef {
+                                kind: Some(pb::ruleset_ref::Kind::Name("r".into())),
+                            }),
+                            ..Default::default()
+                        })),
+                        ..Default::default()
+                    });
+                }
+                for table in ["Installed", "Earlier", "Later"] {
+                    observation.commands.push(pb::Command {
+                        kind: Some(pb::command::Kind::PrintSize(pb::PrintSize {
+                            tables: vec![table.into()],
+                        })),
+                        ..Default::default()
+                    });
+                }
+                let response = run(&mut engine, id, observation);
+                assert_eq!(response.error, None, "{text}");
+                let sizes: Vec<_> = response
+                    .outputs
+                    .iter()
+                    .filter_map(|output| match &output.kind {
+                        Some(pb::command_output::Kind::Sizes(sizes)) => {
+                            Some(sizes.sizes[0].rows as usize)
+                        }
+                        _ => None,
+                    })
+                    .collect();
+                assert_eq!(
+                    sizes,
+                    [
+                        native.get_size("Installed"),
+                        native.get_size("Earlier"),
+                        native.get_size("Later")
+                    ],
+                    "{text}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn source_fail_definition_admission_uses_selected_mode_without_replay_obligations() {
+    use egglog_experimental::protobuf::source::{Source, Submission};
+    let text = "(sort V (Vec i64)) (datatype Held (Hold V)) \
+        (fail (rule () ((Hold (vec-range 5))) :ruleset missing))";
+    let phases: Vec<_> = Source::new_core(None, text)
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    assert!(
+        phases
+            .iter()
+            .all(|phase| phase.rules.is_empty() && phase.commands.is_empty())
+    );
+    let mut engine = Engine::default();
+    let bytes = engine
+        .create(
+            &pb::CreateEGraphRequest {
+                sorts: fixture().sorts[..1].to_vec(),
+                options: Some(pb::EGraphOptions {
+                    cost_sort: Some(0),
+                    execution_mode: pb::ExecutionMode::Proofs.into(),
+                    ..Default::default()
+                }),
+                threads: Some(1),
+                ..Default::default()
+            }
+            .encode_to_vec(),
+        )
+        .unwrap();
+    let id = pb::CreateEGraphResponse::decode(bytes.as_slice())
+        .unwrap()
+        .egraph_id;
+    let occupied = pb::Program {
+        ir_version: 1,
+        rulesets: vec![pb::Ruleset {
+            name: Some("missing".into()),
+            kind: Some(pb::ruleset::Kind::Rules(pb::RuleList::default())),
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    assert_eq!(run(&mut engine, id, occupied).error, None);
+    for phase in phases {
+        assert_eq!(
+            run(&mut engine, id, phase).error,
+            None,
+            "discarded assertions do not rerun in another mode or namespace"
+        );
+    }
+    let mut proofs = Source::new_core(None, text)
+        .unwrap()
+        .with_execution_mode(pb::ExecutionMode::Proofs)
+        .unwrap();
+    assert!(
+        proofs
+            .find_map(Result::err)
+            .unwrap()
+            .to_string()
+            .contains("validator")
+    );
+    for body in ["(Unknown)", "(Hold 5)"] {
+        let text = format!(
+            "(sort V (Vec i64)) (datatype Held (Hold V)) (fail (rule () ({body}) :ruleset missing))"
+        );
+        assert!(
+            Source::new_core(None, &text)
+                .unwrap()
+                .find_map(Result::err)
+                .is_some()
+        );
+    }
+    let mut scoped = Source::new_core(
+        None,
+        "(relation Seen ()) (push) (ruleset local) (pop) (fail (rule () ((Seen)) :ruleset local))",
+    )
+    .unwrap();
+    while let Some(phase) = scoped.next_submission() {
+        if let Submission::Program(phase) = phase.unwrap() {
+            assert!(phase.rules.is_empty() && phase.commands.is_empty());
+        }
+    }
+}
+
+#[test]
+fn source_fail_keeps_encoded_definition_prefixes_and_partial_birewrite() {
+    use egglog_experimental::protobuf::source::Source;
+    for mode in [
+        pb::ExecutionMode::TermEncoding,
+        pb::ExecutionMode::Proofs,
+        pb::ExecutionMode::ProofTesting,
+    ] {
+        for depth in 1..=3 {
+            let mut text = "(datatype E (A) (B))".to_string();
+            for _ in 0..depth {
+                text = format!("(fail {text})");
+            }
+            let source = Source::new_core(None, &text)
+                .unwrap()
+                .with_execution_mode(mode)
+                .unwrap();
+            let mut engine = Engine::default();
+            let bytes = engine
+                .create(
+                    &pb::CreateEGraphRequest {
+                        sorts: fixture().sorts[..1].to_vec(),
+                        options: Some(pb::EGraphOptions {
+                            cost_sort: Some(0),
+                            execution_mode: mode.into(),
+                            ..Default::default()
+                        }),
+                        threads: Some(1),
+                        ..Default::default()
+                    }
+                    .encode_to_vec(),
+                )
+                .unwrap();
+            let id = pb::CreateEGraphResponse::decode(bytes.as_slice())
+                .unwrap()
+                .egraph_id;
+            let mut failed = false;
+            for phase in source {
+                match phase {
+                    Ok(phase) => {
+                        assert_eq!(run(&mut engine, id, phase).error, None, "{mode:?}: {text}")
+                    }
+                    Err(_) => {
+                        failed = true;
+                        break;
+                    }
+                }
+            }
+            assert_eq!(failed, depth % 2 == 1);
+            let response = run(
+                &mut engine,
+                id,
+                pb::Program {
+                    ir_version: 1,
+                    commands: ["A", "B"]
+                        .into_iter()
+                        .map(|table| pb::Command {
+                            kind: Some(pb::command::Kind::PrintSize(pb::PrintSize {
+                                tables: vec![table.into()],
+                            })),
+                            ..Default::default()
+                        })
+                        .collect(),
+                    ..Default::default()
+                },
+            );
+            assert_eq!(
+                response.error, None,
+                "successful constructors survive: {mode:?}: {text}"
+            );
+            assert_eq!(response.outputs.len(), 2);
+        }
+    }
+    let text = "(datatype E (A) (B)) (ruleset r) \
+        (rewrite (B) (A) :ruleset r :name \"both<=\") (A) \
+        (fail (birewrite (A) (B) :ruleset r :name \"both\")) \
+        (run r 1) (check (= (A) (B)))";
+    egglog::EGraph::default()
+        .parse_and_run_program(None, text)
+        .unwrap();
+    let mut engine = Engine::default();
+    let id = create(&mut engine);
+    for phase in Source::new_core(None, text).unwrap() {
+        let phase = phase.unwrap();
+        assert!(
+            phase
+                .rules
+                .iter()
+                .all(|rule| !matches!(rule.kind, Some(pb::rule_decl::Kind::Birewrite(_))))
+        );
+        assert_eq!(run(&mut engine, id, phase).error, None);
+    }
+}
+
+#[test]
 fn source_fail_global_let_does_not_catch_preparation_errors() {
     use egglog_experimental::protobuf::source::Source;
     for core in [false, true] {
@@ -17906,11 +18309,7 @@ fn fail_rejects_nested_invalid_and_non_native_commands_before_effects() {
         };
         assert!(table.rows.is_empty(), "{case}: earlier write ran");
     }
-    for source in [
-        "(fail (sort X))",
-        "(fail (extract 1))",
-        "(fail (print-size))",
-    ] {
+    for source in ["(fail (extract 1))", "(fail (print-size))"] {
         assert!(
             Source::new(None, source).unwrap().next().unwrap().is_err(),
             "{source}"
@@ -21359,6 +21758,7 @@ fn source_validates_each_rule_before_following_effects() {
         (datatype E (A))
         (function f (E) E :merge new)
         (function observed () i64 :merge new)
+        (set (observed) 7)
         (ruleset r)
         (rewrite (f x) x :ruleset r :subsume)
         (set (observed) 1)
@@ -21366,17 +21766,29 @@ fn source_validates_each_rule_before_following_effects() {
     "#,
     )
     .unwrap();
-    for _ in 0..4 {
+    for _ in 0..5 {
         assert_eq!(
             run(&mut engine, id, source.next().unwrap().unwrap()).error,
             None
         );
     }
-    let rule = source.next().unwrap().unwrap();
     assert!(
-        run(&mut engine, id, rule).error.is_some(),
+        source.next().unwrap().is_err(),
         "invalid rule must fail at its source position, not a future run"
     );
+    assert!(source.next().is_none());
+    for phase in Source::new(
+        None,
+        "(function observed () i64 :merge new) (check (= (observed) 7))",
+    )
+    .unwrap()
+    {
+        assert_eq!(
+            run(&mut engine, id, phase.unwrap()).error,
+            None,
+            "earlier write survives and later write never runs"
+        );
+    }
 }
 
 #[test]
@@ -21393,7 +21805,9 @@ fn source_keeps_native_rule_names_and_global_shadowing_checks() {
         ),
         (
             r#"(datatype E (A) (B)) (ruleset r) (rewrite (A) (B) :ruleset r :name "dup<=") (birewrite (A) (B) :ruleset r :name "dup")"#,
-            3,
+            // The forward direction installs before the duplicate backward
+            // direction fails; Source yields that prefix before the error.
+            4,
         ),
         (
             r#"(datatype E (A) (B)) (ruleset r) (birewrite (A) (B) :ruleset r :name "dup") (birewrite (A) (B) :ruleset r :name "dup")"#,
