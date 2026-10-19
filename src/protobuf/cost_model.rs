@@ -293,7 +293,7 @@ impl Session {
         program: &pb::Program,
         extract: &pb::Extract,
         response: &mut pb::RunProgramResponse,
-        native_spans: &NativeSpans,
+        context: &RequestOccurrences,
     ) -> Result<pb::ExtractResult, egglog::Error> {
         let registration = self
             .resolve_cost_model(&extract.cost_model, extract.extractor)
@@ -303,10 +303,15 @@ impl Session {
             .roots
             .iter()
             .map(|index| {
-                self.graph.eval_expr(
-                    &expression(program, *index, &mut HashSet::new(), native_spans)
-                        .expect("validated expression"),
+                eval_extract_root(
+                    &mut self.graph,
+                    program,
+                    *index,
+                    context.extraction_dags.get(index),
+                    true,
+                    &context.native_spans,
                 )
+                .map(|root| root.expect("executed extraction root"))
             })
             .collect::<Result<Vec<_>, _>>()?;
         let observation = Arc::new(freeze::observation(self, &roots)?);

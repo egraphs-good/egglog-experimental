@@ -647,9 +647,11 @@ expansion belongs to the frontend.
 Current limits include requests requiring `profile=true`, Normal-only
 Extract/PrintFunction/Freeze, native proof-mode restrictions on non-global
 no-merge functions, and context-specific lowering/expansion budgets. Normal
-Term/Set actions have a bounded DAG path for closed constructor fragments,
-including native Vec `of`/`empty`, BigInt `from_string` and BigRat `make`.
-Other calls are ordered memo barriers. Live extraction roots remain tree-limited.
+Term/Set actions and extraction roots have a bounded DAG path for closed
+constructor fragments, including native Vec `of`/`empty`, BigInt `from_string`
+and BigRat `make`.
+Other calls are ordered memo barriers; extraction roots evaluate independently.
+Rendering oversized extraction roots to Source remains tree-limited.
 Unsupported modes, values and codecs fail explicitly. These are adapter limits,
 not changes to the schema contract.
 

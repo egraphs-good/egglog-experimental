@@ -223,6 +223,7 @@ struct RequestOccurrences {
     include_run_reports: bool,
     scoped_actions: HashSet<Vec<u32>>,
     constructor_dags: HashMap<Vec<u32>, HashSet<u32>>,
+    extraction_dags: HashMap<u32, HashSet<u32>>,
     union_values: HashMap<u32, Value>,
 }
 
@@ -1092,6 +1093,30 @@ impl Session {
         } else {
             HashMap::new()
         };
+        let extraction_dags = if self.mode == pb::ExecutionMode::Normal {
+            let roots = command_tree(&program.commands)
+                .filter_map(|command| match &command.kind {
+                    Some(pb::command::Kind::Extract(extract)) => Some(extract.roots.as_slice()),
+                    _ => None,
+                })
+                .flatten()
+                .filter(|root| {
+                    depths
+                        .get(**root as usize)
+                        .is_none_or(|depth| *depth <= 256)
+                })
+                .map(|root| (*root, vec![*root]));
+            classify_closed_dags(
+                program,
+                &constructor_targets,
+                &depths,
+                &expansions,
+                &staged.graph,
+                roots,
+            )?
+        } else {
+            HashMap::new()
+        };
         let mut scoped_actions = classify_union_actions(
             program,
             &constructor_targets,
@@ -1485,6 +1510,7 @@ impl Session {
             native_spans,
             scoped_actions,
             constructor_dags,
+            extraction_dags,
             rulesets: occurrences
                 .rulesets
                 .iter()
@@ -1604,6 +1630,23 @@ impl Session {
                     &context.native_spans,
                 )
                 .map_err(|error| error.to_string())?;
+            }
+        }
+        for command in command_tree(&program.commands) {
+            if let Some(pb::command::Kind::Extract(extract)) = &command.kind {
+                for root in &extract.roots {
+                    if let Some(closed) = context.extraction_dags.get(root) {
+                        eval_extract_root(
+                            &mut compiler,
+                            program,
+                            *root,
+                            Some(closed),
+                            false,
+                            &context.native_spans,
+                        )
+                        .map_err(|error| error.to_string())?;
+                    }
+                }
             }
         }
         // Model metadata must see the same fully compiled context, including
@@ -1753,6 +1796,7 @@ impl Session {
                 return extract
                     .roots
                     .iter()
+                    .filter(|index| !context.extraction_dags.contains_key(*index))
                     .map(|index| {
                         Ok(Command::Action(Action::Expr(
                             span.clone(),
@@ -2082,7 +2126,7 @@ impl Session {
             }
             pb::command::Kind::Extract(extract) if !extract.cost_model.is_empty() => {
                 Some(pb::command_output::Kind::Extraction(
-                    self.extract_host_model(program, extract, response, &context.native_spans)?,
+                    self.extract_host_model(program, extract, response, context)?,
                 ))
             }
             pb::command::Kind::Extract(extract) => {
@@ -2090,15 +2134,15 @@ impl Session {
                     .roots
                     .iter()
                     .map(|index| {
-                        self.graph.eval_expr(
-                            &expression(
-                                program,
-                                *index,
-                                &mut HashSet::new(),
-                                &context.native_spans,
-                            )
-                            .expect("validated expression"),
+                        eval_extract_root(
+                            &mut self.graph,
+                            program,
+                            *index,
+                            context.extraction_dags.get(index),
+                            true,
+                            &context.native_spans,
                         )
+                        .map(|root| root.expect("executed extraction root"))
                     })
                     .collect::<Result<Vec<_>, _>>()?;
                 let mut encoded = HashMap::new();
@@ -4666,7 +4710,23 @@ fn classify_constructor_dags(
         ) {
             continue;
         }
-        let roots = action_roots(action)?;
+        candidates.push((path, action_roots(action)?));
+    }
+    classify_closed_dags(program, constructors, depths, expansions, graph, candidates)
+}
+
+// Eligibility is independent of the operation; only evaluated values are local
+// to an action or one ordered extraction root.
+fn classify_closed_dags<K: Eq + std::hash::Hash>(
+    program: &pb::Program,
+    constructors: &HashSet<String>,
+    depths: &[usize],
+    expansions: &[usize],
+    graph: &EGraph,
+    sites: impl IntoIterator<Item = (K, Vec<u32>)>,
+) -> Result<HashMap<K, HashSet<u32>>, String> {
+    let mut candidates = vec![];
+    for (path, roots) in sites {
         let mut needs_scoping = false;
         for root in &roots {
             let depth = depths
@@ -5035,6 +5095,74 @@ fn constructor_dag_actions(
         _ => return Err("constructor action scope requires Term or Set".into()),
     });
     Ok((actions, evaluations))
+}
+
+// One root has the same flush/recovery boundary as native eval_expr. Its memo
+// and captured value never outlive this evaluation, including aggregate Extract.
+fn eval_extract_root(
+    graph: &mut EGraph,
+    program: &pb::Program,
+    index: u32,
+    closed: Option<&HashSet<u32>>,
+    execute: bool,
+    native_spans: &NativeSpans,
+) -> Result<Option<(ArcSort, Value)>, egglog::Error> {
+    let error = egglog::Error::BackendError;
+    let sort_name = node_sort(program, index).map_err(error)?;
+    let sort = graph
+        .get_sort_by_name(&sort_name)
+        .cloned()
+        .ok_or_else(|| error(format!("unknown extraction root sort {sort_name}")))?;
+    let Some(closed) = closed else {
+        let expr = expression(program, index, &mut HashSet::new(), native_spans).map_err(error)?;
+        if execute {
+            return graph.eval_expr(&expr).map(Some);
+        }
+        graph.typecheck_expr_with_bindings_and_output(&expr, &[], sort, egglog::Context::Full)?;
+        return Ok(None);
+    };
+    let action = pb::Action {
+        kind: Some(pb::action::Kind::Term(index)),
+        span: program.nodes[index as usize].span,
+    };
+    let (mut actions, _) = constructor_dag_actions(
+        program,
+        &action,
+        |name| graph.type_info().is_global(name),
+        native_spans,
+        closed,
+    )
+    .map_err(error)?;
+    let Action::Expr(span, terminal) = actions.pop().expect("planned terminal") else {
+        unreachable!("root plan has a Term terminal")
+    };
+    // Avoid both globals and the planner's local bindings.
+    let mut next = actions.len();
+    let name = loop {
+        let candidate = format!("__egglog_proto_action_{next}");
+        next += 1;
+        if !graph.type_info().is_global(&candidate)
+            && !graph.type_info().is_global(&format!("${candidate}"))
+            && !actions
+                .iter()
+                .any(|action| matches!(action, Action::Let(_, name, _) if name == &candidate))
+        {
+            break candidate;
+        }
+    };
+    actions.push(Action::Let(span, name.clone(), terminal));
+    let (result, mut captured) = graph.eval_scoped_actions(&[], execute, |builder| {
+        for action in actions {
+            builder.action(action)?;
+        }
+        let actual = builder.capture_local(&name)?;
+        if actual.name() != sort.name() {
+            return Err(error("extraction root sort mismatch".into()));
+        }
+        Ok(())
+    });
+    result?;
+    Ok(execute.then(|| (sort, captured.pop().expect("executed root capture").1)))
 }
 
 // Only Union locations are retained across direct commands. An admitted closed
@@ -7246,6 +7374,189 @@ mod tests {
                     .len(),
                 if first { 0 } else { 17 }
             );
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct RootCostModel(Arc<std::sync::atomic::AtomicUsize>);
+
+    impl cost_model::NativeCostModel for RootCostModel {
+        fn contract(&self) -> cost_model::CostModelContract {
+            let sort = cost_model::ModelSort {
+                sorts: vec![pb::Sort {
+                    kind: Some(pb::sort::Kind::Family(pb::HostSort {
+                        name: "i64".into(),
+                        args: vec![],
+                    })),
+                    ..Default::default()
+                }],
+                root: 0,
+            };
+            cost_model::CostModelContract {
+                annotation: sort.clone(),
+                objective: sort,
+                additive: true,
+            }
+        }
+        fn start(
+            &self,
+            _: &pb::Program,
+        ) -> Result<Arc<dyn cost_model::CostModelRuntime>, egglog::Error> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(Arc::new(self.clone()))
+        }
+    }
+
+    impl cost_model::CostModelRuntime for RootCostModel {
+        fn run(
+            &self,
+            operation: Box<dyn FnOnce() -> Result<(), egglog::Error> + '_>,
+        ) -> Result<(), egglog::Error> {
+            operation()
+        }
+        fn cost(&self, _: u32, _: &[cost_model::Objective]) -> cost_model::Objective {
+            Arc::new(0i64)
+        }
+        fn compare(
+            &self,
+            _: &cost_model::Objective,
+            _: &cost_model::Objective,
+        ) -> std::cmp::Ordering {
+            std::cmp::Ordering::Equal
+        }
+        fn combine(
+            &self,
+            _: &cost_model::Objective,
+            _: &cost_model::Objective,
+        ) -> cost_model::Objective {
+            Arc::new(0i64)
+        }
+        fn identity(&self) -> cost_model::Objective {
+            Arc::new(0i64)
+        }
+        fn encode(
+            &self,
+            _: &cost_model::Objective,
+        ) -> Result<Option<pb::PrimitiveValue>, egglog::Error> {
+            Ok(Some(pb::PrimitiveValue {
+                value: Some(pb::primitive_value::Value::I64(0)),
+            }))
+        }
+    }
+
+    #[test]
+    fn extraction_dag_roots_have_fresh_memos_and_ordered_native_boundaries() {
+        for extractor in [pb::Extractor::Tree, pb::Extractor::GreedyDag] {
+            for custom in [false, true] {
+                let (mut program, _) = closed_value_dag(
+                    "(primitive read_after (A) i64 (get-node-size!))
+                     (read_after (Leaf (vec-empty) (bigrat (from-string \"7\") (from-string \"2\"))))"
+                );
+                let Some(pb::command::Kind::Action(pb::Action {
+                    kind: Some(pb::action::Kind::Term(root)),
+                    ..
+                })) = &program.commands[0].kind
+                else {
+                    panic!("root")
+                };
+                let root = *root;
+                let (mut engine, id) = host_default_engine();
+                let model = RootCostModel::default();
+                let cost_model = if custom {
+                    engine
+                        .register_cost_model(id, Arc::new(model.clone()))
+                        .unwrap()
+                } else {
+                    String::new()
+                };
+                // Exactly the same Call NodeId must execute twice. Its first
+                // count sees pending rows; the next root sees committed rows.
+                program.commands[0].kind = Some(pb::command::Kind::Extract(pb::Extract {
+                    roots: vec![root, root],
+                    variants: 1,
+                    extractor: extractor.into(),
+                    cost_model,
+                }));
+                engine.graphs[&id].prepare(&mut program.clone()).unwrap();
+                assert_eq!(engine.graphs[&id].graph.num_tuples(), 0);
+                assert_eq!(model.0.load(std::sync::atomic::Ordering::SeqCst), 0);
+                let response = run_host_default(&mut engine, id, program);
+                assert_eq!(response.error, None);
+                let Some(pb::command_output::Kind::Extraction(result)) = &response.outputs[0].kind
+                else {
+                    panic!("aggregate extraction")
+                };
+                assert_eq!(result.roots.len(), 2);
+                for (root, expected) in result.roots.iter().zip([0, 17]) {
+                    let [variant] = root.variants.as_slice() else {
+                        panic!("one variant")
+                    };
+                    assert!(matches!(&response.nodes[variant.term as usize].kind,
+                        Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
+                            value: Some(pb::primitive_value::Value::I64(value)),
+                        })) if *value == expected));
+                }
+                assert_eq!(
+                    engine.graphs[&id]
+                        .graph
+                        .get_size(&native_name("call", "Branch")),
+                    16
+                );
+                assert_eq!(engine.graphs[&id].graph.materialized_eq_classes().len(), 17);
+                assert_eq!(
+                    model.0.load(std::sync::atomic::Ordering::SeqCst),
+                    usize::from(custom)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn extraction_dag_partial_failure_keeps_prefix_and_stops_later_roots() {
+        for custom in [false, true] {
+            let (mut program, _) = closed_value_dag(
+                "(constructor Later () A) (constructor Demand (A BigRat A) A)
+                 (Demand (Leaf (vec-empty) (bigrat (from-string \"7\") (from-string \"2\")))
+                    (bigrat (from-string \"bad\") (from-string \"2\")) (Later))",
+            );
+            let Some(pb::command::Kind::Action(pb::Action {
+                kind: Some(pb::action::Kind::Term(root)),
+                ..
+            })) = &program.commands[0].kind
+            else {
+                panic!("root")
+            };
+            let root = *root;
+            let later = program.nodes.iter().position(|node|
+                matches!(&node.kind, Some(pb::node::Kind::Call(call)) if call.func == "Later")
+            ).unwrap() as u32;
+            let (mut engine, id) = host_default_engine();
+            let model = RootCostModel::default();
+            let cost_model = if custom {
+                engine
+                    .register_cost_model(id, Arc::new(model.clone()))
+                    .unwrap()
+            } else {
+                String::new()
+            };
+            program.commands[0].kind = Some(pb::command::Kind::Extract(pb::Extract {
+                roots: vec![root, later],
+                variants: 1,
+                extractor: pb::Extractor::Tree.into(),
+                cost_model,
+            }));
+            engine.graphs[&id].prepare(&mut program.clone()).unwrap();
+            assert_eq!(engine.graphs[&id].graph.num_tuples(), 0);
+            let response = run_host_default(&mut engine, id, program);
+            let error = response.error.unwrap();
+            assert_eq!(error.code, i32::from(pb::ErrorCode::EvaluationFailed));
+            assert_eq!(error.location.unwrap().path, [0]);
+            assert!(response.outputs.is_empty());
+            let graph = &engine.graphs[&id].graph;
+            assert_eq!(graph.get_size(&native_name("call", "Branch")), 16);
+            assert_eq!(graph.get_size(&native_name("call", "Later")), 0);
+            assert_eq!(graph.get_size(&native_name("call", "Demand")), 0);
+            assert_eq!(model.0.load(std::sync::atomic::Ordering::SeqCst), 0);
         }
     }
 
