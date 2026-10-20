@@ -16,8 +16,9 @@
 
 use crate::{
     Error,
+    effsafe_extract::Roots,
     greedy_dag_extract::{
-        extract_best_greedy_dag, extract_variants_greedy_dag, split_trailing_extractor,
+        Extractor, extract_best_greedy_dag, extract_variants_greedy_dag, split_trailing_extractor,
     },
 };
 use egglog::{
@@ -106,12 +107,29 @@ impl Macro<Vec<Command>> for SetCostDeclarations {
         span: Span,
         parser: &mut Parser,
     ) -> Result<Vec<Command>, ParseError> {
-        let decls = map_fallible(decls, parser, Parser::parse_command)?
-            .into_iter()
-            .flatten()
-            .collect::<Vec<_>>();
+        // Each argument must expand to a datatype or constructor declaration.
+        // Other macros (`:regions`, say) may expand a declaration into extra
+        // commands; those pass through unchanged.
+        let mut expanded: Vec<Command> = vec![];
+        for decl in decls {
+            let commands = parser.parse_command(decl)?;
+            if !commands.iter().any(|c| {
+                matches!(
+                    c,
+                    Command::Datatype { .. }
+                        | Command::Datatypes { .. }
+                        | Command::Constructor { .. }
+                )
+            }) {
+                return Err(ParseError(
+                    span,
+                    "Expect a datatype declaration".to_string(),
+                ));
+            }
+            expanded.extend(commands);
+        }
         let mut cost_table_commands = vec![];
-        for decl in decls.iter() {
+        for decl in expanded.iter() {
             match decl {
                 Command::Datatype { variants, .. } => {
                     let commands = generate_cost_table_commands_from_variants(variants);
@@ -152,15 +170,10 @@ impl Macro<Vec<Command>> for SetCostDeclarations {
                         });
                     }
                 }
-                _ => {
-                    return Err(ParseError(
-                        span,
-                        "Expect a datatype declaration".to_string(),
-                    ));
-                }
+                _ => {}
             }
         }
-        let mut commands = decls;
+        let mut commands = expanded;
         commands.extend(cost_table_commands);
         Ok(commands)
     }
@@ -249,7 +262,15 @@ impl UserDefinedCommand for CustomExtract {
         egraph: &mut EGraph,
         args: &[Expr],
     ) -> Result<Vec<CommandOutput>, egglog::Error> {
-        let (args, use_greedy_dag) = split_trailing_extractor(args)?;
+        let (args, include_subsumed) = crate::effsafe_extract::split_include_subsumed(args);
+        let (args, extractor) = split_trailing_extractor(args)?;
+        let use_greedy_dag = extractor == Extractor::GreedyDag;
+        if include_subsumed && extractor != Extractor::Effsafe {
+            return Err(Error::ParseError(ParseError(
+                span!(),
+                ":include-subsumed is only supported with :extractor effsafe".into(),
+            )));
+        }
         let (expr, variants) = match args {
             [] => {
                 return Err(Error::ParseError(ParseError(
@@ -293,6 +314,28 @@ impl UserDefinedCommand for CustomExtract {
         }
 
         let roots = vec![(sort, value)];
+
+        if extractor == Extractor::Effsafe {
+            if n != 0 {
+                return Err(Error::ParseError(ParseError(
+                    variants.unwrap().span(),
+                    "effect-safe extraction does not support variants".into(),
+                )));
+            }
+            let output = crate::effsafe_extract::extract_with_options(
+                egraph,
+                include_subsumed,
+                &Roots::Values(roots),
+                None,
+            )?;
+            let term = output.terms[0];
+            let cost = output.costs[0];
+            log::info!(
+                "extracted effect-safely with cost {cost}: {}",
+                output.termdag.to_string(term)
+            );
+            return Ok(vec![CommandOutput::ExtractBest(output.termdag, cost, term)]);
+        }
 
         // Omitted or zero variant count means best extraction.
         if n == 0 {

@@ -1,0 +1,4 @@
+;; :include-subsumed only applies to effect-safe extraction.
+(datatype Expr (Arg))
+(let $s0 (Arg))
+(extract $s0 :include-subsumed)

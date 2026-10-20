@@ -1,0 +1,806 @@
+//! The statewalk dynamic program (Section 6 of Flatt et al., "Efficient
+//! Extraction for Effectful E-graphs", OOPSLA 2026).
+//!
+//! Choose a state chain from the region's root to its single entry, requiring
+//! the chain's pure dependencies to be extractable from that chain. Minimize
+//! the supplied statewalk costs, then greedily extract the pure terms.
+
+use std::cmp::Reverse;
+use std::collections::{BinaryHeap, VecDeque};
+
+use egglog::Error;
+use rand_mt::Mt64;
+use rustc_hash::FxHashMap;
+
+use super::cost::{Cost, RegionBoundary};
+use super::greedy::statewalk_greedy_extraction;
+use super::persistent::{Id as VersionId, PersistentBitSet, PersistentCounters};
+use super::term_graph::{EClass, EClassId, EGraphMapping, ENodeId, Extraction, TermGraph};
+
+#[cfg(test)]
+mod tests;
+
+/// The chosen effectful e-nodes of a region, from the root down to the entry.
+pub type Statewalk = Vec<(EClassId, ENodeId)>;
+
+/// Statewalk search optimizations. Both are enabled by default.
+#[derive(Clone, Copy, Debug)]
+pub struct StatewalkOptions {
+    /// Ignore pure e-classes that no later part of the statewalk can use when
+    /// comparing DP states.
+    pub liveness: bool,
+    /// Prune and order visits to non-root *satellites*: effectful e-classes
+    /// whose only effectful parent and child are the same e-class.
+    pub satellite: bool,
+}
+
+impl Default for StatewalkOptions {
+    fn default() -> Self {
+        StatewalkOptions {
+            liveness: true,
+            satellite: true,
+        }
+    }
+}
+
+type Hash = u64;
+type DpId = usize;
+
+struct DpState {
+    cost: Cost,
+    /// Version of the extractable-set bit set for this state.
+    extractable: VersionId,
+    prev: Option<DpId>,
+    class: EClassId,
+    pick: ENodeId,
+}
+
+#[derive(Clone)]
+struct VersionInfo {
+    /// Hash of the full extractable set.
+    true_hash: Hash,
+    /// Hash of the extractable set restricted to live e-classes.
+    masked_hash: Hash,
+    /// Version of the child counters for this extractable set.
+    counters: VersionId,
+}
+
+fn bit(bits: &[u64], i: usize) -> bool {
+    (bits[i >> 6] >> (i & 63)) & 1 != 0
+}
+
+fn set_bit(bits: &mut [u64], i: usize) {
+    bits[i >> 6] |= 1 << (i & 63);
+}
+
+fn saturate_pure(
+    parents: &[Vec<(EClassId, ENodeId)>],
+    remaining: &mut [Vec<u32>],
+    extractable: &mut [bool],
+    mut queue: VecDeque<EClassId>,
+) {
+    while let Some(u) = queue.pop_front() {
+        for &(pc, pn) in &parents[u] {
+            remaining[pc][pn] -= 1;
+            if remaining[pc][pn] == 0 && !extractable[pc] {
+                extractable[pc] = true;
+                queue.push_back(pc);
+            }
+        }
+    }
+}
+
+const SATELLITE_BAR: usize = 6;
+
+struct RequiredSatellite {
+    class: EClassId,
+    cheapest_visits: Vec<ENodeId>,
+    cheapest_returns: Vec<ENodeId>,
+}
+
+fn required_satellites(
+    g: &TermGraph,
+    root: EClassId,
+    satellite_of: &[Option<EClassId>],
+    costs: &[Vec<Cost>],
+) -> Vec<Vec<RequiredSatellite>> {
+    let mut satellites: Vec<Vec<EClassId>> = vec![Vec::new(); g.len()];
+    for (class, hub) in satellite_of.iter().enumerate() {
+        if let Some(hub) = hub {
+            satellites[*hub].push(class);
+        }
+    }
+    let mut required: Vec<Vec<RequiredSatellite>> = (0..g.len()).map(|_| Vec::new()).collect();
+    if !satellites.iter().any(|group| group.len() > SATELLITE_BAR) {
+        return required;
+    }
+    let parents = g.parents();
+    let child_counts = g.child_counts();
+    for (hub, satellites) in satellites
+        .iter()
+        .enumerate()
+        .filter(|(_, group)| group.len() > SATELLITE_BAR)
+    {
+        for &satellite in satellites {
+            // If the root has no finite term without this class, every valid
+            // statewalk must visit it, regardless of which e-nodes it chooses.
+            let mut remaining = child_counts.clone();
+            let mut extractable = vec![false; g.len()];
+            let mut queue = VecDeque::new();
+            for (class, node) in g.enode_ids() {
+                if class != satellite && remaining[class][node] == 0 && !extractable[class] {
+                    extractable[class] = true;
+                    queue.push_back(class);
+                }
+            }
+            while let Some(class) = queue.pop_front() {
+                if extractable[root] {
+                    break;
+                }
+                for &(parent, node) in &parents[class] {
+                    if parent == satellite || extractable[parent] {
+                        continue;
+                    }
+                    remaining[parent][node] -= 1;
+                    if remaining[parent][node] == 0 {
+                        extractable[parent] = true;
+                        queue.push_back(parent);
+                    }
+                }
+            }
+            if extractable[root] {
+                continue;
+            }
+            let min_visit = *costs[satellite].iter().min().unwrap();
+            let cheapest_visits = (0..costs[satellite].len())
+                .filter(|&n| costs[satellite][n] == min_visit)
+                .collect();
+            let returns: Vec<_> = g.classes[hub]
+                .enodes
+                .iter()
+                .enumerate()
+                .filter(|(_, enode)| g.state_child(enode) == Some(satellite))
+                .map(|(node, _)| node)
+                .collect();
+            let min_return = returns.iter().map(|&n| costs[hub][n]).min().unwrap();
+            let cheapest_returns = returns
+                .into_iter()
+                .filter(|&n| costs[hub][n] == min_return)
+                .collect();
+            required[hub].push(RequiredSatellite {
+                class: satellite,
+                cheapest_visits,
+                cheapest_returns,
+            });
+        }
+    }
+    required
+}
+
+/// Everything about a region the DP needs that does not depend on the DP state.
+struct Region {
+    arg: (EClassId, ENodeId),
+    /// Pure e-nodes with the e-class as a child.
+    parents_pure: Vec<Vec<(EClassId, ENodeId)>>,
+    /// Effectful e-nodes with the e-class as a child.
+    parents_effectful: Vec<Vec<(EClassId, ENodeId)>>,
+    /// E-classes extractable from the `Arg` alone.
+    init_extractable: Vec<bool>,
+    /// Dense index of the e-classes that are not initially extractable.
+    compressed: Vec<Option<usize>>,
+    /// Offset of a pure e-class's e-nodes in the counter array.
+    rank: Vec<usize>,
+    /// Random hash contribution of each compressed e-class.
+    base: Vec<Hash>,
+    /// Per effectful e-class, the e-classes live at it (effectful ancestors and
+    /// the pure e-classes they use). Empty when liveness is off.
+    live: Vec<Vec<u64>>,
+    /// `live_delta[c][p]`: compressed pure e-classes live at `c` but not at its
+    /// effectful parent `p`.
+    live_delta: Vec<FxHashMap<EClassId, Vec<usize>>>,
+    /// The e-class a non-root effectful e-class is a satellite of, if any.
+    satellite_of: Vec<Option<EClassId>>,
+    required_satellites: Vec<Vec<RequiredSatellite>>,
+}
+
+impl Region {
+    fn new(
+        g: &TermGraph,
+        root: EClassId,
+        costs: &[Vec<Cost>],
+        opts: StatewalkOptions,
+    ) -> Result<(Self, Vec<u32>), Error> {
+        let entries: Vec<_> = g
+            .enode_ids()
+            .filter(|&(c, n)| g.is_effectful(c) && g.state_child(g.enode(c, n)).is_none())
+            .collect();
+        let &(arg_class, _) = entries.first().ok_or_else(|| {
+            Error::ExtractError(format!(
+                "the region rooted at {} has no entry: no effectful e-node without an \
+                     effectful child (a region needs its own argument or initial state)",
+                describe_class(g, root)
+            ))
+        })?;
+        if entries.iter().any(|&(c, _)| c != arg_class) {
+            return Err(Error::ExtractError(format!(
+                "the region rooted at {} has multiple entry e-classes; \
+                 effect-safe extraction requires exactly one",
+                describe_class(g, root)
+            )));
+        }
+
+        let n = g.len();
+        let mut parents_pure = vec![Vec::new(); n];
+        let mut parents_effectful = vec![Vec::new(); n];
+        let mut child_count: Vec<Vec<u32>> = vec![Vec::new(); n];
+        for (c, node) in g.enode_ids() {
+            let enode = g.enode(c, node);
+            if g.is_effectful(c) {
+                for &child in &enode.children {
+                    if g.is_effectful(child) {
+                        parents_effectful[child].push((c, node));
+                    }
+                }
+            } else {
+                child_count[c].push(enode.children.len() as u32);
+                for &child in &enode.children {
+                    parents_pure[child].push((c, node));
+                }
+            }
+        }
+
+        // Entry alternatives must be extractable before any state is available.
+        let mut init_extractable = vec![false; n];
+        let mut queue = VecDeque::new();
+        for c in g.class_ids() {
+            if !g.is_effectful(c) && g.classes[c].enodes.iter().any(|e| e.is_leaf()) {
+                init_extractable[c] = true;
+                queue.push_back(c);
+            }
+        }
+        saturate_pure(
+            &parents_pure,
+            &mut child_count,
+            &mut init_extractable,
+            queue,
+        );
+        let arg = entries
+            .into_iter()
+            .filter(|&(c, n)| {
+                g.enode(c, n)
+                    .children
+                    .iter()
+                    .all(|&child| init_extractable[child])
+            })
+            .min_by_key(|&(c, n)| costs[c][n])
+            .ok_or_else(|| {
+                Error::ExtractError(format!(
+                    "the region rooted at {} has no entry extractable without a state",
+                    describe_class(g, root)
+                ))
+            })?;
+        init_extractable[arg_class] = true;
+        saturate_pure(
+            &parents_pure,
+            &mut child_count,
+            &mut init_extractable,
+            VecDeque::from([arg_class]),
+        );
+
+        // Dense numbering of the remaining e-classes, and the flat counter array
+        // of the remaining pure e-nodes' children.
+        let mut compressed = vec![None; n];
+        let mut rank = vec![0; n];
+        let mut counts: Vec<u32> = Vec::new();
+        let mut n_compressed = 0;
+        for c in g.class_ids() {
+            if init_extractable[c] {
+                continue;
+            }
+            compressed[c] = Some(n_compressed);
+            n_compressed += 1;
+            if !child_count[c].is_empty() {
+                rank[c] = counts.len();
+                counts.extend_from_slice(&child_count[c]);
+            }
+        }
+        // The counters store (children - 1): a decrement that finds zero means
+        // the last child just became extractable.
+        for count in &mut counts {
+            debug_assert!(*count > 0);
+            *count -= 1;
+        }
+
+        // Random hash contributions; mt19937_64 with its default seed, like the C++.
+        let mut rng = Mt64::new_unseeded();
+        let base: Vec<Hash> = (0..n_compressed).map(|_| rng.next_u64()).collect();
+
+        let mut live: Vec<Vec<u64>> = vec![Vec::new(); n];
+        let mut live_delta: Vec<FxHashMap<EClassId, Vec<usize>>> = vec![FxHashMap::default(); n];
+        if opts.liveness {
+            let words = n.div_ceil(64);
+            for i in g.class_ids().filter(|&c| g.is_effectful(c)) {
+                live[i] = vec![0; words];
+                let mut queue = VecDeque::from([i]);
+                while let Some(u) = queue.pop_front() {
+                    if g.is_effectful(u) && u != root {
+                        for &(v, _) in &parents_effectful[u] {
+                            if !bit(&live[i], v) {
+                                set_bit(&mut live[i], v);
+                                queue.push_back(v);
+                            }
+                        }
+                    }
+                    if bit(&live[i], u) {
+                        for enode in &g.classes[u].enodes {
+                            for &v in &enode.children {
+                                if !init_extractable[v] && !g.is_effectful(v) && !bit(&live[i], v) {
+                                    set_bit(&mut live[i], v);
+                                    queue.push_back(v);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            for i in g.class_ids().filter(|&c| g.is_effectful(c) && c != root) {
+                for &(v, _) in &parents_effectful[i] {
+                    live_delta[i].entry(v).or_insert_with(|| {
+                        let mut delta = Vec::new();
+                        for (k, (&at_i, &at_v)) in live[i].iter().zip(&live[v]).enumerate() {
+                            debug_assert!(at_i & at_v == at_v);
+                            let mut diff = at_i ^ at_v;
+                            while diff != 0 {
+                                let w = (k << 6) + diff.trailing_zeros() as usize;
+                                diff &= diff - 1;
+                                if !g.is_effectful(w) && !init_extractable[w] {
+                                    delta.push(compressed[w].unwrap());
+                                }
+                            }
+                        }
+                        delta
+                    });
+                }
+            }
+        }
+
+        let mut satellite_of = vec![None; n];
+        if opts.satellite {
+            for i in g.class_ids().filter(|&c| g.is_effectful(c) && c != root) {
+                // A satellite's e-nodes all share one effectful child, which is
+                // also its only effectful parent.
+                let mut candidate: Option<EClassId> = None;
+                let mut consistent = true;
+                for enode in &g.classes[i].enodes {
+                    match g.state_child(enode) {
+                        None => {
+                            consistent = false;
+                            break;
+                        }
+                        Some(child) => {
+                            if candidate.is_none() {
+                                candidate = Some(child);
+                            } else if candidate != Some(child) {
+                                consistent = false;
+                                break;
+                            }
+                        }
+                    }
+                }
+                let candidate = candidate.filter(|&c| {
+                    consistent
+                        && !parents_effectful[i].is_empty()
+                        && parents_effectful[i].iter().all(|&(p, _)| p == c)
+                });
+                satellite_of[i] = candidate;
+            }
+        }
+
+        let required_satellites = required_satellites(g, root, &satellite_of, costs);
+        let region = Region {
+            arg,
+            parents_pure,
+            parents_effectful,
+            init_extractable,
+            compressed,
+            rank,
+            base,
+            live,
+            live_delta,
+            satellite_of,
+            required_satellites,
+        };
+        Ok((region, counts))
+    }
+}
+
+/// `root` by the constructors of its e-nodes, for error messages.
+pub(super) fn describe_class(g: &TermGraph, class: EClassId) -> String {
+    let ops: Vec<&str> = g.classes[class]
+        .enodes
+        .iter()
+        .filter_map(|n| g.op_name(n))
+        .collect();
+    format!("an e-class with {ops:?}")
+}
+
+/// The DP's mutable state: the versioned extractable sets and counters, and
+/// the hash-consing tables over them.
+struct Versions {
+    sets: PersistentBitSet,
+    counters: PersistentCounters,
+    info: FxHashMap<VersionId, VersionInfo>,
+    /// Version with a given full extractable set.
+    by_true_hash: FxHashMap<Hash, VersionId>,
+    /// Result of extending a version with an effectful e-class.
+    saturated: FxHashMap<(VersionId, EClassId), VersionId>,
+}
+
+impl Versions {
+    fn is_extractable(&self, region: &Region, version: VersionId, class: EClassId) -> bool {
+        region.init_extractable[class]
+            || self.sets.contains(
+                version,
+                region.compressed[class].expect("class is compressed"),
+            )
+    }
+
+    /// Extend `version` by making the effectful e-class `v` extractable (coming
+    /// from its effectful child `u`), then saturate: every pure e-node whose
+    /// children are all extractable makes its e-class extractable too.
+    /// Returns the new version and its masked hash.
+    fn saturate(
+        &mut self,
+        region: &Region,
+        opts: StatewalkOptions,
+        version: VersionId,
+        u: EClassId,
+        v: EClassId,
+    ) -> (VersionId, Hash) {
+        if let Some(&cached) = self.saturated.get(&(version, v)) {
+            return (cached, self.info[&cached].masked_hash);
+        }
+        self.sets.new_version();
+        self.counters.new_version();
+        let mut info = self.info[&version].clone();
+        let mut new_version = version;
+        if opts.liveness {
+            // E-classes that are live at u but dead at v drop out of the masked hash.
+            if let Some(delta) = region.live_delta[u].get(&v) {
+                for &d in delta {
+                    if self.sets.contains(new_version, d) {
+                        info.masked_hash ^= region.base[d];
+                    }
+                }
+            }
+        }
+        let live_at_v = &region.live[v];
+        let cv = region.compressed[v].expect("v is not initially extractable");
+        new_version = self.sets.insert(new_version, cv).0;
+        info.true_hash ^= region.base[cv];
+        let mut queue = VecDeque::from([v]);
+        while let Some(w) = queue.pop_front() {
+            for &(pc, pn) in &region.parents_pure[w] {
+                if region.init_extractable[pc] {
+                    continue;
+                }
+                let cpc = region.compressed[pc].unwrap();
+                if self.sets.contains(new_version, cpc) {
+                    continue;
+                }
+                let (counters, before) =
+                    self.counters.decrement(info.counters, region.rank[pc] + pn);
+                info.counters = counters;
+                // The counter stores (children - 1), so hitting zero means every child is extractable.
+                if before == 0 {
+                    let (set, already) = self.sets.insert(new_version, cpc);
+                    if !already {
+                        new_version = set;
+                        info.true_hash ^= region.base[cpc];
+                        if !opts.liveness || bit(live_at_v, pc) {
+                            info.masked_hash ^= region.base[cpc];
+                        }
+                        queue.push_back(pc);
+                    }
+                }
+            }
+        }
+        match self.by_true_hash.get(&info.true_hash) {
+            Some(&existing) => {
+                debug_assert!(self.info[&existing].true_hash == info.true_hash);
+                debug_assert!(self.info[&existing].masked_hash == info.masked_hash);
+                new_version = existing;
+            }
+            None => {
+                self.by_true_hash.insert(info.true_hash, new_version);
+                self.info.insert(new_version, info.clone());
+            }
+        }
+        self.saturated.insert((version, v), new_version);
+        (new_version, info.masked_hash)
+    }
+}
+
+/// The cheapest statewalk of the region `g` from `root` down to its entry.
+/// `costs[c][n]` is the statewalk cost of effectful e-node `(c, n)`.
+pub fn statewalk_dp(
+    g: &TermGraph,
+    root: EClassId,
+    costs: &[Vec<Cost>],
+    opts: StatewalkOptions,
+) -> Result<Statewalk, Error> {
+    let (region, counts) = Region::new(g, root, costs, opts)?;
+    let n_compressed = region.compressed.iter().flatten().count();
+
+    let mut versions = Versions {
+        sets: PersistentBitSet::default(),
+        counters: PersistentCounters::default(),
+        info: FxHashMap::default(),
+        by_true_hash: FxHashMap::default(),
+        saturated: FxHashMap::default(),
+    };
+    let init_counters = versions.counters.init(&counts);
+    let init_set = versions.sets.init(&vec![0; n_compressed]);
+    versions.info.insert(
+        init_set,
+        VersionInfo {
+            true_hash: 0,
+            masked_hash: 0,
+            counters: init_counters,
+        },
+    );
+    versions.by_true_hash.insert(0, init_set);
+
+    let (arg_class, arg_node) = region.arg;
+    let mut states: Vec<DpState> = vec![DpState {
+        cost: costs[arg_class][arg_node],
+        extractable: init_set,
+        prev: None,
+        class: arg_class,
+        pick: arg_node,
+    }];
+    let mut state_by_hash: Vec<FxHashMap<Hash, DpId>> = vec![FxHashMap::default(); g.len()];
+    state_by_hash[arg_class].insert(0, 0);
+    let mut heap: BinaryHeap<(Reverse<Cost>, DpId)> = BinaryHeap::new();
+    heap.push((Reverse(states[0].cost), 0));
+    let mut best: Option<DpId> = (root == arg_class).then_some(0);
+
+    while let Some((Reverse(cost), uid)) = heap.pop() {
+        if states[uid].cost != cost || states[uid].class == root {
+            continue;
+        }
+        let u = states[uid].class;
+        let u_version = states[uid].extractable;
+        let mut forced = None;
+        for satellite in &region.required_satellites[u] {
+            let v = satellite.class;
+            if versions.is_extractable(&region, u_version, v) {
+                continue;
+            }
+            let Some(&node) = satellite.cheapest_visits.iter().find(|&&n| {
+                g.enode(v, n)
+                    .children
+                    .iter()
+                    .all(|&c| versions.is_extractable(&region, u_version, c))
+            }) else {
+                continue;
+            };
+            let (after, _) = versions.saturate(&region, opts, u_version, u, v);
+            if satellite.cheapest_returns.iter().any(|&n| {
+                g.enode(u, n)
+                    .children
+                    .iter()
+                    .all(|&c| versions.is_extractable(&region, after, c))
+            }) {
+                // This required round trip is feasible at its minimum cost.
+                // Moving it before any other continuation preserves availability
+                // and cannot increase that continuation's total cost.
+                forced = Some((v, node));
+                break;
+            }
+        }
+        for &(v, vn) in &region.parents_effectful[u] {
+            if forced.is_some_and(|chosen| chosen != (v, vn)) {
+                continue;
+            }
+            let already_extractable = versions.is_extractable(&region, u_version, v);
+            if region.satellite_of[v] == Some(u) && already_extractable {
+                // This non-root detour must return to u, adds no extractable
+                // e-classes, and has nonnegative cost.
+                continue;
+            }
+            let enode = g.enode(v, vn);
+            if !enode
+                .children
+                .iter()
+                .all(|&c| versions.is_extractable(&region, u_version, c))
+            {
+                continue;
+            }
+            let new_cost = cost.saturating_add(costs[v][vn]);
+            if best.is_some_and(|b| states[b].cost <= new_cost) {
+                continue;
+            }
+            let old_hash = versions.info[&u_version].masked_hash;
+            let (new_version, new_hash) = if already_extractable {
+                (u_version, old_hash)
+            } else {
+                versions.saturate(&region, opts, u_version, u, v)
+            };
+            match state_by_hash[v].get(&new_hash) {
+                None => {
+                    let vid = states.len();
+                    state_by_hash[v].insert(new_hash, vid);
+                    states.push(DpState {
+                        cost: new_cost,
+                        extractable: new_version,
+                        prev: Some(uid),
+                        class: v,
+                        pick: vn,
+                    });
+                    heap.push((Reverse(new_cost), vid));
+                    if v == root {
+                        best = Some(vid);
+                    }
+                }
+                Some(&vid) => {
+                    if states[vid].cost > new_cost {
+                        states[vid] = DpState {
+                            cost: new_cost,
+                            extractable: new_version,
+                            prev: Some(uid),
+                            class: v,
+                            pick: vn,
+                        };
+                        heap.push((Reverse(new_cost), vid));
+                        if v == root {
+                            best = Some(vid);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    log::debug!(
+        "effsafe search states={} versions={}",
+        states.len(),
+        versions.info.len()
+    );
+    let Some(best) = best else {
+        return Err(Error::ExtractError(format!(
+            "no effect-safe extraction for the region rooted at {}: no chain of effectful \
+             e-nodes from the root to the entry makes every pure term it needs extractable \
+             (does a pure term read a state from outside this region?)",
+            describe_class(g, root)
+        )));
+    };
+    let mut statewalk = Statewalk::new();
+    let mut cur = Some(best);
+    while let Some(id) = cur {
+        statewalk.push((states[id].class, states[id].pick));
+        cur = states[id].prev;
+    }
+    super::checks::validate!(super::checks::is_valid_statewalk(g, root, &statewalk));
+    Ok(statewalk)
+}
+
+/// Linearize a region along a statewalk: every effectful e-class keeps only its
+/// chosen e-node, whose effectful child is redirected to the next e-class on the
+/// walk. An e-class visited more than once gets a fresh copy per visit.
+/// Returns the linearized e-graph and the mapping back into `g`.
+pub fn linearize(g: &TermGraph, statewalk: &Statewalk) -> (TermGraph, EGraphMapping) {
+    let mut lin = g.empty_like();
+    lin.classes = g
+        .classes
+        .iter()
+        .map(|class| {
+            if class.is_effectful {
+                EClass {
+                    enodes: Vec::new(),
+                    is_effectful: true,
+                    sort: class.sort,
+                }
+            } else {
+                class.clone()
+            }
+        })
+        .collect();
+    let mut to_g = EGraphMapping {
+        classes: g.class_ids().map(Some).collect(),
+        enodes: g
+            .classes
+            .iter()
+            .map(|class| {
+                if class.is_effectful {
+                    Vec::new()
+                } else {
+                    (0..class.enodes.len()).map(Some).collect()
+                }
+            })
+            .collect(),
+    };
+    let mut prev: Option<EClassId> = None;
+    for &(c, n) in statewalk.iter().rev() {
+        let mut enode = g.enode(c, n).clone();
+        for child in &mut enode.children {
+            if g.is_effectful(*child) {
+                *child = prev.expect("the statewalk ends at the entry");
+            }
+        }
+        let lin_class = if lin.classes[c].enodes.is_empty() {
+            lin.classes[c].enodes.push(enode);
+            to_g.enodes[c].push(Some(n));
+            c
+        } else {
+            lin.classes.push(EClass {
+                enodes: vec![enode],
+                is_effectful: true,
+                sort: g.classes[c].sort,
+            });
+            to_g.classes.push(Some(c));
+            to_g.enodes.push(vec![Some(n)]);
+            lin.len() - 1
+        };
+        prev = Some(lin_class);
+    }
+    super::checks::validate!(super::checks::is_wellformed(&lin, true, false));
+    super::checks::validate!(super::checks::is_valid_mapping(
+        &to_g, &lin, g, false, false, false, true
+    ));
+    (lin, to_g)
+}
+
+/// Extract `root` from the region `g`: find the cheapest statewalk, linearize
+/// along it, and greedily extract the pure terms it needs.
+pub fn extract_region(
+    g: &TermGraph,
+    boundary: &dyn RegionBoundary,
+    root: EClassId,
+    costs: &[Vec<Cost>],
+    class_costs: &[Cost],
+    opts: StatewalkOptions,
+) -> Result<Extraction, Error> {
+    let t0 = std::time::Instant::now();
+    let statewalk = statewalk_dp(g, root, costs, opts)?;
+    if log::log_enabled!(log::Level::Debug) {
+        log::debug!(
+            "effsafe dp={:.2}ms walk_len={}",
+            t0.elapsed().as_secs_f64() * 1e3,
+            statewalk.len()
+        );
+    }
+    let t1 = std::time::Instant::now();
+    let (lin, lin_to_g) = linearize(g, &statewalk);
+    let t_lin = t1.elapsed();
+    // The root keeps its id in the linearized e-graph.
+    let t2 = std::time::Instant::now();
+    let (pruned, lin_to_pruned) = lin.prune_unextractable(Some(root));
+    let t_prune = t2.elapsed();
+    let t3 = std::time::Instant::now();
+    let pruned_to_g = lin_to_pruned.inverse(&pruned).then(&lin_to_g);
+    let pruned_class_costs: Vec<Cost> = pruned
+        .class_ids()
+        .map(|c| class_costs[pruned_to_g.class(c)])
+        .collect();
+    let extraction = statewalk_greedy_extraction(
+        &pruned,
+        boundary,
+        &pruned_class_costs,
+        lin_to_pruned.class(root),
+    )?;
+    let t_greedy = t3.elapsed();
+    let t4 = std::time::Instant::now();
+    let extraction = pruned_to_g.apply(&extraction);
+    if log::log_enabled!(log::Level::Debug) {
+        log::debug!(
+            "effsafe linearize={:.2}ms prune={:.2}ms greedy={:.2}ms map={:.2}ms",
+            t_lin.as_secs_f64() * 1e3,
+            t_prune.as_secs_f64() * 1e3,
+            t_greedy.as_secs_f64() * 1e3,
+            t4.elapsed().as_secs_f64() * 1e3
+        );
+    }
+    super::checks::validate!(super::checks::is_effect_safe(g, root, &extraction));
+    Ok(extraction)
+}

@@ -28,6 +28,9 @@ stacker = "0.1.25"
 fixedbitset = "0.5.7"
 # Greedy-DAG's hot maps were 1.90% faster than std on the Taylor 51 canary.
 hashbrown = "0.16.0"
+indexmap = "2"
+rustc-hash = "2"
+rand_mt = { version = "6", default-features = false }
 
 [dev-dependencies]
 glob = "0.3.1"
