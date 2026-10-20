@@ -143,7 +143,7 @@ fn rewrite_merge_rebuilds_equality_members_in_nested_sets() -> Result<(), TypedE
     assert_eq!(i64::try_from(&graph.extract(s.length())?)?, 2);
     assert_eq!(i64::try_from(&graph.extract(pairs.length())?)?, 2);
     // Direct Action Union is outside this slice; use the supported rewrite path.
-    graph.run(&ruleset(rewrite(&a, &b)))?;
+    graph.run(ruleset(rewrite(&a, &b)))?;
     assert_eq!(i64::try_from(&graph.extract(s.length())?)?, 1);
     assert_eq!(i64::try_from(&graph.extract(pairs.length())?)?, 1);
     assert_eq!(Vec::<Atom>::try_from(&graph.extract(&s)?)?.len(), 1);

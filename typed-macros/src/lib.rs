@@ -1210,8 +1210,8 @@ mod tests {
             let stub = syn::parse2::<Stub>(quote!(#attrs fn predicate(value: IList);)).unwrap();
             assert_eq!(
                 declaration_attrs(stub.attrs)
-                    .err()
-                    .expect("mixed callable attributes must be rejected")
+                    .map(|_| ())
+                    .expect_err("mixed callable attributes must be rejected")
                     .to_string(),
                 "duplicate callable attribute"
             );
@@ -1803,8 +1803,8 @@ mod tests {
         );
         assert_eq!(
             options(quote!(from, from(i64)))
-                .err()
-                .expect("duplicate options must be rejected")
+                .map(|_| ())
+                .expect_err("duplicate options must be rejected")
                 .to_string(),
             "duplicate declaration option"
         );
@@ -2088,8 +2088,8 @@ mod tests {
     fn lazy_ruleset_rejects_unsupported_options_signatures_and_parameters() {
         assert_eq!(
             options(quote!(name = "one", name = "two"))
-                .err()
-                .expect("duplicate options must be rejected")
+                .map(|_| ())
+                .expect_err("duplicate options must be rejected")
                 .to_string(),
             "duplicate declaration option"
         );

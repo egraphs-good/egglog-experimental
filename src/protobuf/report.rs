@@ -587,10 +587,10 @@ mod tests {
                     .run_program_observed(
                         commands,
                         &mut |_, origin, output| {
-                            if origin == ExecutionOrigin::Requested {
-                                if let CommandOutput::RunSchedule(report) = output {
-                                    captured = Some(report);
-                                }
+                            if origin == ExecutionOrigin::Requested
+                                && let CommandOutput::RunSchedule(report) = output
+                            {
+                                captured = Some(report);
                             }
                         },
                         &mut |_, _| {},

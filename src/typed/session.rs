@@ -1686,7 +1686,7 @@ mod tests {
                 subsume(&left),
             );
             if in_rule {
-                graph.run_response(&ruleset(rule((), actions))).unwrap();
+                graph.run_response(ruleset(rule((), actions))).unwrap();
             } else {
                 graph.register(actions).unwrap();
             }
@@ -2004,7 +2004,7 @@ mod tests {
         assert!(graph.check(&forged).is_err());
         assert!(
             graph
-                .run_response(&ruleset(rule((), set(&forged, 7))))
+                .run_response(ruleset(rule((), set(&forged, 7))))
                 .is_err()
         );
         assert!(graph.publication.confirmed.is_empty());
@@ -2937,7 +2937,7 @@ mod tests {
         let parent_name = graph.publication.confirmed[&parent_key].1.clone();
         assert_eq!(
             first.ruleset_publication.unwrap().names,
-            [parent_name.clone()]
+            std::slice::from_ref(&parent_name)
         );
         assert_eq!(graph.publication.anchors[&empty_key], parent_key);
         let first_request =
@@ -5180,9 +5180,7 @@ mod tests {
             .unwrap();
         observe(&mut graph, ne(&left, &right), true);
         observe(&mut graph, ne(&left_vec, &right_vec), true);
-        graph
-            .run_response(&ruleset(rewrite(&left, &right)))
-            .unwrap();
+        graph.run_response(ruleset(rewrite(&left, &right))).unwrap();
         observe(&mut graph, ne(&left, &right), false);
         observe(&mut graph, ne(&left_vec, &right_vec), false);
         assert_ne!(left, right);
@@ -5322,7 +5320,7 @@ mod tests {
         };
         let mut graph = EGraph::default();
         for explicit in ["chosen", "", "__typed_ruleset_3"] {
-            graph.run_response(&root(Some(explicit))).unwrap();
+            graph.run_response(root(Some(explicit))).unwrap();
             let request =
                 pb::RunProgramRequest::decode(graph.last_wire.as_ref().unwrap().0.as_slice())
                     .unwrap();
@@ -5340,7 +5338,7 @@ mod tests {
                 Some(pb::ruleset_ref::Kind::Name(explicit.into()))
             );
         }
-        graph.run_response(&root(None)).unwrap();
+        graph.run_response(root(None)).unwrap();
         let request =
             pb::RunProgramRequest::decode(graph.last_wire.as_ref().unwrap().0.as_slice()).unwrap();
         assert_eq!(

@@ -11,6 +11,11 @@ readme = "README.md"
 [workspace]
 members = ["typed-macros"]
 
+[[bin]]
+name = "egglog-experimental"
+path = "src/main.rs"
+required-features = ["bin"]
+
 [[test]]
 harness = false
 name = "files"

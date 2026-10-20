@@ -1391,7 +1391,7 @@ fn typed_union_subsume_invalid_targets_captures_and_occurrences() -> Result<(), 
     }
     // Established captures are still forbidden in rules, including union heads.
     assert!(matches!(
-        graph.run(&ruleset(rule((), union(&saved, &copied)))),
+        graph.run(ruleset(rule((), union(&saved, &copied)))),
         Err(TypedError::Invalid(_))
     ));
     let unbound = ruleset(|x: &I64| rule((), subsume(RuleTerms::Input(x))));
@@ -1406,7 +1406,7 @@ fn typed_union_subsume_invalid_targets_captures_and_occurrences() -> Result<(), 
     assert!(graph.check(eq(&direct_input, &direct_copied))?);
     graph.register(delete(Read(72)))?;
     assert!(!graph.check(Read(72))?);
-    assert!(matches!(graph.run(&ruleset(rule((), (&shared, &shared)))),
+    assert!(matches!(graph.run(ruleset(rule((), (&shared, &shared)))),
         Err(TypedError::Engine(error)) if error.message.contains("repeated action Union occurrence")));
     assert!(!graph.check(Read(72))?);
     graph.register((
@@ -1415,7 +1415,7 @@ fn typed_union_subsume_invalid_targets_captures_and_occurrences() -> Result<(), 
         union(&input, copied.clone()),
         union(&input, &copied),
     ))?;
-    graph.run(&ruleset((rule((), &shared), rule((), &shared))))?;
+    graph.run(ruleset((rule((), &shared), rule((), &shared))))?;
     // Existing constructor conversion, not a new untyped RHS conversion path.
     let atom = Atom::A();
     let wrapped = Math::Wrap(&atom);
@@ -1451,7 +1451,7 @@ fn generated_ne_infers_borrowed_inputs_and_observes_native_merges() -> Result<()
     graph.register((&left, &right, &left_vec, &right_vec))?;
     assert!(graph.check(ne(&left, &right))?);
     assert!(graph.check(ne(&left_vec, &right_vec))?);
-    graph.run(&ruleset(rewrite(&left, &right)))?;
+    graph.run(ruleset(rewrite(&left, &right)))?;
     assert!(graph.check(eq(&left, &right))?);
     assert!(!graph.check(ne(&left, &right))?);
     assert!(!graph.check(ne(&left_vec, &right_vec))?);
@@ -1958,7 +1958,7 @@ fn independent_equal_term_rules_have_independent_matches_and_clones_reuse() -> R
         matches, 2,
         "shared alias once, independent equal occurrence once"
     );
-    let second = graph.run(&group.clone())?;
+    let second = graph.run(group.clone())?;
     let matches: u64 = second
         .profile
         .unwrap()
