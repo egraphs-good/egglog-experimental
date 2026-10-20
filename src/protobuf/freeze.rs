@@ -326,10 +326,38 @@ pub(super) fn observation(
             *name = logical.clone();
         }
     }
+    let mut saved_sorts = HashSet::new();
+    let mut saved_callables = HashSet::new();
+    for declaration in &session.definitions.declarations {
+        match &declaration.kind {
+            Some(pb::declaration::Kind::EqSort(s)) => {
+                saved_sorts.insert(s.name.as_str());
+            }
+            Some(pb::declaration::Kind::Constructor(c)) => {
+                saved_callables.insert(c.name.as_str());
+            }
+            Some(pb::declaration::Kind::Function(f)) => {
+                saved_callables.insert(f.name.as_str());
+            }
+            Some(pb::declaration::Kind::Relation(r)) => {
+                saved_callables.insert(r.name.as_str());
+            }
+            Some(pb::declaration::Kind::Primitive(p)) => {
+                saved_callables.insert(p.name.as_str());
+            }
+            _ => (),
+        }
+    }
     catalog.definitions.declarations.retain_mut(|declaration| {
         let name = match &mut declaration.kind {
             Some(pb::declaration::Kind::EqSort(s)) => {
                 if let Some(logical) = session.names.sorts.get(&s.name) {
+                    if saved_sorts.contains(logical.as_str()) {
+                        // Native signature contexts may synthesize a plain
+                        // EqSort. The retained descriptor owns its exact,
+                        // possibly still-pending parent reference and bindings.
+                        return false;
+                    }
                     s.name = logical.clone();
                 }
                 return true;
@@ -337,22 +365,15 @@ pub(super) fn observation(
             Some(pb::declaration::Kind::Constructor(c)) => &mut c.name,
             Some(pb::declaration::Kind::Function(f)) => &mut f.name,
             Some(pb::declaration::Kind::Relation(r)) => &mut r.name,
-            Some(pb::declaration::Kind::Primitive(p)) => {
-                if let Some(logical) = session.names.callables.get(&p.name)
-                    && session.definitions.declarations.iter().any(|declaration| {
-                        matches!(&declaration.kind, Some(pb::declaration::Kind::Primitive(saved)) if &saved.name == logical)
-                    })
-                {
-                    // This receipt identifies code whose exact authored body
-                    // we already retain. Execution-only container/numeric
-                    // lowering need not be structurally identical to it.
-                    return false;
-                }
-                &mut p.name
-            }
+            Some(pb::declaration::Kind::Primitive(p)) => &mut p.name,
             _ => return true,
         };
         if let Some(logical) = session.names.callables.get(name) {
+            if saved_callables.contains(logical.as_str()) {
+                // Keep exact authored prefixes and primitive bodies rather
+                // than resupplying native execution-only descriptions.
+                return false;
+            }
             *name = logical.clone();
         }
         true

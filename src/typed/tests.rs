@@ -1214,6 +1214,7 @@ fn namespace_fragment(imported: bool, reversed: bool, missing: Option<Declaratio
                     }),
                     ..Default::default()
                 }),
+                ..Default::default()
             }),
         ),
         (

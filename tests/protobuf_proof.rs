@@ -142,6 +142,7 @@ fn source_receiving_mode_preserves_native_global_boundaries() {
                 "failed-init-function",
                 "(fail (let $cap (N (/ 1 0)))) (print-function $cap)",
             ),
+            ("failed-expression", "(fail (N (/ 1 0))) (print-size)"),
             ("ordinary-function", "(function f () E :no-merge)"),
             ("primitive-let", "(let $base 1)"),
             ("presort-alias", "(sort V (Vec i64)) (sort W (Vec i64))"),
@@ -171,7 +172,23 @@ fn source_receiving_mode_preserves_native_global_boundaries() {
             let mut native_outputs = vec![];
             let mut native_result = Ok(());
             let mut native_boundary = None;
-            for (position, command) in commands.into_iter().enumerate() {
+            for (position, mut command) in commands.into_iter().enumerate() {
+                // Whole-action evaluation uses the existing native scoped
+                // boundary, not legacy term encoding's last-instruction catch.
+                if case == "failed-expression"
+                    && let egglog::ast::Command::Fail(span, child) = command
+                {
+                    let egglog::ast::Command::Action(action) = *child else {
+                        panic!("expected authored expression")
+                    };
+                    command = egglog::ast::Command::Fail(
+                        span.clone(),
+                        Box::new(egglog::ast::Command::ActionScope(
+                            span,
+                            egglog::ast::Actions::new(vec![action]),
+                        )),
+                    );
+                }
                 if let Err(error) =
                     native.run_program_with_outputs(vec![command], &mut native_outputs)
                 {
@@ -248,6 +265,9 @@ fn source_receiving_mode_preserves_native_global_boundaries() {
                             id = parent;
                         }
                     }
+                    Ok(Submission::PrintFunction(_)) => {
+                        panic!("mode-boundary fixture must not contain host file presentation")
+                    }
                 }
             }
             let native_sizes = native_outputs
@@ -268,13 +288,32 @@ fn source_receiving_mode_preserves_native_global_boundaries() {
                 "{case}/{mode:?}: native={:?}; bytes={byte_error:?}; sizes={byte_sizes:?}",
                 native_result.as_ref().err().map(ToString::to_string)
             );
-            assert_eq!(
-                byte_error.is_some(),
-                native_result.is_err(),
-                "{case}/{mode:?}"
-            );
-            assert_eq!(byte_boundary, native_boundary, "{case}/{mode:?}");
-            assert_eq!(byte_sizes, native_sizes, "{case}/{mode:?}");
+            if matches!(case, "failed-init" | "failed-init-function") {
+                // Preserve the legacy Core failure/prefix witness independently.
+                // Source does not expose an authored binder as a Fail child.
+                assert!(native_result.is_err(), "{case}/{mode:?}");
+                assert_eq!(native_boundary, Some(1), "{case}/{mode:?}");
+                assert_eq!(
+                    byte_error.as_deref(),
+                    Some("source Fail does not support authored let bindings"),
+                    "{case}/{mode:?}"
+                );
+                assert_eq!(byte_boundary, Some(1), "{case}/{mode:?}");
+                assert!(byte_sizes.is_empty());
+                assert!(source.next_submission().is_none());
+            } else {
+                assert_eq!(
+                    byte_error.is_some(),
+                    native_result.is_err(),
+                    "{case}/{mode:?}"
+                );
+                assert_eq!(byte_boundary, native_boundary, "{case}/{mode:?}");
+                assert_eq!(byte_sizes, native_sizes, "{case}/{mode:?}");
+                if case == "failed-expression" {
+                    assert!(native_result.is_ok());
+                    assert_eq!(byte_sizes, [vec![("N".into(), 0)]]);
+                }
+            }
             // Observe the surviving operand table after failure/recovery without
             // materializing a term or reading a hidden global by default.
             let egglog::CommandOutput::PrintFunctionSize(native_n) =

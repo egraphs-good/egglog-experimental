@@ -28,6 +28,37 @@ def table_response(rows):
 
 
 class TableSchemaTests(unittest.TestCase):
+    def test_reflective_prefix_is_optional_table_metadata_including_empty(self):
+        for tag, table in (
+            ("constructor", ir.Constructor(name="C", output=0)),
+            ("function", ir.Function(name="f", output=0)),
+            ("relation", ir.Relation(name="R")),
+        ):
+            for prefix in [None] + [
+                Oneof(arm, name)
+                for arm in ("public_alias", "default_name")
+                for name in ("", table.name, "other-prefix")
+            ]:
+                declaration = ir.Declaration(kind=Oneof(tag, table), table_name=prefix)
+                validate(declaration)
+                for decoded in (
+                    ir.Declaration.from_binary(declaration.to_binary()),
+                    ir.Declaration.from_json(declaration.to_json()),
+                ):
+                    self.assertEqual(decoded, declaration)
+                    self.assertEqual(decoded.table_name, prefix)
+        with self.assertRaises(ValidationError):
+            validate(ir.Declaration(kind=Oneof("eq_sort", ir.EqSort(name="S")), table_name=Oneof("public_alias", "")))
+
+    def test_parent_key_is_nonempty_when_present_and_preserves_pendingness(self):
+        for parent in (None, "Pending"):
+            sort = ir.EqSort(name="S", uf_parent=parent)
+            validate(sort)
+            self.assertEqual(ir.EqSort.from_binary(sort.to_binary()), sort)
+            self.assertEqual(sort.has_field("uf_parent"), parent is not None)
+        with self.assertRaises(ValidationError):
+            validate(ir.EqSort(name="S", uf_parent=""))
+
     def test_hidden_is_semantic_table_metadata_only(self):
         for tag, table in (
             ("constructor", ir.Constructor(name="C", output=0)),

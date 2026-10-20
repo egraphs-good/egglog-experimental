@@ -774,7 +774,7 @@ impl Session {
         response: &mut pb::RunProgramResponse,
     ) -> Result<RequestOccurrences, Box<pb::Error>> {
         let Prepared {
-            definitions,
+            mut definitions,
             request,
             installations,
             mut pending_declarations,
@@ -837,17 +837,18 @@ impl Session {
         response.ruleset_publication = Some(pb::RulesetPublication { names });
         // Retain only completed registrations and their canonical closures.
         // The compiler clone and its IDs are discarded.
-        self.definitions = definitions;
-        self.definitions.declarations = std::mem::take(&mut self.definitions.declarations)
+        definitions.declarations = std::mem::take(&mut definitions.declarations)
             .into_iter()
             .enumerate()
             .filter_map(|(index, d)| (!pending_declarations.contains(&index)).then_some(d))
             .collect();
-        let (retained_sets, retained_rules) = crate::builtin::definitions::retain_rulesets(
-            &mut self.definitions,
-            &published.into_iter().collect::<Vec<_>>(),
-        )
-        .expect("validated canonical occurrence closure");
+        let (definitions, retained_sets, retained_rules) =
+            crate::builtin::definitions::retain_rulesets_owned(
+                definitions,
+                &published.into_iter().collect::<Vec<_>>(),
+            )
+            .expect("validated canonical occurrence closure");
+        self.definitions = definitions;
         self.rulesets = retained_sets
             .into_iter()
             .map(|i| rulesets[i].clone())
@@ -1022,7 +1023,7 @@ impl Session {
                     span: native_span(program, declaration.span.as_ref(), &native_spans)?,
                     name: sort.name.clone(),
                     presort_and_args: None,
-                    uf: None,
+                    uf: sort.uf_parent.clone().map(|parent| (parent, None)),
                     proof_func: None,
                     container_rebuild: None,
                     proof_constructors: None,
@@ -1137,7 +1138,7 @@ impl Session {
                             _ => Err("constructor costs currently require a nonnegative inert i64".into()),
                         }
                     }).transpose()?;
-                    Command::Constructor { span, name: constructor.name.clone(), table_name: Some(ast::TableName::Public(staged.names.callables[&constructor.name].clone())), schema: signature(program, &constructor.inputs, constructor.output)?, cost, unextractable: constructor.unextractable, hidden: declaration.hidden, let_binding: false, term_constructor: None }
+                    Command::Constructor { span, name: constructor.name.clone(), table_name: Some(native_table_name(declaration, &staged.names.callables[&constructor.name])), schema: signature(program, &constructor.inputs, constructor.output)?, cost, unextractable: constructor.unextractable, hidden: declaration.hidden, let_binding: false, term_constructor: None }
                 }
                 pb::declaration::Kind::Function(function) => {
                     if function.name.is_empty() { return Err("function name must not be empty".into()); }
@@ -1152,13 +1153,13 @@ impl Session {
                         // in Context::Write: builtin calls retain their actual
                         // capabilities, and callable backends are installed first.
                     }
-                    Command::Function { span, name: function.name.clone(), table_name: Some(ast::TableName::Public(staged.names.callables[&function.name].clone())), schema, merge: function.merge.map(|index| expression(program, index, &mut HashSet::new(), &native_spans)).transpose()?, hidden: declaration.hidden, let_binding: false, term_constructor: None, unextractable: true }
+                    Command::Function { span, name: function.name.clone(), table_name: Some(native_table_name(declaration, &staged.names.callables[&function.name])), schema, merge: function.merge.map(|index| expression(program, index, &mut HashSet::new(), &native_spans)).transpose()?, hidden: declaration.hidden, let_binding: false, term_constructor: None, unextractable: true }
                 },
                 pb::declaration::Kind::Primitive(primitive) => primitive_command(program, primitive, span, &native_spans)?,
                 pb::declaration::Kind::Relation(relation) => Command::Relation {
                     span,
                     name: relation.name.clone(),
-                    table_name: Some(ast::TableName::Public(staged.names.callables[&relation.name].clone())),
+                    table_name: Some(native_table_name(declaration, &staged.names.callables[&relation.name])),
                     inputs: relation.inputs.iter().map(|arg| sort_name(&program.sorts, arg.sort)).collect::<Result<_, _>>()?,
                 },
                 _ => return Err("only equality-sort, constructor, function, relation, and primitive declarations execute in this slice".into()),
@@ -3416,6 +3417,18 @@ struct NativeNames {
     callables: HashMap<String, String>,
 }
 
+// Keep reflected priority separate from private callable identity. Absence and
+// an explicit same-key default agree; even Public(key) remains an explicit alias.
+fn native_table_name(declaration: &pb::Declaration, key: &str) -> ast::TableName {
+    match &declaration.table_name {
+        Some(pb::declaration::TableName::PublicAlias(name)) => ast::TableName::Public(name.clone()),
+        Some(pb::declaration::TableName::DefaultName(name)) => {
+            ast::TableName::Default(name.clone())
+        }
+        None => ast::TableName::Default(key.to_owned()),
+    }
+}
+
 // Namespace tags separate sorts, callables, and query leaves. Hex is injective
 // over UTF-8 and always a native source atom, including for punctuation names.
 fn native_name(namespace: &str, logical: &str) -> String {
@@ -3497,6 +3510,11 @@ fn map_callable_names(
 ) {
     for declaration in &mut program.declarations {
         match &mut declaration.kind {
+            Some(pb::declaration::Kind::EqSort(sort)) => {
+                if let Some(parent) = &mut sort.uf_parent {
+                    project_call(parent);
+                }
+            }
             Some(pb::declaration::Kind::Constructor(f)) => project_call(&mut f.name),
             Some(pb::declaration::Kind::Function(f)) => project_call(&mut f.name),
             Some(pb::declaration::Kind::Relation(r)) => project_call(&mut r.name),
@@ -10337,6 +10355,109 @@ mod tests {
     }
 
     #[test]
+    fn installation_moves_retained_descriptor_payloads() {
+        let (mut engine, id) = host_default_engine();
+        let span = Some(pb::Span {
+            file: 0,
+            start: 0,
+            end: 1,
+        });
+        let mut program = pb::Program {
+            ir_version: 1,
+            sorts: vec![pb::Sort {
+                kind: Some(pb::sort::Kind::Family(pb::HostSort {
+                    name: "i64".into(),
+                    args: vec![],
+                })),
+                ..Default::default()
+            }],
+            files: vec![pb::SourceFile {
+                name: "retained.egg".into(),
+                contents: Some("retained source contents\n".repeat(128)),
+            }],
+            declarations: vec![pb::Declaration {
+                kind: Some(pb::declaration::Kind::Function(pb::Function {
+                    name: "retained-function".into(),
+                    output: 0,
+                    ..Default::default()
+                })),
+                span,
+                ..Default::default()
+            }],
+            rules: vec![pb::RuleDecl {
+                name: Some("retained-rule".into()),
+                eval_mode: pb::RuleEvalMode::Seminaive.into(),
+                kind: Some(pb::rule_decl::Kind::Rule(pb::Rule::default())),
+                span,
+                ..Default::default()
+            }],
+            rulesets: vec![pb::Ruleset {
+                name: Some("retained-root".into()),
+                kind: Some(pb::ruleset::Kind::Rules(pb::RuleList { rules: vec![0] })),
+                span,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let session = engine.graphs.get_mut(&id).unwrap();
+        let prepared = session.prepare(&mut program).unwrap();
+        let payloads = |definitions: &pb::Program| {
+            let file = definitions
+                .files
+                .iter()
+                .find(|file| file.name == "retained.egg")
+                .unwrap();
+            let function = definitions
+                .declarations
+                .iter()
+                .find_map(|declaration| match &declaration.kind {
+                    Some(pb::declaration::Kind::Function(function))
+                        if function.name == "retained-function" =>
+                    {
+                        Some(function)
+                    }
+                    _ => None,
+                })
+                .unwrap();
+            assert_eq!(definitions.rules.len(), 1);
+            assert_eq!(definitions.rules[0].name.as_deref(), Some("retained-rule"));
+            assert_eq!(definitions.rulesets.len(), 1);
+            assert_eq!(
+                definitions.rulesets[0].name.as_deref(),
+                Some("retained-root")
+            );
+            [
+                file.contents.as_ref().unwrap().as_ptr(),
+                function.name.as_ptr(),
+                definitions.rules[0].name.as_ref().unwrap().as_ptr(),
+                definitions.rulesets[0].name.as_ref().unwrap().as_ptr(),
+            ]
+        };
+        let before = payloads(&prepared.definitions);
+        let mut expected = prepared.definitions.clone();
+        assert_eq!(
+            crate::builtin::definitions::retain_rulesets(&mut expected, &[0]).unwrap(),
+            (vec![0], vec![0])
+        );
+        let mut response = pb::RunProgramResponse {
+            profile: Some(pb::ProfileSummary::default()),
+            ..Default::default()
+        };
+        session.install(prepared, &mut response).unwrap();
+        assert_eq!(
+            response.ruleset_publication.unwrap().names,
+            ["retained-root"]
+        );
+        assert!(response.outputs.is_empty());
+        assert_eq!(session.definitions, expected);
+        assert_eq!(
+            payloads(&session.definitions),
+            before,
+            "installation must move retained descriptor payloads"
+        );
+    }
+
+    #[test]
     fn native_fault_between_installation_steps_retains_only_completed_roots() {
         // Deliberate in-module fault injection into a genuinely prepared plan:
         // real native panic execution, not a public-request reachability claim.
@@ -10431,8 +10552,8 @@ mod tests {
                 .unwrap();
             session.graph.validate_program(orphan).unwrap();
             if after_first_root {
-                assert_eq!(session.rules, [old_rule.clone()]);
-                assert_eq!(session.rulesets, [old_first.clone()]);
+                assert_eq!(session.rules, std::slice::from_ref(&old_rule));
+                assert_eq!(session.rulesets, std::slice::from_ref(&old_first));
                 let consume = run_host_default(
                     &mut engine,
                     id,

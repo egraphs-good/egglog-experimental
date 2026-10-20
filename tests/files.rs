@@ -365,6 +365,7 @@ fn specialize_oracle_calls(expr: &mut Expr, typed: &ResolvedExpr) -> Result<(), 
 struct NativeOracleNode {
     term: egglog::TermId,
     local: String,
+    value: Value,
 }
 
 // Reconstruct directly from typed semantic children. In particular Map's
@@ -535,6 +536,53 @@ fn validate_extract_outputs(
         Some(count) => count,
         None => count(egraph)?,
     };
+    // The requested algorithm owns its root semantics. Native Tree can select
+    // a distinct one-hop UF parent; greedy deliberately keeps the raw root.
+    // Observe that selected class independently of every returned wire term.
+    let mut selected =
+        |_: &egglog::TermDag, _, _: &ArcSort, value, _: &[Value]| Ok::<_, Error>(value);
+    let selected_values = if nvariants == 0 {
+        let (_, roots) = if extract.use_greedy_dag {
+            extract_best_greedy_dag_with_observer(
+                egraph,
+                roots.clone(),
+                DynamicCostModel,
+                &mut selected,
+            )?
+        } else {
+            egraph.extract_best_with_cost_model_and_observer(
+                roots.clone(),
+                TreeCostModelFromDag(DynamicCostModel),
+                &mut selected,
+            )?
+        };
+        roots
+            .into_iter()
+            .map(|root| {
+                root.map(|root| vec![root]).ok_or_else(|| {
+                    Error::ExtractError("requested extractor returned no term".into())
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?
+    } else {
+        let (_, roots) = if extract.use_greedy_dag {
+            extract_variants_greedy_dag_with_observer(
+                egraph,
+                roots.clone(),
+                nvariants,
+                DynamicCostModel,
+                &mut selected,
+            )?
+        } else {
+            egraph.extract_variants_with_cost_model_and_observer(
+                roots.clone(),
+                nvariants,
+                TreeCostModelFromDag(DynamicCostModel),
+                &mut selected,
+            )?
+        };
+        roots
+    };
     // Invoke the paired extractor once, after every stateful root was evaluated.
     let mut paired_actions = OracleActions::default();
     let mut observe =
@@ -545,7 +593,7 @@ fn validate_extract_outputs(
             paired_actions
                 .actions
                 .push((local.clone(), expr, sort.clone()));
-            Ok(NativeOracleNode { term, local })
+            Ok(NativeOracleNode { term, local, value })
         };
     let paired_nodes = if nvariants == 0 {
         let (_, extracted) = if extract.use_greedy_dag {
@@ -568,7 +616,7 @@ fn validate_extract_outputs(
                 let root = root.ok_or_else(|| {
                     Error::ExtractError("paired extractor returned no term".into())
                 })?;
-                Ok(vec![root.local])
+                Ok(vec![root])
             })
             .collect::<Result<Vec<_>, Error>>()?
     } else {
@@ -589,18 +637,14 @@ fn validate_extract_outputs(
             )?
         };
         extracted
-            .into_iter()
-            .map(|variants| {
-                variants
-                    .into_iter()
-                    .map(|variant| variant.local)
-                    .collect::<Vec<_>>()
-            })
-            .collect::<Vec<_>>()
     };
     let paired_values = paired_actions.evaluate(
         egraph,
-        &paired_nodes.iter().flatten().cloned().collect::<Vec<_>>(),
+        &paired_nodes
+            .iter()
+            .flatten()
+            .map(|node| node.local.clone())
+            .collect::<Vec<_>>(),
     )?;
     let requested = match requested {
         ExtractedExpressions::Frozen(response, terms) => {
@@ -620,23 +664,10 @@ fn validate_extract_outputs(
     }
     let portable = matches!(&requested, ExtractedExpressions::FrozenGroups(..));
     let mut decoder = if let ExtractedExpressions::FrozenGroups(response, _) = &requested {
-        let mut callables = HashMap::new();
-        for (physical, function) in egraph.functions_iter() {
-            if let Some(egglog::ast::TableName::Public(logical)) = &function.func_type().table_name
-                && callables
-                    .insert(logical.clone(), physical.clone())
-                    .is_some()
-            {
-                return Err(Error::ExtractError(format!(
-                    "extraction oracle ambiguous public callable {logical:?}"
-                )));
-            }
-        }
         // One allowance covers all roots and variants, including repeated DAG
         // edges and synthesized reconstruction nodes.
         Some(FrozenDecoder {
             response,
-            callables,
             remaining: 65_536,
             bindings: HashMap::new(),
         })
@@ -680,9 +711,7 @@ fn validate_extract_outputs(
     };
     let mut canonical = egglog::TermDag::default();
     let mut canonical_cache = HashMap::new();
-    for (index, ((root_sort, root_value), paired_nodes)) in
-        roots.into_iter().zip(paired_nodes).enumerate()
-    {
+    for (index, ((root_sort, _), paired_nodes)) in roots.into_iter().zip(paired_nodes).enumerate() {
         let mut requested_values = vec![];
         match &requested {
             ExtractedExpressions::Native(expressions) => {
@@ -705,14 +734,11 @@ fn validate_extract_outputs(
             ExtractedExpressions::Frozen(..) => unreachable!(),
         }
 
-        if requested_values.is_empty() != paired_nodes.is_empty() {
+        if requested_values.len() != selected_values[index].len() {
             return Err(Error::ExtractError(
-                "only one extractor returned variants for the requested root".to_owned(),
+                "extraction oracle variant count differs from the requested native algorithm"
+                    .to_owned(),
             ));
-        }
-
-        for local in paired_nodes {
-            requested_values.push((root_sort.clone(), paired_values[&local]));
         }
         let expected_shape = portable
             .then(|| {
@@ -722,15 +748,25 @@ fn validate_extract_outputs(
                     .map_err(Error::ExtractError)
             })
             .transpose()?;
-        let expected_value = canonical_oracle_value(
-            egraph,
-            &root_sort,
-            root_value,
-            &mut canonical,
-            &mut canonical_cache,
-            0,
-        )?;
-        for (extracted_sort, extracted_value) in requested_values {
+        // Validate the opposite extractor independently against its own typed
+        // selected root, not against Tree's or greedy's different class.
+        let values = requested_values
+            .into_iter()
+            .zip(selected_values[index].iter().copied())
+            .chain(
+                paired_nodes
+                    .into_iter()
+                    .map(|node| ((root_sort.clone(), paired_values[&node.local]), node.value)),
+            );
+        for ((extracted_sort, extracted_value), selected_value) in values {
+            let expected_value = canonical_oracle_value(
+                egraph,
+                &root_sort,
+                selected_value,
+                &mut canonical,
+                &mut canonical_cache,
+                0,
+            )?;
             let same_sort = if let Some(expected_shape) = &expected_shape {
                 *expected_shape
                     == egraph
@@ -1240,7 +1276,6 @@ fn next_native_command(
 // the independent oracle used to check the returned terms.
 struct FrozenDecoder<'a> {
     response: &'a pb::RunProgramResponse,
-    callables: HashMap<String, String>,
     remaining: usize,
     bindings: HashMap<u32, VecDeque<String>>,
 }
@@ -1303,7 +1338,7 @@ impl FrozenDecoder<'_> {
         let mut edges = vec![];
         match node.kind.as_ref() {
             Some(pb::node::Kind::Call(call)) => {
-                let name = self.callables.get(&call.func).unwrap_or(&call.func);
+                let name = &call.func;
                 let columns = graph
                     .get_function(name)
                     .map(|function| &function.func_type().input);
@@ -1358,7 +1393,7 @@ impl FrozenDecoder<'_> {
                     }
                 }
                 Some(V::PartialCall(call)) => {
-                    let name = self.callables.get(&call.func).unwrap_or(&call.func);
+                    let name = &call.func;
                     let columns = graph
                         .get_function(name)
                         .map(|function| &function.func_type().input);
@@ -1467,15 +1502,7 @@ impl FrozenDecoder<'_> {
             .ok_or("extracted node index out of bounds")?;
         let result = match node.kind.as_ref() {
             Some(pb::node::Kind::Call(value)) => {
-                // Public table provenance is not a native expression alias.
-                // Only returned Call references cross that namespace boundary;
-                // generated builtin calls and ordinary String data stay native.
-                let name = self
-                    .callables
-                    .get(&value.func)
-                    .unwrap_or(&value.func)
-                    .clone();
-                self.call(&name, &value.args, depth, annotations)
+                self.call(&value.func, &value.args, depth, annotations)
             }
             Some(pb::node::Kind::PrimitiveValue(value)) => match value.value.as_ref() {
                 Some(V::I64(value)) => {
@@ -1583,13 +1610,8 @@ impl FrozenDecoder<'_> {
                     }
                 }
                 Some(V::PartialCall(value)) => {
-                    let name = self
-                        .callables
-                        .get(&value.func)
-                        .unwrap_or(&value.func)
-                        .clone();
                     let target = self.generated(
-                        Expr::Lit(span!(), Literal::String(name)),
+                        Expr::Lit(span!(), Literal::String(value.func.clone())),
                         depth + 1,
                         annotations,
                     )?;
@@ -1950,7 +1972,7 @@ fn partial_call_oracle_trials() -> Vec<Trial> {
         validate_extract_outputs(&mut positive.native, &positive.extract, ExtractedExpressions::Frozen(&positive.response, positive.terms))
             .map_err(|error| error.to_string())?;
         let mut case = partial_call_oracle_case("(sort First (Vec i64)) (sort Second (Vec i64)) (sort Expected (UnstableFn () i64)) (function captured () Second :merge old) (set (captured) (vec-of 1)) (function oracle_root () Expected :merge old) (set (oracle_root) (unstable-fn \"vec-length\" (captured)))")?;
-        let decoded = FrozenDecoder { response: &case.response, callables: HashMap::new(), remaining: 65_536, bindings: HashMap::new() }
+        let decoded = FrozenDecoder { response: &case.response, remaining: 65_536, bindings: HashMap::new() }
             .expression(case.terms[0], 0, &mut vec![])?;
         let root_sort = case.native.eval_expr(&case.extract.root).map_err(|error| error.to_string())?.0;
         let inference = case.native.typecheck_expr_with_bindings_and_output(&decoded, &[], root_sort, egglog::Context::Full).unwrap_err();
@@ -2011,7 +2033,6 @@ fn partial_call_oracle_trials() -> Vec<Trial> {
             };
             let mut decoder = FrozenDecoder {
                 response: &response,
-                callables: HashMap::new(),
                 remaining: 65_536,
                 bindings: HashMap::new(),
             };
@@ -2046,7 +2067,6 @@ fn partial_call_oracle_trials() -> Vec<Trial> {
             }
             let mut decoder = FrozenDecoder {
                 response: &response,
-                callables: HashMap::new(),
                 remaining: 65_536,
                 bindings: HashMap::new(),
             };
@@ -2070,7 +2090,6 @@ fn partial_call_oracle_trials() -> Vec<Trial> {
             }
             let mut decoder = FrozenDecoder {
                 response: &response,
-                callables: HashMap::new(),
                 remaining: 65_536,
                 bindings: HashMap::new(),
             };
@@ -2120,7 +2139,6 @@ fn partial_call_oracle_trials() -> Vec<Trial> {
             });
             let mut decoder = FrozenDecoder {
                 response: &map,
-                callables: HashMap::new(),
                 remaining: 65_536,
                 bindings: HashMap::new(),
             };
@@ -2180,10 +2198,23 @@ fn public_callable_oracle_trial() -> Trial {
             );
         }
         let mut native = new_experimental_egraph();
-        let mut commands = native
+        let commands = native
             .parse_program(None, &rendered)
-            .map_err(|error| error.to_string())?
-            .into_iter();
+            .map_err(|error| error.to_string())?;
+        let constructor_names = ["Num", "Other"].map(|prefix| {
+            commands
+                .iter()
+                .find_map(|command| match command {
+                    Command::Constructor {
+                        name,
+                        table_name: Some(egglog::ast::TableName::Default(name_prefix)),
+                        ..
+                    } if name_prefix == prefix => Some(name.clone()),
+                    _ => None,
+                })
+                .expect("rendered constructor must retain its soft reflective prefix")
+        });
+        let mut commands = commands.into_iter();
         let mut engine = Engine::default();
         let created = engine
             .create(
@@ -2213,7 +2244,7 @@ fn public_callable_oracle_trial() -> Trial {
             let program = phase.map_err(|error| error.to_string())?;
             for declaration in &program.declarations {
                 if let Some(pb::declaration::Kind::Constructor(constructor)) = &declaration.kind
-                    && constructor.name == "Num"
+                    && constructor.name == constructor_names[0]
                 {
                     assert_eq!(constructor.inputs.len(), 1);
                     assert!(
@@ -2252,16 +2283,10 @@ fn public_callable_oracle_trial() -> Trial {
             saw_extract = true;
             let validation = validation.unwrap();
             let mut physical = vec![];
-            for logical in ["Num", "Other"] {
-                let matches = validation
-                    .functions_iter()
-                    .filter(|(_, function)| {
-                        matches!(&function.func_type().table_name,
-                        Some(egglog::ast::TableName::Public(name)) if name == logical)
-                    })
-                    .collect::<Vec<_>>();
-                assert_eq!(matches.len(), 1);
-                let (name, function) = matches[0];
+            for (logical, name) in ["Num", "Other"].into_iter().zip(&constructor_names) {
+                let function = validation.get_function(name).unwrap();
+                assert!(matches!(&function.func_type().table_name,
+                    Some(egglog::ast::TableName::Default(prefix)) if prefix == logical));
                 assert_ne!(name, logical);
                 assert!(validation.get_function(logical).is_none());
                 assert_eq!(function.func_type().input.len(), 1);
@@ -2287,7 +2312,7 @@ fn public_callable_oracle_trial() -> Trial {
             let Some(pb::node::Kind::Call(call)) = &response.nodes[root].kind else {
                 return Err("canary did not return a constructor Call".into());
             };
-            assert_eq!(call.func, "Num");
+            assert_eq!(call.func, constructor_names[0]);
             assert_eq!(call.args.len(), 1);
             assert!(matches!(
                 &response.nodes[call.args[0] as usize].kind,
@@ -2306,7 +2331,10 @@ fn public_callable_oracle_trial() -> Trial {
             )
             .map_err(|error| error.to_string())?;
             for (target, expected_error) in [
-                ("Other", "term unequal to the requested root"),
+                (
+                    constructor_names[1].as_str(),
+                    "term unequal to the requested root",
+                ),
                 ("missing-callable", "Unbound function missing-callable"),
             ] {
                 let Some(pb::node::Kind::Call(call)) = &mut response.nodes[root].kind else {

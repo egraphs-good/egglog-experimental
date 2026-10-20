@@ -176,9 +176,9 @@ Public Python APIs must be statically checkable with MyPy; typed Rust APIs must
 enforce their types at compilation. Test accepted calls and rejected wrong-sort
 or arity cases, not only runtime validation. A wire signature need not dictate
 the public argument shape. Current Python uses `Map.empty`, `insert`, and
-indexing; Rust's existing `Map::of` accepts typed key/value tuples. A shared bulk
-interface using host tuples versus actual Egglog Pair values remains open; core
-container changes are allowed while preserving existing frontend behavior.
+indexing; Rust's existing `Map::of` accepts typed key/value tuples. The shared bulk
+wire interface is one `Vec<Pair<K, V>>`; frontends may accept typed host tuple
+collections or lower flat text arguments while preserving that core shape.
 Default generated bindings must also preserve static types: report unsupported
 generation rather than weakening types to expose a primitive.
 
@@ -697,6 +697,10 @@ runs. Query locals remain distinct from persistent captures and later
 declarations. Proof requests retain the authored facts, leaving proof execution
 to the receiving mode. Source extraction counts are literal and bounded;
 aggregate extraction preserves its ordered result groups.
+
+Source rejects authored `let` bindings inside `fail`, including nested wrappers;
+evaluate an expression or action directly instead. Fail retains completed
+effects and catches the supported operation's evaluation, not preparation errors.
 
 Reuse one stateful `Renderer` across the stream; `render_submission` handles
 scope submissions too. Compatible declarations are not emitted twice. Core and

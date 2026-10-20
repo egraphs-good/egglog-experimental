@@ -689,6 +689,14 @@ pub struct Declaration {
     pub hidden: bool,
     #[prost(oneof = "declaration::Kind", tags = "1, 2, 3, 4, 5, 6, 10")]
     pub kind: ::core::option::Option<declaration::Kind>,
+    /// Reflective String selector, distinct from the callable key. Absent means a
+    /// soft default of that key. Explicit public aliases take priority over soft
+    /// defaults; Public(key) differs from absence. Default(key) is compatible with
+    /// absence. Empty strings are valid in either arm. Live public aliases and
+    /// live soft defaults are each unique, but an explicit alias may shadow a soft
+    /// default. Structural references (including PrintSize/PrintFunction) use keys.
+    #[prost(oneof = "declaration::TableName", tags = "12, 13")]
+    pub table_name: ::core::option::Option<declaration::TableName>,
 }
 /// Nested message and enum types in `Declaration`.
 pub mod declaration {
@@ -708,6 +716,19 @@ pub mod declaration {
         HostPrimitive(super::HostPrimitive),
         #[prost(message, tag = "10")]
         EqSort(super::EqSort),
+    }
+    /// Reflective String selector, distinct from the callable key. Absent means a
+    /// soft default of that key. Explicit public aliases take priority over soft
+    /// defaults; Public(key) differs from absence. Default(key) is compatible with
+    /// absence. Empty strings are valid in either arm. Live public aliases and
+    /// live soft defaults are each unique, but an explicit alias may shadow a soft
+    /// default. Structural references (including PrintSize/PrintFunction) use keys.
+    #[derive(Clone, PartialEq, Eq, Hash, ::prost::Oneof)]
+    pub enum TableName {
+        #[prost(string, tag = "12")]
+        PublicAlias(::prost::alloc::string::String),
+        #[prost(string, tag = "13")]
+        DefaultName(::prost::alloc::string::String),
     }
 }
 /// An argument's sort and optional label. Calls are positional; labels are not
@@ -729,6 +750,16 @@ pub struct EqSort {
     pub name: ::prost::alloc::string::String,
     #[prost(message, optional, tag = "2")]
     pub bindings: ::core::option::Option<SortBindings>,
+    /// Optional non-owning table key for native Tree root extraction's one-hop
+    /// parent lookup. Absence means no lookup and differs from every present key.
+    /// The table may be absent, which leaves the root unchanged; this reference
+    /// does not demand installation or add a declaration-order dependency. When
+    /// present, its first two stored columns (inputs followed by output) must both
+    /// have this equality sort. Relations' private output cannot satisfy a column.
+    /// Tree best/variants inspect the requested root only, including subsumed rows;
+    /// this neither unions classes nor redirects children or GreedyDag extraction.
+    #[prost(string, optional, tag = "3")]
+    pub uf_parent: ::core::option::Option<::prost::alloc::string::String>,
 }
 /// A concrete constructor whose output is an equality sort.
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -1377,13 +1408,13 @@ pub mod command {
         Prove(super::Prove),
         #[prost(message, tag = "15")]
         ProveExists(super::ProveExists),
-        /// Expect the child's native execution anchor to fail. Lower this wrapper
-        /// before native expansion: prerequisites execute outside the catch, and
-        /// only the final native command is wrapped. An anchor failure succeeds;
-        /// anchor success raises EVALUATION_FAILED. Discard the anchor's outputs
-        /// on either outcome, retaining completed effects and earlier outputs.
-        /// Preparation/typechecking errors, unsupported forms, and failures in
-        /// prerequisite or trailing helpers outside the anchor are not caught.
+        /// Expect the supported child's execution to fail. Evaluating an action's
+        /// arguments belongs to that action, not to a prerequisite outside the
+        /// catch. Failure succeeds; success raises EVALUATION_FAILED. Suppress the
+        /// child's requested outputs on either outcome, retaining completed effects
+        /// and earlier outputs. Preparation/typechecking errors and unsupported
+        /// forms are not caught. Internal maintenance/invariant checks retain their
+        /// native boundaries.
         /// This is not rollback and does not catch process panics. Nested wrappers
         /// retain their distinct expectations and output suppression.
         /// Adds no binder, command list, Union identity scope, or loop iteration.
@@ -1397,9 +1428,9 @@ pub mod command {
 }
 /// One conjunctive query. All facts share the same variable bindings.
 /// Resolve names and types during preparation, but plan the requested query
-/// during execution; a planning/groundedness failure is catchable by Fail at
-/// its native anchor. Internal checks and generated proof helpers retain their
-/// own validation phases and are not moved inside that catch.
+/// during execution; failure of that requested query is catchable by Fail.
+/// Generated proof rules retain their preparation-time admission, and internal
+/// maintenance/invariant failures do not become expected query failures.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct Check {
     /// index into the enclosing `nodes`
@@ -2013,8 +2044,8 @@ pub struct ProofFailure {
 /// own location. These requested outputs must match the located command,
 /// resolving through Fail wrappers subject to their suppression below. Nested
 /// authored control outcomes are folded, never appended here. Fail itself has
-/// no requested output and suppresses every output from its native anchor,
-/// including on unexpected success. Earlier outputs outside that anchor remain.
+/// no requested output and suppresses every requested output from its child,
+/// including on unexpected success. Earlier outputs outside that child remain.
 /// Native helper/maintenance Runs never contribute public outcomes. Their
 /// measured work is attributed in optional ProfileSummary. This changes neither
 /// their execution/effects nor native stopping/error behavior. A requested native
@@ -2027,7 +2058,7 @@ pub struct CommandOutput {
     pub location: ::core::option::Option<CommandLocation>,
     /// Present exactly when requested for a completed top-level Run/Loop. This is
     /// the native complete report, not ProfileSummary or a history reconstruction.
-    /// Internal outputs and Fail anchors remain suppressed. A native failure has
+    /// Internal outputs and Fail children remain suppressed. A native failure has
     /// no complete report. Loop termination is not historical aggregate can_stop.
     #[prost(message, optional, tag = "10")]
     pub run_report: ::core::option::Option<NativeRunReport>,
@@ -2876,7 +2907,7 @@ pub enum ErrorCode {
     /// A primitive or merge failed at run time, including unresolvable merges,
     /// a directly evaluated get_cost has no assigned annotation, or Freeze cannot
     /// encode a required value with a supported codec. Also includes an unmet
-    /// expected-failure assertion: Fail's native anchor succeeded.
+    /// expected-failure assertion: Fail's child succeeded.
     EvaluationFailed = 4,
     /// The requested extractor/cost-model pair is incompatible, or an operation
     /// requiring a finite representative (KeepBest or PrintFunction) cannot

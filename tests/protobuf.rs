@@ -42,8 +42,26 @@ fn source_multi_extract_preserves_one_ordered_batch_and_replays() {
             let mut core = Renderer::core();
             let mut rendered = String::new();
             let mut batches = 0;
+            let mut constructors = [None, None];
             for phase in Source::new(None, &text).unwrap() {
                 let phase = phase.unwrap();
+                for declaration in &phase.declarations {
+                    if let Some(pb::declaration::Kind::Constructor(constructor)) = &declaration.kind
+                    {
+                        let prefix = match &declaration.table_name {
+                            None => &constructor.name,
+                            Some(pb::declaration::TableName::DefaultName(prefix)) => prefix,
+                            other => panic!("expected soft constructor prefix: {other:?}"),
+                        };
+                        if let Some(index) = ["A", "B"].iter().position(|name| prefix == name) {
+                            assert!(
+                                constructors[index]
+                                    .replace(constructor.name.clone())
+                                    .is_none()
+                            );
+                        }
+                    }
+                }
                 if let Some(pb::command::Kind::Extract(extract)) =
                     phase.commands.first().and_then(|c| c.kind.as_ref())
                 {
@@ -105,12 +123,18 @@ fn source_multi_extract_preserves_one_ordered_batch_and_replays() {
                         .collect::<std::collections::HashSet<_>>();
                     assert_eq!(
                         terms,
-                        ["(A 1)".to_string(), "(A 2)".to_string()]
-                            .into_iter()
-                            .collect()
+                        [
+                            format!("({} 1)", constructors[0].as_ref().unwrap()),
+                            format!("({} 2)", constructors[0].as_ref().unwrap()),
+                        ]
+                        .into_iter()
+                        .collect()
                     );
                     assert_eq!(value(&response, result.roots[1].variants[0].term), "42");
-                    assert_eq!(value(&response, result.roots[2].variants[0].term), "(B 3)");
+                    assert_eq!(
+                        value(&response, result.roots[2].variants[0].term),
+                        format!("({} 3)", constructors[1].as_ref().unwrap())
+                    );
                     for term in result.roots.iter().flat_map(|root| &root.variants) {
                         let cost = term.cost.unwrap() as usize;
                         assert_eq!(
@@ -318,8 +342,20 @@ fn source_multi_extract_evaluates_stateful_roots_once_before_extraction() {
         let mut rendered = String::new();
         let mut batches = 0;
         let mut sizes = 0;
+        let mut num = None;
         for phase in Source::new(None, &text).unwrap() {
             let phase = phase.unwrap();
+            for declaration in &phase.declarations {
+                if let Some(pb::declaration::Kind::Constructor(constructor)) = &declaration.kind {
+                    let prefix = match &declaration.table_name {
+                        None => &constructor.name,
+                        Some(pb::declaration::TableName::DefaultName(prefix)) => prefix,
+                        other => panic!("expected soft constructor prefix: {other:?}"),
+                    };
+                    assert_eq!(prefix, "Num");
+                    assert!(num.replace(constructor.name.clone()).is_none());
+                }
+            }
             rendered.push_str(&renderer.render(&phase).unwrap());
             let response = run(&mut engine, id, phase);
             assert_eq!(response.error, None);
@@ -327,9 +363,12 @@ fn source_multi_extract_evaluates_stateful_roots_once_before_extraction() {
                 match &output.kind {
                     Some(pb::command_output::Kind::Extraction(result)) => {
                         assert_eq!(result.roots.len(), 2);
-                        for (root, expected) in result.roots.iter().zip(["(Num 0)", "(Num 1)"]) {
+                        for (root, expected) in result.roots.iter().zip([0, 1]) {
                             assert_eq!(root.variants.len(), 1);
-                            assert_eq!(value(&response, root.variants[0].term), expected);
+                            assert_eq!(
+                                value(&response, root.variants[0].term),
+                                format!("({} {expected})", num.as_ref().unwrap())
+                            );
                         }
                         batches += 1;
                     }
@@ -781,8 +820,22 @@ mod source_loop_header_tests {
                 let mut renderer = Renderer::default();
                 let mut rendered = String::new();
                 let mut failed = false;
+                let mut seed_name = None;
                 for phase in Source::new(Some("header-failure.egg".into()), &text).unwrap() {
                     let mut phase = phase.unwrap();
+                    for declaration in &phase.declarations {
+                        if let Some(pb::declaration::Kind::Constructor(constructor)) =
+                            &declaration.kind
+                        {
+                            let prefix = match &declaration.table_name {
+                                None => &constructor.name,
+                                Some(pb::declaration::TableName::DefaultName(prefix)) => prefix,
+                                other => panic!("expected soft Seed prefix: {other:?}"),
+                            };
+                            assert_eq!(prefix, "Seed");
+                            assert!(seed_name.replace(constructor.name.clone()).is_none());
+                        }
+                    }
                     rendered.push_str(&renderer.render(&phase).unwrap());
                     let response = run(&mut engine, id, phase.clone());
                     if let Some(error) = response.error {
@@ -800,7 +853,7 @@ mod source_loop_header_tests {
                             .iter()
                             .position(|node| {
                                 matches!(&node.kind,
-                            Some(pb::node::Kind::Call(call)) if call.func == "Seed")
+                            Some(pb::node::Kind::Call(call)) if &call.func == seed_name.as_ref().unwrap())
                             })
                             .unwrap() as u32;
                         phase.commands = vec![pb::Command {
@@ -849,9 +902,10 @@ fn hidden_tables_source_native_and_snapshot_replay() {
                             .map(|(name, rows)| {
                                 let function = native.get_function(&name).unwrap();
                                 let logical = match &function.func_type().table_name {
-                                    Some(egglog::ast::TableName::Public(logical)) => {
-                                        logical.clone()
-                                    }
+                                    Some(
+                                        egglog::ast::TableName::Public(logical)
+                                        | egglog::ast::TableName::Default(logical),
+                                    ) => logical.clone(),
                                     _ => name,
                                 };
                                 (logical, rows)
@@ -878,6 +932,8 @@ fn hidden_tables_source_native_and_snapshot_replay() {
             let mut next_rendered = String::new();
             let mut sizes = vec![];
             let mut supplied = vec![];
+            let mut table_names = std::collections::HashMap::new();
+            let mut hidden_keys = vec![];
             for phase in source {
                 let phase = phase.unwrap();
                 for declaration in &phase.declarations {
@@ -886,7 +942,18 @@ fn hidden_tables_source_native_and_snapshot_replay() {
                         Some(pb::declaration::Kind::Function(table)) => &table.name,
                         _ => continue,
                     };
-                    assert_eq!(declaration.hidden, name == "Hidden" || name == "hidden-f");
+                    let label = match &declaration.table_name {
+                        Some(
+                            pb::declaration::TableName::PublicAlias(prefix)
+                            | pb::declaration::TableName::DefaultName(prefix),
+                        ) => prefix,
+                        None => name,
+                    };
+                    assert_eq!(declaration.hidden, label == "Hidden" || label == "hidden-f");
+                    table_names.insert(name.clone(), label.clone());
+                    if declaration.hidden {
+                        hidden_keys.push(name.clone());
+                    }
                     supplied.push(phase.clone());
                 }
                 next_rendered.push_str(&renderer.render(&phase).unwrap());
@@ -898,12 +965,13 @@ fn hidden_tables_source_native_and_snapshot_replay() {
                             result
                                 .sizes
                                 .into_iter()
-                                .map(|size| (size.table, size.rows as usize))
+                                .map(|size| (table_names[&size.table].clone(), size.rows as usize))
                                 .collect::<Vec<_>>(),
                         );
                     }
                 }
             }
+            assert_eq!(hidden_keys.len(), 2);
             assert_eq!(sizes.as_slice(), std::slice::from_ref(&expected));
             for mut changed in supplied {
                 for declaration in &mut changed.declarations {
@@ -945,11 +1013,11 @@ fn hidden_tables_source_native_and_snapshot_replay() {
                     _ => panic!("hidden on unsupported kind"),
                 })
                 .collect::<Vec<_>>();
-            assert_eq!(hidden, ["Hidden", "hidden-f"]);
-            assert!(saved.nodes.iter().any(|node| matches!(&node.kind, Some(pb::node::Kind::Call(call)) if call.func == "Hidden")));
+            assert_eq!(hidden, hidden_keys);
+            assert!(saved.nodes.iter().any(|node| matches!(&node.kind, Some(pb::node::Kind::Call(call)) if call.func == hidden_keys[0])));
             assert!(saved.commands.iter().any(|command| matches!(&command.kind,
                 Some(pb::command::Kind::Action(pb::Action { kind: Some(pb::action::Kind::Set(set)), .. }))
-                if set.target.as_ref().is_some_and(|call| call.func == "hidden-f"))));
+                if set.target.as_ref().is_some_and(|call| call.func == hidden_keys[1]))));
             let restored = create(&mut engine);
             assert_eq!(run(&mut engine, restored, saved.clone()).error, None);
             let mut observe = saved.clone();
@@ -969,11 +1037,11 @@ fn hidden_tables_source_native_and_snapshot_replay() {
                 sizes
                     .sizes
                     .iter()
-                    .map(|size| (size.table.clone(), size.rows as usize))
+                    .map(|size| (table_names[&size.table].clone(), size.rows as usize))
                     .collect::<Vec<_>>(),
                 expected
             );
-            for table in ["Hidden", "hidden-f"] {
+            for table in &hidden_keys {
                 let response = run(
                     &mut engine,
                     restored,
@@ -1879,8 +1947,25 @@ mod constructor_action_dags {
                 let mut engine = Engine::default();
                 let id = create(&mut engine);
                 let mut saw_action = false;
+                let mut callables = [None, None, None, None];
                 for phase in source {
                     let phase = phase.unwrap();
+                    for declaration in &phase.declarations {
+                        let name = match &declaration.kind {
+                            Some(pb::declaration::Kind::Constructor(table)) => &table.name,
+                            Some(pb::declaration::Kind::Function(table)) => &table.name,
+                            _ => continue,
+                        };
+                        let prefix = match &declaration.table_name {
+                            Some(pb::declaration::TableName::DefaultName(prefix)) => prefix,
+                            other => panic!("expected soft table prefix: {other:?}"),
+                        };
+                        let index = ["Wrap", "Pair", "Leaf", "Saved"]
+                            .iter()
+                            .position(|label| prefix == label)
+                            .unwrap();
+                        assert!(callables[index].replace(name.clone()).is_none());
+                    }
                     assert!(phase.rules.is_empty());
                     if let [command] = phase.commands.as_slice() {
                         let Some(pb::command::Kind::Action(action)) = &command.kind else {
@@ -1913,12 +1998,16 @@ mod constructor_action_dags {
                     commands: program(0, 0).commands[1..].to_vec(),
                     ..Default::default()
                 };
+                let Some(pb::command::Kind::PrintSize(print)) = &mut inspect.commands[0].kind
+                else {
+                    unreachable!()
+                };
+                print.tables = callables[..3]
+                    .iter()
+                    .map(|name| name.clone().unwrap())
+                    .collect();
                 if set {
-                    let Some(pb::command::Kind::PrintSize(print)) = &mut inspect.commands[0].kind
-                    else {
-                        unreachable!()
-                    };
-                    print.tables.push("Saved".into());
+                    print.tables.push(callables[3].clone().unwrap());
                 }
                 let response = run(&mut engine, id, inspect);
                 assert_eq!(response.error, None);
@@ -1948,7 +2037,14 @@ mod constructor_action_dags {
                         }
                     })
                     .collect();
-                assert_eq!(functions, if set { vec!["Saved"] } else { vec![] });
+                assert_eq!(
+                    functions,
+                    if set {
+                        vec![callables[3].as_deref().unwrap()]
+                    } else {
+                        vec![]
+                    }
+                );
             }
         }
     }
@@ -2054,12 +2150,28 @@ mod constructor_action_dags {
         let id = create(&mut engine);
         let mut saw_reserved_head = false;
         let mut saw_public_name = false;
+        let mut reserved_head = None;
         for phase in Source::new(None, &text).unwrap() {
             let phase = phase.unwrap();
+            for declaration in &phase.declarations {
+                if declaration.table_name
+                    == Some(pb::declaration::TableName::DefaultName("set".into()))
+                {
+                    let Some(pb::declaration::Kind::Constructor(constructor)) = &declaration.kind
+                    else {
+                        panic!("reserved constructor metadata")
+                    };
+                    assert!(reserved_head.replace(constructor.name.clone()).is_none());
+                }
+                saw_public_name |= declaration.table_name
+                    == Some(pb::declaration::TableName::DefaultName(
+                        "$__egglog_proto_action_0".into(),
+                    ))
+                    && matches!(&declaration.kind, Some(pb::declaration::Kind::Function(function)) if function.inputs.is_empty());
+            }
             saw_reserved_head |= phase.nodes.iter().any(
-                |node| matches!(&node.kind, Some(pb::node::Kind::Call(call)) if call.func == "set"),
+                |node| matches!(&node.kind, Some(pb::node::Kind::Call(call)) if Some(&call.func) == reserved_head.as_ref()),
             );
-            saw_public_name |= phase.declarations.iter().any(|declaration| matches!(&declaration.kind, Some(pb::declaration::Kind::Function(function)) if function.name == "$__egglog_proto_action_0"));
             assert_eq!(run(&mut engine, id, phase).error, None);
         }
         assert!(saw_reserved_head && saw_public_name);
@@ -2784,6 +2896,71 @@ mod constructor_action_dags {
     }
 
     #[test]
+    fn native_proof_testing_checks_a_long_flat_constructor_query() {
+        let mut native = egglog::EGraph::default()
+            .with_proofs_enabled()
+            .with_proof_testing();
+        let mut actions = vec!["(let value0 (Leaf))".to_owned()];
+        let mut query = vec!["(= query0 (Leaf))".to_owned()];
+        for index in 1..=300 {
+            actions.push(format!("(let value{index} (Wrap value{}))", index - 1));
+            if index < 300 {
+                query.push(format!("(= query{index} (Wrap query{}))", index - 1));
+            }
+        }
+        query.push("(Wrap query299)".to_owned());
+        native
+            .parse_and_run_program(
+                None,
+                &format!(
+                    "(datatype Math (Leaf) (Wrap Math)) (action-scope ({}))",
+                    actions.join(" ")
+                ),
+            )
+            .unwrap();
+        native
+            .parse_and_run_program(None, &format!("(check {})", query.join(" ")))
+            .unwrap();
+
+        // An incomplete middle branch must not retain refined subsets and
+        // suppress the complete branch that follows it.
+        let mut native = egglog::EGraph::default()
+            .with_proofs_enabled()
+            .with_proof_testing();
+        let mut actions = vec![];
+        for (seed, wraps) in [(0, 300), (1, 150), (2, 300)] {
+            actions.push(format!("(let value{seed}_0 (Leaf {seed}))"));
+            for index in 1..=wraps {
+                actions.push(format!(
+                    "(let value{seed}_{index} (Wrap value{seed}_{}))",
+                    index - 1
+                ));
+            }
+        }
+        let mut query = vec!["(= query0 (Leaf seed))".to_owned()];
+        for index in 1..300 {
+            query.push(format!("(= query{index} (Wrap query{}))", index - 1));
+        }
+        query.push("(Wrap query299)".to_owned());
+        native
+            .parse_and_run_program(
+                None,
+                &format!(
+                    "(datatype Math (Leaf i64) (Wrap Math))
+                     (relation Found (i64))
+                     (action-scope ({}))
+                     (rule ({}) ((Found seed)))
+                     (run 1)
+                     (check (Found 0) (Found 2))
+                     (fail (check (Found 1)))",
+                    actions.join(" "),
+                    query.join(" "),
+                ),
+            )
+            .unwrap();
+    }
+
+    #[test]
     fn query_graphs_match_deep_and_shared_terms_in_all_modes() {
         for mode in [
             pb::ExecutionMode::Normal,
@@ -3250,6 +3427,316 @@ mod source_reflection {
     }
 
     #[test]
+    fn uf_parent_identity_is_independent_of_scoped_reflective_prefixes() {
+        compare(
+            r#"
+            (sort U)
+            (sort S :internal-uf Parent)
+            (constructor A () S) (constructor B () S)
+            (constructor Q () U :table-name "Parent") (Q)
+            (function chosen () String :merge new)
+            (set (chosen) "Temp")
+            (push)
+            (constructor Parent (S S) U :table-name "Temp")
+            (Parent (B) (A)) (Parent (A) (A))
+            (check (= (chosen) "Temp") (= (get-size! (chosen)) 2)
+                   (= (get-size! "Parent") 1) (= (get-size! "Public") 0))
+            (fail (check (= (A) (B))))
+            (print-size Parent)
+            (extract (B))
+            (pop)
+            (set (chosen) "Public")
+            (constructor Parent (S S) U :table-name "Public")
+            (Parent (B) (A))
+            (check (= (chosen) "Public") (= (get-size! (chosen)) 1)
+                   (= (get-size! "Parent") 1) (= (get-size! "Temp") 0))
+            (fail (check (= (A) (B))))
+            (extract (B))
+            (relation Blank (i64) :table-name "") (Blank 1)
+            (check (= (get-size! "") 1) (= (get-size! "Blank") 0))
+        "#,
+        );
+    }
+
+    #[test]
+    fn soft_prefixes_survive_pending_aliases_reimport_shadow_and_pop() {
+        compare(
+            r#"
+            (sort U) (sort S :internal-uf X)
+            (constructor A () S) (constructor B () S)
+            (extract (B))
+            (function X (S) S :merge old :internal-default-table-name "Parent")
+            (set (X (B)) (A))
+            (function chosen () String :merge new) (set (chosen) "Parent")
+            (check (= (get-size! (chosen)) 1) (= (chosen) "Parent"))
+            (fail (check (= (A) (B))))
+            (extract (B))
+            (push)
+            (constructor Shadow (i64) U :table-name "Parent")
+            (Shadow 1) (Shadow 2)
+            (check (= (get-size! (chosen)) 2) (= (get-size!) 6))
+            (print-size X)
+            (extract (B))
+            (pop)
+            (check (= (get-size! (chosen)) 1) (= (get-size!) 4))
+            (extract (B))
+        "#,
+        );
+        compare(
+            r#"
+            (sort S) (constructor A (i64) S) (A 1) (A 2)
+            (constructor B () S :table-name "A") (B)
+            (check (= (get-size! "A") 1) (= (get-size!) 3))
+            (print-size A)
+        "#,
+        );
+        for public_first in [false, true] {
+            let soft = r#"(constructor physical (i64) S :internal-default-table-name "A") (physical 1) (physical 2)"#;
+            let public = r#"(constructor explicit () S :table-name "A") (explicit)"#;
+            let (first, second) = if public_first {
+                (public, soft)
+            } else {
+                (soft, public)
+            };
+            compare(&format!(
+                r#"(sort S) {first} {second} (check (= (get-size! "A") 1) (= (get-size!) 3)) (print-size physical)"#
+            ));
+        }
+    }
+
+    #[test]
+    fn pending_uf_render_alias_is_reserved_without_decoding_keys_or_prefixes() {
+        let mut text = r#"(sort S :internal-uf Parent) (function Parent (S) S :merge old :internal-default-table-name "Parent")"#.to_owned();
+        for _ in 0..3 {
+            let mut renderer = Renderer::default();
+            let mut rendered = String::new();
+            let mut pending = None;
+            let mut table = None;
+            for phase in Source::new(None, &text).unwrap() {
+                let phase = phase.unwrap();
+                for declaration in &phase.declarations {
+                    match &declaration.kind {
+                        Some(pb::declaration::Kind::EqSort(sort)) => {
+                            pending = sort.uf_parent.clone()
+                        }
+                        Some(pb::declaration::Kind::Function(function)) => {
+                            table = Some(function.name.clone());
+                            assert_eq!(
+                                declaration.table_name,
+                                Some(pb::declaration::TableName::DefaultName("Parent".into()))
+                            );
+                        }
+                        _ => (),
+                    }
+                }
+                rendered.push_str(&renderer.render(&phase).unwrap());
+            }
+            assert_eq!(pending, table);
+            let ast = new_experimental_egraph()
+                .parse_program(None, &rendered)
+                .unwrap();
+            let target = ast
+                .iter()
+                .find_map(|command| match command {
+                    egglog::ast::Command::Sort {
+                        uf: Some((target, None)),
+                        ..
+                    } => Some(target),
+                    _ => None,
+                })
+                .unwrap();
+            let physical = ast
+                .iter()
+                .find_map(|command| match command {
+                    egglog::ast::Command::Function {
+                        name,
+                        table_name: Some(egglog::ast::TableName::Default(prefix)),
+                        ..
+                    } if prefix == "Parent" => Some(name),
+                    _ => None,
+                })
+                .unwrap();
+            assert_eq!(target, physical);
+            assert!(target.len() < 64);
+            text = rendered;
+        }
+    }
+
+    #[test]
+    fn uf_parent_tree_redirects_only_roots_once_including_subsumed_rows() {
+        let text = r#"
+            (sort U) (sort S :internal-uf P)
+            (constructor A () S :cost 3) (constructor B () S :cost 9)
+            (constructor C () S :cost 1) (constructor Box (S) S :cost 1)
+            (let a (A)) (let b (B)) (let c (C)) (let boxed (Box b))
+            (extract b)
+            (constructor P (S S) U) (P b a) (P a c)
+            (fail (check (= a b)))
+            (extract b) (extract b 2) (extract b :extractor greedy-dag)
+            (extract boxed)
+            (subsume (P b a))
+            (extract b) (extract c)
+            (fail (check (= a b))) (fail (check (= a c)))
+        "#;
+        new_experimental_egraph()
+            .parse_and_run_program(None, text)
+            .unwrap();
+        let mut engine = Engine::default();
+        let id = create(&mut engine);
+        let mut extracted = vec![];
+        for phase in Source::new(None, text).unwrap() {
+            let response = run(&mut engine, id, phase.unwrap());
+            assert_eq!(response.error, None);
+            for output in &response.outputs {
+                let Some(pb::command_output::Kind::Extraction(result)) = &output.kind else {
+                    continue;
+                };
+                assert_eq!(result.roots.len(), 1);
+                assert_eq!(result.roots[0].variants.len(), 1);
+                let term = &result.roots[0].variants[0];
+                extracted.push((
+                    value(&response, term.term),
+                    value(&response, term.cost.unwrap()),
+                ));
+            }
+        }
+        assert_eq!(
+            extracted,
+            [
+                ("(B)", "9"),
+                ("(A)", "3"),
+                ("(A)", "3"),
+                ("(B)", "9"),
+                ("(Box (B))", "10"),
+                ("(A)", "3"),
+                ("(C)", "1")
+            ]
+            .map(|(term, cost)| (term.to_owned(), cost.to_owned()))
+        );
+    }
+
+    #[test]
+    fn pending_uf_parent_survives_freeze_then_unary_function_installation() {
+        let source = Source::new(
+            None,
+            r#"
+            (sort S :internal-uf Parent)
+            (constructor A () S) (constructor B () S) (B)
+            (function Parent (S) S :merge old :internal-default-table-name "retained-prefix")
+            (set (Parent (B)) (A))
+            (check (= (get-size! "retained-prefix") 1))
+            (fail (check (= (A) (B))))
+            (extract (B)) (extract (B) 2)
+        "#,
+        )
+        .unwrap();
+        let mut engine = Engine::default();
+        let mut id = create(&mut engine);
+        let mut restored = false;
+        let mut extracts = 0;
+        for phase in source {
+            let phase = phase.unwrap();
+            if phase.declarations.iter().any(|declaration| matches!(&declaration.kind, Some(pb::declaration::Kind::Function(f)) if f.name == "Parent")) {
+                let frozen = run(&mut engine, id, pb::Program {
+                    ir_version: 1,
+                    commands: vec![pb::Command { kind: Some(pb::command::Kind::Freeze(pb::Freeze {})), ..Default::default() }],
+                    ..Default::default()
+                });
+                assert_eq!(frozen.error, None);
+                let Some(pb::command_output::Kind::Snapshot(snapshot)) = &frozen.outputs[0].kind else { panic!("snapshot") };
+                let saved = snapshot.program.as_ref().unwrap();
+                assert!(saved.declarations.iter().any(|declaration| matches!(&declaration.kind, Some(pb::declaration::Kind::EqSort(s)) if s.name == "S" && s.uf_parent.as_deref() == Some("Parent"))));
+                assert!(!saved.declarations.iter().any(|declaration| matches!(&declaration.kind, Some(pb::declaration::Kind::Function(f)) if f.name == "Parent")));
+                id = create(&mut engine);
+                assert_eq!(run(&mut engine, id, saved.clone()).error, None);
+                assert_eq!(phase.declarations[0].table_name, Some(pb::declaration::TableName::DefaultName("retained-prefix".into())));
+                restored = true;
+            }
+            let response = run(&mut engine, id, phase);
+            assert_eq!(response.error, None);
+            for output in &response.outputs {
+                if let Some(pb::command_output::Kind::Extraction(result)) = &output.kind {
+                    assert_eq!(value(&response, result.roots[0].variants[0].term), "(A)");
+                    extracts += 1;
+                }
+            }
+        }
+        assert!(restored);
+        assert_eq!(extracts, 2);
+        let frozen = run(
+            &mut engine,
+            id,
+            pb::Program {
+                ir_version: 1,
+                commands: vec![pb::Command {
+                    kind: Some(pb::command::Kind::Freeze(pb::Freeze {})),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        );
+        assert_eq!(frozen.error, None);
+        let Some(pb::command_output::Kind::Snapshot(snapshot)) = &frozen.outputs[0].kind else {
+            panic!("snapshot")
+        };
+        let saved = snapshot.program.as_ref().unwrap();
+        assert!(saved.declarations.iter().any(|declaration| matches!(&declaration.kind, Some(pb::declaration::Kind::Function(f)) if f.name == "Parent" && matches!(&declaration.table_name, Some(pb::declaration::TableName::DefaultName(name)) if name == "retained-prefix"))));
+        let restored = create(&mut engine);
+        assert_eq!(run(&mut engine, restored, saved.clone()).error, None);
+        let root = saved
+            .nodes
+            .iter()
+            .position(
+                |node| matches!(&node.kind, Some(pb::node::Kind::Call(call)) if call.func == "B"),
+            )
+            .unwrap() as u32;
+        let mut read = saved.clone();
+        read.declarations.clear();
+        read.commands = vec![pb::Command {
+            kind: Some(pb::command::Kind::Extract(pb::Extract {
+                roots: vec![root],
+                variants: 1,
+                extractor: pb::Extractor::Tree.into(),
+                ..Default::default()
+            })),
+            ..Default::default()
+        }];
+        let response = run(&mut engine, restored, read);
+        assert_eq!(response.error, None);
+        let Some(pb::command_output::Kind::Extraction(result)) = &response.outputs[0].kind else {
+            panic!("restored extraction")
+        };
+        assert_eq!(value(&response, result.roots[0].variants[0].term), "(A)");
+    }
+
+    #[test]
+    fn manual_uf_parent_keeps_native_selected_mode_admission() {
+        let text = "(sort S :internal-uf Pending)";
+        for mode in [
+            pb::ExecutionMode::TermEncoding,
+            pb::ExecutionMode::Proofs,
+            pb::ExecutionMode::ProofTesting,
+        ] {
+            let graph = new_experimental_egraph();
+            let mut native = if mode == pb::ExecutionMode::TermEncoding {
+                graph.with_term_encoding_enabled()
+            } else {
+                graph.with_proofs_enabled()
+            };
+            let expected = native
+                .parse_and_run_program(None, text)
+                .unwrap_err()
+                .to_string();
+            let mut source = Source::new(None, text)
+                .unwrap()
+                .with_execution_mode(mode)
+                .unwrap();
+            assert_eq!(source.next().unwrap().unwrap_err().to_string(), expected);
+            assert!(source.next().is_none());
+        }
+    }
+
+    #[test]
     fn public_selectors_and_aggregate_counts_keep_private_helper_provenance() {
         compare(
             r#"
@@ -3372,6 +3859,311 @@ mod source_reflection {
             .unwrap()
             .unwrap();
         assert_eq!(run(&mut engine, id, check).error, None);
+    }
+}
+
+mod uf_parent_headers {
+    use super::*;
+    use pb::declaration::Kind;
+
+    fn packet(table: Kind) -> pb::Program {
+        pb::Program {
+            ir_version: 1,
+            sorts: vec![
+                pb::Sort {
+                    kind: Some(pb::sort::Kind::Eq("S".into())),
+                    ..Default::default()
+                },
+                pb::Sort {
+                    kind: Some(pb::sort::Kind::Eq("U".into())),
+                    ..Default::default()
+                },
+                pb::Sort {
+                    kind: Some(pb::sort::Kind::Family(pb::HostSort {
+                        name: "i64".into(),
+                        args: vec![],
+                    })),
+                    ..Default::default()
+                },
+            ],
+            nodes: vec![pb::Node {
+                sort_id: 2,
+                kind: Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
+                    value: Some(pb::primitive_value::Value::I64(0)),
+                })),
+                ..Default::default()
+            }],
+            declarations: vec![
+                pb::Declaration {
+                    kind: Some(Kind::EqSort(pb::EqSort {
+                        name: "S".into(),
+                        uf_parent: Some("P".into()),
+                        ..Default::default()
+                    })),
+                    ..Default::default()
+                },
+                pb::Declaration {
+                    kind: Some(Kind::EqSort(pb::EqSort {
+                        name: "U".into(),
+                        ..Default::default()
+                    })),
+                    ..Default::default()
+                },
+                pb::Declaration {
+                    kind: Some(table),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn stored_columns_accept_unary_tables_and_reject_other_layouts_before_effects() {
+        let arg = |sort| pb::Arg {
+            sort,
+            name: String::new(),
+        };
+        let tables = [
+            (
+                Kind::Constructor(pb::Constructor {
+                    name: "P".into(),
+                    inputs: vec![arg(0)],
+                    output: 0,
+                    ..Default::default()
+                }),
+                true,
+            ),
+            (
+                Kind::Function(pb::Function {
+                    name: "P".into(),
+                    inputs: vec![arg(0)],
+                    output: 0,
+                    ..Default::default()
+                }),
+                true,
+            ),
+            (
+                Kind::Relation(pb::Relation {
+                    name: "P".into(),
+                    inputs: vec![arg(0), arg(0)],
+                }),
+                true,
+            ),
+            (
+                Kind::Relation(pb::Relation {
+                    name: "P".into(),
+                    inputs: vec![arg(0)],
+                }),
+                false,
+            ),
+            (
+                Kind::Constructor(pb::Constructor {
+                    name: "P".into(),
+                    inputs: vec![arg(0)],
+                    output: 1,
+                    ..Default::default()
+                }),
+                false,
+            ),
+            (
+                Kind::Function(pb::Function {
+                    name: "P".into(),
+                    inputs: vec![arg(2)],
+                    output: 0,
+                    ..Default::default()
+                }),
+                false,
+            ),
+            (
+                Kind::Primitive(pb::Primitive {
+                    name: "P".into(),
+                    inputs: vec![arg(0)],
+                    output: 2,
+                    body: Some(0),
+                }),
+                false,
+            ),
+            (
+                Kind::HostPrimitive(pb::HostPrimitive {
+                    name: "P".into(),
+                    typing: Some(pb::host_primitive::Typing::Signature(
+                        pb::GenericSignature {
+                            inputs: vec![arg(0)],
+                            output: Some(0),
+                            ..Default::default()
+                        },
+                    )),
+                }),
+                false,
+            ),
+        ];
+        for (table, valid) in tables {
+            for reverse in [false, true] {
+                let mut program = packet(table.clone());
+                if reverse {
+                    program.declarations.reverse();
+                }
+                if !valid {
+                    program.commands.push(pb::Command {
+                        kind: Some(pb::command::Kind::Action(pb::Action {
+                            kind: Some(pb::action::Kind::Panic("must not execute".into())),
+                            ..Default::default()
+                        })),
+                        ..Default::default()
+                    });
+                }
+                let mut engine = Engine::default();
+                let id = create(&mut engine);
+                let response = run(&mut engine, id, program);
+                if valid {
+                    assert_eq!(response.error, None, "{table:?}/{reverse}");
+                } else {
+                    let error = response.error.unwrap();
+                    assert_eq!(error.code, i32::from(pb::ErrorCode::InvalidProgram));
+                    assert!(error.message.contains("parent"), "{error:?}");
+                    assert!(response.outputs.is_empty());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn either_later_arrival_rechecks_pending_headers_without_mutating_state() {
+        let table = Kind::Function(pb::Function {
+            name: "P".into(),
+            inputs: vec![pb::Arg {
+                sort: 2,
+                name: String::new(),
+            }],
+            output: 2,
+            ..Default::default()
+        });
+        let program = packet(table);
+        for target_first in [false, true] {
+            let mut first = program.clone();
+            first.declarations.retain(|declaration| {
+                matches!(declaration.kind, Some(Kind::EqSort(_))) != target_first
+            });
+            let mut second = program.clone();
+            second.declarations.retain(|declaration| {
+                matches!(declaration.kind, Some(Kind::EqSort(_))) == target_first
+            });
+            let mut saved = pb::Program::default();
+            egglog_experimental::builtin::definitions::reconcile_declarations(&first, &mut saved)
+                .unwrap();
+            let before = saved.clone();
+            assert!(
+                egglog_experimental::builtin::definitions::reconcile_declarations(
+                    &second, &mut saved
+                )
+                .unwrap_err()
+                .contains("first two stored columns")
+            );
+            assert_eq!(saved, before);
+            let mut engine = Engine::default();
+            let id = create(&mut engine);
+            let text = if target_first {
+                "(function P (i64) i64 :merge old)"
+            } else {
+                "(sort S :internal-uf P)"
+            };
+            for phase in egglog_experimental::protobuf::source::Source::new(None, text).unwrap() {
+                assert_eq!(run(&mut engine, id, phase.unwrap()).error, None);
+            }
+            second.commands.push(pb::Command {
+                kind: Some(pb::command::Kind::Action(pb::Action {
+                    kind: Some(pb::action::Kind::Panic("must not execute".into())),
+                    ..Default::default()
+                })),
+                ..Default::default()
+            });
+            let response = run(&mut engine, id, second);
+            let error = response.error.unwrap();
+            assert_eq!(error.code, i32::from(pb::ErrorCode::InvalidProgram));
+            assert!(
+                error.message.contains("first two stored columns"),
+                "{error:?}"
+            );
+            assert!(response.outputs.is_empty());
+        }
+    }
+
+    #[test]
+    fn parent_presence_and_reflective_prefix_defaults_have_distinct_resupply_rules() {
+        let mut program = packet(Kind::Constructor(pb::Constructor {
+            name: "P".into(),
+            inputs: vec![pb::Arg {
+                sort: 0,
+                name: String::new(),
+            }],
+            output: 0,
+            ..Default::default()
+        }));
+        let mut saved = pb::Program::default();
+        egglog_experimental::builtin::definitions::reconcile_declarations(&program, &mut saved)
+            .unwrap();
+        program.declarations[2].table_name =
+            Some(pb::declaration::TableName::DefaultName("P".into()));
+        assert_eq!(
+            egglog_experimental::builtin::definitions::reconcile_declarations(&program, &mut saved)
+                .unwrap(),
+            [false; 3]
+        );
+        assert_eq!(
+            saved.declarations[2].table_name, None,
+            "first descriptor stays exact"
+        );
+        let mut explicit_first = pb::Program::default();
+        egglog_experimental::builtin::definitions::reconcile_declarations(
+            &program,
+            &mut explicit_first,
+        )
+        .unwrap();
+        let mut implicit = program.clone();
+        implicit.declarations[2].table_name = None;
+        egglog_experimental::builtin::definitions::reconcile_declarations(
+            &implicit,
+            &mut explicit_first,
+        )
+        .unwrap();
+        assert_eq!(
+            explicit_first.declarations[2].table_name,
+            program.declarations[2].table_name
+        );
+        program.declarations[2].table_name =
+            Some(pb::declaration::TableName::PublicAlias("P".into()));
+        assert!(
+            egglog_experimental::builtin::definitions::reconcile_declarations(&program, &mut saved)
+                .unwrap_err()
+                .contains("conflicting declaration")
+        );
+        program.declarations[2].table_name =
+            Some(pb::declaration::TableName::PublicAlias(String::new()));
+        assert!(
+            egglog_experimental::builtin::definitions::reconcile_declarations(&program, &mut saved)
+                .unwrap_err()
+                .contains("conflicting declaration")
+        );
+        program.declarations[2].table_name = None;
+        let Some(Kind::EqSort(sort)) = &mut program.declarations[0].kind else {
+            unreachable!()
+        };
+        sort.uf_parent = None;
+        assert!(
+            egglog_experimental::builtin::definitions::reconcile_declarations(&program, &mut saved)
+                .unwrap_err()
+                .contains("conflicting declaration")
+        );
+        let Some(Kind::EqSort(sort)) = &mut program.declarations[0].kind else {
+            unreachable!()
+        };
+        sort.uf_parent = Some(String::new());
+        assert!(
+            egglog_experimental::builtin::definitions::reconcile_declarations(&program, &mut saved)
+                .unwrap_err()
+                .contains("empty equality-sort parent")
+        );
     }
 }
 
@@ -8431,7 +9223,9 @@ fn core_source_rendered_declarations_reenter_bytes() {
         rendered.push_str(&renderer.render(&phase.unwrap()).unwrap());
     }
     assert!(rendered.contains("(sort Marker)"));
-    assert!(rendered.contains("(constructor Seed (i64) Marker)"));
+    assert!(
+        rendered.contains("(constructor Seed (i64) Marker :internal-default-table-name \"Seed\")")
+    );
     egglog::EGraph::default()
         .parse_and_run_program(None, &rendered)
         .unwrap();
@@ -9658,7 +10452,9 @@ fn core_renderer_keeps_callable_rule_ruleset_and_binder_namespaces_distinct() {
     // Core preserves callable/label strings, not literal ruleset attachments:
     // private selectors must share one installed occurrence without rebinding.
     assert!(text.contains(&format!(":name \"{physical}\"")), "{text}");
-    assert!(text.contains("(function current () i64 :merge new :unextractable)"));
+    assert!(text.contains(
+        "(function current () i64 :internal-default-table-name \"current\" :merge new :unextractable)"
+    ));
     assert!(text.contains("(print-function current"));
     egglog::EGraph::default()
         .parse_and_run_program(None, &text)
@@ -10274,7 +11070,7 @@ fn core_renderer_rejects_unrepresentable_names_before_publication() {
             renderer
                 .render(&base)
                 .unwrap()
-                .contains("(constructor Good () T)")
+                .contains("(constructor Good () T :internal-default-table-name \"Good\")")
         );
         assert!(renderer.render(&base).unwrap().is_empty());
         let mut private = base.clone();
@@ -10288,7 +11084,7 @@ fn core_renderer_rejects_unrepresentable_names_before_publication() {
             renderer
                 .render(&private)
                 .unwrap()
-                .contains("(constructor __egglog_instance_fake () T)")
+                .contains("(constructor __egglog_instance_fake () T :internal-default-table-name \"__egglog_instance_fake\")")
         );
     }
     for sort_first in [false, true] {
@@ -13431,7 +14227,7 @@ fn constant_function_and_constructor_execute_as_bytes_and_resupply() {
                 .functions_iter()
                 .filter(|(_, function)| {
                     matches!(&function.func_type().table_name,
-                        Some(egglog::ast::TableName::Public(name)) if name == "Empty")
+                        Some(egglog::ast::TableName::Default(name)) if name == "Empty")
                 })
                 .map(|(physical, _)| physical.clone())
                 .collect();
@@ -15668,6 +16464,7 @@ fn pair_nested_values_rebuild_and_keep_user_constructor_provenance() {
             kind: Some(pb::declaration::Kind::EqSort(pb::EqSort {
                 name: "Pair".into(),
                 bindings: None,
+                ..Default::default()
             })),
             ..Default::default()
         },
@@ -15822,6 +16619,7 @@ fn nominal_pair_fixture() -> pb::Program {
                     }),
                     ..Default::default()
                 }),
+                ..Default::default()
             })),
             ..Default::default()
         },
@@ -18651,6 +19449,8 @@ fn recursive_fail_keeps_native_run_effects_and_source_shape() {
         (rule () ((set-get (set-of (M 10)) 9)) :ruleset failing)
         (fail (run failing 1))
         (check (M 10))
+        (fail (set-get (set-of (M 30)) 9))
+        (check (M 30))
         (fail (fail (check (M 10))))
         (fail (panic "expected"))
         (M 20)
@@ -18686,12 +19486,12 @@ fn recursive_fail_keeps_native_run_effects_and_source_shape() {
             "Fail must suppress its Run outcome"
         );
     }
-    assert_eq!(wrappers, 3);
+    assert_eq!(wrappers, 4);
 }
 
 #[test]
-fn source_fail_global_let_preserves_prefix_binding_and_nested_expectations() {
-    use egglog_experimental::protobuf::source::{Renderer, Source};
+fn source_fail_rejects_authored_let_before_registration() {
+    use egglog_experimental::protobuf::source::Source;
     for core in [false, true] {
         for (prefix, tail, errors) in [
             (
@@ -18719,76 +19519,53 @@ fn source_fail_global_let_preserves_prefix_binding_and_nested_expectations() {
             // Explicitly continue the same session after an unexpected success:
             // its binding survives, just as earlier argument effects do on failure.
             native.parse_and_run_program(None, tail).unwrap();
-
-            let mut text = format!("{prefix} {tail}");
-            for cycle in 0..2 {
-                let source = if core {
-                    Source::new_core(None, &text)
-                } else {
-                    Source::new(None, &text)
-                }
-                .unwrap();
-                let mut renderer = if core {
-                    Renderer::core()
-                } else {
-                    Renderer::default()
-                };
-                let mut replay = if core {
-                    egglog::EGraph::default()
-                } else {
-                    new_experimental_egraph()
-                };
-                let mut engine = Engine::default();
-                let id = create(&mut engine);
-                let mut rendered = String::new();
-                let mut failures = 0;
-                for phase in source {
-                    let phase = phase.unwrap();
-                    if cycle == 0
-                        && let Some(pb::Command {
-                            kind: Some(pb::command::Kind::Fail(_)),
-                            ..
-                        }) = phase.commands.first()
-                    {
-                        assert_eq!(phase.commands.len(), 1);
-                        let [declaration] = phase.declarations.as_slice() else {
-                            panic!("global declaration must be outside Fail")
-                        };
-                        let Some(pb::declaration::Kind::Function(function)) = &declaration.kind
-                        else {
-                            panic!("expected global function")
-                        };
-                        assert!(function.inputs.is_empty());
-                        let mut anchor = &phase.commands[0];
-                        while let Some(pb::command::Kind::Fail(child)) = &anchor.kind {
-                            anchor = child;
-                        }
-                        let Some(pb::command::Kind::Action(pb::Action {
-                            kind: Some(pb::action::Kind::Set(set)),
-                            ..
-                        })) = &anchor.kind
-                        else {
-                            panic!("only the global assignment belongs inside Fail")
-                        };
-                        assert_eq!(set.target.as_ref().unwrap().func, function.name);
-                    }
-                    let part = renderer.render(&phase).unwrap();
-                    let expected = replay.parse_and_run_program(None, &part);
-                    rendered.push_str(&part);
-                    // The existing helper encodes the request and decodes the
-                    // actual response; cycle two reimports standalone text.
-                    let response = run(&mut engine, id, phase);
-                    assert_eq!(response.error.is_some(), expected.is_err(), "{part}");
-                    assert!(response.outputs.is_empty(), "Fail must suppress outputs");
-                    if let Some(error) = response.error {
-                        assert_eq!(error.code, i32::from(pb::ErrorCode::EvaluationFailed));
-                        assert!(matches!(expected, Err(egglog::Error::ExpectFail(_))));
-                        failures += 1;
-                    }
-                }
-                assert_eq!(failures, errors, "core={core}, cycle={cycle}: {text}");
-                text = rendered;
+        }
+        // Let is an authoring binder, not a wire action. Reject it before its
+        // header or initializer can be registered, regardless of nesting.
+        for depth in 1..=3 {
+            let mut child = "(let $cap (unknown))".to_owned();
+            for _ in 0..depth {
+                child = format!("(fail {child})");
             }
+            let text = format!("(datatype T (C)) (C) {child} (panic \"suffix\")");
+            let mut source = if core {
+                Source::new_core(None, &text)
+            } else {
+                Source::new(None, &text)
+            }
+            .unwrap();
+            let mut engine = Engine::default();
+            let id = create(&mut engine);
+            for _ in 0..2 {
+                let phase = source.next().unwrap().unwrap();
+                assert!(phase.declarations.iter().all(|declaration| !matches!(
+                    &declaration.kind,
+                    Some(pb::declaration::Kind::Function(function)) if function.name == "$cap"
+                )));
+                assert_eq!(run(&mut engine, id, phase).error, None);
+            }
+            let error = source.next().unwrap().unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                "source Fail does not support authored let bindings"
+            );
+            assert!(source.next().is_none());
+            let observation = pb::Program {
+                ir_version: 1,
+                commands: vec![pb::Command {
+                    kind: Some(pb::command::Kind::PrintSize(pb::PrintSize {
+                        tables: vec!["C".into()],
+                    })),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            };
+            let response = run(&mut engine, id, observation);
+            assert_eq!(response.error, None);
+            let Some(pb::command_output::Kind::Sizes(sizes)) = &response.outputs[0].kind else {
+                panic!("completed prefix observation")
+            };
+            assert_eq!(sizes.sizes[0].rows, 1);
         }
     }
 }
@@ -19183,13 +19960,13 @@ fn source_fail_keeps_encoded_definition_prefixes_and_partial_birewrite() {
 }
 
 #[test]
-fn source_fail_global_let_does_not_catch_preparation_errors() {
+fn source_fail_does_not_catch_preparation_errors() {
     use egglog_experimental::protobuf::source::Source;
     for core in [false, true] {
         for (prefix, child, phases) in [
-            ("", "(fail (let $x (unknown)))", 0),
-            ("", "(fail (let $x (+ 1 \"wrong\")))", 0),
-            ("(let $x 1)", "(fail (let $x 2))", 1),
+            ("", "(fail (unknown))", 0),
+            ("", "(fail (+ 1 \"wrong\"))", 0),
+            ("(let $x 1)", "(fail (check (= $x \"wrong\")))", 1),
         ] {
             let text = format!("{prefix} {child} (check (= 1 1))");
             let mut native = if core {
@@ -19209,7 +19986,7 @@ fn source_fail_global_let_does_not_catch_preparation_errors() {
                 source.next().unwrap().unwrap();
             }
             let error = source.next().unwrap().unwrap_err();
-            assert!(!error.to_string().contains("source Fail requires"));
+            assert!(!error.to_string().contains("source Fail does not support"));
             assert!(source.next().is_none());
         }
     }
@@ -20749,6 +21526,31 @@ mod source_provider_context {
                 assert_eq!(provider.evaluations.load(Ordering::SeqCst), 0);
                 assert_eq!(provider.validations.load(Ordering::SeqCst), 0);
                 assert_eq!(phases.iter().map(|phase| phase.rules.len()).max(), Some(1));
+                let replay_tables: Vec<_> = ["HostCost", "WithVector"]
+                    .into_iter()
+                    .take(if mixed { 2 } else { 1 })
+                    .map(|prefix| {
+                        let names: Vec<_> = phases
+                            .iter()
+                            .flat_map(|phase| &phase.declarations)
+                            .filter_map(|declaration| {
+                                if declaration.table_name
+                                    != Some(pb::declaration::TableName::DefaultName(prefix.into()))
+                                {
+                                    return None;
+                                }
+                                let Some(pb::declaration::Kind::Constructor(table)) =
+                                    &declaration.kind
+                                else {
+                                    panic!("expected constructor {prefix}")
+                                };
+                                Some(table.name.clone())
+                            })
+                            .collect();
+                        let [name]: [String; 1] = names.try_into().unwrap();
+                        name
+                    })
+                    .collect();
 
                 let mut engine = Engine::with_extension(provider.clone());
                 let id = create(&mut engine);
@@ -20833,7 +21635,27 @@ mod source_provider_context {
                     })
                     .flatten()
                     .collect();
-                assert_eq!(replay_sizes, expected);
+                assert_eq!(
+                    expected
+                        .iter()
+                        .map(|row| row.table.as_str())
+                        .collect::<Vec<_>>(),
+                    if mixed {
+                        vec!["HostCost", "WithVector"]
+                    } else {
+                        vec!["HostCost"]
+                    }
+                );
+                let replay_expected: Vec<_> = expected
+                    .iter()
+                    .zip(&replay_tables)
+                    .map(|(row, name)| pb::TableSize {
+                        table: name.clone(),
+                        rows: row.rows,
+                    })
+                    .collect();
+                assert_eq!(expected.len(), replay_tables.len());
+                assert_eq!(replay_sizes, replay_expected);
                 // Native RHS writes are staged; deleting an as-yet absent row
                 // does not cancel this match's pending insertion/annotation.
                 assert_eq!(
@@ -20844,8 +21666,14 @@ mod source_provider_context {
                     provider.evaluations.load(Ordering::SeqCst) - before,
                     evaluations
                 );
-                for handle in [id, fresh] {
-                    let response = run(&mut engine, handle, read_cost.clone());
+                for (handle, key) in [(id, "HostCost"), (fresh, replay_tables[0].as_str())] {
+                    let mut read_cost = read_cost.clone();
+                    let Some(pb::node::Kind::GetCost(call)) = &mut read_cost.nodes[1].kind else {
+                        unreachable!()
+                    };
+                    assert_eq!(call.func, "HostCost");
+                    call.func = key.into();
+                    let response = run(&mut engine, handle, read_cost);
                     assert!(response.outputs.is_empty());
                     if mixed {
                         // Both the existence query and exact assigned-C=9 check
@@ -20902,6 +21730,31 @@ mod source_provider_context {
                     let mut rendered = String::new();
                     let mut sizes = vec![];
                     let mut extracted = false;
+                    let expected_prefix = if target.starts_with("(constructor") {
+                        "Target"
+                    } else {
+                        "Item"
+                    };
+                    let constructors: Vec<_> = phases
+                        .iter()
+                        .flat_map(|phase| &phase.declarations)
+                        .filter_map(|declaration| {
+                            let Some(pb::declaration::Kind::Constructor(table)) = &declaration.kind
+                            else {
+                                return None;
+                            };
+                            match &declaration.table_name {
+                                None if table.name == expected_prefix => Some(table.name.clone()),
+                                Some(pb::declaration::TableName::DefaultName(prefix))
+                                    if prefix == expected_prefix =>
+                                {
+                                    Some(table.name.clone())
+                                }
+                                _ => None,
+                            }
+                        })
+                        .collect();
+                    let [expected_constructor]: [String; 1] = constructors.try_into().unwrap();
                     for phase in phases {
                         rendered.push_str(&renderer.render(&phase).unwrap());
                         let response = run(&mut engine, id, phase);
@@ -20918,14 +21771,7 @@ mod source_provider_context {
                                     else {
                                         panic!("applied table result")
                                     };
-                                    assert_eq!(
-                                        call.func,
-                                        if target.starts_with("(constructor") {
-                                            "Target"
-                                        } else {
-                                            "Item"
-                                        }
-                                    );
+                                    assert_eq!(call.func, expected_constructor);
                                     extracted = true;
                                 }
                                 _ => (),

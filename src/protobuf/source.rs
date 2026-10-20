@@ -218,12 +218,6 @@ struct SourceRuleset {
     published_rules: usize,
 }
 
-// Source aliases may have different physical spellings. Retain authored table
-// provenance so two native tables cannot silently become compatible resupply of
-// one wire declaration. Graph snapshots restore this index with its scope.
-#[derive(Clone, Default)]
-struct SourceTableNames(HashMap<String, String>);
-
 struct SourceScope {
     graph: EGraph,
     program: pb::Program,
@@ -1113,15 +1107,6 @@ impl Source {
             | Submission::PrintFunction(PrintFunction { program, .. }) = &mut submission
             {
                 project_source_nodes(&self.program.nodes, first_node, program)?;
-                let types = self.graph.authoring_type_info();
-                let logical_name = |name: &mut String| {
-                    if let Some(function) = types.get_func_type(name)
-                        && let Some(ast::TableName::Public(logical)) = &function.table_name
-                    {
-                        *name = logical.clone();
-                    }
-                };
-                map_callable_names(program, logical_name, logical_name);
             }
             Ok(submission)
         });
@@ -1194,13 +1179,17 @@ impl Source {
         let mut registered_commands = None;
         // Definition registration keeps the native destination context current
         // and supplies empty table backends for later literal function captures.
-        // Runtime Fail also retains a global Let's header.
         // Export the original resolved commands from this same registration;
         // resolving again would repeat provider work and require another graph.
         if let [command] = expanded.as_slice() {
             let mut header = command;
             while let Command::Fail(_, child) = header {
                 header = child;
+            }
+            if matches!(command, Command::Fail(..))
+                && matches!(header, Command::Action(Action::Let(..)))
+            {
+                return Err("source Fail does not support authored let bindings".into());
             }
             let definition = matches!(
                 header,
@@ -1412,7 +1401,10 @@ impl Source {
                 Command::Rewrite(_, _, subsume) => Some(RewriteKind::Directional(*subsume)),
                 Command::BiRewrite(..) => Some(RewriteKind::Bidirectional),
                 Command::Relation {
-                    span, name, inputs, ..
+                    span,
+                    name,
+                    inputs,
+                    table_name,
                 } => {
                     // Resolve the authored declaration in the producer's type
                     // environment, but do not export its desugared private row
@@ -1437,6 +1429,20 @@ impl Source {
                         })
                         .collect::<Result<_, String>>()?;
                     let span = self.span(span)?;
+                    let table_name = match table_name {
+                        None => None,
+                        Some(ast::TableName::Public(name)) => {
+                            Some(pb::declaration::TableName::PublicAlias(name.clone()))
+                        }
+                        Some(ast::TableName::Default(name)) => {
+                            Some(pb::declaration::TableName::DefaultName(name.clone()))
+                        }
+                        Some(ast::TableName::Internal(_)) => {
+                            return Err(
+                                "internal table names require separate source lowering".into()
+                            );
+                        }
+                    };
                     self.relations.insert(name.clone());
                     self.program.declarations.push(pb::Declaration {
                         kind: Some(pb::declaration::Kind::Relation(pb::Relation {
@@ -1444,6 +1450,7 @@ impl Source {
                             inputs,
                         })),
                         span,
+                        table_name,
                         ..Default::default()
                     });
                     continue;
@@ -1684,16 +1691,17 @@ impl Source {
                         span,
                         name,
                         presort_and_args: None,
-                        uf: None,
+                        uf,
                         proof_func: None,
                         container_rebuild: None,
                         proof_constructors: None,
                         unionable: true,
-                    } => {
+                    } if uf.as_ref().is_none_or(|(_, index)| index.is_none()) => {
                         let span = self.span(&span)?;
                         self.program.declarations.push(pb::Declaration {
                             kind: Some(pb::declaration::Kind::EqSort(pb::EqSort {
                                 name,
+                                uf_parent: uf.map(|(parent, _)| parent),
                                 ..Default::default()
                             })),
                             span,
@@ -1757,6 +1765,20 @@ impl Source {
                             .collect::<Result<_, String>>()?;
                         let output = self.sort(&function.schema.output)?;
                         let hidden = function.internal_hidden;
+                        let table_name = match &function.table_name {
+                            None => None,
+                            Some(ast::TableName::Public(name)) => {
+                                Some(pb::declaration::TableName::PublicAlias(name.clone()))
+                            }
+                            Some(ast::TableName::Default(name)) => {
+                                Some(pb::declaration::TableName::DefaultName(name.clone()))
+                            }
+                            Some(ast::TableName::Internal(_)) => {
+                                return Err(
+                                    "internal table names require separate source lowering".into(),
+                                );
+                            }
+                        };
                         let kind = match function.subtype {
                             ast::FunctionSubtype::Constructor => {
                                 let cost = function.cost.map(|cost| {
@@ -1792,6 +1814,7 @@ impl Source {
                         self.program.declarations.push(pb::Declaration {
                             kind: Some(kind),
                             hidden,
+                            table_name,
                             span,
                             ..Default::default()
                         });
@@ -2118,37 +2141,6 @@ impl Source {
     // One phase owns exactly its completed command prefix and new definitions;
     // immutable rule cursors remain publication-local, including failed macros.
     fn phase(&mut self, publish: Vec<usize>, first_rule: usize) -> Result<pb::Program, String> {
-        let mut tables = self
-            .graph
-            .extension_state::<SourceTableNames>()
-            .cloned()
-            .unwrap_or_default();
-        for declaration in &self.program.declarations {
-            let physical = match &declaration.kind {
-                Some(pb::declaration::Kind::Constructor(table)) => &table.name,
-                Some(pb::declaration::Kind::Function(table)) => &table.name,
-                Some(pb::declaration::Kind::Relation(table)) => &table.name,
-                _ => continue,
-            };
-            let logical = self
-                .graph
-                .authoring_type_info()
-                .get_func_type(physical)
-                .and_then(|table| match &table.table_name {
-                    Some(ast::TableName::Public(name)) => Some(name.clone()),
-                    _ => None,
-                })
-                .unwrap_or_else(|| physical.clone());
-            if tables
-                .0
-                .insert(logical.clone(), physical.clone())
-                .is_some_and(|previous| previous != *physical)
-            {
-                return Err(format!(
-                    "distinct source tables share logical name {logical:?}"
-                ));
-            }
-        }
         // The private arena retains every authored occurrence for later
         // publication. A packet needs only its new validation obligations and
         // occurrences referenced by the versions being published now.
@@ -2220,7 +2212,6 @@ impl Source {
             rules,
             rulesets,
         };
-        *self.graph.extension_state_or_default::<SourceTableNames>() = tables;
         Ok(program)
     }
 
@@ -3869,9 +3860,10 @@ impl Renderer {
             }
             names
         } else {
-            // Complete reconciled indices are append-stable across resupply and
-            // request-local arena/declaration order. Aliases exist only in text;
-            // execution and stored definitions retain their original names.
+            // Reserve a bounded alias at the first canonical occurrence, even
+            // when an EqSort references a table before its declaration. Later
+            // headers reuse it; append-stable definition order and scope restore
+            // preserve earlier aliases without decoding generated spellings.
             let mut names = NativeNames::default();
             for (index, declaration) in prepared.definitions.declarations.iter().enumerate() {
                 let (namespace, logical) = match &declaration.kind {
@@ -3886,23 +3878,64 @@ impl Renderer {
                 // aliases. A logical spelling equal to this alias is projected
                 // normally and cannot acquire another declaration's identity.
                 let alias = format!("__egglog_source_{namespace}_{index}");
-                if self.session.graph.get_sort_by_name(&alias).is_some()
-                    || self.session.graph.get_function(&alias).is_some()
-                    || self.session.graph.type_info().is_primitive(&alias)
-                {
-                    return Err(TransportError(format!(
-                        "source alias {alias:?} collides with a native name"
-                    )));
-                }
                 let target = if namespace == "sort" {
                     &mut names.sorts
                 } else {
                     &mut names.callables
                 };
-                target.insert(native_name(namespace, logical), alias);
+                target
+                    .entry(native_name(namespace, logical))
+                    .or_insert(alias);
+                if let Some(pb::declaration::Kind::EqSort(sort)) = &declaration.kind
+                    && let Some(parent) = &sort.uf_parent
+                {
+                    names
+                        .callables
+                        .entry(native_name("call", parent))
+                        .or_insert_with(|| format!("__egglog_source_call_{index}"));
+                }
+            }
+            for alias in names.sorts.values().chain(names.callables.values()) {
+                if self.session.graph.get_sort_by_name(alias).is_some()
+                    || self.session.graph.get_function(alias).is_some()
+                    || self.session.graph.type_info().is_primitive(alias)
+                {
+                    return Err(TransportError(format!(
+                        "source alias {alias:?} collides with a native name"
+                    )));
+                }
             }
             names
         };
+        let sort_aliases: HashSet<_> = authored.sorts.values().cloned().collect();
+        for parent in prepared
+            .definitions
+            .declarations
+            .iter()
+            .filter_map(|declaration| match &declaration.kind {
+                Some(pb::declaration::Kind::EqSort(sort)) => sort.uf_parent.as_ref(),
+                _ => None,
+            })
+        {
+            let alias = authored
+                .callables
+                .get(&native_name("call", parent))
+                .cloned()
+                .unwrap_or_else(|| parent.clone());
+            if sort_aliases.contains(&alias)
+                || self.session.graph.get_sort_by_name(&alias).is_some()
+                || self.session.graph.get_function(&alias).is_some()
+                || self.session.graph.type_info().is_primitive(&alias)
+            {
+                return Err(TransportError(format!(
+                    "parent table alias {alias:?} collides with a native name"
+                )));
+            }
+            authored
+                .callables
+                .entry(native_name("call", parent))
+                .or_insert(alias);
+        }
         let mut sort_names = self.sort_names.clone();
         let mut definitions = prepared.definitions.clone();
         project_names(&mut definitions, &prepared.definitions);
@@ -3980,7 +4013,7 @@ impl Renderer {
                     span: ast::Span::Panic,
                     name: sort.name.clone(),
                     presort_and_args: None,
-                    uf: None,
+                    uf: sort.uf_parent.clone().map(|parent| (parent, None)),
                     proof_func: None,
                     container_rebuild: None,
                     proof_constructors: None,
@@ -3990,6 +4023,10 @@ impl Renderer {
                     .resolve_command_before_proofs(command.clone())
                     .map_err(|error| TransportError(error.to_string()))?;
                 source_sort_names(&mut command, &authored);
+                command = command.map_symbols(
+                    &mut |name: String| authored.callables.get(&name).cloned().unwrap_or(name),
+                    &mut |name| name,
+                );
                 text_native
                     .resolve_command_before_proofs(command)
                     .map_err(|error| TransportError(error.to_string()))?;
@@ -4273,6 +4310,7 @@ fn source_sort_names(command: &mut Command, authored: &NativeNames) {
     let Command::Sort {
         name,
         presort_and_args,
+        uf,
         ..
     } = command
     else {
@@ -4280,6 +4318,13 @@ fn source_sort_names(command: &mut Command, authored: &NativeNames) {
     };
     if let Some(text) = authored.sorts.get(name) {
         *name = text.clone();
+    }
+    if let Some((parent, index)) = uf {
+        for name in std::iter::once(parent).chain(index.iter_mut()) {
+            if let Some(text) = authored.callables.get(name) {
+                *name = text.clone();
+            }
+        }
     }
     if let Some((_, args)) = presort_and_args {
         for arg in args {
@@ -4506,7 +4551,7 @@ fn render_prepared(
             if let Some(pb::declaration::Kind::EqSort(sort)) = &declaration.kind {
                 commands.push(Command::Sort {
                     span: native_span(program, declaration.span.as_ref(), native_spans)?, name: sort.name.clone(), presort_and_args: None,
-                    uf: None, proof_func: None, container_rebuild: None, proof_constructors: None, unionable: true,
+                    uf: sort.uf_parent.clone().map(|parent| (parent, None)), proof_func: None, container_rebuild: None, proof_constructors: None, unionable: true,
                 });
             }
         }
@@ -4515,17 +4560,13 @@ fn render_prepared(
         for &index in declaration_order {
             let declaration = &program.declarations[index];
             let span = native_span(program, declaration.span.as_ref(), native_spans)?;
-            let table_name = if dialect == Dialect::Experimental {
-                let name = match &declaration.kind {
-                    Some(pb::declaration::Kind::Constructor(table)) => Some(&table.name),
-                    Some(pb::declaration::Kind::Function(table)) => Some(&table.name),
-                    Some(pb::declaration::Kind::Relation(table)) => Some(&table.name),
-                    _ => None,
-                };
-                name.map(|name| ast::TableName::Public(table_names[name].clone()))
-            } else {
-                None
+            let name = match &declaration.kind {
+                Some(pb::declaration::Kind::Constructor(table)) => Some(&table.name),
+                Some(pb::declaration::Kind::Function(table)) => Some(&table.name),
+                Some(pb::declaration::Kind::Relation(table)) => Some(&table.name),
+                _ => None,
             };
+            let table_name = name.map(|name| native_table_name(declaration, &table_names[name]));
             commands.push(
                 match declaration
                     .kind

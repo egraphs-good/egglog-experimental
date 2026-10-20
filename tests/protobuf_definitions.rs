@@ -676,6 +676,24 @@ fn ruleset_names_cycles_options_and_retention_obey_occurrence_contract() {
     let new = reconcile_rulesets(&unanchored, &mut destination).unwrap();
     assert_ne!(new.rulesets[0], retained_child);
     assert_ne!(new.rules[0], 0);
+
+    let previous = destination.clone();
+    let missing = destination.rulesets.len();
+    assert_eq!(
+        retain_rulesets(&mut destination, &[missing]).unwrap_err(),
+        "ruleset index out of bounds"
+    );
+    assert_eq!(destination, previous);
+
+    // A later saved-code traversal error must also preserve every input arena.
+    let mut malformed = relation_definition_fixture(false);
+    malformed.nodes[0].kind = None;
+    let previous = malformed.clone();
+    assert_eq!(
+        retain_rulesets(&mut malformed, &[]).unwrap_err(),
+        "missing retained node kind"
+    );
+    assert_eq!(malformed, previous);
 }
 
 #[test]
@@ -2361,6 +2379,7 @@ fn box_definition() -> pb::Program {
                         }),
                         ..Default::default()
                     }),
+                    ..Default::default()
                 })),
                 ..Default::default()
             },

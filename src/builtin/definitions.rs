@@ -14,6 +14,18 @@ enum Namespace {
 
 /// Existing declaration tags select three namespaces; spellings may coincide.
 fn declaration_identity(d: &pb::Declaration) -> Result<(Namespace, &str), String> {
+    if d.table_name.is_some()
+        && !matches!(
+            d.kind,
+            Some(
+                pb::declaration::Kind::Constructor(_)
+                    | pb::declaration::Kind::Function(_)
+                    | pb::declaration::Kind::Relation(_)
+            )
+        )
+    {
+        return Err("only table declarations may have a reflective table prefix".into());
+    }
     if d.hidden
         && !matches!(
             d.kind,
@@ -23,7 +35,12 @@ fn declaration_identity(d: &pb::Declaration) -> Result<(Namespace, &str), String
         return Err("only constructors and functions may be hidden".into());
     }
     let identity = match d.kind.as_ref().ok_or("missing declaration kind")? {
-        pb::declaration::Kind::EqSort(s) => (Namespace::EqSort, s.name.as_str()),
+        pb::declaration::Kind::EqSort(s) => {
+            if s.uf_parent.as_deref() == Some("") {
+                return Err("empty equality-sort parent table key".into());
+            }
+            (Namespace::EqSort, s.name.as_str())
+        }
         pb::declaration::Kind::HostSortFamily(s) => (Namespace::HostSortFamily, s.name.as_str()),
         pb::declaration::Kind::Constructor(c) => (Namespace::Callable, c.name.as_str()),
         pb::declaration::Kind::Function(f) => (Namespace::Callable, f.name.as_str()),
@@ -35,6 +52,59 @@ fn declaration_identity(d: &pb::Declaration) -> Result<(Namespace, &str), String
         return Err("empty declaration name".into());
     }
     Ok(identity)
+}
+
+// A parent key is a non-owning symbolic reference, not a declaration dependency.
+// Check one combined header batch so either arrival order is safe before effects;
+// no native rows, executable bodies or persistent signature catalog are needed.
+fn validate_uf_parents(program: &pb::Program) -> Result<(), String> {
+    let callables: HashMap<_, _> = program
+        .declarations
+        .iter()
+        .filter_map(|declaration| match declaration.kind.as_ref()? {
+            pb::declaration::Kind::Constructor(c) => Some((c.name.as_str(), declaration)),
+            pb::declaration::Kind::Function(f) => Some((f.name.as_str(), declaration)),
+            pb::declaration::Kind::Relation(r) => Some((r.name.as_str(), declaration)),
+            pb::declaration::Kind::Primitive(p) => Some((p.name.as_str(), declaration)),
+            pb::declaration::Kind::HostPrimitive(p) => Some((p.name.as_str(), declaration)),
+            _ => None,
+        })
+        .collect();
+    for sort in program
+        .declarations
+        .iter()
+        .filter_map(|declaration| match &declaration.kind {
+            Some(pb::declaration::Kind::EqSort(sort)) => Some(sort),
+            _ => None,
+        })
+    {
+        let Some(parent) = sort.uf_parent.as_deref() else {
+            continue;
+        };
+        let Some(declaration) = callables.get(parent) else {
+            continue;
+        };
+        let (inputs, output) = match declaration.kind.as_ref().unwrap() {
+            pb::declaration::Kind::Constructor(c) => (&c.inputs, Some(c.output)),
+            pb::declaration::Kind::Function(f) => (&f.inputs, Some(f.output)),
+            pb::declaration::Kind::Relation(r) => (&r.inputs, None),
+            _ => return Err(format!("parent key {parent} must name a table")),
+        };
+        let mut columns = inputs.iter().map(|arg| arg.sort).chain(output);
+        for _ in 0..2 {
+            let column = columns
+                .next()
+                .and_then(|index| program.sorts.get(index as usize));
+            if !matches!(column.and_then(|column| column.kind.as_ref()), Some(pb::sort::Kind::Eq(name)) if name == &sort.name)
+            {
+                return Err(format!(
+                    "parent table {parent} requires first two stored columns of equality sort {}",
+                    sort.name
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Visits every node edge in the admitted saved-code/value shapes. Unknown
@@ -711,14 +781,25 @@ pub fn reconcile_rulesets(
     })
 }
 
-/// Retain exactly the closures of successfully published bindings. Returns the
+/// Transactionally retain the closures of successfully published bindings.
+/// Errors leave the supplied Program unchanged. Returns the
 /// old ruleset/rule indices in their new arena order so derived native handles
 /// can be retained with the same relocation. No native state is reconstructed.
 pub fn retain_rulesets(
     program: &mut pb::Program,
     published: &[usize],
 ) -> Result<(Vec<usize>, Vec<usize>), String> {
-    let mut staged = program.clone();
+    let (retained, sets, rules) = retain_rulesets_owned(program.clone(), published)?;
+    *program = retained;
+    Ok((sets, rules))
+}
+
+// Installation already owns a disposable candidate; preserve its retained
+// payload allocations instead of copying the canonical arenas once more.
+pub(crate) fn retain_rulesets_owned(
+    mut staged: pb::Program,
+    published: &[usize],
+) -> Result<(pb::Program, Vec<usize>, Vec<usize>), String> {
     let roots: HashSet<_> = published.iter().copied().collect();
     let mut sets = HashSet::default();
     let mut rules = HashSet::default();
@@ -748,10 +829,13 @@ pub fn retain_rulesets(
         .enumerate()
         .map(|(new, old)| (*old, new))
         .collect();
-    staged.rulesets = retained_sets
-        .iter()
-        .map(|&index| {
-            let mut ruleset = staged.rulesets[index].clone();
+    staged.rulesets = std::mem::take(&mut staged.rulesets)
+        .into_iter()
+        .enumerate()
+        .filter_map(|(index, mut ruleset)| {
+            if !sets.contains(&index) {
+                return None;
+            }
             if !roots.contains(&index) {
                 ruleset.name = None;
             }
@@ -770,16 +854,16 @@ pub fn retain_rulesets(
                     }
                 }
             }
-            ruleset
+            Some(ruleset)
         })
         .collect();
-    staged.rules = retained_rules
-        .iter()
-        .map(|&i| staged.rules[i].clone())
+    staged.rules = std::mem::take(&mut staged.rules)
+        .into_iter()
+        .enumerate()
+        .filter_map(|(index, rule)| rules.contains(&index).then_some(rule))
         .collect();
     retain_imported_closures(&mut staged, &pb::Program::default())?;
-    *program = staged;
-    Ok((retained_sets, retained_rules))
+    Ok((staged, retained_sets, retained_rules))
 }
 
 struct NodeImport<'a> {
@@ -912,6 +996,11 @@ fn compatible_semantics(
     let mut roots = [vec![], vec![]];
     let mut declarations = [a.clone(), b.clone()];
     for (d, roots) in declarations.iter_mut().zip(&mut roots) {
+        if let Some(pb::declaration::TableName::DefaultName(name)) = &d.table_name
+            && declaration_identity(d)?.1 == name
+        {
+            d.table_name = None;
+        }
         d.bindings = None;
         d.span = None;
         d.doc = None;
@@ -1305,6 +1394,7 @@ pub fn reconcile_declarations(
             added.push(true);
         }
     }
+    validate_uf_parents(&staged)?;
     validate_bindings(&staged)?;
     retain_imported_closures(&mut staged, destination)?;
     *destination = staged;
@@ -1325,12 +1415,12 @@ fn retain_imported_closures(p: &mut pb::Program, previous: &pb::Program) -> Resu
     );
     let mut files = (0..previous.files.len() as u32).collect::<HashSet<_>>();
     let mut pending = nodes.iter().copied().collect::<Vec<_>>();
-    for d in &p.declarations {
+    for d in &mut p.declarations {
         if let Some(s) = d.span {
             files.insert(s.file);
         }
         declaration_refs(
-            &mut d.clone(),
+            d,
             |i| {
                 sorts.insert(*i);
                 Ok(())
@@ -1341,9 +1431,9 @@ fn retain_imported_closures(p: &mut pb::Program, previous: &pb::Program) -> Resu
             },
         )?;
     }
-    for rule in &p.rules {
+    for rule in &mut p.rules {
         rule_refs(
-            &mut rule.clone(),
+            rule,
             |root| {
                 pending.push(*root);
                 Ok(())
@@ -1367,18 +1457,15 @@ fn retain_imported_closures(p: &mut pb::Program, previous: &pb::Program) -> Resu
             continue;
         }
         nodes.insert(i);
-        let n = &p.nodes[i as usize];
+        let n = &mut p.nodes[i as usize];
         sorts.insert(n.sort_id);
         if let Some(s) = n.span {
             files.insert(s.file);
         }
-        node_edges(
-            &mut n.kind.clone().ok_or("missing retained node kind")?,
-            |i| {
-                pending.push(*i);
-                Ok(())
-            },
-        )?;
+        node_edges(n.kind.as_mut().ok_or("missing retained node kind")?, |i| {
+            pending.push(*i);
+            Ok(())
+        })?;
     }
     let mut pending = sorts.iter().copied().collect::<Vec<_>>();
     let mut walked = HashSet::default();

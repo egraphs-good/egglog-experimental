@@ -186,6 +186,7 @@ impl Macro<Vec<Command>> for SetCostDeclarations {
                             name: cost_table_name,
                             table_name: table_name.as_ref().map(|table_name| {
                                 let (egglog::ast::TableName::Public(name)
+                                | egglog::ast::TableName::Default(name)
                                 | egglog::ast::TableName::Internal(name)) = table_name;
                                 egglog::ast::TableName::Internal(get_cost_table_name(name))
                             }),
