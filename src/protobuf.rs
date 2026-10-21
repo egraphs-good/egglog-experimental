@@ -30,10 +30,12 @@ use egglog::{ArcSort, EGraph, Term, TermDag, TermId, Value, span};
 use egglog::{ExecutionEvent, ExecutionOrigin, RepeatContinuation};
 use egglog_ast::span::{EgglogSpan, SrcFile};
 use num::{BigInt, Integer, One, Zero};
+#[cfg(test)]
 use prost::Message;
 
 pub mod cost_model;
 mod freeze;
+mod history;
 mod proof;
 mod report;
 pub mod source;
@@ -123,6 +125,9 @@ pub struct Engine {
     next_id: u64,
     next_cost_model: u64,
     graphs: HashMap<u64, Session>,
+    // Audit ownership never enters Session's compile-only preparation clones.
+    histories: HashMap<u64, history::HistoryLog>,
+    next_history: u64,
     extension: Option<Arc<dyn NativeExtension>>,
 }
 
@@ -438,9 +443,10 @@ impl Engine {
         }
     }
 
-    /// Decodes a creation request and returns an encoded handle.
-    pub fn create(&mut self, bytes: &[u8]) -> Result<Vec<u8>, TransportError> {
-        let request = pb::CreateEGraphRequest::decode(bytes)?;
+    fn create_request(
+        &mut self,
+        request: pb::CreateEGraphRequest,
+    ) -> Result<pb::CreateEGraphResponse, TransportError> {
         let mode =
             pb::ExecutionMode::try_from(request.options.as_ref().map_or(0, |o| o.execution_mode))
                 .map_err(|_| TransportError("unknown execution mode".into()))?;
@@ -535,13 +541,13 @@ impl Engine {
         );
         Ok(pb::CreateEGraphResponse {
             egraph_id: self.next_id,
-        }
-        .encode_to_vec())
+        })
     }
 
-    /// Decodes a clone request, retaining native execution state and independent mutations.
-    pub fn clone_egraph(&mut self, bytes: &[u8]) -> Result<Vec<u8>, TransportError> {
-        let request = pb::CloneEGraphRequest::decode(bytes)?;
+    fn clone_request(
+        &mut self,
+        request: pb::CloneEGraphRequest,
+    ) -> Result<pb::CloneEGraphResponse, TransportError> {
         let mut graph = self
             .graphs
             .get(&request.egraph_id)
@@ -553,25 +559,31 @@ impl Engine {
             .checked_add(1)
             .ok_or_else(|| TransportError("handle space exhausted".into()))?;
         self.graphs.insert(self.next_id, graph);
+        if let Some(history) = self.histories.get(&request.egraph_id).cloned() {
+            self.histories.insert(self.next_id, history);
+        }
         Ok(pb::CloneEGraphResponse {
             egraph_id: self.next_id,
-        }
-        .encode_to_vec())
+        })
     }
 
-    /// Decodes a destruction request and invalidates the addressed handle.
-    pub fn destroy(&mut self, bytes: &[u8]) -> Result<Vec<u8>, TransportError> {
-        let request = pb::DestroyEGraphRequest::decode(bytes)?;
+    fn destroy_request(
+        &mut self,
+        request: pb::DestroyEGraphRequest,
+    ) -> Result<pb::DestroyEGraphResponse, TransportError> {
         self.graphs
             .remove(&request.egraph_id)
             .ok_or_else(|| TransportError("unknown egraph_id".into()))?;
-        Ok(pb::DestroyEGraphResponse {}.encode_to_vec())
+        if let Some(history) = self.histories.get_mut(&request.egraph_id) {
+            history.closed = true;
+        }
+        Ok(pb::DestroyEGraphResponse {})
     }
 
-    /// Restore a directly saved scope, retaining active native pop state only.
-    /// Invalid/stale pairs leave both handles untouched; saved survives success.
-    pub fn return_to(&mut self, bytes: &[u8]) -> Result<Vec<u8>, TransportError> {
-        let request = pb::ReturnToEGraphRequest::decode(bytes)?;
+    fn return_request(
+        &mut self,
+        request: pb::ReturnToEGraphRequest,
+    ) -> Result<pb::ReturnToEGraphResponse, TransportError> {
         if request.active_id == request.saved_id {
             return Err(TransportError(
                 "active and saved handles must differ".into(),
@@ -598,13 +610,20 @@ impl Engine {
         saved.graph = active.graph;
         saved.request = active.request;
         self.graphs.insert(request.saved_id, saved);
-        Ok(pb::ReturnToEGraphResponse {}.encode_to_vec())
+        if let Some(active) = self.histories.get(&request.active_id).cloned() {
+            self.histories
+                .get_mut(&request.saved_id)
+                .expect("paired handles inherit recording")
+                .merge(&active);
+            self.histories.get_mut(&request.active_id).unwrap().closed = true;
+        }
+        Ok(pb::ReturnToEGraphResponse {})
     }
 
-    /// Queries or updates native resources without cloning logical/execution
-    /// state. Allocation failures retain the native thread-pool failure boundary.
-    pub fn configure_resources(&mut self, bytes: &[u8]) -> Result<Vec<u8>, TransportError> {
-        let request = pb::ConfigureEGraphResourcesRequest::decode(bytes)?;
+    fn configure_request(
+        &mut self,
+        request: pb::ConfigureEGraphResourcesRequest,
+    ) -> Result<pb::ConfigureEGraphResourcesResponse, TransportError> {
         let operation = request
             .operation
             .ok_or_else(|| TransportError("missing or unknown resource operation".into()))?;
@@ -656,13 +675,13 @@ impl Engine {
             threads: u64::try_from(session.graph.num_threads())
                 .map_err(|_| TransportError("native thread count exceeds uint64".into()))?,
             no_decomp: session.graph.no_decomp,
-        }
-        .encode_to_vec())
+        })
     }
 
-    /// Executes only the decoded program and returns encoded results and prefix errors.
-    pub fn run(&mut self, bytes: &[u8]) -> Result<Vec<u8>, TransportError> {
-        let request = pb::RunProgramRequest::decode(bytes)?;
+    fn run_request(
+        &mut self,
+        request: pb::RunProgramRequest,
+    ) -> Result<pb::RunProgramResponse, TransportError> {
         let session = self
             .graphs
             .get_mut(&request.egraph_id)
@@ -681,7 +700,7 @@ impl Engine {
                 message: "missing program".into(),
                 ..Default::default()
             });
-            return Ok(response.encode_to_vec());
+            return Ok(response);
         };
         response.files = program.files.clone();
         let prepared = if request.profile {
@@ -693,14 +712,14 @@ impl Engine {
             Ok(prepared) => prepared,
             Err(error) => {
                 response.error = Some(*error.0);
-                return Ok(response.encode_to_vec());
+                return Ok(response);
             }
         };
         let mut context = match session.install(prepared, &mut response) {
             Ok(context) => context,
             Err(error) => {
                 response.error = Some(*error);
-                return Ok(response.encode_to_vec());
+                return Ok(response);
             }
         };
         context.include_run_reports = request.include_run_reports;
@@ -765,7 +784,7 @@ impl Engine {
             }
         }
         response.profile.as_mut().unwrap().complete = response.error.is_none();
-        Ok(response.encode_to_vec())
+        Ok(response)
     }
 }
 

@@ -441,10 +441,17 @@ impl Default for EGraph {
 impl EGraph {
     /// Create a byte engine with the adapter's supported i64 cost domain.
     pub fn new() -> Result<Self, TypedError> {
+        Self::with_recording(false)
+    }
+
+    /// Create a byte engine with optional structured execution history.
+    /// Recording is unbounded when enabled and independent of logical Freeze.
+    pub fn with_recording(record_history: bool) -> Result<Self, TypedError> {
         let mut engine = crate::protobuf::Engine::default();
         // Creation's fixed i64 cost domain is an adapter requirement, not a
         // Rust primitive callable registry.
         let request = pb::CreateEGraphRequest {
+            record_history,
             sorts: vec![pb::Sort {
                 kind: Some(pb::sort::Kind::Family(pb::HostSort {
                     name: "i64".into(),
@@ -833,6 +840,7 @@ impl EGraph {
     }
 
     /// Observe independent logical state through Freeze bytes without evaluating roots.
+    /// This observation is included when execution recording is enabled.
     pub fn freeze(&mut self) -> Result<super::Snapshot, TypedError> {
         let mut packer = Packer::default();
         packer.program.commands.push(pb::Command {
@@ -852,6 +860,25 @@ impl EGraph {
             return Err(TypedError::Decode("extra Freeze observations".into()));
         }
         super::Snapshot::from_export(snapshot, self.captures.values().cloned().collect())
+    }
+
+    /// Retrieve structured request/outcome history; errors when recording is off.
+    /// Retrieval adds no entry and does not require healthy publication state.
+    /// A poisoned native engine remains inspectable through this read-only audit.
+    pub fn history(&self) -> Result<pb::GetHistoryResponse, TypedError> {
+        let bytes = self
+            .engine
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .get_history(
+                &pb::GetHistoryRequest {
+                    egraph_id: self.handle,
+                }
+                .encode_to_vec(),
+            )
+            .map_err(|error| TypedError::Invalid(error.to_string()))?;
+        pb::GetHistoryResponse::decode(bytes.as_slice())
+            .map_err(|error| TypedError::Decode(error.to_string()))
     }
 
     /// Count visible portable table rows without evaluating any expression.
@@ -1248,6 +1275,45 @@ fn adopt(
 mod tests {
     use super::*;
     use crate::typed::Ruleset;
+
+    #[test]
+    fn structured_history_is_opt_in_and_tracks_typed_observations_and_clones() {
+        assert!(EGraph::new().unwrap().history().is_err());
+        let mut graph = EGraph::with_recording(true).unwrap();
+        assert_eq!(graph.history().unwrap().entries.len(), 1);
+        graph.stats().unwrap();
+        let mut cloned = graph.try_clone().unwrap();
+        assert_eq!(graph.history().unwrap().entries.len(), 3);
+        assert_eq!(cloned.history().unwrap().entries.len(), 3);
+        cloned.freeze().unwrap();
+        assert_eq!(cloned.history().unwrap().entries.len(), 4);
+        assert_eq!(graph.history().unwrap().entries.len(), 3);
+        graph.push().unwrap();
+        graph.stats().unwrap();
+        graph.pop().unwrap();
+        let history = graph.history().unwrap();
+        assert!(history.entries.iter().any(|entry| matches!(
+            entry.outcome,
+            Some(pb::history_entry::Outcome::ReturnToResponse(_))
+        )));
+        assert_eq!(graph.history().unwrap(), history);
+    }
+
+    #[test]
+    fn structured_history_remains_readable_after_engine_mutex_is_poisoned() {
+        let graph = EGraph::with_recording(true).unwrap();
+        let engine = graph.engine.clone();
+        assert!(
+            std::thread::spawn(move || {
+                let _guard = engine.lock().unwrap();
+                panic!("native unwind while holding engine");
+            })
+            .join()
+            .is_err()
+        );
+        assert_eq!(graph.history().unwrap().entries.len(), 1);
+        assert!(graph.try_clone().is_err());
+    }
 
     #[test]
     fn generated_predicate_and_size_views_execute_encoded_method_requests() {

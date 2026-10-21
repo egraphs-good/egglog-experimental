@@ -697,8 +697,8 @@ message MaybeValue {
 // Code evaluates args in order. Generic transport, inspection and remapping
 // never materialize/unpickle or invoke host Debug hooks. Opaque bytes/args may
 // be retained without a codec; explicit trusted materialization, evaluation or
-// Freeze encoding requires one or fails. This declares future host obligations,
-// including reference-aware nullary-family rebuilding, not existing runtime support.
+// Freeze encoding requires a reference-preserving codec or fails. Nullary-family
+// rebuilding must also preserve explicit value references.
 message CustomValue {
   bytes payload = 1;
   repeated uint32 args = 2 [packed = true]; // index into the enclosing `nodes`
@@ -1112,7 +1112,6 @@ message FunctionApplication {}
 // Malformed individual bindings and conflicting resupply are installation errors.
 // Cross-definition Python/Rust binding collisions are generation errors for all
 // explicit/derived combinations, never silent fallback, overwrite or renaming.
-// High-level generators and these runtime checks remain unimplemented.
 message SortBindings {
   TypeBinding python = 1;
   TypeBinding rust = 2;
@@ -1764,7 +1763,6 @@ enum Extractor {
 // HostSortFamily and HostPrimitive describe the catalog, including generic
 // signatures, presentation patterns and all referenced sorts. These graphs may
 // contain Sort.var; the reconstruction data and concrete definitions may not.
-// Host binding and export remain unimplemented; never silently omit definitions.
 //
 // Return EGraphSnapshot with the handle's logical options and this Program.
 // Do not export resource settings such as threads. See EGraphSnapshot for
@@ -1880,6 +1878,7 @@ service EgglogService {
   rpc ReturnToEGraph(ReturnToEGraphRequest) returns (ReturnToEGraphResponse);
   rpc ConfigureEGraphResources(ConfigureEGraphResourcesRequest) returns (ConfigureEGraphResourcesResponse);
   rpc RunProgram(RunProgramRequest) returns (RunProgramResponse);
+  rpc GetHistory(GetHistoryRequest) returns (GetHistoryResponse);
 }
 
 // Immutable logical settings, shared by creation and snapshots. cost_sort
@@ -1981,6 +1980,11 @@ message CreateEGraphRequest {
   // rules or change typing/admission. Not part of logical snapshots or source
   // replay. Local rule no_decomp=true still applies when this global is false.
   bool no_decomp = 6;
+
+  // Retain structured request/outcome history for this handle. Off by default;
+  // not a logical option and never restored by Freeze. Clone inherits this
+  // choice. GetHistory specifies retention, observation and lifecycle behavior.
+  bool record_history = 7;
 }
 
 message CreateEGraphResponse {
@@ -2100,6 +2104,76 @@ message ConfigureEGraphResourcesResponse {
 
   // Actual current native planning default after query/update, not an estimate.
   bool no_decomp = 2;
+}
+
+// Retrieve the audit selected at successful creation. Disabled recording and
+// unknown handles are lifecycle errors, distinct from an empty history.
+// Record decoded Create, Clone, Destroy, ReturnTo, ConfigureResources and Run
+// requests, including resource queries and every Program observation such as
+// Freeze. Preserve original submitted messages, request-local arenas, actual
+// responses (including errors and completed-prefix outputs), and their order.
+// GetHistory is never recorded and cannot recursively retain its own export.
+// Undecodable requests and failed creation have no addressable typed history.
+//
+// Clone shares its immutable past and then retains independent continuations.
+// A successful ReturnTo joins both ordered audits, retaining each shared
+// exchange once; restoring logical state never rolls audit history back.
+// Consumed/destroyed handles retain a closed audit until their owning service
+// instance is dropped. Later rejected requests addressing them may be recorded.
+// Recording off retains no accumulating request log. Recording on is unbounded.
+// Native host implementations remain external. This is neither an engine
+// checkpoint nor a guarantee of deterministic or side-effect-free replay.
+message GetHistoryRequest {
+  uint64 egraph_id = 1;
+}
+
+message GetHistoryResponse {
+  repeated HistoryEntry entries = 1;
+  // Effective resources immediately after the original successful creation,
+  // before subsequent exchanges. Clone inherits this same initial context.
+  ConfigureEGraphResourcesResponse initial_resources = 2 [(buf.validate.field).required = true];
+  // True when the addressed native handle has been destroyed or consumed.
+  bool closed = 3;
+}
+
+// One submission and its actual outcome. The response kind must match the
+// request kind. Lifecycle/transport rejection has no fabricated typed response.
+// An interrupted operation retained its request but returned no response (for
+// example a native host callback unwound); no outputs or effects are inferred.
+message HistoryEntry {
+  option (buf.validate.message).cel = {
+    id: "history_entry.matching_response"
+    message: "history response must match its request"
+    expression:
+      "has(this.transport_error) || has(this.interrupted) || "
+      "(has(this.create) && has(this.create_response)) || "
+      "(has(this.clone) && has(this.clone_response)) || "
+      "(has(this.destroy) && has(this.destroy_response)) || "
+      "(has(this.return_to) && has(this.return_to_response)) || "
+      "(has(this.configure_resources) && has(this.configure_resources_response)) || "
+      "(has(this.run_program) && has(this.run_program_response))"
+  };
+  oneof request {
+    option (buf.validate.oneof).required = true;
+    // Preserve invalid submissions as audit data, not permission to execute them.
+    CreateEGraphRequest create = 1 [(buf.validate.field).ignore = IGNORE_ALWAYS];
+    CloneEGraphRequest clone = 2 [(buf.validate.field).ignore = IGNORE_ALWAYS];
+    DestroyEGraphRequest destroy = 3 [(buf.validate.field).ignore = IGNORE_ALWAYS];
+    ReturnToEGraphRequest return_to = 4 [(buf.validate.field).ignore = IGNORE_ALWAYS];
+    ConfigureEGraphResourcesRequest configure_resources = 5 [(buf.validate.field).ignore = IGNORE_ALWAYS];
+    RunProgramRequest run_program = 6 [(buf.validate.field).ignore = IGNORE_ALWAYS];
+  }
+  oneof outcome {
+    option (buf.validate.oneof).required = true;
+    CreateEGraphResponse create_response = 11;
+    CloneEGraphResponse clone_response = 12;
+    DestroyEGraphResponse destroy_response = 13;
+    ReturnToEGraphResponse return_to_response = 14;
+    ConfigureEGraphResourcesResponse configure_resources_response = 15;
+    RunProgramResponse run_program_response = 16;
+    string transport_error = 17;
+    Unit interrupted = 18;
+  }
 }
 
 // Native collection detail, independent of optional report serialization.

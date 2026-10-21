@@ -538,8 +538,8 @@ pub struct MaybeValue {
 /// Code evaluates args in order. Generic transport, inspection and remapping
 /// never materialize/unpickle or invoke host Debug hooks. Opaque bytes/args may
 /// be retained without a codec; explicit trusted materialization, evaluation or
-/// Freeze encoding requires one or fails. This declares future host obligations,
-/// including reference-aware nullary-family rebuilding, not existing runtime support.
+/// Freeze encoding requires a reference-preserving codec or fails. Nullary-family
+/// rebuilding must also preserve explicit value references.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct CustomValue {
     #[prost(bytes = "vec", tag = "1")]
@@ -922,7 +922,6 @@ pub struct FunctionApplication {
 /// Malformed individual bindings and conflicting resupply are installation errors.
 /// Cross-definition Python/Rust binding collisions are generation errors for all
 /// explicit/derived combinations, never silent fallback, overwrite or renaming.
-/// High-level generators and these runtime checks remain unimplemented.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct SortBindings {
     #[prost(message, optional, tag = "1")]
@@ -1582,7 +1581,6 @@ pub struct Extract {
 /// HostSortFamily and HostPrimitive describe the catalog, including generic
 /// signatures, presentation patterns and all referenced sorts. These graphs may
 /// contain Sort.var; the reconstruction data and concrete definitions may not.
-/// Host binding and export remain unimplemented; never silently omit definitions.
 ///
 /// Return EGraphSnapshot with the handle's logical options and this Program.
 /// Do not export resource settings such as threads. See EGraphSnapshot for
@@ -1738,6 +1736,11 @@ pub struct CreateEGraphRequest {
     /// replay. Local rule no_decomp=true still applies when this global is false.
     #[prost(bool, tag = "6")]
     pub no_decomp: bool,
+    /// Retain structured request/outcome history for this handle. Off by default;
+    /// not a logical option and never restored by Freeze. Clone inherits this
+    /// choice. GetHistory specifies retention, observation and lifecycle behavior.
+    #[prost(bool, tag = "7")]
+    pub record_history: bool,
 }
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct CreateEGraphResponse {
@@ -1858,6 +1861,89 @@ pub struct ConfigureEGraphResourcesResponse {
     /// Actual current native planning default after query/update, not an estimate.
     #[prost(bool, tag = "2")]
     pub no_decomp: bool,
+}
+/// Retrieve the audit selected at successful creation. Disabled recording and
+/// unknown handles are lifecycle errors, distinct from an empty history.
+/// Record decoded Create, Clone, Destroy, ReturnTo, ConfigureResources and Run
+/// requests, including resource queries and every Program observation such as
+/// Freeze. Preserve original submitted messages, request-local arenas, actual
+/// responses (including errors and completed-prefix outputs), and their order.
+/// GetHistory is never recorded and cannot recursively retain its own export.
+/// Undecodable requests and failed creation have no addressable typed history.
+///
+/// Clone shares its immutable past and then retains independent continuations.
+/// A successful ReturnTo joins both ordered audits, retaining each shared
+/// exchange once; restoring logical state never rolls audit history back.
+/// Consumed/destroyed handles retain a closed audit until their owning service
+/// instance is dropped. Later rejected requests addressing them may be recorded.
+/// Recording off retains no accumulating request log. Recording on is unbounded.
+/// Native host implementations remain external. This is neither an engine
+/// checkpoint nor a guarantee of deterministic or side-effect-free replay.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct GetHistoryRequest {
+    #[prost(uint64, tag = "1")]
+    pub egraph_id: u64,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct GetHistoryResponse {
+    #[prost(message, repeated, tag = "1")]
+    pub entries: ::prost::alloc::vec::Vec<HistoryEntry>,
+    /// Effective resources immediately after the original successful creation,
+    /// before subsequent exchanges. Clone inherits this same initial context.
+    #[prost(message, optional, tag = "2")]
+    pub initial_resources: ::core::option::Option<ConfigureEGraphResourcesResponse>,
+    /// True when the addressed native handle has been destroyed or consumed.
+    #[prost(bool, tag = "3")]
+    pub closed: bool,
+}
+/// One submission and its actual outcome. The response kind must match the
+/// request kind. Lifecycle/transport rejection has no fabricated typed response.
+/// An interrupted operation retained its request but returned no response (for
+/// example a native host callback unwound); no outputs or effects are inferred.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct HistoryEntry {
+    #[prost(oneof = "history_entry::Request", tags = "1, 2, 3, 4, 5, 6")]
+    pub request: ::core::option::Option<history_entry::Request>,
+    #[prost(oneof = "history_entry::Outcome", tags = "11, 12, 13, 14, 15, 16, 17, 18")]
+    pub outcome: ::core::option::Option<history_entry::Outcome>,
+}
+/// Nested message and enum types in `HistoryEntry`.
+pub mod history_entry {
+    #[derive(Clone, PartialEq, ::prost::Oneof)]
+    pub enum Request {
+        /// Preserve invalid submissions as audit data, not permission to execute them.
+        #[prost(message, tag = "1")]
+        Create(super::CreateEGraphRequest),
+        #[prost(message, tag = "2")]
+        Clone(super::CloneEGraphRequest),
+        #[prost(message, tag = "3")]
+        Destroy(super::DestroyEGraphRequest),
+        #[prost(message, tag = "4")]
+        ReturnTo(super::ReturnToEGraphRequest),
+        #[prost(message, tag = "5")]
+        ConfigureResources(super::ConfigureEGraphResourcesRequest),
+        #[prost(message, tag = "6")]
+        RunProgram(super::RunProgramRequest),
+    }
+    #[derive(Clone, PartialEq, ::prost::Oneof)]
+    pub enum Outcome {
+        #[prost(message, tag = "11")]
+        CreateResponse(super::CreateEGraphResponse),
+        #[prost(message, tag = "12")]
+        CloneResponse(super::CloneEGraphResponse),
+        #[prost(message, tag = "13")]
+        DestroyResponse(super::DestroyEGraphResponse),
+        #[prost(message, tag = "14")]
+        ReturnToResponse(super::ReturnToEGraphResponse),
+        #[prost(message, tag = "15")]
+        ConfigureResourcesResponse(super::ConfigureEGraphResourcesResponse),
+        #[prost(message, tag = "16")]
+        RunProgramResponse(super::RunProgramResponse),
+        #[prost(string, tag = "17")]
+        TransportError(::prost::alloc::string::String),
+        #[prost(message, tag = "18")]
+        Interrupted(super::Unit),
+    }
 }
 /// Execute a program against an existing e-graph.
 #[derive(Clone, PartialEq, ::prost::Message)]

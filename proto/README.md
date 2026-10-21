@@ -71,12 +71,8 @@ both name `Maybe<i64>`. Other frontends may omit them. Text frontends handle nam
 collisions; docs and family/nominal bindings belong to definitions.
 Text rendering chooses one stable alias; binary records retain all aliases.
 
-The three-namespace distinction uses existing tags (unlike the optional alias
-metadata at Sort field 8): previously valid encodings keep their meanings. New
-cross-namespace coexistence requires coordinated immutable schema, engine and
-frontend pins. Old validators reject it, and old name-only indexes may conflate
-the definitions; mixed-epoch readers are not supported. CEL checks local family
-arity, not complete installed-name resolution or resupply compatibility.
+CEL checks local family arity; installed-name resolution and compatible resupply
+remain semantic checks.
 
 Evaluated ordinary expression nodes retain their lazy first-demand result within
 one top-level Action or one rule firing's ordered head. The memo is fresh for
@@ -84,20 +80,14 @@ each firing/evaluation and resets between top-level commands, whose writes
 commit in order. No evaluation is hoisted before its first demand, and failed
 evaluations preserve the completed mutation prefix. Query patterns and Union's
 separate identity scopes are unchanged. Host callback invocation counts are
-not a protocol guarantee. This is a coordinated draft semantic change; older
-readers that reevaluate shared action nodes are not interchangeable consumers.
+not a protocol guarantee.
 
-`Declaration.doc` preserves absence, explicitly empty text, and nonempty text,
-matching existing Python callable/class documentation readers. It remains
-excluded from semantic identity; compatible resupply retains the first stored
-declaration's documentation. Only this doc field has explicit presence; rule
-and ruleset docs are unchanged. This draft changes generated Rust to
-`Option<String>`. Python accepts `None` as unset but its scalar getter still
-returns `""` when absent; readers must use `has_field("doc")`, not truthiness,
-to recover absence. Absent/nonempty canonical bytes remain unchanged, but old
-receivers lose explicit-empty presence on reencoding.
-ProtoJSON distinguishes an omitted field from `"doc":""`. As with the tail
-change below, preserving this distinction requires coordinated consumer pins.
+`Declaration.doc` preserves absence, explicitly empty text, and nonempty text.
+It is excluded from semantic identity; compatible resupply retains the first
+stored documentation. Rust uses `Option<String>`. Python accepts `None` as unset
+but its scalar getter returns `""` when absent: use `has_field("doc")`, not
+truthiness, to recover absence. ProtoJSON distinguishes omission from `"doc":""`.
+Rule and ruleset docs retain ordinary implicit-string semantics.
 
 `HostPrimitive` selects an ordinary `GenericSignature` or the dedicated
 `FunctionApplication` typing form. A signature has an ordered type-parameter
@@ -111,17 +101,6 @@ Parameter labels are diagnostic: changing their spelling does not change the
 definition. A shared pattern is interpreted independently in each signature's
 binder; neither arena sharing nor export combines binders or substitutions.
 Compatibility compares ordered binder positions and structural signatures.
-
-This draft changes field 4 from a singular `Arg` to `repeated Arg`, with
-coordinated immutable schema, engine, and frontend pins, not a deployed stable
-old-wire guarantee. Canonical zero/one-tail binary encodings are unchanged.
-Generated Rust changes `Option<Arg>` to `Vec<Arg>`, Python changes `Arg | None`
-to `list[Arg]`, and ProtoJSON changes the tail object to an array. Old receivers
-are unsafe for wider patterns: they collapse or merge repeated field occurrences
-and lose the pattern width. Previously duplicated singular-field encodings also
-change meaning. All consumers must migrate together. The schema can describe
-grouped tails; native matching, Map registration, and frontend generation are
-separate gates.
 
 Python already separates generic declarations from concrete expression types.
 Its [signatures](https://github.com/egraphs-good/egglog-python/blob/ff72f601a972ca1eb7cb0a1d299813f5d65b1a14/python/egglog/declarations.py#L752-L791)
@@ -448,17 +427,12 @@ one. An absent field leaves the native default unchanged. Creation's existing
 i64 cost-sort and no-declaration limits still apply; native thread-pool resource
 allocation behavior is unchanged.
 
-`ConfigureEGraphResources` specifies live resource query/update over the same
-bytes boundary. Its required operation selects an inert query or a thread-count
-update (zero means auto, positive means exact). Success returns the effective
-positive native count as uint64, not a requested value or frontend CPU estimate.
-Unsupported updates fail before mutation; updates must preserve existing rule
-cursors and logical state. Clone inherits the effective count, later updates are
-handle-local, and resources remain outside snapshots. The protocol is specified
-and implemented by `Engine::configure_resources`, using the native getter/setter
-without cloning execution state. Invalid handles, missing/unknown operations and
-unsupported requests fail explicitly. Immutable logical
-options, future-rule defaults and report-policy controls are not resource fields.
+`ConfigureEGraphResources` queries the effective thread count and `no_decomp`, or
+updates threads, future-rule decomposition policy, or native report detail through
+`report_level`. Zero threads requests automatic parallelism; a positive count is
+exact. Updates preserve logical state and rule cursors. Clone inherits resources,
+later changes are handle-local, and Freeze omits them. Invalid or unsupported
+requests fail explicitly; the native thread-pool allocation boundary is unchanged.
 
 Restore by remapping C's reachable closed sort graph and needed sort declarations
 into a creation request, then executing the exported Program on that fresh handle
@@ -473,14 +447,31 @@ No ordinary native pure non-equality self-cycle has been established; arbitrary 
 cycles remain unproven. `Freeze` must fail when required state cannot be
 represented, not silently omit it or claim a complete export.
 
-**Recording — decided:** an adapter may opt into recording original `Program`
-requests, handle creation/configuration, and their outcomes in order. Recording
-is off by default and separate from current-state export; no runtime recorder or
-new RPC is supplied here. Preserve request boundaries and request-local arenas;
-naively concatenating Programs changes references and action identity scopes.
-Record failures and completed outputs as well as successes. Earlier effects can
-survive failure, so this is an execution record, not a promise of exact replay
-or an engine checkpoint.
+**Execution history:** set `CreateEGraphRequest.record_history=true` at creation
+and retrieve `GetHistoryResponse` through `GetHistory` (`Engine::get_history`).
+Recording is off by default; disabled retrieval errors and retains no growing
+request log. History keeps original typed requests and actual responses, including
+preparation errors, completed-prefix outputs, resource queries and Freeze.
+Transport errors and interrupted/no-response operations are distinct outcomes.
+Audit requests may be invalid inputs; inspecting them does not authorize execution.
+Retrieval itself adds nothing to history.
+
+Clone shares its recorded past and then diverges independently. Successful
+`ReturnToEGraph` restores the saved logical scope while joining both ordered
+audits, counting shared exchanges once. Destroyed or consumed handles retain a
+closed audit until the Engine is dropped. Enabled recording is unbounded; native
+callbacks/codecs remain external. Keep each Program's local arenas separate:
+concatenation changes references and Union identity scopes. History is neither
+a checkpoint nor a promise of deterministic or side-effect-free replay.
+
+The typed Rust API offers the same creation-time choice:
+
+```rust
+let mut graph = egglog_experimental::typed::EGraph::with_recording(true)?;
+graph.stats()?;
+let history = graph.history()?; // Create and Stats; retrieval adds no entry.
+assert_eq!(history.entries.len(), 2);
+```
 
 ### Reporting and timing attribution
 
@@ -519,71 +510,31 @@ earlier effects/outputs remain and later commands do not run. Table statistics
 pair each exact response sort reference with its distinct-value count, in input
 order followed by output.
 
-This draft refinement supersedes whole-table failure for unavailable cells and
-requires coordinated schema, engine and frontend pins. FunctionRow's old integer
-references and new cell messages are not compatible reader layouts. Omitted
-max_rows bytes retain the all-rows meaning; explicit
-zero now means zero. Rust generates `Option<u64>`; Python readers must use
-`has_field("max_rows")`, since its scalar getter returns zero even when absent.
+Rust represents `PrintFunction.max_rows` as `Option<u64>`. Python readers must
+use `has_field("max_rows")`, since the scalar getter returns zero when absent.
 The byte adapter observes admitted Constructor, Function and Relation tables in
 all four execution modes. Encoded observations return logical live rows; native
 raw term-table dumps can retain historical or deleted rows and therefore differ.
 This does not establish full Source text parity. CSV/file output and
 Fail-observation remain separate required conformance gates.
 
-Opt-in `ProfileSummary.runs` aggregates by static authored `Run` site and
-response-local rule occurrence. `maintenance` separately aggregates internal
-Run/query work by its authored cause. A required `MaintenanceSite` selects a
-static command path, declaration index, materialized-sort index, or installing
-ruleset index (including its rules). These refer to the original submitted
-Program before filtering/lowering. Proof-created helpers belong to the proof
-command's site, not to synthetic declarations. Compatible resupply that executes
-no native installation adds no maintenance entry. CEL enforces required sites
-and oneofs, nonempty paths, positive invocation counts, and unique sites;
-request-relative bounds and path/target kinds require the submitted Program.
+`ProfileSummary` provides exclusive phase attribution: authored Run sites are
+separate from internal maintenance attributed to its command or installation
+cause. Failing invocations and completed prefixes remain visible; missing metrics
+are unknown, not zero. These measurements do not partition wall time.
 
-Both summaries count entered invocations, including failing ones, and retain no
-per-iteration history. Each measured native Run/query invocation contributes to
-exactly one bucket; do not also add an enclosing schedule's aggregate. Authored
-Run totals exclude separately attributed inline/trailing maintenance, while
-native backend rebuilding within an authored invocation stays in its rebuild
-total. Rule metrics are breakdowns, not additional elapsed time. Generated rules
-do not acquire fabricated authored identities. Native provenance determines
-attribution, never name patterns or output positions. These phase measurements
-neither cover all helper CPU work nor partition wall time; no proof-checking,
-reconstruction, or serialization timing is inferred.
-Present metrics cover all observed work in their aggregate; an unavailable total
-is absent, not a known subset or zero. A failed request has an explicitly
-incomplete summary, including observed work from a failing Run or installation
-helper; a successful empty summary is complete. Completeness does not promise
-every optional metric. Runtime definition-installation failures retain actual
-registration/effect prefixes, use the definition span, and have no fabricated
-command location; they are not validation failures claiming that nothing ran.
+`include_run_reports` additionally returns native `NativeRunReport` detail at
+completed requested control sites; `Stats` observes the cumulative native report.
+This backend-oriented view and the authored exclusive summary have different
+meanings. `report_level` selects future native collection detail. Both views use
+the response's `rules` catalog for occurrence attribution, also used by errors.
+Labels remain diagnostic; shared occurrences stay shared and distinct equal
+occurrences stay distinct. The schema specifies paths, completeness and metrics.
 
-`RunProgramResponse.rules` gives each attributed occurrence one local index,
-shared by profile rows and errors even with profiling off. A `RuleAttribution`
-routes from a request-local ruleset or installed named root, through composition
-child positions to a leaf rule ordinal, not a `Program.rules` index. The selected
-list entry identifies the rule, including retained rules absent from the request.
-Shared rules have one response catalog entry regardless of route. Names and spans
-are diagnostic; distinct equal occurrences stay distinct, and both directions of
-an authored `BiRewrite` share one entry. Path resolution and identity checks remain normative
-semantic requirements. Detailed traces and runtime implementation are deferred.
-Only referenced catalog entries are returned; profiling off without a rule error
-returns none.
+### Message ownership
 
-### Shared Python/Rust memory
-
-Should Python use independent generated messages and pass bytes, convert them
-to Rust objects, or expose one Rust-owned arena through PyO3? The wire format
-does not choose an in-process representation. Sharing ownership could avoid
-rebuilding the same graph, but needs explicit mutation, lifetime, and threading
-rules; no zero-copy or performance claim has been established.
-
-[PyO3 supports Rust-backed Python classes and shared ownership](https://pyo3.rs/main/class.html#no-lifetime-parameters).
-That is a possible implementation route, not something the current generators
-provide automatically. Compare construction, traversal, crossing the boundary,
-and memory use on the same graph before choosing.
+Arenas are local to each message. The wire contract does not prescribe transport
+or shared-memory ownership.
 
 ### Existing proof engine
 
@@ -604,10 +555,9 @@ execution and contribute only to optional profiling, with the exclusive
 attribution described above. CEL rejects nested Run/Loop outcomes and permits
 nested proof/observation results; matching them to the requested command remains
 an adapter check. Flat byte execution implements requested-only results and
-exclusive authored/maintenance leaf summaries; loops remain unsupported.
+exclusive authored/maintenance leaf summaries.
 The current adapter still requires `profile=true`; it cannot yet
-satisfy the collection-off contract. No profiling-level enum or trace format is
-introduced.
+satisfy the collection-off contract.
 
 `ProofResult` contains separate, inert term and proof arenas. Terms have no sort:
 native proof propositions can describe a function row with inputs and output as
