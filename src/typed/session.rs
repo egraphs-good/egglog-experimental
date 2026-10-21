@@ -2649,7 +2649,7 @@ mod tests {
         for row in &report.num_matches_per_rule {
             let attribution =
                 &response.rules[row.rule.expect("authored rule attribution") as usize];
-            assert_eq!(attribution.rule, 0);
+            assert_eq!(attribution.position, 0);
             assert!(attribution.children.is_empty());
             let Some(pb::ruleset_ref::Kind::Name(name)) = &attribution.root.as_ref().unwrap().kind
             else {

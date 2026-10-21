@@ -6051,7 +6051,7 @@ fn ruleset_selection(
                                     kind: Some(reference.clone()),
                                 }),
                                 children: children.clone(),
-                                rule: ordinal as u32,
+                                position: ordinal as u32,
                                 name: authored.name.clone(),
                                 span: authored.span,
                             },
@@ -10034,7 +10034,7 @@ mod tests {
                     kind: Some(pb::ruleset_ref::Kind::Name(root.into())),
                 }),
                 children,
-                rule: ordinal,
+                position: ordinal,
                 name: program.rules[rule].name.clone(),
                 span: program.rules[rule].span,
             };
@@ -10188,7 +10188,7 @@ mod tests {
             Some(pb::ruleset_ref::Kind::Index(1))
         );
         assert!(origin.children.is_empty());
-        assert_eq!(origin.rule, 0);
+        assert_eq!(origin.position, 0);
         assert_eq!(*direction, pb::NativeRuleDirection::Single);
     }
 
@@ -12177,7 +12177,7 @@ mod tests {
         let retained = &reused.rules[0];
         assert_eq!(retained.root, origin.root);
         assert_eq!(retained.children, origin.children);
-        assert_eq!(retained.rule, origin.rule);
+        assert_eq!(retained.position, origin.position);
         assert_eq!(retained.name, origin.name);
         let (before, after) = (origin.span.unwrap(), retained.span.unwrap());
         assert_eq!((before.start, before.end), (after.start, after.end));

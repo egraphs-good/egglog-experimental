@@ -12880,7 +12880,7 @@ fn shared_rules_deduplicate_selection_not_distinct_equal_labeled_occurrences() {
     let mut routes = response
         .rules
         .iter()
-        .map(|r| (r.children.clone(), r.rule))
+        .map(|r| (r.children.clone(), r.position))
         .collect::<Vec<_>>();
     routes.sort();
     assert_eq!(routes, [(vec![0], 0), (vec![1], 0)]);
@@ -20222,7 +20222,7 @@ fn source_rule_panics_keep_exact_span_and_occurrence_in_every_mode() {
                     };
                     // Attribution is any valid representative route, not the
                     // active Run target or a global rule-arena ordinal.
-                    let authored = &phase.rules[rules.rules[origin.rule as usize] as usize];
+                    let authored = &phase.rules[rules.rules[origin.position as usize] as usize];
                     assert_eq!(authored.name.as_deref(), Some("fired"));
                     assert_eq!(origin.span, authored.span);
                     let span = origin.span.unwrap();
@@ -23068,6 +23068,69 @@ fn source_combined_errors_preserve_the_submitted_prefix() {
             .find_map(Result::err)
             .unwrap();
         assert_eq!(actual.to_string(), error.to_string());
+    }
+}
+
+#[test]
+fn source_ruleset_name_selects_first_immutable_publication() {
+    use egglog_experimental::protobuf::source::Source;
+    let text = r#"
+        (relation Seed (i64))
+        (ruleset r)
+        (rule ((Seed x)) () :ruleset r :name "a")
+        (Seed 1) (run r 1)
+        (rule ((Seed x)) () :ruleset r :name "b")
+        (run r 1)
+        (Seed 2)
+    "#;
+    let mut engine = Engine::default();
+    let id = create(&mut engine);
+    let mut latest = None;
+    for phase in Source::new(None, text).unwrap() {
+        let phase = phase.unwrap();
+        for command in &phase.commands {
+            if let Some(pb::command::Kind::Run(run)) = &command.kind {
+                latest = run.ruleset.clone();
+            }
+        }
+        assert_eq!(run(&mut engine, id, phase).error, None);
+    }
+    let first = pb::RulesetRef {
+        kind: Some(pb::ruleset_ref::Kind::Name("r".into())),
+    };
+    let latest = latest.expect("source Run carries its selected publication");
+    assert_ne!(latest, first);
+    for (selected, expected) in [(first, "a"), (latest, "b")] {
+        let response = run(
+            &mut engine,
+            id,
+            pb::Program {
+                commands: vec![pb::Command {
+                    kind: Some(pb::command::Kind::Run(pb::Run {
+                        ruleset: Some(selected),
+                        ..Default::default()
+                    })),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        );
+        assert_eq!(response.error, None);
+        let fired: Vec<_> = response
+            .profile
+            .unwrap()
+            .runs
+            .iter()
+            .flat_map(|run| &run.rules)
+            .filter(|row| row.matches.is_some_and(|count| count > 0))
+            .map(|row| {
+                response.rules[row.rule.unwrap() as usize]
+                    .name
+                    .clone()
+                    .unwrap()
+            })
+            .collect();
+        assert_eq!(fired, [expected]);
     }
 }
 

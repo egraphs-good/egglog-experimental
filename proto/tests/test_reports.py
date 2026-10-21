@@ -9,6 +9,15 @@ from gen.python.egglog.v1 import egglog_pb as ir
 
 
 class ReportSchemaTests(unittest.TestCase):
+    def test_rule_attribution_position_keeps_tag_three(self):
+        attribution = ir.RuleAttribution(
+            root=ir.RulesetRef(kind=Oneof("name", "root")),
+            children=[1, 2], position=3,
+        )
+        validate(attribution)
+        self.assertEqual(attribution.to_binary(), bytes.fromhex("0a061204726f6f74120201021803"))
+        self.assertEqual(ir.RuleAttribution.from_binary(attribution.to_binary()), attribution)
+
     def test_duration_preserves_native_range(self):
         for seconds, nanos in ((0, 0), (0, 600), (2**64 - 1, 999_999_999)):
             value = ir.ReportDuration(seconds=seconds, nanos=nanos)

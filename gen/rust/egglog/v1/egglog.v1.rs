@@ -3,15 +3,15 @@
 // Draft proposed v1 of a typed, language-neutral Egglog IR, with generated
 // Rust/Python messages. Consumers select the same schema revision; package and
 // service names identify the API, not raw protobuf bytes. Overview: proto/README.md.
-// Every arena index must name an existing entry in its enclosing program,
-// or response. CEL checks the direct node/sort edges below; other
+// Every arena index must name an entry in its enclosing arena-owning message.
+// CEL checks the direct node/sort edges below; other
 // references, including roots in commands and outputs, remain normative.
 // A fact is a bare node index; equality is a `Union` node, so `(= a b)` is a
 // fact naming a union of a and b.
 // Validation rules and normative comments in this file are the specification.
 // Unknown enum values are errors; Rust consumers must check raw enum values.
 // Producers expand datatype/default-argument/include syntax before this boundary.
-// No scope stack: clone an e-graph to save state, including its proof state.
+// Clone saves state, including proof state; ReturnToEGraph restores a saved scope.
 
 // ---------------------------------------------------------------------------
 // PROGRAM AND PROVENANCE — the request payload and the shared span vocabulary.
@@ -47,10 +47,10 @@
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct Program {
     /// Expression arena. Evaluate shared ordinary nodes lazily at first demand,
-    /// retaining their results within one top-level Action or one rule firing's
-    /// ordered head. Start a fresh ordinary memo for each such evaluation; results
-    /// never persist between top-level commands. Query patterns do not use this
-    /// evaluation memo. `Union` locations have separate identity scopes; see `Union`.
+    /// retaining results within one Action command execution (including a loop
+    /// body) or one rule firing's ordered head. Start a fresh ordinary memo for
+    /// each such execution. Query patterns do not use this evaluation memo.
+    /// `Union` locations have separate identity scopes; see `Union`.
     #[prost(message, repeated, tag = "2")]
     pub nodes: ::prost::alloc::vec::Vec<Node>,
     /// Sort arena, separate from expression nodes.
@@ -563,8 +563,8 @@ pub struct Unit {
 /// Set, delete, subsume and SetCost are standalone actions, not value expressions.
 /// Execute action lists in order; each Set uses the function's conflict policy
 /// if that write conflicts. Rule matches and rebuilds have no global order here.
-/// Ordinary memos reset between top-level commands, whose writes commit before
-/// the next command. This does not change Union's separate identity lifetime.
+/// Ordinary memos reset for each Action command execution, including inside loops.
+/// Writes commit in command order; Union has its own separate identity lifetime.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct Action {
     /// Optional origin; omit for an unlocated program. When present, this is the
@@ -1866,14 +1866,15 @@ pub struct ConfigureEGraphResourcesResponse {
 /// unknown handles are lifecycle errors, distinct from an empty history.
 /// Record decoded Create, Clone, Destroy, ReturnTo, ConfigureResources and Run
 /// requests, including resource queries and every Program observation such as
-/// Freeze. Preserve original submitted messages, request-local arenas, actual
-/// responses (including errors and completed-prefix outputs), and their order.
+/// Freeze. Preserve known fields of decoded requests before normalization, local
+/// arenas, and actual responses (including errors and completed-prefix outputs).
+/// This is not a raw-byte record: decoders may discard unknown protobuf fields.
 /// GetHistory is never recorded and cannot recursively retain its own export.
 /// Undecodable requests and failed creation have no addressable typed history.
 ///
 /// Clone shares its immutable past and then retains independent continuations.
-/// A successful ReturnTo joins both ordered audits, retaining each shared
-/// exchange once; restoring logical state never rolls audit history back.
+/// A successful ReturnTo joins both audits in service submission order, retaining
+/// each shared exchange once; restoring logical state never rolls history back.
 /// Consumed/destroyed handles retain a closed audit until their owning service
 /// instance is dropped. Later rejected requests addressing them may be recorded.
 /// Recording off retains no accumulating request log. Recording on is unbounded.
@@ -1925,6 +1926,7 @@ pub mod history_entry {
         #[prost(message, tag = "6")]
         RunProgram(super::RunProgramRequest),
     }
+    #[allow(clippy::large_enum_variant)]
     #[derive(Clone, PartialEq, ::prost::Oneof)]
     pub enum Outcome {
         #[prost(message, tag = "11")]
@@ -2027,7 +2029,7 @@ pub struct RulesetPublication {
 /// One authored Rule occurrence, including both directions of a BiRewrite.
 /// Pick one valid route from the request's ruleset arena or an installed named
 /// root, following composition-child positions (and resolving their refs), to
-/// a leaf RuleList. `rule` is a position in that leaf, NOT a Program.rules index;
+/// a leaf RuleList. `position` is its ordinal, NOT a Program.rules index;
 /// the selected entry resolves to its rule occurrence. This also locates retained
 /// rules/leaves absent from the request. A rule shared by multiple leaves or
 /// repeated positions still has one response-local catalog entry.
@@ -2041,7 +2043,7 @@ pub struct RuleAttribution {
     pub children: ::prost::alloc::vec::Vec<u32>,
     /// ordinal within the selected RuleList
     #[prost(uint32, tag = "3")]
-    pub rule: u32,
+    pub position: u32,
     /// A supplied diagnostic label from this occurrence, absent if it has none.
     /// Representative provenance only, never an invented or lookup identity.
     #[prost(string, optional, tag = "4")]

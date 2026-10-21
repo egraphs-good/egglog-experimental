@@ -182,8 +182,7 @@ impl Engine {
                 },
             );
             let exchange = self.append_history(&[response.egraph_id], Request::Create(original));
-            exchange.entry.lock().unwrap().outcome =
-                Some(Outcome::CreateResponse(response.clone()));
+            exchange.entry.lock().unwrap().outcome = Some(Outcome::CreateResponse(response));
         }
         Ok(response.encode_to_vec())
     }
@@ -236,7 +235,7 @@ impl Engine {
         )
     }
 
-    /// Execute one original submission, retaining actual prefix outputs and errors.
+    /// Execute one decoded typed submission, retaining actual prefix outputs/errors.
     pub fn run(&mut self, bytes: &[u8]) -> Result<Vec<u8>, TransportError> {
         let request = pb::RunProgramRequest::decode(bytes)?;
         self.recorded(

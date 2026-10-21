@@ -2737,7 +2737,7 @@ fn all_modes_return_only_requested_outputs_and_exclusive_profiles() {
                             kind: Some(pb::ruleset_ref::Kind::Name("rebuilding_ruleset".into()))
                         }),
                         children: vec![],
-                        rule: 0,
+                        position: 0,
                         name: Some("derive".into()),
                         span: None,
                     }]

@@ -18,7 +18,7 @@ and comments are the specification. The main pieces are:
   with proof enablement selected in `EGraphOptions`.
 
 An experimental in-process bytes adapter lives in
-[`src/protobuf.rs`](../src/protobuf.rs); current limits are described below.
+`src/protobuf.rs`; current limits are described below.
 It is not a complete service implementation. CEL checks
 directly expressible constraints, not full typing, binding, effects, or cycle
 validity. The remaining requirements are normative comments. CEL can exhaust
@@ -75,10 +75,10 @@ CEL checks local family arity; installed-name resolution and compatible resupply
 remain semantic checks.
 
 Evaluated ordinary expression nodes retain their lazy first-demand result within
-one top-level Action or one rule firing's ordered head. The memo is fresh for
-each firing/evaluation and resets between top-level commands, whose writes
-commit in order. No evaluation is hoisted before its first demand, and failed
-evaluations preserve the completed mutation prefix. Query patterns and Union's
+one Action command execution, including inside loops, or one rule firing's
+ordered head. Each execution gets a fresh memo; writes commit in command order.
+No evaluation is hoisted before its first demand, and failed evaluations preserve
+the completed mutation prefix. Query patterns and Union's
 separate identity scopes are unchanged. Host callback invocation counts are
 not a protocol guarantee.
 
@@ -402,8 +402,8 @@ primitive/lambda invocation, and other command's evaluated inputs has its own
 scope. Retained references follow canonical identity through intervening unions,
 rebuilds, and runs. Queries neither read nor populate this identity mapping.
 Ordinary call results instead use the shorter first-demand memo of one
-top-level Action or one rule firing's ordered head; they never persist between
-top-level commands.
+Action command execution (including inside loops) or one rule firing's ordered
+head; each such execution starts a fresh memo.
 
 ```text
 nodes[0] = E: Union[]
@@ -450,17 +450,20 @@ represented, not silently omit it or claim a complete export.
 **Execution history:** set `CreateEGraphRequest.record_history=true` at creation
 and retrieve `GetHistoryResponse` through `GetHistory` (`Engine::get_history`).
 Recording is off by default; disabled retrieval errors and retains no growing
-request log. History keeps original typed requests and actual responses, including
-preparation errors, completed-prefix outputs, resource queries and Freeze.
+request log. History keeps known fields of decoded typed requests before
+normalization and actual responses, including preparation errors, completed-prefix
+outputs, resource queries and Freeze.
 Transport errors and interrupted/no-response operations are distinct outcomes.
 Audit requests may be invalid inputs; inspecting them does not authorize execution.
+This is not a raw-byte record: decoders may discard unknown protobuf fields.
 Retrieval itself adds nothing to history.
 
 Clone shares its recorded past and then diverges independently. Successful
 `ReturnToEGraph` restores the saved logical scope while joining both ordered
-audits, counting shared exchanges once. Destroyed or consumed handles retain a
-closed audit until the Engine is dropped. Enabled recording is unbounded; native
-callbacks/codecs remain external. Keep each Program's local arenas separate:
+audits in service submission order, counting shared exchanges once. Destroyed or
+consumed handles retain a closed audit until the Engine is dropped. Enabled
+recording is unbounded; native callbacks/codecs remain external. Keep each
+Program's local arenas separate:
 concatenation changes references and Union identity scopes. History is neither
 a checkpoint nor a promise of deterministic or side-effect-free replay.
 
@@ -604,10 +607,15 @@ Python uses `protobuf-py` and `protovalidate`; the compiled Rust SDK uses `prost
 Separately generated imported validation definitions also need `prost-types`.
 No gRPC transport is generated or required.
 
+The implementation subsections below describe the separate integration
+branch/worktree. The schema-only review includes the specification and generated
+SDKs, without these runtime implementations.
+
 ### Byte adapter
 
-[`protobuf::Engine`](../src/protobuf.rs) accepts encoded requests for creation,
-cloning, destruction, scope return, resource configuration and program execution.
+`protobuf::Engine` (`src/protobuf.rs`) accepts encoded requests for creation,
+cloning, destruction, scope return, resource configuration, program execution and
+`GetHistory` retrieval.
 Decode failures and unknown handles are transport errors; program failures are
 returned in `RunProgramResponse.error`. Preparation validates on disposable
 native state without running user actions. Installation and execution retain
@@ -633,7 +641,7 @@ not changes to the schema contract.
 
 ### Source production and rendering
 
-[`protobuf::source::Source`](../src/protobuf/source.rs) resolves native source
+`protobuf::source::Source` (`src/protobuf/source.rs`) resolves native source
 into ordered submissions. Before producing the first submission, use
 `with_execution_mode` once to select the target handle's execution mode; the
 selection is immutable. Omission uses Normal lowering. Native source admission
@@ -655,7 +663,11 @@ bounded Source renderer and fail explicitly for unsupported values.
 
 Captures keep their ordered write positions. Rules retain labels and spans;
 publication uses immutable versions without hoisting future rules into earlier
-runs. Query locals remain distinct from persistent captures and later
+runs. The first publication binds the authored ruleset name; later publications
+use generated names. Source resolves its current alias when producing each Run.
+A raw `RulesetRef{name: "r"}` continues to select the first immutable publication
+of `r`; use the emitted Run's actual reference to select a later publication.
+Query locals remain distinct from persistent captures and later
 declarations. Proof requests retain the authored facts, leaving proof execution
 to the receiving mode. Source extraction counts are literal and bounded;
 aggregate extraction preserves its ordered result groups.
