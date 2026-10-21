@@ -15,7 +15,6 @@ from gen.python.egglog.v1 import egglog_pb as ir
 def constant_program(core, **view_fields):
     """Own every sort/body reference needed by the concrete declaration fixture."""
     return ir.Program(
-        ir_version=1,
         sorts=[
             ir.Sort(kind=Oneof("family", ir.HostSort(name="i64"))),
             ir.Sort(kind=Oneof("eq", "Box")),
@@ -52,7 +51,6 @@ def tail_view_program(language, *, repetitions=2, prefix=(), tail=(0,), slots=(0
         )
         bindings = ir.CallableBindings(rust=ir.RustBindings(views=[view]))
     return ir.Program(
-        ir_version=1,
         sorts=[
             ir.Sort(kind=Oneof("family", ir.HostSort(name="bool"))),
             ir.Sort(kind=Oneof("family", ir.HostSort(name="String"))),
@@ -103,7 +101,7 @@ class BindingSchemaTests(unittest.TestCase):
 
     def test_structural_sort_text_aliases_are_optional_wire_metadata(self):
         for symbols in ([], ["A"], ["A", "Z"]):
-            program = ir.Program(ir_version=1, sorts=[
+            program = ir.Program(sorts=[
                 ir.Sort(kind=Oneof("family", ir.HostSort(name="i64"))),
                 ir.Sort(kind=Oneof("family", ir.HostSort(name="Maybe", args=[0])),
                         egglog_aliases=[ir.EgglogTypeBinding(symbol=s) for s in symbols]),
@@ -371,7 +369,7 @@ class BindingSchemaTests(unittest.TestCase):
         ]
         for declarations in ([nominal, family, callable_], [callable_, family, nominal]):
             with self.subTest(declarations=declarations):
-                program = ir.Program(ir_version=1, sorts=sorts, declarations=declarations)
+                program = ir.Program(sorts=sorts, declarations=declarations)
                 validate(program)
                 decoded = ir.Program.from_binary(program.to_binary())
                 self.assertEqual(decoded, program)
@@ -384,17 +382,16 @@ class BindingSchemaTests(unittest.TestCase):
         family = ir.Declaration(kind=Oneof("host_sort_family", ir.HostSortFamily(name="Pair", arity=2)))
         # Compatible resends are allowed even without an arena use. Metadata
         # compatibility and installed-name resolution remain semantic checks.
-        validate(ir.Program(ir_version=1, declarations=[nominal, family, nominal, family]))
+        validate(ir.Program(declarations=[nominal, family, nominal, family]))
         conflict = ir.Declaration(kind=Oneof("host_sort_family", ir.HostSortFamily(name="Pair", arity=1)))
         for declarations in ([nominal, family, conflict], [conflict, nominal, family]):
             with self.subTest(declarations=declarations), self.assertRaises(ValidationError):
-                validate(ir.Program(ir_version=1, declarations=declarations))
+                validate(ir.Program(declarations=declarations))
 
     def test_nominal_declaration_does_not_mask_bad_family_application(self):
         for width in (0, 1, 3):
             with self.subTest(width=width), self.assertRaises(ValidationError):
                 validate(ir.Program(
-                    ir_version=1,
                     sorts=[
                         ir.Sort(kind=Oneof("eq", "Pair")),
                         ir.Sort(kind=Oneof("family", ir.HostSort(name="Pair", args=[0] * width))),

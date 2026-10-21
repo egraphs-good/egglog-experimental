@@ -1086,8 +1086,8 @@ impl ProtoRun {
                         (rule_kind, phase.rules.as_slice()),
                         (
                             Some(true),
-                            [pb::RuleDecl {
-                                kind: Some(pb::rule_decl::Kind::Rewrite(_)),
+                            [pb::Rule {
+                                kind: Some(pb::rule::Kind::Rewrite(_)),
                                 name: Some(name),
                                 ..
                             }]
@@ -2419,7 +2419,6 @@ fn multi_extract_oracle_trial() -> Trial {
             assert!(response.error.is_none(), "{response:?}");
         }
         let program = pb::Program {
-            ir_version: 1,
             sorts: vec![
                 pb::Sort {
                     kind: Some(pb::sort::Kind::Eq("E".into())),

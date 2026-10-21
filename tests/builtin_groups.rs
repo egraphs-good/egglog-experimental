@@ -67,7 +67,6 @@ mod native_signature {
                 _ => unreachable!(),
             };
             vec![pb::Program {
-                ir_version: 1,
                 sorts: sorts
                     .into_iter()
                     .map(|kind| pb::Sort {
@@ -1003,7 +1002,6 @@ struct Grouped;
 impl Grouped {
     fn wire_definitions() -> Vec<pb::Program> {
         vec![pb::Program {
-            ir_version: 1,
             sorts: vec![
                 pb::Sort {
                     kind: Some(pb::sort::Kind::Var(0)),
@@ -1726,7 +1724,6 @@ fn grouped_native_and_exact_key_typing_share_the_canonical_pattern() {
         (vec![i.clone(), i.clone(), f], i, false),
     ] {
         let mut program = pb::Program {
-            ir_version: 1,
             ..Default::default()
         };
         let arguments = args
@@ -2108,7 +2105,6 @@ mod manual_root_context {
     impl Template {
         fn wire_definitions() -> Vec<pb::Program> {
             vec![pb::Program {
-                ir_version: 1,
                 sorts: vec![pb::Sort {
                     kind: Some(pb::sort::Kind::Family(pb::HostSort {
                         name: "i64".into(),

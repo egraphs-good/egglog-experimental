@@ -551,7 +551,6 @@ mod tests {
                 egraph_id: handle,
                 profile: true,
                 program: Some(pb::Program {
-                    ir_version: 1,
                     sorts: vec![pb::Sort {
                         kind: Some(pb::sort::Kind::Family(pb::HostSort {
                             name: "i64".into(),

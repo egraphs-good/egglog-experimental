@@ -5,14 +5,10 @@ use prost::Message;
 
 // Arena indices are packet-local. Normalize only this saved occurrence's
 // reachable graph before comparing first-position and publication records.
-fn canonical_rule_occurrence(
-    program: &pb::Program,
-    rule: &pb::RuleDecl,
-) -> (pb::RuleDecl, Vec<pb::Node>) {
+fn canonical_rule_occurrence(program: &pb::Program, rule: &pb::Rule) -> (pb::Rule, Vec<pb::Node>) {
     let mut canonical = pb::Program::default();
     egglog_experimental::builtin::definitions::reconcile_rulesets(
         &pb::Program {
-            ir_version: program.ir_version,
             sorts: program.sorts.clone(),
             files: program.files.clone(),
             nodes: program.nodes.clone(),
@@ -418,7 +414,6 @@ fn source_multi_extract_rejects_counts_and_later_roots_inertly() {
             &mut engine,
             id,
             pb::Program {
-                ir_version: 1,
                 commands: vec![pb::Command {
                     kind: Some(pb::command::Kind::PrintSize(pb::PrintSize {
                         tables: vec!["A".into()],
@@ -990,7 +985,6 @@ fn hidden_tables_source_native_and_snapshot_replay() {
                 &mut engine,
                 id,
                 pb::Program {
-                    ir_version: 1,
                     commands: vec![pb::Command {
                         kind: Some(pb::command::Kind::Freeze(pb::Freeze {})),
                         ..Default::default()
@@ -1046,7 +1040,6 @@ fn hidden_tables_source_native_and_snapshot_replay() {
                     &mut engine,
                     restored,
                     pb::Program {
-                        ir_version: 1,
                         commands: vec![pb::Command {
                             kind: Some(pb::command::Kind::PrintSize(pb::PrintSize {
                                 tables: vec![table.into()],
@@ -1170,7 +1163,6 @@ fn hidden_is_rejected_on_non_table_declarations() {
             &mut engine,
             id,
             pb::Program {
-                ir_version: 1,
                 declarations: vec![pb::Declaration {
                     kind: Some(kind),
                     hidden: true,
@@ -1713,7 +1705,6 @@ mod constructor_action_dags {
 
     fn program(wraps: usize, share_every: usize) -> pb::Program {
         let mut program = pb::Program {
-            ir_version: 1,
             sorts: fixture().sorts,
             declarations: vec![pb::Declaration {
                 kind: Some(pb::declaration::Kind::EqSort(pb::EqSort {
@@ -1891,7 +1882,6 @@ mod constructor_action_dags {
         assert_eq!(response.error, None);
         assert!(response.outputs.is_empty());
         let mut inspect = pb::Program {
-            ir_version: 1,
             ..Default::default()
         };
         inspect.commands.push(pb::Command {
@@ -1994,7 +1984,6 @@ mod constructor_action_dags {
                 // Experimental text uses new nominal aliases, not original
                 // keys for same-engine resupply. Observations need no definitions.
                 let mut inspect = pb::Program {
-                    ir_version: 1,
                     commands: program(0, 0).commands[1..].to_vec(),
                     ..Default::default()
                 };
@@ -2365,7 +2354,6 @@ mod constructor_action_dags {
             let id = create(&mut engine);
             let mut failed = false;
             let mut inspect = pb::Program {
-                ir_version: 1,
                 commands: program(0, 0).commands[1..].to_vec(),
                 ..Default::default()
             };
@@ -2618,7 +2606,6 @@ mod constructor_action_dags {
                 },
             );
             let freeze = pb::Program {
-                ir_version: 1,
                 commands: vec![pb::Command {
                     kind: Some(pb::command::Kind::Freeze(pb::Freeze {})),
                     ..Default::default()
@@ -2636,7 +2623,6 @@ mod constructor_action_dags {
                     &mut engine,
                     id,
                     pb::Program {
-                        ir_version: 1,
                         commands: vec![pb::Command {
                             kind: Some(pb::command::Kind::PrintSize(pb::PrintSize {
                                 tables: vec![
@@ -2816,8 +2802,8 @@ mod constructor_action_dags {
                 }),
                 "head" => {
                     invalid_program.commands.clear();
-                    invalid_program.rules.push(pb::RuleDecl {
-                        kind: Some(pb::rule_decl::Kind::Rule(pb::Rule {
+                    invalid_program.rules.push(pb::Rule {
+                        kind: Some(pb::rule::Kind::Rule(pb::RuleBody {
                             head: vec![pb::Action {
                                 kind: Some(pb::action::Kind::Term(root)),
                                 ..Default::default()
@@ -3022,10 +3008,10 @@ mod constructor_action_dags {
                 })),
                 ..Default::default()
             });
-            input.rules.push(pb::RuleDecl {
+            input.rules.push(pb::Rule {
                 name: Some("query-witness".into()),
                 eval_mode: pb::RuleEvalMode::Seminaive.into(),
-                kind: Some(pb::rule_decl::Kind::Rule(pb::Rule {
+                kind: Some(pb::rule::Kind::Rule(pb::RuleBody {
                     query: vec![root, root],
                     head: vec![pb::Action {
                         kind: Some(pb::action::Kind::Term(seen)),
@@ -3035,18 +3021,18 @@ mod constructor_action_dags {
                 ..Default::default()
             });
             if kind != "rule" {
-                input.rules.push(pb::RuleDecl {
+                input.rules.push(pb::Rule {
                     name: Some("query-rewrite".into()),
                     eval_mode: pb::RuleEvalMode::Seminaive.into(),
                     kind: Some(if kind == "rewrite" {
-                        pb::rule_decl::Kind::Rewrite(pb::Rewrite {
+                        pb::rule::Kind::Rewrite(pb::Rewrite {
                             lhs: root,
                             rhs: 0,
                             conditions: vec![root],
                             subsume: false,
                         })
                     } else {
-                        pb::rule_decl::Kind::Birewrite(pb::BiRewrite {
+                        pb::rule::Kind::Birewrite(pb::BiRewrite {
                             lhs: root,
                             rhs: 0,
                             conditions: vec![root],
@@ -3638,7 +3624,6 @@ mod source_reflection {
             let phase = phase.unwrap();
             if phase.declarations.iter().any(|declaration| matches!(&declaration.kind, Some(pb::declaration::Kind::Function(f)) if f.name == "Parent")) {
                 let frozen = run(&mut engine, id, pb::Program {
-                    ir_version: 1,
                     commands: vec![pb::Command { kind: Some(pb::command::Kind::Freeze(pb::Freeze {})), ..Default::default() }],
                     ..Default::default()
                 });
@@ -3667,7 +3652,6 @@ mod source_reflection {
             &mut engine,
             id,
             pb::Program {
-                ir_version: 1,
                 commands: vec![pb::Command {
                     kind: Some(pb::command::Kind::Freeze(pb::Freeze {})),
                     ..Default::default()
@@ -3868,7 +3852,6 @@ mod uf_parent_headers {
 
     fn packet(table: Kind) -> pb::Program {
         pb::Program {
-            ir_version: 1,
             sorts: vec![
                 pb::Sort {
                     kind: Some(pb::sort::Kind::Eq("S".into())),
@@ -4801,7 +4784,6 @@ mod relation_predicates {
             },
         ]);
         pb::Program {
-            ir_version: 1,
             sorts,
             // 0/1 keys; 2/3 R(key); 4 zero; 5 marker write99; 6 marker();
             // 7 query x; 8 merge new; 9 R(x); 10 S(x); 11/12 inert Unit.
@@ -4961,10 +4943,10 @@ mod relation_predicates {
                     ..Default::default()
                 },
             ],
-            rules: vec![pb::RuleDecl {
+            rules: vec![pb::Rule {
                 name: Some("wire predicate forward".into()),
                 eval_mode: pb::RuleEvalMode::Seminaive.into(),
-                kind: Some(pb::rule_decl::Kind::Rule(pb::Rule {
+                kind: Some(pb::rule::Kind::Rule(pb::RuleBody {
                     query: vec![9],
                     head: vec![pb::Action {
                         kind: Some(pb::action::Kind::Term(10)),
@@ -5954,7 +5936,7 @@ mod relation_predicates {
                         invalid.sorts.push(pb::Sort { kind: Some(pb::sort::Kind::Family(pb::HostSort { name: family.into(), args })), ..Default::default() });
                         invalid.nodes[12].kind = Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue { value: Some(value) }));
                     }
-                    "rewrite-lhs" | "rewrite-rhs" => invalid.rules.push(pb::RuleDecl { name: Some(case.into()), eval_mode: pb::RuleEvalMode::Seminaive.into(), kind: Some(pb::rule_decl::Kind::Rewrite(pb::Rewrite { lhs: if case == "rewrite-lhs" { 2 } else { 11 }, rhs: if case == "rewrite-rhs" { 2 } else { 11 }, ..Default::default() })), ..Default::default() }),
+                    "rewrite-lhs" | "rewrite-rhs" => invalid.rules.push(pb::Rule { name: Some(case.into()), eval_mode: pb::RuleEvalMode::Seminaive.into(), kind: Some(pb::rule::Kind::Rewrite(pb::Rewrite { lhs: if case == "rewrite-lhs" { 2 } else { 11 }, rhs: if case == "rewrite-rhs" { 2 } else { 11 }, ..Default::default() })), ..Default::default() }),
                     "nested-fail" => bad.kind = Some(pb::command::Kind::Fail(Box::new(pb::Command { kind: Some(pb::command::Kind::Repeat(pb::Repeat { body: vec![extract], times: Some(1), ..Default::default() })), ..Default::default() }))),
                     "nested-schedule" => bad.kind = Some(pb::command::Kind::Saturate(pb::Saturate { body: vec![pb::Command { kind: Some(pb::command::Kind::Repeat(pb::Repeat { body: vec![extract], times: Some(0), ..Default::default() })), ..Default::default() }], max_iterations: Some(1), ..Default::default() })),
                     "nonunit-annotation" => invalid.nodes[2].sort_id = 0,
@@ -6368,7 +6350,6 @@ fn maybe_catalog_none_preserves_nominal_resolution() {
 #[test]
 fn maybe_values_roundtrip_bytes_preserve_optional_child_zero() {
     let program = pb::Program {
-        ir_version: 1,
         sorts: [("i64", vec![]), ("Maybe", vec![0]), ("Maybe", vec![1])]
             .into_iter()
             .map(|(name, args)| pb::Sort {
@@ -6448,7 +6429,6 @@ fn maybe_values_roundtrip_bytes_preserve_optional_child_zero() {
         "Some(None) shares the None child, not outer None"
     );
     let replay = pb::Program {
-        ir_version: 1,
         sorts: response.sorts,
         nodes: response.nodes,
         commands: vec![pb::Command {
@@ -6491,7 +6471,6 @@ fn maybe_payload_rejection_precedes_writes_and_undefined_unwrap_keeps_prefix() {
         assert_eq!(run(&mut engine, id, phase.clone()).error, None);
     }
     let base = pb::Program {
-        ir_version: 1,
         sorts: vec![
             pb::Sort {
                 kind: Some(pb::sort::Kind::Family(pb::HostSort {
@@ -6659,7 +6638,6 @@ fn maybe_payload_rejection_precedes_writes_and_undefined_unwrap_keeps_prefix() {
         "earlier Maybe extraction survives the undefined unwrap"
     );
     let read = pb::Program {
-        ir_version: 1,
         sorts: vec![pb::Sort {
             kind: Some(pb::sort::Kind::Family(pb::HostSort {
                 name: "i64".into(),
@@ -6702,7 +6680,6 @@ fn maybe_payload_rejection_precedes_writes_and_undefined_unwrap_keeps_prefix() {
 #[test]
 fn named_primitive_direct_bytes_and_capture_reingestion() {
     let program = pb::Program {
-        ir_version: 1,
         sorts: vec![pb::Sort {
             kind: Some(pb::sort::Kind::Family(pb::HostSort {
                 name: "i64".into(),
@@ -6933,7 +6910,6 @@ fn named_primitive_direct_bytes_and_capture_reingestion() {
     drop(engine);
     let saved = pb::RunProgramResponse::decode(bytes.as_slice()).unwrap();
     let mut restored = pb::Program {
-        ir_version: 1,
         sorts: saved.sorts,
         nodes: saved.nodes,
         ..Default::default()
@@ -7163,7 +7139,6 @@ fn source_renderer_later_type_failure_keeps_replayed_prefix() {
             &mut engine,
             id,
             pb::Program {
-                ir_version: 1,
                 commands: vec![pb::Command {
                     kind: Some(pb::command::Kind::PrintFunction(pb::PrintFunction {
                         table: table.unwrap(),
@@ -7235,7 +7210,6 @@ fn named_primitive_source_identity_timing_and_fresh_replay() {
     let mut renderer = Renderer::default();
     let mut rendered = String::new();
     let mut definitions = pb::Program {
-        ir_version: 1,
         ..Default::default()
     };
     let mut saved = None;
@@ -7299,7 +7273,6 @@ fn named_primitive_source_identity_timing_and_fresh_replay() {
     let (function, bytes) = saved.unwrap();
     let saved = pb::RunProgramResponse::decode(bytes.as_slice()).unwrap();
     let mut program = pb::Program {
-        ir_version: 1,
         sorts: saved.sorts,
         nodes: saved.nodes,
         ..Default::default()
@@ -7349,7 +7322,6 @@ fn named_primitive_source_identity_timing_and_fresh_replay() {
 fn named_primitive_container_dependencies_and_unsupported_cycles() {
     use egglog_experimental::protobuf::source::{Renderer, Source};
     let mut program = pb::Program {
-        ir_version: 1,
         ..Default::default()
     };
     for phase in Source::new(
@@ -7615,7 +7587,6 @@ fn named_primitive_preparation_is_inert_and_extensions_are_opt_in() {
 #[test]
 fn function_value_direct_bytes_validate_complete_signatures() {
     let program = pb::Program {
-        ir_version: 1,
         sorts: vec![
             pb::Sort {
                 kind: Some(pb::sort::Kind::Family(pb::HostSort {
@@ -7783,7 +7754,6 @@ fn function_value_direct_bytes_validate_complete_signatures() {
             &mut fresh,
             id,
             pb::Program {
-                ir_version: 1,
                 sorts: saved.sorts,
                 nodes,
                 commands: vec![pb::Command {
@@ -7870,7 +7840,6 @@ fn function_value_source_bytes_and_fresh_renderer() {
 fn function_value_zero_capture_ctor_selects_expected_shape_in_fresh_source() {
     use egglog_experimental::protobuf::source::{Renderer, Source};
     let mut program = pb::Program {
-        ir_version: 1,
         ..Default::default()
     };
     for name in ["i64", "f64", "Unit"] {
@@ -8199,7 +8168,6 @@ fn function_value_nested_variants_keep_capture_types_and_shared_children() {
         ..Default::default()
     });
     let mut program = pb::Program {
-        ir_version: 1,
         sorts,
         nodes,
         commands: vec![pb::Command {
@@ -8273,7 +8241,6 @@ fn function_value_capture_timing_heterogeneity_and_rebuilding() {
                 };
                 captures.push(value(&response, call.args[0]));
                 let mut program = pb::Program {
-                    ir_version: 1,
                     sorts: response.sorts.clone(),
                     nodes: response.nodes.clone(),
                     ..Default::default()
@@ -9408,7 +9375,6 @@ fn experimental_renderer_roundtrips_general_loop_shapes_and_rejects_source_count
         ..Default::default()
     };
     let program = pb::Program {
-        ir_version: 1,
         rulesets: vec![pb::Ruleset {
             name: Some("r".into()),
             kind: Some(pb::ruleset::Kind::Rules(pb::RuleList::default())),
@@ -9937,7 +9903,6 @@ fn source_scheduler_scope_and_rejection_preserve_submitted_prefix() {
             &mut engine,
             id,
             pb::Program {
-                ir_version: 1,
                 commands: vec![pb::Command {
                     kind: Some(pb::command::Kind::PrintSize(pb::PrintSize {
                         tables: vec!["Marker".into()],
@@ -10076,7 +10041,6 @@ fn source_print_size_projection_preserves_selected_table_in_both_dialects() {
             .enumerate()
         {
             let program = pb::Program {
-                ir_version: 1,
                 commands: vec![pb::Command {
                     kind: Some(pb::command::Kind::PrintSize(pb::PrintSize {
                         tables: vec![table.into()],
@@ -10086,7 +10050,6 @@ fn source_print_size_projection_preserves_selected_table_in_both_dialects() {
                 ..Default::default()
             };
             let mut retry = pb::Program {
-                ir_version: 1,
                 rulesets: vec![pb::Ruleset {
                     name: Some(format!("after_unknown_{index}")),
                     kind: Some(pb::ruleset::Kind::Rules(pb::RuleList::default())),
@@ -10636,7 +10599,6 @@ fn source_table_cells_limits_and_unavailability_match_native() {
                             &mut engine,
                             id,
                             pb::Program {
-                                ir_version: 1,
                                 sorts: response.sorts.clone(),
                                 nodes: response.nodes.clone(),
                                 commands: vec![pb::Command {
@@ -10748,7 +10710,6 @@ fn source_table_observation_boundaries_keep_submitted_prefix() {
                 &mut engine,
                 id,
                 pb::Program {
-                    ir_version: 1,
                     commands: vec![pb::Command {
                         kind: Some(pb::command::Kind::PrintFunction(pb::PrintFunction {
                             table: "current".into(),
@@ -11091,7 +11052,6 @@ fn core_renderer_rejects_unrepresentable_names_before_publication() {
         let mut renderer = Renderer::core();
         renderer.render(&base).unwrap();
         let sort = pb::Program {
-            ir_version: 1,
             declarations: vec![pb::Declaration {
                 kind: Some(pb::declaration::Kind::EqSort(pb::EqSort {
                     name: "Shared".into(),
@@ -11193,7 +11153,6 @@ fn core_source_rejects_malformed_dead_until_without_losing_submitted_prefix() {
         &mut engine,
         id,
         pb::Program {
-            ir_version: 1,
             commands: vec![pb::Command {
                 kind: Some(pb::command::Kind::PrintFunction(pb::PrintFunction {
                     table: "Seed".into(),
@@ -11265,7 +11224,6 @@ fn bounded_saturate_observes_native_early_stop_not_exact_repeat() {
         ..Default::default()
     }];
     let program = pb::Program {
-        ir_version: 1,
         rulesets: vec![pb::Ruleset {
             name: Some("empty".into()),
             kind: Some(pb::ruleset::Kind::Rules(pb::RuleList::default())),
@@ -11353,7 +11311,6 @@ fn scope_return_retains_actual_cumulative_report() {
         assert_eq!(run(&mut engine, saved, phase.unwrap()).error, None);
     }
     let stats = pb::Program {
-        ir_version: 1,
         commands: vec![pb::Command {
             kind: Some(pb::command::Kind::Stats(pb::Unit {})),
             ..Default::default()
@@ -11490,7 +11447,6 @@ fn scope_return_keeps_failure_work_without_reusing_popped_rule_keys() {
     }
     assert_eq!(failures, 1);
     let stats = pb::Program {
-        ir_version: 1,
         commands: vec![pb::Command {
             kind: Some(pb::command::Kind::Stats(pb::Unit {})),
             ..Default::default()
@@ -11612,7 +11568,7 @@ fn scope_return_nested_pairs_reject_before_consumption() {
         &mut engine,
         root,
         pb::Program {
-            ir_version: 99,
+            rules: vec![pb::Rule::default()],
             ..Default::default()
         },
     );
@@ -11719,7 +11675,6 @@ fn reports_stats_composition_detail_off_fail_and_source() {
             &mut engine,
             id,
             pb::Program {
-                ir_version: 1,
                 commands: vec![pb::Command {
                     kind: Some(pb::command::Kind::Stats(pb::Unit {})),
                     ..Default::default()
@@ -11901,7 +11856,6 @@ fn reports_stats_composition_detail_off_fail_and_source() {
                 &mut engine,
                 handle,
                 pb::Program {
-                    ir_version: 1,
                     commands: vec![
                         stats.clone(),
                         pb::Command {
@@ -12730,7 +12684,6 @@ fn exact_numeric_catalog_metadata_does_not_add_proof_validators() {
 
 fn shared_rules_fixture() -> pb::Program {
     let mut program = pb::Program {
-        ir_version: 1,
         sorts: vec![pb::Sort {
             kind: Some(pb::sort::Kind::Eq("Item".into())),
             ..Default::default()
@@ -12760,8 +12713,8 @@ fn shared_rules_fixture() -> pb::Program {
                 ..Default::default()
             },
         ],
-        rules: vec![pb::RuleDecl {
-            kind: Some(pb::rule_decl::Kind::Rule(pb::Rule {
+        rules: vec![pb::Rule {
+            kind: Some(pb::rule::Kind::Rule(pb::RuleBody {
                 query: vec![],
                 head: vec![pb::Action {
                     kind: Some(pb::action::Kind::Term(0)),
@@ -12841,7 +12794,7 @@ fn shared_rule_occurrence_reuses_native_cursor_across_leaves_and_resupply() {
         unreachable!()
     };
     c.output = 1;
-    let Some(pb::rule_decl::Kind::Rule(r)) = &mut program.rules[0].kind else {
+    let Some(pb::rule::Kind::Rule(r)) = &mut program.rules[0].kind else {
         unreachable!()
     };
     r.head[0].kind = Some(pb::action::Kind::Term(1));
@@ -12977,7 +12930,6 @@ fn publication_receipts_are_request_scoped_across_command_failure_replay_and_clo
     let mut engine = Engine::default();
     let id = create(&mut engine);
     let mut program = pb::Program {
-        ir_version: 1,
         rulesets: ["older", "", ""]
             .into_iter()
             .map(|name| pb::Ruleset {
@@ -13013,7 +12965,6 @@ fn publication_receipts_are_request_scoped_across_command_failure_replay_and_clo
     assert_eq!(failed.ruleset_publication.unwrap().names, ["", "fresh"]);
 
     let named_run = pb::Program {
-        ir_version: 1,
         commands: vec![pb::Command {
             kind: Some(pb::command::Kind::Run(pb::Run {
                 ruleset: Some(pb::RulesetRef {
@@ -13094,7 +13045,6 @@ fn experimental_renderer_shared_rules_roundtrip() {
     };
     call.func = constructor.name.clone();
     let mut selectors = pb::Program {
-        ir_version: 1,
         sorts: program.sorts.clone(),
         declarations: vec![program.declarations[1].clone()],
         nodes: program.nodes.clone(),
@@ -13550,7 +13500,6 @@ fn native_catalog_snapshot_is_deterministic_and_installs_as_bytes() {
 #[test]
 fn set_values_roundtrip_bytes_nested_empty_and_cloned_handles() {
     let mut program = pb::Program {
-        ir_version: 1,
         sorts: [
             ("i64", vec![]),
             ("Set", vec![0]),
@@ -13653,7 +13602,6 @@ fn set_values_roundtrip_bytes_nested_empty_and_cloned_handles() {
             }
         }
         program = pb::Program {
-            ir_version: 1,
             sorts: response.sorts,
             nodes: response.nodes,
             commands: vec![pb::Command {
@@ -14406,7 +14354,6 @@ fn wire_namespace_private_looking_names_are_distinct_logical_names() {
             );
             // A nominal spelling does not confer host-family provenance.
             let forged_family = pb::Program {
-                ir_version: 1,
                 sorts: vec![pb::Sort {
                     kind: Some(pb::sort::Kind::Family(pb::HostSort {
                         name: "__egglog_proto_vec_3_i64".into(),
@@ -14442,7 +14389,6 @@ fn wire_namespace_undeclared_private_references_cannot_access_constructor() {
         assert_eq!(run(&mut engine, id, phase).error, None);
     }
     let mut program = pb::Program {
-        ir_version: 1,
         sorts: vec![
             fixture().sorts[0].clone(),
             pb::Sort {
@@ -14750,7 +14696,6 @@ fn wire_namespace_same_request_sort_and_constructor() {
 
 fn check_cross_request_namespaces(sort_first: bool, name: &str) {
     let sort = pb::Program {
-        ir_version: 1,
         declarations: vec![pb::Declaration {
             kind: Some(pb::declaration::Kind::EqSort(pb::EqSort {
                 name: name.into(),
@@ -15036,7 +14981,7 @@ fn wire_namespace_query_binders_do_not_rename_merge_variables() {
         })),
         ..Default::default()
     });
-    p.rules[0].kind = Some(pb::rule_decl::Kind::Rule(pb::Rule {
+    p.rules[0].kind = Some(pb::rule::Kind::Rule(pb::RuleBody {
         query: vec![query],
         head: vec![pb::Action {
             kind: Some(pb::action::Kind::Set(pb::Set {
@@ -15366,7 +15311,6 @@ fn initializer_metadata_accepts_expanded_default_calls_and_rejects_semantic_resu
 
 fn pair_fixture() -> pb::Program {
     pb::Program {
-        ir_version: 1,
         sorts: vec![
             pb::Sort {
                 kind: Some(pb::sort::Kind::Family(pb::HostSort {
@@ -15552,7 +15496,6 @@ fn map_value_bytes_extract_reingest_and_render() {
             .parse_and_run_program(None, &renderer.render(&program).unwrap())
             .unwrap();
         program = pb::Program {
-            ir_version: 1,
             sorts: response.sorts,
             nodes: response.nodes,
             commands: vec![pb::Command {
@@ -15941,7 +15884,6 @@ fn nested_map_source_keeps_nominal_and_same_head_user_provenance() {
                 _ => continue,
             }
             let reingest = pb::Program {
-                ir_version: 1,
                 sorts: response.sorts.clone(),
                 nodes: response.nodes.clone(),
                 commands: vec![pb::Command {
@@ -16095,7 +16037,6 @@ fn pair_value_bytes_extract_reingest_and_render() {
             .parse_and_run_program(None, &renderer.render(&program).unwrap())
             .unwrap();
         program = pb::Program {
-            ir_version: 1,
             sorts: response.sorts,
             nodes: response.nodes,
             commands: vec![pb::Command {
@@ -16576,7 +16517,6 @@ fn nominal_pair_source_preserves_names_through_bytes_and_rendering() {
                     );
                 }
                 let reingest = pb::Program {
-                    ir_version: 1,
                     sorts: response.sorts.clone(),
                     nodes: response.nodes.clone(),
                     commands: vec![pb::Command {
@@ -16727,7 +16667,6 @@ fn nominal_pair_resupply_orders_clone_conflicts_and_prefixes() {
                 )
             }) {
                 let phase = pb::Program {
-                    ir_version: 1,
                     declarations: vec![d.clone()],
                     ..Default::default()
                 };
@@ -16971,8 +16910,8 @@ fn source_ungrounded_birewrite_keeps_forward_prefix_and_stops() {
     assert!(prefix.commands.is_empty());
     assert!(matches!(
         prefix.rules.as_slice(),
-        [pb::RuleDecl {
-            kind: Some(pb::rule_decl::Kind::Rewrite(_)),
+        [pb::Rule {
+            kind: Some(pb::rule::Kind::Rewrite(_)),
             name: Some(name),
             ..
         }] if name.ends_with("=>")
@@ -17012,7 +16951,6 @@ fn source_ungrounded_birewrite_keeps_forward_prefix_and_stops() {
                 &mut engine,
                 id,
                 pb::Program {
-                    ir_version: 1,
                     commands: vec![pb::Command {
                         kind: Some(pb::command::Kind::Run(pb::Run {
                             ruleset: Some(pb::RulesetRef {
@@ -17117,8 +17055,8 @@ fn source_grounding_corrections_execute_and_invalid_rules_are_atomic() {
         // Preserve the independent adapter-atomicity oracle: construct invalid
         // wire input by removing the corrected body's grounding conditions.
         match invalid.rules[0].kind.as_mut().unwrap() {
-            pb::rule_decl::Kind::Birewrite(rule) => rule.conditions.clear(),
-            pb::rule_decl::Kind::Rule(rule) => rule.query.truncate([0, 1, 1, 1, 4][case]),
+            pb::rule::Kind::Birewrite(rule) => rule.conditions.clear(),
+            pb::rule::Kind::Rule(rule) => rule.query.truncate([0, 1, 1, 1, 4][case]),
             _ => unreachable!(),
         }
         for phase in phases {
@@ -17167,10 +17105,10 @@ fn source_grounding_corrections_execute_and_invalid_rules_are_atomic() {
                 saw_rule = true;
                 assert_eq!(phase.rules.len(), 1);
                 match &phase.rules[0].kind {
-                    Some(pb::rule_decl::Kind::Birewrite(rule)) if case == 0 => {
+                    Some(pb::rule::Kind::Birewrite(rule)) if case == 0 => {
                         assert_eq!(rule.conditions.len(), 1);
                     }
-                    Some(pb::rule_decl::Kind::Rule(rule)) if case != 0 => {
+                    Some(pb::rule::Kind::Rule(rule)) if case != 0 => {
                         assert_eq!(
                             (rule.query.len(), rule.head.len()),
                             [(0, 0), (2, 1), (2, 0), (3, 2), (7, 2)][case]
@@ -17248,7 +17186,7 @@ fn pair_value_queries_require_grounded_children() {
             }
             if !checked_ungrounded {
                 let mut ungrounded = program.clone();
-                let Some(pb::rule_decl::Kind::Rule(rule)) = &mut ungrounded.rules[0].kind else {
+                let Some(pb::rule::Kind::Rule(rule)) = &mut ungrounded.rules[0].kind else {
                     unreachable!()
                 };
                 assert_eq!(rule.query.len(), 2);
@@ -17327,7 +17265,7 @@ fn map_value_queries_require_grounded_children() {
             }
             if !checked_ungrounded {
                 let mut ungrounded = program.clone();
-                let Some(pb::rule_decl::Kind::Rule(rule)) = &mut ungrounded.rules[0].kind else {
+                let Some(pb::rule::Kind::Rule(rule)) = &mut ungrounded.rules[0].kind else {
                     unreachable!()
                 };
                 assert_eq!(rule.query.len(), 2);
@@ -17902,7 +17840,6 @@ fn source_vec_calls_execute_through_bytes() {
             if let Some(pb::command_output::Kind::Extraction(result)) = &output.kind {
                 results.push(value(&response, result.roots[0].variants[0].term));
                 let reingest = pb::Program {
-                    ir_version: 1,
                     sorts: response.sorts.clone(),
                     nodes: response.nodes.clone(),
                     commands: vec![pb::Command {
@@ -17943,7 +17880,6 @@ fn source_vec_calls_execute_through_bytes() {
 fn vec_range_closed_calls_materialize_and_reject_invalid_annotations() {
     use egglog_experimental::protobuf::source::Renderer;
     let mut program = pb::Program {
-        ir_version: 1,
         sorts: vec![
             pb::Sort {
                 kind: Some(pb::sort::Kind::Family(pb::HostSort {
@@ -18532,7 +18468,6 @@ fn source_structural_sort_aliases_preserve_metadata_and_share_types() {
 fn sort_alias_collisions_are_transactional_text_errors_only() {
     use egglog_experimental::protobuf::source::Renderer;
     let mut program = pb::Program {
-        ir_version: 1,
         sorts: [
             ("i64", vec![]),
             ("String", vec![]),
@@ -18833,7 +18768,6 @@ fn source_scope_underflow_keeps_completed_returns_and_stops_the_queue() {
 fn sort_alias_arriving_after_materialization_keeps_the_emitted_representative() {
     use egglog_experimental::protobuf::source::Renderer;
     let mut program = pb::Program {
-        ir_version: 1,
         sorts: [("i64", vec![]), ("Vec", vec![0])]
             .into_iter()
             .map(|(name, args)| pb::Sort {
@@ -19064,7 +18998,6 @@ fn scalar_source_calls_preserve_canonical_arguments_and_structured_values() {
             };
             assert_eq!(extracted, [literal.to_string()], "rendered {expression}");
             program = pb::Program {
-                ir_version: 1,
                 sorts: response.sorts,
                 nodes: response.nodes,
                 commands: vec![pb::Command {
@@ -19146,7 +19079,6 @@ fn scalar_nested_pair_map_results_reingest_and_render() {
             );
             if pass == 0 {
                 program = pb::Program {
-                    ir_version: 1,
                     sorts: response.sorts,
                     nodes: response.nodes,
                     commands: vec![pb::Command {
@@ -19551,7 +19483,6 @@ fn source_fail_rejects_authored_let_before_registration() {
             );
             assert!(source.next().is_none());
             let observation = pb::Program {
-                ir_version: 1,
                 commands: vec![pb::Command {
                     kind: Some(pb::command::Kind::PrintSize(pb::PrintSize {
                         tables: vec!["C".into()],
@@ -19732,7 +19663,6 @@ fn source_fail_definitions_are_frontend_only_and_keep_installed_prefixes() {
                     }
                 }
                 let mut observation = pb::Program {
-                    ir_version: 1,
                     ..Default::default()
                 };
                 if succeeds && child.starts_with("(rule") {
@@ -19815,7 +19745,6 @@ fn source_fail_definition_admission_uses_selected_mode_without_replay_obligation
         .unwrap()
         .egraph_id;
     let occupied = pb::Program {
-        ir_version: 1,
         rulesets: vec![pb::Ruleset {
             name: Some("missing".into()),
             kind: Some(pb::ruleset::Kind::Rules(pb::RuleList::default())),
@@ -19918,7 +19847,6 @@ fn source_fail_keeps_encoded_definition_prefixes_and_partial_birewrite() {
                 &mut engine,
                 id,
                 pb::Program {
-                    ir_version: 1,
                     commands: ["A", "B"]
                         .into_iter()
                         .map(|table| pb::Command {
@@ -19953,7 +19881,7 @@ fn source_fail_keeps_encoded_definition_prefixes_and_partial_birewrite() {
             phase
                 .rules
                 .iter()
-                .all(|rule| !matches!(rule.kind, Some(pb::rule_decl::Kind::Birewrite(_))))
+                .all(|rule| !matches!(rule.kind, Some(pb::rule::Kind::Birewrite(_))))
         );
         assert_eq!(run(&mut engine, id, phase).error, None);
     }
@@ -20303,7 +20231,7 @@ fn source_rule_panics_keep_exact_span_and_occurrence_in_every_mode() {
                     );
                     assert!(response.outputs.is_empty());
                     assert!(!response.profile.as_ref().unwrap().complete);
-                    let Some(pb::rule_decl::Kind::Rule(fired)) = &authored.kind else {
+                    let Some(pb::rule::Kind::Rule(fired)) = &authored.kind else {
                         panic!("authored plain rule")
                     };
                     let panic = fired
@@ -20487,16 +20415,16 @@ fn invalid_rule_modes_reject_unused_rules_before_command_effects() {
             for unused in [false, true] {
                 let mut program = fixture();
                 program.rules[0].kind = Some(match kind {
-                    "rule" => pb::rule_decl::Kind::Rule(pb::Rule {
+                    "rule" => pb::rule::Kind::Rule(pb::RuleBody {
                         query: vec![12],
                         head: vec![],
                     }),
-                    "rewrite" => pb::rule_decl::Kind::Rewrite(pb::Rewrite {
+                    "rewrite" => pb::rule::Kind::Rewrite(pb::Rewrite {
                         lhs: 9,
                         rhs: 8,
                         ..Default::default()
                     }),
-                    "birewrite" => pb::rule_decl::Kind::Birewrite(pb::BiRewrite {
+                    "birewrite" => pb::rule::Kind::Birewrite(pb::BiRewrite {
                         lhs: 9,
                         rhs: 8,
                         ..Default::default()
@@ -20549,7 +20477,7 @@ fn nondefault_rewrite_options_remain_an_explicit_adapter_limit() {
             for unused in [false, true] {
                 let mut program = fixture();
                 if bidirectional {
-                    program.rules[0].kind = Some(pb::rule_decl::Kind::Birewrite(pb::BiRewrite {
+                    program.rules[0].kind = Some(pb::rule::Kind::Birewrite(pb::BiRewrite {
                         lhs: 9,
                         rhs: 8,
                         ..Default::default()
@@ -20624,7 +20552,7 @@ fn source_rule_head_globals_become_retained_query_bindings() {
         for phase in source {
             let phase = pb::Program::decode(phase.unwrap().encode_to_vec().as_slice()).unwrap();
             if let [rule] = phase.rules.as_slice() {
-                let Some(pb::rule_decl::Kind::Rule(rule)) = &rule.kind else {
+                let Some(pb::rule::Kind::Rule(rule)) = &rule.kind else {
                     panic!("plain rule")
                 };
                 assert_eq!(rule.query.len(), 2); // Trigger plus one shared global capture.
@@ -20698,7 +20626,7 @@ fn source_pure_local_aliases_share_nodes_and_retain_ordered_terms() {
         for phase in source {
             let phase = pb::Program::decode(phase.unwrap().encode_to_vec().as_slice()).unwrap();
             if let [rule] = phase.rules.as_slice() {
-                let Some(pb::rule_decl::Kind::Rule(rule)) = &rule.kind else {
+                let Some(pb::rule::Kind::Rule(rule)) = &rule.kind else {
                     panic!("plain rule")
                 };
                 assert_eq!(rule.head.len(), 7);
@@ -20750,7 +20678,7 @@ fn source_unused_fallible_local_alias_keeps_its_authored_action() {
         .collect::<Result<Vec<_>, _>>()
         .unwrap();
     let phase = phases.iter().find(|phase| !phase.rules.is_empty()).unwrap();
-    let Some(pb::rule_decl::Kind::Rule(rule)) = &phase.rules[0].kind else {
+    let Some(pb::rule::Kind::Rule(rule)) = &phase.rules[0].kind else {
         panic!("plain rule")
     };
     assert_eq!(rule.head.len(), 3);
@@ -21467,8 +21395,8 @@ mod source_provider_context {
                         ..Default::default()
                     });
                 }
-                program.rules = vec![pb::RuleDecl {
-                    kind: Some(pb::rule_decl::Kind::Rule(pb::Rule {
+                program.rules = vec![pb::Rule {
+                    kind: Some(pb::rule::Kind::Rule(pb::RuleBody {
                         query: vec![],
                         head,
                     })),
@@ -21484,7 +21412,6 @@ mod source_provider_context {
                 program.commands.clear();
                 let authored = program.encode_to_vec();
                 let mut observe = pb::Program {
-                    ir_version: 1,
                     commands: vec![
                         pb::Command {
                             kind: Some(pb::command::Kind::Run(pb::Run {
@@ -21556,7 +21483,6 @@ mod source_provider_context {
                 let id = create(&mut engine);
                 let mut custom_node = program.nodes[custom as usize].clone();
                 let mut read_cost = pb::Program {
-                    ir_version: 1,
                     sorts: vec![
                         program.sorts[custom_node.sort_id as usize].clone(),
                         program.sorts[0].clone(),
@@ -22194,7 +22120,7 @@ fn source_core_renderer_rejects_assigned_cost_reads_and_writes_without_state_cha
                         ..Default::default()
                     }),
                     "rule-read" => {
-                        rule = Some(pb::Rule {
+                        rule = Some(pb::RuleBody {
                             query: vec![read],
                             head: vec![],
                         })
@@ -22203,7 +22129,7 @@ fn source_core_renderer_rejects_assigned_cost_reads_and_writes_without_state_cha
                     _ => unreachable!(),
                 }
             } else if case == "rule-write" {
-                rule = Some(pb::Rule {
+                rule = Some(pb::RuleBody {
                     query: vec![],
                     head: vec![write],
                 });
@@ -22229,8 +22155,8 @@ fn source_core_renderer_rejects_assigned_cost_reads_and_writes_without_state_cha
                 program.commands.push(command);
             }
             if let Some(rule) = rule {
-                program.rules.push(pb::RuleDecl {
-                    kind: Some(pb::rule_decl::Kind::Rule(rule)),
+                program.rules.push(pb::Rule {
+                    kind: Some(pb::rule::Kind::Rule(rule)),
                     name: Some("cost".into()),
                     eval_mode: pb::RuleEvalMode::Naive.into(),
                     ..Default::default()
@@ -23247,7 +23173,6 @@ fn source_rule_growth_preserves_old_versions_occurrences_and_cursors() {
                 }
                 rendered.push_str(&renderer.render(&phase).unwrap());
                 let current_run = pb::Program {
-                    ir_version: 1,
                     files: phase.files.clone(),
                     commands: phase.commands.clone(),
                     ..Default::default()
@@ -23272,7 +23197,6 @@ fn source_rule_growth_preserves_old_versions_occurrences_and_cursors() {
                     &mut engine,
                     id,
                     pb::Program {
-                        ir_version: 1,
                         commands: vec![pb::Command {
                             kind: Some(pb::command::Kind::Stats(pb::Unit {})),
                             ..Default::default()
@@ -23305,7 +23229,6 @@ fn source_rule_growth_preserves_old_versions_occurrences_and_cursors() {
                     // Raw named V0 remains selectable after the logical source
                     // name moves to V1, sharing the old advanced match cursor.
                     let old = pb::Program {
-                        ir_version: 1,
                         commands: vec![pb::Command {
                             kind: Some(pb::command::Kind::Run(pb::Run {
                                 ruleset: Some(pb::RulesetRef {
@@ -23467,7 +23390,6 @@ fn core_renderer_private_selectors_reject_literal_global_collisions_inertly() {
     let expected = renderer.render(&repeat).unwrap();
     for kind in ["sort", "function", "let"] {
         let mut conflict = pb::Program {
-            ir_version: 1,
             ..Default::default()
         };
         if kind == "sort" {
@@ -24029,8 +23951,8 @@ fn source_renderer_preserves_expression_action_grammar() {
             ..Default::default()
         };
         rule_program.commands.clear();
-        rule_program.rules = vec![pb::RuleDecl {
-            kind: Some(pb::rule_decl::Kind::Rule(pb::Rule {
+        rule_program.rules = vec![pb::Rule {
+            kind: Some(pb::rule::Kind::Rule(pb::RuleBody {
                 query: vec![],
                 head: vec![action],
             })),
@@ -24047,7 +23969,6 @@ fn source_renderer_preserves_expression_action_grammar() {
             .parse_and_run_program(None, &renderer.render(&rule_program).unwrap())
             .unwrap();
         let selection = pb::Program {
-            ir_version: 1,
             commands: vec![pb::Command {
                 kind: Some(pb::command::Kind::Run(pb::Run {
                     ruleset: Some(pb::RulesetRef {
@@ -24110,7 +24031,7 @@ fn birewrite_source_guards_and_roundtrip_keep_one_authored_rule() {
         for phase in source {
             let phase = pb::Program::decode(phase.unwrap().encode_to_vec().as_slice()).unwrap();
             if let [rule] = phase.rules.as_slice() {
-                assert!(matches!(rule.kind, Some(pb::rule_decl::Kind::Birewrite(_))));
+                assert!(matches!(rule.kind, Some(pb::rule::Kind::Birewrite(_))));
                 assert_eq!(rule.name.as_deref(), Some("both"));
                 saw_rule = true;
             } else {
@@ -24192,7 +24113,7 @@ fn source_plain_rule_and_subsuming_rewrite_roundtrip() {
 }
 
 fn fixture() -> pb::Program {
-    use pb::{action, command, declaration, node, primitive_value, rule_decl, ruleset, sort};
+    use pb::{action, command, declaration, node, primitive_value, rule, ruleset, sort};
     let int = |value| pb::Node {
         sort_id: 0,
         kind: Some(node::Kind::PrimitiveValue(pb::PrimitiveValue {
@@ -24231,7 +24152,6 @@ fn fixture() -> pb::Program {
         ..Default::default()
     };
     pb::Program {
-        ir_version: 1,
         sorts: vec![
             pb::Sort {
                 kind: Some(sort::Kind::Family(pb::HostSort {
@@ -24319,8 +24239,8 @@ fn fixture() -> pb::Program {
                 ..Default::default()
             },
         ],
-        rules: vec![pb::RuleDecl {
-            kind: Some(rule_decl::Kind::Rewrite(pb::Rewrite {
+        rules: vec![pb::Rule {
+            kind: Some(rule::Kind::Rewrite(pb::Rewrite {
                 lhs: 9,
                 rhs: 8,
                 ..Default::default()
@@ -24923,7 +24843,7 @@ fn source_assigned_cost_rule_primitive_cleanup_and_compaction_roundtrip() {
                 Some(pb::declaration::Kind::Primitive(primitive)) if primitive.name == "read_cost"
                     && matches!(phase.nodes[primitive.body.unwrap() as usize].kind, Some(pb::node::Kind::GetCost(_)))));
             rule_costs |= phase.rules.iter().any(|rule| matches!(&rule.kind,
-                Some(pb::rule_decl::Kind::Rule(rule)) if rule.head.iter().filter(|action| matches!(action.kind, Some(pb::action::Kind::SetCost(_)))).count() == 2));
+                Some(pb::rule::Kind::Rule(rule)) if rule.head.iter().filter(|action| matches!(action.kind, Some(pb::action::Kind::SetCost(_)))).count() == 2));
             let rendered = renderer.render(&phase).unwrap();
             native.parse_and_run_program(None, &rendered).unwrap();
             recorded.push_str(&rendered);
@@ -25126,7 +25046,6 @@ fn source_assigned_cost_delete_temps_do_not_capture_authored_binders() {
         args,
     };
     let program = pb::Program {
-        ir_version: 1,
         sorts: fixture().sorts,
         nodes: vec![
             integer(10),
@@ -25183,8 +25102,8 @@ fn source_assigned_cost_delete_temps_do_not_capture_authored_binders() {
                 ..Default::default()
             },
         ],
-        rules: vec![pb::RuleDecl {
-            kind: Some(pb::rule_decl::Kind::Rule(pb::Rule {
+        rules: vec![pb::Rule {
+            kind: Some(pb::rule::Kind::Rule(pb::RuleBody {
                 query: vec![5],
                 head: vec![pb::Action {
                     kind: Some(pb::action::Kind::Delete(call(vec![3, 4]))),
@@ -25457,8 +25376,8 @@ mod rule_assigned_costs {
             })),
             ..Default::default()
         });
-        program.rules = vec![pb::RuleDecl {
-            kind: Some(pb::rule_decl::Kind::Rule(pb::Rule {
+        program.rules = vec![pb::Rule {
+            kind: Some(pb::rule::Kind::Rule(pb::RuleBody {
                 query: vec![18],
                 head: [
                     ("Num", vec![14], 19),
@@ -25566,7 +25485,7 @@ mod rule_assigned_costs {
             let mut engine = Engine::default();
             let id = create(&mut engine);
             let mut program = fixture();
-            let Some(pb::rule_decl::Kind::Rule(rule)) = &mut program.rules[0].kind else {
+            let Some(pb::rule::Kind::Rule(rule)) = &mut program.rules[0].kind else {
                 unreachable!()
             };
             for action in &mut rule.head {
@@ -25724,7 +25643,7 @@ mod rule_assigned_costs {
             })),
             ..Default::default()
         }); // 25
-        let Some(pb::rule_decl::Kind::Rule(rule)) = &mut program.rules[0].kind else {
+        let Some(pb::rule::Kind::Rule(rule)) = &mut program.rules[0].kind else {
             unreachable!()
         };
         rule.query.clear();
@@ -25797,7 +25716,7 @@ mod rule_assigned_costs {
                 let id = create(&mut engine);
                 let mut program = fixture();
                 program.rules[0].eval_mode = mode.into();
-                let Some(pb::rule_decl::Kind::Rule(rule)) = &mut program.rules[0].kind else {
+                let Some(pb::rule::Kind::Rule(rule)) = &mut program.rules[0].kind else {
                     unreachable!()
                 };
                 let Some(pb::action::Kind::SetCost(set)) = &mut rule.head[2].kind else {
@@ -25874,7 +25793,7 @@ mod rule_assigned_costs {
         let id = create(&mut engine);
         let mut program = fixture();
         program.rules[0].eval_mode = pb::RuleEvalMode::Naive.into();
-        let Some(pb::rule_decl::Kind::Rule(rule)) = &mut program.rules[0].kind else {
+        let Some(pb::rule::Kind::Rule(rule)) = &mut program.rules[0].kind else {
             unreachable!()
         };
         rule.head = vec![pb::Action {
@@ -25977,7 +25896,7 @@ mod rule_assigned_costs {
                 kind: Some(pb::node::Kind::Var("not_in_query".into())),
                 ..Default::default()
             });
-            let Some(pb::rule_decl::Kind::Rule(rule)) = &mut program.rules[0].kind else {
+            let Some(pb::rule::Kind::Rule(rule)) = &mut program.rules[0].kind else {
                 unreachable!()
             };
             let Some(pb::action::Kind::SetCost(set)) = &mut rule.head[0].kind else {
@@ -26027,8 +25946,8 @@ mod rule_assigned_costs {
         let mut engine = Engine::default();
         let id = create(&mut engine);
         let mut program = fixture();
-        program.rules.push(pb::RuleDecl {
-            kind: Some(pb::rule_decl::Kind::Rule(pb::Rule {
+        program.rules.push(pb::Rule {
+            kind: Some(pb::rule::Kind::Rule(pb::RuleBody {
                 query: vec![18],
                 head: vec![pb::Action {
                     kind: Some(pb::action::Kind::Delete(pb::Call {
@@ -26233,8 +26152,8 @@ fn rule_deletion_removes_the_same_constructor_annotation() {
         })),
         ..Default::default()
     });
-    program.rules.push(pb::RuleDecl {
-        kind: Some(pb::rule_decl::Kind::Rule(pb::Rule {
+    program.rules.push(pb::Rule {
+        kind: Some(pb::rule::Kind::Rule(pb::RuleBody {
             query: vec![query],
             head: vec![pb::Action {
                 kind: Some(pb::action::Kind::Delete(pb::Call {
@@ -27567,7 +27486,7 @@ fn birewrite_fixture() -> pb::Program {
         })),
         ..Default::default()
     });
-    program.rules[0].kind = Some(pb::rule_decl::Kind::Birewrite(pb::BiRewrite {
+    program.rules[0].kind = Some(pb::rule::Kind::Birewrite(pb::BiRewrite {
         lhs: 9,
         rhs: 14,
         conditions: vec![],
@@ -27990,7 +27909,7 @@ fn birewrite_validates_each_direction_before_any_effects() {
             "output-sort",
         ] {
             let mut program = birewrite_fixture();
-            let Some(pb::rule_decl::Kind::Birewrite(rewrite)) = &mut program.rules[0].kind else {
+            let Some(pb::rule::Kind::Birewrite(rewrite)) = &mut program.rules[0].kind else {
                 unreachable!()
             };
             match mutation {
@@ -28069,7 +27988,7 @@ fn declared_node_sorts_are_checked_in_deferred_code() {
         kind: Some(pb::node::Kind::Var("x".into())),
         ..Default::default()
     });
-    let Some(pb::rule_decl::Kind::Rewrite(rewrite)) = &mut program.rules[0].kind else {
+    let Some(pb::rule::Kind::Rewrite(rewrite)) = &mut program.rules[0].kind else {
         unreachable!()
     };
     rewrite.rhs = rhs;
@@ -28098,7 +28017,7 @@ fn rule_head_annotations_cannot_be_retyped_by_native_inference() {
         })),
         ..Default::default()
     });
-    program.rules[0].kind = Some(pb::rule_decl::Kind::Rule(pb::Rule {
+    program.rules[0].kind = Some(pb::rule::Kind::Rule(pb::RuleBody {
         query: vec![query],
         // Node 8 also spells x, but claims Math rather than the binder's i64.
         head: vec![pb::Action {
@@ -28481,7 +28400,6 @@ fn unavailable_table_cells_keep_rows_and_execute_suffix() {
     );
     assert!(response.profile.as_ref().unwrap().complete);
     let read = pb::Program {
-        ir_version: 1,
         commands: vec![fixture().commands[8].clone()],
         ..Default::default()
     };
@@ -28761,10 +28679,10 @@ fn union_heads_have_independent_scopes_and_saved_rules_remain_usable() {
     }
     program.rules = ["first", "second"]
         .into_iter()
-        .map(|name| pb::RuleDecl {
+        .map(|name| pb::Rule {
             name: Some(name.into()),
             eval_mode: pb::RuleEvalMode::Seminaive.into(),
-            kind: Some(pb::rule_decl::Kind::Rule(pb::Rule {
+            kind: Some(pb::rule::Kind::Rule(pb::RuleBody {
                 query: vec![12],
                 head: vec![pb::Action {
                     kind: Some(pb::action::Kind::Term(13)),
@@ -28774,7 +28692,7 @@ fn union_heads_have_independent_scopes_and_saved_rules_remain_usable() {
             ..Default::default()
         })
         .collect();
-    let Some(pb::rule_decl::Kind::Rule(first)) = &mut program.rules[0].kind else {
+    let Some(pb::rule::Kind::Rule(first)) = &mut program.rules[0].kind else {
         unreachable!()
     };
     first.head.push(pb::Action {
@@ -28836,10 +28754,10 @@ fn union_repeated_heads_reject_even_when_unused_or_resupplied() {
             kind: Some(pb::action::Kind::Term(13)),
             ..Default::default()
         };
-        program.rules = vec![pb::RuleDecl {
+        program.rules = vec![pb::Rule {
             name: Some("merge".into()),
             eval_mode: pb::RuleEvalMode::Seminaive.into(),
-            kind: Some(pb::rule_decl::Kind::Rule(pb::Rule {
+            kind: Some(pb::rule::Kind::Rule(pb::RuleBody {
                 query: vec![12],
                 head: vec![action.clone()],
             })),
@@ -28857,7 +28775,7 @@ fn union_repeated_heads_reject_even_when_unused_or_resupplied() {
             setup.rulesets.clear();
         }
         assert_eq!(run(&mut engine, id, setup).error, None);
-        let Some(pb::rule_decl::Kind::Rule(rule)) = &mut program.rules[0].kind else {
+        let Some(pb::rule::Kind::Rule(rule)) = &mut program.rules[0].kind else {
             unreachable!()
         };
         rule.head.push(action);
@@ -28990,7 +28908,6 @@ fn builtin_i64_merges_execute_and_resupply() {
         // Seed inert nodes so every imported merge root changes arena index.
         // Resupply declarations only: replaying writes could hide a lost row.
         let mut relocated = pb::Program {
-            ir_version: 1,
             sorts: program.sorts.clone(),
             nodes: vec![program.nodes[0].clone(); program.nodes.len() + 1],
             ..Default::default()
@@ -29021,7 +28938,6 @@ fn builtin_i64_merges_execute_and_resupply() {
             &mut engine,
             id,
             pb::Program {
-                ir_version: 1,
                 commands: vec![print],
                 ..Default::default()
             },
@@ -29097,7 +29013,6 @@ fn merge_table_reads_execute_and_resupply() {
     };
     assert_row(&run(&mut engine, id, program.clone()));
     let mut relocated = pb::Program {
-        ir_version: 1,
         sorts: program.sorts.clone(),
         nodes: vec![program.nodes[0].clone(); program.nodes.len() + 1],
         ..Default::default()
@@ -29127,7 +29042,6 @@ fn merge_table_reads_execute_and_resupply() {
         &mut engine,
         id,
         pb::Program {
-            ir_version: 1,
             commands: vec![print],
             ..Default::default()
         },
@@ -29587,7 +29501,6 @@ fn inert_exact_number_payloads_use_closed_action_and_extract_dags() {
         ),
     ] {
         let mut program = pb::Program {
-            ir_version: 1,
             sorts: [family, "String"]
                 .map(|name| pb::Sort {
                     kind: Some(pb::sort::Kind::Family(pb::HostSort {
@@ -29970,7 +29883,6 @@ fn print_size_native_counts_modes_names_and_stats() {
             assert_eq!(run(&mut engine, id, phase.unwrap()).error, None, "{mode:?}");
         }
         let mut program = pb::Program {
-            ir_version: 1,
             ..Default::default()
         };
         program.commands.push(pb::Command {
@@ -30055,7 +29967,6 @@ fn print_size_native_counts_modes_names_and_stats() {
         &mut engine,
         id,
         pb::Program {
-            ir_version: 1,
             commands: vec![pb::Command {
                 kind: Some(pb::command::Kind::PrintSize(pb::PrintSize {
                     tables: vec![],
@@ -30180,7 +30091,6 @@ fn print_size_runtime_errors_preserve_prefix_without_partial_sizes() {
             &mut engine,
             id,
             pb::Program {
-                ir_version: 1,
                 commands: vec![pb::Command {
                     kind: Some(pb::command::Kind::PrintSize(pb::PrintSize {
                         tables: vec!["current".into(), "captured".into()],
@@ -30344,8 +30254,8 @@ fn unused_subsuming_rewrite_still_requires_a_constructor_target() {
         })),
         ..Default::default()
     });
-    program.rules.push(pb::RuleDecl {
-        kind: Some(pb::rule_decl::Kind::Rewrite(pb::Rewrite {
+    program.rules.push(pb::Rule {
+        kind: Some(pb::rule::Kind::Rewrite(pb::Rewrite {
             lhs,
             rhs: 8,
             subsume: true,

@@ -28,7 +28,6 @@ impl SortRef {
             .collect();
         Ok(Self(publish(
             pb::Program {
-                ir_version: 1,
                 sorts: vec![pb::Sort {
                     kind: Some(pb::sort::Kind::Func(pb::FuncSort {
                         params: (0..count).collect(),
@@ -70,7 +69,6 @@ impl SortRef {
             .collect();
         Ok(Self(publish(
             pb::Program {
-                ir_version: 1,
                 sorts: vec![pb::Sort {
                     kind: Some(pb::sort::Kind::Family(pb::HostSort {
                         name: definition.name.clone(),
@@ -206,7 +204,6 @@ impl SortRef {
     pub fn equality(name: &str) -> Self {
         assert!(!name.is_empty(), "sort names must not be empty");
         let program = pb::Program {
-            ir_version: 1,
             sorts: vec![pb::Sort {
                 kind: Some(pb::sort::Kind::Eq(name.into())),
                 ..Default::default()
@@ -470,7 +467,6 @@ impl Callable {
         Self(
             publish(
                 pb::Program {
-                    ir_version: 1,
                     declarations: vec![pb::Declaration {
                         kind: Some(pb::declaration::Kind::Relation(relation)),
                         ..Default::default()
@@ -526,7 +522,6 @@ impl Callable {
             .collect();
         let mut record = publish(
             pb::Program {
-                ir_version: 1,
                 declarations: vec![pb::Declaration {
                     kind: Some(pb::declaration::Kind::Function(function)),
                     ..Default::default()
@@ -580,7 +575,6 @@ impl Callable {
             .map(|cost| Slot::External(cost.0))
             .collect();
         let program = pb::Program {
-            ir_version: 1,
             declarations: vec![pb::Declaration {
                 kind: Some(pb::declaration::Kind::Constructor(constructor)),
                 ..Default::default()

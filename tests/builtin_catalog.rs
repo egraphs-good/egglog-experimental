@@ -170,7 +170,6 @@ mod rooted_default_context {
             }],
         });
         let mut complete = proto::Program {
-            ir_version: 1,
             ..Default::default()
         };
         if relocated {
@@ -333,7 +332,7 @@ mod rooted_default_context {
             integer.clone(),
         )
         .unwrap();
-        for mutation in 0..13 {
+        for mutation in 0..12 {
             let before = graph
                 .type_info()
                 .portable_builtin_catalog()
@@ -364,8 +363,7 @@ mod rooted_default_context {
                     }
                     9 => draft.declarations.push(draft.declarations[root].clone()),
                     10 => types.export_builtin_definition("egglog.core.i64.add", draft)?,
-                    11 => draft.ir_version = 0,
-                    12 => draft.declarations.push(draft.declarations[helper].clone()),
+                    11 => draft.declarations.push(draft.declarations[helper].clone()),
                     _ => unreachable!(),
                 }
                 Ok(())
@@ -468,7 +466,6 @@ mod rooted_default_context {
             }));
         }
         let mut relocated = proto::Program {
-            ir_version: 1,
             sorts: vec![proto::Sort {
                 kind: Some(proto::sort::Kind::Family(proto::HostSort {
                     name: "String".into(),
@@ -1990,7 +1987,6 @@ fn inequality_catalog_uses_one_generic_registration() {
             assert!(primitive.validator().is_some());
         }
         let mut program = proto::Program {
-            ir_version: 1,
             ..Default::default()
         };
         let input = graph.export_sort(&sorts[0], &mut program.sorts).unwrap();
@@ -2710,7 +2706,6 @@ fn annotated_builtins_resolve_in_the_nonexecuting_authoring_context() {
         // this family instance. Selecting only from runtime TypeInfo cannot work.
         assert_eq!(graph.get_sort_by_name("V").is_none(), mode > 0);
         let program = proto::Program {
-            ir_version: 1,
             sorts: vec![
                 proto::Sort {
                     kind: Some(proto::sort::Kind::Family(proto::HostSort {
@@ -2804,7 +2799,6 @@ fn flat_map_export_packs_existing_refs_without_native_pair_vec_aliases() {
             panic!("primitive")
         };
         let mut program = proto::Program {
-            ir_version: 1,
             files: vec![proto::SourceFile {
                 name: "map.egg".into(),
                 contents: None,
@@ -3927,7 +3921,6 @@ fn scalar_variadic_aliases_share_resolved_provider_contexts_and_validators() {
                     key_prim.validator().unwrap()
                 ));
                 let mut exported = proto::Program {
-                    ir_version: 1,
                     ..Default::default()
                 };
                 let sort_id = graph.export_sort(&sort, &mut exported.sorts).unwrap();
@@ -4079,7 +4072,6 @@ fn family_metadata_is_optional_and_frozen_per_language() {
     )
     .unwrap();
     let mut destination = proto::Program {
-        ir_version: 1,
         ..Default::default()
     };
     builtin::import_definition(&definition, &mut destination).unwrap();
@@ -4259,7 +4251,6 @@ fn family_registration_uses_presort_despite_same_named_nominal_sort() {
     let second = graph.export_sort(&scalar, &mut sorts).unwrap();
     let output = graph.export_sort(&actual, &mut sorts).unwrap();
     let program = proto::Program {
-        ir_version: 1,
         sorts,
         ..Default::default()
     };
@@ -5411,7 +5402,6 @@ fn closed_defaults_preserve_optional_zero_and_opaque_children() {
 
     // This exercises declaration validation only, not a substitute provider.
     let base = proto::Program {
-        ir_version: 1,
         sorts: vec![
             proto::Sort {
                 kind: Some(proto::sort::Kind::Family(proto::HostSort {
@@ -5935,7 +5925,6 @@ fn generic_signature_import_remaps_children_and_ignores_binder_labels() {
         .collect::<Vec<_>>();
     let mut definition = definitions.remove(1);
     let mut destination = proto::Program {
-        ir_version: 1,
         sorts: vec![proto::Sort {
             kind: Some(proto::sort::Kind::Eq("Prior".into())),
             ..Default::default()
@@ -5963,7 +5952,6 @@ fn generic_signature_import_remaps_children_and_ignores_binder_labels() {
 #[test]
 fn program_primitive_reconciliation_checks_body_scope_and_identity() {
     let source = proto::Program {
-        ir_version: 1,
         sorts: vec![proto::Sort {
             kind: Some(proto::sort::Kind::Family(proto::HostSort {
                 name: "i64".into(),
@@ -5991,7 +5979,6 @@ fn program_primitive_reconciliation_checks_body_scope_and_identity() {
         ..Default::default()
     };
     let mut destination = proto::Program {
-        ir_version: 1,
         sorts: vec![proto::Sort {
             kind: Some(proto::sort::Kind::Eq("Prior".into())),
             ..Default::default()
@@ -6124,7 +6111,6 @@ fn builtin_dispatch_rejects_native_bindings_that_disagree_with_wire_sorts() {
     let v = graph.get_sort_by_name("V").unwrap().clone();
     let w = graph.get_sort_by_name("W").unwrap().clone();
     let mut program = proto::Program {
-        ir_version: 1,
         ..Default::default()
     };
     let output = graph.export_sort(&v, &mut program.sorts).unwrap();
@@ -6177,7 +6163,6 @@ fn empty_definition_keys_are_rejected_by_import_and_registration() {
     let imported = builtin::import_definition(
         &definition,
         &mut proto::Program {
-            ir_version: 1,
             ..Default::default()
         },
     );
@@ -6234,7 +6219,6 @@ fn canonical_signature_drives_native_checking_and_export() {
                 .is_err()
         );
         let mut exported = proto::Program {
-            ir_version: 1,
             ..Default::default()
         };
         let catalog = graph.type_info().portable_builtin_catalog().unwrap();
@@ -6332,7 +6316,6 @@ fn imported_definitions_keep_namespaces_and_diagnostic_labels_separate() {
     )
     .unwrap();
     let mut destination = proto::Program {
-        ir_version: 1,
         ..Default::default()
     };
     builtin::import_definition(&definition, &mut destination).unwrap();
@@ -6351,7 +6334,6 @@ fn imported_definitions_keep_namespaces_and_diagnostic_labels_separate() {
     )
     .unwrap();
     let mut destination = proto::Program {
-        ir_version: 1,
         declarations: vec![proto::Declaration {
             kind: Some(proto::declaration::Kind::Function(proto::Function {
                 name: "i64".into(),

@@ -30,6 +30,19 @@ that a program is invalid. Complete frontend parity is not yet established.
 Decisions are marked below; the other questions remain open. The schema's
 comments and annotations remain the normative contract.
 
+### Schema revision and rule names
+
+**Decided:** `Program` has no application version field. Generated SDKs, engines,
+and frontends select the same schema revision; incompatible draft changes migrate
+together. The `egglog.v1` package and service names identify this API, but are not
+carried in raw protobuf bytes and do not negotiate a schema. Unknown-field
+handling alone cannot establish semantic compatibility. Removed Program tag 1
+and its old name are reserved to avoid reinterpreting existing draft artifacts.
+
+`Rule` is an authored rule or rewrite occurrence, including its options and
+diagnostic metadata. Its `rule` arm contains a `RuleBody`: the query and ordered
+actions. `RuleList` references occurrences by index; a label is never identity.
+
 ### Shared builtin definitions and type checking
 
 **Decided:** generic definitions are limited to host primitive signatures and
@@ -59,8 +72,7 @@ collisions; docs and family/nominal bindings belong to definitions.
 Text rendering chooses one stable alias; binary records retain all aliases.
 
 The three-namespace distinction uses existing tags (unlike the optional alias
-metadata at Sort field 8) and retains draft
-`ir_version = 1`: all previously valid encodings keep their meanings. New
+metadata at Sort field 8): previously valid encodings keep their meanings. New
 cross-namespace coexistence requires coordinated immutable schema, engine and
 frontend pins. Old validators reject it, and old name-only indexes may conflate
 the definitions; mixed-epoch readers are not supported. CEL checks local family
@@ -107,9 +119,9 @@ Generated Rust changes `Option<Arg>` to `Vec<Arg>`, Python changes `Arg | None`
 to `list[Arg]`, and ProtoJSON changes the tail object to an array. Old receivers
 are unsafe for wider patterns: they collapse or merge repeated field occurrences
 and lose the pattern width. Previously duplicated singular-field encodings also
-change meaning. `ir_version = 1` does not detect this draft incompatibility;
-all consumers must migrate together. The schema can describe grouped tails;
-native matching, Map registration, and frontend generation are separate gates.
+change meaning. All consumers must migrate together. The schema can describe
+grouped tails; native matching, Map registration, and frontend generation are
+separate gates.
 
 Python already separates generic declarations from concrete expression types.
 Its [signatures](https://github.com/egraphs-good/egglog-python/blob/ff72f601a972ca1eb7cb0a1d299813f5d65b1a14/python/egglog/declarations.py#L752-L791)
@@ -353,7 +365,7 @@ fails this draft's new response contract. This observation is not a state export
   each rule occurrence only at its first inclusion. Distinct equal rules remain
   independent. Separate Runs and loop iterations select independently; this
   does not limit firings from query matches or override the scheduler.
-- **Rule-level sharing — decided:** `Program.rules` holds `RuleDecl` occurrences;
+- **Rule-level sharing — decided:** `Program.rules` holds `Rule` occurrences;
   each `RuleList.rules` is an ordered list of arena indices. Different leaves
   and repeated positions may reference the same occurrence; equal separate
   entries remain distinct. Names are optional diagnostic labels, may repeat,
@@ -508,9 +520,9 @@ pair each exact response sort reference with its distinct-value count, in input
 order followed by output.
 
 This draft refinement supersedes whole-table failure for unavailable cells and
-requires coordinated schema, engine and frontend pins. It keeps `ir_version = 1`,
-but FunctionRow's old integer references and new cell messages are not compatible
-reader layouts. Omitted max_rows bytes retain the all-rows meaning; explicit
+requires coordinated schema, engine and frontend pins. FunctionRow's old integer
+references and new cell messages are not compatible reader layouts. Omitted
+max_rows bytes retain the all-rows meaning; explicit
 zero now means zero. Rust generates `Option<u64>`; Python readers must use
 `has_field("max_rows")`, since its scalar getter returns zero even when absent.
 The byte adapter observes admitted Constructor, Function and Relation tables in
@@ -759,7 +771,6 @@ from protobuf import Oneof
 from protovalidate import validate
 
 program = ir.Program(
-    ir_version=1,
     sorts=[ir.Sort(kind=Oneof("family", ir.HostSort(name="i64")))],
     nodes=[ir.Node(sort_id=0, kind=Oneof("primitive_value",
         ir.PrimitiveValue(value=Oneof("i64", 42))))],

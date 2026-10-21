@@ -397,7 +397,7 @@ pub(super) fn source_phase_refs(
     }
     for rule in &mut program.rules {
         match &mut rule.kind {
-            Some(pb::rule_decl::Kind::Rule(rule)) => {
+            Some(pb::rule::Kind::Rule(rule)) => {
                 for index in &mut rule.query {
                     visit(index)?;
                 }
@@ -405,7 +405,7 @@ pub(super) fn source_phase_refs(
                     action(head, &mut visit)?;
                 }
             }
-            Some(pb::rule_decl::Kind::Rewrite(rule)) => {
+            Some(pb::rule::Kind::Rewrite(rule)) => {
                 for index in [&mut rule.lhs, &mut rule.rhs]
                     .into_iter()
                     .chain(&mut rule.conditions)
@@ -413,7 +413,7 @@ pub(super) fn source_phase_refs(
                     visit(index)?;
                 }
             }
-            Some(pb::rule_decl::Kind::Birewrite(rule)) => {
+            Some(pb::rule::Kind::Birewrite(rule)) => {
                 for index in [&mut rule.lhs, &mut rule.rhs]
                     .into_iter()
                     .chain(&mut rule.conditions)
@@ -733,7 +733,6 @@ pub(crate) fn primitive_definition(
             include_base: PathBuf::new(),
             scopes: Vec::new(),
             program: pb::Program {
-                ir_version: 1,
                 ..Default::default()
             },
             rulesets: HashMap::new(),
@@ -845,7 +844,6 @@ impl Source {
             include_base: PathBuf::new(),
             scopes: Vec::new(),
             program: pb::Program {
-                ir_version: 1,
                 ..Default::default()
             },
             rulesets: HashMap::from([(
@@ -2201,7 +2199,6 @@ impl Source {
             })
             .collect();
         let program = pb::Program {
-            ir_version: 1,
             sorts: self.program.sorts.clone(),
             // Node references stay private until advance joins any successful
             // macro prefix, then projects the complete authored phase once.
@@ -2881,7 +2878,7 @@ impl Source {
             names
                 .iter()
                 .find(|name| {
-                    if matches!(previous.kind, Some(pb::rule_decl::Kind::Birewrite(_))) {
+                    if matches!(previous.kind, Some(pb::rule::Kind::Birewrite(_))) {
                         **name == format!("{previous_name}=>")
                             || **name == format!("{previous_name}<=")
                     } else {
@@ -2993,13 +2990,13 @@ impl Source {
             let rhs = self.expr(rhs, Some(&aliases), 0)?;
             let conditions = self.facts(&rule.body[1..])?;
             match rewrite {
-                RewriteKind::Directional(subsume) => pb::rule_decl::Kind::Rewrite(pb::Rewrite {
+                RewriteKind::Directional(subsume) => pb::rule::Kind::Rewrite(pb::Rewrite {
                     lhs,
                     rhs,
                     conditions,
                     subsume,
                 }),
-                RewriteKind::Bidirectional => pb::rule_decl::Kind::Birewrite(pb::BiRewrite {
+                RewriteKind::Bidirectional => pb::rule::Kind::Birewrite(pb::BiRewrite {
                     lhs,
                     rhs,
                     conditions,
@@ -3195,12 +3192,12 @@ impl Source {
                 }
                 index += 1;
             }
-            pb::rule_decl::Kind::Rule(pb::Rule { query, head })
+            pb::rule::Kind::Rule(pb::RuleBody { query, head })
         };
         let span = self.span(&rule.span)?;
         let index = u32::try_from(self.program.rules.len()).map_err(|_| "too many source rules")?;
         let ruleset_name = rule.ruleset.clone();
-        self.program.rules.push(pb::RuleDecl {
+        self.program.rules.push(pb::Rule {
             kind: Some(kind),
             name: Some(rule.name),
             eval_mode: match rule.eval_mode {
@@ -3730,6 +3727,7 @@ impl Renderer {
                 extension: None,
                 mode: pb::ExecutionMode::Normal,
                 definitions: pb::Program::default(),
+                catalog_initialized: false,
                 names: NativeNames::default(),
                 request: 0,
                 clone_parent: None,
@@ -3798,7 +3796,7 @@ impl Renderer {
             ))
             || program.rules.iter().any(|rule| matches!(
                 &rule.kind,
-                Some(pb::rule_decl::Kind::Rule(rule)) if rule.head.iter().any(|action| matches!(action.kind, Some(pb::action::Kind::SetCost(_))))
+                Some(pb::rule::Kind::Rule(rule)) if rule.head.iter().any(|action| matches!(action.kind, Some(pb::action::Kind::SetCost(_))))
             )))
         {
             return Err(TransportError("assigned-cost source rendering is not supported".into()));
@@ -3826,7 +3824,7 @@ impl Renderer {
                 || super::command_tree(&lowered.commands).filter_map(|command| match &command.kind {
                     Some(pb::command::Kind::Action(action)) => Some(action), _ => None,
                 }).chain(lowered.rules.iter().flat_map(|rule| match &rule.kind {
-                    Some(pb::rule_decl::Kind::Rule(rule)) => rule.head.as_slice(), _ => &[],
+                    Some(pb::rule::Kind::Rule(rule)) => rule.head.as_slice(), _ => &[],
                 })).any(|action| match &action.kind {
                     Some(pb::action::Kind::SetCost(set)) => set.target.as_ref().is_some_and(|call| unextractable.contains(&call.func)),
                     Some(pb::action::Kind::Delete(call)) => unextractable.contains(&call.func),
@@ -4457,9 +4455,6 @@ fn render_prepared(
     // Canonical rules and the submitted program have independent file indices.
     let rule_spans = NativeSpans::default();
     let result = (|| -> Result<Vec<Command>, String> {
-        if program.ir_version != 1 {
-            return Err("unsupported source IR version".into());
-        }
         validate_union_occurrences(program)?;
         let mut native = match dialect {
             Dialect::Experimental => crate::new_experimental_egraph(),
@@ -4520,7 +4515,7 @@ fn render_prepared(
         for action in super::command_tree(&program.commands).filter_map(|command| match &command.kind {
             Some(pb::command::Kind::Action(action)) => Some(action), _ => None,
         }).chain(program.rules.iter().flat_map(|rule| match &rule.kind {
-            Some(pb::rule_decl::Kind::Rule(rule)) => rule.head.as_slice(), _ => &[],
+            Some(pb::rule::Kind::Rule(rule)) => rule.head.as_slice(), _ => &[],
         })) {
             match &action.kind {
                 Some(pb::action::Kind::Set(set)) => {
@@ -4633,7 +4628,7 @@ fn render_prepared(
             let mut rule_indices = HashMap::new();
             for (index, name) in prepared.rules.iter().enumerate() {
                 rule_indices.insert(name.clone(), index);
-                if matches!(rule_program.rules[index].kind, Some(pb::rule_decl::Kind::Birewrite(_))) {
+                if matches!(rule_program.rules[index].kind, Some(pb::rule::Kind::Birewrite(_))) {
                     rule_indices.insert(format!("{name}=>"), index);
                     rule_indices.insert(format!("{name}<="), index);
                 }
@@ -4666,8 +4661,8 @@ fn render_prepared(
                 if let Command::Rule { rule } = &mut command {
                     let index = *rule_indices.get(&rule.name).ok_or("missing prepared rule occurrence")?;
                     let rewrite = match &rule_program.rules[index].kind {
-                        Some(pb::rule_decl::Kind::Rewrite(rewrite)) => Some((rewrite.lhs, rewrite.rhs, &rewrite.conditions, Some(rewrite.subsume))),
-                        Some(pb::rule_decl::Kind::Birewrite(rewrite)) => Some((rewrite.lhs, rewrite.rhs, &rewrite.conditions, None)),
+                        Some(pb::rule::Kind::Rewrite(rewrite)) => Some((rewrite.lhs, rewrite.rhs, &rewrite.conditions, Some(rewrite.subsume))),
+                        Some(pb::rule::Kind::Birewrite(rewrite)) => Some((rewrite.lhs, rewrite.rhs, &rewrite.conditions, None)),
                         _ => None,
                     };
                     if let Some((lhs, rhs, conditions, subsume)) = rewrite {
@@ -4697,7 +4692,7 @@ fn render_prepared(
                 }
                 if let Command::Rule { rule } = &mut command {
                     let index = *rule_indices.get(&rule.name).ok_or("missing prepared rule occurrence")?;
-                    if let Some(pb::rule_decl::Kind::Rule(body)) = &rule_program.rules[index].kind {
+                    if let Some(pb::rule::Kind::Rule(body)) = &rule_program.rules[index].kind {
                         let mut head = Vec::new();
                         let mut memo = HashMap::new();
                         let mut next = 0;
@@ -5501,6 +5496,32 @@ mod node_projection_tests {
     use super::*;
 
     #[test]
+    fn renderer_catalog_initialization_is_internal_and_transactional() {
+        let mut renderer = Renderer::default();
+        assert!(!renderer.session.catalog_initialized);
+        assert!(
+            renderer
+                .render(&pb::Program {
+                    rules: vec![pb::Rule::default()],
+                    ..Default::default()
+                })
+                .is_err()
+        );
+        assert!(!renderer.session.catalog_initialized);
+        assert!(renderer.session.definitions.declarations.is_empty());
+        assert_eq!(renderer.render(&pb::Program::default()).unwrap(), "");
+        assert!(renderer.session.catalog_initialized);
+        let definitions = renderer.session.definitions.clone();
+        assert!(!definitions.declarations.is_empty());
+        let mut cloned = renderer.clone();
+        assert!(cloned.session.catalog_initialized);
+        for renderer in [&mut renderer, &mut cloned] {
+            assert_eq!(renderer.render(&pb::Program::default()).unwrap(), "");
+            assert_eq!(renderer.session.definitions, definitions);
+        }
+    }
+
+    #[test]
     fn projection_preserves_cycles_distinct_unions_and_fresh_invalid_records() {
         use pb::{node::Kind as N, primitive_value::Value as V};
         let mut arena: Vec<_> = [
@@ -5645,8 +5666,8 @@ mod node_projection_tests {
                 },
             ],
             rules: vec![
-                pb::RuleDecl {
-                    kind: Some(pb::rule_decl::Kind::Rule(pb::Rule {
+                pb::Rule {
+                    kind: Some(pb::rule::Kind::Rule(pb::RuleBody {
                         query: vec![5],
                         head: vec![
                             pb::Action {
@@ -5691,8 +5712,8 @@ mod node_projection_tests {
                     })),
                     ..Default::default()
                 },
-                pb::RuleDecl {
-                    kind: Some(pb::rule_decl::Kind::Rewrite(pb::Rewrite {
+                pb::Rule {
+                    kind: Some(pb::rule::Kind::Rewrite(pb::Rewrite {
                         lhs: 13,
                         rhs: 14,
                         conditions: vec![15],
@@ -5700,8 +5721,8 @@ mod node_projection_tests {
                     })),
                     ..Default::default()
                 },
-                pb::RuleDecl {
-                    kind: Some(pb::rule_decl::Kind::Birewrite(pb::BiRewrite {
+                pb::Rule {
+                    kind: Some(pb::rule::Kind::Birewrite(pb::BiRewrite {
                         lhs: 16,
                         rhs: 17,
                         conditions: vec![18],

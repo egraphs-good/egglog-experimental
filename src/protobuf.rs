@@ -173,6 +173,8 @@ struct Session {
     mode: pb::ExecutionMode,
     // Authored definitions and presentation/default closures, never execution ASTs.
     definitions: pb::Program,
+    // Source renderers seed their ambient catalog on the first preparation.
+    catalog_initialized: bool,
     names: NativeNames,
     request: u64,
     // Direct clone source and its mutation/namespace stamp, not an ancestry log.
@@ -464,7 +466,6 @@ impl Engine {
             ));
         }
         let program = pb::Program {
-            ir_version: 1,
             sorts: request.sorts,
             files: request.files,
             ..Default::default()
@@ -522,6 +523,7 @@ impl Engine {
                 extension: self.extension.clone(),
                 mode,
                 definitions: catalog,
+                catalog_initialized: true,
                 names: NativeNames::default(),
                 request: 0,
                 clone_parent: None,
@@ -849,6 +851,7 @@ impl Session {
             )
             .expect("validated canonical occurrence closure");
         self.definitions = definitions;
+        self.catalog_initialized = true;
         self.rulesets = retained_sets
             .into_iter()
             .map(|i| rulesets[i].clone())
@@ -875,13 +878,10 @@ impl Session {
     // boundary then registers and compiles the entire request on a disposable
     // clone. Neither clone's runtime state or backend IDs are ever adopted.
     fn prepare(&self, program: &mut pb::Program) -> Result<Prepared, PreparationError> {
-        if program.ir_version != 1 {
-            return Err(format!("unsupported IR version {}", program.ir_version).into());
-        }
         let native_spans = NativeSpans::default();
         validate_relation_uses(program, &self.definitions)?;
         for rule in &program.rules {
-            if let Some(pb::rule_decl::Kind::Rule(rule)) = &rule.kind {
+            if let Some(pb::rule::Kind::Rule(rule)) = &rule.kind {
                 validate_legacy_union_scope(program, &rule.head)?;
             }
         }
@@ -893,12 +893,13 @@ impl Session {
         // These live guards also apply to empty requests. A native named
         // Primitive can be executable while retaining a projection error.
         let native = staged.graph.type_info().builtin_catalog()?;
-        if staged.definitions.ir_version == 0 {
+        if !staged.catalog_initialized {
             staged.definitions = staged
                 .graph
                 .type_info()
                 .portable_builtin_catalog()?
                 .definitions;
+            staged.catalog_initialized = true;
         } else {
             for name in native.undescribed_primitives {
                 if let Some(primitives) = staged.graph.type_info().get_prims(&name) {
@@ -1261,7 +1262,7 @@ impl Session {
                 _ => None,
             })
             .chain(program.rules.iter().flat_map(|rule| match &rule.kind {
-                Some(pb::rule_decl::Kind::Rule(body)) => body.head.as_slice(),
+                Some(pb::rule::Kind::Rule(body)) => body.head.as_slice(),
                 _ => &[],
             }))
         {
@@ -1306,7 +1307,7 @@ impl Session {
             }
         }
         for rule in &program.rules {
-            if let Some(pb::rule_decl::Kind::Rewrite(rewrite)) = &rule.kind
+            if let Some(pb::rule::Kind::Rewrite(rewrite)) = &rule.kind
                 && rewrite.subsume
             {
                 let lhs = program
@@ -1545,7 +1546,7 @@ impl Session {
             }
             let directions: &[(_, _)] = if matches!(
                 staged.definitions.rules[rule].kind,
-                Some(pb::rule_decl::Kind::Birewrite(_))
+                Some(pb::rule::Kind::Birewrite(_))
             ) {
                 &[
                     ("=>", pb::NativeRuleDirection::Forward),
@@ -3559,7 +3560,7 @@ fn map_callable_names(
         actions
             .into_iter()
             .chain(program.rules.iter_mut().flat_map(|r| match &mut r.kind {
-                Some(pb::rule_decl::Kind::Rule(r)) => r.head.as_mut_slice(),
+                Some(pb::rule::Kind::Rule(r)) => r.head.as_mut_slice(),
                 _ => &mut [],
             }))
     {
@@ -4928,16 +4929,16 @@ fn validate_relation_uses(program: &pb::Program, saved: &pb::Program) -> Result<
     }
     for rule in &program.rules {
         match &rule.kind {
-            Some(pb::rule_decl::Kind::Rule(rule)) => {
+            Some(pb::rule::Kind::Rule(rule)) => {
                 for head in &rule.head {
                     action(head)?;
                 }
             }
-            Some(pb::rule_decl::Kind::Rewrite(rewrite)) => {
+            Some(pb::rule::Kind::Rewrite(rewrite)) => {
                 value(rewrite.lhs)?;
                 value(rewrite.rhs)?;
             }
-            Some(pb::rule_decl::Kind::Birewrite(rewrite)) => {
+            Some(pb::rule::Kind::Birewrite(rewrite)) => {
                 value(rewrite.lhs)?;
                 value(rewrite.rhs)?;
             }
@@ -5250,7 +5251,7 @@ fn validate_union_occurrences(program: &pb::Program) -> Result<(), String> {
         }),
     )?;
     for rule in &program.rules {
-        if let Some(pb::rule_decl::Kind::Rule(rule)) = &rule.kind {
+        if let Some(pb::rule::Kind::Rule(rule)) = &rule.kind {
             validate_legacy_union_scope(program, &rule.head)?;
         }
     }
@@ -6099,7 +6100,7 @@ fn lower_rule_cost_deletes(
 
 fn lower_rule(
     program: &pb::Program,
-    rule: &pb::RuleDecl,
+    rule: &pb::Rule,
     ruleset: &str,
     name: &str,
     native_spans: &NativeSpans,
@@ -6116,7 +6117,7 @@ fn lower_rule(
     };
     let span = native_span(program, rule.span.as_ref(), native_spans)?;
     match rule.kind.as_ref().ok_or("missing rule kind")? {
-        kind @ (pb::rule_decl::Kind::Rewrite(_) | pb::rule_decl::Kind::Birewrite(_)) => {
+        kind @ (pb::rule::Kind::Rewrite(_) | pb::rule::Kind::Birewrite(_)) => {
             // Native rewrite commands have no option fields. Keep this
             // adapter limit explicit rather than silently losing wire options.
             if eval_mode != ast::RuleEvalMode::Seminaive || rule.no_decomp || rule.include_subsumed
@@ -6124,14 +6125,14 @@ fn lower_rule(
                 return Err("nondefault rewrite options require native rule expansion, which is not supported yet".into());
             }
             let (lhs, rhs, conditions, subsume, bidirectional) = match kind {
-                pb::rule_decl::Kind::Rewrite(rewrite) => (
+                pb::rule::Kind::Rewrite(rewrite) => (
                     rewrite.lhs,
                     rewrite.rhs,
                     &rewrite.conditions,
                     rewrite.subsume,
                     false,
                 ),
-                pb::rule_decl::Kind::Birewrite(rewrite) => {
+                pb::rule::Kind::Birewrite(rewrite) => {
                     (rewrite.lhs, rewrite.rhs, &rewrite.conditions, false, true)
                 }
                 _ => unreachable!(),
@@ -6227,7 +6228,7 @@ fn lower_rule(
             }
             Ok(commands)
         }
-        pb::rule_decl::Kind::Rule(body) => {
+        pb::rule::Kind::Rule(body) => {
             let mut bindings = HashMap::new();
             check_variables(program, &body.query, &mut bindings, true)?;
             let roots = body
@@ -6726,7 +6727,6 @@ mod tests {
         assert!(Arc::ptr_eq(&file, &span.file));
         assert!(Arc::ptr_eq(&file, &expression_span.file));
         let mut later = pb::Program {
-            ir_version: 1,
             files: vec![pb::SourceFile {
                 name: "fixture.egg".into(),
                 contents: Some("other".into()),
@@ -7350,7 +7350,7 @@ mod tests {
     #[test]
     fn session_catalog_seed_survives_authored_primitives_and_empty_requests() {
         let (mut engine, id) = host_default_engine();
-        assert_eq!(engine.graphs[&id].definitions.ir_version, 1);
+        assert!(engine.graphs[&id].catalog_initialized);
         let mut program = inventory_fixture(
             "(primitive successor (i64) i64 (+ _0 1)) (check (= (successor 3) 4))",
         );
@@ -7374,7 +7374,6 @@ mod tests {
             &mut engine,
             id,
             pb::Program {
-                ir_version: 1,
                 ..Default::default()
             },
         );
@@ -7397,12 +7396,11 @@ mod tests {
                 &mut engine,
                 id,
                 pb::Program {
-                    ir_version: 1,
                     ..Default::default()
                 },
             );
             assert_eq!(initial.error, None);
-            assert_eq!(engine.graphs[&id].definitions.ir_version, 1);
+            assert!(engine.graphs[&id].catalog_initialized);
             let graph = &mut engine.graphs.get_mut(&id).unwrap().graph;
             if corrupt == "registry" {
                 graph.add_pure_primitive(ForeignPrimitive("egglog.core.i64.add".into()), None);
@@ -7433,7 +7431,6 @@ mod tests {
                 &mut engine,
                 id,
                 pb::Program {
-                    ir_version: 1,
                     ..Default::default()
                 },
             );
@@ -7454,7 +7451,6 @@ mod tests {
     fn session_catalog_seed_checks_dependent_primitives_across_scope_returns() {
         let (mut engine, id) = host_default_engine();
         let empty = pb::Program {
-            ir_version: 1,
             ..Default::default()
         };
         let consistent = |engine: &mut Engine, id| {
@@ -7712,7 +7708,6 @@ mod tests {
         use pb::primitive_value::Value as V;
         let text = "shared payload".repeat(4096);
         let program = pb::Program {
-            ir_version: 1,
             sorts: vec![
                 pb::Sort {
                     kind: Some(pb::sort::Kind::Family(pb::HostSort {
@@ -7874,17 +7869,17 @@ mod tests {
         let (query, _) = facts(&program, &[root, root], &spans, None, |_| false).unwrap();
         assert_eq!(query.len(), 29);
         for kind in [
-            pb::rule_decl::Kind::Rule(pb::Rule {
+            pb::rule::Kind::Rule(pb::RuleBody {
                 query: vec![root],
                 head: vec![],
             }),
-            pb::rule_decl::Kind::Rewrite(pb::Rewrite {
+            pb::rule::Kind::Rewrite(pb::Rewrite {
                 lhs: root,
                 rhs: leaf,
                 conditions: vec![root],
                 subsume: true,
             }),
-            pb::rule_decl::Kind::Birewrite(pb::BiRewrite {
+            pb::rule::Kind::Birewrite(pb::BiRewrite {
                 lhs: root,
                 rhs: leaf,
                 conditions: vec![root],
@@ -7892,7 +7887,7 @@ mod tests {
         ] {
             let commands = lower_rule(
                 &program,
-                &pb::RuleDecl {
+                &pb::Rule {
                     kind: Some(kind),
                     eval_mode: pb::RuleEvalMode::Seminaive.into(),
                     ..Default::default()
@@ -8033,10 +8028,10 @@ mod tests {
                 ..Default::default()
             };
             if in_rule {
-                program.rules = vec![pb::RuleDecl {
+                program.rules = vec![pb::Rule {
                     name: Some("diamond".into()),
                     eval_mode: pb::RuleEvalMode::Seminaive.into(),
-                    kind: Some(pb::rule_decl::Kind::Rule(pb::Rule {
+                    kind: Some(pb::rule::Kind::Rule(pb::RuleBody {
                         query: vec![trigger],
                         head: vec![action.clone(), action],
                     })),
@@ -8163,7 +8158,6 @@ mod tests {
                             &mut engine,
                             id,
                             pb::Program {
-                                ir_version: 1,
                                 sorts: vec![proof_sort],
                                 nodes: vec![
                                     pb::Node {
@@ -8570,7 +8564,6 @@ mod tests {
                         &mut engine,
                         id,
                         pb::Program {
-                            ir_version: 1,
                             commands: vec![pb::Command {
                                 kind: Some(pb::command::Kind::Freeze(pb::Freeze::default())),
                                 ..Default::default()
@@ -8611,7 +8604,6 @@ mod tests {
                     );
                     assert!(!engine.graphs[&restored_id].graph.no_decomp);
                     let program = pb::Program {
-                        ir_version: 1,
                         sorts: request.sorts,
                         nodes: vec![
                             pb::Node {
@@ -8950,7 +8942,6 @@ mod tests {
                         &pb::RunProgramRequest {
                             egraph_id: target,
                             program: Some(pb::Program {
-                                ir_version: 1,
                                 commands: vec![pb::Command {
                                     kind: Some(pb::command::Kind::Action(pb::Action {
                                         kind: Some(pb::action::Kind::Panic(
@@ -9033,7 +9024,6 @@ mod tests {
                     &pb::RunProgramRequest {
                         egraph_id: id,
                         program: Some(pb::Program {
-                            ir_version: 1,
                             ..Default::default()
                         }),
                         profile: true,
@@ -9307,7 +9297,6 @@ mod tests {
     #[test]
     fn map_default_saved_closure_never_accumulates_execution_helpers() {
         let program = pb::Program {
-            ir_version: 1,
             sorts: vec![
                 pb::Sort {
                     kind: Some(pb::sort::Kind::Family(pb::HostSort {
@@ -9882,6 +9871,7 @@ mod tests {
                     extension: None,
                     mode: pb::ExecutionMode::Normal,
                     definitions: pb::Program::default(),
+                    catalog_initialized: false,
                     names: NativeNames::default(),
                     request: 0,
                     clone_parent: None,
@@ -9891,7 +9881,6 @@ mod tests {
                     cost_models: HashMap::new(),
                 };
                 let mut program = pb::Program {
-                    ir_version: 1,
                     sorts: vec![pb::Sort {
                         kind: Some(pb::sort::Kind::Family(pb::HostSort {
                             name: "i64".into(),
@@ -9948,7 +9937,7 @@ mod tests {
             });
         }
         for file in [1, 2, 1] {
-            program.rules.push(pb::RuleDecl {
+            program.rules.push(pb::Rule {
                 name: Some("same label".into()),
                 span: Some(pb::Span {
                     file,
@@ -9956,7 +9945,7 @@ mod tests {
                     end: 1,
                 }),
                 eval_mode: pb::RuleEvalMode::Seminaive.into(),
-                kind: Some(pb::rule_decl::Kind::Rule(pb::Rule::default())),
+                kind: Some(pb::rule::Kind::Rule(pb::RuleBody::default())),
                 ..Default::default()
             });
         }
@@ -10077,7 +10066,6 @@ mod tests {
         };
         let prepared = engine.graphs[&id]
             .prepare(&mut pb::Program {
-                ir_version: 1,
                 files: vec![current.clone()],
                 ..Default::default()
             })
@@ -10108,7 +10096,7 @@ mod tests {
     #[test]
     fn attribution_forest_keeps_deep_shared_traversal_iterative() {
         let mut program = pb::Program {
-            rules: vec![pb::RuleDecl::default()],
+            rules: vec![pb::Rule::default()],
             rulesets: vec![pb::Ruleset {
                 kind: Some(pb::ruleset::Kind::Rules(pb::RuleList { rules: vec![0] })),
                 ..Default::default()
@@ -10149,10 +10137,9 @@ mod tests {
     fn attribution_routes_skip_uninstalled_occurrences() {
         let (engine, id) = host_default_engine();
         let program = pb::Program {
-            ir_version: 1,
-            rules: vec![pb::RuleDecl {
+            rules: vec![pb::Rule {
                 name: Some("shared".into()),
-                kind: Some(pb::rule_decl::Kind::Rule(pb::Rule::default())),
+                kind: Some(pb::rule::Kind::Rule(pb::RuleBody::default())),
                 eval_mode: pb::RuleEvalMode::Seminaive.into(),
                 ..Default::default()
             }],
@@ -10190,12 +10177,11 @@ mod tests {
     fn shared_selectors_keep_exact_native_handles_and_first_inclusion_order() {
         let (mut engine, id) = host_default_engine();
         let mut program = pb::Program {
-            ir_version: 1,
             rules: (0..2)
-                .map(|_| pb::RuleDecl {
+                .map(|_| pb::Rule {
                     name: Some("equal label".into()),
                     eval_mode: pb::RuleEvalMode::Seminaive.into(),
-                    kind: Some(pb::rule_decl::Kind::Rule(pb::Rule::default())),
+                    kind: Some(pb::rule::Kind::Rule(pb::RuleBody::default())),
                     ..Default::default()
                 })
                 .collect(),
@@ -10363,7 +10349,6 @@ mod tests {
             end: 1,
         });
         let mut program = pb::Program {
-            ir_version: 1,
             sorts: vec![pb::Sort {
                 kind: Some(pb::sort::Kind::Family(pb::HostSort {
                     name: "i64".into(),
@@ -10384,10 +10369,10 @@ mod tests {
                 span,
                 ..Default::default()
             }],
-            rules: vec![pb::RuleDecl {
+            rules: vec![pb::Rule {
                 name: Some("retained-rule".into()),
                 eval_mode: pb::RuleEvalMode::Seminaive.into(),
-                kind: Some(pb::rule_decl::Kind::Rule(pb::Rule::default())),
+                kind: Some(pb::rule::Kind::Rule(pb::RuleBody::default())),
                 span,
                 ..Default::default()
             }],
@@ -10465,10 +10450,9 @@ mod tests {
         for after_first_root in [false, true] {
             let (mut engine, id) = host_default_engine();
             let program = pb::Program {
-                ir_version: 1,
-                rules: vec![pb::RuleDecl {
+                rules: vec![pb::Rule {
                     eval_mode: pb::RuleEvalMode::Seminaive.into(),
-                    kind: Some(pb::rule_decl::Kind::Rule(pb::Rule::default())),
+                    kind: Some(pb::rule::Kind::Rule(pb::RuleBody::default())),
                     ..Default::default()
                 }],
                 rulesets: ["first", "second"]
@@ -10558,7 +10542,6 @@ mod tests {
                     &mut engine,
                     id,
                     pb::Program {
-                        ir_version: 1,
                         commands: vec![pb::Command {
                             kind: Some(pb::command::Kind::Run(pb::Run {
                                 ruleset: Some(pb::RulesetRef {
@@ -10606,7 +10589,6 @@ mod tests {
         // reachable through the ordinary public typed API without injection.
         let (mut engine, id) = host_default_engine();
         let candidate = pb::Program {
-            ir_version: 1,
             sorts: vec![pb::Sort {
                 kind: Some(pb::sort::Kind::Eq("Item".into())),
                 ..Default::default()
@@ -10637,14 +10619,14 @@ mod tests {
                 ..Default::default()
             }],
             rules: vec![
-                pb::RuleDecl {
+                pb::Rule {
                     eval_mode: pb::RuleEvalMode::Seminaive.into(),
-                    kind: Some(pb::rule_decl::Kind::Rule(pb::Rule::default())),
+                    kind: Some(pb::rule::Kind::Rule(pb::RuleBody::default())),
                     ..Default::default()
                 },
-                pb::RuleDecl {
+                pb::Rule {
                     eval_mode: pb::RuleEvalMode::Seminaive.into(),
-                    kind: Some(pb::rule_decl::Kind::Rule(pb::Rule {
+                    kind: Some(pb::rule::Kind::Rule(pb::RuleBody {
                         query: vec![],
                         head: vec![pb::Action {
                             kind: Some(pb::action::Kind::Term(0)),
@@ -10709,7 +10691,6 @@ mod tests {
         assert_eq!(run_host_default(&mut engine, id, recovery).error, None);
 
         let standalone = pb::Program {
-            ir_version: 1,
             rules: vec![candidate.rules[0].clone()], // r does not depend on D
             rulesets: vec![pb::Ruleset {
                 name: Some("B".into()),
@@ -10767,7 +10748,6 @@ mod tests {
         for complete_name in [false, true] {
             let (mut engine, id) = host_default_engine();
             let mut program = pb::Program {
-                ir_version: 1,
                 rulesets: vec![
                     pb::Ruleset {
                         kind: Some(pb::ruleset::Kind::Rules(pb::RuleList::default())),
@@ -10883,7 +10863,6 @@ mod tests {
             })
             .unwrap();
         let mut definitions = pb::Program {
-            ir_version: 1,
             rulesets: vec![
                 pb::Ruleset {
                     kind: Some(pb::ruleset::Kind::Rules(pb::RuleList::default())),
@@ -11012,7 +10991,6 @@ mod tests {
         let baseline = session.clone();
 
         let mut definitions = pb::Program {
-            ir_version: 1,
             files: vec![pb::SourceFile {
                 name: "install.egg".into(),
                 contents: Some("first second".into()),
@@ -11228,7 +11206,6 @@ mod tests {
                 &mut engine,
                 id,
                 pb::Program {
-                    ir_version: 1,
                     commands: vec![command],
                     ..Default::default()
                 },
@@ -11376,7 +11353,6 @@ mod tests {
                 .unwrap()
                 .definitions;
             let mut program = pb::Program {
-                ir_version: 1,
                 sorts: vec![
                     pb::Sort {
                         kind: Some(pb::sort::Kind::Family(pb::HostSort {
@@ -11486,8 +11462,8 @@ mod tests {
             });
             assert!(run_host_default(&mut engine, id, invalid).error.is_some());
             let mut ungrounded = program.clone();
-            ungrounded.rules.push(pb::RuleDecl {
-                kind: Some(pb::rule_decl::Kind::Rule(pb::Rule {
+            ungrounded.rules.push(pb::Rule {
+                kind: Some(pb::rule::Kind::Rule(pb::RuleBody {
                     query: vec![5],
                     head: vec![pb::Action {
                         kind: Some(pb::action::Kind::Term(6)),
@@ -11767,7 +11743,6 @@ mod tests {
                     _ => (),
                 }
             }
-            program.ir_version = phase.ir_version;
             program.sorts = phase.sorts;
             program.files = phase.files;
             program.nodes.append(&mut phase.nodes);
@@ -12587,9 +12562,9 @@ mod tests {
                     };
                     program.commands.push(action);
                 }
-                7 => program.rules.push(pb::RuleDecl {
+                7 => program.rules.push(pb::Rule {
                     eval_mode: pb::RuleEvalMode::Seminaive.into(),
-                    kind: Some(pb::rule_decl::Kind::Rule(pb::Rule {
+                    kind: Some(pb::rule::Kind::Rule(pb::RuleBody {
                         query: vec![],
                         head: vec![pb::Action {
                             kind: Some(pb::action::Kind::Term(union)),

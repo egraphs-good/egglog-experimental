@@ -843,7 +843,6 @@ mod tests {
                             &pb::RunProgramRequest {
                                 egraph_id: child,
                                 program: Some(pb::Program {
-                                    ir_version: 1,
                                     commands: vec![command],
                                     ..Default::default()
                                 }),

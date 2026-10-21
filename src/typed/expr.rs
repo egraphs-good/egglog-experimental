@@ -97,7 +97,6 @@ pub fn let_<I: ValueInput>(name: impl Into<Arc<str>>, initializer: I) -> I::Owne
     slots[Arena::Node as usize] = vec![Slot::External(initializer.0.clone())];
     let mut record = publish(
         pb::Program {
-            ir_version: 1,
             nodes: vec![pb::Node {
                 kind: Some(pb::node::Kind::Call(call.clone())),
                 ..Default::default()
@@ -141,7 +140,6 @@ impl Expr {
         slots[Arena::Sort as usize] = vec![Slot::External(sort.0)];
         Ok(Self(publish(
             pb::Program {
-                ir_version: 1,
                 nodes: vec![pb::Node {
                     kind: Some(pb::node::Kind::PrimitiveValue(value)),
                     ..Default::default()
@@ -159,7 +157,6 @@ impl Expr {
         let mut slots = std::array::from_fn(|_| vec![]);
         slots[Arena::Sort as usize] = vec![Slot::External(sort.0)];
         let program = pb::Program {
-            ir_version: 1,
             nodes: vec![pb::Node {
                 kind: Some(pb::node::Kind::Var(token)),
                 ..Default::default()
@@ -232,7 +229,6 @@ impl Expr {
     // generic validation paths share this ownership/record construction boundary.
     fn build_call(callable: &Callable, name: &str, arguments: Vec<Self>, output: SortRef) -> Self {
         let program = pb::Program {
-            ir_version: 1,
             nodes: vec![pb::Node {
                 kind: Some(pb::node::Kind::Call(pb::Call {
                     func: name.into(),
@@ -297,7 +293,6 @@ impl Expr {
             return Self::partial_call(declaration, call.func.clone(), captures, sort);
         }
         let mut program = pb::Program {
-            ir_version: 1,
             ..Default::default()
         };
         let mut slots = std::array::from_fn(|_| vec![]);
@@ -409,7 +404,6 @@ impl Expr {
             .collect();
         Ok(Self(publish(
             pb::Program {
-                ir_version: 1,
                 nodes: vec![pb::Node {
                     kind: Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
                         value: Some(pb::primitive_value::Value::PartialCall(pb::Call {

@@ -5,15 +5,15 @@ package egglog.v1;
 import "buf/validate/validate.proto";
 
 // Draft proposed v1 of a typed, language-neutral Egglog IR, with generated
-// Rust/Python messages. This draft uses ir_version = 1;
-// receivers must reject unsupported versions. Overview: proto/README.md.
+// Rust/Python messages. Consumers select the same schema revision; package and
+// service names identify the API, not raw protobuf bytes. Overview: proto/README.md.
 // Every arena index must name an existing entry in its enclosing program,
 // or response. CEL checks the direct node/sort edges below; other
 // references, including roots in commands and outputs, remain normative.
 // A fact is a bare node index; equality is a `Union` node, so `(= a b)` is a
 // fact naming a union of a and b.
 // Validation rules and normative comments in this file are the specification.
-// Unknown versions/enums are errors; Rust consumers must check raw enum values.
+// Unknown enum values are errors; Rust consumers must check raw enum values.
 // Producers expand datatype/default-argument/include syntax before this boundary.
 // No scope stack: clone an e-graph to save state, including its proof state.
 
@@ -269,9 +269,8 @@ message Program {
       "this.nodes[int(i)].call.args.map(a, this.nodes[int(a)].sort_id)))))"
   };
 
-  // This draft's IR version is 1. Reject unsupported values rather than
-  // decoding and re-emitting them; the field constraint only rejects zero.
-  uint32 ir_version = 1 [(buf.validate.field).uint32.gt = 0];
+  reserved 1;
+  reserved "ir_version";
 
   // Expression arena. Evaluate shared ordinary nodes lazily at first demand,
   // retaining their results within one top-level Action or one rule firing's
@@ -298,7 +297,7 @@ message Program {
   // distinct occurrences; labels never identify them. Unused entries do not
   // execute. Only named ruleset roots retain reachable rules across requests;
   // other rules are request-local and omitted by Freeze.
-  repeated RuleDecl rules = 9;
+  repeated Rule rules = 9;
 }
 
 // Source metadata supports diagnostic locations and documentation, not
@@ -1479,11 +1478,11 @@ message RulesetRef {
 // share the occurrence and its rule-owned execution state across groups/Run
 // sites. This does not identify distinct scheduler instances or combine their
 // scheduler-owned state.
-message RuleDecl {
+message Rule {
   oneof kind {
     option (buf.validate.oneof).required = true;
 
-    Rule rule = 1;
+    RuleBody rule = 1;
     Rewrite rewrite = 2;
     BiRewrite birewrite = 3;
   }
@@ -1507,7 +1506,7 @@ message RuleDecl {
 }
 
 // A stored query and ordered action list.
-message Rule {
+message RuleBody {
   repeated uint32 query = 2 [packed = true]; // index into the enclosing `nodes`
   repeated Action head = 3;
 }
@@ -2274,7 +2273,7 @@ message RulesetPublication {
   repeated string names = 1 [(buf.validate.field).repeated.unique = true];
 }
 
-// One authored RuleDecl occurrence, including both directions of a BiRewrite.
+// One authored Rule occurrence, including both directions of a BiRewrite.
 // Pick one valid route from the request's ruleset arena or an installed named
 // root, following composition-child positions (and resolving their refs), to
 // a leaf RuleList. `rule` is a position in that leaf, NOT a Program.rules index;

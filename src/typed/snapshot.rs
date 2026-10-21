@@ -557,7 +557,6 @@ mod tests {
                     ..Default::default()
                 }),
                 program: Some(pb::Program {
-                    ir_version: 1,
                     sorts: vec![
                         pb::Sort {
                             kind: Some(pb::sort::Kind::Family(pb::HostSort {

@@ -325,7 +325,6 @@ fn source_receiving_mode_preserves_native_global_boundaries() {
                 &mut engine,
                 id,
                 pb::Program {
-                    ir_version: 1,
                     commands: vec![pb::Command {
                         kind: Some(pb::command::Kind::PrintSize(pb::PrintSize {
                             tables: vec!["N".into()],
@@ -538,7 +537,6 @@ fn source_receiving_modes_preserve_typed_multi_vec_empty_context() {
             &mut engine,
             id,
             pb::Program {
-                ir_version: 1,
                 commands: vec![pb::Command {
                     kind: Some(pb::command::Kind::PrintSize(pb::PrintSize {
                         tables: vec!["XW".into()],
@@ -908,7 +906,6 @@ fn core_source_failed_control_and_fail_wrappers_keep_prefixes_in_every_mode() {
                     &mut engine,
                     id,
                     pb::Program {
-                        ir_version: 1,
                         commands: vec![pb::Command {
                             kind: Some(pb::command::Kind::Stats(pb::Unit {})),
                             ..Default::default()
@@ -939,7 +936,6 @@ fn core_source_failed_control_and_fail_wrappers_keep_prefixes_in_every_mode() {
                     &mut engine,
                     id,
                     pb::Program {
-                        ir_version: 1,
                         commands: vec![pb::Command {
                             kind: Some(pb::command::Kind::PrintFunction(pb::PrintFunction {
                                 table: "N".into(),
@@ -987,7 +983,6 @@ fn core_source_failed_control_and_fail_wrappers_keep_prefixes_in_every_mode() {
                     &mut engine,
                     id,
                     pb::Program {
-                        ir_version: 1,
                         sorts: vec![
                             pb::Sort {
                                 kind: Some(pb::sort::Kind::Family(pb::HostSort {
@@ -2040,7 +2035,6 @@ fn logical_table_rows_match_native_views_in_every_mode() {
             &mut engine,
             id,
             pb::Program {
-                ir_version: 1,
                 commands: vec![pb::Command {
                     kind: Some(pb::command::Kind::PrintFunction(pb::PrintFunction {
                         table: "$bad".into(),
@@ -2265,7 +2259,6 @@ fn fixture() -> pb::Program {
         });
     }
     pb::Program {
-        ir_version: 1,
         sorts: vec![
             pb::Sort {
                 kind: Some(pb::sort::Kind::Family(pb::HostSort {
@@ -2296,10 +2289,10 @@ fn fixture() -> pb::Program {
             int(3),
             call("N", vec![8]),
         ],
-        rules: vec![pb::RuleDecl {
+        rules: vec![pb::Rule {
             name: Some("derive".into()),
             eval_mode: pb::RuleEvalMode::Seminaive.into(),
-            kind: Some(pb::rule_decl::Kind::Rule(pb::Rule {
+            kind: Some(pb::rule::Kind::Rule(pb::RuleBody {
                 query: vec![3],
                 head: vec![pb::Action {
                     kind: Some(pb::action::Kind::Term(4)),
@@ -2374,7 +2367,7 @@ fn shared_occurrences_resupply_name_and_clone_keep_native_proofs_and_cursors() {
                 ..Default::default()
             });
         }
-        let Some(pb::rule_decl::Kind::Rule(rule)) = &mut program.rules[0].kind else {
+        let Some(pb::rule::Kind::Rule(rule)) = &mut program.rules[0].kind else {
             unreachable!()
         };
         rule.query.push(10);
@@ -2493,7 +2486,6 @@ fn shared_occurrences_resupply_name_and_clone_keep_native_proofs_and_cursors() {
         program.commands.clear();
         assert_eq!(run(&mut engine, clone, program.clone()).error, None);
         let mut name_only = pb::Program {
-            ir_version: 1,
             commands: vec![pb::Command {
                 kind: Some(pb::command::Kind::Run(pb::Run {
                     ruleset: Some(pb::RulesetRef {
@@ -2952,7 +2944,7 @@ fn malformed_later_commands_unused_rules_and_observations_are_atomic_preparation
                 }),
                 2 => {
                     program.rulesets.clear();
-                    let Some(pb::rule_decl::Kind::Rule(rule)) = &mut program.rules[0].kind else {
+                    let Some(pb::rule::Kind::Rule(rule)) = &mut program.rules[0].kind else {
                         unreachable!()
                     };
                     rule.query.clear(); // x in the unused rule head is ungrounded
@@ -4070,7 +4062,7 @@ fn failed_authored_run_counts_entry_without_fabricated_metrics_or_result() {
             })),
             ..Default::default()
         });
-        let Some(pb::rule_decl::Kind::Rule(rule)) = &mut program.rules[0].kind else {
+        let Some(pb::rule::Kind::Rule(rule)) = &mut program.rules[0].kind else {
             unreachable!()
         };
         rule.head = vec![pb::Action {
@@ -4107,7 +4099,6 @@ fn failed_authored_run_counts_entry_without_fabricated_metrics_or_result() {
                 &pb::RunProgramRequest {
                     egraph_id: id,
                     program: Some(pb::Program {
-                        ir_version: 1,
                         ..Default::default()
                     }),
                     profile: false,

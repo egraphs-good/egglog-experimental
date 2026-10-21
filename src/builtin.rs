@@ -238,7 +238,6 @@ pub fn type_constraints(
 pub fn project_description(description: &BuiltinDescription) -> Result<pb::Program, String> {
     description.validate()?;
     let mut program = pb::Program {
-        ir_version: 1,
         ..Default::default()
     };
     let typing = match &description.typing {
@@ -446,7 +445,6 @@ impl PortableTypeInfo for TypeInfo {
         let native = self.builtin_catalog()?;
         let mut result = PortableCatalog {
             definitions: pb::Program {
-                ir_version: 1,
                 ..Default::default()
             },
             undescribed_primitives: native.undescribed_primitives,
@@ -466,7 +464,6 @@ impl PortableTypeInfo for TypeInfo {
             let family = registration::family_metadata(self, &family)?;
             definitions::reconcile_declarations(
                 &pb::Program {
-                    ir_version: 1,
                     declarations: vec![pb::Declaration {
                         kind: Some(pb::declaration::Kind::HostSortFamily(family)),
                         ..Default::default()
@@ -965,11 +962,7 @@ fn definition_root<'a>(
 }
 
 pub(crate) fn definition_key(program: &pb::Program) -> Result<&str, String> {
-    if program.ir_version != 1
-        || !program.commands.is_empty()
-        || !program.rules.is_empty()
-        || !program.rulesets.is_empty()
-    {
+    if !program.commands.is_empty() || !program.rules.is_empty() || !program.rulesets.is_empty() {
         return Err("builtin definition must contain only declaration templates".into());
     }
     let mut validated = vec![];

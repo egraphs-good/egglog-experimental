@@ -248,7 +248,6 @@ fn function_values_reject_deferred_unions_without_eager_allocation() {
     let fresh = ActionTerm::from_expression(Expr(
         publish(
             pb::Program {
-                ir_version: 1,
                 nodes: vec![pb::Node {
                     kind: Some(pb::node::Kind::Union(pb::Union { members: vec![] })),
                     ..Default::default()
@@ -662,7 +661,7 @@ fn typed_table_heads_import_nullary_targets_close_one_binder_and_keep_shared_uni
             |d| matches!(&d.kind, Some(pb::declaration::Kind::Function(f)) if f.name == name)
         ));
     }
-    let Some(pb::rule_decl::Kind::Rule(body)) = &packer.program.rules[0].kind else {
+    let Some(pb::rule::Kind::Rule(body)) = &packer.program.rules[0].kind else {
         panic!()
     };
     let Some(pb::action::Kind::Set(first)) = &body.head[0].kind else {
@@ -691,7 +690,7 @@ fn typed_table_heads_import_nullary_targets_close_one_binder_and_keep_shared_uni
     assert!(last.target.as_ref().unwrap().args.is_empty());
     assert_eq!(last.value, Some(query.members[0]));
     assert_eq!(shared.members[0], query.members[0]);
-    let Some(pb::rule_decl::Kind::Rule(other)) = &packer.program.rules[1].kind else {
+    let Some(pb::rule::Kind::Rule(other)) = &packer.program.rules[1].kind else {
         panic!()
     };
     let Some(pb::action::Kind::Set(other)) = &other.head[0].kind else {
@@ -893,11 +892,11 @@ fn rule_conditions_relocate_once_and_close_the_whole_ordered_binder() {
     let new = packer.intern(extended.0, 0);
     packer.finish().unwrap();
     let program = packer.program;
-    let Some(pb::rule_decl::Kind::Rule(old)) = &program.rules[old as usize].kind else {
+    let Some(pb::rule::Kind::Rule(old)) = &program.rules[old as usize].kind else {
         panic!()
     };
     assert_eq!(old.query.len(), 1);
-    let Some(pb::rule_decl::Kind::Rule(body)) = &program.rules[new as usize].kind else {
+    let Some(pb::rule::Kind::Rule(body)) = &program.rules[new as usize].kind else {
         panic!()
     };
     assert_eq!(body.query.len(), 3);
@@ -946,7 +945,7 @@ fn registration_and_rule_heads_use_the_same_canonical_action_input() {
     let mut packed = Packer::default();
     packed.intern(rule((), heads).0, 0);
     packed.finish().unwrap();
-    let Some(pb::rule_decl::Kind::Rule(body)) = &packed.program.rules[0].kind else {
+    let Some(pb::rule::Kind::Rule(body)) = &packed.program.rules[0].kind else {
         panic!()
     };
     assert!(body.query.is_empty());
@@ -1178,7 +1177,7 @@ fn wide_callbacks_author_generated_binders_without_claiming_grounded_execution()
         .rules
         .iter()
         .map(|r| {
-            let Some(pb::rule_decl::Kind::Rule(body)) = &r.kind else {
+            let Some(pb::rule::Kind::Rule(body)) = &r.kind else {
                 panic!()
             };
             let distinct: std::collections::HashSet<_> = body
@@ -1238,7 +1237,6 @@ fn namespace_fragment(imported: bool, reversed: bool, missing: Option<Declaratio
         declarations.reverse();
     }
     let mut program = pb::Program {
-        ir_version: 1,
         sorts: vec![
             pb::Sort {
                 kind: Some(pb::sort::Kind::Eq("Shared".into())),
@@ -1498,7 +1496,6 @@ fn family_sort_comparison_resolves_slots_not_raw_indices() {
     let shifted = SortRef(
         publish(
             pb::Program {
-                ir_version: 1,
                 sorts: vec![pb::Sort {
                     kind: Some(pb::sort::Kind::Family(pb::HostSort {
                         name: "Vec".into(),
@@ -1575,7 +1572,6 @@ fn generic_tail_patterns_keep_group_width_and_share_every_binding() {
         Callable(
             publish(
                 pb::Program {
-                    ir_version: 1,
                     sorts: (0..2)
                         .map(|i| pb::Sort {
                             kind: Some(pb::sort::Kind::Var(i)),
@@ -1710,7 +1706,6 @@ fn grouped_declarations_relocate_every_tail_position() {
         Callable(
             publish(
                 pb::Program {
-                    ir_version: 1,
                     declarations: vec![pb::Declaration {
                         kind: Some(pb::declaration::Kind::HostPrimitive(pb::HostPrimitive {
                             name: "test.relocated.group".into(),
@@ -2169,7 +2164,6 @@ fn map_publication_requires_both_refs_and_preserves_union_identity() {
         assert!(
             publish(
                 pb::Program {
-                    ir_version: 1,
                     nodes: vec![pb::Node {
                         kind: Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
                             value: Some(pb::primitive_value::Value::Map(pb::MapValue {
@@ -2392,7 +2386,6 @@ fn pair_publication_requires_both_valid_references() {
         assert!(
             publish(
                 pb::Program {
-                    ir_version: 1,
                     nodes: vec![pb::Node {
                         kind: Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
                             value: Some(pb::primitive_value::Value::Pair(pb::PairValue {
@@ -2689,7 +2682,6 @@ fn node(
     slots[Arena::Sort as usize] = vec![Slot::External(sort.0.clone())];
     publish(
         pb::Program {
-            ir_version: 1,
             nodes: vec![pb::Node {
                 kind: Some(kind),
                 ..Default::default()
@@ -2898,7 +2890,6 @@ fn shared_union_identity_and_flat_cycle_reclamation() {
     slots[Arena::Sort as usize] = vec![Slot::External(sort.0)];
     let cycle = publish(
         pb::Program {
-            ir_version: 1,
             nodes: vec![pb::Node {
                 kind: Some(pb::node::Kind::Union(pb::Union { members: vec![0] })),
                 ..Default::default()
@@ -2973,9 +2964,8 @@ fn generated_rule_fields_and_occurrence_locations_are_authoritative() {
         slots[Arena::Node as usize] = vec![Slot::External(x.clone()), Slot::External(y.clone())];
         publish(
             pb::Program {
-                ir_version: 1,
-                rules: vec![pb::RuleDecl {
-                    kind: Some(pb::rule_decl::Kind::Rewrite(pb::Rewrite {
+                rules: vec![pb::Rule {
+                    kind: Some(pb::rule::Kind::Rewrite(pb::Rewrite {
                         lhs: 0,
                         rhs,
                         ..Default::default()
@@ -3005,7 +2995,6 @@ fn generated_rule_fields_and_occurrence_locations_are_authoritative() {
     ];
     let group = publish(
         pb::Program {
-            ir_version: 1,
             rulesets: vec![pb::Ruleset {
                 kind: Some(pb::ruleset::Kind::Rules(pb::RuleList {
                     rules: vec![0, 1, 2, 3],
@@ -3032,7 +3021,7 @@ fn generated_rule_fields_and_occurrence_locations_are_authoritative() {
         packer.program.rules[2].eval_mode,
         pb::RuleEvalMode::Naive as i32
     );
-    let Some(pb::rule_decl::Kind::Rewrite(rule)) = &packer.program.rules[2].kind else {
+    let Some(pb::rule::Kind::Rewrite(rule)) = &packer.program.rules[2].kind else {
         panic!()
     };
     assert_eq!(rule.lhs, rule.rhs);
@@ -3051,7 +3040,6 @@ fn declaration_diagnostics_do_not_change_local_compatibility() {
         Callable(
             publish(
                 pb::Program {
-                    ir_version: 1,
                     declarations: vec![pb::Declaration {
                         kind: Some(pb::declaration::Kind::Constructor(pb::Constructor {
                             name: "Wrap".into(),

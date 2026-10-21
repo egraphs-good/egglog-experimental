@@ -13,7 +13,6 @@ from gen.python.egglog.v1 import egglog_pb as ir
 def signature_program(pattern):
     """Own the signature's arena, binder and presentation-default references."""
     return ir.Program(
-        ir_version=1,
         sorts=[
             ir.Sort(kind=Oneof("family", ir.HostSort(name="i64"))),
             ir.Sort(kind=Oneof("var", 0)),

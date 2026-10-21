@@ -307,13 +307,13 @@ fn import_arenas(
 
 // One reference visitor serves import, structural comparison and retention.
 fn rule_refs(
-    rule: &mut pb::RuleDecl,
+    rule: &mut pb::Rule,
     mut node: impl FnMut(&mut u32) -> Result<(), String>,
     mut span: impl FnMut(&mut Option<pb::Span>) -> Result<(), String>,
 ) -> Result<(), String> {
     span(&mut rule.span)?;
     match rule.kind.as_mut().ok_or("missing rule kind")? {
-        pb::rule_decl::Kind::Rule(rule) => {
+        pb::rule::Kind::Rule(rule) => {
             for root in &mut rule.query {
                 node(root)?;
             }
@@ -342,14 +342,14 @@ fn rule_refs(
                 }
             }
         }
-        pb::rule_decl::Kind::Rewrite(rule) => {
+        pb::rule::Kind::Rewrite(rule) => {
             node(&mut rule.lhs)?;
             node(&mut rule.rhs)?;
             for root in &mut rule.conditions {
                 node(root)?;
             }
         }
-        pb::rule_decl::Kind::Birewrite(rule) => {
+        pb::rule::Kind::Birewrite(rule) => {
             node(&mut rule.lhs)?;
             node(&mut rule.rhs)?;
             for root in &mut rule.conditions {
@@ -546,11 +546,7 @@ pub fn reconcile_rulesets(
     source: &pb::Program,
     destination: &mut pb::Program,
 ) -> Result<RulesetReconciliation, String> {
-    if source.ir_version != 1 {
-        return Err("unsupported ruleset IR version".into());
-    }
     let mut staged = destination.clone();
-    staged.ir_version = 1;
     let old_sets = staged.rulesets.len();
     let old_rules = staged.rules.len();
     let (sorts, files) = import_arenas(source, &mut staged)?;
@@ -1180,11 +1176,7 @@ pub(crate) fn check_builtin_context(
     root_key: &str,
     mut helper: impl FnMut(&str) -> Result<pb::Program, String>,
 ) -> Result<(), String> {
-    if source.ir_version != 1
-        || !source.commands.is_empty()
-        || !source.rules.is_empty()
-        || !source.rulesets.is_empty()
-    {
+    if !source.commands.is_empty() || !source.rules.is_empty() || !source.rulesets.is_empty() {
         return Err("invalid builtin context header".into());
     }
     let mut keys = HashSet::default();
@@ -1229,9 +1221,6 @@ pub(crate) fn check_builtin_context(
         if index != root {
             let (_, key) = declaration_identity(&supplied)?;
             let authoritative = helper(key)?;
-            if authoritative.ir_version != 1 {
-                return Err("unsupported helper context IR version".into());
-            }
             let mut matches = authoritative.declarations.iter().filter(|declaration| {
                 declaration_identity(declaration).ok() == Some((Namespace::Callable, key))
             });
@@ -1342,11 +1331,7 @@ pub fn reconcile_declarations(
     source: &pb::Program,
     destination: &mut pb::Program,
 ) -> Result<Vec<bool>, String> {
-    if source.ir_version != 1 {
-        return Err("unsupported declaration IR version".into());
-    }
     let mut staged = destination.clone();
-    staged.ir_version = 1;
     let (sorts, files) = import_arenas(source, &mut staged)?;
     let mut importer = NodeImport {
         source,

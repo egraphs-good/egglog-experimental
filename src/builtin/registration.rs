@@ -42,7 +42,6 @@ pub fn family_metadata(
 
 fn family_context(types: &TypeInfo) -> Result<pb::Program, String> {
     let mut program = pb::Program {
-        ir_version: 1,
         ..Default::default()
     };
     for family in types.builtin_catalog()?.families {
@@ -193,8 +192,7 @@ impl PortableRegistration for TypeInfo {
         definitions::reconcile_declarations(&families, &mut supplied)?;
         definitions::reconcile_declarations(&generated, &mut supplied)?;
         supply(self, key, &mut supplied)?;
-        if supplied.ir_version != 1
-            || !supplied.commands.is_empty()
+        if !supplied.commands.is_empty()
             || !supplied.rules.is_empty()
             || !supplied.rulesets.is_empty()
         {
@@ -221,7 +219,6 @@ impl PortableRegistration for TypeInfo {
         staged.register_builtin_family(native.clone())?;
         let owner = staged.registered_builtin_family(&family.name)?;
         let mut canonical = pb::Program {
-            ir_version: 1,
             declarations: vec![pb::Declaration {
                 kind: Some(pb::declaration::Kind::HostSortFamily(family_metadata(
                     &staged, &native,
@@ -232,7 +229,6 @@ impl PortableRegistration for TypeInfo {
         };
         definitions::reconcile_declarations(
             &pb::Program {
-                ir_version: 1,
                 declarations: vec![pb::Declaration {
                     kind: Some(pb::declaration::Kind::HostSortFamily(family)),
                     ..Default::default()

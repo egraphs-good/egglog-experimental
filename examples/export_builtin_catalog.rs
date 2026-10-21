@@ -15,10 +15,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         std::io::stdout().lock().write_all(&bytes)?;
     }
-    eprintln!(
-        "Partial catalog, IR version {} (not Freeze).",
-        catalog.definitions.ir_version
-    );
+    eprintln!("Partial catalog (not Freeze).");
     eprintln!(
         "Undescribed primitives: {:?}",
         catalog.undescribed_primitives

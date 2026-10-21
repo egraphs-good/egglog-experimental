@@ -724,7 +724,6 @@ mod tests {
             action::Kind as A, declaration::Kind as D, node::Kind as N, primitive_value::Value as V,
         };
         pb::Program {
-            ir_version: 1,
             sorts: vec![
                 pb::Sort {
                     kind: Some(pb::sort::Kind::Eq("State".into())),
@@ -1165,7 +1164,6 @@ mod tests {
                 &mut engine,
                 id,
                 pb::Program {
-                    ir_version: 1,
                     commands: vec![pb::Command {
                         kind: Some(pb::command::Kind::Freeze(pb::Freeze {})),
                         ..Default::default()

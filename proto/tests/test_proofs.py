@@ -25,7 +25,7 @@ class ExpectedFailureSchemaTests(unittest.TestCase):
                         kind=Oneof("fail", command), span=ir.Span(start=start, end=20),
                     )
                 program = ir.Program(
-                    ir_version=1, files=[ir.SourceFile(name="expected.egg")],
+                    files=[ir.SourceFile(name="expected.egg")],
                     commands=[command],
                 )
                 validate(program)
@@ -60,7 +60,7 @@ class ExpectedFailureSchemaTests(unittest.TestCase):
             for _ in range(2):
                 invalid = ir.Command(kind=Oneof("fail", invalid))
             with self.subTest(command=invalid), self.assertRaises(ValidationError):
-                validate(ir.Program(ir_version=1, commands=[invalid]))
+                validate(ir.Program(commands=[invalid]))
 
     def test_fail_and_loop_nesting_keep_existing_location_shape(self):
         leaf = ir.Command(kind=Oneof("fail", ir.Command(kind=Oneof("check", ir.Check()))))
@@ -69,7 +69,7 @@ class ExpectedFailureSchemaTests(unittest.TestCase):
             Oneof("saturate", ir.Saturate(body=[leaf], max_iterations=1)),
         ):
             with self.subTest(kind=kind.field):
-                program = ir.Program(ir_version=1, commands=[
+                program = ir.Program(commands=[
                     ir.Command(kind=Oneof("fail", ir.Command(kind=kind))),
                 ])
                 validate(program)
@@ -195,7 +195,7 @@ class ProofSchemaTests(unittest.TestCase):
                 sorts = [ir.Sort(kind=Oneof("family", ir.HostSort(name="i64")))]
                 request = ir.CreateEGraphRequest(options=options, sorts=sorts)
                 snapshot = ir.EGraphSnapshot(
-                    options=options, program=ir.Program(ir_version=1, sorts=sorts)
+                    options=options, program=ir.Program(sorts=sorts)
                 )
                 for message in (request, snapshot):
                     validate(message)
@@ -211,7 +211,6 @@ class ProofSchemaTests(unittest.TestCase):
 
     def test_proof_commands_roundtrip(self):
         program = ir.Program(
-            ir_version=1,
             commands=[
                 ir.Command(kind=Oneof("prove", ir.Prove(facts=[]))),
                 ir.Command(kind=Oneof("prove_exists", ir.ProveExists(constructor="Goal"))),

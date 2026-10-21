@@ -22,7 +22,6 @@ fn relation_definition_fixture(reversed: bool) -> pb::Program {
         (vec![list, number], 0, 1)
     };
     pb::Program {
-        ir_version: 1,
         sorts,
         nodes: vec![pb::Node {
             sort_id: number_sort,
@@ -298,7 +297,6 @@ fn structural_sort_aliases_merge_and_survive_alias_only_relocation() {
             ..Default::default()
         };
         let source = pb::Program {
-            ir_version: 1,
             sorts: if reversed {
                 vec![applied, scalar]
             } else {
@@ -408,9 +406,8 @@ fn compiler_sort_aliases_share_types_without_registering_native_instances() {
 // ruleset occurrence topology distinguishes the negative cases.
 fn occurrence_fixture(children: &[&[u32]]) -> pb::Program {
     let mut program = pb::Program {
-        ir_version: 1,
-        rules: vec![pb::RuleDecl {
-            kind: Some(pb::rule_decl::Kind::Rule(pb::Rule::default())),
+        rules: vec![pb::Rule {
+            kind: Some(pb::rule::Kind::Rule(pb::RuleBody::default())),
             eval_mode: pb::RuleEvalMode::Seminaive.into(),
             ..Default::default()
         }],
@@ -636,7 +633,6 @@ fn ruleset_names_cycles_options_and_retention_obey_occurrence_contract() {
 
     // Explicit retained-name references need no copied children or rules.
     let mut by_name = pb::Program {
-        ir_version: 1,
         rulesets: vec![pb::Ruleset {
             name: Some("new".into()),
             kind: Some(pb::ruleset::Kind::Combined(pb::CombinedRuleset {
@@ -719,7 +715,7 @@ fn ruleset_rule_bodies_compare_order_and_union_identity_after_relocation() {
         start: 0,
         end: 4,
     });
-    let Some(pb::rule_decl::Kind::Rule(rule)) = &mut source.rules[0].kind else {
+    let Some(pb::rule::Kind::Rule(rule)) = &mut source.rules[0].kind else {
         unreachable!()
     };
     rule.head = vec![
@@ -741,7 +737,7 @@ fn ruleset_rule_bodies_compare_order_and_union_identity_after_relocation() {
     let previous = destination.clone();
     for change in 0..4 {
         let mut changed = source.clone();
-        let Some(pb::rule_decl::Kind::Rule(rule)) = &mut changed.rules[0].kind else {
+        let Some(pb::rule::Kind::Rule(rule)) = &mut changed.rules[0].kind else {
             unreachable!()
         };
         match change {
@@ -759,7 +755,7 @@ fn ruleset_rule_bodies_compare_order_and_union_identity_after_relocation() {
                 call.func = "G".into();
             }
             _ => {
-                changed.rules[0].kind = Some(pb::rule_decl::Kind::Rewrite(pb::Rewrite {
+                changed.rules[0].kind = Some(pb::rule::Kind::Rewrite(pb::Rewrite {
                     lhs: 0,
                     rhs: 0,
                     ..Default::default()
@@ -771,7 +767,7 @@ fn ruleset_rule_bodies_compare_order_and_union_identity_after_relocation() {
     }
     // Ordinary syntax sharing may differ, but the single Union in both ordered
     // actions must stay one identity. Diagnostics and arena indices may change.
-    let Some(pb::rule_decl::Kind::Rule(rule)) = &mut source.rules[0].kind else {
+    let Some(pb::rule::Kind::Rule(rule)) = &mut source.rules[0].kind else {
         unreachable!()
     };
     rule.head[0].kind = Some(pb::action::Kind::Term(1));
@@ -916,7 +912,7 @@ fn ruleset_and_existing_default_closures_relocate_and_retain_in_one_program() {
         },
     ];
     source.rules[0].span = rule_span;
-    source.rules[0].kind = Some(pb::rule_decl::Kind::Rule(pb::Rule {
+    source.rules[0].kind = Some(pb::rule::Kind::Rule(pb::RuleBody {
         query: vec![],
         head: vec![pb::Action {
             kind: Some(pb::action::Kind::Term(2)),
@@ -926,9 +922,9 @@ fn ruleset_and_existing_default_closures_relocate_and_retain_in_one_program() {
     for ruleset in &mut source.rulesets {
         ruleset.span = rule_span;
     }
-    source.rules.push(pb::RuleDecl {
+    source.rules.push(pb::Rule {
         eval_mode: pb::RuleEvalMode::Seminaive.into(),
-        kind: Some(pb::rule_decl::Kind::Rule(pb::Rule {
+        kind: Some(pb::rule::Kind::Rule(pb::RuleBody {
             query: vec![],
             head: vec![pb::Action {
                 kind: Some(pb::action::Kind::Term(0)),
@@ -1015,7 +1011,7 @@ fn ruleset_and_existing_default_closures_relocate_and_retain_in_one_program() {
         if let Some(span) = &mut rule.span {
             span.file = 1 - span.file;
         }
-        let Some(pb::rule_decl::Kind::Rule(rule)) = &mut rule.kind else {
+        let Some(pb::rule::Kind::Rule(rule)) = &mut rule.kind else {
             unreachable!()
         };
         for action in &mut rule.head {
@@ -1066,7 +1062,6 @@ fn scalar_views_relocate_and_freeze_exact_tail_presence() {
             .export_builtin_definition(&format!("egglog.core.{key}"), &mut source)
             .unwrap();
         let mut destination = pb::Program {
-            ir_version: 1,
             sorts: vec![pb::Sort {
                 kind: Some(pb::sort::Kind::Eq("Unrelated".into())),
                 ..Default::default()
@@ -1842,7 +1837,6 @@ fn declaration_namespaces_coexist_with_defaults_and_frozen_resupply() {
                 // Install the two sort namespaces in both arrival orders before
                 // supplying callable/default closures. Neither shadows the other.
                 let sorts = pb::Program {
-                    ir_version: 1,
                     declarations: incoming
                         .declarations
                         .iter()
@@ -1862,7 +1856,6 @@ fn declaration_namespaces_coexist_with_defaults_and_frozen_resupply() {
                 for d in sorts.declarations {
                     reconcile_declarations(
                         &pb::Program {
-                            ir_version: 1,
                             declarations: vec![d],
                             ..Default::default()
                         },
@@ -2332,7 +2325,6 @@ fn constant_views_reject_malformed_forms_and_signatures_transactionally() {
 
 fn box_definition() -> pb::Program {
     pb::Program {
-        ir_version: 1,
         sorts: vec![
             pb::Sort {
                 kind: Some(pb::sort::Kind::Family(pb::HostSort {

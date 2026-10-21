@@ -281,7 +281,7 @@ pub(super) type Key = (usize, Arena, u32);
 // arenas intact: saved code is not a typed authoring fragment and must not be
 // traversed as though it were stored data.
 pub(super) fn observe(program: pb::Program, root_sort: u32) -> Result<Record, TypedError> {
-    if program.ir_version != 1 || root_sort as usize >= program.sorts.len() {
+    if root_sort as usize >= program.sorts.len() {
         return Err(TypedError::Decode("invalid snapshot Program".into()));
     }
     let lengths = [
@@ -627,7 +627,7 @@ pub(super) fn visit(
                 return Err(invalid());
             }
             match rule.kind.as_mut().ok_or_else(invalid)? {
-                pb::rule_decl::Kind::Rule(r) => {
+                pb::rule::Kind::Rule(r) => {
                     for fact in &mut r.query {
                         *fact = map(Arena::Node, *fact)?;
                     }
@@ -635,7 +635,7 @@ pub(super) fn visit(
                         visit_action(action, |index| map(Arena::Node, index))?;
                     }
                 }
-                pb::rule_decl::Kind::Rewrite(r) => {
+                pb::rule::Kind::Rewrite(r) => {
                     r.lhs = map(Arena::Node, r.lhs)?;
                     for c in &mut r.conditions {
                         *c = map(Arena::Node, *c)?;
@@ -687,8 +687,7 @@ pub(super) fn publish(
     arena: Arena,
     index: u32,
 ) -> Result<Record, TypedError> {
-    if program.ir_version != 1
-        || !program.files.is_empty()
+    if !program.files.is_empty()
         || program
             .commands
             .iter()
@@ -799,7 +798,6 @@ impl Default for Packer {
     fn default() -> Self {
         Self {
             program: pb::Program {
-                ir_version: 1,
                 ..Default::default()
             },
             rulesets: vec![],
@@ -845,7 +843,7 @@ impl Packer {
                 self.program.declarations.len() - 1
             }
             Arena::Rule => {
-                self.program.rules.push(pb::RuleDecl::default());
+                self.program.rules.push(pb::Rule::default());
                 self.program.rules.len() - 1
             }
             Arena::Ruleset => {
@@ -1188,7 +1186,6 @@ impl Packer {
             crate::builtin::definitions::reconcile_declarations(
                 &self.program,
                 &mut pb::Program {
-                    ir_version: 1,
                     ..Default::default()
                 },
             )
@@ -1336,7 +1333,6 @@ mod tests {
             false,
         );
         let program = pb::Program {
-            ir_version: 1,
             commands: vec![pb::Command {
                 kind: Some(pb::command::Kind::Action(pb::Action {
                     kind: Some(pb::action::Kind::Subsume(pb::Call {

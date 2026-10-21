@@ -67,9 +67,9 @@ class DocumentationSchemaTests(unittest.TestCase):
 
     def test_unrelated_rule_documentation_keeps_implicit_string_shape(self):
         self.assertEqual(ir.Ruleset().doc, "")
-        self.assertEqual(ir.RuleDecl().doc, "")
+        self.assertEqual(ir.Rule().doc, "")
         self.assertEqual(ir.Ruleset(doc="").to_binary(), ir.Ruleset().to_binary())
-        self.assertEqual(ir.RuleDecl(doc="").to_binary(), ir.RuleDecl().to_binary())
+        self.assertEqual(ir.Rule(doc="").to_binary(), ir.Rule().to_binary())
 
 
 if __name__ == "__main__":

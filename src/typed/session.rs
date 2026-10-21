@@ -1080,7 +1080,6 @@ fn adopt(
     mut declarations: Vec<Record>,
 ) -> Result<Expr, TypedError> {
     let mut program = pb::Program {
-        ir_version: 1,
         ..Default::default()
     };
     let mut ids = HashMap::from([(root, 0u32)]);
@@ -1704,7 +1703,7 @@ mod tests {
             }
             let program = request.program.as_mut().unwrap();
             let actions: Vec<_> = if in_rule {
-                let Some(pb::rule_decl::Kind::Rule(body)) = &program.rules[0].kind else {
+                let Some(pb::rule::Kind::Rule(body)) = &program.rules[0].kind else {
                     panic!()
                 };
                 body.head.iter().collect()
@@ -2352,7 +2351,6 @@ mod tests {
                 &pb::RunProgramRequest {
                     egraph_id: saved,
                     program: Some(pb::Program {
-                        ir_version: 1,
                         ..Default::default()
                     }),
                     profile: true,
@@ -3033,7 +3031,6 @@ mod tests {
         let named = Ruleset(
             publish(
                 pb::Program {
-                    ir_version: 1,
                     rulesets: vec![pb::Ruleset {
                         name: Some("unfinished-child".into()),
                         kind: Some(pb::ruleset::Kind::Rules(pb::RuleList { rules: vec![0] })),
@@ -3173,9 +3170,8 @@ mod tests {
         let group = ruleset(Rule(
             publish(
                 pb::Program {
-                    ir_version: 1,
-                    rules: vec![pb::RuleDecl {
-                        kind: Some(pb::rule_decl::Kind::Rule(pb::Rule {
+                    rules: vec![pb::Rule {
+                        kind: Some(pb::rule::Kind::Rule(pb::RuleBody {
                             query: vec![],
                             head: vec![pb::Action {
                                 kind: Some(pb::action::Kind::Term(0)),
@@ -3818,7 +3814,6 @@ mod tests {
                 &pb::RunProgramRequest {
                     egraph_id: graph.handle,
                     program: Some(pb::Program {
-                        ir_version: 1,
                         commands: vec![table],
                         ..Default::default()
                     }),
@@ -5071,7 +5066,6 @@ mod tests {
                 .collect();
             let sorts = publish(
                 pb::Program {
-                    ir_version: 1,
                     sorts: program.sorts.clone(),
                     declarations: program.declarations.clone(),
                     ..Default::default()
@@ -5301,7 +5295,6 @@ mod tests {
             Ruleset(
                 publish(
                     pb::Program {
-                        ir_version: 1,
                         rulesets: vec![pb::Ruleset {
                             name: name.map(str::to_owned),
                             kind: Some(pb::ruleset::Kind::Rules(pb::RuleList { rules: vec![] })),

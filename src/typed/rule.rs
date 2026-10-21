@@ -22,7 +22,6 @@ impl<I: ValueInput> From<I> for Action {
         Self(
             publish(
                 pb::Program {
-                    ir_version: 1,
                     commands: vec![pb::Command {
                         kind: Some(pb::command::Kind::Action(pb::Action {
                             kind: Some(pb::action::Kind::Term(0)),
@@ -142,7 +141,6 @@ fn row_action(target: &Expr, mut action: pb::action::Kind, value: Option<Expr>) 
         }
         publish(
             pb::Program {
-                ir_version: 1,
                 commands: vec![pb::Command {
                     kind: Some(pb::command::Kind::Action(pb::Action {
                         kind: Some(action),
@@ -188,7 +186,6 @@ where
     Action(
         publish(
             pb::Program {
-                ir_version: 1,
                 commands: vec![pb::Command {
                     kind: Some(pb::command::Kind::Action(pb::Action {
                         kind: Some(pb::action::Kind::Term(0)),
@@ -220,7 +217,6 @@ fn equality_node(left: &Expr, right: &Expr) -> Expr {
         left.0.resolve(Arena::Sort, node.sort_id).unwrap(),
     )];
     let program = pb::Program {
-        ir_version: 1,
         nodes: vec![pb::Node {
             kind: Some(pb::node::Kind::Union(pb::Union {
                 members: vec![0, 1],
@@ -232,7 +228,7 @@ fn equality_node(left: &Expr, right: &Expr) -> Expr {
     Expr(publish(program, slots, vec![], Arena::Node, 0).unwrap())
 }
 
-/// Each wrapper owns one generated RuleDecl occurrence. Clones retain it.
+/// Each wrapper owns one generated Rule occurrence. Clones retain it.
 #[derive(Clone)]
 pub struct Rule(pub(super) Record, pub(super) Option<String>);
 /// An immutable generated ruleset; cloning preserves its occurrence and children.
@@ -266,9 +262,8 @@ pub fn rule(lhs: impl Facts, rhs: impl Actions) -> Rule {
     Rule(
         publish(
             pb::Program {
-                ir_version: 1,
-                rules: vec![pb::RuleDecl {
-                    kind: Some(pb::rule_decl::Kind::Rule(pb::Rule { query, head })),
+                rules: vec![pb::Rule {
+                    kind: Some(pb::rule::Kind::Rule(pb::RuleBody { query, head })),
                     eval_mode: pb::RuleEvalMode::Seminaive.into(),
                     ..Default::default()
                 }],
@@ -289,7 +284,6 @@ impl Rule {
     pub fn label(self, label: impl Into<String>) -> Self {
         let label = label.into();
         let mut program = pb::Program {
-            ir_version: 1,
             rules: vec![
                 self.0.owner.as_ref().unwrap().program.rules[self.0.index as usize].clone(),
             ],
@@ -332,7 +326,6 @@ impl Rule {
             return self;
         }
         let mut program = pb::Program {
-            ir_version: 1,
             rules: vec![
                 self.0.owner.as_ref().unwrap().program.rules[self.0.index as usize].clone(),
             ],
@@ -346,8 +339,8 @@ impl Rule {
         })
         .expect("published rule has valid references");
         let conditions = match program.rules[0].kind.as_mut().unwrap() {
-            pb::rule_decl::Kind::Rule(body) => &mut body.query,
-            pb::rule_decl::Kind::Rewrite(body) => &mut body.conditions,
+            pb::rule::Kind::Rule(body) => &mut body.query,
+            pb::rule::Kind::Rewrite(body) => &mut body.conditions,
             _ => unreachable!("unsupported published rule"),
         };
         for expr in conditions_roots {
@@ -378,9 +371,8 @@ where
         Slot::External(right.expression().0.clone()),
     ];
     let program = pb::Program {
-        ir_version: 1,
-        rules: vec![pb::RuleDecl {
-            kind: Some(pb::rule_decl::Kind::Rewrite(pb::Rewrite {
+        rules: vec![pb::Rule {
+            kind: Some(pb::rule::Kind::Rewrite(pb::Rewrite {
                 lhs: 0,
                 rhs: 1,
                 ..Default::default()
@@ -509,7 +501,6 @@ pub fn named_ruleset<A>(
     Ruleset(
         publish(
             pb::Program {
-                ir_version: 1,
                 rulesets: vec![pb::Ruleset {
                     name,
                     kind: Some(pb::ruleset::Kind::Combined(pb::CombinedRuleset {
@@ -533,7 +524,6 @@ pub fn named_ruleset<A>(
 // group boundaries instead of flattening/re-authoring existing children.
 fn rule_list(rules: Vec<Rule>, name: Option<String>) -> Ruleset {
     let program = pb::Program {
-        ir_version: 1,
         rulesets: vec![pb::Ruleset {
             name,
             kind: Some(pb::ruleset::Kind::Rules(pb::RuleList {
