@@ -1,0 +1,556 @@
+//! Build the reachable extraction graph, applying effect annotations,
+//! placeholders, and subsumption options. Prune nodes with no finite term.
+
+use std::collections::VecDeque;
+use std::hash::BuildHasherDefault;
+
+use egglog::ast::{Expr, FunctionSubtype, Literal};
+use egglog::extract::DagCostModel;
+use egglog::{ArcSort, EGraph, Error, Value};
+use indexmap::IndexMap;
+use rustc_hash::FxHasher;
+
+use super::EffsafeConfig;
+use super::cost::{Annotation, Cost, RegionBoundary};
+use super::term_graph::{EClass, EClassId, ENode, NodeKind, OpInfo, SortId, TermGraph};
+
+type FxIndexMap<K, V> = IndexMap<K, V, BuildHasherDefault<FxHasher>>;
+
+/// What to extract.
+pub enum Roots<'a> {
+    /// These e-classes.
+    Values(Vec<(ArcSort, Value)>),
+    /// Every e-class holding an e-node of this constructor.
+    Constructor(&'a str),
+}
+
+/// An e-class before numbering: (sort index, canonical value).
+type ClassKey = (SortId, Value);
+
+struct Builder<'e> {
+    egraph: &'e EGraph,
+    config: &'e EffsafeConfig,
+    cost_model: &'e dyn DagCostModel<Cost>,
+    boundary: &'e dyn RegionBoundary,
+    /// Effectful e-nodes dropped because they had several state children; see `validate`.
+    dropped: Vec<String>,
+    g: TermGraph,
+    sort_ids: FxIndexMap<String, SortId>,
+    class_ids: FxIndexMap<ClassKey, EClassId>,
+    /// The single e-class standing in for each placeholder sort.
+    placeholder_classes: FxIndexMap<SortId, EClassId>,
+}
+
+impl<'e> Builder<'e> {
+    fn sort_id(&mut self, sort: &ArcSort) -> SortId {
+        if let Some(&id) = self.sort_ids.get(sort.name()) {
+            return id;
+        }
+        let id = self.g.sorts.len();
+        self.g.sorts.push(sort.clone());
+        self.sort_ids.insert(sort.name().to_string(), id);
+        id
+    }
+
+    fn class_for(&mut self, sort: SortId, value: Value) -> EClassId {
+        *self.class_ids.entry((sort, value)).or_insert_with(|| {
+            self.g.classes.push(EClass {
+                enodes: Vec::new(),
+                is_effectful: false,
+                sort,
+            });
+            self.g.len() - 1
+        })
+    }
+
+    /// The e-class of a child value of the given sort, creating leaf nodes for
+    /// base values and containers on first sight.
+    fn child_class(&mut self, sort: &ArcSort, value: Value) -> EClassId {
+        let sort_id = self.sort_id(sort);
+        if self.config.placeholders.contains_key(sort.name()) {
+            return *self.placeholder_classes.entry(sort_id).or_insert_with(|| {
+                self.g.classes.push(EClass {
+                    enodes: vec![ENode {
+                        kind: NodeKind::Placeholder,
+                        cost: 0,
+                        children: Vec::new(),
+                        regions: Vec::new(),
+                        region_positions: Vec::new(),
+                        arity: 0,
+                        boundary: None,
+                    }],
+                    is_effectful: false,
+                    sort: sort_id,
+                });
+                self.g.len() - 1
+            });
+        }
+        if sort.is_eq_sort() {
+            return self.class_for(sort_id, value);
+        }
+        if let Some(&class) = self.class_ids.get(&(sort_id, value)) {
+            return class;
+        }
+        let class = self.class_for(sort_id, value);
+        let enode = if sort.is_container_sort() {
+            let children: Vec<EClassId> = self
+                .egraph
+                .container_inner_values(sort, value)
+                .into_iter()
+                .map(|(inner_sort, inner)| self.child_class(&inner_sort, inner))
+                .collect();
+            let arity = children.len();
+            ENode {
+                kind: NodeKind::Container(value),
+                cost: self.cost_model.container_cost(self.egraph, sort, value),
+                children,
+                regions: Vec::new(),
+                region_positions: Vec::new(),
+                arity,
+                boundary: None,
+            }
+        } else {
+            ENode {
+                kind: NodeKind::Base(value),
+                cost: self.cost_model.base_value_cost(self.egraph, sort, value),
+                children: Vec::new(),
+                regions: Vec::new(),
+                region_positions: Vec::new(),
+                arity: 0,
+                boundary: None,
+            }
+        };
+        self.g.classes[class].enodes.push(enode);
+        class
+    }
+
+    /// Add every row of every extractable constructor.
+    fn collect(&mut self) -> Result<(), Error> {
+        let functions: Vec<_> = self
+            .egraph
+            .functions_iter()
+            .filter(|(_, func)| {
+                let ty = func.func_type();
+                ty.subtype == FunctionSubtype::Constructor
+                    && ty.output.is_eq_sort()
+                    && !func.is_hidden()
+                    && !func.is_unextractable()
+                    && !func.is_let_binding()
+            })
+            .map(|(name, func)| (name.clone(), func))
+            .collect();
+        for (name, func) in functions {
+            let ty = func.func_type();
+            let mut regions = self.config.regions.get(&name).cloned().unwrap_or_default();
+            regions.sort_unstable();
+            regions.dedup();
+            if let Some(&bad) = regions.iter().find(|&&p| p >= ty.input.len()) {
+                return Err(Error::ExtractError(format!(
+                    "constructor {name} has {} arguments, but :regions names position {bad}",
+                    ty.input.len()
+                )));
+            }
+            let op = self.g.ops.len();
+            self.g.ops.push(OpInfo { name: name.clone() });
+            let out_sort = self.sort_id(&ty.output);
+            let mut rows: Vec<(Value, Vec<Value>, Cost, Option<Annotation>)> = Vec::new();
+            self.egraph.constructor_enodes(&name, |enode| {
+                if !enode.subsumed || self.config.include_subsumed {
+                    let cost = self.cost_model.enode_cost(self.egraph, func, &enode);
+                    let boundary = (!regions.is_empty())
+                        .then(|| self.boundary.annotate(self.egraph, func, &enode));
+                    rows.push((enode.eclass, enode.children.to_vec(), cost, boundary));
+                }
+            })?;
+            for (eclass, children, cost, boundary) in rows {
+                let children: Vec<EClassId> = children
+                    .iter()
+                    .zip(&ty.input)
+                    .map(|(&v, sort)| self.child_class(sort, v))
+                    .collect();
+                let class = self.class_for(out_sort, eclass);
+                let arity = children.len();
+                self.g.classes[class].enodes.push(ENode {
+                    kind: NodeKind::Op(op),
+                    cost,
+                    children,
+                    regions: regions.clone(),
+                    region_positions: regions.clone(),
+                    arity,
+                    boundary,
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// Mark the e-classes recorded by `set-effectful`: every row of every
+    /// generated `effsafe_effectful_<Sort>` relation.
+    fn mark_effectful(&mut self) -> Result<(), Error> {
+        let relations: Vec<(String, ArcSort, FunctionSubtype)> = self
+            .egraph
+            .functions_iter()
+            .filter(|(name, _)| super::set_effectful::effectful_relation_sort(name).is_some())
+            .filter_map(|(name, func)| match &func.func_type().input[..] {
+                [sort] => Some((name.clone(), sort.clone(), func.func_type().subtype)),
+                _ => None,
+            })
+            .collect();
+        for (relation, sort, subtype) in relations {
+            let sort_id = self.sort_id(&sort);
+            let mut values = Vec::new();
+            match subtype {
+                FunctionSubtype::Constructor => self
+                    .egraph
+                    .constructor_enodes(&relation, |enode| values.push(enode.children[0]))?,
+                FunctionSubtype::Custom => self
+                    .egraph
+                    .function_entries(&relation, |entry| values.push(entry.inputs[0]))?,
+            }
+            for value in values {
+                if let Some(&class) = self.class_ids.get(&(sort_id, value)) {
+                    self.g.classes[class].is_effectful = true;
+                }
+            }
+        }
+        self.mark_effectful_containers();
+        Ok(())
+    }
+
+    /// Mark containers holding effectful elements, including nested containers.
+    fn mark_effectful_containers(&mut self) {
+        let g = &mut self.g;
+        let containers: Vec<EClassId> = g
+            .class_ids()
+            .filter(|&c| {
+                g.classes[c]
+                    .enodes
+                    .iter()
+                    .any(|n| matches!(n.kind, NodeKind::Container(_)))
+            })
+            .collect();
+        let mut changed = true;
+        while changed {
+            changed = false;
+            for &c in &containers {
+                if g.classes[c].is_effectful {
+                    continue;
+                }
+                let carries_state = g.classes[c].enodes.iter().any(|n| {
+                    n.children
+                        .iter()
+                        .any(|&child| g.classes[child].is_effectful)
+                });
+                if carries_state {
+                    g.classes[c].is_effectful = true;
+                    changed = true;
+                }
+            }
+        }
+    }
+
+    fn resolve_roots(&mut self, roots: &Roots) -> Result<Vec<EClassId>, Error> {
+        match roots {
+            Roots::Values(values) => values
+                .iter()
+                .map(|(sort, value)| {
+                    let sort_id = self.sort_id(sort);
+                    self.class_ids
+                        .get(&(sort_id, *value))
+                        .copied()
+                        .ok_or_else(|| {
+                            Error::ExtractError(format!(
+                                "root of sort {} has no extractable e-nodes",
+                                sort.name()
+                            ))
+                        })
+                })
+                .collect(),
+            Roots::Constructor(name) => {
+                let Some(op) = self.g.ops.iter().position(|o| o.name == *name) else {
+                    return Err(Error::ExtractError(format!(
+                        "{name} is not an extractable constructor"
+                    )));
+                };
+                Ok(self
+                    .g
+                    .class_ids()
+                    .filter(|&c| {
+                        self.g.classes[c]
+                            .enodes
+                            .iter()
+                            .any(|n| matches!(n.kind, NodeKind::Op(o) if o == op))
+                    })
+                    .collect())
+            }
+        }
+    }
+
+    /// Drop effectful e-nodes with multiple state inputs outside `:regions`.
+    /// Return an error if any root is pure.
+    fn validate(&mut self, roots: &[EClassId]) -> Result<(), Error> {
+        let effectful: Vec<EClassId> = self
+            .g
+            .class_ids()
+            .filter(|&c| self.g.is_effectful(c))
+            .collect();
+        for c in effectful {
+            let enodes = std::mem::take(&mut self.g.classes[c].enodes);
+            let mut kept = Vec::new();
+            for enode in enodes {
+                let state_children = enode
+                    .children
+                    .iter()
+                    .enumerate()
+                    .filter(|&(i, &child)| {
+                        !enode.regions.contains(&i) && self.g.is_effectful(child)
+                    })
+                    .count();
+                if state_children > 1 {
+                    let op = self.g.op_name(&enode).unwrap_or("<container>");
+                    self.dropped.push(format!(
+                        "{op} ({state_children} effectful children that are not marked as regions)"
+                    ));
+                } else {
+                    kept.push(enode);
+                }
+            }
+            self.g.classes[c].enodes = kept;
+        }
+        let g = &self.g;
+        for &root in roots {
+            if !g.is_effectful(root) {
+                let names: Vec<&str> = g.classes[root]
+                    .enodes
+                    .iter()
+                    .filter_map(|n| g.op_name(n))
+                    .collect();
+                return Err(Error::ExtractError(format!(
+                    "extraction root is not effectful (e-class with {names:?}); \
+                     roots must be marked with set-effectful"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// Keep only the e-classes the roots reach. Returns the new root ids.
+    fn restrict_to_reachable(&mut self, roots: &[EClassId]) -> Vec<EClassId> {
+        let g = &self.g;
+        let mut reachable = vec![false; g.len()];
+        let mut queue: VecDeque<EClassId> = VecDeque::new();
+        for &root in roots {
+            if !reachable[root] {
+                reachable[root] = true;
+                queue.push_back(root);
+            }
+        }
+        while let Some(u) = queue.pop_front() {
+            for enode in &g.classes[u].enodes {
+                for &child in &enode.children {
+                    if !reachable[child] {
+                        reachable[child] = true;
+                        queue.push_back(child);
+                    }
+                }
+            }
+        }
+        let mut new_id = vec![None; g.len()];
+        let mut kept = g.empty_like();
+        for c in g.class_ids().filter(|&c| reachable[c]) {
+            new_id[c] = Some(kept.len());
+            kept.classes.push(EClass {
+                enodes: Vec::new(),
+                is_effectful: g.is_effectful(c),
+                sort: g.classes[c].sort,
+            });
+        }
+        for c in g.class_ids().filter(|&c| reachable[c]) {
+            let target = new_id[c].unwrap();
+            for enode in &g.classes[c].enodes {
+                kept.classes[target].enodes.push(
+                    enode.with_children(
+                        enode.children.iter().map(|&v| new_id[v].unwrap()).collect(),
+                    ),
+                );
+            }
+        }
+        let roots = roots.iter().map(|&r| new_id[r].unwrap()).collect();
+        self.g = kept;
+        roots
+    }
+}
+
+/// Check that every placeholder is a well-typed constructor application of
+/// the right sort: the right arity, with each argument a literal or a nested
+/// constructor application of the expected sort.
+fn validate_placeholders(egraph: &EGraph, config: &EffsafeConfig) -> Result<(), Error> {
+    for (sort, expr) in &config.placeholders {
+        check_placeholder(egraph, expr, sort).map_err(|why| {
+            Error::ExtractError(format!(
+                "placeholder {expr} for sort {sort} is not a well-typed constructor \
+                 application of that sort: {why}"
+            ))
+        })?;
+    }
+    Ok(())
+}
+
+fn check_placeholder(egraph: &EGraph, expr: &Expr, sort: &str) -> Result<(), String> {
+    match expr {
+        Expr::Call(_, head, args) => {
+            let Some(func) = egraph.get_function(head) else {
+                return Err(format!("{head} is not a declared constructor"));
+            };
+            let ty = func.func_type();
+            if ty.subtype != FunctionSubtype::Constructor {
+                return Err(format!("{head} is a function, not a constructor"));
+            }
+            if ty.output.name() != sort {
+                return Err(format!(
+                    "{head} has sort {}, expected {sort}",
+                    ty.output.name()
+                ));
+            }
+            if args.len() != ty.input.len() {
+                return Err(format!(
+                    "{head} takes {} argument(s), given {}",
+                    ty.input.len(),
+                    args.len()
+                ));
+            }
+            for (arg, arg_sort) in args.iter().zip(&ty.input) {
+                check_placeholder(egraph, arg, arg_sort.name())?;
+            }
+            Ok(())
+        }
+        Expr::Lit(_, lit) => {
+            let lit_sort = match lit {
+                Literal::Int(_) => "i64",
+                Literal::Float(_) => "f64",
+                Literal::String(_) => "String",
+                Literal::Bool(_) => "bool",
+                Literal::Unit => "Unit",
+            };
+            if lit_sort == sort {
+                Ok(())
+            } else {
+                Err(format!(
+                    "literal {lit} has sort {lit_sort}, expected {sort}"
+                ))
+            }
+        }
+        Expr::Var(_, name) => Err(format!("variable {name} is not allowed in a placeholder")),
+    }
+}
+
+/// Build the extractor's e-graph, limiting the roots before validation.
+pub fn build(
+    egraph: &EGraph,
+    config: &EffsafeConfig,
+    cost_model: &dyn DagCostModel<Cost>,
+    boundary: &dyn RegionBoundary,
+    roots: &Roots,
+    max_roots: Option<usize>,
+) -> Result<(TermGraph, Vec<EClassId>), Error> {
+    validate_placeholders(egraph, config)?;
+    let mut builder = Builder {
+        egraph,
+        config,
+        cost_model,
+        boundary,
+        dropped: Vec::new(),
+        g: TermGraph::default(),
+        sort_ids: FxIndexMap::default(),
+        class_ids: FxIndexMap::default(),
+        placeholder_classes: FxIndexMap::default(),
+    };
+    builder.collect()?;
+    builder.mark_effectful()?;
+    let mut roots = builder.resolve_roots(roots)?;
+    if let Some(limit) = max_roots {
+        roots.truncate(limit);
+    }
+    builder.validate(&roots)?;
+    let roots = builder.restrict_to_reachable(&roots);
+    let (pruned, mapping) = builder.g.prune_unextractable(None);
+    let roots = roots
+        .iter()
+        .map(|&r| {
+            mapping.classes[r].ok_or_else(|| {
+                let dropped = if builder.dropped.is_empty() {
+                    String::new()
+                } else {
+                    format!("; dropped e-nodes: {:?}", builder.dropped)
+                };
+                Error::ExtractError(format!(
+                    "extraction root has no finite term: {}{dropped}",
+                    explain_unextractable(&builder.g, r)
+                ))
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok((pruned, roots))
+}
+
+/// Describe a root with no finite term, including missing extractable constructors.
+fn explain_unextractable(g: &TermGraph, class: EClassId) -> String {
+    let extractable = g.extractable_classes();
+    let root_ops: Vec<&str> = g.classes[class]
+        .enodes
+        .iter()
+        .filter_map(|n| g.op_name(n))
+        .collect();
+    let mut by_sort: Vec<(String, usize)> = Vec::new();
+    let mut empty: Vec<String> = Vec::new();
+    for c in g.class_ids().filter(|&c| !extractable[c]) {
+        let sort = g.sorts[g.classes[c].sort].name().to_string();
+        match by_sort.iter_mut().find(|(s, _)| *s == sort) {
+            Some((_, n)) => *n += 1,
+            None => by_sort.push((sort.clone(), 1)),
+        }
+        if g.classes[c].enodes.is_empty() && empty.len() < 8 {
+            empty.push(sort);
+        }
+    }
+    let mut details = String::new();
+    if std::env::var_os("EFFSAFE_DEBUG").is_some() {
+        let boring = ["Get", "Bop", "Uop", "Top", "Concat", "Single"];
+        for c in g
+            .class_ids()
+            .filter(|&c| !extractable[c])
+            .filter(|&c| {
+                std::env::var("EFFSAFE_DEBUG").as_deref() == Ok("all")
+                    || g.classes[c]
+                        .enodes
+                        .iter()
+                        .any(|n| !boring.contains(&g.op_name(n).unwrap_or("<leaf>")))
+            })
+            .take(200)
+        {
+            details.push_str(&format!(
+                "\n  class {c} ({}):",
+                g.sorts[g.classes[c].sort].name()
+            ));
+            for n in &g.classes[c].enodes {
+                let op = g.op_name(n).unwrap_or("<leaf>");
+                let kids: Vec<String> = n
+                    .children
+                    .iter()
+                    .map(|&k| {
+                        format!(
+                            "{}#{k}{}",
+                            g.sorts[g.classes[k].sort].name(),
+                            if extractable[k] { "" } else { "!" }
+                        )
+                    })
+                    .collect();
+                details.push_str(&format!("\n    {op} {kids:?}"));
+            }
+        }
+    }
+    format!(
+        "root e-class (e-nodes {root_ops:?}); e-classes without a finite term by sort: {by_sort:?}; \
+         e-classes with no extractable e-node (unextractable constructors only): {empty:?}{details}"
+    )
+}

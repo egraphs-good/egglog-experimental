@@ -1,0 +1,22 @@
+;; Two functions share a loop body. effsafe-extract-all extracts every Fn,
+;; and the shared subregion is extracted once and placed under both.
+
+(datatype Expr
+  (Arg)
+  (Num i64)
+  (Add Expr Expr)
+  (Print Expr Expr)
+  (Loop Expr Expr :regions (1))
+  (Call String Expr))
+(constructor Fn (String Expr) Expr)
+(rule ((= e (Arg))) ((set-effectful Expr e)))
+(rule ((= e (Print v s))) ((set-effectful Expr e)))
+(rule ((= e (Loop i b))) ((set-effectful Expr e)))
+(rule ((= e (Call n s))) ((set-effectful Expr e)))
+(rule ((= e (Fn n b))) ((set-effectful Expr e)))
+
+(let $body (Print (Add (Num 1) (Num 2)) (Arg)))
+(let $f (Fn "f" (Loop (Arg) $body)))
+(let $g (Fn "g" (Call "f" (Loop (Print (Num 0) (Arg)) $body))))
+(run 3)
+(print-function Fn :extractor effsafe)
