@@ -188,7 +188,7 @@ impl CapturePlan {
                         "free variable in evaluated input".into(),
                     ));
                 }
-                Some(pb::node::Kind::Union(_)) => eligible = false,
+                Some(pb::node::Kind::Union(_) | pb::node::Kind::Apply(_)) => eligible = false,
                 Some(pb::node::Kind::Call(call)) => {
                     let declaration = record.declaration(&call.func, DeclarationKind::Callable)?;
                     eligible &= declaration.arena == Arena::Declaration
@@ -953,7 +953,7 @@ impl EGraph {
     pub fn num_tuples(&mut self) -> Result<usize, TypedError> {
         let mut packer = Packer::default();
         packer.program.commands.push(pb::Command {
-            kind: Some(pb::command::Kind::PrintSize(pb::PrintSize::default())),
+            kind: Some(pb::command::Kind::TableSizes(pb::GetTableSizes::default())),
             ..Default::default()
         });
         let (response, _files) = one_observation(self.execute(packer, false)?)?;
@@ -1194,6 +1194,10 @@ fn adopt(
         };
         match &mut node.kind {
             Some(pb::node::Kind::Call(call)) => call.args.iter_mut().for_each(&mut relocate),
+            Some(pb::node::Kind::Apply(apply)) => {
+                apply.function.iter_mut().for_each(&mut relocate);
+                apply.args.iter_mut().for_each(&mut relocate);
+            }
             Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
                 value: Some(pb::primitive_value::Value::PartialCall(call)),
             })) => call.args.iter_mut().for_each(&mut relocate),
@@ -1266,7 +1270,6 @@ fn adopt(
             Some(pb::sort::Kind::Eq(name)) => program.declarations.push(pb::Declaration {
                 kind: Some(pb::declaration::Kind::EqSort(pb::EqSort {
                     name: name.clone(),
-                    ..Default::default()
                 })),
                 ..Default::default()
             }),
@@ -1319,7 +1322,7 @@ fn adopt(
     let mut slots = std::array::from_fn(|_| vec![]);
     slots[Arena::Node as usize] = (0..program.nodes.len() as u32).map(Slot::Local).collect();
     slots[Arena::Sort as usize] = (0..program.sorts.len() as u32).map(Slot::Local).collect();
-    let mut record = publish(program, slots, declarations, Arena::Node, 0)?;
+    let mut record = publish(program, slots, declarations, Arena::Node, 0, vec![])?;
     std::sync::Arc::get_mut(record.owner.as_mut().unwrap())
         .expect("fresh adopted owner")
         .ambient = builtins.owner.clone();
@@ -1726,7 +1729,7 @@ mod tests {
                     packer.intern(definition, 0);
                 }
                 packer.program.commands.push(pb::Command {
-                    kind: Some(pb::command::Kind::PrintSize(pb::PrintSize {
+                    kind: Some(pb::command::Kind::TableSizes(pb::GetTableSizes {
                         tables: vec!["ActionAbsent".into()],
                     })),
                     ..Default::default()
@@ -1878,7 +1881,13 @@ mod tests {
             }
             let program = request.program.as_mut().unwrap();
             let actions: Vec<_> = if in_rule {
-                let Some(pb::rule::Kind::Rule(body)) = &program.rules[0].kind else {
+                let Some(pb::command::Kind::Loop(schedule)) = &program.commands[0].kind else {
+                    panic!()
+                };
+                let Some(pb::command::Kind::AddRules(add)) = &schedule.body[0].kind else {
+                    panic!()
+                };
+                let Some(pb::rule::Kind::Rule(body)) = &add.rules[0].kind else {
                     panic!()
                 };
                 body.head.iter().collect()
@@ -3221,7 +3230,7 @@ mod tests {
             ..Default::default()
         });
         let table = pb::Command {
-            kind: Some(pb::command::Kind::PrintFunction(pb::PrintFunction {
+            kind: Some(pb::command::Kind::TableRows(pb::GetTableRows {
                 table: "stored_map".into(),
                 max_rows: Some(10),
             })),
@@ -3266,7 +3275,7 @@ mod tests {
             )
             .unwrap(),
         );
-        let Some(pb::command_output::Kind::PrintedFunction(table_result)) =
+        let Some(pb::command_output::Kind::TableRows(table_result)) =
             &response.output.outputs[1].kind
         else {
             panic!()
@@ -3313,8 +3322,7 @@ mod tests {
                 .map(|bytes| pb::RunProgramResponse::decode(bytes.as_slice()).unwrap()),
         );
         assert!(after.error.is_none());
-        let Some(pb::command_output::Kind::PrintedFunction(table)) = &after.output.outputs[0].kind
-        else {
+        let Some(pb::command_output::Kind::TableRows(table)) = &after.output.outputs[0].kind else {
             panic!()
         };
         let Some(pb::table_cell::Kind::Term(term)) = table.rows[0].output.as_ref().unwrap().kind
@@ -4749,6 +4757,7 @@ mod tests {
                 vec![graph.builtins.clone()],
                 Arena::Sort,
                 root.sort_id,
+                vec![],
             )
             .unwrap();
             assert!(
@@ -4769,10 +4778,10 @@ mod tests {
                 .declaration(&call.func, DeclarationKind::Callable)
                 .unwrap();
             let primitive = declaration.primitive().unwrap();
-            let Some(pb::primitive::Typing::Signature(signature)) = &primitive.typing else {
+            let Some(signature) = &primitive.signature else {
                 panic!()
             };
-            assert_eq!(signature.type_params.len(), 1);
+            assert_eq!(signature.type_param_count as usize, 1);
             assert_eq!(signature.inputs.len(), 2);
             assert!(signature.varargs.is_empty());
             assert_eq!(signature.inputs[0].sort, signature.inputs[1].sort);
@@ -4999,7 +5008,6 @@ mod tests {
                 pb::RunProgramRequest::decode(graph.last_wire.as_ref().unwrap().0.as_slice())
                     .unwrap();
             let program = request.program.unwrap();
-            assert_eq!(program.rules.len(), 1);
             let Some(pb::command::Kind::Loop(repeat)) = &program.commands[0].kind else {
                 panic!("one report scope")
             };
@@ -5007,7 +5015,8 @@ mod tests {
                 panic!("ordered registration")
             };
             assert_eq!(add.group, explicit);
-            assert_eq!(add.rules, [0, 0]);
+            assert_eq!(add.rules.len(), 2);
+            assert_eq!(add.rules[0], add.rules[1]);
             let Some(pb::command::Kind::Run(run)) = &repeat.body[1].kind else {
                 panic!("group selection")
             };

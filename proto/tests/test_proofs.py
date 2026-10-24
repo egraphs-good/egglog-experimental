@@ -95,14 +95,14 @@ class ExpectedFailureSchemaTests(unittest.TestCase):
             ("check", ir.Check(), "1200"),
             ("run", ir.Run(groups=[""]), "1a020a00"),
             ("bind_scheduler", ir.BindScheduler(
-                name="s", scheduler=ir.Scheduler(kind=Oneof("back_off", ir.BackOff())),
-            ), "22070a017312020a00"),
+                name="s", back_off=ir.BackOff(),
+            ), "22050a01731200"),
             ("keep_best", ir.KeepBest(tables=["C"], extractor=ir.Extractor.TREE), "2a050a01431001"),
             ("extract", ir.Extract(roots=[0], variants=1, extractor=ir.Extractor.TREE), "32070a010010011801"),
             ("freeze", ir.Freeze(), "3a00"),
-            ("print_size", ir.PrintSize(), "4200"),
-            ("print_function", ir.PrintFunction(table="C"), "4a030a0143"),
-            ("print_table_stats", ir.PrintTableStats(), "5200"),
+            ("table_sizes", ir.GetTableSizes(), "4200"),
+            ("table_rows", ir.GetTableRows(table="C"), "4a030a0143"),
+            ("table_stats", ir.GetTableStats(), "5200"),
             ("loop", ir.Loop(max_iterations=0), "5a021800"),
             ("prove", ir.Prove(), "7200"),
             ("prove_exists", ir.ProveExists(constructor="C"), "7a030a0143"),
@@ -117,7 +117,8 @@ class ExpectedFailureSchemaTests(unittest.TestCase):
 
 class AdditiveSchemaTests(unittest.TestCase):
     def test_add_rules_has_tag_18_and_keeps_bulk_order_and_duplicates(self):
-        for group, rules in (("", []), ("g", [0]), ("snowman-☃", [2, 0, 2])):
+        rule = ir.Rule(kind=Oneof("rule", ir.RuleBody()), eval_mode=ir.RuleEvalMode.SEMINAIVE)
+        for group, rules in (("", []), ("g", [rule]), ("snowman-☃", [rule, rule, rule])):
             with self.subTest(group=group, rules=rules):
                 command = ir.Command(kind=Oneof("add_rules", ir.AddRules(group=group, rules=rules)))
                 validate(command)
@@ -129,14 +130,12 @@ class AdditiveSchemaTests(unittest.TestCase):
                     self.assertEqual(decoded, command)
         self.assertEqual(ir.Command(kind=Oneof("add_rules", ir.AddRules())).to_binary(), b"\x92\x01\x00")
 
-    def test_add_rules_references_the_program_rule_arena(self):
+    def test_add_rules_owns_rule_values_and_validates_their_roots(self):
         rule = ir.Rule(kind=Oneof("rule", ir.RuleBody()), eval_mode=ir.RuleEvalMode.SEMINAIVE)
-        program = ir.Program(rules=[rule], commands=[
-            ir.Command(kind=Oneof("add_rules", ir.AddRules(group="g", rules=[0, 0]))),
-        ])
+        program = ir.Program(commands=[ir.Command(kind=Oneof("add_rules", ir.AddRules(group="g", rules=[rule, rule])))])
         validate(program)
         self.assertEqual(ir.Program.from_binary(program.to_binary()), program)
-        program.commands[0].kind.value.rules.append(1)
+        program.commands[0].kind.value.rules.append(ir.Rule())
         with self.assertRaises(ValidationError):
             validate(program)
 
@@ -151,13 +150,14 @@ class AdditiveSchemaTests(unittest.TestCase):
         self.assertEqual(ir.Run().to_binary(), b"")
         self.assertEqual(ir.Run(groups=[""]).to_binary(), b"\x0a\x00")
 
-    def test_rule_values_do_not_require_registration_commands(self):
-        program = ir.Program(rules=[
-            ir.Rule(kind=Oneof("rule", ir.RuleBody()), eval_mode=ir.RuleEvalMode.SEMINAIVE),
-        ])
-        validate(program)
-        self.assertEqual(ir.Program.from_binary(program.to_binary()), program)
-        self.assertEqual(program.commands, [])
+    def test_standalone_rule_values_need_no_program_arena(self):
+        rule = ir.Rule(kind=Oneof("rule", ir.RuleBody()), eval_mode=ir.RuleEvalMode.SEMINAIVE)
+        validate(rule)
+        self.assertEqual(ir.Rule.from_binary(rule.to_binary()), rule)
+        self.assertNotIn("rules", ir.Program.__annotations__)
+        self.assertFalse(hasattr(ir, "Scheduler"))
+        with self.assertRaises(TypeError):
+            ir.BindScheduler(name="s", scheduler=ir.BackOff())
 
     def test_successful_response_needs_no_registration_confirmation(self):
         response = ir.RunProgramOutput()

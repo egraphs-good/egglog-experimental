@@ -30,7 +30,6 @@ fn relation_definition_fixture(reversed: bool) -> pb::Program {
             pb::Declaration {
                 kind: Some(pb::declaration::Kind::EqSort(pb::EqSort {
                     name: "IList".into(),
-                    ..Default::default()
                 })),
                 ..Default::default()
             },
@@ -319,7 +318,6 @@ fn box_definition() -> pb::Program {
             pb::Declaration {
                 kind: Some(pb::declaration::Kind::EqSort(pb::EqSort {
                     name: "Box".into(),
-                    ..Default::default()
                 })),
                 ..Default::default()
             },

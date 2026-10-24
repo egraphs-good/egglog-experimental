@@ -3,7 +3,7 @@ use super::{
     decl::Callable,
     expr::{Expr, ValueInput, fresh_scope, variable},
     pb,
-    storage::{Arena, DeclarationKind, Record, Slot, publish, visit, visit_action},
+    storage::{Arena, DeclarationKind, Record, Slot, publish, visit_action, visit_rule},
 };
 use std::sync::LazyLock;
 
@@ -35,6 +35,7 @@ impl<I: ValueInput> From<I> for Action {
                 vec![],
                 Arena::Command,
                 0,
+                vec![],
             )
             .map_err(|error| error.to_string()),
         )
@@ -160,6 +161,7 @@ fn row_action(target: &Expr, mut action: pb::action::Kind, value: Option<Expr>) 
             vec![declaration],
             Arena::Command,
             0,
+            vec![],
         )
     };
     Action(build().map_err(|error| error.to_string()))
@@ -205,6 +207,7 @@ where
             vec![],
             Arena::Command,
             0,
+            vec![],
         )
         .map_err(|error| error.to_string()),
     )
@@ -231,7 +234,7 @@ fn equality_node(left: &Expr, right: &Expr) -> Expr {
         }],
         ..Default::default()
     };
-    Expr(publish(program, slots, vec![], Arena::Node, 0).unwrap())
+    Expr(publish(program, slots, vec![], Arena::Node, 0, vec![]).unwrap())
 }
 
 /// An immutable authored rule value. Registration deduplicates rule content.
@@ -267,18 +270,16 @@ pub fn rule(lhs: impl Facts, rhs: impl Actions) -> Rule {
         .map(|error| error.to_string());
     Rule(
         publish(
-            pb::Program {
-                rules: vec![pb::Rule {
-                    kind: Some(pb::rule::Kind::Rule(pb::RuleBody { query, head })),
-                    eval_mode: pb::RuleEvalMode::Seminaive.into(),
-                    ..Default::default()
-                }],
-                ..Default::default()
-            },
+            pb::Program::default(),
             slots,
             declarations.into_iter().map(|d| d.0).collect(),
             Arena::Rule,
             0,
+            vec![pb::Rule {
+                kind: Some(pb::rule::Kind::Rule(pb::RuleBody { query, head })),
+                eval_mode: pb::RuleEvalMode::Seminaive.into(),
+                ..Default::default()
+            }],
         )
         .unwrap(),
         error,
@@ -289,33 +290,28 @@ impl Rule {
     /// Add an immutable diagnostic presentation, retaining the rule occurrence.
     pub fn label(self, label: impl Into<String>) -> Self {
         let label = label.into();
-        let mut program = pb::Program {
-            rules: vec![
-                self.0.owner.as_ref().unwrap().program().unwrap().rules[self.0.index as usize]
-                    .clone(),
-            ],
-            ..Default::default()
-        };
+        let mut rule = self.0.owner.as_ref().unwrap().rules[self.0.index as usize].clone();
         let mut slots = std::array::from_fn(|_| vec![]);
-        visit(&mut program, Arena::Rule, 0, |arena, index| {
+        visit_rule(&mut rule, |arena, index| {
             let position =
                 u32::try_from(slots[arena as usize].len()).expect("protobuf arena exceeds u32");
             slots[arena as usize].push(Slot::External(self.0.resolve(arena, index)?));
             Ok(position)
         })
         .expect("published rule has valid references");
-        program.rules[0].name = Some(label.clone());
+        rule.name = Some(label.clone());
         let error = self.1.or_else(|| {
             label
                 .is_empty()
                 .then(|| "rule label must not be empty".into())
         });
         let mut record = publish(
-            program,
+            pb::Program::default(),
             slots,
             self.0.owner.as_ref().unwrap().declarations.clone(),
             Arena::Rule,
             0,
+            vec![rule],
         )
         .unwrap();
         std::sync::Arc::get_mut(record.owner.as_mut().unwrap())
@@ -332,21 +328,15 @@ impl Rule {
         if conditions_roots.is_empty() {
             return self;
         }
-        let mut program = pb::Program {
-            rules: vec![
-                self.0.owner.as_ref().unwrap().program().unwrap().rules[self.0.index as usize]
-                    .clone(),
-            ],
-            ..Default::default()
-        };
+        let mut rule = self.0.owner.as_ref().unwrap().rules[self.0.index as usize].clone();
         let mut slots = std::array::from_fn(|_| vec![]);
-        visit(&mut program, Arena::Rule, 0, |arena, index| {
+        visit_rule(&mut rule, |arena, index| {
             let relocated = slots[arena as usize].len();
             slots[arena as usize].push(Slot::External(self.0.resolve(arena, index)?));
             Ok(u32::try_from(relocated).expect("protobuf arena exceeds u32"))
         })
         .expect("published rule has valid references");
-        let conditions = match program.rules[0].kind.as_mut().unwrap() {
+        let conditions = match rule.kind.as_mut().unwrap() {
             pb::rule::Kind::Rule(body) => &mut body.query,
             pb::rule::Kind::Rewrite(body) => &mut body.conditions,
             _ => unreachable!("unsupported published rule"),
@@ -360,7 +350,15 @@ impl Rule {
         }
         let declarations = self.0.owner.as_ref().unwrap().declarations.clone();
         Self(
-            publish(program, slots, declarations, Arena::Rule, 0).unwrap(),
+            publish(
+                pb::Program::default(),
+                slots,
+                declarations,
+                Arena::Rule,
+                0,
+                vec![rule],
+            )
+            .unwrap(),
             self.1,
         )
     }
@@ -378,20 +376,25 @@ where
         Slot::External(left.0),
         Slot::External(right.expression().0.clone()),
     ];
-    let program = pb::Program {
-        rules: vec![pb::Rule {
-            kind: Some(pb::rule::Kind::Rewrite(pb::Rewrite {
-                lhs: 0,
-                rhs: 1,
-                ..Default::default()
-            })),
-            eval_mode: pb::RuleEvalMode::Seminaive.into(),
+    let rule = pb::Rule {
+        kind: Some(pb::rule::Kind::Rewrite(pb::Rewrite {
+            lhs: 0,
+            rhs: 1,
             ..Default::default()
-        }],
+        })),
+        eval_mode: pb::RuleEvalMode::Seminaive.into(),
         ..Default::default()
     };
     Rule(
-        publish(program, slots, vec![], Arena::Rule, 0).unwrap(),
+        publish(
+            pb::Program::default(),
+            slots,
+            vec![],
+            Arena::Rule,
+            0,
+            vec![rule],
+        )
+        .unwrap(),
         None,
     )
 }
@@ -504,8 +507,11 @@ pub fn named_ruleset<A>(
                 else {
                     unreachable!("typed group addition")
                 };
-                for index in &add.rules {
-                    captured.push(Rule(addition.resolve(Arena::Rule, *index).unwrap(), None));
+                for index in 0..add.rules.len() {
+                    captured.push(Rule(
+                        addition.resolve(Arena::Rule, index as u32).unwrap(),
+                        None,
+                    ));
                 }
             }
         }
@@ -530,9 +536,7 @@ fn rule_list(rules: Vec<Rule>, name: Option<String>) -> Ruleset {
         commands: vec![pb::Command {
             kind: Some(pb::command::Kind::AddRules(pb::AddRules {
                 group: name.unwrap_or_else(|| format!("__typed_group_{}", fresh_scope())),
-                rules: (0..rules.len())
-                    .map(|i| u32::try_from(i).expect("protobuf arena exceeds u32"))
-                    .collect(),
+                rules: vec![pb::Rule::default(); rules.len()],
             })),
             ..Default::default()
         }],
@@ -542,7 +546,7 @@ fn rule_list(rules: Vec<Rule>, name: Option<String>) -> Ruleset {
     let error = rules.iter().find_map(|r| r.1.clone());
     slots[Arena::Rule as usize] = rules.into_iter().map(|r| Slot::External(r.0)).collect();
     Ruleset(
-        vec![publish(program, slots, vec![], Arena::Command, 0).unwrap()],
+        vec![publish(program, slots, vec![], Arena::Command, 0, vec![]).unwrap()],
         error,
     )
 }

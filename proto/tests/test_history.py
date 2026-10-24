@@ -23,18 +23,18 @@ class HistorySchemaTests(unittest.TestCase):
                 self.assertEqual(type(request).from_binary(request.to_binary()), request)
 
     def test_history_program_keeps_command_order_and_distinct_union_locations(self):
+        rule = ir.Rule(
+            kind=Oneof("rule", ir.RuleBody(query=[0], head=[ir.Action(kind=Oneof("term", 1))])),
+            eval_mode=ir.RuleEvalMode.SEMINAIVE,
+        )
         program = ir.Program(
             sorts=[ir.Sort(kind=Oneof("eq", "E"))],
             declarations=[ir.Declaration(kind=Oneof("eq_sort", ir.EqSort(name="E")))],
             nodes=[ir.Node(kind=Oneof("union", ir.Union())) for _ in range(2)],
-            rules=[ir.Rule(
-                kind=Oneof("rule", ir.RuleBody(query=[0], head=[ir.Action(kind=Oneof("term", 1))])),
-                eval_mode=ir.RuleEvalMode.SEMINAIVE,
-            )],
             commands=[
                 ir.Command(kind=Oneof("action", ir.Action(kind=Oneof("term", 0)))),
                 ir.Command(kind=Oneof("freeze", ir.Freeze())),
-                ir.Command(kind=Oneof("add_rules", ir.AddRules(group="g", rules=[0, 0]))),
+                ir.Command(kind=Oneof("add_rules", ir.AddRules(group="g", rules=[rule, rule]))),
                 ir.Command(kind=Oneof("run", ir.Run(groups=["g"]))),
             ],
         )
@@ -47,18 +47,17 @@ class HistorySchemaTests(unittest.TestCase):
             self.assertEqual(decoded, program)
             self.assertEqual([command.kind.field for command in decoded.commands],
                              ["action", "freeze", "add_rules", "run"])
-            self.assertEqual(decoded.rules[0].kind.value.query, [0])
-            self.assertEqual(decoded.rules[0].kind.value.head[0].kind.value, 1)
+            self.assertEqual(decoded.commands[2].kind.value.rules[0].kind.value.query, [0])
+            self.assertEqual(decoded.commands[2].kind.value.rules[0].kind.value.head[0].kind.value, 1)
             self.assertEqual(len(decoded.nodes), 2)
 
     def test_exported_history_uses_ordinary_program_validation(self):
         validate(ir.Program())
-        for invalid in (
-            ir.Program(rules=[ir.Rule()]),
-            ir.Program(commands=[ir.Command(kind=Oneof("add_rules", ir.AddRules(rules=[0])))]),
-        ):
-            with self.subTest(program=invalid), self.assertRaises(ValidationError):
-                validate(invalid)
+        with self.assertRaises(TypeError):
+            ir.Program(rules=[])
+        with self.assertRaises(ValidationError):
+            validate(ir.Program(commands=[ir.Command(kind=Oneof("add_rules", ir.AddRules(rules=[ir.Rule()])))]))
+
 
 
 if __name__ == "__main__":

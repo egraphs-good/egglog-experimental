@@ -41,6 +41,7 @@ impl SortRef {
             vec![],
             Arena::Sort,
             0,
+            vec![],
         )?))
     }
 
@@ -75,6 +76,7 @@ impl SortRef {
             vec![family.clone()],
             Arena::Sort,
             0,
+            vec![],
         )?))
     }
 
@@ -124,11 +126,12 @@ impl SortRef {
     }
 
     // A temporary substitution derived solely from protobuf patterns and
-    // concrete sort records. Binder labels are diagnostic, not lookup keys.
+    // concrete sort records. Bindings are sparse, independent of an advertised count.
     pub(super) fn match_pattern(
         &self,
         actual: &Self,
-        bindings: &mut [Option<Self>],
+        bindings: &mut HashMap<u32, Self>,
+        type_param_count: u32,
     ) -> Result<(), TypedError> {
         actual.validate_closed()?;
         let mut pending = vec![(self.0.clone(), actual.0.clone())];
@@ -141,16 +144,16 @@ impl SortRef {
             }
             match (&pattern.sort().unwrap().kind, &actual.sort().unwrap().kind) {
                 (Some(pb::sort::Kind::Var(index)), _) => {
-                    let slot = bindings
-                        .get_mut(*index as usize)
-                        .ok_or_else(|| TypedError::Invalid("unbound signature parameter".into()))?;
+                    if *index >= type_param_count {
+                        return Err(TypedError::Invalid("unbound signature parameter".into()));
+                    }
                     let actual = Self(actual);
-                    if slot.as_ref().is_some_and(|old| old != &actual) {
+                    if bindings.get(index).is_some_and(|old| old != &actual) {
                         return Err(TypedError::Invalid(
                             "inconsistent generic substitution".into(),
                         ));
                     }
-                    *slot = Some(actual);
+                    bindings.insert(*index, actual);
                 }
                 (Some(pb::sort::Kind::Eq(p)), Some(pb::sort::Kind::Eq(a))) if p == a => {}
                 (Some(pb::sort::Kind::Application(p)), Some(pb::sort::Kind::Application(a)))
@@ -195,7 +198,6 @@ impl SortRef {
             declarations: vec![pb::Declaration {
                 kind: Some(pb::declaration::Kind::EqSort(pb::EqSort {
                     name: name.into(),
-                    ..Default::default()
                 })),
                 ..Default::default()
             }],
@@ -208,6 +210,7 @@ impl SortRef {
                 vec![],
                 Arena::Sort,
                 0,
+                vec![],
             )
             .unwrap(),
         )
@@ -341,38 +344,14 @@ impl Callable {
         let owner = self.0.owner.as_ref().unwrap();
         let (name, inputs, result, signature) = if self.0.arena == Arena::Primitive {
             let p = self.0.primitive()?;
-            match &p.typing {
-                Some(pb::primitive::Typing::Signature(s)) => (
+            match &p.signature {
+                Some(s) => (
                     &p.name,
                     &s.inputs,
                     s.output
                         .ok_or_else(|| TypedError::Invalid("missing result pattern".into()))?,
                     Some(s),
                 ),
-                Some(pb::primitive::Typing::Application(_)) => {
-                    let (function, arguments) = arguments.split_first().ok_or_else(|| {
-                        TypedError::Invalid("application requires a function".into())
-                    })?;
-                    let record = &function.0;
-                    let Some(pb::sort::Kind::Func(signature)) = &record.sort().unwrap().kind else {
-                        return Err(TypedError::Invalid(
-                            "application requires a function sort".into(),
-                        ));
-                    };
-                    if arguments.len() != signature.params.len()
-                        || SortRef(record.resolve(Arena::Sort, signature.result)?) != *output
-                    {
-                        return Err(TypedError::Invalid("function application signature".into()));
-                    }
-                    for (argument, parameter) in arguments.iter().zip(&signature.params) {
-                        if *argument != SortRef(record.resolve(Arena::Sort, *parameter)?) {
-                            return Err(TypedError::Invalid(
-                                "function application argument sort".into(),
-                            ));
-                        }
-                    }
-                    return Ok(&p.name);
-                }
                 _ => return Err(TypedError::Invalid("unsupported callable typing".into())),
             }
         } else {
@@ -395,29 +374,25 @@ impl Callable {
         {
             return Err(TypedError::Invalid("callable arity".into()));
         }
-        let mut bindings = vec![None; signature.map_or(0, |s| s.type_params.len())];
+        let type_param_count = signature.map_or(0, |s| s.type_param_count);
+        let mut bindings = HashMap::new();
         for (argument, expected) in arguments
             .iter()
             .zip(inputs.iter().chain(tail.iter().cycle()))
         {
-            SortRef(self.0.resolve(Arena::Sort, expected.sort)?)
-                .match_pattern(argument, &mut bindings)?;
+            SortRef(self.0.resolve(Arena::Sort, expected.sort)?).match_pattern(
+                argument,
+                &mut bindings,
+                type_param_count,
+            )?;
         }
-        SortRef(self.0.resolve(Arena::Sort, result)?).match_pattern(output, &mut bindings)?;
-        if bindings.iter().any(Option::is_none) {
+        SortRef(self.0.resolve(Arena::Sort, result)?).match_pattern(
+            output,
+            &mut bindings,
+            type_param_count,
+        )?;
+        if bindings.len() != type_param_count as usize {
             return Err(TypedError::Invalid("undetermined generic parameter".into()));
-        }
-        for parameter in signature.into_iter().flat_map(|s| &s.equality_type_params) {
-            let sort = bindings
-                .get(*parameter as usize)
-                .and_then(Option::as_ref)
-                .ok_or_else(|| TypedError::Invalid("invalid equality type parameter".into()))?;
-            let record = &sort.0;
-            if !matches!(record.sort().unwrap().kind, Some(pb::sort::Kind::Eq(_))) {
-                return Err(TypedError::Invalid(
-                    "type parameter requires an equality sort".into(),
-                ));
-            }
         }
         Ok(name)
     }
@@ -453,6 +428,7 @@ impl Callable {
                 vec![],
                 Arena::Declaration,
                 0,
+                vec![],
             )
             .unwrap(),
         )
@@ -509,6 +485,7 @@ impl Callable {
             vec![],
             Arena::Declaration,
             0,
+            vec![],
         )
         .unwrap();
         if let Some(merge_parameters) = merge_parameters {
@@ -559,7 +536,7 @@ impl Callable {
             }],
             ..Default::default()
         };
-        Self(publish(program, slots, vec![], Arena::Declaration, 0).unwrap())
+        Self(publish(program, slots, vec![], Arena::Declaration, 0, vec![]).unwrap())
     }
 }
 
@@ -626,17 +603,9 @@ pub(super) fn same_builtin(a: &Record, b: &Record) -> Result<bool, TypedError> {
     if pa.name != pb.name {
         return Ok(false);
     }
-    match (&pa.typing, &pb.typing) {
-        (
-            Some(pb::primitive::Typing::Application(_)),
-            Some(pb::primitive::Typing::Application(_)),
-        ) => Ok(true),
-        (
-            Some(pb::primitive::Typing::Signature(sa)),
-            Some(pb::primitive::Typing::Signature(sb)),
-        ) => {
-            if sa.type_params.len() != sb.type_params.len()
-                || sa.equality_type_params != sb.equality_type_params
+    match (&pa.signature, &pb.signature) {
+        (Some(sa), Some(sb)) => {
+            if sa.type_param_count as usize != sb.type_param_count as usize
                 || sa.inputs.len() != sb.inputs.len()
                 || sa.varargs.len() != sb.varargs.len()
             {

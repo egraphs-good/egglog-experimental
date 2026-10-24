@@ -307,20 +307,12 @@ fn function_value_structural_provenance_and_application_catalog() {
         .portable_builtin_catalog()
         .unwrap()
         .definitions;
-    let declaration = catalog
-        .primitives
-        .iter()
-        .find(|d| d.name == "egglog.core.fn.apply")
-        .expect("uninstantiated function application descriptor");
-    let primitive = declaration;
-    assert!(matches!(
-        primitive.typing,
-        Some(proto::primitive::Typing::Application(_))
-    ));
-    graph
-        .type_info()
-        .check_portable_builtin_signature(&catalog, primitive)
-        .unwrap();
+    assert!(
+        !catalog
+            .primitives
+            .iter()
+            .any(|primitive| primitive.name == "egglog.core.fn.apply")
+    );
     graph
         .parse_and_run_program(
             None,
@@ -385,6 +377,29 @@ fn function_value_structural_provenance_and_application_catalog() {
             assert!(primitive.validator().is_none());
         }
     }
+    graph
+        .parse_and_run_program(
+            None,
+            r#"(function captured_unary () F :merge old)
+                (set (captured_unary) (unstable-fn "+" 1))
+                (function raw_application () F :merge old)
+                (set (raw_application) (unstable-fn "unstable-app" (captured_unary)))
+                (check (= (unstable-app (raw_application) 2) 3))"#,
+        )
+        .unwrap();
+    let (sort, value) = graph
+        .eval_expr(&ast::Expr::Call(
+            ast::Span::Panic,
+            "raw_application".into(),
+            vec![],
+        ))
+        .unwrap();
+    assert_eq!(
+        graph
+            .export_function_value_target(&sort, value)
+            .unwrap_err(),
+        "native application function value requires a program-defined adapter"
+    );
 }
 
 #[test]
@@ -489,10 +504,10 @@ fn remaining_scalar_catalog_preserves_closed_providers() {
             names,
             "{key}"
         );
-        let Some(proto::primitive::Typing::Signature(signature)) = &primitive.typing else {
+        let Some(signature) = &primitive.signature else {
             unreachable!()
         };
-        assert!(signature.type_params.is_empty() && signature.varargs.is_empty());
+        assert!(signature.type_param_count == 0 && signature.varargs.is_empty());
         let sorts: Vec<_> = names
             .iter()
             .map(|name| graph.get_sort_by_name(name).unwrap().clone())
@@ -522,7 +537,7 @@ fn remaining_scalar_catalog_preserves_closed_providers() {
         }
         for mutation in ["input", "output", "arity"] {
             let mut wrong = primitive.clone();
-            let Some(proto::primitive::Typing::Signature(s)) = &mut wrong.typing else {
+            let Some(s) = &mut wrong.signature else {
                 unreachable!()
             };
             let index = if mutation == "output" {
@@ -575,10 +590,10 @@ fn remaining_scalar_generic_catalog_preserves_homogeneous_providers() {
             .find(|d| d.name == key)
             .unwrap_or_else(|| panic!("missing {key}"));
         let primitive = declaration;
-        let Some(proto::primitive::Typing::Signature(signature)) = &primitive.typing else {
+        let Some(signature) = &primitive.signature else {
             unreachable!()
         };
-        assert_eq!(signature.type_params.len(), 1);
+        assert_eq!(signature.type_param_count, 1);
         assert_eq!(signature.inputs.len(), 2);
         assert!(signature.varargs.is_empty());
         assert_eq!(signature.inputs[0].sort, signature.inputs[1].sort);
@@ -738,10 +753,10 @@ fn inequality_catalog_uses_one_generic_registration() {
         .find(|d| d.name == "egglog.core.ne")
         .expect("native inequality is missing its canonical descriptor");
     let primitive = declaration;
-    let Some(proto::primitive::Typing::Signature(signature)) = &primitive.typing else {
+    let Some(signature) = &primitive.signature else {
         unreachable!()
     };
-    assert_eq!(signature.type_params.len(), 1);
+    assert_eq!(signature.type_param_count, 1);
     assert_eq!(signature.inputs.len(), 2);
     assert!(signature.varargs.is_empty());
     assert_eq!(signature.inputs[0].sort, signature.inputs[1].sort);
@@ -874,7 +889,7 @@ fn bigrat_properties_export_actual_signatures_and_views() {
             builtin::signature_sorts(&program, primitive).unwrap(),
             ["BigRat", "BigInt"]
         );
-        let Some(proto::primitive::Typing::Signature(signature)) = &primitive.typing else {
+        let Some(signature) = &primitive.signature else {
             unreachable!()
         };
         assert!(signature.varargs.is_empty());
@@ -929,10 +944,10 @@ fn numeric_catalog_members_preserve_native_providers_and_typed_views() {
             continue; // Constructor contracts are checked separately.
         }
         count += 1;
-        let Some(proto::primitive::Typing::Signature(signature)) = &primitive.typing else {
+        let Some(signature) = &primitive.signature else {
             unreachable!()
         };
-        assert!(signature.type_params.is_empty() && signature.varargs.is_empty());
+        assert!(signature.type_param_count == 0 && signature.varargs.is_empty());
         let sort_names = builtin::signature_sorts(&program, primitive).unwrap();
         assert_eq!(sort_names[0], owner);
         match member {
@@ -1023,10 +1038,10 @@ fn closed_i64_catalog_preserves_signatures_aliases_and_borrowed_views() {
             builtin::signature_sorts(&program, primitive).unwrap(),
             ["i64", "i64", output]
         );
-        let Some(proto::primitive::Typing::Signature(signature)) = &primitive.typing else {
+        let Some(signature) = &primitive.signature else {
             unreachable!()
         };
-        assert!(signature.type_params.is_empty());
+        assert!(signature.type_param_count == 0);
         assert!(signature.varargs.is_empty());
         let sorts = ["i64", "i64", output].map(|s| graph.get_sort_by_name(s).unwrap().clone());
         for context in [Context::Pure, Context::Read, Context::Write, Context::Full] {
@@ -1055,7 +1070,7 @@ fn closed_i64_catalog_preserves_signatures_aliases_and_borrowed_views() {
         }
         for corrupt_output in [false, true] {
             let mut wrong = primitive.clone();
-            let Some(proto::primitive::Typing::Signature(signature)) = &mut wrong.typing else {
+            let Some(signature) = &mut wrong.signature else {
                 unreachable!()
             };
             if corrupt_output {
@@ -1191,10 +1206,10 @@ fn set_catalog_precedes_instances_and_preserves_native_aliases() {
                 .find(|d| d.name == key)
                 .unwrap();
             let p = &d;
-            let Some(proto::primitive::Typing::Signature(s)) = &p.typing else {
+            let Some(s) = &p.signature else {
                 unreachable!()
             };
-            assert_eq!(s.type_params, ["T"]);
+            assert_eq!(s.type_param_count, 1);
             assert_eq!(s.varargs.len(), usize::from(alias == "set-of"));
             assert_eq!(
                 s.inputs.len(),
@@ -1299,10 +1314,10 @@ fn exact_integer_families_and_constructors_use_actual_native_providers() {
             .find(|d| d.name == key)
             .unwrap();
         let p = &d;
-        let Some(proto::primitive::Typing::Signature(s)) = &p.typing else {
+        let Some(s) = &p.signature else {
             unreachable!()
         };
-        assert!(s.type_params.is_empty() && s.varargs.is_empty());
+        assert!(s.type_param_count == 0 && s.varargs.is_empty());
         assert_eq!(s.inputs.len(), inputs.len());
         for (sort, name) in s
             .inputs
@@ -1558,10 +1573,10 @@ fn flat_map_export_packs_existing_refs_without_native_pair_vec_aliases() {
             "packing values need no Pair/Vec constructor callables"
         );
         assert_eq!(primitives[0].name, "egglog.core.map.of");
-        let Some(proto::primitive::Typing::Signature(signature)) = &primitives[0].typing else {
+        let Some(signature) = &primitives[0].signature else {
             unreachable!()
         };
-        assert_eq!(signature.type_params, ["K", "V"]);
+        assert_eq!(signature.type_param_count, 2);
         assert_eq!(signature.inputs.len(), 1);
         assert!(signature.varargs.is_empty());
         let Some(proto::sort::Kind::Application(vector)) =
@@ -1610,7 +1625,7 @@ fn map_catalog_precedes_instances_and_uses_one_vec_of_pairs_input() {
             .expect("canonical Map provider must exist before instances");
         if method == "of" {
             let p = &declaration;
-            let Some(proto::primitive::Typing::Signature(signature)) = &p.typing else {
+            let Some(signature) = &p.signature else {
                 unreachable!()
             };
             assert_eq!(signature.inputs.len(), 1);
@@ -1866,12 +1881,7 @@ fn constant_catalog_export_does_not_execute_the_body_or_validator() {
         .iter()
         .find(|d| d.name == "test.constant")
         .unwrap();
-    assert!(
-        (matches!(
-            declaration.typing,
-            Some(proto::primitive::Typing::Signature(_))
-        ))
-    );
+    assert!(declaration.signature.is_some());
     assert_eq!(BODY.load(Ordering::SeqCst), 0);
     assert_eq!(VALIDATOR.load(Ordering::SeqCst), 0);
     let i = graph.get_sort_by_name("i64").unwrap().clone();
@@ -2022,10 +2032,10 @@ fn scalar_families_and_actual_operation_views_are_complete() {
             .find(|d| d.name == format!("egglog.core.{key}"))
             .unwrap();
         let p = &d;
-        let Some(proto::primitive::Typing::Signature(s)) = &p.typing else {
+        let Some(s) = &p.signature else {
             unreachable!()
         };
-        assert!(s.type_params.is_empty());
+        assert!(s.type_param_count == 0);
         assert_eq!(s.inputs.len(), fixed);
         assert_eq!(s.varargs.len(), usize::from(fixed == 0));
     }
@@ -2521,7 +2531,6 @@ fn export_is_inert_and_reports_unmigrated_registrations() {
             "egglog.core.f64.sub",
             "egglog.core.f64.to_i64",
             "egglog.core.f64.to_string",
-            "egglog.core.fn.apply",
             "egglog.core.i64.abs",
             "egglog.core.i64.add",
             "egglog.core.i64.bitand",
@@ -2659,10 +2668,10 @@ fn pair_definitions_precede_instances_and_preserve_nominal_overloads() {
             .unwrap();
         let d = definition.primitives.first().unwrap();
         let p = &d;
-        let Some(proto::primitive::Typing::Signature(s)) = &p.typing else {
+        let Some(s) = &p.signature else {
             panic!("signature")
         };
-        assert_eq!(s.type_params, ["A", "B"]);
+        assert_eq!(s.type_param_count, 2);
         assert!(s.varargs.is_empty());
         let patterns = [
             definition
@@ -3137,16 +3146,12 @@ fn ordinary_vec_map_signatures_aliases_and_contexts_are_exact() {
             })
             .unwrap();
         let primitive = declaration;
-        let Some(proto::primitive::Typing::Signature(signature)) = &primitive.typing else {
+        let Some(signature) = &primitive.signature else {
             unreachable!()
         };
         assert_eq!(
-            signature.type_params,
-            if family == "vec" {
-                vec!["T"]
-            } else {
-                vec!["K", "V"]
-            }
+            signature.type_param_count,
+            if family == "vec" { 1 } else { 2 }
         );
         use egglog::builtin::{BuiltinTyping, SortPattern};
         let key_sort = SortPattern::Param(0);
@@ -3212,7 +3217,6 @@ fn ordinary_vec_map_signatures_aliases_and_contexts_are_exact() {
         );
         assert_eq!(described.output, patterns[output], "{canonical}");
         assert!(signature.varargs.is_empty());
-        assert!(signature.equality_type_params.is_empty());
         builtin::import_definition(definition, &mut proto::BuiltinCatalog::default()).unwrap();
         let native = native
             .iter()
@@ -3307,11 +3311,11 @@ fn vec_tail_receiver_and_equality_restriction_are_exact() {
             .position(|d| d.name == "egglog.core.vec.append" || d.name == "egglog.core.vec.union");
         let Some(index) = index else { continue };
         let primitive = &definition.primitives[index];
-        let Some(proto::primitive::Typing::Signature(signature)) = &primitive.typing else {
+        let Some(signature) = &primitive.signature else {
             unreachable!()
         };
         let union = primitive.name.ends_with("union");
-        assert_eq!(signature.type_params, ["T"]);
+        assert_eq!(signature.type_param_count, 1);
         assert_eq!(signature.output, Some(1));
         assert_eq!(
             signature.inputs.iter().map(|a| a.sort).collect::<Vec<_>>(),
@@ -3321,49 +3325,12 @@ fn vec_tail_receiver_and_equality_restriction_are_exact() {
             signature.varargs.iter().map(|a| a.sort).collect::<Vec<_>>(),
             if union { vec![] } else { vec![1] }
         );
-        assert_eq!(
-            signature.equality_type_params,
-            if union { vec![0] } else { vec![] }
-        );
         let mut installed = proto::BuiltinCatalog::default();
         builtin::import_definition(&definition, &mut installed).unwrap();
-        for mutation in 0..if union { 4 } else { 1 } {
-            let mut invalid = definition.clone();
-            let declaration = &mut invalid.primitives[index];
-            if union {
-                let p = declaration;
-                let Some(proto::primitive::Typing::Signature(s)) = &mut p.typing else {
-                    unreachable!()
-                };
-                match mutation {
-                    0 => s.equality_type_params.clear(), // distinct semantic signature, not a merge
-                    1 => s.equality_type_params = vec![0, 0],
-                    2 => s.equality_type_params = vec![1],
-                    3 => {
-                        s.type_params.push("U".into());
-                        s.equality_type_params = vec![1, 0];
-                    }
-                    _ => unreachable!(),
-                }
-            } else {
-                let p = declaration;
-                let Some(proto::primitive::Typing::Signature(s)) = &mut p.typing else {
-                    unreachable!()
-                };
-                s.varargs.push(s.varargs[0].clone());
-            }
-            assert!(
-                builtin::import_definition(&invalid, &mut installed.clone()).is_err(),
-                "{union} mutation {mutation}"
-            );
-            if union && mutation != 0 {
-                assert!(
-                    builtin::import_definition(&invalid, &mut proto::BuiltinCatalog::default())
-                        .is_err(),
-                    "fresh {union} mutation {mutation}"
-                );
-            }
-        }
+        let mut invalid = definition.clone();
+        let signature = invalid.primitives[index].signature.as_mut().unwrap();
+        signature.type_param_count += 1;
+        assert!(builtin::import_definition(&invalid, &mut installed).is_err());
     }
 }
 
@@ -3444,10 +3411,9 @@ fn generic_signature_import_remaps_children_and_ignores_binder_labels() {
     builtin::import_definition(&definition, &mut destination).unwrap();
     let before = destination.clone();
     let primitive = &mut definition.primitives.last_mut().unwrap();
-    let Some(proto::primitive::Typing::Signature(signature)) = &mut primitive.typing else {
+    let Some(signature) = &mut primitive.signature else {
         unreachable!()
     };
-    signature.type_params[0] = "Renamed".into();
     signature.varargs[0].name = "renamed".into();
     builtin::import_definition(&definition, &mut destination).unwrap();
     assert_eq!(destination, before);
@@ -3828,15 +3794,13 @@ fn imported_signatures_keep_namespaces_and_diagnostic_labels_separate() {
     );
     let before = destination.clone();
     let mut relabeled = definition.clone();
-    let Some(proto::primitive::Typing::Signature(signature)) = &mut relabeled.primitives[0].typing
-    else {
+    let Some(signature) = &mut relabeled.primitives[0].signature else {
         unreachable!()
     };
     signature.inputs[0].name = "diagnostic label".into();
     builtin::import_definition(&relabeled, &mut destination).unwrap();
     assert_eq!(destination, before);
-    let Some(proto::primitive::Typing::Signature(signature)) = &mut relabeled.primitives[0].typing
-    else {
+    let Some(signature) = &mut relabeled.primitives[0].signature else {
         unreachable!()
     };
     signature.inputs.clear();

@@ -80,18 +80,16 @@ but its scalar getter returns `""` when absent: use `has_field("doc")`, not
 truthiness, to recover absence. ProtoJSON distinguishes omission from `"doc":""`.
 Rule docs retain ordinary implicit-string semantics.
 
-`Primitive` selects an ordinary `GenericSignature` or the dedicated
-`FunctionApplication` typing form. A signature has an ordered type-parameter
-binder, fixed inputs, a required output, and an ordered `varargs` pattern.
+`Primitive.signature` contains ordinary structural typing: a type-parameter
+count, fixed inputs, a required output, and an ordered `varargs` pattern.
 An empty pattern means no tail; a one-element pattern means homogeneous varargs;
 a wider pattern repeats as an ordered group. The flat argument count after the
 fixed prefix must be a multiple of the nonempty pattern's width. Width and order
 are semantic, including `[T, T]`; there is no tuple/group expression node.
-It uses the existing sort arena with signature-bound `Sort.var` indices.
-Parameter labels are diagnostic: changing their spelling does not change the
-definition. A shared pattern is interpreted independently in each signature's
-binder; neither arena sharing nor export combines binders or substitutions.
-Compatibility compares ordered binder positions and structural signatures.
+Signature-bound `Sort.var` indices are below `type_param_count`. Frontends supply
+their own diagnostic parameter names. Native primitive-specific sort and domain
+restrictions are checked at submission before execution; a structural signature
+does not promise support for every substitution.
 
 Examples of shared signatures:
 
@@ -124,17 +122,18 @@ conversions explicit before this boundary. Generics remain: a call instantiates
 one named generic definition, rather than choosing an overload. No concrete
 naming convention is chosen here.
 
-`FunctionApplication` describes a named primitive called through normal `Call`:
-the first argument has a concrete function type, remaining arguments match its
-parameter sorts, and the call has its result sort. It needs no heterogeneous
-type packs or language-specific owner marker.
+`Apply{function,args}` invokes a function value. Its concrete `FuncSort` supplies
+the exact argument and result sorts; evaluate the function first, then arguments
+left-to-right. Application has no public builtin callable identity. Frontends can
+close a concrete application operation in a program-defined primitive when it is
+used as a first-class callback, retaining ordinary named partial application.
 For `PrimitiveValue.partial_call`, captured argument sorts plus the resulting
-`FuncSort.params` form the effective complete argument list; `FuncSort.result`
-supplies its result.
-Apply the target's typing form to that complete call, including varargs or
-function application, and require every generic parameter to be determined.
-The existing relation-capability restriction still applies. A `Lambda` stores only
-captures and its body; its enclosing `FuncSort` supplies parameter and result sorts.
+`FuncSort.params` form the named target's complete argument list, and
+`FuncSort.result` supplies its result. Match its signature, including varargs,
+and determine every generic parameter. Relations cannot be partially applied.
+A `Lambda` stores captures and its body; its enclosing `FuncSort` supplies its
+parameter and result sorts. Apply is executable code, never inert value data;
+deferred bodies may contain it.
 
 `Freeze` does not repeat the backend catalog. Typed inspection or reconstruction
 uses the matching catalog fetched separately. Saved catalogs can support binding
@@ -144,7 +143,7 @@ execution-capability compatibility.
 ### Frontend APIs and generation
 
 The shared catalog describes canonical identities, sort families, generic
-signatures and constraints. Frontends own names, operators, methods/properties,
+signatures. Frontends own names, operators, methods/properties,
 keyword parameters, defaults and host conversions. None of that presentation is
 installed in the engine or included in Freeze/history.
 
@@ -184,15 +183,13 @@ implementations are registered separately.
 
 ### Additive rule groups and declaration reuse
 
-`Program.rules` contains immutable typed rule values. Arena membership alone
-installs nothing. Ordered `AddRules{group,rules}` commands add one or more values
-to a graph-owned group; there is no ruleset declaration or ruleset arena.
+Ordered `AddRules{group,rules}` commands contain immutable typed rule values
+inline and add them to a graph-owned group. There is no rule arena or separate
+group declaration. Frontends may retain reusable owned rule values locally.
 
 ```text
-rules[0] = fold_zero
-rules[1] = fold_constants
-commands = [AddRules("opt", [0]), Run(["opt"]),
-            AddRules("opt", [1]), Run(["opt", "cleanup"])]
+commands = [AddRules("opt", [fold_zero]), Run(["opt"]),
+            AddRules("opt", [fold_constants]), Run(["opt", "cleanup"])]
 ```
 
 Content establishes rule identity across groups and submissions: resolved typed
@@ -257,18 +254,17 @@ commands = [Set(f(), index 0), Set(g(), index 0)]
 ```
 
 `EGraphOptions` records the immutable cost sort C, indexing creation's `sorts`
-or the snapshot's `program.sorts`. C may be any supported closed sort, including
-a custom equality sort. Ordinary Programs have no configuration precondition.
-Creation accepts only sort declarations, resolves them and the closed type arena
-before allocating a handle, and executes no Program. Its optional `threads` is a
+or the snapshot's `program.sorts`. C may be a supported closed backend-provided sort or composition. Ordinary Programs have no configuration precondition.
+Creation resolves its closed type arena before allocating a handle and executes
+no Program. User equality sorts are unavailable at creation. Its optional `threads` is a
 resource request: absent selects receiver policy, zero requests automatic
 parallelism, positive requests that count; unsupported requests fail creation.
 Resources are not exported.
 
 The current byte adapter honors this thread request using the native per-egraph
 configuration API; clones retain that configuration. Wasm rejects counts above
-one. An absent field leaves the native default unchanged. Creation's existing
-i64 cost-sort and no-declaration limits still apply; native thread-pool resource
+one. An absent field leaves the native default unchanged. The adapter currently requires the
+i64 cost sort; native thread-pool resource
 allocation behavior is unchanged.
 
 Threads and `no_decomp` are creation-time choices.
@@ -276,8 +272,7 @@ Threads and `no_decomp` are creation-time choices.
 Clone inherits resources; Freeze omits them. There is no resource-configuration
 RPC or Python live setter in this interface.
 
-Restore by remapping C's reachable closed sort graph and needed sort declarations
-into a creation request, then executing the exported Program on that fresh handle
+Restore by remapping C's reachable closed backend sort graph into a creation request, then executing the exported Program on that fresh handle
 with compatible primitive implementations/codecs and the matching builtin catalog.
 Rules start with fresh execution state. Against an existing handle the Program
 still uses ordinary action semantics; callers must check options for any
@@ -386,9 +381,9 @@ loop. Errors locate the innermost active command independently of their source
 span. Native helper Runs emit no requested control result. A requested result
 completed before trailing maintenance fails remains in the output prefix.
 
-`PrintFunction.max_rows` is optional: absent selects all rows, present zero
+`GetTableRows.max_rows` is optional: absent selects all rows, present zero
 selects none, and a positive value bounds the native scan prefix. The target
-must exist even for zero rows. `PrintedFunction.table` identifies rows whose
+must exist even for zero rows. `TableRows.table` identifies rows whose
 argument/output `TableCell`s contain either an ordinary extracted node reference
 or an `unavailable_sort` response-sort reference when no finite representative
 exists. Positions, multiplicity and subsumed flags remain intact; relation
@@ -398,7 +393,7 @@ earlier effects/outputs remain and later commands do not run. Table statistics
 pair each exact response sort reference with its distinct-value count, in input
 order followed by output.
 
-Rust represents `PrintFunction.max_rows` as `Option<u64>`. Python readers must
+Rust represents `GetTableRows.max_rows` as `Option<u64>`. Python readers must
 use `has_field("max_rows")`, since the scalar getter returns zero when absent.
 The byte adapter observes admitted Constructor, Function and Relation tables in
 all four execution modes. Encoded observations return logical live rows; native

@@ -57,7 +57,7 @@ mod native_signature {
             ];
             let (inputs, output, binders) = match CASE {
                 0 => (vec![4, 2], 3, 2),
-                1 | 2 | 6 | 7 => (vec![0, 0], 0, if CASE == 7 { 2 } else { 1 }),
+                1 | 2 | 6 | 7 => (vec![0, 0], 0, 1),
                 3 => (vec![8], 9, 0),
                 4 => (vec![5, 6], 7, 2),
                 5 => (vec![], 2, 1),
@@ -68,9 +68,8 @@ mod native_signature {
                 primitive_sorts: vec![],
                 primitives: vec![pb::Primitive {
                     name: "test.native_signature".into(),
-                    typing: Some(pb::primitive::Typing::Signature(pb::GenericSignature {
-                        type_params: (0..binders).map(|i| format!("T{i}")).collect(),
-                        equality_type_params: if CASE == 6 { vec![0] } else { vec![] },
+                    signature: Some(pb::GenericSignature {
+                        type_param_count: binders,
                         inputs: inputs
                             .into_iter()
                             .enumerate()
@@ -81,7 +80,7 @@ mod native_signature {
                             .collect(),
                         output: Some(output),
                         ..Default::default()
-                    })),
+                    }),
                     ..Default::default()
                 }],
                 sorts: sorts
@@ -108,6 +107,23 @@ mod native_signature {
                 .iter()
                 .map(|program| builtin::native_definition(program).unwrap())
                 .collect::<Vec<_>>();
+            if CASE == 7 {
+                let builtin::BuiltinTyping::Signature(signature) = &mut definitions[0].typing
+                else {
+                    unreachable!()
+                };
+                signature.params.push(builtin::TypeParameter {
+                    name: String::new(),
+                    equality: false,
+                });
+            }
+            if CASE == 6 {
+                let builtin::BuiltinTyping::Signature(signature) = &mut definitions[0].typing
+                else {
+                    unreachable!()
+                };
+                signature.params[0].equality = true;
+            }
             if CASE == 2 {
                 // Mutate the native scheme after valid wire decoding so its
                 // registry, rather than the wire decoder, rejects the binder.
@@ -1010,8 +1026,8 @@ impl Grouped {
             ],
             primitives: vec![pb::Primitive {
                 name: "test.grouped".into(),
-                typing: Some(pb::primitive::Typing::Signature(pb::GenericSignature {
-                    type_params: vec!["K".into(), "V".into()],
+                signature: Some(pb::GenericSignature {
+                    type_param_count: 2,
                     inputs: vec![pb::Arg {
                         name: "prefix".into(),
                         sort: 3,
@@ -1027,8 +1043,7 @@ impl Grouped {
                         },
                     ],
                     output: Some(2),
-                    ..Default::default()
-                })),
+                }),
                 ..Default::default()
             }],
             sorts: vec![
@@ -1131,7 +1146,7 @@ impl<const INPUT: u32, const SWAP: bool> Foreign<INPUT, SWAP> {
         let declaration = &mut definition.primitives[0];
         let primitive = declaration;
         primitive.name = "test.foreign".into();
-        let Some(pb::primitive::Typing::Signature(signature)) = &mut primitive.typing else {
+        let Some(signature) = &mut primitive.signature else {
             unreachable!()
         };
         signature.inputs = vec![pb::Arg {
@@ -1795,10 +1810,9 @@ fn grouped_signature_identity_preserves_width_and_order_after_relocation() {
         }
     }
     let primitive = &mut definition.primitives[0];
-    let Some(pb::primitive::Typing::Signature(signature)) = &mut primitive.typing else {
+    let Some(signature) = &mut primitive.signature else {
         unreachable!()
     };
-    signature.type_params = vec!["Renamed".into(), "Renamed".into()];
     signature.output = signature.output.map(|i| (i + 3) % 4);
     for arg in signature.inputs.iter_mut().chain(&mut signature.varargs) {
         arg.sort = (arg.sort + 3) % 4;
@@ -1814,7 +1828,7 @@ fn grouped_signature_identity_preserves_width_and_order_after_relocation() {
     for mutation in 0..4 {
         let mut invalid = definition.clone();
         let primitive = &mut invalid.primitives[0];
-        let Some(pb::primitive::Typing::Signature(signature)) = &mut primitive.typing else {
+        let Some(signature) = &mut primitive.signature else {
             unreachable!()
         };
         match mutation {
@@ -1837,7 +1851,7 @@ fn grouped_signature_identity_preserves_width_and_order_after_relocation() {
     }
     // Repeating the same type twice is not a homogeneous one-position tail.
     let primitive = &mut definition.primitives[0];
-    let Some(pb::primitive::Typing::Signature(signature)) = &mut primitive.typing else {
+    let Some(signature) = &mut primitive.signature else {
         unreachable!()
     };
     signature.varargs[1] = signature.varargs[0].clone();
@@ -1845,7 +1859,7 @@ fn grouped_signature_identity_preserves_width_and_order_after_relocation() {
     builtin::import_definition(&definition, &mut equal_positions).unwrap();
     let frozen = equal_positions.clone();
     let primitive = &mut definition.primitives[0];
-    let Some(pb::primitive::Typing::Signature(signature)) = &mut primitive.typing else {
+    let Some(signature) = &mut primitive.signature else {
         unreachable!()
     };
     signature.varargs.pop();
@@ -1898,7 +1912,7 @@ mod manual_registration {
             if wrong_key {
                 root.name = "other.root".into();
             } else {
-                let Some(pb::primitive::Typing::Signature(s)) = &mut root.typing else {
+                let Some(s) = &mut root.signature else {
                     unreachable!()
                 };
                 s.inputs.clear();

@@ -92,30 +92,27 @@ function_parameters!(@[]; A0:0,A1:1,A2:2,A3:3,A4:4,A5:5,A6:6,A7:7,
     A8:8,A9:9,A10:10,A11:11);
 
 macro_rules! function_application {
-    ($method:ident, $index:expr) => {
-        function_application!(@one $method, $index;);
-        function_application!(@many $method, $index; []; A0:0,A1:1,A2:2,A3:3,A4:4,A5:5,A6:6,A7:7,
+    ($method:ident) => {
+        function_application!(@one $method;);
+        function_application!(@many $method; []; A0:0,A1:1,A2:2,A3:3,A4:4,A5:5,A6:6,A7:7,
             A8:8,A9:9,A10:10,A11:11);
     };
-    (@many $method:ident, $index:expr; [$($done:ident:$j:tt,)*];) => {};
-    (@many $method:ident, $index:expr; [$($done:ident:$j:tt,)*]; $next:ident:$i:tt $(,$tail:ident:$k:tt)*) => {
-        function_application!(@one $method, $index; $($done:$j,)* $next:$i);
-        function_application!(@many $method, $index; [$($done:$j,)* $next:$i,]; $($tail:$k),*);
+    (@many $method:ident; [$($done:ident:$j:tt,)*];) => {};
+    (@many $method:ident; [$($done:ident:$j:tt,)*]; $next:ident:$i:tt $(,$tail:ident:$k:tt)*) => {
+        function_application!(@one $method; $($done:$j,)* $next:$i);
+        function_application!(@many $method; [$($done:$j,)* $next:$i,]; $($tail:$k),*);
     };
-    (@one $method:ident, $index:expr; $($t:ident:$i:tt),*) => {
+    (@one $method:ident; $($t:ident:$i:tt),*) => {
         impl<R: crate::typed::EgglogValue, $($t: crate::typed::EgglogValue,)*> self::Function<($($t,)*), R> {
-            /// Apply the catalog-defined function application primitive.
+            /// Apply this symbolic function to its typed arguments.
             #[allow(non_snake_case, clippy::too_many_arguments, reason = "The declaration determines parameter names and arity.")]
             pub fn $method(&self, $($t: impl Into<$t>),*) -> R {
-                let mut record = crate::typed::storage::builtin_catalog().clone();
-                record.arena = crate::typed::storage::Arena::Primitive;
-                record.index = $index;
-                R::from_expression(crate::typed::expr::Expr::call_with_result(
-                    &crate::typed::decl::Callable(record),
-                    vec![<Self as crate::typed::EgglogValue>::expression(self).clone(), $(<$t as crate::typed::EgglogValue>::expression(&$t.into()).clone()),*], R::sort_ref(),
+                R::from_expression(crate::typed::expr::Expr::apply(
+                    <Self as crate::typed::EgglogValue>::expression(self).clone(),
+                    vec![$(<$t as crate::typed::EgglogValue>::expression(&$t.into()).clone()),*],
                 ).expect("typed function application"))
             }
         }
     };
 }
-pub(super) use function_application;
+function_application!(call);

@@ -119,7 +119,7 @@ fn census(engine: &mut Engine, id: u64) -> u64 {
         id,
         pb::Program {
             commands: vec![pb::Command {
-                kind: Some(pb::command::Kind::PrintSize(pb::PrintSize {
+                kind: Some(pb::command::Kind::TableSizes(pb::GetTableSizes {
                     tables: vec!["N".into()],
                 })),
                 ..Default::default()
@@ -657,7 +657,7 @@ fn decomposed_diagnostics_keep_actual_text_and_preserve_execution() {
             handle,
             pb::Program {
                 commands: vec![pb::Command {
-                    kind: Some(pb::command::Kind::PrintSize(pb::PrintSize {
+                    kind: Some(pb::command::Kind::TableSizes(pb::GetTableSizes {
                         tables: vec!["Out".into()],
                     })),
                     ..Default::default()

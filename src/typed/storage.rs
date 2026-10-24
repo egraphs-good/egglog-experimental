@@ -56,6 +56,8 @@ pub(super) enum Slot {
 pub(super) struct Owner {
     pub id: usize,
     pub graph: OwnedGraph,
+    // Reusable authored protobuf rules live privately, outside the wire Program.
+    pub rules: Vec<pb::Rule>,
     pub slots: [Vec<Slot>; 7],
     // Candidate declaration locations, not names/signatures copied from them.
     pub declarations: Vec<Record>,
@@ -399,8 +401,8 @@ pub(super) fn publish_catalog(catalog: pb::BuiltinCatalog) -> Result<Record, Typ
                 "invalid builtin primitive identity".into(),
             ));
         }
-        match &primitive.typing {
-            Some(pb::primitive::Typing::Signature(signature)) => {
+        match &primitive.signature {
+            Some(signature) => {
                 let output = signature
                     .output
                     .ok_or_else(|| TypedError::Invalid("missing builtin output sort".into()))?;
@@ -417,7 +419,6 @@ pub(super) fn publish_catalog(catalog: pb::BuiltinCatalog) -> Result<Record, Typ
                     ));
                 }
             }
-            Some(pb::primitive::Typing::Application(_)) => {}
             None => return Err(TypedError::Invalid("missing builtin typing".into())),
         }
     }
@@ -436,6 +437,7 @@ pub(super) fn publish_catalog(catalog: pb::BuiltinCatalog) -> Result<Record, Typ
         owner: Some(Arc::new(Owner {
             id,
             graph: OwnedGraph::BuiltinCatalog(catalog),
+            rules: vec![],
             slots,
             declarations: vec![],
             ambient: None,
@@ -464,7 +466,7 @@ pub(super) fn observe(
         program.nodes.len(),
         program.sorts.len(),
         program.declarations.len(),
-        program.rules.len(),
+        0,
         program.commands.len(),
         0,
         0,
@@ -477,6 +479,7 @@ pub(super) fn observe(
         owner: Some(Arc::new(Owner {
             id,
             graph: OwnedGraph::Program(program),
+            rules: vec![],
             slots,
             declarations: vec![],
             ambient: builtins.owner.clone(),
@@ -502,6 +505,7 @@ pub(super) fn closure(roots: &[Record]) -> Result<Vec<Record>, TypedError> {
             continue;
         }
         let mut one = pb::Program::default();
+        let mut one_rules = vec![];
         match record.arena {
             Arena::PrimitiveSort => {
                 record.primitive_sort()?;
@@ -510,7 +514,7 @@ pub(super) fn closure(roots: &[Record]) -> Result<Vec<Record>, TypedError> {
             }
             Arena::Primitive => {
                 let primitive = record.primitive()?;
-                if let Some(pb::primitive::Typing::Signature(signature)) = &primitive.typing {
+                if let Some(signature) = &primitive.signature {
                     let output = signature
                         .output
                         .ok_or_else(|| TypedError::Invalid("missing builtin output".into()))?;
@@ -564,8 +568,7 @@ pub(super) fn closure(roots: &[Record]) -> Result<Vec<Record>, TypedError> {
                 .declarations
                 .push(owner.program().unwrap().declarations[record.index as usize].clone()),
             Arena::Rule => {
-                one.rules
-                    .push(owner.program().unwrap().rules[record.index as usize].clone());
+                one_rules.push(owner.rules[record.index as usize].clone());
                 pending.extend(owner.declarations.iter().cloned());
             }
             Arena::Command => {
@@ -574,10 +577,15 @@ pub(super) fn closure(roots: &[Record]) -> Result<Vec<Record>, TypedError> {
                 pending.extend(owner.declarations.iter().cloned());
             }
         }
-        visit(&mut one, record.arena, 0, |arena, index| {
+        let relocate = |arena, index| {
             pending.push(record.resolve(arena, index)?);
             Ok(index)
-        })?;
+        };
+        if record.arena == Arena::Rule {
+            visit_rule(&mut one_rules[0], relocate)?;
+        } else {
+            visit(&mut one, record.arena, 0, relocate)?;
+        }
         result.push(record);
     }
     Ok(result)
@@ -611,6 +619,35 @@ pub(super) fn visit_action(
     Ok(())
 }
 
+pub(super) fn visit_rule(
+    rule: &mut pb::Rule,
+    mut map: impl FnMut(Arena, u32) -> Result<u32, TypedError>,
+) -> Result<(), TypedError> {
+    let invalid = || TypedError::Invalid("unsupported protobuf rule in typed subset".into());
+    if rule.span.is_some() {
+        return Err(invalid());
+    }
+    match rule.kind.as_mut().ok_or_else(invalid)? {
+        pb::rule::Kind::Rule(r) => {
+            for fact in &mut r.query {
+                *fact = map(Arena::Node, *fact)?;
+            }
+            for action in &mut r.head {
+                visit_action(action, |index| map(Arena::Node, index))?;
+            }
+        }
+        pb::rule::Kind::Rewrite(r) => {
+            r.lhs = map(Arena::Node, r.lhs)?;
+            for c in &mut r.conditions {
+                *c = map(Arena::Node, *c)?;
+            }
+            r.rhs = map(Arena::Node, r.rhs)?;
+        }
+        _ => return Err(invalid()),
+    }
+    Ok(())
+}
+
 /// Relocate only admitted shapes. Both publication and packing use this visitor.
 pub(super) fn visit(
     program: &mut pb::Program,
@@ -630,6 +667,13 @@ pub(super) fn visit(
                 pb::node::Kind::Call(c) => {
                     for a in &mut c.args {
                         *a = map(Arena::Node, *a)?;
+                    }
+                }
+                pb::node::Kind::Apply(apply) => {
+                    let function = apply.function.as_mut().ok_or_else(invalid)?;
+                    *function = map(Arena::Node, *function)?;
+                    for argument in &mut apply.args {
+                        *argument = map(Arena::Node, *argument)?;
                     }
                 }
                 pb::node::Kind::Union(u) => {
@@ -758,30 +802,7 @@ pub(super) fn visit(
                 }
             }
         }
-        Arena::Rule => {
-            let rule = &mut program.rules[index as usize];
-            if rule.span.is_some() {
-                return Err(invalid());
-            }
-            match rule.kind.as_mut().ok_or_else(invalid)? {
-                pb::rule::Kind::Rule(r) => {
-                    for fact in &mut r.query {
-                        *fact = map(Arena::Node, *fact)?;
-                    }
-                    for action in &mut r.head {
-                        visit_action(action, |index| map(Arena::Node, index))?;
-                    }
-                }
-                pb::rule::Kind::Rewrite(r) => {
-                    r.lhs = map(Arena::Node, r.lhs)?;
-                    for c in &mut r.conditions {
-                        *c = map(Arena::Node, *c)?;
-                    }
-                    r.rhs = map(Arena::Node, r.rhs)?;
-                }
-                _ => return Err(invalid()),
-            }
-        }
+        Arena::Rule => return Err(invalid()),
         Arena::Command => {
             let command = &mut program.commands[index as usize];
             if command.span.is_some() {
@@ -792,8 +813,10 @@ pub(super) fn visit(
                     visit_action(action, |index| map(Arena::Node, index))?;
                 }
                 pb::command::Kind::AddRules(add) => {
-                    for rule in &mut add.rules {
-                        *rule = map(Arena::Rule, *rule)?;
+                    // Inline values are filled from the private owned imports
+                    // after their independent binders have been packed.
+                    for index in 0..add.rules.len() {
+                        map(Arena::Rule, index as u32)?;
                     }
                 }
                 _ => return Err(invalid()),
@@ -810,6 +833,7 @@ pub(super) fn publish(
     declarations: Vec<Record>,
     arena: Arena,
     index: u32,
+    mut rules: Vec<pb::Rule>,
 ) -> Result<Record, TypedError> {
     if !program.files.is_empty()
         || program.commands.iter().any(|c| {
@@ -827,7 +851,7 @@ pub(super) fn publish(
         program.nodes.len(),
         program.sorts.len(),
         program.declarations.len(),
-        program.rules.len(),
+        rules.len(),
         program.commands.len(),
         0,
         0,
@@ -856,16 +880,23 @@ pub(super) fn publish(
     .into_iter()
     .zip(lengths)
     {
-        for index in 0..len {
-            visit(&mut program, arena, index as u32, |a, i| {
-                if (i as usize) < slots[a as usize].len() {
-                    Ok(i)
-                } else {
-                    Err(TypedError::Invalid(
-                        "protobuf reference out of bounds".into(),
-                    ))
-                }
-            })?;
+        let mut relocate = |a: Arena, i: u32| {
+            if (i as usize) < slots[a as usize].len() {
+                Ok(i)
+            } else {
+                Err(TypedError::Invalid(
+                    "protobuf reference out of bounds".into(),
+                ))
+            }
+        };
+        if arena == Arena::Rule {
+            for rule in &mut rules {
+                visit_rule(rule, &mut relocate)?;
+            }
+        } else {
+            for index in 0..len {
+                visit(&mut program, arena, index as u32, &mut relocate)?;
+            }
         }
     }
     let id = NEXT_OWNER
@@ -891,6 +922,7 @@ pub(super) fn publish(
         owner: Some(Arc::new(Owner {
             id,
             graph: OwnedGraph::Program(program),
+            rules,
             slots,
             declarations,
             ambient: None,
@@ -906,6 +938,8 @@ pub(super) fn publish(
 
 pub(super) struct Packer {
     pub program: pb::Program,
+    pub(super) rules: Vec<pb::Rule>,
+    rule_additions: Vec<(u32, Vec<u32>)>,
     ids: HashMap<(Key, usize), u32>,
     pending: Vec<(Record, usize, u32)>,
     cursor: usize,
@@ -926,6 +960,8 @@ impl Default for Packer {
             program: pb::Program {
                 ..Default::default()
             },
+            rules: vec![],
+            rule_additions: vec![],
             ids: HashMap::new(),
             pending: vec![],
             cursor: 0,
@@ -985,8 +1021,8 @@ impl Packer {
                 self.program.declarations.len() - 1
             }
             Arena::Rule => {
-                self.program.rules.push(pb::Rule::default());
-                self.program.rules.len() - 1
+                self.rules.push(pb::Rule::default());
+                self.rules.len() - 1
             }
             Arena::Command => {
                 self.program.commands.push(pb::Command::default());
@@ -1015,6 +1051,7 @@ impl Packer {
             }
             // Copy exactly one generated record, never the previous fragment.
             let mut one = pb::Program::default();
+            let mut one_rules = vec![];
             match record.arena {
                 Arena::Node => {
                     let mut n = owner.program().unwrap().nodes[record.index as usize].clone();
@@ -1230,10 +1267,9 @@ impl Packer {
                     one.declarations.push(declaration);
                 }
                 Arena::Rule => {
-                    one.rules
-                        .push(owner.program().unwrap().rules[record.index as usize].clone());
+                    one_rules.push(owner.rules[record.index as usize].clone());
                     let mut roots = vec![];
-                    visit(&mut one, Arena::Rule, 0, |arena, index| {
+                    visit_rule(&mut one_rules[0], |arena, index| {
                         roots.push(record.resolve(arena, index)?);
                         Ok(index)
                     })?;
@@ -1268,9 +1304,22 @@ impl Packer {
                     unreachable!("builtin descriptor cannot enter Program queue")
                 }
             }
-            visit(&mut one, record.arena, 0, |a, i| {
-                Ok(self.intern(record.resolve(a, i)?, binder))
-            })?;
+            let mut packed_rules = vec![];
+            let mut relocate = |a, i| {
+                let packed = self.intern(record.resolve(a, i)?, binder);
+                if a == Arena::Rule {
+                    packed_rules.push(packed);
+                }
+                Ok(packed)
+            };
+            if record.arena == Arena::Rule {
+                visit_rule(&mut one_rules[0], relocate)?;
+            } else {
+                visit(&mut one, record.arena, 0, &mut relocate)?;
+            }
+            if !packed_rules.is_empty() {
+                self.rule_additions.push((index, packed_rules));
+            }
             match record.arena {
                 Arena::Node => self.program.nodes[index as usize] = one.nodes.pop().unwrap(),
                 Arena::Sort => self.program.sorts[index as usize] = one.sorts.pop().unwrap(),
@@ -1289,7 +1338,7 @@ impl Packer {
                     }
                     self.program.declarations[index as usize] = d;
                 }
-                Arena::Rule => self.program.rules[index as usize] = one.rules.pop().unwrap(),
+                Arena::Rule => self.rules[index as usize] = one_rules.pop().unwrap(),
                 Arena::Command => {
                     self.program.commands[index as usize] = one.commands.pop().unwrap()
                 }
@@ -1298,6 +1347,17 @@ impl Packer {
                 }
             }
             self.cursor += 1;
+        }
+        for (command, rules) in self.rule_additions.drain(..) {
+            let Some(pb::command::Kind::AddRules(add)) =
+                &mut self.program.commands[command as usize].kind
+            else {
+                return Err(TypedError::Invalid("invalid private rule addition".into()));
+            };
+            add.rules = rules
+                .iter()
+                .map(|index| self.rules[*index as usize].clone())
+                .collect();
         }
         // Independent compatible declarations can have distinct owners. Compare
         // complete node bodies, but keep the original arena references below.
@@ -1524,6 +1584,7 @@ mod tests {
                 vec![constructor.0.clone()],
                 Arena::Command,
                 0,
+                vec![],
             );
             if case == 0 {
                 assert_eq!(
@@ -1546,7 +1607,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn actual_catalog_retains_application_typing_and_checks_authoring_signature() {
+    fn actual_catalog_retains_signatures_without_a_public_application_primitive() {
         use crate::typed::{EgglogValue, builtins::Unit, decl::Callable, expr::Expr};
         let original =
             pb::BuiltinCatalog::decode(include_bytes!("builtins/catalog.pb").as_slice()).unwrap();
@@ -1564,32 +1625,32 @@ mod tests {
             };
             assert_eq!(catalog.encode_to_vec(), bytes);
             assert!(context.owner.as_ref().unwrap().program().is_err());
+            assert!(
+                context
+                    .declaration("egglog.core.fn.apply", DeclarationKind::Callable)
+                    .is_err()
+            );
             let record = context
-                .declaration("egglog.core.fn.apply", DeclarationKind::Callable)
+                .declaration("egglog.core.ne", DeclarationKind::Callable)
                 .unwrap();
-            let application = record.primitive().unwrap().clone();
+            let primitive = record.primitive().unwrap().clone();
             let mut packer = Packer::default();
             packer.intern(record.clone(), 0);
             packer.finish().unwrap();
             assert!(packer.program.sorts.is_empty() && packer.program.nodes.is_empty());
             assert!(packer.program.declarations.is_empty());
-            assert_eq!(packer.builtin_demands[0].primitive().unwrap(), &application);
+            assert_eq!(packer.builtin_demands[0].primitive().unwrap(), &primitive);
             assert!(
                 matches!(Expr::call_with_result(&Callable(record),vec![],Unit::sort_ref()),
-                Err(TypedError::Invalid(message)) if message == "application requires a function")
+                Err(TypedError::Invalid(message)) if message == "callable arity")
             );
         }
     }
 
     #[test]
-    fn retained_application_typing_keeps_checked_publication_boundaries() {
+    fn required_signatures_keep_checked_publication_boundaries() {
         let original =
             pb::BuiltinCatalog::decode(include_bytes!("builtins/catalog.pb").as_slice()).unwrap();
-        let apply = original
-            .primitives
-            .iter()
-            .position(|p| p.name == "egglog.core.fn.apply")
-            .unwrap();
         let ne = original
             .primitives
             .iter()
@@ -1598,11 +1659,9 @@ mod tests {
         for case in 0..4 {
             let mut catalog = original.clone();
             if case == 1 {
-                catalog.primitives[apply].typing = None;
+                catalog.primitives[ne].signature = None;
             } else if case >= 2 {
-                let Some(pb::primitive::Typing::Signature(signature)) =
-                    &mut catalog.primitives[ne].typing
-                else {
+                let Some(signature) = &mut catalog.primitives[ne].signature else {
                     panic!()
                 };
                 if case == 2 {

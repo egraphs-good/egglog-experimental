@@ -177,10 +177,7 @@ fn configured_computed_implementation_is_an_ambient_signature_not_a_user_body() 
         .iter()
         .find(|primitive| primitive.name == "configured_inc")
         .unwrap();
-    assert!(matches!(
-        primitive.typing,
-        Some(pb::primitive::Typing::Signature(_))
-    ));
+    assert!(primitive.signature.is_some());
     let id = create(&mut engine, false);
     let mut renderer = Renderer::with_extension(extension.clone()).unwrap();
     for program in
@@ -265,7 +262,7 @@ fn stream_and_buffer_preserve_prefix_before_exclusive_terminal_error() {
                 ..Default::default()
             },
             pb::Command {
-                kind: Some(pb::command::Kind::PrintSize(pb::PrintSize {
+                kind: Some(pb::command::Kind::TableSizes(pb::GetTableSizes {
                     tables: vec!["Row".into()],
                 })),
                 ..Default::default()
@@ -408,4 +405,116 @@ fn capped_loops_stop_quiet_observers_in_native_text_wire_and_rendered_text() {
             "{rendered}"
         );
     }
+}
+
+#[test]
+fn source_application_is_intrinsic_and_first_class_application_has_a_body() {
+    let mut engine = Engine::default();
+    let id = create(&mut engine, true);
+    let text = r#"
+        (sort F (UnstableFn (i64) i64))
+        (primitive inc (i64) i64 (+ _0 1))
+        (function selected () F :merge old)
+        (set (selected) (unstable-fn "inc"))
+        (check (= (unstable-app (selected) 2) 3))
+        (let adapted (unstable-fn "unstable-app" (selected)))
+        (check (= adapted (unstable-fn "unstable-app" (selected))))
+        (check (= (unstable-app adapted 3) 4))
+        (extract adapted)
+    "#;
+    let mut renderer = Renderer::default();
+    let mut application = false;
+    let mut adapter = false;
+    for program in Source::new(None, text).unwrap() {
+        let program = program.unwrap();
+        application |= program
+            .nodes
+            .iter()
+            .any(|node| matches!(node.kind, Some(pb::node::Kind::Apply(_))));
+        adapter |= program.declarations.iter().any(|declaration| matches!(&declaration.kind, Some(pb::declaration::Kind::UserDefinedPrimitive(primitive)) if primitive.name.starts_with("__egglog_application_")));
+        for node in &program.nodes {
+            let name = match &node.kind {
+                Some(pb::node::Kind::Call(call)) => &call.func,
+                Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
+                    value: Some(pb::primitive_value::Value::PartialCall(call)),
+                })) => &call.func,
+                _ => continue,
+            };
+            assert_ne!(name, "egglog.core.fn.apply");
+            assert_ne!(name, "unstable-app");
+        }
+        renderer.render(&program).unwrap();
+        let frames = run(&mut engine, id, program);
+        assert!(
+            frames.iter().all(|frame| matches!(
+                frame.result,
+                Some(pb::run_program_response::Result::Output(_))
+            )),
+            "{frames:?}"
+        );
+    }
+    assert!(application);
+    assert!(adapter);
+    let frames = run(
+        &mut engine,
+        id,
+        pb::Program {
+            commands: vec![pb::Command {
+                kind: Some(pb::command::Kind::Freeze(pb::Freeze {})),
+                ..Default::default()
+            }],
+            ..Default::default()
+        },
+    );
+    let snapshot = frames
+        .iter()
+        .find_map(|frame| match &frame.result {
+            Some(pb::run_program_response::Result::Output(output)) => {
+                output.outputs.iter().find_map(|output| match &output.kind {
+                    Some(pb::command_output::Kind::Snapshot(snapshot)) => snapshot.program.as_ref(),
+                    _ => None,
+                })
+            }
+            _ => None,
+        })
+        .unwrap();
+    let fresh = create(&mut engine, false);
+    let replay = run(&mut engine, fresh, snapshot.clone());
+    assert!(
+        replay.iter().all(|frame| matches!(
+            frame.result,
+            Some(pb::run_program_response::Result::Output(_))
+        )),
+        "{replay:?}"
+    );
+}
+
+#[test]
+fn named_application_is_rejected_before_history_admission() {
+    let mut engine = Engine::default();
+    let id = create(&mut engine, true);
+    let frames = run(
+        &mut engine,
+        id,
+        pb::Program {
+            nodes: vec![pb::Node {
+                kind: Some(pb::node::Kind::Call(pb::Call {
+                    func: "egglog.core.fn.apply".into(),
+                    ..Default::default()
+                })),
+                ..Default::default()
+            }],
+            ..Default::default()
+        },
+    );
+    assert!(frames.iter().any(|frame| matches!(&frame.result, Some(pb::run_program_response::Result::Error(error)) if error.message.contains("requires Apply"))), "{frames:?}");
+    let history = pb::Program::decode(
+        engine
+            .get_history(&pb::GetHistoryRequest { egraph_id: id }.encode_to_vec())
+            .unwrap()
+            .as_slice(),
+    )
+    .unwrap();
+    assert!(history.nodes.is_empty());
+    assert!(history.commands.is_empty());
 }

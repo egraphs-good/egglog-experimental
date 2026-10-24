@@ -9,17 +9,19 @@ from gen.python.egglog.v1 import egglog_pb as ir
 
 
 class ResourceSchemaTests(unittest.TestCase):
-    def test_creation_accepts_only_user_equality_sort_declarations(self):
-        nominal = ir.Declaration(kind=Oneof("eq_sort", ir.EqSort(name="Pair")))
+    def test_creation_accepts_closed_backend_compositions_without_declarations(self):
         request = ir.CreateEGraphRequest(
-            sorts=[ir.Sort(kind=Oneof("eq", "Pair")), ir.Sort(kind=Oneof("application", ir.SortApplication(name="Pair", args=[0, 0])))],
-            options=ir.EGraphOptions(cost_sort=0), declarations=[nominal, nominal],
+            sorts=[ir.Sort(kind=Oneof("application", ir.SortApplication(name="i64"))),
+                   ir.Sort(kind=Oneof("application", ir.SortApplication(name="Pair", args=[0, 0])))],
+            options=ir.EGraphOptions(cost_sort=1),
         )
         validate(request)
         self.assertEqual(type(request).from_binary(request.to_binary()), request)
-        request.declarations.append(ir.Declaration(kind=Oneof("constructor", ir.Constructor(name="Pair", output=0))))
+        request.sorts[0] = ir.Sort(kind=Oneof("eq", "User"))
         with self.assertRaises(ValidationError):
             validate(request)
+        with self.assertRaises(TypeError):
+            ir.CreateEGraphRequest(declarations=[])
 
     def test_creation_resources_can_be_requested_together(self):
         request = ir.CreateEGraphRequest(

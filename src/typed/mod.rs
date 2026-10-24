@@ -71,13 +71,15 @@
 //! impl List { #[relation] fn row(&mut self); }
 //! ```
 //!
-//! Ordinary Vec/Map methods retain their element/key types. Vec union is
-//! available only for equality-sort elements, not equality-containing containers.
+//! Ordinary Vec/Map methods retain their element/key types. Their generic
+//! signatures describe structural typing; native applicability is checked on
+//! submission. Vec union currently requires equality-sort elements and rejects
+//! primitive or container element sorts before execution.
 //!
 //! ```
 //! use egglog_experimental::typed::{builtins::{I64, Vec}, prelude::*};
 //! fn append<T: EgglogValue>(xs: &Vec<T>, ys: &Vec<T>) -> Vec<T> { xs.append([ys]) }
-//! fn merge<T: EqualitySort>(xs: &Vec<T>, ys: &Vec<T>) -> Vec<T> { xs.union(ys) }
+//! fn merge<T: EgglogValue>(xs: &Vec<T>, ys: &Vec<T>) -> Vec<T> { xs.union(ys) }
 //! let xs = Vec::<I64>::of([1_i64]);
 //! let _ = append(&xs, &xs).append(std::iter::empty::<Vec<I64>>()).push(2_i64).set(0_i64, 3_i64).remove(0_i64).pop();
 //! ```
@@ -86,16 +88,20 @@
 //! let xs = Vec::<I64>::empty();
 //! let _ = xs.append([Vec::<F64>::empty()]);
 //! ```
-//! ```compile_fail,E0599
-//! use egglog_experimental::typed::builtins::{I64, Vec};
-//! let xs = Vec::<I64>::empty();
-//! let _ = xs.union(&xs);
 //! ```
-//! ```compile_fail,E0599
+//! use egglog_experimental::typed::{builtins::{I64, Vec}, prelude::*};
+//! let xs = Vec::<I64>::empty();
+//! let mut graph = EGraph::new()?;
+//! assert!(matches!(graph.register(xs.union(&xs)), Err(TypedError::Engine(_))));
+//! # Ok::<_, TypedError>(())
+//! ```
+//! ```
 //! use egglog_experimental::typed::{builtins::Vec, prelude::*};
 //! #[sort] struct Atom;
 //! let xs = Vec::<Vec<Atom>>::empty();
-//! let _ = xs.union(&xs);
+//! let mut graph = EGraph::new()?;
+//! assert!(matches!(graph.register(xs.union(&xs)), Err(TypedError::Engine(_))));
+//! # Ok::<_, TypedError>(())
 //! ```
 //! ```compile_fail,E0277
 //! use egglog_experimental::typed::builtins::{I64, F64, Vec};

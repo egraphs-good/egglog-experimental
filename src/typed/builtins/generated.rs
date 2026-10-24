@@ -317,12 +317,12 @@ impl<__EgglogType0: crate::typed::EgglogValue, __EgglogType1: crate::typed::Eggl
         let mut __egglog_record =
             ::core::clone::Clone::clone(crate::typed::storage::builtin_catalog());
         __egglog_record.arena = crate::typed::storage::Arena::Primitive;
-        __egglog_record.index = 164;
+        __egglog_record.index = 163;
         let __egglog_value = crate::typed::expr::Expr::call_with_result(&crate::typed::decl::Callable(__egglog_record), __egglog_items, <self::Vec<self::Pair<__EgglogType0, __EgglogType1>> as crate::typed::EgglogValue>::sort_ref()).expect("generated Map Vec packing disagrees with its descriptor");
         let mut __egglog_record =
             ::core::clone::Clone::clone(crate::typed::storage::builtin_catalog());
         __egglog_record.arena = crate::typed::storage::Arena::Primitive;
-        __egglog_record.index = 109;
+        __egglog_record.index = 108;
         <Self as crate::typed::EgglogValue>::from_expression(
             crate::typed::expr::Expr::call_with_result(
                 &crate::typed::decl::Callable(__egglog_record),
@@ -339,7 +339,7 @@ impl<__EgglogType0: crate::typed::EgglogValue, __EgglogType1: crate::typed::Eggl
         ::std::vec::Vec<(__EgglogType0, __EgglogType1)>,
         crate::typed::TypedError,
     > {
-        let __egglog_constructors = [104, 109, 159, 164, 140].map(|__egglog_index| {
+        let __egglog_constructors = [103, 108, 158, 163, 139].map(|__egglog_index| {
             let mut __egglog_record =
                 ::core::clone::Clone::clone(crate::typed::storage::builtin_catalog());
             __egglog_record.arena = crate::typed::storage::Arena::Primitive;
@@ -459,11 +459,11 @@ impl<__EgglogType0: crate::typed::EgglogValue> ::core::convert::TryFrom<&self::M
         let mut __egglog_none =
             ::core::clone::Clone::clone(crate::typed::storage::builtin_catalog());
         __egglog_none.arena = crate::typed::storage::Arena::Primitive;
-        __egglog_none.index = 175;
+        __egglog_none.index = 174;
         let mut __egglog_some =
             ::core::clone::Clone::clone(crate::typed::storage::builtin_catalog());
         __egglog_some.arena = crate::typed::storage::Arena::Primitive;
-        __egglog_some.index = 176;
+        __egglog_some.index = 175;
         ::core::result::Result::Ok(
             __egglog_value
                 .0
@@ -605,7 +605,7 @@ impl<__EgglogType0: crate::typed::EgglogValue, __EgglogType1: crate::typed::Eggl
         let mut __egglog_record =
             ::core::clone::Clone::clone(crate::typed::storage::builtin_catalog());
         __egglog_record.arena = crate::typed::storage::Arena::Primitive;
-        __egglog_record.index = 140;
+        __egglog_record.index = 139;
         let [__egglog_left, __egglog_right] = self.0.pair_fields(
             &crate::typed::decl::Callable(__egglog_record),
             &<__EgglogType0 as crate::typed::EgglogValue>::sort_ref(),
@@ -631,7 +631,7 @@ impl<
         let mut __egglog_record =
             ::core::clone::Clone::clone(crate::typed::storage::builtin_catalog());
         __egglog_record.arena = crate::typed::storage::Arena::Primitive;
-        __egglog_record.index = 140;
+        __egglog_record.index = 139;
         <Self as crate::typed::EgglogValue>::from_expression(
             crate::typed::expr::Expr::call_with_result(
                 &crate::typed::decl::Callable(__egglog_record),
@@ -4324,7 +4324,6 @@ impl self::F64 {
         )
     }
 }
-function_application!(call, 77);
 impl self::I64 {
     /// Author a catalog-defined call without evaluating its arguments.
     pub fn abs(&self) -> self::I64 {
@@ -4333,7 +4332,7 @@ impl self::I64 {
         let mut __egglog_record =
             ::core::clone::Clone::clone(crate::typed::storage::builtin_catalog());
         __egglog_record.arena = crate::typed::storage::Arena::Primitive;
-        __egglog_record.index = 78;
+        __egglog_record.index = 77;
         <self::I64 as crate::typed::EgglogValue>::from_expression(
             crate::typed::expr::Expr::call_with_result(
                 &crate::typed::decl::Callable(__egglog_record),
@@ -4351,7 +4350,7 @@ impl ::core::ops::Add<self::I64> for self::I64 {
         let mut __egglog_record =
             ::core::clone::Clone::clone(crate::typed::storage::builtin_catalog());
         __egglog_record.arena = crate::typed::storage::Arena::Primitive;
-        __egglog_record.index = 79;
+        __egglog_record.index = 78;
         <self::I64 as crate::typed::EgglogValue>::from_expression(crate::typed::expr::Expr::call(
             &crate::typed::decl::Callable(__egglog_record),
             ::std::vec![
@@ -4368,7 +4367,7 @@ impl ::core::ops::Add<&self::I64> for self::I64 {
         let mut __egglog_record =
             ::core::clone::Clone::clone(crate::typed::storage::builtin_catalog());
         __egglog_record.arena = crate::typed::storage::Arena::Primitive;
-        __egglog_record.index = 79;
+        __egglog_record.index = 78;
         <self::I64 as crate::typed::EgglogValue>::from_expression(crate::typed::expr::Expr::call(
             &crate::typed::decl::Callable(__egglog_record),
             ::std::vec![
@@ -4385,7 +4384,7 @@ impl ::core::ops::Add<self::I64> for &self::I64 {
         let mut __egglog_record =
             ::core::clone::Clone::clone(crate::typed::storage::builtin_catalog());
         __egglog_record.arena = crate::typed::storage::Arena::Primitive;
-        __egglog_record.index = 79;
+        __egglog_record.index = 78;
         <self::I64 as crate::typed::EgglogValue>::from_expression(crate::typed::expr::Expr::call(
             &crate::typed::decl::Callable(__egglog_record),
             ::std::vec![
@@ -4402,7 +4401,7 @@ impl ::core::ops::Add<&self::I64> for &self::I64 {
         let mut __egglog_record =
             ::core::clone::Clone::clone(crate::typed::storage::builtin_catalog());
         __egglog_record.arena = crate::typed::storage::Arena::Primitive;
-        __egglog_record.index = 79;
+        __egglog_record.index = 78;
         <self::I64 as crate::typed::EgglogValue>::from_expression(crate::typed::expr::Expr::call(
             &crate::typed::decl::Callable(__egglog_record),
             ::std::vec![
@@ -4419,7 +4418,7 @@ impl ::core::ops::BitAnd<self::I64> for self::I64 {
         let mut __egglog_record =
             ::core::clone::Clone::clone(crate::typed::storage::builtin_catalog());
         __egglog_record.arena = crate::typed::storage::Arena::Primitive;
-        __egglog_record.index = 80;
+        __egglog_record.index = 79;
         <self::I64 as crate::typed::EgglogValue>::from_expression(crate::typed::expr::Expr::call(
             &crate::typed::decl::Callable(__egglog_record),
             ::std::vec![
@@ -4436,7 +4435,7 @@ impl ::core::ops::BitAnd<&self::I64> for self::I64 {
         let mut __egglog_record =
             ::core::clone::Clone::clone(crate::typed::storage::builtin_catalog());
         __egglog_record.arena = crate::typed::storage::Arena::Primitive;
-        __egglog_record.index = 80;
+        __egglog_record.index = 79;
         <self::I64 as crate::typed::EgglogValue>::from_expression(crate::typed::expr::Expr::call(
             &crate::typed::decl::Callable(__egglog_record),
             ::std::vec![
@@ -4453,7 +4452,7 @@ impl ::core::ops::BitAnd<self::I64> for &self::I64 {
         let mut __egglog_record =
             ::core::clone::Clone::clone(crate::typed::storage::builtin_catalog());
         __egglog_record.arena = crate::typed::storage::Arena::Primitive;
-        __egglog_record.index = 80;
+        __egglog_record.index = 79;
         <self::I64 as crate::typed::EgglogValue>::from_expression(crate::typed::expr::Expr::call(
             &crate::typed::decl::Callable(__egglog_record),
             ::std::vec![
@@ -4470,7 +4469,7 @@ impl ::core::ops::BitAnd<&self::I64> for &self::I64 {
         let mut __egglog_record =
             ::core::clone::Clone::clone(crate::typed::storage::builtin_catalog());
         __egglog_record.arena = crate::typed::storage::Arena::Primitive;
-        __egglog_record.index = 80;
+        __egglog_record.index = 79;
         <self::I64 as crate::typed::EgglogValue>::from_expression(crate::typed::expr::Expr::call(
             &crate::typed::decl::Callable(__egglog_record),
             ::std::vec![
@@ -4487,7 +4486,7 @@ impl ::core::ops::BitOr<self::I64> for self::I64 {
         let mut __egglog_record =
             ::core::clone::Clone::clone(crate::typed::storage::builtin_catalog());
         __egglog_record.arena = crate::typed::storage::Arena::Primitive;
-        __egglog_record.index = 81;
+        __egglog_record.index = 80;
         <self::I64 as crate::typed::EgglogValue>::from_expression(crate::typed::expr::Expr::call(
             &crate::typed::decl::Callable(__egglog_record),
             ::std::vec![
@@ -4504,7 +4503,7 @@ impl ::core::ops::BitOr<&self::I64> for self::I64 {
         let mut __egglog_record =
             ::core::clone::Clone::clone(crate::typed::storage::builtin_catalog());
         __egglog_record.arena = crate::typed::storage::Arena::Primitive;
-        __egglog_record.index = 81;
+        __egglog_record.index = 80;
         <self::I64 as crate::typed::EgglogValue>::from_expression(crate::typed::expr::Expr::call(
             &crate::typed::decl::Callable(__egglog_record),
             ::std::vec![
@@ -4521,7 +4520,7 @@ impl ::core::ops::BitOr<self::I64> for &self::I64 {
         let mut __egglog_record =
             ::core::clone::Clone::clone(crate::typed::storage::builtin_catalog());
         __egglog_record.arena = crate::typed::storage::Arena::Primitive;
-        __egglog_record.index = 81;
+        __egglog_record.index = 80;
         <self::I64 as crate::typed::EgglogValue>::from_expression(crate::typed::expr::Expr::call(
             &crate::typed::decl::Callable(__egglog_record),
             ::std::vec![
@@ -4538,7 +4537,7 @@ impl ::core::ops::BitOr<&self::I64> for &self::I64 {
         let mut __egglog_record =
             ::core::clone::Clone::clone(crate::typed::storage::builtin_catalog());
         __egglog_record.arena = crate::typed::storage::Arena::Primitive;
-        __egglog_record.index = 81;
+        __egglog_record.index = 80;
         <self::I64 as crate::typed::EgglogValue>::from_expression(crate::typed::expr::Expr::call(
             &crate::typed::decl::Callable(__egglog_record),
             ::std::vec![
@@ -4555,7 +4554,7 @@ impl ::core::ops::BitXor<self::I64> for self::I64 {
         let mut __egglog_record =
             ::core::clone::Clone::clone(crate::typed::storage::builtin_catalog());
         __egglog_record.arena = crate::typed::storage::Arena::Primitive;
-        __egglog_record.index = 82;
+        __egglog_record.index = 81;
         <self::I64 as crate::typed::EgglogValue>::from_expression(crate::typed::expr::Expr::call(
             &crate::typed::decl::Callable(__egglog_record),
             ::std::vec![
@@ -4572,7 +4571,7 @@ impl ::core::ops::BitXor<&self::I64> for self::I64 {
         let mut __egglog_record =
             ::core::clone::Clone::clone(crate::typed::storage::builtin_catalog());
         __egglog_record.arena = crate::typed::storage::Arena::Primitive;
-        __egglog_record.index = 82;
+        __egglog_record.index = 81;
         <self::I64 as crate::typed::EgglogValue>::from_expression(crate::typed::expr::Expr::call(
             &crate::typed::decl::Callable(__egglog_record),
             ::std::vec![
@@ -4589,7 +4588,7 @@ impl ::core::ops::BitXor<self::I64> for &self::I64 {
         let mut __egglog_record =
             ::core::clone::Clone::clone(crate::typed::storage::builtin_catalog());
         __egglog_record.arena = crate::typed::storage::Arena::Primitive;
-        __egglog_record.index = 82;
+        __egglog_record.index = 81;
         <self::I64 as crate::typed::EgglogValue>::from_expression(crate::typed::expr::Expr::call(
             &crate::typed::decl::Callable(__egglog_record),
             ::std::vec![
@@ -4606,7 +4605,7 @@ impl ::core::ops::BitXor<&self::I64> for &self::I64 {
         let mut __egglog_record =
             ::core::clone::Clone::clone(crate::typed::storage::builtin_catalog());
         __egglog_record.arena = crate::typed::storage::Arena::Primitive;
-        __egglog_record.index = 82;
+        __egglog_record.index = 81;
         <self::I64 as crate::typed::EgglogValue>::from_expression(crate::typed::expr::Expr::call(
             &crate::typed::decl::Callable(__egglog_record),
             ::std::vec![
@@ -4628,7 +4627,7 @@ impl self::I64 {
         let mut __egglog_record =
             ::core::clone::Clone::clone(crate::typed::storage::builtin_catalog());
         __egglog_record.arena = crate::typed::storage::Arena::Primitive;
-        __egglog_record.index = 83;
+        __egglog_record.index = 82;
         <self::Bool as crate::typed::EgglogValue>::from_expression(
             crate::typed::expr::Expr::call_with_result(
                 &crate::typed::decl::Callable(__egglog_record),
@@ -4650,7 +4649,7 @@ impl self::I64 {
         let mut __egglog_record =
             ::core::clone::Clone::clone(crate::typed::storage::builtin_catalog());
         __egglog_record.arena = crate::typed::storage::Arena::Primitive;
-        __egglog_record.index = 84;
+        __egglog_record.index = 83;
         <self::Bool as crate::typed::EgglogValue>::from_expression(
             crate::typed::expr::Expr::call_with_result(
                 &crate::typed::decl::Callable(__egglog_record),
@@ -4672,7 +4671,7 @@ impl self::I64 {
         let mut __egglog_record =
             ::core::clone::Clone::clone(crate::typed::storage::builtin_catalog());
         __egglog_record.arena = crate::typed::storage::Arena::Primitive;
-        __egglog_record.index = 85;
+        __egglog_record.index = 84;
         <self::Bool as crate::typed::EgglogValue>::from_expression(
             crate::typed::expr::Expr::call_with_result(
                 &crate::typed::decl::Callable(__egglog_record),
@@ -4694,7 +4693,7 @@ impl self::I64 {
         let mut __egglog_record =
             ::core::clone::Clone::clone(crate::typed::storage::builtin_catalog());
         __egglog_record.arena = crate::typed::storage::Arena::Primitive;
-        __egglog_record.index = 86;
+        __egglog_record.index = 85;
         <self::Bool as crate::typed::EgglogValue>::from_expression(
             crate::typed::expr::Expr::call_with_result(
                 &crate::typed::decl::Callable(__egglog_record),
@@ -4716,7 +4715,7 @@ impl self::I64 {
         let mut __egglog_record =
             ::core::clone::Clone::clone(crate::typed::storage::builtin_catalog());
         __egglog_record.arena = crate::typed::storage::Arena::Primitive;
-        __egglog_record.index = 87;
+        __egglog_record.index = 86;
         <self::Bool as crate::typed::EgglogValue>::from_expression(
             crate::typed::expr::Expr::call_with_result(
                 &crate::typed::decl::Callable(__egglog_record),
@@ -4734,7 +4733,7 @@ impl ::core::ops::Div<self::I64> for self::I64 {
         let mut __egglog_record =
             ::core::clone::Clone::clone(crate::typed::storage::builtin_catalog());
         __egglog_record.arena = crate::typed::storage::Arena::Primitive;
-        __egglog_record.index = 88;
+        __egglog_record.index = 87;
         <self::I64 as crate::typed::EgglogValue>::from_expression(crate::typed::expr::Expr::call(
             &crate::typed::decl::Callable(__egglog_record),
             ::std::vec![
@@ -4751,7 +4750,7 @@ impl ::core::ops::Div<&self::I64> for self::I64 {
         let mut __egglog_record =
             ::core::clone::Clone::clone(crate::typed::storage::builtin_catalog());
         __egglog_record.arena = crate::typed::storage::Arena::Primitive;
-        __egglog_record.index = 88;
+        __egglog_record.index = 87;
         <self::I64 as crate::typed::EgglogValue>::from_expression(crate::typed::expr::Expr::call(
             &crate::typed::decl::Callable(__egglog_record),
             ::std::vec![
@@ -4768,7 +4767,7 @@ impl ::core::ops::Div<self::I64> for &self::I64 {
         let mut __egglog_record =
             ::core::clone::Clone::clone(crate::typed::storage::builtin_catalog());
         __egglog_record.arena = crate::typed::storage::Arena::Primitive;
-        __egglog_record.index = 88;
+        __egglog_record.index = 87;
         <self::I64 as crate::typed::EgglogValue>::from_expression(crate::typed::expr::Expr::call(
             &crate::typed::decl::Callable(__egglog_record),
             ::std::vec![
@@ -4785,7 +4784,7 @@ impl ::core::ops::Div<&self::I64> for &self::I64 {
         let mut __egglog_record =
             ::core::clone::Clone::clone(crate::typed::storage::builtin_catalog());
         __egglog_record.arena = crate::typed::storage::Arena::Primitive;
-        __egglog_record.index = 88;
+        __egglog_record.index = 87;
         <self::I64 as crate::typed::EgglogValue>::from_expression(crate::typed::expr::Expr::call(
             &crate::typed::decl::Callable(__egglog_record),
             ::std::vec![
@@ -4807,7 +4806,7 @@ impl self::I64 {
         let mut __egglog_record =
             ::core::clone::Clone::clone(crate::typed::storage::builtin_catalog());
         __egglog_record.arena = crate::typed::storage::Arena::Primitive;
-        __egglog_record.index = 89;
+        __egglog_record.index = 88;
         <self::Unit as crate::typed::EgglogValue>::from_expression(
             crate::typed::expr::Expr::call_with_result(
                 &crate::typed::decl::Callable(__egglog_record),
@@ -4829,7 +4828,7 @@ impl self::I64 {
         let mut __egglog_record =
             ::core::clone::Clone::clone(crate::typed::storage::builtin_catalog());
         __egglog_record.arena = crate::typed::storage::Arena::Primitive;
-        __egglog_record.index = 90;
+        __egglog_record.index = 89;
         <self::Unit as crate::typed::EgglogValue>::from_expression(
             crate::typed::expr::Expr::call_with_result(
                 &crate::typed::decl::Callable(__egglog_record),
@@ -4851,7 +4850,7 @@ impl self::I64 {
         let mut __egglog_record =
             ::core::clone::Clone::clone(crate::typed::storage::builtin_catalog());
         __egglog_record.arena = crate::typed::storage::Arena::Primitive;
-        __egglog_record.index = 91;
+        __egglog_record.index = 90;
         <self::Unit as crate::typed::EgglogValue>::from_expression(
             crate::typed::expr::Expr::call_with_result(
                 &crate::typed::decl::Callable(__egglog_record),
@@ -4870,7 +4869,7 @@ impl self::I64 {
         let mut __egglog_record =
             ::core::clone::Clone::clone(crate::typed::storage::builtin_catalog());
         __egglog_record.arena = crate::typed::storage::Arena::Primitive;
-        __egglog_record.index = 92;
+        __egglog_record.index = 91;
         <self::I64 as crate::typed::EgglogValue>::from_expression(
             crate::typed::expr::Expr::call_with_result(
                 &crate::typed::decl::Callable(__egglog_record),
@@ -4892,7 +4891,7 @@ impl self::I64 {
         let mut __egglog_record =
             ::core::clone::Clone::clone(crate::typed::storage::builtin_catalog());
         __egglog_record.arena = crate::typed::storage::Arena::Primitive;
-        __egglog_record.index = 93;
+        __egglog_record.index = 92;
         <self::Unit as crate::typed::EgglogValue>::from_expression(
             crate::typed::expr::Expr::call_with_result(
                 &crate::typed::decl::Callable(__egglog_record),
@@ -4914,7 +4913,7 @@ impl self::I64 {
         let mut __egglog_record =
             ::core::clone::Clone::clone(crate::typed::storage::builtin_catalog());
         __egglog_record.arena = crate::typed::storage::Arena::Primitive;
-        __egglog_record.index = 94;
+        __egglog_record.index = 93;
         <self::I64 as crate::typed::EgglogValue>::from_expression(
             crate::typed::expr::Expr::call_with_result(
                 &crate::typed::decl::Callable(__egglog_record),
@@ -4936,7 +4935,7 @@ impl self::I64 {
         let mut __egglog_record =
             ::core::clone::Clone::clone(crate::typed::storage::builtin_catalog());
         __egglog_record.arena = crate::typed::storage::Arena::Primitive;
-        __egglog_record.index = 95;
+        __egglog_record.index = 94;
         <self::I64 as crate::typed::EgglogValue>::from_expression(
             crate::typed::expr::Expr::call_with_result(
                 &crate::typed::decl::Callable(__egglog_record),
@@ -4954,7 +4953,7 @@ impl ::core::ops::Mul<self::I64> for self::I64 {
         let mut __egglog_record =
             ::core::clone::Clone::clone(crate::typed::storage::builtin_catalog());
         __egglog_record.arena = crate::typed::storage::Arena::Primitive;
-        __egglog_record.index = 96;
+        __egglog_record.index = 95;
         <self::I64 as crate::typed::EgglogValue>::from_expression(crate::typed::expr::Expr::call(
             &crate::typed::decl::Callable(__egglog_record),
             ::std::vec![
@@ -4971,7 +4970,7 @@ impl ::core::ops::Mul<&self::I64> for self::I64 {
         let mut __egglog_record =
             ::core::clone::Clone::clone(crate::typed::storage::builtin_catalog());
         __egglog_record.arena = crate::typed::storage::Arena::Primitive;
-        __egglog_record.index = 96;
+        __egglog_record.index = 95;
         <self::I64 as crate::typed::EgglogValue>::from_expression(crate::typed::expr::Expr::call(
             &crate::typed::decl::Callable(__egglog_record),
             ::std::vec![
@@ -4988,7 +4987,7 @@ impl ::core::ops::Mul<self::I64> for &self::I64 {
         let mut __egglog_record =
             ::core::clone::Clone::clone(crate::typed::storage::builtin_catalog());
         __egglog_record.arena = crate::typed::storage::Arena::Primitive;
-        __egglog_record.index = 96;
+        __egglog_record.index = 95;
         <self::I64 as crate::typed::EgglogValue>::from_expression(crate::typed::expr::Expr::call(
             &crate::typed::decl::Callable(__egglog_record),
             ::std::vec![
@@ -5005,7 +5004,7 @@ impl ::core::ops::Mul<&self::I64> for &self::I64 {
         let mut __egglog_record =
             ::core::clone::Clone::clone(crate::typed::storage::builtin_catalog());
         __egglog_record.arena = crate::typed::storage::Arena::Primitive;
-        __egglog_record.index = 96;
+        __egglog_record.index = 95;
         <self::I64 as crate::typed::EgglogValue>::from_expression(crate::typed::expr::Expr::call(
             &crate::typed::decl::Callable(__egglog_record),
             ::std::vec![
@@ -5022,7 +5021,7 @@ impl ::core::ops::Not for self::I64 {
         let mut __egglog_record =
             ::core::clone::Clone::clone(crate::typed::storage::builtin_catalog());
         __egglog_record.arena = crate::typed::storage::Arena::Primitive;
-        __egglog_record.index = 97;
+        __egglog_record.index = 96;
         <self::I64 as crate::typed::EgglogValue>::from_expression(
             crate::typed::expr::Expr::call_with_result(
                 &crate::typed::decl::Callable(__egglog_record),
@@ -5040,7 +5039,7 @@ impl ::core::ops::Not for &self::I64 {
         let mut __egglog_record =
             ::core::clone::Clone::clone(crate::typed::storage::builtin_catalog());
         __egglog_record.arena = crate::typed::storage::Arena::Primitive;
-        __egglog_record.index = 97;
+        __egglog_record.index = 96;
         <self::I64 as crate::typed::EgglogValue>::from_expression(
             crate::typed::expr::Expr::call_with_result(
                 &crate::typed::decl::Callable(__egglog_record),
@@ -5058,7 +5057,7 @@ impl ::core::ops::Rem<self::I64> for self::I64 {
         let mut __egglog_record =
             ::core::clone::Clone::clone(crate::typed::storage::builtin_catalog());
         __egglog_record.arena = crate::typed::storage::Arena::Primitive;
-        __egglog_record.index = 98;
+        __egglog_record.index = 97;
         <self::I64 as crate::typed::EgglogValue>::from_expression(crate::typed::expr::Expr::call(
             &crate::typed::decl::Callable(__egglog_record),
             ::std::vec![
@@ -5075,7 +5074,7 @@ impl ::core::ops::Rem<&self::I64> for self::I64 {
         let mut __egglog_record =
             ::core::clone::Clone::clone(crate::typed::storage::builtin_catalog());
         __egglog_record.arena = crate::typed::storage::Arena::Primitive;
-        __egglog_record.index = 98;
+        __egglog_record.index = 97;
         <self::I64 as crate::typed::EgglogValue>::from_expression(crate::typed::expr::Expr::call(
             &crate::typed::decl::Callable(__egglog_record),
             ::std::vec![
@@ -5092,7 +5091,7 @@ impl ::core::ops::Rem<self::I64> for &self::I64 {
         let mut __egglog_record =
             ::core::clone::Clone::clone(crate::typed::storage::builtin_catalog());
         __egglog_record.arena = crate::typed::storage::Arena::Primitive;
-        __egglog_record.index = 98;
+        __egglog_record.index = 97;
         <self::I64 as crate::typed::EgglogValue>::from_expression(crate::typed::expr::Expr::call(
             &crate::typed::decl::Callable(__egglog_record),
             ::std::vec![
@@ -5109,7 +5108,7 @@ impl ::core::ops::Rem<&self::I64> for &self::I64 {
         let mut __egglog_record =
             ::core::clone::Clone::clone(crate::typed::storage::builtin_catalog());
         __egglog_record.arena = crate::typed::storage::Arena::Primitive;
-        __egglog_record.index = 98;
+        __egglog_record.index = 97;
         <self::I64 as crate::typed::EgglogValue>::from_expression(crate::typed::expr::Expr::call(
             &crate::typed::decl::Callable(__egglog_record),
             ::std::vec![
@@ -5126,7 +5125,7 @@ impl ::core::ops::Shl<self::I64> for self::I64 {
         let mut __egglog_record =
             ::core::clone::Clone::clone(crate::typed::storage::builtin_catalog());
         __egglog_record.arena = crate::typed::storage::Arena::Primitive;
-        __egglog_record.index = 99;
+        __egglog_record.index = 98;
         <self::I64 as crate::typed::EgglogValue>::from_expression(crate::typed::expr::Expr::call(
             &crate::typed::decl::Callable(__egglog_record),
             ::std::vec![
@@ -5143,7 +5142,7 @@ impl ::core::ops::Shl<&self::I64> for self::I64 {
         let mut __egglog_record =
             ::core::clone::Clone::clone(crate::typed::storage::builtin_catalog());
         __egglog_record.arena = crate::typed::storage::Arena::Primitive;
-        __egglog_record.index = 99;
+        __egglog_record.index = 98;
         <self::I64 as crate::typed::EgglogValue>::from_expression(crate::typed::expr::Expr::call(
             &crate::typed::decl::Callable(__egglog_record),
             ::std::vec![
@@ -5160,7 +5159,7 @@ impl ::core::ops::Shl<self::I64> for &self::I64 {
         let mut __egglog_record =
             ::core::clone::Clone::clone(crate::typed::storage::builtin_catalog());
         __egglog_record.arena = crate::typed::storage::Arena::Primitive;
-        __egglog_record.index = 99;
+        __egglog_record.index = 98;
         <self::I64 as crate::typed::EgglogValue>::from_expression(crate::typed::expr::Expr::call(
             &crate::typed::decl::Callable(__egglog_record),
             ::std::vec![
@@ -5177,7 +5176,7 @@ impl ::core::ops::Shl<&self::I64> for &self::I64 {
         let mut __egglog_record =
             ::core::clone::Clone::clone(crate::typed::storage::builtin_catalog());
         __egglog_record.arena = crate::typed::storage::Arena::Primitive;
-        __egglog_record.index = 99;
+        __egglog_record.index = 98;
         <self::I64 as crate::typed::EgglogValue>::from_expression(crate::typed::expr::Expr::call(
             &crate::typed::decl::Callable(__egglog_record),
             ::std::vec![
@@ -5194,7 +5193,7 @@ impl ::core::ops::Shr<self::I64> for self::I64 {
         let mut __egglog_record =
             ::core::clone::Clone::clone(crate::typed::storage::builtin_catalog());
         __egglog_record.arena = crate::typed::storage::Arena::Primitive;
-        __egglog_record.index = 100;
+        __egglog_record.index = 99;
         <self::I64 as crate::typed::EgglogValue>::from_expression(crate::typed::expr::Expr::call(
             &crate::typed::decl::Callable(__egglog_record),
             ::std::vec![
@@ -5211,7 +5210,7 @@ impl ::core::ops::Shr<&self::I64> for self::I64 {
         let mut __egglog_record =
             ::core::clone::Clone::clone(crate::typed::storage::builtin_catalog());
         __egglog_record.arena = crate::typed::storage::Arena::Primitive;
-        __egglog_record.index = 100;
+        __egglog_record.index = 99;
         <self::I64 as crate::typed::EgglogValue>::from_expression(crate::typed::expr::Expr::call(
             &crate::typed::decl::Callable(__egglog_record),
             ::std::vec![
@@ -5228,7 +5227,7 @@ impl ::core::ops::Shr<self::I64> for &self::I64 {
         let mut __egglog_record =
             ::core::clone::Clone::clone(crate::typed::storage::builtin_catalog());
         __egglog_record.arena = crate::typed::storage::Arena::Primitive;
-        __egglog_record.index = 100;
+        __egglog_record.index = 99;
         <self::I64 as crate::typed::EgglogValue>::from_expression(crate::typed::expr::Expr::call(
             &crate::typed::decl::Callable(__egglog_record),
             ::std::vec![
@@ -5245,7 +5244,7 @@ impl ::core::ops::Shr<&self::I64> for &self::I64 {
         let mut __egglog_record =
             ::core::clone::Clone::clone(crate::typed::storage::builtin_catalog());
         __egglog_record.arena = crate::typed::storage::Arena::Primitive;
-        __egglog_record.index = 100;
+        __egglog_record.index = 99;
         <self::I64 as crate::typed::EgglogValue>::from_expression(crate::typed::expr::Expr::call(
             &crate::typed::decl::Callable(__egglog_record),
             ::std::vec![
@@ -5262,7 +5261,7 @@ impl ::core::ops::Sub<self::I64> for self::I64 {
         let mut __egglog_record =
             ::core::clone::Clone::clone(crate::typed::storage::builtin_catalog());
         __egglog_record.arena = crate::typed::storage::Arena::Primitive;
-        __egglog_record.index = 101;
+        __egglog_record.index = 100;
         <self::I64 as crate::typed::EgglogValue>::from_expression(crate::typed::expr::Expr::call(
             &crate::typed::decl::Callable(__egglog_record),
             ::std::vec![
@@ -5279,7 +5278,7 @@ impl ::core::ops::Sub<&self::I64> for self::I64 {
         let mut __egglog_record =
             ::core::clone::Clone::clone(crate::typed::storage::builtin_catalog());
         __egglog_record.arena = crate::typed::storage::Arena::Primitive;
-        __egglog_record.index = 101;
+        __egglog_record.index = 100;
         <self::I64 as crate::typed::EgglogValue>::from_expression(crate::typed::expr::Expr::call(
             &crate::typed::decl::Callable(__egglog_record),
             ::std::vec![
@@ -5296,7 +5295,7 @@ impl ::core::ops::Sub<self::I64> for &self::I64 {
         let mut __egglog_record =
             ::core::clone::Clone::clone(crate::typed::storage::builtin_catalog());
         __egglog_record.arena = crate::typed::storage::Arena::Primitive;
-        __egglog_record.index = 101;
+        __egglog_record.index = 100;
         <self::I64 as crate::typed::EgglogValue>::from_expression(crate::typed::expr::Expr::call(
             &crate::typed::decl::Callable(__egglog_record),
             ::std::vec![
@@ -5313,7 +5312,7 @@ impl ::core::ops::Sub<&self::I64> for &self::I64 {
         let mut __egglog_record =
             ::core::clone::Clone::clone(crate::typed::storage::builtin_catalog());
         __egglog_record.arena = crate::typed::storage::Arena::Primitive;
-        __egglog_record.index = 101;
+        __egglog_record.index = 100;
         <self::I64 as crate::typed::EgglogValue>::from_expression(crate::typed::expr::Expr::call(
             &crate::typed::decl::Callable(__egglog_record),
             ::std::vec![
@@ -5332,7 +5331,7 @@ impl self::I64 {
         let mut __egglog_record =
             ::core::clone::Clone::clone(crate::typed::storage::builtin_catalog());
         __egglog_record.arena = crate::typed::storage::Arena::Primitive;
-        __egglog_record.index = 102;
+        __egglog_record.index = 101;
         <self::String as crate::typed::EgglogValue>::from_expression(
             crate::typed::expr::Expr::call_with_result(
                 &crate::typed::decl::Callable(__egglog_record),
@@ -5362,7 +5361,7 @@ impl<__EgglogType0: crate::typed::EgglogValue, __EgglogType1: crate::typed::Eggl
         let mut __egglog_record =
             ::core::clone::Clone::clone(crate::typed::storage::builtin_catalog());
         __egglog_record.arena = crate::typed::storage::Arena::Primitive;
-        __egglog_record.index = 103;
+        __egglog_record.index = 102;
         <self::Unit as crate::typed::EgglogValue>::from_expression(
             crate::typed::expr::Expr::call_with_result(
                 &crate::typed::decl::Callable(__egglog_record),
@@ -5384,7 +5383,7 @@ impl<__EgglogType0: crate::typed::EgglogValue, __EgglogType1: crate::typed::Eggl
         let mut __egglog_record =
             ::core::clone::Clone::clone(crate::typed::storage::builtin_catalog());
         __egglog_record.arena = crate::typed::storage::Arena::Primitive;
-        __egglog_record.index = 104;
+        __egglog_record.index = 103;
         <self::Map<__EgglogType0, __EgglogType1> as crate::typed::EgglogValue>::from_expression(
             crate::typed::expr::Expr::call_with_result(
                 &crate::typed::decl::Callable(__egglog_record),
@@ -5411,7 +5410,7 @@ impl<__EgglogType0: crate::typed::EgglogValue, __EgglogType1: crate::typed::Eggl
         let mut __egglog_record =
             ::core::clone::Clone::clone(crate::typed::storage::builtin_catalog());
         __egglog_record.arena = crate::typed::storage::Arena::Primitive;
-        __egglog_record.index = 105;
+        __egglog_record.index = 104;
         <__EgglogType1 as crate::typed::EgglogValue>::from_expression(
             crate::typed::expr::Expr::call_with_result(
                 &crate::typed::decl::Callable(__egglog_record),
@@ -5451,7 +5450,7 @@ impl<__EgglogType0: crate::typed::EgglogValue, __EgglogType1: crate::typed::Eggl
         let mut __egglog_record =
             ::core::clone::Clone::clone(crate::typed::storage::builtin_catalog());
         __egglog_record.arena = crate::typed::storage::Arena::Primitive;
-        __egglog_record.index = 106;
+        __egglog_record.index = 105;
         <self::Map<__EgglogType0, __EgglogType1> as crate::typed::EgglogValue>::from_expression(
             crate::typed::expr::Expr::call_with_result(
                 &crate::typed::decl::Callable(__egglog_record),
@@ -5473,7 +5472,7 @@ impl<__EgglogType0: crate::typed::EgglogValue, __EgglogType1: crate::typed::Eggl
         let mut __egglog_record =
             ::core::clone::Clone::clone(crate::typed::storage::builtin_catalog());
         __egglog_record.arena = crate::typed::storage::Arena::Primitive;
-        __egglog_record.index = 107;
+        __egglog_record.index = 106;
         <self::I64 as crate::typed::EgglogValue>::from_expression(
             crate::typed::expr::Expr::call_with_result(
                 &crate::typed::decl::Callable(__egglog_record),
@@ -5503,7 +5502,7 @@ impl<__EgglogType0: crate::typed::EgglogValue, __EgglogType1: crate::typed::Eggl
         let mut __egglog_record =
             ::core::clone::Clone::clone(crate::typed::storage::builtin_catalog());
         __egglog_record.arena = crate::typed::storage::Arena::Primitive;
-        __egglog_record.index = 108;
+        __egglog_record.index = 107;
         <self::Unit as crate::typed::EgglogValue>::from_expression(
             crate::typed::expr::Expr::call_with_result(
                 &crate::typed::decl::Callable(__egglog_record),
@@ -5531,7 +5530,7 @@ impl<__EgglogType0: crate::typed::EgglogValue, __EgglogType1: crate::typed::Eggl
         let mut __egglog_record =
             ::core::clone::Clone::clone(crate::typed::storage::builtin_catalog());
         __egglog_record.arena = crate::typed::storage::Arena::Primitive;
-        __egglog_record.index = 109;
+        __egglog_record.index = 108;
         <self::Map<__EgglogType0, __EgglogType1> as crate::typed::EgglogValue>::from_expression(
             crate::typed::expr::Expr::call_with_result(
                 &crate::typed::decl::Callable(__egglog_record),
@@ -5561,7 +5560,7 @@ impl<__EgglogType0: crate::typed::EgglogValue, __EgglogType1: crate::typed::Eggl
         let mut __egglog_record =
             ::core::clone::Clone::clone(crate::typed::storage::builtin_catalog());
         __egglog_record.arena = crate::typed::storage::Arena::Primitive;
-        __egglog_record.index = 110;
+        __egglog_record.index = 109;
         <self::Map<__EgglogType0, __EgglogType1> as crate::typed::EgglogValue>::from_expression(
             crate::typed::expr::Expr::call_with_result(
                 &crate::typed::decl::Callable(__egglog_record),
@@ -5597,7 +5596,7 @@ impl<__EgglogType0: crate::typed::EgglogValue> self::MultiSet<__EgglogType0> {
         let mut __egglog_record =
             ::core::clone::Clone::clone(crate::typed::storage::builtin_catalog());
         __egglog_record.arena = crate::typed::storage::Arena::Primitive;
-        __egglog_record.index = 111;
+        __egglog_record.index = 110;
         <self::Unit as crate::typed::EgglogValue>::from_expression(
             crate::typed::expr::Expr::call_with_result(
                 &crate::typed::decl::Callable(__egglog_record),
@@ -5625,7 +5624,7 @@ impl<__EgglogType0: crate::typed::EgglogValue> self::MultiSet<__EgglogType0> {
         let mut __egglog_record =
             ::core::clone::Clone::clone(crate::typed::storage::builtin_catalog());
         __egglog_record.arena = crate::typed::storage::Arena::Primitive;
-        __egglog_record.index = 112;
+        __egglog_record.index = 111;
         <self::Unit as crate::typed::EgglogValue>::from_expression(
             crate::typed::expr::Expr::call_with_result(
                 &crate::typed::decl::Callable(__egglog_record),
@@ -5648,7 +5647,7 @@ pub fn multiset_contains_swapped<__EgglogType0: crate::typed::expr::ValueInput>(
 
     let mut __egglog_record = ::core::clone::Clone::clone(crate::typed::storage::builtin_catalog());
     __egglog_record.arena = crate::typed::storage::Arena::Primitive;
-    __egglog_record.index = 113;
+    __egglog_record.index = 112;
     <self::Unit as crate::typed::EgglogValue>::from_expression(
         crate::typed::expr::Expr::call_with_result(
             &crate::typed::decl::Callable(__egglog_record),
@@ -5672,7 +5671,7 @@ impl<__EgglogType0: crate::typed::EgglogValue> self::MultiSet<__EgglogType0> {
         let mut __egglog_record =
             ::core::clone::Clone::clone(crate::typed::storage::builtin_catalog());
         __egglog_record.arena = crate::typed::storage::Arena::Primitive;
-        __egglog_record.index = 114;
+        __egglog_record.index = 113;
         <self::I64 as crate::typed::EgglogValue>::from_expression(
             crate::typed::expr::Expr::call_with_result(
                 &crate::typed::decl::Callable(__egglog_record),
@@ -5708,7 +5707,7 @@ impl<__EgglogType0: crate::typed::EgglogValue> self::MultiSet<__EgglogType0> {
         let mut __egglog_record =
             ::core::clone::Clone::clone(crate::typed::storage::builtin_catalog());
         __egglog_record.arena = crate::typed::storage::Arena::Primitive;
-        __egglog_record.index = 115;
+        __egglog_record.index = 114;
         <self::Unit as crate::typed::EgglogValue>::from_expression(
             crate::typed::expr::Expr::call_with_result(
                 &crate::typed::decl::Callable(__egglog_record),
@@ -5738,7 +5737,7 @@ impl<__EgglogType0: crate::typed::EgglogValue> self::MultiSet<__EgglogType0> {
         let mut __egglog_record =
             ::core::clone::Clone::clone(crate::typed::storage::builtin_catalog());
         __egglog_record.arena = crate::typed::storage::Arena::Primitive;
-        __egglog_record.index = 116;
+        __egglog_record.index = 115;
         <self::MultiSet<__EgglogType0> as crate::typed::EgglogValue>::from_expression(
             crate::typed::expr::Expr::call_with_result(
                 &crate::typed::decl::Callable(__egglog_record),
@@ -5768,7 +5767,7 @@ impl<__EgglogType0: crate::typed::EgglogValue> self::MultiSet<__EgglogType0> {
         let mut __egglog_record =
             ::core::clone::Clone::clone(crate::typed::storage::builtin_catalog());
         __egglog_record.arena = crate::typed::storage::Arena::Primitive;
-        __egglog_record.index = 117;
+        __egglog_record.index = 116;
         <self::MultiSet<__EgglogType0> as crate::typed::EgglogValue>::from_expression(
             crate::typed::expr::Expr::call_with_result(
                 &crate::typed::decl::Callable(__egglog_record),
@@ -5801,7 +5800,7 @@ pub fn multiset_flat_map<__EgglogType0: crate::typed::EgglogValue>(
 
     let mut __egglog_record = ::core::clone::Clone::clone(crate::typed::storage::builtin_catalog());
     __egglog_record.arena = crate::typed::storage::Arena::Primitive;
-    __egglog_record.index = 118;
+    __egglog_record.index = 117;
     <self::MultiSet<__EgglogType0> as crate::typed::EgglogValue>::from_expression(
         crate::typed::expr::Expr::call_with_result(
             &crate::typed::decl::Callable(__egglog_record),
@@ -5828,7 +5827,7 @@ impl<__EgglogType0: crate::typed::EgglogValue> self::MultiSet<__EgglogType0> {
         let mut __egglog_record =
             ::core::clone::Clone::clone(crate::typed::storage::builtin_catalog());
         __egglog_record.arena = crate::typed::storage::Arena::Primitive;
-        __egglog_record.index = 119;
+        __egglog_record.index = 118;
         <self::MultiSet<__EgglogType0> as crate::typed::EgglogValue>::from_expression(
             crate::typed::expr::Expr::call_with_result(
                 &crate::typed::decl::Callable(__egglog_record),
@@ -5859,7 +5858,7 @@ impl<__EgglogType0: crate::typed::EgglogValue> self::MultiSet<__EgglogType0> {
         let mut __egglog_record =
             ::core::clone::Clone::clone(crate::typed::storage::builtin_catalog());
         __egglog_record.arena = crate::typed::storage::Arena::Primitive;
-        __egglog_record.index = 120;
+        __egglog_record.index = 119;
         <self::MultiSet<__EgglogType0> as crate::typed::EgglogValue>::from_expression(
             crate::typed::expr::Expr::call_with_result(
                 &crate::typed::decl::Callable(__egglog_record),
@@ -5879,7 +5878,7 @@ impl<__EgglogType0: crate::typed::EgglogValue> self::MultiSet<__EgglogType0> {
         let mut __egglog_record =
             ::core::clone::Clone::clone(crate::typed::storage::builtin_catalog());
         __egglog_record.arena = crate::typed::storage::Arena::Primitive;
-        __egglog_record.index = 121;
+        __egglog_record.index = 120;
         <self::I64 as crate::typed::EgglogValue>::from_expression(
             crate::typed::expr::Expr::call_with_result(
                 &crate::typed::decl::Callable(__egglog_record),
@@ -5902,7 +5901,7 @@ impl<__EgglogType0: crate::typed::EgglogValue> self::MultiSet<__EgglogType0> {
         let mut __egglog_record =
             ::core::clone::Clone::clone(crate::typed::storage::builtin_catalog());
         __egglog_record.arena = crate::typed::storage::Arena::Primitive;
-        __egglog_record.index = 122;
+        __egglog_record.index = 121;
         <self::MultiSet<__EgglogType1> as crate::typed::EgglogValue>::from_expression(
             crate::typed::expr::Expr::call_with_result(
                 &crate::typed::decl::Callable(__egglog_record),
@@ -5930,7 +5929,7 @@ impl<__EgglogType0: crate::typed::EgglogValue> self::MultiSet<__EgglogType0> {
         let mut __egglog_record =
             ::core::clone::Clone::clone(crate::typed::storage::builtin_catalog());
         __egglog_record.arena = crate::typed::storage::Arena::Primitive;
-        __egglog_record.index = 123;
+        __egglog_record.index = 122;
         <self::Unit as crate::typed::EgglogValue>::from_expression(
             crate::typed::expr::Expr::call_with_result(
                 &crate::typed::decl::Callable(__egglog_record),
@@ -5953,7 +5952,7 @@ pub fn multiset_not_contains_swapped<__EgglogType0: crate::typed::expr::ValueInp
 
     let mut __egglog_record = ::core::clone::Clone::clone(crate::typed::storage::builtin_catalog());
     __egglog_record.arena = crate::typed::storage::Arena::Primitive;
-    __egglog_record.index = 124;
+    __egglog_record.index = 123;
     <self::Unit as crate::typed::EgglogValue>::from_expression(
         crate::typed::expr::Expr::call_with_result(
             &crate::typed::decl::Callable(__egglog_record),
@@ -5981,7 +5980,7 @@ impl<__EgglogType0: crate::typed::EgglogValue> self::MultiSet<__EgglogType0> {
         let mut __egglog_record =
             ::core::clone::Clone::clone(crate::typed::storage::builtin_catalog());
         __egglog_record.arena = crate::typed::storage::Arena::Primitive;
-        __egglog_record.index = 125;
+        __egglog_record.index = 124;
         <self::MultiSet<__EgglogType0> as crate::typed::EgglogValue>::from_expression(
             crate::typed::expr::Expr::call_with_result(
                 &crate::typed::decl::Callable(__egglog_record),
@@ -6001,7 +6000,7 @@ impl<__EgglogType0: crate::typed::EgglogValue> self::MultiSet<__EgglogType0> {
         let mut __egglog_record =
             ::core::clone::Clone::clone(crate::typed::storage::builtin_catalog());
         __egglog_record.arena = crate::typed::storage::Arena::Primitive;
-        __egglog_record.index = 126;
+        __egglog_record.index = 125;
         <__EgglogType0 as crate::typed::EgglogValue>::from_expression(
             crate::typed::expr::Expr::call_with_result(
                 &crate::typed::decl::Callable(__egglog_record),
@@ -6021,7 +6020,7 @@ impl<__EgglogType0: crate::typed::EgglogValue> self::MultiSet<__EgglogType0> {
         let mut __egglog_record =
             ::core::clone::Clone::clone(crate::typed::storage::builtin_catalog());
         __egglog_record.arena = crate::typed::storage::Arena::Primitive;
-        __egglog_record.index = 127;
+        __egglog_record.index = 126;
         <__EgglogType0 as crate::typed::EgglogValue>::from_expression(
             crate::typed::expr::Expr::call_with_result(
                 &crate::typed::decl::Callable(__egglog_record),
@@ -6053,7 +6052,7 @@ pub fn multiset_fold<__EgglogType0: crate::typed::expr::ValueInput>(
 
     let mut __egglog_record = ::core::clone::Clone::clone(crate::typed::storage::builtin_catalog());
     __egglog_record.arena = crate::typed::storage::Arena::Primitive;
-    __egglog_record.index = 128;
+    __egglog_record.index = 127;
     <<__EgglogType0 as crate::typed::expr::ValueInput>::Owned as crate::typed::EgglogValue>::from_expression(crate::typed::expr::Expr::call_with_result(
             &crate::typed::decl::Callable(__egglog_record), __egglog_args,
             <<__EgglogType0 as crate::typed::expr::ValueInput>::Owned as crate::typed::EgglogValue>::sort_ref(),
@@ -6076,7 +6075,7 @@ impl<__EgglogType0: crate::typed::EgglogValue> self::MultiSet<__EgglogType0> {
         let mut __egglog_record =
             ::core::clone::Clone::clone(crate::typed::storage::builtin_catalog());
         __egglog_record.arena = crate::typed::storage::Arena::Primitive;
-        __egglog_record.index = 129;
+        __egglog_record.index = 128;
         <self::MultiSet<__EgglogType0> as crate::typed::EgglogValue>::from_expression(
             crate::typed::expr::Expr::call_with_result(
                 &crate::typed::decl::Callable(__egglog_record),
@@ -6099,7 +6098,7 @@ pub fn multiset_remove_swapped<__EgglogType0: crate::typed::expr::ValueInput>(
 
     let mut __egglog_record = ::core::clone::Clone::clone(crate::typed::storage::builtin_catalog());
     __egglog_record.arena = crate::typed::storage::Arena::Primitive;
-    __egglog_record.index = 130;
+    __egglog_record.index = 129;
     <self::MultiSet<<__EgglogType0 as crate::typed::expr::ValueInput>::Owned> as crate::typed::EgglogValue>::from_expression(crate::typed::expr::Expr::call_with_result(
             &crate::typed::decl::Callable(__egglog_record), __egglog_args,
             <self::MultiSet<<__EgglogType0 as crate::typed::expr::ValueInput>::Owned> as crate::typed::EgglogValue>::sort_ref(),
@@ -6114,7 +6113,7 @@ impl<__EgglogType0: crate::typed::EgglogValue> self::MultiSet<__EgglogType0> {
         let mut __egglog_record =
             ::core::clone::Clone::clone(crate::typed::storage::builtin_catalog());
         __egglog_record.arena = crate::typed::storage::Arena::Primitive;
-        __egglog_record.index = 131;
+        __egglog_record.index = 130;
         <self::MultiSet<__EgglogType0> as crate::typed::EgglogValue>::from_expression(
             crate::typed::expr::Expr::call_with_result(
                 &crate::typed::decl::Callable(__egglog_record),
@@ -6150,7 +6149,7 @@ impl<__EgglogType0: crate::typed::EgglogValue> self::MultiSet<__EgglogType0> {
         let mut __egglog_record =
             ::core::clone::Clone::clone(crate::typed::storage::builtin_catalog());
         __egglog_record.arena = crate::typed::storage::Arena::Primitive;
-        __egglog_record.index = 132;
+        __egglog_record.index = 131;
         <self::MultiSet<__EgglogType0> as crate::typed::EgglogValue>::from_expression(
             crate::typed::expr::Expr::call_with_result(
                 &crate::typed::decl::Callable(__egglog_record),
@@ -6181,7 +6180,7 @@ impl<__EgglogType0: crate::typed::EgglogValue> self::MultiSet<__EgglogType0> {
         let mut __egglog_record =
             ::core::clone::Clone::clone(crate::typed::storage::builtin_catalog());
         __egglog_record.arena = crate::typed::storage::Arena::Primitive;
-        __egglog_record.index = 133;
+        __egglog_record.index = 132;
         <self::MultiSet<__EgglogType0> as crate::typed::EgglogValue>::from_expression(
             crate::typed::expr::Expr::call_with_result(
                 &crate::typed::decl::Callable(__egglog_record),
@@ -6213,7 +6212,7 @@ pub fn multiset_subtract_swapped<__EgglogType0: crate::typed::EgglogValue>(
 
     let mut __egglog_record = ::core::clone::Clone::clone(crate::typed::storage::builtin_catalog());
     __egglog_record.arena = crate::typed::storage::Arena::Primitive;
-    __egglog_record.index = 134;
+    __egglog_record.index = 133;
     <self::MultiSet<__EgglogType0> as crate::typed::EgglogValue>::from_expression(
         crate::typed::expr::Expr::call_with_result(
             &crate::typed::decl::Callable(__egglog_record),
@@ -6243,7 +6242,7 @@ impl<__EgglogType0: crate::typed::EgglogValue> self::MultiSet<__EgglogType0> {
         let mut __egglog_record =
             ::core::clone::Clone::clone(crate::typed::storage::builtin_catalog());
         __egglog_record.arena = crate::typed::storage::Arena::Primitive;
-        __egglog_record.index = 135;
+        __egglog_record.index = 134;
         <self::MultiSet<__EgglogType0> as crate::typed::EgglogValue>::from_expression(
             crate::typed::expr::Expr::call_with_result(
                 &crate::typed::decl::Callable(__egglog_record),
@@ -6269,7 +6268,7 @@ impl<__EgglogType0: crate::typed::EgglogValue> self::MultiSet<__EgglogType0> {
         let mut __egglog_record =
             ::core::clone::Clone::clone(crate::typed::storage::builtin_catalog());
         __egglog_record.arena = crate::typed::storage::Arena::Primitive;
-        __egglog_record.index = 136;
+        __egglog_record.index = 135;
         <self::MultiSet<__EgglogType0> as crate::typed::EgglogValue>::from_expression(
             crate::typed::expr::Expr::call_with_result(
                 &crate::typed::decl::Callable(__egglog_record),
@@ -6281,7 +6280,7 @@ impl<__EgglogType0: crate::typed::EgglogValue> self::MultiSet<__EgglogType0> {
     }
 }
 
-impl<__EgglogType0: crate::typed::EqualitySort> self::MultiSet<__EgglogType0> {
+impl<__EgglogType0: crate::typed::EgglogValue> self::MultiSet<__EgglogType0> {
     /// Author a catalog-defined call without evaluating its arguments.
     pub fn union_values(&self) -> __EgglogType0 {
         let __egglog_args = ::std::vec![::core::clone::Clone::clone(&self.0)];
@@ -6289,7 +6288,7 @@ impl<__EgglogType0: crate::typed::EqualitySort> self::MultiSet<__EgglogType0> {
         let mut __egglog_record =
             ::core::clone::Clone::clone(crate::typed::storage::builtin_catalog());
         __egglog_record.arena = crate::typed::storage::Arena::Primitive;
-        __egglog_record.index = 137;
+        __egglog_record.index = 136;
         <__EgglogType0 as crate::typed::EgglogValue>::from_expression(
             crate::typed::expr::Expr::call_with_result(
                 &crate::typed::decl::Callable(__egglog_record),
@@ -6310,7 +6309,7 @@ pub fn ne<__EgglogType0: crate::typed::expr::ValueInput>(
 
     let mut __egglog_record = ::core::clone::Clone::clone(crate::typed::storage::builtin_catalog());
     __egglog_record.arena = crate::typed::storage::Arena::Primitive;
-    __egglog_record.index = 138;
+    __egglog_record.index = 137;
     <self::Unit as crate::typed::EgglogValue>::from_expression(
         crate::typed::expr::Expr::call_with_result(
             &crate::typed::decl::Callable(__egglog_record),
@@ -6331,7 +6330,7 @@ impl<__EgglogType0: crate::typed::EgglogValue, __EgglogType1: crate::typed::Eggl
         let mut __egglog_record =
             ::core::clone::Clone::clone(crate::typed::storage::builtin_catalog());
         __egglog_record.arena = crate::typed::storage::Arena::Primitive;
-        __egglog_record.index = 139;
+        __egglog_record.index = 138;
         <__EgglogType0 as crate::typed::EgglogValue>::from_expression(
             crate::typed::expr::Expr::call_with_result(
                 &crate::typed::decl::Callable(__egglog_record),
@@ -6369,7 +6368,7 @@ impl<__EgglogType0: crate::typed::EgglogValue, __EgglogType1: crate::typed::Eggl
         let mut __egglog_record =
             ::core::clone::Clone::clone(crate::typed::storage::builtin_catalog());
         __egglog_record.arena = crate::typed::storage::Arena::Primitive;
-        __egglog_record.index = 140;
+        __egglog_record.index = 139;
         <self::Pair<__EgglogType0, __EgglogType1> as crate::typed::EgglogValue>::from_expression(
             crate::typed::expr::Expr::call_with_result(
                 &crate::typed::decl::Callable(__egglog_record),
@@ -6391,7 +6390,7 @@ impl<__EgglogType0: crate::typed::EgglogValue, __EgglogType1: crate::typed::Eggl
         let mut __egglog_record =
             ::core::clone::Clone::clone(crate::typed::storage::builtin_catalog());
         __egglog_record.arena = crate::typed::storage::Arena::Primitive;
-        __egglog_record.index = 141;
+        __egglog_record.index = 140;
         <__EgglogType1 as crate::typed::EgglogValue>::from_expression(
             crate::typed::expr::Expr::call_with_result(
                 &crate::typed::decl::Callable(__egglog_record),
@@ -6419,7 +6418,7 @@ impl<__EgglogType0: crate::typed::EgglogValue> self::Set<__EgglogType0> {
         let mut __egglog_record =
             ::core::clone::Clone::clone(crate::typed::storage::builtin_catalog());
         __egglog_record.arena = crate::typed::storage::Arena::Primitive;
-        __egglog_record.index = 142;
+        __egglog_record.index = 141;
         <self::Unit as crate::typed::EgglogValue>::from_expression(
             crate::typed::expr::Expr::call_with_result(
                 &crate::typed::decl::Callable(__egglog_record),
@@ -6450,7 +6449,7 @@ impl<__EgglogType0: crate::typed::EgglogValue> self::Set<__EgglogType0> {
         let mut __egglog_record =
             ::core::clone::Clone::clone(crate::typed::storage::builtin_catalog());
         __egglog_record.arena = crate::typed::storage::Arena::Primitive;
-        __egglog_record.index = 143;
+        __egglog_record.index = 142;
         <self::Set<__EgglogType0> as crate::typed::EgglogValue>::from_expression(
             crate::typed::expr::Expr::call_with_result(
                 &crate::typed::decl::Callable(__egglog_record),
@@ -6470,7 +6469,7 @@ impl<__EgglogType0: crate::typed::EgglogValue> self::Set<__EgglogType0> {
         let mut __egglog_record =
             ::core::clone::Clone::clone(crate::typed::storage::builtin_catalog());
         __egglog_record.arena = crate::typed::storage::Arena::Primitive;
-        __egglog_record.index = 144;
+        __egglog_record.index = 143;
         <self::Set<__EgglogType0> as crate::typed::EgglogValue>::from_expression(
             crate::typed::expr::Expr::call_with_result(
                 &crate::typed::decl::Callable(__egglog_record),
@@ -6495,7 +6494,7 @@ impl<__EgglogType0: crate::typed::EgglogValue> self::Set<__EgglogType0> {
         let mut __egglog_record =
             ::core::clone::Clone::clone(crate::typed::storage::builtin_catalog());
         __egglog_record.arena = crate::typed::storage::Arena::Primitive;
-        __egglog_record.index = 145;
+        __egglog_record.index = 144;
         <__EgglogType0 as crate::typed::EgglogValue>::from_expression(
             crate::typed::expr::Expr::call_with_result(
                 &crate::typed::decl::Callable(__egglog_record),
@@ -6523,7 +6522,7 @@ impl<__EgglogType0: crate::typed::EgglogValue> self::Set<__EgglogType0> {
         let mut __egglog_record =
             ::core::clone::Clone::clone(crate::typed::storage::builtin_catalog());
         __egglog_record.arena = crate::typed::storage::Arena::Primitive;
-        __egglog_record.index = 146;
+        __egglog_record.index = 145;
         <self::Set<__EgglogType0> as crate::typed::EgglogValue>::from_expression(
             crate::typed::expr::Expr::call_with_result(
                 &crate::typed::decl::Callable(__egglog_record),
@@ -6554,7 +6553,7 @@ impl<__EgglogType0: crate::typed::EgglogValue> self::Set<__EgglogType0> {
         let mut __egglog_record =
             ::core::clone::Clone::clone(crate::typed::storage::builtin_catalog());
         __egglog_record.arena = crate::typed::storage::Arena::Primitive;
-        __egglog_record.index = 147;
+        __egglog_record.index = 146;
         <self::Set<__EgglogType0> as crate::typed::EgglogValue>::from_expression(
             crate::typed::expr::Expr::call_with_result(
                 &crate::typed::decl::Callable(__egglog_record),
@@ -6574,7 +6573,7 @@ impl<__EgglogType0: crate::typed::EgglogValue> self::Set<__EgglogType0> {
         let mut __egglog_record =
             ::core::clone::Clone::clone(crate::typed::storage::builtin_catalog());
         __egglog_record.arena = crate::typed::storage::Arena::Primitive;
-        __egglog_record.index = 148;
+        __egglog_record.index = 147;
         <self::I64 as crate::typed::EgglogValue>::from_expression(
             crate::typed::expr::Expr::call_with_result(
                 &crate::typed::decl::Callable(__egglog_record),
@@ -6602,7 +6601,7 @@ impl<__EgglogType0: crate::typed::EgglogValue> self::Set<__EgglogType0> {
         let mut __egglog_record =
             ::core::clone::Clone::clone(crate::typed::storage::builtin_catalog());
         __egglog_record.arena = crate::typed::storage::Arena::Primitive;
-        __egglog_record.index = 149;
+        __egglog_record.index = 148;
         <self::Unit as crate::typed::EgglogValue>::from_expression(
             crate::typed::expr::Expr::call_with_result(
                 &crate::typed::decl::Callable(__egglog_record),
@@ -6631,7 +6630,7 @@ impl<__EgglogType0: crate::typed::EgglogValue> self::Set<__EgglogType0> {
         let mut __egglog_record =
             ::core::clone::Clone::clone(crate::typed::storage::builtin_catalog());
         __egglog_record.arena = crate::typed::storage::Arena::Primitive;
-        __egglog_record.index = 150;
+        __egglog_record.index = 149;
         <self::Set<__EgglogType0> as crate::typed::EgglogValue>::from_expression(
             crate::typed::expr::Expr::call_with_result(
                 &crate::typed::decl::Callable(__egglog_record),
@@ -6659,7 +6658,7 @@ impl<__EgglogType0: crate::typed::EgglogValue> self::Set<__EgglogType0> {
         let mut __egglog_record =
             ::core::clone::Clone::clone(crate::typed::storage::builtin_catalog());
         __egglog_record.arena = crate::typed::storage::Arena::Primitive;
-        __egglog_record.index = 151;
+        __egglog_record.index = 150;
         <self::Set<__EgglogType0> as crate::typed::EgglogValue>::from_expression(
             crate::typed::expr::Expr::call_with_result(
                 &crate::typed::decl::Callable(__egglog_record),
@@ -6690,7 +6689,7 @@ impl<__EgglogType0: crate::typed::EgglogValue> self::Set<__EgglogType0> {
         let mut __egglog_record =
             ::core::clone::Clone::clone(crate::typed::storage::builtin_catalog());
         __egglog_record.arena = crate::typed::storage::Arena::Primitive;
-        __egglog_record.index = 152;
+        __egglog_record.index = 151;
         <self::Set<__EgglogType0> as crate::typed::EgglogValue>::from_expression(
             crate::typed::expr::Expr::call_with_result(
                 &crate::typed::decl::Callable(__egglog_record),
@@ -6713,7 +6712,7 @@ pub fn join(
     }
     let mut __egglog_record = ::core::clone::Clone::clone(crate::typed::storage::builtin_catalog());
     __egglog_record.arena = crate::typed::storage::Arena::Primitive;
-    __egglog_record.index = 153;
+    __egglog_record.index = 152;
     <self::String as crate::typed::EgglogValue>::from_expression(
         crate::typed::expr::Expr::call_with_result(
             &crate::typed::decl::Callable(__egglog_record),
@@ -6730,7 +6729,7 @@ impl ::core::ops::Add<self::String> for self::String {
         let mut __egglog_record =
             ::core::clone::Clone::clone(crate::typed::storage::builtin_catalog());
         __egglog_record.arena = crate::typed::storage::Arena::Primitive;
-        __egglog_record.index = 153;
+        __egglog_record.index = 152;
         <self::String as crate::typed::EgglogValue>::from_expression(
             crate::typed::expr::Expr::call_with_result(
                 &crate::typed::decl::Callable(__egglog_record),
@@ -6751,7 +6750,7 @@ impl ::core::ops::Add<&self::String> for self::String {
         let mut __egglog_record =
             ::core::clone::Clone::clone(crate::typed::storage::builtin_catalog());
         __egglog_record.arena = crate::typed::storage::Arena::Primitive;
-        __egglog_record.index = 153;
+        __egglog_record.index = 152;
         <self::String as crate::typed::EgglogValue>::from_expression(
             crate::typed::expr::Expr::call_with_result(
                 &crate::typed::decl::Callable(__egglog_record),
@@ -6772,7 +6771,7 @@ impl ::core::ops::Add<self::String> for &self::String {
         let mut __egglog_record =
             ::core::clone::Clone::clone(crate::typed::storage::builtin_catalog());
         __egglog_record.arena = crate::typed::storage::Arena::Primitive;
-        __egglog_record.index = 153;
+        __egglog_record.index = 152;
         <self::String as crate::typed::EgglogValue>::from_expression(
             crate::typed::expr::Expr::call_with_result(
                 &crate::typed::decl::Callable(__egglog_record),
@@ -6793,7 +6792,7 @@ impl ::core::ops::Add<&self::String> for &self::String {
         let mut __egglog_record =
             ::core::clone::Clone::clone(crate::typed::storage::builtin_catalog());
         __egglog_record.arena = crate::typed::storage::Arena::Primitive;
-        __egglog_record.index = 153;
+        __egglog_record.index = 152;
         <self::String as crate::typed::EgglogValue>::from_expression(
             crate::typed::expr::Expr::call_with_result(
                 &crate::typed::decl::Callable(__egglog_record),
@@ -6826,7 +6825,7 @@ pub fn count_matches(
 
     let mut __egglog_record = ::core::clone::Clone::clone(crate::typed::storage::builtin_catalog());
     __egglog_record.arena = crate::typed::storage::Arena::Primitive;
-    __egglog_record.index = 154;
+    __egglog_record.index = 153;
     <self::I64 as crate::typed::EgglogValue>::from_expression(
         crate::typed::expr::Expr::call_with_result(
             &crate::typed::decl::Callable(__egglog_record),
@@ -6859,7 +6858,7 @@ impl self::String {
         let mut __egglog_record =
             ::core::clone::Clone::clone(crate::typed::storage::builtin_catalog());
         __egglog_record.arena = crate::typed::storage::Arena::Primitive;
-        __egglog_record.index = 155;
+        __egglog_record.index = 154;
         <self::String as crate::typed::EgglogValue>::from_expression(
             crate::typed::expr::Expr::call_with_result(
                 &crate::typed::decl::Callable(__egglog_record),
@@ -6880,7 +6879,7 @@ pub fn value_eq<__EgglogType0: crate::typed::expr::ValueInput>(
 
     let mut __egglog_record = ::core::clone::Clone::clone(crate::typed::storage::builtin_catalog());
     __egglog_record.arena = crate::typed::storage::Arena::Primitive;
-    __egglog_record.index = 156;
+    __egglog_record.index = 155;
     <self::Unit as crate::typed::EgglogValue>::from_expression(
         crate::typed::expr::Expr::call_with_result(
             &crate::typed::decl::Callable(__egglog_record),
@@ -6912,7 +6911,7 @@ impl<__EgglogType0: crate::typed::EgglogValue> self::Vec<__EgglogType0> {
         let mut __egglog_record =
             ::core::clone::Clone::clone(crate::typed::storage::builtin_catalog());
         __egglog_record.arena = crate::typed::storage::Arena::Primitive;
-        __egglog_record.index = 157;
+        __egglog_record.index = 156;
         <self::Vec<__EgglogType0> as crate::typed::EgglogValue>::from_expression(
             crate::typed::expr::Expr::call_with_result(
                 &crate::typed::decl::Callable(__egglog_record),
@@ -6940,7 +6939,7 @@ impl<__EgglogType0: crate::typed::EgglogValue> self::Vec<__EgglogType0> {
         let mut __egglog_record =
             ::core::clone::Clone::clone(crate::typed::storage::builtin_catalog());
         __egglog_record.arena = crate::typed::storage::Arena::Primitive;
-        __egglog_record.index = 158;
+        __egglog_record.index = 157;
         <self::Unit as crate::typed::EgglogValue>::from_expression(
             crate::typed::expr::Expr::call_with_result(
                 &crate::typed::decl::Callable(__egglog_record),
@@ -6960,7 +6959,7 @@ impl<__EgglogType0: crate::typed::EgglogValue> self::Vec<__EgglogType0> {
         let mut __egglog_record =
             ::core::clone::Clone::clone(crate::typed::storage::builtin_catalog());
         __egglog_record.arena = crate::typed::storage::Arena::Primitive;
-        __egglog_record.index = 159;
+        __egglog_record.index = 158;
         <self::Vec<__EgglogType0> as crate::typed::EgglogValue>::from_expression(
             crate::typed::expr::Expr::call_with_result(
                 &crate::typed::decl::Callable(__egglog_record),
@@ -6985,7 +6984,7 @@ impl<__EgglogType0: crate::typed::EgglogValue> self::Vec<__EgglogType0> {
         let mut __egglog_record =
             ::core::clone::Clone::clone(crate::typed::storage::builtin_catalog());
         __egglog_record.arena = crate::typed::storage::Arena::Primitive;
-        __egglog_record.index = 160;
+        __egglog_record.index = 159;
         <__EgglogType0 as crate::typed::EgglogValue>::from_expression(
             crate::typed::expr::Expr::call_with_result(
                 &crate::typed::decl::Callable(__egglog_record),
@@ -7005,7 +7004,7 @@ impl<__EgglogType0: crate::typed::EgglogValue> self::Vec<__EgglogType0> {
         let mut __egglog_record =
             ::core::clone::Clone::clone(crate::typed::storage::builtin_catalog());
         __egglog_record.arena = crate::typed::storage::Arena::Primitive;
-        __egglog_record.index = 161;
+        __egglog_record.index = 160;
         <self::I64 as crate::typed::EgglogValue>::from_expression(
             crate::typed::expr::Expr::call_with_result(
                 &crate::typed::decl::Callable(__egglog_record),
@@ -7028,7 +7027,7 @@ impl<__EgglogType0: crate::typed::EgglogValue> self::Vec<__EgglogType0> {
         let mut __egglog_record =
             ::core::clone::Clone::clone(crate::typed::storage::builtin_catalog());
         __egglog_record.arena = crate::typed::storage::Arena::Primitive;
-        __egglog_record.index = 162;
+        __egglog_record.index = 161;
         <self::Vec<__EgglogType1> as crate::typed::EgglogValue>::from_expression(
             crate::typed::expr::Expr::call_with_result(
                 &crate::typed::decl::Callable(__egglog_record),
@@ -7056,7 +7055,7 @@ impl<__EgglogType0: crate::typed::EgglogValue> self::Vec<__EgglogType0> {
         let mut __egglog_record =
             ::core::clone::Clone::clone(crate::typed::storage::builtin_catalog());
         __egglog_record.arena = crate::typed::storage::Arena::Primitive;
-        __egglog_record.index = 163;
+        __egglog_record.index = 162;
         <self::Unit as crate::typed::EgglogValue>::from_expression(
             crate::typed::expr::Expr::call_with_result(
                 &crate::typed::decl::Callable(__egglog_record),
@@ -7085,7 +7084,7 @@ impl<__EgglogType0: crate::typed::EgglogValue> self::Vec<__EgglogType0> {
         let mut __egglog_record =
             ::core::clone::Clone::clone(crate::typed::storage::builtin_catalog());
         __egglog_record.arena = crate::typed::storage::Arena::Primitive;
-        __egglog_record.index = 164;
+        __egglog_record.index = 163;
         <self::Vec<__EgglogType0> as crate::typed::EgglogValue>::from_expression(
             crate::typed::expr::Expr::call_with_result(
                 &crate::typed::decl::Callable(__egglog_record),
@@ -7105,7 +7104,7 @@ impl<__EgglogType0: crate::typed::EgglogValue> self::Vec<__EgglogType0> {
         let mut __egglog_record =
             ::core::clone::Clone::clone(crate::typed::storage::builtin_catalog());
         __egglog_record.arena = crate::typed::storage::Arena::Primitive;
-        __egglog_record.index = 165;
+        __egglog_record.index = 164;
         <self::Vec<__EgglogType0> as crate::typed::EgglogValue>::from_expression(
             crate::typed::expr::Expr::call_with_result(
                 &crate::typed::decl::Callable(__egglog_record),
@@ -7133,7 +7132,7 @@ impl<__EgglogType0: crate::typed::EgglogValue> self::Vec<__EgglogType0> {
         let mut __egglog_record =
             ::core::clone::Clone::clone(crate::typed::storage::builtin_catalog());
         __egglog_record.arena = crate::typed::storage::Arena::Primitive;
-        __egglog_record.index = 166;
+        __egglog_record.index = 165;
         <self::Vec<__EgglogType0> as crate::typed::EgglogValue>::from_expression(
             crate::typed::expr::Expr::call_with_result(
                 &crate::typed::decl::Callable(__egglog_record),
@@ -7153,7 +7152,7 @@ impl self::I64 {
         let mut __egglog_record =
             ::core::clone::Clone::clone(crate::typed::storage::builtin_catalog());
         __egglog_record.arena = crate::typed::storage::Arena::Primitive;
-        __egglog_record.index = 167;
+        __egglog_record.index = 166;
         <self::Vec<self::I64> as crate::typed::EgglogValue>::from_expression(
             crate::typed::expr::Expr::call_with_result(
                 &crate::typed::decl::Callable(__egglog_record),
@@ -7181,7 +7180,7 @@ impl<__EgglogType0: crate::typed::EgglogValue> self::Vec<__EgglogType0> {
         let mut __egglog_record =
             ::core::clone::Clone::clone(crate::typed::storage::builtin_catalog());
         __egglog_record.arena = crate::typed::storage::Arena::Primitive;
-        __egglog_record.index = 168;
+        __egglog_record.index = 167;
         <self::Vec<__EgglogType0> as crate::typed::EgglogValue>::from_expression(
             crate::typed::expr::Expr::call_with_result(
                 &crate::typed::decl::Callable(__egglog_record),
@@ -7219,7 +7218,7 @@ impl<__EgglogType0: crate::typed::EgglogValue> self::Vec<__EgglogType0> {
         let mut __egglog_record =
             ::core::clone::Clone::clone(crate::typed::storage::builtin_catalog());
         __egglog_record.arena = crate::typed::storage::Arena::Primitive;
-        __egglog_record.index = 169;
+        __egglog_record.index = 168;
         <self::Vec<__EgglogType0> as crate::typed::EgglogValue>::from_expression(
             crate::typed::expr::Expr::call_with_result(
                 &crate::typed::decl::Callable(__egglog_record),
@@ -7231,7 +7230,7 @@ impl<__EgglogType0: crate::typed::EgglogValue> self::Vec<__EgglogType0> {
     }
 }
 
-impl<__EgglogType0: crate::typed::EqualitySort> self::Vec<__EgglogType0> {
+impl<__EgglogType0: crate::typed::EgglogValue> self::Vec<__EgglogType0> {
     /// Author a catalog-defined call without evaluating its arguments.
     pub fn union(
         &self,
@@ -7250,7 +7249,7 @@ impl<__EgglogType0: crate::typed::EqualitySort> self::Vec<__EgglogType0> {
         let mut __egglog_record =
             ::core::clone::Clone::clone(crate::typed::storage::builtin_catalog());
         __egglog_record.arena = crate::typed::storage::Arena::Primitive;
-        __egglog_record.index = 170;
+        __egglog_record.index = 169;
         <self::Vec<__EgglogType0> as crate::typed::EgglogValue>::from_expression(
             crate::typed::expr::Expr::call_with_result(
                 &crate::typed::decl::Callable(__egglog_record),
@@ -7270,7 +7269,7 @@ impl self::F64 {
         let mut __egglog_record =
             ::core::clone::Clone::clone(crate::typed::storage::builtin_catalog());
         __egglog_record.arena = crate::typed::storage::Arena::Primitive;
-        __egglog_record.index = 171;
+        __egglog_record.index = 170;
         <self::Unit as crate::typed::EgglogValue>::from_expression(
             crate::typed::expr::Expr::call_with_result(
                 &crate::typed::decl::Callable(__egglog_record),
@@ -7310,7 +7309,7 @@ impl<__EgglogType0: crate::typed::EgglogValue, __EgglogType1: crate::typed::Eggl
         let mut __egglog_record =
             ::core::clone::Clone::clone(crate::typed::storage::builtin_catalog());
         __egglog_record.arena = crate::typed::storage::Arena::Primitive;
-        __egglog_record.index = 172;
+        __egglog_record.index = 171;
         <__EgglogType2 as crate::typed::EgglogValue>::from_expression(
             crate::typed::expr::Expr::call_with_result(
                 &crate::typed::decl::Callable(__egglog_record),
@@ -7340,7 +7339,7 @@ impl<__EgglogType0: crate::typed::EgglogValue> self::Maybe<__EgglogType0> {
         let mut __egglog_record =
             ::core::clone::Clone::clone(crate::typed::storage::builtin_catalog());
         __egglog_record.arena = crate::typed::storage::Arena::Primitive;
-        __egglog_record.index = 173;
+        __egglog_record.index = 172;
         <self::Maybe<__EgglogType0> as crate::typed::EgglogValue>::from_expression(
             crate::typed::expr::Expr::call_with_result(
                 &crate::typed::decl::Callable(__egglog_record),
@@ -7364,7 +7363,7 @@ impl<__EgglogType0: crate::typed::EgglogValue> self::Maybe<__EgglogType0> {
         let mut __egglog_record =
             ::core::clone::Clone::clone(crate::typed::storage::builtin_catalog());
         __egglog_record.arena = crate::typed::storage::Arena::Primitive;
-        __egglog_record.index = 174;
+        __egglog_record.index = 173;
         <__EgglogType1 as crate::typed::EgglogValue>::from_expression(
             crate::typed::expr::Expr::call_with_result(
                 &crate::typed::decl::Callable(__egglog_record),
@@ -7384,7 +7383,7 @@ impl<__EgglogType0: crate::typed::EgglogValue> self::Maybe<__EgglogType0> {
         let mut __egglog_record =
             ::core::clone::Clone::clone(crate::typed::storage::builtin_catalog());
         __egglog_record.arena = crate::typed::storage::Arena::Primitive;
-        __egglog_record.index = 175;
+        __egglog_record.index = 174;
         <self::Maybe<__EgglogType0> as crate::typed::EgglogValue>::from_expression(
             crate::typed::expr::Expr::call_with_result(
                 &crate::typed::decl::Callable(__egglog_record),
@@ -7411,7 +7410,7 @@ impl<__EgglogType0: crate::typed::EgglogValue> self::Maybe<__EgglogType0> {
         let mut __egglog_record =
             ::core::clone::Clone::clone(crate::typed::storage::builtin_catalog());
         __egglog_record.arena = crate::typed::storage::Arena::Primitive;
-        __egglog_record.index = 176;
+        __egglog_record.index = 175;
         <self::Maybe<__EgglogType0> as crate::typed::EgglogValue>::from_expression(
             crate::typed::expr::Expr::call_with_result(
                 &crate::typed::decl::Callable(__egglog_record),
@@ -7431,7 +7430,7 @@ impl<__EgglogType0: crate::typed::EgglogValue> self::Maybe<__EgglogType0> {
         let mut __egglog_record =
             ::core::clone::Clone::clone(crate::typed::storage::builtin_catalog());
         __egglog_record.arena = crate::typed::storage::Arena::Primitive;
-        __egglog_record.index = 177;
+        __egglog_record.index = 176;
         <__EgglogType0 as crate::typed::EgglogValue>::from_expression(
             crate::typed::expr::Expr::call_with_result(
                 &crate::typed::decl::Callable(__egglog_record),
@@ -7459,7 +7458,7 @@ impl<__EgglogType0: crate::typed::EgglogValue> self::Maybe<__EgglogType0> {
         let mut __egglog_record =
             ::core::clone::Clone::clone(crate::typed::storage::builtin_catalog());
         __egglog_record.arena = crate::typed::storage::Arena::Primitive;
-        __egglog_record.index = 178;
+        __egglog_record.index = 177;
         <__EgglogType0 as crate::typed::EgglogValue>::from_expression(
             crate::typed::expr::Expr::call_with_result(
                 &crate::typed::decl::Callable(__egglog_record),
@@ -7479,7 +7478,7 @@ impl self::Rational {
         let mut __egglog_record =
             ::core::clone::Clone::clone(crate::typed::storage::builtin_catalog());
         __egglog_record.arena = crate::typed::storage::Arena::Primitive;
-        __egglog_record.index = 179;
+        __egglog_record.index = 178;
         <self::Rational as crate::typed::EgglogValue>::from_expression(
             crate::typed::expr::Expr::call_with_result(
                 &crate::typed::decl::Callable(__egglog_record),
@@ -7497,7 +7496,7 @@ impl ::core::ops::Add<self::Rational> for self::Rational {
         let mut __egglog_record =
             ::core::clone::Clone::clone(crate::typed::storage::builtin_catalog());
         __egglog_record.arena = crate::typed::storage::Arena::Primitive;
-        __egglog_record.index = 180;
+        __egglog_record.index = 179;
         <self::Rational as crate::typed::EgglogValue>::from_expression(
             crate::typed::expr::Expr::call(
                 &crate::typed::decl::Callable(__egglog_record),
@@ -7516,7 +7515,7 @@ impl ::core::ops::Add<&self::Rational> for self::Rational {
         let mut __egglog_record =
             ::core::clone::Clone::clone(crate::typed::storage::builtin_catalog());
         __egglog_record.arena = crate::typed::storage::Arena::Primitive;
-        __egglog_record.index = 180;
+        __egglog_record.index = 179;
         <self::Rational as crate::typed::EgglogValue>::from_expression(
             crate::typed::expr::Expr::call(
                 &crate::typed::decl::Callable(__egglog_record),
@@ -7535,7 +7534,7 @@ impl ::core::ops::Add<self::Rational> for &self::Rational {
         let mut __egglog_record =
             ::core::clone::Clone::clone(crate::typed::storage::builtin_catalog());
         __egglog_record.arena = crate::typed::storage::Arena::Primitive;
-        __egglog_record.index = 180;
+        __egglog_record.index = 179;
         <self::Rational as crate::typed::EgglogValue>::from_expression(
             crate::typed::expr::Expr::call(
                 &crate::typed::decl::Callable(__egglog_record),
@@ -7554,7 +7553,7 @@ impl ::core::ops::Add<&self::Rational> for &self::Rational {
         let mut __egglog_record =
             ::core::clone::Clone::clone(crate::typed::storage::builtin_catalog());
         __egglog_record.arena = crate::typed::storage::Arena::Primitive;
-        __egglog_record.index = 180;
+        __egglog_record.index = 179;
         <self::Rational as crate::typed::EgglogValue>::from_expression(
             crate::typed::expr::Expr::call(
                 &crate::typed::decl::Callable(__egglog_record),
@@ -7575,7 +7574,7 @@ impl self::Rational {
         let mut __egglog_record =
             ::core::clone::Clone::clone(crate::typed::storage::builtin_catalog());
         __egglog_record.arena = crate::typed::storage::Arena::Primitive;
-        __egglog_record.index = 181;
+        __egglog_record.index = 180;
         <self::Rational as crate::typed::EgglogValue>::from_expression(
             crate::typed::expr::Expr::call_with_result(
                 &crate::typed::decl::Callable(__egglog_record),
@@ -7594,7 +7593,7 @@ impl self::Rational {
         let mut __egglog_record =
             ::core::clone::Clone::clone(crate::typed::storage::builtin_catalog());
         __egglog_record.arena = crate::typed::storage::Arena::Primitive;
-        __egglog_record.index = 182;
+        __egglog_record.index = 181;
         <self::Rational as crate::typed::EgglogValue>::from_expression(
             crate::typed::expr::Expr::call_with_result(
                 &crate::typed::decl::Callable(__egglog_record),
@@ -7613,7 +7612,7 @@ impl self::Rational {
         let mut __egglog_record =
             ::core::clone::Clone::clone(crate::typed::storage::builtin_catalog());
         __egglog_record.arena = crate::typed::storage::Arena::Primitive;
-        __egglog_record.index = 183;
+        __egglog_record.index = 182;
         <self::I64 as crate::typed::EgglogValue>::from_expression(
             crate::typed::expr::Expr::call_with_result(
                 &crate::typed::decl::Callable(__egglog_record),
@@ -7631,7 +7630,7 @@ impl ::core::ops::Div<self::Rational> for self::Rational {
         let mut __egglog_record =
             ::core::clone::Clone::clone(crate::typed::storage::builtin_catalog());
         __egglog_record.arena = crate::typed::storage::Arena::Primitive;
-        __egglog_record.index = 184;
+        __egglog_record.index = 183;
         <self::Rational as crate::typed::EgglogValue>::from_expression(
             crate::typed::expr::Expr::call(
                 &crate::typed::decl::Callable(__egglog_record),
@@ -7650,7 +7649,7 @@ impl ::core::ops::Div<&self::Rational> for self::Rational {
         let mut __egglog_record =
             ::core::clone::Clone::clone(crate::typed::storage::builtin_catalog());
         __egglog_record.arena = crate::typed::storage::Arena::Primitive;
-        __egglog_record.index = 184;
+        __egglog_record.index = 183;
         <self::Rational as crate::typed::EgglogValue>::from_expression(
             crate::typed::expr::Expr::call(
                 &crate::typed::decl::Callable(__egglog_record),
@@ -7669,7 +7668,7 @@ impl ::core::ops::Div<self::Rational> for &self::Rational {
         let mut __egglog_record =
             ::core::clone::Clone::clone(crate::typed::storage::builtin_catalog());
         __egglog_record.arena = crate::typed::storage::Arena::Primitive;
-        __egglog_record.index = 184;
+        __egglog_record.index = 183;
         <self::Rational as crate::typed::EgglogValue>::from_expression(
             crate::typed::expr::Expr::call(
                 &crate::typed::decl::Callable(__egglog_record),
@@ -7688,7 +7687,7 @@ impl ::core::ops::Div<&self::Rational> for &self::Rational {
         let mut __egglog_record =
             ::core::clone::Clone::clone(crate::typed::storage::builtin_catalog());
         __egglog_record.arena = crate::typed::storage::Arena::Primitive;
-        __egglog_record.index = 184;
+        __egglog_record.index = 183;
         <self::Rational as crate::typed::EgglogValue>::from_expression(
             crate::typed::expr::Expr::call(
                 &crate::typed::decl::Callable(__egglog_record),
@@ -7709,7 +7708,7 @@ impl self::Rational {
         let mut __egglog_record =
             ::core::clone::Clone::clone(crate::typed::storage::builtin_catalog());
         __egglog_record.arena = crate::typed::storage::Arena::Primitive;
-        __egglog_record.index = 185;
+        __egglog_record.index = 184;
         <self::Rational as crate::typed::EgglogValue>::from_expression(
             crate::typed::expr::Expr::call_with_result(
                 &crate::typed::decl::Callable(__egglog_record),
@@ -7731,7 +7730,7 @@ impl self::Rational {
         let mut __egglog_record =
             ::core::clone::Clone::clone(crate::typed::storage::builtin_catalog());
         __egglog_record.arena = crate::typed::storage::Arena::Primitive;
-        __egglog_record.index = 186;
+        __egglog_record.index = 185;
         <self::Unit as crate::typed::EgglogValue>::from_expression(
             crate::typed::expr::Expr::call_with_result(
                 &crate::typed::decl::Callable(__egglog_record),
@@ -7753,7 +7752,7 @@ impl self::Rational {
         let mut __egglog_record =
             ::core::clone::Clone::clone(crate::typed::storage::builtin_catalog());
         __egglog_record.arena = crate::typed::storage::Arena::Primitive;
-        __egglog_record.index = 187;
+        __egglog_record.index = 186;
         <self::Unit as crate::typed::EgglogValue>::from_expression(
             crate::typed::expr::Expr::call_with_result(
                 &crate::typed::decl::Callable(__egglog_record),
@@ -7775,7 +7774,7 @@ impl self::Rational {
         let mut __egglog_record =
             ::core::clone::Clone::clone(crate::typed::storage::builtin_catalog());
         __egglog_record.arena = crate::typed::storage::Arena::Primitive;
-        __egglog_record.index = 188;
+        __egglog_record.index = 187;
         <self::Unit as crate::typed::EgglogValue>::from_expression(
             crate::typed::expr::Expr::call_with_result(
                 &crate::typed::decl::Callable(__egglog_record),
@@ -7794,7 +7793,7 @@ impl self::Rational {
         let mut __egglog_record =
             ::core::clone::Clone::clone(crate::typed::storage::builtin_catalog());
         __egglog_record.arena = crate::typed::storage::Arena::Primitive;
-        __egglog_record.index = 189;
+        __egglog_record.index = 188;
         <self::Rational as crate::typed::EgglogValue>::from_expression(
             crate::typed::expr::Expr::call_with_result(
                 &crate::typed::decl::Callable(__egglog_record),
@@ -7816,7 +7815,7 @@ impl self::Rational {
         let mut __egglog_record =
             ::core::clone::Clone::clone(crate::typed::storage::builtin_catalog());
         __egglog_record.arena = crate::typed::storage::Arena::Primitive;
-        __egglog_record.index = 190;
+        __egglog_record.index = 189;
         <self::Unit as crate::typed::EgglogValue>::from_expression(
             crate::typed::expr::Expr::call_with_result(
                 &crate::typed::decl::Callable(__egglog_record),
@@ -7847,7 +7846,7 @@ impl self::Rational {
         let mut __egglog_record =
             ::core::clone::Clone::clone(crate::typed::storage::builtin_catalog());
         __egglog_record.arena = crate::typed::storage::Arena::Primitive;
-        __egglog_record.index = 191;
+        __egglog_record.index = 190;
         <self::Rational as crate::typed::EgglogValue>::from_expression(
             crate::typed::expr::Expr::call_with_result(
                 &crate::typed::decl::Callable(__egglog_record),
@@ -7872,7 +7871,7 @@ impl self::Rational {
         let mut __egglog_record =
             ::core::clone::Clone::clone(crate::typed::storage::builtin_catalog());
         __egglog_record.arena = crate::typed::storage::Arena::Primitive;
-        __egglog_record.index = 192;
+        __egglog_record.index = 191;
         <self::Rational as crate::typed::EgglogValue>::from_expression(
             crate::typed::expr::Expr::call_with_result(
                 &crate::typed::decl::Callable(__egglog_record),
@@ -7897,7 +7896,7 @@ impl self::Rational {
         let mut __egglog_record =
             ::core::clone::Clone::clone(crate::typed::storage::builtin_catalog());
         __egglog_record.arena = crate::typed::storage::Arena::Primitive;
-        __egglog_record.index = 193;
+        __egglog_record.index = 192;
         <self::Rational as crate::typed::EgglogValue>::from_expression(
             crate::typed::expr::Expr::call_with_result(
                 &crate::typed::decl::Callable(__egglog_record),
@@ -7915,7 +7914,7 @@ impl ::core::ops::Mul<self::Rational> for self::Rational {
         let mut __egglog_record =
             ::core::clone::Clone::clone(crate::typed::storage::builtin_catalog());
         __egglog_record.arena = crate::typed::storage::Arena::Primitive;
-        __egglog_record.index = 194;
+        __egglog_record.index = 193;
         <self::Rational as crate::typed::EgglogValue>::from_expression(
             crate::typed::expr::Expr::call(
                 &crate::typed::decl::Callable(__egglog_record),
@@ -7934,7 +7933,7 @@ impl ::core::ops::Mul<&self::Rational> for self::Rational {
         let mut __egglog_record =
             ::core::clone::Clone::clone(crate::typed::storage::builtin_catalog());
         __egglog_record.arena = crate::typed::storage::Arena::Primitive;
-        __egglog_record.index = 194;
+        __egglog_record.index = 193;
         <self::Rational as crate::typed::EgglogValue>::from_expression(
             crate::typed::expr::Expr::call(
                 &crate::typed::decl::Callable(__egglog_record),
@@ -7953,7 +7952,7 @@ impl ::core::ops::Mul<self::Rational> for &self::Rational {
         let mut __egglog_record =
             ::core::clone::Clone::clone(crate::typed::storage::builtin_catalog());
         __egglog_record.arena = crate::typed::storage::Arena::Primitive;
-        __egglog_record.index = 194;
+        __egglog_record.index = 193;
         <self::Rational as crate::typed::EgglogValue>::from_expression(
             crate::typed::expr::Expr::call(
                 &crate::typed::decl::Callable(__egglog_record),
@@ -7972,7 +7971,7 @@ impl ::core::ops::Mul<&self::Rational> for &self::Rational {
         let mut __egglog_record =
             ::core::clone::Clone::clone(crate::typed::storage::builtin_catalog());
         __egglog_record.arena = crate::typed::storage::Arena::Primitive;
-        __egglog_record.index = 194;
+        __egglog_record.index = 193;
         <self::Rational as crate::typed::EgglogValue>::from_expression(
             crate::typed::expr::Expr::call(
                 &crate::typed::decl::Callable(__egglog_record),
@@ -7991,7 +7990,7 @@ impl ::core::ops::Neg for self::Rational {
         let mut __egglog_record =
             ::core::clone::Clone::clone(crate::typed::storage::builtin_catalog());
         __egglog_record.arena = crate::typed::storage::Arena::Primitive;
-        __egglog_record.index = 195;
+        __egglog_record.index = 194;
         <self::Rational as crate::typed::EgglogValue>::from_expression(
             crate::typed::expr::Expr::call_with_result(
                 &crate::typed::decl::Callable(__egglog_record),
@@ -8009,7 +8008,7 @@ impl ::core::ops::Neg for &self::Rational {
         let mut __egglog_record =
             ::core::clone::Clone::clone(crate::typed::storage::builtin_catalog());
         __egglog_record.arena = crate::typed::storage::Arena::Primitive;
-        __egglog_record.index = 195;
+        __egglog_record.index = 194;
         <self::Rational as crate::typed::EgglogValue>::from_expression(
             crate::typed::expr::Expr::call_with_result(
                 &crate::typed::decl::Callable(__egglog_record),
@@ -8029,7 +8028,7 @@ impl self::Rational {
         let mut __egglog_record =
             ::core::clone::Clone::clone(crate::typed::storage::builtin_catalog());
         __egglog_record.arena = crate::typed::storage::Arena::Primitive;
-        __egglog_record.index = 196;
+        __egglog_record.index = 195;
         <self::I64 as crate::typed::EgglogValue>::from_expression(
             crate::typed::expr::Expr::call_with_result(
                 &crate::typed::decl::Callable(__egglog_record),
@@ -8054,7 +8053,7 @@ impl self::Rational {
         let mut __egglog_record =
             ::core::clone::Clone::clone(crate::typed::storage::builtin_catalog());
         __egglog_record.arena = crate::typed::storage::Arena::Primitive;
-        __egglog_record.index = 197;
+        __egglog_record.index = 196;
         <self::Rational as crate::typed::EgglogValue>::from_expression(
             crate::typed::expr::Expr::call_with_result(
                 &crate::typed::decl::Callable(__egglog_record),
@@ -8073,7 +8072,7 @@ impl self::Rational {
         let mut __egglog_record =
             ::core::clone::Clone::clone(crate::typed::storage::builtin_catalog());
         __egglog_record.arena = crate::typed::storage::Arena::Primitive;
-        __egglog_record.index = 198;
+        __egglog_record.index = 197;
         <self::Rational as crate::typed::EgglogValue>::from_expression(
             crate::typed::expr::Expr::call_with_result(
                 &crate::typed::decl::Callable(__egglog_record),
@@ -8092,7 +8091,7 @@ impl self::Rational {
         let mut __egglog_record =
             ::core::clone::Clone::clone(crate::typed::storage::builtin_catalog());
         __egglog_record.arena = crate::typed::storage::Arena::Primitive;
-        __egglog_record.index = 199;
+        __egglog_record.index = 198;
         <self::Rational as crate::typed::EgglogValue>::from_expression(
             crate::typed::expr::Expr::call_with_result(
                 &crate::typed::decl::Callable(__egglog_record),
@@ -8110,7 +8109,7 @@ impl ::core::ops::Sub<self::Rational> for self::Rational {
         let mut __egglog_record =
             ::core::clone::Clone::clone(crate::typed::storage::builtin_catalog());
         __egglog_record.arena = crate::typed::storage::Arena::Primitive;
-        __egglog_record.index = 200;
+        __egglog_record.index = 199;
         <self::Rational as crate::typed::EgglogValue>::from_expression(
             crate::typed::expr::Expr::call(
                 &crate::typed::decl::Callable(__egglog_record),
@@ -8129,7 +8128,7 @@ impl ::core::ops::Sub<&self::Rational> for self::Rational {
         let mut __egglog_record =
             ::core::clone::Clone::clone(crate::typed::storage::builtin_catalog());
         __egglog_record.arena = crate::typed::storage::Arena::Primitive;
-        __egglog_record.index = 200;
+        __egglog_record.index = 199;
         <self::Rational as crate::typed::EgglogValue>::from_expression(
             crate::typed::expr::Expr::call(
                 &crate::typed::decl::Callable(__egglog_record),
@@ -8148,7 +8147,7 @@ impl ::core::ops::Sub<self::Rational> for &self::Rational {
         let mut __egglog_record =
             ::core::clone::Clone::clone(crate::typed::storage::builtin_catalog());
         __egglog_record.arena = crate::typed::storage::Arena::Primitive;
-        __egglog_record.index = 200;
+        __egglog_record.index = 199;
         <self::Rational as crate::typed::EgglogValue>::from_expression(
             crate::typed::expr::Expr::call(
                 &crate::typed::decl::Callable(__egglog_record),
@@ -8167,7 +8166,7 @@ impl ::core::ops::Sub<&self::Rational> for &self::Rational {
         let mut __egglog_record =
             ::core::clone::Clone::clone(crate::typed::storage::builtin_catalog());
         __egglog_record.arena = crate::typed::storage::Arena::Primitive;
-        __egglog_record.index = 200;
+        __egglog_record.index = 199;
         <self::Rational as crate::typed::EgglogValue>::from_expression(
             crate::typed::expr::Expr::call(
                 &crate::typed::decl::Callable(__egglog_record),
@@ -8188,7 +8187,7 @@ impl self::Rational {
         let mut __egglog_record =
             ::core::clone::Clone::clone(crate::typed::storage::builtin_catalog());
         __egglog_record.arena = crate::typed::storage::Arena::Primitive;
-        __egglog_record.index = 201;
+        __egglog_record.index = 200;
         <self::F64 as crate::typed::EgglogValue>::from_expression(
             crate::typed::expr::Expr::call_with_result(
                 &crate::typed::decl::Callable(__egglog_record),
@@ -8206,7 +8205,7 @@ pub fn get_node_size() -> self::I64 {
 
     let mut __egglog_record = ::core::clone::Clone::clone(crate::typed::storage::builtin_catalog());
     __egglog_record.arena = crate::typed::storage::Arena::Primitive;
-    __egglog_record.index = 202;
+    __egglog_record.index = 201;
     <self::I64 as crate::typed::EgglogValue>::from_expression(
         crate::typed::expr::Expr::call_with_result(
             &crate::typed::decl::Callable(__egglog_record),
@@ -8228,7 +8227,7 @@ pub fn get_table_size(
     }
     let mut __egglog_record = ::core::clone::Clone::clone(crate::typed::storage::builtin_catalog());
     __egglog_record.arena = crate::typed::storage::Arena::Primitive;
-    __egglog_record.index = 203;
+    __egglog_record.index = 202;
     <self::I64 as crate::typed::EgglogValue>::from_expression(
         crate::typed::expr::Expr::call_with_result(
             &crate::typed::decl::Callable(__egglog_record),
@@ -8240,10 +8239,7 @@ pub fn get_table_size(
 }
 
 /// Author a catalog-defined call without evaluating its arguments.
-pub fn subst<
-    __EgglogType0: crate::typed::EqualitySort,
-    __EgglogType1: crate::typed::EqualitySort,
->(
+pub fn subst<__EgglogType0: crate::typed::EgglogValue, __EgglogType1: crate::typed::EgglogValue>(
     __egglog_arg_0: __EgglogType0,
     __egglog_arg_1: self::Map<__EgglogType1, __EgglogType1>,
 ) -> __EgglogType0 {
@@ -8260,7 +8256,7 @@ pub fn subst<
 
     let mut __egglog_record = ::core::clone::Clone::clone(crate::typed::storage::builtin_catalog());
     __egglog_record.arena = crate::typed::storage::Arena::Primitive;
-    __egglog_record.index = 204;
+    __egglog_record.index = 203;
     <__EgglogType0 as crate::typed::EgglogValue>::from_expression(
         crate::typed::expr::Expr::call_with_result(
             &crate::typed::decl::Callable(__egglog_record),

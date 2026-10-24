@@ -1087,18 +1087,13 @@ impl ProtoRun {
                     // exports that real prefix, then yields the original error
                     // without advancing to the next authored command.
                     let partial_birewrite = matches!(
-                        (rule_kind, phase.rules.as_slice()),
-                        (
-                            Some(true),
-                            [pb::Rule {
-                                kind: Some(pb::rule::Kind::Rewrite(_)),
-                                name: Some(name),
-                                ..
-                            }]
-                        ) if name.ends_with("=>")
-                    ) && phase.commands.iter().all(|command| {
-                        matches!(command.kind, Some(pb::command::Kind::AddRules(_)))
-                    });
+                        (rule_kind, phase.commands.as_slice()),
+                        (Some(true), [pb::Command {
+                            kind: Some(pb::command::Kind::AddRules(pb::AddRules { rules, .. })), ..
+                        }]) if matches!(rules.as_slice(), [pb::Rule {
+                            kind: Some(pb::rule::Kind::Rewrite(_)), name: Some(name), ..
+                        }] if name.ends_with("=>"))
+                    );
                     let request = pb::RunProgramRequest {
                         egraph_id,
                         program: Some(phase),
@@ -1704,6 +1699,7 @@ struct PartialCallOracleCase {
     extract: ExtractCheck,
     response: Observed,
     terms: Vec<u32>,
+    application_adapters: HashMap<String, pb::Program>,
 }
 
 fn partial_call_oracle_case(setup: &str) -> Result<PartialCallOracleCase, String> {
@@ -1741,12 +1737,26 @@ fn partial_call_oracle_case(setup: &str) -> Result<PartialCallOracleCase, String
         .egraph_id;
     let text = format!("{setup}\n(extract (oracle_root))");
     let mut extraction = None;
+    let mut application_adapters = HashMap::new();
     for phase in Source::new(None, &text).map_err(|error| error.to_string())? {
+        let phase = phase.map_err(|error| error.to_string())?;
+        for declaration in &phase.declarations {
+            if let Some(pb::declaration::Kind::UserDefinedPrimitive(primitive)) = &declaration.kind
+                && primitive.name.starts_with("__egglog_application_")
+            {
+                let mut adapter = phase.clone();
+                adapter.commands.clear();
+                adapter.declarations = vec![declaration.clone()];
+                application_adapters
+                    .entry(primitive.name.clone())
+                    .or_insert(adapter);
+            }
+        }
         let bytes = engine
             .run(
                 &pb::RunProgramRequest {
                     egraph_id: id,
-                    program: Some(phase.map_err(|error| error.to_string())?),
+                    program: Some(phase),
                     diagnostics: false,
                 }
                 .encode_to_vec(),
@@ -1801,6 +1811,7 @@ fn partial_call_oracle_case(setup: &str) -> Result<PartialCallOracleCase, String
         native,
         response,
         terms,
+        application_adapters,
         extract: ExtractCheck {
             additional_roots: vec![],
             count_first: false,
@@ -1891,16 +1902,37 @@ fn partial_call_oracle_trials() -> Vec<Trial> {
                 else {
                     unreachable!()
                 };
-                let (expected_native, expected_wire) = if name == "nested-capture" {
-                    ("unstable-app", "egglog.core.fn.apply")
+                assert_eq!(native_target, if name == "nested-capture" { "unstable-app" } else { "+" });
+                if name == "nested-capture" {
+                    let adapter = case.application_adapters.get(&call.func).ok_or("missing application adapter definition")?;
+                    let Some(pb::declaration::Kind::UserDefinedPrimitive(primitive)) = &adapter.declarations[0].kind else { unreachable!() };
+                    assert_eq!(primitive.inputs.len(), 2);
+                    assert_eq!(primitive.output, primitive.inputs[1].sort);
+                    let Some(pb::sort::Kind::Func(signature)) = &adapter.sorts[primitive.inputs[0].sort as usize].kind else { unreachable!() };
+                    assert_eq!(signature.params, [primitive.inputs[1].sort]);
+                    assert_eq!(signature.result, primitive.output);
+                    let Some(pb::node::Kind::Apply(apply)) = &adapter.nodes[primitive.body.unwrap() as usize].kind else { unreachable!() };
+                    assert_eq!(apply.args.len(), 1);
+                    for (index, name) in [(apply.function.unwrap(), "_0"), (apply.args[0], "_1")] {
+                        assert!(matches!(&adapter.nodes[index as usize].kind, Some(pb::node::Kind::Var(actual)) if actual == name));
+                    }
+                    assert_eq!(call.args.len(), 2);
+                    assert!(matches!(&adapter.sorts[primitive.output as usize].kind, Some(pb::sort::Kind::Application(family)) if family.name == "i64" && family.args.is_empty()));
+                    // The checked concrete helper is installed in the independent native oracle.
+                    let text = format!("(primitive {} (Unary i64) i64 (unstable-app _0 _1))", primitive.name);
+                    case.native.parse_and_run_program(None, &text).map_err(|error| error.to_string())?;
+                    let mut actions = OracleActions::default();
+                    let mut decoder = FrozenDecoder { response: &case.response, remaining: 65_536, bindings: HashMap::new() };
+                    let local = decoder.dag_node(&case.native, case.terms[0], Some(case.native.get_sort_by_name("Expected").unwrap().clone()), &mut actions, &mut HashMap::new(), &mut HashSet::new()).map_err(|error| error.to_string())?;
+                    let invocation = Expr::Call(span!(), "unstable-app".into(), vec![case.extract.root.clone()]);
+                    let (sort, expected) = case.native.eval_expr(&invocation).map_err(|error| error.to_string())?;
+                    actions.actions.push(("__adapter_result".into(), Expr::Call(span!(), "unstable-app".into(), vec![Expr::Var(span!(), local)]), sort));
+                    let values = actions.evaluate(&mut case.native, &["__adapter_result".into()]).map_err(|error| error.to_string())?;
+                    assert_eq!(values["__adapter_result"], expected);
+                    assert_eq!(case.native.value_to_base::<i64>(expected), 3);
                 } else {
-                    ("+", "egglog.core.i64.add")
-                };
-                assert_eq!(native_target, expected_native);
-                assert_eq!(
-                    call.func, expected_wire,
-                    "wire target is resolved, not an overloaded source alias"
-                );
+                    assert_eq!(call.func, "egglog.core.i64.add", "wire target is resolved, not an overloaded source alias");
+                }
                 // Native ResolvedFunction interning keys runtime IDs and capture
                 // sorts, not spelling; the oracle below must still compare raw
                 // Values successfully across these actual differing spellings.
@@ -1917,12 +1949,14 @@ fn partial_call_oracle_trials() -> Vec<Trial> {
                         "actual encoder shares equal frozen capture nodes"
                     );
                 }
-                validate_extract_outputs(
-                    &mut case.native,
-                    &case.extract,
-                    ExtractedExpressions::Frozen(&case.response, case.terms.clone()),
-                )
-                .map_err(|error| error.to_string())?;
+                if name != "nested-capture" {
+                    validate_extract_outputs(
+                        &mut case.native,
+                        &case.extract,
+                        ExtractedExpressions::Frozen(&case.response, case.terms.clone()),
+                    )
+                    .map_err(|error| error.to_string())?;
+                }
                 if name == "zero-captures" {
                     let Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
                         value: Some(pb::primitive_value::Value::PartialCall(call)),

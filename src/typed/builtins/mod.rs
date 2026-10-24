@@ -35,11 +35,16 @@
 //! use egglog_experimental::typed::builtins::{bool_ne, F64, I64};
 //! bool_ne(I64::from(1), F64::from(1.0));
 //! ```
-//! ```compile_fail,E0277
-//! use egglog_experimental::typed::builtins::{subst, I64, Map};
-//! subst(I64::from(1), Map::<I64, I64>::empty());
+//! Native applicability can be narrower than the structural signature. `subst`
+//! requires equality-sort substitution keys; primitive keys fail on submission:
+//!
+//! ```
+//! use egglog_experimental::typed::{builtins::{subst, I64, Map}, prelude::*};
+//! let value = subst(I64::from(1), Map::<I64, I64>::empty());
+//! let mut graph = EGraph::new()?;
+//! assert!(matches!(graph.register(value), Err(TypedError::Engine(_))));
+//! # Ok::<_, TypedError>(())
 //! ```
 mod function;
-use function::function_application;
 pub use function::{Function, FunctionArgs};
 include!("generated.rs");

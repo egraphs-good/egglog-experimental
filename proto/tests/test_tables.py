@@ -20,7 +20,7 @@ def table_response(rows):
             "primitive_value", ir.PrimitiveValue(value=Oneof("unit", ir.Unit()))
         ))],
         outputs=[ir.CommandOutput(
-            kind=Oneof("printed_function", ir.PrintedFunction(table="f", rows=rows)),
+            kind=Oneof("table_rows", ir.TableRows(table="f", rows=rows)),
             location=ir.CommandLocation(path=[0]),
         )],
     )
@@ -49,14 +49,12 @@ class TableSchemaTests(unittest.TestCase):
         with self.assertRaises(ValidationError):
             validate(ir.Declaration(kind=Oneof("eq_sort", ir.EqSort(name="S")), table_name=Oneof("public_alias", "")))
 
-    def test_parent_key_is_nonempty_when_present_and_preserves_pendingness(self):
-        for parent in (None, "Pending"):
-            sort = ir.EqSort(name="S", uf_parent=parent)
-            validate(sort)
-            self.assertEqual(ir.EqSort.from_binary(sort.to_binary()), sort)
-            self.assertEqual(sort.has_field("uf_parent"), parent is not None)
-        with self.assertRaises(ValidationError):
-            validate(ir.EqSort(name="S", uf_parent=""))
+    def test_internal_parent_is_not_public_sort_metadata(self):
+        sort = ir.EqSort(name="S")
+        validate(sort)
+        self.assertEqual(ir.EqSort.from_binary(sort.to_binary()), sort)
+        with self.assertRaises(TypeError):
+            ir.EqSort(name="S", uf_parent="Pending")
 
     def test_hidden_is_owned_by_constructor_or_function(self):
         for tag, table in (
@@ -80,7 +78,7 @@ class TableSchemaTests(unittest.TestCase):
         ):
             with self.subTest(limit=limit):
                 command = ir.Command(kind=Oneof(
-                    "print_function", ir.PrintFunction(table="C", max_rows=limit)
+                    "table_rows", ir.GetTableRows(table="C", max_rows=limit)
                 ))
                 validate(command)
                 self.assertEqual(command.to_binary(), bytes.fromhex(encoded))
@@ -89,10 +87,10 @@ class TableSchemaTests(unittest.TestCase):
                     ir.Command.from_json(command.to_json()),
                 ):
                     self.assertEqual(decoded, command)
-                    print_function = decoded.kind.value
-                    self.assertEqual(print_function.has_field("max_rows"), limit is not None)
-                    self.assertEqual(print_function.max_rows, 0 if limit is None else limit)
-                payload = json.loads(command.to_json())["printFunction"]
+                    table_rows = decoded.kind.value
+                    self.assertEqual(table_rows.has_field("max_rows"), limit is not None)
+                    self.assertEqual(table_rows.max_rows, 0 if limit is None else limit)
+                payload = json.loads(command.to_json())["tableRows"]
                 if limit is None:
                     self.assertNotIn("maxRows", payload)
                 else:

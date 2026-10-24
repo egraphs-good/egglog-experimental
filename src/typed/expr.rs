@@ -124,6 +124,7 @@ pub fn let_<I: ValueInput>(name: impl Into<Arc<str>>, initializer: I) -> I::Owne
         vec![callable.0],
         Arena::Node,
         0,
+        vec![],
     )
     .expect("canonical capture fragment");
     Arc::get_mut(record.owner.as_mut().unwrap())
@@ -157,6 +158,7 @@ impl Expr {
             vec![],
             Arena::Node,
             0,
+            vec![],
         )?))
     }
 
@@ -170,18 +172,18 @@ impl Expr {
             }],
             ..Default::default()
         };
-        Self(publish(program, slots, vec![], Arena::Node, 0).unwrap())
+        Self(publish(program, slots, vec![], Arena::Node, 0, vec![]).unwrap())
     }
 
     pub fn call(callable: &Callable, arguments: Vec<Self>) -> Self {
         let owner = callable.0.owner.as_ref().unwrap();
         let (name, inputs, output) = if callable.0.arena == Arena::Primitive {
             let primitive = callable.0.primitive().expect("owned builtin primitive");
-            let Some(pb::primitive::Typing::Signature(signature)) = &primitive.typing else {
+            let Some(signature) = &primitive.signature else {
                 panic!("unsupported callable typing")
             };
             assert!(
-                signature.type_params.is_empty() && signature.varargs.is_empty(),
+                signature.type_param_count == 0 && signature.varargs.is_empty(),
                 "generic primitive calls require an explicit result sort"
             );
             (
@@ -239,6 +241,55 @@ impl Expr {
         Ok(Self::build_call(callable, name, arguments, output))
     }
 
+    pub(super) fn apply(function: Self, arguments: Vec<Self>) -> Result<Self, TypedError> {
+        let node = &function.0.owner.as_ref().unwrap().program()?.nodes[function.0.index as usize];
+        let function_sort = function.0.resolve(Arena::Sort, node.sort_id)?;
+        let Some(pb::sort::Kind::Func(signature)) = &function_sort.sort()?.kind else {
+            return Err(TypedError::Invalid(
+                "application requires a function sort".into(),
+            ));
+        };
+        if arguments.len() != signature.params.len() {
+            return Err(TypedError::Invalid("function application arity".into()));
+        }
+        for (argument, parameter) in arguments.iter().zip(&signature.params) {
+            let node =
+                &argument.0.owner.as_ref().unwrap().program()?.nodes[argument.0.index as usize];
+            if SortRef(argument.0.resolve(Arena::Sort, node.sort_id)?)
+                != SortRef(function_sort.resolve(Arena::Sort, *parameter)?)
+            {
+                return Err(TypedError::Invalid(
+                    "function application argument sort".into(),
+                ));
+            }
+        }
+        let output = function_sort.resolve(Arena::Sort, signature.result)?;
+        let mut slots = std::array::from_fn(|_| vec![]);
+        slots[Arena::Sort as usize] = vec![Slot::External(output)];
+        let count = arguments.len() as u32;
+        slots[Arena::Node as usize] = std::iter::once(function)
+            .chain(arguments)
+            .map(|value| Slot::External(value.0))
+            .collect();
+        Ok(Self(publish(
+            pb::Program {
+                nodes: vec![pb::Node {
+                    kind: Some(pb::node::Kind::Apply(pb::Apply {
+                        function: Some(0),
+                        args: (1..=count).collect(),
+                    })),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+            slots,
+            vec![],
+            Arena::Node,
+            0,
+            vec![],
+        )?))
+    }
+
     // Publish one generated Call and location-only imports. Both closed and
     // generic validation paths share this ownership/record construction boundary.
     fn build_call(callable: &Callable, name: &str, arguments: Vec<Self>, output: SortRef) -> Self {
@@ -255,7 +306,17 @@ impl Expr {
         let mut slots = std::array::from_fn(|_| vec![]);
         slots[Arena::Node as usize] = arguments.into_iter().map(|a| Slot::External(a.0)).collect();
         slots[Arena::Sort as usize] = vec![Slot::External(output.0)];
-        Self(publish(program, slots, vec![callable.0.clone()], Arena::Node, 0).unwrap())
+        Self(
+            publish(
+                program,
+                slots,
+                vec![callable.0.clone()],
+                Arena::Node,
+                0,
+                vec![],
+            )
+            .unwrap(),
+        )
     }
 
     // Lift one typed callback into the existing computed-function declaration.
@@ -408,7 +469,7 @@ impl Expr {
             ..Default::default()
         });
         slots[Arena::Node as usize] = (0..program.nodes.len() as u32).map(Slot::Local).collect();
-        let callable = publish(program, slots, declarations, Arena::Declaration, 0)?;
+        let callable = publish(program, slots, declarations, Arena::Declaration, 0, vec![])?;
         Self::partial_call(callable, name, captures, sort)
     }
 
@@ -444,6 +505,7 @@ impl Expr {
             vec![callable],
             Arena::Node,
             0,
+            vec![],
         )?))
     }
 
@@ -1163,6 +1225,23 @@ impl PartialEq for Expr {
                             | pb::primitive_value::Value::Rational(_)
                     )
                 ) && a == b => {}
+                (Some(pb::node::Kind::Apply(a_apply)), Some(pb::node::Kind::Apply(b_apply)))
+                    if a_apply.args.len() == b_apply.args.len() =>
+                {
+                    let (Some(a_function), Some(b_function)) = (a_apply.function, b_apply.function)
+                    else {
+                        return false;
+                    };
+                    for (ia, ib) in std::iter::once(a_function)
+                        .chain(a_apply.args.iter().copied())
+                        .zip(std::iter::once(b_function).chain(b_apply.args.iter().copied()))
+                    {
+                        pending.push((
+                            a.resolve(Arena::Node, ia).unwrap(),
+                            b.resolve(Arena::Node, ib).unwrap(),
+                        ));
+                    }
+                }
                 (Some(pb::node::Kind::Call(ca)), Some(pb::node::Kind::Call(cb)))
                 | (
                     Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
@@ -1224,8 +1303,16 @@ impl Hash for Expr {
             }
             let pair_children;
             let map_children;
+            let apply_children;
             let children: &[u32] = match &node.kind {
                 Some(pb::node::Kind::Call(c)) => &c.args,
+                Some(pb::node::Kind::Apply(apply)) => {
+                    apply_children =
+                        std::iter::once(apply.function.expect("published function operand"))
+                            .chain(apply.args.iter().copied())
+                            .collect::<Vec<_>>();
+                    &apply_children
+                }
                 Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
                     value: Some(pb::primitive_value::Value::PartialCall(c)),
                 })) => &c.args,
@@ -1286,6 +1373,18 @@ impl Hash for Expr {
                     c.args.len().hash(&mut h);
                     for i in &c.args {
                         let child = record.resolve(Arena::Node, *i).unwrap();
+                        hashes[&(child.owner.as_ref().unwrap().id, child.arena, child.index)]
+                            .hash(&mut h);
+                    }
+                }
+                Some(pb::node::Kind::Apply(apply)) => {
+                    16u8.hash(&mut h);
+                    apply.args.len().hash(&mut h);
+                    for index in
+                        std::iter::once(apply.function.expect("published function operand"))
+                            .chain(apply.args.iter().copied())
+                    {
+                        let child = record.resolve(Arena::Node, index).unwrap();
                         hashes[&(child.owner.as_ref().unwrap().id, child.arena, child.index)]
                             .hash(&mut h);
                     }
@@ -1409,6 +1508,7 @@ impl std::fmt::Debug for Expr {
         // Deliberately bounded, with no recursive child formatting.
         match &n.kind {
             Some(pb::node::Kind::Call(c)) => write!(f, "Call({:?}, {} args)", c.func, c.args.len()),
+            Some(pb::node::Kind::Apply(apply)) => write!(f, "Apply({} args)", apply.args.len()),
             Some(pb::node::Kind::Var(v)) => write!(f, "Var({v:?})"),
             Some(pb::node::Kind::Union(u)) => write!(f, "Union({} members)", u.members.len()),
             Some(pb::node::Kind::PrimitiveValue(v)) => write!(f, "Literal({:?})", v.value),

@@ -5,6 +5,29 @@ use prost::Message;
 use std::collections::HashMap;
 use std::sync::Arc;
 
+/// Visit inline rule values in command order, including nested command lists.
+pub(crate) fn rules(program: &pb::Program) -> impl Iterator<Item = &pb::Rule> {
+    super::command_tree(&program.commands).flat_map(|command| match &command.kind {
+        Some(pb::command::Kind::AddRules(add)) => add.rules.as_slice(),
+        _ => &[],
+    })
+}
+
+/// Mutable traversal of inline rule values, preserving enclosing command order.
+pub(crate) fn rules_mut(program: &mut pb::Program) -> Vec<&mut pb::Rule> {
+    let mut result = vec![];
+    let mut pending: Vec<_> = program.commands.iter_mut().rev().collect();
+    while let Some(command) = pending.pop() {
+        match &mut command.kind {
+            Some(pb::command::Kind::AddRules(add)) => result.extend(add.rules.iter_mut()),
+            Some(pb::command::Kind::Fail(child)) => pending.push(child),
+            Some(pb::command::Kind::Loop(body)) => pending.extend(body.body.iter_mut().rev()),
+            _ => (),
+        }
+    }
+    result
+}
+
 /// Append prepared rule/command arenas without identifying their node locations
 /// with another input's locations. Named declarations are reconciled separately,
 /// keeping cumulative command data out of declaration reconciliation.
@@ -17,7 +40,6 @@ pub(super) fn append(
     source.declarations.clear();
     let nodes = u32::try_from(destination.nodes.len()).map_err(|_| "too many nodes")?;
     let sorts = u32::try_from(destination.sorts.len()).map_err(|_| "too many sorts")?;
-    let rules = u32::try_from(destination.rules.len()).map_err(|_| "too many rules")?;
     source::source_phase_refs(&mut source, |index| {
         *index = index.checked_add(nodes).ok_or("too many nodes")?;
         Ok(())
@@ -37,7 +59,7 @@ pub(super) fn append(
             Ok(())
         })?;
     }
-    for rule in &mut source.rules {
+    for rule in rules_mut(&mut source) {
         crate::builtin::definitions::rule_refs(
             rule,
             |_| Ok(()),
@@ -49,11 +71,6 @@ pub(super) fn append(
         relocate_span(&mut command.span, files)?;
         match &mut command.kind {
             Some(pb::command::Kind::Action(action)) => relocate_span(&mut action.span, files)?,
-            Some(pb::command::Kind::AddRules(add)) => {
-                for index in &mut add.rules {
-                    *index = index.checked_add(rules).ok_or("too many rules")?;
-                }
-            }
             Some(pb::command::Kind::Fail(child)) => pending.push(child),
             Some(pb::command::Kind::Loop(body)) => pending.extend(&mut body.body),
             _ => (),
@@ -62,7 +79,6 @@ pub(super) fn append(
     destination.sorts.append(&mut source.sorts);
     destination.nodes.append(&mut source.nodes);
     destination.files.append(&mut source.files);
-    destination.rules.append(&mut source.rules);
     destination.commands.append(&mut source.commands);
     Ok(())
 }
@@ -81,7 +97,7 @@ pub(super) fn append_rule(
     destination: &mut pb::Program,
     record: &RuleRecord,
     file_offsets: &mut HashMap<usize, u32>,
-) -> Result<(), String> {
+) -> Result<pb::Rule, String> {
     let identity = Arc::as_ptr(&record.files) as usize;
     let offset = if let Some(offset) = file_offsets.get(&identity) {
         *offset
@@ -91,7 +107,15 @@ pub(super) fn append_rule(
         file_offsets.insert(identity, offset);
         offset
     };
-    append(destination, &record.program, offset)
+    append(destination, &record.program, offset)?;
+    let command = destination
+        .commands
+        .pop()
+        .ok_or("missing owned rule command")?;
+    let Some(pb::command::Kind::AddRules(mut add)) = command.kind else {
+        return Err("owned rule requires one AddRules command".into());
+    };
+    add.rules.pop().ok_or_else(|| "missing owned rule".into())
 }
 
 fn relocate_span(span: &mut Option<pb::Span>, offset: u32) -> Result<(), String> {
@@ -125,7 +149,7 @@ fn sort_refs(
 /// Copy exactly one rooted rule graph. Numbering follows ordered roots/edges,
 /// independent of source arena allocation, and allocates before following edges
 /// so both shared locations and Union cycles survive.
-pub(super) fn rule(source: &pb::Program, index: u32) -> Result<pb::Program, String> {
+pub(super) fn rule(source: &pb::Program, rule: &pb::Rule) -> Result<pb::Program, String> {
     let mut result = pb::Program::default();
     let mut indices = HashMap::new();
     let mut import = |index: &mut u32, nodes: &mut Vec<pb::Node>| -> Result<(), String> {
@@ -145,11 +169,7 @@ pub(super) fn rule(source: &pb::Program, index: u32) -> Result<pb::Program, Stri
         *index = local;
         Ok(())
     };
-    let mut rule = source
-        .rules
-        .get(index as usize)
-        .ok_or("rule index out of bounds")?
-        .clone();
+    let mut rule = rule.clone();
     crate::builtin::definitions::rule_refs(
         &mut rule,
         |index| import(index, &mut result.nodes),
@@ -204,7 +224,13 @@ pub(super) fn rule(source: &pb::Program, index: u32) -> Result<pb::Program, Stri
             &mut interned,
         )?;
     }
-    result.rules.push(rule);
+    result.commands.push(pb::Command {
+        kind: Some(pb::command::Kind::AddRules(pb::AddRules {
+            group: String::new(),
+            rules: vec![rule],
+        })),
+        ..Default::default()
+    });
     Ok(result)
 }
 
@@ -238,7 +264,7 @@ pub(super) fn rule_key(rule: &pb::Program) -> Result<Vec<u8>, String> {
         }
     }
     let mut outer = std::collections::HashSet::new();
-    let mut roots = key.rules[0].clone();
+    let mut roots = rules(&key).next().ok_or("missing owned rule")?.clone();
     let mut pending = vec![];
     crate::builtin::definitions::rule_refs(
         &mut roots,
@@ -291,7 +317,7 @@ pub(super) fn rule_key(rule: &pb::Program) -> Result<Vec<u8>, String> {
     for sort in &mut key.sorts {
         sort.span = None;
     }
-    for rule in &mut key.rules {
+    for rule in rules_mut(&mut key) {
         rule.name = None;
         rule.doc.clear();
         crate::builtin::definitions::rule_refs(
@@ -340,7 +366,7 @@ pub(super) fn rule_key(rule: &pb::Program) -> Result<Vec<u8>, String> {
         *index = local;
         Ok(())
     };
-    let mut roots = key.rules[0].clone();
+    let mut roots = rules(&key).next().ok_or("missing owned rule")?.clone();
     crate::builtin::definitions::rule_refs(
         &mut roots,
         |index| import(index, &mut key.nodes),
@@ -349,7 +375,10 @@ pub(super) fn rule_key(rule: &pb::Program) -> Result<Vec<u8>, String> {
             Ok(())
         },
     )?;
-    key.rules[0] = roots;
+    *rules_mut(&mut key)
+        .into_iter()
+        .next()
+        .ok_or("missing owned rule")? = roots;
     let mut cursor = 0;
     while cursor < key.nodes.len() {
         let mut node = std::mem::take(&mut key.nodes[cursor]);
@@ -386,12 +415,18 @@ mod tests {
                     ..Default::default()
                 },
             ],
-            rules: vec![pb::Rule {
-                eval_mode: pb::RuleEvalMode::Seminaive.into(),
-                kind: Some(pb::rule::Kind::Rule(pb::RuleBody {
-                    query: vec![0],
-                    head: vec![pb::Action {
-                        kind: Some(pb::action::Kind::Term(1)),
+            commands: vec![pb::Command {
+                kind: Some(pb::command::Kind::AddRules(pb::AddRules {
+                    group: String::new(),
+                    rules: vec![pb::Rule {
+                        eval_mode: pb::RuleEvalMode::Seminaive.into(),
+                        kind: Some(pb::rule::Kind::Rule(pb::RuleBody {
+                            query: vec![0],
+                            head: vec![pb::Action {
+                                kind: Some(pb::action::Kind::Term(1)),
+                                ..Default::default()
+                            }],
+                        })),
                         ..Default::default()
                     }],
                 })),
@@ -404,11 +439,11 @@ mod tests {
     #[test]
     fn content_key_ignores_metadata_allocation_and_outer_binder_spelling() {
         let source = fixture("_0");
-        let expected = rule_key(&rule(&source, 0).unwrap()).unwrap();
+        let expected = rule_key(&rule(&source, rules(&source).next().unwrap()).unwrap()).unwrap();
         let mut changed = fixture("x");
-        changed.rules[0].name = Some("diagnostic".into());
-        changed.rules[0].doc = "documentation".into();
-        changed.rules[0].span = Some(pb::Span {
+        rules_mut(&mut changed).into_iter().next().unwrap().name = Some("diagnostic".into());
+        rules_mut(&mut changed).into_iter().next().unwrap().doc = "documentation".into();
+        rules_mut(&mut changed).into_iter().next().unwrap().span = Some(pb::Span {
             file: 0,
             start: 0,
             end: 1,
@@ -418,7 +453,7 @@ mod tests {
             contents: Some("x".into()),
         });
         changed.nodes.insert(0, pb::Node::default());
-        let mut body = changed.rules[0].clone();
+        let mut body = rules(&changed).next().unwrap().clone();
         crate::builtin::definitions::rule_refs(
             &mut body,
             |index| {
@@ -428,44 +463,62 @@ mod tests {
             |_| Ok(()),
         )
         .unwrap();
-        changed.rules[0] = body;
+        *rules_mut(&mut changed).into_iter().next().unwrap() = body;
         changed.nodes[2].kind = Some(pb::node::Kind::Call(pb::Call {
             func: "output".into(),
             args: vec![1, 1],
         }));
-        assert_eq!(expected, rule_key(&rule(&changed, 0).unwrap()).unwrap());
-        changed.rules[0].no_decomp = true;
-        assert_ne!(expected, rule_key(&rule(&changed, 0).unwrap()).unwrap());
+        assert_eq!(
+            expected,
+            rule_key(&rule(&changed, rules(&changed).next().unwrap()).unwrap()).unwrap()
+        );
+        rules_mut(&mut changed)
+            .into_iter()
+            .next()
+            .unwrap()
+            .no_decomp = true;
+        assert_ne!(
+            expected,
+            rule_key(&rule(&changed, rules(&changed).next().unwrap()).unwrap()).unwrap()
+        );
     }
 
     #[test]
     fn content_key_preserves_sharing_and_lambda_positional_binding() {
         let source = fixture("_0");
-        let expected = rule_key(&rule(&source, 0).unwrap()).unwrap();
+        let expected = rule_key(&rule(&source, rules(&source).next().unwrap()).unwrap()).unwrap();
         let mut changed = source.clone();
         changed.nodes.push(changed.nodes[0].clone());
         let Some(pb::node::Kind::Call(call)) = &mut changed.nodes[1].kind else {
             unreachable!()
         };
         call.args[1] = 2;
-        assert_eq!(expected, rule_key(&rule(&changed, 0).unwrap()).unwrap());
+        assert_eq!(
+            expected,
+            rule_key(&rule(&changed, rules(&changed).next().unwrap()).unwrap()).unwrap()
+        );
         let mut changed = source.clone();
         changed.nodes.push(changed.nodes[1].clone());
-        let Some(pb::rule::Kind::Rule(body)) = &mut changed.rules[0].kind else {
+        let Some(pb::rule::Kind::Rule(body)) =
+            &mut rules_mut(&mut changed).into_iter().next().unwrap().kind
+        else {
             unreachable!()
         };
         body.head.push(pb::Action {
             kind: Some(pb::action::Kind::Term(2)),
             ..Default::default()
         });
-        let separate_calls = rule_key(&rule(&changed, 0).unwrap()).unwrap();
-        let Some(pb::rule::Kind::Rule(body)) = &mut changed.rules[0].kind else {
+        let separate_calls =
+            rule_key(&rule(&changed, rules(&changed).next().unwrap()).unwrap()).unwrap();
+        let Some(pb::rule::Kind::Rule(body)) =
+            &mut rules_mut(&mut changed).into_iter().next().unwrap().kind
+        else {
             unreachable!()
         };
         body.head[1].kind = Some(pb::action::Kind::Term(1));
         assert_ne!(
             separate_calls,
-            rule_key(&rule(&changed, 0).unwrap()).unwrap()
+            rule_key(&rule(&changed, rules(&changed).next().unwrap()).unwrap()).unwrap()
         );
 
         let mut shared = source.clone();
@@ -478,16 +531,21 @@ mod tests {
             })),
             ..Default::default()
         });
-        let Some(pb::rule::Kind::Rule(body)) = &mut shared.rules[0].kind else {
+        let Some(pb::rule::Kind::Rule(body)) =
+            &mut rules_mut(&mut shared).into_iter().next().unwrap().kind
+        else {
             unreachable!()
         };
         body.head.push(pb::Action {
             kind: Some(pb::action::Kind::Term(2)),
             ..Default::default()
         });
-        let shared_key = rule_key(&rule(&shared, 0).unwrap()).unwrap();
+        let shared_key = rule_key(&rule(&shared, rules(&shared).next().unwrap()).unwrap()).unwrap();
         shared.nodes[0].kind = Some(pb::node::Kind::Var("_1".into()));
-        assert_ne!(shared_key, rule_key(&rule(&shared, 0).unwrap()).unwrap());
+        assert_ne!(
+            shared_key,
+            rule_key(&rule(&shared, rules(&shared).next().unwrap()).unwrap()).unwrap()
+        );
 
         // Equal positional spellings in distinct locations do not bind an
         // unrelated ordinary query variable to the lambda's parameter.
@@ -502,18 +560,21 @@ mod tests {
             })),
             ..Default::default()
         });
-        let Some(pb::rule::Kind::Rule(body)) = &mut separate.rules[0].kind else {
+        let Some(pb::rule::Kind::Rule(body)) =
+            &mut rules_mut(&mut separate).into_iter().next().unwrap().kind
+        else {
             unreachable!()
         };
         body.head.push(pb::Action {
             kind: Some(pb::action::Kind::Term(3)),
             ..Default::default()
         });
-        let separate_key = rule_key(&rule(&separate, 0).unwrap()).unwrap();
+        let separate_key =
+            rule_key(&rule(&separate, rules(&separate).next().unwrap()).unwrap()).unwrap();
         separate.nodes[0].kind = Some(pb::node::Kind::Var("x".into()));
         assert_eq!(
             separate_key,
-            rule_key(&rule(&separate, 0).unwrap()).unwrap()
+            rule_key(&rule(&separate, rules(&separate).next().unwrap()).unwrap()).unwrap()
         );
     }
 }

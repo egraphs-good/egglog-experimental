@@ -69,7 +69,7 @@ fn complete_native_catalog_uses_existing_generic_and_function_views() {
         "pub fn match_<__EgglogType1: crate::typed::EgglogValue>(&self, __egglog_arg_0: self::Function<(__EgglogType0,), __EgglogType1>, __egglog_arg_1: __EgglogType1) -> __EgglogType1",
         "pub fn get_node_size() -> self::I64",
         "pub fn get_table_size(__egglog_arg_0: impl ::core::iter::IntoIterator<Item = impl ::core::convert::Into<self::String>>) -> self::I64",
-        "pub fn subst<__EgglogType0: crate::typed::EqualitySort, __EgglogType1: crate::typed::EqualitySort>(__egglog_arg_0: __EgglogType0, __egglog_arg_1: self::Map<__EgglogType1, __EgglogType1>) -> __EgglogType0",
+        "pub fn subst<__EgglogType0: crate::typed::EgglogValue, __EgglogType1: crate::typed::EgglogValue>(__egglog_arg_0: __EgglogType0, __egglog_arg_1: self::Map<__EgglogType1, __EgglogType1>) -> __EgglogType0",
     ] {
         assert!(
             source.contains(method),
@@ -93,11 +93,6 @@ fn generic_free_functions_follow_binders_slots_names_and_results() {
             .unwrap();
         let p = &mut changed.primitives[index];
         p.name = "test.generic.renamed".into();
-        let Some(pb::primitive::Typing::Signature(s)) = &mut p.typing else {
-            panic!()
-        };
-        s.type_params[0] = "not a Rust identifier 🦀".into();
-        s.equality_type_params = vec![0];
         let mut views = local.callables.remove("egglog.core.ne").unwrap();
         views[0].path[3] = "renamed_generic".into();
         views[0].params.reverse();
@@ -115,7 +110,7 @@ fn generic_free_functions_follow_binders_slots_names_and_results() {
             .split_once("\n    }\n")
             .unwrap()
             .0;
-        assert!(body.contains("crate::typed::EqualitySort"));
+        assert!(body.contains("crate::typed::expr::ValueInput"));
         assert!(
             body.find("Into::into(__egglog_arg_1)").unwrap()
                 < body.find("Borrow::borrow(&__egglog_arg_0)").unwrap()
@@ -133,23 +128,6 @@ fn generic_free_functions_follow_binders_slots_names_and_results() {
     let (source, deferred, _) = generate(&program, &absent).unwrap();
     assert!(deferred.contains(&"egglog.core.ne".into()));
     assert!(!source.contains("pub fn ne<"));
-    for restrictions in [vec![1], vec![0, 0]] {
-        let mut changed = program.clone();
-        let p = changed
-            .primitives
-            .iter_mut()
-            .find(|p| p.name == "egglog.core.ne")
-            .unwrap();
-        let Some(pb::primitive::Typing::Signature(s)) = &mut p.typing else {
-            panic!()
-        };
-        s.equality_type_params = restrictions;
-        assert!(
-            generate(&changed, &mapping)
-                .unwrap_err()
-                .contains("equality binders must be strictly increasing and in range")
-        );
-    }
 }
 
 #[test]
@@ -166,10 +144,7 @@ fn generic_free_functions_reject_unsupported_or_ambiguous_views() {
         (7, "unsupported generic Rust free function view"),
         (8, "unsupported generic Rust free function view"),
         (9, "specialized generic Rust views are not supported yet"),
-        (
-            10,
-            "generic Rust free function requires an input anchor for every binder",
-        ),
+        (10, "undetermined generic parameter"),
         (11, "unsupported generic Rust free function view"),
         (12, "Rust free function name collision"),
         (13, "unsupported Rust identifier"),
@@ -197,11 +172,9 @@ fn generic_free_functions_reject_unsupported_or_ambiguous_views() {
                     .iter_mut()
                     .find(|p| p.name == "egglog.core.ne")
                     .unwrap();
-                let Some(pb::primitive::Typing::Signature(s)) = &mut p.typing else {
-                    panic!()
-                };
+                let Some(s) = &mut p.signature else { panic!() };
                 if case == 10 {
-                    s.type_params.push("unanchored".into());
+                    s.type_param_count += 1;
                 } else {
                     s.varargs.push(s.inputs[0].clone());
                 }
@@ -223,7 +196,7 @@ fn generic_free_functions_reject_unsupported_or_ambiguous_views() {
     );
     assert_eq!(
         generate(&program, &local).unwrap_err(),
-        "unsupported Rust function application view"
+        "orphan Rust callable mapping: egglog.core.fn.apply"
     );
 }
 
@@ -324,21 +297,18 @@ fn map_codec_uses_actual_nested_records_and_presentation_metadata() {
     let source = checked_source(&program, &local);
     assert!(source.contains("pub struct RenamedMap"));
     assert!(source.contains("pub fn lookup("));
-    for case in 0..5 {
+    for case in [0, 2, 3, 4] {
         let mut changed = program.clone();
         let p = changed
             .primitives
             .iter_mut()
             .find(|p| p.name == "egglog.core.map.of")
             .unwrap();
-        let Some(pb::primitive::Typing::Signature(s)) = &mut p.typing else {
-            panic!()
-        };
+        let Some(s) = &mut p.signature else { panic!() };
         match case {
             0 => {
-                s.type_params.pop();
+                s.type_param_count -= 1;
             }
-            1 => s.equality_type_params = vec![0],
             2 => s.inputs.clear(),
             3 => s.output = Some(s.inputs[0].sort),
             _ => s.varargs.push(s.inputs[0].clone()),
@@ -373,13 +343,11 @@ fn maybe_codec_follows_catalog_identity_and_checks_optional_child_scheme() {
             .iter_mut()
             .find(|p| p.name == "egglog.experimental.maybe.some")
             .unwrap();
-        let Some(pb::primitive::Typing::Signature(s)) = &mut p.typing else {
-            panic!()
-        };
+        let Some(s) = &mut p.signature else { panic!() };
         match case {
             0 => s.inputs.clear(),
             1 => s.output = Some(s.inputs[0].sort),
-            2 => s.type_params.push("extra".into()),
+            2 => s.type_param_count += 1,
             _ => s.varargs.push(s.inputs[0].clone()),
         }
         assert!(
@@ -414,16 +382,14 @@ fn pair_codec_follows_catalog_identity_paths_and_two_binders() {
             .iter_mut()
             .find(|p| p.name == "egglog.core.pair.make")
             .unwrap();
-        let Some(pb::primitive::Typing::Signature(s)) = &mut p.typing else {
-            panic!()
-        };
+        let Some(s) = &mut p.signature else { panic!() };
         match case {
             0 => {
                 s.inputs.pop();
             }
             1 => s.output = Some(s.inputs[0].sort),
             2 => {
-                s.type_params.pop();
+                s.type_param_count -= 1;
             }
             _ => s.varargs.push(s.inputs[0].clone()),
         }
@@ -512,9 +478,7 @@ fn grouped_tail_views_are_explicitly_rejected_but_records_are_retained() {
         .iter_mut()
         .find(|p| p.name == key)
         .unwrap();
-    let Some(pb::primitive::Typing::Signature(s)) = &mut p.typing else {
-        panic!()
-    };
+    let Some(s) = &mut p.signature else { panic!() };
     if s.varargs.is_empty() {
         s.varargs = s.inputs.clone();
         s.inputs.clear();
@@ -638,20 +602,16 @@ fn assert_locations(program: &pb::BuiltinCatalog, mapping: &RustPresentation, so
         };
         for view in views.iter().filter(|v| v.trait_impl.is_none()) {
             let name = view.path.last().unwrap();
-            if matches!(p.typing, Some(pb::primitive::Typing::Application(_))) {
-                assert!(source.contains(&format!("function_application!({name}, {index});")));
-            } else {
-                let marker = format!("pub fn {name}");
-                assert!(
-                    source.split(&marker).skip(1).any(|part| {
-                        part.split_once("\n    }\n")
-                            .unwrap()
-                            .0
-                            .contains(&format!(".index = {index};"))
-                    }),
-                    "missing {name} at {index}"
-                );
-            }
+            let marker = format!("pub fn {name}");
+            assert!(
+                source.split(&marker).skip(1).any(|part| {
+                    part.split_once("\n    }\n")
+                        .unwrap()
+                        .0
+                        .contains(&format!(".index = {index};"))
+                }),
+                "missing {name} at {index}"
+            );
         }
     }
     for (index, sort) in program.sorts.iter().enumerate() {
@@ -762,7 +722,7 @@ fn native_records_determine_paths_locations_and_argument_order() {
         }
     }
     for primitive in &mut changed.primitives {
-        if let Some(pb::primitive::Typing::Signature(s)) = &mut primitive.typing {
+        if let Some(s) = &mut primitive.signature {
             for a in s.inputs.iter_mut().chain(&mut s.varargs) {
                 a.sort = last - a.sort
             }
@@ -975,9 +935,7 @@ fn native_vec_views_drive_generic_members_and_relocated_declarations() {
         .iter_mut()
         .find(|p| p.name == "egglog.core.vec.get")
         .unwrap();
-    let Some(pb::primitive::Typing::Signature(s)) = &mut p.typing else {
-        panic!()
-    };
+    let Some(s) = &mut p.signature else { panic!() };
     s.output = Some(integer);
     assert!(checked_source(&changed, &mapping).contains("-> self::I64"));
     let graph = Arc::new(pb::BuiltinCatalog {
@@ -1003,5 +961,24 @@ fn native_vec_views_drive_generic_members_and_relocated_declarations() {
     assert_eq!(
         checked_source(&program, &local),
         checked_source(&program, &mapping)
+    );
+}
+
+#[test]
+fn generic_count_must_be_determined_by_actual_referenced_sorts() {
+    let (mut catalog, mapping) = native_fixture();
+    catalog
+        .primitives
+        .iter_mut()
+        .find(|p| p.name == "egglog.core.ne")
+        .unwrap()
+        .signature
+        .as_mut()
+        .unwrap()
+        .type_param_count = u32::MAX;
+    assert!(
+        generate(&catalog, &mapping)
+            .unwrap_err()
+            .contains("undetermined generic parameter")
     );
 }

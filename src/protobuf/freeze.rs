@@ -726,7 +726,6 @@ mod tests {
             declarations: vec![
                 D::EqSort(pb::EqSort {
                     name: "State".into(),
-                    ..Default::default()
                 }),
                 D::Constructor(pb::Constructor {
                     name: "Num".into(),

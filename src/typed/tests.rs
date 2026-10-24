@@ -261,6 +261,7 @@ fn function_values_reject_deferred_unions_without_eager_allocation() {
             vec![],
             Arena::Node,
             0,
+            vec![],
         )
         .unwrap(),
     ));
@@ -662,7 +663,7 @@ fn typed_table_heads_import_nullary_targets_close_one_binder_and_keep_shared_uni
             |d| matches!(&d.kind, Some(pb::declaration::Kind::Function(f)) if f.name == name)
         ));
     }
-    let Some(pb::rule::Kind::Rule(body)) = &packer.program.rules[0].kind else {
+    let Some(pb::rule::Kind::Rule(body)) = &packer.rules[0].kind else {
         panic!()
     };
     let Some(pb::action::Kind::Set(first)) = &body.head[0].kind else {
@@ -691,7 +692,7 @@ fn typed_table_heads_import_nullary_targets_close_one_binder_and_keep_shared_uni
     assert!(last.target.as_ref().unwrap().args.is_empty());
     assert_eq!(last.value, Some(query.members[0]));
     assert_eq!(shared.members[0], query.members[0]);
-    let Some(pb::rule::Kind::Rule(other)) = &packer.program.rules[1].kind else {
+    let Some(pb::rule::Kind::Rule(other)) = &packer.rules[1].kind else {
         panic!()
     };
     let Some(pb::action::Kind::Set(other)) = &other.head[0].kind else {
@@ -893,12 +894,13 @@ fn rule_conditions_relocate_once_and_close_the_whole_ordered_binder() {
     let old = packer.intern(original.0, 0);
     let new = packer.intern(extended.0, 0);
     packer.finish().unwrap();
+    let packed_rules = packer.rules;
     let program = packer.program;
-    let Some(pb::rule::Kind::Rule(old)) = &program.rules[old as usize].kind else {
+    let Some(pb::rule::Kind::Rule(old)) = &packed_rules[old as usize].kind else {
         panic!()
     };
     assert_eq!(old.query.len(), 1);
-    let Some(pb::rule::Kind::Rule(body)) = &program.rules[new as usize].kind else {
+    let Some(pb::rule::Kind::Rule(body)) = &packed_rules[new as usize].kind else {
         panic!()
     };
     assert_eq!(body.query.len(), 3);
@@ -947,7 +949,7 @@ fn registration_and_rule_heads_use_the_same_canonical_action_input() {
     let mut packed = Packer::default();
     packed.intern(rule((), heads).0, 0);
     packed.finish().unwrap();
-    let Some(pb::rule::Kind::Rule(body)) = &packed.program.rules[0].kind else {
+    let Some(pb::rule::Kind::Rule(body)) = &packed.rules[0].kind else {
         panic!()
     };
     assert!(body.query.is_empty());
@@ -1032,8 +1034,7 @@ fn nested_fail_keeps_packed_roots_and_fragment_admission() {
             std::array::from_fn(|_| vec![]),
             vec![],
             Arena::Node,
-            facts[0],
-        ),
+            facts[0], vec![],),
         Err(TypedError::Invalid(message)) if message == "unsupported typed fragment sections"
     ));
 }
@@ -1052,14 +1053,15 @@ fn additive_composition_packs_shared_rule_records_and_empty_additions() {
         packer.intern(addition, 0);
     }
     packer.finish().unwrap();
+    assert_eq!(packer.rules.len(), 2);
     let p = packer.program;
-    // Packing retains distinct authored records; native registration owns content identity.
-    assert_eq!(p.rules.len(), 2);
+    // Inline resupply preserves order; native registration owns content identity.
     assert_eq!(p.commands.len(), 4);
     let Some(pb::command::Kind::AddRules(leaf)) = &p.commands[0].kind else {
         panic!()
     };
-    assert_eq!(leaf.rules, [0, 0, 1]);
+    assert_eq!(leaf.rules.len(), 3);
+    assert_eq!(leaf.rules[0], leaf.rules[1]);
     let Some(pb::command::Kind::AddRules(empty)) = &p.commands[1].kind else {
         panic!()
     };
@@ -1150,7 +1152,6 @@ fn wide_callbacks_author_generated_binders_without_claiming_grounded_execution()
     }
     packed.finish().unwrap();
     let widths: Vec<_> = packed
-        .program
         .rules
         .iter()
         .map(|r| {
@@ -1195,7 +1196,6 @@ fn namespace_fragment(imported: bool, reversed: bool, missing: Option<Declaratio
             DeclarationKind::EqSort,
             pb::declaration::Kind::EqSort(pb::EqSort {
                 name: "Shared".into(),
-                ..Default::default()
             }),
         ),
         (
@@ -1249,7 +1249,15 @@ fn namespace_fragment(imported: bool, reversed: bool, missing: Option<Declaratio
     };
     let mut imports = vec![family];
     if imported {
-        let source = publish(program.clone(), slots(), imports.clone(), Arena::Node, 0).unwrap();
+        let source = publish(
+            program.clone(),
+            slots(),
+            imports.clone(),
+            Arena::Node,
+            0,
+            vec![],
+        )
+        .unwrap();
         imports.extend((0..program.declarations.len()).map(|index| Record {
             owner: source.owner.clone(),
             arena: Arena::Declaration,
@@ -1257,7 +1265,7 @@ fn namespace_fragment(imported: bool, reversed: bool, missing: Option<Declaratio
         }));
         program.declarations.clear();
     }
-    publish(program, slots(), imports, Arena::Node, 0).unwrap()
+    publish(program, slots(), imports, Arena::Node, 0, vec![]).unwrap()
 }
 
 #[test]
@@ -1302,8 +1310,15 @@ fn nominal_family_and_callable_names_close_independently() {
                     program.declarations.retain(|d| d != definition);
                     let mut slots = std::array::from_fn(|_| vec![]);
                     slots[Arena::Sort as usize] = vec![Slot::Local(0), Slot::Local(1)];
-                    let mixed =
-                        publish(program, slots, vec![declaration.clone()], Arena::Node, 0).unwrap();
+                    let mixed = publish(
+                        program,
+                        slots,
+                        vec![declaration.clone()],
+                        Arena::Node,
+                        0,
+                        vec![],
+                    )
+                    .unwrap();
                     let selected = mixed.declaration("Shared", kind).unwrap();
                     assert!(Arc::ptr_eq(
                         selected.owner.as_ref().unwrap(),
@@ -1386,18 +1401,11 @@ fn missing_declaration_kind_never_uses_a_same_named_other_kind() {
 
 #[test]
 fn namespace_split_keeps_same_kind_and_callable_kind_conflicts() {
-    for changed in 0..4 {
+    for changed in 1..4 {
         let root = namespace_fragment(false, false, None);
         let mut program = root.owner.as_ref().unwrap().program().unwrap().clone();
         let mut imports = root.owner.as_ref().unwrap().declarations.clone();
         match changed {
-            0 => {
-                let Some(pb::declaration::Kind::EqSort(d)) = &mut program.declarations[0].kind
-                else {
-                    panic!()
-                };
-                d.uf_parent = Some("Shared_parent".into());
-            }
             1 => {
                 let Some(pb::declaration::Kind::Constructor(d)) = &mut program.declarations[1].kind
                 else {
@@ -1429,7 +1437,7 @@ fn namespace_split_keeps_same_kind_and_callable_kind_conflicts() {
         }
         let mut slots = std::array::from_fn(|_| vec![]);
         slots[Arena::Sort as usize] = vec![Slot::Local(0), Slot::Local(1)];
-        let other = publish(program, slots, imports, Arena::Node, 0).unwrap();
+        let other = publish(program, slots, imports, Arena::Node, 0, vec![]).unwrap();
         let mut packer = Packer::default();
         for record in [root, other] {
             packer.intern(record.resolve(Arena::Sort, 1).unwrap(), 0);
@@ -1472,6 +1480,7 @@ fn family_sort_comparison_resolves_slots_not_raw_indices() {
             vec![family],
             Arena::Sort,
             0,
+            vec![],
         )
         .unwrap(),
     );
@@ -1552,8 +1561,8 @@ fn generic_tail_patterns_keep_group_width_and_share_every_binding() {
             ],
             primitives: vec![pb::Primitive {
                 name: "test.grouped".into(),
-                typing: Some(pb::primitive::Typing::Signature(pb::GenericSignature {
-                    type_params: (0..parameters).map(|i| format!("T{i}")).collect(),
+                signature: Some(pb::GenericSignature {
+                    type_param_count: parameters,
                     inputs: inputs
                         .iter()
                         .map(|sort| pb::Arg {
@@ -1569,8 +1578,7 @@ fn generic_tail_patterns_keep_group_width_and_share_every_binding() {
                         })
                         .collect(),
                     output: Some(output),
-                    ..Default::default()
-                })),
+                }),
                 ..Default::default()
             }],
             ..Default::default()
@@ -1584,6 +1592,10 @@ fn generic_tail_patterns_keep_group_width_and_share_every_binding() {
     };
     let integer = I64::from(7).expression().clone();
     let float = F64::from(2.5).expression().clone();
+    let huge = declaration(&[0], &[], 0, u32::MAX);
+    assert!(
+        matches!(huge.check_call(&[I64::sort_ref()], &I64::sort_ref()), Err(super::TypedError::Invalid(message)) if message == "undetermined generic parameter")
+    );
     let fixed = declaration(&[0], &[], 0, 1);
     assert!(Expr::call_with_result(&fixed, vec![integer.clone()], I64::sort_ref()).is_ok());
     for arguments in [vec![], vec![integer.clone(), integer.clone()]] {
@@ -1687,7 +1699,7 @@ fn grouped_builtin_demands_retain_every_tail_position() {
             ],
             primitives: vec![pb::Primitive {
                 name: "test.relocated.group".into(),
-                typing: Some(pb::primitive::Typing::Signature(pb::GenericSignature {
+                signature: Some(pb::GenericSignature {
                     inputs: vec![pb::Arg {
                         sort: tail[0],
                         name: "prefix".into(),
@@ -1702,7 +1714,7 @@ fn grouped_builtin_demands_retain_every_tail_position() {
                         })
                         .collect(),
                     ..Default::default()
-                })),
+                }),
                 doc: Some("retain complete grouped record".into()),
                 ..Default::default()
             }],
@@ -1732,7 +1744,7 @@ fn grouped_builtin_demands_retain_every_tail_position() {
             primitive.doc.as_deref(),
             Some("retain complete grouped record")
         );
-        let Some(pb::primitive::Typing::Signature(signature)) = &primitive.typing else {
+        let Some(signature) = &primitive.signature else {
             panic!()
         };
         assert_eq!(signature.varargs.len(), 3);
@@ -2150,7 +2162,8 @@ fn map_publication_requires_both_refs_and_preserves_union_identity() {
                 slots,
                 vec![],
                 Arena::Node,
-                0
+                0,
+                vec![]
             )
             .is_err()
         );
@@ -2373,7 +2386,8 @@ fn pair_publication_requires_both_valid_references() {
                 slots,
                 vec![],
                 Arena::Node,
-                0
+                0,
+                vec![]
             )
             .is_err()
         );
@@ -2653,6 +2667,7 @@ fn node(
         declarations,
         Arena::Node,
         0,
+        vec![],
     )
     .unwrap()
 }
@@ -2861,6 +2876,7 @@ fn shared_union_identity_and_flat_cycle_reclamation() {
         vec![],
         Arena::Node,
         0,
+        vec![],
     )
     .unwrap();
     let weak = Arc::downgrade(cycle.owner.as_ref().unwrap());
@@ -2924,23 +2940,21 @@ fn generated_rule_fields_and_shared_locations_are_authoritative() {
         let mut slots = std::array::from_fn(|_| vec![]);
         slots[Arena::Node as usize] = vec![Slot::External(x.clone()), Slot::External(y.clone())];
         publish(
-            pb::Program {
-                rules: vec![pb::Rule {
-                    kind: Some(pb::rule::Kind::Rewrite(pb::Rewrite {
-                        lhs: 0,
-                        rhs,
-                        ..Default::default()
-                    })),
-                    eval_mode: mode,
-                    name: Some("same diagnostic label".into()),
-                    ..Default::default()
-                }],
-                ..Default::default()
-            },
+            pb::Program::default(),
             slots,
             vec![],
             Arena::Rule,
             0,
+            vec![pb::Rule {
+                kind: Some(pb::rule::Kind::Rewrite(pb::Rewrite {
+                    lhs: 0,
+                    rhs,
+                    ..Default::default()
+                })),
+                eval_mode: mode,
+                name: Some("same diagnostic label".into()),
+                ..Default::default()
+            }],
         )
         .unwrap()
     };
@@ -2959,7 +2973,7 @@ fn generated_rule_fields_and_shared_locations_are_authoritative() {
             commands: vec![pb::Command {
                 kind: Some(pb::command::Kind::AddRules(pb::AddRules {
                     group: "fields".into(),
-                    rules: vec![0, 1, 2, 3],
+                    rules: vec![pb::Rule::default(); 4],
                 })),
                 ..Default::default()
             }],
@@ -2969,6 +2983,7 @@ fn generated_rule_fields_and_shared_locations_are_authoritative() {
         vec![],
         Arena::Command,
         0,
+        vec![],
     )
     .unwrap();
     let mut packer = Packer::default();
@@ -2977,13 +2992,11 @@ fn generated_rule_fields_and_shared_locations_are_authoritative() {
     let Some(pb::command::Kind::AddRules(rules)) = &packer.program.commands[0].kind else {
         panic!()
     };
-    assert_eq!(rules.rules, [0, 0, 1, 2]);
-    assert_eq!(packer.program.rules.len(), 3);
-    assert_eq!(
-        packer.program.rules[2].eval_mode,
-        pb::RuleEvalMode::Naive as i32
-    );
-    let Some(pb::rule::Kind::Rewrite(rule)) = &packer.program.rules[2].kind else {
+    assert_eq!(rules.rules.len(), 4);
+    assert_eq!(rules.rules[0], rules.rules[1]);
+    assert_eq!(packer.rules.len(), 3);
+    assert_eq!(packer.rules[2].eval_mode, pb::RuleEvalMode::Naive as i32);
+    let Some(pb::rule::Kind::Rewrite(rule)) = &packer.rules[2].kind else {
         panic!()
     };
     assert_eq!(rule.lhs, rule.rhs);
@@ -3022,6 +3035,7 @@ fn declaration_diagnostics_do_not_change_local_compatibility() {
                 vec![],
                 Arena::Declaration,
                 0,
+                vec![],
             )
             .unwrap(),
         )

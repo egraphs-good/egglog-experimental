@@ -43,9 +43,9 @@ class SemanticHeaderTests(unittest.TestCase):
             validate(ir.Program(sorts=[ir.Sort(kind=Oneof("var", 0))]))
         catalog = ir.BuiltinCatalog(
             sorts=[ir.Sort(kind=Oneof("var", 0))],
-            primitives=[ir.Primitive(name="p", typing=Oneof("signature", ir.GenericSignature(
-                type_params=["T"], inputs=[ir.Arg(sort=0)], output=0,
-            )))],
+            primitives=[ir.Primitive(name="p", signature=ir.GenericSignature(
+                type_param_count=1, inputs=[ir.Arg(sort=0)], output=0,
+            ))],
         )
         validate(catalog)
         self.assertEqual(ir.BuiltinCatalog.from_binary(catalog.to_binary()), catalog)

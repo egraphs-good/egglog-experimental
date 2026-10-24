@@ -6,7 +6,7 @@ use egglog_experimental::proto as pb;
 use prost::Message;
 #[path = "../src/typed/builtins/presentation.rs"]
 mod presentation;
-use presentation::{Receiver, RustPresentation};
+use presentation::RustPresentation;
 use std::{
     collections::{BTreeMap, HashSet},
     fmt::Write as _,
@@ -471,49 +471,10 @@ impl ::core::convert::From<&::core::primitive::str> for self::{name} {{
             deferred.push(primitive.name.clone());
             continue;
         };
-        let signature = match &primitive.typing {
-            Some(pb::primitive::Typing::Signature(signature)) => signature,
-            Some(pb::primitive::Typing::Application(_)) => {
-                for view in rust {
-                    if view.path.len() != 1
-                        || view.owner_sort.is_some()
-                        || view.receiver
-                            != Some(Receiver {
-                                core_input: Some(0),
-                                borrowed: true,
-                            })
-                        || view.params.len() != 1
-                        || view.params[0].core_input != Some(1)
-                        || view.params[0].borrowed
-                        || view.trait_impl.is_some()
-                        || view.borrowed_self
-                        || view.tail_repetitions.is_some()
-                    {
-                        return Err("unsupported Rust function application view".into());
-                    }
-                    identifier(&view.path[0])?;
-                    writeln!(source, "function_application!({}, {index});", view.path[0]).unwrap();
-                }
-                continue;
-            }
-            _ => {
-                return Err(format!(
-                    "unsupported selected Rust typing: {}",
-                    primitive.name
-                ));
-            }
-        };
-        if signature
-            .equality_type_params
-            .iter()
-            .any(|&i| i as usize >= signature.type_params.len())
-            || signature
-                .equality_type_params
-                .windows(2)
-                .any(|w| w[0] >= w[1])
-        {
-            return Err("equality binders must be strictly increasing and in range".into());
-        }
+        let signature = primitive
+            .signature
+            .as_ref()
+            .ok_or_else(|| format!("missing selected Rust signature: {}", primitive.name))?;
         if signature.varargs.len() > 1 {
             return Err(format!(
                 "unsupported selected Rust tail width {} for {}",
@@ -521,7 +482,7 @@ impl ::core::convert::From<&::core::primitive::str> for self::{name} {{
                 primitive.name
             ));
         }
-        if !signature.type_params.is_empty() {
+        if signature.type_param_count != 0 {
             emit_generic_views(
                 program,
                 presentation,
@@ -955,7 +916,7 @@ fn rust_type(
 }
 
 // Private generic identifiers cannot capture any authored public type. Core
-// binder labels remain diagnostic; their positions determine the Rust mapping.
+// parameter positions determine the Rust mapping.
 fn generic_parameters(presentation: &RustPresentation, count: usize) -> Vec<String> {
     let mut occupied: HashSet<String> = presentation
         .families
@@ -1064,14 +1025,13 @@ impl<{generics}> crate::typed::EgglogValue for self::{name}<{types}> {{
                     if p.name != identity {
                         return None;
                     }
-                    let Some(pb::primitive::Typing::Signature(s)) = &p.typing else {
+                    let Some(s) = &p.signature else {
                         return None;
                     };
                     Some((i, s))
                 })
                 .ok_or("missing catalog Maybe constructor")?;
-            if signature.type_params.len() != 1
-                || !signature.equality_type_params.is_empty()
+            if signature.type_param_count as usize != 1
                 || signature.inputs.len() != arity
                 || !signature.varargs.is_empty()
                 || rust_type(
@@ -1140,15 +1100,14 @@ impl<{t}: crate::typed::EgglogValue> ::core::convert::TryFrom<&self::{name}<{t}>
                 if p.name != "egglog.core.pair.make" {
                     return None;
                 }
-                let Some(pb::primitive::Typing::Signature(s)) = &p.typing else {
+                let Some(s) = &p.signature else {
                     return None;
                 };
                 Some((index, s))
             })
             .ok_or("missing catalog Pair constructor")?;
         let owner = format!("self::{name}<{types}>");
-        if signature.type_params.len() != arity
-            || !signature.equality_type_params.is_empty()
+        if signature.type_param_count as usize != arity
             || signature.inputs.len() != arity
             || !signature.varargs.is_empty()
             || rust_type(
@@ -1231,7 +1190,7 @@ fn emit_map_codec(
             .iter()
             .enumerate()
             .find_map(|(i, p)| {
-                let Some(pb::primitive::Typing::Signature(s)) = &p.typing else {
+                let Some(s) = &p.signature else {
                     return None;
                 };
                 (p.name == identity).then_some((i, s))
@@ -1266,8 +1225,7 @@ fn emit_map_codec(
     };
     if pair_family.name != "Pair"
         || pair_family.args.len() != 2
-        || pair_make.type_params.len() != 2
-        || !pair_make.equality_type_params.is_empty()
+        || pair_make.type_param_count as usize != 2
         || pair_make.inputs.len() != 2
         || !pair_make.varargs.is_empty()
         || pair_make.inputs.iter().zip(parameters).any(|(arg, ty)| {
@@ -1296,8 +1254,7 @@ fn emit_map_codec(
     };
     if vec_family.name != "Vec"
         || vec_family.args.len() != 1
-        || vec_of.type_params.len() != 1
-        || !vec_of.equality_type_params.is_empty()
+        || vec_of.type_param_count as usize != 1
         || !vec_of.inputs.is_empty()
         || vec_of.varargs.len() != 1
         || rust_type(
@@ -1312,8 +1269,7 @@ fn emit_map_codec(
             vec_of.varargs[0].sort,
             std::slice::from_ref(&pair_type),
         )? != pair_type
-        || vec_empty.type_params.len() != 1
-        || !vec_empty.equality_type_params.is_empty()
+        || vec_empty.type_param_count as usize != 1
         || !vec_empty.inputs.is_empty()
         || !vec_empty.varargs.is_empty()
         || rust_type(
@@ -1322,8 +1278,7 @@ fn emit_map_codec(
             vec_empty.output.ok_or("missing Vec empty output")?,
             std::slice::from_ref(&pair_type),
         )? != vec_type
-        || empty.type_params.len() != 2
-        || !empty.equality_type_params.is_empty()
+        || empty.type_param_count as usize != 2
         || !empty.inputs.is_empty()
         || !empty.varargs.is_empty()
         || rust_type(
@@ -1332,8 +1287,7 @@ fn emit_map_codec(
             empty.output.ok_or("missing Map empty output")?,
             parameters,
         )? != owner
-        || of.type_params.len() != 2
-        || !of.equality_type_params.is_empty()
+        || of.type_param_count as usize != 2
         || of.inputs.len() != 1
         || !of.varargs.is_empty()
         || rust_type(
@@ -1426,7 +1380,7 @@ fn emit_generic_views(
     occupied: &HashSet<&str>,
 ) -> Result<(), String> {
     let primitive = &program.primitives[index];
-    let Some(pb::primitive::Typing::Signature(signature)) = &primitive.typing else {
+    let Some(signature) = &primitive.signature else {
         return Err("unsupported generic typing".into());
     };
     let rust = presentation
@@ -1436,7 +1390,43 @@ fn emit_generic_views(
     if rust.is_empty() {
         return Err("empty generic Rust views".into());
     }
-    let parameters = generic_parameters(presentation, signature.type_params.len());
+    // Check actual referenced data before allocating generated identifiers. A
+    // malformed count must not require memory proportional to its scalar value.
+    let mut pending = signature
+        .inputs
+        .iter()
+        .chain(&signature.varargs)
+        .map(|arg| arg.sort)
+        .chain(signature.output)
+        .collect::<Vec<_>>();
+    let mut seen = HashSet::new();
+    let mut referenced = HashSet::new();
+    while let Some(index) = pending.pop() {
+        if !seen.insert(index) {
+            continue;
+        }
+        match program
+            .sorts
+            .get(index as usize)
+            .and_then(|sort| sort.kind.as_ref())
+            .ok_or("invalid generic sort reference")?
+        {
+            pb::sort::Kind::Var(index) if *index < signature.type_param_count => {
+                referenced.insert(*index);
+            }
+            pb::sort::Kind::Var(_) => return Err("unbound generic parameter".into()),
+            pb::sort::Kind::Application(family) => pending.extend(&family.args),
+            pb::sort::Kind::Func(function) => {
+                pending.extend(&function.params);
+                pending.push(function.result);
+            }
+            _ => (),
+        }
+    }
+    if referenced.len() != signature.type_param_count as usize {
+        return Err("undetermined generic parameter".into());
+    }
+    let parameters = generic_parameters(presentation, referenced.len());
     let value = local_name("value", occupied);
     let record = local_name("record", occupied);
     let args = local_name("args", occupied);
@@ -1589,16 +1579,7 @@ fn emit_generic_views(
         identifier(method)?;
         let generics = parameters
             .iter()
-            .enumerate()
-            .map(|(i, t)| {
-                if (owner.is_some() || concrete_inputs)
-                    && signature.equality_type_params.contains(&(i as u32))
-                {
-                    format!("{t}: crate::typed::EqualitySort")
-                } else {
-                    format!("{t}: {bound}")
-                }
-            })
+            .map(|t| format!("{t}: {bound}"))
             .collect::<Vec<_>>();
         let output = rust_type(
             program,
@@ -1699,20 +1680,6 @@ fn emit_generic_views(
         let mutability = if tail.is_some() { "mut " } else { "" };
         let tail_code = tail.map_or_else(String::new, |(name, ty)| format!("for {value} in ::core::iter::IntoIterator::into_iter({name}) {{ let {value}: {ty} = ::core::convert::Into::into({value}); {args}.push(::core::clone::Clone::clone(<{ty} as crate::typed::EgglogValue>::expression(&{value}))); }}"));
         let params = params.join(", ");
-        let restrictions =
-            if owner.is_none() && !concrete_inputs && !signature.equality_type_params.is_empty() {
-                format!(
-                    " where {}",
-                    signature
-                        .equality_type_params
-                        .iter()
-                        .map(|i| { format!("{}: crate::typed::EqualitySort", types[*i as usize]) })
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                )
-            } else {
-                String::new()
-            };
         let (prefix, suffix, method_generics) = match owner {
             Some(owner) => (
                 format!(
@@ -1731,7 +1698,7 @@ fn emit_generic_views(
         writeln!(source, r#"
 {prefix}
     /// Author a catalog-defined call without evaluating its arguments.
-    pub fn {method}{method_generics}({params}) -> {output}{restrictions} {{
+    pub fn {method}{method_generics}({params}) -> {output} {{
         let {mutability}{args} = ::std::vec![{inputs}];
         {tail_code}
         let mut {record} = ::core::clone::Clone::clone(crate::typed::storage::builtin_catalog());

@@ -55,6 +55,19 @@ pub(super) fn binder(roots: &[Record]) -> Result<HashMap<String, String>, TypedE
                     ));
                 }
             }
+            Some(pb::node::Kind::Apply(apply)) => {
+                for index in apply.args.iter().rev() {
+                    pending.push(r.resolve(Arena::Node, *index)?);
+                }
+                pending.push(
+                    r.resolve(
+                        Arena::Node,
+                        apply.function.ok_or_else(|| {
+                            TypedError::Invalid("missing function operand".into())
+                        })?,
+                    )?,
+                );
+            }
             Some(pb::node::Kind::Call(c)) => {
                 for i in c.args.iter().rev() {
                     pending.push(r.resolve(Arena::Node, *i)?);

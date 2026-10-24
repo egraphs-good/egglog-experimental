@@ -144,13 +144,13 @@ impl PrintFunction {
         };
         let [
             pb::CommandOutput {
-                kind: Some(pb::command_output::Kind::PrintedFunction(table)),
+                kind: Some(pb::command_output::Kind::TableRows(table)),
                 ..
             },
         ] = response.outputs.as_slice()
         else {
             return Err(TransportError(
-                "source table presentation requires one PrintedFunction output".into(),
+                "source table presentation requires one TableRows output".into(),
             ));
         };
         // Borrow the actual response arenas by ownership transfer, not a copy
@@ -245,6 +245,7 @@ enum SourceRuleset {
 struct SourceScope {
     graph: EGraph,
     program: pb::Program,
+    rules: Vec<pb::Rule>,
     rulesets: HashMap<String, SourceRuleset>,
     relations: HashSet<String>,
     schedulers: HashSet<String>,
@@ -266,6 +267,7 @@ pub struct Source {
     include_base: PathBuf,
     scopes: Vec<SourceScope>,
     program: pb::Program,
+    rules: Vec<pb::Rule>,
     rulesets: HashMap<String, SourceRuleset>,
     relations: HashSet<String>,
     // Names only: the producer must never instantiate or run a scheduler.
@@ -283,6 +285,14 @@ pub(super) fn source_node_refs(
 ) -> Result<(), String> {
     use pb::{node::Kind as N, primitive_value::Value as V};
     match &mut node.kind {
+        Some(N::Apply(apply)) => {
+            if let Some(function) = &mut apply.function {
+                visit(function)?;
+            }
+            for argument in &mut apply.args {
+                visit(argument)?;
+            }
+        }
         Some(N::Call(call) | N::GetCost(call)) => {
             for index in &mut call.args {
                 visit(index)?;
@@ -402,7 +412,7 @@ pub(super) fn source_phase_refs(
             visit(index)?;
         }
     }
-    for rule in &mut program.rules {
+    for rule in graph::rules_mut(program) {
         match &mut rule.kind {
             Some(pb::rule::Kind::Rule(rule)) => {
                 for index in &mut rule.query {
@@ -463,9 +473,9 @@ pub(super) fn source_phase_refs(
                 | pb::command::Kind::BindScheduler(_)
                 | pb::command::Kind::KeepBest(_)
                 | pb::command::Kind::Freeze(_)
-                | pb::command::Kind::PrintSize(_)
-                | pb::command::Kind::PrintFunction(_)
-                | pb::command::Kind::PrintTableStats(_)
+                | pb::command::Kind::TableSizes(_)
+                | pb::command::Kind::TableRows(_)
+                | pb::command::Kind::TableStats(_)
                 | pb::command::Kind::ProveExists(_)
                 | pb::command::Kind::Stats(_)
                 | pb::command::Kind::Explain(_),
@@ -607,7 +617,7 @@ pub fn produce_input(
     fact_directory: Option<&Path>,
     extension: Option<Arc<dyn NativeExtension>>,
 ) -> Result<pb::Program, TransportError> {
-    if !descriptor.commands.is_empty() || !descriptor.rules.is_empty() {
+    if !descriptor.commands.is_empty() || graph::rules(descriptor).next().is_some() {
         return Err(TransportError(
             "input descriptor must contain declarations only".into(),
         ));
@@ -729,6 +739,7 @@ pub(crate) fn primitive_definition(
             program: pb::Program {
                 ..Default::default()
             },
+            rules: vec![],
             rulesets: HashMap::new(),
             relations: HashSet::new(),
             schedulers: HashSet::new(),
@@ -841,6 +852,7 @@ impl Source {
             program: pb::Program {
                 ..Default::default()
             },
+            rules: vec![],
             rulesets: HashMap::from([(String::new(), SourceRuleset::Rules(vec![]))]),
             relations: HashSet::new(),
             schedulers: HashSet::new(),
@@ -941,6 +953,7 @@ impl Source {
                         self.scopes.push(SourceScope {
                             graph: self.graph.clone(),
                             program: self.program.clone(),
+                            rules: self.rules.clone(),
                             rulesets: self.rulesets.clone(),
                             relations: self.relations.clone(),
                             schedulers: self.schedulers.clone(),
@@ -959,6 +972,7 @@ impl Source {
                         };
                         self.graph.restore_from(saved.graph);
                         self.program = saved.program;
+                        self.rules = saved.rules;
                         self.rulesets = saved.rulesets;
                         self.relations = saved.relations;
                         self.schedulers = saved.schedulers;
@@ -1130,6 +1144,7 @@ impl Source {
         let rule = expanded.pop().unwrap();
         let mut prefix = self.compile_expanded(expanded, None)?;
         let program = self.program.clone();
+        let rules = self.rules.clone();
         let rulesets = self.rulesets.clone();
         match self.compile_expanded(vec![rule], None) {
             Ok(mut complete) => {
@@ -1141,6 +1156,7 @@ impl Source {
                 // Native retains the constructor if its later rule fails. Do
                 // not export any nodes or group additions from that child.
                 self.program = program;
+                self.rules = rules;
                 self.rulesets = rulesets;
                 self.pending_error = Some(error);
                 Ok(prefix)
@@ -1154,7 +1170,12 @@ impl Source {
         expanded: Vec<Command>,
         explicit_sort_alias: Option<String>,
     ) -> Result<pb::Program, String> {
-        let first_rule = self.program.rules.len();
+        if expanded
+            .iter()
+            .any(|command| matches!(command, Command::Sort { uf: Some(_), .. }))
+        {
+            return Err("manual :internal-uf source is unsupported by the public protocol".into());
+        }
         let encoded = self
             .mode
             .is_some_and(|mode| mode != pb::ExecutionMode::Normal);
@@ -1676,10 +1697,7 @@ impl Source {
                     } if uf.as_ref().is_none_or(|(_, index)| index.is_none()) => {
                         let span = self.span(&span)?;
                         self.program.declarations.push(pb::Declaration {
-                            kind: Some(pb::declaration::Kind::EqSort(pb::EqSort {
-                                name,
-                                uf_parent: uf.map(|(parent, _)| parent),
-                            })),
+                            kind: Some(pb::declaration::Kind::EqSort(pb::EqSort { name })),
                             span,
                             ..Default::default()
                         });
@@ -1927,7 +1945,7 @@ impl Source {
                         let span = self.span(&span)?;
                         self.program.commands.push(pb::Command {
                             span,
-                            kind: Some(pb::command::Kind::PrintFunction(pb::PrintFunction {
+                            kind: Some(pb::command::Kind::TableRows(pb::GetTableRows {
                                 table,
                                 max_rows,
                             })),
@@ -2046,7 +2064,7 @@ impl Source {
                         let span = self.span(&span)?;
                         self.program.commands.push(pb::Command {
                             span,
-                            kind: Some(pb::command::Kind::PrintSize(pb::PrintSize {
+                            kind: Some(pb::command::Kind::TableSizes(pb::GetTableSizes {
                                 tables: table.into_iter().collect(),
                             })),
                         });
@@ -2069,35 +2087,19 @@ impl Source {
             }
         }
         self.pending_error = definition_error;
-        let program = self.phase(first_rule)?;
+        let program = self.phase()?;
         Ok(program)
     }
 
     // Each packet carries the newly authored bodies and ordered additions.
-    fn phase(&mut self, first_rule: usize) -> Result<pb::Program, String> {
-        let mut commands = std::mem::take(&mut self.program.commands);
-        let mut pending: Vec<_> = commands.iter_mut().collect();
-        while let Some(command) = pending.pop() {
-            match &mut command.kind {
-                Some(pb::command::Kind::AddRules(add)) => {
-                    for index in &mut add.rules {
-                        *index = index
-                            .checked_sub(u32::try_from(first_rule).map_err(|_| "too many rules")?)
-                            .ok_or("source addition escaped its authored phase")?;
-                    }
-                }
-                Some(pb::command::Kind::Fail(child)) => pending.push(child),
-                Some(pb::command::Kind::Loop(body)) => pending.extend(&mut body.body),
-                _ => (),
-            }
-        }
+    fn phase(&mut self) -> Result<pb::Program, String> {
+        let commands = std::mem::take(&mut self.program.commands);
         Ok(pb::Program {
             sorts: self.program.sorts.clone(),
             nodes: vec![],
             files: self.program.files.clone(),
             declarations: std::mem::take(&mut self.program.declarations),
             commands,
-            rules: self.program.rules[first_rule..].to_vec(),
         })
     }
 
@@ -2108,7 +2110,6 @@ impl Source {
         captures: Vec<String>,
         deletion: Option<String>,
     ) -> Result<pb::Program, String> {
-        let first_rule = self.program.rules.len();
         let deleting = deletion.is_some();
         let (constructor, arity) = if let Some(constructor) = deletion {
             (constructor, captures.len())
@@ -2179,7 +2180,7 @@ impl Source {
                     }
                     self.program.commands.extend(prefix);
                     self.pending_error = Some(error.to_string());
-                    return self.phase(first_rule);
+                    return self.phase();
                 }
             };
             let [N::CoreAction(action)] = resolved.as_slice() else {
@@ -2284,7 +2285,7 @@ impl Source {
                 }),
             })),
         });
-        self.phase(first_rule)
+        self.phase()
     }
 
     // Text combined groups are live frontend selectors; the wire directly
@@ -2584,7 +2585,7 @@ impl Source {
                 };
                 return Ok(pb::Command {
                     span: self.span(&span)?,
-                    kind: Some(pb::command::Kind::PrintSize(pb::PrintSize { tables })),
+                    kind: Some(pb::command::Kind::TableSizes(pb::GetTableSizes { tables })),
                 });
             }
             _ => return Err("source schedule body has no supported native projection".into()),
@@ -2641,7 +2642,7 @@ impl Source {
             vec![rule.name.clone()]
         };
         if let Some(duplicate) = list.iter().find_map(|index| {
-            let previous = &self.program.rules[*index as usize];
+            let previous = &self.rules[*index as usize];
             let previous_name = previous.name.as_ref()?;
             names
                 .iter()
@@ -2667,9 +2668,7 @@ impl Source {
                 let next = locals.len();
                 var.name = locals
                     .entry(var.name)
-                    .or_insert_with(|| {
-                        format!("{}{}_{next}", self.local_prefix, self.program.rules.len())
-                    })
+                    .or_insert_with(|| format!("{}{}_{next}", self.local_prefix, self.rules.len()))
                     .clone();
             }
             var
@@ -2690,7 +2689,7 @@ impl Source {
                         name: format!(
                             "{}{}_{}",
                             self.local_prefix,
-                            self.program.rules.len(),
+                            self.rules.len(),
                             locals.len() + globals.len()
                         ),
                         sort: var.sort.clone(),
@@ -2963,9 +2962,9 @@ impl Source {
             pb::rule::Kind::Rule(pb::RuleBody { query, head })
         };
         let span = self.span(&rule.span)?;
-        let index = u32::try_from(self.program.rules.len()).map_err(|_| "too many source rules")?;
+        let index = u32::try_from(self.rules.len()).map_err(|_| "too many source rules")?;
         let ruleset_name = rule.ruleset.clone();
-        self.program.rules.push(pb::Rule {
+        self.rules.push(pb::Rule {
             kind: Some(kind),
             name: Some(rule.name),
             eval_mode: match rule.eval_mode {
@@ -2987,7 +2986,7 @@ impl Source {
             span,
             kind: Some(pb::command::Kind::AddRules(pb::AddRules {
                 group: ruleset_name,
-                rules: vec![index],
+                rules: vec![self.rules[index as usize].clone()],
             })),
         });
         Ok(())
@@ -3424,9 +3423,7 @@ fn source_scheduler_binding(span: &ast::Span, args: &[Expr]) -> Result<pb::BindS
     }
     Ok(pb::BindScheduler {
         name: name.clone(),
-        scheduler: Some(pb::Scheduler {
-            kind: Some(pb::scheduler::Kind::BackOff(options)),
-        }),
+        back_off: Some(options),
     })
 }
 
@@ -3576,7 +3573,7 @@ impl Renderer {
                 &command.kind,
                 Some(pb::command::Kind::Action(action)) if matches!(action.kind, Some(pb::action::Kind::SetCost(_)))
             ))
-            || program.rules.iter().any(|rule| matches!(
+            || graph::rules(program).any(|rule| matches!(
                 &rule.kind,
                 Some(pb::rule::Kind::Rule(rule)) if rule.head.iter().any(|action| matches!(action.kind, Some(pb::action::Kind::SetCost(_))))
             )))
@@ -3605,7 +3602,7 @@ impl Renderer {
             if lowered.nodes.iter().any(|node| matches!(&node.kind, Some(pb::node::Kind::GetCost(call)) if unextractable.contains(&call.func)))
                 || super::command_tree(&lowered.commands).filter_map(|command| match &command.kind {
                     Some(pb::command::Kind::Action(action)) => Some(action), _ => None,
-                }).chain(lowered.rules.iter().flat_map(|rule| match &rule.kind {
+                }).chain(graph::rules(&lowered).flat_map(|rule| match &rule.kind {
                     Some(pb::rule::Kind::Rule(rule)) => rule.head.as_slice(), _ => &[],
                 })).any(|action| match &action.kind {
                     Some(pb::action::Kind::SetCost(set)) => set.target.as_ref().is_some_and(|call| unextractable.contains(&call.func)),
@@ -3672,14 +3669,6 @@ impl Renderer {
                 target
                     .entry(native_name(namespace, logical))
                     .or_insert(alias);
-                if let Some(pb::declaration::Kind::EqSort(sort)) = &declaration.kind
-                    && let Some(parent) = &sort.uf_parent
-                {
-                    names
-                        .callables
-                        .entry(native_name("call", parent))
-                        .or_insert_with(|| format!("__egglog_source_call_{index}"));
-                }
             }
             for alias in names.sorts.values().chain(names.callables.values()) {
                 if self.session.graph.get_sort_by_name(alias).is_some()
@@ -3693,35 +3682,6 @@ impl Renderer {
             }
             names
         };
-        let sort_aliases: HashSet<_> = authored.sorts.values().cloned().collect();
-        for parent in prepared
-            .definitions
-            .declarations
-            .iter()
-            .filter_map(|declaration| match &declaration.kind {
-                Some(pb::declaration::Kind::EqSort(sort)) => sort.uf_parent.as_ref(),
-                _ => None,
-            })
-        {
-            let alias = authored
-                .callables
-                .get(&native_name("call", parent))
-                .cloned()
-                .unwrap_or_else(|| parent.clone());
-            if sort_aliases.contains(&alias)
-                || self.session.graph.get_sort_by_name(&alias).is_some()
-                || self.session.graph.get_function(&alias).is_some()
-                || self.session.graph.type_info().is_primitive(&alias)
-            {
-                return Err(TransportError(format!(
-                    "parent table alias {alias:?} collides with a native name"
-                )));
-            }
-            authored
-                .callables
-                .entry(native_name("call", parent))
-                .or_insert(alias);
-        }
         let mut sort_names = self.sort_names.clone();
         let mut definitions = prepared.definitions.clone();
         project_names(
@@ -3798,7 +3758,7 @@ impl Renderer {
                     span: ast::Span::Panic,
                     name: sort.name.clone(),
                     presort_and_args: None,
-                    uf: sort.uf_parent.clone().map(|parent| (parent, None)),
+                    uf: None,
                     proof_func: None,
                     container_rebuild: None,
                     proof_constructors: None,
@@ -4071,7 +4031,7 @@ fn source_builtin_names(
             }
             _ => continue,
         };
-        if authored.callables.contains_key(&call.func) {
+        if call.func == "unstable-app" || authored.callables.contains_key(&call.func) {
             continue;
         }
         let mut arguments = call
@@ -4339,7 +4299,7 @@ fn render_prepared(
         }
         for action in super::command_tree(&program.commands).filter_map(|command| match &command.kind {
             Some(pb::command::Kind::Action(action)) => Some(action), _ => None,
-        }).chain(program.rules.iter().flat_map(|rule| match &rule.kind {
+        }).chain(graph::rules(program).flat_map(|rule| match &rule.kind {
             Some(pb::rule::Kind::Rule(rule)) => rule.head.as_slice(), _ => &[],
         })) {
             match &action.kind {
@@ -4374,7 +4334,7 @@ fn render_prepared(
             if let Some(pb::declaration::Kind::EqSort(sort)) = &declaration.kind {
                 commands.push(Command::Sort {
                     span: native_span(program, declaration.span.as_ref(), native_spans)?, name: sort.name.clone(), presort_and_args: None,
-                    uf: sort.uf_parent.clone().map(|parent| (parent, None)), proof_func: None, container_rebuild: None, proof_constructors: None, unionable: true,
+                    uf: None, proof_func: None, container_rebuild: None, proof_constructors: None, unionable: true,
                 });
             }
         }
@@ -4450,13 +4410,13 @@ fn render_prepared(
         {
             // Native handles and canonical rules are aligned by occurrence, not
             // label/body equality. Change presentation only, never Prepared.
-            let labels: HashMap<_, _> = prepared_rules.iter().zip(&program.rules)
+            let labels: HashMap<_, _> = prepared_rules.iter().zip(graph::rules(program))
                 .map(|(native, rule)| (native.as_str(), rule.name.as_deref().unwrap_or("")))
                 .collect();
             let mut rule_indices = HashMap::new();
             for (index, name) in prepared_rules.iter().enumerate() {
                 rule_indices.insert(name.clone(), index);
-                if matches!(rule_program.rules[index].kind, Some(pb::rule::Kind::Birewrite(_))) {
+                if matches!(graph::rules(rule_program).nth(index).ok_or("missing inline rule")?.kind, Some(pb::rule::Kind::Birewrite(_))) {
                     rule_indices.insert(format!("{name}=>"), index);
                     rule_indices.insert(format!("{name}<="), index);
                 }
@@ -4479,7 +4439,7 @@ fn render_prepared(
                     // Execution plans use physical symbols. Reuse the same
                     // planner with text aliases occupied before presentation,
                     // keeping the rewrite witness and head references aligned.
-                    command = lower_rule(rule_program, &rule_program.rules[index], &rule.ruleset,
+                    command = lower_rule(rule_program, graph::rules(rule_program).nth(index).ok_or("missing inline rule")?, &rule.ruleset,
                         &prepared_rules[index], &rule_spans, &query_occupied)?
                         .into_iter().find(|candidate| matches!(candidate,
                             Command::Rule { rule: candidate } if candidate.name == rule.name))
@@ -4487,7 +4447,7 @@ fn render_prepared(
                 }
                 if let Command::Rule { rule } = &mut command {
                     let index = *rule_indices.get(&rule.name).ok_or("missing prepared rule occurrence")?;
-                    let rewrite = match &rule_program.rules[index].kind {
+                    let rewrite = match &graph::rules(rule_program).nth(index).ok_or("missing inline rule")?.kind {
                         Some(pb::rule::Kind::Rewrite(rewrite)) => Some((rewrite.lhs, rewrite.rhs, &rewrite.conditions, Some(rewrite.subsume))),
                         Some(pb::rule::Kind::Birewrite(rewrite)) => Some((rewrite.lhs, rewrite.rhs, &rewrite.conditions, None)),
                         _ => None,
@@ -4519,7 +4479,7 @@ fn render_prepared(
                 }
                 if let Command::Rule { rule } = &mut command {
                     let index = *rule_indices.get(&rule.name).ok_or("missing prepared rule occurrence")?;
-                    if let Some(pb::rule::Kind::Rule(body)) = &rule_program.rules[index].kind {
+                    if let Some(pb::rule::Kind::Rule(body)) = &graph::rules(rule_program).nth(index).ok_or("missing inline rule")?.kind {
                         let mut head = Vec::new();
                         let mut memo = HashMap::new();
                         let mut next = 0;
@@ -4580,7 +4540,7 @@ fn render_prepared(
         let mut selectors = HashMap::new();
         fn project_controls(
             commands: &mut Vec<pb::Command>, registry: &mut rules::Registry,
-            candidates: &[rules::Candidate], selectors: &mut HashMap<Vec<usize>, String>,
+            candidates: &[rules::Candidate], candidate_cursor: &mut usize, selectors: &mut HashMap<Vec<usize>, String>,
             definitions: &mut Vec<Command>, request: u64, repeated: bool,
         ) -> Result<Vec<usize>, String> {
             let mut retained = vec![];
@@ -4589,8 +4549,10 @@ fn render_prepared(
                 match &mut command.kind {
                     Some(pb::command::Kind::AddRules(add)) => {
                         if repeated { return Err("source cannot render AddRules inside a repeated loop".into()); }
-                        for &index in &add.rules {
-                            let index = registry.intern(&candidates[index as usize]);
+                        for _ in &add.rules {
+                            let candidate = candidates.get(*candidate_cursor).ok_or("missing prepared inline rule occurrence")?;
+                            *candidate_cursor += 1;
+                            let index = registry.intern(candidate);
                             let group = registry.groups.entry(add.group.clone()).or_default();
                             if !group.contains(&index) { group.push(index); }
                         }
@@ -4612,14 +4574,14 @@ fn render_prepared(
                             // No additions execute, but every Run still needs a
                             // valid empty/private selector for native compilation.
                             let mut shadow = registry.clone();
-                            project_controls(&mut body.body,&mut shadow,candidates,selectors,definitions,request,false)?;
+                            project_controls(&mut body.body,&mut shadow,candidates,candidate_cursor,selectors,definitions,request,false)?;
                         } else {
-                            project_controls(&mut body.body,registry,candidates,selectors,definitions,request,repeated || body.max_iterations != Some(1))?;
+                            project_controls(&mut body.body,registry,candidates,candidate_cursor,selectors,definitions,request,repeated || body.max_iterations != Some(1))?;
                         }
                     }
                     Some(pb::command::Kind::Fail(child)) => {
                         let mut body = vec![(**child).clone()];
-                        project_controls(&mut body,registry,candidates,selectors,definitions,request,repeated)?;
+                        project_controls(&mut body,registry,candidates,candidate_cursor,selectors,definitions,request,repeated)?;
                         let [replacement]: [pb::Command; 1] = body.try_into().map_err(|_| "source Fail cannot wrap AddRules")?;
                         **child = replacement;
                     }
@@ -4631,7 +4593,7 @@ fn render_prepared(
             *commands = retained;
             Ok(positions)
         }
-        let positions = project_controls(&mut render_program.commands,&mut render_registry,&prepared.context.candidates,&mut selectors,&mut commands,prepared.request,false)?;
+        let positions = project_controls(&mut render_program.commands,&mut render_registry,&prepared.context.candidates,&mut 0,&mut selectors,&mut commands,prepared.request,false)?;
         for (projected_position, mut command) in render_program.commands.iter().enumerate() {
             let position = positions[projected_position];
             let mut fail_spans = vec![];
@@ -4683,7 +4645,7 @@ fn render_prepared(
                 pb::command::Kind::Stats(_) => {
                     commands.push(Command::PrintOverallStatistics(span, None));
                 }
-                pb::command::Kind::PrintSize(print) => {
+                pb::command::Kind::TableSizes(print) => {
                     if print.tables.len() > 1 {
                         return Err("source print-size supports at most one table".into());
                     }
@@ -4704,7 +4666,7 @@ fn render_prepared(
                 pb::command::Kind::ProveExists(prove) => {
                     commands.push(Command::ProveExists(span, prove.constructor.clone()))
                 }
-                pb::command::Kind::PrintFunction(print) => {
+                pb::command::Kind::TableRows(print) => {
                     commands.push(Command::PrintFunction(
                         span, print.table.clone(),
                         print.max_rows.map(usize::try_from).transpose().map_err(|_| "table row limit exceeds native usize")?,
@@ -5157,9 +5119,7 @@ fn source_extended_schedule(
             (head, args)
         }
         pb::command::Kind::BindScheduler(bind) => {
-            let Some(pb::scheduler::Kind::BackOff(options)) =
-                bind.scheduler.as_ref().and_then(|s| s.kind.as_ref())
-            else {
+            let Some(options) = bind.back_off.as_ref() else {
                 return Err("source scheduler kind is unsupported".into());
             };
             let mut args = vec![];
@@ -5190,7 +5150,7 @@ fn source_extended_schedule(
                 ],
             )
         }
-        pb::command::Kind::PrintSize(print) if print.tables.len() <= 1 => {
+        pb::command::Kind::TableSizes(print) if print.tables.len() <= 1 => {
             let args = print
                 .tables
                 .iter()
@@ -5318,7 +5278,14 @@ mod node_projection_tests {
         assert!(
             renderer
                 .render(&pb::Program {
-                    rules: vec![pb::Rule::default()],
+                    commands: vec![pb::Command {
+                        kind: Some(pb::command::Kind::AddRules(pb::AddRules {
+                            group: String::new(),
+                            rules: vec![pb::Rule::default()]
+                        })),
+                        ..Default::default()
+                    },],
+
                     ..Default::default()
                 })
                 .is_err()
@@ -5468,122 +5435,131 @@ mod node_projection_tests {
                     ..Default::default()
                 },
             ],
-            rules: vec![
-                pb::Rule {
-                    kind: Some(pb::rule::Kind::Rule(pb::RuleBody {
-                        query: vec![5],
-                        head: vec![
-                            pb::Action {
-                                kind: Some(pb::action::Kind::Set(pb::Set {
-                                    target: Some(pb::Call {
-                                        args: vec![6],
-                                        ..Default::default()
-                                    }),
-                                    value: Some(7),
+
+            commands: vec![
+                pb::Command {
+                    kind: Some(pb::command::Kind::AddRules(pb::AddRules {
+                        group: String::new(),
+                        rules: vec![
+                            pb::Rule {
+                                kind: Some(pb::rule::Kind::Rule(pb::RuleBody {
+                                    query: vec![5],
+                                    head: vec![
+                                        pb::Action {
+                                            kind: Some(pb::action::Kind::Set(pb::Set {
+                                                target: Some(pb::Call {
+                                                    args: vec![6],
+                                                    ..Default::default()
+                                                }),
+                                                value: Some(7),
+                                            })),
+                                            ..Default::default()
+                                        },
+                                        pb::Action {
+                                            kind: Some(pb::action::Kind::SetCost(pb::SetCost {
+                                                target: Some(pb::Call {
+                                                    args: vec![8],
+                                                    ..Default::default()
+                                                }),
+                                                cost: Some(9),
+                                            })),
+                                            ..Default::default()
+                                        },
+                                        pb::Action {
+                                            kind: Some(pb::action::Kind::Delete(pb::Call {
+                                                args: vec![10],
+                                                ..Default::default()
+                                            })),
+                                            ..Default::default()
+                                        },
+                                        pb::Action {
+                                            kind: Some(pb::action::Kind::Subsume(pb::Call {
+                                                args: vec![11],
+                                                ..Default::default()
+                                            })),
+                                            ..Default::default()
+                                        },
+                                        pb::Action {
+                                            kind: Some(pb::action::Kind::Term(12)),
+                                            ..Default::default()
+                                        },
+                                    ],
                                 })),
                                 ..Default::default()
                             },
-                            pb::Action {
-                                kind: Some(pb::action::Kind::SetCost(pb::SetCost {
-                                    target: Some(pb::Call {
-                                        args: vec![8],
-                                        ..Default::default()
-                                    }),
-                                    cost: Some(9),
-                                })),
-                                ..Default::default()
-                            },
-                            pb::Action {
-                                kind: Some(pb::action::Kind::Delete(pb::Call {
-                                    args: vec![10],
+                            pb::Rule {
+                                kind: Some(pb::rule::Kind::Rewrite(pb::Rewrite {
+                                    lhs: 13,
+                                    rhs: 14,
+                                    conditions: vec![15],
                                     ..Default::default()
                                 })),
                                 ..Default::default()
                             },
-                            pb::Action {
-                                kind: Some(pb::action::Kind::Subsume(pb::Call {
-                                    args: vec![11],
-                                    ..Default::default()
+                            pb::Rule {
+                                kind: Some(pb::rule::Kind::Birewrite(pb::BiRewrite {
+                                    lhs: 16,
+                                    rhs: 17,
+                                    conditions: vec![18],
                                 })),
-                                ..Default::default()
-                            },
-                            pb::Action {
-                                kind: Some(pb::action::Kind::Term(12)),
                                 ..Default::default()
                             },
                         ],
                     })),
                     ..Default::default()
                 },
-                pb::Rule {
-                    kind: Some(pb::rule::Kind::Rewrite(pb::Rewrite {
-                        lhs: 13,
-                        rhs: 14,
-                        conditions: vec![15],
+                pb::Command {
+                    kind: Some(pb::command::Kind::Fail(Box::new(pb::Command {
+                        kind: Some(pb::command::Kind::Loop(pb::Loop {
+                            until: vec![19],
+                            body: vec![pb::Command {
+                                kind: Some(pb::command::Kind::Loop(pb::Loop {
+                                    until: vec![20],
+                                    body: vec![
+                                        pb::Command {
+                                            kind: Some(pb::command::Kind::Check(pb::Check {
+                                                facts: vec![21],
+                                            })),
+                                            ..Default::default()
+                                        },
+                                        pb::Command {
+                                            kind: Some(pb::command::Kind::Prove(pb::Prove {
+                                                facts: vec![22],
+                                            })),
+                                            ..Default::default()
+                                        },
+                                        pb::Command {
+                                            kind: Some(pb::command::Kind::Extract(pb::Extract {
+                                                roots: vec![23],
+                                                ..Default::default()
+                                            })),
+                                            ..Default::default()
+                                        },
+                                        pb::Command {
+                                            kind: Some(pb::command::Kind::Action(pb::Action {
+                                                kind: Some(pb::action::Kind::Set(pb::Set {
+                                                    target: Some(pb::Call {
+                                                        args: vec![24],
+                                                        ..Default::default()
+                                                    }),
+                                                    value: Some(25),
+                                                })),
+                                                ..Default::default()
+                                            })),
+                                            ..Default::default()
+                                        },
+                                    ],
+                                    ..Default::default()
+                                })),
+                                ..Default::default()
+                            }],
+                            ..Default::default()
+                        })),
                         ..Default::default()
-                    })),
-                    ..Default::default()
-                },
-                pb::Rule {
-                    kind: Some(pb::rule::Kind::Birewrite(pb::BiRewrite {
-                        lhs: 16,
-                        rhs: 17,
-                        conditions: vec![18],
-                    })),
+                    }))),
                     ..Default::default()
                 },
             ],
-            commands: vec![pb::Command {
-                kind: Some(pb::command::Kind::Fail(Box::new(pb::Command {
-                    kind: Some(pb::command::Kind::Loop(pb::Loop {
-                        until: vec![19],
-                        body: vec![pb::Command {
-                            kind: Some(pb::command::Kind::Loop(pb::Loop {
-                                until: vec![20],
-                                body: vec![
-                                    pb::Command {
-                                        kind: Some(pb::command::Kind::Check(pb::Check {
-                                            facts: vec![21],
-                                        })),
-                                        ..Default::default()
-                                    },
-                                    pb::Command {
-                                        kind: Some(pb::command::Kind::Prove(pb::Prove {
-                                            facts: vec![22],
-                                        })),
-                                        ..Default::default()
-                                    },
-                                    pb::Command {
-                                        kind: Some(pb::command::Kind::Extract(pb::Extract {
-                                            roots: vec![23],
-                                            ..Default::default()
-                                        })),
-                                        ..Default::default()
-                                    },
-                                    pb::Command {
-                                        kind: Some(pb::command::Kind::Action(pb::Action {
-                                            kind: Some(pb::action::Kind::Set(pb::Set {
-                                                target: Some(pb::Call {
-                                                    args: vec![24],
-                                                    ..Default::default()
-                                                }),
-                                                value: Some(25),
-                                            })),
-                                            ..Default::default()
-                                        })),
-                                        ..Default::default()
-                                    },
-                                ],
-                                ..Default::default()
-                            })),
-                            ..Default::default()
-                        }],
-                        ..Default::default()
-                    })),
-                    ..Default::default()
-                }))),
-                ..Default::default()
-            }],
             ..Default::default()
         };
         let mut visited = HashSet::new();

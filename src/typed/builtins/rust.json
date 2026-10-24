@@ -1866,23 +1866,6 @@
         }
       }
     ],
-    "egglog.core.fn.apply": [
-      {
-        "params": [
-          {
-            "coreInput": 1,
-            "name": "args"
-          }
-        ],
-        "path": [
-          "call"
-        ],
-        "receiver": {
-          "borrowed": true,
-          "coreInput": 0
-        }
-      }
-    ],
     "egglog.core.i64.abs": [
       {
         "ownerSort": 2,

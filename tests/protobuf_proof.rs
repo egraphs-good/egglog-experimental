@@ -325,7 +325,7 @@ fn source_receiving_mode_preserves_native_global_boundaries() {
                 id,
                 pb::Program {
                     commands: vec![pb::Command {
-                        kind: Some(pb::command::Kind::PrintSize(pb::PrintSize {
+                        kind: Some(pb::command::Kind::TableSizes(pb::GetTableSizes {
                             tables: vec!["N".into()],
                         })),
                         ..Default::default()
@@ -527,7 +527,7 @@ fn source_receiving_modes_preserve_typed_multi_vec_empty_context() {
             id,
             pb::Program {
                 commands: vec![pb::Command {
-                    kind: Some(pb::command::Kind::PrintSize(pb::PrintSize {
+                    kind: Some(pb::command::Kind::TableSizes(pb::GetTableSizes {
                         tables: vec!["XW".into()],
                     })),
                     ..Default::default()
@@ -582,7 +582,7 @@ fn source_receiving_mode_aggregate_values_match_native_exactly() {
         let response = run(&mut engine, id, phase.unwrap());
         assert_eq!(response.error, None);
         for output in &response.output.outputs {
-            if let Some(pb::command_output::Kind::PrintedFunction(table)) = &output.kind {
+            if let Some(pb::command_output::Kind::TableRows(table)) = &output.kind {
                 assert_eq!(table.table, "Observed");
                 for row in &table.rows {
                     byte_values.push(
@@ -838,7 +838,7 @@ fn core_source_failed_control_and_fail_wrappers_keep_prefixes_in_every_mode() {
                     id,
                     pb::Program {
                         commands: vec![pb::Command {
-                            kind: Some(pb::command::Kind::PrintFunction(pb::PrintFunction {
+                            kind: Some(pb::command::Kind::TableRows(pb::GetTableRows {
                                 table: "N".into(),
                                 max_rows: None,
                             })),
@@ -849,7 +849,7 @@ fn core_source_failed_control_and_fail_wrappers_keep_prefixes_in_every_mode() {
                 );
                 {
                     assert_eq!(table.error, None);
-                    let Some(pb::command_output::Kind::PrintedFunction(rows)) =
+                    let Some(pb::command_output::Kind::TableRows(rows)) =
                         &table.output.outputs[0].kind
                     else {
                         unreachable!()
@@ -1660,7 +1660,7 @@ fn logical_table_rows_match_native_views_in_every_mode() {
         }
     }
 
-    fn wire_rows(response: &Observed, table: &pb::PrintedFunction) -> ObservedRows {
+    fn wire_rows(response: &Observed, table: &pb::TableRows) -> ObservedRows {
         table
             .rows
             .iter()
@@ -1847,7 +1847,7 @@ fn logical_table_rows_match_native_views_in_every_mode() {
                 .commands
                 .iter()
                 .filter_map(|command| match &command.kind {
-                    Some(pb::command::Kind::PrintFunction(print)) => Some(print.clone()),
+                    Some(pb::command::Kind::TableRows(print)) => Some(print.clone()),
                     _ => None,
                 })
                 .collect::<Vec<_>>();
@@ -1860,7 +1860,7 @@ fn logical_table_rows_match_native_views_in_every_mode() {
             assert_eq!(response.error, None, "{mode:?}");
             assert_eq!(response.output.outputs.len(), requests.len());
             for (output, request) in response.output.outputs.iter().zip(requests) {
-                let Some(pb::command_output::Kind::PrintedFunction(table)) = &output.kind else {
+                let Some(pb::command_output::Kind::TableRows(table)) = &output.kind else {
                     panic!("table observation")
                 };
                 let actual = wire_rows(&response, table);
@@ -1938,7 +1938,7 @@ fn logical_table_rows_match_native_views_in_every_mode() {
             id,
             pb::Program {
                 commands: vec![pb::Command {
-                    kind: Some(pb::command::Kind::PrintFunction(pb::PrintFunction {
+                    kind: Some(pb::command::Kind::TableRows(pb::GetTableRows {
                         table: "$bad".into(),
                         max_rows: None,
                     })),
@@ -1949,8 +1949,7 @@ fn logical_table_rows_match_native_views_in_every_mode() {
         );
         assert_eq!(response.error, None, "failed initializer table/{mode:?}");
         assert_eq!(response.output.outputs.len(), 1);
-        let Some(pb::command_output::Kind::PrintedFunction(table)) =
-            &response.output.outputs[0].kind
+        let Some(pb::command_output::Kind::TableRows(table)) = &response.output.outputs[0].kind
         else {
             panic!("failed initializer observation")
         };
@@ -2013,7 +2012,7 @@ fn table_observation_keeps_completed_prefix_and_encoding_errors_are_not_unavaila
         assert_eq!(run(&mut engine, id, program.clone()).error, None);
         program.commands = vec![
             pb::Command {
-                kind: Some(pb::command::Kind::PrintFunction(pb::PrintFunction {
+                kind: Some(pb::command::Kind::TableRows(pb::GetTableRows {
                     table: "N".into(),
                     max_rows: None,
                 })),
@@ -2024,7 +2023,7 @@ fn table_observation_keeps_completed_prefix_and_encoding_errors_are_not_unavaila
         let response = run(&mut engine, id, program);
         assert!(response.error.is_some());
         assert!(
-            matches!(&response.output.outputs[..], [output] if matches!(&output.kind, Some(pb::command_output::Kind::PrintedFunction(table)) if table.rows.len() == 1))
+            matches!(&response.output.outputs[..], [output] if matches!(&output.kind, Some(pb::command_output::Kind::TableRows(table)) if table.rows.len() == 1))
         );
 
         let provider = Arc::new(RejectEncoding::default());
@@ -2036,13 +2035,13 @@ fn table_observation_keeps_completed_prefix_and_encoding_errors_are_not_unavaila
         assert_eq!(run(&mut engine, id, program.clone()).error, None);
         program.commands = vec![
             pb::Command {
-                kind: Some(pb::command::Kind::PrintSize(pb::PrintSize {
+                kind: Some(pb::command::Kind::TableSizes(pb::GetTableSizes {
                     tables: vec!["N".into()],
                 })),
                 ..Default::default()
             },
             pb::Command {
-                kind: Some(pb::command::Kind::PrintFunction(pb::PrintFunction {
+                kind: Some(pb::command::Kind::TableRows(pb::GetTableRows {
                     table: "N".into(),
                     max_rows: None,
                 })),
@@ -2063,14 +2062,14 @@ fn table_observation_keeps_completed_prefix_and_encoding_errors_are_not_unavaila
         assert!(provider.encodings.load(Ordering::SeqCst) > 0);
         let encoded = provider.encodings.load(Ordering::SeqCst);
         program.commands.remove(0);
-        let Some(pb::command::Kind::PrintFunction(print)) = &mut program.commands[0].kind else {
+        let Some(pb::command::Kind::TableRows(print)) = &mut program.commands[0].kind else {
             unreachable!()
         };
         print.max_rows = Some(0);
         let response = run(&mut engine, id, program);
         assert_eq!(response.error, None);
         assert!(
-            matches!(&response.output.outputs[..], [output] if matches!(&output.kind, Some(pb::command_output::Kind::PrintedFunction(table)) if table.rows.is_empty()))
+            matches!(&response.output.outputs[..], [output] if matches!(&output.kind, Some(pb::command_output::Kind::TableRows(table)) if table.rows.is_empty()))
         );
         assert!(response.output.nodes.is_empty() && response.output.sorts.is_empty());
         assert_eq!(provider.encodings.load(Ordering::SeqCst), encoded);
@@ -2154,7 +2153,6 @@ fn fixture() -> pb::Program {
     let mut declarations = vec![pb::Declaration {
         kind: Some(pb::declaration::Kind::EqSort(pb::EqSort {
             name: "Num".into(),
-            ..Default::default()
         })),
         ..Default::default()
     }];
@@ -2172,6 +2170,18 @@ fn fixture() -> pb::Program {
             ..Default::default()
         });
     }
+    let rule = pb::Rule {
+        name: Some("derive".into()),
+        eval_mode: pb::RuleEvalMode::Seminaive.into(),
+        kind: Some(pb::rule::Kind::Rule(pb::RuleBody {
+            query: vec![3],
+            head: vec![pb::Action {
+                kind: Some(pb::action::Kind::Term(4)),
+                ..Default::default()
+            }],
+        })),
+        ..Default::default()
+    };
     pb::Program {
         sorts: vec![
             pb::Sort {
@@ -2203,23 +2213,11 @@ fn fixture() -> pb::Program {
             int(3),
             call("N", vec![8]),
         ],
-        rules: vec![pb::Rule {
-            name: Some("derive".into()),
-            eval_mode: pb::RuleEvalMode::Seminaive.into(),
-            kind: Some(pb::rule::Kind::Rule(pb::RuleBody {
-                query: vec![3],
-                head: vec![pb::Action {
-                    kind: Some(pb::action::Kind::Term(4)),
-                    ..Default::default()
-                }],
-            })),
-            ..Default::default()
-        }],
         commands: vec![
             pb::Command {
                 kind: Some(pb::command::Kind::AddRules(pb::AddRules {
                     group: "rebuilding_ruleset".into(),
-                    rules: vec![0],
+                    rules: vec![rule],
                 })),
                 ..Default::default()
             },
@@ -2281,7 +2279,11 @@ fn shared_content_resupply_groups_and_clone_keep_native_proofs_and_cursors() {
                 ..Default::default()
             });
         }
-        let Some(pb::rule::Kind::Rule(rule)) = &mut program.rules[0].kind else {
+        let Some(pb::command::Kind::AddRules(registration)) = &mut program.commands[0].kind else {
+            unreachable!()
+        };
+        let original = &mut registration.rules[0];
+        let Some(pb::rule::Kind::Rule(rule)) = &mut original.kind else {
             unreachable!()
         };
         rule.query.push(10);
@@ -2289,28 +2291,27 @@ fn shared_content_resupply_groups_and_clone_keep_native_proofs_and_cursors() {
             name: "rule.egg".into(),
             contents: Some("derive".into()),
         }];
-        program.rules[0].span = Some(pb::Span {
+        original.span = Some(pb::Span {
             file: 0,
             start: 0,
             end: 6,
         });
-        let mut same_content = program.rules[0].clone();
+        let mut same_content = original.clone();
         same_content.name = Some("another label".into());
         same_content.span = None;
         same_content.doc = "diagnostics do not create another native rule".into();
-        program.rules.push(same_content);
         let mut commands = vec![
             pb::Command {
                 kind: Some(pb::command::Kind::AddRules(pb::AddRules {
                     group: "left".into(),
-                    rules: vec![0, 0],
+                    rules: vec![original.clone(), original.clone()],
                 })),
                 ..Default::default()
             },
             pb::Command {
                 kind: Some(pb::command::Kind::AddRules(pb::AddRules {
                     group: "right".into(),
-                    rules: vec![1],
+                    rules: vec![same_content],
                 })),
                 ..Default::default()
             },
@@ -2347,10 +2348,20 @@ fn shared_content_resupply_groups_and_clone_keep_native_proofs_and_cursors() {
         let id = create(&mut engine, mode);
         for iteration in 0..2 {
             if iteration == 1 {
-                program.rules[0].name = None;
-                program.rules[0].span = None;
-                program.rules[0].doc = "resupply keeps first-registration diagnostics".into();
-                program.rules[1].name = Some("resupplied label".into());
+                for (index, command) in program.commands[..2].iter_mut().enumerate() {
+                    let Some(pb::command::Kind::AddRules(registration)) = &mut command.kind else {
+                        unreachable!()
+                    };
+                    for rule in &mut registration.rules {
+                        if index == 0 {
+                            rule.name = None;
+                            rule.span = None;
+                            rule.doc = "resupply keeps first-registration diagnostics".into();
+                        } else {
+                            rule.name = Some("resupplied label".into());
+                        }
+                    }
+                }
             }
             let response = run(&mut engine, id, program.clone());
             assert_eq!(response.error, None, "{mode:?}, {iteration}");
@@ -2399,10 +2410,14 @@ fn shared_content_resupply_groups_and_clone_keep_native_proofs_and_cursors() {
         let clone = pb::CloneEGraphResponse::decode(cloned.as_slice())
             .unwrap()
             .egraph_id;
+        let Some(pb::command::Kind::AddRules(registration)) = &program.commands[1].kind else {
+            unreachable!()
+        };
+        let child_rule = registration.rules[0].clone();
         program.commands = vec![pb::Command {
             kind: Some(pb::command::Kind::AddRules(pb::AddRules {
                 group: "child".into(),
-                rules: vec![1],
+                rules: vec![child_rule],
             })),
             ..Default::default()
         }];
@@ -2431,7 +2446,6 @@ fn shared_content_resupply_groups_and_clone_keep_native_proofs_and_cursors() {
             unreachable!()
         };
         r.groups = vec!["right".into(), "left".into(), "right".into()];
-        program.rules.clear();
         program.files = vec![pb::SourceFile {
             name: "later.egg".into(),
             contents: None,
@@ -2624,7 +2638,6 @@ fn proof_failure_preserves_owned_prefix_clone_mode_and_native_error_order() {
             .egraph_id;
         let mut program = fixture();
         program.declarations.clear();
-        program.rules.clear();
         program.commands = vec![
             pb::Command {
                 kind: Some(pb::command::Kind::ProveExists(pb::ProveExists {
@@ -2705,7 +2718,7 @@ fn proof_failure_preserves_owned_prefix_clone_mode_and_native_error_order() {
 }
 
 #[test]
-fn malformed_later_commands_unused_rules_and_observations_are_atomic_preparation() {
+fn malformed_later_commands_unentered_rules_and_observations_are_atomic_preparation() {
     for mode in [
         pb::ExecutionMode::Normal,
         pb::ExecutionMode::TermEncoding,
@@ -2732,11 +2745,22 @@ fn malformed_later_commands_unused_rules_and_observations_are_atomic_preparation
                     ..Default::default()
                 }),
                 2 => {
-                    program.commands.remove(0);
-                    let Some(pb::rule::Kind::Rule(rule)) = &mut program.rules[0].kind else {
+                    let mut registration = program.commands.remove(0);
+                    let Some(pb::command::Kind::AddRules(add)) = &mut registration.kind else {
                         unreachable!()
                     };
-                    rule.query.clear(); // x in the unused rule head is ungrounded
+                    let Some(pb::rule::Kind::Rule(rule)) = &mut add.rules[0].kind else {
+                        unreachable!()
+                    };
+                    rule.query.clear(); // x in the unentered rule head is ungrounded
+                    program.commands.push(pb::Command {
+                        kind: Some(pb::command::Kind::Loop(pb::Loop {
+                            body: vec![registration],
+                            max_iterations: Some(0),
+                            ..Default::default()
+                        })),
+                        ..Default::default()
+                    });
                 }
                 3 => program.commands.push(pb::Command {
                     kind: Some(pb::command::Kind::Extract(pb::Extract {
@@ -2762,7 +2786,7 @@ fn malformed_later_commands_unused_rules_and_observations_are_atomic_preparation
                         });
                     }
                     program.commands.push(pb::Command {
-                        kind: Some(pb::command::Kind::PrintFunction(pb::PrintFunction {
+                        kind: Some(pb::command::Kind::TableRows(pb::GetTableRows {
                             table: if invalid == 5 { "computed" } else { "missing" }.into(),
                             max_rows: Some(0),
                         })),
@@ -2854,7 +2878,6 @@ fn source_and_renderer_keep_proof_commands_authored() {
                 .any(|c| matches!(c.kind, Some(pb::command::Kind::Prove(_))))
             {
                 assert!(phase.declarations.is_empty());
-                assert!(phase.rules.is_empty());
                 assert_eq!(phase.commands.len(), 1);
             }
             let text = renderer.render(&phase).unwrap();
@@ -3707,7 +3730,10 @@ fn failed_authored_run_has_no_fabricated_result_and_keeps_seed() {
             })),
             ..Default::default()
         });
-        let Some(pb::rule::Kind::Rule(rule)) = &mut program.rules[0].kind else {
+        let Some(pb::command::Kind::AddRules(registration)) = &mut program.commands[0].kind else {
+            unreachable!()
+        };
+        let Some(pb::rule::Kind::Rule(rule)) = &mut registration.rules[0].kind else {
             unreachable!()
         };
         rule.head = vec![pb::Action {

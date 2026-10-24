@@ -26,12 +26,7 @@ fn declaration_identity(d: &pb::Declaration) -> Result<(Namespace, &str), String
         return Err("only table declarations may have a reflective table prefix".into());
     }
     let identity = match d.kind.as_ref().ok_or("missing declaration kind")? {
-        pb::declaration::Kind::EqSort(s) => {
-            if s.uf_parent.as_deref() == Some("") {
-                return Err("empty equality-sort parent table key".into());
-            }
-            (Namespace::EqSort, s.name.as_str())
-        }
+        pb::declaration::Kind::EqSort(s) => (Namespace::EqSort, s.name.as_str()),
         pb::declaration::Kind::Constructor(c) => (Namespace::Callable, c.name.as_str()),
         pb::declaration::Kind::Function(f) => (Namespace::Callable, f.name.as_str()),
         pb::declaration::Kind::Relation(r) => (Namespace::Callable, r.name.as_str()),
@@ -43,58 +38,6 @@ fn declaration_identity(d: &pb::Declaration) -> Result<(Namespace, &str), String
     Ok(identity)
 }
 
-// A parent key is a non-owning symbolic reference, not a declaration dependency.
-// Check one combined header batch so either arrival order is safe before effects;
-// no native rows, executable bodies or persistent signature catalog are needed.
-fn validate_uf_parents(program: &pb::Program) -> Result<(), String> {
-    let callables: HashMap<_, _> = program
-        .declarations
-        .iter()
-        .filter_map(|declaration| match declaration.kind.as_ref()? {
-            pb::declaration::Kind::Constructor(c) => Some((c.name.as_str(), declaration)),
-            pb::declaration::Kind::Function(f) => Some((f.name.as_str(), declaration)),
-            pb::declaration::Kind::Relation(r) => Some((r.name.as_str(), declaration)),
-            pb::declaration::Kind::UserDefinedPrimitive(p) => Some((p.name.as_str(), declaration)),
-            _ => None,
-        })
-        .collect();
-    for sort in program
-        .declarations
-        .iter()
-        .filter_map(|declaration| match &declaration.kind {
-            Some(pb::declaration::Kind::EqSort(sort)) => Some(sort),
-            _ => None,
-        })
-    {
-        let Some(parent) = sort.uf_parent.as_deref() else {
-            continue;
-        };
-        let Some(declaration) = callables.get(parent) else {
-            continue;
-        };
-        let (inputs, output) = match declaration.kind.as_ref().unwrap() {
-            pb::declaration::Kind::Constructor(c) => (&c.inputs, Some(c.output)),
-            pb::declaration::Kind::Function(f) => (&f.inputs, Some(f.output)),
-            pb::declaration::Kind::Relation(r) => (&r.inputs, None),
-            _ => return Err(format!("parent key {parent} must name a table")),
-        };
-        let mut columns = inputs.iter().map(|arg| arg.sort).chain(output);
-        for _ in 0..2 {
-            let column = columns
-                .next()
-                .and_then(|index| program.sorts.get(index as usize));
-            if !matches!(column.and_then(|column| column.kind.as_ref()), Some(pb::sort::Kind::Eq(name)) if name == &sort.name)
-            {
-                return Err(format!(
-                    "parent table {parent} requires first two stored columns of equality sort {}",
-                    sort.name
-                ));
-            }
-        }
-    }
-    Ok(())
-}
-
 /// Visits every node edge in the admitted saved-code/value shapes. Unknown
 /// forms fail, rather than retaining an unrelocated or unchecked reference.
 fn node_edges(
@@ -103,6 +46,14 @@ fn node_edges(
 ) -> Result<(), String> {
     use pb::{node::Kind as N, primitive_value::Value as V};
     match kind {
+        N::Apply(apply) => {
+            if let Some(function) = &mut apply.function {
+                f(function)?;
+            }
+            for argument in &mut apply.args {
+                f(argument)?;
+            }
+        }
         N::Call(c) | N::GetCost(c) => {
             for i in &mut c.args {
                 f(i)?;
@@ -534,7 +485,6 @@ pub fn reconcile_declarations(
             added.push(true);
         }
     }
-    validate_uf_parents(&staged)?;
     validate_semantics(&staged)?;
     retain_imported_closures(&mut staged, destination)?;
     *destination = staged;
@@ -565,7 +515,7 @@ fn retain_imported_closures(p: &mut pb::Program, previous: &pb::Program) -> Resu
             },
         )?;
     }
-    for rule in &mut p.rules {
+    for rule in crate::protobuf::graph::rules_mut(p) {
         rule_refs(
             rule,
             |root| {
@@ -685,7 +635,7 @@ fn retain_imported_closures(p: &mut pb::Program, previous: &pb::Program) -> Resu
             },
         )?;
     }
-    for rule in &mut p.rules {
+    for rule in crate::protobuf::graph::rules_mut(p) {
         rule_refs(
             rule,
             |root| {

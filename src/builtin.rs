@@ -15,10 +15,11 @@ pub fn signature_sorts(
     program: &pb::BuiltinCatalog,
     primitive: &pb::Primitive,
 ) -> Result<Vec<String>, String> {
-    let Some(pb::primitive::Typing::Signature(signature)) = &primitive.typing else {
-        return Err("function-application builtin typing is not implemented yet".into());
-    };
-    if primitive.name.is_empty() || !signature.type_params.is_empty() {
+    let signature = primitive
+        .signature
+        .as_ref()
+        .ok_or("missing builtin signature")?;
+    if primitive.name.is_empty() || signature.type_param_count != 0 {
         return Err("builtin typing currently requires a named closed signature".into());
     }
     signature.inputs.iter().chain(&signature.varargs).map(|arg| arg.sort).chain(std::iter::once(signature.output.ok_or("missing builtin result sort")?)).map(|index| {
@@ -139,54 +140,48 @@ fn wire_description(
     program: &pb::BuiltinCatalog,
     primitive: &pb::Primitive,
 ) -> Result<BuiltinDescription, String> {
-    let typing = match primitive
-        .typing
+    let signature = primitive
+        .signature
         .as_ref()
-        .ok_or("missing builtin typing form")?
-    {
-        pb::primitive::Typing::Application(_) => BuiltinTyping::FunctionApplication,
-        pb::primitive::Typing::Signature(signature) => {
-            if signature
-                .equality_type_params
-                .windows(2)
-                .any(|w| w[0] >= w[1])
-                || signature
-                    .equality_type_params
-                    .iter()
-                    .any(|i| *i as usize >= signature.type_params.len())
-            {
-                return Err("invalid equality type parameter indices".into());
-            }
-            let arguments = |args: &[pb::Arg]| {
-                args.iter()
-                    .map(|arg| {
-                        Ok(Argument {
-                            name: arg.name.clone(),
-                            sort: native_pattern(&program.sorts, arg.sort, 0)?,
-                        })
-                    })
-                    .collect::<Result<Vec<_>, String>>()
-            };
-            BuiltinTyping::Signature(Signature {
-                params: signature
-                    .type_params
-                    .iter()
-                    .enumerate()
-                    .map(|(i, name)| TypeParameter {
-                        name: name.clone(),
-                        equality: signature.equality_type_params.contains(&(i as u32)),
-                    })
-                    .collect(),
-                fixed: arguments(&signature.inputs)?,
-                tail: arguments(&signature.varargs)?,
-                output: native_pattern(
-                    &program.sorts,
-                    signature.output.ok_or("missing builtin result")?,
-                    0,
-                )?,
+        .ok_or("missing builtin signature")?;
+    let mut normalized_sorts = vec![];
+    normalized_signature(program, primitive, &mut normalized_sorts)?;
+    let referenced: HashSet<_> = normalized_sorts
+        .iter()
+        .filter_map(|sort| match sort.kind {
+            Some(pb::sort::Kind::Var(index)) => Some(index),
+            _ => None,
+        })
+        .collect();
+    if referenced.len() != signature.type_param_count as usize {
+        return Err("undetermined builtin type parameter".into());
+    }
+    let arguments = |args: &[pb::Arg]| {
+        args.iter()
+            .map(|arg| {
+                Ok(Argument {
+                    name: arg.name.clone(),
+                    sort: native_pattern(&program.sorts, arg.sort, 0)?,
+                })
             })
-        }
+            .collect::<Result<Vec<_>, String>>()
     };
+    let typing = BuiltinTyping::Signature(Signature {
+        params: referenced
+            .iter()
+            .map(|_| TypeParameter {
+                name: String::new(),
+                equality: false,
+            })
+            .collect(),
+        fixed: arguments(&signature.inputs)?,
+        tail: arguments(&signature.varargs)?,
+        output: native_pattern(
+            &program.sorts,
+            signature.output.ok_or("missing builtin result")?,
+            0,
+        )?,
+    });
     // Aliases are presentation; the native checker compares the semantic scheme.
     Ok(BuiltinDescription {
         key: primitive.name.clone(),
@@ -267,44 +262,33 @@ fn project_primitive(
     sorts: &mut Vec<pb::Sort>,
 ) -> Result<pb::Primitive, String> {
     description.validate()?;
-    let typing = match &description.typing {
-        BuiltinTyping::FunctionApplication => {
-            pb::primitive::Typing::Application(pb::FunctionApplication {})
-        }
-        BuiltinTyping::FunctionConstructor => {
-            return Err("function construction projects to PartialCall, not a primitive".into());
-        }
-        BuiltinTyping::Signature(signature) => {
-            let mut arguments = |args: &[Argument]| {
-                args.iter()
-                    .map(|arg| {
-                        Ok(pb::Arg {
-                            name: arg.name.clone(),
-                            sort: export_pattern(&arg.sort, sorts)?,
-                        })
-                    })
-                    .collect::<Result<Vec<_>, String>>()
-            };
-            let inputs = arguments(&signature.fixed)?;
-            let varargs = arguments(&signature.tail)?;
-            let output = export_pattern(&signature.output, sorts)?;
-            pb::primitive::Typing::Signature(pb::GenericSignature {
-                type_params: signature.params.iter().map(|p| p.name.clone()).collect(),
-                inputs,
-                varargs,
-                output: Some(output),
-                equality_type_params: signature
-                    .params
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(i, p)| p.equality.then_some(i as u32))
-                    .collect(),
-            })
-        }
+    let BuiltinTyping::Signature(signature) = &description.typing else {
+        return Err(
+            "function construction/application is intrinsic, not a public primitive".into(),
+        );
     };
+    let mut arguments = |args: &[Argument]| {
+        args.iter()
+            .map(|arg| {
+                Ok(pb::Arg {
+                    name: arg.name.clone(),
+                    sort: export_pattern(&arg.sort, sorts)?,
+                })
+            })
+            .collect::<Result<Vec<_>, String>>()
+    };
+    let inputs = arguments(&signature.fixed)?;
+    let varargs = arguments(&signature.tail)?;
+    let output = export_pattern(&signature.output, sorts)?;
     Ok(pb::Primitive {
         name: description.key.clone(),
-        typing: Some(typing),
+        signature: Some(pb::GenericSignature {
+            type_param_count: u32::try_from(signature.params.len())
+                .map_err(|_| "too many type parameters")?,
+            inputs,
+            varargs,
+            output: Some(output),
+        }),
         ..Default::default()
     })
 }
@@ -354,6 +338,14 @@ impl PortableTypeInfo for TypeInfo {
         output: u32,
         native: &[ArcSort],
     ) -> Result<String, String> {
+        if self.builtin_description(key).is_ok_and(|description| {
+            matches!(
+                description.typing,
+                BuiltinTyping::FunctionApplication | BuiltinTyping::FunctionConstructor
+            )
+        }) {
+            return Err("function application/construction requires its structural node".into());
+        }
         if native.len() != arguments.len() + 1 {
             return Err("builtin native signature arity mismatch".into());
         }
@@ -413,7 +405,10 @@ impl PortableTypeInfo for TypeInfo {
         };
         for description in &native.descriptions {
             if description.key == "egglog.core.map.flat"
-                || matches!(description.typing, BuiltinTyping::FunctionConstructor)
+                || matches!(
+                    description.typing,
+                    BuiltinTyping::FunctionConstructor | BuiltinTyping::FunctionApplication
+                )
             {
                 continue;
             }
@@ -461,11 +456,11 @@ impl PortableTypeInfo for TypeInfo {
                         )?;
                         let projected = pb::Primitive {
                             name: defined.name.clone(),
-                            typing: Some(pb::primitive::Typing::Signature(pb::GenericSignature {
+                            signature: Some(pb::GenericSignature {
                                 inputs,
                                 output: Some(output),
                                 ..Default::default()
-                            })),
+                            }),
                             ..Default::default()
                         };
                         if let Some(previous) = result
@@ -513,7 +508,15 @@ impl PortableTypeInfo for TypeInfo {
         program: &pb::BuiltinCatalog,
         primitive: &pb::Primitive,
     ) -> Result<(), String> {
-        self.check_builtin_signature(&wire_description(program, primitive)?)
+        let native = project_description(self.builtin_description(&primitive.name)?)?;
+        let root = definition_root(&native, &primitive.name)?;
+        let mut sorts = vec![];
+        if normalized_signature(program, primitive, &mut sorts)?
+            != normalized_signature(&native, root, &mut sorts)?
+        {
+            return Err("builtin signature differs from native signature".into());
+        }
+        Ok(())
     }
 
     fn export_function_target(
@@ -524,12 +527,77 @@ impl PortableTypeInfo for TypeInfo {
         resolved: Option<&egglog::sort::ResolvedFunctionId>,
         destination: &mut pb::Program,
     ) -> Result<String, String> {
-        export_target(
-            self,
-            self.resolve_function_target(name, inputs, output, resolved)?,
-            destination,
-        )
+        let target = self.resolve_function_target(name, inputs, output, resolved)?;
+        if matches!(&target, egglog::builtin::NativeFunctionTarget::Primitive(primitives) if primitives.iter().any(|primitive| primitive.primitive.builtin_description().is_some_and(|description| matches!(description.typing, BuiltinTyping::FunctionApplication))))
+        {
+            return application_adapter(self, inputs, output, destination);
+        }
+        export_target(self, target, destination)
     }
+}
+
+// A first-class native application operation has no public callable identity.
+// Close its concrete signature in ordinary program code, so named partials and
+// extracted values retain the same existing function-value representation.
+fn application_adapter(
+    types: &TypeInfo,
+    inputs: &[ArcSort],
+    output: &ArcSort,
+    destination: &mut pb::Program,
+) -> Result<String, String> {
+    use std::fmt::Write;
+    let mut name = String::from("__egglog_application_");
+    for sort in inputs.iter().chain([output]) {
+        write!(name, "{}_", sort.name().len()).unwrap();
+        for byte in sort.name().bytes() {
+            write!(name, "{byte:02x}").unwrap();
+        }
+    }
+    let mut adapter = pb::Program::default();
+    let mut arguments = vec![];
+    let mut nodes = vec![];
+    for (index, sort) in inputs.iter().enumerate() {
+        let sort = export_pattern(&types.native_sort_pattern(sort)?, &mut adapter.sorts)?;
+        arguments.push(pb::Arg {
+            sort,
+            name: format!("_{index}"),
+        });
+        let node =
+            u32::try_from(adapter.nodes.len()).map_err(|_| "too many application adapter nodes")?;
+        adapter.nodes.push(pb::Node {
+            sort_id: sort,
+            kind: Some(pb::node::Kind::Var(format!("_{index}"))),
+            ..Default::default()
+        });
+        nodes.push(node);
+    }
+    let (function, args) = nodes
+        .split_first()
+        .ok_or("application adapter requires a function input")?;
+    let output = export_pattern(&types.native_sort_pattern(output)?, &mut adapter.sorts)?;
+    let body =
+        u32::try_from(adapter.nodes.len()).map_err(|_| "too many application adapter nodes")?;
+    adapter.nodes.push(pb::Node {
+        sort_id: output,
+        kind: Some(pb::node::Kind::Apply(pb::Apply {
+            function: Some(*function),
+            args: args.to_vec(),
+        })),
+        ..Default::default()
+    });
+    adapter.declarations.push(pb::Declaration {
+        kind: Some(pb::declaration::Kind::UserDefinedPrimitive(
+            pb::UserDefinedPrimitive {
+                name: name.clone(),
+                inputs: arguments,
+                output,
+                body: Some(body),
+            },
+        )),
+        ..Default::default()
+    });
+    definitions::reconcile_declarations(&adapter, destination)?;
+    Ok(name)
 }
 
 fn export_target(
@@ -542,15 +610,22 @@ fn export_target(
         egglog::builtin::NativeFunctionTarget::Primitive(primitives) => {
             let mut selected = None;
             for primitive in primitives {
+                let description = primitive.primitive.builtin_description();
+                if description.is_some_and(|description| {
+                    matches!(description.typing, BuiltinTyping::FunctionApplication)
+                }) {
+                    return Err(
+                        "native application function value requires a program-defined adapter"
+                            .into(),
+                    );
+                }
                 let any: &dyn std::any::Any = &*primitive.primitive;
                 let key = if let Some(defined) =
                     any.downcast_ref::<crate::primitive::DefinedPrimitive>()
                 {
                     defined.name.clone()
                 } else {
-                    primitive
-                        .primitive
-                        .builtin_description()
+                    description
                         .ok_or("function target has no native description")?
                         .key
                         .clone()
@@ -654,7 +729,10 @@ impl PortablePrimitive for SpecializedPrimitive {
             .builtin_description()
             .ok_or_else(|| format!("primitive {} has no native description", self.name()))?;
         if description.key == "egglog.core.map.flat"
-            || matches!(description.typing, BuiltinTyping::FunctionConstructor)
+            || matches!(
+                description.typing,
+                BuiltinTyping::FunctionConstructor | BuiltinTyping::FunctionApplication
+            )
         {
             return Err("source facade requires structural call projection".into());
         }
@@ -684,6 +762,15 @@ impl PortablePrimitive for SpecializedPrimitive {
             }
         }
         let description = self.prim_with_id.primitive.builtin_description();
+        if description.is_some_and(|d| matches!(d.typing, BuiltinTyping::FunctionApplication)) {
+            let (function, args) = args
+                .split_first()
+                .ok_or("native application requires a function")?;
+            return Ok(pb::node::Kind::Apply(pb::Apply {
+                function: Some(*function),
+                args: args.to_vec(),
+            }));
+        }
         if description.is_some_and(|d| matches!(d.typing, BuiltinTyping::FunctionConstructor)) {
             let function = self
                 .output()
@@ -859,30 +946,14 @@ pub(crate) fn normalized_signature(
     program: &pb::BuiltinCatalog,
     primitive: &pb::Primitive,
     sorts: &mut Vec<pb::Sort>,
-) -> Result<pb::primitive::Typing, String> {
+) -> Result<pb::GenericSignature, String> {
     if primitive.name.is_empty() {
         return Err("builtin definition key must not be empty".into());
     }
-    let signature = match &primitive.typing {
-        Some(pb::primitive::Typing::Signature(signature)) => signature,
-        Some(typing @ pb::primitive::Typing::Application(_)) => return Ok(typing.clone()),
-        None => return Err("missing builtin typing form".into()),
-    };
-    let mut signature = signature.clone();
-    if signature
-        .equality_type_params
-        .windows(2)
-        .any(|w| w[0] >= w[1])
-        || signature
-            .equality_type_params
-            .iter()
-            .any(|i| *i as usize >= signature.type_params.len())
-    {
-        return Err("invalid equality type parameter indices".into());
-    }
-    for label in &mut signature.type_params {
-        label.clear();
-    }
+    let mut signature = primitive
+        .signature
+        .clone()
+        .ok_or("missing builtin signature")?;
     let output = signature
         .output
         .as_mut()
@@ -909,7 +980,7 @@ pub(crate) fn normalized_signature(
             continue;
         }
         match sorts[index as usize].kind.as_ref().unwrap() {
-            pb::sort::Kind::Var(index) if (*index as usize) >= signature.type_params.len() => {
+            pb::sort::Kind::Var(index) if *index >= signature.type_param_count => {
                 return Err("unbound builtin type parameter".into());
             }
             pb::sort::Kind::Application(family) => pending.extend(&family.args),
@@ -920,7 +991,7 @@ pub(crate) fn normalized_signature(
             _ => (),
         }
     }
-    Ok(pb::primitive::Typing::Signature(signature))
+    Ok(signature)
 }
 
 fn definition_root<'a>(
@@ -967,7 +1038,7 @@ pub fn import_definition(
         return Ok(key);
     }
     let mut primitive = primitive.clone();
-    if let Some(pb::primitive::Typing::Signature(signature)) = &mut primitive.typing {
+    if let Some(signature) = &mut primitive.signature {
         for argument in signature
             .inputs
             .iter_mut()

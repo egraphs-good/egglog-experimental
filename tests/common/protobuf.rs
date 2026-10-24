@@ -139,7 +139,7 @@ impl Observed {
                             }
                         }
                     }
-                    Some(pb::command_output::Kind::PrintedFunction(table)) => {
+                    Some(pb::command_output::Kind::TableRows(table)) => {
                         for cell in table
                             .rows
                             .iter_mut()

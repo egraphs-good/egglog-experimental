@@ -2,6 +2,36 @@
 
 use super::*;
 
+// Request-local provenance for each inline addition. Fail wrappers are path
+// transparent, matching CommandLocation; loop bodies add one list coordinate.
+pub(super) fn additions(
+    commands: &[pb::Command],
+) -> impl Iterator<Item = (Vec<u32>, &pb::AddRules)> {
+    let mut pending = commands
+        .iter()
+        .enumerate()
+        .rev()
+        .map(|(index, command)| (vec![index as u32], command))
+        .collect::<Vec<_>>();
+    std::iter::from_fn(move || {
+        loop {
+            let (path, command) = pending.pop()?;
+            match &command.kind {
+                Some(pb::command::Kind::AddRules(add)) => return Some((path, add)),
+                Some(pb::command::Kind::Fail(child)) => pending.push((path, child)),
+                Some(pb::command::Kind::Loop(body)) => {
+                    pending.extend(body.body.iter().enumerate().rev().map(|(index, command)| {
+                        let mut path = path.clone();
+                        path.push(index as u32);
+                        (path, command)
+                    }))
+                }
+                _ => (),
+            }
+        }
+    })
+}
+
 #[derive(Clone)]
 pub(super) struct Candidate {
     pub record: Arc<graph::RuleRecord>,
@@ -52,14 +82,21 @@ impl Registry {
 
     pub(super) fn add(
         &mut self,
+        path: &[u32],
         add: &pb::AddRules,
         candidates: &[Candidate],
         executor: &mut NativeExecutor<'_>,
         context: &mut RequestOccurrences,
         response: &mut pb::RunProgramOutput,
     ) -> Result<(), egglog::Error> {
-        for &local in &add.rules {
-            let candidate = &candidates[local as usize];
+        let start = *context
+            .candidate_offsets
+            .get(path)
+            .ok_or_else(|| egglog::Error::BackendError("unprepared inline addition".into()))?;
+        for local in 0..add.rules.len() {
+            let candidate = candidates.get(start + local).ok_or_else(|| {
+                egglog::Error::BackendError("unprepared inline rule occurrence".into())
+            })?;
             let index = self.intern(candidate);
             let rule = &mut self.rules[index];
             while rule.completed < rule.candidate.commands.len() {
@@ -126,28 +163,25 @@ impl Registry {
     }
 
     pub(super) fn reconstruct(&self, destination: &mut pb::Program) -> Result<(), String> {
-        let mut mapping = HashMap::new();
+        let mut mapping: HashMap<usize, pb::Rule> = HashMap::new();
         let mut file_offsets = HashMap::new();
         let mut groups: Vec<_> = self.groups.iter().collect();
         groups.sort_unstable_by(|a, b| a.0.cmp(b.0));
         for (group, rules) in groups {
             let mut selected = vec![];
             for &index in rules {
-                let local = match mapping.get(&index) {
-                    Some(index) => *index,
-                    None => {
-                        let local =
-                            u32::try_from(destination.rules.len()).map_err(|_| "too many rules")?;
-                        graph::append_rule(
-                            destination,
-                            &self.rules[index].candidate.record,
-                            &mut file_offsets,
-                        )?;
-                        mapping.insert(index, local);
-                        local
-                    }
+                let rule = if let Some(rule) = mapping.get(&index) {
+                    rule.clone()
+                } else {
+                    let rule = graph::append_rule(
+                        destination,
+                        &self.rules[index].candidate.record,
+                        &mut file_offsets,
+                    )?;
+                    mapping.insert(index, rule.clone());
+                    rule
                 };
-                selected.push(local);
+                selected.push(rule);
             }
             destination.commands.push(pb::Command {
                 kind: Some(pb::command::Kind::AddRules(pb::AddRules {
