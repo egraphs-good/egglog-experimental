@@ -30,8 +30,11 @@ class Program(Message[_ProgramFields]):
     its groundedness failures, occurs during execution; generated helper/rule
     validation remains preparation.
     Sorts are acyclic; expression cycles must pass through a `Union` node.
-    Install declarations before commands, order-independently and without
-    executing their bodies. Rules register only when AddRules executes.
+    Declarations form one batch for the whole Program. Install them before any
+    command, order-independently and without executing their bodies. Resolving
+    declaration dependencies is not loop execution: loop bodies contain only
+    commands and never repeat declaration installation. Rules register only when
+    AddRules executes.
     Definitions installed on this handle may be referenced by name without
     resending them. Node and sort indices refer to this Program's
     arenas, not previous requests; all referenced entries must be included here.
@@ -55,8 +58,8 @@ class Program(Message[_ProgramFields]):
     Attributes:
         nodes:
             Expression arena. Evaluate shared ordinary nodes lazily at first demand,
-            retaining results within one Action command execution (including a loop
-            body) or one rule firing's ordered head. Start a fresh ordinary memo for
+            retaining results within one Action command execution (including actions
+            in loops) or one rule firing's ordered head. Start a fresh ordinary memo for
             each such execution. Query patterns do not use this evaluation memo.
             `Union` locations have separate identity scopes; see `Union`.
 
@@ -110,9 +113,8 @@ _SourceFileFields: TypeAlias = Literal["name", "contents"]
 
 class SourceFile(Message[_SourceFileFields]):
     """
-    Source metadata supports diagnostic locations and documentation, not
-    arbitrary comment attachment, formatting or source round-tripping.
-    A source file shared by spans in the enclosing payload.
+    A source file shared by diagnostic/documentation spans in the enclosing
+    payload. Source metadata does not preserve formatting or arbitrary comments.
 
     ```proto
     message egglog.v1.SourceFile
@@ -206,18 +208,17 @@ _SortFields: TypeAlias = Literal["eq", "application", "func", "var", "span"]
 
 class Sort(Message[_SortFields]):
     """
-    Closed types are structurally interned. Equal container/function shapes
-    denote the same sort.
-    Signatures reuse binder-local variables.
-    A shared pattern is interpreted independently in each GenericSignature;
-    arena sharing never shares substitutions between signatures or calls.
-    Sorts are acyclic through SortApplication.args and FuncSort.params/result. CEL
-    checks direct indices, not acyclicity or recursive variable scope.
-    References do not declare sorts: eq resolves user EqSort declarations;
-    application resolves a configured-backend PrimitiveSort from GetBuiltins. Equal name spellings do not identify or substitute these kinds.
-    Missing names and family-arity mismatches are errors. Builtin references do
-    not require explicit descriptor declarations. Response references resolve
-    against the associated handle; their arenas do not redeclare definitions.
+    Closed sorts are structurally interned: equal container/function shapes
+    denote the same sort. GenericSignature variables are binder-local; shared
+    patterns never share substitutions between signatures or calls.
+    Sorts are acyclic through SortApplication.args and FuncSort.params/result.
+    CEL checks direct indices, not acyclicity or nested variable scope.
+    References do not declare sorts: eq resolves a user EqSort; application
+    resolves a configured-backend PrimitiveSort from GetBuiltins. These nominal
+    namespaces are distinct even when names have the same spelling.
+    Missing names and family-arity mismatches are errors. Builtin references need
+    no descriptor declarations. Output references resolve against the associated
+    handle; output arenas do not redeclare definitions.
 
     ```proto
     message egglog.v1.Sort
@@ -230,7 +231,7 @@ class Sort(Message[_SortFields]):
             ```
         span:
             Optional representative type-use origin; excluded from sort identity.
-            Documentation belongs to the defining Declaration.
+            Documentation belongs to the defining Declaration or catalog entry.
 
             ```proto
             optional egglog.v1.Span span = 5;
@@ -256,10 +257,10 @@ _SortApplicationFields: TypeAlias = Literal["name", "args"]
 
 class SortApplication(Message[_SortApplicationFields]):
     """
-    A host-family application: no args for i64/Unit, or e.g. Vec<i64> and
+    A primitive-sort application: no args for i64/Unit, or e.g. Vec<i64> and
     Map<String, Math>. Arg count equals declared family arity, including zero.
     Args may be patterns only in a GenericSignature; otherwise
-    recursively closed. Host-family sorts are not equality sorts.
+    recursively closed. Primitive sorts are not equality sorts.
 
     ```proto
     message egglog.v1.SortApplication
@@ -297,7 +298,7 @@ _FuncSortFields: TypeAlias = Literal["params", "result"]
 
 class FuncSort(Message[_FuncSortFields]):
     """
-    A structural function type, not a named host sort family. Its parameter and
+    A structural function type, not a PrimitiveSort application. Its parameter and
     result sorts may be patterns in a GenericSignature;
     otherwise closed.
 
@@ -342,33 +343,32 @@ class Node(Message[_NodeFields]):
     Typed syntax. The producer supplies the resolved sort; the verifier checks
     it against the value payload, binding, or callable signature.
 
-    USE CONTEXT IS NORMATIVE. Every use must be valid independently, even when
-    one node is shared between code and data. The contexts are query, action,
-    deferred code, and inert value data:
+    Every use must be valid independently, even when a node is shared between
+    code and data. The contexts are query, action, deferred code and inert data:
     Rule queries, rewrite LHSs/conditions, checks, and loop-until facts are queries.
     Rule heads, rewrite RHSs, top-level actions, and operations' evaluated inputs
     use the action context.
-    - Queries share one binder across all facts. Rule heads and rewrite RHSs
-     may use names bound by that query; top-level evaluated inputs have no
-     free variables. Every variable must belong to its use's binder.
-    - Function merges, primitives, and lambda bodies use only their own binders
-     (see those messages). At every use, the body and its transitive callees
-     must be legal in that execution context. Hosts publish the capabilities
-     of ambient primitives; receivers check these obligations. A Union in an
-     evaluated body can write, even though the body contains only expressions.
-    - Inert values (declared costs and extracted data) contain no variables,
-     get_cost reads or Union and must be finite. Saved code bodies retain
-     their own binders, so these are use-site rules, not bans on an entire arena.
+    - Queries share one binder across all facts. Rule heads and rewrite RHSs may
+      use that binder; top-level evaluated inputs have no free variables.
+      Every variable must belong to its use's binder.
+    - Function merges, primitives and lambda bodies use only their own binders
+      (see those messages). Their bodies and transitive callees must be legal in
+      each execution context. Hosts publish ambient primitive capabilities;
+      receivers check them. An evaluated Union can write even in an expression body.
+    - Inert values (declared costs and extracted data) must be finite and contain
+      no variables, get_cost reads or Union. Saved code retains its own binders;
+      these restrictions apply at each use, not to the entire arena.
 
     Scalar values are inert. Child-bearing values follow the surrounding
     context; constructing a value does not grant inverse query matching or
     relax groundedness. Calls and host value materialization must obey their
     enclosing execution context's capabilities, including query-mode restrictions.
 
-    Call/get_cost arguments, Union members and PrimitiveValue children inherit
-    the surrounding context and binder. Each is a value position: a row position
-    never propagates to children. A lambda body starts its own code
-    context and binder, also in a value position. See Call for relation rows.
+    Call/get_cost arguments, Apply's function/arguments, Union members and
+    PrimitiveValue children inherit the surrounding context and binder. Each is
+    a value position; row positions never propagate to children. A lambda body
+    starts its own code context and binder, also in a value position. See Call
+    for relation rows.
     CEL does not propagate these contexts or check binding and effects.
 
     ```proto
@@ -418,35 +418,22 @@ _UnionFields: TypeAlias = Literal["members"]
 
 class Union(Message[_UnionFields]):
     """
-    A class/equality group. The node's INDEX identifies its occurrence; the
-    enclosing `sort_id` is the group's sort.
+    A class/equality group identified by its node index and typed by sort_id.
+    A constructor Call member is a stored extraction alternative; a function Call
+    is a lookup whose result participates in the equality, never an alternative.
+    A PrimitiveValue member contributes its exact concrete value. Exports recreate
+    function rows with Set, including Unit outputs, rather than Call members.
+    Relation rows use bare Calls and cannot be Union members.
 
-    Member roles follow from the callee's declaration, never from position:
-      constructor call    an extraction alternative when stored in this class
-      function call       a lookup whose result participates in the equality
-      primitive value     an exact concrete value participating in the equality
-    A function call member is never an extraction alternative.
-
-    Exports write function rows with Set, including Unit-returning functions;
-    they do not evaluate function Call members to recreate missing rows.
-    Relation rows are inserted with a bare Call, never a Union member.
-
-    MEANING DEPENDS ON POSITION, and the position PROPAGATES into nested
-    expressions — a union may be an argument, as in `f(Union[a, b])`:
-      fact      a and b match the same value; `f` then matches using it. This is
-                `(= a b)`. NEVER mutates.
-      action    merge a and b's classes, then pass the resulting class to `f`.
-                Equality sorts only; a base sort needs the directional `Set`.
-    Union is a value node, not restricted to a standalone action. Top-level
-    input uses the action context only when a command demands its evaluation.
-    Nesting does not permit reordering around reads, effects or row conflicts.
-
-    An empty union allocates a fresh equality class in an ACTION context,
-    including as a call argument; no temporary constructor row is needed.
-    Every empty union requires an equality sort. Queries require a nonempty
-    union; actions require an equality sort even when nonempty. Nonempty
-    primitive-sort unions are permitted in queries. Extracted
-    data forbids unions; deferred code obeys its execution context as in Node.
+    Context propagates through nested expressions, including call arguments:
+    - In queries, members constrain one common value without mutation. Nonempty
+      unions may have primitive sorts; empty unions are invalid.
+    - In actions, merge the members' classes and yield that class. The sort must
+      be an equality sort; primitive-sort writes require directional Set instead.
+      An empty Union allocates a fresh class without a temporary constructor row.
+    Top-level nodes run only when a command demands them. Nesting never permits
+    reordering around reads, effects or row conflicts. Extracted data forbids
+    unions; deferred code follows Node's execution-context rules.
 
     During one rule firing, a Union location identifies one class across the
     whole ordered head. Direct Actions in an executed command list share one
@@ -461,39 +448,20 @@ class Union(Message[_UnionFields]):
     they remain nonallocating constraints.
     This identity rule does not memoize ordinary calls.
 
-    CANONICALIZATION MAY IDENTIFY DISTINCT LOCATIONS. A row belongs to exactly
-    one class, so two groups that share a member denote the SAME class afterwards —
-    `Union[Num(0), A]` and `Union[Num(0), B]` are one class containing `Num(0)`,
-    `A` and `B`. Distinct indices are distinct groups only when nothing forces
-    them together; two EMPTY unions share no member and stay separate classes.
+    Canonicalization may identify distinct locations: a row belongs to exactly
+    one class, so groups sharing a member denote the same class afterwards.
+    Distinct empty Unions initially allocate distinct classes. A row's identity
+    is its callable and canonical arguments, not its Call node index; duplicate
+    Call nodes cannot be subsumed independently.
 
-    A ROW IS ITS KEY, not its node. The same callable with the same arguments is
-    ONE table row however many arena entries spell it, so two structurally equal
-    call nodes cannot be subsumed independently.
-
-    CYCLES. An equality-sort constructor argument can reference a class, so a
-    class can reach itself:
-
-      0: Math  Union[2, 3]     the class c
-      1: i64   PrimitiveValue.i64(0)
-      2: Math  Num(1)
-      3: Math  Add(0, 0)       both args are class 0
-
-    That spells `c = Num(0) | Add(c, c)`. The cycle is in the graph, not the
-    messages: node 3 stores the integers 0 and 0. Consumers MUST walk with a
-    visited set.
-
-    NORMATIVE: a cycle MUST pass through a union node. Removing Union's outgoing
-    edges must leave an acyclic graph of Call/get_cost arguments and every
-    PrimitiveValue child, including custom args and lambda bodies/captures.
-    Union members still obey their inherited use context and bounds.
-    A call reaching itself with no class boundary is invalid, not a recursive
-    value. These cycle rules are not enforced by CEL.
-
-    NEVER HASH-CONSED. A producer MUST append union nodes positionally and MUST
-    NOT route them through a node-sharing or dedup path: two empty unions of the
-    same sort are different classes, and the distinction is unrecoverable
-    afterwards.
+    Every expression cycle must pass through Union. Removing its outgoing edges
+    must leave an acyclic graph of Call/get_cost arguments, Apply's function and
+    arguments, and every PrimitiveValue child, including custom args and lambda
+    bodies/captures. Union members retain their inherited use context and bounds.
+    Self-reaching calls without a Union boundary are invalid. CEL does not check
+    cycles; consumers must track visited nodes when traversing the graph.
+    Producers must append Union nodes positionally, never hash-cons or deduplicate
+    them: equal-looking locations may denote distinct classes.
 
     ```proto
     message egglog.v1.Union
@@ -540,10 +508,9 @@ class Call(Message[_CallFields]):
     For Node.call, the enclosing node's sort matches the result; relation calls
     use Unit. Relation calls are restricted to row positions: a query fact,
     `Action.term`, or `Action.delete`. They cannot be value
-    arguments, `Set.value`, `Union` members, lambda captures/results, or deferred code.
-    The restriction applies to installed and ambient names as well as local
-    declarations. A relation row is the bare `Call` node itself; see `Union`
-    for the Unit-sorted row rule.
+    arguments, `Set.value`, `Union` members, lambda captures/results, or deferred
+    code. This restriction covers installed, ambient and locally declared names.
+    A relation row is the bare `Call` node itself.
 
     ```proto
     message egglog.v1.Call
@@ -581,10 +548,10 @@ _ApplyFields: TypeAlias = Literal["function", "args"]
 
 class Apply(Message[_ApplyFields]):
     """
-    Apply a concrete function value. Evaluate the function first, followed by
-    arguments left-to-right. The function's FuncSort supplies the exact parameter
-    and result sorts. Apply is executable code, never inert value data; deferred
-    lambda and primitive bodies may contain it.
+    Intrinsic application of a concrete function value, not a named primitive.
+    Evaluate the function first, then arguments left-to-right. Its FuncSort
+    supplies the exact parameter and result sorts. Apply is executable code,
+    never inert value data; deferred lambda and primitive bodies may contain it.
 
     ```proto
     message egglog.v1.Apply
@@ -671,12 +638,12 @@ _PrimitiveValueFields: TypeAlias = Literal["i64", "f64_bits", "string", "bool", 
 
 class PrimitiveValue(Message[_PrimitiveValueFields]):
     """
-    Native values, selected and typed by the enclosing Node.sort_id. The five
-    scalar arms retain their exact payloads: f64_bits preserves IEEE-754 bits,
+    Native values, selected and typed by the enclosing Node.sort_id. Scalar
+    arms retain their exact payloads: f64_bits preserves IEEE-754 bits,
     while Egglog equality identifies signed zeroes and all NaN bit patterns.
     BigInt/BigRat/Rational and vec/set/multiset/map/pair/maybe use their matching
     SortApplication family applications; lambda/partial_call use FuncSort.
-    CustomValue supports host sorts, including nullary families with value children.
+    CustomValue supports other primitive sorts, including nullary families with value children.
     Verify payload/sort agreement and child types; CEL checks their indices only.
 
     Evaluated children run left-to-right in field/list order (map key then value
@@ -969,7 +936,7 @@ _CustomValueFields: TypeAlias = Literal["payload", "args"]
 
 class CustomValue(Message[_CustomValueFields]):
     """
-    For host sorts without a dedicated PrimitiveValue arm. The exact enclosing
+    For primitive sorts without a dedicated PrimitiveValue arm. The exact enclosing
     sort selects the codec and its valid arg arity/sorts; no separate type tag.
     A nullary family may still have value args (e.g. PyObject); these are not
     SortApplication's type args and need not have the same arity.
@@ -977,7 +944,7 @@ class CustomValue(Message[_CustomValueFields]):
     never arena/class indices, engine Value IDs or raw process pointers. Traversal,
     rebuilding and remapping must rewrite args regardless of sort kind, without
     altering bytes or arg slots/order/multiplicity; generic sorting/dedup is invalid.
-    Host equality uses payload plus canonical args, not necessarily byte equality.
+    Backend equality uses payload plus canonical args, not necessarily byte equality.
     The codec reconstructs the native value preserving references and obeying
     the enclosing execution capabilities; trust is not an effect exemption.
     Code evaluates args in order. Generic transport, inspection and remapping
@@ -1227,10 +1194,10 @@ class Declaration(Message[_DeclarationFields]):
         table_name:
             Reflective String selector, distinct from the callable key. Absent means a
             soft default of that key. Explicit public aliases take priority over soft
-            defaults; Public(key) differs from absence. Default(key) is compatible with
-            absence. Empty strings are valid in either arm. Live public aliases and
-            live soft defaults are each unique, but an explicit alias may shadow a soft
-            default. Structural references (including GetTableSizes/GetTableRows) use keys.
+            defaults; public_alias=key differs from absence, while default_name=key
+            is compatible with absence. Empty strings are valid in either arm. Live
+            public aliases and live soft defaults are each unique; an alias may shadow a soft
+            default. Structural references, including table observation commands, use keys.
 
             ```proto
             oneof table_name
@@ -1425,8 +1392,8 @@ class Function(Message[_FunctionFields]):
             uint32 output = 3;
             ```
         merge:
-            Deferred code bound only over the literal names old and new, including in an exported
-            declaration. Absent asserts equality on conflict.
+            Deferred code bound only over old and new, including in exported
+            declarations. Absent asserts equality on conflict.
 
             index into the enclosing `nodes`
 
@@ -1505,10 +1472,10 @@ _UserDefinedPrimitiveFields: TypeAlias = Literal["name", "inputs", "output", "bo
 class UserDefinedPrimitive(Message[_UserDefinedPrimitiveFields]):
     """
     A concrete program-defined computed function, distinct from Primitive.
-    Its body and transitive callees must be legal at every
-    use, using backend-published ambient capabilities; the receiver checks this.
-    An expression-only body may still write through Union. No effect-inference
-    algorithm or fallback for recursive definitions is prescribed here.
+    Its body and transitive callees must be legal at every use, using
+    backend-published ambient capabilities checked by the receiver. Union may
+    write even in an expression-only body. No effect-inference algorithm or
+    fallback for recursive definitions is prescribed.
 
     ```proto
     message egglog.v1.UserDefinedPrimitive
@@ -1720,8 +1687,9 @@ class GenericSignature(Message[_GenericSignatureFields]):
     of the pattern width. Pattern order and width are semantic, even [T, T];
     arguments remain flat, with no tuple/group node. Sort indices reference
     BuiltinCatalog.sorts.
-    Sort.var indices bind below type_param_count. All variable uses, including nested SortApplication and
-    FuncSort patterns, must be in this signature's binder. Each actual call
+    Sort.var indices bind in [0, type_param_count), without parameter names or
+    kind constraints. All uses, including nested SortApplication and FuncSort
+    patterns, must be in this signature's binder. Each actual call
     matches all concrete argument and result sorts structurally to obtain one
     consistent, complete substitution across all repetitions and the result.
     Reject undetermined parameters: e.g.
@@ -2003,7 +1971,7 @@ _CommandFields: TypeAlias = Literal["action", "check", "run", "bind_scheduler", 
 class Command(Message[_CommandFields]):
     """
     One command, at top level or in a loop body: every command may appear in
-    `Loop`. Declarations are not commands.
+    `Loop`. Declarations are installed once at Program scope, outside commands.
 
     ```proto
     message egglog.v1.Command
@@ -2329,9 +2297,8 @@ class KeepBest(Message[_KeepBestFields]):
     the full sort C, including class references, across the internal clear.
     Discarded rows lose annotations; static declaration costs remain unchanged.
     Reconstruction/canonicalization collisions retain existing merge-new rules.
-    With the same options and no intervening changes, desired repeat stability
-    is semantic, not byte/index identity. This is neither an enforced API
-    precondition nor a universal guarantee; no model/extractor restriction is added.
+    Repeated calls have no universal stability guarantee or additional
+    model/extractor precondition.
 
     ```proto
     message egglog.v1.KeepBest
@@ -2449,15 +2416,14 @@ class Freeze(Message[_FreezeFields]):
     host resources. Preserve execution_mode, but reconstruction does not preserve
     original derivations or promise equivalent proof results.
 
-    Include every installed declaration and sort, even unused or empty tables;
-    every registered rule content once and group membership in first-registration
-    order. Reconstruct membership with AddRules commands containing rule values;
-    omit never-registered rule values. Backend builtin descriptors remain in
-    GetBuiltins and are never included in the reconstruction Program.
+    Include every installed declaration and sort, even unused or empty tables,
+    and preserve registered rule content and each group's first-registration
+    membership order. Reconstruct membership with AddRules containing rule values;
+    a value shared by groups appears in each group's addition. Omit unregistered
+    rule values. Backend builtin descriptors remain in GetBuiltins.
     Include saved code and its dependencies without executing it.
-    Host implementations/codecs remain external.
-    Reconstruction sorts are concrete. Generic signature patterns remain solely
-    in GetBuiltins; neither builtin declarations nor their pattern arenas are copied.
+    Host implementations/codecs remain external. Reconstruction sorts are
+    concrete; builtin declarations and signature-pattern arenas are not copied.
 
     Return EGraphSnapshot with the handle's logical options and this Program.
     Do not export resource settings such as threads. See EGraphSnapshot for
@@ -2465,10 +2431,10 @@ class Freeze(Message[_FreezeFields]):
     installation follows Program's normal rules; scheduler/seminaive history
     is not resumed.
 
-    The export's commands contain ordinary data Actions followed by AddRules
-    membership reconstruction, with no queries, Runs or loops. Emit exactly one direct Action.term
-    for each canonical equality class, naming its unique Union location whose
-    members are all its constructor rows. Include empty/unreachable classes.
+    Export commands contain data Actions followed by AddRules, with no queries,
+    Runs or loops. Emit exactly one direct Action.term for each canonical equality
+    class, naming its unique Union location with all its constructor rows as
+    members. Include empty/unreachable classes.
     Emit relation rows as direct Action.term Calls; write every function row,
     including Unit outputs, with Set. Then emit SetCost annotations, then subsume
     for subsumed constructor rows; no delete or panic actions.
@@ -2737,7 +2703,7 @@ class EGraphOptions(Message[_EGraphOptionsFields]):
             optional uint32 cost_sort = 1;
             ```
         execution_mode:
-            Select before executing user declarations. Host providers must be installed
+            Select before installing user declarations. Host providers must be installed
             before term encoding captures their typechecking/validation environment.
 
             ```proto
@@ -2886,17 +2852,15 @@ _EGraphSnapshotFields: TypeAlias = Literal["options", "program"]
 
 class EGraphSnapshot(Message[_EGraphSnapshotFields]):
     """
-    Portable logical state, not an execution checkpoint. The Program owns all
-    arenas/files, including the C selected by options. Every sort is concrete;
-    builtin signature patterns remain in GetBuiltins.
-    Restore by remapping C's closed backend sort graph into
-    a CreateEGraphRequest, selecting receiver resource settings, then executing
-    program normally on the fresh compatible handle. No creation-time commands
-    or resumed scheduler/delta state are implied. Options preserve global
-    seminaive admission explicitly, not query plans or runtime resource/planner settings.
-    Executing program against
-    an existing handle still has ordinary Program semantics; callers must check
-    option compatibility for any restoration equivalence claim.
+    Portable logical state with all arenas/files owned by program, including
+    the concrete cost sort C selected by options. Builtin patterns remain in
+    GetBuiltins. For fresh-handle restoration, remap C's closed backend sort graph
+    into CreateEGraphRequest, choose receiver resources, then execute program on
+    the compatible handle. Creation executes no commands. Global seminaive
+    admission is preserved; scheduler/delta state, query plans and runtime
+    resource/planner settings are not resumed. Execution against an existing
+    handle follows ordinary Program semantics; restoration equivalence requires
+    compatible options.
 
     ```proto
     message egglog.v1.EGraphSnapshot
@@ -2933,8 +2897,7 @@ _CloneEGraphRequestFields: TypeAlias = Literal["egraph_id"]
 class CloneEGraphRequest(Message[_CloneEGraphRequestFields]):
     """
     Clone the addressed e-graph, retaining C, logical options, resources and
-    proof state.
-    No complexity guarantee.
+    proof state. No complexity guarantee.
 
     ```proto
     message egglog.v1.CloneEGraphRequest
@@ -3049,9 +3012,8 @@ class GetHistoryRequest(Message[_GetHistoryRequestFields]):
     Remap arenas while preserving command order, graph sharing and distinct Union
     locations. Declarations are cumulative, so earlier Freeze observations may
     contain extra definition metadata. This is not exact replay after failure.
-    GetHistory itself contributes no input. Clone retains its own shared past;
-    destroying a branch discards its inputs while a saved clone retains its prefix.
-    Destroy releases its graph's history. Host implementations remain external.
+    GetHistory contributes no input. Clone retains the shared past independently;
+    Destroy releases only its graph's history. Host implementations remain external.
 
     ```proto
     message egglog.v1.GetHistoryRequest
@@ -3127,9 +3089,10 @@ _RunProgramResponseFields: TypeAlias = Literal["output", "error", "files"]
 
 class RunProgramResponse(Message[_RunProgramResponseFields]):
     """
-    Each streamed chunk owns complete local arenas, independent of every other
-    chunk and the request. Nested Programs own their own arenas. Observations are
-    delivered during loops; a final completion/error chunk precedes stream end.
+    Each output chunk owns complete local node/sort arenas in RunProgramOutput,
+    independent of other chunks and the request. Nested Programs own their arenas.
+    Observations are delivered during loops; a final completion/error chunk
+    precedes stream end.
     Cancellation preserves completed effects and outputs. It is cooperative at
     command boundaries and does not roll back.
 
@@ -3170,7 +3133,7 @@ _RunProgramOutputFields: TypeAlias = Literal["nodes", "sorts", "outputs"]
 
 class RunProgramOutput(Message[_RunProgramOutputFields]):
     """
-    One completed observation batch with self-contained node and sort arenas.
+    One completed output batch with self-contained node and sort arenas.
     Spans index the enclosing RunProgramResponse.files. Earlier success frames
     remain valid when a later terminal frame reports an error.
 
@@ -3899,26 +3862,21 @@ class ExtractedTerm(Message[_ExtractedTermFields]):
 
     Attributes:
         term:
-            index into `RunProgramResponse.nodes`
+            index into `RunProgramOutput.nodes`
 
             ```proto
             uint32 term = 1;
             ```
         cost:
-            The cost as INERT VALUE DATA, using PrimitiveValue payloads,
-            never an expression to evaluate. Its sort_id identifies the selected model's
-            result sort D in RunProgramResponse.sorts; D need not equal stored C.
-            Select its representation/host codec from that sort. No implicit numeric
-            cast or promotion occurs.
+            Finite, closed inert PrimitiveValue data, never an evaluated expression.
+            Its sort_id selects the model's result sort D in RunProgramOutput.sorts,
+            which may differ from stored C, and the corresponding representation/codec.
+            No implicit numeric cast or promotion occurs. The host cost_model defines
+            cost comparison, combination and identity; this field only encodes its value.
+            Absent means no portable cost encoding, including when D has no codec;
+            it must remain distinguishable from an encoded zero.
 
-            This field is the ENCODING only. The comparison, combination and identity
-            of a cost domain belong to the host's `cost_model`, not this wire value.
-
-            A cost domain with no codec has no portable form here. Absent means NO
-            PORTABLE COST, which is not a cost of zero and not "free"; a caller must be
-            able to tell an unencodable cost from an encoded zero.
-
-            index into `RunProgramResponse.nodes`
+            index into `RunProgramOutput.nodes`
 
             ```proto
             optional uint32 cost = 2;
@@ -4177,7 +4135,7 @@ class ColumnStats(Message[_ColumnStatsFields]):
 
     Attributes:
         sort:
-            index into `RunProgramResponse.sorts`
+            index into `RunProgramOutput.sorts`
 
             ```proto
             uint32 sort = 1;
