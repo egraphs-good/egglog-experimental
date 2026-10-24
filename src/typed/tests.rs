@@ -583,8 +583,7 @@ fn typed_table_actions_preserve_exact_wire_operands_and_real_execution() {
     let request = pb::RunProgramRequest {
         egraph_id: handle,
         program: Some(decoded),
-        profile: true,
-        ..Default::default()
+        diagnostics: false,
     };
     let response_bytes = engine.run(&request.encode_to_vec()).unwrap();
     let response = pb::RunProgramResponse::decode(response_bytes.as_slice()).unwrap();

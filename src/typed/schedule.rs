@@ -54,6 +54,16 @@ impl From<&Schedule> for Schedule {
 }
 
 impl Schedule {
+    /// Observe one owned snapshot after this entire schedule. Place this
+    /// composition inside repeat/saturate to choose an observation per iteration.
+    pub fn with_snapshots(mut self) -> Self {
+        self.commands.push(pb::Command {
+            kind: Some(pb::command::Kind::Freeze(pb::Freeze {})),
+            ..Default::default()
+        });
+        self
+    }
+
     /// Execute the body exactly this many times; zero still registers its rules.
     pub fn repeat(self, times: u64) -> Self {
         Self {

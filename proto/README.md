@@ -384,7 +384,7 @@ one. An absent field leaves the native default unchanged. Creation's existing
 i64 cost-sort and no-declaration limits still apply; native thread-pool resource
 allocation behavior is unchanged.
 
-Threads, `no_decomp` and native `report_level` are creation-time choices.
+Threads and `no_decomp` are creation-time choices.
 `CreateEGraphResponse.threads` acknowledges the effective positive thread count.
 Clone inherits resources; Freeze omits them. There is no resource-configuration
 RPC or Python live setter in this interface.
@@ -430,30 +430,64 @@ let history = graph.history()?;
 assert_eq!(history.commands.len(), 1); // Stats; retrieval adds nothing.
 ```
 
-### Reporting and timing attribution
+### Execution results, diagnostics and streaming
 
-**Decided:** `RunProgramRequest.profile` is off by default. Off disables optional
-diagnostic collection and retention, not just output; scheduler-required counters,
-progress, and stopping checks are unchanged. This is a schema contract, not an
-implemented collection-off path or a performance claim.
+Ordinary `Run`, `Repeat` and `Saturate` return the same small `RunResult`:
+`updated` reports any database change; scheduler-aware `can_stop` preserves the
+backend's existing conservative aggregation across compound schedules. A bounded
+run finishing does not itself prove saturation. Readiness is computed during
+execution, never by calling the scheduler again from a client.
 
-Each completed top-level `Run` returns `RunOutcome` (`updated`, `can_stop`);
-`Repeat` and `Saturate` return `LoopOutcome` (any update, body-execution count,
-termination reason). Nested control outcomes are folded into their enclosing
-loop, not emitted separately. Zero-iteration loops still have an outcome.
-Historical `can_stop` values are not ANDed into a loop's stopping status.
+`RunProgramRequest.diagnostics` defaults to false. Off skips optional timers,
+per-rule metric maps and retained iteration reports while leaving scheduler
+counts and decisions intact. Opting in emits one `Diagnostic` output immediately
+after a completed top-level control result at the same `CommandLocation`.
+`Stats` uses the same document type for previously collected cumulative detail;
+it does not retroactively collect runs executed with diagnostics off.
 
-All requested observations remain in completion order, including inside loops
-and with profiling off. Each output has a `CommandLocation`: a static command
-path plus one zero-based iteration coordinate per enclosing loop. Errors locate
-the innermost active command independently of their most specific source span.
-Source fallback is expression, action, rule, then active command.
-A failed loop has no outcome, but its completed observations and earlier effects
-remain; execution and termination semantics are unchanged.
-Native helper/maintenance Runs do not become public outcomes. A requested native
-result completed before trailing maintenance fails remains in the output prefix.
-RunOutcome keeps the requested native schedule's `updated`/`can_stop`, including
-inline helper work; exclusive profiling does not redefine those flags.
+The current native format is `application/vnd.egglog.run-report+json`. Its JSON
+contains `iterations` and the native `search_and_apply_time_per_rule`,
+`num_matches_per_rule`, `search_and_apply_time_per_ruleset`,
+`merge_time_per_ruleset` and `rebuild_time_per_ruleset` maps. Native durations are
+`{secs,nanos}`. The document omits the duplicate `updated`/`can_stop` fields.
+Names and physical plans are backend diagnostics, with no portable attribution
+or operator model. A plan's `stages` are `[kind, optional_stats, next_indices]`
+tuples; unavailable stage counters remain absent.
+Decomposed/materialized plans use an opaque `text` presentation with their symbol
+mapping; unavailable structured `stages` are omitted, rather than shown as empty.
+`Explain.groups` inspects
+current selected rule query plans without executing or advancing their cursors,
+returning `application/vnd.egglog.query-plan+json` as native `[name,plan]` pairs.
+
+`RunProgram` is canonically streaming. `Engine::run_stream` synchronously calls
+an output callback with owned, self-contained response chunks, in observation
+order, including inside loops. Each chunk has its own complete local arenas;
+Freeze Programs and proof arenas remain independently owned. A final completion
+or error chunk precedes stream completion, including an empty success chunk.
+`Engine::run` buffers this same executor and relocates chunk-local references.
+
+The synchronous callback supplies backpressure without a growing queue. Returning
+`ControlFlow::Break(())` on an observation chunk cancels at a safe boundary and returns a
+transport cancellation error; completed effects remain. A failed or cancelled
+loop has no fabricated completed result. Earlier observations remain usable,
+and the live state need not equal the last received snapshot. `Fail` does not
+catch cancellation. Same-engine callback reentry is rejected while execution is
+active. The final callback's return value cannot cancel already completed work
+or replace its actual error. Input history records only the accepted input Program, independently of
+streamed outputs.
+
+The typed Rust API offers `run(schedule) -> RunResult`,
+`run_with_diagnostics(schedule) -> (RunResult, Diagnostic)` and
+`stats() -> Diagnostic`. `Schedule::with_snapshots()` appends one Freeze after
+the chosen schedule. `schedule.with_snapshots().repeat(3)` observes each body;
+`schedule.repeat(3).with_snapshots()` observes once after the loop.
+`run_stream(schedule, |snapshot| ...)` delivers only explicitly requested owned
+snapshots while execution proceeds; those snapshots outlive the graph.
+
+Outputs carry a command path and one zero-based iteration coordinate per enclosing
+loop. Errors locate the innermost active command independently of their source
+span. Native helper Runs emit no requested control result. A requested result
+completed before trailing maintenance fails remains in the output prefix.
 
 `PrintFunction.max_rows` is optional: absent selects all rows, present zero
 selects none, and a positive value bounds the native scan prefix. The target
@@ -475,20 +509,6 @@ raw term-table dumps can retain historical or deleted rows and therefore differ.
 This does not establish full Source text parity. CSV/file output and
 Fail-observation remain separate required conformance gates.
 
-`ProfileSummary` provides exclusive phase attribution: authored Run sites are
-separate from internal maintenance attributed to its command or installation
-cause. Failing invocations and completed prefixes remain visible; missing metrics
-are unknown, not zero. These measurements do not partition wall time.
-
-`include_run_reports` additionally returns native `NativeRunReport` detail at
-completed requested control sites; `Stats` observes the cumulative native report.
-This backend-oriented view and the authored exclusive summary have different
-meanings. Creation-time `report_level` selects native collection detail. Both
-views and errors reference the response's canonical `Rule` catalog and its local
-node/sort/source arenas. Shared content has one catalog entry; first registration
-supplies its diagnostic metadata. Group timings retain selected group names and
-exact native keys. The schema specifies paths, completeness and metrics.
-
 ### Message ownership
 
 Arenas are local to each message. The wire contract does not prescribe transport
@@ -498,7 +518,7 @@ or shared-memory ownership.
 
 `EGraphOptions.execution_mode` selects ordinary execution (the default), term
 encoding, proofs, or proof testing. Clone retains the mode and proof state.
-The local byte adapter supports all four modes with `profile=true`; unknown
+The local byte adapter supports all four modes; unknown
 mode values fail creation before allocating a handle. Flat Prove/ProveExists
 requests use the current native engine and return owned proof bytes.
 Snapshots retain the mode, but logical reconstruction does not preserve original
@@ -509,13 +529,9 @@ run and its effects before proof extraction fails. Successful proof requests
 return the proof at the originating command location, including inside loops.
 
 **Decided:** proof mode returns requested results only. Helper Runs remain native
-execution and contribute only to optional profiling, with the exclusive
-attribution described above. CEL rejects nested Run/Loop outcomes and permits
-nested proof/observation results; matching them to the requested command remains
-an adapter check. Flat byte execution implements requested-only results and
-exclusive authored/maintenance leaf summaries.
-The current adapter still requires `profile=true`; it cannot yet
-satisfy the collection-off contract.
+execution and can appear in explicitly collected backend diagnostics. CEL rejects
+nested control results and permits nested proof/observation results; matching them
+to requested commands remains an adapter check.
 
 `ProofResult` contains separate, inert term and proof arenas. Terms have no sort:
 native proof propositions can describe a function row with inputs and output as
@@ -570,7 +586,8 @@ SDKs, without these runtime implementations.
 
 `protobuf::Engine` (`src/protobuf.rs`) accepts encoded requests for creation,
 cloning, destruction, scope return, program execution and
-`GetHistory` retrieval.
+`GetHistory` retrieval. `run_stream` is the canonical execution path; `run`
+collects its owned response chunks.
 Decode failures and unknown handles are transport errors; program failures are
 returned in `RunProgramResponse.error`. Preparation validates on disposable
 native state without running user actions. Installation and execution retain
@@ -582,8 +599,7 @@ resupply asserts the installed definition; it does not replace a host
 implementation. Defaults are checked without evaluation; omitted-argument
 expansion belongs to the frontend.
 
-Current limits include requests requiring `profile=true`, Normal-only
-Extract/Freeze, native proof-mode restrictions on non-global
+Current limits include Normal-only Extract/Freeze, native proof-mode restrictions on non-global
 no-merge functions, and context-specific lowering/expansion budgets. Evaluated
 action graphs use lazy first-demand native locals, including ordinary primitive
 calls and exact numeric values, in all four modes. Ordered rule heads share one

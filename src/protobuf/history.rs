@@ -95,6 +95,19 @@ impl Engine {
             .encode_to_vec())
     }
 
+    /// Execute synchronously, delivering owned observations at safe command
+    /// boundaries. The callback applies backpressure directly: no queue grows
+    /// while it runs. Break cancels later commands without rolling effects back.
+    /// A final completion/error chunk precedes successful stream completion.
+    /// Its callback return value is ignored because execution has already ended.
+    pub fn run_stream(
+        &mut self,
+        bytes: &[u8],
+        emit: &mut dyn FnMut(pb::RunProgramResponse) -> std::ops::ControlFlow<()>,
+    ) -> Result<(), TransportError> {
+        self.run_request_stream(pb::RunProgramRequest::decode(bytes)?, emit)
+    }
+
     /// Export the accumulated Program without recording this observation.
     pub fn get_history(&self, bytes: &[u8]) -> Result<Vec<u8>, TransportError> {
         let request = pb::GetHistoryRequest::decode(bytes)?;
@@ -156,8 +169,7 @@ mod tests {
                 &pb::RunProgramRequest {
                     egraph_id: id,
                     program: Some(declaration),
-                    profile: true,
-                    ..Default::default()
+                    diagnostics: false,
                 }
                 .encode_to_vec(),
             )
@@ -186,8 +198,7 @@ mod tests {
                     &pb::RunProgramRequest {
                         egraph_id: id,
                         program: Some(input.clone()),
-                        profile: true,
-                        ..Default::default()
+                        diagnostics: false,
                     }
                     .encode_to_vec(),
                 )
@@ -215,8 +226,7 @@ mod tests {
                 &pb::RunProgramRequest {
                     egraph_id: id,
                     program: Some(rejected),
-                    profile: true,
-                    ..Default::default()
+                    diagnostics: false,
                 }
                 .encode_to_vec(),
             )
@@ -249,8 +259,7 @@ mod tests {
                 &pb::RunProgramRequest {
                     egraph_id: id,
                     program: Some(failure),
-                    profile: true,
-                    ..Default::default()
+                    diagnostics: false,
                 }
                 .encode_to_vec(),
             )
@@ -297,8 +306,7 @@ mod tests {
                 &pb::RunProgramRequest {
                     egraph_id: id,
                     program: Some(pb::Program::default()),
-                    profile: true,
-                    ..Default::default()
+                    diagnostics: false,
                 }
                 .encode_to_vec(),
             )
@@ -318,8 +326,7 @@ mod tests {
                     &pb::RunProgramRequest {
                         egraph_id: child,
                         program: Some(pb::Program::default()),
-                        profile: true,
-                        ..Default::default()
+                        diagnostics: false,
                     }
                     .encode_to_vec(),
                 )

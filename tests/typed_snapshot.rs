@@ -211,34 +211,21 @@ fn snapshot_keeps_cycles_empty_classes_and_observation_provenance() -> Result<()
 }
 
 #[test]
-fn composed_schedules_return_exact_reports_and_register_zero_repeat() -> Result<(), TypedError> {
+fn composed_schedules_return_small_results_and_opt_in_diagnostics() -> Result<(), TypedError> {
     let root = let_("root", Node::Number(3));
     let copy = ruleset(|value: &egg::I64| {
         rewrite(Node::Number(value), Node::Link(Node::Number(value))).label("copy")
     });
     let mut graph = EGraph::new()?;
     let empty = graph.run(copy.repeat(0))?;
-    assert!(!empty.detail.updated);
-    assert!(empty.detail.iterations.is_empty());
+    assert!(!empty.updated);
     graph.register(&root)?;
-    let result = graph.run(sequence((&copy, &copy)).saturate())?;
-    assert!(result.detail.updated);
-    assert!(!result.detail.iterations.is_empty());
-    assert!(
-        result
-            .rules
-            .iter()
-            .any(|rule| rule.name.as_deref() == Some("copy"))
-    );
-    assert!(!graph.run(&copy)?.detail.updated);
-    let stats = graph.stats()?;
-    assert!(
-        stats
-            .detail
-            .num_matches_per_rule
-            .iter()
-            .any(|entry| entry.value > 0)
-    );
+    let (result, diagnostic) = graph.run_with_diagnostics(sequence((&copy, &copy)).saturate())?;
+    assert!(result.updated);
+    let report: serde_json::Value = serde_json::from_str(&diagnostic.content).unwrap();
+    assert!(!report["iterations"].as_array().unwrap().is_empty());
+    assert!(!graph.run(&copy)?.updated);
+    assert!(diagnostic_matches(&graph.stats()?) > 0);
     assert!(
         graph
             .freeze()?
@@ -248,31 +235,26 @@ fn composed_schedules_return_exact_reports_and_register_zero_repeat() -> Result<
     Ok(())
 }
 
+fn diagnostic_matches(diagnostic: &Diagnostic) -> u64 {
+    assert_eq!(diagnostic.format, "application/vnd.egglog.run-report+json");
+    let value: serde_json::Value = serde_json::from_str(&diagnostic.content).unwrap();
+    value["num_matches_per_rule"]
+        .as_object()
+        .unwrap()
+        .values()
+        .map(|value| value.as_u64().unwrap())
+        .sum()
+}
+
 #[test]
 fn diagnostic_labels_share_content_and_consumed_cursors() -> Result<(), TypedError> {
     let shared = rule((), Node::Number(4));
     let first = ruleset((&shared, shared.clone().label("first presentation")));
     let later = ruleset(shared.label("later presentation"));
     let mut graph = EGraph::new()?;
-    let report = graph.run(&first)?;
-    assert_eq!(
-        report
-            .detail
-            .num_matches_per_rule
-            .iter()
-            .map(|entry| entry.value)
-            .sum::<u64>(),
-        1
-    );
-    let report = graph.run(&later)?;
-    assert_eq!(
-        report
-            .detail
-            .num_matches_per_rule
-            .iter()
-            .map(|entry| entry.value)
-            .sum::<u64>(),
-        0
-    );
+    let (_, diagnostic) = graph.run_with_diagnostics(&first)?;
+    assert_eq!(diagnostic_matches(&diagnostic), 1);
+    let (_, diagnostic) = graph.run_with_diagnostics(&later)?;
+    assert_eq!(diagnostic_matches(&diagnostic), 0);
     Ok(())
 }

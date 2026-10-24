@@ -6,8 +6,7 @@
 //! table rows in all four modes. Extraction remains ordinary-mode only.
 //! Unsupported forms fail explicitly before installation.
 //! Explicit native extensions may additionally supply inert host-value codecs.
-//! In particular, profiling must currently be requested: the
-//! native engine cannot yet disable its optional timing collection.
+//! Detailed timing and native reports are collected only when requested.
 //!
 //! Decoded protobuf messages supply all authored semantics. Native ASTs exist
 //! during validation and execution; the native engine retains its compiled
@@ -18,6 +17,7 @@ use crate::builtin::{PortableEGraph, PortablePrimitive, PortableTypeInfo};
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
+use std::ops::ControlFlow;
 use std::sync::Arc;
 
 use crate::proto as pb;
@@ -49,11 +49,40 @@ type ExecutionFailureSite = (pb::CommandLocation, Option<pb::Span>);
 
 #[derive(Default)]
 struct ScheduleMeasurements {
-    requested: HashMap<Vec<u32>, LeafSummary>,
-    maintenance: HashMap<Option<Vec<u32>>, LeafSummary>,
-    selected: Vec<Vec<String>>,
     failure: Option<ExecutionFailureSite>,
     changed: bool,
+}
+
+struct OutputStream<'a> {
+    emit: &'a mut dyn FnMut(pb::RunProgramResponse) -> ControlFlow<()>,
+    cancelled: bool,
+}
+
+impl OutputStream<'_> {
+    fn flush(
+        &mut self,
+        response: &mut pb::RunProgramResponse,
+        context: &mut RequestOccurrences,
+    ) -> Result<(), egglog::Error> {
+        if !response.outputs.is_empty() {
+            let chunk = std::mem::replace(
+                response,
+                pb::RunProgramResponse {
+                    files: context.files.clone(),
+                    ..Default::default()
+                },
+            );
+            context.response_rules.clear();
+            context.file_offsets.clear();
+            context.file_offsets.insert(context.source_files_key, 0);
+            self.cancelled = (self.emit)(chunk).is_break();
+        }
+        if self.cancelled {
+            Err(egglog::Error::BackendError("execution cancelled".into()))
+        } else {
+            Ok(())
+        }
+    }
 }
 
 // Fail is path-transparent; only ordered command lists add a path component.
@@ -194,7 +223,7 @@ struct Session {
 
 struct Installation {
     command: Option<Command>,
-    site: pb::maintenance_site::Target,
+    source_declaration: Option<u32>,
     span: Option<pb::Span>,
     declaration: Option<usize>,
 }
@@ -218,77 +247,19 @@ struct RequestOccurrences {
     registry: rules::Registry,
     candidates: Vec<rules::Candidate>,
     selection: String,
-    selections: HashMap<String, Vec<Vec<String>>>,
     records: HashMap<String, Arc<graph::RuleRecord>>,
     file_offsets: HashMap<usize, u32>,
-    origins: HashMap<String, (String, pb::NativeRuleDirection)>,
+    source_files_key: usize,
+    origins: HashMap<String, String>,
     response_rules: HashMap<String, u32>,
     files: Vec<pb::SourceFile>,
     // Indexed by the execution arena, not the response's merged source files.
     native_spans: NativeSpans,
-    include_run_reports: bool,
+    diagnostics: bool,
     scoped_actions: HashSet<Vec<u32>>,
     action_dags: HashMap<Vec<u32>, HashSet<u32>>,
     extraction_dags: HashMap<u32, HashSet<u32>>,
     union_values: HashMap<u32, Value>,
-}
-
-struct LeafSummary {
-    invocations: u64,
-    nanos: [Option<u64>; 3],
-    rules: HashMap<String, (u64, Option<u64>)>,
-}
-
-impl Default for LeafSummary {
-    fn default() -> Self {
-        Self {
-            invocations: 0,
-            nanos: [Some(0); 3],
-            rules: HashMap::new(),
-        }
-    }
-}
-
-impl LeafSummary {
-    fn finish(
-        &mut self,
-        result: Result<&egglog_reports::RunReport, &egglog::Error>,
-        authored_rules: bool,
-    ) {
-        let Ok(report) = result else {
-            self.nanos = [None; 3];
-            // An earlier successful iteration is not a complete site total.
-            // Admitted loop bodies cannot catch this failure and resume here.
-            self.rules.clear();
-            return;
-        };
-        for (total, measured) in self.nanos.iter_mut().zip([
-            &report.search_and_apply_time_per_ruleset,
-            &report.merge_time_per_ruleset,
-            &report.rebuild_time_per_ruleset,
-        ]) {
-            *total = total.and_then(|old| {
-                let elapsed = measured.values().map(|d| d.as_nanos()).sum::<u128>();
-                old.checked_add(u64::try_from(elapsed).ok()?)
-            });
-        }
-        if authored_rules {
-            for (name, matches) in &report.num_matches_per_rule {
-                let (count, nanos) = self.rules.entry(name.to_string()).or_insert((0, Some(0)));
-                *count += *matches as u64;
-                *nanos = nanos.and_then(|old| {
-                    old.checked_add(
-                        report
-                            .search_and_apply_time_per_rule
-                            .get(name)?
-                            .as_nanos()
-                            .try_into()
-                            .ok()?,
-                    )
-                });
-            }
-        }
-    }
 }
 
 fn execution_error(
@@ -476,6 +447,9 @@ impl Engine {
         };
         let native_spans = NativeSpans::default();
         let mut graph = crate::new_experimental_egraph();
+        // Provider setup and the original proof typechecking clone inherit the
+        // byte adapter's off policy, before any optional native work can run.
+        graph.set_report_level(egglog_reports::ReportLevel::Off);
         graph.seminaive = seminaive;
         graph.no_decomp = no_decomp;
         if let Some(extension) = &self.extension {
@@ -516,14 +490,7 @@ impl Engine {
                     .map_err(|_| TransportError("thread count exceeds native usize".into()))?,
             );
         }
-        if let Some(level) = request.report_level {
-            graph.set_report_level(match pb::ReportLevel::try_from(level) {
-                Ok(pb::ReportLevel::TimeOnly) => egglog_reports::ReportLevel::TimeOnly,
-                Ok(pb::ReportLevel::WithPlan) => egglog_reports::ReportLevel::WithPlan,
-                Ok(pb::ReportLevel::StageInfo) => egglog_reports::ReportLevel::StageInfo,
-                _ => return Err(TransportError("unknown report level".into())),
-            });
-        }
+        graph.set_report_level(egglog_reports::ReportLevel::Off);
         let threads = u64::try_from(graph.num_threads())
             .map_err(|_| TransportError("native thread count exceeds uint64".into()))?;
         self.next_id = self
@@ -626,6 +593,32 @@ impl Engine {
         &mut self,
         request: pb::RunProgramRequest,
     ) -> Result<pb::RunProgramResponse, TransportError> {
+        let mut response = pb::RunProgramResponse::default();
+        let mut collection_error = None;
+        let mut source_files = HashMap::new();
+        let result = self.run_request_stream(request, &mut |chunk| match graph::append_response(
+            &mut response,
+            chunk,
+            &mut source_files,
+        ) {
+            Ok(()) => ControlFlow::Continue(()),
+            Err(error) => {
+                collection_error = Some(TransportError(error));
+                ControlFlow::Break(())
+            }
+        });
+        if let Some(error) = collection_error {
+            return Err(error);
+        }
+        result?;
+        Ok(response)
+    }
+
+    fn run_request_stream(
+        &mut self,
+        request: pb::RunProgramRequest,
+        emit: &mut dyn FnMut(pb::RunProgramResponse) -> ControlFlow<()>,
+    ) -> Result<(), TransportError> {
         let original = self
             .histories
             .contains_key(&request.egraph_id)
@@ -635,12 +628,10 @@ impl Engine {
             .graphs
             .get_mut(&request.egraph_id)
             .ok_or_else(|| TransportError("unknown egraph_id".into()))?;
-        let mut response = pb::RunProgramResponse {
-            profile: request.profile.then(|| pb::ProfileSummary {
-                complete: false,
-                ..Default::default()
-            }),
-            ..Default::default()
+        let mut response = pb::RunProgramResponse::default();
+        let mut stream = OutputStream {
+            emit,
+            cancelled: false,
         };
         let Some(mut program) = request.program else {
             response.error = Some(pb::Error {
@@ -648,19 +639,25 @@ impl Engine {
                 message: "missing program".into(),
                 ..Default::default()
             });
-            return Ok(response);
+            let _ = (stream.emit)(response);
+            return Ok(());
         };
         response.files = program.files.clone();
-        let prepared = if request.profile {
-            session.prepare(&mut program)
+        session.graph.set_report_level(if request.diagnostics {
+            egglog_reports::ReportLevel::StageInfo
         } else {
-            Err("profile=false is unsupported until native collection can be disabled".into())
-        };
+            egglog_reports::ReportLevel::Off
+        });
+        let prepared = session.prepare(&mut program);
         let prepared = match prepared {
             Ok(prepared) => prepared,
             Err(error) => {
                 response.error = Some(*error.0);
-                return Ok(response);
+                session
+                    .graph
+                    .set_report_level(egglog_reports::ReportLevel::Off);
+                let _ = (stream.emit)(response);
+                return Ok(());
             }
         };
         if let Some(original) = original {
@@ -673,10 +670,15 @@ impl Engine {
             Ok(context) => context,
             Err(error) => {
                 response.error = Some(*error);
-                return Ok(response);
+                session
+                    .graph
+                    .set_report_level(egglog_reports::ReportLevel::Off);
+                let _ = (stream.emit)(response);
+                return Ok(());
             }
         };
-        context.include_run_reports = request.include_run_reports;
+        context.diagnostics = request.diagnostics;
+        let mut transport_error = None;
         for (index, command) in program.commands.iter().enumerate() {
             let location = pb::CommandLocation {
                 path: vec![index as u32],
@@ -690,7 +692,11 @@ impl Engine {
                 &location,
                 &mut response,
                 &mut failure_site,
+                &mut stream,
             );
+            if stream.cancelled {
+                break;
+            }
             if let Err(error) = result {
                 let panic = matches!(
                     &command.kind,
@@ -723,17 +729,32 @@ impl Engine {
                     panic,
                 );
                 if let Some(origin) = origin {
-                    error.rule = report::rule_reference(&origin, &mut context, &mut response)
-                        .map_err(TransportError)?
-                        .0;
+                    match report::rule_reference(&origin, &mut context, &mut response) {
+                        Ok(rule) => error.rule = rule,
+                        Err(error) => transport_error = Some(TransportError(error)),
+                    }
                 }
                 response.error = Some(error);
                 break;
             }
         }
         session.registry = std::mem::take(&mut context.registry);
-        response.profile.as_mut().unwrap().complete = response.error.is_none();
-        Ok(response)
+        session
+            .graph
+            .set_report_level(egglog_reports::ReportLevel::Off);
+        if let Some(error) = transport_error {
+            return Err(error);
+        }
+        if stream.cancelled {
+            return Err(TransportError("execution cancelled".into()));
+        }
+        if response.outputs.is_empty() && response.error.is_none() {
+            response.files.clear();
+        }
+        // Completion is already known; declining this final delivery cannot
+        // cancel finished work or replace its actual engine error.
+        let _ = (stream.emit)(response);
+        Ok(())
     }
 }
 
@@ -763,7 +784,6 @@ impl Session {
                 }
                 .run_observed(
                     vec![command.clone()],
-                    installation.site,
                     None,
                     &mut context,
                     response,
@@ -976,7 +996,7 @@ impl Session {
                 pending_declarations.insert(declaration_indices[index].unwrap());
                 installations.push(Installation {
                     command: Some(command),
-                    site: pb::maintenance_site::Target::Declaration(index as u32),
+                    source_declaration: Some(index as u32),
                     span: declaration.span,
                     declaration: declaration_indices[index],
                 });
@@ -996,7 +1016,7 @@ impl Session {
             let site = sort_sites[index as usize];
             installations.push(Installation {
                 command: Some(command),
-                site: pb::maintenance_site::Target::Sort(site),
+                source_declaration: None,
                 span: program.sorts[site as usize].span,
                 declaration: None,
             });
@@ -1141,7 +1161,7 @@ impl Session {
                     .map_err(|error| error.to_string())?;
                 installations.push(Installation {
                     command: Some(cost_table),
-                    site: pb::maintenance_site::Target::Declaration(index as u32),
+                    source_declaration: Some(index as u32),
                     span: declaration.span,
                     declaration: None,
                 });
@@ -1149,7 +1169,7 @@ impl Session {
             pending_declarations.insert(declaration_indices[index].unwrap());
             installations.push(Installation {
                 command: Some(command),
-                site: pb::maintenance_site::Target::Declaration(index as u32),
+                source_declaration: Some(index as u32),
                 span: declaration.span,
                 declaration: declaration_indices[index],
             });
@@ -1269,6 +1289,7 @@ impl Session {
             extraction_dags,
             files: program.files.clone(),
             file_offsets: [(Arc::as_ptr(&rule_files) as usize, 0)].into(),
+            source_files_key: Arc::as_ptr(&rule_files) as usize,
             ..Default::default()
         };
         self.registry.origins(&mut context);
@@ -1598,7 +1619,9 @@ impl Session {
                 stored_table_signature(&self.definitions, logical)?;
                 return Ok(vec![]);
             }
-            pb::command::Kind::Freeze(_) | pb::command::Kind::AddRules(_) => return Ok(vec![]),
+            pb::command::Kind::Freeze(_)
+            | pb::command::Kind::AddRules(_)
+            | pb::command::Kind::Explain(_) => return Ok(vec![]),
             _ => {
                 return Err(
                     "this command kind is not supported by the initial byte adapter".into(),
@@ -1749,6 +1772,11 @@ impl Session {
             {
                 self.lower_command(program, command, context, &mut HashMap::new())
             }
+            pb::command::Kind::Freeze(_) | pb::command::Kind::Explain(_)
+                if self.mode == pb::ExecutionMode::Normal =>
+            {
+                Ok(vec![])
+            }
             _ if in_loop => {
                 Err("loop body command has no supported native mutation-progress witness".into())
             }
@@ -1779,6 +1807,8 @@ impl Session {
         }
     }
 
+    // Keep the authored site, failure prefix and synchronous output sink explicit.
+    #[allow(clippy::too_many_arguments)]
     fn execute(
         &mut self,
         program: &pb::Program,
@@ -1787,11 +1817,19 @@ impl Session {
         location: &pb::CommandLocation,
         response: &mut pb::RunProgramResponse,
         failure_site: &mut Option<ExecutionFailureSite>,
+        stream: &mut OutputStream<'_>,
     ) -> Result<(), egglog::Error> {
         let output = match command.kind.as_ref().unwrap() {
             pb::command::Kind::Fail(child) if context.scoped_actions.contains(&location.path) => {
-                let result =
-                    self.execute(program, child, context, location, response, failure_site);
+                let result = self.execute(
+                    program,
+                    child,
+                    context,
+                    location,
+                    response,
+                    failure_site,
+                    stream,
+                );
                 *failure_site = None;
                 if result.is_ok() {
                     return Err(egglog::Error::ExpectFail(
@@ -1821,8 +1859,10 @@ impl Session {
                     context,
                     response,
                     root: location,
+                    stream,
+                    definitions: &self.definitions,
+                    extension: self.extension.as_ref(),
                     measurements: &measurements,
-                    outcome: None,
                     export_error: None,
                     suppressed: !fail_spans.is_empty(),
                     anchor,
@@ -1853,18 +1893,23 @@ impl Session {
                 let result = result.and_then(|()| envelope.export_error.take().map_or(Ok(()), Err));
                 let measurements = measurements.into_inner();
                 *failure_site = measurements.failure.clone();
-                measurements.publish(
-                    pb::maintenance_site::Target::Command(pb::StaticCommandPath {
-                        path: location.path.clone(),
-                    }),
-                    context,
-                    response,
-                );
                 result?;
                 None
             }
-            pb::command::Kind::Freeze(_) => Some(pb::command_output::Kind::Snapshot(
-                freeze::export(self, &context.registry)?,
+            pb::command::Kind::Freeze(_) => {
+                Some(pb::command_output::Kind::Snapshot(freeze::export(
+                    freeze::View {
+                        graph: &self.graph,
+                        names: &self.names,
+                        definitions: &self.definitions,
+                        mode: self.mode,
+                        extension: self.extension.as_ref(),
+                    },
+                    &context.registry,
+                )?))
+            }
+            pb::command::Kind::Explain(explain) => Some(pb::command_output::Kind::Diagnostic(
+                report::explain(&self.graph, &context.registry, &explain.groups)?,
             )),
             pb::command::Kind::Action(action)
                 if context.scoped_actions.contains(&location.path) =>
@@ -1883,13 +1928,6 @@ impl Session {
                     &context.native_spans,
                 );
                 *failure_site = measurements.failure.clone();
-                measurements.publish(
-                    pb::maintenance_site::Target::Command(pb::StaticCommandPath {
-                        path: location.path.clone(),
-                    }),
-                    context,
-                    response,
-                );
                 result?;
                 None
             }
@@ -2202,9 +2240,6 @@ impl Session {
                 }
                 .run_observed(
                     commands,
-                    pb::maintenance_site::Target::Command(pb::StaticCommandPath {
-                        path: location.path.clone(),
-                    }),
                     Some(RequestedObservation {
                         command,
                         location,
@@ -2223,10 +2258,9 @@ impl Session {
             response.outputs.push(pb::CommandOutput {
                 kind: Some(kind),
                 location: Some(location.clone()),
-                run_report: None,
             });
         }
-        Ok(())
+        stream.flush(response, context)
     }
 }
 
@@ -2257,7 +2291,6 @@ impl NativeExecutor<'_> {
     fn run_observed(
         &mut self,
         commands: Vec<Command>,
-        site: pb::maintenance_site::Target,
         requested: Option<RequestedObservation<'_>>,
         context: &mut RequestOccurrences,
         response: &mut pb::RunProgramResponse,
@@ -2307,13 +2340,8 @@ impl NativeExecutor<'_> {
                         **captured = Some(report);
                         return;
                     }
-                    if context.include_run_reports {
-                        match report::export(
-                            &report,
-                            &measurements.borrow().selected,
-                            context,
-                            response,
-                        ) {
+                    if context.diagnostics {
+                        match report::export(&report) {
                             Ok(detail) => run_report = Some(detail),
                             Err(error) => {
                                 export_error = Some(egglog::Error::BackendError(error));
@@ -2321,7 +2349,7 @@ impl NativeExecutor<'_> {
                             }
                         }
                     }
-                    pb::command_output::Kind::Run(pb::RunOutcome {
+                    pb::command_output::Kind::Run(pb::RunResult {
                         updated: report.updated,
                         can_stop: report.can_stop,
                     })
@@ -2373,15 +2401,13 @@ impl NativeExecutor<'_> {
                         }
                     }
                 }
-                egglog::CommandOutput::OverallStatistics(report) => {
-                    match report::export(&report, &[], context, response) {
-                        Ok(detail) => pb::command_output::Kind::Statistics(detail),
-                        Err(error) => {
-                            export_error = Some(egglog::Error::BackendError(error));
-                            return;
-                        }
+                egglog::CommandOutput::OverallStatistics(report) => match report::export(&report) {
+                    Ok(detail) => pb::command_output::Kind::Diagnostic(detail),
+                    Err(error) => {
+                        export_error = Some(egglog::Error::BackendError(error));
+                        return;
                     }
-                }
+                },
                 egglog::CommandOutput::ProveExists {
                     proof_store,
                     proof_id,
@@ -2397,8 +2423,13 @@ impl NativeExecutor<'_> {
             response.outputs.push(pb::CommandOutput {
                 kind: Some(kind),
                 location: Some(location.clone()),
-                run_report,
             });
+            if let Some(diagnostic) = run_report {
+                response.outputs.push(pb::CommandOutput {
+                    kind: Some(pb::command_output::Kind::Diagnostic(diagnostic)),
+                    location: Some(location.clone()),
+                });
+            }
         };
         let mut observe = |_: usize, event: ExecutionEvent<'_>| {
             if let ExecutionEvent::ActionsFinished { changed, .. } = event {
@@ -2454,11 +2485,6 @@ impl NativeExecutor<'_> {
             report.updated |= actions_changed;
             report.can_stop &= !actions_changed;
         }
-        if captured.is_none() {
-            owned_measurements
-                .into_inner()
-                .publish(site, context, response);
-        }
         (
             result.and_then(|()| export_error.map_or(Ok(()), Err)),
             registered,
@@ -2471,7 +2497,7 @@ impl ScheduleMeasurements {
     fn observe(
         &mut self,
         event: ExecutionEvent<'_>,
-        mode: pb::ExecutionMode,
+        _mode: pb::ExecutionMode,
         location: Option<&pb::CommandLocation>,
         sites: &ScheduleSites<'_>,
     ) {
@@ -2480,146 +2506,27 @@ impl ScheduleMeasurements {
             ExecutionEvent::RunFinished {
                 result: Ok(report), ..
             } => self.changed |= report.updated,
-            _ => (),
-        }
-        match event {
             ExecutionEvent::CommandCompleted {
                 origin: ExecutionOrigin::Requested,
                 ..
             } => self.failure = None,
-            ExecutionEvent::RunStarted { origin, schedule }
-            | ExecutionEvent::RunFinished {
-                origin, schedule, ..
-            } => {
-                let mapped = schedule.and_then(|schedule| {
+            ExecutionEvent::RunFinished {
+                schedule,
+                result: Err(_),
+                ..
+            } if self.failure.is_none() => {
+                self.failure = schedule.and_then(|schedule| {
                     let (command, path) = sites.get(schedule.path)?;
-                    let mut nested = location.expect("schedule has command site").clone();
+                    let mut nested = location?.clone();
                     nested.path.extend(path);
                     nested
                         .iterations
                         .extend(schedule.iterations.iter().map(|i| *i as u64));
-                    Some((*command, nested))
+                    Some((nested, command.span))
                 });
-                let authored = origin == ExecutionOrigin::Requested;
-                if matches!(event, ExecutionEvent::RunStarted { .. })
-                    && let Some((
-                        pb::Command {
-                            kind: Some(pb::command::Kind::Run(run)),
-                            ..
-                        },
-                        _,
-                    )) = &mapped
-                {
-                    let selected = &run.groups;
-                    if !self.selected.contains(selected) {
-                        self.selected.push(selected.clone());
-                    }
-                }
-                if matches!(event, ExecutionEvent::RunFinished { result: Err(_), .. })
-                    && self.failure.is_none()
-                {
-                    self.failure = mapped
-                        .as_ref()
-                        .map(|(command, location)| (location.clone(), command.span));
-                }
-                let path = mapped
-                    .as_ref()
-                    .map(|(_, location)| location.path.clone())
-                    .or_else(|| location.map(|location| location.path.clone()));
-                let summary = if authored {
-                    self.requested
-                        .entry(path.expect("authored Run has command site"))
-                        .or_default()
-                } else {
-                    self.maintenance.entry(path).or_default()
-                };
-                match event {
-                    ExecutionEvent::RunStarted { .. } => summary.invocations += 1,
-                    ExecutionEvent::RunFinished { result, .. } => {
-                        summary.finish(result, authored && mode == pb::ExecutionMode::Normal)
-                    }
-                    _ => unreachable!(),
-                }
             }
             _ => (),
         }
-    }
-
-    fn publish(
-        self,
-        site: pb::maintenance_site::Target,
-        context: &mut RequestOccurrences,
-        response: &mut pb::RunProgramResponse,
-    ) {
-        let measurements = self;
-        let mut profile = response.profile.take().expect("summary requested");
-        let mut requested: Vec<_> = measurements.requested.into_iter().collect();
-        requested.sort_unstable_by(|a, b| a.0.cmp(&b.0));
-        for (path, requested) in requested {
-            let mut rules: Vec<pb::RuleSummary> = vec![];
-            let mut positions = HashMap::new();
-            let mut measured: Vec<_> = requested.rules.into_iter().collect();
-            measured.sort_unstable_by(|a, b| a.0.cmp(&b.0));
-            for (name, (matches, nanos)) in measured {
-                if let (Some(index), _) = report::rule_reference(&name, context, response)
-                    .expect("registered rule catalog")
-                {
-                    let position = *positions.entry(index).or_insert_with(|| {
-                        rules.push(pb::RuleSummary {
-                            rule: Some(index),
-                            matches: Some(0),
-                            search_and_apply_nanos: Some(0),
-                        });
-                        rules.len() - 1
-                    });
-                    let rule = &mut rules[position];
-                    rule.matches = rule.matches.and_then(|old| old.checked_add(matches));
-                    rule.search_and_apply_nanos = rule
-                        .search_and_apply_nanos
-                        .and_then(|old| old.checked_add(nanos?));
-                }
-            }
-            profile.runs.push(pb::RunSummary {
-                command_path: path,
-                invocations: requested.invocations,
-                rules,
-                search_and_apply_nanos: requested.nanos[0],
-                merge_nanos: requested.nanos[1],
-                rebuild_nanos: requested.nanos[2],
-            });
-        }
-        let mut maintenance: Vec<_> = measurements.maintenance.into_iter().collect();
-        maintenance.sort_unstable_by(|a, b| a.0.cmp(&b.0));
-        for (path, maintenance) in maintenance {
-            let site = Some(pb::MaintenanceSite {
-                target: Some(path.map_or_else(
-                    || site.clone(),
-                    |path| pb::maintenance_site::Target::Command(pb::StaticCommandPath { path }),
-                )),
-            });
-            if let Some(existing) = profile.maintenance.iter_mut().find(|m| m.site == site) {
-                existing.invocations += maintenance.invocations;
-                for (total, next) in [
-                    &mut existing.search_and_apply_nanos,
-                    &mut existing.merge_nanos,
-                    &mut existing.rebuild_nanos,
-                ]
-                .into_iter()
-                .zip(maintenance.nanos)
-                {
-                    *total = total.and_then(|old| old.checked_add(next?));
-                }
-            } else {
-                profile.maintenance.push(pb::MaintenanceSummary {
-                    site,
-                    invocations: maintenance.invocations,
-                    search_and_apply_nanos: maintenance.nanos[0],
-                    merge_nanos: maintenance.nanos[1],
-                    rebuild_nanos: maintenance.nanos[2],
-                });
-            }
-        }
-        response.profile = Some(profile);
     }
 }
 
@@ -2707,28 +2614,32 @@ fn wire_back_off(
     ))
 }
 
-struct WireSchedule<'a> {
+struct WireSchedule<'a, 'stream> {
     executor: NativeExecutor<'a>,
     program: &'a pb::Program,
     context: &'a mut RequestOccurrences,
     response: &'a mut pb::RunProgramResponse,
     root: &'a pb::CommandLocation,
+    stream: &'a mut OutputStream<'stream>,
+    definitions: &'a pb::Program,
+    extension: Option<&'a Arc<dyn NativeExtension>>,
     measurements: &'a RefCell<ScheduleMeasurements>,
     bindings: Vec<(String, SchedulerBinding)>,
-    outcome: &'a mut Option<pb::LoopOutcome>,
     suppressed: bool,
     partial: &'a mut ControlReport,
 }
 
-struct WireEnvelope<'a> {
+struct WireEnvelope<'a, 'stream> {
     mode: pb::ExecutionMode,
     names: &'a NativeNames,
     program: &'a pb::Program,
     context: &'a mut RequestOccurrences,
     response: &'a mut pb::RunProgramResponse,
     root: &'a pb::CommandLocation,
+    stream: &'a mut OutputStream<'stream>,
+    definitions: &'a pb::Program,
+    extension: Option<&'a Arc<dyn NativeExtension>>,
     measurements: &'a RefCell<ScheduleMeasurements>,
-    outcome: Option<pb::LoopOutcome>,
     export_error: Option<egglog::Error>,
     suppressed: bool,
     anchor: &'a pb::Command,
@@ -2736,7 +2647,7 @@ struct WireEnvelope<'a> {
     partial: ControlReport,
 }
 
-impl WireEnvelope<'_> {
+impl WireEnvelope<'_, '_> {
     fn execute(&mut self, graph: &mut EGraph) -> Result<egglog_reports::RunReport, egglog::Error> {
         let mut control = WireSchedule {
             executor: NativeExecutor {
@@ -2748,9 +2659,11 @@ impl WireEnvelope<'_> {
             context: self.context,
             response: self.response,
             root: self.root,
+            stream: self.stream,
+            definitions: self.definitions,
+            extension: self.extension,
             measurements: self.measurements,
             bindings: self.bindings.clone(),
-            outcome: &mut self.outcome,
             suppressed: self.suppressed,
             partial: &mut self.partial,
         };
@@ -2763,14 +2676,10 @@ impl WireEnvelope<'_> {
             self.measurements.borrow_mut().failure = None;
             return;
         };
-        let kind = if let Some(outcome) = self.outcome.take() {
-            pb::command_output::Kind::Loop(outcome)
-        } else {
-            pb::command_output::Kind::Run(pb::RunOutcome {
-                updated: report.updated,
-                can_stop: report.can_stop,
-            })
-        };
+        let kind = pb::command_output::Kind::Run(pb::RunResult {
+            updated: report.updated,
+            can_stop: report.can_stop,
+        });
         self.export_error = self.output(kind, report).err();
     }
 
@@ -2781,27 +2690,25 @@ impl WireEnvelope<'_> {
     ) -> Result<(), egglog::Error> {
         let run_report = self
             .context
-            .include_run_reports
-            .then(|| {
-                report::export(
-                    report,
-                    &self.measurements.borrow().selected,
-                    self.context,
-                    self.response,
-                )
-            })
+            .diagnostics
+            .then(|| report::export(report))
             .transpose()
             .map_err(egglog::Error::BackendError)?;
         self.response.outputs.push(pb::CommandOutput {
             kind: Some(kind),
             location: Some(self.root.clone()),
-            run_report,
         });
+        if let Some(diagnostic) = run_report {
+            self.response.outputs.push(pb::CommandOutput {
+                kind: Some(pb::command_output::Kind::Diagnostic(diagnostic)),
+                location: Some(self.root.clone()),
+            });
+        }
         Ok(())
     }
 }
 
-impl WireSchedule<'_> {
+impl WireSchedule<'_, '_> {
     fn location(&self, path: &[usize], iterations: &[u64]) -> pb::CommandLocation {
         let mut location = self.root.clone();
         location.path.extend(path.iter().map(|index| *index as u32));
@@ -2810,7 +2717,7 @@ impl WireSchedule<'_> {
     }
 }
 
-impl ControlContext for WireSchedule<'_> {
+impl ControlContext for WireSchedule<'_, '_> {
     type Node = pb::Command;
     type Error = egglog::Error;
     type Scope = (usize, HashMap<u32, Value>);
@@ -2845,6 +2752,9 @@ impl ControlContext for WireSchedule<'_> {
         path: &[usize],
         iterations: &[u64],
     ) -> Result<ControlReport, egglog::Error> {
+        if self.stream.cancelled {
+            return Err(egglog::Error::BackendError("execution cancelled".into()));
+        }
         let location = self.location(path, iterations);
         if let Some(pb::command::Kind::Fail(_)) = &node.kind {
             let mut anchor = node;
@@ -2868,8 +2778,10 @@ impl ControlContext for WireSchedule<'_> {
                 context: self.context,
                 response: self.response,
                 root: &location,
+                stream: self.stream,
+                definitions: self.definitions,
+                extension: self.extension,
                 measurements: self.measurements,
-                outcome: None,
                 export_error: None,
                 suppressed: true,
                 anchor,
@@ -2900,6 +2812,9 @@ impl ControlContext for WireSchedule<'_> {
             if result.is_err() && self.measurements.borrow().failure.is_none() {
                 self.measurements.borrow_mut().failure = Some((location, node.span));
             }
+            if self.stream.cancelled {
+                return Err(egglog::Error::BackendError("execution cancelled".into()));
+            }
             result?;
             return Ok(partial);
         }
@@ -2926,7 +2841,6 @@ impl ControlContext for WireSchedule<'_> {
                 add,
                 &candidates,
                 &mut self.executor,
-                &location,
                 self.context,
                 self.response,
             );
@@ -2940,24 +2854,43 @@ impl ControlContext for WireSchedule<'_> {
         }
         if let Some(pb::command::Kind::Run(run)) = &node.kind {
             let mut registry = std::mem::take(&mut self.context.registry);
-            let result = registry.selection(
-                &run.groups,
-                &mut self.executor,
-                &location,
-                self.context,
-                self.response,
-            );
+            let result =
+                registry.selection(&run.groups, &mut self.executor, self.context, self.response);
             self.context.registry = registry;
             let selection = result?;
-            let groups = self
-                .context
-                .selections
-                .entry(selection.clone())
-                .or_default();
-            if !groups.contains(&run.groups) {
-                groups.push(run.groups.clone());
-            }
             self.context.selection = selection;
+        }
+        if let Some(pb::command::Kind::Freeze(_)) = &node.kind {
+            if !self.suppressed {
+                let snapshot = freeze::export(
+                    freeze::View {
+                        graph: self.executor.graph,
+                        names: self.executor.names,
+                        definitions: self.definitions,
+                        mode: self.executor.mode,
+                        extension: self.extension,
+                    },
+                    &self.context.registry,
+                )?;
+                self.response.outputs.push(pb::CommandOutput {
+                    kind: Some(pb::command_output::Kind::Snapshot(snapshot)),
+                    location: Some(location),
+                });
+                self.stream.flush(self.response, self.context)?;
+            }
+            return Ok(ControlReport::default());
+        }
+        if let Some(pb::command::Kind::Explain(explain)) = &node.kind {
+            if !self.suppressed {
+                let diagnostic =
+                    report::explain(self.executor.graph, &self.context.registry, &explain.groups)?;
+                self.response.outputs.push(pb::CommandOutput {
+                    kind: Some(pb::command_output::Kind::Diagnostic(diagnostic)),
+                    location: Some(location),
+                });
+                self.stream.flush(self.response, self.context)?;
+            }
+            return Ok(ControlReport::default());
         }
         let binding = match &node.kind {
             Some(pb::command::Kind::Run(run)) if !run.scheduler.is_empty() => Some(
@@ -3035,9 +2968,6 @@ impl ControlContext for WireSchedule<'_> {
         let mut report = None;
         let (result, _, _) = self.executor.run_observed(
             commands,
-            pb::maintenance_site::Target::Command(pb::StaticCommandPath {
-                path: location.path.clone(),
-            }),
             Some(RequestedObservation {
                 command: node,
                 location: &location,
@@ -3052,6 +2982,9 @@ impl ControlContext for WireSchedule<'_> {
                 emit_outputs: !self.suppressed,
             }),
         );
+        if !self.suppressed {
+            self.stream.flush(self.response, self.context)?;
+        }
         if result.is_err() && self.measurements.borrow().failure.is_none() {
             let span = match &node.kind {
                 Some(pb::command::Kind::Action(action)) => action.span.or(node.span),
@@ -3133,26 +3066,12 @@ impl ControlContext for WireSchedule<'_> {
     fn completed(
         &mut self,
         _: &pb::Command,
-        path: &[usize],
+        _: &[usize],
         _: &[u64],
-        report: &ControlReport,
-        count: u64,
-        stop: ControlStop,
+        _: &ControlReport,
+        _: u64,
+        _: ControlStop,
     ) -> Result<(), egglog::Error> {
-        if path.is_empty() {
-            let termination = match stop {
-                ControlStop::Count => pb::TerminationReason::CountReached,
-                ControlStop::Bound => pb::TerminationReason::IterationLimit,
-                ControlStop::Saturated => pb::TerminationReason::Saturated,
-                ControlStop::Until => pb::TerminationReason::UntilMatched,
-                ControlStop::SchedulerLimit => pb::TerminationReason::SchedulerLimit,
-            };
-            *self.outcome = Some(pb::LoopOutcome {
-                updated: report.report.updated,
-                iterations: count,
-                termination: Some(termination.into()),
-            });
-        }
         Ok(())
     }
 }
@@ -6768,7 +6687,7 @@ mod tests {
                     "{invalid}"
                 );
                 assert!(response.outputs.is_empty());
-                assert!(response.profile.unwrap().maintenance.is_empty());
+
                 assert_eq!(engine.graphs[&id].definitions, definitions);
                 assert_eq!(engine.graphs[&id].request, request);
                 assert_eq!(engine.graphs[&id].graph.num_tuples(), tuples);
@@ -7129,9 +7048,6 @@ mod tests {
             );
             assert_eq!(response.error.unwrap().message, expected, "{corrupt}");
             assert!(response.outputs.is_empty());
-            let profile = response.profile.unwrap();
-            assert!(!profile.complete);
-            assert!(profile.maintenance.is_empty());
             assert_eq!(engine.graphs[&id].request, request);
             assert_eq!(engine.graphs[&id].definitions, definitions);
             assert_eq!(engine.graphs[&id].graph.num_tuples(), tuples);
@@ -7380,7 +7296,7 @@ mod tests {
         let (mut engine, id) = host_default_engine();
         let response = run_host_default(&mut engine, id, program);
         assert_eq!(response.error, None);
-        assert!(response.profile.unwrap().complete);
+
         let Some(pb::command_output::Kind::Sizes(sizes)) = &response.outputs[0].kind else {
             panic!("observable tables, not unfolded extraction")
         };
@@ -8342,7 +8258,6 @@ mod tests {
                         assert!(error.message.contains("egglog.experimental.size.tables"));
                         assert!(error.location.is_none());
                         assert!(error.proof_failure.is_none());
-                        assert!(response.profile.unwrap().maintenance.is_empty());
                     }
                 }
             }
@@ -8450,13 +8365,44 @@ mod tests {
                 &pb::RunProgramRequest {
                     egraph_id,
                     program: Some(program),
-                    profile: true,
-                    include_run_reports: false,
+                    diagnostics: false,
                 }
                 .encode_to_vec(),
             )
             .unwrap();
         pb::RunProgramResponse::decode(bytes.as_slice()).unwrap()
+    }
+
+    fn run_diagnostic_matches(
+        engine: &mut Engine,
+        egraph_id: u64,
+        program: pb::Program,
+    ) -> (pb::RunProgramResponse, u64) {
+        let response = engine
+            .run_request(pb::RunProgramRequest {
+                egraph_id,
+                program: Some(program),
+                diagnostics: true,
+            })
+            .unwrap();
+        let matches = response
+            .outputs
+            .iter()
+            .filter_map(|output| match &output.kind {
+                Some(pb::command_output::Kind::Diagnostic(document)) => Some(document),
+                _ => None,
+            })
+            .map(|document| {
+                let value: serde_json::Value = serde_json::from_str(&document.content).unwrap();
+                value["num_matches_per_rule"]
+                    .as_object()
+                    .unwrap()
+                    .values()
+                    .map(|value| value.as_u64().unwrap())
+                    .sum::<u64>()
+            })
+            .sum();
+        (response, matches)
     }
 
     fn host_default_program(default_node: u32) -> pb::Program {
@@ -8674,8 +8620,7 @@ mod tests {
             let request = pb::RunProgramRequest {
                 egraph_id: id,
                 program: Some(program.clone()),
-                profile: true,
-                include_run_reports: false,
+                diagnostics: false,
             };
             let response = pb::RunProgramResponse::decode(
                 engine.run(&request.encode_to_vec()).unwrap().as_slice(),
@@ -9286,40 +9231,6 @@ mod tests {
     }
 
     #[test]
-    fn leaf_summary_preserves_measured_zero_and_unavailable_totals_independently() {
-        let mut report = egglog_reports::RunReport::default();
-        let mut authored = LeafSummary::default();
-        let mut maintenance = LeafSummary::default();
-        authored.invocations += 1;
-        authored.finish(Ok(&report), true);
-        assert_eq!(authored.nanos, [Some(0); 3]);
-        report
-            .search_and_apply_time_per_ruleset
-            .insert("r".into(), std::time::Duration::from_nanos(7));
-        report
-            .merge_time_per_ruleset
-            .insert("r".into(), std::time::Duration::from_nanos(11));
-        report
-            .rebuild_time_per_ruleset
-            .insert("r".into(), std::time::Duration::from_nanos(13));
-        for _ in 0..2 {
-            maintenance.invocations += 1;
-            maintenance.finish(Ok(&report), false);
-        }
-        assert_eq!(maintenance.nanos, [Some(14), Some(22), Some(26)]);
-        maintenance.invocations += 1;
-        maintenance.finish(
-            Err(&egglog::Error::BackendError("failed leaf".into())),
-            false,
-        );
-        maintenance.invocations += 1;
-        maintenance.finish(Ok(&report), false);
-        assert_eq!(maintenance.invocations, 4);
-        assert_eq!(maintenance.nanos, [None; 3]);
-        assert_eq!(authored.nanos, [Some(0); 3]);
-    }
-
-    #[test]
     fn installation_sites_use_original_indices_and_resupply_executes_nothing() {
         let (mut engine, id) = host_default_engine();
         let session = engine.graphs.get_mut(&id).unwrap();
@@ -9346,7 +9257,6 @@ mod tests {
             .iter()
             .position(|s| matches!(&s.kind, Some(pb::sort::Kind::Family(f)) if f.name == "i64"))
             .unwrap() as u32;
-        let vector = program.sorts.len() as u32;
         program.sorts.push(pb::Sort {
             kind: Some(pb::sort::Kind::Family(pb::HostSort {
                 name: "Vec".into(),
@@ -9359,19 +9269,13 @@ mod tests {
             prepared
                 .installations
                 .iter()
-                .map(|i| i.site.clone())
+                .map(|i| i.source_declaration)
                 .collect::<Vec<_>>(),
-            [
-                pb::maintenance_site::Target::Declaration(1),
-                pb::maintenance_site::Target::Sort(vector),
-                pb::maintenance_site::Target::Declaration(2),
-            ]
+            [Some(1), None, Some(2),]
         );
         let installed = run_host_default(&mut engine, id, program.clone());
         assert_eq!(installed.error, None);
         assert!(installed.outputs.is_empty());
-        let maintenance = installed.profile.unwrap().maintenance;
-        assert!(maintenance.is_empty(), "declaration resupply runs no rules");
         let cloned = engine
             .clone_egraph(&pb::CloneEGraphRequest { egraph_id: id }.encode_to_vec())
             .unwrap();
@@ -9381,7 +9285,6 @@ mod tests {
         for id in [id, clone] {
             let response = run_host_default(&mut engine, id, program.clone());
             assert_eq!(response.error, None);
-            assert!(response.profile.unwrap().maintenance.is_empty());
         }
     }
 
@@ -9444,7 +9347,7 @@ mod tests {
         let response = run_host_default(&mut engine, id, program);
         assert_eq!(response.error, None);
         assert!(
-            matches!(&response.outputs[0].kind, Some(pb::command_output::Kind::Loop(outcome)) if outcome.iterations == 3 && outcome.updated)
+            matches!(&response.outputs[0].kind, Some(pb::command_output::Kind::Run(outcome)) if outcome.updated && !outcome.can_stop)
         );
         assert_eq!(
             engine.graphs[&id]
@@ -9610,6 +9513,7 @@ mod tests {
                 let mut program = inventory_fixture(&source);
                 let failure_index = program.commands.len() - 1;
                 let span = program.commands[failure_index].span;
+                let source_file = program.files[span.unwrap().file as usize].clone();
                 if reused {
                     program
                         .commands
@@ -9619,7 +9523,10 @@ mod tests {
                 let error = response.error.unwrap();
                 assert_eq!(error.code, i32::from(pb::ErrorCode::EvaluationFailed));
                 assert_eq!(error.location.unwrap().path, [failure_index as u32]);
-                assert_eq!(error.span, span);
+                let actual = error.span.unwrap();
+                let expected = span.unwrap();
+                assert_eq!((actual.start, actual.end), (expected.start, expected.end));
+                assert_eq!(response.files[actual.file as usize], source_file);
                 assert!(response.outputs.is_empty());
                 let graph = &engine.graphs[&id].graph;
                 assert_eq!(graph.materialized_eq_classes().len(), expected_classes);
@@ -9670,6 +9577,7 @@ mod tests {
             panic!("fixture Union")
         };
         let action_span = action.span.unwrap();
+        let action_file = program.files[action_span.file as usize].clone();
         assert_ne!(action_span, command_span);
         // Force first-use retention; the duplicate and After marker must remain
         // unentered after the first Union's later member fails.
@@ -9680,8 +9588,7 @@ mod tests {
                     &pb::RunProgramRequest {
                         egraph_id: id,
                         program: Some(program),
-                        profile: true,
-                        include_run_reports: true,
+                        diagnostics: true,
                     }
                     .encode_to_vec(),
                 )
@@ -9693,59 +9600,44 @@ mod tests {
         assert_eq!(error.code, i32::from(pb::ErrorCode::EvaluationFailed));
         assert_eq!(error.location.as_ref().unwrap().path, [3]);
         assert!(error.location.as_ref().unwrap().iterations.is_empty());
-        assert_eq!(error.span, Some(action_span));
-        assert_eq!(response.outputs.len(), 2);
-        for (output, path) in response.outputs.iter().zip([1, 2]) {
+        let span = error.span.unwrap();
+        assert_eq!((span.start, span.end), (action_span.start, action_span.end));
+        assert_eq!(response.files[span.file as usize], action_file);
+        assert_eq!(response.outputs.len(), 3);
+        for (output, path) in response.outputs.iter().zip([1, 1, 2]) {
             assert_eq!(output.location.as_ref().unwrap().path, [path]);
             assert!(output.location.as_ref().unwrap().iterations.is_empty());
         }
         let Some(pb::command_output::Kind::Run(outcome)) = &response.outputs[0].kind else {
-            panic!("completed Run output")
+            panic!("Run")
         };
-        let run_report = response.outputs[0].run_report.as_ref().unwrap();
-        let Some(pb::command_output::Kind::Statistics(stats)) = &response.outputs[1].kind else {
-            panic!("completed Stats output")
+        let Some(pb::command_output::Kind::Diagnostic(run_detail)) = &response.outputs[1].kind
+        else {
+            panic!("Run diagnostic")
         };
-        assert!(response.outputs[1].run_report.is_none());
+        let Some(pb::command_output::Kind::Diagnostic(stats)) = &response.outputs[2].kind else {
+            panic!("Stats")
+        };
         let native_report = native.get_overall_run_report();
         assert_eq!(
             (outcome.updated, outcome.can_stop),
             (native_report.updated, native_report.can_stop)
         );
+        let run_detail: serde_json::Value = serde_json::from_str(&run_detail.content).unwrap();
+        assert!(run_detail.get("updated").is_none());
         assert_eq!(
-            (run_report.updated, run_report.can_stop),
-            (outcome.updated, outcome.can_stop)
-        );
-        assert_eq!(run_report.iterations.len(), native_report.iterations.len());
-        assert_eq!(
-            native_report.num_matches_per_rule.values().sum::<usize>(),
+            run_detail["num_matches_per_rule"]
+                .as_object()
+                .unwrap()
+                .values()
+                .map(|value| value.as_u64().unwrap())
+                .sum::<u64>(),
             1
         );
-        assert_eq!(run_report.num_matches_per_rule.len(), 1);
-        assert_eq!(run_report.num_matches_per_rule[0].value, 1);
-        assert_eq!(run_report.num_matches_per_rule[0].rule, Some(0));
-        assert_eq!(
-            run_report.num_matches_per_rule[0].direction,
-            Some(pb::NativeRuleDirection::Single.into())
+        assert!(
+            response.rules.is_empty(),
+            "diagnostic text has no attributed rule catalog"
         );
-        assert_eq!(stats.num_matches_per_rule, run_report.num_matches_per_rule);
-        assert_eq!(response.rules.len(), 1);
-        let origin = &response.rules[0];
-        assert_eq!(origin.name.as_deref(), Some("make-goal"));
-        assert!(origin.kind.is_some());
-        let profile = response.profile.as_ref().unwrap();
-        assert!(!profile.complete);
-        assert_eq!(profile.runs.len(), 1);
-        assert!(profile.maintenance.is_empty(), "actions add no maintenance");
-        let summary = &profile.runs[0];
-        assert_eq!(summary.command_path, [1]);
-        assert_eq!(summary.invocations, 1);
-        assert!(summary.search_and_apply_nanos.is_some());
-        assert!(summary.merge_nanos.is_some());
-        assert!(summary.rebuild_nanos.is_some());
-        assert_eq!(summary.rules.len(), 1);
-        assert_eq!(summary.rules[0].rule, Some(0));
-        assert_eq!(summary.rules[0].matches, Some(1));
         let graph = &engine.graphs[&id].graph;
         assert_eq!(
             graph.materialized_eq_classes().len(),
@@ -9787,8 +9679,7 @@ mod tests {
                     &pb::RunProgramRequest {
                         egraph_id: id,
                         program: Some(retry),
-                        profile: true,
-                        include_run_reports: true,
+                        diagnostics: true,
                     }
                     .encode_to_vec(),
                 )
@@ -9801,29 +9692,8 @@ mod tests {
         assert_eq!(reused.outputs[0].location.as_ref().unwrap().path, [0]);
         assert_eq!(
             reused.outputs[0].kind,
-            Some(pb::command_output::Kind::Statistics(stats.clone())),
-            "the exact cumulative report, including every timing, survives failure"
-        );
-        assert_eq!(reused.rules.len(), 1);
-        let retained = &reused.rules[0];
-        assert_eq!(retained.eval_mode, origin.eval_mode);
-        assert_eq!(retained.name, origin.name);
-        let (before, after) = (origin.span.unwrap(), retained.span.unwrap());
-        assert_eq!((before.start, before.end), (after.start, after.end));
-        assert_eq!(
-            response.files[before.file as usize],
-            reused.files[after.file as usize]
-        );
-        let profile = reused.profile.unwrap();
-        assert!(profile.complete && profile.runs.is_empty());
-        assert!(
-            profile.maintenance.iter().all(|entry| {
-                matches!(
-                    &entry.site.as_ref().unwrap().target,
-                    Some(pb::maintenance_site::Target::Command(path)) if path.path == [2]
-                )
-            }),
-            "only the ordinary Check may contribute query maintenance"
+            Some(pb::command_output::Kind::Diagnostic(stats.clone())),
+            "cumulative collected detail survives failure"
         );
         let graph = &engine.graphs[&id].graph;
         assert_eq!(graph.materialized_eq_classes().len(), 4);
@@ -10251,7 +10121,7 @@ mod tests {
                 } else {
                     assert_eq!(response.error, None);
                     assert!(
-                        matches!(&response.outputs[0].kind, Some(pb::command_output::Kind::Loop(outcome)) if outcome.iterations == u64::from(case == 9) && outcome.updated == (case == 9))
+                        matches!(&response.outputs[0].kind, Some(pb::command_output::Kind::Run(outcome)) if outcome.updated == (case == 9))
                     );
                 }
                 assert_eq!(graph.get_size(&native_name("call", "Atom")), 1);
@@ -10407,17 +10277,9 @@ mod tests {
             let mut input = inventory_fixture(
                 "(datatype E (N i64) (Goal i64)) (ruleset a) (rule ((N x)) ((Goal x)) :ruleset a :name \"first\") (N 1) (run a 1) (check (Goal 1))",
             );
-            let first = run_host_default(&mut engine, id, input.clone());
+            let (first, matches) = run_diagnostic_matches(&mut engine, id, input.clone());
             assert_eq!(first.error, None);
-            assert_eq!(
-                first.profile.unwrap().runs[0]
-                    .rules
-                    .iter()
-                    .map(|rule| rule.matches.unwrap())
-                    .sum::<u64>(),
-                u64::from(mode == pb::ExecutionMode::Normal),
-                "{mode:?} requested profile"
-            );
+            assert!(matches > 0, "{mode:?} executes the initial rule");
             input.rules[0].name = Some("later".into());
             input.rules[0].doc = "metadata does not restart a rule".into();
             for node in &mut input.nodes {
@@ -10441,16 +10303,9 @@ mod tests {
                     ..Default::default()
                 },
             ];
-            let retry = run_host_default(&mut engine, id, input.clone());
+            let (retry, matches) = run_diagnostic_matches(&mut engine, id, input.clone());
             assert_eq!(retry.error, None);
-            assert_eq!(
-                retry.profile.unwrap().runs[0]
-                    .rules
-                    .iter()
-                    .map(|rule| rule.matches.unwrap())
-                    .sum::<u64>(),
-                0
-            );
+            assert_eq!(matches, 0);
             let registry = &engine.graphs[&id].registry;
             assert_eq!(registry.rules.len(), 1);
             assert_eq!(registry.groups["a"], registry.groups["b"]);
@@ -10473,10 +10328,7 @@ mod tests {
                 .rules[0];
             assert_eq!(representative.name.as_deref(), Some("first"));
             assert!(representative.doc.is_empty());
-            if mode == pb::ExecutionMode::Normal {
-                assert_eq!(stats.rules.len(), 1);
-                assert_eq!(stats.rules[0].name.as_deref(), Some("first"));
-            }
+            assert!(stats.rules.is_empty(), "Stats is opaque diagnostic text");
 
             input.rules[0].no_decomp = true;
             input.commands.truncate(1);
@@ -10498,7 +10350,9 @@ mod tests {
                     },
                 );
                 assert_eq!(empty.error, None);
-                assert!(empty.profile.unwrap().runs[0].rules.is_empty());
+                assert!(
+                    matches!(&empty.outputs[0].kind, Some(pb::command_output::Kind::Run(result)) if !result.updated && result.can_stop)
+                );
             }
         }
     }
@@ -10634,10 +10488,7 @@ mod tests {
             1,
             Command::Action(Action::Panic(ast::Span::Panic, "registration fault".into())),
         );
-        let mut response = pb::RunProgramResponse {
-            profile: Some(pb::ProfileSummary::default()),
-            ..Default::default()
-        };
+        let mut response = pb::RunProgramResponse::default();
         let mut context = session.install(prepared, &mut response).unwrap();
         assert!(
             session
@@ -10650,7 +10501,11 @@ mod tests {
                         iterations: vec![]
                     },
                     &mut response,
-                    &mut None
+                    &mut None,
+                    &mut OutputStream {
+                        emit: &mut |_| ControlFlow::Continue(()),
+                        cancelled: false
+                    },
                 )
                 .is_err()
         );
@@ -10677,7 +10532,7 @@ mod tests {
             })),
             ..Default::default()
         };
-        let before_retry = run_host_default(
+        let (before_retry, matches) = run_diagnostic_matches(
             &mut engine,
             id,
             pb::Program {
@@ -10686,10 +10541,7 @@ mod tests {
             },
         );
         assert_eq!(before_retry.error, None);
-        assert_eq!(
-            before_retry.profile.unwrap().runs[0].rules[0].matches,
-            Some(1)
-        );
+        assert_eq!(matches, 1);
         // Remove only the injected host fault. A compatible resupply resumes
         // after the existing holder and preserves the first rule's cursor.
         engine.graphs.get_mut(&id).unwrap().registry.rules[1]
@@ -10697,16 +10549,9 @@ mod tests {
             .commands
             .remove(1);
         input.commands.push(run);
-        let retry = run_host_default(&mut engine, id, input);
+        let (retry, matches) = run_diagnostic_matches(&mut engine, id, input);
         assert_eq!(retry.error, None);
-        assert_eq!(
-            retry.profile.unwrap().runs[0]
-                .rules
-                .iter()
-                .map(|rule| rule.matches.unwrap())
-                .sum::<u64>(),
-            1
-        );
+        assert_eq!(matches, 1);
         let registry = &engine.graphs[&id].registry;
         assert_eq!(registry.groups["a"], [0, 1]);
         assert_eq!(registry.rules.len(), 2);
@@ -10773,7 +10618,7 @@ mod tests {
             ],
             ..Default::default()
         };
-        let response = run_host_default(&mut engine, id, input);
+        let mut response = run_host_default(&mut engine, id, input);
         assert_eq!(response.error, None);
         let rules = &engine.graphs[&id].registry.rules;
         assert!(Arc::ptr_eq(
@@ -10785,6 +10630,14 @@ mod tests {
                 .iter()
                 .all(|rule| rule.candidate.record.program.files.is_empty())
         );
+        let mut context = RequestOccurrences::default();
+        engine.graphs[&id].registry.origins(&mut context);
+        context
+            .file_offsets
+            .insert(Arc::as_ptr(&rules[0].candidate.record.files) as usize, 0);
+        for rule in rules {
+            report::rule_reference(&rule.candidate.name, &mut context, &mut response).unwrap();
+        }
         assert_eq!(response.rules.len(), 2);
         assert_eq!(
             response.files.len(),

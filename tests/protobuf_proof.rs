@@ -100,7 +100,6 @@ fn source_receiving_mode_preserves_actual_global_proof_requests() {
                     rendered.push_str(&renderer.render(&program).unwrap());
                     let response = run(&mut engine, id, program);
                     assert_eq!(response.error, None, "{fixture}/{mode:?}/replay{replay}");
-                    assert!(response.profile.unwrap().complete);
                     for output in response.outputs {
                         if let Some(pb::command_output::Kind::Proof(proof)) = output.kind {
                             assert!(
@@ -661,21 +660,20 @@ fn source_receiving_mode_is_fixed_before_first_submission_and_normal_stays_funct
 }
 
 #[test]
-fn core_source_controls_keep_native_stopping_reports_and_modes() {
-    use egglog::{ExecutionEvent, ExecutionOrigin, NativeLoopStop};
+fn core_source_controls_keep_native_stopping_flags_and_modes() {
     for mode in [
         pb::ExecutionMode::Normal,
         pb::ExecutionMode::TermEncoding,
         pb::ExecutionMode::Proofs,
         pb::ExecutionMode::ProofTesting,
     ] {
-        for (schedule, exact) in [
-            ("(repeat 0 r)", true),
-            ("(seq r)", true),
-            ("(repeat 1 r)", false),
-            ("(repeat 3 r)", false),
-            ("(saturate r)", false),
-            ("(repeat 3 (seq r (saturate r)))", false),
+        for schedule in [
+            "(repeat 0 r)",
+            "(seq r)",
+            "(repeat 1 r)",
+            "(repeat 3 r)",
+            "(saturate r)",
+            "(repeat 3 (seq r (saturate r)))",
         ] {
             let setup = "(datatype Mark (Seed i64) (Goal i64)) (ruleset r) (rewrite (Seed x) (Goal x) :ruleset r :name \"derive\") (Seed 0)";
             let control = format!("(run-schedule {schedule})");
@@ -688,65 +686,25 @@ fn core_source_controls_keep_native_stopping_reports_and_modes() {
             };
             native.parse_and_run_program(None, setup).unwrap();
             let commands = native.parse_program(None, &control).unwrap();
-            let mut outcome = None;
-            let mut runs = 0;
-            let mut committed = 0;
-            let mut whole_updated = None;
+            let mut expected = None;
             native
                 .run_program_observed(
                     commands,
                     &mut |_, origin, output| {
-                        if origin == ExecutionOrigin::Requested
+                        if origin == egglog::ExecutionOrigin::Requested
                             && let egglog::CommandOutput::RunSchedule(report) = output
                         {
-                            committed += 1;
-                            whole_updated = Some(report.updated);
+                            assert!(
+                                expected
+                                    .replace((report.updated, report.can_stop))
+                                    .is_none()
+                            );
                         }
                     },
-                    &mut |_, event| match event {
-                        ExecutionEvent::RunStarted {
-                            origin: ExecutionOrigin::Requested,
-                            ..
-                        } => runs += 1,
-                        ExecutionEvent::LoopFinished {
-                            origin: ExecutionOrigin::Requested,
-                            schedule: Some(site),
-                            completed,
-                            stop,
-                            result,
-                        } if site.path == [0] => {
-                            // The actual Core parser's outer run-schedule Sequence
-                            // is an envelope; its one child is the authored loop.
-                            outcome =
-                                Some((completed as u64, stop.unwrap(), result.unwrap().updated));
-                        }
-                        _ => (),
-                    },
+                    &mut |_, _| {},
                 )
                 .unwrap();
-            assert_eq!(committed, 1);
-            let (iterations, stop, updated) = if schedule == "(seq r)" {
-                // Native Sequence is one ordered pass, not an observed native
-                // loop. Its whole-command report is the updated oracle.
-                assert!(outcome.is_none());
-                (1, NativeLoopStop::CountReached, whole_updated.unwrap())
-            } else {
-                outcome.unwrap_or_else(|| panic!("missing loop {mode:?}/{schedule}"))
-            };
-            let termination = if exact {
-                pb::TerminationReason::CountReached
-            } else if stop == NativeLoopStop::CountReached {
-                pb::TerminationReason::IterationLimit
-            } else {
-                pb::TerminationReason::Saturated
-            };
-            let matches = native
-                .get_overall_run_report()
-                .num_matches_per_rule
-                .get("derive")
-                .copied()
-                .unwrap_or(0) as u64;
-            let check = if iterations == 0 {
+            let check = if schedule == "(repeat 0 r)" {
                 ""
             } else {
                 "(check (= (Seed 0) (Goal 0)))"
@@ -756,16 +714,16 @@ fn core_source_controls_keep_native_stopping_reports_and_modes() {
             let mut renderer = Renderer::core();
             let mut rendered = String::new();
             for roundtrip in [false, true] {
-                let source = if roundtrip {
+                let text = if roundtrip {
                     rendered.clone()
                 } else {
                     original.clone()
                 };
                 let mut engine = Engine::default();
                 let id = create(&mut engine, mode);
-                let mut loops = 0;
-                let mut stats = 0;
-                for phase in Source::new_core(Some("mode-loop.egg".into()), &source).unwrap() {
+                let mut controls = 0;
+                let mut statistics = 0;
+                for phase in Source::new_core(Some("mode-loop.egg".into()), &text).unwrap() {
                     let phase = phase.unwrap();
                     if !roundtrip {
                         rendered.push_str(&renderer.render(&phase).unwrap());
@@ -777,48 +735,25 @@ fn core_source_controls_keep_native_stopping_reports_and_modes() {
                     );
                     for output in &response.outputs {
                         match &output.kind {
-                            Some(pb::command_output::Kind::Loop(actual)) => {
-                                loops += 1;
-                                assert_eq!(
-                                    (actual.iterations, actual.termination, actual.updated),
-                                    (iterations, Some(termination.into()), updated)
-                                );
+                            Some(pb::command_output::Kind::Run(actual)) => {
+                                controls += 1;
+                                assert_eq!((actual.updated, actual.can_stop), expected.unwrap());
                                 assert_eq!(output.location.as_ref().unwrap().path, [0]);
-                                assert_eq!(
-                                    response
-                                        .profile
-                                        .as_ref()
-                                        .unwrap()
-                                        .runs
-                                        .iter()
-                                        .map(|run| run.invocations)
-                                        .sum::<u64>(),
-                                    runs
-                                );
                             }
-                            Some(pb::command_output::Kind::Statistics(report)) => {
-                                stats += 1;
-                                let count = report
-                                    .num_matches_per_rule
-                                    .iter()
-                                    .filter(|row| {
-                                        row.rule.is_some_and(|i| {
-                                            response.rules[i as usize].name.as_deref()
-                                                == Some("derive")
-                                        })
-                                    })
-                                    .map(|row| row.value)
-                                    .sum::<u64>();
-                                assert_eq!(
-                                    count, matches,
-                                    "{mode:?}/{schedule}/reimport={roundtrip}"
+                            Some(pb::command_output::Kind::Diagnostic(_)) => {
+                                statistics += 1;
+                                assert!(
+                                    diagnostic_json(output)["iterations"]
+                                        .as_array()
+                                        .unwrap()
+                                        .is_empty()
                                 );
                             }
                             _ => (),
                         }
                     }
                 }
-                assert_eq!((loops, stats), (1, 1));
+                assert_eq!((controls, statistics), (1, 1));
             }
         }
     }
@@ -853,12 +788,6 @@ fn core_source_failed_control_and_fail_wrappers_keep_prefixes_in_every_mode() {
                 depth == 1,
                 "native {mode:?}/{depth}"
             );
-            let native_matches = native
-                .get_overall_run_report()
-                .num_matches_per_rule
-                .get("derive")
-                .copied()
-                .unwrap_or(0) as u64;
             native
                 .parse_and_run_program(None, "(check (N 9223372036854775807))")
                 .unwrap();
@@ -897,7 +826,6 @@ fn core_source_failed_control_and_fail_wrappers_keep_prefixes_in_every_mode() {
                             location.iterations,
                             if depth == 0 { vec![1] } else { vec![] }
                         );
-                        assert!(!response.profile.unwrap().complete);
                         break; // Never advance source after a decoded error.
                     }
                 }
@@ -914,24 +842,7 @@ fn core_source_failed_control_and_fail_wrappers_keep_prefixes_in_every_mode() {
                     },
                 );
                 assert_eq!(read.error, None);
-                let Some(pb::command_output::Kind::Statistics(report)) = &read.outputs[0].kind
-                else {
-                    unreachable!()
-                };
-                let matches = report
-                    .num_matches_per_rule
-                    .iter()
-                    .filter(|row| {
-                        row.rule.is_some_and(|i| {
-                            read.rules[i as usize].name.as_deref() == Some("derive")
-                        })
-                    })
-                    .map(|row| row.value)
-                    .sum::<u64>();
-                assert_eq!(
-                    matches, native_matches,
-                    "failed whole schedule must not commit earlier leaf totals"
-                );
+                assert!(diagnostic_json(&read.outputs[0])["iterations"].is_array());
                 let table = run(
                     &mut engine,
                     id,
@@ -2208,8 +2119,7 @@ fn run(engine: &mut Engine, id: u64, program: pb::Program) -> pb::RunProgramResp
             &pb::RunProgramRequest {
                 egraph_id: id,
                 program: Some(program),
-                profile: true,
-                include_run_reports: false,
+                diagnostics: false,
             }
             .encode_to_vec(),
         )
@@ -2217,6 +2127,16 @@ fn run(engine: &mut Engine, id: u64, program: pb::Program) -> pb::RunProgramResp
     let response = pb::RunProgramResponse::decode(bytes.as_slice()).unwrap();
     assert_eq!(response.encode_to_vec(), bytes);
     response
+}
+
+fn diagnostic_json(output: &pb::CommandOutput) -> serde_json::Value {
+    let Some(pb::command_output::Kind::Diagnostic(document)) = &output.kind else {
+        panic!("expected a diagnostic document")
+    };
+    assert_eq!(document.format, "application/vnd.egglog.run-report+json");
+    let value: serde_json::Value = serde_json::from_str(&document.content).unwrap();
+    assert!(value.get("updated").is_none() && value.get("can_stop").is_none());
+    value
 }
 
 // Hand-authored wire IR, independent of the Source producer. N and Goal share
@@ -2476,18 +2396,6 @@ fn shared_content_resupply_groups_and_clone_keep_native_proofs_and_cursors() {
                 p.justification,
                 Some(pb::proof_step::Justification::Rule(_))
             ))));
-            if mode == pb::ExecutionMode::Normal {
-                assert_eq!(
-                    response
-                        .profile
-                        .unwrap()
-                        .runs
-                        .iter()
-                        .map(|r| r.rules.iter().map(|r| r.matches.unwrap()).sum::<u64>())
-                        .collect::<Vec<_>>(),
-                    [u64::from(iteration == 0), 0, 0]
-                );
-            }
         }
         let cloned = engine
             .clone_egraph(&pb::CloneEGraphRequest { egraph_id: id }.encode_to_vec())
@@ -2553,307 +2461,153 @@ fn shared_content_resupply_groups_and_clone_keep_native_proofs_and_cursors() {
                 outcome.updated,
                 "clone cursor must not consume the other's new input"
             );
-            if mode == pb::ExecutionMode::Normal {
-                assert_eq!(response.rules.len(), 1);
-                assert_eq!(response.rules[0].name.as_deref(), Some("derive"));
-                let span = response.rules[0].span.unwrap();
-                assert_eq!(response.files[span.file as usize].name, "rule.egg");
-                assert_eq!(span.file, 1);
-                let Some(pb::rule::Kind::Rule(rule)) = &response.rules[0].kind else {
-                    unreachable!()
-                };
-                assert!(
-                    rule.query
-                        .iter()
-                        .all(|&node| (node as usize) < response.nodes.len())
-                );
-                assert_eq!(response.profile.unwrap().runs[0].rules[0].matches, Some(1));
-            }
+            assert!(response.rules.is_empty());
         }
     }
 }
 
 #[test]
-fn all_modes_return_only_requested_outputs_and_exclusive_profiles() {
-    for (mode, include_run_reports) in [
+fn all_modes_return_requested_proofs_control_and_optional_diagnostics() {
+    for mode in [
         pb::ExecutionMode::Normal,
         pb::ExecutionMode::TermEncoding,
         pb::ExecutionMode::Proofs,
         pb::ExecutionMode::ProofTesting,
-    ]
-    .into_iter()
-    .flat_map(|mode| [false, true].map(|include| (mode, include)))
-    {
-        let mut engine = Engine::default();
-        let id = create(&mut engine, mode);
-        let mut program = fixture();
-        // The wire namespaces may share a spelling, unlike native source.
-        let Some(pb::declaration::Kind::Constructor(constructor)) =
-            &mut program.declarations[1].kind
-        else {
-            unreachable!()
-        };
-        constructor.name = "Num".into();
-        for node in &mut program.nodes {
-            if let Some(pb::node::Kind::Call(call)) = &mut node.kind
-                && call.func == "N"
-            {
-                call.func = "Num".into();
-            }
-        }
-        let text = Renderer::default().render(&program).unwrap();
-        let native = egglog_experimental::new_experimental_egraph();
-        let mut native = match mode {
-            pb::ExecutionMode::Normal => native,
-            pb::ExecutionMode::TermEncoding => native.with_term_encoding_enabled(),
-            pb::ExecutionMode::Proofs => native.with_proofs_enabled(),
-            pb::ExecutionMode::ProofTesting => native.with_proofs_enabled().with_proof_testing(),
-        };
-        native.set_num_threads(1);
-        let commands = native.parse_program(None, &text).unwrap();
-        let mut native_reports = vec![];
-        let mut leaves = vec![];
-        let native_result = native.run_program_observed(
-            commands,
-            &mut |cause, origin, output| {
-                if origin == egglog::ExecutionOrigin::Requested
-                    && let egglog::CommandOutput::RunSchedule(report) = output
+    ] {
+        for diagnostics in [false, true] {
+            let mut engine = Engine::default();
+            let id = create(&mut engine, mode);
+            let mut program = fixture();
+            // Core sort and callable namespaces can share a wire spelling.
+            let Some(pb::declaration::Kind::Constructor(constructor)) =
+                &mut program.declarations[1].kind
+            else {
+                unreachable!()
+            };
+            constructor.name = "Num".into();
+            for node in &mut program.nodes {
+                if let Some(pb::node::Kind::Call(call)) = &mut node.kind
+                    && call.func == "N"
                 {
-                    native_reports.push((cause, report));
+                    call.func = "Num".into();
                 }
-            },
-            &mut |cause, event| {
-                if let egglog::ExecutionEvent::RunStarted { origin, .. } = event {
-                    leaves.push((cause, origin));
-                }
-            },
-        );
-        assert_eq!(
-            native_result.is_ok(),
-            matches!(
+            }
+            let text = Renderer::default().render(&program).unwrap();
+            let graph = egglog_experimental::new_experimental_egraph();
+            let mut native = match mode {
+                pb::ExecutionMode::Normal => graph,
+                pb::ExecutionMode::TermEncoding => graph.with_term_encoding_enabled(),
+                pb::ExecutionMode::Proofs => graph.with_proofs_enabled(),
+                _ => graph.with_proofs_enabled().with_proof_testing(),
+            };
+            native.set_num_threads(1);
+            let commands = native.parse_program(None, &text).unwrap();
+            let mut native_report = None;
+            let native_result = native.run_program_observed(
+                commands,
+                &mut |_, origin, output| {
+                    if origin == egglog::ExecutionOrigin::Requested
+                        && let egglog::CommandOutput::RunSchedule(report) = output
+                    {
+                        assert!(native_report.replace(report).is_none());
+                    }
+                },
+                &mut |_, _| {},
+            );
+            let proof_mode = matches!(
                 mode,
                 pb::ExecutionMode::Proofs | pb::ExecutionMode::ProofTesting
+            );
+            assert_eq!(native_result.is_ok(), proof_mode);
+            let native_report = native_report.unwrap();
+            let response = pb::RunProgramResponse::decode(
+                engine
+                    .run(
+                        &pb::RunProgramRequest {
+                            egraph_id: id,
+                            program: Some(program),
+                            diagnostics,
+                        }
+                        .encode_to_vec(),
+                    )
+                    .unwrap()
+                    .as_slice(),
             )
-        );
-        assert_eq!(native_reports.len(), 1);
-        let (cause, native_report) = &native_reports[0];
-        let native_leaves: Vec<_> = leaves.iter().filter(|(index, _)| index == cause).collect();
-        let response = pb::RunProgramResponse::decode(
-            engine
-                .run(
-                    &pb::RunProgramRequest {
-                        egraph_id: id,
-                        program: Some(program),
-                        profile: true,
-                        include_run_reports,
-                    }
-                    .encode_to_vec(),
-                )
-                .unwrap()
-                .as_slice(),
-        )
-        .unwrap();
-        let profile = response.profile.as_ref().unwrap();
-        assert_eq!(profile.runs.len(), 1);
-        assert_eq!(profile.runs[0].command_path, [2]);
-        assert_eq!(profile.runs[0].invocations, 1);
-        assert_eq!(
-            native_leaves
-                .iter()
-                .filter(|(_, origin)| *origin == egglog::ExecutionOrigin::Requested)
-                .count() as u64,
-            profile.runs[0].invocations,
-        );
-        assert!(profile.runs[0].search_and_apply_nanos.is_some());
-        assert!(profile.runs[0].merge_nanos.is_some());
-        assert!(profile.runs[0].rebuild_nanos.is_some());
-        let Some(pb::command_output::Kind::Run(outcome)) = &response.outputs[0].kind else {
-            panic!("requested run")
-        };
-        assert!(outcome.updated);
-        assert!(!outcome.can_stop);
-        assert_eq!(
-            response.outputs[0].run_report.is_some(),
-            include_run_reports
-        );
-        if let Some(report) = &response.outputs[0].run_report {
+            .unwrap();
+            let Some(pb::command_output::Kind::Run(result)) = &response.outputs[0].kind else {
+                panic!("missing requested control result")
+            };
             assert_eq!(
-                (report.updated, report.can_stop),
-                (outcome.updated, outcome.can_stop)
-            );
-            assert_eq!(
-                report.iterations.len(),
-                native_report.iterations.len(),
-                "paired native history: mode={mode:?}"
-            );
-            assert_eq!(
-                (report.updated, report.can_stop),
+                (result.updated, result.can_stop),
                 (native_report.updated, native_report.can_stop)
             );
-            // The requested native anchor includes its instrumented schedule's
-            // complete history; one requested leaf need not mean one iteration.
-            for (iteration, native) in report.iterations.iter().zip(&native_report.iterations) {
-                let ruleset = iteration.rule_set_report.as_ref().unwrap();
-                assert_eq!(ruleset.changed, native.rule_set_report.changed);
-                let mut matches: Vec<_> = ruleset
-                    .rule_reports
-                    .iter()
-                    .flat_map(|row| &row.reports)
-                    .map(|report| report.num_matches)
-                    .collect();
-                let mut native_matches: Vec<_> = native
-                    .rule_set_report
-                    .rule_reports
-                    .values()
-                    .flatten()
-                    .map(|report| report.num_matches as u64)
-                    .collect();
-                matches.sort_unstable();
-                native_matches.sort_unstable();
+            let documents = response
+                .outputs
+                .iter()
+                .filter(|output| {
+                    matches!(output.kind, Some(pb::command_output::Kind::Diagnostic(_)))
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(documents.len(), usize::from(diagnostics));
+            if diagnostics {
+                let document = diagnostic_json(documents[0]);
+                assert_eq!(documents[0].location, response.outputs[0].location);
                 assert_eq!(
-                    matches, native_matches,
-                    "paired native iteration matches: mode={mode:?}"
+                    document["iterations"].as_array().unwrap().len(),
+                    native_report.iterations.len()
+                );
+                assert_eq!(
+                    document["num_matches_per_rule"]
+                        .as_object()
+                        .unwrap()
+                        .values()
+                        .map(|count| count.as_u64().unwrap())
+                        .sum::<u64>(),
+                    native_report.num_matches_per_rule.values().sum::<usize>() as u64
                 );
             }
-        }
-        let paths: Vec<_> = response
-            .outputs
-            .iter()
-            .map(|output| output.location.as_ref().unwrap().path.clone())
-            .collect();
-        if matches!(
-            mode,
-            pb::ExecutionMode::Normal | pb::ExecutionMode::TermEncoding
-        ) {
-            assert_eq!(paths, [vec![2]]);
-            let error = response.error.unwrap();
-            assert_eq!(error.code, i32::from(pb::ErrorCode::ProofFailed));
-            assert_eq!(
-                error.proof_failure.unwrap().reason,
-                i32::from(pb::ProofFailureReason::ProofsNotEnabled)
-            );
-            assert_eq!(error.location.unwrap().path, [4]);
-            assert!(!profile.complete);
-        } else {
-            assert_eq!(response.error, None);
-            assert!(profile.complete);
-            assert_eq!(
-                paths,
-                if mode == pb::ExecutionMode::ProofTesting {
-                    vec![vec![2], vec![3], vec![4], vec![5]]
-                } else {
-                    vec![vec![2], vec![4], vec![5]]
-                }
-            );
-            for output in response.outputs.iter().skip(1) {
-                assert!(output.run_report.is_none());
-                let Some(pb::command_output::Kind::Proof(proof)) = &output.kind else {
-                    panic!("proof only")
-                };
-                assert!(proof.root.is_some());
-                assert!(!proof.proofs.is_empty());
-                assert!(!proof.terms.is_empty());
-            }
-        }
-        if mode != pb::ExecutionMode::Normal {
-            if let Some(report) = &response.outputs[0].run_report {
-                // Detail rows retain canonical content in the response arenas even though
-                // exclusive ProfileSummary deliberately omits transformed counts.
-                let [rule] = response.rules.as_slice() else {
-                    panic!("expected one canonical authored rule")
-                };
-                assert_eq!(rule.name.as_deref(), Some("derive"));
-                assert_eq!(rule.eval_mode, i32::from(pb::RuleEvalMode::Seminaive));
-                assert!(rule.span.is_none());
-                let Some(pb::rule::Kind::Rule(body)) = &rule.kind else {
-                    panic!("expected authored rule body")
-                };
-                let [query] = body.query.as_slice() else {
-                    panic!("expected one query fact")
-                };
-                let Some(pb::node::Kind::Call(query)) = &response.nodes[*query as usize].kind
-                else {
-                    panic!("expected query call in response nodes")
-                };
-                assert_eq!(query.func, "Num");
-                let [
-                    pb::Action {
-                        kind: Some(pb::action::Kind::Term(head)),
-                        ..
-                    },
-                ] = body.head.as_slice()
-                else {
-                    panic!("expected one rule action")
-                };
-                let Some(pb::node::Kind::Call(head)) = &response.nodes[*head as usize].kind else {
-                    panic!("expected rule action in response nodes")
-                };
-                assert_eq!(head.func, "Goal");
-                assert_eq!(head.args, query.args);
-                let mapped: Vec<_> = report
-                    .num_matches_per_rule
-                    .iter()
-                    .filter(|row| row.rule.is_some())
-                    .collect();
-                let [authored] = mapped.as_slice() else {
-                    panic!("expected one authored native count row")
-                };
+            let requested = response
+                .outputs
+                .iter()
+                .filter(|output| {
+                    !matches!(output.kind, Some(pb::command_output::Kind::Diagnostic(_)))
+                })
+                .collect::<Vec<_>>();
+            let paths = requested
+                .iter()
+                .map(|output| output.location.as_ref().unwrap().path.clone())
+                .collect::<Vec<_>>();
+            if proof_mode {
+                assert_eq!(response.error, None);
                 assert_eq!(
-                    authored.value,
-                    native_report.num_matches_per_rule["derive"] as u64
+                    paths,
+                    if mode == pb::ExecutionMode::ProofTesting {
+                        vec![vec![2], vec![3], vec![4], vec![5]]
+                    } else {
+                        vec![vec![2], vec![4], vec![5]]
+                    }
                 );
-                for (name, rule, direction) in report
-                    .num_matches_per_rule
-                    .iter()
-                    .map(|row| (&row.native_name, row.rule, row.direction))
-                    .chain(
-                        report
-                            .search_and_apply_time_per_rule
-                            .iter()
-                            .map(|row| (&row.native_name, row.rule, row.direction)),
-                    )
-                    .chain(
-                        report
-                            .iterations
-                            .iter()
-                            .flat_map(|iteration| {
-                                &iteration.rule_set_report.as_ref().unwrap().rule_reports
-                            })
-                            .map(|row| (&row.native_name, row.rule, row.direction)),
-                    )
-                {
-                    assert_eq!(
-                        (rule, direction),
-                        if name == &authored.native_name {
-                            (Some(0), Some(pb::NativeRuleDirection::Single.into()))
-                        } else {
-                            (None, None)
-                        },
-                        "helper attribution: {name}"
-                    );
+                for output in requested.iter().skip(1) {
+                    let Some(pb::command_output::Kind::Proof(proof)) = &output.kind else {
+                        panic!("proof only")
+                    };
+                    assert!((proof.root.unwrap() as usize) < proof.proofs.len());
+                    assert!(!proof.terms.is_empty());
                 }
             } else {
-                assert!(response.rules.is_empty());
+                assert_eq!(paths, [vec![2]]);
+                let error = response.error.unwrap();
+                assert_eq!(error.code, i32::from(pb::ErrorCode::ProofFailed));
+                assert_eq!(
+                    error.proof_failure.unwrap().reason,
+                    i32::from(pb::ProofFailureReason::ProofsNotEnabled)
+                );
+                assert_eq!(error.location.unwrap().path, [4]);
             }
-            // No guessed transformed rule counts in the exclusive profile,
-            // regardless of whether detailed reports were separately requested.
-            assert!(profile.runs[0].rules.is_empty());
-            for index in [2, 4] {
-                let site = Some(pb::MaintenanceSite {
-                    target: Some(pb::maintenance_site::Target::Command(
-                        pb::StaticCommandPath { path: vec![index] },
-                    )),
-                });
-                let maintenance = profile.maintenance.iter().find(|m| m.site == site).unwrap();
-                assert!(maintenance.invocations > 1);
-                assert!(maintenance.search_and_apply_nanos.is_some());
-            }
-            assert!(profile.maintenance.iter().any(|m| {
-                matches!(
-                    m.site.as_ref().and_then(|s| s.target.as_ref()),
-                    Some(pb::maintenance_site::Target::Command(path)) if path.path == [0]
-                )
-            }));
+            assert!(
+                response.rules.is_empty(),
+                "metrics are opaque diagnostic data"
+            );
         }
     }
 }
@@ -3063,9 +2817,6 @@ fn malformed_later_commands_unused_rules_and_observations_are_atomic_preparation
                 );
             }
             assert!(failed.outputs.is_empty());
-            let profile = failed.profile.unwrap();
-            assert!(!profile.complete);
-            assert!(profile.runs.is_empty() && profile.maintenance.is_empty());
             // The same definitions still install, and the rejected action left no N(1).
             let mut retry = fixture();
             retry.commands = vec![pb::Command {
@@ -3332,12 +3083,6 @@ fn scalar_variadic_prove_and_prove_exists_keep_boundary_arities_and_requested_ou
                     actual.iter().map(|(_, kind)| *kind).collect::<Vec<_>>(),
                     requested
                 );
-                if !expected.iter().any(|(_, kind)| *kind == "run") {
-                    assert!(
-                        response.profile.as_ref().unwrap().runs.is_empty(),
-                        "internal proof helpers are not authored runs"
-                    );
-                }
             }
             assert!(seen_concat && seen_or);
             assert_eq!(proof_commands, ["prove", "prove", "exists", "exists"]);
@@ -3347,9 +3092,9 @@ fn scalar_variadic_prove_and_prove_exists_keep_boundary_arities_and_requested_ou
 }
 
 #[test]
-fn schedule_controls_match_native_counts_sites_and_stopping_in_every_mode() {
+fn schedule_controls_match_native_flags_and_execution_in_every_mode() {
     use egglog::ast::{Command, RunConfig, Schedule};
-    use egglog::{ExecutionEvent, ExecutionOrigin, NativeLoopStop, RepeatContinuation};
+    use egglog::{ExecutionEvent, ExecutionOrigin, RepeatContinuation};
     for mode in [
         pb::ExecutionMode::Normal,
         pb::ExecutionMode::TermEncoding,
@@ -3505,18 +3250,11 @@ fn schedule_controls_match_native_counts_sites_and_stopping_in_every_mode() {
                     },
                 )
                 .unwrap();
-            let (completed, stop, updated) = expected.unwrap();
+            let (completed, _stop, _updated) = expected.unwrap();
             if case >= 7 {
                 assert_eq!(completed, 3);
                 assert_eq!(native_runs, if case == 7 { 3 } else { 6 });
             }
-            let reason = if case <= 1 || case >= 7 {
-                pb::TerminationReason::CountReached
-            } else if stop == NativeLoopStop::CountReached {
-                pb::TerminationReason::IterationLimit
-            } else {
-                pb::TerminationReason::Saturated
-            };
             program.commands.truncate(2);
             program.commands.push(pb::Command {
                 kind: Some(kind),
@@ -3530,8 +3268,7 @@ fn schedule_controls_match_native_counts_sites_and_stopping_in_every_mode() {
                         &pb::RunProgramRequest {
                             egraph_id: id,
                             program: Some(program.clone()),
-                            profile: true,
-                            include_run_reports: true,
+                            diagnostics: true,
                         }
                         .encode_to_vec(),
                     )
@@ -3540,33 +3277,25 @@ fn schedule_controls_match_native_counts_sites_and_stopping_in_every_mode() {
             )
             .unwrap();
             assert_eq!(response.error, None, "mode {mode:?}, case {case}");
-            assert_eq!(response.outputs.len(), 1, "no nested control outputs");
-            let Some(pb::command_output::Kind::Loop(outcome)) = &response.outputs[0].kind else {
+            assert_eq!(
+                response.outputs.len(),
+                2,
+                "one result and one diagnostic, no nested control results"
+            );
+            let Some(pb::command_output::Kind::Run(outcome)) = &response.outputs[0].kind else {
                 panic!("{response:?}")
             };
+            let expected_report = expected_report.unwrap();
             assert_eq!(
-                (outcome.iterations, outcome.termination, outcome.updated),
-                (completed as u64, Some(reason.into()), updated),
+                (outcome.updated, outcome.can_stop),
+                (expected_report.updated, expected_report.can_stop),
                 "mode {mode:?}, case {case}"
             );
-            let report = response.outputs[0].run_report.as_ref().unwrap();
-            let expected_report = expected_report.unwrap();
-            assert_eq!(report.updated, expected_report.updated);
-            assert_eq!(report.can_stop, expected_report.can_stop);
-            assert_eq!(report.iterations.len(), expected_report.iterations.len());
-            let profile = response.profile.unwrap();
+            let document = diagnostic_json(&response.outputs[1]);
             assert_eq!(
-                profile.runs.iter().map(|run| run.invocations).sum::<u64>(),
-                native_runs
+                document["iterations"].as_array().unwrap().len(),
+                expected_report.iterations.len()
             );
-            for run in &profile.runs {
-                assert!(
-                    run.command_path == [2, 0]
-                        || case == 6 && run.command_path == [2, 1, 0]
-                        || case == 8 && run.command_path == [2, 0, 0]
-                );
-            }
-            assert_eq!(profile.runs.is_empty(), case == 0 || case == 5);
             if case == 3 {
                 let mut whole_body = program.clone();
                 let Some(pb::command::Kind::Saturate(saturate)) = &mut whole_body.commands[2].kind
@@ -3604,7 +3333,6 @@ fn schedule_controls_match_native_counts_sites_and_stopping_in_every_mode() {
             let replay_id = create(&mut engine, mode);
             let mut loops = 0;
             let mut proofs = 0;
-            let mut replay_runs = 0;
             for phase in Source::new(Some("rendered-control.egg".into()), &rendered).unwrap() {
                 let phase = phase.unwrap();
                 let check_phase = matches!(
@@ -3620,8 +3348,7 @@ fn schedule_controls_match_native_counts_sites_and_stopping_in_every_mode() {
                             &pb::RunProgramRequest {
                                 egraph_id: replay_id,
                                 program: Some(phase),
-                                profile: true,
-                                include_run_reports: true,
+                                diagnostics: true,
                             }
                             .encode_to_vec(),
                         )
@@ -3636,33 +3363,27 @@ fn schedule_controls_match_native_counts_sites_and_stopping_in_every_mode() {
                         assert_eq!(mode, pb::ExecutionMode::ProofTesting);
                         assert!(!proof.terms.is_empty());
                         assert!((proof.root.unwrap() as usize) < proof.proofs.len());
-                        assert!(output.run_report.is_none());
                         proofs += 1;
                         continue;
                     }
-                    let Some(pb::command_output::Kind::Loop(outcome)) = &output.kind else {
-                        panic!("unexpected replay output: {output:?}")
-                    };
-                    loops += 1;
-                    assert_eq!(output.location.as_ref().unwrap().path, [0]);
-                    assert_eq!(
-                        (outcome.iterations, outcome.termination, outcome.updated),
-                        (completed as u64, Some(reason.into()), updated)
-                    );
-                    let report = output.run_report.as_ref().unwrap();
-                    assert_eq!(report.updated, expected_report.updated);
-                    assert_eq!(report.can_stop, expected_report.can_stop);
-                    assert_eq!(report.iterations.len(), expected_report.iterations.len());
-                }
-                let profile = replay.profile.unwrap();
-                assert!(profile.complete);
-                replay_runs += profile.runs.iter().map(|run| run.invocations).sum::<u64>();
-                for run in &profile.runs {
-                    assert!(
-                        run.command_path == [0, 0]
-                            || case == 6 && run.command_path == [0, 1, 0]
-                            || case == 8 && run.command_path == [0, 0, 0]
-                    );
+                    match &output.kind {
+                        Some(pb::command_output::Kind::Run(outcome)) => {
+                            loops += 1;
+                            assert_eq!(output.location.as_ref().unwrap().path, [0]);
+                            assert_eq!(
+                                (outcome.updated, outcome.can_stop),
+                                (expected_report.updated, expected_report.can_stop)
+                            );
+                        }
+                        Some(pb::command_output::Kind::Diagnostic(_)) => {
+                            let document = diagnostic_json(output);
+                            assert_eq!(
+                                document["iterations"].as_array().unwrap().len(),
+                                expected_report.iterations.len()
+                            );
+                        }
+                        _ => panic!("unexpected replay output: {output:?}"),
+                    }
                 }
             }
             assert_eq!(loops, 1);
@@ -3674,103 +3395,6 @@ fn schedule_controls_match_native_counts_sites_and_stopping_in_every_mode() {
                     0
                 },
                 "{mode:?}/{case}"
-            );
-            assert_eq!(replay_runs, native_runs);
-        }
-    }
-}
-
-#[test]
-fn composite_reports_include_only_entered_group_selections() {
-    for mode in [
-        pb::ExecutionMode::Normal,
-        pb::ExecutionMode::TermEncoding,
-        pb::ExecutionMode::Proofs,
-        pb::ExecutionMode::ProofTesting,
-    ] {
-        for entered_second_group in [false, true] {
-            let mut program = fixture();
-            let first_group = program.commands[2].clone();
-            let mut second_group = first_group.clone();
-            let Some(pb::command::Kind::Run(run)) = &mut second_group.kind else {
-                unreachable!()
-            };
-            run.groups = vec!["same_content".into()];
-            let second = if entered_second_group {
-                second_group
-            } else {
-                pb::Command {
-                    kind: Some(pb::command::Kind::Repeat(pb::Repeat {
-                        times: Some(0),
-                        body: vec![second_group],
-                        ..Default::default()
-                    })),
-                    ..Default::default()
-                }
-            };
-            program.commands.truncate(2);
-            program.commands.push(pb::Command {
-                kind: Some(pb::command::Kind::AddRules(pb::AddRules {
-                    group: "same_content".into(),
-                    rules: vec![0],
-                })),
-                ..Default::default()
-            });
-            program.commands.push(first_group.clone());
-            program.commands.push(pb::Command {
-                kind: Some(pb::command::Kind::Repeat(pb::Repeat {
-                    times: Some(1),
-                    body: vec![first_group, second],
-                    ..Default::default()
-                })),
-                ..Default::default()
-            });
-            let mut engine = Engine::default();
-            let id = create(&mut engine, mode);
-            let response = pb::RunProgramResponse::decode(
-                engine
-                    .run(
-                        &pb::RunProgramRequest {
-                            egraph_id: id,
-                            program: Some(program),
-                            profile: true,
-                            include_run_reports: true,
-                        }
-                        .encode_to_vec(),
-                    )
-                    .unwrap()
-                    .as_slice(),
-            )
-            .unwrap();
-            assert_eq!(response.error, None);
-            let first = response.outputs[0].run_report.as_ref().unwrap();
-            let physical = &first
-                .search_and_apply_time_per_ruleset
-                .iter()
-                .find(|row| row.groups == ["rebuilding_ruleset"])
-                .unwrap()
-                .native_name;
-            let report = response.outputs[1].run_report.as_ref().unwrap();
-            let profile = response.profile.as_ref().unwrap();
-            assert_eq!(profile.runs.len(), if entered_second_group { 3 } else { 2 });
-            let authored: Vec<_> = report
-                .search_and_apply_time_per_ruleset
-                .iter()
-                .filter(|row| &row.native_name == physical)
-                .collect();
-            assert_eq!(authored.len(), 1, "{mode:?}: {report:?}");
-            assert_eq!(
-                authored[0].groups,
-                if entered_second_group {
-                    vec!["rebuilding_ruleset", "same_content"]
-                } else {
-                    vec!["rebuilding_ruleset"]
-                }
-            );
-            assert_eq!(
-                response.rules.len(),
-                1,
-                "both groups share canonical content"
             );
         }
     }
@@ -3865,42 +3489,16 @@ fn dead_schedule_bodies_are_validated_before_effects_in_every_mode() {
                 let output = &response.outputs[0];
                 assert_eq!(output.location.as_ref().unwrap().path, [2]);
                 assert!(output.location.as_ref().unwrap().iterations.is_empty());
-                assert!(output.run_report.is_none());
-                let Some(pb::command_output::Kind::Loop(outcome)) = &output.kind else {
+                let Some(pb::command_output::Kind::Run(outcome)) = &output.kind else {
                     panic!("{mode:?}/{case}: {output:?}")
                 };
-                assert_eq!(
-                    (outcome.iterations, outcome.termination, outcome.updated),
-                    (0, Some(pb::TerminationReason::CountReached.into()), false)
-                );
+                assert!(!outcome.updated && outcome.can_stop);
             } else {
                 assert!(
                     response.error.as_ref().unwrap().location.is_none(),
                     "{mode:?}/{case}: {response:?}"
                 );
                 assert!(response.outputs.is_empty());
-            }
-            let profile = response.profile.unwrap();
-            assert_eq!(profile.complete, valid);
-            assert!(profile.runs.is_empty(), "{mode:?}/{case}: {profile:?}");
-            if !valid || mode == pb::ExecutionMode::Normal {
-                assert!(
-                    profile.maintenance.is_empty(),
-                    "{mode:?}/{case}: {profile:?}"
-                );
-            } else {
-                // Native encoded normalization still surrounds AddRules,
-                // seed action and outer zero loop. No nested body is entered.
-                use pb::maintenance_site::Target;
-                assert_eq!(profile.maintenance.len(), 3, "{mode:?}/{case}: {profile:?}");
-                for (maintenance, target) in profile.maintenance.iter().zip([
-                    Target::Command(pb::StaticCommandPath { path: vec![0] }),
-                    Target::Command(pb::StaticCommandPath { path: vec![1] }),
-                    Target::Command(pb::StaticCommandPath { path: vec![2] }),
-                ]) {
-                    assert_eq!(maintenance.site.as_ref().unwrap().target, Some(target));
-                    assert!(maintenance.invocations > 0);
-                }
             }
             let rendered = Renderer::core().render(&program);
             if matches!(case, "add-rules" | "unknown") {
@@ -3940,7 +3538,7 @@ fn dead_schedule_bodies_are_validated_before_effects_in_every_mode() {
 }
 
 #[test]
-fn repeated_leaf_failure_discards_incomplete_rule_totals() {
+fn repeated_leaf_failure_has_no_completed_result_and_retains_prefix() {
     use egglog::ast::{Command, RunConfig, Schedule};
     use egglog::{ExecutionEvent, ExecutionOrigin};
 
@@ -4066,29 +3664,24 @@ fn repeated_leaf_failure_discards_incomplete_rule_totals() {
             if exact { vec![1, 0] } else { vec![1] }
         );
         assert!(response.outputs.is_empty());
-        let profile = response.profile.unwrap();
-        assert!(!profile.complete);
-        assert_eq!(profile.runs.len(), 1);
-        let summary = &profile.runs[0];
-        assert_eq!(summary.command_path, path);
-        assert_eq!(summary.invocations, 2);
+        let mut retained = fixture();
+        retained.nodes[0].kind = Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
+            value: Some(pb::primitive_value::Value::I64(i64::MAX)),
+        }));
+        retained.commands = vec![pb::Command {
+            kind: Some(pb::command::Kind::Check(pb::Check { facts: vec![2] })),
+            ..Default::default()
+        }];
         assert_eq!(
-            (
-                summary.search_and_apply_nanos,
-                summary.merge_nanos,
-                summary.rebuild_nanos
-            ),
-            (None, None, None)
-        );
-        assert!(
-            summary.rules.is_empty(),
-            "partial earlier totals survived: {summary:?}"
+            run(&mut engine, id, retained).error,
+            None,
+            "the completed first iteration remains available after the second fails"
         );
     }
 }
 
 #[test]
-fn failed_authored_run_counts_entry_without_fabricated_metrics_or_result() {
+fn failed_authored_run_has_no_fabricated_result_and_keeps_seed() {
     for mode in [
         pb::ExecutionMode::Normal,
         pb::ExecutionMode::TermEncoding,
@@ -4137,25 +3730,6 @@ fn failed_authored_run_counts_entry_without_fabricated_metrics_or_result() {
         assert_eq!(error.code, i32::from(pb::ErrorCode::EvaluationFailed));
         assert_eq!(error.location.unwrap().path, [2]);
         assert!(response.outputs.is_empty());
-        let profile = response.profile.unwrap();
-        assert!(!profile.complete);
-        assert_eq!(profile.runs.len(), 1);
-        let run = &profile.runs[0];
-        assert_eq!(run.invocations, 1);
-        assert_eq!(
-            (
-                run.search_and_apply_nanos,
-                run.merge_nanos,
-                run.rebuild_nanos
-            ),
-            (None, None, None)
-        );
-        assert!(run.rules.is_empty());
-        for maintenance in profile.maintenance {
-            // Independently successful inline/earlier maintenance is complete.
-            assert!(maintenance.invocations > 0);
-            assert!(maintenance.search_and_apply_nanos.is_some());
-        }
         let mut retry = fixture();
         retry.commands = vec![pb::Command {
             kind: Some(pb::command::Kind::Check(pb::Check { facts: vec![2] })),
@@ -4166,8 +3740,7 @@ fn failed_authored_run_counts_entry_without_fabricated_metrics_or_result() {
                 &pb::RunProgramRequest {
                     egraph_id: id,
                     program: Some(retry),
-                    profile: true,
-                    include_run_reports: false,
+                    diagnostics: false,
                 }
                 .encode_to_vec(),
             )
@@ -4177,8 +3750,5 @@ fn failed_authored_run_counts_entry_without_fabricated_metrics_or_result() {
             response.error, None,
             "completed prefixes remain usable after failure"
         );
-        let profile = response.profile.unwrap();
-        assert!(profile.complete);
-        assert!(profile.runs.is_empty());
     }
 }

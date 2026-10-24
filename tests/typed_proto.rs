@@ -3,6 +3,19 @@
 use egglog_experimental::typed::prelude::*;
 use std::hash::{DefaultHasher, Hash, Hasher};
 
+fn diagnostic_matches(diagnostic: &Diagnostic) -> u64 {
+    assert_eq!(diagnostic.format, "application/vnd.egglog.run-report+json");
+    let value: serde_json::Value = serde_json::from_str(&diagnostic.content).unwrap();
+    assert!(value.get("updated").is_none());
+    assert!(value.get("can_stop").is_none());
+    value["num_matches_per_rule"]
+        .as_object()
+        .unwrap()
+        .values()
+        .map(|value| value.as_u64().unwrap())
+        .sum()
+}
+
 mod relation_predicates {
     use super::*;
     use egglog_experimental::proto as pb;
@@ -1155,36 +1168,11 @@ mod lazy_rulesets {
     fn lazy_ruleset_initializer_names_and_shared_cursors() -> Result<(), TypedError> {
         for mut graph in [EGraph::default(), EGraph::default()] {
             graph.register(RuleTerms::Input(83))?;
-            let response = graph.run(&copy)?;
-            assert_eq!(response.rules.len(), 1);
-            assert_eq!(
-                response
-                    .profile
-                    .unwrap()
-                    .runs
-                    .iter()
-                    .flat_map(|run| &run.rules)
-                    .map(|rule| rule.matches.unwrap())
-                    .sum::<u64>(),
-                1
-            );
+            let response = graph.run_with_diagnostics(&copy)?;
+            assert_eq!(diagnostic_matches(&response.1), 1);
 
-            let response = graph.run(&nested)?;
-            assert!(
-                response.rules.is_empty(),
-                "consumed content has no referenced run rows"
-            );
-            assert_eq!(
-                response
-                    .profile
-                    .unwrap()
-                    .runs
-                    .iter()
-                    .flat_map(|run| &run.rules)
-                    .map(|rule| rule.matches.unwrap())
-                    .sum::<u64>(),
-                0
-            );
+            let response = graph.run_with_diagnostics(&nested)?;
+            assert_eq!(diagnostic_matches(&response.1), 0);
 
             let forced = std::cell::Cell::new(0);
             let lazy_alias = LazyLock::new(|| {
@@ -1200,18 +1188,8 @@ mod lazy_rulesets {
             let mut cloned = graph.try_clone()?;
             let copied = (*copy).clone();
             for group in [&*copy, &alias, &copied] {
-                let response = cloned.run(group)?;
-                assert_eq!(
-                    response
-                        .profile
-                        .unwrap()
-                        .runs
-                        .iter()
-                        .flat_map(|run| &run.rules)
-                        .map(|rule| rule.matches.unwrap())
-                        .sum::<u64>(),
-                    0
-                );
+                let response = cloned.run_with_diagnostics(group)?;
+                assert_eq!(diagnostic_matches(&response.1), 0);
             }
             assert!(graph.check(RuleTerms::Copied(83))?);
         }
@@ -1272,7 +1250,7 @@ mod lazy_rulesets {
         );
         assert!(!graph.check(RuleTerms::Copied(126))?);
         let response = graph.run(&valid)?;
-        assert_eq!(response.rules.len(), 1);
+        assert!(response.updated);
         assert!(graph.check(RuleTerms::Copied(126))?);
         Ok(())
     }
@@ -1280,23 +1258,13 @@ mod lazy_rulesets {
     #[test]
     fn lazy_ruleset_equal_names_add_distinct_content_to_one_group() -> Result<(), TypedError> {
         let mut graph = EGraph::default();
-        graph.run(&collision_first)?;
-        graph.run(&collision_other)?;
+        graph.run_with_diagnostics(&collision_first)?;
+        graph.run_with_diagnostics(&collision_other)?;
         assert!(graph.check(RuleTerms::Second(127))?);
-        let response = graph.run(&collision_first)?;
-        assert_eq!(
-            response
-                .profile
-                .unwrap()
-                .runs
-                .iter()
-                .flat_map(|run| &run.rules)
-                .map(|rule| rule.matches.unwrap())
-                .sum::<u64>(),
-            0
-        );
+        let response = graph.run_with_diagnostics(&collision_first)?;
+        assert_eq!(diagnostic_matches(&response.1), 0);
         let mut independent = EGraph::default();
-        independent.run(&collision_other)?;
+        independent.run_with_diagnostics(&collision_other)?;
         assert!(independent.check(RuleTerms::Second(127))?);
         Ok(())
     }
@@ -1667,7 +1635,7 @@ fn typed_table_nullary_head_only_and_query_binders() -> Result<(), TypedError> {
     assert!(!graph.check(Read(7))?);
     graph.register(RuleTerms::Input(7))?;
     let response = graph.run(&conditional)?;
-    assert!(response.detail.updated);
+    assert!(response.updated);
     assert_eq!(i64::try_from(&graph.extract(EmptyRead())?)?, 11);
     assert_eq!(i64::try_from(&graph.extract(Read(7))?)?, 7);
     graph.register(delete(EmptyRead()))?;
@@ -1819,25 +1787,18 @@ fn typed_scope_clone_is_an_independent_current_state_without_saved_scopes() -> R
     source.push()?;
     source.push()?;
     source.register(RuleTerms::Input(1))?;
-    source.run(&group)?;
+    source.run_with_diagnostics(&group)?;
     let mut cloned = source.try_clone()?;
     assert!(matches!(cloned.pop(), Err(TypedError::Invalid(_))));
-    let response = cloned.run(&group)?;
+    let response = cloned.run_with_diagnostics(&group)?;
     assert_eq!(
-        response
-            .profile
-            .unwrap()
-            .runs
-            .iter()
-            .flat_map(|r| &r.rules)
-            .map(|r| r.matches.unwrap())
-            .sum::<u64>(),
+        diagnostic_matches(&response.1),
         0,
         "cloning keeps already consumed cursors"
     );
     cloned.push()?;
     cloned.register(RuleTerms::Input(2))?;
-    cloned.run(&group)?;
+    cloned.run_with_diagnostics(&group)?;
     assert!(!source.check(RuleTerms::Copied(2))?);
     source.pop()?;
     source.pop()?;
@@ -1848,48 +1809,29 @@ fn typed_scope_clone_is_an_independent_current_state_without_saved_scopes() -> R
     assert!(cloned.check(RuleTerms::Copied(1))?);
     assert!(!cloned.check(RuleTerms::Copied(2))?);
     cloned.register(RuleTerms::Input(3))?;
-    cloned.run(&group)?;
+    cloned.run_with_diagnostics(&group)?;
     assert!(cloned.check(RuleTerms::Copied(3))?);
     Ok(())
 }
 
 #[test]
-fn typed_report_run_and_stats_keep_cumulative_native_work() -> Result<(), TypedError> {
-    use egglog_experimental::{proto as pb, typed::builtins::I64};
+fn typed_diagnostics_and_stats_keep_cumulative_native_work() -> Result<(), TypedError> {
+    use egglog_experimental::typed::builtins::I64;
     let group = ruleset(|x: &I64| rule(RuleTerms::Input(x), RuleTerms::Copied(x)));
     let mut graph = EGraph::new()?;
     let mut previous_history = 0;
     let mut matches = 0;
     for input in [1, 2] {
         graph.register(RuleTerms::Input(input))?;
-        let run = graph.run(&group)?;
-        let detail = &run.detail;
-        matches += detail
-            .num_matches_per_rule
-            .iter()
-            .map(|row| row.value)
-            .sum::<u64>();
+        let (_, diagnostic) = graph.run_with_diagnostics(&group)?;
+        matches += diagnostic_matches(&diagnostic);
         let stats = graph.stats()?;
-        let report = &stats.detail;
-        assert!(report.iterations.len() > previous_history);
-        previous_history = report.iterations.len();
-        assert_eq!(
-            report
-                .num_matches_per_rule
-                .iter()
-                .map(|row| row.value)
-                .sum::<u64>(),
-            matches
-        );
+        let report: serde_json::Value = serde_json::from_str(&stats.content).unwrap();
+        let iterations = report["iterations"].as_array().unwrap().len();
+        assert!(iterations > previous_history);
+        previous_history = iterations;
+        assert_eq!(diagnostic_matches(&stats), matches);
         assert!(matches > 0);
-        assert!(report.num_matches_per_rule.iter().all(|row| {
-            row.rule
-                .is_some_and(|index| (index as usize) < stats.rules.len())
-                && row.direction == Some(pb::NativeRuleDirection::Single as i32)
-        }));
-        // The high-level observation returns native detail directly. The wire
-        // envelope/control-companion distinction remains covered internally.
-        assert!(stats.profile.as_ref().unwrap().complete);
         assert!(graph.check(RuleTerms::Copied(input))?);
     }
     Ok(())
@@ -1938,28 +1880,14 @@ fn independent_equal_term_rules_share_content_matches_and_cloned_cursors() -> Re
     let independent = rule((), RuleTerms::Copied(42));
     let group = ruleset((shared.clone(), &shared, independent));
     let mut graph = EGraph::default();
-    let first = graph.run(&group)?;
-    let matches: u64 = first
-        .profile
-        .unwrap()
-        .runs
-        .iter()
-        .flat_map(|run| &run.rules)
-        .map(|rule| rule.matches.expect("normal rule matches measured"))
-        .sum();
+    let first = graph.run_with_diagnostics(&group)?;
+    let matches: u64 = diagnostic_matches(&first.1);
     assert_eq!(
         matches, 1,
         "equal rule content is registered and matched once"
     );
-    let second = graph.run(group.clone())?;
-    let matches: u64 = second
-        .profile
-        .unwrap()
-        .runs
-        .iter()
-        .flat_map(|run| &run.rules)
-        .map(|rule| rule.matches.expect("normal rule matches measured"))
-        .sum();
+    let second = graph.run_with_diagnostics(group.clone())?;
+    let matches: u64 = diagnostic_matches(&second.1);
     assert_eq!(
         matches, 0,
         "cloning the group cannot reset consumed cursors"
@@ -1978,15 +1906,8 @@ fn overlapping_groups_and_diamonds_share_content_cursors() -> Result<(), TypedEr
     let flat_overlap = ruleset(&shared);
     let mut graph = EGraph::default();
     for (group, expected) in [(&left, 1), (&diamond, 0), (&right, 0), (&flat_overlap, 0)] {
-        let response = graph.run(group)?;
-        let matches: u64 = response
-            .profile
-            .unwrap()
-            .runs
-            .iter()
-            .flat_map(|run| &run.rules)
-            .map(|rule| rule.matches.expect("normal rule matches measured"))
-            .sum();
+        let response = graph.run_with_diagnostics(group)?;
+        let matches: u64 = diagnostic_matches(&response.1);
         assert_eq!(
             matches, expected,
             "one cursor per rule content across every selected group"
@@ -2002,23 +1923,16 @@ fn native_clone_retains_cursors_but_not_subsequent_mutations() -> Result<(), Typ
     let group = ruleset(|x: &I64| rule(RuleTerms::Input(x), RuleTerms::Copied(x)));
     let mut original = EGraph::default();
     original.register(RuleTerms::Input(1))?;
-    original.run(&group)?;
+    original.run_with_diagnostics(&group)?;
     let mut cloned = original.try_clone()?;
-    let response = cloned.run(&group)?;
-    let matches: u64 = response
-        .profile
-        .unwrap()
-        .runs
-        .iter()
-        .flat_map(|run| &run.rules)
-        .map(|rule| rule.matches.unwrap())
-        .sum();
+    let response = cloned.run_with_diagnostics(&group)?;
+    let matches: u64 = diagnostic_matches(&response.1);
     assert_eq!(matches, 0, "native clone preserves consumed cursors");
     original.register(RuleTerms::Input(2))?;
-    original.run(&group)?;
+    original.run_with_diagnostics(&group)?;
     assert!(!cloned.check(RuleTerms::Copied(2))?);
     cloned.register(RuleTerms::Input(3))?;
-    cloned.run(&group)?;
+    cloned.run_with_diagnostics(&group)?;
     assert!(!original.check(RuleTerms::Copied(3))?);
     drop(original);
     assert!(cloned.check((RuleTerms::Copied(1), RuleTerms::Copied(3)))?);

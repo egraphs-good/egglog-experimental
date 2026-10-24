@@ -2,10 +2,21 @@
 use super::*;
 use std::hash::Hash;
 
+// A read-only execution view keeps snapshot export independent of Session's
+// ownership, so the same exporter can observe a live loop without cloning it.
+#[derive(Clone, Copy)]
+pub(super) struct View<'a> {
+    pub graph: &'a EGraph,
+    pub names: &'a NativeNames,
+    pub definitions: &'a pb::Program,
+    pub mode: pb::ExecutionMode,
+    pub extension: Option<&'a Arc<dyn NativeExtension>>,
+}
+
 // The only retained graph is the generated Program. These maps assign wire
 // locations to native values; the queue closes container edges iteratively.
 struct Export<'a, K, F> {
-    session: &'a Session,
+    session: View<'a>,
     program: pb::Program,
     classes: HashMap<K, u32>,
     canonical: F,
@@ -75,9 +86,8 @@ impl<K: Eq + Hash, F: Fn(&ArcSort, Value) -> K> Export<'_, K, F> {
             let custom = self
                 .session
                 .extension
-                .as_ref()
                 .map(|extension| {
-                    extension.encode_observed_custom_value(&self.session.graph, &sort, value)
+                    extension.encode_observed_custom_value(self.session.graph, &sort, value)
                 })
                 .transpose()
                 .map_err(egglog::Error::BackendError)?
@@ -284,7 +294,7 @@ impl<K: Eq + Hash, F: Fn(&ArcSort, Value) -> K> Export<'_, K, F> {
 }
 
 pub(super) fn export(
-    session: &Session,
+    session: View<'_>,
     registry: &rules::Registry,
 ) -> Result<pb::EGraphSnapshot, egglog::Error> {
     let mut observation = observation(session, &[])?;
@@ -309,7 +319,7 @@ pub(super) fn export(
 }
 
 pub(super) fn observation(
-    session: &Session,
+    session: View<'_>,
     roots: &[(ArcSort, Value)],
 ) -> Result<cost_model::Observation, egglog::Error> {
     if session.mode != pb::ExecutionMode::Normal {
@@ -653,8 +663,7 @@ mod tests {
         let request = pb::RunProgramRequest {
             egraph_id: id,
             program: Some(program),
-            profile: true,
-            include_run_reports: false,
+            diagnostics: false,
         };
         pb::RunProgramResponse::decode(engine.run(&request.encode_to_vec()).unwrap().as_slice())
             .unwrap()
@@ -675,7 +684,18 @@ mod tests {
             assert_eq!(run(&mut engine, id, phase.unwrap()).error, None);
         }
         // This is the same complete, inert Program supplied to NativeCostModel::start.
-        let observed = observation(&engine.graphs[&id], &[]).unwrap();
+        let session = &engine.graphs[&id];
+        let observed = observation(
+            View {
+                graph: &session.graph,
+                names: &session.names,
+                definitions: &session.definitions,
+                mode: session.mode,
+                extension: session.extension.as_ref(),
+            },
+            &[],
+        )
+        .unwrap();
         let program = &observed.program;
         assert_eq!(
             program
@@ -712,7 +732,17 @@ mod tests {
                 .graph
                 .eval_expr(&Expr::Lit(span!(), literal))
                 .unwrap();
-            let observed = observation(session, std::slice::from_ref(&root)).unwrap();
+            let observed = observation(
+                View {
+                    graph: &session.graph,
+                    names: &session.names,
+                    definitions: &session.definitions,
+                    mode: session.mode,
+                    extension: session.extension.as_ref(),
+                },
+                std::slice::from_ref(&root),
+            )
+            .unwrap();
             let index = observed.values[&(root.0.name().to_owned(), root.1)];
             assert_eq!(
                 observed.program.nodes[index as usize].kind,

@@ -10,15 +10,15 @@
 //! `EGraph::try_clone` clones native state/cursors and binding observations;
 //! subsequent mutations are independent. No definitions or commands are replayed.
 //! `push`/`pop` explicitly save/restore native data, cursors and typed bindings.
-//! Pop retains cumulative native statistics and fresh-name state, and can recover
+//! Pop retains collected cumulative diagnostics and fresh-name state, and can recover
 //! an uncertain current transport state from its known healthy saved scope.
 //! A clone starts with an empty scope stack, even inside a scope. Dropping a graph
 //! discards its owned handles; it does not pop or merge work into another graph.
-//! `run` includes actual native detail beside its outcome/profile; `stats` returns
-//! cumulative native statistics. Both return `RunReport` with exact generated
-//! native detail and its rule-attribution catalog, not generic command outputs
-//! or a second report model. Emitting detail does
-//! not disable or reconfigure native collection; unavailable plans remain absent.
+//! `run` returns the backend's `updated` and scheduler-aware `can_stop` flags.
+//! `run_with_diagnostics` also returns an opaque backend diagnostic; `stats`
+//! observes cumulative diagnostics. Detailed collection is opt-in.
+//! `Schedule::with_snapshots` chooses the observation cadence; `run_stream`
+//! delivers those owned snapshots during execution and supports cancellation.
 //! I64/F64 arithmetic, String/Bool operations, Unit literals and generic
 //! Vec/Pair/Map operations use engine-owned metadata.
 //! Ordered container decoding retains child expression ownership. Foreign open
@@ -544,9 +544,15 @@
 //! assert!(graph.check(Term::Seen(7))?);
 //! assert!(!graph.check(Term::Seen(8))?);
 //! let stats = graph.stats()?;
-//! assert!(!stats.detail.iterations.is_empty());
+//! assert!(!stats.content.is_empty());
 //! let shared = ruleset((&marks, &marks)); // canonical composition, no rule copies
 //! graph.run(&shared)?;
+//! let mut snapshots = Vec::new();
+//! graph.run_stream(Schedule::from(&shared).with_snapshots().repeat(2), |snapshot| {
+//!     snapshots.push(snapshot);
+//!     std::ops::ControlFlow::Continue(())
+//! })?;
+//! assert_eq!(snapshots.len(), 2);
 //! graph.push()?;
 //! graph.register(Term::Input(9))?;
 //! assert!(graph.check(Term::Input(9))?);
@@ -1151,6 +1157,8 @@ mod session;
 mod snapshot;
 mod storage;
 
+/// Small execution results and opaque backend-specific diagnostic documents.
+pub use crate::proto::{Diagnostic, RunResult};
 pub use builtins::ne;
 pub use decl::SortRef;
 pub use egglog_experimental_typed_macros::{
@@ -1164,31 +1172,6 @@ pub use schedule::{Schedule, sequence};
 pub use selector::get_args;
 pub use session::EGraph;
 pub use snapshot::{ClassRef, ProducerRef, Snapshot, TableRowRef, ValueRef};
-/// Exact reports returned by high-level run/statistics observations.
-pub mod report {
-    pub use crate::proto::report_stage::Kind as ReportStageKind;
-    pub use crate::proto::{NativeRunReport as NativeReport, ProfileSummary, ReportDuration};
-
-    /// Exact native metrics together with their response-local attribution.
-    /// A successful high-level observation has validated all referenced rule
-    /// entries and required metrics; generic command outputs remain private.
-    #[derive(Clone, Debug)]
-    pub struct RunReport {
-        /// Native history and authoritative aggregate maps.
-        pub detail: NativeReport,
-        /// Registered rule values indexed by optional metric attribution.
-        pub rules: Vec<crate::proto::Rule>,
-        /// Response-local node arena referenced by the rule catalog.
-        pub nodes: Vec<crate::proto::Node>,
-        /// Response-local sort arena referenced by the rule catalog.
-        pub sorts: Vec<crate::proto::Sort>,
-        /// Source files referenced by diagnostic spans in the rule catalog.
-        pub files: Vec<crate::proto::SourceFile>,
-        /// Exclusive work attribution requested by this typed session.
-        pub profile: Option<ProfileSummary>,
-    }
-}
-pub use report::RunReport;
 
 /// Authoring, decoding or structured engine failure.
 #[derive(Debug)]
@@ -1223,9 +1206,9 @@ impl std::error::Error for TypedError {}
 /// Common authoring types, declaration macros and operations.
 pub mod prelude {
     pub use super::{
-        Action, EGraph, EgglogValue, EqualitySort, Fact, Rule, Ruleset, Schedule, Snapshot,
-        TypedError, constructor, declarations, delete, eq, function, get_args, let_, ne, relation,
-        rewrite, rule, ruleset, sequence, set, sort, subsume, union, var,
+        Action, Diagnostic, EGraph, EgglogValue, EqualitySort, Fact, Rule, Ruleset, RunResult,
+        Schedule, Snapshot, TypedError, constructor, declarations, delete, eq, function, get_args,
+        let_, ne, relation, rewrite, rule, ruleset, sequence, set, sort, subsume, union, var,
     };
 }
 

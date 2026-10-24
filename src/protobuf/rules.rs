@@ -61,7 +61,6 @@ impl Registry {
         add: &pb::AddRules,
         candidates: &[Candidate],
         executor: &mut NativeExecutor<'_>,
-        location: &pb::CommandLocation,
         context: &mut RequestOccurrences,
         response: &mut pb::RunProgramResponse,
     ) -> Result<(), egglog::Error> {
@@ -73,9 +72,6 @@ impl Registry {
             while rule.completed < rule.candidate.commands.len() {
                 let (result, registered, _) = executor.run_observed(
                     vec![rule.candidate.commands[rule.completed].clone()],
-                    pb::maintenance_site::Target::Command(pb::StaticCommandPath {
-                        path: location.path.clone(),
-                    }),
                     None,
                     context,
                     response,
@@ -102,7 +98,6 @@ impl Registry {
         &mut self,
         groups: &[String],
         executor: &mut NativeExecutor<'_>,
-        location: &pb::CommandLocation,
         context: &mut RequestOccurrences,
         response: &mut pb::RunProgramResponse,
     ) -> Result<String, egglog::Error> {
@@ -125,9 +120,6 @@ impl Registry {
                 name.clone(),
                 holders,
             )],
-            pb::maintenance_site::Target::Command(pb::StaticCommandPath {
-                path: location.path.clone(),
-            }),
             None,
             context,
             response,
@@ -182,22 +174,19 @@ impl Candidate {
             .records
             .entry(self.name.clone())
             .or_insert_with(|| self.record.clone());
-        let directions: &[(_, _)] = if matches!(
+        let suffixes: &[&str] = if matches!(
             self.record.program.rules[0].kind,
             Some(pb::rule::Kind::Birewrite(_))
         ) {
-            &[
-                ("=>", pb::NativeRuleDirection::Forward),
-                ("<=", pb::NativeRuleDirection::Reverse),
-            ]
+            &["=>", "<="]
         } else {
-            &[("", pb::NativeRuleDirection::Single)]
+            &[""]
         };
-        for (suffix, direction) in directions {
+        for suffix in suffixes {
             context
                 .origins
                 .entry(format!("{}{suffix}", self.name))
-                .or_insert((self.name.clone(), *direction));
+                .or_insert_with(|| self.name.clone());
         }
     }
 }

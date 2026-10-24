@@ -314,7 +314,16 @@ impl Session {
                 .map(|root| root.expect("executed extraction root"))
             })
             .collect::<Result<Vec<_>, _>>()?;
-        let observation = Arc::new(freeze::observation(self, &roots)?);
+        let observation = Arc::new(freeze::observation(
+            freeze::View {
+                graph: &self.graph,
+                names: &self.names,
+                definitions: &self.definitions,
+                mode: self.mode,
+                extension: self.extension.as_ref(),
+            },
+            &roots,
+        )?);
         let runtime = registration.start(&observation.program)?;
         let mut result = None;
         runtime.run(Box::new(|| {
@@ -445,7 +454,16 @@ impl Session {
         let additive = registration.contract().additive;
         // Every retained table cell already belongs to this complete view.
         // All observation/codec failures precede the shared plan's clear step.
-        let observation = Arc::new(freeze::observation(self, &[])?);
+        let observation = Arc::new(freeze::observation(
+            freeze::View {
+                graph: &self.graph,
+                names: &self.names,
+                definitions: &self.definitions,
+                mode: self.mode,
+                extension: self.extension.as_ref(),
+            },
+            &[],
+        )?);
         let runtime = registration.start(&observation.program)?;
         let model = ObservedModel {
             observation,
@@ -549,7 +567,7 @@ mod tests {
                 .unwrap();
             let request = pb::RunProgramRequest {
                 egraph_id: handle,
-                profile: true,
+                diagnostics: false,
                 program: Some(pb::Program {
                     sorts: vec![pb::Sort {
                         kind: Some(pb::sort::Kind::Family(pb::HostSort {
@@ -576,7 +594,6 @@ mod tests {
                     }],
                     ..Default::default()
                 }),
-                ..Default::default()
             };
             let response = engine.run(&request.encode_to_vec()).unwrap();
             let error = pb::RunProgramResponse::decode(response.as_slice())

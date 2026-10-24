@@ -10,7 +10,8 @@ use super::{
 use prost::Message;
 use std::{
     collections::{HashMap, HashSet},
-    sync::{Arc, Mutex},
+    ops::ControlFlow,
+    sync::{Arc, Mutex, MutexGuard, TryLockError},
 };
 
 // A request plan retains locations and destination bindings only. Generated
@@ -237,6 +238,7 @@ struct SavedScope {
 /// A byte-protocol session. No native EGraph or AST execution escape hatch.
 pub struct EGraph {
     engine: Arc<Mutex<crate::protobuf::Engine>>,
+    discarded: Arc<Mutex<Vec<u64>>>,
     handle: u64,
     // An uncertain response cannot establish the completed action prefix.
     usable: bool,
@@ -250,15 +252,53 @@ pub struct EGraph {
     last_wire: Option<(Vec<u8>, Vec<u8>)>,
 }
 
+// Destruction may be requested from a snapshot callback while the engine is
+// exclusively borrowed. Drain without holding both mutexes during native work.
+fn drain_discarded(
+    engine: &mut crate::protobuf::Engine,
+    discarded: &Mutex<Vec<u64>>,
+) -> Result<(), TypedError> {
+    let handles = std::mem::take(
+        &mut *discarded
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner()),
+    );
+    for (index, handle) in handles.iter().enumerate() {
+        if let Err(error) =
+            engine.destroy(&pb::DestroyEGraphRequest { egraph_id: *handle }.encode_to_vec())
+        {
+            discarded
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .extend_from_slice(&handles[index..]);
+            return Err(TypedError::Invalid(error.to_string()));
+        }
+    }
+    Ok(())
+}
+
 impl Drop for EGraph {
     fn drop(&mut self) {
-        // Never recover a poisoned engine or panic during destruction. A
-        // poisoned transport's remaining storage is released with its last Arc.
-        if let Ok(mut engine) = self.engine.lock() {
-            for handle in std::iter::once(self.handle).chain(self.scopes.iter().map(|s| s.handle)) {
-                let _ =
-                    engine.destroy(&pb::DestroyEGraphRequest { egraph_id: handle }.encode_to_vec());
+        let handles =
+            std::iter::once(self.handle).chain(self.scopes.iter().map(|scope| scope.handle));
+        if let Ok(mut engine) = self.engine.try_lock() {
+            let _ = drain_discarded(&mut engine, &self.discarded);
+            for handle in handles {
+                if engine
+                    .destroy(&pb::DestroyEGraphRequest { egraph_id: handle }.encode_to_vec())
+                    .is_err()
+                {
+                    self.discarded
+                        .lock()
+                        .unwrap_or_else(|poison| poison.into_inner())
+                        .push(handle);
+                }
             }
+        } else {
+            self.discarded
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .extend(handles);
         }
     }
 }
@@ -270,6 +310,19 @@ impl Default for EGraph {
 }
 
 impl EGraph {
+    // Reject callback reentry instead of waiting on the mutex we already own.
+    // A successful guard also completes graph destruction deferred by callbacks.
+    fn lock_engine(&self) -> Result<MutexGuard<'_, crate::protobuf::Engine>, TypedError> {
+        let mut engine = self.engine.try_lock().map_err(|error| {
+            TypedError::Invalid(match error {
+                TryLockError::WouldBlock => "byte engine is already executing".into(),
+                TryLockError::Poisoned(_) => "byte engine mutex poisoned".into(),
+            })
+        })?;
+        drain_discarded(&mut engine, &self.discarded)?;
+        Ok(engine)
+    }
+
     /// Create a byte engine with the adapter's supported i64 cost domain.
     pub fn new() -> Result<Self, TypedError> {
         Self::with_recording(false)
@@ -305,6 +358,7 @@ impl EGraph {
             .egraph_id;
         Ok(Self {
             engine: Arc::new(Mutex::new(engine)),
+            discarded: Arc::new(Mutex::new(vec![])),
             handle,
             usable: true,
             declarations: HashMap::new(),
@@ -328,9 +382,7 @@ impl EGraph {
             ));
         }
         let bytes = self
-            .engine
-            .lock()
-            .map_err(|_| TypedError::Invalid("byte engine mutex poisoned".into()))?
+            .lock_engine()?
             .clone_egraph(
                 &pb::CloneEGraphRequest {
                     egraph_id: self.handle,
@@ -343,6 +395,7 @@ impl EGraph {
             .egraph_id;
         Ok(Self {
             engine: self.engine.clone(),
+            discarded: self.discarded.clone(),
             handle,
             usable: true,
             declarations: self.declarations.clone(),
@@ -365,9 +418,7 @@ impl EGraph {
         }
         let declarations = self.declarations.clone();
         let bytes = self
-            .engine
-            .lock()
-            .map_err(|_| TypedError::Invalid("byte engine mutex poisoned".into()))?
+            .lock_engine()?
             .clone_egraph(
                 &pb::CloneEGraphRequest {
                     egraph_id: self.handle,
@@ -396,9 +447,7 @@ impl EGraph {
             .last()
             .ok_or_else(|| TypedError::Invalid("no saved scope".into()))?;
         let bytes = self
-            .engine
-            .lock()
-            .map_err(|_| TypedError::Invalid("byte engine mutex poisoned".into()))?
+            .lock_engine()?
             .return_to(
                 &pb::ReturnToEGraphRequest {
                     active_id: self.handle,
@@ -422,11 +471,11 @@ impl EGraph {
         Ok(())
     }
 
-    fn execute(
+    fn prepare_request(
         &mut self,
-        mut packer: Packer,
-        include_run_reports: bool,
-    ) -> Result<pb::RunProgramResponse, TypedError> {
+        packer: &mut Packer,
+        diagnostics: bool,
+    ) -> Result<Vec<u8>, TypedError> {
         if !self.usable {
             return Err(TypedError::Invalid(
                 "session transport state is unknown".into(),
@@ -461,15 +510,21 @@ impl EGraph {
         let message = pb::RunProgramRequest {
             egraph_id: self.handle,
             program: Some(std::mem::take(&mut packer.program)),
-            profile: true,
-            include_run_reports,
+            diagnostics,
         };
         let request = message.encode_to_vec();
         packer.program = message.program.unwrap();
+        Ok(request)
+    }
+
+    fn execute(
+        &mut self,
+        mut packer: Packer,
+        diagnostics: bool,
+    ) -> Result<pb::RunProgramResponse, TypedError> {
+        let request = self.prepare_request(&mut packer, diagnostics)?;
         let bytes = self
-            .engine
-            .lock()
-            .map_err(|_| TypedError::Invalid("byte engine mutex poisoned".into()))?
+            .lock_engine()?
             .run(&request)
             .map_err(|e| TypedError::Invalid(e.to_string()))?;
         #[cfg(test)]
@@ -490,8 +545,30 @@ impl EGraph {
             self.usable = false;
             TypedError::Decode(e.to_string())
         })?;
+        self.acknowledge(packer, &response, true)?;
+        if let Some(error) = response.error.clone() {
+            return Err(TypedError::Engine(Box::new(error)));
+        }
+        Ok(response)
+    }
+
+    // Apply only observed completion. On cancellation an output acknowledges its
+    // earlier top-level prefix, while a successful end acknowledges all commands.
+    fn acknowledge(
+        &mut self,
+        packer: Packer,
+        response: &pb::RunProgramResponse,
+        finished: bool,
+    ) -> Result<(), TypedError> {
         let completed = match &response.error {
-            None => packer.program.commands.len(),
+            None if finished => packer.program.commands.len(),
+            None => response
+                .outputs
+                .iter()
+                .filter_map(|output| output.location.as_ref()?.path.first())
+                .copied()
+                .max()
+                .unwrap_or(0) as usize,
             Some(error) => match &error.location {
                 None => 0,
                 Some(location) => {
@@ -529,7 +606,13 @@ impl EGraph {
                 }
             },
         };
-        if response.error.as_ref().is_none_or(|e| e.location.is_some()) {
+        if finished && response.error.is_none()
+            || response
+                .error
+                .as_ref()
+                .is_some_and(|e| e.location.is_some())
+            || !response.outputs.is_empty()
+        {
             self.declarations.extend(packer.declarations);
         }
         for (index, recipe, slot) in packer.initializations {
@@ -538,10 +621,7 @@ impl EGraph {
                 self.captures.insert(name, (recipe, slot));
             }
         }
-        if let Some(error) = response.error.clone() {
-            return Err(TypedError::Engine(Box::new(error)));
-        }
-        Ok(response)
+        Ok(())
     }
 
     /// Submit expressions and row writes/deletions as ordered top-level actions.
@@ -588,57 +668,136 @@ impl EGraph {
         Ok(())
     }
 
-    /// Execute an authored schedule and return its exact native report with
-    /// validated rule attribution and profiling.
+    /// Execute an authored schedule with optional diagnostics collection disabled.
     pub fn run(
         &mut self,
         schedule: impl Into<super::Schedule>,
-    ) -> Result<super::RunReport, TypedError> {
-        select_report(self.run_response(schedule)?, false)
+    ) -> Result<super::RunResult, TypedError> {
+        let response = self.execute(pack_schedule(schedule.into(), false)?, false)?;
+        Ok(select_run(response, false)?.0)
     }
 
-    fn run_response(
+    /// Execute a schedule and return its backend-specific diagnostic document.
+    pub fn run_with_diagnostics(
         &mut self,
         schedule: impl Into<super::Schedule>,
-    ) -> Result<pb::RunProgramResponse, TypedError> {
-        let schedule = schedule.into();
-        let mut packer = Packer::default();
-        for ruleset in schedule.rulesets {
-            if let Some(error) = ruleset.1 {
-                return Err(TypedError::Invalid(error));
-            }
-            for addition in ruleset.0 {
-                packer.intern(addition, 0);
-            }
-        }
-        packer.finish()?;
-        packer.program.commands.extend(schedule.commands);
-        if packer.program.commands.len() != 1 {
-            packer.program.commands = vec![pb::Command {
-                kind: Some(pb::command::Kind::Repeat(pb::Repeat {
-                    body: std::mem::take(&mut packer.program.commands),
-                    times: Some(1),
-                    ..Default::default()
-                })),
-                ..Default::default()
-            }];
-        }
-        self.execute(packer, true)
+    ) -> Result<(super::RunResult, super::Diagnostic), TypedError> {
+        let response = self.execute(pack_schedule(schedule.into(), false)?, true)?;
+        let (result, diagnostic) = select_run(response, true)?;
+        Ok((
+            result,
+            diagnostic.expect("required diagnostic was validated"),
+        ))
     }
 
-    /// Observe actual cumulative native statistics, with their attribution catalog.
-    /// Returns native detail and its attribution, not a reconstruction from prior runs.
-    pub fn stats(&mut self) -> Result<super::RunReport, TypedError> {
-        select_report(self.stats_response()?, true)
+    /// Deliver the owned snapshots requested by Schedule::with_snapshots while
+    /// the schedule is still executing. Break cancels at a safe command boundary;
+    /// completed effects remain, and cancellation does not return a RunResult.
+    pub fn run_stream(
+        &mut self,
+        schedule: impl Into<super::Schedule>,
+        mut observe: impl FnMut(super::Snapshot) -> ControlFlow<()>,
+    ) -> Result<super::RunResult, TypedError> {
+        let mut packer = pack_schedule(schedule.into(), true)?;
+        let request = self.prepare_request(&mut packer, false)?;
+        let captures = self.captures.values().cloned().collect::<Vec<_>>();
+        let mut last = None;
+        let mut result = None;
+        let mut decode_error = None;
+        let mut observer_panic = None;
+        let (transport, cleanup) = {
+            let mut engine = self.lock_engine()?;
+            let transport = engine.run_stream(&request, &mut |chunk| {
+                let mut flow = ControlFlow::Continue(());
+                for output in &chunk.outputs {
+                    match &output.kind {
+                        Some(pb::command_output::Kind::Snapshot(export)) => {
+                            match super::Snapshot::from_export(export.clone(), captures.clone()) {
+                                Ok(snapshot) => {
+                                    // Finalize cancellation while the engine guard is
+                                    // healthy, then resume only this observer's panic.
+                                    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+                                        || observe(snapshot),
+                                    )) {
+                                        Ok(next) => flow = next,
+                                        Err(payload) => {
+                                            observer_panic = Some(payload);
+                                            flow = ControlFlow::Break(());
+                                        }
+                                    }
+                                }
+                                Err(error) => {
+                                    decode_error = Some(error);
+                                    flow = ControlFlow::Break(());
+                                }
+                            }
+                        }
+                        Some(pb::command_output::Kind::Run(value)) if result.is_none() => {
+                            result = Some(*value)
+                        }
+                        _ => {
+                            decode_error = Some(TypedError::Decode(
+                                "unexpected streamed schedule observation".into(),
+                            ));
+                            flow = ControlFlow::Break(());
+                        }
+                    }
+                    if flow.is_break() {
+                        break;
+                    }
+                }
+                last = Some(chunk);
+                flow
+            });
+            let cleanup = drain_discarded(&mut engine, &self.discarded);
+            (transport, cleanup)
+        };
+        if let Some(payload) = observer_panic {
+            if let Some(response) = last {
+                let _ = self.acknowledge(packer, &response, false);
+            }
+            std::panic::resume_unwind(payload);
+        }
+        if let Some(response) = last {
+            self.acknowledge(packer, &response, transport.is_ok())?;
+            if let Some(error) = decode_error {
+                return Err(error);
+            }
+            if let Some(error) = response.error {
+                return Err(TypedError::Engine(Box::new(error)));
+            }
+        }
+        cleanup?;
+        transport.map_err(|error| TypedError::Invalid(error.to_string()))?;
+        result.ok_or_else(|| TypedError::Decode("missing completed schedule result".into()))
     }
 
-    fn stats_response(&mut self) -> Result<pb::RunProgramResponse, TypedError> {
+    /// Observe cumulative backend diagnostics without executing a schedule.
+    pub fn stats(&mut self) -> Result<super::Diagnostic, TypedError> {
         let mut packer = Packer::default();
         packer.program.commands.push(pb::Command {
             kind: Some(pb::command::Kind::Stats(pb::Unit {})),
             ..Default::default()
         });
-        self.execute(packer, false)
+        let response = self.execute(packer, false)?;
+        let [output] = response.outputs.as_slice() else {
+            return Err(TypedError::Decode(
+                "missing or extra statistics observation".into(),
+            ));
+        };
+        if output
+            .location
+            .as_ref()
+            .is_none_or(|location| location.path != [0] || !location.iterations.is_empty())
+        {
+            return Err(TypedError::Decode("unexpected statistics location".into()));
+        }
+        let Some(pb::command_output::Kind::Diagnostic(diagnostic)) = &output.kind else {
+            return Err(TypedError::Decode(
+                "wrong statistics observation kind".into(),
+            ));
+        };
+        Ok(diagnostic.clone())
     }
 
     /// Observe independent logical state through Freeze bytes without evaluating roots.
@@ -667,10 +826,17 @@ impl EGraph {
     /// Retrieve accumulated accepted inputs; errors when recording is off.
     /// Retrieval adds no commands. Pop restores the saved history prefix.
     pub fn history(&self) -> Result<pb::Program, TypedError> {
-        let bytes = self
-            .engine
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner())
+        let mut engine = match self.engine.try_lock() {
+            Ok(engine) => engine,
+            Err(TryLockError::Poisoned(poison)) => poison.into_inner(),
+            Err(TryLockError::WouldBlock) => {
+                return Err(TypedError::Invalid(
+                    "byte engine is already executing".into(),
+                ));
+            }
+        };
+        drain_discarded(&mut engine, &self.discarded)?;
+        let bytes = engine
             .get_history(
                 &pb::GetHistoryRequest {
                     egraph_id: self.handle,
@@ -766,138 +932,96 @@ impl EGraph {
     }
 }
 
-// A high-level observation selects its natural result and validates all
-// required metrics here; consumers never interpret generic command outputs.
-fn select_report(
+// Pack one high-level schedule as a single control result, keeping AddRules
+// ordered before its selected groups and snapshots at the authored cadence.
+fn pack_schedule(schedule: super::Schedule, snapshots: bool) -> Result<Packer, TypedError> {
+    let mut pending = schedule.commands.iter().collect::<Vec<_>>();
+    while let Some(command) = pending.pop() {
+        match &command.kind {
+            Some(pb::command::Kind::Repeat(repeat)) => pending.extend(&repeat.body),
+            Some(pb::command::Kind::Saturate(saturate)) => pending.extend(&saturate.body),
+            Some(pb::command::Kind::Freeze(_)) if !snapshots => {
+                return Err(TypedError::Invalid(
+                    "snapshot schedules require run_stream".into(),
+                ));
+            }
+            _ => (),
+        }
+    }
+    let mut packer = Packer::default();
+    for group in schedule.rulesets {
+        if let Some(error) = group.1 {
+            return Err(TypedError::Invalid(error));
+        }
+        for addition in group.0 {
+            packer.intern(addition, 0);
+        }
+    }
+    packer.finish()?;
+    packer.program.commands.extend(schedule.commands);
+    if packer.program.commands.len() != 1
+        || !matches!(
+            packer.program.commands[0].kind,
+            Some(
+                pb::command::Kind::Run(_)
+                    | pb::command::Kind::Repeat(_)
+                    | pb::command::Kind::Saturate(_)
+            )
+        )
+    {
+        packer.program.commands = vec![pb::Command {
+            kind: Some(pb::command::Kind::Repeat(pb::Repeat {
+                body: std::mem::take(&mut packer.program.commands),
+                times: Some(1),
+                ..Default::default()
+            })),
+            ..Default::default()
+        }];
+    }
+    Ok(packer)
+}
+
+// The diagnostic is an opaque document, never a second source of control flags.
+fn select_run(
     response: pb::RunProgramResponse,
-    statistics: bool,
-) -> Result<super::RunReport, TypedError> {
-    let rules = response.rules;
-    let profile = response.profile;
+    diagnostics: bool,
+) -> Result<(pb::RunResult, Option<pb::Diagnostic>), TypedError> {
     let mut outputs = response.outputs.into_iter();
-    let output = outputs
+    let first = outputs
         .next()
-        .ok_or_else(|| TypedError::Decode("missing run report".into()))?;
-    if outputs.next().is_some()
-        || output
-            .location
-            .as_ref()
-            .is_none_or(|location| location.path != [0] || !location.iterations.is_empty())
+        .ok_or_else(|| TypedError::Decode("missing schedule result".into()))?;
+    if first
+        .location
+        .as_ref()
+        .is_none_or(|location| location.path != [0] || !location.iterations.is_empty())
     {
         return Err(TypedError::Decode(
-            "unexpected report observation location".into(),
+            "unexpected schedule result location".into(),
         ));
     }
-    let report = match output.kind {
-        Some(pb::command_output::Kind::Statistics(report)) if statistics => report,
-        Some(pb::command_output::Kind::Run(outcome)) if !statistics => {
-            let report = output
-                .run_report
-                .ok_or_else(|| TypedError::Decode("run detail is missing".into()))?;
-            if outcome.updated != report.updated || outcome.can_stop != report.can_stop {
-                return Err(TypedError::Decode(
-                    "run outcome disagrees with its report".into(),
-                ));
-            }
-            report
-        }
-        Some(pb::command_output::Kind::Loop(outcome)) if !statistics => {
-            let report = output
-                .run_report
-                .ok_or_else(|| TypedError::Decode("loop detail is missing".into()))?;
-            if outcome.updated != report.updated || outcome.termination.is_none() {
-                return Err(TypedError::Decode(
-                    "loop outcome disagrees with its report".into(),
-                ));
-            }
-            report
-        }
-        _ => return Err(TypedError::Decode("wrong report observation kind".into())),
+    let Some(pb::command_output::Kind::Run(result)) = first.kind else {
+        return Err(TypedError::Decode("wrong schedule result kind".into()));
     };
-    if report.updated && report.can_stop {
-        return Err(TypedError::Decode(
-            "updated report cannot permit stopping".into(),
-        ));
-    }
-    let duration = |value: Option<&pb::ReportDuration>| -> Result<(), TypedError> {
-        if value.is_none_or(|duration| duration.nanos >= 1_000_000_000) {
-            Err(TypedError::Decode(
-                "invalid required report duration".into(),
-            ))
-        } else {
-            Ok(())
+    let diagnostic = if diagnostics {
+        let next = outputs
+            .next()
+            .ok_or_else(|| TypedError::Decode("missing schedule diagnostic".into()))?;
+        if next.location != first.location {
+            return Err(TypedError::Decode(
+                "diagnostic location differs from its result".into(),
+            ));
         }
+        let Some(pb::command_output::Kind::Diagnostic(diagnostic)) = next.kind else {
+            return Err(TypedError::Decode("wrong schedule diagnostic kind".into()));
+        };
+        Some(diagnostic)
+    } else {
+        None
     };
-    for value in &report.search_and_apply_time_per_rule {
-        duration(value.value.as_ref())?;
+    if outputs.next().is_some() {
+        return Err(TypedError::Decode("extra schedule observations".into()));
     }
-    for (rule, direction) in report
-        .search_and_apply_time_per_rule
-        .iter()
-        .map(|entry| (entry.rule, entry.direction))
-        .chain(
-            report
-                .num_matches_per_rule
-                .iter()
-                .map(|entry| (entry.rule, entry.direction)),
-        )
-        .chain(
-            report
-                .iterations
-                .iter()
-                .flat_map(|iteration| iteration.rule_set_report.iter())
-                .flat_map(|report| &report.rule_reports)
-                .map(|entry| (entry.rule, entry.direction)),
-        )
-    {
-        if rule.is_some() != direction.is_some()
-            || rule.is_some_and(|index| index as usize >= rules.len())
-        {
-            return Err(TypedError::Decode("invalid report rule attribution".into()));
-        }
-    }
-    for value in report
-        .search_and_apply_time_per_ruleset
-        .iter()
-        .chain(&report.merge_time_per_ruleset)
-        .chain(&report.rebuild_time_per_ruleset)
-    {
-        duration(value.value.as_ref())?;
-    }
-    for iteration in &report.iterations {
-        duration(iteration.rebuild_time.as_ref())?;
-        let ruleset = iteration
-            .rule_set_report
-            .as_ref()
-            .ok_or_else(|| TypedError::Decode("missing iteration ruleset report".into()))?;
-        duration(ruleset.search_and_apply_time.as_ref())?;
-        duration(ruleset.merge_time.as_ref())?;
-        for entry in &ruleset.rule_reports {
-            for rule in &entry.reports {
-                duration(rule.search_and_apply_time.as_ref())?;
-                if let Some(plan) = &rule.plan {
-                    for stage in &plan.stages {
-                        if stage.kind.is_none()
-                            || stage
-                                .next
-                                .iter()
-                                .any(|next| *next as usize >= plan.stages.len())
-                        {
-                            return Err(TypedError::Decode("invalid report plan stage".into()));
-                        }
-                    }
-                }
-            }
-        }
-    }
-    Ok(super::RunReport {
-        detail: report,
-        rules,
-        nodes: response.nodes,
-        sorts: response.sorts,
-        files: response.files,
-        profile,
-    })
+    Ok((result, diagnostic))
 }
 
 // Adopt only the selected inert term closure. Other response nodes can be
@@ -1076,6 +1200,19 @@ fn adopt(
 mod tests {
     use super::*;
     use crate::typed::Ruleset;
+
+    fn diagnostic_matches(diagnostic: &pb::Diagnostic) -> u64 {
+        assert_eq!(diagnostic.format, "application/vnd.egglog.run-report+json");
+        let value: serde_json::Value = serde_json::from_str(&diagnostic.content).unwrap();
+        assert!(value.get("updated").is_none());
+        assert!(value.get("can_stop").is_none());
+        value["num_matches_per_rule"]
+            .as_object()
+            .unwrap()
+            .values()
+            .map(|value| value.as_u64().unwrap())
+            .sum()
+    }
 
     fn pack_run(group: &Ruleset) -> Packer {
         let schedule = super::super::Schedule::from(group);
@@ -1560,7 +1697,7 @@ mod tests {
                 subsume(&left),
             );
             if in_rule {
-                graph.run_response(ruleset(rule((), actions))).unwrap();
+                graph.run(ruleset(rule((), actions))).unwrap();
             } else {
                 graph.register(actions).unwrap();
             }
@@ -1573,7 +1710,7 @@ mod tests {
                     response
                         .outputs
                         .iter()
-                        .any(|out| matches!(&out.kind, Some(pb::command_output::Kind::Loop(_))))
+                        .any(|out| matches!(&out.kind, Some(pb::command_output::Kind::Run(_))))
                 );
             }
             let program = request.program.as_mut().unwrap();
@@ -1876,11 +2013,7 @@ mod tests {
         assert!(graph.register((set(CaptureRead(9), 9), &forged)).is_err());
         assert!(graph.extract(&forged).is_err());
         assert!(graph.check(&forged).is_err());
-        assert!(
-            graph
-                .run_response(ruleset(rule((), set(&forged, 7))))
-                .is_err()
-        );
+        assert!(graph.run(ruleset(rule((), set(&forged, 7)))).is_err());
         assert!(!graph.check(CaptureRead(9)).unwrap());
         let prefix = I64::from_expression(Expr::call(
             &super::super::decl::Callable::function(
@@ -2041,7 +2174,6 @@ mod tests {
                 &pb::RunProgramRequest {
                     egraph_id: graph.handle,
                     program: Some(definitions),
-                    profile: true,
                     ..Default::default()
                 }
                 .encode_to_vec(),
@@ -2115,7 +2247,7 @@ mod tests {
         let child = ruleset((&base, rule(Fact(value), I64::from(7) + I64::from(8))));
         let inner = ruleset((&child, &child, rule((), I64::from(9))));
         let mut graph = EGraph::default();
-        graph.run_response(&base).unwrap();
+        graph.run(&base).unwrap();
         let baseline = observations(&graph);
         let original = graph.handle;
         let engine = graph.engine.clone();
@@ -2125,12 +2257,12 @@ mod tests {
         graph.push().unwrap();
         let middle = graph.handle;
         assert_eq!(graph.scopes[0].handle, original);
-        graph.run_response(&child).unwrap();
+        graph.run(&child).unwrap();
         assert!(graph.declarations.len() > baseline.len());
         let child_state = observations(&graph);
         graph.push().unwrap();
         let active = graph.handle;
-        graph.run_response(&inner).unwrap();
+        graph.run(&inner).unwrap();
         graph.pop().unwrap();
         assert_eq!(graph.handle, middle);
         assert_eq!(observations(&graph), child_state);
@@ -2153,7 +2285,7 @@ mod tests {
                 "Return already consumed the child"
             );
         }
-        graph.run_response(&inner).unwrap();
+        graph.run(&inner).unwrap();
         assert!(graph.declarations.len() > baseline.len());
         graph.push().unwrap();
         graph.push().unwrap();
@@ -2175,7 +2307,7 @@ mod tests {
                 "Drop discarded every owned handle"
             );
         }
-        independent.run_response(&inner).unwrap();
+        independent.run(&inner).unwrap();
     }
 
     #[test]
@@ -2184,7 +2316,7 @@ mod tests {
         let group = ruleset(());
         let mut graph = EGraph::default();
         graph.push().unwrap();
-        graph.run_response(&group).unwrap();
+        graph.run(&group).unwrap();
         let active = graph.handle;
         let saved = graph.scopes[0].handle;
         // Test-only access violates the private saved-frame invariant, exercising
@@ -2199,8 +2331,7 @@ mod tests {
                     program: Some(pb::Program {
                         ..Default::default()
                     }),
-                    profile: true,
-                    include_run_reports: false,
+                    diagnostics: false,
                 }
                 .encode_to_vec(),
             )
@@ -2217,7 +2348,7 @@ mod tests {
         assert_eq!(graph.scopes.len(), 1);
         assert_eq!(graph.scopes[0].handle, saved);
         assert!(graph.usable);
-        graph.run_response(&group).unwrap();
+        graph.run(&group).unwrap();
     }
 
     #[test]
@@ -2225,7 +2356,7 @@ mod tests {
         use super::super::ruleset;
         let group = ruleset(());
         let mut graph = EGraph::default();
-        graph.run_response(&group).unwrap();
+        graph.run(&group).unwrap();
         graph.push().unwrap();
         let pending = pack_run(&ruleset(()));
         assert!(matches!(
@@ -2234,7 +2365,7 @@ mod tests {
         ));
         for error in [
             graph.push().unwrap_err(),
-            graph.run_response(&group).unwrap_err(),
+            graph.run(&group).unwrap_err(),
             graph.try_clone().err().expect("unusable cannot clone"),
         ] {
             assert!(matches!(error, TypedError::Invalid(message)
@@ -2243,7 +2374,7 @@ mod tests {
         assert_eq!(graph.scopes.len(), 1);
         graph.pop().unwrap();
         assert!(graph.usable);
-        graph.run_response(&group).unwrap();
+        graph.run(&group).unwrap();
         graph.push().unwrap();
         let active = graph.handle;
         let saved = graph.scopes[0].handle;
@@ -2267,313 +2398,6 @@ mod tests {
     }
 
     #[test]
-    fn typed_scope_failed_prefix_restores_logic_but_retains_native_statistics() {
-        use super::super::{builtins::I64, rule, rule::Fact, ruleset};
-        for preinstalled in [true, false] {
-            let value = Expr::call(
-                &Callable::constructor(
-                    "Scope.Done",
-                    vec![],
-                    SortRef::equality("Scope"),
-                    None,
-                    false,
-                ),
-                vec![],
-            );
-            let group = ruleset(rule(Fact(value.clone()), I64::from(7)));
-            let mut graph = EGraph::default();
-            if preinstalled {
-                graph.run_response(&group).unwrap();
-            }
-            graph.push().unwrap();
-            let mut packer = pack_run(&group);
-            let root = packer.intern(value.0.clone(), 0);
-            packer.program.commands.insert(
-                0,
-                pb::Command {
-                    kind: Some(pb::command::Kind::Action(pb::Action {
-                        kind: Some(pb::action::Kind::Term(root)),
-                        ..Default::default()
-                    })),
-                    ..Default::default()
-                },
-            );
-            packer.program.commands.push(pb::Command {
-                kind: Some(pb::command::Kind::Action(pb::Action {
-                    kind: Some(pb::action::Kind::Panic("scoped failure after Run".into())),
-                    ..Default::default()
-                })),
-                ..Default::default()
-            });
-            let Err(TypedError::Engine(error)) = graph.execute(packer, true) else {
-                panic!("expected scoped execution failure after actual work")
-            };
-            assert_eq!(error.code, pb::ErrorCode::Panic as i32);
-            assert_eq!(error.location.as_ref().unwrap().path, [3]);
-            assert!(graph.usable, "ordinary error remains retryable");
-            assert!(graph.check(Fact(value.clone())).unwrap());
-            let before = graph.stats_response().unwrap();
-            let Some(pb::command_output::Kind::Statistics(before_report)) = &before.outputs[0].kind
-            else {
-                panic!("missing scoped statistics")
-            };
-            assert!(!before_report.iterations.is_empty());
-            assert_eq!(
-                before_report
-                    .num_matches_per_rule
-                    .iter()
-                    .map(|r| r.value)
-                    .sum::<u64>(),
-                1
-            );
-            graph.pop().unwrap();
-            assert!(!graph.check(Fact(value)).unwrap());
-            let after = graph.stats_response().unwrap();
-            let Some(pb::command_output::Kind::Statistics(after_report)) = &after.outputs[0].kind
-            else {
-                panic!("missing restored statistics")
-            };
-            if preinstalled {
-                assert_eq!(
-                    after.outputs, before.outputs,
-                    "every native field survives pop"
-                );
-                assert_eq!(after.rules, before.rules);
-            } else {
-                assert_eq!(
-                    after_report.iterations.len(),
-                    before_report.iterations.len()
-                );
-                assert_eq!(
-                    after_report
-                        .num_matches_per_rule
-                        .iter()
-                        .map(|r| (&r.native_name, r.value))
-                        .collect::<Vec<_>>(),
-                    before_report
-                        .num_matches_per_rule
-                        .iter()
-                        .map(|r| (&r.native_name, r.value))
-                        .collect::<Vec<_>>()
-                );
-                assert!(
-                    after_report
-                        .num_matches_per_rule
-                        .iter()
-                        .all(|r| r.rule.is_none() && r.direction.is_none())
-                );
-                assert!(after.rules.is_empty(), "no child-only attribution journal");
-            }
-            // Exact same-handle native getter, including all fields/attribution;
-            // the two requests' own profiling times are separate measurements.
-            let request = &graph.last_wire.as_ref().unwrap().0;
-            let direct = graph.engine.lock().unwrap().run(request).unwrap();
-            let direct = pb::RunProgramResponse::decode(direct.as_slice()).unwrap();
-            assert!(direct.error.is_none());
-            assert_eq!(after.outputs, direct.outputs);
-            assert_eq!(after.rules, direct.rules);
-            graph.run_response(&group).unwrap();
-        }
-    }
-
-    #[test]
-    fn typed_report_run_is_the_actual_decoded_response() {
-        use super::super::{builtins::I64, rule, ruleset};
-        let group = ruleset(rule((), I64::from(7)));
-        let mut graph = EGraph::default();
-        let mut detail_off = graph.try_clone().unwrap();
-        let response = graph.run_response(&group).unwrap();
-        let (input, output) = graph.last_wire.as_ref().unwrap();
-        assert_eq!(
-            pb::RunProgramResponse::decode(output.as_slice()).unwrap(),
-            response
-        );
-        let request = pb::RunProgramRequest::decode(input.as_slice()).unwrap();
-        assert!(request.profile);
-        assert!(response.profile.as_ref().unwrap().complete);
-        let [output] = response.outputs.as_slice() else {
-            panic!("one requested Run output")
-        };
-        let Some(pb::command_output::Kind::Loop(outcome)) = &output.kind else {
-            panic!("missing registration/schedule outcome")
-        };
-        let report = output
-            .run_report
-            .as_ref()
-            .expect("typed Run requests actual native detail");
-        assert!(request.include_run_reports);
-        assert_eq!(report.updated, outcome.updated);
-        assert!(!report.iterations.is_empty());
-        assert_eq!(
-            report
-                .num_matches_per_rule
-                .iter()
-                .map(|row| row.value)
-                .sum::<u64>(),
-            1
-        );
-        for row in &report.num_matches_per_rule {
-            let attribution =
-                &response.rules[row.rule.expect("authored rule attribution") as usize];
-            assert!(matches!(attribution.kind, Some(pb::rule::Kind::Rule(_))));
-            assert_eq!(row.direction, Some(pb::NativeRuleDirection::Single as i32));
-        }
-        let mut packer = pack_run(&group);
-        packer.program.commands = vec![pb::Command {
-            kind: Some(pb::command::Kind::Repeat(pb::Repeat {
-                body: std::mem::take(&mut packer.program.commands),
-                times: Some(1),
-                ..Default::default()
-            })),
-            ..Default::default()
-        }];
-        let off = detail_off.execute(packer, false).unwrap();
-        assert_eq!(off.outputs[0].kind, output.kind);
-        assert!(off.outputs[0].run_report.is_none());
-        assert!(off.profile.as_ref().unwrap().complete);
-        assert_eq!(
-            off.profile
-                .as_ref()
-                .unwrap()
-                .runs
-                .iter()
-                .flat_map(|run| &run.rules)
-                .map(|rule| rule.matches)
-                .collect::<Vec<_>>(),
-            response
-                .profile
-                .as_ref()
-                .unwrap()
-                .runs
-                .iter()
-                .flat_map(|run| &run.rules)
-                .map(|rule| rule.matches)
-                .collect::<Vec<_>>()
-        );
-        let stats = detail_off.stats_response().unwrap();
-        assert!(matches!(&stats.outputs[0].kind,
-            Some(pb::command_output::Kind::Statistics(report)) if !report.iterations.is_empty()));
-        let request =
-            pb::RunProgramRequest::decode(detail_off.last_wire.as_ref().unwrap().0.as_slice())
-                .unwrap();
-        assert!(!request.include_run_reports);
-        assert!(matches!(
-            request.program.unwrap().commands[0].kind,
-            Some(pb::command::Kind::Stats(_))
-        ));
-    }
-
-    #[test]
-    fn typed_report_stats_keeps_actual_failed_prefix_and_same_handle_fields() {
-        use super::super::{builtins::I64, rule, ruleset};
-        let group = ruleset(rule((), I64::from(7)));
-        let value = Expr::call(
-            &Callable::constructor(
-                "Report.Done",
-                vec![],
-                SortRef::equality("Report"),
-                None,
-                false,
-            ),
-            vec![],
-        );
-        let mut graph = EGraph::default();
-        let mut packer = pack_run(&group);
-        let root = packer.intern(value.0.clone(), 0);
-        packer.program.commands.insert(
-            0,
-            pb::Command {
-                kind: Some(pb::command::Kind::Action(pb::Action {
-                    kind: Some(pb::action::Kind::Term(root)),
-                    ..Default::default()
-                })),
-                ..Default::default()
-            },
-        );
-        packer.program.commands.push(pb::Command {
-            kind: Some(pb::command::Kind::Action(pb::Action {
-                kind: Some(pb::action::Kind::Panic("after actual Run".into())),
-                ..Default::default()
-            })),
-            ..Default::default()
-        });
-        let Err(TypedError::Engine(error)) = graph.execute(packer, true) else {
-            panic!("expected execution failure after prefix")
-        };
-        assert_eq!(error.code, pb::ErrorCode::Panic as i32);
-        assert_eq!(error.location.as_ref().unwrap().path, [3]);
-        let prefix =
-            pb::RunProgramResponse::decode(graph.last_wire.as_ref().unwrap().1.as_slice()).unwrap();
-        assert!(!prefix.profile.as_ref().unwrap().complete);
-        assert!(
-            !prefix.outputs[0]
-                .run_report
-                .as_ref()
-                .unwrap()
-                .iterations
-                .is_empty()
-        );
-        assert!(graph.usable);
-        assert!(graph.check(super::super::rule::Fact(value)).unwrap());
-        let observed = graph.stats_response().unwrap();
-        let (request, output) = graph.last_wire.as_ref().unwrap();
-        assert_eq!(
-            pb::RunProgramResponse::decode(output.as_slice()).unwrap(),
-            observed
-        );
-        let request = pb::RunProgramRequest::decode(request.as_slice()).unwrap();
-        assert!(request.profile);
-        assert!(!request.include_run_reports);
-        assert!(matches!(
-            request.program.as_ref().unwrap().commands[0].kind,
-            Some(pb::command::Kind::Stats(_))
-        ));
-        let Some(pb::command_output::Kind::Statistics(report)) = &observed.outputs[0].kind else {
-            panic!("missing actual statistics")
-        };
-        assert!(!report.iterations.is_empty());
-        assert_eq!(
-            report
-                .num_matches_per_rule
-                .iter()
-                .map(|row| row.value)
-                .sum::<u64>(),
-            1
-        );
-        // Repeat the exact request on the same handle: Stats performs no new
-        // rule work. Request-profile timings are separate observations, whereas
-        // every retained native report field and attribution must agree.
-        let direct = graph
-            .engine
-            .lock()
-            .unwrap()
-            .run(&request.encode_to_vec())
-            .unwrap();
-        let direct = pb::RunProgramResponse::decode(direct.as_slice()).unwrap();
-        assert_eq!(observed.outputs, direct.outputs);
-        assert_eq!(observed.rules, direct.rules);
-        assert!(direct.error.is_none());
-        let recovered = graph.run_response(&group).unwrap();
-        assert!(recovered.profile.unwrap().complete);
-
-        // Decoder-only negative fixture: an unclassified native diagnostic key
-        // is not made into an authored identity. This is not a producer claim.
-        let mut unknown = observed;
-        let Some(pb::command_output::Kind::Statistics(report)) = &mut unknown.outputs[0].kind
-        else {
-            unreachable!()
-        };
-        let row = &mut report.num_matches_per_rule[0];
-        row.native_name = "unclassified-native-row".into();
-        row.rule = None;
-        row.direction = None;
-        let accepted = graph
-            .accept_response(Packer::default(), &unknown.encode_to_vec())
-            .unwrap();
-        assert_eq!(accepted, unknown);
-    }
-
-    #[test]
     fn typed_report_stats_rejects_poisoned_transport() {
         let mut graph = EGraph::default();
         let engine = graph.engine.clone();
@@ -2586,7 +2410,7 @@ mod tests {
             .is_err()
         );
         assert!(
-            matches!(graph.stats_response(), Err(TypedError::Invalid(message)) if message == "byte engine mutex poisoned")
+            matches!(graph.stats(), Err(TypedError::Invalid(message)) if message == "byte engine mutex poisoned")
         );
         assert!(graph.last_wire.is_none());
     }
@@ -2597,22 +2421,12 @@ mod tests {
         let group = ruleset(rule((), I64::from(7)).label("first"));
         let equal = ruleset(rule((), I64::from(7)).label("later"));
         let mut graph = EGraph::default();
-        graph.run(&group).unwrap();
+        let (_, diagnostic) = graph.run_with_diagnostics(&group).unwrap();
+        assert_eq!(diagnostic_matches(&diagnostic), 1);
         let mut cloned = graph.try_clone().unwrap();
         for current in [&mut graph, &mut cloned] {
-            let report = current.run(&equal).unwrap();
-            assert_eq!(
-                report
-                    .detail
-                    .num_matches_per_rule
-                    .iter()
-                    .map(|r| r.value)
-                    .sum::<u64>(),
-                0
-            );
-            let cumulative = current.stats().unwrap();
-            assert_eq!(cumulative.rules.len(), 1);
-            assert_eq!(cumulative.rules[0].name.as_deref(), Some("first"));
+            let (_, diagnostic) = current.run_with_diagnostics(&equal).unwrap();
+            assert_eq!(diagnostic_matches(&diagnostic), 0);
         }
         drop(graph);
         cloned.run(&group).unwrap();
@@ -2631,6 +2445,228 @@ mod tests {
         assert!(graph.try_clone().is_err());
         graph.pop().unwrap();
         graph.run(ruleset(())).unwrap();
+    }
+
+    #[test]
+    fn run_flags_and_opt_in_diagnostic_are_the_actual_wire_observations() {
+        use super::super::{builtins::I64, rule, ruleset};
+        let group = ruleset(rule((), I64::from(7)));
+        let mut graph = EGraph::default();
+        let (result, diagnostic) = graph.run_with_diagnostics(&group).unwrap();
+        let (input, output) = graph.last_wire.as_ref().unwrap();
+        assert!(
+            pb::RunProgramRequest::decode(input.as_slice())
+                .unwrap()
+                .diagnostics
+        );
+        let response = pb::RunProgramResponse::decode(output.as_slice()).unwrap();
+        let [control, detail] = response.outputs.as_slice() else {
+            panic!("one result and one diagnostic")
+        };
+        assert_eq!(control.kind, Some(pb::command_output::Kind::Run(result)));
+        assert_eq!(
+            detail.kind,
+            Some(pb::command_output::Kind::Diagnostic(diagnostic.clone()))
+        );
+        assert_eq!(control.location, detail.location);
+        assert_eq!(diagnostic_matches(&diagnostic), 1);
+        graph.run(&group).unwrap();
+        let (input, output) = graph.last_wire.as_ref().unwrap();
+        assert!(
+            !pb::RunProgramRequest::decode(input.as_slice())
+                .unwrap()
+                .diagnostics
+        );
+        let response = pb::RunProgramResponse::decode(output.as_slice()).unwrap();
+        assert!(matches!(
+            response.outputs.as_slice(),
+            [pb::CommandOutput {
+                kind: Some(pb::command_output::Kind::Run(_)),
+                ..
+            }]
+        ));
+        let stats = graph.stats().unwrap();
+        assert_eq!(diagnostic_matches(&stats), 1);
+        let request = graph.last_wire.as_ref().unwrap().0.clone();
+        let direct = graph.engine.lock().unwrap().run(&request).unwrap();
+        let direct = pb::RunProgramResponse::decode(direct.as_slice()).unwrap();
+        assert_eq!(
+            direct.outputs[0].kind,
+            Some(pb::command_output::Kind::Diagnostic(stats))
+        );
+    }
+
+    fn stream_counter() -> super::super::builtins::I64 {
+        use super::super::{builtins::I64, decl::Callable};
+        I64::from_expression(Expr::call(
+            &Callable::function(
+                "StreamCounter",
+                vec![],
+                I64::sort_ref(),
+                Some(|_: Expr, new: Expr| new),
+            ),
+            vec![],
+        ))
+    }
+
+    #[test]
+    fn failed_scoped_prefix_restores_data_and_keeps_collected_diagnostics() {
+        use super::super::{eq, rule, ruleset, set};
+        let counter = stream_counter();
+        let group = ruleset(rule(eq(&counter, 0), set(&counter, 1)));
+        let mut graph = EGraph::default();
+        graph.register(set(&counter, 0)).unwrap();
+        graph.push().unwrap();
+        let (_, diagnostic) = graph.run_with_diagnostics(&group).unwrap();
+        assert_eq!(diagnostic_matches(&diagnostic), 1);
+        let mut fail = Packer::default();
+        fail.program.commands.push(pb::Command {
+            kind: Some(pb::command::Kind::Action(pb::Action {
+                kind: Some(pb::action::Kind::Panic("after collected work".into())),
+                ..Default::default()
+            })),
+            ..Default::default()
+        });
+        assert!(matches!(
+            graph.execute(fail, false),
+            Err(TypedError::Engine(_))
+        ));
+        assert!(graph.check(eq(&counter, 1)).unwrap());
+        graph.pop().unwrap();
+        assert!(graph.check(eq(&counter, 0)).unwrap());
+        assert_eq!(diagnostic_matches(&graph.stats().unwrap()), 1);
+        graph.run(&group).unwrap();
+        assert!(graph.check(eq(&counter, 1)).unwrap());
+    }
+
+    #[test]
+    fn snapshots_are_live_owned_and_cancellation_releases_callback_dropped_clones() {
+        use super::super::{Schedule, builtins::I64, eq, let_, rule, ruleset, set};
+        let counter = stream_counter();
+        let group = ruleset((
+            rule(eq(&counter, 0), set(&counter, 1)),
+            rule(eq(&counter, 1), set(&counter, 2)),
+            rule(eq(&counter, 2), I64::from(1) / I64::from(0)),
+        ));
+        let mut graph = EGraph::with_recording(true).unwrap();
+        let capture = let_("initial", &counter);
+        graph.register((set(&counter, 0), &capture)).unwrap();
+        let mut dropped = Some(graph.try_clone().unwrap());
+        let dropped_handle = dropped.as_ref().unwrap().handle;
+        let mut other = graph.try_clone().unwrap();
+        let mut snapshots = vec![];
+        let error = graph.run_stream(Schedule::from(&group).with_snapshots().repeat(3), |snapshot| {
+            assert!(matches!(other.check(eq(&counter, 0)), Err(TypedError::Invalid(message)) if message == "byte engine is already executing"));
+            drop(dropped.take());
+            let observed = snapshot.lookup(&capture).unwrap();
+            assert_eq!(i64::try_from(&observed).unwrap(), 0);
+            snapshots.push(snapshot);
+            ControlFlow::Break(())
+        }).unwrap_err();
+        assert!(
+            matches!(error, TypedError::Invalid(message) if message.contains("execution cancelled"))
+        );
+        assert_eq!(snapshots.len(), 1);
+        assert_eq!(
+            i64::try_from(&graph.extract(&counter).unwrap()).unwrap(),
+            1,
+            "second iteration did not run before first snapshot delivery"
+        );
+        assert!(graph.discarded.lock().unwrap().is_empty());
+        assert!(
+            graph
+                .engine
+                .lock()
+                .unwrap()
+                .clone_egraph(
+                    &pb::CloneEGraphRequest {
+                        egraph_id: dropped_handle
+                    }
+                    .encode_to_vec()
+                )
+                .is_err()
+        );
+        assert!(graph.history().unwrap().commands.len() >= 2);
+        other.check(eq(&counter, 0)).unwrap();
+        drop(graph);
+        assert!(
+            snapshots[0].rows().next().is_some(),
+            "views outlive the executing graph"
+        );
+    }
+
+    #[test]
+    fn observer_unwind_preserves_sibling_reuse_and_drains_callback_drops() {
+        use super::super::{Schedule, eq, rule, ruleset, set};
+        let mut graph = EGraph::new().unwrap();
+        let counter = stream_counter();
+        graph.register(set(&counter, 0)).unwrap();
+        let mut sibling = graph.try_clone().unwrap();
+        let mut discarded = Some(graph.try_clone().unwrap());
+        let discarded_handle = discarded.as_ref().unwrap().handle;
+        let group = ruleset(rule(eq(&counter, 0), set(&counter, 1)));
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = graph.run_stream(Schedule::from(&group).with_snapshots().repeat(3), |_| {
+                drop(discarded.take());
+                std::panic::panic_any("observer witness");
+            });
+        }))
+        .unwrap_err();
+        assert_eq!(panic.downcast_ref::<&str>(), Some(&"observer witness"));
+        assert!(graph.check(eq(&counter, 1)).unwrap());
+        assert!(sibling.check(eq(&counter, 0)).unwrap());
+        assert!(graph.discarded.lock().unwrap().is_empty());
+        assert!(
+            graph
+                .lock_engine()
+                .unwrap()
+                .clone_egraph(
+                    &pb::CloneEGraphRequest {
+                        egraph_id: discarded_handle
+                    }
+                    .encode_to_vec(),
+                )
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn streamed_snapshots_keep_failure_prefix_and_explicit_observation_cadence() {
+        use super::super::{Schedule, builtins::I64, eq, rule, ruleset, set};
+        let counter = stream_counter();
+        let group = ruleset((
+            rule(eq(&counter, 0), set(&counter, 1)),
+            rule(eq(&counter, 1), set(&counter, 2)),
+            rule(eq(&counter, 2), I64::from(1) / I64::from(0)),
+        ));
+        let mut graph = EGraph::default();
+        graph.register(set(&counter, 0)).unwrap();
+        let mut snapshots = vec![];
+        let error = graph
+            .run_stream(
+                Schedule::from(&group).with_snapshots().repeat(3),
+                |snapshot| {
+                    snapshots.push(snapshot);
+                    ControlFlow::Continue(())
+                },
+            )
+            .unwrap_err();
+        assert!(matches!(error, TypedError::Engine(_)));
+        assert_eq!(snapshots.len(), 2);
+        assert_eq!(i64::try_from(&graph.extract(&counter).unwrap()).unwrap(), 2);
+        let empty = ruleset(());
+        let mut count = 0;
+        graph
+            .run_stream(Schedule::from(&empty).repeat(3).with_snapshots(), |_| {
+                count += 1;
+                ControlFlow::Continue(())
+            })
+            .unwrap();
+        assert_eq!(
+            count, 1,
+            "observation belongs after the chosen whole schedule"
+        );
+        assert!(graph.run(Schedule::from(&empty).with_snapshots()).is_err());
     }
 
     #[test]
@@ -2964,8 +3000,7 @@ mod tests {
         let request = pb::RunProgramRequest {
             egraph_id: graph.handle,
             program: Some(program),
-            profile: true,
-            include_run_reports: false,
+            diagnostics: false,
         }
         .encode_to_vec();
         let bytes = graph.engine.lock().unwrap().run(&request).unwrap();
@@ -2973,7 +3008,6 @@ mod tests {
         let error = response.error.as_ref().unwrap();
         assert_eq!(error.code, pb::ErrorCode::EvaluationFailed as i32);
         assert_eq!(error.location.as_ref().unwrap().path, [4]);
-        assert!(!response.profile.as_ref().unwrap().complete);
         assert_eq!(response.outputs.len(), 2);
         let Some(pb::command_output::Kind::Extraction(extraction)) = &response.outputs[0].kind
         else {
@@ -3010,8 +3044,7 @@ mod tests {
                         commands: vec![table],
                         ..Default::default()
                     }),
-                    profile: true,
-                    include_run_reports: false,
+                    diagnostics: false,
                 }
                 .encode_to_vec(),
             )
@@ -4367,7 +4400,7 @@ mod tests {
             .unwrap();
         observe(&mut graph, ne(&left, &right), true);
         observe(&mut graph, ne(&left_vec, &right_vec), true);
-        graph.run_response(ruleset(rewrite(&left, &right))).unwrap();
+        graph.run(ruleset(rewrite(&left, &right))).unwrap();
         observe(&mut graph, ne(&left, &right), false);
         observe(&mut graph, ne(&left_vec, &right_vec), false);
         assert_ne!(left, right);
@@ -4468,7 +4501,7 @@ mod tests {
         let (input, output) = graph.last_wire.as_ref().unwrap();
         let request = pb::RunProgramRequest::decode(input.as_slice()).unwrap();
         assert_eq!(request.egraph_id, graph.handle);
-        assert!(request.profile);
+        assert!(!request.diagnostics);
         assert!(
             matches!(&request.program.unwrap().nodes[root as usize].kind, Some(pb::node::Kind::Call(c)) if c.func == "ByteWitness.Leaf")
         );
@@ -4489,7 +4522,7 @@ mod tests {
         let mut graph = EGraph::default();
         for explicit in ["chosen", "", "__typed_ruleset_3"] {
             let group = named_ruleset(|| Some(explicit.into()), (&child, &child));
-            graph.run_response(group).unwrap();
+            graph.run(group).unwrap();
             let request =
                 pb::RunProgramRequest::decode(graph.last_wire.as_ref().unwrap().0.as_slice())
                     .unwrap();

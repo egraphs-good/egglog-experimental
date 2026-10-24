@@ -9,23 +9,6 @@ from gen.python.egglog.v1 import egglog_pb as ir
 
 
 class ResourceSchemaTests(unittest.TestCase):
-    def test_report_level_is_an_optional_validated_creation_setting(self):
-        for level in (None, ir.ReportLevel.TIME_ONLY, ir.ReportLevel.WITH_PLAN, ir.ReportLevel.STAGE_INFO):
-            request = ir.CreateEGraphRequest(
-                sorts=[ir.Sort(kind=Oneof("family", ir.HostSort(name="i64")))],
-                options=ir.EGraphOptions(cost_sort=0), report_level=level,
-            )
-            validate(request)
-            decoded = type(request).from_binary(request.to_binary())
-            self.assertEqual(decoded, request)
-            self.assertEqual(decoded.has_field("report_level"), level is not None)
-        for level in (0, 99):
-            with self.subTest(level=level), self.assertRaises(ValidationError):
-                validate(ir.CreateEGraphRequest(
-                    sorts=[ir.Sort(kind=Oneof("family", ir.HostSort(name="i64")))],
-                    options=ir.EGraphOptions(cost_sort=0), report_level=level,
-                ))
-
     def test_creation_separates_nominal_and_host_family_names(self):
         nominal = ir.Declaration(kind=Oneof("eq_sort", ir.EqSort(name="Pair")))
         family = ir.Declaration(kind=Oneof("host_sort_family", ir.HostSortFamily(name="Pair", arity=2)))
@@ -78,7 +61,6 @@ class ResourceSchemaTests(unittest.TestCase):
         request = ir.CreateEGraphRequest(
             sorts=[ir.Sort(kind=Oneof("family", ir.HostSort(name="i64")))],
             options=ir.EGraphOptions(cost_sort=0), threads=0, no_decomp=True,
-            report_level=ir.ReportLevel.WITH_PLAN,
         )
         validate(request)
         self.assertEqual(type(request).from_binary(request.to_binary()), request)

@@ -462,7 +462,8 @@ pub(super) fn source_phase_refs(
                 | pb::command::Kind::PrintFunction(_)
                 | pb::command::Kind::PrintTableStats(_)
                 | pb::command::Kind::ProveExists(_)
-                | pb::command::Kind::Stats(_),
+                | pb::command::Kind::Stats(_)
+                | pb::command::Kind::Explain(_),
             )
             | None => (),
         }
@@ -618,13 +619,7 @@ pub fn produce_input(
         .map_err(|error| TransportError(error.0.message))?;
     compiler
         .session
-        .install(
-            prepared,
-            &mut pb::RunProgramResponse {
-                profile: Some(pb::ProfileSummary::default()),
-                ..Default::default()
-            },
-        )
+        .install(prepared, &mut pb::RunProgramResponse::default())
         .map_err(|error| TransportError(error.message))?;
     let signature = compiler
         .session
@@ -3899,20 +3894,19 @@ impl Renderer {
             let constructors: HashMap<_, _> = prepared
                 .installations
                 .iter()
-                .filter_map(
-                    |installation| match (&installation.site, &installation.command) {
-                        (
-                            pb::maintenance_site::Target::Declaration(index),
-                            Some(Command::Constructor { name, .. }),
-                        ) => Some((*index, name.clone())),
+                .filter_map(|installation| {
+                    match (installation.source_declaration, &installation.command) {
+                        (Some(index), Some(Command::Constructor { name, .. })) => {
+                            Some((index, name.clone()))
+                        }
                         _ => None,
-                    },
-                )
+                    }
+                })
                 .collect();
             for installation in &prepared.installations {
                 if installation.declaration.is_none()
-                    && let pb::maintenance_site::Target::Declaration(index) = &installation.site
-                    && let Some(constructor) = constructors.get(index)
+                    && let Some(index) = installation.source_declaration
+                    && let Some(constructor) = constructors.get(&index)
                     && let Some(Command::Function {
                         name, hidden: true, ..
                     }) = &installation.command
@@ -3976,21 +3970,12 @@ impl Renderer {
         // Adopt neither that state nor its private-name stamp on failed render.
         let mut session = self.session.clone();
         let mut context = session
-            .install(
-                prepared,
-                &mut pb::RunProgramResponse {
-                    profile: Some(pb::ProfileSummary::default()),
-                    ..Default::default()
-                },
-            )
+            .install(prepared, &mut pb::RunProgramResponse::default())
             .map_err(|error| TransportError(error.message))?;
         // Retain inert definitions only, never scheduler work. Preparation of
         // the next phase reads this same native binding metadata. The cloned
         // Session is adopted only after text and all registrations succeeded.
-        let mut response = pb::RunProgramResponse {
-            profile: Some(pb::ProfileSummary::default()),
-            ..Default::default()
-        };
+        let mut response = pb::RunProgramResponse::default();
         for command in &lowered.commands {
             if let Some(pb::command::Kind::BindScheduler(bind)) = &command.kind {
                 let (scheduler, resource_limited) =
@@ -4029,6 +4014,10 @@ impl Renderer {
                             },
                             &mut response,
                             &mut None,
+                            &mut OutputStream {
+                                emit: &mut |_| ControlFlow::Continue(()),
+                                cancelled: false,
+                            },
                         )
                         .map_err(|error| TransportError(error.to_string()))?;
                 }

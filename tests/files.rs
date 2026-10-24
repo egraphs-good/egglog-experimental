@@ -1023,8 +1023,7 @@ impl ProtoRun {
                                         &pb::RunProgramRequest {
                                             egraph_id,
                                             program: Some(program.clone()),
-                                            profile: true,
-                                            include_run_reports: false,
+                                            diagnostics: false,
                                         }
                                         .encode_to_vec(),
                                     )?;
@@ -1098,8 +1097,7 @@ impl ProtoRun {
                     let request = pb::RunProgramRequest {
                         egraph_id,
                         program: Some(phase),
-                        profile: true,
-                        include_run_reports: false,
+                        diagnostics: false,
                     };
                     let bytes = engine
                         .run(&request.encode_to_vec())
@@ -1741,8 +1739,7 @@ fn partial_call_oracle_case(setup: &str) -> Result<PartialCallOracleCase, String
                 &pb::RunProgramRequest {
                     egraph_id: id,
                     program: Some(phase.map_err(|error| error.to_string())?),
-                    profile: true,
-                    include_run_reports: false,
+                    diagnostics: false,
                 }
                 .encode_to_vec(),
             )
@@ -2267,8 +2264,7 @@ fn public_callable_oracle_trial() -> Trial {
                     &pb::RunProgramRequest {
                         egraph_id: id,
                         program: Some(program),
-                        profile: true,
-                        include_run_reports: false,
+                        diagnostics: false,
                     }
                     .encode_to_vec(),
                 )
@@ -2406,8 +2402,7 @@ fn multi_extract_oracle_trial() -> Trial {
                     &pb::RunProgramRequest {
                         egraph_id: id,
                         program: Some(phase.map_err(|e| e.to_string())?),
-                        profile: true,
-                        ..Default::default()
+                        diagnostics: false,
                     }
                     .encode_to_vec(),
                 )
@@ -2463,8 +2458,7 @@ fn multi_extract_oracle_trial() -> Trial {
                 &pb::RunProgramRequest {
                     egraph_id: id,
                     program: Some(program),
-                    profile: true,
-                    ..Default::default()
+                    diagnostics: false,
                 }
                 .encode_to_vec(),
             )
