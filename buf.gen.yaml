@@ -1,0 +1,20 @@
+# Local codegen plugins; setup and tested versions are in proto/README.md.
+# `make proto-gen` syncs Python tools and passes --include-imports so Python's
+# references to the validation descriptors resolve. Dependencies may need
+# network access on first use. No tonic client/server code is generated.
+version: v2
+inputs:
+  - directory: proto
+plugins:
+  - local: ["uv", "run", "protoc-gen-py"]
+    out: gen/python
+
+  # Keep well-known types in prost-types rather than generating duplicate types.
+  - local: protoc-gen-prost
+    out: gen/rust
+    # Repeated MapEntry suppresses prost's automatic Eq/Hash derivation up to
+    # Node. These preserve syntax hashing, not semantic host-value equality.
+    opt:
+      - 'type_attribute=.egglog.v1.MapValue=#[derive(Eq\, Hash)]'
+      - 'type_attribute=.egglog.v1.PrimitiveValue=#[derive(Eq\, Hash)]'
+      - 'type_attribute=.egglog.v1.Node=#[derive(Eq\, Hash)]'

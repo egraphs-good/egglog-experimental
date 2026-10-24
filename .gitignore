@@ -1,2 +1,5 @@
 /target
 .DS_Store
+
+# Generated protobuf sources in gen/ are versioned; see proto/README.md.
+__pycache__/

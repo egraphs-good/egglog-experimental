@@ -1,0 +1,12 @@
+[package]
+name = "egglog-proto"
+version = "0.1.0"
+edition = "2024"
+description = "Generated protobuf messages for the experimental Egglog IR"
+license = "MIT"
+
+[lib]
+path = "lib.rs"
+
+[dependencies]
+prost = "0.14.4"
