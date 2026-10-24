@@ -61,21 +61,17 @@ struct OutputStream<'a> {
 impl OutputStream<'_> {
     fn flush(
         &mut self,
-        response: &mut pb::RunProgramResponse,
-        context: &mut RequestOccurrences,
+        response: &mut pb::RunProgramOutput,
+        context: &RequestOccurrences,
     ) -> Result<(), egglog::Error> {
         if !response.outputs.is_empty() {
-            let chunk = std::mem::replace(
-                response,
-                pb::RunProgramResponse {
-                    files: context.files.clone(),
-                    ..Default::default()
-                },
-            );
-            context.response_rules.clear();
-            context.file_offsets.clear();
-            context.file_offsets.insert(context.source_files_key, 0);
-            self.cancelled = (self.emit)(chunk).is_break();
+            self.cancelled = (self.emit)(pb::RunProgramResponse {
+                result: Some(pb::run_program_response::Result::Output(std::mem::take(
+                    response,
+                ))),
+                files: context.files.clone(),
+            })
+            .is_break();
         }
         if self.cancelled {
             Err(egglog::Error::BackendError("execution cancelled".into()))
@@ -101,10 +97,7 @@ fn action_sites(commands: &[pb::Command]) -> impl Iterator<Item = (Vec<u32>, &pb
             match &command.kind {
                 Some(pb::command::Kind::Action(action)) => return Some((path, action)),
                 Some(pb::command::Kind::Fail(child)) => pending.push((path, child)),
-                Some(
-                    pb::command::Kind::Repeat(pb::Repeat { body, .. })
-                    | pb::command::Kind::Saturate(pb::Saturate { body, .. }),
-                ) => {
+                Some(pb::command::Kind::Loop(pb::Loop { body, .. })) => {
                     pending.extend(body.iter().enumerate().rev().map(|(index, child)| {
                         let mut child_path = path.clone();
                         child_path.push(index as u32);
@@ -123,8 +116,7 @@ fn command_tree(commands: &[pb::Command]) -> impl Iterator<Item = &pb::Command> 
         let command = pending.pop()?;
         match &command.kind {
             Some(pb::command::Kind::Fail(child)) => pending.push(child.as_ref()),
-            Some(pb::command::Kind::Repeat(body)) => pending.extend(body.body.iter().rev()),
-            Some(pb::command::Kind::Saturate(body)) => pending.extend(body.body.iter().rev()),
+            Some(pb::command::Kind::Loop(body)) => pending.extend(body.body.iter().rev()),
             _ => (),
         }
         Some(command)
@@ -159,6 +151,7 @@ pub struct Engine {
     // Input ownership never enters Session's compile-only preparation clones.
     histories: HashMap<u64, history::HistoryLog>,
     extension: Option<Arc<dyn NativeExtension>>,
+    builtins: Option<Arc<pb::BuiltinCatalog>>,
 }
 
 /// Explicit native code availability, independent of any wire declaration.
@@ -206,14 +199,12 @@ struct Session {
     graph: EGraph,
     extension: Option<Arc<dyn NativeExtension>>,
     mode: pb::ExecutionMode,
-    // Authored definitions and presentation/default closures, never execution ASTs.
+    // Installed user definitions, never builtin descriptors or execution ASTs.
     definitions: pb::Program,
-    // Source renderers seed their ambient catalog on the first preparation.
-    catalog_initialized: bool,
+    builtins: Arc<pb::BuiltinCatalog>,
     names: NativeNames,
+    // Monotonic namespace stamp for this graph's prepared requests.
     request: u64,
-    // Direct clone source and its mutation/namespace stamp, not an ancestry log.
-    clone_parent: Option<(u64, u64)>,
     registry: rules::Registry,
     // Successfully registered closed container aliases, including encoded modes
     // where physical TypeInfo is not the authoring type environment.
@@ -247,11 +238,6 @@ struct RequestOccurrences {
     registry: rules::Registry,
     candidates: Vec<rules::Candidate>,
     selection: String,
-    records: HashMap<String, Arc<graph::RuleRecord>>,
-    file_offsets: HashMap<usize, u32>,
-    source_files_key: usize,
-    origins: HashMap<String, String>,
-    response_rules: HashMap<String, u32>,
     files: Vec<pb::SourceFile>,
     // Indexed by the execution arena, not the response's merged source files.
     native_spans: NativeSpans,
@@ -264,15 +250,10 @@ struct RequestOccurrences {
 
 fn execution_error(
     error: egglog::Error,
-    names: &NativeNames,
-    files: &[pb::SourceFile],
+    files: &mut Vec<pb::SourceFile>,
     span: Option<pb::Span>,
     location: Option<pb::CommandLocation>,
-    panic: bool,
 ) -> pb::Error {
-    // Native Fail reports its wrapper's span, whereas a helper may retain an
-    // inner authored origin. Only map sources already owned by this response;
-    // generated helper text is not a fabricated user source location.
     let native_origin = match &error {
         egglog::Error::CheckError(_, span)
         | egglog::Error::NoSuchRuleset(_, span)
@@ -286,10 +267,17 @@ fn execution_error(
             let ast::Span::Egglog(origin) = origin else {
                 return None;
             };
-            let file = files.iter().position(|file| {
-                origin.file.name.as_deref() == Some(file.name.as_str())
-                    && file.contents.as_ref() == Some(&origin.file.contents)
-            })?;
+            let source = pb::SourceFile {
+                name: origin.file.name.clone().unwrap_or_default(),
+                contents: Some(origin.file.contents.clone()),
+            };
+            let file = match files.iter().position(|file| file == &source) {
+                Some(file) => file,
+                None => {
+                    files.push(source);
+                    files.len() - 1
+                }
+            };
             Some(pb::Span {
                 file: u32::try_from(file).ok()?,
                 start: u32::try_from(origin.i).ok()?,
@@ -297,49 +285,15 @@ fn execution_error(
             })
         })
         .or(span);
-    let code = match &error {
-        egglog::Error::CheckError(..) => pb::ErrorCode::CheckFailed,
-        egglog::Error::ExtractError(..) => pb::ErrorCode::ExtractionFailed,
-        egglog::Error::Panic { .. } => pb::ErrorCode::Panic,
-        egglog::Error::NoSuchRuleset(..)
-        | egglog::Error::TypeError(egglog::TypeError::UnboundFunction(..)) => {
-            pb::ErrorCode::UnknownName
-        }
-        egglog::Error::ProofError { .. } => pb::ErrorCode::ProofFailed,
-        _ if panic => pb::ErrorCode::Panic,
-        _ => pb::ErrorCode::EvaluationFailed,
-    };
-    let proof_failure = if let egglog::Error::ProofError { error, .. } = &error {
-        use egglog::proof::ProveExistsError as E;
-        let (reason, constructor) = match error {
-            E::RequiresConstructor => (pb::ProofFailureReason::RequiresConstructor, None),
-            E::PrimitivesUnsupported => (pb::ProofFailureReason::PrimitivesUnsupported, None),
-            E::QueryDidNotMatch { constructor } => (
-                pb::ProofFailureReason::QueryDidNotMatch,
-                Some(
-                    names
-                        .callables
-                        .get(constructor)
-                        .unwrap_or(constructor)
-                        .clone(),
-                ),
-            ),
-            E::ProofsNotEnabled => (pb::ProofFailureReason::ProofsNotEnabled, None),
-        };
-        Some(pb::ProofFailure {
-            reason: reason.into(),
-            constructor,
-        })
-    } else {
-        None
-    };
     pb::Error {
-        code: code.into(),
+        code: if matches!(error, egglog::Error::CheckError(..)) {
+            pb::ErrorCode::CheckFailed.into()
+        } else {
+            pb::ErrorCode::RuntimeFailure.into()
+        },
         message: error.to_string(),
         span,
         location,
-        proof_failure,
-        ..Default::default()
     }
 }
 
@@ -434,7 +388,7 @@ impl Engine {
             .options
             .and_then(|options| options.cost_sort)
             .and_then(|index| request.sorts.get(index as usize));
-        if !matches!(cost.and_then(|sort| sort.kind.as_ref()), Some(pb::sort::Kind::Family(family)) if family.name == "i64" && family.args.is_empty())
+        if !matches!(cost.and_then(|sort| sort.kind.as_ref()), Some(pb::sort::Kind::Application(family)) if family.name == "i64" && family.args.is_empty())
         {
             return Err(TransportError(
                 "this adapter currently requires the i64 cost sort".into(),
@@ -461,11 +415,14 @@ impl Engine {
             pb::ExecutionMode::Proofs => graph.with_proofs_enabled(),
             pb::ExecutionMode::ProofTesting => graph.with_proofs_enabled().with_proof_testing(),
         };
-        let catalog = graph
-            .type_info()
-            .portable_builtin_catalog()
-            .map_err(TransportError)?
-            .definitions;
+        let builtins = match &self.builtins {
+            Some(catalog) => catalog.clone(),
+            None => {
+                let catalog = crate::builtin::configured_catalog(&graph).map_err(TransportError)?;
+                self.builtins = Some(catalog.clone());
+                catalog
+            }
+        };
         for (index, sort) in program.sorts.iter().enumerate() {
             validate_nullary_family(graph.type_info(), sort).map_err(TransportError)?;
             let name = sort_name(&program.sorts, index as u32).map_err(TransportError)?;
@@ -503,11 +460,10 @@ impl Engine {
                 graph,
                 extension: self.extension.clone(),
                 mode,
-                definitions: catalog,
-                catalog_initialized: true,
+                definitions: pb::Program::default(),
+                builtins,
                 names: NativeNames::default(),
                 request: 0,
-                clone_parent: None,
                 registry: rules::Registry::default(),
                 sorts: HashSet::new(),
                 cost_models: HashMap::new(),
@@ -523,12 +479,11 @@ impl Engine {
         &mut self,
         request: pb::CloneEGraphRequest,
     ) -> Result<pb::CloneEGraphResponse, TransportError> {
-        let mut graph = self
+        let graph = self
             .graphs
             .get(&request.egraph_id)
             .ok_or_else(|| TransportError("unknown egraph_id".into()))?
             .clone();
-        graph.clone_parent = Some((request.egraph_id, graph.request));
         self.next_id = self
             .next_id
             .checked_add(1)
@@ -555,63 +510,16 @@ impl Engine {
         Ok(pb::DestroyEGraphResponse {})
     }
 
-    fn return_request(
-        &mut self,
-        request: pb::ReturnToEGraphRequest,
-    ) -> Result<pb::ReturnToEGraphResponse, TransportError> {
-        if request.active_id == request.saved_id {
-            return Err(TransportError(
-                "active and saved handles must differ".into(),
-            ));
-        }
-        let active = self
-            .graphs
-            .get(&request.active_id)
-            .ok_or_else(|| TransportError("unknown active_id".into()))?;
-        let saved = self
-            .graphs
-            .get(&request.saved_id)
-            .ok_or_else(|| TransportError("unknown saved_id".into()))?;
-        if active.clone_parent != Some((request.saved_id, saved.request))
-            || active.request < saved.request
-        {
-            return Err(TransportError("unrelated or stale scope return".into()));
-        }
-        // Pair validation is complete. Move graphs; no recompilation, report
-        // summation, provider execution, or replacement canonical ownership.
-        let mut active = self.graphs.remove(&request.active_id).unwrap();
-        let mut saved = self.graphs.remove(&request.saved_id).unwrap();
-        active.graph.restore_from(saved.graph);
-        saved.graph = active.graph;
-        saved.request = active.request;
-        self.graphs.insert(request.saved_id, saved);
-        self.histories.remove(&request.active_id);
-        Ok(pb::ReturnToEGraphResponse {})
-    }
-
     fn run_request(
         &mut self,
         request: pb::RunProgramRequest,
-    ) -> Result<pb::RunProgramResponse, TransportError> {
-        let mut response = pb::RunProgramResponse::default();
-        let mut collection_error = None;
-        let mut source_files = HashMap::new();
-        let result = self.run_request_stream(request, &mut |chunk| match graph::append_response(
-            &mut response,
-            chunk,
-            &mut source_files,
-        ) {
-            Ok(()) => ControlFlow::Continue(()),
-            Err(error) => {
-                collection_error = Some(TransportError(error));
-                ControlFlow::Break(())
-            }
-        });
-        if let Some(error) = collection_error {
-            return Err(error);
-        }
-        result?;
-        Ok(response)
+    ) -> Result<Vec<pb::RunProgramResponse>, TransportError> {
+        let mut frames = Vec::new();
+        self.run_request_stream(request, &mut |frame| {
+            frames.push(frame);
+            ControlFlow::Continue(())
+        })?;
+        Ok(frames)
     }
 
     fn run_request_stream(
@@ -628,35 +536,32 @@ impl Engine {
             .graphs
             .get_mut(&request.egraph_id)
             .ok_or_else(|| TransportError("unknown egraph_id".into()))?;
-        let mut response = pb::RunProgramResponse::default();
-        let mut stream = OutputStream {
-            emit,
-            cancelled: false,
-        };
         let Some(mut program) = request.program else {
-            response.error = Some(pb::Error {
-                code: pb::ErrorCode::InvalidProgram.into(),
-                message: "missing program".into(),
-                ..Default::default()
+            let _ = emit(pb::RunProgramResponse {
+                result: Some(pb::run_program_response::Result::Error(pb::Error {
+                    code: pb::ErrorCode::InvalidProgram.into(),
+                    message: "missing program".into(),
+                    ..Default::default()
+                })),
+                files: vec![],
             });
-            let _ = (stream.emit)(response);
             return Ok(());
         };
-        response.files = program.files.clone();
         session.graph.set_report_level(if request.diagnostics {
             egglog_reports::ReportLevel::StageInfo
         } else {
             egglog_reports::ReportLevel::Off
         });
-        let prepared = session.prepare(&mut program);
-        let prepared = match prepared {
+        let prepared = match session.prepare(&mut program) {
             Ok(prepared) => prepared,
             Err(error) => {
-                response.error = Some(*error.0);
                 session
                     .graph
                     .set_report_level(egglog_reports::ReportLevel::Off);
-                let _ = (stream.emit)(response);
+                let _ = emit(pb::RunProgramResponse {
+                    result: Some(pb::run_program_response::Result::Error(*error.0)),
+                    files: program.files,
+                });
                 return Ok(());
             }
         };
@@ -666,19 +571,32 @@ impl Engine {
                 .unwrap()
                 .append(original);
         }
+        let mut response = pb::RunProgramOutput::default();
         let mut context = match session.install(prepared, &mut response) {
             Ok(context) => context,
-            Err(error) => {
-                response.error = Some(*error);
+            Err((error, files)) => {
                 session
                     .graph
                     .set_report_level(egglog_reports::ReportLevel::Off);
-                let _ = (stream.emit)(response);
+                if !response.outputs.is_empty() {
+                    let _ = emit(pb::RunProgramResponse {
+                        result: Some(pb::run_program_response::Result::Output(response)),
+                        files: files.clone(),
+                    });
+                }
+                let _ = emit(pb::RunProgramResponse {
+                    result: Some(pb::run_program_response::Result::Error(*error)),
+                    files,
+                });
                 return Ok(());
             }
         };
         context.diagnostics = request.diagnostics;
-        let mut transport_error = None;
+        let mut stream = OutputStream {
+            emit,
+            cancelled: false,
+        };
+        let mut failure = None;
         for (index, command) in program.commands.iter().enumerate() {
             let location = pb::CommandLocation {
                 path: vec![index as u32],
@@ -698,13 +616,6 @@ impl Engine {
                 break;
             }
             if let Err(error) = result {
-                let panic = matches!(
-                    &command.kind,
-                    Some(pb::command::Kind::Action(pb::Action {
-                        kind: Some(pb::action::Kind::Panic(_)),
-                        ..
-                    }))
-                );
                 let (location, span) = failure_site.unwrap_or_else(|| {
                     (
                         location,
@@ -714,27 +625,12 @@ impl Engine {
                         },
                     )
                 });
-                let origin = match &error {
-                    egglog::Error::Panic {
-                        rule: Some(rule), ..
-                    } => Some(rule.clone()),
-                    _ => None,
-                };
-                let mut error = execution_error(
+                failure = Some(execution_error(
                     error,
-                    &session.names,
-                    &response.files,
+                    &mut context.files,
                     span,
                     Some(location),
-                    panic,
-                );
-                if let Some(origin) = origin {
-                    match report::rule_reference(&origin, &mut context, &mut response) {
-                        Ok(rule) => error.rule = rule,
-                        Err(error) => transport_error = Some(TransportError(error)),
-                    }
-                }
-                response.error = Some(error);
+                ));
                 break;
             }
         }
@@ -742,18 +638,33 @@ impl Engine {
         session
             .graph
             .set_report_level(egglog_reports::ReportLevel::Off);
-        if let Some(error) = transport_error {
-            return Err(error);
-        }
         if stream.cancelled {
             return Err(TransportError("execution cancelled".into()));
         }
-        if response.outputs.is_empty() && response.error.is_none() {
-            response.files.clear();
+        if let Some(error) = failure {
+            if !response.outputs.is_empty() {
+                // Work is complete: declining a terminal delivery cannot hide
+                // the actual error or invalidate the already-completed prefix.
+                let _ = (stream.emit)(pb::RunProgramResponse {
+                    result: Some(pb::run_program_response::Result::Output(response)),
+                    files: context.files.clone(),
+                });
+            }
+            let _ = (stream.emit)(pb::RunProgramResponse {
+                result: Some(pb::run_program_response::Result::Error(error)),
+                files: context.files,
+            });
+        } else {
+            let files = if response.outputs.is_empty() {
+                vec![]
+            } else {
+                context.files
+            };
+            let _ = (stream.emit)(pb::RunProgramResponse {
+                result: Some(pb::run_program_response::Result::Output(response)),
+                files,
+            });
         }
-        // Completion is already known; declining this final delivery cannot
-        // cancel finished work or replace its actual engine error.
-        let _ = (stream.emit)(response);
         Ok(())
     }
 }
@@ -762,8 +673,8 @@ impl Session {
     fn install(
         &mut self,
         prepared: Prepared,
-        response: &mut pb::RunProgramResponse,
-    ) -> Result<RequestOccurrences, Box<pb::Error>> {
+        response: &mut pb::RunProgramOutput,
+    ) -> Result<RequestOccurrences, (Box<pb::Error>, Vec<pb::SourceFile>)> {
         let Prepared {
             mut definitions,
             request,
@@ -773,7 +684,6 @@ impl Session {
             ..
         } = prepared;
         self.request = request;
-        response.files = context.files.clone();
         let mut failure = None;
         for installation in installations {
             let (result, registered, _) = if let Some(command) = &installation.command {
@@ -818,17 +728,16 @@ impl Session {
             .filter_map(|(index, d)| (!pending_declarations.contains(&index)).then_some(d))
             .collect();
         self.definitions = definitions;
-        self.catalog_initialized = true;
-        self.names = project_names(&mut pb::Program::default(), &self.definitions);
+        self.names = project_names(
+            &mut pb::Program::default(),
+            &self.definitions,
+            &self.builtins,
+        );
         match failure {
-            Some((error, span)) => Err(Box::new(execution_error(
-                error,
-                &self.names,
-                &response.files,
-                span,
-                None,
-                false,
-            ))),
+            Some((error, span)) => {
+                let error = execution_error(error, &mut context.files, span, None);
+                Err((Box::new(error), context.files))
+            }
             None => Ok(context),
         }
     }
@@ -837,6 +746,13 @@ impl Session {
     // boundary then registers and compiles the entire request on a disposable
     // clone. Neither clone's runtime state or backend IDs are ever adopted.
     fn prepare(&self, program: &mut pb::Program) -> Result<Prepared, PreparationError> {
+        if program
+            .sorts
+            .iter()
+            .any(|sort| matches!(sort.kind, Some(pb::sort::Kind::Var(_))))
+        {
+            return Err("input Programs contain only concrete sorts".into());
+        }
         let mut authored_input = program.clone();
         let rule_files = Arc::new(std::mem::take(&mut authored_input.files));
         let native_spans = NativeSpans::default();
@@ -851,28 +767,23 @@ impl Session {
             .request
             .checked_add(1)
             .ok_or("request identity space exhausted")?;
-        // These live guards also apply to empty requests. A native named
-        // Primitive can be executable while retaining a projection error.
-        let native = staged.graph.type_info().builtin_catalog()?;
-        if !staged.catalog_initialized {
-            staged.definitions = staged
-                .graph
-                .type_info()
-                .portable_builtin_catalog()?
-                .definitions;
-            staged.catalog_initialized = true;
-        } else {
-            for name in native.undescribed_primitives {
-                if let Some(primitives) = staged.graph.type_info().get_prims(&name) {
-                    for primitive in primitives {
-                        let any: &dyn std::any::Any = primitive.primitive.as_ref();
-                        if let Some(defined) =
-                            any.downcast_ref::<crate::primitive::DefinedPrimitive>()
-                        {
-                            defined.definition.as_ref().map_err(Clone::clone)?;
-                        }
-                    }
-                }
+        // Native registrations remain authoritative even for empty requests.
+        staged.graph.type_info().builtin_catalog()?;
+        for declaration in &program.declarations {
+            let name = match &declaration.kind {
+                Some(pb::declaration::Kind::Constructor(c)) => &c.name,
+                Some(pb::declaration::Kind::Function(f)) => &f.name,
+                Some(pb::declaration::Kind::Relation(r)) => &r.name,
+                Some(pb::declaration::Kind::UserDefinedPrimitive(p)) => &p.name,
+                _ => continue,
+            };
+            if self
+                .builtins
+                .primitives
+                .iter()
+                .any(|primitive| &primitive.name == name)
+            {
+                return Err(format!("user callable conflicts with builtin {name}").into());
             }
         }
         let mut next_declaration = staged.definitions.declarations.len();
@@ -890,9 +801,9 @@ impl Session {
             .collect();
         let mut pending_declarations = HashSet::new();
         let mut installations = vec![];
-        staged.names = project_names(program, &staged.definitions);
+        staged.names = project_names(program, &staged.definitions, &self.builtins);
         let mut authored = staged.definitions.clone();
-        project_names(&mut authored, &staged.definitions);
+        project_names(&mut authored, &staged.definitions, &self.builtins);
         let signatures: HashMap<_, _> = authored
             .declarations
             .iter()
@@ -909,7 +820,7 @@ impl Session {
                     Some(f.output),
                     Some(ast::FunctionSubtype::Custom),
                 )),
-                Some(pb::declaration::Kind::Primitive(p)) => {
+                Some(pb::declaration::Kind::UserDefinedPrimitive(p)) => {
                     Some((&p.name, &p.inputs, Some(p.output), None))
                 }
                 Some(pb::declaration::Kind::Relation(r)) => Some((
@@ -961,7 +872,7 @@ impl Session {
                 Some(pb::declaration::Kind::Constructor(f)) => &f.name,
                 Some(pb::declaration::Kind::Function(f)) => &f.name,
                 Some(pb::declaration::Kind::Relation(r)) => &r.name,
-                Some(pb::declaration::Kind::Primitive(p)) => &p.name,
+                Some(pb::declaration::Kind::UserDefinedPrimitive(p)) => &p.name,
                 _ => continue,
             };
             if staged.graph.get_sort_by_name(name).is_some()
@@ -1040,7 +951,6 @@ impl Session {
                 return Err(format!("sort kind mismatch for {name}").into());
             }
         }
-        validate_host_declarations(program, &mut staged.graph)?;
         validate_node_graph(program, &native_spans)?;
         let mut action_dags = classify_action_dags(program)?;
         let extraction_dags = if self.mode == pb::ExecutionMode::Normal {
@@ -1071,56 +981,113 @@ impl Session {
             if !added[index] {
                 continue;
             }
-            if matches!(
-                declaration.kind,
-                Some(
-                    pb::declaration::Kind::HostPrimitive(_)
-                        | pb::declaration::Kind::HostSortFamily(_)
-                )
-            ) {
-                continue; // Already checked against the native catalog above.
-            }
             let span = native_span(program, declaration.span.as_ref(), &native_spans)?;
-            let command = match declaration.kind.as_ref().ok_or("missing declaration kind")? {
+            let command = match declaration
+                .kind
+                .as_ref()
+                .ok_or("missing declaration kind")?
+            {
                 pb::declaration::Kind::EqSort(_) => continue,
                 pb::declaration::Kind::Constructor(constructor) => {
-                    if constructor.name.is_empty() { return Err("constructor name must not be empty".into()); }
-                    let output = program.sorts.get(constructor.output as usize).ok_or("constructor output sort out of bounds")?;
+                    if constructor.name.is_empty() {
+                        return Err("constructor name must not be empty".into());
+                    }
+                    let output = program
+                        .sorts
+                        .get(constructor.output as usize)
+                        .ok_or("constructor output sort out of bounds")?;
                     if !matches!(output.kind, Some(pb::sort::Kind::Eq(_))) {
                         return Err("constructor output must be an equality sort".into());
                     }
-                    let cost = constructor.cost.map(|index| -> Result<u64, String> {
-                        let node = program.nodes.get(index as usize).ok_or("cost index out of bounds")?;
-                        match &node.kind {
-                            Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue { value: Some(pb::primitive_value::Value::I64(cost)) })) if *cost >= 0 && node_sort(program, index)? == "i64" => Ok(*cost as u64),
-                            _ => Err("constructor costs currently require a nonnegative inert i64".into()),
-                        }
-                    }).transpose()?;
-                    Command::Constructor { span, name: constructor.name.clone(), table_name: Some(native_table_name(declaration, &staged.names.callables[&constructor.name])), schema: signature(program, &constructor.inputs, constructor.output)?, cost, unextractable: constructor.unextractable, hidden: declaration.hidden, let_binding: false, term_constructor: None }
+                    let cost = constructor
+                        .cost
+                        .map(|index| -> Result<u64, String> {
+                            let node = program
+                                .nodes
+                                .get(index as usize)
+                                .ok_or("cost index out of bounds")?;
+                            match &node.kind {
+                                Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
+                                    value: Some(pb::primitive_value::Value::I64(cost)),
+                                })) if *cost >= 0 && node_sort(program, index)? == "i64" => {
+                                    Ok(*cost as u64)
+                                }
+                                _ => Err(
+                                    "constructor costs currently require a nonnegative inert i64"
+                                        .into(),
+                                ),
+                            }
+                        })
+                        .transpose()?;
+                    Command::Constructor {
+                        span,
+                        name: constructor.name.clone(),
+                        table_name: Some(native_table_name(
+                            declaration,
+                            &staged.names.callables[&constructor.name],
+                        )),
+                        schema: signature(program, &constructor.inputs, constructor.output)?,
+                        cost,
+                        unextractable: constructor.unextractable,
+                        hidden: constructor.hidden,
+                        let_binding: false,
+                        term_constructor: None,
+                    }
                 }
                 pb::declaration::Kind::Function(function) => {
-                    if function.name.is_empty() { return Err("function name must not be empty".into()); }
+                    if function.name.is_empty() {
+                        return Err("function name must not be empty".into());
+                    }
                     let schema = signature(program, &function.inputs, function.output)?;
                     if let Some(index) = function.merge {
                         if node_sort(program, index)? != schema.output {
                             return Err("merge output sort mismatch".into());
                         }
-                        let mut bindings = HashMap::from([("old".into(), schema.output.clone()), ("new".into(), schema.output.clone())]);
+                        let mut bindings = HashMap::from([
+                            ("old".into(), schema.output.clone()),
+                            ("new".into(), schema.output.clone()),
+                        ]);
                         check_variables(program, &[index], &mut bindings, false)?;
                         // Native function validation resolves this deferred body
                         // in Context::Write: builtin calls retain their actual
                         // capabilities, and callable backends are installed first.
                     }
-                    Command::Function { span, name: function.name.clone(), table_name: Some(native_table_name(declaration, &staged.names.callables[&function.name])), schema, merge: function.merge.map(|index| expression(program, index, &mut HashSet::new(), &native_spans)).transpose()?, hidden: declaration.hidden, let_binding: false, term_constructor: None, unextractable: true }
-                },
-                pb::declaration::Kind::Primitive(primitive) => primitive_command(program, primitive, span, &native_spans)?,
+                    Command::Function {
+                        span,
+                        name: function.name.clone(),
+                        table_name: Some(native_table_name(
+                            declaration,
+                            &staged.names.callables[&function.name],
+                        )),
+                        schema,
+                        merge: function
+                            .merge
+                            .map(|index| {
+                                expression(program, index, &mut HashSet::new(), &native_spans)
+                            })
+                            .transpose()?,
+                        hidden: function.hidden,
+                        let_binding: false,
+                        term_constructor: None,
+                        unextractable: true,
+                    }
+                }
+                pb::declaration::Kind::UserDefinedPrimitive(primitive) => {
+                    primitive_command(program, primitive, span, &native_spans)?
+                }
                 pb::declaration::Kind::Relation(relation) => Command::Relation {
                     span,
                     name: relation.name.clone(),
-                    table_name: Some(native_table_name(declaration, &staged.names.callables[&relation.name])),
-                    inputs: relation.inputs.iter().map(|arg| sort_name(&program.sorts, arg.sort)).collect::<Result<_, _>>()?,
+                    table_name: Some(native_table_name(
+                        declaration,
+                        &staged.names.callables[&relation.name],
+                    )),
+                    inputs: relation
+                        .inputs
+                        .iter()
+                        .map(|arg| sort_name(&program.sorts, arg.sort))
+                        .collect::<Result<_, _>>()?,
                 },
-                _ => return Err("only equality-sort, constructor, function, relation, and primitive declarations execute in this slice".into()),
             };
             // Computed bodies close in the final compile-only pass, after
             // preceding table declarations have actual disposable backends.
@@ -1246,7 +1213,7 @@ impl Session {
             };
             let (_, subtype) = signatures.get(&call.func).ok_or_else(|| {
                 PreparationError(Box::new(pb::Error {
-                    code: pb::ErrorCode::UnknownName.into(),
+                    code: pb::ErrorCode::RuntimeFailure.into(),
                     message: format!("unknown action target {}", call.func),
                     span: action.span,
                     ..Default::default()
@@ -1288,11 +1255,8 @@ impl Session {
             action_dags,
             extraction_dags,
             files: program.files.clone(),
-            file_offsets: [(Arc::as_ptr(&rule_files) as usize, 0)].into(),
-            source_files_key: Arc::as_ptr(&rule_files) as usize,
             ..Default::default()
         };
-        self.registry.origins(&mut context);
         let mut validation: Vec<_> = installations
             .iter()
             .filter_map(|i| i.command.clone())
@@ -1429,17 +1393,7 @@ impl Session {
         program.declarations = std::mem::take(&mut program.declarations)
             .into_iter()
             .zip(added)
-            .filter_map(|(declaration, added)| {
-                (added
-                    || matches!(
-                        declaration.kind,
-                        Some(
-                            pb::declaration::Kind::HostPrimitive(_)
-                                | pb::declaration::Kind::HostSortFamily(_)
-                        )
-                    ))
-                .then_some(declaration)
-            })
+            .filter_map(|(declaration, added)| added.then_some(declaration))
             .collect();
         Ok(Prepared {
             definitions: staged.definitions,
@@ -1481,8 +1435,7 @@ impl Session {
                             | pb::command::Kind::Prove(_)
                             | pb::command::Kind::ProveExists(_)
                             | pb::command::Kind::Run(_)
-                            | pb::command::Kind::Repeat(_)
-                            | pb::command::Kind::Saturate(_)
+                            | pb::command::Kind::Loop(_)
                             | pb::command::Kind::Stats(_)
                             | pb::command::Kind::PrintSize(_)
                     )
@@ -1522,7 +1475,7 @@ impl Session {
                     .get(&prove.constructor)
                     .ok_or_else(|| {
                         PreparationError(Box::new(pb::Error {
-                            code: pb::ErrorCode::UnknownName.into(),
+                            code: pb::ErrorCode::RuntimeFailure.into(),
                             message: format!("unknown constructor {}", prove.constructor),
                             span: command.span,
                             ..Default::default()
@@ -1595,7 +1548,7 @@ impl Session {
                         }
                     }) {
                         return Err(PreparationError(Box::new(pb::Error {
-                            code: pb::ErrorCode::UnknownName.into(),
+                            code: pb::ErrorCode::RuntimeFailure.into(),
                             message: format!("unknown table {table}"),
                             span: command.span,
                             ..Default::default()
@@ -1610,7 +1563,7 @@ impl Session {
                 }
                 let logical = self.names.callables.get(&print.table).ok_or_else(|| {
                     PreparationError(Box::new(pb::Error {
-                        code: pb::ErrorCode::UnknownName.into(),
+                        code: pb::ErrorCode::RuntimeFailure.into(),
                         message: format!("unknown table {}", print.table),
                         span: command.span,
                         ..Default::default()
@@ -1666,7 +1619,7 @@ impl Session {
             pb::command::Kind::Run(run) => {
                 if !run.scheduler.is_empty() && !schedulers.contains(&run.scheduler) {
                     return Err(PreparationError(Box::new(pb::Error {
-                        code: pb::ErrorCode::UnknownName.into(),
+                        code: pb::ErrorCode::RuntimeFailure.into(),
                         message: format!("unknown scheduler {}", run.scheduler),
                         span: command.span,
                         ..Default::default()
@@ -1674,20 +1627,8 @@ impl Session {
                 }
                 self.lower_command(program, command, context, &mut HashMap::new())
             }
-            pb::command::Kind::Repeat(_) | pb::command::Kind::Saturate(_) => {
-                let (body, until) = match &command.kind {
-                    Some(pb::command::Kind::Repeat(repeat)) => {
-                        repeat.times.ok_or("missing Repeat count")?;
-                        (&repeat.body, &repeat.until)
-                    }
-                    Some(pb::command::Kind::Saturate(saturate)) => {
-                        if saturate.max_iterations == Some(0) {
-                            return Err("Saturate bound must be positive".into());
-                        }
-                        (&saturate.body, &saturate.until)
-                    }
-                    _ => unreachable!(),
-                };
+            pb::command::Kind::Loop(body) => {
+                let (body, until) = (&body.body, &body.until);
                 let mut commands = vec![];
                 if !until.is_empty() {
                     conditions.push((
@@ -1815,7 +1756,7 @@ impl Session {
         command: &pb::Command,
         context: &mut RequestOccurrences,
         location: &pb::CommandLocation,
-        response: &mut pb::RunProgramResponse,
+        response: &mut pb::RunProgramOutput,
         failure_site: &mut Option<ExecutionFailureSite>,
         stream: &mut OutputStream<'_>,
     ) -> Result<(), egglog::Error> {
@@ -2096,7 +2037,7 @@ impl Session {
                     let input_sorts = view.func_type().input[..expected_inputs.len()].to_vec();
                     let output_sort = view.func_type().input.last().unwrap().clone();
                     let mut checked_sorts = vec![];
-                    let mut exported = pb::RunProgramResponse::default();
+                    let mut exported = pb::RunProgramOutput::default();
                     for (sort, expected) in input_sorts
                         .iter()
                         .chain(expected_output.map(|_| &output_sort))
@@ -2293,7 +2234,7 @@ impl NativeExecutor<'_> {
         commands: Vec<Command>,
         requested: Option<RequestedObservation<'_>>,
         context: &mut RequestOccurrences,
-        response: &mut pb::RunProgramResponse,
+        response: &mut pb::RunProgramOutput,
         control: Option<ScheduleCapture<'_>>,
     ) -> (
         Result<(), egglog::Error>,
@@ -2533,10 +2474,7 @@ impl ScheduleMeasurements {
 fn control_command(command: &pb::Command) -> bool {
     match &command.kind {
         Some(
-            pb::command::Kind::Run(_)
-            | pb::command::Kind::AddRules(_)
-            | pb::command::Kind::Repeat(_)
-            | pb::command::Kind::Saturate(_),
+            pb::command::Kind::Run(_) | pb::command::Kind::AddRules(_) | pb::command::Kind::Loop(_),
         ) => true,
         Some(pb::command::Kind::Fail(child)) => control_command(child),
         _ => false,
@@ -2618,7 +2556,7 @@ struct WireSchedule<'a, 'stream> {
     executor: NativeExecutor<'a>,
     program: &'a pb::Program,
     context: &'a mut RequestOccurrences,
-    response: &'a mut pb::RunProgramResponse,
+    response: &'a mut pb::RunProgramOutput,
     root: &'a pb::CommandLocation,
     stream: &'a mut OutputStream<'stream>,
     definitions: &'a pb::Program,
@@ -2634,7 +2572,7 @@ struct WireEnvelope<'a, 'stream> {
     names: &'a NativeNames,
     program: &'a pb::Program,
     context: &'a mut RequestOccurrences,
-    response: &'a mut pb::RunProgramResponse,
+    response: &'a mut pb::RunProgramOutput,
     root: &'a pb::CommandLocation,
     stream: &'a mut OutputStream<'stream>,
     definitions: &'a pb::Program,
@@ -2724,12 +2662,7 @@ impl ControlContext for WireSchedule<'_, '_> {
 
     fn view<'a>(&self, node: &'a pb::Command) -> Result<Control<'a, pb::Command>, egglog::Error> {
         Ok(match node.kind.as_ref().expect("validated command") {
-            pb::command::Kind::Repeat(repeat) => {
-                Control::Repeat(&repeat.body, repeat.times.unwrap())
-            }
-            pb::command::Kind::Saturate(saturate) => {
-                Control::Saturate(&saturate.body, saturate.max_iterations)
-            }
+            pb::command::Kind::Loop(body) => Control::Loop(&body.body, body.max_iterations),
             _ => Control::Leaf,
         })
     }
@@ -3010,8 +2943,7 @@ impl ControlContext for WireSchedule<'_, '_> {
         iterations: &[u64],
     ) -> Result<bool, egglog::Error> {
         let until = match &node.kind {
-            Some(pb::command::Kind::Repeat(repeat)) => &repeat.until,
-            Some(pb::command::Kind::Saturate(saturate)) => &saturate.until,
+            Some(pb::command::Kind::Loop(body)) => &body.until,
             _ => unreachable!(),
         };
         if until.is_empty() {
@@ -3112,9 +3044,17 @@ fn native_name(namespace: &str, logical: &str) -> String {
 // symbol by spelling it, and native validation will reject the unbound name.
 // Private-looking spellings are ordinary logical names, including source that
 // was rendered earlier. They receive the same projection, never prefix decoding.
-fn project_names(program: &mut pb::Program, definitions: &pb::Program) -> NativeNames {
+fn project_names(
+    program: &mut pb::Program,
+    definitions: &pb::Program,
+    builtins: &pb::BuiltinCatalog,
+) -> NativeNames {
     let mut names = NativeNames::default();
-    let mut host_keys = HashSet::new();
+    let host_keys: HashSet<_> = builtins
+        .primitives
+        .iter()
+        .map(|p| p.name.as_str())
+        .collect();
     for declaration in &definitions.declarations {
         match &declaration.kind {
             Some(pb::declaration::Kind::EqSort(s)) => {
@@ -3137,13 +3077,10 @@ fn project_names(program: &mut pb::Program, definitions: &pb::Program) -> Native
                     .callables
                     .insert(native_name("call", &r.name), r.name.clone());
             }
-            Some(pb::declaration::Kind::Primitive(p)) => {
+            Some(pb::declaration::Kind::UserDefinedPrimitive(p)) => {
                 names
                     .callables
                     .insert(native_name("call", &p.name), p.name.clone());
-            }
-            Some(pb::declaration::Kind::HostPrimitive(p)) => {
-                host_keys.insert(p.name.as_str());
             }
             _ => (),
         }
@@ -3185,7 +3122,7 @@ fn map_callable_names(
             Some(pb::declaration::Kind::Constructor(f)) => project_call(&mut f.name),
             Some(pb::declaration::Kind::Function(f)) => project_call(&mut f.name),
             Some(pb::declaration::Kind::Relation(r)) => project_call(&mut r.name),
-            Some(pb::declaration::Kind::Primitive(p)) => project_call(&mut p.name),
+            Some(pb::declaration::Kind::UserDefinedPrimitive(p)) => project_call(&mut p.name),
             _ => (),
         }
     }
@@ -3204,8 +3141,7 @@ fn map_callable_names(
     while let Some(command) = commands.pop() {
         match &mut command.kind {
             Some(pb::command::Kind::Fail(child)) => commands.push(child.as_mut()),
-            Some(pb::command::Kind::Repeat(body)) => commands.extend(body.body.iter_mut()),
-            Some(pb::command::Kind::Saturate(body)) => commands.extend(body.body.iter_mut()),
+            Some(pb::command::Kind::Loop(body)) => commands.extend(body.body.iter_mut()),
             Some(pb::command::Kind::Action(action)) => actions.push(action),
             Some(pb::command::Kind::PrintSize(print)) => {
                 for table in &mut print.tables {
@@ -3277,7 +3213,7 @@ fn structural_sort_name(
             }
             Ok(Some(name))
         }
-        Some(pb::sort::Kind::Family(family))
+        Some(pb::sort::Kind::Application(family))
             if matches!(family.name.as_str(), "Vec" | "Set" | "MultiSet" | "Maybe")
                 && family.args.len() == 1 =>
         {
@@ -3297,7 +3233,7 @@ fn structural_sort_name(
                     .transpose()
             })
         }
-        Some(pb::sort::Kind::Family(family))
+        Some(pb::sort::Kind::Application(family))
             if matches!(family.name.as_str(), "Pair" | "Map") && family.args.len() == 2 =>
         {
             let first = structural_sort_name(sorts, family.args[0], active)?;
@@ -3319,7 +3255,7 @@ fn structural_sort_name(
                 })
                 .transpose()
         }
-        Some(pb::sort::Kind::Family(family))
+        Some(pb::sort::Kind::Application(family))
             if family.args.is_empty() && !family.name.is_empty() =>
         {
             Ok(Some(family.name.clone()))
@@ -3335,7 +3271,7 @@ fn structural_sort_name(
 // A wire spelling alone cannot introduce a native host sort, or reinterpret a
 // native equality/container sort as a nullary host value.
 fn validate_nullary_family(types: &egglog::TypeInfo, sort: &pb::Sort) -> Result<(), String> {
-    let Some(pb::sort::Kind::Family(family)) = &sort.kind else {
+    let Some(pb::sort::Kind::Application(family)) = &sort.kind else {
         return Ok(());
     };
     if !family.args.is_empty() {
@@ -3403,7 +3339,10 @@ fn declaration_order(program: &pb::Program, graph: &mut EGraph) -> Result<Vec<us
         .filter(|(_, d)| {
             !matches!(
                 d.kind,
-                Some(pb::declaration::Kind::Function(_) | pb::declaration::Kind::Primitive(_))
+                Some(
+                    pb::declaration::Kind::Function(_)
+                        | pb::declaration::Kind::UserDefinedPrimitive(_)
+                )
             )
         })
         .map(|(i, _)| i)
@@ -3414,7 +3353,7 @@ fn declaration_order(program: &pb::Program, graph: &mut EGraph) -> Result<Vec<us
         .enumerate()
         .filter_map(|(i, d)| match &d.kind {
             Some(pb::declaration::Kind::Function(f)) => Some((f.name.as_str(), i)),
-            Some(pb::declaration::Kind::Primitive(p)) => Some((p.name.as_str(), i)),
+            Some(pb::declaration::Kind::UserDefinedPrimitive(p)) => Some((p.name.as_str(), i)),
             _ => None,
         })
         .collect();
@@ -3423,7 +3362,7 @@ fn declaration_order(program: &pb::Program, graph: &mut EGraph) -> Result<Vec<us
     for (i, d) in program.declarations.iter().enumerate() {
         let (name, body, primitive) = match &d.kind {
             Some(pb::declaration::Kind::Function(f)) => (f.name.as_str(), f.merge, false),
-            Some(pb::declaration::Kind::Primitive(p)) => (
+            Some(pb::declaration::Kind::UserDefinedPrimitive(p)) => (
                 p.name.as_str(),
                 Some(p.body.ok_or("missing primitive body")?),
                 true,
@@ -3490,7 +3429,7 @@ fn declaration_order(program: &pb::Program, graph: &mut EGraph) -> Result<Vec<us
 
 fn primitive_command(
     program: &pb::Program,
-    primitive: &pb::Primitive,
+    primitive: &pb::UserDefinedPrimitive,
     span: ast::Span,
     native_spans: &NativeSpans,
 ) -> Result<Command, String> {
@@ -3554,7 +3493,7 @@ fn materialize_sorts(
             return Ok(());
         };
         let (presort, children) = match &program.sorts[index as usize].kind {
-            Some(pb::sort::Kind::Family(family)) if !family.args.is_empty() => {
+            Some(pb::sort::Kind::Application(family)) if !family.args.is_empty() => {
                 (family.name.as_str(), family.args.clone())
             }
             Some(pb::sort::Kind::Func(function)) => (
@@ -3780,7 +3719,7 @@ fn lower_container_values(program: &mut pb::Program) -> Result<Vec<u32>, String>
                     pb::primitive_value::Value::BigRat(_) => "BigRat",
                     _ => "Rational",
                 };
-                if !matches!(program.sorts.get(node.sort_id as usize).and_then(|s| s.kind.as_ref()), Some(pb::sort::Kind::Family(f)) if f.name == expected && f.args.is_empty())
+                if !matches!(program.sorts.get(node.sort_id as usize).and_then(|s| s.kind.as_ref()), Some(pb::sort::Kind::Application(f)) if f.name == expected && f.args.is_empty())
                 {
                     return Err(format!("{expected} payload/sort mismatch"));
                 }
@@ -3838,7 +3777,7 @@ fn lower_container_values(program: &mut pb::Program) -> Result<Vec<u32>, String>
                 ),
                 _ => continue,
             };
-            let Some(pb::sort::Kind::Family(family)) = program
+            let Some(pb::sort::Kind::Application(family)) = program
                 .sorts
                 .get(node.sort_id as usize)
                 .and_then(|s| s.kind.as_ref())
@@ -3871,7 +3810,7 @@ fn lower_container_values(program: &mut pb::Program) -> Result<Vec<u32>, String>
             let mut sorts = program.sorts.clone();
             let pair_sort = u32::try_from(sorts.len()).map_err(|_| "too many sorts")?;
             sorts.push(pb::Sort {
-                kind: Some(pb::sort::Kind::Family(pb::HostSort {
+                kind: Some(pb::sort::Kind::Application(pb::SortApplication {
                     name: "Pair".into(),
                     args: parameters,
                 })),
@@ -3879,7 +3818,7 @@ fn lower_container_values(program: &mut pb::Program) -> Result<Vec<u32>, String>
             });
             let vector_sort = u32::try_from(sorts.len()).map_err(|_| "too many sorts")?;
             sorts.push(pb::Sort {
-                kind: Some(pb::sort::Kind::Family(pb::HostSort {
+                kind: Some(pb::sort::Kind::Application(pb::SortApplication {
                     name: "Vec".into(),
                     args: vec![pair_sort],
                 })),
@@ -3984,55 +3923,6 @@ fn signature(
         input,
         output: sort_name(&program.sorts, output)?,
     })
-}
-
-fn validate_host_declarations(program: &pb::Program, graph: &mut EGraph) -> Result<(), String> {
-    // Presentation/defaults were reconciled against the full staged context.
-    // Provider checks must not revalidate saved code in a pruned namespace.
-    for declaration in &program.declarations {
-        match &declaration.kind {
-            Some(pb::declaration::Kind::HostPrimitive(primitive)) => {
-                graph
-                    .type_info()
-                    .check_portable_builtin_signature(program, primitive)?;
-            }
-            Some(pb::declaration::Kind::HostSortFamily(family)) => {
-                if matches!(
-                    family.name.as_str(),
-                    "Vec" | "Set" | "MultiSet" | "Pair" | "Map" | "Maybe"
-                ) {
-                    let arity =
-                        if matches!(family.name.as_str(), "Vec" | "Set" | "MultiSet" | "Maybe") {
-                            1
-                        } else {
-                            2
-                        };
-                    if family.arity != arity || declaration.bindings.is_some() {
-                        return Err(format!(
-                            "unsupported or incompatible {} family descriptor",
-                            family.name
-                        ));
-                    }
-                    continue;
-                }
-                let sort = graph
-                    .get_sort_by_name(&family.name)
-                    .ok_or_else(|| format!("unknown host sort family {}", family.name))?;
-                if family.arity != 0
-                    || declaration.bindings.is_some()
-                    || sort.is_eq_sort()
-                    || sort.is_container_sort()
-                {
-                    return Err(format!(
-                        "unsupported or incompatible host sort family {}",
-                        family.name
-                    ));
-                }
-            }
-            _ => (),
-        }
-    }
-    Ok(())
 }
 
 fn expression(
@@ -4460,7 +4350,7 @@ fn validate_relation_uses(program: &pb::Program, saved: &pb::Program) -> Result<
                 if relations.contains(call.func.as_str())
                     && !matches!(
                         program.sorts.get(node.sort_id as usize).and_then(|sort| sort.kind.as_ref()),
-                        Some(pb::sort::Kind::Family(family)) if family.name == "Unit" && family.args.is_empty()
+                        Some(pb::sort::Kind::Application(family)) if family.name == "Unit" && family.args.is_empty()
                     )
                 {
                     return Err("relation calls require the Unit predicate annotation".into());
@@ -4567,7 +4457,7 @@ fn validate_relation_uses(program: &pb::Program, saved: &pb::Program) -> Result<
                     value(merge)?;
                 }
             }
-            Some(pb::declaration::Kind::Primitive(primitive)) => {
+            Some(pb::declaration::Kind::UserDefinedPrimitive(primitive)) => {
                 if let Some(body) = primitive.body {
                     value(body)?;
                 }
@@ -4578,19 +4468,6 @@ fn validate_relation_uses(program: &pb::Program, saved: &pb::Program) -> Result<
                 }
             }
             _ => (),
-        }
-        if let Some(python) = declaration
-            .bindings
-            .as_ref()
-            .and_then(|bindings| bindings.python.as_ref())
-        {
-            for view in &python.views {
-                for parameter in &view.params {
-                    if let Some(default) = parameter.default_expr {
-                        value(default)?;
-                    }
-                }
-            }
         }
     }
     for rule in &program.rules {
@@ -5930,7 +5807,7 @@ fn encode_sort(
     graph: &EGraph,
     names: &NativeNames,
     sort: &ArcSort,
-    response: &mut pb::RunProgramResponse,
+    response: &mut pb::RunProgramOutput,
 ) -> Result<u32, egglog::Error> {
     let mut sorts = vec![];
     let index = graph
@@ -5955,7 +5832,7 @@ fn encode_term(
     sort: &ArcSort,
     native_value: Value,
     children: &[u32],
-    response: &mut pb::RunProgramResponse,
+    response: &mut pb::RunProgramOutput,
     encoded: &mut HashMap<pb::Node, u32>,
 ) -> Result<u32, egglog::Error> {
     let (graph, names) = (&session.graph, &session.names);
@@ -6009,7 +5886,7 @@ fn encode_term(
         Term::App(name, native_children) if name == "multiset-of" && sort.is_container_sort() => {
             let sort_id = encode_sort(graph, names, sort, response)?;
             if sort.value_type() != Some(std::any::TypeId::of::<egglog::sort::MultiSetContainer>())
-                || !matches!(&response.sorts[sort_id as usize].kind, Some(pb::sort::Kind::Family(family)) if family.name == "MultiSet" && family.args.len() == 1)
+                || !matches!(&response.sorts[sort_id as usize].kind, Some(pb::sort::Kind::Application(family)) if family.name == "MultiSet" && family.args.len() == 1)
                 || native_children.len() != children.len()
                 || sort.inner_sorts().len() != 1
             {
@@ -6017,7 +5894,7 @@ fn encode_term(
                     "MultiSet term/sort/arity mismatch".into(),
                 ));
             }
-            let Some(pb::sort::Kind::Family(family)) = &response.sorts[sort_id as usize].kind
+            let Some(pb::sort::Kind::Application(family)) = &response.sorts[sort_id as usize].kind
             else {
                 unreachable!("validated MultiSet family")
             };
@@ -6044,7 +5921,7 @@ fn encode_term(
             let expected = if name == "set-of" { "Set" } else { "Vec" };
             let sort_id = encode_sort(graph, names, sort, response)?;
             let inner = sort.inner_sorts();
-            if !matches!(&response.sorts[sort_id as usize].kind, Some(pb::sort::Kind::Family(family)) if family.name == expected && family.args.len() == 1)
+            if !matches!(&response.sorts[sort_id as usize].kind, Some(pb::sort::Kind::Application(family)) if family.name == expected && family.args.len() == 1)
                 || inner.len() != 1
             {
                 return Err(egglog::Error::ExtractError(format!(
@@ -6068,7 +5945,7 @@ fn encode_term(
         {
             let sort_id = encode_sort(graph, names, sort, response)?;
             if sort.value_type() != Some(std::any::TypeId::of::<crate::maybe::MaybeContainer>())
-                || !matches!(&response.sorts[sort_id as usize].kind, Some(pb::sort::Kind::Family(family)) if family.name == "Maybe" && family.args.len() == 1)
+                || !matches!(&response.sorts[sort_id as usize].kind, Some(pb::sort::Kind::Application(family)) if family.name == "Maybe" && family.args.len() == 1)
                 || children.len() != usize::from(name == "maybe-some")
                 || native_children.len() != children.len()
                 || sort.inner_sorts().len() != 1
@@ -6086,7 +5963,7 @@ fn encode_term(
         Term::App(name, _) if name == "pair" && sort.is_container_sort() => {
             let sort_id = encode_sort(graph, names, sort, response)?;
             let inner = sort.inner_sorts();
-            if !matches!(&response.sorts[sort_id as usize].kind, Some(pb::sort::Kind::Family(family)) if family.name == "Pair" && family.args.len() == 2)
+            if !matches!(&response.sorts[sort_id as usize].kind, Some(pb::sort::Kind::Application(family)) if family.name == "Pair" && family.args.len() == 2)
                 || children.len() != 2
                 || inner.len() != 2
             {
@@ -6104,7 +5981,7 @@ fn encode_term(
         Term::App(name, _) if name == "map-of" && sort.is_container_sort() => {
             let sort_id = encode_sort(graph, names, sort, response)?;
             let inner = sort.inner_sorts();
-            if !matches!(&response.sorts[sort_id as usize].kind, Some(pb::sort::Kind::Family(family)) if family.name == "Map" && family.args.len() == 2)
+            if !matches!(&response.sorts[sort_id as usize].kind, Some(pb::sort::Kind::Application(family)) if family.name == "Map" && family.args.len() == 2)
                 || !children.len().is_multiple_of(2)
                 || inner.len() != 2
             {
@@ -6212,8 +6089,13 @@ fn encode_exact_number(
 }
 
 #[cfg(test)]
+#[path = "../tests/common/protobuf.rs"]
+pub(crate) mod fixtures;
+
+#[cfg(test)]
 mod tests {
     use super::*;
+    use crate::protobuf::fixtures::Observed;
 
     #[test]
     fn native_spans_share_files_and_preserve_validation_boundaries() {
@@ -6382,7 +6264,7 @@ mod tests {
                 self.calls.fetch_add(1, Ordering::SeqCst);
                 let sort = |name: &str| ModelSort {
                     sorts: vec![pb::Sort {
-                        kind: Some(pb::sort::Kind::Family(pb::HostSort {
+                        kind: Some(pb::sort::Kind::Application(pb::SortApplication {
                             name: name.into(),
                             args: vec![],
                         })),
@@ -6463,12 +6345,14 @@ mod tests {
                 },
             ]);
             program.declarations.push(pb::Declaration {
-                kind: Some(pb::declaration::Kind::Primitive(pb::Primitive {
-                    name: "factory".into(),
-                    inputs: vec![],
-                    output: function,
-                    body: Some(partial),
-                })),
+                kind: Some(pb::declaration::Kind::UserDefinedPrimitive(
+                    pb::UserDefinedPrimitive {
+                        name: "factory".into(),
+                        inputs: vec![],
+                        output: function,
+                        body: Some(partial),
+                    },
+                )),
                 ..Default::default()
             });
             // Creating a constructor function value needs Write, so evaluate
@@ -6527,7 +6411,7 @@ mod tests {
                         let response = run_host_default(&mut engine, id, missing);
                         assert_eq!(
                             response.error.unwrap().code,
-                            i32::from(pb::ErrorCode::EvaluationFailed)
+                            i32::from(pb::ErrorCode::RuntimeFailure)
                         );
                         assert_eq!(engine.graphs[&id].graph.num_tuples(), tuples);
                     }
@@ -6535,12 +6419,13 @@ mod tests {
                     let response = run_host_default(&mut engine, id, program);
                     assert_eq!(response.error, None);
                     let Some(pb::command_output::Kind::Extraction(extraction)) =
-                        &response.outputs[0].kind
+                        &response.output.outputs[0].kind
                     else {
                         panic!("applied factory result")
                     };
                     let term = extraction.roots[0].variants[0].term;
-                    let Some(pb::node::Kind::Call(call)) = &response.nodes[term as usize].kind
+                    let Some(pb::node::Kind::Call(call)) =
+                        &response.output.nodes[term as usize].kind
                     else {
                         panic!("table result")
                     };
@@ -6583,12 +6468,7 @@ mod tests {
                 args.first().copied()
             });
             // This private fixture completes ambient initialization after Create.
-            session.definitions = session
-                .graph
-                .type_info()
-                .portable_builtin_catalog()
-                .unwrap()
-                .definitions;
+            session.builtins = crate::builtin::configured_catalog(&session.graph).unwrap();
             let mut program = inventory_fixture(
                 "(function Target (i64 i64) i64 :merge (+ old new))
                  (sort F (UnstableFn (i64) i64))
@@ -6630,7 +6510,7 @@ mod tests {
             for invalid in ["unknown", "arity", "argument", "output"] {
                 let mut program = program.clone();
                 let capture = program.nodes.len() as u32;
-                let scalar = program.sorts.iter().position(|sort| matches!(&sort.kind, Some(pb::sort::Kind::Family(family)) if family.name == "i64")).unwrap() as u32;
+                let scalar = program.sorts.iter().position(|sort| matches!(&sort.kind, Some(pb::sort::Kind::Application(family)) if family.name == "i64")).unwrap() as u32;
                 program.nodes.push(pb::Node {
                     sort_id: scalar,
                     kind: Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
@@ -6686,7 +6566,7 @@ mod tests {
                     i32::from(pb::ErrorCode::InvalidProgram),
                     "{invalid}"
                 );
-                assert!(response.outputs.is_empty());
+                assert!(response.output.outputs.is_empty());
 
                 assert_eq!(engine.graphs[&id].definitions, definitions);
                 assert_eq!(engine.graphs[&id].request, request);
@@ -6794,9 +6674,8 @@ mod tests {
                     );
                 }
             }
-            // A genuine native projection Err may be retained despite successful
-            // compilation. Full metadata resolution must still reject it on a
-            // disposable compiler, not silently inspect only the live seed.
+            // Backend computed implementations publish their actual signatures;
+            // metadata resolution does not need to export or execute their bodies.
             let (mut engine, id) = host_default_engine();
             let calls = Arc::new(AtomicUsize::new(0));
             let model = engine
@@ -6825,20 +6704,18 @@ mod tests {
                 )
                 .unwrap();
             staged.graph = staged.graph.validate_program(commands).unwrap();
-            let expected = staged
-                .graph
-                .type_info()
-                .portable_builtin_catalog()
-                .err()
-                .unwrap();
-            assert_eq!(
+            let catalog = staged.graph.type_info().portable_builtin_catalog().unwrap();
+            assert!(
+                catalog
+                    .definitions
+                    .primitives
+                    .iter()
+                    .any(|primitive| { primitive.name == "projection_missing" })
+            );
+            assert!(
                 staged
                     .resolve_cost_model(&model, pb::Extractor::Tree.into())
-                    .err()
-                    .unwrap()
-                    .0
-                    .message,
-                expected
+                    .is_ok()
             );
             assert_eq!(bodies.load(Ordering::SeqCst), 0);
             assert!(
@@ -6885,12 +6762,12 @@ mod tests {
                     }
                     let kind = match wrapper {
                         "fail" => pb::command::Kind::Fail(Box::new(child)),
-                        "zero" | "repeat" => pb::command::Kind::Repeat(pb::Repeat {
-                            times: Some(u64::from(wrapper == "repeat")),
+                        "zero" | "repeat" => pb::command::Kind::Loop(pb::Loop {
+                            max_iterations: Some(u64::from(wrapper == "repeat")),
                             body: vec![child],
                             until: vec![],
                         }),
-                        "saturate" => pb::command::Kind::Saturate(pb::Saturate {
+                        "saturate" => pb::command::Kind::Loop(pb::Loop {
                             body: vec![child],
                             max_iterations: Some(1),
                             until: vec![],
@@ -6910,7 +6787,7 @@ mod tests {
                         "mutation-progress witness"
                     }));
                     assert_eq!(calls.load(Ordering::SeqCst), 0);
-                    assert!(response.outputs.is_empty());
+                    assert!(response.output.outputs.is_empty());
                     assert_eq!(engine.graphs[&id].graph.num_tuples(), 0);
                     assert!(
                         engine.graphs[&id]
@@ -6933,12 +6810,12 @@ mod tests {
                 span: spans[0],
                 kind: Some(pb::command::Kind::Fail(Box::new(pb::Command {
                     span: spans[1],
-                    kind: Some(pb::command::Kind::Repeat(pb::Repeat {
-                        times: Some(0),
+                    kind: Some(pb::command::Kind::Loop(pb::Loop {
+                        max_iterations: Some(0),
                         until: vec![],
                         body: vec![pb::Command {
                             span: spans[2],
-                            kind: Some(pb::command::Kind::Saturate(pb::Saturate {
+                            kind: Some(pb::command::Kind::Loop(pb::Loop {
                                 max_iterations: Some(1),
                                 until: vec![],
                                 body: vec![pb::Command {
@@ -6962,7 +6839,7 @@ mod tests {
     #[test]
     fn session_catalog_seed_survives_authored_primitives_and_empty_requests() {
         let (mut engine, id) = host_default_engine();
-        assert!(engine.graphs[&id].catalog_initialized);
+        assert!(!engine.graphs[&id].builtins.primitives.is_empty());
         let mut program = inventory_fixture(
             "(primitive successor (i64) i64 (+ _0 1)) (check (= (successor 3) 4))",
         );
@@ -6990,7 +6867,7 @@ mod tests {
             },
         );
         assert_eq!(empty.error, None);
-        assert!(empty.outputs.is_empty());
+        assert!(empty.output.outputs.is_empty());
         assert_eq!(engine.graphs[&id].definitions, definitions);
         program.declarations.clear();
         program.commands = commands;
@@ -6998,61 +6875,16 @@ mod tests {
     }
 
     #[test]
-    fn session_catalog_seed_keeps_live_errors_on_sort_free_requests() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        static BODIES: AtomicUsize = AtomicUsize::new(0);
-
-        for corrupt in ["registry", "projection"] {
-            let (mut engine, id) = host_default_engine();
-            let initial = run_host_default(
-                &mut engine,
-                id,
-                pb::Program {
-                    ..Default::default()
-                },
-            );
-            assert_eq!(initial.error, None);
-            assert!(engine.graphs[&id].catalog_initialized);
-            let graph = &mut engine.graphs.get_mut(&id).unwrap().graph;
-            if corrupt == "registry" {
-                graph.add_pure_primitive(ForeignPrimitive("egglog.core.i64.add".into()), None);
-            } else {
-                // Executable native bodies can retain a portable projection
-                // error. No body is evaluated by registration or preparation.
-                egglog::add_primitive!(
-                    graph,
-                    "unprojectable-body" = |value: i64| -> i64 {
-                        {
-                            BODIES.fetch_add(1, Ordering::SeqCst);
-                            value
-                        }
-                    }
-                );
-                graph
-                    .parse_and_run_program(
-                        None,
-                        "(primitive projection_missing (i64) i64 (unprojectable-body _0))",
-                    )
-                    .unwrap();
-            }
-            let expected = graph.type_info().portable_builtin_catalog().err().unwrap();
-            let tuples = graph.num_tuples();
-            let definitions = engine.graphs[&id].definitions.clone();
-            let request = engine.graphs[&id].request;
-            let response = run_host_default(
-                &mut engine,
-                id,
-                pb::Program {
-                    ..Default::default()
-                },
-            );
-            assert_eq!(response.error.unwrap().message, expected, "{corrupt}");
-            assert!(response.outputs.is_empty());
-            assert_eq!(engine.graphs[&id].request, request);
-            assert_eq!(engine.graphs[&id].definitions, definitions);
-            assert_eq!(engine.graphs[&id].graph.num_tuples(), tuples);
-            assert_eq!(BODIES.load(Ordering::SeqCst), 0);
-        }
+    fn cached_builtin_environment_keeps_live_registry_errors_on_empty_requests() {
+        let (mut engine, id) = host_default_engine();
+        let graph = &mut engine.graphs.get_mut(&id).unwrap().graph;
+        graph.add_pure_primitive(ForeignPrimitive("egglog.core.i64.add".into()), None);
+        let expected = graph.type_info().builtin_catalog().err().unwrap();
+        let definitions = engine.graphs[&id].definitions.clone();
+        let response = run_host_default(&mut engine, id, pb::Program::default());
+        assert_eq!(response.error.unwrap().message, expected);
+        assert!(response.output.outputs.is_empty());
+        assert_eq!(engine.graphs[&id].definitions, definitions);
     }
 
     #[test]
@@ -7067,7 +6899,7 @@ mod tests {
             let definitions = session.definitions.clone();
             let response = run_host_default(engine, id, empty.clone());
             assert_eq!(response.error, None);
-            assert!(response.outputs.is_empty());
+            assert!(response.output.outputs.is_empty());
             assert_eq!(engine.graphs[&id].definitions, definitions);
         };
         let base = "(primitive seed_a (i64) i64 (+ _0 1))
@@ -7104,18 +6936,12 @@ mod tests {
             let error = response.error.unwrap();
             assert_eq!(error.code, i32::from(pb::ErrorCode::InvalidProgram));
             assert!(error.message.contains("conflicting declaration seed_b"));
-            assert!(response.outputs.is_empty());
+            assert!(response.output.outputs.is_empty());
             assert_eq!(engine.graphs[&clone].request, request);
             assert_eq!(engine.graphs[&clone].definitions, before);
             consistent(&mut engine, clone);
             engine
-                .return_to(
-                    &pb::ReturnToEGraphRequest {
-                        active_id: clone,
-                        saved_id: id,
-                    }
-                    .encode_to_vec(),
-                )
+                .destroy(&pb::DestroyEGraphRequest { egraph_id: clone }.encode_to_vec())
                 .unwrap();
             assert_eq!(engine.graphs[&id].definitions, definitions);
             assert!(
@@ -7297,7 +7123,7 @@ mod tests {
         let response = run_host_default(&mut engine, id, program);
         assert_eq!(response.error, None);
 
-        let Some(pb::command_output::Kind::Sizes(sizes)) = &response.outputs[0].kind else {
+        let Some(pb::command_output::Kind::Sizes(sizes)) = &response.output.outputs[0].kind else {
             panic!("observable tables, not unfolded extraction")
         };
         assert_eq!(
@@ -7317,14 +7143,14 @@ mod tests {
         let program = pb::Program {
             sorts: vec![
                 pb::Sort {
-                    kind: Some(pb::sort::Kind::Family(pb::HostSort {
+                    kind: Some(pb::sort::Kind::Application(pb::SortApplication {
                         name: "String".into(),
                         args: vec![],
                     })),
                     ..Default::default()
                 },
                 pb::Sort {
-                    kind: Some(pb::sort::Kind::Family(pb::HostSort {
+                    kind: Some(pb::sort::Kind::Application(pb::SortApplication {
                         name: "BigRat".into(),
                         args: vec![],
                     })),
@@ -7539,7 +7365,7 @@ mod tests {
         ).unwrap() as u32;
         let sort_id = program.nodes[root as usize].sort_id;
         let vector = program.sorts.iter().position(|sort|
-            matches!(&sort.kind, Some(pb::sort::Kind::Family(family)) if family.name == "Vec")
+            matches!(&sort.kind, Some(pb::sort::Kind::Application(family)) if family.name == "Vec")
         ).unwrap() as u32;
         for _ in 0..16 {
             let children = program.nodes.len() as u32;
@@ -7790,7 +7616,7 @@ mod tests {
                         );
                         assert_eq!(response.error, None, "{in_rule}/{mode:?}/{replay}");
                         let Some(pb::command_output::Kind::Proof(proof)) =
-                            &response.outputs[0].kind
+                            &response.output.outputs[0].kind
                         else {
                             panic!("proof output")
                         };
@@ -7914,9 +7740,9 @@ mod tests {
             let (mut engine, id) = host_default_engine();
             let response = run_host_default(&mut engine, id, program);
             let error = response.error.unwrap();
-            assert_eq!(error.code, i32::from(pb::ErrorCode::EvaluationFailed));
+            assert_eq!(error.code, i32::from(pb::ErrorCode::RuntimeFailure));
             assert_eq!(error.location.unwrap().path, [0]);
-            assert!(response.outputs.is_empty());
+            assert!(response.output.outputs.is_empty());
             let graph = &engine.graphs[&id].graph;
             assert_eq!(
                 graph.get_size(&native_name("call", "Branch")),
@@ -7929,7 +7755,7 @@ mod tests {
             for phase in source::Source::new(None, &text).unwrap() {
                 let response = run_host_default(&mut replay, replay_id, phase.unwrap());
                 if let Some(error) = response.error {
-                    assert_eq!(error.code, i32::from(pb::ErrorCode::EvaluationFailed));
+                    assert_eq!(error.code, i32::from(pb::ErrorCode::RuntimeFailure));
                     failed = true;
                     break;
                 }
@@ -7952,7 +7778,7 @@ mod tests {
         fn contract(&self) -> cost_model::CostModelContract {
             let sort = cost_model::ModelSort {
                 sorts: vec![pb::Sort {
-                    kind: Some(pb::sort::Kind::Family(pb::HostSort {
+                    kind: Some(pb::sort::Kind::Application(pb::SortApplication {
                         name: "i64".into(),
                         args: vec![],
                     })),
@@ -8050,7 +7876,8 @@ mod tests {
                 assert_eq!(model.0.load(std::sync::atomic::Ordering::SeqCst), 0);
                 let response = run_host_default(&mut engine, id, program);
                 assert_eq!(response.error, None);
-                let Some(pb::command_output::Kind::Extraction(result)) = &response.outputs[0].kind
+                let Some(pb::command_output::Kind::Extraction(result)) =
+                    &response.output.outputs[0].kind
                 else {
                     panic!("aggregate extraction")
                 };
@@ -8059,7 +7886,7 @@ mod tests {
                     let [variant] = root.variants.as_slice() else {
                         panic!("one variant")
                     };
-                    assert!(matches!(&response.nodes[variant.term as usize].kind,
+                    assert!(matches!(&response.output.nodes[variant.term as usize].kind,
                         Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
                             value: Some(pb::primitive_value::Value::I64(value)),
                         })) if *value == expected));
@@ -8117,9 +7944,9 @@ mod tests {
             assert_eq!(engine.graphs[&id].graph.num_tuples(), 0);
             let response = run_host_default(&mut engine, id, program);
             let error = response.error.unwrap();
-            assert_eq!(error.code, i32::from(pb::ErrorCode::EvaluationFailed));
+            assert_eq!(error.code, i32::from(pb::ErrorCode::RuntimeFailure));
             assert_eq!(error.location.unwrap().path, [0]);
-            assert!(response.outputs.is_empty());
+            assert!(response.output.outputs.is_empty());
             let graph = &engine.graphs[&id].graph;
             assert_eq!(graph.get_size(&native_name("call", "Branch")), 16);
             assert_eq!(graph.get_size(&native_name("call", "Later")), 0);
@@ -8141,7 +7968,7 @@ mod tests {
                     let mut engine = Engine::default();
                     let request = pb::CreateEGraphRequest {
                         sorts: vec![pb::Sort {
-                            kind: Some(pb::sort::Kind::Family(pb::HostSort {
+                            kind: Some(pb::sort::Kind::Application(pb::SortApplication {
                                 name: "i64".into(),
                                 args: vec![],
                             })),
@@ -8180,7 +8007,7 @@ mod tests {
                     );
                     assert_eq!(frozen.error, None);
                     let Some(pb::command_output::Kind::Snapshot(snapshot)) =
-                        &frozen.outputs[0].kind
+                        &frozen.output.outputs[0].kind
                     else {
                         panic!("expected actual frozen options");
                     };
@@ -8247,17 +8074,12 @@ mod tests {
                     if seminaive == Some(false) {
                         // Compile admission above is independent of this later
                         // normal-mode proof extraction failure, not proof success.
-                        assert_eq!(error.code, pb::ErrorCode::ProofFailed as i32);
+                        assert_eq!(error.code, pb::ErrorCode::RuntimeFailure as i32);
                         assert_eq!(error.location.unwrap().path, vec![0]);
-                        assert_eq!(
-                            error.proof_failure.unwrap().reason,
-                            pb::ProofFailureReason::ProofsNotEnabled as i32
-                        );
                     } else {
                         assert_eq!(error.code, pb::ErrorCode::InvalidProgram as i32);
                         assert!(error.message.contains("egglog.experimental.size.tables"));
                         assert!(error.location.is_none());
-                        assert!(error.proof_failure.is_none());
                     }
                 }
             }
@@ -8325,7 +8147,7 @@ mod tests {
         let mut engine = Engine::default();
         let request = pb::CreateEGraphRequest {
             sorts: vec![pb::Sort {
-                kind: Some(pb::sort::Kind::Family(pb::HostSort {
+                kind: Some(pb::sort::Kind::Application(pb::SortApplication {
                     name: "i64".into(),
                     args: vec![],
                 })),
@@ -8355,11 +8177,7 @@ mod tests {
         (engine, id)
     }
 
-    fn run_host_default(
-        engine: &mut Engine,
-        egraph_id: u64,
-        program: pb::Program,
-    ) -> pb::RunProgramResponse {
+    fn run_host_default(engine: &mut Engine, egraph_id: u64, program: pb::Program) -> Observed {
         let bytes = engine
             .run(
                 &pb::RunProgramRequest {
@@ -8370,22 +8188,29 @@ mod tests {
                 .encode_to_vec(),
             )
             .unwrap();
-        pb::RunProgramResponse::decode(bytes.as_slice()).unwrap()
+        Observed::from_frames(
+            (bytes)
+                .iter()
+                .map(|bytes| pb::RunProgramResponse::decode(bytes.as_slice()).unwrap()),
+        )
     }
 
     fn run_diagnostic_matches(
         engine: &mut Engine,
         egraph_id: u64,
         program: pb::Program,
-    ) -> (pb::RunProgramResponse, u64) {
-        let response = engine
-            .run_request(pb::RunProgramRequest {
-                egraph_id,
-                program: Some(program),
-                diagnostics: true,
-            })
-            .unwrap();
+    ) -> (Observed, u64) {
+        let response = Observed::from_frames(
+            engine
+                .run_request(pb::RunProgramRequest {
+                    egraph_id,
+                    program: Some(program),
+                    diagnostics: true,
+                })
+                .unwrap(),
+        );
         let matches = response
+            .output
             .outputs
             .iter()
             .filter_map(|output| match &output.kind {
@@ -8393,7 +8218,7 @@ mod tests {
                 _ => None,
             })
             .map(|document| {
-                let value: serde_json::Value = serde_json::from_str(&document.content).unwrap();
+                let value: serde_json::Value = serde_json::from_slice(&document.content).unwrap();
                 value["num_matches_per_rule"]
                     .as_object()
                     .unwrap()
@@ -8405,265 +8230,12 @@ mod tests {
         (response, matches)
     }
 
-    fn host_default_program(default_node: u32) -> pb::Program {
-        let (mut fixture, id) = host_default_engine();
-        let mut p = fixture
-            .graphs
-            .get_mut(&id)
-            .unwrap()
-            .graph
-            .type_info()
-            .portable_builtin_catalog()
-            .unwrap()
-            .definitions;
-        let i64_sort = p.sorts.iter().position(|s| matches!(&s.kind, Some(pb::sort::Kind::Family(f)) if f.name == "i64" && f.args.is_empty())).unwrap() as u32;
-        p.nodes = vec![
-            pb::Node {
-                sort_id: i64_sort,
-                kind: Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
-                    value: Some(pb::primitive_value::Value::I64(i64::MAX)),
-                })),
-                ..Default::default()
-            },
-            pb::Node {
-                sort_id: i64_sort,
-                kind: Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
-                    value: Some(pb::primitive_value::Value::I64(1)),
-                })),
-                ..Default::default()
-            },
-            pb::Node {
-                sort_id: i64_sort,
-                kind: Some(pb::node::Kind::Call(pb::Call {
-                    func: "egglog.core.i64.add".into(),
-                    args: vec![0, 1],
-                })),
-                ..Default::default()
-            },
-            pb::Node {
-                sort_id: i64_sort,
-                kind: Some(pb::node::Kind::Call(pb::Call {
-                    func: "current".into(),
-                    args: vec![],
-                })),
-                ..Default::default()
-            },
-        ];
-        p.declarations.push(pb::Declaration {
-            kind: Some(pb::declaration::Kind::Function(pb::Function {
-                name: "current".into(),
-                inputs: vec![],
-                output: i64_sort,
-                merge: None,
-            })),
-            ..Default::default()
-        });
-        let get = p.declarations.iter_mut().find(|d| matches!(&d.kind, Some(pb::declaration::Kind::HostPrimitive(h)) if h.name == "test.default.identity")).unwrap();
-        get.bindings.as_mut().unwrap().python = Some(pb::PythonBindings {
-            views: vec![pb::PythonCallable {
-                kind: pb::PythonCallKind::Function.into(),
-                path: vec!["test".into(), "identity".into()],
-                params: vec![pb::PythonParameter {
-                    core_input: Some(0),
-                    name: "value".into(),
-                    default_expr: Some(default_node),
-                }],
-                ..Default::default()
-            }],
-        });
-        p
-    }
-
-    #[test]
-    fn host_binding_default_keeps_builtin_callee_context_without_evaluation() {
-        let (mut engine, id) = host_default_engine();
-        // MAX + 1 would fail if evaluated. It remains a valid closed template.
-        assert_eq!(
-            run_host_default(&mut engine, id, host_default_program(2)).error,
-            None
-        );
-        assert_eq!(
-            run_host_default(&mut engine, id, host_default_program(2)).error,
-            None
-        );
-        assert!(
-            run_host_default(&mut engine, id, host_default_program(1))
-                .error
-                .is_some()
-        );
-        assert_eq!(
-            HOST_DEFAULT_BODY_CALLS.load(std::sync::atomic::Ordering::SeqCst),
-            0
-        );
-    }
-
-    #[test]
-    fn host_binding_default_keeps_user_callee_context_without_evaluation() {
-        let (mut engine, id) = host_default_engine();
-        assert_eq!(
-            run_host_default(&mut engine, id, host_default_program(3)).error,
-            None
-        );
-        let mut resend = host_default_program(3);
-        resend
-            .declarations
-            .retain(|d| !matches!(d.kind, Some(pb::declaration::Kind::Function(_))));
-        assert_eq!(
-            run_host_default(&mut engine, id, resend).error,
-            None,
-            "default can refer to an ambient installed table"
-        );
-        assert!(
-            run_host_default(&mut engine, id, host_default_program(1))
-                .error
-                .is_some()
-        );
-        assert_eq!(
-            HOST_DEFAULT_BODY_CALLS.load(std::sync::atomic::Ordering::SeqCst),
-            0
-        );
-    }
-
-    #[test]
-    fn map_default_saved_closure_never_accumulates_execution_helpers() {
-        let program = pb::Program {
-            sorts: vec![
-                pb::Sort {
-                    kind: Some(pb::sort::Kind::Family(pb::HostSort {
-                        name: "i64".into(),
-                        args: vec![],
-                    })),
-                    ..Default::default()
-                },
-                pb::Sort {
-                    kind: Some(pb::sort::Kind::Family(pb::HostSort {
-                        name: "Map".into(),
-                        args: vec![0, 0],
-                    })),
-                    ..Default::default()
-                },
-            ],
-            nodes: vec![
-                pb::Node {
-                    sort_id: 0,
-                    kind: Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
-                        value: Some(pb::primitive_value::Value::I64(7)),
-                    })),
-                    ..Default::default()
-                },
-                pb::Node {
-                    sort_id: 1,
-                    kind: Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
-                        value: Some(pb::primitive_value::Value::Map(pb::MapValue {
-                            entries: vec![
-                                pb::MapEntry {
-                                    key: Some(0),
-                                    value: Some(0)
-                                };
-                                2
-                            ],
-                        })),
-                    })),
-                    ..Default::default()
-                },
-            ],
-            declarations: vec![pb::Declaration {
-                kind: Some(pb::declaration::Kind::Function(pb::Function {
-                    name: "take_map".into(),
-                    inputs: vec![pb::Arg {
-                        name: "map".into(),
-                        sort: 1,
-                    }],
-                    output: 0,
-                    merge: None,
-                })),
-                bindings: Some(pb::CallableBindings {
-                    python: Some(pb::PythonBindings {
-                        views: vec![pb::PythonCallable {
-                            kind: pb::PythonCallKind::Function.into(),
-                            path: vec!["test".into(), "take_map".into()],
-                            params: vec![pb::PythonParameter {
-                                core_input: Some(0),
-                                name: "map".into(),
-                                default_expr: Some(1),
-                            }],
-                            ..Default::default()
-                        }],
-                    }),
-                    ..Default::default()
-                }),
-                ..Default::default()
-            }],
-            ..Default::default()
-        };
-        let mut engine = Engine::default();
-        let id = pb::CreateEGraphResponse::decode(
-            engine
-                .create(
-                    &pb::CreateEGraphRequest {
-                        sorts: vec![program.sorts[0].clone()],
-                        options: Some(pb::EGraphOptions {
-                            cost_sort: Some(0),
-                            ..Default::default()
-                        }),
-                        ..Default::default()
-                    }
-                    .encode_to_vec(),
-                )
-                .unwrap()
-                .as_slice(),
-        )
-        .unwrap()
-        .egraph_id;
-        let mut saved = None;
-        for _ in 0..4 {
-            let request = pb::RunProgramRequest {
-                egraph_id: id,
-                program: Some(program.clone()),
-                diagnostics: false,
-            };
-            let response = pb::RunProgramResponse::decode(
-                engine.run(&request.encode_to_vec()).unwrap().as_slice(),
-            )
-            .unwrap();
-            assert_eq!(response.error, None);
-            let definitions = &engine.graphs[&id].definitions;
-            if let Some(previous) = &saved {
-                assert_eq!(
-                    definitions, previous,
-                    "resupply must not grow the saved closure"
-                );
-            }
-            assert_eq!(definitions.nodes.len(), 2);
-            assert!(
-                definitions
-                    .nodes
-                    .iter()
-                    .all(|n| matches!(n.kind, Some(pb::node::Kind::PrimitiveValue(_))))
-            );
-            let map = definitions
-                .nodes
-                .iter()
-                .find_map(|n| match &n.kind {
-                    Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
-                        value: Some(pb::primitive_value::Value::Map(map)),
-                    })) => Some(map),
-                    _ => None,
-                })
-                .unwrap();
-            assert_eq!(map.entries.len(), 2);
-            assert_eq!(map.entries[0], map.entries[1]);
-            assert_eq!(map.entries[0].key, map.entries[0].value);
-            saved = Some(definitions.clone());
-        }
-    }
-
     #[test]
     fn extracted_node_interning_preserves_exact_float_bits() {
         let (mut engine, id) = host_default_engine();
         let session = engine.graphs.get_mut(&id).unwrap();
         let sort = session.graph.get_sort_by_name("f64").unwrap();
-        let mut response = pb::RunProgramResponse::default();
+        let mut response = pb::RunProgramOutput::default();
         let mut encoded = HashMap::new();
         // Separate native term arenas avoid OrderedFloat's own NaN/zero equality;
         // this regression concerns only the emitted protobuf node key.
@@ -8712,7 +8284,7 @@ mod tests {
         let odd = terms.app("map-of".into(), vec![child]);
         let even = terms.app("map-of".into(), vec![child, child]);
         for (term, sort) in [(odd, "M"), (even, "V")] {
-            let mut response = pb::RunProgramResponse::default();
+            let mut response = pb::RunProgramOutput::default();
             let children = match terms.get(term) {
                 Term::App(_, children) => vec![0; children.len()],
                 _ => unreachable!(),
@@ -8752,7 +8324,7 @@ mod tests {
         ] {
             let term = terms.app(name.into(), children);
             for observed_count in 0..=2 {
-                let mut response = pb::RunProgramResponse::default();
+                let mut response = pb::RunProgramOutput::default();
                 assert!(
                     encode_term(
                         session,
@@ -8777,14 +8349,14 @@ mod tests {
         let mut program = pb::Program {
             sorts: vec![
                 pb::Sort {
-                    kind: Some(pb::sort::Kind::Family(pb::HostSort {
+                    kind: Some(pb::sort::Kind::Application(pb::SortApplication {
                         name: "i64".into(),
                         args: vec![],
                     })),
                     ..Default::default()
                 },
                 pb::Sort {
-                    kind: Some(pb::sort::Kind::Family(pb::HostSort {
+                    kind: Some(pb::sort::Kind::Application(pb::SortApplication {
                         name: "Set".into(),
                         args: vec![0],
                     })),
@@ -8838,7 +8410,7 @@ mod tests {
         let child = terms.lit(Literal::Int(7));
         for (name, sort) in [("set-of", "V"), ("vec-of", "S")] {
             let term = terms.app(name.into(), vec![child]);
-            let mut response = pb::RunProgramResponse::default();
+            let mut response = pb::RunProgramOutput::default();
             assert!(
                 encode_term(
                     session,
@@ -8861,7 +8433,7 @@ mod tests {
         for threads in [None, Some(0), Some(1), Some(2)] {
             let request = pb::CreateEGraphRequest {
                 sorts: vec![pb::Sort {
-                    kind: Some(pb::sort::Kind::Family(pb::HostSort {
+                    kind: Some(pb::sort::Kind::Application(pb::SortApplication {
                         name: "i64".into(),
                         args: vec![],
                     })),
@@ -8918,7 +8490,7 @@ mod tests {
         for execution_mode in [99, -1] {
             let request = pb::CreateEGraphRequest {
                 sorts: vec![pb::Sort {
-                    kind: Some(pb::sort::Kind::Family(pb::HostSort {
+                    kind: Some(pb::sort::Kind::Application(pb::SortApplication {
                         name: "i64".into(),
                         args: vec![],
                     })),
@@ -8986,17 +8558,17 @@ mod tests {
                     extension: None,
                     mode: pb::ExecutionMode::Normal,
                     definitions: pb::Program::default(),
-                    catalog_initialized: false,
+                    builtins: crate::builtin::configured_catalog(&crate::new_experimental_egraph())
+                        .unwrap(),
                     names: NativeNames::default(),
                     request: 0,
-                    clone_parent: None,
                     registry: rules::Registry::default(),
                     sorts: HashSet::new(),
                     cost_models: HashMap::new(),
                 };
                 let mut program = pb::Program {
                     sorts: vec![pb::Sort {
-                        kind: Some(pb::sort::Kind::Family(pb::HostSort {
+                        kind: Some(pb::sort::Kind::Application(pb::SortApplication {
                             name: "i64".into(),
                             args: vec![],
                         })),
@@ -9070,16 +8642,11 @@ mod tests {
             session.mode = mode;
             // This private fixture finishes ambient initialization after Create;
             // real extensions initialize before the seed is captured.
-            session.definitions = session
-                .graph
-                .type_info()
-                .portable_builtin_catalog()
-                .unwrap()
-                .definitions;
+            session.builtins = crate::builtin::configured_catalog(&session.graph).unwrap();
             let mut program = pb::Program {
                 sorts: vec![
                     pb::Sort {
-                        kind: Some(pb::sort::Kind::Family(pb::HostSort {
+                        kind: Some(pb::sort::Kind::Application(pb::SortApplication {
                             name: "i64".into(),
                             args: vec![],
                         })),
@@ -9241,24 +8808,19 @@ mod tests {
             .next()
             .unwrap()
             .unwrap();
-        program.declarations.insert(
-            0,
-            pb::Declaration {
-                kind: Some(pb::declaration::Kind::HostSortFamily(pb::HostSortFamily {
-                    name: "i64".into(),
-                    ..Default::default()
-                })),
-                ..Default::default()
-            },
-        );
+        program
+            .declarations
+            .insert(0, program.declarations[0].clone());
         program.declarations.push(program.declarations[2].clone()); // compatible resupply
         let i64_sort = program
             .sorts
             .iter()
-            .position(|s| matches!(&s.kind, Some(pb::sort::Kind::Family(f)) if f.name == "i64"))
+            .position(
+                |s| matches!(&s.kind, Some(pb::sort::Kind::Application(f)) if f.name == "i64"),
+            )
             .unwrap() as u32;
         program.sorts.push(pb::Sort {
-            kind: Some(pb::sort::Kind::Family(pb::HostSort {
+            kind: Some(pb::sort::Kind::Application(pb::SortApplication {
                 name: "Vec".into(),
                 args: vec![i64_sort],
             })),
@@ -9271,11 +8833,11 @@ mod tests {
                 .iter()
                 .map(|i| i.source_declaration)
                 .collect::<Vec<_>>(),
-            [Some(1), None, Some(2),]
+            [Some(0), None, Some(2),]
         );
         let installed = run_host_default(&mut engine, id, program.clone());
         assert_eq!(installed.error, None);
-        assert!(installed.outputs.is_empty());
+        assert!(installed.output.outputs.is_empty());
         let cloned = engine
             .clone_egraph(&pb::CloneEGraphRequest { egraph_id: id }.encode_to_vec())
             .unwrap();
@@ -9330,12 +8892,12 @@ mod tests {
             ..Default::default()
         };
         program.commands.push(pb::Command {
-            kind: Some(pb::command::Kind::Repeat(pb::Repeat {
-                times: Some(3),
+            kind: Some(pb::command::Kind::Loop(pb::Loop {
+                max_iterations: Some(3),
                 until: vec![],
                 body: vec![pb::Command {
-                    kind: Some(pb::command::Kind::Repeat(pb::Repeat {
-                        times: Some(2),
+                    kind: Some(pb::command::Kind::Loop(pb::Loop {
+                        max_iterations: Some(2),
                         until: vec![],
                         body: vec![action.clone(), action],
                     })),
@@ -9347,7 +8909,7 @@ mod tests {
         let response = run_host_default(&mut engine, id, program);
         assert_eq!(response.error, None);
         assert!(
-            matches!(&response.outputs[0].kind, Some(pb::command_output::Kind::Run(outcome)) if outcome.updated && !outcome.can_stop)
+            matches!(&response.output.outputs[0].kind, Some(pb::command_output::Kind::Run(outcome)) if outcome.updated && !outcome.can_stop)
         );
         assert_eq!(
             engine.graphs[&id]
@@ -9394,7 +8956,7 @@ mod tests {
     }
 
     #[test]
-    fn byte_class_inventory_clone_return_and_failure_prefix() {
+    fn byte_class_inventory_clone_destroy_and_failure_prefix() {
         let (mut engine, id) = host_default_engine();
         let initial = inventory_fixture("(datatype A (AItem i64)) (AItem 1)");
         assert_eq!(run_host_default(&mut engine, id, initial).error, None);
@@ -9418,15 +8980,9 @@ mod tests {
         );
         assert_eq!(engine.graphs[&id].graph.materialized_eq_classes(), prefix);
         let response = engine
-            .return_to(
-                &pb::ReturnToEGraphRequest {
-                    active_id: child,
-                    saved_id: id,
-                }
-                .encode_to_vec(),
-            )
+            .destroy(&pb::DestroyEGraphRequest { egraph_id: child }.encode_to_vec())
             .unwrap();
-        pb::ReturnToEGraphResponse::decode(response.as_slice()).unwrap();
+        pb::DestroyEGraphResponse::decode(response.as_slice()).unwrap();
         assert_eq!(engine.graphs[&id].graph.materialized_eq_classes(), prefix);
         assert_eq!(
             run_host_default(
@@ -9488,7 +9044,7 @@ mod tests {
         });
         let response = run_host_default(&mut engine, id, program);
         assert_eq!(response.error, None);
-        assert!(response.outputs.is_empty());
+        assert!(response.output.outputs.is_empty());
         let graph = &engine.graphs[&id].graph;
         assert_eq!(graph.materialized_eq_classes().len(), 3);
         assert_eq!(graph.get_size(&native_name("call", "AItem")), 1);
@@ -9521,13 +9077,13 @@ mod tests {
                 }
                 let response = run_host_default(&mut engine, id, program);
                 let error = response.error.unwrap();
-                assert_eq!(error.code, i32::from(pb::ErrorCode::EvaluationFailed));
+                assert_eq!(error.code, i32::from(pb::ErrorCode::RuntimeFailure));
                 assert_eq!(error.location.unwrap().path, [failure_index as u32]);
                 let actual = error.span.unwrap();
                 let expected = span.unwrap();
                 assert_eq!((actual.start, actual.end), (expected.start, expected.end));
                 assert_eq!(response.files[actual.file as usize], source_file);
-                assert!(response.outputs.is_empty());
+                assert!(response.output.outputs.is_empty());
                 let graph = &engine.graphs[&id].graph;
                 assert_eq!(graph.materialized_eq_classes().len(), expected_classes);
                 for table in ["N", "Seen"] {
@@ -9582,8 +9138,8 @@ mod tests {
         // Force first-use retention; the duplicate and After marker must remain
         // unentered after the first Union's later member fails.
         program.commands.insert(4, program.commands[3].clone());
-        let response = pb::RunProgramResponse::decode(
-            engine
+        let response = Observed::from_frames(
+            (engine
                 .run(
                     &pb::RunProgramRequest {
                         egraph_id: id,
@@ -9592,30 +9148,32 @@ mod tests {
                     }
                     .encode_to_vec(),
                 )
-                .unwrap()
-                .as_slice(),
-        )
-        .unwrap();
+                .unwrap())
+            .iter()
+            .map(|bytes| pb::RunProgramResponse::decode(bytes.as_slice()).unwrap()),
+        );
         let error = response.error.as_ref().unwrap();
-        assert_eq!(error.code, i32::from(pb::ErrorCode::EvaluationFailed));
+        assert_eq!(error.code, i32::from(pb::ErrorCode::RuntimeFailure));
         assert_eq!(error.location.as_ref().unwrap().path, [3]);
         assert!(error.location.as_ref().unwrap().iterations.is_empty());
         let span = error.span.unwrap();
         assert_eq!((span.start, span.end), (action_span.start, action_span.end));
         assert_eq!(response.files[span.file as usize], action_file);
-        assert_eq!(response.outputs.len(), 3);
-        for (output, path) in response.outputs.iter().zip([1, 1, 2]) {
+        assert_eq!(response.output.outputs.len(), 3);
+        for (output, path) in response.output.outputs.iter().zip([1, 1, 2]) {
             assert_eq!(output.location.as_ref().unwrap().path, [path]);
             assert!(output.location.as_ref().unwrap().iterations.is_empty());
         }
-        let Some(pb::command_output::Kind::Run(outcome)) = &response.outputs[0].kind else {
+        let Some(pb::command_output::Kind::Run(outcome)) = &response.output.outputs[0].kind else {
             panic!("Run")
         };
-        let Some(pb::command_output::Kind::Diagnostic(run_detail)) = &response.outputs[1].kind
+        let Some(pb::command_output::Kind::Diagnostic(run_detail)) =
+            &response.output.outputs[1].kind
         else {
             panic!("Run diagnostic")
         };
-        let Some(pb::command_output::Kind::Diagnostic(stats)) = &response.outputs[2].kind else {
+        let Some(pb::command_output::Kind::Diagnostic(stats)) = &response.output.outputs[2].kind
+        else {
             panic!("Stats")
         };
         let native_report = native.get_overall_run_report();
@@ -9623,7 +9181,7 @@ mod tests {
             (outcome.updated, outcome.can_stop),
             (native_report.updated, native_report.can_stop)
         );
-        let run_detail: serde_json::Value = serde_json::from_str(&run_detail.content).unwrap();
+        let run_detail: serde_json::Value = serde_json::from_slice(&run_detail.content).unwrap();
         assert!(run_detail.get("updated").is_none());
         assert_eq!(
             run_detail["num_matches_per_rule"]
@@ -9634,10 +9192,7 @@ mod tests {
                 .sum::<u64>(),
             1
         );
-        assert!(
-            response.rules.is_empty(),
-            "diagnostic text has no attributed rule catalog"
-        );
+
         let graph = &engine.graphs[&id].graph;
         assert_eq!(
             graph.materialized_eq_classes().len(),
@@ -9673,8 +9228,8 @@ mod tests {
             })),
             ..Default::default()
         });
-        let reused = pb::RunProgramResponse::decode(
-            engine
+        let reused = Observed::from_frames(
+            (engine
                 .run(
                     &pb::RunProgramRequest {
                         egraph_id: id,
@@ -9683,15 +9238,18 @@ mod tests {
                     }
                     .encode_to_vec(),
                 )
-                .unwrap()
-                .as_slice(),
-        )
-        .unwrap();
+                .unwrap())
+            .iter()
+            .map(|bytes| pb::RunProgramResponse::decode(bytes.as_slice()).unwrap()),
+        );
         assert_eq!(reused.error, None);
-        assert_eq!(reused.outputs.len(), 1);
-        assert_eq!(reused.outputs[0].location.as_ref().unwrap().path, [0]);
+        assert_eq!(reused.output.outputs.len(), 1);
         assert_eq!(
-            reused.outputs[0].kind,
+            reused.output.outputs[0].location.as_ref().unwrap().path,
+            [0]
+        );
+        assert_eq!(
+            reused.output.outputs[0].kind,
             Some(pb::command_output::Kind::Diagnostic(stats.clone())),
             "cumulative collected detail survives failure"
         );
@@ -9774,7 +9332,7 @@ mod tests {
         });
         let response = run_host_default(&mut engine, id, program);
         assert_eq!(response.error, None);
-        assert!(response.outputs.is_empty());
+        assert!(response.output.outputs.is_empty());
         let graph = &engine.graphs[&id].graph;
         assert_eq!(graph.materialized_eq_classes().len(), 4);
         assert_eq!(graph.get_size(&native_name("call", "Box")), 4);
@@ -9807,7 +9365,7 @@ mod tests {
             .sorts
             .iter()
             .position(|sort| {
-                matches!(&sort.kind, Some(pb::sort::Kind::Family(family)) if family.name == "Vec")
+                matches!(&sort.kind, Some(pb::sort::Kind::Application(family)) if family.name == "Vec")
             })
             .unwrap() as u32;
         assert!(program.nodes.is_empty());
@@ -9862,7 +9420,7 @@ mod tests {
         }
         let response = run_host_default(&mut engine, id, program);
         assert_eq!(response.error, None);
-        assert!(response.outputs.is_empty());
+        assert!(response.output.outputs.is_empty());
         let graph = &engine.graphs[&id].graph;
         assert_eq!(graph.materialized_eq_classes().len(), 3);
         assert_eq!(graph.num_tuples(), 2, "only the two authored Holder rows");
@@ -9915,9 +9473,9 @@ mod tests {
         });
         let response = run_host_default(&mut engine, id, program.clone());
         assert_eq!(response.error, None);
-        assert_eq!(response.outputs.len(), 1);
+        assert_eq!(response.output.outputs.len(), 1);
         assert!(matches!(
-            response.outputs[0].kind,
+            response.output.outputs[0].kind,
             Some(pb::command_output::Kind::Run(_))
         ));
         let graph = &engine.graphs[&id].graph;
@@ -9990,7 +9548,7 @@ mod tests {
         });
         let response = run_host_default(&mut engine, id, program);
         assert_eq!(response.error, None);
-        assert_eq!(response.outputs.len(), 1);
+        assert_eq!(response.output.outputs.len(), 1);
         let graph = &mut engine.graphs.get_mut(&id).unwrap().graph;
         assert_eq!(graph.get_size(&native_name("call", "Atom")), 2);
         graph
@@ -10092,18 +9650,20 @@ mod tests {
                     ..Default::default()
                 }),
                 8 => program.declarations.push(pb::Declaration {
-                    kind: Some(pb::declaration::Kind::Primitive(pb::Primitive {
-                        name: "deferred".into(),
-                        inputs: vec![],
-                        output: sort_id,
-                        body: Some(union),
-                    })),
+                    kind: Some(pb::declaration::Kind::UserDefinedPrimitive(
+                        pb::UserDefinedPrimitive {
+                            name: "deferred".into(),
+                            inputs: vec![],
+                            output: sort_id,
+                            body: Some(union),
+                        },
+                    )),
                     ..Default::default()
                 }),
                 _ => program.commands.push(pb::Command {
-                    kind: Some(pb::command::Kind::Repeat(pb::Repeat {
+                    kind: Some(pb::command::Kind::Loop(pb::Loop {
                         body: vec![action],
-                        times: Some(u64::from(case == 9)),
+                        max_iterations: Some(u64::from(case == 9)),
                         until: vec![],
                     })),
                     ..Default::default()
@@ -10115,13 +9675,13 @@ mod tests {
                 if case == 0 {
                     assert_eq!(
                         response.error.unwrap().code,
-                        i32::from(pb::ErrorCode::EvaluationFailed)
+                        i32::from(pb::ErrorCode::RuntimeFailure)
                     );
-                    assert!(response.outputs.is_empty());
+                    assert!(response.output.outputs.is_empty());
                 } else {
                     assert_eq!(response.error, None);
                     assert!(
-                        matches!(&response.outputs[0].kind, Some(pb::command_output::Kind::Run(outcome)) if outcome.updated == (case == 9))
+                        matches!(&response.output.outputs[0].kind, Some(pb::command_output::Kind::Run(outcome)) if outcome.updated == (case == 9))
                     );
                 }
                 assert_eq!(graph.get_size(&native_name("call", "Atom")), 1);
@@ -10137,7 +9697,7 @@ mod tests {
                 i32::from(pb::ErrorCode::InvalidProgram),
                 "case {case}"
             );
-            assert!(response.outputs.is_empty());
+            assert!(response.output.outputs.is_empty());
             assert_eq!(graph.num_tuples(), 0, "case {case}");
             assert!(graph.materialized_eq_classes().is_empty(), "case {case}");
         }
@@ -10176,9 +9736,9 @@ mod tests {
             let response = run_host_default(&mut engine, id, program);
             assert_eq!(response.error.is_some(), baseline.is_err());
             if let Some(error) = response.error {
-                assert_eq!(error.code, i32::from(pb::ErrorCode::EvaluationFailed));
+                assert_eq!(error.code, i32::from(pb::ErrorCode::RuntimeFailure));
             }
-            assert!(response.outputs.is_empty());
+            assert!(response.output.outputs.is_empty());
             let graph = &engine.graphs[&id].graph;
             assert_eq!(graph.materialized_eq_classes().len(), classes);
             assert_eq!(
@@ -10206,7 +9766,7 @@ mod tests {
             .iter()
             .position(|sort| matches!(&sort.kind, Some(pb::sort::Kind::Eq(name)) if name == "A"))
             .unwrap() as u32;
-        let integer = program.sorts.iter().position(|sort| matches!(&sort.kind, Some(pb::sort::Kind::Family(family)) if family.name == "i64")).unwrap() as u32;
+        let integer = program.sorts.iter().position(|sort| matches!(&sort.kind, Some(pb::sort::Kind::Application(family)) if family.name == "i64")).unwrap() as u32;
         let union = program.nodes.len() as u32;
         program.nodes.push(pb::Node {
             sort_id,
@@ -10244,7 +9804,7 @@ mod tests {
         });
         let response = run_host_default(&mut engine, id, program);
         assert_eq!(response.error, None);
-        assert_eq!(response.outputs.len(), 1);
+        assert_eq!(response.output.outputs.len(), 1);
         let graph = &engine.graphs[&id].graph;
         assert_eq!(graph.materialized_eq_classes().len(), 1);
         assert_eq!(graph.num_tuples(), 3);
@@ -10328,7 +9888,6 @@ mod tests {
                 .rules[0];
             assert_eq!(representative.name.as_deref(), Some("first"));
             assert!(representative.doc.is_empty());
-            assert!(stats.rules.is_empty(), "Stats is opaque diagnostic text");
 
             input.rules[0].no_decomp = true;
             input.commands.truncate(1);
@@ -10351,7 +9910,7 @@ mod tests {
                 );
                 assert_eq!(empty.error, None);
                 assert!(
-                    matches!(&empty.outputs[0].kind, Some(pb::command_output::Kind::Run(result)) if !result.updated && result.can_stop)
+                    matches!(&empty.output.outputs[0].kind, Some(pb::command_output::Kind::Run(result)) if !result.updated && result.can_stop)
                 );
             }
         }
@@ -10377,7 +9936,7 @@ mod tests {
         let response = run_host_default(&mut engine, id, input);
         assert_eq!(response.error, None);
         let Some(pb::command_output::Kind::Snapshot(snapshot)) =
-            &response.outputs.last().unwrap().kind
+            &response.output.outputs.last().unwrap().kind
         else {
             panic!("snapshot")
         };
@@ -10418,8 +9977,8 @@ mod tests {
         );
         let check = input.commands.pop().unwrap();
         input.commands = vec![pb::Command {
-            kind: Some(pb::command::Kind::Repeat(pb::Repeat {
-                times: Some(1),
+            kind: Some(pb::command::Kind::Loop(pb::Loop {
+                max_iterations: Some(1),
                 body: input.commands,
                 ..Default::default()
             })),
@@ -10429,8 +9988,8 @@ mod tests {
         let initial = renderer.render(&input).unwrap();
         native.parse_and_run_program(None, &initial).unwrap();
         input.commands = vec![pb::Command {
-            kind: Some(pb::command::Kind::Repeat(pb::Repeat {
-                times: Some(1),
+            kind: Some(pb::command::Kind::Loop(pb::Loop {
+                max_iterations: Some(1),
                 body: vec![
                     pb::Command {
                         kind: Some(pb::command::Kind::AddRules(pb::AddRules {
@@ -10488,7 +10047,7 @@ mod tests {
             1,
             Command::Action(Action::Panic(ast::Span::Panic, "registration fault".into())),
         );
-        let mut response = pb::RunProgramResponse::default();
+        let mut response = pb::RunProgramOutput::default();
         let mut context = session.install(prepared, &mut response).unwrap();
         assert!(
             session
@@ -10583,7 +10142,7 @@ mod tests {
         second.no_decomp = true;
         let input = pb::Program {
             sorts: vec![pb::Sort {
-                kind: Some(pb::sort::Kind::Family(pb::HostSort {
+                kind: Some(pb::sort::Kind::Application(pb::SortApplication {
                     name: "i64".into(),
                     args: vec![],
                 })),
@@ -10618,7 +10177,7 @@ mod tests {
             ],
             ..Default::default()
         };
-        let mut response = run_host_default(&mut engine, id, input);
+        let response = run_host_default(&mut engine, id, input);
         assert_eq!(response.error, None);
         let rules = &engine.graphs[&id].registry.rules;
         assert!(Arc::ptr_eq(
@@ -10630,22 +10189,30 @@ mod tests {
                 .iter()
                 .all(|rule| rule.candidate.record.program.files.is_empty())
         );
-        let mut context = RequestOccurrences::default();
-        engine.graphs[&id].registry.origins(&mut context);
-        context
-            .file_offsets
-            .insert(Arc::as_ptr(&rules[0].candidate.record.files) as usize, 0);
-        for rule in rules {
-            report::rule_reference(&rule.candidate.name, &mut context, &mut response).unwrap();
-        }
-        assert_eq!(response.rules.len(), 2);
-        assert_eq!(
-            response.files.len(),
-            1,
-            "reuse the request's provenance arena for all its rules"
+        let frozen = run_host_default(
+            &mut engine,
+            id,
+            pb::Program {
+                commands: vec![pb::Command {
+                    kind: Some(pb::command::Kind::Freeze(pb::Freeze {})),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
         );
-        for rule in response.rules {
-            let file = &response.files[rule.span.unwrap().file as usize];
+        let Some(pb::command_output::Kind::Snapshot(snapshot)) = &frozen.output.outputs[0].kind
+        else {
+            panic!("snapshot")
+        };
+        let program = snapshot.program.as_ref().unwrap();
+        assert_eq!(program.rules.len(), 2);
+        assert_eq!(
+            program.files.len(),
+            1,
+            "all rules reuse their owned submission provenance"
+        );
+        for rule in &program.rules {
+            let file = &program.files[rule.span.unwrap().file as usize];
             assert_eq!(file.name, "shared.egg");
             assert_eq!(file.contents.as_ref().unwrap().len(), 100_000);
         }
@@ -10653,7 +10220,7 @@ mod tests {
 
     #[test]
     fn additive_source_rejects_dynamic_additions_through_single_iteration_wrappers() {
-        for saturate in [false, true] {
+        for max_iterations in [Some(2), None] {
             let mut input = inventory_fixture(
                 "(datatype E (N i64) (Goal i64)) (ruleset g) (rule ((N x)) ((Goal x)) :ruleset g)",
             );
@@ -10665,27 +10232,19 @@ mod tests {
                 ..Default::default()
             };
             let single = pb::Command {
-                kind: Some(pb::command::Kind::Repeat(pb::Repeat {
-                    times: Some(1),
+                kind: Some(pb::command::Kind::Loop(pb::Loop {
+                    max_iterations: Some(1),
                     body: vec![run.clone(), input.commands.remove(0), run],
                     ..Default::default()
                 })),
                 ..Default::default()
             };
             input.commands = vec![pb::Command {
-                kind: Some(if saturate {
-                    pb::command::Kind::Saturate(pb::Saturate {
-                        max_iterations: Some(2),
-                        body: vec![single],
-                        ..Default::default()
-                    })
-                } else {
-                    pb::command::Kind::Repeat(pb::Repeat {
-                        times: Some(2),
-                        body: vec![single],
-                        ..Default::default()
-                    })
-                }),
+                kind: Some(pb::command::Kind::Loop(pb::Loop {
+                    max_iterations,
+                    body: vec![single],
+                    ..Default::default()
+                })),
                 ..Default::default()
             }];
             let error = source::Renderer::default().render(&input).unwrap_err();

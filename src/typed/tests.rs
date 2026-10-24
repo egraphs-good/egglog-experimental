@@ -5,6 +5,9 @@ use super::{
     pb,
     storage::{Arena, DeclarationKind, Packer, Record, Slot, publish},
 };
+pub(super) use crate::protobuf::fixtures as observations;
+
+use observations::Observed;
 use prost::Message;
 use std::sync::Arc;
 
@@ -266,32 +269,26 @@ fn function_values_reject_deferred_unions_without_eager_allocation() {
 }
 
 #[test]
-fn sort_text_alias_metadata_does_not_affect_type_identity_or_hash() {
-    use super::{
-        EgglogValue,
-        builtins::{I64, Vec},
-    };
+fn primitive_sort_documentation_is_retained_without_changing_type_identity() {
+    use super::{EgglogValue, builtins::I64};
     use std::hash::{DefaultHasher, Hash, Hasher};
-    let mut packer = Packer::default();
-    let index = packer.intern(Vec::<I64>::sort_ref().0, 0);
-    packer.finish().unwrap();
+    let catalog =
+        pb::BuiltinCatalog::decode(include_bytes!("builtins/catalog.pb").as_slice()).unwrap();
     let mut sorts = vec![];
-    for symbols in [vec![], vec!["A"], vec!["Z"], vec!["A", "Z"]] {
-        let mut program = packer.program.clone();
-        program.sorts[index as usize].egglog_aliases = symbols
-            .into_iter()
-            .map(|symbol| pb::EgglogTypeBinding {
-                symbol: symbol.into(),
-            })
-            .collect();
-        let mut slots = std::array::from_fn(|_| vec![]);
-        slots[Arena::Sort as usize] = (0..program.sorts.len() as u32).map(Slot::Local).collect();
-        slots[Arena::Declaration as usize] = (0..program.declarations.len() as u32)
-            .map(Slot::Local)
-            .collect();
-        sorts.push(SortRef(
-            publish(program, slots, vec![], Arena::Sort, index).unwrap(),
-        ));
+    for doc in [None, Some("A"), Some("Z"), Some("A and Z")] {
+        let mut supplied = catalog.clone();
+        supplied
+            .primitive_sorts
+            .iter_mut()
+            .find(|family| family.name == "Vec")
+            .unwrap()
+            .doc = doc.map(str::to_owned);
+        let context = super::storage::publish_catalog(supplied).unwrap();
+        let definition = context
+            .declaration("Vec", DeclarationKind::PrimitiveSort)
+            .unwrap();
+        assert_eq!(definition.primitive_sort().unwrap().doc.as_deref(), doc);
+        sorts.push(SortRef::family(&definition, vec![I64::sort_ref()]).unwrap());
     }
     for sort in &sorts {
         assert!(&sorts[0] == sort);
@@ -357,7 +354,7 @@ fn typed_capture_recipe_identity_ownership_and_negative_markers() {
                 let Some(pb::command::Kind::Action(pb::Action {
                     kind: Some(pb::action::Kind::Set(set)),
                     ..
-                })) = &mut owner.program.commands[0].kind
+                })) = &mut owner.program_mut().unwrap().commands[0].kind
                 else {
                     unreachable!()
                 };
@@ -561,7 +558,7 @@ fn typed_table_actions_preserve_exact_wire_operands_and_real_execution() {
         .create(
             &pb::CreateEGraphRequest {
                 sorts: vec![pb::Sort {
-                    kind: Some(pb::sort::Kind::Family(pb::HostSort {
+                    kind: Some(pb::sort::Kind::Application(pb::SortApplication {
                         name: "i64".into(),
                         args: vec![],
                     })),
@@ -586,14 +583,19 @@ fn typed_table_actions_preserve_exact_wire_operands_and_real_execution() {
         diagnostics: false,
     };
     let response_bytes = engine.run(&request.encode_to_vec()).unwrap();
-    let response = pb::RunProgramResponse::decode(response_bytes.as_slice()).unwrap();
+    let response = Observed::from_frames(
+        response_bytes
+            .iter()
+            .map(|bytes| pb::RunProgramResponse::decode(bytes.as_slice()).unwrap()),
+    );
     assert!(response.error.is_none(), "{:?}", response.error);
     let extracted: Vec<_> = response
+        .output
         .outputs
         .iter()
         .filter_map(|output| match &output.kind {
             Some(pb::command_output::Kind::Extraction(result)) => {
-                Some(&response.nodes[result.roots[0].variants[0].term as usize].kind)
+                Some(&response.output.nodes[result.roots[0].variants[0].term as usize].kind)
             }
             _ => None,
         })
@@ -653,7 +655,7 @@ fn typed_table_heads_import_nullary_targets_close_one_binder_and_keep_shared_uni
     for name in ["HeadOnly", "Nullary"] {
         let record = &packer.declarations[name];
         assert!(matches!(
-            &record.owner.as_ref().unwrap().program.declarations[record.index as usize].kind,
+            &record.owner.as_ref().unwrap().program().unwrap().declarations[record.index as usize].kind,
             Some(pb::declaration::Kind::Function(function)) if function.name == name
         ));
         assert!(packer.program.declarations.iter().any(
@@ -780,7 +782,8 @@ fn typed_table_function_syntax_rejects_inert_data_and_incompatible_selectors() {
         .owner
         .as_ref()
         .unwrap()
-        .program
+        .program()
+        .unwrap()
         .nodes[primitive.expression().0.index as usize]
         .kind
     else {
@@ -1175,26 +1178,23 @@ fn wide_callbacks_author_generated_binders_without_claiming_grounded_execution()
 // The same spelling deliberately names a nominal sort, an applied family,
 // and a constructor. Imports retain the original generated records.
 fn namespace_fragment(imported: bool, reversed: bool, missing: Option<DeclarationKind>) -> Record {
+    let family = super::storage::publish_catalog(pb::BuiltinCatalog {
+        primitive_sorts: (missing != Some(DeclarationKind::PrimitiveSort))
+            .then(|| pb::PrimitiveSort {
+                name: "Shared".into(),
+                arity: 1,
+                ..Default::default()
+            })
+            .into_iter()
+            .collect(),
+        ..Default::default()
+    })
+    .unwrap();
     let mut declarations = vec![
         (
             DeclarationKind::EqSort,
             pb::declaration::Kind::EqSort(pb::EqSort {
                 name: "Shared".into(),
-                bindings: Some(pb::SortBindings {
-                    rust: Some(pb::TypeBinding {
-                        path: vec!["Original".into()],
-                        type_params: vec![],
-                    }),
-                    ..Default::default()
-                }),
-                ..Default::default()
-            }),
-        ),
-        (
-            DeclarationKind::HostSortFamily,
-            pb::declaration::Kind::HostSortFamily(pb::HostSortFamily {
-                name: "Shared".into(),
-                arity: 1,
                 ..Default::default()
             }),
         ),
@@ -1217,7 +1217,7 @@ fn namespace_fragment(imported: bool, reversed: bool, missing: Option<Declaratio
                 ..Default::default()
             },
             pb::Sort {
-                kind: Some(pb::sort::Kind::Family(pb::HostSort {
+                kind: Some(pb::sort::Kind::Application(pb::SortApplication {
                     name: "Shared".into(),
                     args: vec![0],
                 })),
@@ -1247,20 +1247,16 @@ fn namespace_fragment(imported: bool, reversed: bool, missing: Option<Declaratio
         slots[Arena::Sort as usize] = vec![Slot::Local(0), Slot::Local(1)];
         slots
     };
-    let imports = if imported {
-        let source = publish(program.clone(), slots(), vec![], Arena::Node, 0).unwrap();
-        let records = (0..program.declarations.len())
-            .map(|index| Record {
-                owner: source.owner.clone(),
-                arena: Arena::Declaration,
-                index: index as u32,
-            })
-            .collect();
+    let mut imports = vec![family];
+    if imported {
+        let source = publish(program.clone(), slots(), imports.clone(), Arena::Node, 0).unwrap();
+        imports.extend((0..program.declarations.len()).map(|index| Record {
+            owner: source.owner.clone(),
+            arena: Arena::Declaration,
+            index: index as u32,
+        }));
         program.declarations.clear();
-        records
-    } else {
-        vec![]
-    };
+    }
     publish(program, slots(), imports, Arena::Node, 0).unwrap()
 }
 
@@ -1276,39 +1272,34 @@ fn nominal_family_and_callable_names_close_independently() {
             assert!(nominal == SortRef::equality("Shared"));
             for kind in [
                 DeclarationKind::EqSort,
-                DeclarationKind::HostSortFamily,
+                DeclarationKind::PrimitiveSort,
                 DeclarationKind::Callable,
             ] {
                 let declaration = root.declaration("Shared", kind).unwrap();
-                let actual = &declaration.owner.as_ref().unwrap().program.declarations
-                    [declaration.index as usize]
-                    .kind;
-                assert!(matches!(
-                    (kind, actual),
-                    (
-                        DeclarationKind::EqSort,
-                        Some(pb::declaration::Kind::EqSort(_))
-                    ) | (
-                        DeclarationKind::HostSortFamily,
-                        Some(pb::declaration::Kind::HostSortFamily(_))
-                    ) | (
-                        DeclarationKind::Callable,
-                        Some(pb::declaration::Kind::Constructor(_))
-                    )
-                ));
-                if imported {
-                    assert!(root.owner.as_ref().unwrap().declarations.iter().any(|r| {
-                        Arc::ptr_eq(
-                            r.owner.as_ref().unwrap(),
-                            declaration.owner.as_ref().unwrap(),
-                        ) && r.index == declaration.index
-                    }));
+                if kind == DeclarationKind::PrimitiveSort {
+                    assert_eq!(declaration.primitive_sort().unwrap().name, "Shared");
+                    assert_eq!(declaration.arena, Arena::PrimitiveSort);
                 } else {
+                    let definition = &declaration
+                        .owner
+                        .as_ref()
+                        .unwrap()
+                        .program()
+                        .unwrap()
+                        .declarations[declaration.index as usize];
+                    assert!(matches!(
+                        (kind, &definition.kind),
+                        (
+                            DeclarationKind::EqSort,
+                            Some(pb::declaration::Kind::EqSort(_))
+                        ) | (
+                            DeclarationKind::Callable,
+                            Some(pb::declaration::Kind::Constructor(_))
+                        )
+                    ));
                     // Wrong-kind local records must not shadow the correct import.
-                    let mut program = root.owner.as_ref().unwrap().program.clone();
-                    program
-                        .declarations
-                        .retain(|d| d.kind.as_ref() != actual.as_ref());
+                    let mut program = root.owner.as_ref().unwrap().program().unwrap().clone();
+                    program.declarations.retain(|d| d != definition);
                     let mut slots = std::array::from_fn(|_| vec![]);
                     slots[Arena::Sort as usize] = vec![Slot::Local(0), Slot::Local(1)];
                     let mixed =
@@ -1322,7 +1313,7 @@ fn nominal_family_and_callable_names_close_independently() {
                 }
             }
             let definition = root
-                .declaration("Shared", DeclarationKind::HostSortFamily)
+                .declaration("Shared", DeclarationKind::PrimitiveSort)
                 .unwrap();
             let applied = SortRef::family(&definition, vec![nominal]).unwrap();
             assert!(applied == family);
@@ -1343,16 +1334,18 @@ fn nominal_family_and_callable_names_close_independently() {
                     packer.intern(record, 0);
                 }
                 packer.finish().unwrap();
-                assert_eq!(packer.program.declarations.len(), 3);
-                assert!(packer.program.declarations.iter().any(|d| matches!(
-                    &d.kind, Some(pb::declaration::Kind::EqSort(d)) if d.name == "Shared"
-                )));
-                assert!(packer.program.declarations.iter().any(|d| matches!(
-                    &d.kind, Some(pb::declaration::Kind::HostSortFamily(d)) if d.name == "Shared"
-                )));
-                assert!(packer.program.declarations.iter().any(|d| matches!(
-                    &d.kind, Some(pb::declaration::Kind::Constructor(d)) if d.name == "Shared"
-                )));
+                assert_eq!(packer.program.declarations.len(), 2);
+                assert!(packer.program.declarations.iter().any(|d| matches!(&d.kind,
+                    Some(pb::declaration::Kind::EqSort(d)) if d.name == "Shared")));
+                assert!(packer.program.declarations.iter().any(|d| matches!(&d.kind,
+                    Some(pb::declaration::Kind::Constructor(d)) if d.name == "Shared")));
+                assert!(
+                    packer
+                        .builtin_demands
+                        .iter()
+                        .any(|d| d.arena == Arena::PrimitiveSort
+                            && d.primitive_sort().unwrap().name == "Shared")
+                );
                 let bytes = packer.program.encode_to_vec();
                 assert_eq!(
                     pb::Program::decode(bytes.as_slice()).unwrap(),
@@ -1369,14 +1362,14 @@ fn missing_declaration_kind_never_uses_a_same_named_other_kind() {
         for reversed in [false, true] {
             for missing in [
                 DeclarationKind::EqSort,
-                DeclarationKind::HostSortFamily,
+                DeclarationKind::PrimitiveSort,
                 DeclarationKind::Callable,
             ] {
                 let root = namespace_fragment(imported, reversed, Some(missing));
                 assert!(root.declaration("Shared", missing).is_err());
                 let required = match missing {
                     DeclarationKind::EqSort => root.resolve(Arena::Sort, 0).unwrap(),
-                    DeclarationKind::HostSortFamily => {
+                    DeclarationKind::PrimitiveSort => {
                         let family = root.resolve(Arena::Sort, 1).unwrap();
                         assert!(SortRef(family.clone()).validate_closed().is_err());
                         family
@@ -1395,52 +1388,48 @@ fn missing_declaration_kind_never_uses_a_same_named_other_kind() {
 fn namespace_split_keeps_same_kind_and_callable_kind_conflicts() {
     for changed in 0..4 {
         let root = namespace_fragment(false, false, None);
-        let mut program = root.owner.as_ref().unwrap().program.clone();
+        let mut program = root.owner.as_ref().unwrap().program().unwrap().clone();
+        let mut imports = root.owner.as_ref().unwrap().declarations.clone();
         match changed {
             0 => {
                 let Some(pb::declaration::Kind::EqSort(d)) = &mut program.declarations[0].kind
                 else {
-                    unreachable!()
+                    panic!()
                 };
-                d.bindings = Some(pb::SortBindings {
-                    rust: Some(pb::TypeBinding {
-                        path: vec!["Changed".into()],
-                        type_params: vec![],
-                    }),
-                    ..Default::default()
-                });
+                d.uf_parent = Some("Shared_parent".into());
             }
             1 => {
-                let Some(pb::declaration::Kind::HostSortFamily(d)) =
-                    &mut program.declarations[1].kind
+                let Some(pb::declaration::Kind::Constructor(d)) = &mut program.declarations[1].kind
                 else {
-                    unreachable!()
-                };
-                d.arity = 2;
-            }
-            2 => {
-                let Some(pb::declaration::Kind::Constructor(d)) = &mut program.declarations[2].kind
-                else {
-                    unreachable!()
+                    panic!()
                 };
                 d.unextractable = true;
             }
-            _ => {
-                program.declarations[2].kind =
-                    Some(pb::declaration::Kind::HostPrimitive(pb::HostPrimitive {
-                        name: "Shared".into(),
-                        typing: Some(pb::host_primitive::Typing::Signature(
-                            pb::GenericSignature {
-                                output: Some(0),
-                                ..Default::default()
-                            },
-                        )),
-                    }));
+            2 => {
+                program.declarations[1].kind = Some(pb::declaration::Kind::Function(pb::Function {
+                    name: "Shared".into(),
+                    output: 0,
+                    ..Default::default()
+                }))
             }
+            3 => {
+                imports = vec![
+                    super::storage::publish_catalog(pb::BuiltinCatalog {
+                        primitive_sorts: vec![pb::PrimitiveSort {
+                            name: "Shared".into(),
+                            arity: 2,
+                            ..Default::default()
+                        }],
+                        ..Default::default()
+                    })
+                    .unwrap(),
+                ]
+            }
+            _ => unreachable!(),
         }
         let mut slots = std::array::from_fn(|_| vec![]);
         slots[Arena::Sort as usize] = vec![Slot::Local(0), Slot::Local(1)];
-        let other = publish(program, slots, vec![], Arena::Node, 0).unwrap();
+        let other = publish(program, slots, imports, Arena::Node, 0).unwrap();
         let mut packer = Packer::default();
         for record in [root, other] {
             packer.intern(record.resolve(Arena::Sort, 1).unwrap(), 0);
@@ -1454,7 +1443,7 @@ fn namespace_split_keeps_same_kind_and_callable_kind_conflicts() {
 fn family_sort_comparison_resolves_slots_not_raw_indices() {
     use super::{EgglogValue, builtins::I64};
     let family = super::storage::builtin_catalog()
-        .declaration("Vec", DeclarationKind::HostSortFamily)
+        .declaration("Vec", DeclarationKind::PrimitiveSort)
         .unwrap();
     let integers = SortRef::family(&family, vec![I64::sort_ref()]).unwrap();
     let atoms = SortRef::family(&family, vec![SortRef::equality("Atom")]).unwrap();
@@ -1471,7 +1460,7 @@ fn family_sort_comparison_resolves_slots_not_raw_indices() {
         publish(
             pb::Program {
                 sorts: vec![pb::Sort {
-                    kind: Some(pb::sort::Kind::Family(pb::HostSort {
+                    kind: Some(pb::sort::Kind::Application(pb::SortApplication {
                         name: "Vec".into(),
                         args: vec![1],
                     })),
@@ -1497,7 +1486,7 @@ fn generic_calls_infer_from_actual_arguments_and_result_records() {
     use super::{EgglogValue, builtins::I64};
     let catalog = super::storage::builtin_catalog();
     let family = catalog
-        .declaration("Vec", DeclarationKind::HostSortFamily)
+        .declaration("Vec", DeclarationKind::PrimitiveSort)
         .unwrap();
     let integers = SortRef::family(&family, vec![I64::sort_ref()]).unwrap();
     let atoms = SortRef::family(&family, vec![SortRef::equality("A")]).unwrap();
@@ -1534,59 +1523,63 @@ fn generic_tail_patterns_keep_group_width_and_share_every_binding() {
         EgglogValue,
         builtins::{F64, I64},
     };
-    // Locations 0/1 are binder variables; 2/3 import concrete scalar sorts.
+    // Locations 0/1 are binder variables; 2/3 are owned concrete scalar sorts.
     let declaration = |inputs: &[u32], tail: &[u32], output, parameters| {
-        let mut slots = std::array::from_fn(|_| vec![]);
-        slots[Arena::Sort as usize] = vec![
-            Slot::Local(0),
-            Slot::Local(1),
-            Slot::External(I64::sort_ref().0),
-            Slot::External(F64::sort_ref().0),
-        ];
-        Callable(
-            publish(
-                pb::Program {
-                    sorts: (0..2)
-                        .map(|i| pb::Sort {
-                            kind: Some(pb::sort::Kind::Var(i)),
+        let catalog = super::storage::publish_catalog(pb::BuiltinCatalog {
+            sorts: vec![
+                pb::Sort {
+                    kind: Some(pb::sort::Kind::Var(0)),
+                    ..Default::default()
+                },
+                pb::Sort {
+                    kind: Some(pb::sort::Kind::Var(1)),
+                    ..Default::default()
+                },
+                I64::sort_ref().0.sort().unwrap().clone(),
+                F64::sort_ref().0.sort().unwrap().clone(),
+            ],
+            primitive_sorts: vec![
+                pb::PrimitiveSort {
+                    name: "i64".into(),
+                    arity: 0,
+                    ..Default::default()
+                },
+                pb::PrimitiveSort {
+                    name: "f64".into(),
+                    arity: 0,
+                    ..Default::default()
+                },
+            ],
+            primitives: vec![pb::Primitive {
+                name: "test.grouped".into(),
+                typing: Some(pb::primitive::Typing::Signature(pb::GenericSignature {
+                    type_params: (0..parameters).map(|i| format!("T{i}")).collect(),
+                    inputs: inputs
+                        .iter()
+                        .map(|sort| pb::Arg {
+                            sort: *sort,
                             ..Default::default()
                         })
                         .collect(),
-                    declarations: vec![pb::Declaration {
-                        kind: Some(pb::declaration::Kind::HostPrimitive(pb::HostPrimitive {
-                            name: "test.grouped".into(),
-                            typing: Some(pb::host_primitive::Typing::Signature(
-                                pb::GenericSignature {
-                                    type_params: (0..parameters).map(|i| format!("T{i}")).collect(),
-                                    inputs: inputs
-                                        .iter()
-                                        .map(|sort| pb::Arg {
-                                            sort: *sort,
-                                            ..Default::default()
-                                        })
-                                        .collect(),
-                                    varargs: tail
-                                        .iter()
-                                        .map(|sort| pb::Arg {
-                                            sort: *sort,
-                                            ..Default::default()
-                                        })
-                                        .collect(),
-                                    output: Some(output),
-                                    ..Default::default()
-                                },
-                            )),
-                        })),
-                        ..Default::default()
-                    }],
+                    varargs: tail
+                        .iter()
+                        .map(|sort| pb::Arg {
+                            sort: *sort,
+                            ..Default::default()
+                        })
+                        .collect(),
+                    output: Some(output),
                     ..Default::default()
-                },
-                slots,
-                vec![],
-                Arena::Declaration,
-                0,
-            )
-            .unwrap(),
+                })),
+                ..Default::default()
+            }],
+            ..Default::default()
+        })
+        .unwrap();
+        Callable(
+            catalog
+                .declaration("test.grouped", DeclarationKind::Callable)
+                .unwrap(),
         )
     };
     let integer = I64::from(7).expression().clone();
@@ -1669,50 +1662,57 @@ fn generic_tail_patterns_keep_group_width_and_share_every_binding() {
 }
 
 #[test]
-fn grouped_declarations_relocate_every_tail_position() {
+fn grouped_builtin_demands_retain_every_tail_position() {
     use super::{
         EgglogValue,
         builtins::{F64, I64},
     };
-    let declaration = |imports: Vec<SortRef>, tail: Vec<u32>| {
-        let mut slots = std::array::from_fn(|_| vec![]);
-        slots[Arena::Sort as usize] = imports.into_iter().map(|s| Slot::External(s.0)).collect();
-        Callable(
-            publish(
-                pb::Program {
-                    declarations: vec![pb::Declaration {
-                        kind: Some(pb::declaration::Kind::HostPrimitive(pb::HostPrimitive {
-                            name: "test.relocated.group".into(),
-                            typing: Some(pb::host_primitive::Typing::Signature(
-                                pb::GenericSignature {
-                                    inputs: vec![pb::Arg {
-                                        sort: tail[0],
-                                        name: "prefix".into(),
-                                    }],
-                                    output: Some(tail[0]),
-                                    varargs: tail
-                                        .into_iter()
-                                        .enumerate()
-                                        .map(|(i, sort)| pb::Arg {
-                                            sort,
-                                            name: format!("item{i}"),
-                                        })
-                                        .collect(),
-                                    ..Default::default()
-                                },
-                            )),
-                        })),
-                        doc: Some("retain complete grouped record".into()),
-                        ..Default::default()
-                    }],
+    let declaration = |sorts: Vec<SortRef>, tail: Vec<u32>| {
+        let catalog = super::storage::publish_catalog(pb::BuiltinCatalog {
+            sorts: sorts
+                .into_iter()
+                .map(|s| s.0.sort().unwrap().clone())
+                .collect(),
+            primitive_sorts: vec![
+                pb::PrimitiveSort {
+                    name: "i64".into(),
+                    arity: 0,
                     ..Default::default()
                 },
-                slots,
-                vec![],
-                Arena::Declaration,
-                0,
-            )
-            .unwrap(),
+                pb::PrimitiveSort {
+                    name: "f64".into(),
+                    arity: 0,
+                    ..Default::default()
+                },
+            ],
+            primitives: vec![pb::Primitive {
+                name: "test.relocated.group".into(),
+                typing: Some(pb::primitive::Typing::Signature(pb::GenericSignature {
+                    inputs: vec![pb::Arg {
+                        sort: tail[0],
+                        name: "prefix".into(),
+                    }],
+                    output: Some(tail[0]),
+                    varargs: tail
+                        .into_iter()
+                        .enumerate()
+                        .map(|(i, sort)| pb::Arg {
+                            sort,
+                            name: format!("item{i}"),
+                        })
+                        .collect(),
+                    ..Default::default()
+                })),
+                doc: Some("retain complete grouped record".into()),
+                ..Default::default()
+            }],
+            ..Default::default()
+        })
+        .unwrap();
+        Callable(
+            catalog
+                .declaration("test.relocated.group", DeclarationKind::Callable)
+                .unwrap(),
         )
     };
     let original = declaration(vec![I64::sort_ref(), F64::sort_ref()], vec![0, 1, 0]);
@@ -1720,36 +1720,35 @@ fn grouped_declarations_relocate_every_tail_position() {
     let changed = declaration(vec![I64::sort_ref(), I64::sort_ref()], vec![0, 1, 0]);
     assert!(super::decl::same_callable(&original.0, &relocated.0).unwrap());
     assert!(super::decl::same_callable(&original.0, &changed.0).is_err());
-    let mut programs = vec![];
     for callable in [&original, &relocated] {
         let mut packer = Packer::default();
         packer.intern(callable.0.clone(), 0);
         packer.finish().unwrap();
-        let declaration = &packer.program.declarations[0];
+        assert!(packer.program.declarations.is_empty());
+        assert!(packer.program.sorts.is_empty());
+        let demand = &packer.builtin_demands[0];
+        let primitive = demand.primitive().unwrap();
         assert_eq!(
-            declaration.doc.as_deref(),
+            primitive.doc.as_deref(),
             Some("retain complete grouped record")
         );
-        let Some(pb::declaration::Kind::HostPrimitive(primitive)) = &declaration.kind else {
-            panic!()
-        };
-        let Some(pb::host_primitive::Typing::Signature(signature)) = &primitive.typing else {
+        let Some(pb::primitive::Typing::Signature(signature)) = &primitive.typing else {
             panic!()
         };
         assert_eq!(signature.varargs.len(), 3);
-        for (position, (arg, family)) in signature
+        for (position, (arg, name)) in signature
             .varargs
             .iter()
             .zip(["i64", "f64", "i64"])
             .enumerate()
         {
             assert_eq!(arg.name, format!("item{position}"));
-            assert!(matches!(&packer.program.sorts[arg.sort as usize].kind,
-                Some(pb::sort::Kind::Family(f)) if f.name == family));
+            assert!(
+                matches!(&demand.resolve(Arena::Sort,arg.sort).unwrap().sort().unwrap().kind,
+                Some(pb::sort::Kind::Application(f)) if f.name == name)
+            );
         }
-        programs.push(packer.program.encode_to_vec());
     }
-    assert_eq!(programs[0], programs[1]);
 }
 
 #[test]
@@ -1827,7 +1826,7 @@ fn set_values_relocate_without_changing_order_multiplicity_or_occurrences() {
 
     let atom = SortRef::equality("SetOccurrenceAtom");
     let family = super::storage::builtin_catalog()
-        .declaration("Set", DeclarationKind::HostSortFamily)
+        .declaration("Set", DeclarationKind::PrimitiveSort)
         .unwrap();
     let set = SortRef::family(&family, vec![atom.clone()]).unwrap();
     let union = || {
@@ -1878,7 +1877,7 @@ fn set_payload_walkers_handle_deep_finite_data_iteratively() {
     use std::hash::{DefaultHasher, Hash, Hasher};
     let atom = SortRef::equality("SetDeepAtom");
     let family = super::storage::builtin_catalog()
-        .declaration("Set", DeclarationKind::HostSortFamily)
+        .declaration("Set", DeclarationKind::PrimitiveSort)
         .unwrap();
     let set = SortRef::family(&family, vec![atom.clone()]).unwrap();
     let leaf = Callable::constructor("SetDeepLeaf", vec![], atom.clone(), None, false);
@@ -2158,7 +2157,7 @@ fn map_publication_requires_both_refs_and_preserves_union_identity() {
     }
     let atom = SortRef::equality("Atom");
     let family = super::storage::builtin_catalog()
-        .declaration("Map", DeclarationKind::HostSortFamily)
+        .declaration("Map", DeclarationKind::PrimitiveSort)
         .unwrap();
     let sort = SortRef::family(&family, vec![atom.clone(), atom.clone()]).unwrap();
     let union = || {
@@ -2211,7 +2210,7 @@ fn pair_fields_relocate_preserve_aliases_and_reject_impostors() {
     use std::hash::{DefaultHasher, Hash, Hasher};
     let catalog = super::storage::builtin_catalog();
     let family = catalog
-        .declaration("Pair", DeclarationKind::HostSortFamily)
+        .declaration("Pair", DeclarationKind::PrimitiveSort)
         .unwrap();
     let make = Callable(
         catalog
@@ -2345,7 +2344,7 @@ fn pair_publication_requires_both_valid_references() {
     use super::{EgglogValue, builtins::I64};
     let catalog = super::storage::builtin_catalog();
     let family = catalog
-        .declaration("Pair", DeclarationKind::HostSortFamily)
+        .declaration("Pair", DeclarationKind::PrimitiveSort)
         .unwrap();
     let sort = SortRef::family(&family, vec![I64::sort_ref(), I64::sort_ref()]).unwrap();
     for (first, second) in [
@@ -2386,7 +2385,7 @@ fn pair_values_keep_union_allocation_identity() {
     let atom = SortRef::equality("Atom");
     let catalog = super::storage::builtin_catalog();
     let family = catalog
-        .declaration("Pair", DeclarationKind::HostSortFamily)
+        .declaration("Pair", DeclarationKind::PrimitiveSort)
         .unwrap();
     let sort = SortRef::family(&family, vec![atom.clone(), atom.clone()]).unwrap();
     let make = Callable(
@@ -2458,7 +2457,7 @@ fn vec_calls_and_values_preserve_actual_ordered_child_records() {
             Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue { value: Some(pb::primitive_value::Value::I64(v)) })) if *v == expected));
     }
     let owner = vector.expression().0.owner.as_ref().unwrap();
-    assert_eq!(owner.program.nodes.len(), 1);
+    assert_eq!(owner.program().unwrap().nodes.len(), 1);
     assert_eq!(owner.slots[Arena::Node as usize].len(), 3);
     drop(vector);
     assert!(
@@ -2516,7 +2515,7 @@ fn vec_calls_and_values_preserve_actual_ordered_child_records() {
 
     let atom = SortRef::equality("VecOwnershipAtom");
     let family = super::storage::builtin_catalog()
-        .declaration("Vec", DeclarationKind::HostSortFamily)
+        .declaration("Vec", DeclarationKind::PrimitiveSort)
         .unwrap();
     let vector_sort = SortRef::family(&family, vec![atom.clone()]).unwrap();
     let of = Callable(
@@ -2539,7 +2538,7 @@ fn vec_calls_and_values_preserve_actual_ordered_child_records() {
             };
             let vector = Expr::call_with_result(&of, children, vector_sort.clone()).unwrap();
             let owner = vector.0.owner.as_ref().unwrap();
-            assert_eq!(owner.program.nodes.len(), 1);
+            assert_eq!(owner.program().unwrap().nodes.len(), 1);
             assert_eq!(owner.slots[Arena::Node as usize].len(), 2);
             assert_eq!(owner.declarations.len(), 1);
             term = Expr::call(&pack, vec![vector]);
@@ -2573,8 +2572,8 @@ fn scalar_records_remain_authoritative_and_parents_are_reclaimed() {
     }
     assert_eq!(
         packed.declarations.len(),
-        2,
-        "only reachable scalar family and primitive"
+        0,
+        "builtin descriptors remain in the ambient catalog"
     );
     drop(a);
     assert!(
@@ -2586,7 +2585,7 @@ fn scalar_records_remain_authoritative_and_parents_are_reclaimed() {
         for _ in 0..100_000 {
             value = if left { value + &leaf } else { &leaf + value };
             let owner = value.expression().0.owner.as_ref().unwrap();
-            assert_eq!(owner.program.nodes.len(), 1);
+            assert_eq!(owner.program().unwrap().nodes.len(), 1);
             assert_eq!(owner.slots[Arena::Node as usize].len(), 2);
             assert_eq!(owner.declarations.len(), 1);
         }
@@ -2597,35 +2596,22 @@ fn scalar_records_remain_authoritative_and_parents_are_reclaimed() {
 }
 
 #[test]
-fn host_calls_read_changed_generated_definitions_not_cached_signatures() {
+fn builtin_calls_read_owned_definitions_not_cached_signatures() {
     use super::{EgglogValue, builtins::I64};
-    let mut program = super::storage::builtin_catalog()
-        .owner
-        .as_ref()
-        .unwrap()
-        .program
-        .clone();
-    let index = program
-        .declarations
-        .iter()
-        .position(|d| {
-            matches!(&d.kind,
-        Some(pb::declaration::Kind::HostPrimitive(h)) if h.name == "egglog.core.i64.add")
-        })
+    let mut catalog =
+        pb::BuiltinCatalog::decode(include_bytes!("builtins/catalog.pb").as_slice()).unwrap();
+    let primitive = catalog
+        .primitives
+        .iter_mut()
+        .find(|p| p.name == "egglog.core.i64.add")
         .unwrap();
-    let Some(pb::declaration::Kind::HostPrimitive(primitive)) =
-        &mut program.declarations[index].kind
-    else {
-        panic!()
-    };
     primitive.name = "test.changed.generated.key".into();
-    let mut slots = std::array::from_fn(|_| vec![]);
-    slots[Arena::Sort as usize] = (0..program.sorts.len() as u32).map(Slot::Local).collect();
-    slots[Arena::Declaration as usize] = (0..program.declarations.len() as u32)
-        .map(Slot::Local)
-        .collect();
-    let callable =
-        Callable(publish(program, slots, vec![], Arena::Declaration, index as u32).unwrap());
+    let context = super::storage::publish_catalog(catalog).unwrap();
+    let callable = Callable(
+        context
+            .declaration("test.changed.generated.key", DeclarationKind::Callable)
+            .unwrap(),
+    );
     let call = Expr::call(
         &callable,
         vec![
@@ -2633,14 +2619,15 @@ fn host_calls_read_changed_generated_definitions_not_cached_signatures() {
             I64::from(11).expression().clone(),
         ],
     );
+    drop(context);
     let packed = packed_query(&[call.0]);
     assert!(
-        matches!(&packed.nodes[0].kind, Some(pb::node::Kind::Call(c)) if c.func == "test.changed.generated.key")
+        matches!(&packed.nodes[0].kind,Some(pb::node::Kind::Call(c)) if c.func == "test.changed.generated.key")
     );
-    assert!(packed.declarations.iter().any(|d| matches!(&d.kind,
-        Some(pb::declaration::Kind::HostPrimitive(h)) if h.name == "test.changed.generated.key")));
-    assert!(!packed.declarations.iter().any(|d| matches!(&d.kind,
-        Some(pb::declaration::Kind::HostPrimitive(h)) if h.name == "egglog.core.i64.add")));
+    assert!(
+        packed.declarations.is_empty(),
+        "backend descriptors never enter Programs"
+    );
 }
 
 // A private raw-record builder lets tests mutate only generated fields before
@@ -2907,7 +2894,7 @@ fn retained_leaf_releases_all_parents_with_bounded_immediate_imports() {
                 },
             );
             let owner = root.0.owner.as_ref().unwrap();
-            assert_eq!(owner.program.nodes.len(), 1);
+            assert_eq!(owner.program().unwrap().nodes.len(), 1);
             assert_eq!(owner.slots.iter().map(Vec::len).sum::<usize>(), 3);
             assert_eq!(owner.declarations.len(), 1);
             parents.push(Arc::downgrade(owner));
@@ -3062,7 +3049,14 @@ fn declaration_diagnostics_do_not_change_local_compatibility() {
         assert_eq!(wraps.len(), 1);
         assert_eq!(
             *wraps[0],
-            first.0.owner.as_ref().unwrap().program.declarations[0],
+            first
+                .0
+                .owner
+                .as_ref()
+                .unwrap()
+                .program()
+                .unwrap()
+                .declarations[0],
             "packing retains the complete first record, including documentation presence"
         );
         let encoded = packed.program.encode_to_vec();

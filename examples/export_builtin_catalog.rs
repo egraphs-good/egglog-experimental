@@ -15,7 +15,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         std::io::stdout().lock().write_all(&bytes)?;
     }
-    eprintln!("Partial catalog (not Freeze).");
+    eprintln!("Backend builtin catalog (not graph state).");
     eprintln!(
         "Undescribed primitives: {:?}",
         catalog.undescribed_primitives

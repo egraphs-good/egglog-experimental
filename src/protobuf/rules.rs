@@ -50,25 +50,18 @@ impl Registry {
         indices
     }
 
-    pub(super) fn origins(&self, context: &mut RequestOccurrences) {
-        for rule in &self.rules {
-            rule.candidate.origins(context);
-        }
-    }
-
     pub(super) fn add(
         &mut self,
         add: &pb::AddRules,
         candidates: &[Candidate],
         executor: &mut NativeExecutor<'_>,
         context: &mut RequestOccurrences,
-        response: &mut pb::RunProgramResponse,
+        response: &mut pb::RunProgramOutput,
     ) -> Result<(), egglog::Error> {
         for &local in &add.rules {
             let candidate = &candidates[local as usize];
             let index = self.intern(candidate);
             let rule = &mut self.rules[index];
-            rule.candidate.origins(context);
             while rule.completed < rule.candidate.commands.len() {
                 let (result, registered, _) = executor.run_observed(
                     vec![rule.candidate.commands[rule.completed].clone()],
@@ -99,7 +92,7 @@ impl Registry {
         groups: &[String],
         executor: &mut NativeExecutor<'_>,
         context: &mut RequestOccurrences,
-        response: &mut pb::RunProgramResponse,
+        response: &mut pb::RunProgramOutput,
     ) -> Result<String, egglog::Error> {
         let indices = self.ordered_union(groups);
         if let Some(name) = self.selections.get(&indices) {
@@ -165,28 +158,5 @@ impl Registry {
             });
         }
         Ok(())
-    }
-}
-
-impl Candidate {
-    fn origins(&self, context: &mut RequestOccurrences) {
-        context
-            .records
-            .entry(self.name.clone())
-            .or_insert_with(|| self.record.clone());
-        let suffixes: &[&str] = if matches!(
-            self.record.program.rules[0].kind,
-            Some(pb::rule::Kind::Birewrite(_))
-        ) {
-            &["=>", "<="]
-        } else {
-            &[""]
-        };
-        for suffix in suffixes {
-            context
-                .origins
-                .entry(format!("{}{suffix}", self.name))
-                .or_insert_with(|| self.name.clone());
-        }
     }
 }

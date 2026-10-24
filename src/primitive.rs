@@ -104,7 +104,6 @@ impl RegisterPrimitive {
             output: output_sort,
             body,
             hidden_bindings,
-            definition: definition.clone(),
         };
         match context {
             Context::Pure => egraph.add_pure_primitive(primitive, None),
@@ -120,11 +119,10 @@ impl RegisterPrimitive {
 pub(crate) struct DefinedPrimitive {
     pub(crate) name: String,
     input_vars: Vec<String>,
-    input: Vec<ArcSort>,
-    output: ArcSort,
+    pub(crate) input: Vec<ArcSort>,
+    pub(crate) output: ArcSort,
     body: ResolvedExpr,
     hidden_bindings: Vec<(String, Value)>,
-    pub(crate) definition: Result<crate::proto::Program, String>,
 }
 
 impl Primitive for DefinedPrimitive {

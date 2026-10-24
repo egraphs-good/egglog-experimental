@@ -27,6 +27,7 @@ impl Snapshot {
     pub(super) fn from_export(
         export: pb::EGraphSnapshot,
         captures: Vec<(Record, String)>,
+        builtins: &Record,
     ) -> Result<Self, TypedError> {
         let root = export
             .options
@@ -35,8 +36,8 @@ impl Snapshot {
         let program = export
             .program
             .ok_or_else(|| TypedError::Decode("snapshot has no Program".into()))?;
-        let source = observe(program, root)?;
-        let program = &source.owner.as_ref().unwrap().program;
+        let source = observe(program, root, builtins)?;
+        let program = &source.owner.as_ref().unwrap().program().unwrap();
         let mut classes = Vec::new();
         let mut membership = HashMap::new();
         let mut capture_rows = Vec::new();
@@ -298,7 +299,14 @@ location_identity!(ClassRef, ProducerRef, ValueRef, TableRowRef);
 impl<'s> TableRowRef<'s> {
     // Interpret the two reconstruction forms without copying their stored data.
     fn fields(self) -> (&'s pb::Call, Option<u32>) {
-        let program = &self.snapshot.source.owner.as_ref().unwrap().program;
+        let program = &self
+            .snapshot
+            .source
+            .owner
+            .as_ref()
+            .unwrap()
+            .program()
+            .unwrap();
         match &program.commands[self.index as usize].kind {
             Some(pb::command::Kind::Action(pb::Action {
                 kind: Some(pb::action::Kind::Term(index)),
@@ -340,8 +348,16 @@ impl<'s> TableRowRef<'s> {
 impl<'s> ClassRef<'s> {
     /// Producers in the export's captured order, including subsumed rows.
     pub fn nodes(self) -> impl ExactSizeIterator<Item = ProducerRef<'s>> + Clone {
-        let Some(pb::node::Kind::Union(union)) =
-            &self.snapshot.source.owner.as_ref().unwrap().program.nodes[self.index as usize].kind
+        let Some(pb::node::Kind::Union(union)) = &self
+            .snapshot
+            .source
+            .owner
+            .as_ref()
+            .unwrap()
+            .program()
+            .unwrap()
+            .nodes[self.index as usize]
+            .kind
         else {
             unreachable!("inventoried class")
         };
@@ -357,7 +373,8 @@ impl<'s> ClassRef<'s> {
             .source
             .resolve(Arena::Node, self.index)
             .unwrap();
-        let sort = record.owner.as_ref().unwrap().program.nodes[record.index as usize].sort_id;
+        let sort =
+            record.owner.as_ref().unwrap().program().unwrap().nodes[record.index as usize].sort_id;
         SortRef(record.resolve(Arena::Sort, sort).unwrap())
     }
 }
@@ -365,8 +382,16 @@ impl<'s> ClassRef<'s> {
 impl<'s> ProducerRef<'s> {
     /// Inspect shallow fields without evaluating or choosing representatives.
     pub fn args(self) -> impl ExactSizeIterator<Item = ValueRef<'s>> + Clone {
-        let Some(pb::node::Kind::Call(call)) =
-            &self.snapshot.source.owner.as_ref().unwrap().program.nodes[self.index as usize].kind
+        let Some(pb::node::Kind::Call(call)) = &self
+            .snapshot
+            .source
+            .owner
+            .as_ref()
+            .unwrap()
+            .program()
+            .unwrap()
+            .nodes[self.index as usize]
+            .kind
         else {
             unreachable!("inventoried producer")
         };
@@ -381,8 +406,16 @@ impl<'s> ProducerRef<'s> {
     }
     /// Constructor display name retained by the exact exported declaration.
     pub fn name(self) -> &'s str {
-        let Some(pb::node::Kind::Call(call)) =
-            &self.snapshot.source.owner.as_ref().unwrap().program.nodes[self.index as usize].kind
+        let Some(pb::node::Kind::Call(call)) = &self
+            .snapshot
+            .source
+            .owner
+            .as_ref()
+            .unwrap()
+            .program()
+            .unwrap()
+            .nodes[self.index as usize]
+            .kind
         else {
             unreachable!("inventoried producer")
         };
@@ -400,7 +433,8 @@ impl<'s> ProducerRef<'s> {
             .owner
             .as_ref()
             .unwrap()
-            .program
+            .program()
+            .unwrap()
             .declarations
             .iter()
             .find_map(|declaration| match &declaration.kind {
@@ -441,15 +475,23 @@ impl<'s> ValueRef<'s> {
             .source
             .resolve(Arena::Node, self.index)
             .unwrap();
-        let sort = record.owner.as_ref().unwrap().program.nodes[record.index as usize].sort_id;
+        let sort =
+            record.owner.as_ref().unwrap().program().unwrap().nodes[record.index as usize].sort_id;
         SortRef(record.resolve(Arena::Sort, sort).unwrap())
     }
 
     /// Ordered container fields. Class references are leaves, preserving cycles.
     pub fn children(self) -> impl ExactSizeIterator<Item = ValueRef<'s>> {
         use pb::primitive_value::Value;
-        let indices = match &self.snapshot.source.owner.as_ref().unwrap().program.nodes
-            [self.index as usize]
+        let indices = match &self
+            .snapshot
+            .source
+            .owner
+            .as_ref()
+            .unwrap()
+            .program()
+            .unwrap()
+            .nodes[self.index as usize]
             .kind
         {
             Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue { value: Some(value) })) => {
@@ -481,7 +523,16 @@ impl<'s> ValueRef<'s> {
 impl fmt::Display for ValueRef<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         use pb::primitive_value::Value;
-        match &self.snapshot.source.owner.as_ref().unwrap().program.nodes[self.index as usize].kind
+        match &self
+            .snapshot
+            .source
+            .owner
+            .as_ref()
+            .unwrap()
+            .program()
+            .unwrap()
+            .nodes[self.index as usize]
+            .kind
         {
             Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue { value: Some(value) })) => {
                 match value {
@@ -505,9 +556,9 @@ impl fmt::Display for ValueRef<'_> {
 
 impl fmt::Display for SortRef {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match &self.0.owner.as_ref().unwrap().program.sorts[self.0.index as usize].kind {
+        match &self.0.sort().unwrap().kind {
             Some(pb::sort::Kind::Eq(name)) => f.write_str(name),
-            Some(pb::sort::Kind::Family(family)) => {
+            Some(pb::sort::Kind::Application(family)) => {
                 if family.args.is_empty() {
                     return f.write_str(&family.name);
                 }
@@ -560,10 +611,19 @@ impl fmt::Display for SortRef {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use prost::Message;
 
     #[test]
     fn opaque_custom_children_are_shallow_ordered_references() {
         // Shape-only observation: no host codec is installed or executed.
+        let mut catalog =
+            pb::BuiltinCatalog::decode(include_bytes!("builtins/catalog.pb").as_slice()).unwrap();
+        catalog.primitive_sorts.push(pb::PrimitiveSort {
+            name: "Opaque".into(),
+            arity: 0,
+            ..Default::default()
+        });
+        let builtins = super::super::storage::publish_catalog(catalog).unwrap();
         let snapshot = Snapshot::from_export(
             pb::EGraphSnapshot {
                 options: Some(pb::EGraphOptions {
@@ -573,7 +633,7 @@ mod tests {
                 program: Some(pb::Program {
                     sorts: vec![
                         pb::Sort {
-                            kind: Some(pb::sort::Kind::Family(pb::HostSort {
+                            kind: Some(pb::sort::Kind::Application(pb::SortApplication {
                                 name: "i64".into(),
                                 args: vec![],
                             })),
@@ -584,7 +644,7 @@ mod tests {
                             ..Default::default()
                         },
                         pb::Sort {
-                            kind: Some(pb::sort::Kind::Family(pb::HostSort {
+                            kind: Some(pb::sort::Kind::Application(pb::SortApplication {
                                 name: "Opaque".into(),
                                 args: vec![],
                             })),
@@ -644,6 +704,7 @@ mod tests {
                 }),
             },
             vec![],
+            &builtins,
         )
         .unwrap();
         let children: Vec<_> = ValueRef {

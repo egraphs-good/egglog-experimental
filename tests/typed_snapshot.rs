@@ -222,7 +222,7 @@ fn composed_schedules_return_small_results_and_opt_in_diagnostics() -> Result<()
     graph.register(&root)?;
     let (result, diagnostic) = graph.run_with_diagnostics(sequence((&copy, &copy)).saturate())?;
     assert!(result.updated);
-    let report: serde_json::Value = serde_json::from_str(&diagnostic.content).unwrap();
+    let report: serde_json::Value = serde_json::from_slice(&diagnostic.content).unwrap();
     assert!(!report["iterations"].as_array().unwrap().is_empty());
     assert!(!graph.run(&copy)?.updated);
     assert!(diagnostic_matches(&graph.stats()?) > 0);
@@ -237,7 +237,7 @@ fn composed_schedules_return_small_results_and_opt_in_diagnostics() -> Result<()
 
 fn diagnostic_matches(diagnostic: &Diagnostic) -> u64 {
     assert_eq!(diagnostic.format, "application/vnd.egglog.run-report+json");
-    let value: serde_json::Value = serde_json::from_str(&diagnostic.content).unwrap();
+    let value: serde_json::Value = serde_json::from_slice(&diagnostic.content).unwrap();
     value["num_matches_per_rule"]
         .as_object()
         .unwrap()

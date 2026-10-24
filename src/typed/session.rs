@@ -56,16 +56,17 @@ impl CapturePlan {
             let owner = record.owner.as_ref().unwrap();
             let name = match record.arena {
                 Arena::Declaration if !private_declarations.contains(&record.key()) => {
-                    match &owner.program.declarations[record.index as usize].kind {
+                    match &owner.program().unwrap().declarations[record.index as usize].kind {
                         Some(pb::declaration::Kind::Constructor(c)) => Some(&c.name),
                         Some(pb::declaration::Kind::Function(f)) => Some(&f.name),
                         Some(pb::declaration::Kind::Relation(r)) => Some(&r.name),
-                        Some(pb::declaration::Kind::HostPrimitive(p)) => Some(&p.name),
+                        Some(pb::declaration::Kind::UserDefinedPrimitive(p)) => Some(&p.name),
                         _ => None,
                     }
                 }
+                Arena::Primitive => Some(&record.primitive()?.name),
                 Arena::Node if record.capture()?.is_none() => {
-                    match &owner.program.nodes[record.index as usize].kind {
+                    match &owner.program().unwrap().nodes[record.index as usize].kind {
                         Some(pb::node::Kind::Call(c)) => Some(&c.func),
                         _ => None,
                     }
@@ -180,7 +181,7 @@ impl CapturePlan {
                 captures.push(record);
                 continue;
             }
-            let node = &owner.program.nodes[record.index as usize];
+            let node = &owner.program().unwrap().nodes[record.index as usize];
             match &node.kind {
                 Some(pb::node::Kind::Var(_)) if evaluated => {
                     return Err(TypedError::Invalid(
@@ -190,12 +191,18 @@ impl CapturePlan {
                 Some(pb::node::Kind::Union(_)) => eligible = false,
                 Some(pb::node::Kind::Call(call)) => {
                     let declaration = record.declaration(&call.func, DeclarationKind::Callable)?;
-                    eligible &= matches!(
-                        declaration.owner.as_ref().unwrap().program.declarations
-                            [declaration.index as usize]
-                            .kind,
-                        Some(pb::declaration::Kind::Constructor(_))
-                    );
+                    eligible &= declaration.arena == Arena::Declaration
+                        && matches!(
+                            declaration
+                                .owner
+                                .as_ref()
+                                .unwrap()
+                                .program()
+                                .unwrap()
+                                .declarations[declaration.index as usize]
+                                .kind,
+                            Some(pb::declaration::Kind::Constructor(_))
+                        );
                 }
                 _ => (),
             }
@@ -238,6 +245,7 @@ struct SavedScope {
 /// A byte-protocol session. No native EGraph or AST execution escape hatch.
 pub struct EGraph {
     engine: Arc<Mutex<crate::protobuf::Engine>>,
+    builtins: Record,
     discarded: Arc<Mutex<Vec<u64>>>,
     handle: u64,
     // An uncertain response cannot establish the completed action prefix.
@@ -249,7 +257,7 @@ pub struct EGraph {
     reserved_names: HashSet<String>,
     next_capture: u64,
     #[cfg(test)]
-    last_wire: Option<(Vec<u8>, Vec<u8>)>,
+    last_wire: Option<(Vec<u8>, Vec<Vec<u8>>)>,
 }
 
 // Destruction may be requested from a snapshot callback while the engine is
@@ -332,12 +340,19 @@ impl EGraph {
     /// Recording is unbounded when enabled and independent of logical Freeze.
     pub fn with_recording(record_history: bool) -> Result<Self, TypedError> {
         let mut engine = crate::protobuf::Engine::default();
+        let bytes = engine
+            .get_builtins(&pb::GetBuiltinsRequest {}.encode_to_vec())
+            .map_err(|e| TypedError::Invalid(e.to_string()))?;
+        let builtins = super::storage::publish_catalog(
+            pb::BuiltinCatalog::decode(bytes.as_slice())
+                .map_err(|e| TypedError::Decode(e.to_string()))?,
+        )?;
         // Creation's fixed i64 cost domain is an adapter requirement, not a
         // Rust primitive callable registry.
         let request = pb::CreateEGraphRequest {
             record_history,
             sorts: vec![pb::Sort {
-                kind: Some(pb::sort::Kind::Family(pb::HostSort {
+                kind: Some(pb::sort::Kind::Application(pb::SortApplication {
                     name: "i64".into(),
                     args: vec![],
                 })),
@@ -358,6 +373,7 @@ impl EGraph {
             .egraph_id;
         Ok(Self {
             engine: Arc::new(Mutex::new(engine)),
+            builtins,
             discarded: Arc::new(Mutex::new(vec![])),
             handle,
             usable: true,
@@ -395,6 +411,7 @@ impl EGraph {
             .egraph_id;
         Ok(Self {
             engine: self.engine.clone(),
+            builtins: self.builtins.clone(),
             discarded: self.discarded.clone(),
             handle,
             usable: true,
@@ -439,32 +456,35 @@ impl EGraph {
     }
 
     /// Restore the latest scope, including typed bindings and health.
-    /// Cumulative native statistics and fresh-name state survive the pop.
-    /// An empty stack or rejected native return leaves this session unchanged.
+    /// Destroy the active graph and its diagnostics, then resume saved state.
+    /// Fresh-name state survives; an empty stack or rejected destroy changes nothing.
     pub fn pop(&mut self) -> Result<(), TypedError> {
-        let saved = self
-            .scopes
-            .last()
-            .ok_or_else(|| TypedError::Invalid("no saved scope".into()))?;
+        if self.scopes.is_empty() {
+            return Err(TypedError::Invalid("no saved scope".into()));
+        }
         let bytes = self
             .lock_engine()?
-            .return_to(
-                &pb::ReturnToEGraphRequest {
-                    active_id: self.handle,
-                    saved_id: saved.handle,
+            .destroy(
+                &pb::DestroyEGraphRequest {
+                    egraph_id: self.handle,
                 }
                 .encode_to_vec(),
             )
             .map_err(|e| TypedError::Invalid(e.to_string()))?;
-        // Native success already consumed the active handle. Transfer ownership
-        // before decoding its empty acknowledgement; never destroy that child.
-        let saved = self.scopes.pop().unwrap();
+        self.finish_pop(&bytes)
+    }
+
+    // A successful destroy has already disposed the active handle. Transfer
+    // ownership before decoding its acknowledgement so even a corrupt reply
+    // cannot make Drop destroy that handle again.
+    fn finish_pop(&mut self, bytes: &[u8]) -> Result<(), TypedError> {
+        let saved = self.scopes.pop().expect("pop checked the saved frame");
         self.handle = saved.handle;
         self.declarations = saved.declarations;
         self.captures = saved.captures;
         self.private_slots = saved.private_slots;
         self.usable = true;
-        pb::ReturnToEGraphResponse::decode(bytes.as_slice()).map_err(|e| {
+        pb::DestroyEGraphResponse::decode(bytes).map_err(|e| {
             self.usable = false;
             TypedError::Decode(e.to_string())
         })?;
@@ -482,6 +502,22 @@ impl EGraph {
             ));
         }
         packer.finish()?;
+        for demand in &packer.builtin_demands {
+            let (name, kind) = if demand.arena == Arena::PrimitiveSort {
+                (
+                    &demand.primitive_sort()?.name,
+                    DeclarationKind::PrimitiveSort,
+                )
+            } else {
+                (&demand.primitive()?.name, DeclarationKind::Callable)
+            };
+            let actual = self.builtins.declaration(name, kind)?;
+            if !super::decl::same_builtin(demand, &actual)? {
+                return Err(TypedError::Invalid(format!(
+                    "backend builtin signature differs: {name}"
+                )));
+            }
+        }
         if packer.observed_data {
             return Err(TypedError::Invalid(
                 "snapshot observations cannot be submitted as live expressions".into(),
@@ -521,7 +557,7 @@ impl EGraph {
         &mut self,
         mut packer: Packer,
         diagnostics: bool,
-    ) -> Result<pb::RunProgramResponse, TypedError> {
+    ) -> Result<Vec<pb::RunProgramResponse>, TypedError> {
         let request = self.prepare_request(&mut packer, diagnostics)?;
         let bytes = self
             .lock_engine()?
@@ -534,36 +570,84 @@ impl EGraph {
         self.accept_response(packer, &bytes)
     }
 
-    // The effect boundary: reject uncertain replies without inventing recovery,
-    // and retain completed capture initializations before ordinary native errors.
+    // Retain the actual frame sequence. A malformed later frame cannot erase a
+    // known earlier prefix, but it does make subsequent execution uncertain.
     fn accept_response(
         &mut self,
         packer: Packer,
-        bytes: &[u8],
-    ) -> Result<pb::RunProgramResponse, TypedError> {
-        let response = pb::RunProgramResponse::decode(bytes).map_err(|e| {
-            self.usable = false;
-            TypedError::Decode(e.to_string())
-        })?;
-        self.acknowledge(packer, &response, true)?;
-        if let Some(error) = response.error.clone() {
-            return Err(TypedError::Engine(Box::new(error)));
+        bytes: &[Vec<u8>],
+    ) -> Result<Vec<pb::RunProgramResponse>, TypedError> {
+        let mut frames = Vec::with_capacity(bytes.len());
+        for bytes in bytes {
+            match pb::RunProgramResponse::decode(bytes.as_slice()) {
+                Ok(frame) if frame.result.is_some() => frames.push(frame),
+                result => {
+                    let _ = self.acknowledge(packer, &frames, false);
+                    self.usable = false;
+                    return Err(TypedError::Decode(match result {
+                        Err(error) => error.to_string(),
+                        _ => "missing response frame result".into(),
+                    }));
+                }
+            }
         }
-        Ok(response)
+        let valid_terminal = frames.last().is_some_and(|frame| match &frame.result {
+            Some(pb::run_program_response::Result::Error(_)) => true,
+            Some(pb::run_program_response::Result::Output(output)) => {
+                output.outputs.is_empty() && output.nodes.is_empty() && output.sorts.is_empty()
+            }
+            None => false,
+        });
+        if !valid_terminal
+            || frames
+                .iter()
+                .take(frames.len().saturating_sub(1))
+                .any(|frame| {
+                    matches!(
+                        frame.result,
+                        Some(pb::run_program_response::Result::Error(_))
+                    )
+                })
+        {
+            let _ = self.acknowledge(packer, &frames, false);
+            self.usable = false;
+            return Err(TypedError::Decode("invalid terminal response frame".into()));
+        }
+        self.acknowledge(packer, &frames, true)?;
+        if frames.last().is_some_and(|frame| {
+            matches!(
+                frame.result,
+                Some(pb::run_program_response::Result::Error(_))
+            )
+        }) {
+            return Err(TypedError::Engine(Box::new(frames.pop().unwrap())));
+        }
+        Ok(frames)
     }
 
-    // Apply only observed completion. On cancellation an output acknowledges its
-    // earlier top-level prefix, while a successful end acknowledges all commands.
+    // Apply only completed observations or the real located terminal failure.
+    // Cancellation acknowledges no fabricated result or successful completion.
     fn acknowledge(
         &mut self,
         packer: Packer,
-        response: &pb::RunProgramResponse,
+        frames: &[pb::RunProgramResponse],
         finished: bool,
     ) -> Result<(), TypedError> {
-        let completed = match &response.error {
+        let error = frames.iter().find_map(|frame| match &frame.result {
+            Some(pb::run_program_response::Result::Error(error)) => Some(error),
+            _ => None,
+        });
+        let observed = frames
+            .iter()
+            .filter_map(|frame| match &frame.result {
+                Some(pb::run_program_response::Result::Output(output)) => Some(&output.outputs),
+                _ => None,
+            })
+            .flatten()
+            .collect::<Vec<_>>();
+        let completed = match error {
             None if finished => packer.program.commands.len(),
-            None => response
-                .outputs
+            None => observed
                 .iter()
                 .filter_map(|output| output.location.as_ref()?.path.first())
                 .copied()
@@ -584,17 +668,13 @@ impl EGraph {
                     }
                     let mut command = &packer.program.commands[location.path[0] as usize];
                     for child in &location.path[1..] {
-                        let body = match &command.kind {
-                            Some(pb::command::Kind::Repeat(repeat)) => &repeat.body,
-                            Some(pb::command::Kind::Saturate(saturate)) => &saturate.body,
-                            _ => {
-                                self.usable = false;
-                                return Err(TypedError::Decode(
-                                    "failure path enters a non-loop".into(),
-                                ));
-                            }
+                        let Some(pb::command::Kind::Loop(body)) = &command.kind else {
+                            self.usable = false;
+                            return Err(TypedError::Decode(
+                                "failure path enters a non-loop".into(),
+                            ));
                         };
-                        let Some(next) = body.get(*child as usize) else {
+                        let Some(next) = body.body.get(*child as usize) else {
                             self.usable = false;
                             return Err(TypedError::Decode(
                                 "failure child index out of bounds".into(),
@@ -606,12 +686,9 @@ impl EGraph {
                 }
             },
         };
-        if finished && response.error.is_none()
-            || response
-                .error
-                .as_ref()
-                .is_some_and(|e| e.location.is_some())
-            || !response.outputs.is_empty()
+        if finished && error.is_none()
+            || error.is_some_and(|e| e.location.is_some())
+            || !observed.is_empty()
         {
             self.declarations.extend(packer.declarations);
         }
@@ -701,71 +778,92 @@ impl EGraph {
         let mut packer = pack_schedule(schedule.into(), true)?;
         let request = self.prepare_request(&mut packer, false)?;
         let captures = self.captures.values().cloned().collect::<Vec<_>>();
-        let mut last = None;
+        let builtins = self.builtins.clone();
+        let mut prefix = None;
+        let mut terminal_error = None;
         let mut result = None;
         let mut decode_error = None;
         let mut observer_panic = None;
         let (transport, cleanup) = {
             let mut engine = self.lock_engine()?;
-            let transport = engine.run_stream(&request, &mut |chunk| {
+            let transport = engine.run_stream(&request, &mut |frame| {
                 let mut flow = ControlFlow::Continue(());
-                for output in &chunk.outputs {
-                    match &output.kind {
-                        Some(pb::command_output::Kind::Snapshot(export)) => {
-                            match super::Snapshot::from_export(export.clone(), captures.clone()) {
-                                Ok(snapshot) => {
-                                    // Finalize cancellation while the engine guard is
-                                    // healthy, then resume only this observer's panic.
-                                    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(
-                                        || observe(snapshot),
-                                    )) {
-                                        Ok(next) => flow = next,
-                                        Err(payload) => {
-                                            observer_panic = Some(payload);
+                match &frame.result {
+                    Some(pb::run_program_response::Result::Output(payload)) => {
+                        for output in &payload.outputs {
+                            match &output.kind {
+                                Some(pb::command_output::Kind::Snapshot(export)) => {
+                                    match super::Snapshot::from_export(
+                                        export.clone(),
+                                        captures.clone(),
+                                        &builtins,
+                                    ) {
+                                        Ok(snapshot) => match std::panic::catch_unwind(
+                                            std::panic::AssertUnwindSafe(|| observe(snapshot)),
+                                        ) {
+                                            Ok(next) => flow = next,
+                                            Err(payload) => {
+                                                observer_panic = Some(payload);
+                                                flow = ControlFlow::Break(());
+                                            }
+                                        },
+                                        Err(error) => {
+                                            decode_error = Some(error);
                                             flow = ControlFlow::Break(());
                                         }
                                     }
                                 }
-                                Err(error) => {
-                                    decode_error = Some(error);
+                                Some(pb::command_output::Kind::Run(value)) if result.is_none() => {
+                                    result = Some(*value)
+                                }
+                                _ => {
+                                    decode_error = Some(TypedError::Decode(
+                                        "unexpected streamed schedule observation".into(),
+                                    ));
                                     flow = ControlFlow::Break(());
                                 }
                             }
+                            if flow.is_break() {
+                                break;
+                            }
                         }
-                        Some(pb::command_output::Kind::Run(value)) if result.is_none() => {
-                            result = Some(*value)
-                        }
-                        _ => {
-                            decode_error = Some(TypedError::Decode(
-                                "unexpected streamed schedule observation".into(),
-                            ));
-                            flow = ControlFlow::Break(());
+                        if !payload.outputs.is_empty() {
+                            prefix = Some(frame);
                         }
                     }
-                    if flow.is_break() {
-                        break;
+                    Some(pb::run_program_response::Result::Error(_)) => {
+                        terminal_error = Some(frame)
+                    }
+                    None => {
+                        decode_error =
+                            Some(TypedError::Decode("missing streamed frame result".into()));
+                        flow = ControlFlow::Break(());
                     }
                 }
-                last = Some(chunk);
                 flow
             });
             let cleanup = drain_discarded(&mut engine, &self.discarded);
             (transport, cleanup)
         };
+        let mut frames = prefix.into_iter().collect::<Vec<_>>();
+        if let Some(error) = terminal_error {
+            frames.push(error);
+        }
         if let Some(payload) = observer_panic {
-            if let Some(response) = last {
-                let _ = self.acknowledge(packer, &response, false);
-            }
+            let _ = self.acknowledge(packer, &frames, false);
             std::panic::resume_unwind(payload);
         }
-        if let Some(response) = last {
-            self.acknowledge(packer, &response, transport.is_ok())?;
-            if let Some(error) = decode_error {
-                return Err(error);
-            }
-            if let Some(error) = response.error {
-                return Err(TypedError::Engine(Box::new(error)));
-            }
+        self.acknowledge(packer, &frames, transport.is_ok())?;
+        if let Some(error) = decode_error {
+            return Err(error);
+        }
+        if frames.last().is_some_and(|frame| {
+            matches!(
+                frame.result,
+                Some(pb::run_program_response::Result::Error(_))
+            )
+        }) {
+            return Err(TypedError::Engine(Box::new(frames.pop().unwrap())));
         }
         cleanup?;
         transport.map_err(|error| TypedError::Invalid(error.to_string()))?;
@@ -779,7 +877,7 @@ impl EGraph {
             kind: Some(pb::command::Kind::Stats(pb::Unit {})),
             ..Default::default()
         });
-        let response = self.execute(packer, false)?;
+        let (response, _files) = one_observation(self.execute(packer, false)?)?;
         let [output] = response.outputs.as_slice() else {
             return Err(TypedError::Decode(
                 "missing or extra statistics observation".into(),
@@ -808,7 +906,7 @@ impl EGraph {
             kind: Some(pb::command::Kind::Freeze(pb::Freeze {})),
             ..Default::default()
         });
-        let response = self.execute(packer, false)?;
+        let (response, _files) = one_observation(self.execute(packer, false)?)?;
         let mut outputs = response.outputs.into_iter();
         let Some(pb::CommandOutput {
             kind: Some(pb::command_output::Kind::Snapshot(snapshot)),
@@ -820,7 +918,11 @@ impl EGraph {
         if outputs.next().is_some() {
             return Err(TypedError::Decode("extra Freeze observations".into()));
         }
-        super::Snapshot::from_export(snapshot, self.captures.values().cloned().collect())
+        super::Snapshot::from_export(
+            snapshot,
+            self.captures.values().cloned().collect(),
+            &self.builtins,
+        )
     }
 
     /// Retrieve accumulated accepted inputs; errors when recording is off.
@@ -854,7 +956,7 @@ impl EGraph {
             kind: Some(pb::command::Kind::PrintSize(pb::PrintSize::default())),
             ..Default::default()
         });
-        let response = self.execute(packer, false)?;
+        let (response, _files) = one_observation(self.execute(packer, false)?)?;
         let mut outputs = response.outputs.into_iter();
         let Some(pb::CommandOutput {
             kind: Some(pb::command_output::Kind::Sizes(sizes)),
@@ -889,7 +991,7 @@ impl EGraph {
         });
         match self.execute(packer, false) {
             Ok(_) => Ok(true),
-            Err(TypedError::Engine(error)) if error.code == pb::ErrorCode::CheckFailed as i32 => {
+            Err(TypedError::Engine(frame)) if matches!(&frame.result, Some(pb::run_program_response::Result::Error(error)) if error.code == pb::ErrorCode::CheckFailed as i32) => {
                 Ok(false)
             }
             Err(error) => Err(error),
@@ -913,7 +1015,7 @@ impl EGraph {
             })),
             ..Default::default()
         });
-        let response = self.execute(packer, false)?;
+        let (response, _files) = one_observation(self.execute(packer, false)?)?;
         let term = response
             .outputs
             .iter()
@@ -928,6 +1030,7 @@ impl EGraph {
             &response,
             term,
             self.declarations.values().cloned().collect(),
+            &self.builtins,
         )?)
     }
 }
@@ -938,8 +1041,7 @@ fn pack_schedule(schedule: super::Schedule, snapshots: bool) -> Result<Packer, T
     let mut pending = schedule.commands.iter().collect::<Vec<_>>();
     while let Some(command) = pending.pop() {
         match &command.kind {
-            Some(pb::command::Kind::Repeat(repeat)) => pending.extend(&repeat.body),
-            Some(pb::command::Kind::Saturate(saturate)) => pending.extend(&saturate.body),
+            Some(pb::command::Kind::Loop(repeat)) => pending.extend(&repeat.body),
             Some(pb::command::Kind::Freeze(_)) if !snapshots => {
                 return Err(TypedError::Invalid(
                     "snapshot schedules require run_stream".into(),
@@ -962,17 +1064,13 @@ fn pack_schedule(schedule: super::Schedule, snapshots: bool) -> Result<Packer, T
     if packer.program.commands.len() != 1
         || !matches!(
             packer.program.commands[0].kind,
-            Some(
-                pb::command::Kind::Run(_)
-                    | pb::command::Kind::Repeat(_)
-                    | pb::command::Kind::Saturate(_)
-            )
+            Some(pb::command::Kind::Run(_) | pb::command::Kind::Loop(_))
         )
     {
         packer.program.commands = vec![pb::Command {
-            kind: Some(pb::command::Kind::Repeat(pb::Repeat {
+            kind: Some(pb::command::Kind::Loop(pb::Loop {
                 body: std::mem::take(&mut packer.program.commands),
-                times: Some(1),
+                max_iterations: Some(1),
                 ..Default::default()
             })),
             ..Default::default()
@@ -983,10 +1081,16 @@ fn pack_schedule(schedule: super::Schedule, snapshots: bool) -> Result<Packer, T
 
 // The diagnostic is an opaque document, never a second source of control flags.
 fn select_run(
-    response: pb::RunProgramResponse,
+    frames: Vec<pb::RunProgramResponse>,
     diagnostics: bool,
 ) -> Result<(pb::RunResult, Option<pb::Diagnostic>), TypedError> {
-    let mut outputs = response.outputs.into_iter();
+    let mut outputs = frames
+        .into_iter()
+        .filter_map(|frame| match frame.result {
+            Some(pb::run_program_response::Result::Output(output)) => Some(output.outputs),
+            _ => None,
+        })
+        .flatten();
     let first = outputs
         .next()
         .ok_or_else(|| TypedError::Decode("missing schedule result".into()))?;
@@ -1024,12 +1128,36 @@ fn select_run(
     Ok((result, diagnostic))
 }
 
+// A selected observation keeps exactly its actual frame's graph and origins.
+// Empty completion frames carry no observation and are never a data owner.
+fn one_observation(
+    frames: Vec<pb::RunProgramResponse>,
+) -> Result<(pb::RunProgramOutput, Vec<pb::SourceFile>), TypedError> {
+    let mut selected = None;
+    for frame in frames {
+        let Some(pb::run_program_response::Result::Output(output)) = frame.result else {
+            return Err(TypedError::Decode(
+                "expected a successful observation frame".into(),
+            ));
+        };
+        if output.outputs.is_empty() {
+            continue;
+        }
+        if output.outputs.len() != 1 || selected.is_some() {
+            return Err(TypedError::Decode("missing or extra observation".into()));
+        }
+        selected = Some((output, frame.files));
+    }
+    selected.ok_or_else(|| TypedError::Decode("missing observation".into()))
+}
+
 // Adopt only the selected inert term closure. Other response nodes can be
 // scalar costs or independent observations and are not this expression's roots.
 fn adopt(
-    response: &pb::RunProgramResponse,
+    response: &pb::RunProgramOutput,
     root: u32,
     mut declarations: Vec<Record>,
+    builtins: &Record,
 ) -> Result<Expr, TypedError> {
     let mut program = pb::Program {
         ..Default::default()
@@ -1142,7 +1270,7 @@ fn adopt(
                 })),
                 ..Default::default()
             }),
-            Some(pb::sort::Kind::Family(f))
+            Some(pb::sort::Kind::Application(f))
                 if (matches!(f.name.as_str(), "Vec" | "Set" | "MultiSet" | "Maybe")
                     && f.args.len() == 1)
                     || (matches!(f.name.as_str(), "Pair" | "Map") && f.args.len() == 2)
@@ -1160,7 +1288,7 @@ fn adopt(
             {
                 declarations.push(
                     super::storage::builtin_catalog()
-                        .declaration(&f.name, DeclarationKind::HostSortFamily)?,
+                        .declaration(&f.name, DeclarationKind::PrimitiveSort)?,
                 );
                 for child in &mut f.args {
                     let next = sorts.len() as u32;
@@ -1191,7 +1319,11 @@ fn adopt(
     let mut slots = std::array::from_fn(|_| vec![]);
     slots[Arena::Node as usize] = (0..program.nodes.len() as u32).map(Slot::Local).collect();
     slots[Arena::Sort as usize] = (0..program.sorts.len() as u32).map(Slot::Local).collect();
-    let result = Expr(publish(program, slots, declarations, Arena::Node, 0)?);
+    let mut record = publish(program, slots, declarations, Arena::Node, 0)?;
+    std::sync::Arc::get_mut(record.owner.as_mut().unwrap())
+        .expect("fresh adopted owner")
+        .ambient = builtins.owner.clone();
+    let result = Expr(record);
     result.validate_inert()?;
     Ok(result)
 }
@@ -1200,10 +1332,11 @@ fn adopt(
 mod tests {
     use super::*;
     use crate::typed::Ruleset;
+    use crate::typed::tests::observations::Observed;
 
     fn diagnostic_matches(diagnostic: &pb::Diagnostic) -> u64 {
         assert_eq!(diagnostic.format, "application/vnd.egglog.run-report+json");
-        let value: serde_json::Value = serde_json::from_str(&diagnostic.content).unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&diagnostic.content).unwrap();
         assert!(value.get("updated").is_none());
         assert!(value.get("can_stop").is_none());
         value["num_matches_per_rule"]
@@ -1238,11 +1371,21 @@ mod tests {
         assert_eq!(cloned.history().unwrap().commands.len(), 2);
         assert_eq!(graph.history().unwrap().commands.len(), 1);
         graph.push().unwrap();
+        let active = graph.handle;
         graph.stats().unwrap();
         graph.pop().unwrap();
         let history = graph.history().unwrap();
         assert_eq!(history.commands.len(), 1);
         assert_eq!(graph.history().unwrap(), history);
+        assert_eq!(cloned.history().unwrap().commands.len(), 2);
+        assert!(
+            graph
+                .engine
+                .lock()
+                .unwrap()
+                .get_history(&pb::GetHistoryRequest { egraph_id: active }.encode_to_vec())
+                .is_err()
+        );
     }
 
     #[test]
@@ -1490,18 +1633,26 @@ mod tests {
         let mut packer = Packer::default();
         let root = packer.intern(callback.expression().0.clone(), 0);
         packer.finish().unwrap();
-        let response = pb::RunProgramResponse {
+        let response = pb::RunProgramOutput {
             nodes: packer.program.nodes,
             sorts: packer.program.sorts,
             ..Default::default()
         };
         let declarations = packer.declarations.into_values().collect::<Vec<_>>();
-        assert!(adopt(&response, root, declarations.clone()).is_ok());
+        assert!(
+            adopt(
+                &response,
+                root,
+                declarations.clone(),
+                super::super::storage::builtin_catalog()
+            )
+            .is_ok()
+        );
         for case in 0..7 {
             let mut invalid = response.clone();
             let float = invalid.sorts.len() as u32;
             invalid.sorts.push(pb::Sort {
-                kind: Some(pb::sort::Kind::Family(pb::HostSort {
+                kind: Some(pb::sort::Kind::Application(pb::SortApplication {
                     name: "f64".into(),
                     args: vec![],
                 })),
@@ -1541,7 +1692,13 @@ mod tests {
                 _ => invalid.nodes[root as usize].sort_id = float,
             }
             assert!(
-                adopt(&invalid, root, declarations.clone()).is_err(),
+                adopt(
+                    &invalid,
+                    root,
+                    declarations.clone(),
+                    super::super::storage::builtin_catalog()
+                )
+                .is_err(),
                 "corrupt PartialCall signature {case}"
             );
         }
@@ -1574,8 +1731,9 @@ mod tests {
                     })),
                     ..Default::default()
                 });
-                let response = graph.execute(packer, false).unwrap();
-                let Some(pb::command_output::Kind::Sizes(sizes)) = &response.outputs[0].kind else {
+                let response = Observed::from_frames(graph.execute(packer, false).unwrap());
+                let Some(pb::command_output::Kind::Sizes(sizes)) = &response.output.outputs[0].kind
+                else {
                     panic!()
                 };
                 sizes.sizes[0].rows
@@ -1703,11 +1861,16 @@ mod tests {
             }
             let (request, response) = graph.last_wire.as_ref().unwrap();
             let mut request = pb::RunProgramRequest::decode(request.as_slice()).unwrap();
-            let response = pb::RunProgramResponse::decode(response.as_slice()).unwrap();
+            let response = Observed::from_frames(
+                response
+                    .iter()
+                    .map(|bytes| pb::RunProgramResponse::decode(bytes.as_slice()).unwrap()),
+            );
             assert!(response.error.is_none());
             if in_rule {
                 assert!(
                     response
+                        .output
                         .outputs
                         .iter()
                         .any(|out| matches!(&out.kind, Some(pb::command_output::Kind::Run(_))))
@@ -1778,13 +1941,18 @@ mod tests {
             assert!(!graph.check(ne(&saved_left, &saved_right)).unwrap());
             assert_eq!(graph.extract(&saved_left).unwrap(), right);
             let (_, bytes) = graph.last_wire.as_ref().unwrap();
-            let extracted = pb::RunProgramResponse::decode(bytes.as_slice()).unwrap();
-            let Some(pb::command_output::Kind::Extraction(output)) = &extracted.outputs[0].kind
+            let extracted = Observed::from_frames(
+                bytes
+                    .iter()
+                    .map(|bytes| pb::RunProgramResponse::decode(bytes.as_slice()).unwrap()),
+            );
+            let Some(pb::command_output::Kind::Extraction(output)) =
+                &extracted.output.outputs[0].kind
             else {
                 panic!()
             };
             assert!(
-                matches!(&extracted.nodes[output.roots[0].variants[0].term as usize].kind,
+                matches!(&extracted.output.nodes[output.roots[0].variants[0].term as usize].kind,
                 Some(pb::node::Kind::Call(call)) if call.func == "ActionRight")
             );
 
@@ -1804,7 +1972,11 @@ mod tests {
                 .unwrap()
                 .run(&request.encode_to_vec())
                 .unwrap();
-            let invalid = pb::RunProgramResponse::decode(bytes.as_slice()).unwrap();
+            let invalid = Observed::from_frames(
+                bytes
+                    .iter()
+                    .map(|bytes| pb::RunProgramResponse::decode(bytes.as_slice()).unwrap()),
+            );
             assert_eq!(
                 invalid.error.unwrap().code,
                 pb::ErrorCode::InvalidProgram as i32
@@ -1815,7 +1987,7 @@ mod tests {
                 1
             );
             assert!(matches!(
-                graph.accept_response(Packer::default(), &[0xff]),
+                graph.accept_response(Packer::default(), &[vec![0xff]]),
                 Err(TypedError::Decode(_))
             ));
             assert!(
@@ -1855,7 +2027,11 @@ mod tests {
             .unwrap();
         let (input, output) = graph.last_wire.as_ref().unwrap();
         let request = pb::RunProgramRequest::decode(input.as_slice()).unwrap();
-        let response = pb::RunProgramResponse::decode(output.as_slice()).unwrap();
+        let response = Observed::from_frames(
+            output
+                .iter()
+                .map(|bytes| pb::RunProgramResponse::decode(bytes.as_slice()).unwrap()),
+        );
         assert!(response.error.is_none());
         let program = request.program.unwrap();
         assert_eq!(program.commands.len(), 5);
@@ -2077,11 +2253,17 @@ mod tests {
             } else {
                 graph.register(&right)
             };
-            let Err(TypedError::Engine(error)) = result else {
+            let Err(TypedError::Engine(frame)) = result else {
                 panic!("real missing-row evaluation failure")
             };
-            assert_eq!(error.code, pb::ErrorCode::EvaluationFailed as i32);
-            assert_eq!(error.location.unwrap().path, [u32::from(left_first)]);
+            let Some(pb::run_program_response::Result::Error(error)) = &frame.result else {
+                panic!("terminal error frame")
+            };
+            assert_eq!(error.code, pb::ErrorCode::RuntimeFailure as i32);
+            assert_eq!(
+                error.location.as_ref().unwrap().path,
+                [u32::from(left_first)]
+            );
             assert_eq!(graph.captures.len(), usize::from(left_first));
             assert!(graph.usable);
             assert!(
@@ -2107,10 +2289,10 @@ mod tests {
     fn typed_capture_invalid_locations_promote_nothing_and_saved_pop_recovers() {
         use super::super::{builtins::I64, let_, ruleset};
         for (path, iterations, code) in [
-            (vec![], vec![], pb::ErrorCode::EvaluationFailed),
-            (vec![999], vec![], pb::ErrorCode::EvaluationFailed),
-            (vec![0, 0], vec![], pb::ErrorCode::EvaluationFailed),
-            (vec![1], vec![0], pb::ErrorCode::EvaluationFailed),
+            (vec![], vec![], pb::ErrorCode::RuntimeFailure),
+            (vec![999], vec![], pb::ErrorCode::RuntimeFailure),
+            (vec![0, 0], vec![], pb::ErrorCode::RuntimeFailure),
+            (vec![1], vec![0], pb::ErrorCode::RuntimeFailure),
             (vec![1], vec![], pb::ErrorCode::InvalidProgram),
         ] {
             let mut graph = EGraph::default();
@@ -2127,15 +2309,15 @@ mod tests {
             packer.program.commands.push(run);
             packer.finish().unwrap();
             let response = pb::RunProgramResponse {
-                error: Some(pb::Error {
+                result: Some(pb::run_program_response::Result::Error(pb::Error {
                     code: code.into(),
                     location: Some(pb::CommandLocation { path, iterations }),
                     ..Default::default()
-                }),
+                })),
                 ..Default::default()
             };
             assert!(matches!(
-                graph.accept_response(packer, &response.encode_to_vec()),
+                graph.accept_response(packer, &[response.encode_to_vec()]),
                 Err(TypedError::Decode(_))
             ));
             assert!(!graph.usable);
@@ -2180,10 +2362,13 @@ mod tests {
             )
             .unwrap();
         assert!(
-            pb::RunProgramResponse::decode(installed.as_slice())
-                .unwrap()
-                .error
-                .is_none()
+            Observed::from_frames(
+                installed
+                    .iter()
+                    .map(|bytes| { pb::RunProgramResponse::decode(bytes.as_slice()).unwrap() })
+            )
+            .error
+            .is_none()
         );
         // The actual failed packet has no command location and no completed Set.
         packer.program.commands.push(pb::Command {
@@ -2192,8 +2377,11 @@ mod tests {
             })),
             ..Default::default()
         });
-        let Err(TypedError::Engine(error)) = graph.execute(packer, false) else {
+        let Err(TypedError::Engine(frame)) = graph.execute(packer, false) else {
             panic!("invalid packet")
+        };
+        let Some(pb::run_program_response::Result::Error(error)) = &frame.result else {
+            panic!("terminal error frame")
         };
         assert!(error.location.is_none());
         assert_eq!(error.code, pb::ErrorCode::InvalidProgram as i32);
@@ -2282,7 +2470,7 @@ mod tests {
                         .encode_to_vec()
                     )
                     .is_err(),
-                "Return already consumed the child"
+                "Pop already destroyed the active graph"
             );
         }
         graph.run(&inner).unwrap();
@@ -2311,44 +2499,64 @@ mod tests {
     }
 
     #[test]
-    fn typed_scope_stale_return_preserves_frontend_ownership() {
+    fn typed_scope_rejected_destroy_preserves_frontend_ownership() {
         use super::super::ruleset;
         let group = ruleset(());
         let mut graph = EGraph::default();
         graph.push().unwrap();
         graph.run(&group).unwrap();
-        let active = graph.handle;
+        let active = std::mem::replace(&mut graph.handle, u64::MAX);
         let saved = graph.scopes[0].handle;
-        // Test-only access violates the private saved-frame invariant, exercising
-        // the adapter's rejection without exposing a public handle escape hatch.
-        let bytes = graph
-            .engine
-            .lock()
-            .unwrap()
-            .run(
-                &pb::RunProgramRequest {
-                    egraph_id: saved,
-                    program: Some(pb::Program {
-                        ..Default::default()
-                    }),
-                    diagnostics: false,
-                }
-                .encode_to_vec(),
-            )
-            .unwrap();
-        assert!(
-            pb::RunProgramResponse::decode(bytes.as_slice())
-                .unwrap()
-                .error
-                .is_none()
-        );
+        // Reject an unknown handle without disposing either owned graph.
         assert!(matches!(graph.pop(), Err(TypedError::Invalid(message))
-            if message == "unrelated or stale scope return"));
-        assert_eq!(graph.handle, active);
+            if message == "unknown egraph_id"));
+        assert_eq!(graph.handle, u64::MAX);
         assert_eq!(graph.scopes.len(), 1);
         assert_eq!(graph.scopes[0].handle, saved);
         assert!(graph.usable);
+        graph.handle = active;
         graph.run(&group).unwrap();
+        graph.pop().unwrap();
+        assert_eq!(graph.handle, saved);
+        assert!(graph.scopes.is_empty());
+        graph.run(&group).unwrap();
+    }
+
+    #[test]
+    fn typed_scope_corrupt_destroy_ack_never_destroys_the_active_handle_twice() {
+        use super::super::ruleset;
+        let mut graph = EGraph::default();
+        let mut independent = graph.try_clone().unwrap();
+        let saved = graph.handle;
+        graph.push().unwrap();
+        let active = graph.handle;
+        let engine = graph.engine.clone();
+        let discarded = graph.discarded.clone();
+        let bytes = engine
+            .lock()
+            .unwrap()
+            .destroy(&pb::DestroyEGraphRequest { egraph_id: active }.encode_to_vec())
+            .unwrap();
+        pb::DestroyEGraphResponse::decode(bytes.as_slice()).unwrap();
+        assert!(matches!(
+            graph.finish_pop(&[0xff]),
+            Err(TypedError::Decode(_))
+        ));
+        assert_eq!(graph.handle, saved);
+        assert!(graph.scopes.is_empty());
+        assert!(!graph.usable);
+        drop(graph);
+        assert!(discarded.lock().unwrap().is_empty());
+        for handle in [active, saved] {
+            assert!(
+                engine
+                    .lock()
+                    .unwrap()
+                    .clone_egraph(&pb::CloneEGraphRequest { egraph_id: handle }.encode_to_vec())
+                    .is_err()
+            );
+        }
+        independent.run(ruleset(())).unwrap();
     }
 
     #[test]
@@ -2360,7 +2568,7 @@ mod tests {
         graph.push().unwrap();
         let pending = pack_run(&ruleset(()));
         assert!(matches!(
-            graph.accept_response(pending, &[0xff]),
+            graph.accept_response(pending, &[vec![0xff]]),
             Err(TypedError::Decode(_))
         ));
         for error in [
@@ -2394,7 +2602,7 @@ mod tests {
         assert_eq!(graph.handle, active);
         assert_eq!(graph.scopes.len(), 1);
         assert_eq!(graph.scopes[0].handle, saved);
-        drop(graph); // Must not panic or implicitly return scopes.
+        drop(graph); // Must not panic or implicitly resume scopes.
     }
 
     #[test]
@@ -2438,7 +2646,7 @@ mod tests {
         let mut graph = EGraph::default();
         graph.push().unwrap();
         assert!(matches!(
-            graph.accept_response(Packer::default(), &[0xff]),
+            graph.accept_response(Packer::default(), &[vec![0xff]]),
             Err(TypedError::Decode(_))
         ));
         assert!(graph.register(I64::from(3)).is_err());
@@ -2459,8 +2667,12 @@ mod tests {
                 .unwrap()
                 .diagnostics
         );
-        let response = pb::RunProgramResponse::decode(output.as_slice()).unwrap();
-        let [control, detail] = response.outputs.as_slice() else {
+        let response = Observed::from_frames(
+            output
+                .iter()
+                .map(|bytes| pb::RunProgramResponse::decode(bytes.as_slice()).unwrap()),
+        );
+        let [control, detail] = response.output.outputs.as_slice() else {
             panic!("one result and one diagnostic")
         };
         assert_eq!(control.kind, Some(pb::command_output::Kind::Run(result)));
@@ -2477,9 +2689,13 @@ mod tests {
                 .unwrap()
                 .diagnostics
         );
-        let response = pb::RunProgramResponse::decode(output.as_slice()).unwrap();
+        let response = Observed::from_frames(
+            output
+                .iter()
+                .map(|bytes| pb::RunProgramResponse::decode(bytes.as_slice()).unwrap()),
+        );
         assert!(matches!(
-            response.outputs.as_slice(),
+            response.output.outputs.as_slice(),
             [pb::CommandOutput {
                 kind: Some(pb::command_output::Kind::Run(_)),
                 ..
@@ -2489,9 +2705,13 @@ mod tests {
         assert_eq!(diagnostic_matches(&stats), 1);
         let request = graph.last_wire.as_ref().unwrap().0.clone();
         let direct = graph.engine.lock().unwrap().run(&request).unwrap();
-        let direct = pb::RunProgramResponse::decode(direct.as_slice()).unwrap();
+        let direct = Observed::from_frames(
+            direct
+                .iter()
+                .map(|bytes| pb::RunProgramResponse::decode(bytes.as_slice()).unwrap()),
+        );
         assert_eq!(
-            direct.outputs[0].kind,
+            direct.output.outputs[0].kind,
             Some(pb::command_output::Kind::Diagnostic(stats))
         );
     }
@@ -2510,7 +2730,7 @@ mod tests {
     }
 
     #[test]
-    fn failed_scoped_prefix_restores_data_and_keeps_collected_diagnostics() {
+    fn failed_scoped_prefix_restores_data_and_discards_active_diagnostics() {
         use super::super::{eq, rule, ruleset, set};
         let counter = stream_counter();
         let group = ruleset(rule(eq(&counter, 0), set(&counter, 1)));
@@ -2534,7 +2754,8 @@ mod tests {
         assert!(graph.check(eq(&counter, 1)).unwrap());
         graph.pop().unwrap();
         assert!(graph.check(eq(&counter, 0)).unwrap());
-        assert_eq!(diagnostic_matches(&graph.stats().unwrap()), 1);
+        assert_eq!(diagnostic_matches(&graph.stats().unwrap()), 0);
+        assert_eq!(diagnostic_matches(&diagnostic), 1);
         graph.run(&group).unwrap();
         assert!(graph.check(eq(&counter, 1)).unwrap());
     }
@@ -2693,9 +2914,9 @@ mod tests {
             ),
         ];
         for (family, value) in cases {
-            let response = pb::RunProgramResponse {
+            let response = pb::RunProgramOutput {
                 sorts: vec![pb::Sort {
-                    kind: Some(pb::sort::Kind::Family(pb::HostSort {
+                    kind: Some(pb::sort::Kind::Application(pb::SortApplication {
                         name: family.into(),
                         args: vec![],
                     })),
@@ -2710,7 +2931,13 @@ mod tests {
                 }],
                 ..Default::default()
             };
-            let adopted = adopt(&response, 0, vec![]).unwrap();
+            let adopted = adopt(
+                &response,
+                0,
+                vec![],
+                super::super::storage::builtin_catalog(),
+            )
+            .unwrap();
             let mut packed = Packer::default();
             let root = packed.intern(adopted.0, 0);
             packed.finish().unwrap();
@@ -2719,11 +2946,11 @@ mod tests {
                 response.nodes[0].kind
             );
             let mut wrong = response.clone();
-            let Some(pb::sort::Kind::Family(sort)) = &mut wrong.sorts[0].kind else {
+            let Some(pb::sort::Kind::Application(sort)) = &mut wrong.sorts[0].kind else {
                 unreachable!()
             };
             sort.name = "i64".into();
-            assert!(adopt(&wrong, 0, vec![]).is_err());
+            assert!(adopt(&wrong, 0, vec![], super::super::storage::builtin_catalog()).is_err());
             let invalid = match value {
                 Value::BigInt(_) => ["", "+1", "01", "-0", " 1", "1_0"]
                     .map(|s| Value::BigInt(s.into()))
@@ -2766,7 +2993,7 @@ mod tests {
                     value: Some(value),
                 }));
                 assert!(
-                    adopt(&bad, 0, vec![]).is_err(),
+                    adopt(&bad, 0, vec![], super::super::storage::builtin_catalog()).is_err(),
                     "accepted malformed {family} payload"
                 );
                 assert_eq!(
@@ -2836,7 +3063,7 @@ mod tests {
                 ..Default::default()
             });
             let mut graph = EGraph::default();
-            let response = graph.execute(packer, false).unwrap();
+            let response = Observed::from_frames(graph.execute(packer, false).unwrap());
             let request =
                 pb::RunProgramRequest::decode(graph.last_wire.as_ref().unwrap().0.as_slice())
                     .unwrap()
@@ -2853,18 +3080,25 @@ mod tests {
                 )),
                 "symbolic child was evaluated before submission"
             );
-            let Some(pb::command_output::Kind::Extraction(extracted)) = &response.outputs[0].kind
+            let Some(pb::command_output::Kind::Extraction(extracted)) =
+                &response.output.outputs[0].kind
             else {
                 panic!()
             };
             let term = extracted.roots[0].variants[0].term;
             assert_eq!(
-                response.nodes[term as usize].kind,
+                response.output.nodes[term as usize].kind,
                 Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
                     value: Some(expected)
                 }))
             );
-            let adopted = adopt(&response, term, vec![]).unwrap();
+            let adopted = adopt(
+                &response.output,
+                term,
+                vec![],
+                super::super::storage::builtin_catalog(),
+            )
+            .unwrap();
             adopted.validate_inert().unwrap();
         }
     }
@@ -2903,14 +3137,19 @@ mod tests {
                 .all(|c| c.args.len() == 1)
         );
         assert!(!request.nodes.iter().any(|n| matches!(&n.kind, Some(pb::node::Kind::Call(c)) if c.func == "map-of" || c.func == "map-from-pairs")));
-        let response = pb::RunProgramResponse::decode(response.as_slice()).unwrap();
-        let Some(pb::command_output::Kind::Extraction(extraction)) = &response.outputs[0].kind
+        let response = Observed::from_frames(
+            response
+                .iter()
+                .map(|bytes| pb::RunProgramResponse::decode(bytes.as_slice()).unwrap()),
+        );
+        let Some(pb::command_output::Kind::Extraction(extraction)) =
+            &response.output.outputs[0].kind
         else {
             panic!()
         };
         let term = extraction.roots[0].variants[0].term;
         assert!(matches!(
-            &response.nodes[term as usize].kind,
+            &response.output.nodes[term as usize].kind,
             Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
                 value: Some(pb::primitive_value::Value::Map(_))
             }))
@@ -3004,20 +3243,31 @@ mod tests {
         }
         .encode_to_vec();
         let bytes = graph.engine.lock().unwrap().run(&request).unwrap();
-        let response = pb::RunProgramResponse::decode(bytes.as_slice()).unwrap();
+        let response = Observed::from_frames(
+            bytes
+                .iter()
+                .map(|bytes| pb::RunProgramResponse::decode(bytes.as_slice()).unwrap()),
+        );
         let error = response.error.as_ref().unwrap();
-        assert_eq!(error.code, pb::ErrorCode::EvaluationFailed as i32);
+        assert_eq!(error.code, pb::ErrorCode::RuntimeFailure as i32);
         assert_eq!(error.location.as_ref().unwrap().path, [4]);
-        assert_eq!(response.outputs.len(), 2);
-        let Some(pb::command_output::Kind::Extraction(extraction)) = &response.outputs[0].kind
+        assert_eq!(response.output.outputs.len(), 2);
+        let Some(pb::command_output::Kind::Extraction(extraction)) =
+            &response.output.outputs[0].kind
         else {
             panic!()
         };
         let extracted = Map::<I64, F64>::from_expression(
-            adopt(&response, extraction.roots[0].variants[0].term, vec![]).unwrap(),
+            adopt(
+                &response.output,
+                extraction.roots[0].variants[0].term,
+                vec![],
+                super::super::storage::builtin_catalog(),
+            )
+            .unwrap(),
         );
         let Some(pb::command_output::Kind::PrintedFunction(table_result)) =
-            &response.outputs[1].kind
+            &response.output.outputs[1].kind
         else {
             panic!()
         };
@@ -3027,7 +3277,15 @@ mod tests {
         else {
             panic!("expected available Map output")
         };
-        let observed = Map::<I64, F64>::from_expression(adopt(&response, term, vec![]).unwrap());
+        let observed = Map::<I64, F64>::from_expression(
+            adopt(
+                &response.output,
+                term,
+                vec![],
+                super::super::storage::builtin_catalog(),
+            )
+            .unwrap(),
+        );
         assert_eq!(observed, extracted);
         assert_eq!(
             observed.entries().unwrap(),
@@ -3049,16 +3307,30 @@ mod tests {
                 .encode_to_vec(),
             )
             .unwrap();
-        let after = pb::RunProgramResponse::decode(bytes.as_slice()).unwrap();
+        let after = Observed::from_frames(
+            bytes
+                .iter()
+                .map(|bytes| pb::RunProgramResponse::decode(bytes.as_slice()).unwrap()),
+        );
         assert!(after.error.is_none());
-        let Some(pb::command_output::Kind::PrintedFunction(table)) = &after.outputs[0].kind else {
+        let Some(pb::command_output::Kind::PrintedFunction(table)) = &after.output.outputs[0].kind
+        else {
             panic!()
         };
         let Some(pb::table_cell::Kind::Term(term)) = table.rows[0].output.as_ref().unwrap().kind
         else {
             panic!("expected available Map output")
         };
-        assert_eq!(adopt(&after, term, vec![]).unwrap(), *observed.expression());
+        assert_eq!(
+            adopt(
+                &after.output,
+                term,
+                vec![],
+                super::super::storage::builtin_catalog()
+            )
+            .unwrap(),
+            *observed.expression()
+        );
         drop(graph);
         assert_eq!(EGraph::default().extract(&extracted).unwrap(), observed);
     }
@@ -3069,24 +3341,24 @@ mod tests {
             EgglogValue,
             builtins::{F64, I64, Map},
         };
-        let response = pb::RunProgramResponse {
+        let response = pb::RunProgramOutput {
             sorts: vec![
                 pb::Sort {
-                    kind: Some(pb::sort::Kind::Family(pb::HostSort {
+                    kind: Some(pb::sort::Kind::Application(pb::SortApplication {
                         name: "f64".into(),
                         args: vec![],
                     })),
                     ..Default::default()
                 },
                 pb::Sort {
-                    kind: Some(pb::sort::Kind::Family(pb::HostSort {
+                    kind: Some(pb::sort::Kind::Application(pb::SortApplication {
                         name: "Map".into(),
                         args: vec![2, 0],
                     })),
                     ..Default::default()
                 },
                 pb::Sort {
-                    kind: Some(pb::sort::Kind::Family(pb::HostSort {
+                    kind: Some(pb::sort::Kind::Application(pb::SortApplication {
                         name: "i64".into(),
                         args: vec![],
                     })),
@@ -3130,7 +3402,15 @@ mod tests {
             ],
             ..Default::default()
         };
-        let value = Map::<I64, F64>::from_expression(adopt(&response, 2, vec![]).unwrap());
+        let value = Map::<I64, F64>::from_expression(
+            adopt(
+                &response,
+                2,
+                vec![],
+                super::super::storage::builtin_catalog(),
+            )
+            .unwrap(),
+        );
         let entries = value.entries().unwrap();
         assert_eq!(
             entries,
@@ -3146,7 +3426,8 @@ mod tests {
                 .owner
                 .as_ref()
                 .unwrap()
-                .program
+                .program()
+                .unwrap()
                 .nodes
                 .len(),
             3
@@ -3173,7 +3454,13 @@ mod tests {
                 } else {
                     map.entries[0].value = child;
                 }
-                let error = adopt(&malformed, 2, vec![]).unwrap_err();
+                let error = adopt(
+                    &malformed,
+                    2,
+                    vec![],
+                    super::super::storage::builtin_catalog(),
+                )
+                .unwrap_err();
                 assert!(
                     matches!(error, TypedError::Decode(ref s) if s == if child.is_none() { "missing Map child" } else { "invalid response node index" }),
                     "{error}"
@@ -3184,27 +3471,27 @@ mod tests {
             let mut wrong = response.clone();
             wrong.nodes[child].sort_id = if child == 0 { 0 } else { 2 };
             assert!(
-                matches!(adopt(&wrong, 2, vec![]), Err(TypedError::Decode(s)) if s == "Map payload child sort mismatch")
+                matches!(adopt(&wrong, 2, vec![], super::super::storage::builtin_catalog()), Err(TypedError::Decode(s)) if s == "Map payload child sort mismatch")
             );
         }
         for kind in [
             pb::sort::Kind::Eq("Map".into()),
-            pb::sort::Kind::Family(pb::HostSort {
+            pb::sort::Kind::Application(pb::SortApplication {
                 name: "Pair".into(),
                 args: vec![2, 0],
             }),
-            pb::sort::Kind::Family(pb::HostSort {
+            pb::sort::Kind::Application(pb::SortApplication {
                 name: "Map".into(),
                 args: vec![2],
             }),
         ] {
             let mut wrong = response.clone();
             wrong.sorts[1].kind = Some(kind);
-            assert!(adopt(&wrong, 2, vec![]).is_err());
+            assert!(adopt(&wrong, 2, vec![], super::super::storage::builtin_catalog()).is_err());
         }
         let atom = SortRef::equality("A");
         let family = super::super::storage::builtin_catalog()
-            .declaration("Map", DeclarationKind::HostSortFamily)
+            .declaration("Map", DeclarationKind::PrimitiveSort)
             .unwrap();
         let sort = SortRef::family(&family, vec![atom.clone(), F64::sort_ref()]).unwrap();
         let pack = Callable::constructor("Pack", vec![sort], atom, None, false);
@@ -3215,7 +3502,7 @@ mod tests {
             args: vec![2],
         }));
         assert!(
-            matches!(adopt(&cycle, 2, vec![pack.0]), Err(TypedError::Decode(s)) if s == "cyclic extraction is not inert data")
+            matches!(adopt(&cycle, 2, vec![pack.0], super::super::storage::builtin_catalog()), Err(TypedError::Decode(s)) if s == "cyclic extraction is not inert data")
         );
     }
 
@@ -3237,14 +3524,19 @@ mod tests {
                 .iter()
                 .any(|n| matches!(&n.kind, Some(pb::node::Kind::Call(c)) if c.func == "pair"))
         );
-        let response = pb::RunProgramResponse::decode(response.as_slice()).unwrap();
-        let Some(pb::command_output::Kind::Extraction(extraction)) = &response.outputs[0].kind
+        let response = Observed::from_frames(
+            response
+                .iter()
+                .map(|bytes| pb::RunProgramResponse::decode(bytes.as_slice()).unwrap()),
+        );
+        let Some(pb::command_output::Kind::Extraction(extraction)) =
+            &response.output.outputs[0].kind
         else {
             panic!()
         };
         let index = extraction.roots[0].variants[0].term;
         assert!(matches!(
-            &response.nodes[index as usize].kind,
+            &response.output.nodes[index as usize].kind,
             Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
                 value: Some(pb::primitive_value::Value::Pair(_))
             }))
@@ -3266,24 +3558,24 @@ mod tests {
                 .declaration("egglog.core.pair.make", DeclarationKind::Callable)
                 .unwrap(),
         );
-        let response = pb::RunProgramResponse {
+        let response = pb::RunProgramOutput {
             sorts: vec![
                 pb::Sort {
-                    kind: Some(pb::sort::Kind::Family(pb::HostSort {
+                    kind: Some(pb::sort::Kind::Application(pb::SortApplication {
                         name: "f64".into(),
                         args: vec![],
                     })),
                     ..Default::default()
                 },
                 pb::Sort {
-                    kind: Some(pb::sort::Kind::Family(pb::HostSort {
+                    kind: Some(pb::sort::Kind::Application(pb::SortApplication {
                         name: "Pair".into(),
                         args: vec![2, 0],
                     })),
                     ..Default::default()
                 },
                 pb::Sort {
-                    kind: Some(pb::sort::Kind::Family(pb::HostSort {
+                    kind: Some(pb::sort::Kind::Application(pb::SortApplication {
                         name: "i64".into(),
                         args: vec![],
                     })),
@@ -3319,13 +3611,30 @@ mod tests {
             ],
             ..Default::default()
         };
-        let value = adopt(&response, 2, vec![]).unwrap();
+        let value = adopt(
+            &response,
+            2,
+            vec![],
+            super::super::storage::builtin_catalog(),
+        )
+        .unwrap();
         let [left, right] = value
             .pair_fields(&make, &I64::sort_ref(), &F64::sort_ref())
             .unwrap();
         assert_eq!(i64::try_from(&I64::from_expression(left)).unwrap(), 7);
         assert_eq!(f64::try_from(&F64::from_expression(right)).unwrap(), 1.5);
-        assert_eq!(value.0.owner.as_ref().unwrap().program.nodes.len(), 3);
+        assert_eq!(
+            value
+                .0
+                .owner
+                .as_ref()
+                .unwrap()
+                .program()
+                .unwrap()
+                .nodes
+                .len(),
+            3
+        );
         for first in [false, true] {
             for child in [None, Some(99)] {
                 let mut malformed = response.clone();
@@ -3340,7 +3649,13 @@ mod tests {
                 } else {
                     pair.second = child;
                 }
-                let error = adopt(&malformed, 2, vec![]).unwrap_err();
+                let error = adopt(
+                    &malformed,
+                    2,
+                    vec![],
+                    super::super::storage::builtin_catalog(),
+                )
+                .unwrap_err();
                 assert!(
                     matches!(error, TypedError::Decode(ref s) if s == if child.is_none() { "missing Pair child" } else { "invalid response node index" }),
                     "{error}"
@@ -3350,25 +3665,33 @@ mod tests {
         let mut wrong = response.clone();
         wrong.nodes[0].sort_id = 0;
         assert!(
-            matches!(adopt(&wrong, 2, vec![]), Err(TypedError::Decode(s)) if s == "Pair payload child sort mismatch")
+            matches!(adopt(&wrong, 2, vec![], super::super::storage::builtin_catalog()), Err(TypedError::Decode(s)) if s == "Pair payload child sort mismatch")
         );
         for kind in [
             pb::sort::Kind::Eq("Pair".into()),
-            pb::sort::Kind::Family(pb::HostSort {
+            pb::sort::Kind::Application(pb::SortApplication {
                 name: "Vec".into(),
                 args: vec![2],
             }),
-            pb::sort::Kind::Family(pb::HostSort {
+            pb::sort::Kind::Application(pb::SortApplication {
                 name: "Pair".into(),
                 args: vec![2],
             }),
         ] {
             let mut malformed = response.clone();
             malformed.sorts[1].kind = Some(kind);
-            assert!(adopt(&malformed, 2, vec![]).is_err());
+            assert!(
+                adopt(
+                    &malformed,
+                    2,
+                    vec![],
+                    super::super::storage::builtin_catalog()
+                )
+                .is_err()
+            );
         }
         let mut repeated = response.clone();
-        repeated.sorts[1].kind = Some(pb::sort::Kind::Family(pb::HostSort {
+        repeated.sorts[1].kind = Some(pb::sort::Kind::Application(pb::SortApplication {
             name: "Pair".into(),
             args: vec![2, 2],
         }));
@@ -3378,7 +3701,13 @@ mod tests {
                 second: Some(0),
             })),
         }));
-        let shared = adopt(&repeated, 2, vec![]).unwrap();
+        let shared = adopt(
+            &repeated,
+            2,
+            vec![],
+            super::super::storage::builtin_catalog(),
+        )
+        .unwrap();
         let [left, right] = shared
             .pair_fields(&make, &I64::sort_ref(), &I64::sort_ref())
             .unwrap();
@@ -3391,7 +3720,7 @@ mod tests {
         let atom = SortRef::equality("A");
         let pair = SortRef::family(
             &catalog
-                .declaration("Pair", DeclarationKind::HostSortFamily)
+                .declaration("Pair", DeclarationKind::PrimitiveSort)
                 .unwrap(),
             vec![atom.clone(), F64::sort_ref()],
         )
@@ -3404,7 +3733,7 @@ mod tests {
             args: vec![2],
         }));
         assert!(
-            matches!(adopt(&cycle, 2, vec![pack.0]), Err(TypedError::Decode(s)) if s == "cyclic extraction is not inert data")
+            matches!(adopt(&cycle, 2, vec![pack.0], super::super::storage::builtin_catalog()), Err(TypedError::Decode(s)) if s == "cyclic extraction is not inert data")
         );
     }
 
@@ -3414,24 +3743,24 @@ mod tests {
             EgglogValue,
             builtins::{I64, Maybe, Vec as EVec},
         };
-        let response = pb::RunProgramResponse {
+        let response = pb::RunProgramOutput {
             sorts: vec![
                 pb::Sort {
-                    kind: Some(pb::sort::Kind::Family(pb::HostSort {
+                    kind: Some(pb::sort::Kind::Application(pb::SortApplication {
                         name: "i64".into(),
                         args: vec![],
                     })),
                     ..Default::default()
                 },
                 pb::Sort {
-                    kind: Some(pb::sort::Kind::Family(pb::HostSort {
+                    kind: Some(pb::sort::Kind::Application(pb::SortApplication {
                         name: "Maybe".into(),
                         args: vec![0],
                     })),
                     ..Default::default()
                 },
                 pb::Sort {
-                    kind: Some(pb::sort::Kind::Family(pb::HostSort {
+                    kind: Some(pb::sort::Kind::Application(pb::SortApplication {
                         name: "Vec".into(),
                         args: vec![1],
                     })),
@@ -3468,7 +3797,15 @@ mod tests {
             ],
             ..Default::default()
         };
-        let value = Maybe::<I64>::from_expression(adopt(&response, 2, vec![]).unwrap());
+        let value = Maybe::<I64>::from_expression(
+            adopt(
+                &response,
+                2,
+                vec![],
+                super::super::storage::builtin_catalog(),
+            )
+            .unwrap(),
+        );
         assert_eq!(Option::<I64>::try_from(&value).unwrap(), Some(I64::from(7)));
         assert_eq!(
             value
@@ -3477,12 +3814,21 @@ mod tests {
                 .owner
                 .as_ref()
                 .unwrap()
-                .program
+                .program()
+                .unwrap()
                 .nodes
                 .len(),
             2
         );
-        let repeated = EVec::<Maybe<I64>>::from_expression(adopt(&response, 3, vec![]).unwrap());
+        let repeated = EVec::<Maybe<I64>>::from_expression(
+            adopt(
+                &response,
+                3,
+                vec![],
+                super::super::storage::builtin_catalog(),
+            )
+            .unwrap(),
+        );
         let repeated = Vec::<Maybe<I64>>::try_from(&repeated).unwrap();
         assert_eq!(repeated[0], repeated[1]);
         assert_eq!(
@@ -3501,7 +3847,9 @@ mod tests {
             panic!()
         };
         payload.value = None;
-        let none = Maybe::<I64>::from_expression(adopt(&none, 2, vec![]).unwrap());
+        let none = Maybe::<I64>::from_expression(
+            adopt(&none, 2, vec![], super::super::storage::builtin_catalog()).unwrap(),
+        );
         assert_eq!(Option::<I64>::try_from(&none).unwrap(), None);
         assert_ne!(none, value);
         for case in 0..7 {
@@ -3518,16 +3866,18 @@ mod tests {
                 1 => malformed.nodes[0].sort_id = 1,
                 2 => malformed.sorts[1].kind = Some(pb::sort::Kind::Eq("Maybe".into())),
                 3 => {
-                    malformed.sorts[1].kind = Some(pb::sort::Kind::Family(pb::HostSort {
-                        name: "Vec".into(),
-                        args: vec![0],
-                    }))
+                    malformed.sorts[1].kind =
+                        Some(pb::sort::Kind::Application(pb::SortApplication {
+                            name: "Vec".into(),
+                            args: vec![0],
+                        }))
                 }
                 4 => {
-                    malformed.sorts[1].kind = Some(pb::sort::Kind::Family(pb::HostSort {
-                        name: "Maybe".into(),
-                        args: vec![],
-                    }))
+                    malformed.sorts[1].kind =
+                        Some(pb::sort::Kind::Application(pb::SortApplication {
+                            name: "Maybe".into(),
+                            args: vec![],
+                        }))
                 }
                 5 => malformed.nodes[0].kind = Some(pb::node::Kind::Var("symbolic".into())),
                 _ => {
@@ -3540,13 +3890,19 @@ mod tests {
                 }
             }
             assert!(
-                adopt(&malformed, 2, vec![]).is_err(),
+                adopt(
+                    &malformed,
+                    2,
+                    vec![],
+                    super::super::storage::builtin_catalog()
+                )
+                .is_err(),
                 "Maybe response negative {case}"
             );
         }
         let atom = SortRef::equality("A");
         let family = super::super::storage::builtin_catalog()
-            .declaration("Maybe", DeclarationKind::HostSortFamily)
+            .declaration("Maybe", DeclarationKind::PrimitiveSort)
             .unwrap();
         let sort = SortRef::family(&family, vec![atom.clone()]).unwrap();
         let pack = Callable::constructor("Pack", vec![sort], atom, None, false);
@@ -3557,24 +3913,24 @@ mod tests {
             args: vec![2],
         }));
         assert!(
-            matches!(adopt(&cycle, 2, vec![pack.0]), Err(TypedError::Decode(s)) if s == "cyclic extraction is not inert data")
+            matches!(adopt(&cycle, 2, vec![pack.0], super::super::storage::builtin_catalog()), Err(TypedError::Decode(s)) if s == "cyclic extraction is not inert data")
         );
     }
 
     #[test]
     fn vec_response_adoption_checks_relocation_payloads_and_cycles() {
         use crate::typed::{EgglogValue, builtins::I64};
-        let response = pb::RunProgramResponse {
+        let response = pb::RunProgramOutput {
             sorts: vec![
                 pb::Sort {
-                    kind: Some(pb::sort::Kind::Family(pb::HostSort {
+                    kind: Some(pb::sort::Kind::Application(pb::SortApplication {
                         name: "i64".into(),
                         args: vec![],
                     })),
                     ..Default::default()
                 },
                 pb::Sort {
-                    kind: Some(pb::sort::Kind::Family(pb::HostSort {
+                    kind: Some(pb::sort::Kind::Application(pb::SortApplication {
                         name: "Vec".into(),
                         args: vec![0],
                     })),
@@ -3606,7 +3962,13 @@ mod tests {
             ],
             ..Default::default()
         };
-        let value = adopt(&response, 0, vec![]).unwrap();
+        let value = adopt(
+            &response,
+            0,
+            vec![],
+            super::super::storage::builtin_catalog(),
+        )
+        .unwrap();
         let children = value.sequence_elements(&I64::sort_ref(), "Vec").unwrap();
         assert_eq!(children[0].0.index, children[2].0.index);
         assert_eq!(
@@ -3625,36 +3987,36 @@ mod tests {
         };
         items.items[0] = 99;
         assert!(
-            matches!(adopt(&missing, 0, vec![]), Err(TypedError::Decode(s)) if s == "invalid response node index")
+            matches!(adopt(&missing, 0, vec![], super::super::storage::builtin_catalog()), Err(TypedError::Decode(s)) if s == "invalid response node index")
         );
         let mut wrong = response.clone();
         wrong.nodes[1].sort_id = 1;
         assert!(
-            matches!(adopt(&wrong, 0, vec![]), Err(TypedError::Decode(s)) if s == "Vec payload element sort mismatch")
+            matches!(adopt(&wrong, 0, vec![], super::super::storage::builtin_catalog()), Err(TypedError::Decode(s)) if s == "Vec payload element sort mismatch")
         );
         let mut cyclic_sort = response;
-        let Some(pb::sort::Kind::Family(f)) = &mut cyclic_sort.sorts[1].kind else {
+        let Some(pb::sort::Kind::Application(f)) = &mut cyclic_sort.sorts[1].kind else {
             panic!()
         };
         f.args[0] = 1;
         assert!(
-            matches!(adopt(&cyclic_sort, 0, vec![]), Err(TypedError::Invalid(s)) if s == "cyclic concrete sort")
+            matches!(adopt(&cyclic_sort, 0, vec![], super::super::storage::builtin_catalog()), Err(TypedError::Invalid(s)) if s == "cyclic concrete sort")
         );
 
         let atom = SortRef::equality("A");
         let family = super::super::storage::builtin_catalog()
-            .declaration("Vec", DeclarationKind::HostSortFamily)
+            .declaration("Vec", DeclarationKind::PrimitiveSort)
             .unwrap();
         let vector = SortRef::family(&family, vec![atom.clone()]).unwrap();
         let pack = Callable::constructor("Pack", vec![vector], atom, None, false);
-        let cycle = pb::RunProgramResponse {
+        let cycle = pb::RunProgramOutput {
             sorts: vec![
                 pb::Sort {
                     kind: Some(pb::sort::Kind::Eq("A".into())),
                     ..Default::default()
                 },
                 pb::Sort {
-                    kind: Some(pb::sort::Kind::Family(pb::HostSort {
+                    kind: Some(pb::sort::Kind::Application(pb::SortApplication {
                         name: "Vec".into(),
                         args: vec![0],
                     })),
@@ -3682,7 +4044,7 @@ mod tests {
             ..Default::default()
         };
         assert!(
-            matches!(adopt(&cycle, 0, vec![pack.0]), Err(TypedError::Decode(s)) if s == "cyclic extraction is not inert data")
+            matches!(adopt(&cycle, 0, vec![pack.0], super::super::storage::builtin_catalog()), Err(TypedError::Decode(s)) if s == "cyclic extraction is not inert data")
         );
     }
 
@@ -3820,7 +4182,7 @@ mod tests {
                 ..Default::default()
             });
             let mut graph = EGraph::default();
-            let response = graph.execute(packer, false).unwrap();
+            let response = Observed::from_frames(graph.execute(packer, false).unwrap());
             let request =
                 pb::RunProgramRequest::decode(graph.last_wire.as_ref().unwrap().0.as_slice())
                     .unwrap()
@@ -3848,51 +4210,26 @@ mod tests {
                     })
                     .collect::<Vec<_>>();
                 assert_eq!(actual, inputs);
-                let declaration = request
-                    .declarations
-                    .iter()
-                    .find(|d| {
-                        matches!(&d.kind,
-                    Some(pb::declaration::Kind::HostPrimitive(p)) if p.name == provider)
-                    })
-                    .unwrap();
-                if matches!(
-                    provider,
-                    "egglog.core.string.concat" | "egglog.core.bool.or"
-                ) {
-                    let rust = declaration
-                        .bindings
-                        .as_ref()
-                        .unwrap()
-                        .rust
-                        .as_ref()
-                        .unwrap();
-                    assert_eq!(rust.views.last().unwrap().tail_repetitions, Some(2));
-                    let python = declaration
-                        .bindings
-                        .as_ref()
-                        .unwrap()
-                        .python
-                        .as_ref()
-                        .unwrap();
-                    assert_eq!(python.views.last().unwrap().tail_repetitions, Some(2));
-                    if provider == "egglog.core.string.concat" {
-                        assert_eq!(rust.views[0].tail_repetitions, None);
-                    }
-                }
             }
-            let Some(pb::command_output::Kind::Extraction(extracted)) = &response.outputs[0].kind
+            let Some(pb::command_output::Kind::Extraction(extracted)) =
+                &response.output.outputs[0].kind
             else {
                 panic!()
             };
             let term = extracted.roots[0].variants[0].term;
             assert_eq!(
-                response.nodes[term as usize].kind,
+                response.output.nodes[term as usize].kind,
                 Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
                     value: Some(expected.clone())
                 }))
             );
-            let adopted = adopt(&response, term, vec![]).unwrap();
+            let adopted = adopt(
+                &response.output,
+                term,
+                vec![],
+                super::super::storage::builtin_catalog(),
+            )
+            .unwrap();
             match expected {
                 Value::String(value) => assert_eq!(
                     String::try_from(&ensure_sort::<EString>(adopted).unwrap()).unwrap(),
@@ -3906,22 +4243,37 @@ mod tests {
                 _ => panic!(),
             }
             let mut malformed = response.clone();
-            malformed.nodes[term as usize].kind =
+            malformed.output.nodes[term as usize].kind =
                 Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
                     value: Some(Value::I64(0)),
                 }));
             assert!(
-                adopt(&malformed, term, vec![]).is_err(),
+                adopt(
+                    &malformed.output,
+                    term,
+                    vec![],
+                    super::super::storage::builtin_catalog()
+                )
+                .is_err(),
                 "wrong scalar payload for {provider}"
             );
-            let sort = response.nodes[term as usize].sort_id;
+            let sort = response.output.nodes[term as usize].sort_id;
             malformed = response;
-            let Some(pb::sort::Kind::Family(family)) = &mut malformed.sorts[sort as usize].kind
+            let Some(pb::sort::Kind::Application(family)) =
+                &mut malformed.output.sorts[sort as usize].kind
             else {
                 panic!()
             };
             family.name = "UnsupportedScalar".into();
-            assert!(adopt(&malformed, term, vec![]).is_err());
+            assert!(
+                adopt(
+                    &malformed.output,
+                    term,
+                    vec![],
+                    super::super::storage::builtin_catalog()
+                )
+                .is_err()
+            );
         }
     }
 
@@ -3938,27 +4290,60 @@ mod tests {
             Some(pb::node::Kind::Call(c)) if c.func == "egglog.core.i64.add")));
         assert!(!p.nodes.iter().any(|n| matches!(&n.kind,
             Some(pb::node::Kind::Call(c)) if c.func == "+")));
-        let mut response = pb::RunProgramResponse::decode(output.as_slice()).unwrap();
-        let Some(pb::command_output::Kind::Extraction(extracted)) = &response.outputs[0].kind
+        let mut response = Observed::from_frames(
+            output
+                .iter()
+                .map(|bytes| pb::RunProgramResponse::decode(bytes.as_slice()).unwrap()),
+        );
+        let Some(pb::command_output::Kind::Extraction(extracted)) =
+            &response.output.outputs[0].kind
         else {
             panic!()
         };
         let term = extracted.roots[0].variants[0].term;
         let declarations = graph.declarations.values().cloned().collect::<Vec<_>>();
-        assert!(ensure_sort::<I64>(adopt(&response, term, declarations.clone()).unwrap()).is_ok());
-        assert!(ensure_sort::<F64>(adopt(&response, term, declarations.clone()).unwrap()).is_err());
-        response.nodes[term as usize].kind =
+        assert!(
+            ensure_sort::<I64>(
+                adopt(
+                    &response.output,
+                    term,
+                    declarations.clone(),
+                    super::super::storage::builtin_catalog()
+                )
+                .unwrap()
+            )
+            .is_ok()
+        );
+        assert!(
+            ensure_sort::<F64>(
+                adopt(
+                    &response.output,
+                    term,
+                    declarations.clone(),
+                    super::super::storage::builtin_catalog()
+                )
+                .unwrap()
+            )
+            .is_err()
+        );
+        response.output.nodes[term as usize].kind =
             Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
                 value: Some(pb::primitive_value::Value::F64Bits(0)),
             }));
         assert!(
-            adopt(&response, term, declarations.clone()).is_err(),
+            adopt(
+                &response.output,
+                term,
+                declarations.clone(),
+                super::super::storage::builtin_catalog()
+            )
+            .is_err(),
             "f64 payload in i64 sort"
         );
-        let sort_id = response.nodes[term as usize].sort_id;
-        let first = response.nodes.len() as u32;
+        let sort_id = response.output.nodes[term as usize].sort_id;
+        let first = response.output.nodes.len() as u32;
         for value in [2, 3] {
-            response.nodes.push(pb::Node {
+            response.output.nodes.push(pb::Node {
                 sort_id,
                 kind: Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
                     value: Some(pb::primitive_value::Value::I64(value)),
@@ -3966,7 +4351,7 @@ mod tests {
                 ..Default::default()
             });
         }
-        response.nodes[term as usize].kind = Some(pb::node::Kind::Call(pb::Call {
+        response.output.nodes[term as usize].kind = Some(pb::node::Kind::Call(pb::Call {
             func: "egglog.core.i64.add".into(),
             args: vec![first, first + 1],
         }));
@@ -3976,14 +4361,20 @@ mod tests {
                 .declaration("egglog.core.i64.add", DeclarationKind::Callable)
                 .unwrap(),
         );
-        let error = adopt(&response, term, declarations).unwrap_err();
+        let error = adopt(
+            &response.output,
+            term,
+            declarations,
+            super::super::storage::builtin_catalog(),
+        )
+        .unwrap_err();
         assert!(
             matches!(error, TypedError::Decode(ref message) if message == "extracted call is not a constructor"),
             "wrong rejection guard: {error}"
         );
     }
 
-    fn response(args: Vec<u32>, child: bool) -> (pb::RunProgramResponse, Vec<Record>) {
+    fn response(args: Vec<u32>, child: bool) -> (pb::RunProgramOutput, Vec<Record>) {
         let sort = SortRef::equality("M");
         let pair = Callable::constructor(
             "Pair",
@@ -3993,7 +4384,7 @@ mod tests {
             false,
         );
         let leaf = Callable::constructor("Leaf", vec![], sort, None, false);
-        let mut response = pb::RunProgramResponse {
+        let mut response = pb::RunProgramOutput {
             sorts: vec![pb::Sort {
                 kind: Some(pb::sort::Kind::Eq("M".into())),
                 ..Default::default()
@@ -4023,13 +4414,37 @@ mod tests {
     fn decoded_data_rejects_cycles_missing_children_and_bad_signatures() {
         let (r, declarations) = response(vec![0, 0], false);
         assert!(
-            adopt(&r, 0, declarations).is_err(),
+            adopt(
+                &r,
+                0,
+                declarations,
+                super::super::storage::builtin_catalog()
+            )
+            .is_err(),
             "call-only cycle is not inert data"
         );
         let (r, declarations) = response(vec![1, 1], false);
-        assert!(adopt(&r, 0, declarations).is_err(), "missing child");
+        assert!(
+            adopt(
+                &r,
+                0,
+                declarations,
+                super::super::storage::builtin_catalog()
+            )
+            .is_err(),
+            "missing child"
+        );
         let (r, declarations) = response(vec![], false);
-        assert!(adopt(&r, 0, declarations).is_err(), "wrong call arity");
+        assert!(
+            adopt(
+                &r,
+                0,
+                declarations,
+                super::super::storage::builtin_catalog()
+            )
+            .is_err(),
+            "wrong call arity"
+        );
         let (mut r, declarations) = response(vec![1, 1], true);
         r.sorts.push(pb::Sort {
             kind: Some(pb::sort::Kind::Eq("N".into())),
@@ -4037,7 +4452,13 @@ mod tests {
         });
         r.nodes[1].sort_id = 1;
         assert!(
-            adopt(&r, 0, declarations).is_err(),
+            adopt(
+                &r,
+                0,
+                declarations,
+                super::super::storage::builtin_catalog()
+            )
+            .is_err(),
             "wrong child/output sort"
         );
         let (mut r, declarations) = response(vec![1, 1], true);
@@ -4047,12 +4468,24 @@ mod tests {
         });
         r.nodes[0].sort_id = 1;
         assert!(
-            adopt(&r, 0, declarations).is_err(),
+            adopt(
+                &r,
+                0,
+                declarations,
+                super::super::storage::builtin_catalog()
+            )
+            .is_err(),
             "wrong root output sort"
         );
         let (r, declarations) = response(vec![1, 1], true);
         assert!(
-            adopt(&r, 0, declarations).is_ok(),
+            adopt(
+                &r,
+                0,
+                declarations,
+                super::super::storage::builtin_catalog()
+            )
+            .is_ok(),
             "shared finite child is valid"
         );
     }
@@ -4063,21 +4496,21 @@ mod tests {
             EgglogValue,
             builtins::{I64, Set},
         };
-        let response = pb::RunProgramResponse {
+        let response = pb::RunProgramOutput {
             sorts: vec![
                 pb::Sort {
                     kind: Some(pb::sort::Kind::Eq("Unused".into())),
                     ..Default::default()
                 },
                 pb::Sort {
-                    kind: Some(pb::sort::Kind::Family(pb::HostSort {
+                    kind: Some(pb::sort::Kind::Application(pb::SortApplication {
                         name: "i64".into(),
                         args: vec![],
                     })),
                     ..Default::default()
                 },
                 pb::Sort {
-                    kind: Some(pb::sort::Kind::Family(pb::HostSort {
+                    kind: Some(pb::sort::Kind::Application(pb::SortApplication {
                         name: "Set".into(),
                         args: vec![1],
                     })),
@@ -4115,7 +4548,16 @@ mod tests {
             ],
             ..Default::default()
         };
-        let adopted = ensure_sort::<Set<I64>>(adopt(&response, 2, vec![]).unwrap()).unwrap();
+        let adopted = ensure_sort::<Set<I64>>(
+            adopt(
+                &response,
+                2,
+                vec![],
+                super::super::storage::builtin_catalog(),
+            )
+            .unwrap(),
+        )
+        .unwrap();
         assert_eq!(
             Vec::<I64>::try_from(&adopted).unwrap(),
             [I64::from(11), I64::from(7)]
@@ -4127,7 +4569,8 @@ mod tests {
                 .owner
                 .as_ref()
                 .unwrap()
-                .program
+                .program()
+                .unwrap()
                 .nodes
                 .len(),
             3
@@ -4144,13 +4587,13 @@ mod tests {
                         }))
                 }
                 1 => {
-                    let Some(pb::sort::Kind::Family(f)) = &mut malformed.sorts[2].kind else {
+                    let Some(pb::sort::Kind::Application(f)) = &mut malformed.sorts[2].kind else {
                         panic!()
                     };
                     f.name = "Vec".into();
                 }
                 2..=4 => {
-                    let Some(pb::sort::Kind::Family(f)) = &mut malformed.sorts[2].kind else {
+                    let Some(pb::sort::Kind::Application(f)) = &mut malformed.sorts[2].kind else {
                         panic!()
                     };
                     f.args = match case {
@@ -4172,7 +4615,13 @@ mod tests {
                 _ => unreachable!(),
             }
             assert!(
-                adopt(&malformed, 2, vec![]).is_err(),
+                adopt(
+                    &malformed,
+                    2,
+                    vec![],
+                    super::super::storage::builtin_catalog()
+                )
+                .is_err(),
                 "Set adoption negative {case}"
             );
         }
@@ -4185,23 +4634,23 @@ mod tests {
             .declaration("egglog.core.i64.add", DeclarationKind::Callable)
             .unwrap();
         assert!(
-            matches!(adopt(&symbolic, 2, vec![add]), Err(TypedError::Decode(message)) if message == "extracted call is not a constructor")
+            matches!(adopt(&symbolic, 2, vec![add], super::super::storage::builtin_catalog()), Err(TypedError::Decode(message)) if message == "extracted call is not a constructor")
         );
 
         let atom = SortRef::equality("SetCycle");
         let family = super::super::storage::builtin_catalog()
-            .declaration("Set", DeclarationKind::HostSortFamily)
+            .declaration("Set", DeclarationKind::PrimitiveSort)
             .unwrap();
         let set = SortRef::family(&family, vec![atom.clone()]).unwrap();
         let pack = Callable::constructor("Pack", vec![set], atom, None, false);
-        let cyclic = pb::RunProgramResponse {
+        let cyclic = pb::RunProgramOutput {
             sorts: vec![
                 pb::Sort {
                     kind: Some(pb::sort::Kind::Eq("SetCycle".into())),
                     ..Default::default()
                 },
                 pb::Sort {
-                    kind: Some(pb::sort::Kind::Family(pb::HostSort {
+                    kind: Some(pb::sort::Kind::Application(pb::SortApplication {
                         name: "Set".into(),
                         args: vec![0],
                     })),
@@ -4229,7 +4678,7 @@ mod tests {
             ..Default::default()
         };
         assert!(
-            matches!(adopt(&cyclic, 0, vec![pack.0]), Err(TypedError::Decode(message)) if message == "cyclic extraction is not inert data")
+            matches!(adopt(&cyclic, 0, vec![pack.0], super::super::storage::builtin_catalog()), Err(TypedError::Decode(message)) if message == "cyclic extraction is not inert data")
         );
     }
 
@@ -4297,7 +4746,7 @@ mod tests {
                     ..Default::default()
                 },
                 slots,
-                vec![],
+                vec![graph.builtins.clone()],
                 Arena::Sort,
                 root.sort_id,
             )
@@ -4314,42 +4763,44 @@ mod tests {
                 ),
             );
             assert!(matches!(&program.sorts[root.sort_id as usize].kind,
-                Some(pb::sort::Kind::Family(f)) if f.name == "Unit" && f.args.is_empty()));
-            let declaration = program
-                .declarations
-                .iter()
-                .find(|d| {
-                    matches!(&d.kind,
-                Some(pb::declaration::Kind::HostPrimitive(p)) if p.name == call.func)
-                })
+                Some(pb::sort::Kind::Application(f)) if f.name == "Unit" && f.args.is_empty()));
+            let declaration = graph
+                .builtins
+                .declaration(&call.func, DeclarationKind::Callable)
                 .unwrap();
-            let Some(pb::declaration::Kind::HostPrimitive(p)) = &declaration.kind else {
+            let primitive = declaration.primitive().unwrap();
+            let Some(pb::primitive::Typing::Signature(signature)) = &primitive.typing else {
                 panic!()
             };
-            let Some(pb::host_primitive::Typing::Signature(s)) = &p.typing else {
-                panic!()
-            };
-            assert_eq!(s.type_params.len(), 1);
-            assert_eq!(s.inputs.len(), 2);
-            assert!(s.varargs.is_empty());
-            assert_eq!(s.inputs[0].sort, s.inputs[1].sort);
+            assert_eq!(signature.type_params.len(), 1);
+            assert_eq!(signature.inputs.len(), 2);
+            assert!(signature.varargs.is_empty());
+            assert_eq!(signature.inputs[0].sort, signature.inputs[1].sort);
             assert_eq!(
-                program.sorts[s.inputs[0].sort as usize].kind,
+                declaration
+                    .resolve(Arena::Sort, signature.inputs[0].sort)
+                    .unwrap()
+                    .sort()
+                    .unwrap()
+                    .kind,
                 Some(pb::sort::Kind::Var(0))
             );
             assert!(
-                SortRef(sorts.resolve(Arena::Sort, s.output.unwrap()).unwrap()) == SortRef(sorts)
+                SortRef(
+                    declaration
+                        .resolve(Arena::Sort, signature.output.unwrap())
+                        .unwrap()
+                ) == SortRef(sorts)
             );
-            assert!(
-                !program.declarations.iter().any(|d| matches!(&d.kind,
-                Some(pb::declaration::Kind::HostPrimitive(p)) if p.name == "egglog.core.fn.apply")),
-                "ordinary ne packs its reachable declarations, not the whole catalog"
+            let generated = crate::typed::storage::builtin_catalog()
+                .declaration(&call.func, DeclarationKind::Callable)
+                .unwrap();
+            assert!(crate::typed::decl::same_builtin(&declaration, &generated).unwrap());
+            let response = Observed::from_frames(
+                output
+                    .iter()
+                    .map(|bytes| pb::RunProgramResponse::decode(bytes.as_slice()).unwrap()),
             );
-            let catalog = crate::typed::storage::builtin_catalog();
-            let original = catalog.owner.as_ref().unwrap().program.declarations.iter().find(|d|
-                matches!(&d.kind, Some(pb::declaration::Kind::HostPrimitive(p)) if p.name == call.func)).unwrap();
-            assert_eq!(declaration.bindings, original.bindings);
-            let response = pb::RunProgramResponse::decode(output.as_slice()).unwrap();
             assert_eq!(
                 response.error.as_ref().map(|e| e.code),
                 (!expected).then_some(pb::ErrorCode::CheckFailed as i32)
@@ -4410,7 +4861,7 @@ mod tests {
         // Corrupt bytes cannot turn failed checks into success or permit a
         // subsequent call on a session with unknown transport state.
         assert!(matches!(
-            graph.accept_response(Packer::default(), &[0xff]),
+            graph.accept_response(Packer::default(), &[vec![0xff]]),
             Err(TypedError::Decode(_))
         ));
         assert!(matches!(graph.check(ne(I64::from(17), 23)),
@@ -4446,9 +4897,14 @@ mod tests {
                 matches!(&program.nodes[*index as usize].kind, Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue { value: Some(pb::primitive_value::Value::I64(value)) })) if *value == expected)
             );
         }
-        let response = pb::RunProgramResponse::decode(output.as_slice()).unwrap();
+        let response = Observed::from_frames(
+            output
+                .iter()
+                .map(|bytes| pb::RunProgramResponse::decode(bytes.as_slice()).unwrap()),
+        );
         assert!(response.error.is_none());
         let term = response
+            .output
             .outputs
             .iter()
             .find_map(|out| match &out.kind {
@@ -4456,7 +4912,7 @@ mod tests {
                 _ => None,
             })
             .unwrap();
-        let root = &response.nodes[term as usize];
+        let root = &response.output.nodes[term as usize];
         let Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
             value: Some(pb::primitive_value::Value::Set(items)),
         })) = &root.kind
@@ -4464,17 +4920,29 @@ mod tests {
             panic!()
         };
         assert_eq!(items.items.len(), 2);
-        let Some(pb::sort::Kind::Family(family)) = &response.sorts[root.sort_id as usize].kind
+        let Some(pb::sort::Kind::Application(family)) =
+            &response.output.sorts[root.sort_id as usize].kind
         else {
             panic!()
         };
         assert_eq!(family.name, "Set");
         assert_eq!(family.args.len(), 1);
         for child in &items.items {
-            assert_eq!(response.nodes[*child as usize].sort_id, family.args[0]);
+            assert_eq!(
+                response.output.nodes[*child as usize].sort_id,
+                family.args[0]
+            );
         }
-        let independently_adopted =
-            ensure_sort::<Set<I64>>(adopt(&response, term, vec![]).unwrap()).unwrap();
+        let independently_adopted = ensure_sort::<Set<I64>>(
+            adopt(
+                &response.output,
+                term,
+                vec![],
+                super::super::storage::builtin_catalog(),
+            )
+            .unwrap(),
+        )
+        .unwrap();
         assert_eq!(extracted, independently_adopted);
         assert_eq!(Vec::<I64>::try_from(&extracted).unwrap().len(), 2);
         assert_ne!(authored.expression(), extracted.expression());
@@ -4506,11 +4974,15 @@ mod tests {
             matches!(&request.program.unwrap().nodes[root as usize].kind, Some(pb::node::Kind::Call(c)) if c.func == "ByteWitness.Leaf")
         );
         assert_eq!(
-            pb::RunProgramResponse::decode(output.as_slice()).unwrap(),
+            output
+                .iter()
+                .map(|bytes| pb::RunProgramResponse::decode(bytes.as_slice()).unwrap())
+                .collect::<Vec<_>>(),
             response
         );
+        let observed = Observed::from_frames(response);
         assert!(matches!(
-            response.outputs[0].kind,
+            observed.output.outputs[0].kind,
             Some(pb::command_output::Kind::Extraction(_))
         ));
     }
@@ -4528,7 +5000,7 @@ mod tests {
                     .unwrap();
             let program = request.program.unwrap();
             assert_eq!(program.rules.len(), 1);
-            let Some(pb::command::Kind::Repeat(repeat)) = &program.commands[0].kind else {
+            let Some(pb::command::Kind::Loop(repeat)) = &program.commands[0].kind else {
                 panic!("one report scope")
             };
             let Some(pb::command::Kind::AddRules(add)) = &repeat.body[0].kind else {

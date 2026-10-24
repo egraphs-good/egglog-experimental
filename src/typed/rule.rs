@@ -86,7 +86,8 @@ fn row_action(target: &Expr, mut action: pb::action::Kind, value: Option<Expr>) 
                 "capture storage is not an authored row target".into(),
             ));
         }
-        let node = &target.0.owner.as_ref().unwrap().program.nodes[target.0.index as usize];
+        let node =
+            &target.0.owner.as_ref().unwrap().program().unwrap().nodes[target.0.index as usize];
         let Some(pb::node::Kind::Call(call)) = &node.kind else {
             return Err(TypedError::Invalid(
                 "row action requires a direct declared call".into(),
@@ -95,9 +96,14 @@ fn row_action(target: &Expr, mut action: pb::action::Kind, value: Option<Expr>) 
         let declaration = target
             .0
             .declaration(&call.func, DeclarationKind::Callable)?;
-        let kind = &declaration.owner.as_ref().unwrap().program.declarations
-            [declaration.index as usize]
-            .kind;
+        let kind = declaration
+            .owner
+            .as_ref()
+            .unwrap()
+            .program()
+            .ok()
+            .and_then(|program| program.declarations.get(declaration.index as usize))
+            .and_then(|declaration| declaration.kind.as_ref());
         if !matches!(
             (kind, &action),
             (
@@ -207,7 +213,7 @@ where
 // Facts and explicit union actions share one fresh canonical node constructor,
 // preserving ordered member ownership and the actual result-sort reference.
 fn equality_node(left: &Expr, right: &Expr) -> Expr {
-    let node = &left.0.owner.as_ref().unwrap().program.nodes[left.0.index as usize];
+    let node = &left.0.owner.as_ref().unwrap().program().unwrap().nodes[left.0.index as usize];
     let mut slots = std::array::from_fn(|_| vec![]);
     slots[Arena::Node as usize] = vec![
         Slot::External(left.0.clone()),
@@ -285,7 +291,8 @@ impl Rule {
         let label = label.into();
         let mut program = pb::Program {
             rules: vec![
-                self.0.owner.as_ref().unwrap().program.rules[self.0.index as usize].clone(),
+                self.0.owner.as_ref().unwrap().program().unwrap().rules[self.0.index as usize]
+                    .clone(),
             ],
             ..Default::default()
         };
@@ -327,7 +334,8 @@ impl Rule {
         }
         let mut program = pb::Program {
             rules: vec![
-                self.0.owner.as_ref().unwrap().program.rules[self.0.index as usize].clone(),
+                self.0.owner.as_ref().unwrap().program().unwrap().rules[self.0.index as usize]
+                    .clone(),
             ],
             ..Default::default()
         };
@@ -492,7 +500,7 @@ pub fn named_ruleset<A>(
             for addition in group.0 {
                 let owner = addition.owner.as_ref().unwrap();
                 let Some(pb::command::Kind::AddRules(add)) =
-                    &owner.program.commands[addition.index as usize].kind
+                    &owner.program().unwrap().commands[addition.index as usize].kind
                 else {
                     unreachable!("typed group addition")
                 };
@@ -628,8 +636,10 @@ mod action_input {
         ) -> Result<(), TypedError> {
             let record = self.0.map_err(TypedError::Invalid)?;
             let owner = record.owner.as_ref().unwrap();
-            let Some(pb::command::Kind::Action(mut action)) =
-                owner.program.commands[record.index as usize].kind.clone()
+            let Some(pb::command::Kind::Action(mut action)) = owner.program().unwrap().commands
+                [record.index as usize]
+                .kind
+                .clone()
             else {
                 unreachable!("owned action record")
             };
@@ -743,7 +753,7 @@ arities!(@[]; A0:0,A1:1,A2:2,A3:3,A4:4,A5:5,A6:6,A7:7,A8:8,A9:9,
     A60:60,A61:61,A62:62,A63:63);
 
 pub(super) fn ensure_sort<S: EgglogValue>(expr: Expr) -> Result<S, TypedError> {
-    let node = &expr.0.owner.as_ref().unwrap().program.nodes[expr.0.index as usize];
+    let node = &expr.0.owner.as_ref().unwrap().program().unwrap().nodes[expr.0.index as usize];
     if SortRef(expr.0.resolve(Arena::Sort, node.sort_id)?) != S::sort_ref() {
         return Err(TypedError::Decode(
             "decoded expression has another sort".into(),

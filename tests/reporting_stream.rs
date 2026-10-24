@@ -1,14 +1,17 @@
+#[path = "common/protobuf.rs"]
+mod fixture;
 use egglog_experimental::{
     proto as pb,
     protobuf::{Engine, source::Source},
 };
+use fixture::Observed;
 use prost::Message;
 use std::ops::ControlFlow;
 
 fn create(engine: &mut Engine, recording: bool) -> u64 {
     let request = pb::CreateEGraphRequest {
         sorts: vec![pb::Sort {
-            kind: Some(pb::sort::Kind::Family(pb::HostSort {
+            kind: Some(pb::sort::Kind::Application(pb::SortApplication {
                 name: "i64".into(),
                 args: vec![],
             })),
@@ -26,26 +29,22 @@ fn create(engine: &mut Engine, recording: bool) -> u64 {
         .egraph_id
 }
 
-fn submit(
-    engine: &mut Engine,
-    id: u64,
-    program: pb::Program,
-    diagnostics: bool,
-) -> pb::RunProgramResponse {
-    pb::RunProgramResponse::decode(
-        engine
-            .run(
-                &pb::RunProgramRequest {
-                    egraph_id: id,
-                    program: Some(program),
-                    diagnostics,
-                }
-                .encode_to_vec(),
-            )
-            .unwrap()
-            .as_slice(),
+fn submit(engine: &mut Engine, id: u64, program: pb::Program, diagnostics: bool) -> Observed {
+    let bytes = engine
+        .run(
+            &pb::RunProgramRequest {
+                egraph_id: id,
+                program: Some(program),
+                diagnostics,
+            }
+            .encode_to_vec(),
+        )
+        .unwrap();
+    Observed::from_frames(
+        bytes
+            .iter()
+            .map(|bytes| pb::RunProgramResponse::decode(bytes.as_slice()).unwrap()),
     )
-    .unwrap()
 }
 
 fn seed(engine: &mut Engine, id: u64) {
@@ -58,7 +57,7 @@ fn seed(engine: &mut Engine, id: u64) {
 fn loop_program() -> pb::Program {
     pb::Program {
         sorts: vec![pb::Sort {
-            kind: Some(pb::sort::Kind::Family(pb::HostSort {
+            kind: Some(pb::sort::Kind::Application(pb::SortApplication {
                 name: "i64".into(),
                 args: vec![],
             })),
@@ -72,8 +71,8 @@ fn loop_program() -> pb::Program {
         }],
         commands: vec![
             pb::Command {
-                kind: Some(pb::command::Kind::Repeat(pb::Repeat {
-                    times: Some(3),
+                kind: Some(pb::command::Kind::Loop(pb::Loop {
+                    max_iterations: Some(3),
                     body: vec![
                         pb::Command {
                             kind: Some(pb::command::Kind::Run(pb::Run {
@@ -130,7 +129,7 @@ fn census(engine: &mut Engine, id: u64) -> u64 {
         false,
     );
     assert_eq!(response.error, None);
-    let Some(pb::command_output::Kind::Sizes(sizes)) = &response.outputs[0].kind else {
+    let Some(pb::command_output::Kind::Sizes(sizes)) = &response.output.outputs[0].kind else {
         panic!("sizes")
     };
     sizes.sizes[0].rows
@@ -151,7 +150,9 @@ fn streaming_snapshots_cancel_before_next_iteration_and_preserve_live_prefix() {
             }
             .encode_to_vec(),
             &mut |chunk| {
-                assert_eq!(chunk.error, None);
+                let Some(pb::run_program_response::Result::Output(chunk)) = chunk.result else {
+                    panic!("unexpected error frame")
+                };
                 let Some(pb::command_output::Kind::Snapshot(snapshot)) = &chunk.outputs[0].kind
                 else {
                     panic!("first snapshot")
@@ -177,7 +178,7 @@ fn streaming_snapshots_cancel_before_next_iteration_and_preserve_live_prefix() {
         history
             .commands
             .iter()
-            .any(|command| matches!(command.kind, Some(pb::command::Kind::Repeat(_))))
+            .any(|command| matches!(command.kind, Some(pb::command::Kind::Loop(_))))
     );
     // The same live graph remains usable; no completed control was fabricated.
     let response = submit(&mut engine, id, loop_program(), false);
@@ -186,7 +187,7 @@ fn streaming_snapshots_cancel_before_next_iteration_and_preserve_live_prefix() {
 }
 
 #[test]
-fn streamed_chunks_are_local_ordered_and_buffered_execution_relocates_them() {
+fn streamed_frames_are_local_ordered_and_match_buffered_execution_exactly() {
     let mut engine = Engine::default();
     let id = create(&mut engine, false);
     seed(&mut engine, id);
@@ -198,7 +199,7 @@ fn streamed_chunks_are_local_ordered_and_buffered_execution_relocates_them() {
     )
     .unwrap()
     .egraph_id;
-    let mut chunks = vec![];
+    let mut frames = vec![];
     engine
         .run_stream(
             &pb::RunProgramRequest {
@@ -207,64 +208,65 @@ fn streamed_chunks_are_local_ordered_and_buffered_execution_relocates_them() {
                 diagnostics: false,
             }
             .encode_to_vec(),
-            &mut |chunk| {
-                chunks.push(chunk);
+            &mut |frame| {
+                frames.push(frame);
                 ControlFlow::Continue(())
             },
         )
         .unwrap();
-    assert!(chunks.last().unwrap().outputs.is_empty());
-    let mut snapshots = vec![];
+    assert!(
+        matches!(&frames.last().unwrap().result,Some(pb::run_program_response::Result::Output(output)) if output.outputs.is_empty())
+    );
     let mut iterations = vec![];
-    for chunk in &chunks {
-        assert_eq!(chunk.error, None);
-        for output in &chunk.outputs {
-            match &output.kind {
-                Some(pb::command_output::Kind::Snapshot(snapshot)) => {
-                    snapshots.push(snapshot.clone());
-                    iterations.push(output.location.as_ref().unwrap().iterations.clone());
+    let mut terms = vec![];
+    for frame in &frames {
+        let Some(pb::run_program_response::Result::Output(output)) = &frame.result else {
+            panic!("unexpected error frame")
+        };
+        for command in &output.outputs {
+            match &command.kind {
+                Some(pb::command_output::Kind::Snapshot(_)) => {
+                    iterations.push(command.location.as_ref().unwrap().iterations.clone())
                 }
                 Some(pb::command_output::Kind::Extraction(extraction)) => {
                     let variant = &extraction.roots[0].variants[0];
-                    assert!((variant.term as usize) < chunk.nodes.len());
-                    assert!((variant.cost.unwrap() as usize) < chunk.nodes.len());
+                    assert!((variant.term as usize) < output.nodes.len());
+                    assert!((variant.cost.unwrap() as usize) < output.nodes.len());
                     assert!(
-                        chunk
+                        output
                             .nodes
                             .iter()
-                            .all(|node| (node.sort_id as usize) < chunk.sorts.len())
+                            .all(|node| (node.sort_id as usize) < output.sorts.len())
                     );
+                    terms.push(variant.term);
                 }
                 _ => (),
             }
         }
     }
     assert_eq!(iterations, [vec![0], vec![1], vec![2]]);
-    let buffered = submit(&mut engine, clone, loop_program(), false);
-    assert_eq!(buffered.error, None);
-    assert_eq!(
-        buffered
-            .outputs
-            .iter()
-            .filter_map(|output| match &output.kind {
-                Some(pb::command_output::Kind::Snapshot(snapshot)) => Some(snapshot.clone()),
-                _ => None,
-            })
-            .collect::<Vec<_>>(),
-        snapshots
-    );
-    let terms = buffered
-        .outputs
-        .iter()
-        .filter_map(|output| match &output.kind {
-            Some(pb::command_output::Kind::Extraction(extraction)) => {
-                Some(extraction.roots[0].variants[0].term)
-            }
-            _ => None,
-        })
-        .collect::<Vec<_>>();
     assert_eq!(terms.len(), 2);
-    assert!(terms.windows(2).all(|pair| pair[0] < pair[1]));
+    assert_eq!(
+        terms[0], terms[1],
+        "each extraction owns a fresh local arena"
+    );
+    let buffered = engine
+        .run(
+            &pb::RunProgramRequest {
+                egraph_id: clone,
+                program: Some(loop_program()),
+                diagnostics: false,
+            }
+            .encode_to_vec(),
+        )
+        .unwrap();
+    assert_eq!(
+        buffered,
+        frames
+            .iter()
+            .map(Message::encode_to_vec)
+            .collect::<Vec<_>>()
+    );
 }
 
 #[test]
@@ -295,12 +297,12 @@ fn default_off_diagnostics_explain_and_opt_in_preserve_control_and_data() {
         false,
     );
     assert_eq!(explained.error, None);
-    let Some(pb::command_output::Kind::Diagnostic(plan)) = &explained.outputs[0].kind else {
+    let Some(pb::command_output::Kind::Diagnostic(plan)) = &explained.output.outputs[0].kind else {
         panic!("plan")
     };
     assert_eq!(plan.format, "application/vnd.egglog.query-plan+json");
     assert!(
-        !serde_json::from_str::<serde_json::Value>(&plan.content)
+        !serde_json::from_slice::<serde_json::Value>(&plan.content)
             .unwrap()
             .as_array()
             .unwrap()
@@ -312,11 +314,13 @@ fn default_off_diagnostics_explain_and_opt_in_preserve_control_and_data() {
     assert_eq!(off.error, None);
     assert_eq!(on.error, None);
     let off_result = off
+        .output
         .outputs
         .iter()
         .find(|output| matches!(output.kind, Some(pb::command_output::Kind::Run(_))))
         .unwrap();
     let on_result = on
+        .output
         .outputs
         .iter()
         .find(|output| matches!(output.kind, Some(pb::command_output::Kind::Run(_))))
@@ -326,6 +330,7 @@ fn default_off_diagnostics_explain_and_opt_in_preserve_control_and_data() {
         matches!(&off_result.kind, Some(pb::command_output::Kind::Run(result)) if result.updated && !result.can_stop)
     );
     let Some(pb::command_output::Kind::Diagnostic(diagnostic)) = &on
+        .output
         .outputs
         .iter()
         .find(|output| matches!(output.kind, Some(pb::command_output::Kind::Diagnostic(_))))
@@ -334,7 +339,7 @@ fn default_off_diagnostics_explain_and_opt_in_preserve_control_and_data() {
     else {
         panic!("diagnostic")
     };
-    let detail: serde_json::Value = serde_json::from_str(&diagnostic.content).unwrap();
+    let detail: serde_json::Value = serde_json::from_slice(&diagnostic.content).unwrap();
     assert!(detail.get("updated").is_none() && detail.get("can_stop").is_none());
     assert!(!detail["iterations"].as_array().unwrap().is_empty());
     for (handle, collected) in [(id, false), (clone, true)] {
@@ -350,10 +355,11 @@ fn default_off_diagnostics_explain_and_opt_in_preserve_control_and_data() {
             },
             false,
         );
-        let Some(pb::command_output::Kind::Diagnostic(diagnostic)) = &stats.outputs[0].kind else {
+        let Some(pb::command_output::Kind::Diagnostic(diagnostic)) = &stats.output.outputs[0].kind
+        else {
             panic!("stats")
         };
-        let detail: serde_json::Value = serde_json::from_str(&diagnostic.content).unwrap();
+        let detail: serde_json::Value = serde_json::from_slice(&diagnostic.content).unwrap();
         assert_eq!(
             !detail["iterations"].as_array().unwrap().is_empty(),
             collected
@@ -376,7 +382,7 @@ fn later_loop_failure_keeps_delivered_observation_and_has_no_completed_result() 
     seed(&mut engine, id);
     let mut program = loop_program();
     program.commands.truncate(1);
-    let Some(pb::command::Kind::Repeat(repeat)) = &mut program.commands[0].kind else {
+    let Some(pb::command::Kind::Loop(repeat)) = &mut program.commands[0].kind else {
         unreachable!()
     };
     repeat.body.push(pb::Command {
@@ -397,15 +403,17 @@ fn later_loop_failure_keeps_delivered_observation_and_has_no_completed_result() 
             }
             .encode_to_vec(),
             &mut |chunk| {
-                for output in chunk.outputs {
-                    assert!(matches!(
-                        output.kind,
-                        Some(pb::command_output::Kind::Snapshot(_))
-                    ));
-                    observed += 1;
-                }
-                if let Some(error) = chunk.error {
-                    final_error = Some(error);
+                match chunk.result.expect("frame result") {
+                    pb::run_program_response::Result::Output(output) => {
+                        for command in output.outputs {
+                            assert!(matches!(
+                                command.kind,
+                                Some(pb::command_output::Kind::Snapshot(_))
+                            ));
+                            observed += 1;
+                        }
+                    }
+                    pb::run_program_response::Result::Error(error) => final_error = Some(error),
                 }
                 ControlFlow::Continue(())
             },
@@ -413,7 +421,7 @@ fn later_loop_failure_keeps_delivered_observation_and_has_no_completed_result() 
         .unwrap();
     assert_eq!(observed, 1);
     let error = final_error.unwrap();
-    assert_eq!(error.code, pb::ErrorCode::Panic as i32);
+    assert_eq!(error.code, pb::ErrorCode::RuntimeFailure as i32);
     assert_eq!(error.location.unwrap().iterations, [0]);
     assert_eq!(census(&mut engine, id), 2);
 }
@@ -455,10 +463,14 @@ fn backoff_quiet_deferred_rounds_preserve_readiness_with_collection_off_and_on()
                 diagnostics,
             );
             assert_eq!(response.error, None);
-            let Some(pb::command_output::Kind::Run(result)) = response.outputs[0].kind else {
+            let Some(pb::command_output::Kind::Run(result)) = response.output.outputs[0].kind
+            else {
                 panic!("RunResult")
             };
-            assert_eq!(response.outputs.len(), if diagnostics { 2 } else { 1 });
+            assert_eq!(
+                response.output.outputs.len(),
+                if diagnostics { 2 } else { 1 }
+            );
             flags.push((result.updated, result.can_stop));
             if result.can_stop {
                 break;
@@ -483,13 +495,13 @@ fn cancellation_stops_before_authored_fail_and_cannot_turn_into_caught_success()
     seed(&mut engine, id);
     let mut program = loop_program();
     program.commands.truncate(1);
-    let Some(pb::command::Kind::Repeat(repeat)) = &mut program.commands[0].kind else {
+    let Some(pb::command::Kind::Loop(repeat)) = &mut program.commands[0].kind else {
         unreachable!()
     };
     repeat.body.push(pb::Command {
         kind: Some(pb::command::Kind::Fail(Box::new(pb::Command {
-            kind: Some(pb::command::Kind::Repeat(pb::Repeat {
-                times: Some(3),
+            kind: Some(pb::command::Kind::Loop(pb::Loop {
+                max_iterations: Some(3),
                 body: repeat.body.clone(),
                 ..Default::default()
             })),
@@ -507,8 +519,10 @@ fn cancellation_stops_before_authored_fail_and_cannot_turn_into_caught_success()
             }
             .encode_to_vec(),
             &mut |chunk| {
-                assert!(chunk.error.is_none());
-                delivered += chunk.outputs.len();
+                let Some(pb::run_program_response::Result::Output(output)) = chunk.result else {
+                    panic!("unexpected error frame")
+                };
+                delivered += output.outputs.len();
                 ControlFlow::Break(())
             },
         )
@@ -542,7 +556,7 @@ fn terminal_callback_break_preserves_actual_errors_and_completed_success() {
                 }],
                 ..Default::default()
             }),
-            Some(pb::ErrorCode::Panic),
+            Some(pb::ErrorCode::RuntimeFailure),
         ),
         (Some(pb::Program::default()), None),
     ] {
@@ -558,8 +572,13 @@ fn terminal_callback_break_preserves_actual_errors_and_completed_success() {
                 .encode_to_vec(),
                 &mut |chunk| {
                     delivered += 1;
-                    assert!(chunk.outputs.is_empty());
-                    actual = chunk.error;
+                    actual = match chunk.result.expect("frame result") {
+                        pb::run_program_response::Result::Output(output) => {
+                            assert!(output.outputs.is_empty());
+                            None
+                        }
+                        pb::run_program_response::Result::Error(error) => Some(error),
+                    };
                     ControlFlow::Break(())
                 },
             )
@@ -601,11 +620,11 @@ fn decomposed_diagnostics_keep_actual_text_and_preserve_execution() {
     let on = submit(&mut engine, clone, request, true);
     assert_eq!(off.error, None);
     assert_eq!(on.error, None);
-    assert_eq!(off.outputs[0], on.outputs[0]);
-    let Some(pb::command_output::Kind::Diagnostic(document)) = &on.outputs[1].kind else {
+    assert_eq!(off.output.outputs[0], on.output.outputs[0]);
+    let Some(pb::command_output::Kind::Diagnostic(document)) = &on.output.outputs[1].kind else {
         panic!("diagnostic")
     };
-    let detail: serde_json::Value = serde_json::from_str(&document.content).unwrap();
+    let detail: serde_json::Value = serde_json::from_slice(&document.content).unwrap();
     let mut fallback = false;
     for iteration in detail["iterations"].as_array().unwrap() {
         for reports in iteration["rule_set_report"]["rule_reports"]
@@ -647,7 +666,7 @@ fn decomposed_diagnostics_keep_actual_text_and_preserve_execution() {
             },
             false,
         );
-        let Some(pb::command_output::Kind::Sizes(sizes)) = &result.outputs[0].kind else {
+        let Some(pb::command_output::Kind::Sizes(sizes)) = &result.output.outputs[0].kind else {
             panic!("Out rows")
         };
         assert_eq!(sizes.sizes[0].rows, 1);

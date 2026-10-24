@@ -1,6 +1,5 @@
 """Repeated-tail wire/CEL checks, not generic call matching or execution."""
 
-import copy
 import json
 import unittest
 
@@ -11,29 +10,20 @@ from gen.python.egglog.v1 import egglog_pb as ir
 
 
 def signature_program(pattern):
-    """Own the signature's arena, binder and presentation-default references."""
-    return ir.Program(
+    """Own the signature's sort arena and binder."""
+    return ir.BuiltinCatalog(
         sorts=[
-            ir.Sort(kind=Oneof("family", ir.HostSort(name="i64"))),
+            ir.Sort(kind=Oneof("application", ir.SortApplication(name="i64"))),
             ir.Sort(kind=Oneof("var", 0)),
             ir.Sort(kind=Oneof("var", 1)),
-            ir.Sort(kind=Oneof("family", ir.HostSort(name="Map", args=[1, 2]))),
+            ir.Sort(kind=Oneof("application", ir.SortApplication(name="Map", args=[1, 2]))),
             ir.Sort(kind=Oneof("var", 2)),
         ],
-        nodes=[ir.Node(sort_id=0, kind=Oneof("primitive_value", ir.PrimitiveValue(value=Oneof("i64", 7))))],
-        declarations=[
-            ir.Declaration(kind=Oneof("host_sort_family", ir.HostSortFamily(name="i64"))),
-            ir.Declaration(kind=Oneof("host_sort_family", ir.HostSortFamily(name="Map", arity=2))),
-            ir.Declaration(kind=Oneof("host_primitive", ir.HostPrimitive(
-                name="test.pairs",
-                typing=Oneof("signature", ir.GenericSignature(
-                    type_params=["K", "V"],
-                    inputs=[ir.Arg(name="prefix", sort=0)],
-                    output=3,
-                    varargs=[ir.Arg(name=f"tail{i}", sort=sort) for i, sort in enumerate(pattern)],
-                )),
-            ))),
-        ],
+        primitive_sorts=[ir.PrimitiveSort(name="i64"), ir.PrimitiveSort(name="Map", arity=2)],
+        primitives=[ir.Primitive(name="test.pairs", typing=Oneof("signature", ir.GenericSignature(
+            type_params=["K", "V"], inputs=[ir.Arg(name="prefix", sort=0)], output=3,
+            varargs=[ir.Arg(name=f"tail{i}", sort=sort) for i, sort in enumerate(pattern)],
+        )))],
     )
 
 
@@ -43,10 +33,10 @@ class SignatureSchemaTests(unittest.TestCase):
             with self.subTest(pattern=pattern):
                 program = signature_program(pattern)
                 validate(program)
-                decoded = ir.Program.from_binary(program.to_binary())
+                decoded = ir.BuiltinCatalog.from_binary(program.to_binary())
                 self.assertEqual(decoded, program)
                 self.assertEqual(
-                    [arg.sort for arg in decoded.declarations[-1].kind.value.typing.value.varargs],
+                    [arg.sort for arg in decoded.primitives[-1].typing.value.varargs],
                     pattern,
                 )
 
@@ -59,74 +49,11 @@ class SignatureSchemaTests(unittest.TestCase):
                     with self.assertRaises(ValidationError):
                         validate(signature_program(pattern))
         program = signature_program([1, 2])
-        program.declarations[-1].kind.value.typing.value.type_params = []
+        program.primitives[-1].typing.value.type_params = []
         with self.assertRaises(ValidationError):
             validate(program)
 
-    def test_all_nonempty_patterns_have_one_logical_presentation_tail(self):
-        for pattern in [[], [1], [1, 2], [1, 1], [1, 2, 1]]:
-            with self.subTest(pattern=pattern):
-                program = signature_program(pattern)
-                names = ["prefix", "entries"] if pattern else ["prefix"]
-                program.declarations[-1].bindings = ir.CallableBindings(
-                    python=ir.PythonBindings(views=[ir.PythonCallable(
-                        kind=ir.PythonCallKind.FUNCTION, path=["test", "pairs"],
-                        params=[ir.PythonParameter(core_input=i, name=name) for i, name in enumerate(names)],
-                    )]),
-                    rust=ir.RustBindings(views=[ir.RustCallable(
-                        path=["test", "pairs"],
-                        params=[ir.RustParameter(core_input=i, name=name) for i, name in enumerate(names)],
-                    )]),
-                )
-                validate(program)
-                self.assertEqual(ir.Program.from_binary(program.to_binary()), program)
 
-    def test_tail_is_one_final_parameter_without_default_or_receiver(self):
-        python = ir.PythonCallable(
-            kind=ir.PythonCallKind.FUNCTION, path=["test", "pairs"],
-            params=[ir.PythonParameter(core_input=0, name="prefix"), ir.PythonParameter(core_input=1, name="entries")],
-        )
-        rust = ir.RustCallable(
-            path=["test", "pairs"],
-            params=[ir.RustParameter(core_input=0, name="prefix"), ir.RustParameter(core_input=1, name="entries")],
-        )
-        for language, view in [("python", python), ("rust", rust)]:
-            bad_views = []
-            missing = copy.deepcopy(view)
-            missing.params.pop()
-            bad_views.append(missing)
-            extra = copy.deepcopy(view)
-            extra.params.append(type(view.params[0])(core_input=2, name="not_a_second_slot"))
-            bad_views.append(extra)
-            reversed_params = copy.deepcopy(view)
-            reversed_params.params.reverse()
-            bad_views.append(reversed_params)
-            receiver = copy.deepcopy(view)
-            receiver.path = ["pairs"]
-            receiver.owner = ir.BindingOwner(kind=Oneof("sort", 0))
-            receiver.params.pop()
-            if language == "python":
-                receiver.kind = ir.PythonCallKind.METHOD
-                receiver.receiver = 1
-                default = copy.deepcopy(view)
-                default.params[-1].default_expr = 0
-                bad_views.append(default)
-            else:
-                receiver.receiver = ir.RustReceiver(core_input=1)
-            bad_views.append(receiver)
-            for bad in bad_views:
-                with self.subTest(language=language, view=bad), self.assertRaises(ValidationError):
-                    program = signature_program([1, 2])
-                    program.declarations[-1].bindings = ir.CallableBindings(**{
-                        language: (ir.PythonBindings if language == "python" else ir.RustBindings)(views=[bad]),
-                    })
-                    validate(program)
-            with self.subTest(language=language, spurious_tail=True), self.assertRaises(ValidationError):
-                program = signature_program([])
-                program.declarations[-1].bindings = ir.CallableBindings(**{
-                    language: (ir.PythonBindings if language == "python" else ir.RustBindings)(views=[view]),
-                })
-                validate(program)
 
     def test_old_zero_tail_canonical_bytes_are_unchanged(self):
         # Captured from the published S805ce71 singular-field Python bindings.

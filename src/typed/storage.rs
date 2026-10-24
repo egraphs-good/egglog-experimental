@@ -17,16 +17,9 @@ static NEXT_OWNER: AtomicUsize = AtomicUsize::new(0);
 pub(super) fn builtin_catalog() -> &'static Record {
     static CATALOG: OnceLock<Record> = OnceLock::new();
     CATALOG.get_or_init(|| {
-        let program = pb::Program::decode(include_bytes!("builtins/catalog.pb").as_slice())
+        let catalog = pb::BuiltinCatalog::decode(include_bytes!("builtins/catalog.pb").as_slice())
             .expect("generated catalog is valid protobuf");
-        assert!(program.nodes.is_empty() && program.rules.is_empty());
-        let mut slots = std::array::from_fn(|_| vec![]);
-        slots[Arena::Sort as usize] = (0..program.sorts.len() as u32).map(Slot::Local).collect();
-        slots[Arena::Declaration as usize] = (0..program.declarations.len() as u32)
-            .map(Slot::Local)
-            .collect();
-        publish(program, slots, vec![], Arena::Sort, 0)
-            .expect("unsupported generated catalog shape")
+        publish_catalog(catalog).expect("unsupported generated catalog shape")
     })
 }
 
@@ -37,12 +30,14 @@ pub(super) enum Arena {
     Declaration,
     Rule,
     Command,
+    PrimitiveSort,
+    Primitive,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(super) enum DeclarationKind {
     EqSort,
-    HostSortFamily,
+    PrimitiveSort,
     Callable,
 }
 
@@ -60,10 +55,11 @@ pub(super) enum Slot {
 
 pub(super) struct Owner {
     pub id: usize,
-    pub program: pb::Program,
-    pub slots: [Vec<Slot>; 5],
+    pub graph: OwnedGraph,
+    pub slots: [Vec<Slot>; 7],
     // Candidate declaration locations, not names/signatures copied from them.
     pub declarations: Vec<Record>,
+    pub ambient: Option<Arc<Owner>>,
     // Locations in this owner's generated records, never an initializer copy.
     pub capture: Option<(u32, u32)>,
     // Function declaration and its two exact parameter locations in Node slots.
@@ -72,6 +68,34 @@ pub(super) struct Owner {
     pub observed: bool,
     // Diagnostic presentations share their underlying authored rule record.
     pub rule_origin: Option<Record>,
+}
+
+pub(super) enum OwnedGraph {
+    Program(pb::Program),
+    BuiltinCatalog(pb::BuiltinCatalog),
+}
+
+impl Owner {
+    // A catalog is never implicitly converted to a user Program. Callers that
+    // require executable/user arenas cross this checked ownership boundary.
+    pub fn program(&self) -> Result<&pb::Program, TypedError> {
+        match &self.graph {
+            OwnedGraph::Program(program) => Ok(program),
+            OwnedGraph::BuiltinCatalog(_) => Err(TypedError::Invalid(
+                "builtin catalog is not a user Program".into(),
+            )),
+        }
+    }
+
+    #[cfg(test)]
+    pub fn program_mut(&mut self) -> Result<&mut pb::Program, TypedError> {
+        match &mut self.graph {
+            OwnedGraph::Program(program) => Ok(program),
+            OwnedGraph::BuiltinCatalog(_) => Err(TypedError::Invalid(
+                "builtin catalog is not a user Program".into(),
+            )),
+        }
+    }
 }
 
 // A validated, temporary view of the generated Function/Call/Set linkage.
@@ -104,6 +128,9 @@ impl Drop for Record {
                         pending.push(child);
                     }
                 }
+                if let Some(ambient) = owner.ambient.take() {
+                    pending.push(ambient);
+                }
                 if let Some(mut origin) = owner.rule_origin.take()
                     && let Some(parent) = origin.owner.take()
                 {
@@ -115,6 +142,39 @@ impl Drop for Record {
 }
 
 impl Record {
+    pub fn sort(&self) -> Result<&pb::Sort, TypedError> {
+        if self.arena != Arena::Sort {
+            return Err(TypedError::Invalid("expected an owned sort".into()));
+        }
+        let sorts = match &self.owner.as_ref().unwrap().graph {
+            OwnedGraph::Program(program) => &program.sorts,
+            OwnedGraph::BuiltinCatalog(catalog) => &catalog.sorts,
+        };
+        sorts
+            .get(self.index as usize)
+            .ok_or_else(|| TypedError::Invalid("owned sort out of bounds".into()))
+    }
+
+    pub fn primitive_sort(&self) -> Result<&pb::PrimitiveSort, TypedError> {
+        match (&self.owner.as_ref().unwrap().graph, self.arena) {
+            (OwnedGraph::BuiltinCatalog(catalog), Arena::PrimitiveSort) => {
+                catalog.primitive_sorts.get(self.index as usize)
+            }
+            _ => None,
+        }
+        .ok_or_else(|| TypedError::Invalid("expected an owned primitive sort descriptor".into()))
+    }
+
+    pub fn primitive(&self) -> Result<&pb::Primitive, TypedError> {
+        match (&self.owner.as_ref().unwrap().graph, self.arena) {
+            (OwnedGraph::BuiltinCatalog(catalog), Arena::Primitive) => {
+                catalog.primitives.get(self.index as usize)
+            }
+            _ => None,
+        }
+        .ok_or_else(|| TypedError::Invalid("expected an owned primitive descriptor".into()))
+    }
+
     pub fn key(&self) -> Key {
         let mut record = self;
         while record.arena == Arena::Rule {
@@ -136,9 +196,15 @@ impl Record {
             return Ok(None);
         };
         let invalid = || TypedError::Invalid("invalid canonical capture recipe".into());
-        let node = owner.program.nodes.get(read as usize).ok_or_else(invalid)?;
+        let node = owner
+            .program()
+            .unwrap()
+            .nodes
+            .get(read as usize)
+            .ok_or_else(invalid)?;
         let command = owner
-            .program
+            .program()
+            .unwrap()
             .commands
             .get(initialization as usize)
             .ok_or_else(invalid)?;
@@ -163,9 +229,14 @@ impl Record {
             return Err(invalid());
         };
         let declaration = self.declaration(&call.func, DeclarationKind::Callable)?;
-        let Some(pb::declaration::Kind::Function(function)) =
-            &declaration.owner.as_ref().unwrap().program.declarations[declaration.index as usize]
-                .kind
+        let Some(pb::declaration::Kind::Function(function)) = &declaration
+            .owner
+            .as_ref()
+            .unwrap()
+            .program()
+            .unwrap()
+            .declarations[declaration.index as usize]
+            .kind
         else {
             return Err(invalid());
         };
@@ -193,7 +264,8 @@ impl Record {
             .owner
             .as_ref()
             .unwrap()
-            .program
+            .program()
+            .unwrap()
             .nodes
             .get(initializer.index as usize)
             .ok_or_else(invalid)?;
@@ -231,53 +303,160 @@ impl Record {
     }
 
     pub fn declaration(&self, name: &str, kind: DeclarationKind) -> Result<Self, TypedError> {
-        let owner = self.owner.as_ref().unwrap();
-        let matches = |d: &pb::Declaration| match &d.kind {
-            Some(pb::declaration::Kind::EqSort(d)) => {
-                kind == DeclarationKind::EqSort && d.name == name
+        let mut pending = vec![self.clone()];
+        let mut seen = std::collections::HashSet::new();
+        while let Some(context) = pending.pop() {
+            let owner = context.owner.as_ref().unwrap();
+            if !seen.insert(owner.id) {
+                continue;
             }
-            Some(pb::declaration::Kind::HostSortFamily(d)) => {
-                kind == DeclarationKind::HostSortFamily && d.name == name
+            let found = match &owner.graph {
+                OwnedGraph::BuiltinCatalog(catalog) => match kind {
+                    DeclarationKind::PrimitiveSort => catalog
+                        .primitive_sorts
+                        .iter()
+                        .position(|p| p.name == name)
+                        .map(|i| (Arena::PrimitiveSort, i)),
+                    DeclarationKind::Callable => catalog
+                        .primitives
+                        .iter()
+                        .position(|p| p.name == name)
+                        .map(|i| (Arena::Primitive, i)),
+                    DeclarationKind::EqSort => None,
+                },
+                OwnedGraph::Program(program) => program
+                    .declarations
+                    .iter()
+                    .position(|d| match &d.kind {
+                        Some(pb::declaration::Kind::EqSort(d)) => {
+                            kind == DeclarationKind::EqSort && d.name == name
+                        }
+                        Some(pb::declaration::Kind::Constructor(d)) => {
+                            kind == DeclarationKind::Callable && d.name == name
+                        }
+                        Some(pb::declaration::Kind::Function(d)) => {
+                            kind == DeclarationKind::Callable && d.name == name
+                        }
+                        Some(pb::declaration::Kind::Relation(d)) => {
+                            kind == DeclarationKind::Callable && d.name == name
+                        }
+                        Some(pb::declaration::Kind::UserDefinedPrimitive(d)) => {
+                            kind == DeclarationKind::Callable && d.name == name
+                        }
+                        _ => false,
+                    })
+                    .map(|i| (Arena::Declaration, i)),
+            };
+            if let Some((arena, index)) = found {
+                return Ok(Self {
+                    owner: context.owner.clone(),
+                    arena,
+                    index: index as u32,
+                });
             }
-            Some(pb::declaration::Kind::Constructor(d)) => {
-                kind == DeclarationKind::Callable && d.name == name
+            pending.extend(owner.declarations.iter().rev().cloned());
+            if let Some(ambient) = &owner.ambient {
+                pending.push(Self {
+                    owner: Some(ambient.clone()),
+                    arena: Arena::PrimitiveSort,
+                    index: 0,
+                });
             }
-            Some(pb::declaration::Kind::Function(d)) => {
-                kind == DeclarationKind::Callable && d.name == name
-            }
-            Some(pb::declaration::Kind::Relation(d)) => {
-                kind == DeclarationKind::Callable && d.name == name
-            }
-            Some(pb::declaration::Kind::HostPrimitive(d)) => {
-                kind == DeclarationKind::Callable && d.name == name
-            }
-            Some(pb::declaration::Kind::Primitive(d)) => {
-                kind == DeclarationKind::Callable && d.name == name
-            }
-            _ => false,
-        };
-        if let Some(index) = owner.program.declarations.iter().position(matches) {
-            return Ok(Self {
-                owner: self.owner.clone(),
-                arena: Arena::Declaration,
-                index: index as u32,
-            });
         }
-        owner
-            .declarations
-            .iter()
-            .find(|r| matches(&r.owner.as_ref().unwrap().program.declarations[r.index as usize]))
-            .cloned()
-            .ok_or_else(|| TypedError::Invalid(format!("{kind:?} declaration unavailable: {name}")))
+        Err(TypedError::Invalid(format!(
+            "{kind:?} definition unavailable: {name}"
+        )))
     }
 }
 
 pub(super) type Key = (usize, Arena, u32);
 
+pub(super) fn publish_catalog(catalog: pb::BuiltinCatalog) -> Result<Record, TypedError> {
+    let mut sorts = pb::Program {
+        sorts: catalog.sorts.clone(),
+        ..Default::default()
+    };
+    for index in 0..sorts.sorts.len() as u32 {
+        visit(&mut sorts, Arena::Sort, index, |arena, index| {
+            if arena == Arena::Sort && (index as usize) < catalog.sorts.len() {
+                Ok(index)
+            } else {
+                Err(TypedError::Invalid(
+                    "builtin sort reference out of bounds".into(),
+                ))
+            }
+        })?;
+    }
+    let mut names = std::collections::HashSet::new();
+    for primitive in &catalog.primitive_sorts {
+        if primitive.name.is_empty() || !names.insert((false, &primitive.name)) {
+            return Err(TypedError::Invalid("invalid builtin sort identity".into()));
+        }
+    }
+    for primitive in &catalog.primitives {
+        if primitive.name.is_empty() || !names.insert((true, &primitive.name)) {
+            return Err(TypedError::Invalid(
+                "invalid builtin primitive identity".into(),
+            ));
+        }
+        match &primitive.typing {
+            Some(pb::primitive::Typing::Signature(signature)) => {
+                let output = signature
+                    .output
+                    .ok_or_else(|| TypedError::Invalid("missing builtin output sort".into()))?;
+                if signature
+                    .inputs
+                    .iter()
+                    .chain(&signature.varargs)
+                    .map(|arg| arg.sort)
+                    .chain([output])
+                    .any(|i| i as usize >= catalog.sorts.len())
+                {
+                    return Err(TypedError::Invalid(
+                        "builtin signature reference out of bounds".into(),
+                    ));
+                }
+            }
+            Some(pb::primitive::Typing::Application(_)) => {}
+            None => return Err(TypedError::Invalid("missing builtin typing".into())),
+        }
+    }
+    let mut slots = std::array::from_fn(|_| vec![]);
+    slots[Arena::Sort as usize] = (0..catalog.sorts.len() as u32).map(Slot::Local).collect();
+    slots[Arena::PrimitiveSort as usize] = (0..catalog.primitive_sorts.len() as u32)
+        .map(Slot::Local)
+        .collect();
+    slots[Arena::Primitive as usize] = (0..catalog.primitives.len() as u32)
+        .map(Slot::Local)
+        .collect();
+    let id = NEXT_OWNER
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |i| i.checked_add(1))
+        .expect("owner identity exhausted");
+    Ok(Record {
+        owner: Some(Arc::new(Owner {
+            id,
+            graph: OwnedGraph::BuiltinCatalog(catalog),
+            slots,
+            declarations: vec![],
+            ambient: None,
+            capture: None,
+            merge_parameters: None,
+            observed: false,
+            rule_origin: None,
+        })),
+        arena: Arena::Sort,
+        index: 0,
+    })
+}
+
 // Freeze is an already-checked, complete reconstruction Program. Keep its
 // arenas intact: saved code is not a typed authoring fragment and must not be
 // traversed as though it were stored data.
-pub(super) fn observe(program: pb::Program, root_sort: u32) -> Result<Record, TypedError> {
+pub(super) fn observe(
+    program: pb::Program,
+    root_sort: u32,
+    builtins: &Record,
+) -> Result<Record, TypedError> {
     if root_sort as usize >= program.sorts.len() {
         return Err(TypedError::Decode("invalid snapshot Program".into()));
     }
@@ -287,6 +466,8 @@ pub(super) fn observe(program: pb::Program, root_sort: u32) -> Result<Record, Ty
         program.declarations.len(),
         program.rules.len(),
         program.commands.len(),
+        0,
+        0,
     ];
     let slots = lengths.map(|len| (0..len as u32).map(Slot::Local).collect());
     let id = NEXT_OWNER
@@ -295,9 +476,10 @@ pub(super) fn observe(program: pb::Program, root_sort: u32) -> Result<Record, Ty
     Ok(Record {
         owner: Some(Arc::new(Owner {
             id,
-            program,
+            graph: OwnedGraph::Program(program),
             slots,
             declarations: vec![],
+            ambient: builtins.owner.clone(),
             capture: None,
             merge_parameters: None,
             observed: true,
@@ -321,9 +503,34 @@ pub(super) fn closure(roots: &[Record]) -> Result<Vec<Record>, TypedError> {
         }
         let mut one = pb::Program::default();
         match record.arena {
+            Arena::PrimitiveSort => {
+                record.primitive_sort()?;
+                result.push(record);
+                continue;
+            }
+            Arena::Primitive => {
+                let primitive = record.primitive()?;
+                if let Some(pb::primitive::Typing::Signature(signature)) = &primitive.typing {
+                    let output = signature
+                        .output
+                        .ok_or_else(|| TypedError::Invalid("missing builtin output".into()))?;
+                    for sort in signature
+                        .inputs
+                        .iter()
+                        .chain(&signature.varargs)
+                        .map(|arg| arg.sort)
+                        .chain([output])
+                    {
+                        pending.push(record.resolve(Arena::Sort, sort)?);
+                    }
+                }
+                result.push(record);
+                continue;
+            }
             Arena::Node => {
                 let node = owner
-                    .program
+                    .program()
+                    .unwrap()
                     .nodes
                     .get(record.index as usize)
                     .ok_or_else(|| TypedError::Invalid("invalid node location".into()))?;
@@ -341,13 +548,13 @@ pub(super) fn closure(roots: &[Record]) -> Result<Vec<Record>, TypedError> {
                 one.nodes.push(node.clone());
             }
             Arena::Sort => {
-                let sort = &owner.program.sorts[record.index as usize];
+                let sort = record.sort()?;
                 match &sort.kind {
                     Some(pb::sort::Kind::Eq(name)) => {
                         pending.push(record.declaration(name, DeclarationKind::EqSort)?)
                     }
-                    Some(pb::sort::Kind::Family(f)) => {
-                        pending.push(record.declaration(&f.name, DeclarationKind::HostSortFamily)?)
+                    Some(pb::sort::Kind::Application(f)) => {
+                        pending.push(record.declaration(&f.name, DeclarationKind::PrimitiveSort)?)
                     }
                     _ => (),
                 }
@@ -355,15 +562,15 @@ pub(super) fn closure(roots: &[Record]) -> Result<Vec<Record>, TypedError> {
             }
             Arena::Declaration => one
                 .declarations
-                .push(owner.program.declarations[record.index as usize].clone()),
+                .push(owner.program().unwrap().declarations[record.index as usize].clone()),
             Arena::Rule => {
                 one.rules
-                    .push(owner.program.rules[record.index as usize].clone());
+                    .push(owner.program().unwrap().rules[record.index as usize].clone());
                 pending.extend(owner.declarations.iter().cloned());
             }
             Arena::Command => {
                 one.commands
-                    .push(owner.program.commands[record.index as usize].clone());
+                    .push(owner.program().unwrap().commands[record.index as usize].clone());
                 pending.extend(owner.declarations.iter().cloned());
             }
         }
@@ -498,7 +705,7 @@ pub(super) fn visit(
             }
             match s.kind.as_mut().ok_or_else(invalid)? {
                 pb::sort::Kind::Eq(_) | pb::sort::Kind::Var(_) => {}
-                pb::sort::Kind::Family(f) => {
+                pb::sort::Kind::Application(f) => {
                     for arg in &mut f.args {
                         *arg = map(Arena::Sort, *arg)?;
                     }
@@ -517,7 +724,7 @@ pub(super) fn visit(
                 return Err(invalid());
             }
             match d.kind.as_mut().ok_or_else(invalid)? {
-                pb::declaration::Kind::EqSort(_) | pb::declaration::Kind::HostSortFamily(_) => {}
+                pb::declaration::Kind::EqSort(_) => {}
                 pb::declaration::Kind::Constructor(c) => {
                     for a in &mut c.inputs {
                         a.sort = map(Arena::Sort, a.sort)?;
@@ -541,76 +748,13 @@ pub(super) fn visit(
                         arg.sort = map(Arena::Sort, arg.sort)?;
                     }
                 }
-                pb::declaration::Kind::Primitive(primitive) => {
+                pb::declaration::Kind::UserDefinedPrimitive(primitive) => {
                     for arg in &mut primitive.inputs {
                         arg.sort = map(Arena::Sort, arg.sort)?;
                     }
                     primitive.output = map(Arena::Sort, primitive.output)?;
                     let body = primitive.body.as_mut().ok_or_else(invalid)?;
                     *body = map(Arena::Node, *body)?;
-                }
-                pb::declaration::Kind::HostPrimitive(p) => {
-                    match p.typing.as_mut().ok_or_else(invalid)? {
-                        pb::host_primitive::Typing::Signature(signature) => {
-                            for arg in signature
-                                .inputs
-                                .iter_mut()
-                                .chain(signature.varargs.iter_mut())
-                            {
-                                arg.sort = map(Arena::Sort, arg.sort)?;
-                            }
-                            let output = signature.output.as_mut().ok_or_else(invalid)?;
-                            *output = map(Arena::Sort, *output)?;
-                        }
-                        // This marker contains no arena references to relocate.
-                        pb::host_primitive::Typing::Application(_) => {}
-                    }
-                }
-            }
-            let application = matches!(
-                &d.kind,
-                Some(pb::declaration::Kind::HostPrimitive(pb::HostPrimitive {
-                    typing: Some(pb::host_primitive::Typing::Application(_)),
-                    ..
-                }))
-            );
-            if let Some(bindings) = &mut d.bindings {
-                if let Some(python) = &mut bindings.python {
-                    for view in &mut python.views {
-                        if let Some(owner) = &mut view.owner {
-                            match owner.kind.as_mut().ok_or_else(invalid)? {
-                                pb::binding_owner::Kind::Sort(sort) => {
-                                    *sort = map(Arena::Sort, *sort)?
-                                }
-                                pb::binding_owner::Kind::Function(_) if application => {}
-                                _ => return Err(invalid()),
-                            }
-                        }
-                        // Saved defaults need their own binder closure support;
-                        // the scalar catalog contains none.
-                        if view.params.iter().any(|p| p.default_expr.is_some()) {
-                            return Err(invalid());
-                        }
-                    }
-                }
-                if let Some(rust) = &mut bindings.rust {
-                    for view in &mut rust.views {
-                        if let Some(owner) = &mut view.owner {
-                            match owner.kind.as_mut().ok_or_else(invalid)? {
-                                pb::binding_owner::Kind::Sort(sort) => {
-                                    *sort = map(Arena::Sort, *sort)?
-                                }
-                                pb::binding_owner::Kind::Function(_) if application => {}
-                                _ => return Err(invalid()),
-                            }
-                        }
-                        if let Some(trait_impl) = &mut view.trait_impl {
-                            for arg in &mut trait_impl.args {
-                                let sort = arg.sort.as_mut().ok_or_else(invalid)?;
-                                *sort = map(Arena::Sort, *sort)?;
-                            }
-                        }
-                    }
                 }
             }
         }
@@ -655,13 +799,14 @@ pub(super) fn visit(
                 _ => return Err(invalid()),
             }
         }
+        Arena::PrimitiveSort | Arena::Primitive => return Err(invalid()),
     }
     Ok(())
 }
 
 pub(super) fn publish(
     mut program: pb::Program,
-    slots: [Vec<Slot>; 5],
+    slots: [Vec<Slot>; 7],
     declarations: Vec<Record>,
     arena: Arena,
     index: u32,
@@ -684,6 +829,8 @@ pub(super) fn publish(
         program.declarations.len(),
         program.rules.len(),
         program.commands.len(),
+        0,
+        0,
     ];
     if index as usize >= lengths[arena as usize] {
         return Err(TypedError::Invalid("invalid fragment root".into()));
@@ -743,9 +890,10 @@ pub(super) fn publish(
     Ok(Record {
         owner: Some(Arc::new(Owner {
             id,
-            program,
+            graph: OwnedGraph::Program(program),
             slots,
             declarations,
+            ambient: None,
             capture: None,
             merge_parameters: None,
             observed: false,
@@ -763,6 +911,7 @@ pub(super) struct Packer {
     cursor: usize,
     pub binders: Vec<HashMap<String, String>>,
     pub declarations: HashMap<String, Record>,
+    pub builtin_demands: Vec<Record>,
     // Request-local renaming of proven recipe locations, never string aliases.
     pub captures: HashMap<Key, String>,
     pub initializations: Vec<(u32, Record, String)>,
@@ -782,6 +931,7 @@ impl Default for Packer {
             cursor: 0,
             binders: vec![HashMap::new()],
             declarations: HashMap::new(),
+            builtin_demands: vec![],
             captures: HashMap::new(),
             initializations: vec![],
             ordinary_callables: std::collections::HashSet::new(),
@@ -805,6 +955,22 @@ impl Packer {
         if let Some(index) = self.ids.get(&key) {
             return *index;
         }
+        if matches!(record.arena, Arena::PrimitiveSort | Arena::Primitive) {
+            let index = record.index;
+            if record.arena == Arena::Primitive {
+                self.declarations.insert(
+                    record
+                        .primitive()
+                        .expect("owned primitive descriptor")
+                        .name
+                        .clone(),
+                    record.clone(),
+                );
+            }
+            self.builtin_demands.push(record);
+            self.ids.insert(key, index);
+            return index;
+        }
         let index = match record.arena {
             Arena::Node => {
                 self.program.nodes.push(pb::Node::default());
@@ -825,6 +991,9 @@ impl Packer {
             Arena::Command => {
                 self.program.commands.push(pb::Command::default());
                 self.program.commands.len() - 1
+            }
+            Arena::PrimitiveSort | Arena::Primitive => {
+                unreachable!("builtin demand is not a Program record")
             }
         };
         let index = u32::try_from(index).expect("protobuf arena exceeds u32");
@@ -848,7 +1017,7 @@ impl Packer {
             let mut one = pb::Program::default();
             match record.arena {
                 Arena::Node => {
-                    let mut n = owner.program.nodes[record.index as usize].clone();
+                    let mut n = owner.program().unwrap().nodes[record.index as usize].clone();
                     if record.capture()?.is_some()
                         && !self
                             .captures
@@ -888,14 +1057,14 @@ impl Packer {
                     one.nodes.push(n);
                 }
                 Arena::Sort => {
-                    let s = owner.program.sorts[record.index as usize].clone();
+                    let s = record.sort().unwrap().clone();
                     match &s.kind {
                         Some(pb::sort::Kind::Eq(name)) => {
                             self.intern(record.declaration(name, DeclarationKind::EqSort)?, 0);
                         }
-                        Some(pb::sort::Kind::Family(f)) => {
+                        Some(pb::sort::Kind::Application(f)) => {
                             self.intern(
-                                record.declaration(&f.name, DeclarationKind::HostSortFamily)?,
+                                record.declaration(&f.name, DeclarationKind::PrimitiveSort)?,
                                 0,
                             );
                         }
@@ -904,7 +1073,8 @@ impl Packer {
                     one.sorts.push(s);
                 }
                 Arena::Declaration => {
-                    let mut declaration = owner.program.declarations[record.index as usize].clone();
+                    let mut declaration =
+                        owner.program().unwrap().declarations[record.index as usize].clone();
                     match &mut declaration.kind {
                         Some(pb::declaration::Kind::Function(f)) => {
                             if let Some(merge) = f.merge {
@@ -925,8 +1095,9 @@ impl Packer {
                                     (record.resolve(Arena::Node, parameter_slots[1])?, "new"),
                                 ];
                                 for (parameter, label) in &parameters {
-                                    let node = &parameter.owner.as_ref().unwrap().program.nodes
-                                        [parameter.index as usize];
+                                    let node =
+                                        &parameter.owner.as_ref().unwrap().program().unwrap().nodes
+                                            [parameter.index as usize];
                                     if !matches!(
                                         &node.kind,
                                         Some(pb::node::Kind::Var(name)) if name.as_str() == *label
@@ -950,7 +1121,7 @@ impl Packer {
                                     )
                                 });
                                 let root = record.resolve(Arena::Node, merge)?;
-                                let node = &root.owner.as_ref().unwrap().program.nodes
+                                let node = &root.owner.as_ref().unwrap().program().unwrap().nodes
                                     [root.index as usize];
                                 if super::SortRef(root.resolve(Arena::Sort, node.sort_id)?)
                                     != output
@@ -975,7 +1146,8 @@ impl Packer {
                                             "captures are forbidden in function merges".into(),
                                         ));
                                     }
-                                    let node = &owner.program.nodes[child.index as usize];
+                                    let node =
+                                        &owner.program().unwrap().nodes[child.index as usize];
                                     if let Some(pb::node::Kind::Var(name)) = &node.kind
                                         && (!parameters.iter().any(|(parameter, label)| {
                                             *parameter == key && name.as_str() == *label
@@ -1019,7 +1191,7 @@ impl Packer {
                         Some(pb::declaration::Kind::Constructor(c)) => {
                             if let Some(index) = c.cost {
                                 let cost = record.resolve(Arena::Node, index)?;
-                                let node = &cost.owner.as_ref().unwrap().program.nodes
+                                let node = &cost.owner.as_ref().unwrap().program().unwrap().nodes
                                     [cost.index as usize];
                                 let sort = cost.resolve(Arena::Sort, node.sort_id)?;
                                 if super::SortRef(sort)
@@ -1041,10 +1213,7 @@ impl Packer {
                         Some(pb::declaration::Kind::Relation(r)) => {
                             self.ordinary_callables.insert(r.name.clone());
                         }
-                        Some(pb::declaration::Kind::HostPrimitive(p)) => {
-                            self.ordinary_callables.insert(p.name.clone());
-                        }
-                        Some(pb::declaration::Kind::Primitive(p)) => {
+                        Some(pb::declaration::Kind::UserDefinedPrimitive(p)) => {
                             self.ordinary_callables.insert(p.name.clone());
                             binder = self.binders.len();
                             self.binders.push(
@@ -1062,7 +1231,7 @@ impl Packer {
                 }
                 Arena::Rule => {
                     one.rules
-                        .push(owner.program.rules[record.index as usize].clone());
+                        .push(owner.program().unwrap().rules[record.index as usize].clone());
                     let mut roots = vec![];
                     visit(&mut one, Arena::Rule, 0, |arena, index| {
                         roots.push(record.resolve(arena, index)?);
@@ -1079,7 +1248,8 @@ impl Packer {
                     self.binders.push(super::close::binder(&roots)?);
                 }
                 Arena::Command => {
-                    let mut command = owner.program.commands[record.index as usize].clone();
+                    let mut command =
+                        owner.program().unwrap().commands[record.index as usize].clone();
                     if let Some(name) = self.captures.get(&(owner.id, record.arena, record.index)) {
                         let Some(pb::command::Kind::Action(pb::Action {
                             kind: Some(pb::action::Kind::Set(set)),
@@ -1093,6 +1263,9 @@ impl Packer {
                         set.target.as_mut().unwrap().func = name.clone();
                     }
                     one.commands.push(command);
+                }
+                Arena::PrimitiveSort | Arena::Primitive => {
+                    unreachable!("builtin descriptor cannot enter Program queue")
                 }
             }
             visit(&mut one, record.arena, 0, |a, i| {
@@ -1108,8 +1281,7 @@ impl Packer {
                     let name = match &d.kind {
                         Some(pb::declaration::Kind::Constructor(c)) => Some(&c.name),
                         Some(pb::declaration::Kind::Function(f)) => Some(&f.name),
-                        Some(pb::declaration::Kind::Primitive(p)) => Some(&p.name),
-                        Some(pb::declaration::Kind::HostPrimitive(p)) => Some(&p.name),
+                        Some(pb::declaration::Kind::UserDefinedPrimitive(p)) => Some(&p.name),
                         _ => None,
                     };
                     if let Some(name) = name {
@@ -1121,6 +1293,9 @@ impl Packer {
                 Arena::Command => {
                     self.program.commands[index as usize] = one.commands.pop().unwrap()
                 }
+                Arena::PrimitiveSort | Arena::Primitive => {
+                    unreachable!("builtin descriptor cannot enter Program queue")
+                }
             }
             self.cursor += 1;
         }
@@ -1131,16 +1306,12 @@ impl Packer {
         for d in &self.program.declarations {
             let (kind, name) = match &d.kind {
                 Some(pb::declaration::Kind::EqSort(d)) => (DeclarationKind::EqSort, &d.name),
-                Some(pb::declaration::Kind::HostSortFamily(d)) => {
-                    (DeclarationKind::HostSortFamily, &d.name)
-                }
                 Some(pb::declaration::Kind::Constructor(d)) => (DeclarationKind::Callable, &d.name),
                 Some(pb::declaration::Kind::Function(d)) => (DeclarationKind::Callable, &d.name),
                 Some(pb::declaration::Kind::Relation(d)) => (DeclarationKind::Callable, &d.name),
-                Some(pb::declaration::Kind::HostPrimitive(d)) => {
+                Some(pb::declaration::Kind::UserDefinedPrimitive(d)) => {
                     (DeclarationKind::Callable, &d.name)
                 }
-                Some(pb::declaration::Kind::Primitive(d)) => (DeclarationKind::Callable, &d.name),
                 _ => unreachable!(),
             };
             if seen.insert((kind, name), d).is_none() {
@@ -1157,6 +1328,22 @@ impl Packer {
             .map_err(TypedError::Invalid)?;
         }
         self.program.declarations = kept;
+        let mut builtins: HashMap<(bool, String), &Record> = HashMap::new();
+        for record in &self.builtin_demands {
+            let key = if record.arena == Arena::PrimitiveSort {
+                (false, record.primitive_sort()?.name.clone())
+            } else {
+                (true, record.primitive()?.name.clone())
+            };
+            if let Some(previous) = builtins.insert(key.clone(), record)
+                && !super::decl::same_builtin(previous, record)?
+            {
+                return Err(TypedError::Invalid(format!(
+                    "conflicting builtin descriptor: {}",
+                    key.1
+                )));
+            }
+        }
         Ok(())
     }
 }
@@ -1345,7 +1532,8 @@ mod tests {
                         .owner
                         .as_ref()
                         .unwrap()
-                        .program
+                        .program()
+                        .unwrap()
                         .encode_to_vec(),
                     bytes
                 );
@@ -1358,227 +1546,83 @@ mod tests {
     use super::*;
 
     #[test]
-    fn actual_catalog_retains_application_metadata_and_checks_authoring_signature() {
+    fn actual_catalog_retains_application_typing_and_checks_authoring_signature() {
         use crate::typed::{EgglogValue, builtins::Unit, decl::Callable, expr::Expr};
         let original =
-            pb::Program::decode(include_bytes!("builtins/catalog.pb").as_slice()).unwrap();
+            pb::BuiltinCatalog::decode(include_bytes!("builtins/catalog.pb").as_slice()).unwrap();
         for reverse in [false, true] {
-            let mut program = original.clone();
+            let mut catalog = original.clone();
             if reverse {
-                program.declarations.reverse();
+                catalog.primitives.reverse();
+                catalog.primitive_sorts.reverse();
             }
-            let index = program.declarations.iter().position(|d| matches!(&d.kind,
-                Some(pb::declaration::Kind::HostPrimitive(p)) if p.name == "egglog.core.fn.apply"
-            )).unwrap() as u32;
-            let bytes = program.encode_to_vec();
-            let application = program.declarations[index as usize].clone();
-            let mut slots = std::array::from_fn(|_| vec![]);
-            slots[Arena::Sort as usize] =
-                (0..program.sorts.len() as u32).map(Slot::Local).collect();
-            slots[Arena::Declaration as usize] = (0..program.declarations.len() as u32)
-                .map(Slot::Local)
-                .collect();
-            let record = publish(program, slots, vec![], Arena::Declaration, index)
-                .expect("the actual complete catalog must retain its descriptors");
-            assert_eq!(
-                record.owner.as_ref().unwrap().program.encode_to_vec(),
-                bytes
-            );
+            let bytes = catalog.encode_to_vec();
+            let context =
+                publish_catalog(catalog).expect("the actual catalog retains its descriptors");
+            let OwnedGraph::BuiltinCatalog(catalog) = &context.owner.as_ref().unwrap().graph else {
+                panic!()
+            };
+            assert_eq!(catalog.encode_to_vec(), bytes);
+            assert!(context.owner.as_ref().unwrap().program().is_err());
+            let record = context
+                .declaration("egglog.core.fn.apply", DeclarationKind::Callable)
+                .unwrap();
+            let application = record.primitive().unwrap().clone();
             let mut packer = Packer::default();
             packer.intern(record.clone(), 0);
             packer.finish().unwrap();
             assert!(packer.program.sorts.is_empty() && packer.program.nodes.is_empty());
-            assert_eq!(packer.program.declarations, [application]);
+            assert!(packer.program.declarations.is_empty());
+            assert_eq!(packer.builtin_demands[0].primitive().unwrap(), &application);
             assert!(
-                matches!(Expr::call_with_result(&Callable(record), vec![], Unit::sort_ref()),
+                matches!(Expr::call_with_result(&Callable(record),vec![],Unit::sort_ref()),
                 Err(TypedError::Invalid(message)) if message == "application requires a function")
             );
         }
     }
 
     #[test]
-    fn retained_application_markers_keep_checked_publication_boundaries() {
+    fn retained_application_typing_keeps_checked_publication_boundaries() {
         let original =
-            pb::Program::decode(include_bytes!("builtins/catalog.pb").as_slice()).unwrap();
-        let apply = original.declarations.iter().position(|d| matches!(&d.kind,
-            Some(pb::declaration::Kind::HostPrimitive(p)) if p.name == "egglog.core.fn.apply"
-        )).unwrap();
-        let ne = original
-            .declarations
+            pb::BuiltinCatalog::decode(include_bytes!("builtins/catalog.pb").as_slice()).unwrap();
+        let apply = original
+            .primitives
             .iter()
-            .position(|d| {
-                matches!(&d.kind,
-                    Some(pb::declaration::Kind::HostPrimitive(p)) if p.name == "egglog.core.ne"
-                )
-            })
+            .position(|p| p.name == "egglog.core.fn.apply")
             .unwrap();
-        let function_owner = original.declarations[apply]
-            .bindings
-            .as_ref()
-            .unwrap()
-            .python
-            .as_ref()
-            .unwrap()
-            .views[0]
-            .owner;
-        for rust in [false, true] {
-            // The Rust marker is an emitter-only variation; no wrapper or call
-            // is produced. Both language branches must enforce the same rule.
-            for case in 0..7 {
-                let mut program = original.clone();
-                if rust {
-                    program.declarations[apply].bindings.as_mut().unwrap().rust =
-                        Some(pb::RustBindings {
-                            views: vec![pb::RustCallable {
-                                path: vec!["call".into()],
-                                owner: function_owner,
-                                receiver: Some(pb::RustReceiver {
-                                    core_input: Some(0),
-                                    borrowed: false,
-                                }),
-                                params: vec![pb::RustParameter {
-                                    name: "args".into(),
-                                    core_input: Some(1),
-                                    borrowed: false,
-                                }],
-                                ..Default::default()
-                            }],
-                        });
-                }
-                let target = if case == 3 { ne } else { apply };
-                if case == 3 {
-                    if rust {
-                        program.declarations[ne].bindings.as_mut().unwrap().rust = program
-                            .declarations[apply]
-                            .bindings
-                            .as_ref()
-                            .unwrap()
-                            .rust
-                            .clone();
-                    } else {
-                        program.declarations[ne].bindings.as_mut().unwrap().python = program
-                            .declarations[apply]
-                            .bindings
-                            .as_ref()
-                            .unwrap()
-                            .python
-                            .clone();
-                    }
-                }
-                let declaration = &mut program.declarations[target];
-                match case {
-                    0 | 3 => {} // unchanged positive, or Function owner on Signature
-                    1 => {
-                        let Some(pb::declaration::Kind::HostPrimitive(p)) = &mut declaration.kind
-                        else {
-                            panic!()
-                        };
-                        p.typing = None;
-                    }
-                    2 | 4 => {
-                        let bindings = declaration.bindings.as_mut().unwrap();
-                        let owner = if rust {
-                            bindings.rust.as_mut().unwrap().views[0]
-                                .owner
-                                .as_mut()
-                                .unwrap()
-                        } else {
-                            bindings.python.as_mut().unwrap().views[0]
-                                .owner
-                                .as_mut()
-                                .unwrap()
-                        };
-                        owner.kind = (case == 4).then_some(pb::binding_owner::Kind::Sort(u32::MAX));
-                    }
-                    5 => {
-                        // Defaults and Rust trait arguments must not be skipped
-                        // when the declaration itself has no arena references.
-                        let bindings = declaration.bindings.as_mut().unwrap();
-                        if rust {
-                            bindings.rust.as_mut().unwrap().views[0].trait_impl =
-                                Some(pb::RustTrait {
-                                    path: vec!["Test".into()],
-                                    args: vec![pb::RustType {
-                                        sort: Some(u32::MAX),
-                                        borrowed: false,
-                                    }],
-                                    ..Default::default()
-                                });
-                        } else {
-                            bindings.python.as_mut().unwrap().views[0].params[0].default_expr =
-                                Some(0);
-                        }
-                    }
-                    6 => {
-                        let Some(pb::declaration::Kind::HostPrimitive(p)) =
-                            &mut program.declarations[ne].kind
-                        else {
-                            panic!()
-                        };
-                        let Some(pb::host_primitive::Typing::Signature(s)) = &mut p.typing else {
-                            panic!()
-                        };
-                        s.inputs[0].sort = u32::MAX;
-                    }
-                    _ => unreachable!(),
-                }
-                let bytes = program.encode_to_vec();
-                let mut slots = std::array::from_fn(|_| vec![]);
-                slots[Arena::Sort as usize] =
-                    (0..program.sorts.len() as u32).map(Slot::Local).collect();
-                slots[Arena::Declaration as usize] = (0..program.declarations.len() as u32)
-                    .map(Slot::Local)
-                    .collect();
-                let result = publish(program, slots, vec![], Arena::Declaration, apply as u32);
-                if case == 0 {
-                    assert_eq!(
-                        result
-                            .unwrap()
-                            .owner
-                            .as_ref()
-                            .unwrap()
-                            .program
-                            .encode_to_vec(),
-                        bytes
-                    );
+        let ne = original
+            .primitives
+            .iter()
+            .position(|p| p.name == "egglog.core.ne")
+            .unwrap();
+        for case in 0..4 {
+            let mut catalog = original.clone();
+            if case == 1 {
+                catalog.primitives[apply].typing = None;
+            } else if case >= 2 {
+                let Some(pb::primitive::Typing::Signature(signature)) =
+                    &mut catalog.primitives[ne].typing
+                else {
+                    panic!()
+                };
+                if case == 2 {
+                    signature.inputs[0].sort = u32::MAX;
                 } else {
-                    assert!(
-                        matches!(result, Err(TypedError::Invalid(_))),
-                        "rust={rust}, case={case}"
-                    );
+                    signature.output = None;
                 }
             }
+            let bytes = catalog.encode_to_vec();
+            let result = publish_catalog(catalog);
+            if case == 0 {
+                let context = result.unwrap();
+                let OwnedGraph::BuiltinCatalog(catalog) = &context.owner.as_ref().unwrap().graph
+                else {
+                    panic!()
+                };
+                assert_eq!(catalog.encode_to_vec(), bytes);
+            } else {
+                assert!(matches!(result, Err(TypedError::Invalid(_))), "case={case}");
+            }
         }
-        // Ordinary Signature references still visit every input and output.
-        let mut relocated = original.clone();
-        visit(
-            &mut relocated,
-            Arena::Declaration,
-            ne as u32,
-            |arena, index| {
-                assert_eq!(arena, Arena::Sort);
-                Ok(index + 1)
-            },
-        )
-        .unwrap();
-        let Some(pb::declaration::Kind::HostPrimitive(before)) = &original.declarations[ne].kind
-        else {
-            panic!()
-        };
-        let Some(pb::host_primitive::Typing::Signature(before)) = &before.typing else {
-            panic!()
-        };
-        let Some(pb::declaration::Kind::HostPrimitive(after)) = &relocated.declarations[ne].kind
-        else {
-            panic!()
-        };
-        let Some(pb::host_primitive::Typing::Signature(after)) = &after.typing else {
-            panic!()
-        };
-        assert_eq!(
-            after.inputs.iter().map(|a| a.sort).collect::<Vec<_>>(),
-            before.inputs.iter().map(|a| a.sort + 1).collect::<Vec<_>>()
-        );
-        assert_eq!(after.output, before.output.map(|s| s + 1));
     }
 }

@@ -8,11 +8,10 @@ use crate::proto as pb;
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Namespace {
     EqSort,
-    HostSortFamily,
     Callable,
 }
 
-/// Existing declaration tags select three namespaces; spellings may coincide.
+/// Existing declaration tags select two namespaces; spellings may coincide.
 fn declaration_identity(d: &pb::Declaration) -> Result<(Namespace, &str), String> {
     if d.table_name.is_some()
         && !matches!(
@@ -26,14 +25,6 @@ fn declaration_identity(d: &pb::Declaration) -> Result<(Namespace, &str), String
     {
         return Err("only table declarations may have a reflective table prefix".into());
     }
-    if d.hidden
-        && !matches!(
-            d.kind,
-            Some(pb::declaration::Kind::Constructor(_) | pb::declaration::Kind::Function(_))
-        )
-    {
-        return Err("only constructors and functions may be hidden".into());
-    }
     let identity = match d.kind.as_ref().ok_or("missing declaration kind")? {
         pb::declaration::Kind::EqSort(s) => {
             if s.uf_parent.as_deref() == Some("") {
@@ -41,12 +32,10 @@ fn declaration_identity(d: &pb::Declaration) -> Result<(Namespace, &str), String
             }
             (Namespace::EqSort, s.name.as_str())
         }
-        pb::declaration::Kind::HostSortFamily(s) => (Namespace::HostSortFamily, s.name.as_str()),
         pb::declaration::Kind::Constructor(c) => (Namespace::Callable, c.name.as_str()),
         pb::declaration::Kind::Function(f) => (Namespace::Callable, f.name.as_str()),
         pb::declaration::Kind::Relation(r) => (Namespace::Callable, r.name.as_str()),
-        pb::declaration::Kind::Primitive(p) => (Namespace::Callable, p.name.as_str()),
-        pb::declaration::Kind::HostPrimitive(p) => (Namespace::Callable, p.name.as_str()),
+        pb::declaration::Kind::UserDefinedPrimitive(p) => (Namespace::Callable, p.name.as_str()),
     };
     if identity.1.is_empty() {
         return Err("empty declaration name".into());
@@ -65,8 +54,7 @@ fn validate_uf_parents(program: &pb::Program) -> Result<(), String> {
             pb::declaration::Kind::Constructor(c) => Some((c.name.as_str(), declaration)),
             pb::declaration::Kind::Function(f) => Some((f.name.as_str(), declaration)),
             pb::declaration::Kind::Relation(r) => Some((r.name.as_str(), declaration)),
-            pb::declaration::Kind::Primitive(p) => Some((p.name.as_str(), declaration)),
-            pb::declaration::Kind::HostPrimitive(p) => Some((p.name.as_str(), declaration)),
+            pb::declaration::Kind::UserDefinedPrimitive(p) => Some((p.name.as_str(), declaration)),
             _ => None,
         })
         .collect();
@@ -193,62 +181,14 @@ fn declaration_refs(
                 sort(&mut a.sort)?;
             }
         }
-        pb::declaration::Kind::Primitive(p) => {
+        pb::declaration::Kind::UserDefinedPrimitive(p) => {
             for a in &mut p.inputs {
                 sort(&mut a.sort)?;
             }
             sort(&mut p.output)?;
             node(p.body.as_mut().ok_or("missing primitive body")?)?;
         }
-        pb::declaration::Kind::HostPrimitive(p) => {
-            match p.typing.as_mut().ok_or("missing host typing")? {
-                pb::host_primitive::Typing::Signature(s) => {
-                    for a in s.inputs.iter_mut().chain(s.varargs.iter_mut()) {
-                        sort(&mut a.sort)?;
-                    }
-                    sort(s.output.as_mut().ok_or("missing signature result")?)?;
-                }
-                pb::host_primitive::Typing::Application(_) => (),
-            }
-        }
-        pb::declaration::Kind::EqSort(_) | pb::declaration::Kind::HostSortFamily(_) => (),
-    }
-    if let Some(b) = &mut d.bindings {
-        for owner in b
-            .python
-            .iter_mut()
-            .flat_map(|b| &mut b.views)
-            .filter_map(|v| v.owner.as_mut())
-            .chain(
-                b.rust
-                    .iter_mut()
-                    .flat_map(|b| &mut b.views)
-                    .filter_map(|v| v.owner.as_mut()),
-            )
-        {
-            if let Some(pb::binding_owner::Kind::Sort(i)) = &mut owner.kind {
-                sort(i)?;
-            }
-        }
-        for p in b
-            .python
-            .iter_mut()
-            .flat_map(|b| &mut b.views)
-            .flat_map(|v| &mut v.params)
-        {
-            if let Some(i) = &mut p.default_expr {
-                node(i)?;
-            }
-        }
-        for a in b
-            .rust
-            .iter_mut()
-            .flat_map(|b| &mut b.views)
-            .filter_map(|v| v.trait_impl.as_mut())
-            .flat_map(|t| &mut t.args)
-        {
-            sort(a.sort.as_mut().ok_or("missing Rust trait sort")?)?;
-        }
+        pb::declaration::Kind::EqSort(_) => (),
     }
     Ok(())
 }
@@ -275,7 +215,7 @@ fn relocate_span(
     Ok(())
 }
 
-// Both declaration defaults and rule bodies live in the same canonical arenas.
+// Declaration bodies/costs and rules use the same canonical arenas.
 fn import_arenas(
     source: &pb::Program,
     destination: &mut pb::Program,
@@ -495,12 +435,10 @@ fn compatible_semantics(
         {
             d.table_name = None;
         }
-        d.bindings = None;
         d.span = None;
         d.doc = None;
         match d.kind.as_mut().unwrap() {
-            pb::declaration::Kind::EqSort(s) => s.bindings = None,
-            pb::declaration::Kind::HostSortFamily(s) => s.bindings = None,
+            pb::declaration::Kind::EqSort(_) => (),
             pb::declaration::Kind::Constructor(c) => {
                 for a in &mut c.inputs {
                     a.name.clear();
@@ -516,22 +454,9 @@ fn compatible_semantics(
                     a.name.clear();
                 }
             }
-            pb::declaration::Kind::Primitive(c) => {
+            pb::declaration::Kind::UserDefinedPrimitive(c) => {
                 for a in &mut c.inputs {
                     a.name.clear();
-                }
-            }
-            pb::declaration::Kind::HostPrimitive(c) => {
-                match c.typing.as_mut().ok_or("missing host typing")? {
-                    pb::host_primitive::Typing::Signature(s) => {
-                        for a in s.inputs.iter_mut().chain(s.varargs.iter_mut()) {
-                            a.name.clear();
-                        }
-                        for label in &mut s.type_params {
-                            label.clear();
-                        }
-                    }
-                    pb::host_primitive::Typing::Application(_) => (),
                 }
             }
         }
@@ -557,273 +482,7 @@ fn compatible_semantics(
     Ok(true)
 }
 
-fn merge_language<T: Clone + PartialEq>(
-    old: &mut Option<T>,
-    new: &Option<T>,
-) -> Result<(), String> {
-    if let Some(new) = new {
-        match old {
-            Some(old) if old != new => return Err("conflicting language binding".into()),
-            None => *old = Some(new.clone()),
-            _ => (),
-        }
-    }
-    Ok(())
-}
-
-fn merge_bindings(
-    p: &pb::Program,
-    old: &mut pb::Declaration,
-    new: &pb::Declaration,
-) -> Result<(), String> {
-    let sorts = match (&mut old.kind, &new.kind) {
-        (Some(pb::declaration::Kind::EqSort(a)), Some(pb::declaration::Kind::EqSort(b))) => {
-            Some((&mut a.bindings, &b.bindings))
-        }
-        (
-            Some(pb::declaration::Kind::HostSortFamily(a)),
-            Some(pb::declaration::Kind::HostSortFamily(b)),
-        ) => Some((&mut a.bindings, &b.bindings)),
-        _ => None,
-    };
-    if let Some((old, Some(new))) = sorts {
-        let old = old.get_or_insert_default();
-        merge_language(&mut old.python, &new.python)?;
-        merge_language(&mut old.rust, &new.rust)?;
-        merge_language(&mut old.egglog, &new.egglog)?;
-    }
-    if let Some(new) = &new.bindings {
-        let old = old.bindings.get_or_insert_default();
-        if let (Some(a), Some(b)) = (&old.python, &new.python) {
-            let mut a = a.clone();
-            let mut b = b.clone();
-            let mut comparison = NodeComparison::default();
-            let mut ar = vec![];
-            let mut br = vec![];
-            for (block, roots) in [(&mut a, &mut ar), (&mut b, &mut br)] {
-                for p in block.views.iter_mut().flat_map(|v| &mut v.params) {
-                    if let Some(i) = &mut p.default_expr {
-                        roots.push(*i);
-                        *i = 0;
-                    }
-                }
-            }
-            if a != b || ar.len() != br.len() {
-                return Err("conflicting Python binding".into());
-            }
-            for (a, b) in ar.into_iter().zip(br) {
-                if !comparison.equal(p, a, b)? {
-                    return Err("conflicting Python defaults".into());
-                }
-            }
-        } else if old.python.is_none() {
-            old.python = new.python.clone();
-        }
-        merge_language(&mut old.rust, &new.rust)?;
-        merge_language(&mut old.egglog, &new.egglog)?;
-    }
-    Ok(())
-}
-
-/// Family evidence cannot first-supply presentation on behalf of its registered
-/// owner. Compare complete records after relocating diagnostic file references;
-/// ordinary reconciliation deliberately permits more than this authority check.
-pub(crate) fn check_builtin_context_families(
-    source: &pb::Program,
-    authoritative: &pb::Program,
-) -> Result<(), String> {
-    let mut staged = pb::Program::default();
-    let (_, source_files) = import_arenas(source, &mut staged)?;
-    let (_, authoritative_files) = import_arenas(authoritative, &mut staged)?;
-    let mut seen = HashSet::default();
-    for declaration in &source.declarations {
-        let Some(pb::declaration::Kind::HostSortFamily(family)) = &declaration.kind else {
-            continue;
-        };
-        if !seen.insert(family.name.as_str()) {
-            return Err(format!("duplicate builtin context family {}", family.name));
-        }
-        let mut matches = authoritative.declarations.iter().filter(|known| {
-            matches!(&known.kind, Some(pb::declaration::Kind::HostSortFamily(known)) if known.name == family.name)
-        });
-        let mut expected = matches
-            .next()
-            .ok_or("unregistered builtin context family")?
-            .clone();
-        if matches.next().is_some() {
-            return Err("duplicate registered builtin context family".into());
-        }
-        let mut supplied = declaration.clone();
-        relocate_span(&mut supplied.span, source, &source_files)?;
-        relocate_span(&mut expected.span, authoritative, &authoritative_files)?;
-        if supplied != expected {
-            return Err(format!(
-                "conflicting builtin context family {}",
-                family.name
-            ));
-        }
-    }
-    Ok(())
-}
-
-/// Checks a rooted builtin context without installing declarations. Helpers must
-/// already be registered; the callback returns their authoritative contexts.
-/// The caller separately checks the root's generated native signature.
-pub(crate) fn check_builtin_context(
-    source: &pb::Program,
-    root_key: &str,
-    mut helper: impl FnMut(&str) -> Result<pb::Program, String>,
-) -> Result<(), String> {
-    if !source.commands.is_empty() || !source.rules.is_empty() {
-        return Err("invalid builtin context header".into());
-    }
-    let mut keys = HashSet::default();
-    for declaration in &source.declarations {
-        declaration_identity(declaration)?;
-        match &declaration.kind {
-            Some(pb::declaration::Kind::HostPrimitive(primitive)) => {
-                if !keys.insert(primitive.name.as_str()) {
-                    return Err(format!("duplicate builtin context key {}", primitive.name));
-                }
-            }
-            Some(pb::declaration::Kind::HostSortFamily(_)) => (),
-            _ => return Err("unsupported builtin context declaration".into()),
-        }
-    }
-    if !keys.contains(root_key) {
-        return Err(format!("missing builtin context root {root_key}"));
-    }
-
-    let mut staged = pb::Program::default();
-    reconcile_declarations(source, &mut staged)?;
-    let callables = staged
-        .declarations
-        .iter()
-        .enumerate()
-        .filter_map(|(index, declaration)| match &declaration.kind {
-            Some(pb::declaration::Kind::HostPrimitive(primitive)) => {
-                Some((primitive.name.clone(), index))
-            }
-            _ => None,
-        })
-        .collect::<HashMap<_, _>>();
-    let root = callables[root_key];
-    let mut pending = vec![root];
-    let mut reached = HashSet::default();
-    let mut walked = HashSet::default();
-    while let Some(index) = pending.pop() {
-        if !reached.insert(index) {
-            continue;
-        }
-        let supplied = staged.declarations[index].clone();
-        if index != root {
-            let (_, key) = declaration_identity(&supplied)?;
-            let authoritative = helper(key)?;
-            let mut matches = authoritative.declarations.iter().filter(|declaration| {
-                declaration_identity(declaration).ok() == Some((Namespace::Callable, key))
-            });
-            let mut expected = matches
-                .next()
-                .ok_or("registered helper context is missing its declaration")?
-                .clone();
-            if matches.next().is_some()
-                || !matches!(
-                    &expected.kind,
-                    Some(pb::declaration::Kind::HostPrimitive(_))
-                )
-            {
-                return Err("invalid registered helper context declaration".into());
-            }
-            let (sorts, files) = import_arenas(&authoritative, &mut staged)?;
-            relocate_span(&mut expected.span, &authoritative, &files)?;
-            let mut importer = NodeImport {
-                source: &authoritative,
-                sorts: &sorts,
-                files: &files,
-                nodes: &mut staged.nodes,
-                imported: HashMap::default(),
-                active: HashSet::default(),
-            };
-            declaration_refs(
-                &mut expected,
-                |index| {
-                    *index = *sorts
-                        .get(*index as usize)
-                        .ok_or("helper declaration sort out of bounds")?;
-                    Ok(())
-                },
-                |index| {
-                    *index = importer.import(*index)?;
-                    Ok(())
-                },
-            )?;
-
-            // Unlike language reconciliation, helper evidence cannot enrich or
-            // omit any authoritative field, including an absent language block.
-            let mut declarations = [supplied.clone(), expected];
-            let mut roots = [Vec::new(), Vec::new()];
-            for (declaration, roots) in declarations.iter_mut().zip(&mut roots) {
-                declaration_refs(
-                    declaration,
-                    |_| Ok(()),
-                    |index| {
-                        roots.push(*index);
-                        *index = 0;
-                        Ok(())
-                    },
-                )?;
-            }
-            if declarations[0] != declarations[1] || roots[0].len() != roots[1].len() {
-                return Err(format!("conflicting builtin context helper {key}"));
-            }
-            let mut comparison = NodeComparison::default();
-            for (&left, &right) in roots[0].iter().zip(&roots[1]) {
-                if !comparison.equal(&staged, left, right)? {
-                    return Err(format!("conflicting builtin context helper defaults {key}"));
-                }
-            }
-        }
-
-        let mut nodes = supplied
-            .bindings
-            .iter()
-            .filter_map(|bindings| bindings.python.as_ref())
-            .flat_map(|bindings| &bindings.views)
-            .flat_map(|view| &view.params)
-            .filter_map(|parameter| parameter.default_expr)
-            .collect::<Vec<_>>();
-        while let Some(index) = nodes.pop() {
-            if !walked.insert(index) {
-                continue;
-            }
-            let mut kind = staged
-                .nodes
-                .get(index as usize)
-                .and_then(|node| node.kind.clone())
-                .ok_or("missing builtin context default node")?;
-            if let pb::node::Kind::Call(call) = &kind {
-                pending.push(
-                    *callables
-                        .get(&call.func)
-                        .ok_or("unknown builtin context default callee")?,
-                );
-            }
-            node_edges(&mut kind, |index| {
-                nodes.push(*index);
-                Ok(())
-            })?;
-        }
-    }
-    for (key, index) in callables {
-        if !reached.contains(&index) {
-            return Err(format!("unreachable builtin context helper {key}"));
-        }
-    }
-    Ok(())
-}
-
-/// Transactionally imports declaration closures and reconciles each language's
-/// first supplied block. The returned flags identify newly installed definitions
+/// Transactionally imports and reconciles semantic declaration closures. The returned flags identify newly installed definitions
 /// in source order; compatible resupplies never ask a native engine to redeclare.
 pub fn reconcile_declarations(
     source: &pb::Program,
@@ -865,12 +524,10 @@ pub fn reconcile_declarations(
             .iter()
             .position(|old| declaration_identity(old).ok() == Some(identity));
         if let Some(i) = existing {
-            let mut old = staged.declarations[i].clone();
+            let old = staged.declarations[i].clone();
             if !compatible_semantics(&staged, &old, &d)? {
                 return Err(format!("conflicting declaration {}", identity.1));
             }
-            merge_bindings(&staged, &mut old, &d)?;
-            staged.declarations[i] = old;
             added.push(false);
         } else {
             staged.declarations.push(d);
@@ -878,7 +535,7 @@ pub fn reconcile_declarations(
         }
     }
     validate_uf_parents(&staged)?;
-    validate_bindings(&staged)?;
+    validate_semantics(&staged)?;
     retain_imported_closures(&mut staged, destination)?;
     *destination = staged;
     Ok(added)
@@ -890,12 +547,6 @@ pub fn reconcile_declarations(
 fn retain_imported_closures(p: &mut pb::Program, previous: &pb::Program) -> Result<(), String> {
     let mut nodes = (0..previous.nodes.len() as u32).collect::<HashSet<_>>();
     let mut sorts = (0..previous.sorts.len() as u32).collect::<HashSet<_>>();
-    sorts.extend(
-        p.sorts
-            .iter()
-            .enumerate()
-            .filter_map(|(index, sort)| (!sort.egglog_aliases.is_empty()).then_some(index as u32)),
-    );
     let mut files = (0..previous.files.len() as u32).collect::<HashSet<_>>();
     let mut pending = nodes.iter().copied().collect::<Vec<_>>();
     for d in &mut p.declarations {
@@ -956,7 +607,7 @@ fn retain_imported_closures(p: &mut pb::Program, previous: &pb::Program) -> Resu
         if let Some(s) = s.span {
             files.insert(s.file);
         }
-        if let Some(pb::sort::Kind::Family(f)) = &s.kind {
+        if let Some(pb::sort::Kind::Application(f)) = &s.kind {
             pending.extend(&f.args);
         } else if let Some(pb::sort::Kind::Func(f)) = &s.kind {
             pending.extend(&f.params);
@@ -1008,7 +659,7 @@ fn retain_imported_closures(p: &mut pb::Program, previous: &pb::Program) -> Resu
         if let Some(span) = &mut s.span {
             span.file = file_map[span.file as usize].unwrap();
         }
-        if let Some(pb::sort::Kind::Family(f)) = &mut s.kind {
+        if let Some(pb::sort::Kind::Application(f)) = &mut s.kind {
             for i in &mut f.args {
                 *i = sort_map[*i as usize].unwrap();
             }
@@ -1063,19 +714,12 @@ fn pattern_scope(p: &pb::Program, index: u32, parameters: usize) -> Result<(), S
             .sorts
             .get(i as usize)
             .and_then(|s| s.kind.as_ref())
-            .ok_or("binding sort out of bounds")?
+            .ok_or("signature sort out of bounds")?
         {
             pb::sort::Kind::Var(i) if *i as usize >= parameters => {
-                return Err("unbound presentation sort parameter".into());
+                return Err("unbound signature sort parameter".into());
             }
-            pb::sort::Kind::Family(f) => {
-                if let Some(d) = p.declarations.iter().find(|d| {
-                    declaration_identity(d).ok()
-                        == Some((Namespace::HostSortFamily, f.name.as_str()))
-                }) && !matches!(&d.kind, Some(pb::declaration::Kind::HostSortFamily(family)) if family.arity as usize == f.args.len())
-                {
-                    return Err("presentation family arity mismatch".into());
-                }
+            pb::sort::Kind::Application(f) => {
                 pending.extend(&f.args);
             }
             pb::sort::Kind::Eq(_) | pb::sort::Kind::Var(_) => (),
@@ -1088,654 +732,65 @@ fn pattern_scope(p: &pb::Program, index: u32, parameters: usize) -> Result<(), S
     Ok(())
 }
 
-fn owner_sort(p: &pb::Program, owner: &pb::BindingOwner, parameters: usize) -> Result<u32, String> {
-    let Some(pb::binding_owner::Kind::Sort(i)) = owner.kind else {
-        return Err("invalid or unsupported binding owner".into());
-    };
-    pattern_scope(p, i, parameters)?;
-    Ok(i)
-}
-
-/// Checks a default's own closure, not a union of scopes from other uses. Call
-/// evaluation and context capability validation belong to its emitted use.
-fn closed_default(p: &pb::Program, root: u32) -> Result<(), String> {
-    let mut pending = vec![root];
-    let mut seen = HashSet::default();
-    while let Some(i) = pending.pop() {
-        if !seen.insert(i) {
-            continue;
-        }
-        let n = p
-            .nodes
-            .get(i as usize)
-            .ok_or("default node out of bounds")?;
-        pattern_scope(p, n.sort_id, 0)?;
-        let mut kind = n.kind.clone().ok_or("missing default node kind")?;
-        match &kind {
-            pb::node::Kind::Var(_) => return Err("free variable in default template".into()),
-            pb::node::Kind::Call(call) => {
-                let declaration = p
-                    .declarations
-                    .iter()
-                    .find(|d| {
-                        declaration_identity(d).ok()
-                            == Some((Namespace::Callable, call.func.as_str()))
-                    })
-                    .ok_or("unknown default callee")?;
-                let (inputs, output, tail, parameters) = match declaration.kind.as_ref().unwrap() {
-                    pb::declaration::Kind::Constructor(c) => (&c.inputs, c.output, &[][..], 0),
-                    pb::declaration::Kind::Function(f) => (&f.inputs, f.output, &[][..], 0),
-                    pb::declaration::Kind::Primitive(p) => (&p.inputs, p.output, &[][..], 0),
-                    pb::declaration::Kind::HostPrimitive(h) => {
-                        let Some(pb::host_primitive::Typing::Signature(s)) = &h.typing else {
-                            return Err("unsupported default callee signature".into());
-                        };
-                        (
-                            &s.inputs,
-                            s.output.ok_or("missing default callee result")?,
-                            s.varargs.as_slice(),
-                            s.type_params.len(),
-                        )
-                    }
-                    _ => return Err("unsupported default callee".into()),
-                };
-                if call.args.len() < inputs.len()
-                    || if tail.is_empty() {
-                        call.args.len() != inputs.len()
-                    } else {
-                        !(call.args.len() - inputs.len()).is_multiple_of(tail.len())
-                    }
-                {
-                    return Err("default call arity mismatch".into());
-                }
-                let mut substitution = HashMap::default();
-                for (position, arg) in call.args.iter().enumerate() {
-                    let expected = inputs
-                        .get(position)
-                        .unwrap_or_else(|| &tail[(position - inputs.len()) % tail.len()])
-                        .sort;
-                    let actual = p
-                        .nodes
-                        .get(*arg as usize)
-                        .ok_or("default argument out of bounds")?
-                        .sort_id;
-                    pattern_scope(p, actual, 0)?;
-                    match_pattern(p, expected, actual, &mut substitution)?;
-                }
-                match_pattern(p, output, n.sort_id, &mut substitution)?;
-                if substitution.len() != parameters {
-                    return Err("default call does not determine every type parameter".into());
-                }
-                if let Some(pb::declaration::Kind::HostPrimitive(primitive)) = &declaration.kind
-                    && let Some(pb::host_primitive::Typing::Signature(signature)) =
-                        &primitive.typing
-                    && signature.equality_type_params.iter().any(|i| {
-                        substitution.get(i).is_none_or(|sort| {
-                            !matches!(p.sorts[*sort as usize].kind, Some(pb::sort::Kind::Eq(_)))
-                        })
-                    })
-                {
-                    return Err("default type parameter requires an equality sort".into());
-                }
-            }
-            pb::node::Kind::Union(u) => {
-                for member in &u.members {
-                    if p.nodes
-                        .get(*member as usize)
-                        .ok_or("default member out of bounds")?
-                        .sort_id
-                        != n.sort_id
-                    {
-                        return Err("default union sort mismatch".into());
-                    }
-                }
-            }
-            pb::node::Kind::PrimitiveValue(v) => {
-                use pb::primitive_value::Value as V;
-                let expected = match v.value.as_ref().ok_or("missing default value")? {
-                    V::I64(_) => "i64",
-                    V::F64Bits(_) => "f64",
-                    V::String(_) => "String",
-                    V::Bool(_) => "bool",
-                    V::Unit(_) => "Unit",
-                    V::Maybe(v) => {
-                        let Some(pb::sort::Kind::Family(f)) = &p.sorts[n.sort_id as usize].kind
-                        else {
-                            return Err("default Maybe sort mismatch".into());
-                        };
-                        if f.name != "Maybe" || f.args.len() != 1 {
-                            return Err("default Maybe sort mismatch".into());
-                        }
-                        if let Some(member) = v.value
-                            && p.nodes
-                                .get(member as usize)
-                                .ok_or("default Maybe child out of bounds")?
-                                .sort_id
-                                != f.args[0]
-                        {
-                            return Err("default Maybe child sort mismatch".into());
-                        }
-                        node_edges(&mut kind, |i| {
-                            pending.push(*i);
-                            Ok(())
-                        })?;
-                        continue;
-                    }
-                    V::Vec(v) => {
-                        let Some(pb::sort::Kind::Family(f)) = &p.sorts[n.sort_id as usize].kind
-                        else {
-                            return Err("default Vec sort mismatch".into());
-                        };
-                        if f.name != "Vec" || f.args.len() != 1 {
-                            return Err("default Vec sort mismatch".into());
-                        }
-                        for member in &v.items {
-                            if p.nodes
-                                .get(*member as usize)
-                                .ok_or("default Vec item out of bounds")?
-                                .sort_id
-                                != f.args[0]
-                            {
-                                return Err("default Vec item sort mismatch".into());
-                            }
-                        }
-                        node_edges(&mut kind, |i| {
-                            pending.push(*i);
-                            Ok(())
-                        })?;
-                        continue;
-                    }
-                    V::Map(v) => {
-                        let Some(pb::sort::Kind::Family(f)) = &p.sorts[n.sort_id as usize].kind
-                        else {
-                            return Err("default Map sort mismatch".into());
-                        };
-                        if f.name != "Map" || f.args.len() != 2 {
-                            return Err("default Map sort mismatch".into());
-                        }
-                        for entry in &v.entries {
-                            for (member, expected) in
-                                [entry.key, entry.value].into_iter().zip(&f.args)
-                            {
-                                if p.nodes
-                                    .get(member.ok_or("missing default Map child")? as usize)
-                                    .ok_or("default Map child out of bounds")?
-                                    .sort_id
-                                    != *expected
-                                {
-                                    return Err("default Map child sort mismatch".into());
-                                }
-                            }
-                        }
-                        node_edges(&mut kind, |i| {
-                            pending.push(*i);
-                            Ok(())
-                        })?;
-                        continue;
-                    }
-                    V::Pair(v) => {
-                        let Some(pb::sort::Kind::Family(f)) = &p.sorts[n.sort_id as usize].kind
-                        else {
-                            return Err("default Pair sort mismatch".into());
-                        };
-                        if f.name != "Pair" || f.args.len() != 2 {
-                            return Err("default Pair sort mismatch".into());
-                        }
-                        for (member, expected) in [v.first, v.second].into_iter().zip(&f.args) {
-                            if p.nodes
-                                .get(member.ok_or("missing default Pair child")? as usize)
-                                .ok_or("default Pair child out of bounds")?
-                                .sort_id
-                                != *expected
-                            {
-                                return Err("default Pair child sort mismatch".into());
-                            }
-                        }
-                        node_edges(&mut kind, |i| {
-                            pending.push(*i);
-                            Ok(())
-                        })?;
-                        continue;
-                    }
-                    V::Custom(_) => {
-                        if !matches!(
-                            &p.sorts[n.sort_id as usize].kind,
-                            Some(pb::sort::Kind::Family(_))
-                        ) {
-                            return Err("default Custom sort mismatch".into());
-                        }
-                        // Codec-specific payload/child validation belongs to
-                        // the emitted use, not portable metadata inspection.
-                        node_edges(&mut kind, |i| {
-                            pending.push(*i);
-                            Ok(())
-                        })?;
-                        continue;
-                    }
-                    _ => return Err("unsupported default value template".into()),
-                };
-                if !matches!(&p.sorts[n.sort_id as usize].kind, Some(pb::sort::Kind::Family(f)) if f.name == expected && f.args.is_empty())
-                {
-                    return Err("default literal sort mismatch".into());
-                }
-            }
-            _ => return Err("unsupported default node kind".into()),
-        }
-        node_edges(&mut kind, |i| {
-            pending.push(*i);
-            Ok(())
-        })?;
-    }
-    Ok(())
-}
-
-/// Validates presentation independently of core identity. This operates only on
-/// generated records and never executes a default, native body, or validator.
-fn validate_bindings(p: &pb::Program) -> Result<(), String> {
+/// Validate semantic signature scopes and authored primitive bodies without execution.
+fn validate_semantics(p: &pb::Program) -> Result<(), String> {
     for d in &p.declarations {
-        if matches!(&d.kind, Some(pb::declaration::Kind::HostPrimitive(h)) if matches!(h.typing, Some(pb::host_primitive::Typing::Application(_))))
-        {
-            if let Some(b) = &d.bindings {
-                if let Some(rust) = &b.rust {
-                    if rust.views.len() > 1 {
-                        return Err("function application accepts at most one Rust view".into());
-                    }
-                    for v in &rust.views {
-                        if v.path.len() != 1
-                            || v.path[0].is_empty()
-                            || !matches!(
-                                v.owner.as_ref().and_then(|o| o.kind.as_ref()),
-                                Some(pb::binding_owner::Kind::Function(_))
-                            )
-                            || v.receiver
-                                != Some(pb::RustReceiver {
-                                    core_input: Some(0),
-                                    borrowed: true,
-                                })
-                            || !matches!(v.params.as_slice(), [p] if p.core_input == Some(1) && !p.name.is_empty() && !p.borrowed)
-                            || v.trait_impl.is_some()
-                            || v.borrowed_self
-                            || v.tail_repetitions.is_some()
-                        {
-                            return Err("invalid function application Rust view".into());
-                        }
-                    }
-                }
-                if let Some(python) = &b.python {
-                    if python.views.len() > 1 {
-                        return Err("function application accepts at most one Python view".into());
-                    }
-                    for v in &python.views {
-                        if v.kind != pb::PythonCallKind::Method as i32
-                            || v.path != ["__call__"]
-                            || !matches!(
-                                v.owner.as_ref().and_then(|o| o.kind.as_ref()),
-                                Some(pb::binding_owner::Kind::Function(_))
-                            )
-                            || v.receiver != Some(0)
-                            || !matches!(v.params.as_slice(), [p] if p.core_input == Some(1)
-                                && p.name == "args" && p.default_expr.is_none())
-                            || v.mutates.is_some()
-                            || v.tail_repetitions.is_some()
-                        {
-                            return Err("invalid function application Python view".into());
-                        }
-                    }
-                }
-                for view in b.egglog.iter().flat_map(|b| &b.views) {
-                    if view.symbol.is_empty() || view.datatype_member {
-                        return Err("invalid Egglog view".into());
-                    }
-                }
+        let (inputs, output) = match d.kind.as_ref().ok_or("missing declaration kind")? {
+            pb::declaration::Kind::EqSort(_) => {
+                continue;
             }
-            continue;
-        }
-        let (inputs, output, tail, parameters) =
-            match d.kind.as_ref().ok_or("missing declaration kind")? {
-                pb::declaration::Kind::EqSort(s) => {
-                    validate_sort_bindings(s.bindings.as_ref(), 0)?;
-                    if d.bindings.is_some() {
-                        return Err("callable bindings on sort".into());
-                    }
-                    continue;
+            pb::declaration::Kind::Constructor(c) => (&c.inputs, Some(c.output)),
+            pb::declaration::Kind::Function(f) => (&f.inputs, Some(f.output)),
+            pb::declaration::Kind::Relation(r) => (&r.inputs, None),
+            pb::declaration::Kind::UserDefinedPrimitive(primitive) => {
+                let root = primitive.body.ok_or("missing primitive body")?;
+                if p.nodes
+                    .get(root as usize)
+                    .ok_or("primitive body out of bounds")?
+                    .sort_id
+                    != primitive.output
+                {
+                    return Err("primitive body result sort mismatch".into());
                 }
-                pb::declaration::Kind::HostSortFamily(s) => {
-                    validate_sort_bindings(s.bindings.as_ref(), s.arity as usize)?;
-                    if d.bindings.is_some() {
-                        return Err("callable bindings on sort".into());
+                // Scope belongs to this declaration, even when another
+                // declaration shares the same imported body nodes.
+                let mut pending = vec![root];
+                let mut seen = HashSet::default();
+                while let Some(i) = pending.pop() {
+                    if !seen.insert(i) {
+                        continue;
                     }
-                    continue;
-                }
-                pb::declaration::Kind::Constructor(c) => (&c.inputs, Some(c.output), &[][..], 0),
-                pb::declaration::Kind::Function(f) => (&f.inputs, Some(f.output), &[][..], 0),
-                pb::declaration::Kind::Relation(r) => (&r.inputs, None, &[][..], 0),
-                pb::declaration::Kind::Primitive(primitive) => {
-                    let root = primitive.body.ok_or("missing primitive body")?;
-                    if p.nodes
-                        .get(root as usize)
-                        .ok_or("primitive body out of bounds")?
-                        .sort_id
-                        != primitive.output
-                    {
-                        return Err("primitive body result sort mismatch".into());
-                    }
-                    // Scope belongs to this declaration, even when another
-                    // declaration shares the same imported body nodes.
-                    let mut pending = vec![root];
-                    let mut seen = HashSet::default();
-                    while let Some(i) = pending.pop() {
-                        if !seen.insert(i) {
-                            continue;
+                    let node = p
+                        .nodes
+                        .get(i as usize)
+                        .ok_or("primitive body node out of bounds")?;
+                    pattern_scope(p, node.sort_id, 0)?;
+                    let mut kind = node.kind.clone().ok_or("missing primitive body node")?;
+                    if let pb::node::Kind::Var(name) = &kind {
+                        let index = name
+                            .strip_prefix('_')
+                            .and_then(|s| s.parse::<usize>().ok())
+                            .filter(|index| name == &format!("_{index}"));
+                        if index
+                            .and_then(|index| primitive.inputs.get(index))
+                            .is_none_or(|arg| arg.sort != node.sort_id)
+                        {
+                            return Err(format!(
+                                "unbound or inconsistently typed primitive variable {name}"
+                            ));
                         }
-                        let node = p
-                            .nodes
-                            .get(i as usize)
-                            .ok_or("primitive body node out of bounds")?;
-                        pattern_scope(p, node.sort_id, 0)?;
-                        let mut kind = node.kind.clone().ok_or("missing primitive body node")?;
-                        if let pb::node::Kind::Var(name) = &kind {
-                            let index = name
-                                .strip_prefix('_')
-                                .and_then(|s| s.parse::<usize>().ok())
-                                .filter(|index| name == &format!("_{index}"));
-                            if index
-                                .and_then(|index| primitive.inputs.get(index))
-                                .is_none_or(|arg| arg.sort != node.sort_id)
-                            {
-                                return Err(format!(
-                                    "unbound or inconsistently typed primitive variable {name}"
-                                ));
-                            }
-                        }
-                        node_edges(&mut kind, |child| {
-                            pending.push(*child);
-                            Ok(())
-                        })?;
                     }
-                    (&primitive.inputs, Some(primitive.output), &[][..], 0)
+                    node_edges(&mut kind, |child| {
+                        pending.push(*child);
+                        Ok(())
+                    })?;
                 }
-                pb::declaration::Kind::HostPrimitive(h) => {
-                    let Some(pb::host_primitive::Typing::Signature(s)) = &h.typing else {
-                        return Err("unsupported binding signature".into());
-                    };
-                    if s.equality_type_params.windows(2).any(|w| w[0] >= w[1])
-                        || s.equality_type_params
-                            .iter()
-                            .any(|i| *i as usize >= s.type_params.len())
-                    {
-                        return Err("invalid equality type parameter indices".into());
-                    }
-                    (
-                        &s.inputs,
-                        Some(s.output.ok_or("missing signature result")?),
-                        s.varargs.as_slice(),
-                        s.type_params.len(),
-                    )
-                }
-            };
-        for i in inputs
-            .iter()
-            .map(|a| a.sort)
-            .chain(output)
-            .chain(tail.iter().map(|a| a.sort))
-        {
-            pattern_scope(p, i, parameters)?;
-        }
-        let Some(b) = &d.bindings else {
-            continue;
+                (&primitive.inputs, Some(primitive.output))
+            }
         };
-        for v in b.python.iter().flat_map(|b| &b.views) {
-            let kind =
-                pb::PythonCallKind::try_from(v.kind).map_err(|_| "invalid Python call kind")?;
-            use pb::PythonCallKind as K;
-            if kind == K::Unspecified
-                || (v.tail_repetitions.is_some() && !matches!(kind, K::Function | K::Method))
-                || matches!(kind, K::Function | K::Constant) == v.owner.is_some()
-                || matches!(kind, K::Method | K::Property) != v.receiver.is_some()
-                || v.path.iter().enumerate().any(|(i, component)| {
-                    component.is_empty()
-                        && (!matches!(kind, K::Function | K::Constant) || i + 1 != v.path.len())
-                })
-                || match kind {
-                    K::Initializer => !v.path.is_empty(),
-                    K::Function | K::Constant => v.path.is_empty(),
-                    _ => v.path.len() != 1,
-                }
-                || (matches!(kind, K::Property | K::ClassVariable | K::Constant)
-                    && !v.params.is_empty())
-                || (kind == K::Constant && parameters != 0)
-            {
-                return Err("invalid Python view form".into());
-            }
-            let owner = v
-                .owner
-                .as_ref()
-                .map(|o| owner_sort(p, o, parameters))
-                .transpose()?;
-            let slots = v
-                .params
-                .iter()
-                .map(|p| p.core_input)
-                .chain(v.receiver.map(Some))
-                .collect::<Vec<_>>();
-            let effective = view_inputs(inputs, tail, v.tail_repetitions, v.receiver, &slots)?;
-            if v.tail_repetitions.is_none() && effective.len() > inputs.len() && kind != K::Method {
-                return Err("only a method can consume a tail receiver".into());
-            }
-            if kind == K::Initializer && output.is_none_or(|output| owner != Some(output)) {
-                return Err("initializer result differs from owner".into());
-            }
-            if let Some(r) = v.receiver
-                && effective.get(r as usize).copied() != owner
-            {
-                return Err("receiver differs from owner".into());
-            }
-            for (position, param) in v.params.iter().enumerate() {
-                let slot = param.core_input.unwrap() as usize;
-                if param.name.is_empty() {
-                    return Err("empty Python parameter".into());
-                }
-                if v.tail_repetitions.is_none()
-                    && slot == effective.len()
-                    && (position + 1 != v.params.len() || param.default_expr.is_some())
-                {
-                    return Err("invalid Python tail parameter".into());
-                }
-                if let Some(root) = param.default_expr {
-                    if slot >= inputs.len() {
-                        return Err("expanded tail inputs cannot have defaults".into());
-                    }
-                    closed_default(p, root)?;
-                    let expected = inputs[slot].sort;
-                    let actual = p.nodes[root as usize].sort_id;
-                    let mut substitution = HashMap::default();
-                    match_pattern(p, expected, actual, &mut substitution)?;
-                }
-            }
-            if let Some(m) = v.mutates
-                && (kind == K::Initializer
-                    || output.is_none_or(|output| {
-                        inputs.get(m as usize).map(|a| a.sort) != Some(output)
-                    }))
-            {
-                return Err("invalid mutated input".into());
-            }
+        for i in inputs.iter().map(|a| a.sort).chain(output) {
+            pattern_scope(p, i, 0)?;
         }
-        for v in b.rust.iter().flat_map(|b| &b.views) {
-            if v.path.is_empty()
-                || v.path.iter().any(String::is_empty)
-                || (v.owner.is_some() && v.path.len() != 1)
-                || ((v.receiver.is_some() || v.trait_impl.is_some()) && v.owner.is_none())
-                || (v.borrowed_self && v.trait_impl.is_none())
-            {
-                return Err("invalid Rust view form".into());
-            }
-            let owner = v
-                .owner
-                .as_ref()
-                .map(|o| owner_sort(p, o, parameters))
-                .transpose()?;
-            let slots = v
-                .params
-                .iter()
-                .map(|p| p.core_input)
-                .chain(v.receiver.map(|r| r.core_input))
-                .collect::<Vec<_>>();
-            let effective = view_inputs(
-                inputs,
-                tail,
-                v.tail_repetitions,
-                v.receiver.and_then(|r| r.core_input),
-                &slots,
-            )?;
-            if let Some(r) = v.receiver
-                && (r.core_input.is_none()
-                    || effective.get(r.core_input.unwrap() as usize).copied() != owner)
-            {
-                return Err("Rust receiver differs from owner".into());
-            }
-            for (position, param) in v.params.iter().enumerate() {
-                if param.name.is_empty()
-                    || (v.tail_repetitions.is_none()
-                        && param.core_input == Some(effective.len() as u32)
-                        && position + 1 != v.params.len())
-                {
-                    return Err("invalid Rust parameter".into());
-                }
-            }
-            if let Some(t) = &v.trait_impl {
-                if t.path.is_empty()
-                    || t.path.iter().any(String::is_empty)
-                    || t.output_associated_type
-                        .as_ref()
-                        .is_some_and(String::is_empty)
-                {
-                    return Err("invalid Rust trait path".into());
-                }
-                for a in &t.args {
-                    pattern_scope(p, a.sort.ok_or("missing trait sort")?, parameters)?;
-                }
-            }
-        }
-        for v in b.egglog.iter().flat_map(|b| &b.views) {
-            if v.symbol.is_empty()
-                || (v.datatype_member
-                    && !matches!(d.kind, Some(pb::declaration::Kind::Constructor(_))))
-            {
-                return Err("invalid Egglog view".into());
-            }
-        }
-    }
-    Ok(())
-}
-
-fn validate_sort_bindings(b: Option<&pb::SortBindings>, arity: usize) -> Result<(), String> {
-    if let Some(b) = b {
-        for t in b.python.iter().chain(b.rust.iter()) {
-            if t.path.iter().any(String::is_empty)
-                || t.type_params.iter().any(String::is_empty)
-                || (!t.type_params.is_empty() && t.type_params.len() != arity)
-            {
-                return Err("invalid sort presentation".into());
-            }
-        }
-    }
-    Ok(())
-}
-
-/// Validate a view's complete mapping before allocating expanded tail inputs.
-/// Sorts are interned structurally by reconciliation; their indices compare
-/// invariantly, including nested family arguments and bound variables.
-fn view_inputs(
-    inputs: &[pb::Arg],
-    tail: &[pb::Arg],
-    repetitions: Option<u32>,
-    receiver: Option<u32>,
-    slots: &[Option<u32>],
-) -> Result<Vec<u32>, String> {
-    let fixed = u32::try_from(inputs.len()).map_err(|_| "too many fixed inputs")?;
-    let consumes_tail = repetitions.is_none() && receiver == Some(fixed);
-    if consumes_tail && tail.len() != 1 {
-        return Err("tail receiver requires a homogeneous variadic signature".into());
-    }
-    let count = match repetitions {
-        Some(repetitions) => {
-            if tail.is_empty() {
-                return Err("tail repetitions require a variadic host signature".into());
-            }
-            let width = u32::try_from(tail.len()).map_err(|_| "too many tail inputs")?;
-            fixed
-                .checked_add(
-                    repetitions
-                        .checked_mul(width)
-                        .ok_or("view input count overflow")?,
-                )
-                .ok_or("view input count overflow")?
-        }
-        None => fixed
-            .checked_add(u32::from(!tail.is_empty()) + u32::from(consumes_tail))
-            .ok_or("view input count overflow")?,
-    };
-    if slots.len() != count as usize {
-        return Err("presentation must cover each core input exactly once".into());
-    }
-    let set = slots.iter().copied().collect::<HashSet<_>>();
-    if set.len() != slots.len() || slots.iter().any(|s| s.is_none_or(|s| s >= count)) {
-        return Err("presentation must cover each core input exactly once".into());
-    }
-    // The consuming receiver adds one fixed operand, followed by a logical tail.
-    let effective = if repetitions.is_some() {
-        count as usize
-    } else {
-        inputs.len() + usize::from(consumes_tail)
-    };
-    Ok(inputs
-        .iter()
-        .chain(tail.iter().cycle())
-        .take(effective)
-        .map(|a| a.sort)
-        .collect())
-}
-
-fn match_pattern(
-    p: &pb::Program,
-    pattern: u32,
-    concrete: u32,
-    bindings: &mut HashMap<u32, u32>,
-) -> Result<(), String> {
-    match (
-        &p.sorts[pattern as usize].kind,
-        &p.sorts[concrete as usize].kind,
-    ) {
-        (Some(pb::sort::Kind::Var(v)), _) => {
-            if bindings
-                .insert(*v, concrete)
-                .is_some_and(|old| old != concrete)
-            {
-                return Err("inconsistent default sort substitution".into());
-            }
-        }
-        (Some(pb::sort::Kind::Family(a)), Some(pb::sort::Kind::Family(b)))
-            if a.name == b.name && a.args.len() == b.args.len() =>
-        {
-            for (a, b) in a.args.iter().zip(&b.args) {
-                match_pattern(p, *a, *b, bindings)?;
-            }
-        }
-        (Some(pb::sort::Kind::Func(a)), Some(pb::sort::Kind::Func(b)))
-            if a.params.len() == b.params.len() =>
-        {
-            for (a, b) in a
-                .params
-                .iter()
-                .chain([&a.result])
-                .zip(b.params.iter().chain([&b.result]))
-            {
-                match_pattern(p, *a, *b, bindings)?;
-            }
-        }
-        (a, b) if a == b => (),
-        _ => return Err("default sort differs from parameter".into()),
     }
     Ok(())
 }

@@ -240,7 +240,7 @@ impl Session {
     ) -> Result<Arc<dyn NativeCostModel>, PreparationError> {
         let model = self.cost_models.get(name).cloned().ok_or_else(|| {
             PreparationError(Box::new(pb::Error {
-                code: pb::ErrorCode::UnknownName.into(),
+                code: pb::ErrorCode::RuntimeFailure.into(),
                 message: format!("unknown cost model {name}"),
                 ..Default::default()
             }))
@@ -277,7 +277,7 @@ impl Session {
             return Err("cost model objective sort must be closed".into());
         }
         let objective_sort = &objective[objective_root as usize];
-        if !matches!(&objective_sort.kind, Some(pb::sort::Kind::Family(family)) if family.args.is_empty())
+        if !matches!(&objective_sort.kind, Some(pb::sort::Kind::Application(family)) if family.args.is_empty())
         {
             return Err("host model objectives currently require a registered leaf sort".into());
         }
@@ -292,7 +292,7 @@ impl Session {
         &mut self,
         program: &pb::Program,
         extract: &pb::Extract,
-        response: &mut pb::RunProgramResponse,
+        response: &mut pb::RunProgramOutput,
         context: &RequestOccurrences,
     ) -> Result<pb::ExtractResult, egglog::Error> {
         let registration = self
@@ -390,7 +390,7 @@ impl Session {
                             validate_exact_number(exact).map_err(egglog::Error::ExtractError)?;
                         }
                         let family = match &response.sorts[objective as usize].kind {
-                            Some(pb::sort::Kind::Family(family)) if family.args.is_empty() => {
+                            Some(pb::sort::Kind::Application(family)) if family.args.is_empty() => {
                                 &family.name
                             }
                             _ => {
@@ -505,6 +505,7 @@ impl Session {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::protobuf::fixtures::Observed;
 
     struct InvalidObjective(&'static str);
 
@@ -513,7 +514,7 @@ mod tests {
             let sorts = ["i64", self.0]
                 .into_iter()
                 .map(|name| pb::Sort {
-                    kind: Some(pb::sort::Kind::Family(pb::HostSort {
+                    kind: Some(pb::sort::Kind::Application(pb::SortApplication {
                         name: name.into(),
                         args: vec![],
                     })),
@@ -542,7 +543,7 @@ mod tests {
             .create(
                 &pb::CreateEGraphRequest {
                     sorts: vec![pb::Sort {
-                        kind: Some(pb::sort::Kind::Family(pb::HostSort {
+                        kind: Some(pb::sort::Kind::Application(pb::SortApplication {
                             name: "i64".into(),
                             args: vec![],
                         })),
@@ -570,7 +571,7 @@ mod tests {
                 diagnostics: false,
                 program: Some(pb::Program {
                     sorts: vec![pb::Sort {
-                        kind: Some(pb::sort::Kind::Family(pb::HostSort {
+                        kind: Some(pb::sort::Kind::Application(pb::SortApplication {
                             name: "i64".into(),
                             args: vec![],
                         })),
@@ -596,10 +597,13 @@ mod tests {
                 }),
             };
             let response = engine.run(&request.encode_to_vec()).unwrap();
-            let error = pb::RunProgramResponse::decode(response.as_slice())
-                .unwrap()
-                .error
-                .unwrap();
+            let error = Observed::from_frames(
+                (response)
+                    .iter()
+                    .map(|bytes| pb::RunProgramResponse::decode(bytes.as_slice()).unwrap()),
+            )
+            .error
+            .unwrap();
             assert_eq!(error.code, i32::from(pb::ErrorCode::InvalidProgram));
             assert!(error.message.contains(family), "{}", error.message);
             engine.release_cost_model(handle, &name).unwrap();

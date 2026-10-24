@@ -1,5 +1,5 @@
 use egglog::EGraph;
-use egglog_experimental::{PortableTypeInfo, proto as pb};
+use egglog_experimental::PortableTypeInfo;
 use std::sync::{
     Arc,
     atomic::{AtomicUsize, Ordering},
@@ -12,7 +12,7 @@ macro_rules! forward_context_primitive {
     ($graph:expr, $context:expr, $inputs:ident, $body:expr) => {
         egglog_experimental::add_primitive!(
             $graph,
-            "forwarded-receiver"[id = "test.receiver.forwarded", context = |_, _, _| Ok(())] =
+            "forwarded-receiver"[id = "test.receiver.forwarded"] =
                 {$context: (Arc<AtomicUsize>, i64)} [$inputs: i64] -> i64 {
                     {
                         let _ = self::Ordering::SeqCst;
@@ -43,7 +43,7 @@ impl Provider {
         );
         egglog_experimental::add_primitive!(
             graph,
-            "bindings-receiver"[id = "test.receiver.bindings", bindings = |_| pb::CallableBindings::default()] =
+            "bindings-receiver"[id = "test.receiver.bindings"] =
                 {(self.calls.clone(), self.offset): (Arc<AtomicUsize>, i64)}
                 |value: i64| -?> i64 {
                     Some({
@@ -58,7 +58,7 @@ impl Provider {
         });
         egglog_experimental::add_primitive_with_validator!(
             graph,
-            "validator-receiver"[id = "test.receiver.validator", bindings = |_| pb::CallableBindings::default()] =
+            "validator-receiver"[id = "test.receiver.validator"] =
                 {(self.calls.clone(), self.offset): (Arc<AtomicUsize>, i64)}
                 |value: i64| -> i64 {
                     {
@@ -86,8 +86,13 @@ fn caller_receiver_survives_portable_and_nested_macro_forwarding() {
         "test.receiver.forwarded",
         "test.receiver.validator",
     ] {
-        assert!(catalog.definitions.declarations.iter().any(|declaration|
-            matches!(&declaration.kind, Some(pb::declaration::Kind::HostPrimitive(primitive)) if primitive.name == key)));
+        assert!(
+            catalog
+                .definitions
+                .primitives
+                .iter()
+                .any(|primitive| primitive.name == key)
+        );
     }
     assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
     graph

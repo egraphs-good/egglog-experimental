@@ -11,7 +11,7 @@
 // Validation rules and normative comments in this file are the specification.
 // Unknown enum values are errors; Rust consumers must check raw enum values.
 // Producers expand datatype/default-argument/include syntax before this boundary.
-// Clone saves state, including proof state; ReturnToEGraph restores a saved scope.
+// Clone saves state, including proof state. Destroy discards only its handle.
 
 // ---------------------------------------------------------------------------
 // PROGRAM AND PROVENANCE — the request payload and the shared span vocabulary.
@@ -40,8 +40,7 @@
 /// firings and other commands' evaluated inputs have their own scopes as in Union.
 /// Fail is transparent to these scopes: a wrapped direct Action still belongs
 /// to its enclosing command list, and the wrapper adds no Union identity scope.
-/// Sort.var is legal only in HostPrimitive signatures and their presentation
-/// owner/trait patterns, sharing that signature's binder. Node sorts, lambda
+/// Sort.var is legal only in BuiltinCatalog signatures. Node sorts, lambda
 /// parameter sorts, cost sorts and concrete declaration signatures must be
 /// recursively closed. CEL rejects direct variable roots; closure is normative.
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -82,7 +81,7 @@ pub struct SourceFile {
     pub contents: ::core::option::Option<::prost::alloc::string::String>,
 }
 /// A byte range. Resolve `file` against the nearest arena-owning payload's
-/// `files`: `Program`, `CreateEGraphRequest`, `RunProgramResponse`, or
+/// `files`: `Program`, `BuiltinCatalog`, `CreateEGraphRequest`, `RunProgramResponse`, or
 /// a nested exported `Program`. Re-emission must remap or include those files,
 /// or strip spans, including origins from definitions installed by earlier requests;
 /// dangling indices are invalid. The range is half-open [start, end), with
@@ -107,29 +106,22 @@ pub struct Span {
 
 /// Closed types are structurally interned. Equal container/function shapes
 /// denote the same sort.
-/// Signatures and their presentation patterns reuse binder-local variables.
+/// Signatures reuse binder-local variables.
 /// A shared pattern is interpreted independently in each GenericSignature;
 /// arena sharing never shares substitutions between signatures or calls.
-/// Sorts are acyclic through HostSort.args and FuncSort.params/result. CEL
+/// Sorts are acyclic through SortApplication.args and FuncSort.params/result. CEL
 /// checks direct indices, not acyclicity or recursive variable scope.
-/// References do not declare sorts: resolve equality names and host families
-/// against local declarations, installed definitions or ambient host definitions
-/// in their respective namespaces: eq only resolves EqSort, family only resolves
-/// HostSortFamily. Equal name spellings do not identify or substitute these kinds.
+/// References do not declare sorts: eq resolves user EqSort declarations;
+/// application resolves a configured-backend PrimitiveSort from GetBuiltins. Equal name spellings do not identify or substitute these kinds.
 /// Missing names and family-arity mismatches are errors. Builtin references do
 /// not require explicit descriptor declarations. Response references resolve
 /// against the associated handle; their arenas do not redeclare definitions.
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct Sort {
     /// Optional representative type-use origin; excluded from sort identity.
-    /// Documentation and family/nominal bindings belong to the defining Declaration.
+    /// Documentation belongs to the defining Declaration.
     #[prost(message, optional, tag = "5")]
     pub span: ::core::option::Option<Span>,
-    /// Optional text aliases, excluded from identity; other frontends may omit them.
-    /// Interning equal sorts collects distinct symbols, without a resupply contract.
-    /// Text frontends resolve spelling collisions; aliases declare no semantic sort.
-    #[prost(message, repeated, tag = "8")]
-    pub egglog_aliases: ::prost::alloc::vec::Vec<EgglogTypeBinding>,
     #[prost(oneof = "sort::Kind", tags = "1, 2, 4, 7")]
     pub kind: ::core::option::Option<sort::Kind>,
 }
@@ -140,7 +132,7 @@ pub mod sort {
         #[prost(string, tag = "1")]
         Eq(::prost::alloc::string::String),
         #[prost(message, tag = "2")]
-        Family(super::HostSort),
+        Application(super::SortApplication),
         #[prost(message, tag = "4")]
         Func(super::FuncSort),
         /// index into the enclosing GenericSignature.type_params
@@ -150,10 +142,10 @@ pub mod sort {
 }
 /// A host-family application: no args for i64/Unit, or e.g. Vec<i64> and
 /// Map<String, Math>. Arg count equals declared family arity, including zero.
-/// Args may be patterns only in a GenericSignature or its bindings; otherwise
+/// Args may be patterns only in a GenericSignature; otherwise
 /// recursively closed. Host-family sorts are not equality sorts.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct HostSort {
+pub struct SortApplication {
     #[prost(string, tag = "1")]
     pub name: ::prost::alloc::string::String,
     /// index into the enclosing `sorts`
@@ -161,7 +153,7 @@ pub struct HostSort {
     pub args: ::prost::alloc::vec::Vec<u32>,
 }
 /// A structural function type, not a named host sort family. Its parameter and
-/// result sorts may be patterns in a GenericSignature or its presentation;
+/// result sorts may be patterns in a GenericSignature;
 /// otherwise closed.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct FuncSort {
@@ -193,9 +185,6 @@ pub struct FuncSort {
 ///   must be legal in that execution context. Hosts publish the capabilities
 ///   of ambient primitives; receivers check these obligations. A Union in an
 ///   evaluated body can write, even though the body contains only expressions.
-/// - Presentation defaults are closed symbolic templates, not evaluated at
-///   installation/export. Lambda bodies keep their own binders; every expanded
-///   use must satisfy its ordinary execution context's typing/effect rules.
 /// - Inert values (declared costs and extracted data) contain no variables,
 ///   get_cost reads or Union and must be finite. Saved code bodies retain
 ///   their own binders, so these are use-site rules, not bans on an entire arena.
@@ -250,7 +239,7 @@ pub mod node {
         /// may bind in the query binder; an absent annotation contributes no match.
         /// It has seminaive dependencies like a table lookup, not a Pure-only primitive.
         /// When evaluated, evaluate args once each, left-to-right, then read the cost;
-        /// absence fails with EVALUATION_FAILED. This requires a read-capable context,
+        /// absence fails with RUNTIME_FAILURE. This requires a read-capable context,
         /// so is invalid in SEMINAIVE heads or Pure/Write code. Args inherit the use's
         /// context/binder. Not inert data; saved code may use it under these rules.
         #[prost(message, tag = "9")]
@@ -348,7 +337,7 @@ pub struct Union {
 /// that definition's signature. Generic instantiation does not select another
 /// definition. Frontends resolve overloaded surface syntax and conversions
 /// before this boundary. Missing names and signature mismatches are errors.
-/// HostPrimitive's typing form checks all concrete argument AND result sorts;
+/// Primitive's typing form checks all concrete argument AND result sorts;
 /// every generic parameter must be determined. There are no call-level type args.
 ///
 /// For Node.call, the enclosing node's sort matches the result; relation calls
@@ -391,7 +380,7 @@ pub struct Lambda {
 /// scalar arms retain their exact payloads: f64_bits preserves IEEE-754 bits,
 /// while Egglog equality identifies signed zeroes and all NaN bit patterns.
 /// BigInt/BigRat/Rational and vec/set/multiset/map/pair/maybe use their matching
-/// HostSort family applications; lambda/partial_call use FuncSort.
+/// SortApplication family applications; lambda/partial_call use FuncSort.
 /// CustomValue supports host sorts, including nullary families with value children.
 /// Verify payload/sort agreement and child types; CEL checks their indices only.
 ///
@@ -405,6 +394,11 @@ pub struct Lambda {
 /// Lambda captures are constructed now and its body is separately scoped code.
 /// Symbolic operations such as rational(n,d), vec-of or function application
 /// remain Calls; they are not interchangeable with already-formed value data.
+/// Dedicated scalar arms require the nullary applications i64, f64, String,
+/// bool, Unit, BigInt, BigRat and Rational respectively. Vec/Set/MultiSet/Maybe
+/// require their named unary applications; Map and Pair require their named
+/// binary applications. Lambda and partial_call require FuncSort. Other backend
+/// values use CustomValue rather than overloading these family names.
 #[derive(Eq, Hash)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct PrimitiveValue {
@@ -522,7 +516,7 @@ pub struct MaybeValue {
 /// For host sorts without a dedicated PrimitiveValue arm. The exact enclosing
 /// sort selects the codec and its valid arg arity/sorts; no separate type tag.
 /// A nullary family may still have value args (e.g. PyObject); these are not
-/// HostSort's type args and need not have the same arity.
+/// SortApplication's type args and need not have the same arity.
 /// All Egglog references are explicit args. Payload bytes may refer to arg slots,
 /// never arena/class indices, engine Value IDs or raw process pointers. Traversal,
 /// rebuilding and remapping must rewrite args regardless of sort kind, without
@@ -642,43 +636,29 @@ pub struct SetCost {
 /// Order-independent, immutable definitions. New names may be added. Resending
 /// a complete definition is optional and checks compatibility: identical
 /// definitions are no-ops; conflicting definitions are errors. User tables and
-/// computed primitives have complete, concrete definitions, not signature-only
-/// imports. Host descriptors instead assert an available compatible provider;
-/// they never install native code. Referencing an ambient definition by name
-/// does not require resending its descriptor.
+/// computed primitives have complete, concrete definitions. Builtin primitives
+/// and primitive sorts are resolved by canonical name against GetBuiltins;
+/// their descriptors are not input declarations.
 /// Compare referenced expression subgraphs structurally, not request-local
-/// indices. Provenance, argument labels and language bindings do not
-/// participate in semantic identity; bindings have their own resupply checks.
+/// indices. Provenance, documentation and argument labels do not participate
+/// in semantic identity.
 /// Comparison must preserve Union sharing/identity topology; ordinary syntax
 /// sharing may differ. One empty Union reused twice is not two fresh Unions.
-/// Callable names are unique across Constructor, Function, Relation, Primitive
-/// and HostPrimitive, including ambient definitions. EqSort, HostSortFamily and
-/// callable names occupy three distinct namespaces, selected by existing kind
-/// tags. Equal spellings may coexist across namespaces. Compatible resends retain
+/// Callable names are unique across Constructor, Function, Relation and
+/// UserDefinedPrimitive, including ambient builtin primitives. Equality sorts
+/// and primitive sorts occupy distinct nominal namespaces, selected by Sort's
+/// kind. Equal spellings may coexist across namespaces. Compatible resends retain
 /// the definition; conflicts within a namespace never shadow definitions.
-/// Host descriptor compatibility compares family arity or primitive typing form
-/// and structural signature, including ordered binder positions. Parameter
-/// labels are diagnostic; alpha-renaming those labels is compatible.
-/// Native implementation, codec and execution-capability compatibility remain
-/// host obligations; descriptor equality alone does not establish them.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct Declaration {
     /// Optional diagnostic origin; excluded from semantic identity.
     #[prost(message, optional, tag = "7")]
     pub span: ::core::option::Option<Span>,
-    #[prost(message, optional, tag = "8")]
-    pub bindings: ::core::option::Option<CallableBindings>,
     /// Optional documentation; excluded from semantic identity. Absent and
     /// explicitly empty documentation remain distinct.
     #[prost(string, optional, tag = "9")]
     pub doc: ::core::option::Option<::prost::alloc::string::String>,
-    /// Semantic table visibility, valid only for Constructor and Function.
-    /// Hidden tables are excluded from PrintSize and visible aggregate counts;
-    /// hidden constructors are also excluded from extraction candidates.
-    /// Definitions and rows remain present in queries, observations and Freeze.
-    #[prost(bool, tag = "11")]
-    pub hidden: bool,
-    #[prost(oneof = "declaration::Kind", tags = "1, 2, 3, 4, 5, 6, 10")]
+    #[prost(oneof = "declaration::Kind", tags = "1, 2, 3, 4, 10")]
     pub kind: ::core::option::Option<declaration::Kind>,
     /// Reflective String selector, distinct from the callable key. Absent means a
     /// soft default of that key. Explicit public aliases take priority over soft
@@ -700,11 +680,7 @@ pub mod declaration {
         #[prost(message, tag = "3")]
         Relation(super::Relation),
         #[prost(message, tag = "4")]
-        Primitive(super::Primitive),
-        #[prost(message, tag = "5")]
-        HostSortFamily(super::HostSortFamily),
-        #[prost(message, tag = "6")]
-        HostPrimitive(super::HostPrimitive),
+        UserDefinedPrimitive(super::UserDefinedPrimitive),
         #[prost(message, tag = "10")]
         EqSort(super::EqSort),
     }
@@ -733,14 +709,11 @@ pub struct Arg {
     pub name: ::prost::alloc::string::String,
 }
 /// A concrete nullary equality-sort definition. Its nominal namespace is distinct
-/// from host families and callables; same-name compatible resends are idempotent.
-/// Bindings have SortBindings' separate first-supply/resupply contract.
+/// from primitive sorts and callables; same-name compatible resends are idempotent.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct EqSort {
     #[prost(string, tag = "1")]
     pub name: ::prost::alloc::string::String,
-    #[prost(message, optional, tag = "2")]
-    pub bindings: ::core::option::Option<SortBindings>,
     /// Optional non-owning table key for native Tree root extraction's one-hop
     /// parent lookup. Absence means no lookup and differs from every present key.
     /// The table may be absent, which leaves the root unchanged; this reference
@@ -773,6 +746,10 @@ pub struct Constructor {
     pub cost: ::core::option::Option<u32>,
     #[prost(bool, tag = "5")]
     pub unextractable: bool,
+    /// Exclude this constructor from aggregate observations and extraction;
+    /// retain its rows in queries and snapshots.
+    #[prost(bool, tag = "6")]
+    pub hidden: bool,
 }
 /// A concrete table-backed function.
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -784,12 +761,15 @@ pub struct Function {
     /// index into the enclosing `sorts`
     #[prost(uint32, tag = "3")]
     pub output: u32,
-    /// Deferred code bound only over old and new, including in an exported
+    /// Deferred code bound only over the literal names old and new, including in an exported
     /// declaration. Absent asserts equality on conflict.
     ///
     /// index into the enclosing `nodes`
     #[prost(uint32, optional, tag = "4")]
     pub merge: ::core::option::Option<u32>,
+    /// Exclude this function from aggregate observations; retain its rows.
+    #[prost(bool, tag = "5")]
+    pub hidden: bool,
 }
 /// A concrete set of tuples, inserted by an action call and matched by row existence.
 /// The declaration has no output field; typed calls have implicit sort Unit.
@@ -801,13 +781,13 @@ pub struct Relation {
     #[prost(message, repeated, tag = "2")]
     pub inputs: ::prost::alloc::vec::Vec<Arg>,
 }
-/// A concrete program-defined computed function, distinct from HostPrimitive.
+/// A concrete program-defined computed function, distinct from Primitive.
 /// Its body and transitive callees must be legal at every
-/// use, using host-published ambient capabilities; the receiver checks this.
+/// use, using backend-published ambient capabilities; the receiver checks this.
 /// An expression-only body may still write through Union. No effect-inference
 /// algorithm or fallback for recursive definitions is prescribed here.
 #[derive(Clone, PartialEq, ::prost::Message)]
-pub struct Primitive {
+pub struct UserDefinedPrimitive {
     #[prost(string, tag = "1")]
     pub name: ::prost::alloc::string::String,
     #[prost(message, repeated, tag = "2")]
@@ -822,30 +802,50 @@ pub struct Primitive {
     #[prost(uint32, optional, tag = "4")]
     pub body: ::core::option::Option<u32>,
 }
-/// A named host sort family, including nullary scalar sorts. Names are immutable;
-/// compatible resends agree on arity. Every application uses HostSort, including
-/// arity-zero families. No generic user equality
-/// sorts or implementation/codec code are declared by this descriptor.
+/// Read-only configured-backend catalog. Signatures and their sort patterns are
+/// authoritative machine data; frontend presentation mappings remain external.
+/// All sort and file indices refer to this message. It is independent of graph
+/// contents, execution mode and creation settings, and is never part of Program,
+/// Freeze or input history. Implementations and value codecs remain external.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct BuiltinCatalog {
+    #[prost(message, repeated, tag = "1")]
+    pub sorts: ::prost::alloc::vec::Vec<Sort>,
+    #[prost(message, repeated, tag = "2")]
+    pub primitive_sorts: ::prost::alloc::vec::Vec<PrimitiveSort>,
+    #[prost(message, repeated, tag = "3")]
+    pub primitives: ::prost::alloc::vec::Vec<Primitive>,
+    #[prost(message, repeated, tag = "4")]
+    pub files: ::prost::alloc::vec::Vec<SourceFile>,
+}
+/// A backend-provided sort family, including nullary scalar sorts. Every
+/// application uses SortApplication, with exactly arity arguments.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct HostSortFamily {
+pub struct PrimitiveSort {
     #[prost(string, tag = "1")]
     pub name: ::prost::alloc::string::String,
     #[prost(uint32, tag = "2")]
     pub arity: u32,
     #[prost(message, optional, tag = "3")]
-    pub bindings: ::core::option::Option<SortBindings>,
+    pub span: ::core::option::Option<Span>,
+    #[prost(string, optional, tag = "4")]
+    pub doc: ::core::option::Option<::prost::alloc::string::String>,
 }
-/// A host-implemented callable. Submission asserts that a compatible native
-/// implementation is available; it supplies neither a body nor executable code.
+/// A backend-provided callable. A Program calls its canonical name without
+/// declaring it. Its implementation and context capabilities remain native.
 #[derive(Clone, PartialEq, ::prost::Message)]
-pub struct HostPrimitive {
+pub struct Primitive {
     #[prost(string, tag = "1")]
     pub name: ::prost::alloc::string::String,
-    #[prost(oneof = "host_primitive::Typing", tags = "2, 3")]
-    pub typing: ::core::option::Option<host_primitive::Typing>,
+    #[prost(message, optional, tag = "4")]
+    pub span: ::core::option::Option<Span>,
+    #[prost(string, optional, tag = "5")]
+    pub doc: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(oneof = "primitive::Typing", tags = "2, 3")]
+    pub typing: ::core::option::Option<primitive::Typing>,
 }
-/// Nested message and enum types in `HostPrimitive`.
-pub mod host_primitive {
+/// Nested message and enum types in `Primitive`.
+pub mod primitive {
     #[derive(Clone, PartialEq, ::prost::Oneof)]
     pub enum Typing {
         #[prost(message, tag = "2")]
@@ -854,15 +854,15 @@ pub mod host_primitive {
         Application(super::FunctionApplication),
     }
 }
-/// An ordinary host signature: a fixed prefix followed by zero or more
+/// An ordinary primitive signature: a fixed prefix followed by zero or more
 /// repetitions of the ordered varargs pattern. An empty pattern means no tail
 /// (exact fixed arity); one Arg describes homogeneous varargs. For a nonempty
 /// pattern, the actual argument count minus the fixed prefix must be a multiple
 /// of the pattern width. Pattern order and width are semantic, even \[T, T\];
 /// arguments remain flat, with no tuple/group node. Sort indices reference
-/// Program.sorts.
+/// BuiltinCatalog.sorts.
 /// Sort.var indices bind by position in type_params; labels do not bind by name
-/// and need not be distinct. All variable uses, including nested HostSort and
+/// and need not be distinct. All variable uses, including nested SortApplication and
 /// FuncSort patterns, must be in this signature's binder. Each actual call
 /// matches all concrete argument and result sorts structurally to obtain one
 /// consistent, complete substitution across all repetitions and the result.
@@ -894,273 +894,6 @@ pub struct GenericSignature {
 /// PrimitiveValue.partial_call supplies an effective complete call; see that field.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct FunctionApplication {
-}
-// ---------------------------------------------------------------------------
-// LANGUAGE BINDINGS — optional views, never additional core definitions.
-// ---------------------------------------------------------------------------
-
-/// Each language block is fixed when first supplied for the semantic definition.
-/// Absence makes no assertion/removal; another language may first arrive later.
-/// Reconcile all supplies order-independently, including repeated same-name
-/// declarations, before interning away duplicate presentations.
-/// Agreeing supplies are allowed; conflicting supplies are errors. Compare
-/// arena references structurally, not by index. Sort comparison excludes attached
-/// bindings; default calls identify their core callee, not its presentation.
-/// Compare all default roots within each language block together, preserving
-/// shared/distinct Union topology.
-/// Bindings never change semantic definition identity or duplicate docs/spans.
-///
-/// Without a Python/Rust block, generators derive conservative type/free-function
-/// wrappers, preserving exact core names, signatures and argument order. Derived
-/// wrappers install no bindings. Empty blocks carry no hiding instruction; their
-/// generation behavior and identifier normalization are not specified here.
-/// Malformed individual bindings and conflicting resupply are installation errors.
-/// Cross-definition Python/Rust binding collisions are generation errors for all
-/// explicit/derived combinations, never silent fallback, overwrite or renaming.
-#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct SortBindings {
-    #[prost(message, optional, tag = "1")]
-    pub python: ::core::option::Option<TypeBinding>,
-    #[prost(message, optional, tag = "2")]
-    pub rust: ::core::option::Option<TypeBinding>,
-    #[prost(message, optional, tag = "3")]
-    pub egglog: ::core::option::Option<EgglogTypeBinding>,
-}
-/// A target-language type path (module/crate segments, then type name), distinct
-/// from its core sort/family name. Parameters remain in core family order.
-/// Optional labels name those parameters; if supplied, their count equals arity.
-/// They introduce no Sort.var binder. Nullary EqSort/families have no parameters.
-#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct TypeBinding {
-    #[prost(string, repeated, tag = "1")]
-    pub path: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
-    #[prost(string, repeated, tag = "2")]
-    pub type_params: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
-}
-/// Surface sort/family symbol; family parameters retain core order.
-#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct EgglogTypeBinding {
-    #[prost(string, tag = "1")]
-    pub symbol: ::prost::alloc::string::String,
-}
-/// The same per-language lifetime/compatibility contract as SortBindings.
-/// No view changes the core signature. A surface call supplies every core input
-/// exactly once after receiver mapping, defaults and tail expansion; it emits an
-/// ordinary Call in core argument order. Parameter names are surface names, not
-/// binders for defaults. Views of generic host primitives share that signature's
-/// type binder for owner/trait sort patterns; other views have no type binder.
-/// Presentation cannot rescue a core call whose generic substitution is not
-/// determined by its concrete argument/result sorts under the usual call rules.
-/// Recursive binder/owner/default typing checks are normative.
-/// With tail_repetitions absent, a nonempty tail occupies one logical slot.
-/// With it present, only a HostPrimitive GenericSignature with a nonempty tail
-/// is allowed. For N fixed inputs, tail width W and count R, the view has exactly
-/// N + R*W fixed slots, with no logical tail slot. Slot i has the original input
-/// sort for i < N, otherwise varargs\[(i-N) % W\]. Receiver/parameters cover these
-/// slots exactly once; receiver owner and all arguments must match these sorts
-/// under the canonical signature's substitution. Check count arithmetic and
-/// mapped-slot count before expansion. R=0 is valid and distinct from absence.
-/// Defaults and Python mutation remain limited to original fixed inputs.
-/// This restricts a surface spelling's arity; it introduces no callable, binder,
-/// signature, provider or packing node. The emitted Call still checks against
-/// the unchanged canonical signature. New consumers preserve absent-field
-/// meaning; older consumers that discard this field may widen the surface arity.
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct CallableBindings {
-    #[prost(message, optional, tag = "1")]
-    pub python: ::core::option::Option<PythonBindings>,
-    #[prost(message, optional, tag = "2")]
-    pub rust: ::core::option::Option<RustBindings>,
-    #[prost(message, optional, tag = "3")]
-    pub egglog: ::core::option::Option<EgglogBindings>,
-}
-/// Owner identity, not a display path. A sort pattern refers to the enclosing
-/// callable's signature binder, or must be closed when it has no generic binder.
-/// The function marker is only for FunctionApplication's structural function
-/// wrapper: receiver core input 0, with tail/result derived from its concrete
-/// FuncSort. It introduces neither a named sort family nor a type-pack binder.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct BindingOwner {
-    #[prost(oneof = "binding_owner::Kind", tags = "1, 2")]
-    pub kind: ::core::option::Option<binding_owner::Kind>,
-}
-/// Nested message and enum types in `BindingOwner`.
-pub mod binding_owner {
-    #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Oneof)]
-    pub enum Kind {
-        /// index into Program.sorts
-        #[prost(uint32, tag = "1")]
-        Sort(u32),
-        #[prost(message, tag = "2")]
-        Function(super::FunctionTypeOwner),
-    }
-}
-#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct FunctionTypeOwner {
-}
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct PythonBindings {
-    #[prost(message, repeated, tag = "1")]
-    pub views: ::prost::alloc::vec::Vec<PythonCallable>,
-}
-/// Free functions and CONSTANT use a qualified path; members use one name on owner.
-/// Function/constant paths are nonempty; final names may be empty, qualifiers may not.
-/// INITIALIZER instead omits path and derives __init__.
-/// METHOD/PROPERTY map a real core input as receiver. INITIALIZER/CLASS_METHOD
-/// have no core self/cls input. Only INITIALIZER requires result = owner;
-/// class methods and class variables may return a different sort.
-/// METHOD/PROPERTY receiver sort must match owner under the same substitution.
-/// PROPERTY has only a receiver; CLASS_VARIABLE is a nullary expression view.
-/// CONSTANT is an ownerless named expression (C, not C()), backed by a nullary
-/// concrete core signature. It has no receiver, parameters or mutated input.
-/// It does not change declaration semantics or evaluate a body at installation
-/// or export. FUNCTION stays callable even when its core signature is nullary.
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct PythonCallable {
-    #[prost(enumeration = "PythonCallKind", tag = "1")]
-    pub kind: i32,
-    #[prost(string, repeated, tag = "2")]
-    pub path: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
-    #[prost(message, optional, tag = "3")]
-    pub owner: ::core::option::Option<BindingOwner>,
-    /// fixed view input, not implicit Python self/cls
-    #[prost(uint32, optional, tag = "4")]
-    pub receiver: ::core::option::Option<u32>,
-    /// surface order, excluding receiver
-    #[prost(message, repeated, tag = "5")]
-    pub params: ::prost::alloc::vec::Vec<PythonParameter>,
-    /// Replace this supplied argument wrapper with the Call result and return
-    /// Python None. Applies to free functions as well as methods. The fixed input
-    /// and core result sorts must agree; this does not change the core result to
-    /// Unit or assert a database effect. Initializers cannot use this convention.
-    #[prost(uint32, optional, tag = "6")]
-    pub mutates: ::core::option::Option<u32>,
-    /// Optional fixed-tail view; see CallableBindings. Supported for FUNCTION and
-    /// METHOD only. In particular, zero repetitions do not create a CONSTANT view.
-    #[prost(uint32, optional, tag = "7")]
-    pub tail_repetitions: ::core::option::Option<u32>,
-}
-/// Ordered surface parameter. Without tail_repetitions, fixed core inputs
-/// occupy [0, n). A nonempty varargs pattern has one logical tail slot n for the
-/// whole flat tail, not one slot per pattern position. It must be last in surface
-/// order and have no default. A METHOD receiver at slot n may consume the first
-/// operand of a homogeneous (width-one) tail; the remaining tail occupies slot
-/// n+1. This view requires at least one actual tail operand, leaves the core
-/// signature unchanged, and is unavailable for a zero-tail call. Grouped tails,
-/// properties, and FunctionApplication cannot use this convention.
-/// FunctionApplication has
-/// fixed slot 0 plus tail slot 1, whose heterogeneous sorts come from the actual FuncSort.
-/// With tail_repetitions present, every slot is fixed, including expanded tail
-/// operands; those operands have no default. See CallableBindings for their sorts.
-/// No redundant varargs flag or generic expression template is introduced.
-#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct PythonParameter {
-    #[prost(uint32, optional, tag = "1")]
-    pub core_input: ::core::option::Option<u32>,
-    #[prost(string, tag = "2")]
-    pub name: ::prost::alloc::string::String,
-    /// Typed symbolic syntax, not an evaluated/captured value. It must have no
-    /// free/query variables; lambda-local bound variables are allowed. Calls are
-    /// allowed and installation/export never evaluates them. Node sorts remain
-    /// concrete; a default can constrain a generic call's substitution at use.
-    /// Check each use under its binder: sharing a node with a lambda body does
-    /// not bind that node in a capture or another default root.
-    /// Expand omitted defaults together into the emitted call with fresh Union
-    /// identities, preserving sharing within that expansion; no cross-call cache
-    /// of classes/values. Check ordinary binding, typing and effect rules at use.
-    ///
-    /// index into Program.nodes
-    #[prost(uint32, optional, tag = "3")]
-    pub default_expr: ::core::option::Option<u32>,
-}
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct RustBindings {
-    #[prost(message, repeated, tag = "1")]
-    pub views: ::prost::alloc::vec::Vec<RustCallable>,
-}
-/// No owner means free function (qualified path); otherwise path is one member
-/// name. Owner without receiver is associated; with receiver it is a method.
-/// trait_impl selects a trait implementation, which may have either form.
-/// Associated-function output need not equal owner. Receiver's core sort matches
-/// owner; borrowing only affects wrapper ownership, not that semantic sort.
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct RustCallable {
-    #[prost(string, repeated, tag = "1")]
-    pub path: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
-    #[prost(message, optional, tag = "2")]
-    pub owner: ::core::option::Option<BindingOwner>,
-    /// impl Trait for &Owner, independent of receiver syntax
-    #[prost(bool, tag = "3")]
-    pub borrowed_self: bool,
-    #[prost(message, optional, tag = "4")]
-    pub receiver: ::core::option::Option<RustReceiver>,
-    /// surface order, excluding receiver
-    #[prost(message, repeated, tag = "5")]
-    pub params: ::prost::alloc::vec::Vec<RustParameter>,
-    #[prost(message, optional, tag = "6")]
-    pub trait_impl: ::core::option::Option<RustTrait>,
-    /// Optional fixed-tail view; see CallableBindings. Borrowing is unchanged.
-    #[prost(uint32, optional, tag = "7")]
-    pub tail_repetitions: ::core::option::Option<u32>,
-}
-/// Receiver ownership relative to impl Self: self or &self. For an impl on
-/// &Owner, by-value self is already &Owner, while &self is &&Owner.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct RustReceiver {
-    #[prost(uint32, optional, tag = "1")]
-    pub core_input: ::core::option::Option<u32>,
-    #[prost(bool, tag = "2")]
-    pub borrowed: bool,
-}
-/// Same fixed/tail input-slot convention as PythonParameter. Borrowing describes
-/// a fixed wrapper or the tail's elements, not a new core reference sort.
-/// Into/iterator conveniences remain generator policy; no host converter body.
-#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct RustParameter {
-    #[prost(uint32, optional, tag = "1")]
-    pub core_input: ::core::option::Option<u32>,
-    #[prost(string, tag = "2")]
-    pub name: ::prost::alloc::string::String,
-    #[prost(bool, tag = "3")]
-    pub borrowed: bool,
-}
-/// Named trait, explicit type arguments, and an optional associated output such
-/// as std::ops::Add<Rhs>::Output. That associated type is the core result wrapper.
-/// Types reuse the callable's signature binder, including mixed/concrete owner
-/// applications. Trait conformance/coherence is checked during Rust generation.
-/// Arbitrary associated types, lifetimes, const generics, mutable borrowing and
-/// where-clause/code payloads are not represented by this limited view.
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct RustTrait {
-    #[prost(string, repeated, tag = "1")]
-    pub path: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
-    #[prost(message, repeated, tag = "2")]
-    pub args: ::prost::alloc::vec::Vec<RustType>,
-    #[prost(string, optional, tag = "3")]
-    pub output_associated_type: ::core::option::Option<::prost::alloc::string::String>,
-}
-#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct RustType {
-    /// index into Program.sorts
-    #[prost(uint32, optional, tag = "1")]
-    pub sort: ::core::option::Option<u32>,
-    #[prost(bool, tag = "2")]
-    pub borrowed: bool,
-}
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct EgglogBindings {
-    #[prost(message, repeated, tag = "1")]
-    pub views: ::prost::alloc::vec::Vec<EgglogCallable>,
-}
-/// Surface symbol in core argument order. datatype_member is valid only for a
-/// Constructor: group it under its existing equality output sort's presentation.
-/// It does not add a datatype definition or select a text-overload policy.
-#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct EgglogCallable {
-    #[prost(string, tag = "1")]
-    pub symbol: ::prost::alloc::string::String,
-    #[prost(bool, tag = "2")]
-    pub datatype_member: bool,
 }
 // ---------------------------------------------------------------------------
 // RULE DEFINITIONS — immutable content, registered by ordered commands.
@@ -1252,7 +985,7 @@ pub struct BiRewrite {
 // ---------------------------------------------------------------------------
 
 /// One command, at top level or in a loop body: every command may appear in
-/// `Repeat` or `Saturate`. Declarations are not commands.
+/// `Loop`. Declarations are not commands.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct Command {
     /// Origin. Locates a failure attributed to a command rather than an
@@ -1260,7 +993,7 @@ pub struct Command {
     /// Surfaces as `Error.span`.
     #[prost(message, optional, tag = "13")]
     pub span: ::core::option::Option<Span>,
-    #[prost(oneof = "command::Kind", tags = "1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 14, 15, 16, 17, 18, 19")]
+    #[prost(oneof = "command::Kind", tags = "1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 14, 15, 16, 17, 18, 19")]
     pub kind: ::core::option::Option<command::Kind>,
 }
 /// Nested message and enum types in `Command`.
@@ -1288,18 +1021,16 @@ pub mod command {
         #[prost(message, tag = "10")]
         PrintTableStats(super::PrintTableStats),
         #[prost(message, tag = "11")]
-        Repeat(super::Repeat),
-        #[prost(message, tag = "12")]
-        Saturate(super::Saturate),
+        Loop(super::Loop),
         #[prost(message, tag = "14")]
         Prove(super::Prove),
         #[prost(message, tag = "15")]
         ProveExists(super::ProveExists),
         /// Expect the supported child's execution to fail. Evaluating an action's
         /// arguments belongs to that action, not to a prerequisite outside the
-        /// catch. Failure succeeds; success raises EVALUATION_FAILED. Suppress the
-        /// child's requested outputs on either outcome, retaining completed effects
-        /// and earlier outputs. Preparation/typechecking errors and unsupported
+        /// catch. Failure succeeds; success raises RUNTIME_FAILURE. Produce no
+        /// requested outputs anywhere inside the child scope, on either outcome;
+        /// retain completed effects and outputs preceding that scope. Preparation/typechecking errors and unsupported
         /// forms are not caught. Internal maintenance/invariant checks retain their
         /// native boundaries.
         /// This is not rollback and does not catch process panics. Nested wrappers
@@ -1475,17 +1206,12 @@ pub struct Extract {
 /// Include every installed declaration and sort, even unused or empty tables;
 /// every registered rule content once and group membership in first-registration
 /// order. Reconstruct membership with AddRules commands referencing Program.rules;
-/// omit never-registered rule values. Host builtin declaration descriptors,
-/// including generic families and distinct core callables, remain included.
+/// omit never-registered rule values. Backend builtin descriptors remain in
+/// GetBuiltins and are never included in the reconstruction Program.
 /// Include saved code and its dependencies without executing it.
-/// Include supplied language bindings and all bindings-only sort/default-node
-/// dependencies, remapping their arena references. Do not export derived wrapper
-/// defaults as if they were supplied bindings. Preserve default-root Union
-/// sharing without evaluating templates or confusing them with stored classes.
 /// Host implementations/codecs remain external.
-/// HostSortFamily and HostPrimitive describe the catalog, including generic
-/// signatures, presentation patterns and all referenced sorts. These graphs may
-/// contain Sort.var; the reconstruction data and concrete definitions may not.
+/// Reconstruction sorts are concrete. Generic signature patterns remain solely
+/// in GetBuiltins; neither builtin declarations nor their pattern arenas are copied.
 ///
 /// Return EGraphSnapshot with the handle's logical options and this Program.
 /// Do not export resource settings such as threads. See EGraphSnapshot for
@@ -1515,7 +1241,7 @@ pub struct Extract {
 /// these actions or materializes custom values. Executing them is explicit
 /// trusted materialization and requires the appropriate host codecs.
 /// If any required state/definition/value cannot be represented,
-/// Freeze fails with EVALUATION_FAILED instead of returning a partial export.
+/// Freeze fails with RUNTIME_FAILURE instead of returning a partial export.
 /// Export completeness, canonical keys and reference preservation are normative
 /// obligations, not established by Program's local CEL checks.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
@@ -1552,41 +1278,17 @@ pub struct PrintTableStats {
     #[prost(string, repeated, tag = "1")]
     pub tables: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
 }
-/// Execute `body` exactly `times` times, unless `until` matches or execution
-/// fails. Does not stop early when the database is unchanged. A completed
-/// top-level Repeat returns RunResult.
+/// Execute the body in order until its complete iteration reports can_stop,
+/// the optional cap is reached, until matches, or execution fails. Run itself
+/// remains one round. A completed top-level Loop returns RunResult.
 #[derive(Clone, PartialEq, ::prost::Message)]
-pub struct Repeat {
+pub struct Loop {
     #[prost(message, repeated, tag = "1")]
     pub body: ::prost::alloc::vec::Vec<Command>,
     /// Conjunctive pre-check before each iteration. Empty means no condition.
-    ///
-    /// index into the enclosing `nodes`
     #[prost(uint32, repeated, tag = "2")]
     pub until: ::prost::alloc::vec::Vec<u32>,
-    /// Required; an explicit zero performs no iterations.
-    #[prost(uint64, optional, tag = "3")]
-    pub times: ::core::option::Option<u64>,
-}
-/// Repeat `body` until a complete iteration can stop, or a bound or `until`
-/// condition ends it. Stop only when the iteration made no changes and every
-/// consulted scheduler permits stopping. An unbounded body may diverge.
-/// A completed top-level Saturate returns RunResult.
-///
-/// Progress is recomputed each iteration over every mutation in the body:
-/// actions, `keep_best`, extraction-root evaluation, and nested loops. Row
-/// counts alone do not detect changes. A nested loop contributes its whole run
-/// to the parent iteration, not only its final no-op step.
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct Saturate {
-    #[prost(message, repeated, tag = "1")]
-    pub body: ::prost::alloc::vec::Vec<Command>,
-    /// Conjunctive pre-check, as on `Repeat`.
-    ///
-    /// index into the enclosing `nodes`
-    #[prost(uint32, repeated, tag = "2")]
-    pub until: ::prost::alloc::vec::Vec<u32>,
-    /// Absent means unbounded; reaching a bound is not proof of saturation.
+    /// Absent is unbounded; zero executes no body or until check.
     #[prost(uint64, optional, tag = "3")]
     pub max_iterations: ::core::option::Option<u64>,
 }
@@ -1596,6 +1298,10 @@ pub struct Saturate {
 pub struct Explain {
     #[prost(string, repeated, tag = "1")]
     pub groups: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+}
+/// Inspect the configured backend; no EGraph handle or graph state is involved.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct GetBuiltinsRequest {
 }
 /// Immutable logical settings, shared by creation and snapshots. cost_sort
 /// indexes CreateEGraphRequest.sorts or EGraphSnapshot.program.sorts respectively.
@@ -1622,8 +1328,8 @@ pub struct EGraphOptions {
 /// declarations against ambient host definitions, then validate options and this
 /// acyclic, recursively closed sort arena before allocating a handle. Equality
 /// declarations allow custom C without an already-existing handle. Compatible
-/// repeated definitions are allowed; conflicting arity/bindings within a
-/// namespace are errors. EqSort and HostSortFamily may have the same name.
+/// repeated definitions are allowed; conflicting definitions are errors.
+/// Equality sorts and primitive sorts may have the same name.
 /// Successful creation retains these sort declarations on the new handle, so
 /// later Programs may reference their names without resending definitions.
 /// Unsupported options/resources are lifecycle errors, not RunProgram.error.
@@ -1663,13 +1369,13 @@ pub struct CreateEGraphResponse {
     pub threads: u64,
 }
 /// Portable logical state, not an execution checkpoint. The Program owns all
-/// arenas/files, including the C selected by options. Only C's reachable sort
-/// graph must be closed; unrelated generic signature patterns may remain.
+/// arenas/files, including the C selected by options. Every sort is concrete;
+/// builtin signature patterns remain in GetBuiltins.
 /// Restore by remapping C's closed sort graph and needed sort declarations into
 /// a CreateEGraphRequest, selecting receiver resource settings, then executing
 /// program normally on the fresh compatible handle. No creation-time commands
 /// or resumed scheduler/delta state are implied. Options preserve global
-/// seminaive admission, not query plans or runtime resource/planner settings.
+/// seminaive admission explicitly, not query plans or runtime resource/planner settings.
 /// Executing program against
 /// an existing handle still has ordinary Program semantics; callers must check
 /// option compatibility for any restoration equivalence claim.
@@ -1702,26 +1408,6 @@ pub struct DestroyEGraphRequest {
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct DestroyEGraphResponse {
 }
-/// Return an active direct clone to its saved scope. The saved handle survives;
-/// the active handle is consumed. Retain the active cumulative native report,
-/// complete symbol generator and monotonic namespace stamp, but restore all
-/// other saved logical/resource state. Do not sum the saved report prefix twice.
-///
-/// Both handles must be live, distinct and directly paired by Clone. Reject if
-/// the saved handle has accepted a Program since that Clone; rejected requests
-/// do not invalidate pairing. Validate
-/// before mutation. Ordinary Clone/Destroy retain independent copy/discard
-/// semantics. Invalid pairing is a lifecycle error, not RunProgram.error.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct ReturnToEGraphRequest {
-    #[prost(uint64, tag = "1")]
-    pub active_id: u64,
-    #[prost(uint64, tag = "2")]
-    pub saved_id: u64,
-}
-#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct ReturnToEGraphResponse {
-}
 /// Retrieve one accumulated input Program for this live graph. Recording is
 /// selected at creation and off by default; disabled or unknown handles error.
 /// Retain original decoded authored Programs only after successful preparation,
@@ -1732,7 +1418,7 @@ pub struct ReturnToEGraphResponse {
 /// locations. Declarations are cumulative, so earlier Freeze observations may
 /// contain extra definition metadata. This is not exact replay after failure.
 /// GetHistory itself contributes no input. Clone retains its own shared past;
-/// ReturnTo restores the saved history prefix and discards the consumed branch.
+/// destroying a branch discards its inputs while a saved clone retains its prefix.
 /// Destroy releases its graph's history. Host implementations remain external.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct GetHistoryRequest {
@@ -1759,33 +1445,39 @@ pub struct RunProgramRequest {
 /// command boundaries and does not roll back.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct RunProgramResponse {
+    /// Origins for this frame's payload, including definitions installed earlier.
+    /// Nested exported Programs own their files independently.
+    #[prost(message, repeated, tag = "3")]
+    pub files: ::prost::alloc::vec::Vec<SourceFile>,
+    #[prost(oneof = "run_program_response::Result", tags = "1, 2")]
+    pub result: ::core::option::Option<run_program_response::Result>,
+}
+/// Nested message and enum types in `RunProgramResponse`.
+pub mod run_program_response {
+    #[derive(Clone, PartialEq, ::prost::Oneof)]
+    pub enum Result {
+        #[prost(message, tag = "1")]
+        Output(super::RunProgramOutput),
+        #[prost(message, tag = "2")]
+        Error(super::Error),
+    }
+}
+/// One completed observation batch with self-contained node and sort arenas.
+/// Spans index the enclosing RunProgramResponse.files. Earlier success frames
+/// remain valid when a later terminal frame reports an error.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct RunProgramOutput {
     #[prost(message, repeated, tag = "1")]
     pub nodes: ::prost::alloc::vec::Vec<Node>,
     #[prost(message, repeated, tag = "2")]
     pub sorts: ::prost::alloc::vec::Vec<Sort>,
-    /// Completion order. Completed top-level Run/Repeat/Saturate commands return
-    /// RunResult; observations are emitted at every depth, including during loops.
-    /// Native maintenance contributes no requested output.
+    /// Completion order. Only completed top-level controls return RunResult;
+    /// observations are delivered at every depth, including during loops.
     #[prost(message, repeated, tag = "3")]
     pub outputs: ::prost::alloc::vec::Vec<CommandOutput>,
-    /// Origins for this response's nodes, sorts, rules and errors, including
-    /// installed definitions from earlier requests. Exported Programs own files.
-    #[prost(message, repeated, tag = "4")]
-    pub files: ::prost::alloc::vec::Vec<SourceFile>,
-    /// Absent on success. Present means execution stopped; `outputs` contains
-    /// completed outputs, and every entry is valid. A failed loop has
-    /// no outcome, but observations completed within it remain here. A requested
-    /// native result completed before a trailing maintenance failure remains here.
-    #[prost(message, optional, tag = "5")]
-    pub error: ::core::option::Option<Error>,
-    /// Canonical registered rule content referenced by errors.
-    /// Rule node/sort/span references use this response's arenas. Equivalent
-    /// content has one catalog entry; first-registration diagnostics represent it.
-    #[prost(message, repeated, tag = "6")]
-    pub rules: ::prost::alloc::vec::Vec<Rule>,
 }
 /// One dynamic command execution in the submitted Program. path\[0\] indexes
-/// Program.commands; each later component indexes the previous Repeat/Saturate
+/// Program.commands; each later component indexes the previous Loop
 /// command's body, resolving through any Fail wrappers at that position.
 /// Wrappers add no path component or iteration coordinate. A list-site failure
 /// locates the outer wrapper, with the most specific source span in Error.span.
@@ -1826,36 +1518,13 @@ pub struct Error {
     /// runtime helper failure during definition installation.
     #[prost(message, optional, tag = "4")]
     pub location: ::core::option::Option<CommandLocation>,
-    /// Supplied structurally for an attributed rule/rewrite failure, never parsed
-    /// from message text. Presence is independent of diagnostic collection.
-    ///
-    /// index into RunProgramResponse.rules
-    #[prost(uint32, optional, tag = "5")]
-    pub rule: ::core::option::Option<u32>,
-    /// Engine-internal origin as `file:line:col`; empty when there is none.
-    /// Diagnostic only, and not a `Span`: `Span.file` indexes USER source.
-    #[prost(string, tag = "6")]
-    pub engine_origin: ::prost::alloc::string::String,
-    /// Native runtime proof failure, supplied structurally, never parsed from text.
-    /// Earlier parsing/typechecking failures retain their ordinary error class.
-    #[prost(message, optional, tag = "7")]
-    pub proof_failure: ::core::option::Option<ProofFailure>,
-}
-/// Causes from the current engine's ProveExistsError, not proof-checker verdicts.
-#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct ProofFailure {
-    #[prost(enumeration = "ProofFailureReason", tag = "1")]
-    pub reason: i32,
-    /// Present when supplied by the native failure, such as a missing witness.
-    #[prost(string, optional, tag = "2")]
-    pub constructor: ::core::option::Option<::prost::alloc::string::String>,
 }
 // ---------------------------------------------------------------------------
 // COMMAND OUTPUTS — the `CommandOutput.kind` arms, in arm order.
 // ---------------------------------------------------------------------------
 
 /// Observations match the located command, including inside loops. Only completed
-/// top-level Run/Repeat/Saturate commands emit RunResult. Fail suppresses every
+/// top-level Run/Loop commands emit RunResult. Fail suppresses every
 /// requested output from its child. Errors appear in the final chunk; completed
 /// prefixes remain observable.
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -1892,8 +1561,8 @@ pub mod command_output {
 pub struct Diagnostic {
     #[prost(string, tag = "1")]
     pub format: ::prost::alloc::string::String,
-    #[prost(string, tag = "2")]
-    pub content: ::prost::alloc::string::String,
+    #[prost(bytes = "vec", tag = "2")]
+    pub content: ::prost::alloc::vec::Vec<u8>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ProofResult {
@@ -2025,7 +1694,7 @@ pub struct ProofCongr {
     #[prost(uint32, optional, tag = "3")]
     pub child_proof: ::core::option::Option<u32>,
 }
-/// One completed top-level Run/Repeat/Saturate, independent of diagnostics.
+/// One completed top-level Run/Loop, independent of diagnostics.
 /// Preserve native updated/can_stop, including conservative compound aggregation
 /// and helper work; do not recompute stopping from diagnostic history.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
@@ -2192,50 +1861,6 @@ pub struct OutDegreeStats {
     #[prost(double, tag = "6")]
     pub p75: f64,
 }
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
-#[repr(i32)]
-pub enum PythonCallKind {
-    Unspecified = 0,
-    Function = 1,
-    Initializer = 2,
-    Method = 3,
-    ClassMethod = 4,
-    Property = 5,
-    ClassVariable = 6,
-    Constant = 7,
-}
-impl PythonCallKind {
-    /// String value of the enum field names used in the ProtoBuf definition.
-    ///
-    /// The values are not transformed in any way and thus are considered stable
-    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
-    pub fn as_str_name(&self) -> &'static str {
-        match self {
-            Self::Unspecified => "PYTHON_CALL_KIND_UNSPECIFIED",
-            Self::Function => "PYTHON_CALL_KIND_FUNCTION",
-            Self::Initializer => "PYTHON_CALL_KIND_INITIALIZER",
-            Self::Method => "PYTHON_CALL_KIND_METHOD",
-            Self::ClassMethod => "PYTHON_CALL_KIND_CLASS_METHOD",
-            Self::Property => "PYTHON_CALL_KIND_PROPERTY",
-            Self::ClassVariable => "PYTHON_CALL_KIND_CLASS_VARIABLE",
-            Self::Constant => "PYTHON_CALL_KIND_CONSTANT",
-        }
-    }
-    /// Creates an enum from field names used in the ProtoBuf definition.
-    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
-        match value {
-            "PYTHON_CALL_KIND_UNSPECIFIED" => Some(Self::Unspecified),
-            "PYTHON_CALL_KIND_FUNCTION" => Some(Self::Function),
-            "PYTHON_CALL_KIND_INITIALIZER" => Some(Self::Initializer),
-            "PYTHON_CALL_KIND_METHOD" => Some(Self::Method),
-            "PYTHON_CALL_KIND_CLASS_METHOD" => Some(Self::ClassMethod),
-            "PYTHON_CALL_KIND_PROPERTY" => Some(Self::Property),
-            "PYTHON_CALL_KIND_CLASS_VARIABLE" => Some(Self::ClassVariable),
-            "PYTHON_CALL_KIND_CONSTANT" => Some(Self::Constant),
-            _ => None,
-        }
-    }
-}
 /// Rule evaluation strategies; UNSPECIFIED is invalid.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]
@@ -2343,31 +1968,16 @@ impl ExecutionMode {
         }
     }
 }
-/// Failure classes: one value per class of remedy, not one per engine error.
+/// Failure classes distinguish malformed inputs, failed assertions and execution.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]
 pub enum ErrorCode {
     Unspecified = 0,
-    /// Malformed or ill-typed program; nothing ran.
+    /// Malformed or ill-typed program. Requested Check planning can fail here
+    /// during execution, after completed prefix effects.
     InvalidProgram = 1,
-    /// A `check` did not hold.
     CheckFailed = 2,
-    /// An authored `panic` action fired.
-    Panic = 3,
-    /// A primitive or merge failed at run time, including unresolvable merges,
-    /// a directly evaluated get_cost has no assigned annotation, or Freeze cannot
-    /// encode a required value with a supported codec. Also includes an unmet
-    /// expected-failure assertion: Fail's child succeeded.
-    EvaluationFailed = 4,
-    /// The requested extractor/cost-model pair is incompatible, or an operation
-    /// requiring a finite representative (KeepBest or PrintFunction) cannot
-    /// obtain one.
-    /// Extract instead returns empty variants when a root has no finite term.
-    ExtractionFailed = 5,
-    /// A named scheduler, table or cost model does not exist.
-    UnknownName = 6,
-    /// A proof request failed; proof_failure distinguishes its native cause.
-    ProofFailed = 7,
+    RuntimeFailure = 3,
 }
 impl ErrorCode {
     /// String value of the enum field names used in the ProtoBuf definition.
@@ -2379,11 +1989,7 @@ impl ErrorCode {
             Self::Unspecified => "ERROR_CODE_UNSPECIFIED",
             Self::InvalidProgram => "ERROR_CODE_INVALID_PROGRAM",
             Self::CheckFailed => "ERROR_CODE_CHECK_FAILED",
-            Self::Panic => "ERROR_CODE_PANIC",
-            Self::EvaluationFailed => "ERROR_CODE_EVALUATION_FAILED",
-            Self::ExtractionFailed => "ERROR_CODE_EXTRACTION_FAILED",
-            Self::UnknownName => "ERROR_CODE_UNKNOWN_NAME",
-            Self::ProofFailed => "ERROR_CODE_PROOF_FAILED",
+            Self::RuntimeFailure => "ERROR_CODE_RUNTIME_FAILURE",
         }
     }
     /// Creates an enum from field names used in the ProtoBuf definition.
@@ -2392,46 +1998,7 @@ impl ErrorCode {
             "ERROR_CODE_UNSPECIFIED" => Some(Self::Unspecified),
             "ERROR_CODE_INVALID_PROGRAM" => Some(Self::InvalidProgram),
             "ERROR_CODE_CHECK_FAILED" => Some(Self::CheckFailed),
-            "ERROR_CODE_PANIC" => Some(Self::Panic),
-            "ERROR_CODE_EVALUATION_FAILED" => Some(Self::EvaluationFailed),
-            "ERROR_CODE_EXTRACTION_FAILED" => Some(Self::ExtractionFailed),
-            "ERROR_CODE_UNKNOWN_NAME" => Some(Self::UnknownName),
-            "ERROR_CODE_PROOF_FAILED" => Some(Self::ProofFailed),
-            _ => None,
-        }
-    }
-}
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
-#[repr(i32)]
-pub enum ProofFailureReason {
-    Unspecified = 0,
-    RequiresConstructor = 1,
-    PrimitivesUnsupported = 2,
-    QueryDidNotMatch = 3,
-    ProofsNotEnabled = 4,
-}
-impl ProofFailureReason {
-    /// String value of the enum field names used in the ProtoBuf definition.
-    ///
-    /// The values are not transformed in any way and thus are considered stable
-    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
-    pub fn as_str_name(&self) -> &'static str {
-        match self {
-            Self::Unspecified => "PROOF_FAILURE_REASON_UNSPECIFIED",
-            Self::RequiresConstructor => "PROOF_FAILURE_REASON_REQUIRES_CONSTRUCTOR",
-            Self::PrimitivesUnsupported => "PROOF_FAILURE_REASON_PRIMITIVES_UNSUPPORTED",
-            Self::QueryDidNotMatch => "PROOF_FAILURE_REASON_QUERY_DID_NOT_MATCH",
-            Self::ProofsNotEnabled => "PROOF_FAILURE_REASON_PROOFS_NOT_ENABLED",
-        }
-    }
-    /// Creates an enum from field names used in the ProtoBuf definition.
-    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
-        match value {
-            "PROOF_FAILURE_REASON_UNSPECIFIED" => Some(Self::Unspecified),
-            "PROOF_FAILURE_REASON_REQUIRES_CONSTRUCTOR" => Some(Self::RequiresConstructor),
-            "PROOF_FAILURE_REASON_PRIMITIVES_UNSUPPORTED" => Some(Self::PrimitivesUnsupported),
-            "PROOF_FAILURE_REASON_QUERY_DID_NOT_MATCH" => Some(Self::QueryDidNotMatch),
-            "PROOF_FAILURE_REASON_PROOFS_NOT_ENABLED" => Some(Self::ProofsNotEnabled),
+            "ERROR_CODE_RUNTIME_FAILURE" => Some(Self::RuntimeFailure),
             _ => None,
         }
     }

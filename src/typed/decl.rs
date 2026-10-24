@@ -47,14 +47,7 @@ impl SortRef {
     // Instantiate the actual catalog family, retaining only its record and
     // ordered parameter locations. No frontend family/signature table exists.
     pub(super) fn family(family: &Record, parameters: Vec<Self>) -> Result<Self, TypedError> {
-        let owner = family.owner.as_ref().unwrap();
-        let Some(pb::declaration::Kind::HostSortFamily(definition)) =
-            &owner.program.declarations[family.index as usize].kind
-        else {
-            return Err(TypedError::Invalid(
-                "expected a host family definition".into(),
-            ));
-        };
+        let definition = family.primitive_sort()?;
         if parameters.len() != definition.arity as usize {
             return Err(TypedError::Invalid("family parameter arity".into()));
         }
@@ -70,7 +63,7 @@ impl SortRef {
         Ok(Self(publish(
             pb::Program {
                 sorts: vec![pb::Sort {
-                    kind: Some(pb::sort::Kind::Family(pb::HostSort {
+                    kind: Some(pb::sort::Kind::Application(pb::SortApplication {
                         name: definition.name.clone(),
                         args,
                     })),
@@ -102,18 +95,12 @@ impl SortRef {
             }
             colors.insert(key, 1);
             pending.push((record.clone(), true));
-            match &owner.program.sorts[record.index as usize].kind {
+            match &record.sort().unwrap().kind {
                 Some(pb::sort::Kind::Eq(_)) => {}
-                Some(pb::sort::Kind::Family(f)) => {
+                Some(pb::sort::Kind::Application(f)) => {
                     let declaration =
-                        record.declaration(&f.name, DeclarationKind::HostSortFamily)?;
-                    let Some(pb::declaration::Kind::HostSortFamily(d)) =
-                        &declaration.owner.as_ref().unwrap().program.declarations
-                            [declaration.index as usize]
-                            .kind
-                    else {
-                        return Err(TypedError::Invalid("invalid family declaration".into()));
-                    };
+                        record.declaration(&f.name, DeclarationKind::PrimitiveSort)?;
+                    let d = declaration.primitive_sort()?;
                     if d.arity as usize != f.args.len() {
                         return Err(TypedError::Invalid("family sort arity".into()));
                     }
@@ -152,10 +139,7 @@ impl SortRef {
             if !seen.insert((p.id, pattern.index, a.id, actual.index)) {
                 continue;
             }
-            match (
-                &p.program.sorts[pattern.index as usize].kind,
-                &a.program.sorts[actual.index as usize].kind,
-            ) {
+            match (&pattern.sort().unwrap().kind, &actual.sort().unwrap().kind) {
                 (Some(pb::sort::Kind::Var(index)), _) => {
                     let slot = bindings
                         .get_mut(*index as usize)
@@ -169,7 +153,7 @@ impl SortRef {
                     *slot = Some(actual);
                 }
                 (Some(pb::sort::Kind::Eq(p)), Some(pb::sort::Kind::Eq(a))) if p == a => {}
-                (Some(pb::sort::Kind::Family(p)), Some(pb::sort::Kind::Family(a)))
+                (Some(pb::sort::Kind::Application(p)), Some(pb::sort::Kind::Application(a)))
                     if p.name == a.name && p.args.len() == a.args.len() =>
                 {
                     for (p, a) in p.args.iter().zip(&a.args) {
@@ -240,13 +224,10 @@ impl PartialEq for SortRef {
             if !seen.insert((oa.id, a.index, ob.id, b.index)) {
                 continue;
             }
-            match (
-                &oa.program.sorts[a.index as usize].kind,
-                &ob.program.sorts[b.index as usize].kind,
-            ) {
+            match (&a.sort().unwrap().kind, &b.sort().unwrap().kind) {
                 (Some(pb::sort::Kind::Eq(a)), Some(pb::sort::Kind::Eq(b))) if a == b => {}
                 (Some(pb::sort::Kind::Var(a)), Some(pb::sort::Kind::Var(b))) if a == b => {}
-                (Some(pb::sort::Kind::Family(fa)), Some(pb::sort::Kind::Family(fb)))
+                (Some(pb::sort::Kind::Application(fa)), Some(pb::sort::Kind::Application(fb)))
                     if fa.name == fb.name && fa.args.len() == fb.args.len() =>
                 {
                     for (ia, ib) in fa.args.iter().zip(&fb.args) {
@@ -290,14 +271,11 @@ impl Hash for SortRef {
             if hashes.contains_key(&key) {
                 continue;
             }
-            let kind = owner.program.sorts[record.index as usize]
-                .kind
-                .as_ref()
-                .unwrap();
+            let kind = record.sort().unwrap().kind.as_ref().unwrap();
             if !finish {
                 assert!(active.insert(key), "cyclic sort");
                 pending.push((record.clone(), true));
-                if let pb::sort::Kind::Family(f) = kind {
+                if let pb::sort::Kind::Application(f) = kind {
                     for child in f.args.iter().rev() {
                         pending.push((record.resolve(Arena::Sort, *child).unwrap(), false));
                     }
@@ -318,7 +296,7 @@ impl Hash for SortRef {
                     1u8.hash(&mut hash);
                     index.hash(&mut hash);
                 }
-                pb::sort::Kind::Family(f) => {
+                pb::sort::Kind::Application(f) => {
                     2u8.hash(&mut hash);
                     f.name.hash(&mut hash);
                     f.args.len().hash(&mut hash);
@@ -361,29 +339,22 @@ impl Callable {
             sort.validate_closed()?;
         }
         let owner = self.0.owner.as_ref().unwrap();
-        let (name, inputs, result, signature) = match &owner.program.declarations
-            [self.0.index as usize]
-            .kind
-        {
-            Some(pb::declaration::Kind::Constructor(c)) => (&c.name, &c.inputs, c.output, None),
-            Some(pb::declaration::Kind::Function(f)) => (&f.name, &f.inputs, f.output, None),
-            Some(pb::declaration::Kind::Primitive(p)) => (&p.name, &p.inputs, p.output, None),
-            Some(pb::declaration::Kind::HostPrimitive(p)) => match &p.typing {
-                Some(pb::host_primitive::Typing::Signature(s)) => (
+        let (name, inputs, result, signature) = if self.0.arena == Arena::Primitive {
+            let p = self.0.primitive()?;
+            match &p.typing {
+                Some(pb::primitive::Typing::Signature(s)) => (
                     &p.name,
                     &s.inputs,
                     s.output
                         .ok_or_else(|| TypedError::Invalid("missing result pattern".into()))?,
                     Some(s),
                 ),
-                Some(pb::host_primitive::Typing::Application(_)) => {
+                Some(pb::primitive::Typing::Application(_)) => {
                     let (function, arguments) = arguments.split_first().ok_or_else(|| {
                         TypedError::Invalid("application requires a function".into())
                     })?;
                     let record = &function.0;
-                    let Some(pb::sort::Kind::Func(signature)) =
-                        &record.owner.as_ref().unwrap().program.sorts[record.index as usize].kind
-                    else {
+                    let Some(pb::sort::Kind::Func(signature)) = &record.sort().unwrap().kind else {
                         return Err(TypedError::Invalid(
                             "application requires a function sort".into(),
                         ));
@@ -403,8 +374,16 @@ impl Callable {
                     return Ok(&p.name);
                 }
                 _ => return Err(TypedError::Invalid("unsupported callable typing".into())),
-            },
-            _ => return Err(TypedError::Invalid("expected a value callable".into())),
+            }
+        } else {
+            match &owner.program()?.declarations[self.0.index as usize].kind {
+                Some(pb::declaration::Kind::Constructor(c)) => (&c.name, &c.inputs, c.output, None),
+                Some(pb::declaration::Kind::Function(f)) => (&f.name, &f.inputs, f.output, None),
+                Some(pb::declaration::Kind::UserDefinedPrimitive(p)) => {
+                    (&p.name, &p.inputs, p.output, None)
+                }
+                _ => return Err(TypedError::Invalid("expected a value callable".into())),
+            }
         };
         let tail = signature.map_or(&[][..], |s| s.varargs.as_slice());
         let tail_len = arguments
@@ -434,10 +413,7 @@ impl Callable {
                 .and_then(Option::as_ref)
                 .ok_or_else(|| TypedError::Invalid("invalid equality type parameter".into()))?;
             let record = &sort.0;
-            if !matches!(
-                record.owner.as_ref().unwrap().program.sorts[record.index as usize].kind,
-                Some(pb::sort::Kind::Eq(_))
-            ) {
+            if !matches!(record.sort().unwrap().kind, Some(pb::sort::Kind::Eq(_))) {
                 return Err(TypedError::Invalid(
                     "type parameter requires an equality sort".into(),
                 ));
@@ -508,6 +484,7 @@ impl Callable {
                 .collect(),
             output: inputs.len() as u32,
             merge: merge.as_ref().map(|_| 2),
+            hidden: false,
         };
         let mut slots = std::array::from_fn(|_| vec![]);
         slots[Arena::Node as usize] = merge
@@ -563,6 +540,7 @@ impl Callable {
             output: inputs.len() as u32,
             cost: cost.as_ref().map(|_| 0),
             unextractable,
+            hidden: false,
         };
         let mut slots = std::array::from_fn(|_| vec![]);
         slots[Arena::Sort as usize] = inputs
@@ -586,33 +564,107 @@ impl Callable {
 }
 
 pub(super) fn same_callable(a: &Record, b: &Record) -> Result<bool, TypedError> {
-    let oa = a.owner.as_ref().unwrap();
-    let ob = b.owner.as_ref().unwrap();
-    if oa.id == ob.id && a.index == b.index {
+    if a.key() == b.key() {
         return Ok(true);
     }
-    let name_a = match &oa.program.declarations[a.index as usize].kind {
-        Some(pb::declaration::Kind::Constructor(c)) => &c.name,
-        Some(pb::declaration::Kind::Function(f)) => &f.name,
-        Some(pb::declaration::Kind::Relation(r)) => &r.name,
-        Some(pb::declaration::Kind::HostPrimitive(p)) => &p.name,
-        Some(pb::declaration::Kind::Primitive(p)) => &p.name,
-        _ => unreachable!(),
+    let name_a = if a.arena == Arena::Primitive {
+        &a.primitive()?.name
+    } else {
+        match &a.owner.as_ref().unwrap().program()?.declarations[a.index as usize].kind {
+            Some(pb::declaration::Kind::Constructor(c)) => &c.name,
+            Some(pb::declaration::Kind::Function(f)) => &f.name,
+            Some(pb::declaration::Kind::Relation(r)) => &r.name,
+            Some(pb::declaration::Kind::UserDefinedPrimitive(p)) => &p.name,
+            _ => return Err(TypedError::Invalid("expected a callable record".into())),
+        }
     };
-    let name_b = match &ob.program.declarations[b.index as usize].kind {
-        Some(pb::declaration::Kind::Constructor(c)) => &c.name,
-        Some(pb::declaration::Kind::Function(f)) => &f.name,
-        Some(pb::declaration::Kind::Relation(r)) => &r.name,
-        Some(pb::declaration::Kind::HostPrimitive(p)) => &p.name,
-        Some(pb::declaration::Kind::Primitive(p)) => &p.name,
-        _ => unreachable!(),
+    let name_b = if b.arena == Arena::Primitive {
+        &b.primitive()?.name
+    } else {
+        match &b.owner.as_ref().unwrap().program()?.declarations[b.index as usize].kind {
+            Some(pb::declaration::Kind::Constructor(c)) => &c.name,
+            Some(pb::declaration::Kind::Function(f)) => &f.name,
+            Some(pb::declaration::Kind::Relation(r)) => &r.name,
+            Some(pb::declaration::Kind::UserDefinedPrimitive(p)) => &p.name,
+            _ => return Err(TypedError::Invalid("expected a callable record".into())),
+        }
     };
     if name_a != name_b {
         return Ok(false);
+    }
+    if a.arena == Arena::Primitive || b.arena == Arena::Primitive {
+        return if same_builtin(a, b)? {
+            Ok(true)
+        } else {
+            Err(TypedError::Invalid(format!(
+                "conflicting declaration {name_a}"
+            )))
+        };
     }
     let mut packer = Packer::default();
     packer.intern(a.clone(), 0);
     packer.intern(b.clone(), 0);
     packer.finish()?;
     Ok(true)
+}
+
+pub(super) fn same_builtin(a: &Record, b: &Record) -> Result<bool, TypedError> {
+    if a.arena != b.arena {
+        return Ok(false);
+    }
+    if a.key() == b.key() {
+        return Ok(true);
+    }
+    if a.arena == Arena::PrimitiveSort {
+        let (a, b) = (a.primitive_sort()?, b.primitive_sort()?);
+        return Ok(a.name == b.name && a.arity == b.arity);
+    }
+    if a.arena != Arena::Primitive {
+        return Ok(false);
+    }
+    let (pa, pb) = (a.primitive()?, b.primitive()?);
+    if pa.name != pb.name {
+        return Ok(false);
+    }
+    match (&pa.typing, &pb.typing) {
+        (
+            Some(pb::primitive::Typing::Application(_)),
+            Some(pb::primitive::Typing::Application(_)),
+        ) => Ok(true),
+        (
+            Some(pb::primitive::Typing::Signature(sa)),
+            Some(pb::primitive::Typing::Signature(sb)),
+        ) => {
+            if sa.type_params.len() != sb.type_params.len()
+                || sa.equality_type_params != sb.equality_type_params
+                || sa.inputs.len() != sb.inputs.len()
+                || sa.varargs.len() != sb.varargs.len()
+            {
+                return Ok(false);
+            }
+            let (Some(oa), Some(ob)) = (sa.output, sb.output) else {
+                return Err(TypedError::Invalid("missing builtin result sort".into()));
+            };
+            for (ia, ib) in sa
+                .inputs
+                .iter()
+                .chain(&sa.varargs)
+                .map(|arg| arg.sort)
+                .chain([oa])
+                .zip(
+                    sb.inputs
+                        .iter()
+                        .chain(&sb.varargs)
+                        .map(|arg| arg.sort)
+                        .chain([ob]),
+                )
+            {
+                if SortRef(a.resolve(Arena::Sort, ia)?) != SortRef(b.resolve(Arena::Sort, ib)?) {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
+        }
+        _ => Ok(false),
+    }
 }

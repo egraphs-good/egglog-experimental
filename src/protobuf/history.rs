@@ -55,6 +55,21 @@ impl HistoryLog {
 }
 
 impl Engine {
+    /// Inspect the configured backend without allocating an e-graph handle.
+    pub fn get_builtins(&mut self, bytes: &[u8]) -> Result<Vec<u8>, TransportError> {
+        pb::GetBuiltinsRequest::decode(bytes)?;
+        if self.builtins.is_none() {
+            let mut graph = crate::new_experimental_egraph();
+            graph.set_report_level(egglog_reports::ReportLevel::Off);
+            if let Some(extension) = &self.extension {
+                extension.initialize(&mut graph).map_err(TransportError)?;
+            }
+            self.builtins =
+                Some(crate::builtin::configured_catalog(&graph).map_err(TransportError)?);
+        }
+        Ok(self.builtins.as_ref().unwrap().encode_to_vec())
+    }
+
     /// Create a graph. Recording is off unless explicitly requested.
     pub fn create(&mut self, bytes: &[u8]) -> Result<Vec<u8>, TransportError> {
         let request = pb::CreateEGraphRequest::decode(bytes)?;
@@ -81,18 +96,13 @@ impl Engine {
             .encode_to_vec())
     }
 
-    /// Restore the saved graph and input prefix; consume the active branch.
-    pub fn return_to(&mut self, bytes: &[u8]) -> Result<Vec<u8>, TransportError> {
-        Ok(self
-            .return_request(pb::ReturnToEGraphRequest::decode(bytes)?)?
-            .encode_to_vec())
-    }
-
     /// Execute typed inputs. Preparation rejection does not enter history.
-    pub fn run(&mut self, bytes: &[u8]) -> Result<Vec<u8>, TransportError> {
+    pub fn run(&mut self, bytes: &[u8]) -> Result<Vec<Vec<u8>>, TransportError> {
         Ok(self
             .run_request(pb::RunProgramRequest::decode(bytes)?)?
-            .encode_to_vec())
+            .into_iter()
+            .map(|frame| frame.encode_to_vec())
+            .collect())
     }
 
     /// Execute synchronously, delivering owned observations at safe command
@@ -125,6 +135,7 @@ impl Engine {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::protobuf::fixtures::Observed;
 
     fn recorded_engine() -> (Engine, u64) {
         let mut engine = Engine::default();
@@ -133,7 +144,7 @@ mod tests {
                 &pb::CreateEGraphRequest {
                     record_history: true,
                     sorts: vec![pb::Sort {
-                        kind: Some(pb::sort::Kind::Family(pb::HostSort {
+                        kind: Some(pb::sort::Kind::Application(pb::SortApplication {
                             name: "i64".into(),
                             args: vec![],
                         })),
@@ -204,9 +215,12 @@ mod tests {
                 )
                 .unwrap();
             assert_eq!(
-                pb::RunProgramResponse::decode(response.as_slice())
-                    .unwrap()
-                    .error,
+                Observed::from_frames(
+                    (response)
+                        .iter()
+                        .map(|bytes| pb::RunProgramResponse::decode(bytes.as_slice()).unwrap())
+                )
+                .error,
                 None
             );
         }
@@ -232,10 +246,13 @@ mod tests {
             )
             .unwrap();
         assert!(
-            pb::RunProgramResponse::decode(response.as_slice())
-                .unwrap()
-                .error
-                .is_some()
+            Observed::from_frames(
+                (response)
+                    .iter()
+                    .map(|bytes| pb::RunProgramResponse::decode(bytes.as_slice()).unwrap())
+            )
+            .error
+            .is_some()
         );
         assert!(Arc::ptr_eq(
             before.as_ref().unwrap(),
@@ -265,10 +282,13 @@ mod tests {
             )
             .unwrap();
         assert!(
-            pb::RunProgramResponse::decode(response.as_slice())
-                .unwrap()
-                .error
-                .is_some()
+            Observed::from_frames(
+                (response)
+                    .iter()
+                    .map(|bytes| pb::RunProgramResponse::decode(bytes.as_slice()).unwrap())
+            )
+            .error
+            .is_some()
         );
         let bytes = engine
             .get_history(&pb::GetHistoryRequest { egraph_id: id }.encode_to_vec())
@@ -299,7 +319,7 @@ mod tests {
     }
 
     #[test]
-    fn live_history_prefixes_share_and_release_with_clone_return_destroy_and_engine() {
+    fn live_history_prefixes_share_and_release_with_clone_destroy_and_engine() {
         let (mut engine, id) = recorded_engine();
         engine
             .run(
@@ -333,10 +353,7 @@ mod tests {
                 .unwrap();
             let branch = Arc::downgrade(engine.histories[&child].head.as_ref().unwrap());
             engine
-                .return_request(pb::ReturnToEGraphRequest {
-                    active_id: child,
-                    saved_id: id,
-                })
+                .destroy_request(pb::DestroyEGraphRequest { egraph_id: child })
                 .unwrap();
             assert!(branch.upgrade().is_none());
             assert_eq!(engine.histories.len(), 1);
@@ -349,14 +366,6 @@ mod tests {
                     .is_none()
             );
         }
-        assert!(
-            engine
-                .return_request(pb::ReturnToEGraphRequest {
-                    active_id: id,
-                    saved_id: id
-                })
-                .is_err()
-        );
         assert!(prefix.upgrade().is_some());
         let child = engine
             .clone_request(pb::CloneEGraphRequest { egraph_id: id })

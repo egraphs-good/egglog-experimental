@@ -1,4 +1,4 @@
-//! Typed composition of the protocol's existing Run, Repeat and Saturate forms.
+//! Typed composition of the protocol's Run and capped Loop forms.
 use super::{Ruleset, pb};
 use std::collections::HashSet;
 
@@ -18,7 +18,7 @@ impl From<&Ruleset> for Schedule {
             .filter_map(|record| {
                 let owner = record.owner.as_ref().unwrap();
                 let Some(pb::command::Kind::AddRules(add)) =
-                    &owner.program.commands[record.index as usize].kind
+                    &owner.program().unwrap().commands[record.index as usize].kind
                 else {
                     unreachable!("typed group addition")
                 };
@@ -64,13 +64,14 @@ impl Schedule {
         self
     }
 
-    /// Execute the body exactly this many times; zero still registers its rules.
-    pub fn repeat(self, times: u64) -> Self {
+    /// Execute at most this many iterations, stopping when the body can stop.
+    /// Zero still registers the schedule's rules.
+    pub fn repeat(self, max_iterations: u64) -> Self {
         Self {
             commands: vec![pb::Command {
-                kind: Some(pb::command::Kind::Repeat(pb::Repeat {
+                kind: Some(pb::command::Kind::Loop(pb::Loop {
                     body: self.commands,
-                    times: Some(times),
+                    max_iterations: Some(max_iterations),
                     ..Default::default()
                 })),
                 ..Default::default()
@@ -82,7 +83,7 @@ impl Schedule {
     pub fn saturate(self) -> Self {
         Self {
             commands: vec![pb::Command {
-                kind: Some(pb::command::Kind::Saturate(pb::Saturate {
+                kind: Some(pb::command::Kind::Loop(pb::Loop {
                     body: self.commands,
                     ..Default::default()
                 })),
@@ -95,8 +96,8 @@ impl Schedule {
 
 impl Ruleset {
     /// Repeat this group selection without resetting registered rule state.
-    pub fn repeat(&self, times: u64) -> Schedule {
-        Schedule::from(self).repeat(times)
+    pub fn repeat(&self, max_iterations: u64) -> Schedule {
+        Schedule::from(self).repeat(max_iterations)
     }
     /// Saturate this selection of groups.
     pub fn saturate(&self) -> Schedule {
@@ -107,7 +108,7 @@ impl Ruleset {
         for record in &self.0 {
             let owner = record.owner.as_ref().unwrap();
             if let Some(pb::command::Kind::AddRules(add)) =
-                &owner.program.commands[record.index as usize].kind
+                &owner.program().unwrap().commands[record.index as usize].kind
                 && !add.rules.is_empty()
             {
                 return false;

@@ -108,7 +108,7 @@ macro_rules! function_application {
             #[allow(non_snake_case, clippy::too_many_arguments, reason = "The declaration determines parameter names and arity.")]
             pub fn $method(&self, $($t: impl Into<$t>),*) -> R {
                 let mut record = crate::typed::storage::builtin_catalog().clone();
-                record.arena = crate::typed::storage::Arena::Declaration;
+                record.arena = crate::typed::storage::Arena::Primitive;
                 record.index = $index;
                 R::from_expression(crate::typed::expr::Expr::call_with_result(
                     &crate::typed::decl::Callable(record),

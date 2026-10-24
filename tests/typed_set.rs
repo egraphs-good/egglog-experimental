@@ -1,5 +1,6 @@
 #![cfg(feature = "typed")]
 
+use egglog_experimental::proto as pb;
 use egglog_experimental::typed::{
     builtins::{I64, Pair, Set, Unit, Vec as EVec},
     prelude::*,
@@ -52,13 +53,13 @@ fn generated_set_methods_execute_as_bytes_without_local_deduplication() -> Resul
     assert_eq!(i64::try_from(&graph.extract(indexed.get(0_i64))?)?, 1);
     assert_eq!(i64::try_from(&graph.extract(indexed.get(3_i64))?)?, -1);
     for index in [-1_i64, 2] {
-        let TypedError::Engine(error) = graph.extract(s.get(index)).unwrap_err() else {
+        let TypedError::Engine(frame) = graph.extract(s.get(index)).unwrap_err() else {
             panic!("expected native partial get failure")
         };
-        assert_eq!(
-            error.code,
-            egglog_experimental::proto::ErrorCode::EvaluationFailed as i32
-        );
+        let Some(pb::run_program_response::Result::Error(error)) = &frame.result else {
+            panic!("expected terminal error frame")
+        };
+        assert_eq!(error.code, pb::ErrorCode::RuntimeFailure as i32);
         assert!(graph.check(s.contains(1_i64))?);
     }
     for predicate in [s.contains(9_i64), s.not_contains(1_i64)] {

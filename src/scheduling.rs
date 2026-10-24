@@ -24,10 +24,11 @@
 //! - **`(seq step...)`** — run each step once, in order.
 //! - **`(saturate step...)`** — repeatedly run the body until it makes no further
 //!   progress (the accumulated report's `can_stop` is set).
-//! - **`(repeat n step...)`** — run the body `n` times.
+//! - **`(repeat n step...)`** — run the body at most `n` times, stopping after a
+//!   complete iteration reports `can_stop`. Zero skips the body and guard.
 //! - **`(saturate () (max-iterations n) (until fact...) (body step...))`** —
-//!   explicit loop options; the bound and guard are optional. Exact repetition
-//!   uses `(repeat () (times n) (until fact...) (body step...))`.
+//!   explicit loop options; the bound and guard are optional. The equivalent
+//!   bounded spelling is `(repeat () (times n) (until fact...) (body step...))`.
 //! - **`(eval expr...)`** — evaluate each `expr` in the full read/write
 //!   (FullState) context and add the resulting terms to the e-graph, the
 //!   schedule-step analogue of a top-level expression like `(Add (Num 1) (Num 2))`.
@@ -76,7 +77,6 @@ pub(crate) type PermanentSchedulerState = HashMap<String, SchedulerBinding>;
 pub(crate) use schedulers::BackOffScheduler;
 
 pub(crate) struct LoopHeader<'a> {
-    pub exact: bool,
     pub bound: Option<u64>,
     pub until: Option<Vec<Fact>>,
     pub body: &'a [Expr],
@@ -109,9 +109,6 @@ pub(crate) fn loop_header(expr: &Expr) -> Result<Option<LoopHeader<'_>>, egglog:
                     return Err(invalid());
                 };
                 let count = u64::try_from(*count).map_err(|_| invalid())?;
-                if !exact && count == 0 {
-                    return Err(invalid());
-                }
                 bound = Some(count);
             }
             "until" if until.is_none() => {
@@ -138,7 +135,6 @@ pub(crate) fn loop_header(expr: &Expr) -> Result<Option<LoopHeader<'_>>, egglog:
         return Err(invalid());
     }
     Ok(Some(LoopHeader {
-        exact,
         bound,
         until,
         body: body.ok_or_else(invalid)?,
@@ -150,13 +146,11 @@ pub(crate) fn loop_header(expr: &Expr) -> Result<Option<LoopHeader<'_>>, egglog:
 pub(crate) enum Control<'a, N> {
     Leaf,
     Sequence(&'a [N]),
-    Repeat(&'a [N], u64),
-    Saturate(&'a [N], Option<u64>),
+    Loop(&'a [N], Option<u64>),
 }
 
 #[derive(Clone, Copy)]
 pub(crate) enum ControlStop {
-    Count,
     Bound,
     Saturated,
     Until,
@@ -206,7 +200,7 @@ pub(crate) fn fold_control<C: ControlContext>(
     path: &mut Vec<usize>,
     iterations: &mut Vec<u64>,
 ) -> Result<ControlReport, C::Error> {
-    let (body, bound, exact) = match context.view(node)? {
+    let (body, bound) = match context.view(node)? {
         Control::Leaf => return context.leaf(node, path, iterations),
         Control::Sequence(body) => {
             let scope = context.enter_scope();
@@ -214,18 +208,13 @@ pub(crate) fn fold_control<C: ControlContext>(
             context.leave_scope(scope);
             return result;
         }
-        Control::Repeat(body, count) => (body, Some(count), true),
-        Control::Saturate(body, bound) => (body, bound, false),
+        Control::Loop(body, bound) => (body, bound),
     };
     let mut total = ControlReport::default();
     let mut count = 0;
     let stop = loop {
         if bound == Some(count) {
-            break if exact {
-                ControlStop::Count
-            } else {
-                ControlStop::Bound
-            };
+            break ControlStop::Bound;
         }
         if context.until(node, path, iterations)? {
             break ControlStop::Until;
@@ -242,7 +231,7 @@ pub(crate) fn fold_control<C: ControlContext>(
         total.resource_limited |= next.resource_limited;
         total.report.union(next.report);
         count += 1;
-        if !exact && can_stop {
+        if can_stop {
             break if total.resource_limited {
                 ControlStop::SchedulerLimit
             } else {
@@ -345,8 +334,7 @@ fn validate_action_steps(egraph: &mut egglog::EGraph, roots: &[Expr]) -> Result<
             || egglog::Error::ParseError(ParseError(expr.span(), "Invalid schedule".into()));
         let header = loop_header(expr)?;
         let skipped = header.as_ref().is_some_and(|header| {
-            header.exact && header.bound == Some(0)
-                || header.until.as_ref().is_some_and(Vec::is_empty)
+            header.bound == Some(0) || header.until.as_ref().is_some_and(Vec::is_empty)
         }) || matches!(expr, Expr::Call(_, head, args) if head == "repeat"
             && matches!(args.first(), Some(Expr::Lit(_, Literal::Int(count))) if *count <= 0));
         if skipped {
@@ -789,18 +777,14 @@ impl ControlContext for NativeSchedule<'_> {
 
     fn view<'a>(&self, node: &'a Expr) -> Result<Control<'a, Expr>, egglog::Error> {
         if let Some(header) = loop_header(node)? {
-            return Ok(if header.exact {
-                Control::Repeat(header.body, header.bound.expect("required count"))
-            } else {
-                Control::Saturate(header.body, header.bound)
-            });
+            return Ok(Control::Loop(header.body, header.bound));
         }
         Ok(match node {
             Expr::Call(_, name, body) if name == "seq" => Control::Sequence(body),
-            Expr::Call(_, name, body) if name == "saturate" => Control::Saturate(body, None),
+            Expr::Call(_, name, body) if name == "saturate" => Control::Loop(body, None),
             Expr::Call(_, name, body) if name == "repeat" => match body.as_slice() {
                 [Expr::Lit(_, Literal::Int(count)), body @ ..] => {
-                    Control::Repeat(body, (*count).max(0) as u64)
+                    Control::Loop(body, Some((*count).max(0) as u64))
                 }
                 _ => {
                     return Err(egglog::Error::ParseError(ParseError(

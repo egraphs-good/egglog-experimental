@@ -1,9 +1,7 @@
 use egglog::extract::DEFAULT_COST_MODEL;
 use egglog::sort::{PairContainer, Presort, VecContainer, VecSort};
 use egglog::*;
-use egglog_experimental::builtin::{
-    PortableEGraph, PortablePrimitive, PortableRegistration, PortableTypeInfo,
-};
+use egglog_experimental::builtin::{PortableEGraph, PortablePrimitive, PortableTypeInfo};
 use egglog_experimental::{
     add_literal_prim, add_primitive, add_primitive_with_validator, builtin, proto,
 };
@@ -11,768 +9,6 @@ use std::sync::{
     Arc,
     atomic::{AtomicUsize, Ordering},
 };
-
-#[test]
-fn builtin_default_context_baseline_gap_isolated_and_legacy_multiroot() {
-    static CALLS: AtomicUsize = AtomicUsize::new(0);
-    CALLS.store(0, Ordering::SeqCst);
-    let mut graph = EGraph::default();
-    add_literal_prim!(
-        &mut graph,
-        "default-helper"[id = "test.default_helper"] = || -> i64 {
-            {
-                CALLS.fetch_add(1, Ordering::SeqCst);
-                17
-            }
-        }
-    );
-    let integer = graph.get_sort_by_name("i64").unwrap().clone();
-    let mut isolated = builtin::closed_signature(
-        "test.default_consumer",
-        "default-consumer",
-        &[("value", integer.clone())],
-        &[],
-        integer,
-    )
-    .unwrap();
-    let root = isolated.declarations.last_mut().unwrap();
-    let Some(proto::declaration::Kind::HostPrimitive(primitive)) = &root.kind else {
-        unreachable!()
-    };
-    let Some(proto::host_primitive::Typing::Signature(signature)) = &primitive.typing else {
-        unreachable!()
-    };
-    isolated.nodes.push(proto::Node {
-        sort_id: signature.output.unwrap(),
-        kind: Some(proto::node::Kind::Call(proto::Call {
-            func: "test.default_helper".into(),
-            args: vec![],
-        })),
-        ..Default::default()
-    });
-    root.bindings.as_mut().unwrap().python = Some(proto::PythonBindings {
-        views: vec![proto::PythonCallable {
-            kind: proto::PythonCallKind::Function.into(),
-            path: vec!["test".into(), "default_consumer".into()],
-            params: vec![proto::PythonParameter {
-                core_input: Some(0),
-                name: "value".into(),
-                default_expr: Some(0),
-            }],
-            ..Default::default()
-        }],
-    });
-    let mut destination = proto::Program::default();
-    let before = destination.clone();
-    let error =
-        builtin::definitions::reconcile_declarations(&isolated, &mut destination).unwrap_err();
-    assert!(error.contains("unknown default callee"), "{error}");
-    assert_eq!(destination, before);
-
-    let mut complete = proto::Program::default();
-    graph
-        .type_info()
-        .export_builtin_definition("test.default_helper", &mut complete)
-        .unwrap();
-    builtin::definitions::reconcile_declarations(&isolated, &mut complete).unwrap();
-    assert_eq!(
-        complete
-            .declarations
-            .iter()
-            .filter(|declaration| {
-                matches!(
-                    declaration.kind,
-                    Some(proto::declaration::Kind::HostPrimitive(_))
-                )
-            })
-            .count(),
-        2
-    );
-    let error = builtin::import_definition(&complete, &mut destination).unwrap_err();
-    assert!(error.contains("exactly one builtin"), "{error}");
-    assert_eq!(destination, before);
-    assert_eq!(CALLS.load(Ordering::SeqCst), 0);
-}
-
-mod rooted_default_context {
-    use super::*;
-
-    static CALLS: AtomicUsize = AtomicUsize::new(0);
-
-    // Compose a genuine helper export with a generated root, including all
-    // index relocation. Reordering happens only after the closed import.
-    fn supply(
-        types: &TypeInfo,
-        key: &str,
-        draft: &mut proto::Program,
-        helper: &str,
-        helper_first: bool,
-        relocated: bool,
-        argument: bool,
-    ) -> Result<(), String> {
-        let mut consumer = draft.clone();
-        let root = consumer.declarations.iter().position(|declaration| {
-            matches!(&declaration.kind, Some(proto::declaration::Kind::HostPrimitive(primitive)) if primitive.name == key)
-        }).unwrap();
-        let Some(proto::declaration::Kind::HostPrimitive(primitive)) =
-            &consumer.declarations[root].kind
-        else {
-            unreachable!()
-        };
-        let Some(proto::host_primitive::Typing::Signature(signature)) = &primitive.typing else {
-            unreachable!()
-        };
-        let output = signature.output.unwrap();
-        let args = if argument {
-            let index = consumer.nodes.len() as u32;
-            consumer.nodes.push(proto::Node {
-                sort_id: output,
-                kind: Some(proto::node::Kind::PrimitiveValue(proto::PrimitiveValue {
-                    value: Some(proto::primitive_value::Value::I64(3)),
-                })),
-                ..Default::default()
-            });
-            vec![index]
-        } else {
-            vec![]
-        };
-        let default = consumer.nodes.len() as u32;
-        consumer.files.push(proto::SourceFile {
-            name: "default.egg".into(),
-            contents: Some("helper".into()),
-        });
-        consumer.nodes.push(proto::Node {
-            sort_id: output,
-            kind: Some(proto::node::Kind::Call(proto::Call {
-                func: helper.into(),
-                args,
-            })),
-            span: Some(proto::Span {
-                file: 0,
-                start: 0,
-                end: 6,
-            }),
-        });
-        consumer.declarations[root]
-            .bindings
-            .as_mut()
-            .unwrap()
-            .python = Some(proto::PythonBindings {
-            views: vec![proto::PythonCallable {
-                kind: proto::PythonCallKind::Function.into(),
-                path: vec!["test".into(), key.replace('.', "_")],
-                params: vec![proto::PythonParameter {
-                    core_input: Some(0),
-                    name: "value".into(),
-                    default_expr: Some(default),
-                }],
-                ..Default::default()
-            }],
-        });
-        let mut complete = proto::Program {
-            ..Default::default()
-        };
-        if relocated {
-            complete.sorts.push(proto::Sort {
-                kind: Some(proto::sort::Kind::Family(proto::HostSort {
-                    name: "String".into(),
-                    args: vec![],
-                })),
-                ..Default::default()
-            });
-            complete.nodes.push(proto::Node {
-                sort_id: 0,
-                kind: Some(proto::node::Kind::PrimitiveValue(proto::PrimitiveValue {
-                    value: Some(proto::primitive_value::Value::String("unused".into())),
-                })),
-                ..Default::default()
-            });
-            complete.files.push(proto::SourceFile {
-                name: "padding.egg".into(),
-                contents: None,
-            });
-        }
-        types.export_builtin_definition(helper, &mut complete)?;
-        builtin::definitions::reconcile_declarations(&consumer, &mut complete)?;
-        if !helper_first {
-            let root = complete.declarations.iter().position(|declaration| {
-                matches!(&declaration.kind, Some(proto::declaration::Kind::HostPrimitive(primitive)) if primitive.name == key)
-            }).unwrap();
-            let helper = complete.declarations.iter().position(|declaration| {
-                matches!(&declaration.kind, Some(proto::declaration::Kind::HostPrimitive(primitive)) if primitive.name == helper)
-            }).unwrap();
-            complete.declarations.swap(root, helper);
-        }
-        *draft = complete;
-        Ok(())
-    }
-
-    #[test]
-    fn macro_context_retains_root_closure_and_native_helper_identity() {
-        for (helper_first, relocated) in [(true, false), (false, true)] {
-            let mut graph = EGraph::default();
-            add_literal_prim!(
-                &mut graph,
-                "context-helper"[id = "test.context_helper"] = || -> i64 {
-                    {
-                        CALLS.fetch_add(1, Ordering::SeqCst);
-                        17
-                    }
-                }
-            );
-            let integer = graph.get_sort_by_name("i64").unwrap().clone();
-            let before = ResolvedCall::from_resolution(
-                "context-helper",
-                std::slice::from_ref(&integer),
-                graph.type_info(),
-                Context::Pure,
-                &ast::Span::Panic,
-            )
-            .unwrap();
-            let count = CALLS.load(Ordering::SeqCst);
-            add_literal_prim!(&mut graph, "context-root"[id = "test.context_root", context = |types, key, draft| {
-                supply(types, key, draft, "test.context_helper", helper_first, relocated, false)
-            }] = |value: i64| -> i64 { value });
-            for context in [Context::Pure, Context::Read, Context::Write, Context::Full] {
-                let alias = ResolvedCall::from_resolution(
-                    "context-root",
-                    &[integer.clone(), integer.clone()],
-                    graph.type_info(),
-                    context,
-                    &ast::Span::Panic,
-                )
-                .unwrap();
-                let keyed = ResolvedCall::from_resolution(
-                    "test.context_root",
-                    &[integer.clone(), integer.clone()],
-                    graph.type_info(),
-                    context,
-                    &ast::Span::Panic,
-                )
-                .unwrap();
-                assert_eq!(alias, keyed);
-            }
-            let after = ResolvedCall::from_resolution(
-                "context-helper",
-                std::slice::from_ref(&integer),
-                graph.type_info(),
-                Context::Pure,
-                &ast::Span::Panic,
-            )
-            .unwrap();
-            assert_eq!(before, after);
-            let (ResolvedCall::Primitive(before), ResolvedCall::Primitive(after)) = (before, after)
-            else {
-                unreachable!()
-            };
-            assert!(Arc::ptr_eq(
-                before.validator().unwrap(),
-                after.validator().unwrap()
-            ));
-            assert_eq!(
-                graph
-                    .type_info()
-                    .get_prims("test.context_helper")
-                    .unwrap()
-                    .len(),
-                1
-            );
-            let mut exported = proto::Program::default();
-            graph
-                .type_info()
-                .export_builtin_definition("test.context_root", &mut exported)
-                .unwrap();
-            let root = exported.declarations.iter().find(|declaration| {
-                matches!(&declaration.kind, Some(proto::declaration::Kind::HostPrimitive(primitive)) if primitive.name == "test.context_root")
-            }).unwrap();
-            let default = root
-                .bindings
-                .as_ref()
-                .unwrap()
-                .python
-                .as_ref()
-                .unwrap()
-                .views[0]
-                .params[0]
-                .default_expr
-                .unwrap();
-            if !relocated {
-                assert_eq!(default, 0);
-            }
-            assert!(
-                matches!(&exported.nodes[default as usize].kind, Some(proto::node::Kind::Call(call)) if call.func == "test.context_helper" && call.args.is_empty())
-            );
-            assert_eq!(
-                CALLS.load(Ordering::SeqCst),
-                count,
-                "metadata must invoke neither body nor validator"
-            );
-            graph
-                .parse_and_run_program(
-                    None,
-                    "(check (= (context-root 5) 5) (= (context-helper) 17))",
-                )
-                .unwrap();
-        }
-    }
-
-    #[test]
-    fn context_rejects_mutation_unknown_helpers_and_atomic_duplicates() {
-        let mut graph = EGraph::default();
-        add_literal_prim!(
-            &mut graph,
-            "context-helper"[id = "test.context_helper"] = || -> i64 { 17 }
-        );
-        let integer = graph.get_sort_by_name("i64").unwrap().clone();
-        let generated = builtin::closed_signature(
-            "test.context_root",
-            "context-root",
-            &[("value", integer.clone())],
-            &[],
-            integer.clone(),
-        )
-        .unwrap();
-        for mutation in 0..12 {
-            let before = graph
-                .type_info()
-                .portable_builtin_catalog()
-                .unwrap()
-                .definitions;
-            let error = graph.type_info().prepare_builtin_context("test.context_root", "context-root", generated.clone(), |types, key, draft| {
-                supply(types, key, draft, "test.context_helper", true, true, false)?;
-                let helper = draft.declarations.iter().position(|declaration| {
-                    matches!(&declaration.kind, Some(proto::declaration::Kind::HostPrimitive(primitive)) if primitive.name == "test.context_helper")
-                }).unwrap();
-                let root = draft.declarations.iter().position(|declaration| {
-                    matches!(&declaration.kind, Some(proto::declaration::Kind::HostPrimitive(primitive)) if primitive.name == key)
-                }).unwrap();
-                let default = draft.declarations[root].bindings.as_ref().unwrap().python.as_ref().unwrap().views[0].params[0].default_expr.unwrap();
-                match mutation {
-                    0 => draft.declarations[helper].bindings.as_mut().unwrap().python = Some(proto::PythonBindings::default()),
-                    1 => draft.declarations[helper].bindings.as_mut().unwrap().rust = Some(proto::RustBindings::default()),
-                    2 => draft.declarations[helper].bindings.as_mut().unwrap().egglog = None,
-                    3 => draft.declarations[helper].doc = Some("forged helper".into()),
-                    4 => if let Some(proto::node::Kind::Call(call)) = &mut draft.nodes[default as usize].kind { call.func = "test.unknown".into(); },
-                    5 => if let Some(proto::node::Kind::Call(call)) = &mut draft.nodes[default as usize].kind { call.args.push(999); },
-                    6 => draft.nodes[default as usize].kind = Some(proto::node::Kind::Var("free".into())),
-                    7 => draft.nodes[default as usize].sort_id = 0,
-                    8 => {
-                        let Some(proto::declaration::Kind::HostPrimitive(primitive)) = &draft.declarations[root].kind else { unreachable!() };
-                        let Some(proto::host_primitive::Typing::Signature(signature)) = &primitive.typing else { unreachable!() };
-                        draft.sorts[signature.output.unwrap() as usize].kind = Some(proto::sort::Kind::Family(proto::HostSort { name: "String".into(), args: vec![] }));
-                    }
-                    9 => draft.declarations.push(draft.declarations[root].clone()),
-                    10 => types.export_builtin_definition("egglog.core.i64.add", draft)?,
-                    11 => draft.declarations.push(draft.declarations[helper].clone()),
-                    _ => unreachable!(),
-                }
-                Ok(())
-            }).unwrap_err();
-            assert!(!error.is_empty());
-            assert_eq!(
-                graph
-                    .type_info()
-                    .portable_builtin_catalog()
-                    .unwrap()
-                    .definitions,
-                before
-            );
-            assert!(graph.type_info().get_prims("context-root").is_none());
-        }
-        add_literal_prim!(&mut graph, "context-root"[id = "test.context_root", context = |types, key, draft| {
-            supply(types, key, draft, "test.context_helper", false, false, false)
-        }] = |value: i64| -> i64 { value });
-        let before = ResolvedCall::from_resolution(
-            "context-root",
-            &[integer.clone(), integer.clone()],
-            graph.type_info(),
-            Context::Pure,
-            &ast::Span::Panic,
-        )
-        .unwrap();
-        let catalog = graph
-            .type_info()
-            .portable_builtin_catalog()
-            .unwrap()
-            .definitions;
-        assert!(
-            graph
-                .type_info()
-                .prepare_builtin_context(
-                    "test.context_root",
-                    "second-root",
-                    generated,
-                    |_, _, _| Ok(())
-                )
-                .is_err()
-        );
-        assert_eq!(
-            graph
-                .type_info()
-                .portable_builtin_catalog()
-                .unwrap()
-                .definitions,
-            catalog
-        );
-        assert!(graph.type_info().get_prims("second-root").is_none());
-        let after = ResolvedCall::from_resolution(
-            "context-root",
-            &[integer.clone(), integer],
-            graph.type_info(),
-            Context::Pure,
-            &ast::Span::Panic,
-        )
-        .unwrap();
-        assert_eq!(before, after);
-    }
-
-    #[test]
-    fn context_follows_helper_defaults_even_with_explicit_call_arguments() {
-        let mut graph = EGraph::default();
-        add_literal_prim!(
-            &mut graph,
-            "context-leaf"[id = "test.context_leaf"] = || -> i64 { 9 }
-        );
-        add_literal_prim!(&mut graph, "context-middle"[id = "test.context_middle", context = |types, key, draft| {
-            supply(types, key, draft, "test.context_leaf", true, false, false)
-        }] = |value: i64| -> i64 { value });
-        let integer = graph.get_sort_by_name("i64").unwrap().clone();
-        let generated = builtin::closed_signature(
-            "test.context_root",
-            "context-root",
-            &[("value", integer.clone())],
-            &[],
-            integer,
-        )
-        .unwrap();
-        let prepared = graph
-            .type_info()
-            .prepare_builtin_context(
-                "test.context_root",
-                "context-root",
-                generated.clone(),
-                |types, key, draft| {
-                    supply(types, key, draft, "test.context_middle", true, true, true)
-                },
-            )
-            .unwrap();
-        for key in [
-            "test.context_leaf",
-            "test.context_middle",
-            "test.context_root",
-        ] {
-            assert!(prepared.declarations.iter().any(|declaration| {
-                matches!(&declaration.kind, Some(proto::declaration::Kind::HostPrimitive(primitive)) if primitive.name == key)
-            }));
-        }
-        let mut relocated = proto::Program {
-            sorts: vec![proto::Sort {
-                kind: Some(proto::sort::Kind::Family(proto::HostSort {
-                    name: "String".into(),
-                    args: vec![],
-                })),
-                ..Default::default()
-            }],
-            ..Default::default()
-        };
-        builtin::import_rooted_definition("test.context_root", &prepared, &mut relocated).unwrap();
-        let once = relocated.clone();
-        builtin::import_rooted_definition("test.context_root", &prepared, &mut relocated).unwrap();
-        assert_eq!(
-            relocated, once,
-            "equivalent defaults survive arena relocation"
-        );
-        let error = graph.type_info().prepare_builtin_context("test.context_root", "context-root", generated.clone(), |types, key, draft| {
-            supply(types, key, draft, "test.context_middle", true, true, true)?;
-            let helper = draft.declarations.iter().find(|declaration| {
-                matches!(&declaration.kind, Some(proto::declaration::Kind::HostPrimitive(primitive)) if primitive.name == "test.context_middle")
-            }).unwrap();
-            let default = helper.bindings.as_ref().unwrap().python.as_ref().unwrap().views[0].params[0].default_expr.unwrap();
-            draft.nodes[default as usize].kind = Some(proto::node::Kind::PrimitiveValue(proto::PrimitiveValue {
-                value: Some(proto::primitive_value::Value::I64(99)),
-            }));
-            Ok(())
-        }).unwrap_err();
-        assert!(error.contains("helper defaults"), "{error}");
-        let error = graph.type_info().prepare_builtin_context("test.context_root", "context-root", generated, |types, key, draft| {
-            supply(types, key, draft, "test.context_middle", false, false, true)?;
-            draft.declarations.retain(|declaration| {
-                !matches!(&declaration.kind, Some(proto::declaration::Kind::HostPrimitive(primitive)) if primitive.name == "test.context_leaf")
-            });
-            Ok(())
-        }).unwrap_err();
-        assert!(error.contains("callee"), "{error}");
-    }
-
-    #[test]
-    fn root_context_preserves_absent_empty_and_first_language_supplies() {
-        let mut graph = EGraph::default();
-        let integer = graph.get_sort_by_name("i64").unwrap().clone();
-        let generated = builtin::closed_signature(
-            "test.language_root",
-            "language-root",
-            &[("value", integer.clone())],
-            &[],
-            integer,
-        )
-        .unwrap();
-        for python in [false, true] {
-            for empty_first in [false, true] {
-                let mut first = generated.clone();
-                let root = first.declarations.last_mut().unwrap();
-                let Some(proto::declaration::Kind::HostPrimitive(primitive)) = &root.kind else {
-                    unreachable!()
-                };
-                let Some(proto::host_primitive::Typing::Signature(signature)) = &primitive.typing
-                else {
-                    unreachable!()
-                };
-                let owner = Some(proto::BindingOwner {
-                    kind: Some(proto::binding_owner::Kind::Sort(signature.inputs[0].sort)),
-                });
-                if python {
-                    root.bindings.as_mut().unwrap().python = if empty_first {
-                        Some(proto::PythonBindings::default())
-                    } else {
-                        Some(proto::PythonBindings {
-                            views: vec![proto::PythonCallable {
-                                kind: proto::PythonCallKind::Method.into(),
-                                path: vec!["method".into()],
-                                owner,
-                                receiver: Some(0),
-                                ..Default::default()
-                            }],
-                        })
-                    };
-                } else {
-                    root.bindings.as_mut().unwrap().rust = if empty_first {
-                        Some(proto::RustBindings::default())
-                    } else {
-                        Some(proto::RustBindings {
-                            views: vec![proto::RustCallable {
-                                path: vec!["method".into()],
-                                owner,
-                                receiver: Some(proto::RustReceiver {
-                                    core_input: Some(0),
-                                    borrowed: false,
-                                }),
-                                ..Default::default()
-                            }],
-                        })
-                    };
-                }
-                let prepared = graph
-                    .type_info()
-                    .prepare_builtin_context(
-                        "test.language_root",
-                        "language-root",
-                        generated.clone(),
-                        |_, _, draft| {
-                            draft.declarations.last_mut().unwrap().bindings =
-                                first.declarations.last().unwrap().bindings.clone();
-                            Ok(())
-                        },
-                    )
-                    .unwrap();
-                let frozen = prepared.clone();
-                let mut absent = generated.clone();
-                builtin::definitions::reconcile_declarations(&prepared, &mut absent).unwrap();
-                assert_eq!(absent, prepared);
-                let mut changed = first;
-                let bindings = changed
-                    .declarations
-                    .last_mut()
-                    .unwrap()
-                    .bindings
-                    .as_mut()
-                    .unwrap();
-                if python {
-                    let views = &mut bindings.python.as_mut().unwrap().views;
-                    if empty_first {
-                        views.push(proto::PythonCallable {
-                            kind: proto::PythonCallKind::Function.into(),
-                            path: vec!["different".into()],
-                            params: vec![proto::PythonParameter {
-                                core_input: Some(0),
-                                name: "value".into(),
-                                default_expr: None,
-                            }],
-                            ..Default::default()
-                        });
-                    } else {
-                        views.clear();
-                    }
-                } else {
-                    let views = &mut bindings.rust.as_mut().unwrap().views;
-                    if empty_first {
-                        views.push(proto::RustCallable {
-                            path: vec!["different".into()],
-                            params: vec![proto::RustParameter {
-                                core_input: Some(0),
-                                name: "value".into(),
-                                borrowed: false,
-                            }],
-                            ..Default::default()
-                        });
-                    } else {
-                        views.clear();
-                    }
-                }
-                let mut destination = prepared;
-                assert!(
-                    builtin::definitions::reconcile_declarations(&changed, &mut destination)
-                        .is_err()
-                );
-                assert_eq!(destination, frozen);
-            }
-        }
-    }
-
-    #[test]
-    fn context_family_evidence_cannot_first_supply_absent_languages() {
-        #[derive(Debug)]
-        struct ContextScalar;
-        impl prelude::BaseSort for ContextScalar {
-            type Base = i64;
-            fn name(&self) -> &str {
-                "ContextScalar"
-            }
-            fn reconstruct_termdag(
-                &self,
-                _: &sort::BaseValues,
-                _: Value,
-                _: &mut TermDag,
-            ) -> TermId {
-                panic!("family metadata must not reconstruct a native value")
-            }
-        }
-        for outer_present in [false, true] {
-            let mut graph = EGraph::default();
-            prelude::add_base_sort(&mut graph, ContextScalar, ast::Span::Panic).unwrap();
-            graph
-                .type_info()
-                .register_portable_family(proto::HostSortFamily {
-                    name: "ContextScalar".into(),
-                    arity: 0,
-                    bindings: outer_present.then(proto::SortBindings::default),
-                })
-                .unwrap();
-            let scalar = graph.get_sort_by_name("ContextScalar").unwrap().clone();
-            let generated = builtin::closed_signature(
-                "test.family_root",
-                "family-root",
-                &[("value", scalar.clone())],
-                &[],
-                scalar,
-            )
-            .unwrap();
-            let before = graph
-                .type_info()
-                .portable_builtin_catalog()
-                .unwrap()
-                .definitions;
-            let prepared = graph
-                .type_info()
-                .prepare_builtin_context(
-                    "test.family_root",
-                    "family-root",
-                    generated.clone(),
-                    |_, _, _| Ok(()),
-                )
-                .unwrap();
-            let family = prepared
-                .declarations
-                .iter()
-                .find_map(|declaration| match &declaration.kind {
-                    Some(proto::declaration::Kind::HostSortFamily(family))
-                        if family.name == "ContextScalar" =>
-                    {
-                        Some(family)
-                    }
-                    _ => None,
-                })
-                .unwrap();
-            assert_eq!(
-                family.bindings,
-                outer_present.then(proto::SortBindings::default)
-            );
-            for mutation in 0..3 {
-                if mutation == 0 && outer_present {
-                    continue;
-                }
-                let error = graph
-                    .type_info()
-                    .prepare_builtin_context(
-                        "test.family_root",
-                        "family-root",
-                        generated.clone(),
-                        |_, _, draft| {
-                            let family = draft
-                                .declarations
-                                .iter_mut()
-                                .find_map(|declaration| match &mut declaration.kind {
-                                    Some(proto::declaration::Kind::HostSortFamily(family))
-                                        if family.name == "ContextScalar" =>
-                                    {
-                                        Some(family)
-                                    }
-                                    _ => None,
-                                })
-                                .unwrap();
-                            if mutation == 0 {
-                                family.bindings = Some(proto::SortBindings::default());
-                            } else {
-                                let forged = proto::TypeBinding {
-                                    path: vec!["forged".into(), "ContextScalar".into()],
-                                    ..Default::default()
-                                };
-                                let bindings = family.bindings.get_or_insert_default();
-                                if mutation == 1 {
-                                    bindings.python = Some(forged);
-                                } else {
-                                    bindings.rust = Some(forged);
-                                }
-                            }
-                            Ok(())
-                        },
-                    )
-                    .unwrap_err();
-                assert!(error.contains("context family"), "{error}");
-                assert_eq!(
-                    graph
-                        .type_info()
-                        .portable_builtin_catalog()
-                        .unwrap()
-                        .definitions,
-                    before
-                );
-                assert!(!graph.type_info().is_primitive("family-root"));
-            }
-            for duplicate in [false, true] {
-                let error = graph.type_info().prepare_builtin_context("test.family_root", "family-root", generated.clone(), |_, _, draft| {
-                    let family = draft.declarations.iter().position(|declaration| {
-                        matches!(&declaration.kind, Some(proto::declaration::Kind::HostSortFamily(family)) if family.name == "ContextScalar")
-                    }).unwrap();
-                    if duplicate { draft.declarations.push(draft.declarations[family].clone()); }
-                    else {
-                        draft.files.push(proto::SourceFile { name: "forged-family.egg".into(), contents: Some("family".into()) });
-                        draft.declarations[family].span = Some(proto::Span { file: 0, start: 0, end: 6 });
-                    }
-                    Ok(())
-                }).unwrap_err();
-                assert!(error.contains("context family"), "{error}");
-                assert_eq!(
-                    graph
-                        .type_info()
-                        .portable_builtin_catalog()
-                        .unwrap()
-                        .definitions,
-                    before
-                );
-            }
-        }
-    }
-}
 
 #[test]
 fn native_signature_all_selection_routes_intersect_native_predicate() {
@@ -1038,310 +274,6 @@ fn function_value_observer_uses_semantic_view_children() {
 }
 
 #[test]
-fn function_application_python_view_is_provider_owned() {
-    let mut graph = EGraph::default();
-    let catalog = graph
-        .type_info()
-        .portable_builtin_catalog()
-        .unwrap()
-        .definitions;
-    let declaration = catalog
-        .declarations
-        .iter()
-        .find(|d| {
-            matches!(&d.kind,
-                Some(proto::declaration::Kind::HostPrimitive(p)) if p.name == "egglog.core.fn.apply"
-            )
-        })
-        .unwrap();
-    let bindings = declaration.bindings.as_ref().unwrap();
-    assert_eq!(
-        bindings.egglog.as_ref().unwrap().views[0].symbol,
-        "unstable-app"
-    );
-    assert_eq!(bindings.rust.as_ref().unwrap().views[0].path, ["call"]);
-    assert!(matches!(
-        bindings.rust.as_ref().unwrap().views[0]
-            .owner
-            .as_ref()
-            .and_then(|owner| owner.kind.as_ref()),
-        Some(proto::binding_owner::Kind::Function(_))
-    ));
-    assert_eq!(
-        bindings
-            .python
-            .as_ref()
-            .expect("provider function-owner view")
-            .views,
-        [proto::PythonCallable {
-            kind: proto::PythonCallKind::Method.into(),
-            path: vec!["__call__".into()],
-            owner: Some(proto::BindingOwner {
-                kind: Some(proto::binding_owner::Kind::Function(
-                    proto::FunctionTypeOwner {}
-                )),
-            }),
-            receiver: Some(0),
-            params: vec![proto::PythonParameter {
-                core_input: Some(1),
-                name: "args".into(),
-                default_expr: None,
-            }],
-            ..Default::default()
-        }]
-    );
-}
-
-#[test]
-fn function_application_python_metadata_reconciles_and_rejects_malformed_views() {
-    let mut definition = builtin::project_description(
-        &<sort::FunctionSort as Presort>::builtin_definitions().remove(0),
-    )
-    .unwrap();
-    definition.declarations[0].bindings.as_mut().unwrap().rust = None;
-    let view = proto::PythonCallable {
-        kind: proto::PythonCallKind::Method.into(),
-        path: vec!["__call__".into()],
-        owner: Some(proto::BindingOwner {
-            kind: Some(proto::binding_owner::Kind::Function(
-                proto::FunctionTypeOwner {},
-            )),
-        }),
-        receiver: Some(0),
-        params: vec![proto::PythonParameter {
-            core_input: Some(1),
-            name: "args".into(),
-            default_expr: None,
-        }],
-        ..Default::default()
-    };
-    definition.declarations[0].bindings.as_mut().unwrap().python =
-        Some(proto::PythonBindings { views: vec![view] });
-    let mut absent = definition.clone();
-    absent.declarations[0].bindings.as_mut().unwrap().python = None;
-    for supplies in [[&absent, &definition], [&definition, &absent]] {
-        let mut destination = proto::Program::default();
-        for supply in supplies {
-            builtin::definitions::reconcile_declarations(supply, &mut destination).unwrap();
-        }
-        builtin::definitions::reconcile_declarations(&definition, &mut destination).unwrap();
-        assert_eq!(
-            destination, definition,
-            "absence cannot erase the first supplied block"
-        );
-        let mut batch = definition.clone();
-        batch.declarations = supplies.iter().map(|p| p.declarations[0].clone()).collect();
-        let mut destination = proto::Program::default();
-        builtin::definitions::reconcile_declarations(&batch, &mut destination).unwrap();
-        assert_eq!(
-            destination, definition,
-            "same-fragment reconciliation agrees"
-        );
-    }
-    let mut empty = absent.clone();
-    empty.declarations[0].bindings.as_mut().unwrap().python =
-        Some(proto::PythonBindings::default());
-    for supplies in [[&empty, &definition], [&definition, &empty]] {
-        let mut destination = proto::Program::default();
-        builtin::definitions::reconcile_declarations(supplies[0], &mut destination).unwrap();
-        let before = destination.clone();
-        assert!(
-            builtin::definitions::reconcile_declarations(supplies[1], &mut destination).is_err()
-        );
-        assert_eq!(
-            destination, before,
-            "a supplied empty block is still immutable"
-        );
-        let mut batch = definition.clone();
-        batch.declarations = supplies.iter().map(|p| p.declarations[0].clone()).collect();
-        let mut destination = proto::Program::default();
-        assert!(builtin::definitions::reconcile_declarations(&batch, &mut destination).is_err());
-        assert_eq!(destination, proto::Program::default());
-    }
-    let mut no_bindings = absent.clone();
-    no_bindings.declarations[0].bindings = None;
-    let mut destination = no_bindings;
-    builtin::definitions::reconcile_declarations(&definition, &mut destination).unwrap();
-    assert_eq!(destination, definition);
-    let mut empty_rust = definition.clone();
-    empty_rust.declarations[0].bindings.as_mut().unwrap().rust =
-        Some(proto::RustBindings::default());
-    builtin::definitions::reconcile_declarations(&empty_rust, &mut destination).unwrap();
-    assert_eq!(destination, empty_rust);
-    for case in [
-        "owner_missing",
-        "owner_unset",
-        "owner_sort",
-        "kind",
-        "unknown_kind",
-        "path_empty",
-        "path_component_empty",
-        "path_qualified",
-        "path_other",
-        "receiver_missing",
-        "receiver_tail",
-        "params_missing",
-        "params_extra",
-        "slot_missing",
-        "slot_receiver",
-        "slot_other",
-        "param_empty",
-        "param_other",
-        "default",
-        "mutates_zero",
-        "mutates_tail",
-        "tail_zero",
-        "tail_one",
-        "views_extra",
-        "views_duplicate",
-        "non_application",
-        "rust",
-        "egglog_empty",
-        "egglog_member",
-    ] {
-        let mut invalid = definition.clone();
-        // A valid referenced scalar/default makes the negative discriminate
-        // presentation validation from an out-of-bounds arena reference.
-        invalid.sorts.push(proto::Sort {
-            kind: Some(proto::sort::Kind::Family(proto::HostSort {
-                name: "i64".into(),
-                args: vec![],
-            })),
-            ..Default::default()
-        });
-        invalid.nodes.push(proto::Node {
-            sort_id: 0,
-            kind: Some(proto::node::Kind::PrimitiveValue(proto::PrimitiveValue {
-                value: Some(proto::primitive_value::Value::I64(1)),
-            })),
-            ..Default::default()
-        });
-        let bindings = invalid.declarations[0].bindings.as_mut().unwrap();
-        let view = &mut bindings.python.as_mut().unwrap().views[0];
-        match case {
-            "owner_missing" => view.owner = None,
-            "owner_unset" => view.owner = Some(proto::BindingOwner::default()),
-            "owner_sort" => {
-                view.owner.as_mut().unwrap().kind = Some(proto::binding_owner::Kind::Sort(0))
-            }
-            "kind" => view.kind = proto::PythonCallKind::Function.into(),
-            "unknown_kind" => view.kind = 99,
-            "path_empty" => view.path.clear(),
-            "path_component_empty" => view.path[0].clear(),
-            "path_qualified" => view.path.insert(0, "module".into()),
-            "path_other" => view.path[0] = "apply".into(),
-            "receiver_missing" => view.receiver = None,
-            "receiver_tail" => view.receiver = Some(1),
-            "params_missing" => view.params.clear(),
-            "params_extra" => view.params.push(view.params[0].clone()),
-            "slot_missing" => view.params[0].core_input = None,
-            "slot_receiver" => view.params[0].core_input = Some(0),
-            "slot_other" => view.params[0].core_input = Some(2),
-            "param_empty" => view.params[0].name.clear(),
-            "param_other" => view.params[0].name = "values".into(),
-            "default" => view.params[0].default_expr = Some(0),
-            "mutates_zero" => view.mutates = Some(0),
-            "mutates_tail" => view.mutates = Some(1),
-            "tail_zero" => view.tail_repetitions = Some(0),
-            "tail_one" => view.tail_repetitions = Some(1),
-            "views_extra" => {
-                let mut other = view.clone();
-                other.path[0] = "apply".into();
-                bindings.python.as_mut().unwrap().views.push(other);
-            }
-            "views_duplicate" => {
-                let duplicate = view.clone();
-                bindings.python.as_mut().unwrap().views.push(duplicate);
-            }
-            "non_application" => {
-                let Some(proto::declaration::Kind::HostPrimitive(primitive)) =
-                    &mut invalid.declarations[0].kind
-                else {
-                    unreachable!()
-                };
-                primitive.typing = Some(proto::host_primitive::Typing::Signature(
-                    proto::GenericSignature {
-                        inputs: vec![proto::Arg {
-                            name: "receiver".into(),
-                            sort: 0,
-                        }],
-                        varargs: vec![proto::Arg {
-                            name: "args".into(),
-                            sort: 0,
-                        }],
-                        output: Some(0),
-                        ..Default::default()
-                    },
-                ));
-            }
-            "rust" => {
-                bindings.rust = Some(proto::RustBindings {
-                    views: vec![proto::RustCallable::default()],
-                })
-            }
-            "egglog_empty" => bindings.egglog.as_mut().unwrap().views[0].symbol.clear(),
-            "egglog_member" => bindings.egglog.as_mut().unwrap().views[0].datatype_member = true,
-            _ => unreachable!(),
-        }
-        let mut destination = proto::Program::default();
-        let error = builtin::definitions::reconcile_declarations(&invalid, &mut destination)
-            .expect_err(case);
-        if case == "rust" {
-            assert!(error.contains("invalid function application Rust view"));
-        }
-        assert_eq!(
-            destination,
-            proto::Program::default(),
-            "{case} must be transactional"
-        );
-    }
-}
-
-#[test]
-fn function_application_rust_metadata_rejects_malformed_views() {
-    let definition = builtin::project_description(
-        &<sort::FunctionSort as Presort>::builtin_definitions().remove(0),
-    )
-    .unwrap();
-    builtin::definitions::reconcile_declarations(&definition, &mut proto::Program::default())
-        .unwrap();
-    for case in 0..13 {
-        let mut invalid = definition.clone();
-        let bindings = invalid.declarations[0]
-            .bindings
-            .as_mut()
-            .unwrap()
-            .rust
-            .as_mut()
-            .unwrap();
-        let view = &mut bindings.views[0];
-        match case {
-            0 => view.path.clear(),
-            1 => view.path[0].clear(),
-            2 => view.owner = None,
-            3 => view.owner = Some(proto::BindingOwner::default()),
-            4 => view.receiver = None,
-            5 => view.receiver.as_mut().unwrap().core_input = Some(1),
-            6 => view.receiver.as_mut().unwrap().borrowed = false,
-            7 => view.params.clear(),
-            8 => view.params[0].core_input = Some(0),
-            9 => view.params[0].borrowed = true,
-            10 => view.borrowed_self = true,
-            11 => view.tail_repetitions = Some(1),
-            _ => {
-                let duplicate = view.clone();
-                bindings.views.push(duplicate);
-            }
-        }
-        assert!(
-            builtin::definitions::reconcile_declarations(&invalid, &mut proto::Program::default())
-                .is_err(),
-            "malformed Rust application view {case}"
-        );
-    }
-}
-
-#[test]
 fn multiset_index_operations_preserve_function_capture_prefixes() {
     let mut graph = EGraph::default();
     graph
@@ -1376,19 +308,14 @@ fn function_value_structural_provenance_and_application_catalog() {
         .unwrap()
         .definitions;
     let declaration = catalog
-        .declarations
+        .primitives
         .iter()
-        .find(|d| {
-            matches!(&d.kind,
-        Some(proto::declaration::Kind::HostPrimitive(p)) if p.name == "egglog.core.fn.apply")
-        })
+        .find(|d| d.name == "egglog.core.fn.apply")
         .expect("uninstantiated function application descriptor");
-    let Some(proto::declaration::Kind::HostPrimitive(primitive)) = &declaration.kind else {
-        unreachable!()
-    };
+    let primitive = declaration;
     assert!(matches!(
         primitive.typing,
-        Some(proto::host_primitive::Typing::Application(_))
+        Some(proto::primitive::Typing::Application(_))
     ));
     graph
         .type_info()
@@ -1540,106 +467,32 @@ fn remaining_scalar_catalog_preserves_closed_providers() {
         .iter()
         .filter_map(|(suffix, ..)| {
             let key = format!("egglog.core.{suffix}");
-            (!catalog.declarations.iter().any(|d| {
-                matches!(&d.kind,
-            Some(proto::declaration::Kind::HostPrimitive(p)) if p.name == key)
-            }))
-            .then_some(key)
+            (!catalog.primitives.iter().any(|d| d.name == key)).then_some(key)
         })
         .collect();
     assert!(
         missing.is_empty(),
         "missing scalar catalog entries: {missing:?}"
     );
-    for &(suffix, alias, names, python) in cases {
+    for &(suffix, alias, names, _python) in cases {
         let key = format!("egglog.core.{suffix}");
         let declarations: Vec<_> = catalog
-            .declarations
+            .primitives
             .iter()
-            .filter(|d| {
-                matches!(&d.kind,
-            Some(proto::declaration::Kind::HostPrimitive(p)) if p.name == key)
-            })
+            .filter(|d| d.name == key)
             .collect();
         assert_eq!(declarations.len(), 1, "{key}");
         let declaration = declarations[0];
-        let Some(proto::declaration::Kind::HostPrimitive(primitive)) = &declaration.kind else {
-            unreachable!()
-        };
+        let primitive = declaration;
         assert_eq!(
             builtin::signature_sorts(&catalog, primitive).unwrap(),
             names,
             "{key}"
         );
-        let Some(proto::host_primitive::Typing::Signature(signature)) = &primitive.typing else {
+        let Some(proto::primitive::Typing::Signature(signature)) = &primitive.typing else {
             unreachable!()
         };
         assert!(signature.type_params.is_empty() && signature.varargs.is_empty());
-        let bindings = declaration.bindings.as_ref().unwrap();
-        assert_eq!(bindings.egglog.as_ref().unwrap().views[0].symbol, alias);
-        if let Some(python) = python {
-            let py = &bindings.python.as_ref().unwrap().views[0];
-            let rs = &bindings.rust.as_ref().unwrap().views[0];
-            assert_eq!(py.path.last().unwrap(), python);
-            assert_eq!(py.owner, rs.owner);
-            match suffix {
-                "f64.from_i64" => {
-                    assert_eq!(py.kind, i32::from(proto::PythonCallKind::ClassMethod));
-                    assert_eq!(
-                        py.owner.as_ref().unwrap().kind,
-                        Some(proto::binding_owner::Kind::Sort(signature.output.unwrap()))
-                    );
-                    assert_eq!(py.params[0].name, "i");
-                    assert_eq!(rs.params[0].name, "i");
-                    assert!(py.receiver.is_none() && rs.receiver.is_none());
-                }
-                "string.count_matches" => {
-                    assert_eq!(py.kind, i32::from(proto::PythonCallKind::Function));
-                    assert!(py.owner.is_none() && py.receiver.is_none() && rs.receiver.is_none());
-                    assert_eq!(
-                        py.params
-                            .iter()
-                            .map(|p| p.name.as_str())
-                            .collect::<Vec<_>>(),
-                        ["s", "pattern"]
-                    );
-                    assert_eq!(
-                        rs.params
-                            .iter()
-                            .map(|p| p.name.as_str())
-                            .collect::<Vec<_>>(),
-                        ["s", "pattern"]
-                    );
-                }
-                _ => {
-                    assert_eq!(py.kind, i32::from(proto::PythonCallKind::Method));
-                    assert_eq!(py.receiver, Some(0));
-                    assert_eq!(rs.receiver.as_ref().unwrap().core_input, Some(0));
-                    assert_eq!(
-                        py.owner.as_ref().unwrap().kind,
-                        Some(proto::binding_owner::Kind::Sort(signature.inputs[0].sort))
-                    );
-                    if matches!(suffix, "i64.gt" | "i64.le") {
-                        assert!(rs.receiver.as_ref().unwrap().borrowed);
-                    }
-                    if suffix == "f64.pow" {
-                        assert!(rs.trait_impl.is_none());
-                    }
-                }
-            }
-        } else {
-            assert!(bindings.python.is_none(), "{key}");
-            let view = &bindings.rust.as_ref().unwrap().views[0];
-            assert_eq!(
-                view.path,
-                [if suffix == "bool.guard" {
-                    "guard"
-                } else {
-                    "bool_eq"
-                }]
-            );
-            assert_eq!(view.receiver.as_ref().unwrap().core_input, Some(0));
-        }
         let sorts: Vec<_> = names
             .iter()
             .map(|name| graph.get_sort_by_name(name).unwrap().clone())
@@ -1669,7 +522,7 @@ fn remaining_scalar_catalog_preserves_closed_providers() {
         }
         for mutation in ["input", "output", "arity"] {
             let mut wrong = primitive.clone();
-            let Some(proto::host_primitive::Typing::Signature(s)) = &mut wrong.typing else {
+            let Some(proto::primitive::Typing::Signature(s)) = &mut wrong.typing else {
                 unreachable!()
             };
             let index = if mutation == "output" {
@@ -1678,7 +531,7 @@ fn remaining_scalar_catalog_preserves_closed_providers() {
                 s.inputs[0].sort
             };
             let other = catalog.sorts.iter().position(|sort| matches!(&sort.kind,
-                Some(proto::sort::Kind::Family(f)) if f.args.is_empty() && f.name != names[if mutation == "output" {names.len()-1} else {0}])).unwrap() as u32;
+                Some(proto::sort::Kind::Application(f)) if f.args.is_empty() && f.name != names[if mutation == "output" {names.len()-1} else {0}])).unwrap() as u32;
             assert_ne!(other, index);
             match mutation {
                 "input" => s.inputs[0].sort = other,
@@ -1717,17 +570,12 @@ fn remaining_scalar_generic_catalog_preserves_homogeneous_providers() {
         ("egglog.core.value_eq", "value-eq", "Unit", false),
     ] {
         let declaration = catalog
-            .declarations
+            .primitives
             .iter()
-            .find(|d| {
-                matches!(&d.kind,
-            Some(proto::declaration::Kind::HostPrimitive(p)) if p.name == key)
-            })
+            .find(|d| d.name == key)
             .unwrap_or_else(|| panic!("missing {key}"));
-        let Some(proto::declaration::Kind::HostPrimitive(primitive)) = &declaration.kind else {
-            unreachable!()
-        };
-        let Some(proto::host_primitive::Typing::Signature(signature)) = &primitive.typing else {
+        let primitive = declaration;
+        let Some(proto::primitive::Typing::Signature(signature)) = &primitive.typing else {
             unreachable!()
         };
         assert_eq!(signature.type_params.len(), 1);
@@ -1739,21 +587,7 @@ fn remaining_scalar_generic_catalog_preserves_homogeneous_providers() {
             Some(proto::sort::Kind::Var(0))
         );
         assert!(
-            matches!(&catalog.sorts[signature.output.unwrap() as usize].kind, Some(proto::sort::Kind::Family(f)) if f.name == output && f.args.is_empty())
-        );
-        let bindings = declaration.bindings.as_ref().unwrap();
-        assert_eq!(bindings.egglog.as_ref().unwrap().views[0].symbol, alias);
-        assert!(bindings.python.is_none());
-        assert_eq!(
-            bindings.rust.as_ref().unwrap().views[0]
-                .path
-                .last()
-                .unwrap(),
-            if key == "egglog.core.bool_ne" {
-                "bool_ne"
-            } else {
-                "value_eq"
-            }
+            matches!(&catalog.sorts[signature.output.unwrap() as usize].kind, Some(proto::sort::Kind::Application(f)) if f.name == output && f.args.is_empty())
         );
         for name in [
             "i64", "bool", "f64", "String", "BigInt", "BigRat", "Unit", "Item", "Items", "Ints",
@@ -1897,13 +731,14 @@ fn inequality_native_baseline() {
 fn inequality_catalog_uses_one_generic_registration() {
     let mut graph = EGraph::default();
     let catalog = graph.type_info().portable_builtin_catalog().unwrap();
-    let declaration = catalog.definitions.declarations.iter().find(|d| {
-        matches!(&d.kind, Some(proto::declaration::Kind::HostPrimitive(p)) if p.name == "egglog.core.ne")
-    }).expect("native inequality is missing its canonical descriptor");
-    let Some(proto::declaration::Kind::HostPrimitive(primitive)) = &declaration.kind else {
-        unreachable!()
-    };
-    let Some(proto::host_primitive::Typing::Signature(signature)) = &primitive.typing else {
+    let declaration = catalog
+        .definitions
+        .primitives
+        .iter()
+        .find(|d| d.name == "egglog.core.ne")
+        .expect("native inequality is missing its canonical descriptor");
+    let primitive = declaration;
+    let Some(proto::primitive::Typing::Signature(signature)) = &primitive.typing else {
         unreachable!()
     };
     assert_eq!(signature.type_params.len(), 1);
@@ -1916,35 +751,7 @@ fn inequality_catalog_uses_one_generic_registration() {
     );
     assert!(
         matches!(&catalog.definitions.sorts[signature.output.unwrap() as usize].kind,
-        Some(proto::sort::Kind::Family(f)) if f.name == "Unit" && f.args.is_empty())
-    );
-    let bindings = declaration.bindings.as_ref().unwrap();
-    assert_eq!(bindings.egglog.as_ref().unwrap().views[0].symbol, "!=");
-    assert!(bindings.python.is_none());
-    assert_eq!(
-        bindings
-            .rust
-            .as_ref()
-            .expect("inequality needs a Rust view")
-            .views,
-        vec![proto::RustCallable {
-            path: ["egglog_experimental", "typed", "builtins", "ne"]
-                .map(str::to_owned)
-                .into(),
-            params: signature
-                .inputs
-                .iter()
-                .enumerate()
-                .map(|(index, input)| {
-                    proto::RustParameter {
-                        name: input.name.clone(),
-                        core_input: Some(index as u32),
-                        borrowed: false,
-                    }
-                })
-                .collect(),
-            ..Default::default()
-        }]
+        Some(proto::sort::Kind::Application(f)) if f.name == "Unit" && f.args.is_empty())
     );
     assert!(
         !catalog
@@ -2038,8 +845,12 @@ fn inequality_catalog_export_does_not_execute_generic_provider() {
         .unwrap()
         .definitions;
     assert_eq!(before, after);
-    assert!(before.declarations.iter().any(|d| matches!(&d.kind,
-        Some(proto::declaration::Kind::HostPrimitive(p)) if p.name == "test.counted-generic")));
+    assert!(
+        before
+            .primitives
+            .iter()
+            .any(|d| d.name == "test.counted-generic")
+    );
     assert_eq!(CALLS.load(Ordering::SeqCst), 0);
 }
 
@@ -2054,35 +865,19 @@ fn bigrat_properties_export_actual_signatures_and_views() {
     for name in ["numer", "denom"] {
         let key = format!("egglog.core.bigrat.{name}");
         let declaration = program
-            .declarations
+            .primitives
             .iter()
-            .find(|d| matches!(&d.kind, Some(proto::declaration::Kind::HostPrimitive(p)) if p.name == key))
+            .find(|d| d.name == key)
             .unwrap_or_else(|| panic!("missing native catalog definition {key}"));
-        let Some(proto::declaration::Kind::HostPrimitive(primitive)) = &declaration.kind else {
-            unreachable!()
-        };
+        let primitive = declaration;
         assert_eq!(
             builtin::signature_sorts(&program, primitive).unwrap(),
             ["BigRat", "BigInt"]
         );
-        let Some(proto::host_primitive::Typing::Signature(signature)) = &primitive.typing else {
+        let Some(proto::primitive::Typing::Signature(signature)) = &primitive.typing else {
             unreachable!()
         };
-        let bindings = declaration.bindings.as_ref().unwrap();
-        let python = &bindings.python.as_ref().unwrap().views[0];
-        let rust = &bindings.rust.as_ref().unwrap().views[0];
-        assert_eq!(python.path, [name]);
-        assert_eq!(python.kind, i32::from(proto::PythonCallKind::Property));
-        assert_eq!(python.receiver, Some(0));
-        assert!(python.params.is_empty());
-        assert_eq!(
-            python.owner.as_ref().unwrap().kind,
-            Some(proto::binding_owner::Kind::Sort(signature.inputs[0].sort))
-        );
-        assert_eq!(rust.path, [name]);
-        assert_eq!(rust.owner, python.owner);
-        assert_eq!(rust.receiver.as_ref().unwrap().core_input, Some(0));
-        assert!(rust.params.is_empty());
+        assert!(signature.varargs.is_empty());
         let sorts = ["BigRat", "BigInt"].map(|s| graph.get_sort_by_name(s).unwrap().clone());
         for context in [Context::Pure, Context::Read, Context::Write, Context::Full] {
             let ResolvedCall::Primitive(alias) = ResolvedCall::from_resolution(
@@ -2120,10 +915,8 @@ fn numeric_catalog_members_preserve_native_providers_and_typed_views() {
         .unwrap()
         .definitions;
     let mut count = 0;
-    for declaration in &program.declarations {
-        let Some(proto::declaration::Kind::HostPrimitive(primitive)) = &declaration.kind else {
-            continue;
-        };
+    for declaration in &program.primitives {
+        let primitive = declaration;
         let owner = if primitive.name.starts_with("egglog.core.bigint.") {
             "BigInt"
         } else if primitive.name.starts_with("egglog.core.bigrat.") {
@@ -2136,7 +929,7 @@ fn numeric_catalog_members_preserve_native_providers_and_typed_views() {
             continue; // Constructor contracts are checked separately.
         }
         count += 1;
-        let Some(proto::host_primitive::Typing::Signature(signature)) = &primitive.typing else {
+        let Some(proto::primitive::Typing::Signature(signature)) = &primitive.typing else {
             unreachable!()
         };
         assert!(signature.type_params.is_empty() && signature.varargs.is_empty());
@@ -2154,66 +947,13 @@ fn numeric_catalog_members_preserve_native_providers_and_typed_views() {
             "to_f64" => assert_eq!(sort_names, ["BigRat", "f64"]),
             _ => assert!(sort_names.iter().all(|name| name == owner)),
         }
-        let bindings = declaration.bindings.as_ref().unwrap();
-        let alias = &bindings.egglog.as_ref().unwrap().views[0].symbol;
-        let python = &bindings.python.as_ref().unwrap().views[0];
-        let rust = &bindings.rust.as_ref().unwrap().views[0];
-        assert_eq!(python.receiver, Some(0));
-        assert_eq!(
-            python.owner.as_ref().unwrap().kind,
-            Some(proto::binding_owner::Kind::Sort(signature.inputs[0].sort))
-        );
-        assert_eq!(rust.owner, python.owner);
-        assert_eq!(rust.path, [member]);
-        assert_eq!(rust.receiver.as_ref().unwrap().core_input, Some(0));
-        let expected_slots = (1..signature.inputs.len() as u32).collect::<Vec<_>>();
-        assert_eq!(
-            python
-                .params
-                .iter()
-                .map(|p| p.core_input.unwrap())
-                .collect::<Vec<_>>(),
-            expected_slots
-        );
-        assert_eq!(
-            rust.params
-                .iter()
-                .map(|p| p.core_input.unwrap())
-                .collect::<Vec<_>>(),
-            expected_slots
-        );
-        let expected_trait = match member {
-            "add" => Some("Add"),
-            "sub" => Some("Sub"),
-            "mul" => Some("Mul"),
-            "div" => Some("Div"),
-            "rem" => Some("Rem"),
-            "bitand" => Some("BitAnd"),
-            "bitor" => Some("BitOr"),
-            "bitxor" => Some("BitXor"),
-            "shl" => Some("Shl"),
-            "shr" => Some("Shr"),
-            "not" => Some("Not"),
-            "neg" => Some("Neg"),
-            _ => None,
-        };
-        assert_eq!(
-            rust.trait_impl.as_ref().map(|t| t.path.join("::")),
-            expected_trait.map(|name| format!("core::ops::{name}"))
-        );
-        if let Some(trait_impl) = &rust.trait_impl {
-            assert_eq!(
-                trait_impl
-                    .args
-                    .iter()
-                    .map(|a| a.sort.unwrap())
-                    .collect::<Vec<_>>(),
-                signature.inputs[1..]
-                    .iter()
-                    .map(|p| p.sort)
-                    .collect::<Vec<_>>()
-            );
-        }
+        let aliases = graph
+            .type_info()
+            .builtin_description(&primitive.name)
+            .unwrap()
+            .aliases
+            .clone();
+        let alias = &aliases[0];
         let native_sorts = sort_names
             .iter()
             .map(|name| graph.get_sort_by_name(name).unwrap().clone())
@@ -2257,60 +997,37 @@ fn closed_i64_catalog_preserves_signatures_aliases_and_borrowed_views() {
     let float = program
         .sorts
         .iter()
-        .position(|s| matches!(&s.kind, Some(proto::sort::Kind::Family(f)) if f.name == "f64"))
+        .position(|s| matches!(&s.kind, Some(proto::sort::Kind::Application(f)) if f.name == "f64"))
         .unwrap() as u32;
-    for (key, alias, python, method, trait_name, output) in [
-        ("sub", "-", "__sub__", "sub", Some("Sub"), "i64"),
-        ("mul", "*", "__mul__", "mul", Some("Mul"), "i64"),
-        ("div", "/", "__truediv__", "div", Some("Div"), "i64"),
-        ("rem", "%", "__mod__", "rem", Some("Rem"), "i64"),
-        ("bitand", "&", "__and__", "bitand", Some("BitAnd"), "i64"),
-        ("lt", "<", "__lt__", "lt", None, "Unit"),
-        ("ge", ">=", "__ge__", "ge", None, "Unit"),
-        ("min", "min", "min", "min", None, "i64"),
-        ("max", "max", "max", "max", None, "i64"),
+    for (key, alias, output) in [
+        ("sub", "-", "i64"),
+        ("mul", "*", "i64"),
+        ("div", "/", "i64"),
+        ("rem", "%", "i64"),
+        ("bitand", "&", "i64"),
+        ("lt", "<", "Unit"),
+        ("ge", ">=", "Unit"),
+        ("min", "min", "i64"),
+        ("max", "max", "i64"),
     ] {
         let key = format!("egglog.core.i64.{key}");
         let definitions: Vec<_> = program
-            .declarations
+            .primitives
             .iter()
-            .filter(|d| {
-                matches!(
-                    &d.kind, Some(proto::declaration::Kind::HostPrimitive(p)) if p.name == key
-                )
-            })
+            .filter(|d| d.name == key)
             .collect();
         assert_eq!(definitions.len(), 1, "{key}");
         let declaration = definitions[0];
-        let Some(proto::declaration::Kind::HostPrimitive(primitive)) = &declaration.kind else {
-            unreachable!()
-        };
+        let primitive = declaration;
         assert_eq!(
             builtin::signature_sorts(&program, primitive).unwrap(),
             ["i64", "i64", output]
         );
-        let Some(proto::host_primitive::Typing::Signature(signature)) = &primitive.typing else {
+        let Some(proto::primitive::Typing::Signature(signature)) = &primitive.typing else {
             unreachable!()
         };
         assert!(signature.type_params.is_empty());
         assert!(signature.varargs.is_empty());
-        let bindings = declaration.bindings.as_ref().unwrap();
-        assert_eq!(bindings.egglog.as_ref().unwrap().views[0].symbol, alias);
-        assert_eq!(bindings.python.as_ref().unwrap().views[0].path, [python]);
-        let rust = &bindings.rust.as_ref().unwrap().views[0];
-        assert_eq!(rust.path, [method]);
-        assert_eq!(rust.receiver.as_ref().unwrap().core_input, Some(0));
-        assert_eq!(
-            rust.receiver.as_ref().unwrap().borrowed,
-            trait_name.is_none()
-        );
-        assert_eq!(rust.params.len(), 1);
-        assert_eq!(rust.params[0].core_input, Some(1));
-        assert!(!rust.params[0].borrowed);
-        assert_eq!(
-            rust.trait_impl.as_ref().map(|t| t.path.join("::")),
-            trait_name.map(|t| format!("core::ops::{t}"))
-        );
         let sorts = ["i64", "i64", output].map(|s| graph.get_sort_by_name(s).unwrap().clone());
         for context in [Context::Pure, Context::Read, Context::Write, Context::Full] {
             let ResolvedCall::Primitive(source) = ResolvedCall::from_resolution(
@@ -2338,8 +1055,7 @@ fn closed_i64_catalog_preserves_signatures_aliases_and_borrowed_views() {
         }
         for corrupt_output in [false, true] {
             let mut wrong = primitive.clone();
-            let Some(proto::host_primitive::Typing::Signature(signature)) = &mut wrong.typing
-            else {
+            let Some(proto::primitive::Typing::Signature(signature)) = &mut wrong.typing else {
                 unreachable!()
             };
             if corrupt_output {
@@ -2427,24 +1143,20 @@ fn set_catalog_precedes_instances_and_preserves_native_aliases() {
     );
     let family = before
         .definitions
-        .declarations
+        .primitive_sorts
         .iter()
-        .find_map(|d| match &d.kind {
-            Some(proto::declaration::Kind::HostSortFamily(f)) if f.name == "Set" => Some(f),
-            _ => None,
-        })
+        .find(|d| d.name == "Set")
         .unwrap();
     assert_eq!(family.arity, 1);
-    let bindings = family.bindings.as_ref().unwrap();
     assert_eq!(
-        bindings.python.as_ref().unwrap().path,
-        ["egglog", "builtins", "Set"]
+        before
+            .definitions
+            .primitives
+            .iter()
+            .filter(|d| d.name.starts_with("egglog.core.set."))
+            .count(),
+        11
     );
-    assert_eq!(
-        bindings.rust.as_ref().unwrap().path,
-        ["egglog_experimental", "typed", "builtins", "Set"]
-    );
-    assert_eq!(before.definitions.declarations.iter().filter(|d| matches!(&d.kind, Some(proto::declaration::Kind::HostPrimitive(p)) if p.name.starts_with("egglog.core.set."))).count(), 11);
     graph.parse_and_run_program(None, "(sort SI (Set i64)) (sort Other (Set i64)) (sort Math) (constructor A () Math) (sort SM (Set Math))").unwrap();
     for (element, set) in [("i64", "SI"), ("Math", "SM")] {
         for (key, alias, inputs, output) in [
@@ -2472,11 +1184,14 @@ fn set_catalog_precedes_instances_and_preserves_native_aliases() {
                 .chain([output])
                 .map(|name| graph.get_sort_by_name(name).unwrap().clone())
                 .collect::<Vec<_>>();
-            let d = before.definitions.declarations.iter().find(|d| matches!(&d.kind, Some(proto::declaration::Kind::HostPrimitive(p)) if p.name == key)).unwrap();
-            let Some(proto::declaration::Kind::HostPrimitive(p)) = &d.kind else {
-                unreachable!()
-            };
-            let Some(proto::host_primitive::Typing::Signature(s)) = &p.typing else {
+            let d = before
+                .definitions
+                .primitives
+                .iter()
+                .find(|d| d.name == key)
+                .unwrap();
+            let p = &d;
+            let Some(proto::primitive::Typing::Signature(s)) = &p.typing else {
                 unreachable!()
             };
             assert_eq!(s.type_params, ["T"]);
@@ -2485,19 +1200,6 @@ fn set_catalog_precedes_instances_and_preserves_native_aliases() {
                 s.inputs.len(),
                 if alias == "set-of" { 0 } else { inputs.len() }
             );
-            let bindings = d.bindings.as_ref().unwrap();
-            assert_eq!(bindings.egglog.as_ref().unwrap().views[0].symbol, alias);
-            let rs = &bindings.rust.as_ref().unwrap().views[0];
-            assert_eq!(rs.path, [key.strip_prefix("egglog.core.set.").unwrap()]);
-            assert_eq!(bindings.python.is_some(), alias != "set-get");
-            if let Some(python) = &bindings.python {
-                let py = &python.views[0];
-                assert_eq!(py.owner, rs.owner);
-                assert_eq!(
-                    py.receiver,
-                    (!matches!(alias, "set-of" | "set-empty")).then_some(0)
-                );
-            }
             for context in [Context::Pure, Context::Read, Context::Write, Context::Full] {
                 let ResolvedCall::Primitive(a) = ResolvedCall::from_resolution(
                     alias,
@@ -2554,62 +1256,50 @@ fn exact_integer_families_and_constructors_use_actual_native_providers() {
     let mut graph = EGraph::default();
     assert!(graph.get_sort_by_name("Rational").is_none());
     let catalog = graph.type_info().portable_builtin_catalog().unwrap();
-    assert!(!catalog.definitions.declarations.iter().any(|d| matches!(&d.kind, Some(proto::declaration::Kind::HostPrimitive(p)) if p.name.starts_with("egglog.experimental.rational."))));
+    assert!(
+        !catalog
+            .definitions
+            .primitives
+            .iter()
+            .any(|d| d.name.starts_with("egglog.experimental.rational."))
+    );
     for name in ["BigInt", "BigRat"] {
         let family = catalog
             .definitions
-            .declarations
+            .primitive_sorts
             .iter()
-            .find_map(|d| match &d.kind {
-                Some(proto::declaration::Kind::HostSortFamily(f)) if f.name == name => Some(f),
-                _ => None,
-            })
+            .find(|d| d.name == name)
             .unwrap();
         assert_eq!(family.arity, 0);
-        let bindings = family.bindings.as_ref().unwrap();
-        assert_eq!(
-            bindings.python.as_ref().unwrap().path,
-            ["egglog", "builtins", name]
-        );
-        assert_eq!(
-            bindings.rust.as_ref().unwrap().path,
-            ["egglog_experimental", "typed", "builtins", name]
-        );
     }
-    for (key, alias, inputs, output, python_kind, python_path, rust_path) in [
+    for (key, alias, inputs, output) in [
         (
             "egglog.core.bigint.from_i64",
             "bigint",
             &["i64"][..],
             "BigInt",
-            proto::PythonCallKind::Initializer,
-            &[][..],
-            "new",
         ),
         (
             "egglog.core.bigint.from_string",
             "from-string",
             &["String"][..],
             "BigInt",
-            proto::PythonCallKind::ClassMethod,
-            &["from_string"][..],
-            "from_string",
         ),
         (
             "egglog.core.bigrat.make",
             "bigrat",
             &["BigInt", "BigInt"][..],
             "BigRat",
-            proto::PythonCallKind::Initializer,
-            &[][..],
-            "new",
         ),
     ] {
-        let d = catalog.definitions.declarations.iter().find(|d| matches!(&d.kind, Some(proto::declaration::Kind::HostPrimitive(p)) if p.name == key)).unwrap();
-        let Some(proto::declaration::Kind::HostPrimitive(p)) = &d.kind else {
-            unreachable!()
-        };
-        let Some(proto::host_primitive::Typing::Signature(s)) = &p.typing else {
+        let d = catalog
+            .definitions
+            .primitives
+            .iter()
+            .find(|d| d.name == key)
+            .unwrap();
+        let p = &d;
+        let Some(proto::primitive::Typing::Signature(s)) = &p.typing else {
             unreachable!()
         };
         assert!(s.type_params.is_empty() && s.varargs.is_empty());
@@ -2622,37 +1312,9 @@ fn exact_integer_families_and_constructors_use_actual_native_providers() {
             .zip(inputs.iter().copied().chain([output]))
         {
             assert!(
-                matches!(&catalog.definitions.sorts[sort as usize].kind, Some(proto::sort::Kind::Family(f)) if f.name == name && f.args.is_empty())
+                matches!(&catalog.definitions.sorts[sort as usize].kind, Some(proto::sort::Kind::Application(f)) if f.name == name && f.args.is_empty())
             );
         }
-        let b = d.bindings.as_ref().unwrap();
-        assert_eq!(b.egglog.as_ref().unwrap().views[0].symbol, alias);
-        let py = &b.python.as_ref().unwrap().views[0];
-        let rs = &b.rust.as_ref().unwrap().views[0];
-        assert_eq!(py.kind, i32::from(python_kind));
-        assert_eq!(py.path, python_path);
-        assert_eq!(rs.path, [rust_path]);
-        assert_eq!(
-            py.owner.as_ref().unwrap().kind,
-            Some(proto::binding_owner::Kind::Sort(s.output.unwrap()))
-        );
-        assert_eq!(rs.owner, py.owner);
-        assert_eq!(py.receiver, None);
-        assert_eq!(rs.receiver, None);
-        assert_eq!(
-            py.params
-                .iter()
-                .map(|p| p.core_input.unwrap())
-                .collect::<Vec<_>>(),
-            (0..inputs.len() as u32).collect::<Vec<_>>()
-        );
-        assert_eq!(
-            rs.params
-                .iter()
-                .map(|p| p.core_input.unwrap())
-                .collect::<Vec<_>>(),
-            (0..inputs.len() as u32).collect::<Vec<_>>()
-        );
         let sorts = inputs
             .iter()
             .chain([&output])
@@ -2708,14 +1370,14 @@ fn annotated_builtins_resolve_in_the_nonexecuting_authoring_context() {
         let program = proto::Program {
             sorts: vec![
                 proto::Sort {
-                    kind: Some(proto::sort::Kind::Family(proto::HostSort {
+                    kind: Some(proto::sort::Kind::Application(proto::SortApplication {
                         name: "i64".into(),
                         args: vec![],
                     })),
                     ..Default::default()
                 },
                 proto::Sort {
-                    kind: Some(proto::sort::Kind::Family(proto::HostSort {
+                    kind: Some(proto::sort::Kind::Application(proto::SortApplication {
                         name: "Vec".into(),
                         args: vec![0],
                     })),
@@ -2876,13 +1538,19 @@ fn flat_map_export_packs_existing_refs_without_native_pair_vec_aliases() {
         };
         assert_eq!(vector.items, (2..2 + count as u32).collect::<Vec<_>>());
         assert_eq!(program.nodes.last().unwrap().span, span);
-        let primitives = program
-            .declarations
+        assert!(
+            program.declarations.is_empty(),
+            "builtin signatures stay in GetBuiltins"
+        );
+        let catalog = graph
+            .type_info()
+            .portable_builtin_catalog()
+            .unwrap()
+            .definitions;
+        let primitives = catalog
+            .primitives
             .iter()
-            .filter_map(|declaration| match &declaration.kind {
-                Some(proto::declaration::Kind::HostPrimitive(primitive)) => Some(primitive),
-                _ => None,
-            })
+            .filter(|primitive| primitive.name == "egglog.core.map.of")
             .collect::<Vec<_>>();
         assert_eq!(
             primitives.len(),
@@ -2890,27 +1558,27 @@ fn flat_map_export_packs_existing_refs_without_native_pair_vec_aliases() {
             "packing values need no Pair/Vec constructor callables"
         );
         assert_eq!(primitives[0].name, "egglog.core.map.of");
-        let Some(proto::host_primitive::Typing::Signature(signature)) = &primitives[0].typing
-        else {
+        let Some(proto::primitive::Typing::Signature(signature)) = &primitives[0].typing else {
             unreachable!()
         };
         assert_eq!(signature.type_params, ["K", "V"]);
         assert_eq!(signature.inputs.len(), 1);
         assert!(signature.varargs.is_empty());
-        let Some(proto::sort::Kind::Family(vector)) =
-            &program.sorts[signature.inputs[0].sort as usize].kind
+        let Some(proto::sort::Kind::Application(vector)) =
+            &catalog.sorts[signature.inputs[0].sort as usize].kind
         else {
             panic!("Vec<Pair<K, V>> signature input")
         };
         assert_eq!(vector.name, "Vec");
         assert_eq!(vector.args.len(), 1);
-        let Some(proto::sort::Kind::Family(pair)) = &program.sorts[vector.args[0] as usize].kind
+        let Some(proto::sort::Kind::Application(pair)) =
+            &catalog.sorts[vector.args[0] as usize].kind
         else {
             panic!("Pair<K, V> signature element")
         };
         assert_eq!(pair.name, "Pair");
-        let Some(proto::sort::Kind::Family(map)) =
-            &program.sorts[signature.output.unwrap() as usize].kind
+        let Some(proto::sort::Kind::Application(map)) =
+            &catalog.sorts[signature.output.unwrap() as usize].kind
         else {
             panic!("Map<K, V> signature result")
         };
@@ -2929,147 +1597,36 @@ fn map_catalog_precedes_instances_and_uses_one_vec_of_pairs_input() {
         .unwrap()
         .definitions;
     let family = before
-        .declarations
+        .primitive_sorts
         .iter()
-        .find_map(|d| match &d.kind {
-            Some(proto::declaration::Kind::HostSortFamily(f)) if f.name == "Map" => Some(f),
-            _ => None,
-        })
+        .find(|d| d.name == "Map")
         .unwrap();
     assert_eq!(family.arity, 2);
-    let bindings = family.bindings.as_ref().unwrap();
-    assert_eq!(
-        bindings.python.as_ref().unwrap(),
-        &proto::TypeBinding {
-            path: vec!["egglog".into(), "builtins".into(), "Map".into()],
-            type_params: vec!["K".into(), "V".into()]
-        }
-    );
-    assert_eq!(
-        bindings.rust.as_ref().unwrap(),
-        &proto::TypeBinding {
-            path: vec![
-                "egglog_experimental".into(),
-                "typed".into(),
-                "builtins".into(),
-                "Map".into()
-            ],
-            type_params: vec!["K".into(), "V".into()]
-        }
-    );
     for method in ["empty", "of", "get", "insert"] {
-        let declaration = before.declarations.iter().find(|d| matches!(&d.kind,
-            Some(proto::declaration::Kind::HostPrimitive(p)) if p.name == format!("egglog.core.map.{method}")
-        )).expect("canonical Map provider must exist before instances");
-        let views = declaration.bindings.as_ref().unwrap();
-        let python = &views.python.as_ref().unwrap().views[0];
-        let rust = &views.rust.as_ref().unwrap().views[0];
-        assert_eq!(python.owner, rust.owner);
-        let owner = match python.owner.as_ref().unwrap().kind {
-            Some(proto::binding_owner::Kind::Sort(i)) => i,
-            _ => panic!("owner"),
-        };
-        let Some(proto::sort::Kind::Family(owner)) = &before.sorts[owner as usize].kind else {
-            panic!("family")
-        };
-        assert_eq!(owner.name, "Map");
-        assert_eq!(
-            owner
-                .args
-                .iter()
-                .map(|i| before.sorts[*i as usize].kind.clone())
-                .collect::<Vec<_>>(),
-            [
-                Some(proto::sort::Kind::Var(0)),
-                Some(proto::sort::Kind::Var(1))
-            ]
-        );
-        let receiver = matches!(method, "get" | "insert");
-        assert_eq!(
-            python.kind,
-            if receiver {
-                proto::PythonCallKind::Method
-            } else {
-                proto::PythonCallKind::ClassMethod
-            } as i32
-        );
-        assert_eq!(
-            python.path,
-            [match method {
-                "of" => "from_pairs",
-                "get" => "__getitem__",
-                _ => method,
-            }]
-        );
-        assert_eq!(python.receiver, receiver.then_some(0));
-        assert!(python.mutates.is_none());
-        assert_eq!(
-            rust.path,
-            [if method == "of" { "from_pairs" } else { method }]
-        );
-        assert_eq!(
-            rust.receiver,
-            receiver.then_some(proto::RustReceiver {
-                core_input: Some(0),
-                borrowed: true
-            })
-        );
-        assert!(rust.trait_impl.is_none() && !rust.borrowed_self);
-        let expected: &[(&str, u32)] = match method {
-            "empty" => &[],
-            "of" => &[("entries", 0)],
-            "get" => &[("key", 1)],
-            _ => &[("key", 1), ("value", 2)],
-        };
-        assert_eq!(
-            python
-                .params
-                .iter()
-                .map(|p| (p.name.as_str(), p.core_input.unwrap()))
-                .collect::<Vec<_>>(),
-            expected
-        );
-        assert!(python.params.iter().all(|p| p.default_expr.is_none()));
-        assert_eq!(
-            rust.params
-                .iter()
-                .map(|p| (p.name.as_str(), p.core_input.unwrap()))
-                .collect::<Vec<_>>(),
-            expected
-        );
-        assert!(rust.params.iter().all(|p| !p.borrowed));
+        let declaration = before
+            .primitives
+            .iter()
+            .find(|d| d.name == format!("egglog.core.map.{method}"))
+            .expect("canonical Map provider must exist before instances");
         if method == "of" {
-            let Some(proto::declaration::Kind::HostPrimitive(p)) = &declaration.kind else {
-                unreachable!()
-            };
-            let Some(proto::host_primitive::Typing::Signature(signature)) = &p.typing else {
+            let p = &declaration;
+            let Some(proto::primitive::Typing::Signature(signature)) = &p.typing else {
                 unreachable!()
             };
             assert_eq!(signature.inputs.len(), 1);
             assert!(signature.varargs.is_empty());
-            let Some(proto::sort::Kind::Family(vec)) =
+            let Some(proto::sort::Kind::Application(vec)) =
                 &before.sorts[signature.inputs[0].sort as usize].kind
             else {
                 panic!("Vec")
             };
             assert_eq!(vec.name, "Vec");
-            let Some(proto::sort::Kind::Family(pair)) = &before.sorts[vec.args[0] as usize].kind
+            let Some(proto::sort::Kind::Application(pair)) =
+                &before.sorts[vec.args[0] as usize].kind
             else {
                 panic!("Pair")
             };
             assert_eq!(pair.name, "Pair");
-            assert_eq!(
-                declaration
-                    .bindings
-                    .as_ref()
-                    .unwrap()
-                    .egglog
-                    .as_ref()
-                    .unwrap()
-                    .views[0]
-                    .symbol,
-                "map-from-pairs"
-            );
         }
     }
     graph
@@ -3219,11 +1776,11 @@ fn resolved_call_export_checks_direct_annotations_and_preserves_ordinary_calls()
         for wrong in [
             proto::sort::Kind::Eq("i64".into()),
             proto::sort::Kind::Var(0),
-            proto::sort::Kind::Family(proto::HostSort {
+            proto::sort::Kind::Application(proto::SortApplication {
                 name: "f64".into(),
                 args: vec![],
             }),
-            proto::sort::Kind::Family(proto::HostSort {
+            proto::sort::Kind::Application(proto::SortApplication {
                 name: "Vec".into(),
                 args: vec![0],
             }),
@@ -3261,7 +1818,7 @@ fn resolved_call_export_checks_direct_annotations_and_preserves_ordinary_calls()
     };
     let mut source = proto::Program {
         sorts: vec![proto::Sort {
-            kind: Some(proto::sort::Kind::Family(proto::HostSort {
+            kind: Some(proto::sort::Kind::Application(proto::SortApplication {
                 name: "i64".into(),
                 args: vec![],
             })),
@@ -3282,249 +1839,38 @@ fn resolved_call_export_checks_direct_annotations_and_preserves_ordinary_calls()
 }
 
 #[test]
-fn vec_map_python_view_preserves_native_receiver_and_callback_order() {
-    let catalog = EGraph::default()
-        .type_info()
-        .portable_builtin_catalog()
-        .unwrap()
-        .definitions;
-    let declaration = catalog
-        .declarations
-        .iter()
-        .find(|d| {
-            matches!(&d.kind,
-                Some(proto::declaration::Kind::HostPrimitive(p)) if p.name == "egglog.core.vec.map"
-            )
-        })
-        .unwrap();
-    let Some(proto::declaration::Kind::HostPrimitive(primitive)) = &declaration.kind else {
-        unreachable!()
-    };
-    let Some(proto::host_primitive::Typing::Signature(signature)) = &primitive.typing else {
-        unreachable!()
-    };
-    let bindings = declaration.bindings.as_ref().unwrap();
-    let rust = &bindings.rust.as_ref().unwrap().views[0];
-    let python = &bindings.python.as_ref().unwrap().views[0];
-    assert_eq!(python.kind, proto::PythonCallKind::Method as i32);
-    assert_eq!(python.path, ["map"]);
-    assert_eq!(python.owner, rust.owner);
-    assert_eq!(python.receiver, rust.receiver.as_ref().unwrap().core_input);
-    assert_eq!(python.receiver, Some(1));
-    assert_eq!(
-        python.params,
-        [proto::PythonParameter {
-            core_input: rust.params[0].core_input,
-            name: signature.inputs[0].name.clone(),
-            default_expr: None,
-        }]
-    );
-    assert_eq!(python.params[0].core_input, Some(0));
-    assert!(python.mutates.is_none());
-    assert!(signature.varargs.is_empty());
-    assert!(matches!(
-        catalog.sorts[signature.inputs[0].sort as usize].kind,
-        Some(proto::sort::Kind::Func(_))
-    ));
-    assert_eq!(
-        python.owner.as_ref().unwrap().kind,
-        Some(proto::binding_owner::Kind::Sort(signature.inputs[1].sort))
-    );
-}
-
-#[test]
-fn vec_catalog_has_generic_and_closed_language_views() {
-    let catalog = EGraph::default()
-        .type_info()
-        .portable_builtin_catalog()
-        .unwrap()
-        .definitions;
-    let family = catalog
-        .declarations
-        .iter()
-        .find_map(|d| match &d.kind {
-            Some(proto::declaration::Kind::HostSortFamily(f)) if f.name == "Vec" => Some(f),
-            _ => None,
-        })
-        .unwrap();
-    let binding = family.bindings.as_ref().expect("Vec family presentation");
-    let python = binding.python.as_ref().expect("Vec Python binding");
-    assert_eq!(python.path, ["egglog", "builtins", "Vec"]);
-    assert_eq!(python.type_params, ["T"]);
-    let rust = binding.rust.as_ref().unwrap();
-    assert_eq!(
-        rust.path,
-        ["egglog_experimental", "typed", "builtins", "Vec"]
-    );
-    assert_eq!(rust.type_params, ["T"]);
-    for method in ["empty", "of", "get", "range"] {
-        let declaration = catalog.declarations.iter().find(|d| matches!(&d.kind, Some(proto::declaration::Kind::HostPrimitive(p)) if p.name == format!("egglog.core.vec.{method}"))).unwrap();
-        let bindings = declaration.bindings.as_ref().unwrap();
-        let python = &bindings.python.as_ref().unwrap().views[0];
-        assert_eq!(
-            python.kind,
-            match method {
-                "of" => proto::PythonCallKind::Initializer,
-                "empty" => proto::PythonCallKind::ClassMethod,
-                _ => proto::PythonCallKind::Method,
-            } as i32
-        );
-        assert_eq!(
-            python.path,
-            match method {
-                "of" => vec![],
-                "empty" => vec!["empty"],
-                "range" => vec!["range"],
-                _ => vec!["__getitem__"],
-            }
-        );
-        assert_eq!(
-            python.receiver,
-            matches!(method, "get" | "range").then_some(0)
-        );
-        assert_eq!(
-            python.params,
-            match method {
-                "of" => vec![proto::PythonParameter {
-                    core_input: Some(0),
-                    name: "args".into(),
-                    default_expr: None
-                }],
-                "get" => vec![proto::PythonParameter {
-                    core_input: Some(1),
-                    name: "index".into(),
-                    default_expr: None
-                }],
-                _ => vec![],
-            }
-        );
-        assert!(python.mutates.is_none());
-        assert_eq!(
-            bindings.egglog.as_ref().unwrap().views[0].symbol,
-            format!("vec-{method}")
-        );
-        let rust = &bindings
-            .rust
-            .as_ref()
-            .expect("Vec callable presentation")
-            .views[0];
-        assert_eq!(python.owner, rust.owner);
-        assert_eq!(rust.path, [method]);
-        let Some(proto::binding_owner::Kind::Sort(owner)) = rust.owner.unwrap().kind else {
-            panic!("sort owner")
-        };
-        let Some(proto::sort::Kind::Family(owner)) = &catalog.sorts[owner as usize].kind else {
-            panic!("Vec owner")
-        };
-        if method == "range" {
-            assert_eq!(owner.name, "i64");
-            assert!(owner.args.is_empty());
-            let Some(proto::declaration::Kind::HostPrimitive(primitive)) = &declaration.kind else {
-                unreachable!()
-            };
-            let Some(proto::host_primitive::Typing::Signature(signature)) = &primitive.typing
-            else {
-                unreachable!()
-            };
-            assert!(signature.type_params.is_empty());
-            assert!(signature.varargs.is_empty());
-            assert_eq!(signature.inputs.len(), 1);
-            assert_eq!(
-                catalog.sorts[signature.inputs[0].sort as usize].kind,
-                Some(proto::sort::Kind::Family(owner.clone()))
-            );
-            let Some(proto::sort::Kind::Family(output)) =
-                &catalog.sorts[signature.output.unwrap() as usize].kind
-            else {
-                unreachable!()
-            };
-            assert_eq!(output.name, "Vec");
-            assert_eq!(output.args.len(), 1);
-            assert_eq!(
-                catalog.sorts[output.args[0] as usize].kind,
-                Some(proto::sort::Kind::Family(owner.clone()))
-            );
-        } else {
-            assert_eq!(owner.name, "Vec");
-            assert!(matches!(
-                catalog.sorts[owner.args[0] as usize].kind,
-                Some(proto::sort::Kind::Var(0))
-            ));
-        }
-        let expected = match method {
-            "empty" => (None, vec![]),
-            "of" => (
-                None,
-                vec![proto::RustParameter {
-                    core_input: Some(0),
-                    name: "values".into(),
-                    borrowed: false,
-                }],
-            ),
-            "range" => (
-                Some(proto::RustReceiver {
-                    core_input: Some(0),
-                    borrowed: true,
-                }),
-                vec![],
-            ),
-            _ => (
-                Some(proto::RustReceiver {
-                    core_input: Some(0),
-                    borrowed: true,
-                }),
-                vec![proto::RustParameter {
-                    core_input: Some(1),
-                    name: "index".into(),
-                    borrowed: false,
-                }],
-            ),
-        };
-        assert_eq!((rust.receiver, rust.params.clone()), expected);
-    }
-}
-
-#[test]
 fn constant_catalog_export_does_not_execute_the_body_or_validator() {
     static BODY: AtomicUsize = AtomicUsize::new(0);
     static VALIDATOR: AtomicUsize = AtomicUsize::new(0);
-    let bindings = |_: &proto::GenericSignature| proto::CallableBindings {
-        python: Some(proto::PythonBindings {
-            views: vec![proto::PythonCallable {
-                kind: proto::PythonCallKind::Constant.into(),
-                path: vec!["test".into(), "C".into()],
-                ..Default::default()
-            }],
-        }),
-        egglog: Some(proto::EgglogBindings {
-            views: vec![proto::EgglogCallable {
-                symbol: "constant".into(),
-                datatype_member: false,
-            }],
-        }),
-        ..Default::default()
-    };
     let mut graph = EGraph::default();
-    add_primitive_with_validator!(&mut graph, "constant" [id = "test.constant", bindings = bindings] = || -> i64 {
-        { BODY.fetch_add(1, Ordering::SeqCst); 7 }
-    }, |_: &mut TermDag, _: &[TermId]| { VALIDATOR.fetch_add(1, Ordering::SeqCst); None });
+    add_primitive_with_validator!(
+        &mut graph,
+        "constant"[id = "test.constant"] = || -> i64 {
+            {
+                BODY.fetch_add(1, Ordering::SeqCst);
+                7
+            }
+        },
+        |_: &mut TermDag, _: &[TermId]| {
+            VALIDATOR.fetch_add(1, Ordering::SeqCst);
+            None
+        }
+    );
     let catalog = graph
         .type_info()
         .portable_builtin_catalog()
         .unwrap()
         .definitions;
-    let declaration = catalog.declarations.iter().find(|d| matches!(&d.kind, Some(proto::declaration::Kind::HostPrimitive(p)) if p.name == "test.constant")).unwrap();
-    assert_eq!(
-        declaration
-            .bindings
-            .as_ref()
-            .unwrap()
-            .python
-            .as_ref()
-            .unwrap()
-            .views[0]
-            .kind,
-        proto::PythonCallKind::Constant as i32
+    let declaration = catalog
+        .primitives
+        .iter()
+        .find(|d| d.name == "test.constant")
+        .unwrap();
+    assert!(
+        (matches!(
+            declaration.typing,
+            Some(proto::primitive::Typing::Signature(_))
+        ))
     );
     assert_eq!(BODY.load(Ordering::SeqCst), 0);
     assert_eq!(VALIDATOR.load(Ordering::SeqCst), 0);
@@ -3637,167 +1983,22 @@ fn map_packing_preserves_ordered_failing_child_evaluation() {
 }
 
 #[test]
-fn scalar_catalog_has_authoritative_language_views() {
-    let catalog = EGraph::default()
-        .type_info()
-        .portable_builtin_catalog()
-        .unwrap()
-        .definitions;
-    for (scalar, rust_name) in [("i64", "I64"), ("f64", "F64")] {
-        let family = catalog
-            .declarations
-            .iter()
-            .find_map(|d| match &d.kind {
-                Some(proto::declaration::Kind::HostSortFamily(f)) if f.name == scalar => Some(f),
-                _ => None,
-            })
-            .unwrap();
-        let bindings = family
-            .bindings
-            .as_ref()
-            .expect("native family must supply presentation");
-        assert_eq!(
-            bindings.python.as_ref().unwrap().path,
-            ["egglog", "builtins", scalar]
-        );
-        assert_eq!(
-            bindings.rust.as_ref().unwrap().path,
-            ["egglog_experimental", "typed", "builtins", rust_name]
-        );
-        let declaration = catalog.declarations.iter().find(|d| matches!(&d.kind, Some(proto::declaration::Kind::HostPrimitive(p)) if p.name == format!("egglog.core.{scalar}.add"))).unwrap();
-        let bindings = declaration.bindings.as_ref().unwrap();
-        let Some(proto::declaration::Kind::HostPrimitive(primitive)) = &declaration.kind else {
-            unreachable!()
-        };
-        let Some(proto::host_primitive::Typing::Signature(signature)) = &primitive.typing else {
-            unreachable!()
-        };
-        let python = &bindings.python.as_ref().unwrap().views[0];
-        assert_eq!(python.kind, proto::PythonCallKind::Method as i32);
-        assert_eq!(python.path, ["__add__"]);
-        assert_eq!(python.receiver, Some(0));
-        assert_eq!(python.params[0].core_input, Some(1));
-        let rust = &bindings.rust.as_ref().unwrap().views[0];
-        assert_eq!(rust.path, ["add"]);
-        assert_eq!(rust.receiver.unwrap().core_input, Some(0));
-        assert_eq!(
-            rust.trait_impl.as_ref().unwrap().path,
-            ["core", "ops", "Add"]
-        );
-        assert_eq!(
-            rust.trait_impl
-                .as_ref()
-                .unwrap()
-                .output_associated_type
-                .as_deref(),
-            Some("Output")
-        );
-        assert_eq!(python.owner, rust.owner);
-        // Preserve the complete previously supplied Add blocks, including
-        // parameter labels and absent specialization fields.
-        assert_eq!(
-            bindings.python,
-            Some(proto::PythonBindings {
-                views: vec![proto::PythonCallable {
-                    kind: proto::PythonCallKind::Method.into(),
-                    path: vec!["__add__".into()],
-                    owner: python.owner,
-                    receiver: Some(0),
-                    params: vec![proto::PythonParameter {
-                        core_input: Some(1),
-                        name: "other".into(),
-                        default_expr: None,
-                    }],
-                    ..Default::default()
-                }],
-            })
-        );
-        assert_eq!(
-            bindings.rust,
-            Some(proto::RustBindings {
-                views: vec![proto::RustCallable {
-                    path: vec!["add".into()],
-                    owner: rust.owner,
-                    receiver: Some(proto::RustReceiver {
-                        core_input: Some(0),
-                        borrowed: false
-                    }),
-                    params: vec![proto::RustParameter {
-                        core_input: Some(1),
-                        name: "rhs".into(),
-                        borrowed: false,
-                    }],
-                    trait_impl: Some(proto::RustTrait {
-                        path: vec!["core".into(), "ops".into(), "Add".into()],
-                        args: vec![proto::RustType {
-                            sort: Some(signature.inputs[1].sort),
-                            borrowed: false,
-                        }],
-                        output_associated_type: Some("Output".into()),
-                    }),
-                    ..Default::default()
-                }],
-            })
-        );
-        for operation in ["lt", "gt"] {
-            let declaration = catalog
-                .declarations
-                .iter()
-                .find(|d| {
-                    matches!(&d.kind,
-                Some(proto::declaration::Kind::HostPrimitive(p))
-                    if p.name == format!("egglog.core.{scalar}.{operation}"))
-                })
-                .unwrap();
-            let rust = &declaration
-                .bindings
-                .as_ref()
-                .unwrap()
-                .rust
-                .as_ref()
-                .unwrap()
-                .views[0];
-            assert_eq!(
-                rust.receiver,
-                Some(proto::RustReceiver {
-                    core_input: Some(0),
-                    borrowed: true,
-                })
-            );
-            assert!(rust.trait_impl.is_none());
-        }
-    }
-}
-
-#[test]
 fn scalar_families_and_actual_operation_views_are_complete() {
     let catalog = EGraph::default()
         .type_info()
         .portable_builtin_catalog()
         .unwrap();
-    for (family, name) in [("String", "String"), ("bool", "Bool"), ("Unit", "Unit")] {
+    for (family, _name) in [("String", "String"), ("bool", "Bool"), ("Unit", "Unit")] {
         let declaration = catalog
             .definitions
-            .declarations
+            .primitive_sorts
             .iter()
-            .find_map(|d| match &d.kind {
-                Some(proto::declaration::Kind::HostSortFamily(f)) if f.name == family => Some(f),
-                _ => None,
-            })
+            .find(|d| d.name == family)
             .unwrap();
         assert_eq!(declaration.arity, 0);
-        let bindings = declaration.bindings.as_ref().unwrap();
-        assert_eq!(
-            bindings.python.as_ref().unwrap().path,
-            ["egglog", "builtins", name]
-        );
-        assert_eq!(
-            bindings.rust.as_ref().unwrap().path,
-            ["egglog_experimental", "typed", "builtins", name]
-        );
         assert!(!catalog.undescribed_sorts.iter().any(|s| s == family));
     }
-    for (key, alias, fixed, python_name, rust_name, trait_name) in [
+    for (key, _alias, fixed, _python_name, _rust_name, _trait_name) in [
         ("string.concat", "+", 0, "__add__", "add", Some("Add")),
         ("string.replace", "replace", 3, "replace", "replace", None),
         ("bool.not", "not", 1, "__invert__", "not", Some("Not")),
@@ -3814,55 +2015,19 @@ fn scalar_families_and_actual_operation_views_are_complete() {
             None,
         ),
     ] {
-        let d = catalog.definitions.declarations.iter().find(|d| matches!(&d.kind,
-            Some(proto::declaration::Kind::HostPrimitive(p)) if p.name == format!("egglog.core.{key}"))).unwrap();
-        let Some(proto::declaration::Kind::HostPrimitive(p)) = &d.kind else {
-            unreachable!()
-        };
-        let Some(proto::host_primitive::Typing::Signature(s)) = &p.typing else {
+        let d = catalog
+            .definitions
+            .primitives
+            .iter()
+            .find(|d| d.name == format!("egglog.core.{key}"))
+            .unwrap();
+        let p = &d;
+        let Some(proto::primitive::Typing::Signature(s)) = &p.typing else {
             unreachable!()
         };
         assert!(s.type_params.is_empty());
         assert_eq!(s.inputs.len(), fixed);
         assert_eq!(s.varargs.len(), usize::from(fixed == 0));
-        let b = d.bindings.as_ref().unwrap();
-        assert_eq!(b.egglog.as_ref().unwrap().views[0].symbol, alias);
-        let py_views = &b.python.as_ref().unwrap().views;
-        let rs_views = &b.rust.as_ref().unwrap().views;
-        if key == "string.concat" {
-            assert_eq!(py_views.len(), 2);
-            assert_eq!(rs_views.len(), 2);
-            assert_eq!(py_views[0].kind, proto::PythonCallKind::Function as i32);
-            assert_eq!(py_views[0].path, ["egglog", "builtins", "join"]);
-            assert_eq!(
-                rs_views[0].path,
-                ["egglog_experimental", "typed", "builtins", "join"]
-            );
-            assert_eq!(py_views[0].tail_repetitions, None);
-            assert_eq!(rs_views[0].tail_repetitions, None);
-            assert_eq!(py_views[0].params[0].core_input, Some(0));
-            assert_eq!(rs_views[0].params[0].core_input, Some(0));
-        } else {
-            assert_eq!(py_views.len(), 1);
-            assert_eq!(rs_views.len(), 1);
-        }
-        let py = py_views.last().unwrap();
-        let rs = rs_views.last().unwrap();
-        assert_eq!(py.path, [python_name]);
-        assert_eq!(rs.path, [rust_name]);
-        assert_eq!(py.owner, rs.owner);
-        assert_eq!(py.receiver, Some(0));
-        assert_eq!(rs.receiver.unwrap().core_input, Some(0));
-        assert_eq!(py.tail_repetitions, (fixed == 0).then_some(2));
-        assert_eq!(rs.tail_repetitions, (fixed == 0).then_some(2));
-        assert_eq!(
-            rs.trait_impl.as_ref().map(|t| t.path[2].as_str()),
-            trait_name
-        );
-        if key == "bool.not" {
-            assert!(py.params.is_empty());
-            assert!(rs.trait_impl.as_ref().unwrap().args.is_empty());
-        }
     }
     for migrated in ["guard", "count-matches", "bool-<"] {
         assert!(
@@ -4060,60 +2225,6 @@ fn scalar_catalog_operations_preserve_native_proofs() {
 }
 
 #[test]
-fn family_metadata_is_optional_and_frozen_per_language() {
-    let graph = EGraph::default();
-    let scalar = graph.get_sort_by_name("i64").unwrap().clone();
-    let mut definition = builtin::closed_signature(
-        "test.identity",
-        "identity",
-        &[("x", scalar.clone())],
-        &[],
-        scalar,
-    )
-    .unwrap();
-    let mut destination = proto::Program {
-        ..Default::default()
-    };
-    builtin::import_definition(&definition, &mut destination).unwrap();
-    let Some(proto::declaration::Kind::HostSortFamily(family)) =
-        &mut definition.declarations[0].kind
-    else {
-        unreachable!()
-    };
-    family.bindings = Some(proto::SortBindings {
-        python: Some(proto::TypeBinding {
-            path: vec!["test".into(), "Int".into()],
-            ..Default::default()
-        }),
-        ..Default::default()
-    });
-    builtin::import_definition(&definition, &mut destination).unwrap();
-    let frozen = destination.clone();
-    let Some(proto::declaration::Kind::HostSortFamily(family)) =
-        &mut definition.declarations[0].kind
-    else {
-        unreachable!()
-    };
-    family.bindings = None;
-    builtin::import_definition(&definition, &mut destination).unwrap();
-    assert_eq!(destination, frozen);
-    let Some(proto::declaration::Kind::HostSortFamily(family)) =
-        &mut definition.declarations[0].kind
-    else {
-        unreachable!()
-    };
-    family.bindings = Some(proto::SortBindings {
-        python: Some(proto::TypeBinding::default()),
-        ..Default::default()
-    });
-    assert!(builtin::import_definition(&definition, &mut destination).is_err());
-    assert_eq!(
-        destination, frozen,
-        "conflict must not modify the destination"
-    );
-}
-
-#[test]
 fn authoritative_family_exports_without_a_described_callable() {
     struct CatalogOnly;
     impl Presort for CatalogOnly {
@@ -4139,20 +2250,19 @@ fn authoritative_family_exports_without_a_described_callable() {
         .unwrap();
     graph
         .type_info()
-        .register_portable_family(proto::HostSortFamily {
+        .register_builtin_family(builtin::FamilyDescription {
             name: "CatalogOnly".into(),
             arity: 1,
-            bindings: Some(proto::SortBindings {
-                python: Some(proto::TypeBinding {
-                    path: vec!["test".into(), "CatalogOnly".into()],
-                    type_params: vec!["T".into()],
-                }),
-                ..Default::default()
-            }),
         })
         .unwrap();
     let catalog = graph.type_info().portable_builtin_catalog().unwrap();
-    assert!(catalog.definitions.declarations.iter().any(|d| matches!(&d.kind, Some(proto::declaration::Kind::HostSortFamily(f)) if f.name == "CatalogOnly" && f.bindings.is_some())));
+    assert!(
+        catalog
+            .definitions
+            .primitive_sorts
+            .iter()
+            .any(|d| d.name == "CatalogOnly" && d.arity == 1)
+    );
     assert!(
         !catalog
             .undescribed_families
@@ -4172,10 +2282,9 @@ fn family_registration_rejects_native_kind_and_arity_mismatches_transactionally(
         assert!(
             graph
                 .type_info()
-                .register_portable_family(proto::HostSortFamily {
+                .register_builtin_family(builtin::FamilyDescription {
                     name: name.into(),
                     arity,
-                    ..Default::default()
                 })
                 .is_err(),
             "invalid family {name}/{arity}"
@@ -4203,10 +2312,9 @@ fn family_registration_uses_presort_despite_same_named_nominal_sort() {
     graph.parse_and_run_program(None, "(sort Pair)").unwrap();
     graph
         .type_info()
-        .register_portable_family(proto::HostSortFamily {
+        .register_builtin_family(builtin::FamilyDescription {
             name: "Pair".into(),
             arity: 2,
-            bindings: None,
         })
         .unwrap();
     assert_eq!(
@@ -4219,10 +2327,9 @@ fn family_registration_uses_presort_despite_same_named_nominal_sort() {
     );
     let error = graph
         .type_info()
-        .register_portable_family(proto::HostSortFamily {
+        .register_builtin_family(builtin::FamilyDescription {
             name: "Pair".into(),
             arity: 1,
-            bindings: None,
         })
         .unwrap_err();
     assert!(
@@ -4269,11 +2376,13 @@ fn family_registration_uses_presort_despite_same_named_nominal_sort() {
         let mut wrong = program.clone();
         wrong.sorts[index as usize].kind =
             Some(match wrong.sorts[index as usize].kind.as_ref().unwrap() {
-                proto::sort::Kind::Eq(name) => proto::sort::Kind::Family(proto::HostSort {
-                    name: name.clone(),
-                    args: vec![],
-                }),
-                proto::sort::Kind::Family(f) => proto::sort::Kind::Eq(f.name.clone()),
+                proto::sort::Kind::Eq(name) => {
+                    proto::sort::Kind::Application(proto::SortApplication {
+                        name: name.clone(),
+                        args: vec![],
+                    })
+                }
+                proto::sort::Kind::Application(f) => proto::sort::Kind::Eq(f.name.clone()),
                 _ => unreachable!(),
             });
         assert!(
@@ -4328,14 +2437,9 @@ fn export_is_inert_and_reports_unmigrated_registrations() {
     assert!(catalog.undescribed_sorts.is_empty());
     let keys = catalog
         .definitions
-        .declarations
+        .primitives
         .iter()
-        .filter_map(|declaration| match &declaration.kind {
-            Some(proto::declaration::Kind::HostPrimitive(primitive)) => {
-                Some(primitive.name.as_str())
-            }
-            _ => None,
-        })
+        .map(|declaration| declaration.name.as_str())
         .collect::<Vec<_>>();
     assert_eq!(
         keys,
@@ -4538,52 +2642,24 @@ fn pair_definitions_precede_instances_and_preserve_nominal_overloads() {
     );
     let family = before
         .definitions
-        .declarations
+        .primitive_sorts
         .iter()
-        .find_map(|d| match &d.kind {
-            Some(proto::declaration::Kind::HostSortFamily(f)) if f.name == "Pair" => Some(f),
-            _ => None,
-        })
+        .find(|family| family.name == "Pair")
         .unwrap();
     assert_eq!(family.arity, 2);
-    assert_eq!(
-        family.bindings,
-        Some(proto::SortBindings {
-            python: Some(proto::TypeBinding {
-                path: vec!["egglog".into(), "builtins".into(), "Pair".into()],
-                type_params: vec!["L".into(), "R".into()],
-            }),
-            rust: Some(proto::TypeBinding {
-                path: vec![
-                    "egglog_experimental".into(),
-                    "typed".into(),
-                    "builtins".into(),
-                    "Pair".into()
-                ],
-                type_params: vec!["L".into(), "R".into()],
-            }),
-            ..Default::default()
-        })
-    );
-    for (key, alias, inputs, output) in [
+    for (key, _alias, inputs, output) in [
         ("make", "pair", vec![0, 1], 2),
         ("first", "pair-first", vec![2], 0),
         ("second", "pair-second", vec![2], 1),
     ] {
-        let mut definition = proto::Program::default();
+        let mut definition = proto::BuiltinCatalog::default();
         graph
             .type_info()
             .export_builtin_definition(&format!("egglog.core.pair.{key}"), &mut definition)
             .unwrap();
-        let d = definition
-            .declarations
-            .iter()
-            .find(|d| matches!(d.kind, Some(proto::declaration::Kind::HostPrimitive(_))))
-            .unwrap();
-        let Some(proto::declaration::Kind::HostPrimitive(p)) = &d.kind else {
-            unreachable!()
-        };
-        let Some(proto::host_primitive::Typing::Signature(s)) = &p.typing else {
+        let d = definition.primitives.first().unwrap();
+        let p = &d;
+        let Some(proto::primitive::Typing::Signature(s)) = &p.typing else {
             panic!("signature")
         };
         assert_eq!(s.type_params, ["A", "B"]);
@@ -4603,7 +2679,7 @@ fn pair_definitions_precede_instances_and_preserve_nominal_overloads() {
                 .sorts
                 .iter()
                 .position(
-                    |s| matches!(&s.kind, Some(proto::sort::Kind::Family(f)) if f.name == "Pair"),
+                    |s| matches!(&s.kind, Some(proto::sort::Kind::Application(f)) if f.name == "Pair"),
                 )
                 .unwrap() as u32,
         ];
@@ -4612,12 +2688,11 @@ fn pair_definitions_precede_instances_and_preserve_nominal_overloads() {
             inputs.into_iter().map(|i| patterns[i]).collect::<Vec<_>>()
         );
         assert_eq!(s.output, Some(patterns[output]));
-        let Some(proto::sort::Kind::Family(f)) = &definition.sorts[patterns[2] as usize].kind
+        let Some(proto::sort::Kind::Application(f)) = &definition.sorts[patterns[2] as usize].kind
         else {
             unreachable!()
         };
         assert_eq!(f.args, patterns[..2]);
-        let bindings = d.bindings.as_ref().unwrap();
         assert_eq!(
             s.inputs.iter().map(|a| a.name.as_str()).collect::<Vec<_>>(),
             if key == "make" {
@@ -4626,68 +2701,6 @@ fn pair_definitions_precede_instances_and_preserve_nominal_overloads() {
                 vec!["pair"]
             }
         );
-        let owner = Some(proto::BindingOwner {
-            kind: Some(proto::binding_owner::Kind::Sort(patterns[2])),
-        });
-        assert_eq!(
-            bindings.python.as_ref().unwrap().views,
-            [proto::PythonCallable {
-                kind: if key == "make" {
-                    proto::PythonCallKind::Initializer
-                } else {
-                    proto::PythonCallKind::Property
-                }
-                .into(),
-                path: match key {
-                    "make" => vec![],
-                    "first" => vec!["left".into()],
-                    _ => vec!["right".into()],
-                },
-                owner,
-                receiver: (key != "make").then_some(0),
-                params: if key == "make" {
-                    ["left", "right"]
-                        .into_iter()
-                        .enumerate()
-                        .map(|(i, name)| proto::PythonParameter {
-                            core_input: Some(i as u32),
-                            name: name.into(),
-                            default_expr: None,
-                        })
-                        .collect()
-                } else {
-                    vec![]
-                },
-                mutates: None,
-                tail_repetitions: None,
-            }]
-        );
-        assert_eq!(
-            bindings.rust.as_ref().unwrap().views,
-            [proto::RustCallable {
-                path: vec![if key == "make" { "new" } else { key }.into()],
-                owner,
-                receiver: (key != "make").then_some(proto::RustReceiver {
-                    core_input: Some(0),
-                    borrowed: true
-                }),
-                params: if key == "make" {
-                    ["left", "right"]
-                        .into_iter()
-                        .enumerate()
-                        .map(|(i, name)| proto::RustParameter {
-                            core_input: Some(i as u32),
-                            name: name.into(),
-                            borrowed: false,
-                        })
-                        .collect()
-                } else {
-                    vec![]
-                },
-                ..Default::default()
-            }]
-        );
-        assert_eq!(bindings.egglog.as_ref().unwrap().views[0].symbol, alias);
     }
     graph
         .parse_and_run_program(
@@ -4735,7 +2748,7 @@ fn pair_definitions_precede_instances_and_preserve_nominal_overloads() {
         .export_sort(graph.get_sort_by_name("Nested").unwrap(), &mut sorts)
         .unwrap();
     assert!(
-        matches!(&sorts[nested as usize].kind, Some(proto::sort::Kind::Family(f)) if f.name == "Pair" && f.args.len() == 2)
+        matches!(&sorts[nested as usize].kind, Some(proto::sort::Kind::Application(f)) if f.name == "Pair" && f.args.len() == 2)
     );
     let i = graph.get_sort_by_name("i64").unwrap();
     let s = graph.get_sort_by_name("String").unwrap();
@@ -4889,7 +2902,13 @@ fn vec_definitions_precede_instances_and_preserve_nominal_overloads() {
         "egglog.core.vec.range",
         "egglog.core.vec.map",
     ] {
-        assert!(before.definitions.declarations.iter().any(|declaration| matches!(&declaration.kind, Some(proto::declaration::Kind::HostPrimitive(primitive)) if primitive.name == key)));
+        assert!(
+            before
+                .definitions
+                .primitives
+                .iter()
+                .any(|declaration| declaration.name == key)
+        );
     }
     graph
         .parse_and_run_program(
@@ -5027,10 +3046,14 @@ fn ordinary_vec_map_definitions_are_complete() {
         "egglog.core.map.contains",
         "egglog.core.map.not_contains",
     ] {
-        assert!(catalog.definitions.declarations.iter().any(|declaration| matches!(
-            &declaration.kind,
-            Some(proto::declaration::Kind::HostPrimitive(primitive)) if primitive.name == key
-        )), "missing definition {key}");
+        assert!(
+            catalog
+                .definitions
+                .primitives
+                .iter()
+                .any(|declaration| declaration.name == key),
+            "missing definition {key}"
+        );
     }
 }
 
@@ -5104,11 +3127,17 @@ fn ordinary_vec_map_signatures_aliases_and_contexts_are_exact() {
                 .map(|description| builtin::project_description(description).unwrap())
                 .collect::<Vec<_>>()
         };
-        let (definition, declaration) = definitions.iter().find_map(|p| p.declarations.iter().find(|d| matches!(&d.kind, Some(proto::declaration::Kind::HostPrimitive(h)) if h.name == canonical)).map(|d| (p, d))).unwrap();
-        let Some(proto::declaration::Kind::HostPrimitive(primitive)) = &declaration.kind else {
-            unreachable!()
-        };
-        let Some(proto::host_primitive::Typing::Signature(signature)) = &primitive.typing else {
+        let (definition, declaration) = definitions
+            .iter()
+            .find_map(|p| {
+                p.primitives
+                    .iter()
+                    .find(|d| d.name == canonical)
+                    .map(|d| (p, d))
+            })
+            .unwrap();
+        let primitive = declaration;
+        let Some(proto::primitive::Typing::Signature(signature)) = &primitive.typing else {
             unreachable!()
         };
         assert_eq!(
@@ -5184,32 +3213,7 @@ fn ordinary_vec_map_signatures_aliases_and_contexts_are_exact() {
         assert_eq!(described.output, patterns[output], "{canonical}");
         assert!(signature.varargs.is_empty());
         assert!(signature.equality_type_params.is_empty());
-        let bindings = declaration.bindings.as_ref().unwrap();
-        assert_eq!(bindings.egglog.as_ref().unwrap().views[0].symbol, alias);
-        let python = &bindings.python.as_ref().unwrap().views[0];
-        let rust = &bindings.rust.as_ref().unwrap().views[0];
-        assert_eq!(python.path, [key]);
-        assert_eq!(rust.path, [key]);
-        assert_eq!(python.receiver, Some(0));
-        assert_eq!(rust.receiver.as_ref().unwrap().core_input, Some(0));
-        assert!(rust.receiver.as_ref().unwrap().borrowed);
-        assert_eq!(
-            python
-                .params
-                .iter()
-                .map(|p| p.core_input.unwrap())
-                .collect::<Vec<_>>(),
-            (1..fixed.len() as u32).collect::<Vec<_>>()
-        );
-        assert_eq!(
-            rust.params
-                .iter()
-                .map(|p| p.core_input.unwrap())
-                .collect::<Vec<_>>(),
-            (1..fixed.len() as u32).collect::<Vec<_>>()
-        );
-        builtin::definitions::reconcile_declarations(definition, &mut proto::Program::default())
-            .unwrap();
+        builtin::import_definition(definition, &mut proto::BuiltinCatalog::default()).unwrap();
         let native = native
             .iter()
             .map(|name| graph.get_sort_by_name(name).unwrap().clone())
@@ -5297,14 +3301,13 @@ fn vec_tail_receiver_and_equality_restriction_are_exact() {
         .map(|description| builtin::project_description(description).unwrap())
         .collect::<Vec<_>>()
     {
-        let index = definition.declarations.iter().position(|d| matches!(&d.kind, Some(proto::declaration::Kind::HostPrimitive(p)) if p.name == "egglog.core.vec.append" || p.name == "egglog.core.vec.union"));
+        let index = definition
+            .primitives
+            .iter()
+            .position(|d| d.name == "egglog.core.vec.append" || d.name == "egglog.core.vec.union");
         let Some(index) = index else { continue };
-        let Some(proto::declaration::Kind::HostPrimitive(primitive)) =
-            &definition.declarations[index].kind
-        else {
-            unreachable!()
-        };
-        let Some(proto::host_primitive::Typing::Signature(signature)) = &primitive.typing else {
+        let primitive = &definition.primitives[index];
+        let Some(proto::primitive::Typing::Signature(signature)) = &primitive.typing else {
             unreachable!()
         };
         let union = primitive.name.ends_with("union");
@@ -5322,16 +3325,14 @@ fn vec_tail_receiver_and_equality_restriction_are_exact() {
             signature.equality_type_params,
             if union { vec![0] } else { vec![] }
         );
-        let mut installed = proto::Program::default();
-        builtin::definitions::reconcile_declarations(&definition, &mut installed).unwrap();
-        for mutation in 0..if union { 4 } else { 6 } {
+        let mut installed = proto::BuiltinCatalog::default();
+        builtin::import_definition(&definition, &mut installed).unwrap();
+        for mutation in 0..if union { 4 } else { 1 } {
             let mut invalid = definition.clone();
-            let declaration = &mut invalid.declarations[index];
+            let declaration = &mut invalid.primitives[index];
             if union {
-                let Some(proto::declaration::Kind::HostPrimitive(p)) = &mut declaration.kind else {
-                    unreachable!()
-                };
-                let Some(proto::host_primitive::Typing::Signature(s)) = &mut p.typing else {
+                let p = declaration;
+                let Some(proto::primitive::Typing::Signature(s)) = &mut p.typing else {
                     unreachable!()
                 };
                 match mutation {
@@ -5345,514 +3346,23 @@ fn vec_tail_receiver_and_equality_restriction_are_exact() {
                     _ => unreachable!(),
                 }
             } else {
-                let view = &mut declaration
-                    .bindings
-                    .as_mut()
-                    .unwrap()
-                    .python
-                    .as_mut()
-                    .unwrap()
-                    .views[0];
-                match mutation {
-                    0 => view.receiver = Some(1),
-                    1 => view.params[0].core_input = Some(0),
-                    2 => view.params.clear(),
-                    3 => {
-                        view.owner.as_mut().unwrap().kind =
-                            Some(proto::binding_owner::Kind::Sort(2))
-                    }
-                    4 => view.kind = proto::PythonCallKind::Property as i32,
-                    5 => {
-                        let Some(proto::declaration::Kind::HostPrimitive(p)) =
-                            &mut declaration.kind
-                        else {
-                            unreachable!()
-                        };
-                        let Some(proto::host_primitive::Typing::Signature(s)) = &mut p.typing
-                        else {
-                            unreachable!()
-                        };
-                        s.varargs.push(s.varargs[0].clone());
-                    }
-                    _ => unreachable!(),
-                }
+                let p = declaration;
+                let Some(proto::primitive::Typing::Signature(s)) = &mut p.typing else {
+                    unreachable!()
+                };
+                s.varargs.push(s.varargs[0].clone());
             }
             assert!(
-                builtin::definitions::reconcile_declarations(&invalid, &mut installed.clone())
-                    .is_err(),
+                builtin::import_definition(&invalid, &mut installed.clone()).is_err(),
                 "{union} mutation {mutation}"
             );
-            if !union || mutation != 0 {
+            if union && mutation != 0 {
                 assert!(
-                    builtin::definitions::reconcile_declarations(
-                        &invalid,
-                        &mut proto::Program::default()
-                    )
-                    .is_err(),
+                    builtin::import_definition(&invalid, &mut proto::BuiltinCatalog::default())
+                        .is_err(),
                     "fresh {union} mutation {mutation}"
                 );
             }
-        }
-    }
-}
-
-#[test]
-fn closed_defaults_preserve_optional_zero_and_opaque_children() {
-    use prost::Message as _;
-
-    // This exercises declaration validation only, not a substitute provider.
-    let base = proto::Program {
-        sorts: vec![
-            proto::Sort {
-                kind: Some(proto::sort::Kind::Family(proto::HostSort {
-                    name: "i64".into(),
-                    args: vec![],
-                })),
-                ..Default::default()
-            },
-            proto::Sort {
-                kind: Some(proto::sort::Kind::Family(proto::HostSort {
-                    name: "Maybe".into(),
-                    args: vec![0],
-                })),
-                ..Default::default()
-            },
-            proto::Sort {
-                kind: Some(proto::sort::Kind::Family(proto::HostSort {
-                    name: "Maybe".into(),
-                    args: vec![1],
-                })),
-                ..Default::default()
-            },
-            proto::Sort {
-                kind: Some(proto::sort::Kind::Family(proto::HostSort {
-                    name: "PyObject".into(),
-                    args: vec![],
-                })),
-                ..Default::default()
-            },
-            proto::Sort {
-                kind: Some(proto::sort::Kind::Family(proto::HostSort {
-                    name: "Opaque".into(),
-                    args: vec![0],
-                })),
-                ..Default::default()
-            },
-        ],
-        nodes: vec![
-            proto::Node {
-                sort_id: 0,
-                kind: Some(proto::node::Kind::PrimitiveValue(proto::PrimitiveValue {
-                    value: Some(proto::primitive_value::Value::I64(0)),
-                })),
-                ..Default::default()
-            },
-            proto::Node {
-                sort_id: 1,
-                kind: Some(proto::node::Kind::PrimitiveValue(proto::PrimitiveValue {
-                    value: Some(proto::primitive_value::Value::Maybe(proto::MaybeValue {
-                        value: None,
-                    })),
-                })),
-                ..Default::default()
-            },
-            proto::Node {
-                sort_id: 1,
-                kind: Some(proto::node::Kind::PrimitiveValue(proto::PrimitiveValue {
-                    value: Some(proto::primitive_value::Value::Maybe(proto::MaybeValue {
-                        value: Some(0),
-                    })),
-                })),
-                ..Default::default()
-            },
-            proto::Node {
-                sort_id: 2,
-                kind: Some(proto::node::Kind::PrimitiveValue(proto::PrimitiveValue {
-                    value: Some(proto::primitive_value::Value::Maybe(proto::MaybeValue {
-                        value: Some(1),
-                    })),
-                })),
-                ..Default::default()
-            },
-            proto::Node {
-                sort_id: 3,
-                kind: Some(proto::node::Kind::PrimitiveValue(proto::PrimitiveValue {
-                    value: Some(proto::primitive_value::Value::Custom(proto::CustomValue {
-                        payload: b"\x80\x05N.".to_vec(),
-                        args: vec![],
-                    })),
-                })),
-                ..Default::default()
-            },
-            // Value children are independent of the family's type arguments.
-            proto::Node {
-                sort_id: 3,
-                kind: Some(proto::node::Kind::PrimitiveValue(proto::PrimitiveValue {
-                    value: Some(proto::primitive_value::Value::Custom(proto::CustomValue {
-                        payload: b"\xff\x00opaque".to_vec(),
-                        args: vec![0, 2, 0],
-                    })),
-                })),
-                ..Default::default()
-            },
-            proto::Node {
-                sort_id: 4,
-                kind: Some(proto::node::Kind::PrimitiveValue(proto::PrimitiveValue {
-                    value: Some(proto::primitive_value::Value::Custom(proto::CustomValue {
-                        payload: b"not a pickle".to_vec(),
-                        args: vec![5, 0, 5],
-                    })),
-                })),
-                ..Default::default()
-            },
-        ],
-        declarations: vec![proto::Declaration {
-            kind: Some(proto::declaration::Kind::Function(proto::Function {
-                name: "take_maybe".into(),
-                inputs: vec![proto::Arg {
-                    name: "value".into(),
-                    sort: 1,
-                }],
-                output: 0,
-                merge: None,
-            })),
-            bindings: Some(proto::CallableBindings {
-                python: Some(proto::PythonBindings {
-                    views: vec![proto::PythonCallable {
-                        kind: proto::PythonCallKind::Function.into(),
-                        path: vec!["test".into(), "take_maybe".into()],
-                        params: vec![proto::PythonParameter {
-                            core_input: Some(0),
-                            name: "value".into(),
-                            default_expr: Some(1),
-                        }],
-                        ..Default::default()
-                    }],
-                }),
-                ..Default::default()
-            }),
-            ..Default::default()
-        }],
-        ..Default::default()
-    };
-    for root in 1..base.nodes.len() {
-        let mut program = base.clone();
-        let Some(proto::declaration::Kind::Function(function)) = &mut program.declarations[0].kind
-        else {
-            panic!()
-        };
-        function.inputs[0].sort = program.nodes[root].sort_id;
-        program.declarations[0]
-            .bindings
-            .as_mut()
-            .unwrap()
-            .python
-            .as_mut()
-            .unwrap()
-            .views[0]
-            .params[0]
-            .default_expr = Some(root as u32);
-        let mut installed = proto::Program::default();
-        builtin::definitions::reconcile_declarations(&program, &mut installed).unwrap();
-        let frozen = installed.clone();
-        builtin::definitions::reconcile_declarations(&program, &mut installed).unwrap();
-        assert_eq!(installed, frozen);
-        // Existing arena entries force relocation; binary inspection and
-        // compatible resupply preserve opaque payloads and ordered references.
-        let mut relocated = proto::Program {
-            sorts: base.sorts.clone(),
-            nodes: vec![base.nodes[0].clone()],
-            ..Default::default()
-        };
-        builtin::definitions::reconcile_declarations(&program, &mut relocated).unwrap();
-        let encoded = relocated.encode_to_vec();
-        let decoded = proto::Program::decode(encoded.as_slice()).unwrap();
-        assert_eq!(decoded, relocated);
-        builtin::definitions::reconcile_declarations(&decoded, &mut installed).unwrap();
-        assert_eq!(installed, frozen);
-        if let Some(proto::node::Kind::PrimitiveValue(proto::PrimitiveValue {
-            value: Some(proto::primitive_value::Value::Custom(expected)),
-        })) = &program.nodes[root].kind
-        {
-            let default = decoded.declarations[0]
-                .bindings
-                .as_ref()
-                .unwrap()
-                .python
-                .as_ref()
-                .unwrap()
-                .views[0]
-                .params[0]
-                .default_expr
-                .unwrap();
-            let Some(proto::node::Kind::PrimitiveValue(proto::PrimitiveValue {
-                value: Some(proto::primitive_value::Value::Custom(actual)),
-            })) = &decoded.nodes[default as usize].kind
-            else {
-                panic!()
-            };
-            assert_eq!(actual.payload, expected.payload);
-            assert_eq!(actual.args.len(), expected.args.len());
-            if !actual.args.is_empty() {
-                assert_eq!(actual.args[0], actual.args[2]);
-                assert_ne!(actual.args[0], actual.args[1]);
-                for (actual, expected) in actual.args.iter().zip(&expected.args) {
-                    let Some(proto::node::Kind::PrimitiveValue(actual)) =
-                        &decoded.nodes[*actual as usize].kind
-                    else {
-                        panic!()
-                    };
-                    let Some(proto::node::Kind::PrimitiveValue(expected)) =
-                        &program.nodes[*expected as usize].kind
-                    else {
-                        panic!()
-                    };
-                    assert_eq!(
-                        std::mem::discriminant(actual.value.as_ref().unwrap()),
-                        std::mem::discriminant(expected.value.as_ref().unwrap())
-                    );
-                }
-            }
-        }
-        if root >= 4 {
-            for mutation in 0..9 {
-                let mut malformed = program.clone();
-                match mutation {
-                    2 => {
-                        malformed.sorts[program.nodes[root].sort_id as usize].kind =
-                            Some(proto::sort::Kind::Eq("NotHost".into()))
-                    }
-                    3 => {
-                        malformed.sorts[program.nodes[root].sort_id as usize].kind =
-                            Some(proto::sort::Kind::Func(proto::FuncSort {
-                                params: vec![],
-                                result: 0,
-                            }))
-                    }
-                    4 => malformed.nodes[root].kind = Some(proto::node::Kind::Var("free".into())),
-                    5 => {
-                        let Some(proto::declaration::Kind::Function(function)) =
-                            &mut malformed.declarations[0].kind
-                        else {
-                            panic!()
-                        };
-                        function.inputs[0].sort = 0;
-                    }
-                    _ => {
-                        let child = match mutation {
-                            0 => 99,
-                            1 => root as u32,
-                            _ => {
-                                let child = malformed.nodes.len() as u32;
-                                let (sort_id, kind) = match mutation {
-                                    6 => (0, proto::node::Kind::Var("query".into())),
-                                    7 => {
-                                        let sort = malformed.sorts.len() as u32;
-                                        malformed.sorts.push(proto::Sort {
-                                            kind: Some(proto::sort::Kind::Family(
-                                                proto::HostSort {
-                                                    name: "Unit".into(),
-                                                    args: vec![],
-                                                },
-                                            )),
-                                            ..Default::default()
-                                        });
-                                        malformed.declarations.push(proto::Declaration {
-                                            kind: Some(proto::declaration::Kind::Relation(
-                                                proto::Relation {
-                                                    name: "predicate".into(),
-                                                    inputs: vec![],
-                                                },
-                                            )),
-                                            ..Default::default()
-                                        });
-                                        (
-                                            sort,
-                                            proto::node::Kind::Call(proto::Call {
-                                                func: "predicate".into(),
-                                                args: vec![],
-                                            }),
-                                        )
-                                    }
-                                    _ => (
-                                        0,
-                                        proto::node::Kind::Call(proto::Call {
-                                            func: "take_maybe".into(),
-                                            args: vec![0],
-                                        }),
-                                    ),
-                                };
-                                malformed.nodes.push(proto::Node {
-                                    sort_id,
-                                    kind: Some(kind),
-                                    ..Default::default()
-                                });
-                                child
-                            }
-                        };
-                        let Some(proto::node::Kind::PrimitiveValue(proto::PrimitiveValue {
-                            value: Some(proto::primitive_value::Value::Custom(value)),
-                        })) = &mut malformed.nodes[root].kind
-                        else {
-                            panic!()
-                        };
-                        value.args = vec![child];
-                    }
-                }
-                assert!(
-                    builtin::definitions::reconcile_declarations(
-                        &malformed,
-                        &mut proto::Program::default()
-                    )
-                    .is_err(),
-                    "custom root {root}, mutation {mutation}"
-                );
-                assert!(
-                    builtin::definitions::reconcile_declarations(&malformed, &mut installed)
-                        .is_err(),
-                    "custom resupply root {root}, mutation {mutation}"
-                );
-                assert_eq!(installed, frozen);
-            }
-            continue;
-        }
-        for mutation in 0..5 {
-            let mut malformed = program.clone();
-            match mutation {
-                0 => {
-                    malformed.nodes[root].kind =
-                        Some(proto::node::Kind::PrimitiveValue(proto::PrimitiveValue {
-                            value: Some(proto::primitive_value::Value::Maybe(proto::MaybeValue {
-                                value: Some(99),
-                            })),
-                        }))
-                }
-                1 => {
-                    malformed.nodes[root].kind =
-                        Some(proto::node::Kind::PrimitiveValue(proto::PrimitiveValue {
-                            value: Some(proto::primitive_value::Value::Maybe(proto::MaybeValue {
-                                value: Some(root as u32),
-                            })),
-                        }))
-                }
-                2 => {
-                    malformed.sorts[program.nodes[root].sort_id as usize].kind =
-                        Some(proto::sort::Kind::Family(proto::HostSort {
-                            name: "Vec".into(),
-                            args: vec![0],
-                        }))
-                }
-                3 => {
-                    malformed.sorts[program.nodes[root].sort_id as usize].kind =
-                        Some(proto::sort::Kind::Family(proto::HostSort {
-                            name: "Maybe".into(),
-                            args: vec![],
-                        }))
-                }
-                _ => malformed.nodes[root].kind = Some(proto::node::Kind::Var("free".into())),
-            }
-            assert!(
-                builtin::definitions::reconcile_declarations(
-                    &malformed,
-                    &mut proto::Program::default()
-                )
-                .is_err(),
-                "root {root}, mutation {mutation}"
-            );
-            assert!(
-                builtin::definitions::reconcile_declarations(&malformed, &mut installed).is_err()
-            );
-            assert_eq!(installed, frozen);
-        }
-    }
-}
-
-#[test]
-fn closed_defaults_enforce_exact_equality_binders_after_substitution() {
-    let definition = VecSort::builtin_definitions().iter().map(|description| builtin::project_description(description).unwrap()).collect::<Vec<_>>().into_iter().find(|p| p.declarations.iter().any(|d| matches!(&d.kind, Some(proto::declaration::Kind::HostPrimitive(h)) if h.name == "egglog.core.vec.union"))).unwrap();
-    for element in [
-        proto::sort::Kind::Eq("Atom".into()),
-        proto::sort::Kind::Family(proto::HostSort {
-            name: "i64".into(),
-            args: vec![],
-        }),
-        proto::sort::Kind::Family(proto::HostSort {
-            name: "Vec".into(),
-            args: vec![4],
-        }),
-    ] {
-        let valid = matches!(element, proto::sort::Kind::Eq(_));
-        let mut candidate = definition.clone();
-        let concrete = candidate.sorts.len() as u32;
-        candidate.sorts.push(proto::Sort {
-            kind: Some(element),
-            ..Default::default()
-        });
-        candidate.sorts.push(proto::Sort {
-            kind: Some(proto::sort::Kind::Family(proto::HostSort {
-                name: "Vec".into(),
-                args: vec![concrete],
-            })),
-            ..Default::default()
-        });
-        // In the container-negative case, use a distinct closed Eq leaf.
-        if !valid
-            && matches!(&candidate.sorts[concrete as usize].kind, Some(proto::sort::Kind::Family(f)) if f.name == "Vec")
-        {
-            let leaf = candidate.sorts.len() as u32;
-            candidate.sorts.push(proto::Sort {
-                kind: Some(proto::sort::Kind::Eq("Atom".into())),
-                ..Default::default()
-            });
-            let Some(proto::sort::Kind::Family(f)) = &mut candidate.sorts[concrete as usize].kind
-            else {
-                unreachable!()
-            };
-            f.args = vec![leaf];
-        }
-        candidate.declarations.push(proto::Declaration {
-            kind: Some(proto::declaration::Kind::EqSort(proto::EqSort {
-                name: "Atom".into(),
-                ..Default::default()
-            })),
-            ..Default::default()
-        });
-        candidate.nodes = vec![
-            proto::Node {
-                sort_id: concrete + 1,
-                kind: Some(proto::node::Kind::PrimitiveValue(proto::PrimitiveValue {
-                    value: Some(proto::primitive_value::Value::Vec(Default::default())),
-                })),
-                ..Default::default()
-            },
-            proto::Node {
-                sort_id: concrete + 1,
-                kind: Some(proto::node::Kind::Call(proto::Call {
-                    func: "egglog.core.vec.union".into(),
-                    args: vec![0, 0],
-                })),
-                ..Default::default()
-            },
-        ];
-        let declaration = candidate.declarations.iter_mut().find(|d| matches!(&d.kind, Some(proto::declaration::Kind::HostPrimitive(h)) if h.name == "egglog.core.vec.union")).unwrap();
-        declaration
-            .bindings
-            .as_mut()
-            .unwrap()
-            .python
-            .as_mut()
-            .unwrap()
-            .views[0]
-            .params[0]
-            .default_expr = Some(1);
-        let result = builtin::definitions::reconcile_declarations(
-            &candidate,
-            &mut proto::Program::default(),
-        );
-        if valid {
-            result.unwrap();
-        } else {
-            assert!(result.unwrap_err().contains("requires an equality sort"));
         }
     }
 }
@@ -5924,7 +3434,7 @@ fn generic_signature_import_remaps_children_and_ignores_binder_labels() {
         .map(|description| builtin::project_description(description).unwrap())
         .collect::<Vec<_>>();
     let mut definition = definitions.remove(1);
-    let mut destination = proto::Program {
+    let mut destination = proto::BuiltinCatalog {
         sorts: vec![proto::Sort {
             kind: Some(proto::sort::Kind::Eq("Prior".into())),
             ..Default::default()
@@ -5933,12 +3443,8 @@ fn generic_signature_import_remaps_children_and_ignores_binder_labels() {
     };
     builtin::import_definition(&definition, &mut destination).unwrap();
     let before = destination.clone();
-    let Some(proto::declaration::Kind::HostPrimitive(primitive)) =
-        &mut definition.declarations.last_mut().unwrap().kind
-    else {
-        unreachable!()
-    };
-    let Some(proto::host_primitive::Typing::Signature(signature)) = &mut primitive.typing else {
+    let primitive = &mut definition.primitives.last_mut().unwrap();
+    let Some(proto::primitive::Typing::Signature(signature)) = &mut primitive.typing else {
         unreachable!()
     };
     signature.type_params[0] = "Renamed".into();
@@ -5953,7 +3459,7 @@ fn generic_signature_import_remaps_children_and_ignores_binder_labels() {
 fn program_primitive_reconciliation_checks_body_scope_and_identity() {
     let source = proto::Program {
         sorts: vec![proto::Sort {
-            kind: Some(proto::sort::Kind::Family(proto::HostSort {
+            kind: Some(proto::sort::Kind::Application(proto::SortApplication {
                 name: "i64".into(),
                 args: vec![],
             })),
@@ -5965,15 +3471,17 @@ fn program_primitive_reconciliation_checks_body_scope_and_identity() {
             ..Default::default()
         }],
         declarations: vec![proto::Declaration {
-            kind: Some(proto::declaration::Kind::Primitive(proto::Primitive {
-                name: "identity".into(),
-                inputs: vec![proto::Arg {
-                    name: "value".into(),
-                    sort: 0,
-                }],
-                output: 0,
-                body: Some(0),
-            })),
+            kind: Some(proto::declaration::Kind::UserDefinedPrimitive(
+                proto::UserDefinedPrimitive {
+                    name: "identity".into(),
+                    inputs: vec![proto::Arg {
+                        name: "value".into(),
+                        sort: 0,
+                    }],
+                    output: 0,
+                    body: Some(0),
+                },
+            )),
             ..Default::default()
         }],
         ..Default::default()
@@ -6004,7 +3512,7 @@ fn program_primitive_reconciliation_checks_body_scope_and_identity() {
         "lambda",
     ] {
         let mut candidate = source.clone();
-        let Some(proto::declaration::Kind::Primitive(primitive)) =
+        let Some(proto::declaration::Kind::UserDefinedPrimitive(primitive)) =
             &mut candidate.declarations[0].kind
         else {
             unreachable!()
@@ -6018,7 +3526,7 @@ fn program_primitive_reconciliation_checks_body_scope_and_identity() {
             "noncanonical" => candidate.nodes[0].kind = Some(proto::node::Kind::Var("_00".into())),
             "sort" => {
                 candidate.sorts.push(proto::Sort {
-                    kind: Some(proto::sort::Kind::Family(proto::HostSort {
+                    kind: Some(proto::sort::Kind::Application(proto::SortApplication {
                         name: "bool".into(),
                         args: vec![],
                     })),
@@ -6033,12 +3541,14 @@ fn program_primitive_reconciliation_checks_body_scope_and_identity() {
                     }))
             }
             "shared-scope" => candidate.declarations.push(proto::Declaration {
-                kind: Some(proto::declaration::Kind::Primitive(proto::Primitive {
-                    name: "nullary".into(),
-                    inputs: vec![],
-                    output: 0,
-                    body: Some(0),
-                })),
+                kind: Some(proto::declaration::Kind::UserDefinedPrimitive(
+                    proto::UserDefinedPrimitive {
+                        name: "nullary".into(),
+                        inputs: vec![],
+                        output: 0,
+                        body: Some(0),
+                    },
+                )),
                 ..Default::default()
             }),
             "cycle" => {
@@ -6074,7 +3584,8 @@ fn program_primitive_reconciliation_checks_body_scope_and_identity() {
         );
     }
     let mut distinct = source;
-    let Some(proto::declaration::Kind::Primitive(primitive)) = &mut distinct.declarations[0].kind
+    let Some(proto::declaration::Kind::UserDefinedPrimitive(primitive)) =
+        &mut distinct.declarations[0].kind
     else {
         unreachable!()
     };
@@ -6153,19 +3664,10 @@ fn empty_definition_keys_are_rejected_by_import_and_registration() {
     )
     .unwrap();
     let mut native = builtin::native_definition(&definition).unwrap();
-    let Some(proto::declaration::Kind::HostPrimitive(primitive)) =
-        &mut definition.declarations.last_mut().unwrap().kind
-    else {
-        unreachable!()
-    };
+    let primitive = &mut definition.primitives.last_mut().unwrap();
     primitive.name.clear();
     native.key.clear();
-    let imported = builtin::import_definition(
-        &definition,
-        &mut proto::Program {
-            ..Default::default()
-        },
-    );
+    let imported = builtin::import_definition(&definition, &mut proto::BuiltinCatalog::default());
     let primitive = Invalid(native);
     let destination = proto::Program::default();
     assert!(builtin::project_description(primitive.builtin_description().unwrap()).is_err());
@@ -6218,13 +3720,19 @@ fn canonical_signature_drives_native_checking_and_export() {
                 .parse_and_run_program(None, &format!("(identity {bad})"))
                 .is_err()
         );
-        let mut exported = proto::Program {
+        let mut exported = proto::BuiltinCatalog {
             ..Default::default()
         };
         let catalog = graph.type_info().portable_builtin_catalog().unwrap();
         let definition = builtin::project_description(&definition).unwrap();
         builtin::import_definition(&definition, &mut exported).unwrap();
-        assert!(catalog.definitions.declarations.iter().any(|declaration| matches!(&declaration.kind, Some(proto::declaration::Kind::HostPrimitive(primitive)) if primitive.name == "test.identity")));
+        assert!(
+            catalog
+                .definitions
+                .primitives
+                .iter()
+                .any(|declaration| declaration.name == "test.identity")
+        );
         assert_eq!(exported, definition);
     }
 }
@@ -6304,215 +3812,34 @@ fn native_builtin_arity_errors_keep_source_aliases() {
 }
 
 #[test]
-fn imported_definitions_keep_namespaces_and_diagnostic_labels_separate() {
+fn imported_signatures_keep_namespaces_and_diagnostic_labels_separate() {
     let graph = EGraph::default();
     let sort = graph.get_sort_by_name("i64").unwrap().clone();
-    let definition = builtin::closed_signature(
-        "i64",
-        "identity",
-        &[("value", sort.clone())],
-        &[],
-        sort.clone(),
-    )
-    .unwrap();
-    let mut destination = proto::Program {
-        ..Default::default()
-    };
+    let definition =
+        builtin::closed_signature("i64", "identity", &[("value", sort.clone())], &[], sort)
+            .unwrap();
+    let mut destination = proto::BuiltinCatalog::default();
     builtin::import_definition(&definition, &mut destination).unwrap();
+    assert_eq!(destination.primitive_sorts.len(), 1);
+    assert_eq!(destination.primitives.len(), 1);
     assert_eq!(
-        destination.declarations.len(),
-        2,
-        "sort and callable i64 are distinct"
+        destination.primitive_sorts[0].name,
+        destination.primitives[0].name
     );
-
-    let definition = builtin::closed_signature(
-        "test.identity",
-        "identity",
-        &[("value", sort.clone())],
-        &[],
-        sort,
-    )
-    .unwrap();
-    let mut destination = proto::Program {
-        declarations: vec![proto::Declaration {
-            kind: Some(proto::declaration::Kind::Function(proto::Function {
-                name: "i64".into(),
-                output: 0,
-                ..Default::default()
-            })),
-            ..Default::default()
-        }],
-        ..Default::default()
-    };
-    builtin::import_definition(&definition, &mut destination).unwrap();
-    assert_eq!(destination.declarations.len(), 3);
+    let before = destination.clone();
     let mut relabeled = definition.clone();
-    let declaration = relabeled.declarations.last_mut().unwrap();
-    let Some(proto::declaration::Kind::HostPrimitive(primitive)) = &mut declaration.kind else {
-        unreachable!()
-    };
-    let Some(proto::host_primitive::Typing::Signature(signature)) = &mut primitive.typing else {
-        unreachable!()
-    };
-    signature.inputs[0].name = "renamed_diagnostic_label".into();
-    builtin::import_definition(&relabeled, &mut destination).unwrap();
-    assert_eq!(destination.declarations.len(), 3);
-
-    // Existing presentation information remains immutable.
-    relabeled
-        .declarations
-        .last_mut()
-        .unwrap()
-        .bindings
-        .as_mut()
-        .unwrap()
-        .egglog
-        .as_mut()
-        .unwrap()
-        .views[0]
-        .symbol = "different".into();
-    assert!(builtin::import_definition(&relabeled, &mut destination).is_err());
-    let Some(proto::declaration::Kind::Function(function)) = &mut destination.declarations[0].kind
+    let Some(proto::primitive::Typing::Signature(signature)) = &mut relabeled.primitives[0].typing
     else {
         unreachable!()
     };
-    function.name = "test.identity".into();
-    assert!(builtin::import_definition(&definition, &mut destination).is_err());
-}
-
-#[cfg(test)]
-mod source_packing_provenance {
-    use super::*;
-
-    #[test]
-    fn source_packing_checks_actual_callable_dependencies() {
-        for (source, key) in [
-            ("map-of", "egglog.core.map.of"),
-            ("map-of", "egglog.core.pair.make"),
-            ("map-of", "egglog.core.vec.of"),
-            ("map-of", "egglog.core.vec.empty"),
-            ("pair", "egglog.core.pair.make"),
-        ] {
-            let mut graph = EGraph::default();
-            graph
-                .parse_and_run_program(None, "(sort M (Map i64 i64)) (sort P (Pair i64 i64))")
-                .unwrap();
-            let i = graph.get_sort_by_name("i64").unwrap().clone();
-            let m = graph
-                .get_sort_by_name(if source == "pair" { "P" } else { "M" })
-                .unwrap()
-                .clone();
-            let empty = key.ends_with("empty");
-            let mut native = if empty {
-                vec![]
-            } else {
-                vec![i.clone(), i.clone()]
-            };
-            native.push(m);
-            let egglog::ResolvedCall::Primitive(primitive) = egglog::ResolvedCall::from_resolution(
-                source,
-                &native,
-                graph.type_info(),
-                Context::Pure,
-                &ast::Span::Panic,
-            )
-            .unwrap() else {
-                unreachable!()
-            };
-            let mut definition = proto::Program::default();
-            graph
-                .type_info()
-                .export_builtin_definition(key, &mut definition)
-                .unwrap();
-            let declaration = definition.declarations.iter_mut().find(|declaration| {
-                matches!(&declaration.kind, Some(proto::declaration::Kind::HostPrimitive(primitive)) if primitive.name == key)
-            }).unwrap();
-            let Some(proto::declaration::Kind::HostPrimitive(primitive_definition)) =
-                &mut declaration.kind
-            else {
-                unreachable!()
-            };
-            let Some(proto::host_primitive::Typing::Signature(signature)) =
-                &mut primitive_definition.typing
-            else {
-                unreachable!()
-            };
-            // Same key and binder count, wrong endpoint. For Pair, input
-            // mutation also discriminates when both concrete arguments are i64.
-            if key.ends_with("make") {
-                signature.inputs[1].sort = signature.inputs[0].sort;
-            } else {
-                signature.output = Some(0);
-            }
-            let unused = source == "map-of" && key != "egglog.core.map.of";
-            if unused {
-                // Constructor language views constrain the original signature.
-                // The unused alternative is a valid ordinary callable.
-                let bindings = declaration.bindings.as_mut().unwrap();
-                bindings.python = None;
-                bindings.rust = None;
-            }
-            if source == "pair" || unused {
-                // Each alternative is valid alone. Only actual dependencies
-                // must agree with the exact selected native registration.
-                builtin::import_definition(&definition, &mut proto::Program::default()).unwrap();
-            }
-            // Resupply a conflicting callable. Map packing depends on map.of;
-            // pair and vector values do not call their constructor primitives.
-            let mut destination = definition;
-            let sort_id = graph.export_sort(&i, &mut destination.sorts).unwrap();
-            destination.nodes.push(proto::Node {
-                sort_id,
-                kind: Some(proto::node::Kind::Var("x".into())),
-                ..Default::default()
-            });
-            let original = destination.nodes.clone();
-            let declarations = destination.declarations.clone();
-            let unused = declarations.iter().find(|declaration| {
-                matches!(&declaration.kind, Some(proto::declaration::Kind::HostPrimitive(primitive)) if primitive.name == key)
-            }).unwrap().clone();
-            let result = primitive.export_builtin_call(
-                &graph,
-                if empty { &[] } else { &[0, 0] },
-                None,
-                &mut destination,
-            );
-            if source == "pair" || key == "egglog.core.map.of" {
-                assert!(result.is_err(), "{key}");
-                assert_eq!(destination.nodes, original, "no helpers emitted for {key}");
-                assert_eq!(
-                    destination.declarations, declarations,
-                    "conflicting authority remains unchanged for {key}"
-                );
-            } else {
-                let call = result.unwrap();
-                assert_eq!(call.func, "egglog.core.map.of");
-                assert_eq!(call.args.len(), 1);
-                assert_eq!(&destination.nodes[..original.len()], &original);
-                assert_eq!(destination.declarations.iter().find(|declaration| {
-                    matches!(&declaration.kind, Some(proto::declaration::Kind::HostPrimitive(primitive)) if primitive.name == key)
-                }), Some(&unused), "unused conflicting callable remains unchanged for {key}");
-                assert!(
-                    destination.nodes[original.len()..]
-                        .iter()
-                        .all(|node| matches!(
-                            &node.kind,
-                            Some(proto::node::Kind::PrimitiveValue(proto::PrimitiveValue {
-                                value: Some(
-                                    proto::primitive_value::Value::Pair(_)
-                                        | proto::primitive_value::Value::Vec(_)
-                                ),
-                            }))
-                        )),
-                    "packing emits values without constructor calls for {key}"
-                );
-                assert!(matches!(
-                    &destination.nodes[call.args[0] as usize].kind,
-                    Some(proto::node::Kind::PrimitiveValue(proto::PrimitiveValue {
-                        value: Some(proto::primitive_value::Value::Vec(_)),
-                    }))
-                ));
-            }
-        }
-    }
+    signature.inputs[0].name = "diagnostic label".into();
+    builtin::import_definition(&relabeled, &mut destination).unwrap();
+    assert_eq!(destination, before);
+    let Some(proto::primitive::Typing::Signature(signature)) = &mut relabeled.primitives[0].typing
+    else {
+        unreachable!()
+    };
+    signature.inputs.clear();
+    assert!(builtin::import_definition(&relabeled, &mut destination).is_err());
+    assert_eq!(destination, before);
 }

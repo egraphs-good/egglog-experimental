@@ -1,5 +1,6 @@
 #![cfg(feature = "typed")]
 
+use egglog_experimental::proto as pb;
 use egglog_experimental::typed::{
     builtins::{I64, Vec as EVec},
     prelude::*,
@@ -42,7 +43,8 @@ fn append_receiver_and_equality_union_execute_as_bytes() -> Result<(), TypedErro
     assert!(graph.check(eq(&a, &b))?);
     let bad_length = left.union(EVec::<Atom>::empty());
     assert!(
-        matches!(graph.register(bad_length), Err(TypedError::Engine(error)) if error.code == egglog_experimental::proto::ErrorCode::EvaluationFailed as i32)
+        matches!(graph.register(bad_length), Err(TypedError::Engine(frame)) if matches!(&frame.result, Some(pb::run_program_response::Result::Error(error))
+        if error.code == pb::ErrorCode::RuntimeFailure as i32))
     );
     Ok(())
 }
@@ -75,7 +77,8 @@ fn ordinary_vector_methods_preserve_values_and_failures_through_bytes() -> Resul
     for index in [-1_i64, 3] {
         for call in [xs.set(index, 9_i64), xs.remove(index)] {
             assert!(
-                matches!(graph.extract(call), Err(TypedError::Engine(error)) if error.code == egglog_experimental::proto::ErrorCode::EvaluationFailed as i32)
+                matches!(graph.extract(call), Err(TypedError::Engine(frame)) if matches!(&frame.result, Some(pb::run_program_response::Result::Error(error))
+        if error.code == pb::ErrorCode::RuntimeFailure as i32))
             );
         }
     }
@@ -134,16 +137,17 @@ fn generated_vec_calls_and_ordered_values_execute_as_bytes() -> Result<(), Typed
     let last: I64 = I64::from(5).range().get(4_i64);
     assert_eq!(i64::try_from(&graph.extract(last)?)?, 4);
     let range_error = graph.extract(I64::from(5).range().get(5_i64)).unwrap_err();
-    assert!(matches!(range_error, TypedError::Engine(error)
-        if error.code == egglog_experimental::proto::ErrorCode::EvaluationFailed as i32));
+    assert!(matches!(range_error, TypedError::Engine(frame)
+        if matches!(&frame.result, Some(pb::run_program_response::Result::Error(error))
+            if error.code == pb::ErrorCode::RuntimeFailure as i32)));
     let error = graph.extract(xs.get(9_i64)).unwrap_err();
-    let TypedError::Engine(error) = error else {
+    let TypedError::Engine(frame) = error else {
         panic!("{error}")
     };
-    assert_eq!(
-        error.code,
-        egglog_experimental::proto::ErrorCode::EvaluationFailed as i32
-    );
+    let Some(pb::run_program_response::Result::Error(error)) = &frame.result else {
+        panic!("expected terminal error frame")
+    };
+    assert_eq!(error.code, pb::ErrorCode::RuntimeFailure as i32);
     assert!(graph.check(eq(xs.get(0_i64), I64::from(7)))?);
     Ok(())
 }

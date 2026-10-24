@@ -5,6 +5,10 @@ use egglog_experimental::protobuf::{
 };
 use prost::Message;
 
+#[path = "common/protobuf.rs"]
+mod fixture;
+use fixture::Observed;
+
 #[test]
 fn source_receiving_mode_preserves_actual_global_proof_requests() {
     // Keep these small original Core fixtures local: dependency packages need
@@ -100,7 +104,7 @@ fn source_receiving_mode_preserves_actual_global_proof_requests() {
                     rendered.push_str(&renderer.render(&program).unwrap());
                     let response = run(&mut engine, id, program);
                     assert_eq!(response.error, None, "{fixture}/{mode:?}/replay{replay}");
-                    for output in response.outputs {
+                    for output in response.output.outputs {
                         if let Some(pb::command_output::Kind::Proof(proof)) = output.kind {
                             assert!(
                                 proof
@@ -219,7 +223,7 @@ fn source_receiving_mode_preserves_native_global_boundaries() {
                     }
                     Ok(Submission::Program(program)) => {
                         let response = run(&mut engine, id, program);
-                        for output in response.outputs {
+                        for output in response.output.outputs {
                             if let Some(pb::command_output::Kind::Sizes(sizes)) = output.kind {
                                 byte_sizes.push(
                                     sizes
@@ -253,12 +257,8 @@ fn source_receiving_mode_preserves_native_global_boundaries() {
                         for _ in 0..count {
                             let parent = saved.pop().unwrap();
                             engine
-                                .return_to(
-                                    &pb::ReturnToEGraphRequest {
-                                        active_id: id,
-                                        saved_id: parent,
-                                    }
-                                    .encode_to_vec(),
+                                .destroy(
+                                    &pb::DestroyEGraphRequest { egraph_id: id }.encode_to_vec(),
                                 )
                                 .unwrap();
                             id = parent;
@@ -334,7 +334,8 @@ fn source_receiving_mode_preserves_native_global_boundaries() {
                 },
             );
             assert_eq!(response.error, None, "recovery {case}/{mode:?}");
-            let Some(pb::command_output::Kind::Sizes(sizes)) = &response.outputs[0].kind else {
+            let Some(pb::command_output::Kind::Sizes(sizes)) = &response.output.outputs[0].kind
+            else {
                 panic!("wire N observation")
             };
             assert_eq!(
@@ -413,21 +414,11 @@ fn source_receiving_modes_preserve_canonical_sort_alias_uses() {
         let id = create(&mut engine, mode);
         let mut proofs = 0;
         let mut sizes = None;
-        let mut aliases = (false, false);
         for phase in source {
             let phase = phase.unwrap();
-            for sort in &phase.sorts {
-                let names = sort
-                    .egglog_aliases
-                    .iter()
-                    .map(|alias| alias.symbol.as_str())
-                    .collect::<Vec<_>>();
-                aliases.0 |= names == ["V", "W"];
-                aliases.1 |= names == ["NestedV", "NestedW"];
-            }
             let response = run(&mut engine, id, phase);
             assert_eq!(response.error, None, "canonical aliases/{mode:?}");
-            for output in response.outputs {
+            for output in response.output.outputs {
                 match output.kind {
                     Some(pb::command_output::Kind::Proof(proof)) => {
                         assert!(
@@ -449,7 +440,6 @@ fn source_receiving_modes_preserve_canonical_sort_alias_uses() {
                 }
             }
         }
-        assert!(aliases.0 && aliases.1, "canonical alias metadata/{mode:?}");
         assert_eq!(sizes.unwrap(), native_sizes, "canonical aliases/{mode:?}");
         assert_eq!(proofs, native_proofs, "canonical aliases/{mode:?}");
     }
@@ -546,7 +536,7 @@ fn source_receiving_modes_preserve_typed_multi_vec_empty_context() {
             },
         );
         assert_eq!(response.error, None);
-        let Some(pb::command_output::Kind::Sizes(sizes)) = &response.outputs[0].kind else {
+        let Some(pb::command_output::Kind::Sizes(sizes)) = &response.output.outputs[0].kind else {
             panic!("typed XW size")
         };
         assert_eq!(
@@ -591,7 +581,7 @@ fn source_receiving_mode_aggregate_values_match_native_exactly() {
     for phase in source {
         let response = run(&mut engine, id, phase.unwrap());
         assert_eq!(response.error, None);
-        for output in &response.outputs {
+        for output in &response.output.outputs {
             if let Some(pb::command_output::Kind::PrintedFunction(table)) = &output.kind {
                 assert_eq!(table.table, "Observed");
                 for row in &table.rows {
@@ -602,7 +592,7 @@ fn source_receiving_mode_aggregate_values_match_native_exactly() {
                                 let Some(pb::table_cell::Kind::Term(term)) = &cell.kind else {
                                     panic!("encoded size input must be available")
                                 };
-                                match &response.nodes[*term as usize].kind {
+                                match &response.output.nodes[*term as usize].kind {
                                     Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
                                         value: Some(pb::primitive_value::Value::I64(value)),
                                     })) => *value,
@@ -733,7 +723,7 @@ fn core_source_controls_keep_native_stopping_flags_and_modes() {
                         response.error, None,
                         "{mode:?}/{schedule}/reimport={roundtrip}"
                     );
-                    for output in &response.outputs {
+                    for output in &response.output.outputs {
                         match &output.kind {
                             Some(pb::command_output::Kind::Run(actual)) => {
                                 controls += 1;
@@ -813,12 +803,12 @@ fn core_source_failed_control_and_fail_wrappers_keep_prefixes_in_every_mode() {
                     }
                     let response = run(&mut engine, id, phase);
                     assert!(
-                        response.outputs.is_empty(),
+                        response.output.outputs.is_empty(),
                         "failed or caught schedules have no completed outcome"
                     );
                     if let Some(error) = response.error {
                         failed = true;
-                        assert_eq!(error.code, i32::from(pb::ErrorCode::EvaluationFailed));
+                        assert_eq!(error.code, i32::from(pb::ErrorCode::RuntimeFailure));
                         assert!(error.span.is_some());
                         let location = error.location.unwrap();
                         assert_eq!(location.path, if depth == 0 { vec![0, 0] } else { vec![0] });
@@ -842,7 +832,7 @@ fn core_source_failed_control_and_fail_wrappers_keep_prefixes_in_every_mode() {
                     },
                 );
                 assert_eq!(read.error, None);
-                assert!(diagnostic_json(&read.outputs[0])["iterations"].is_array());
+                assert!(diagnostic_json(&read.output.outputs[0])["iterations"].is_array());
                 let table = run(
                     &mut engine,
                     id,
@@ -860,7 +850,7 @@ fn core_source_failed_control_and_fail_wrappers_keep_prefixes_in_every_mode() {
                 {
                     assert_eq!(table.error, None);
                     let Some(pb::command_output::Kind::PrintedFunction(rows)) =
-                        &table.outputs[0].kind
+                        &table.output.outputs[0].kind
                     else {
                         unreachable!()
                     };
@@ -871,7 +861,7 @@ fn core_source_failed_control_and_fail_wrappers_keep_prefixes_in_every_mode() {
                             let Some(pb::table_cell::Kind::Term(term)) = row.args[0].kind else {
                                 panic!("expected available i64 input")
                             };
-                            match &table.nodes[term as usize].kind {
+                            match &table.output.nodes[term as usize].kind {
                                 Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
                                     value: Some(pb::primitive_value::Value::I64(value)),
                                 })) => *value,
@@ -896,7 +886,7 @@ fn core_source_failed_control_and_fail_wrappers_keep_prefixes_in_every_mode() {
                     pb::Program {
                         sorts: vec![
                             pb::Sort {
-                                kind: Some(pb::sort::Kind::Family(pb::HostSort {
+                                kind: Some(pb::sort::Kind::Application(pb::SortApplication {
                                     name: "i64".into(),
                                     args: vec![],
                                 })),
@@ -952,7 +942,7 @@ fn core_source_failed_control_and_fail_wrappers_keep_prefixes_in_every_mode() {
 }
 
 #[test]
-fn scope_return_restores_proof_state_and_can_prove_again() {
+fn scope_pop_restores_proof_state_and_can_prove_again() {
     for mode in [
         pb::ExecutionMode::Normal,
         pb::ExecutionMode::TermEncoding,
@@ -1026,16 +1016,10 @@ fn scope_return_restores_proof_state_and_can_prove_again() {
         let child = run(&mut engine, active, work.clone());
         assert_eq!(child.error, None, "child {mode:?}");
         if proving {
-            assert!(child.outputs.iter().any(|output| matches!(&output.kind, Some(pb::command_output::Kind::Proof(proof)) if proof.root.is_some())));
+            assert!(child.output.outputs.iter().any(|output| matches!(&output.kind, Some(pb::command_output::Kind::Proof(proof)) if proof.root.is_some())));
         }
         engine
-            .return_to(
-                &pb::ReturnToEGraphRequest {
-                    active_id: active,
-                    saved_id: saved,
-                }
-                .encode_to_vec(),
-            )
+            .destroy(&pb::DestroyEGraphRequest { egraph_id: active }.encode_to_vec())
             .unwrap();
         let mut absent = fixture();
         absent.commands = vec![pb::Command {
@@ -1047,13 +1031,14 @@ fn scope_return_restores_proof_state_and_can_prove_again() {
         let restored = run(&mut engine, saved, absent);
         assert_eq!(
             restored.error, None,
-            "scoped Goal must be absent after return in {mode:?}"
+            "scoped Goal must be absent after pop in {mode:?}"
         );
-        assert!(restored.outputs.is_empty());
+        assert!(restored.output.outputs.is_empty());
         let after = run(&mut engine, saved, work);
         assert_eq!(after.error, None, "after return {mode:?}");
         if proving {
             let proofs: Vec<_> = after
+                .output
                 .outputs
                 .iter()
                 .filter_map(|output| match &output.kind {
@@ -1123,7 +1108,7 @@ fn recursive_fail_run_rendering_preserves_native_command_in_every_mode() {
             text.push_str(&renderer.render(&phase).unwrap());
             let response = run(&mut engine, id, phase);
             assert_eq!(response.error, None, "original bytes {mode:?}");
-            assert!(response.outputs.is_empty());
+            assert!(response.output.outputs.is_empty());
         }
         // Display's run-schedule spelling is shadowed by an experimental
         // UserDefined command. Re-export must retain a real native Run leaf,
@@ -1147,7 +1132,7 @@ fn recursive_fail_run_rendering_preserves_native_command_in_every_mode() {
         for phase in phases {
             let response = run(&mut engine, id, phase);
             assert_eq!(response.error, None, "re-exported bytes {mode:?}");
-            assert!(response.outputs.is_empty());
+            assert!(response.output.outputs.is_empty());
         }
     }
 }
@@ -1260,7 +1245,7 @@ fn recursive_fail_matches_native_checks_in_every_execution_mode() {
                     let right = union.members[1] as usize;
                     phase.nodes[right].sort_id = phase.sorts.len() as u32;
                     phase.sorts.push(pb::Sort {
-                        kind: Some(pb::sort::Kind::Family(pb::HostSort {
+                        kind: Some(pb::sort::Kind::Application(pb::SortApplication {
                             name: "String".into(),
                             args: vec![],
                         })),
@@ -1284,7 +1269,7 @@ fn recursive_fail_matches_native_checks_in_every_execution_mode() {
                 phase.commands[0].kind,
                 Some(pb::command::Kind::Fail(_))
             ));
-            let integer = phase.sorts.iter().position(|s| matches!(&s.kind, Some(pb::sort::Kind::Family(f)) if f.name == "i64" && f.args.is_empty())).unwrap() as u32;
+            let integer = phase.sorts.iter().position(|s| matches!(&s.kind, Some(pb::sort::Kind::Application(f)) if f.name == "i64" && f.args.is_empty())).unwrap() as u32;
             let mark = phase
                 .sorts
                 .iter()
@@ -1363,10 +1348,8 @@ fn recursive_fail_matches_native_checks_in_every_execution_mode() {
                 }
                 let code = if preparation {
                     pb::ErrorCode::InvalidProgram
-                } else if case == "ungrounded" {
-                    pb::ErrorCode::EvaluationFailed
-                } else if mode == pb::ExecutionMode::ProofTesting {
-                    pb::ErrorCode::ProofFailed
+                } else if case == "ungrounded" || mode == pb::ExecutionMode::ProofTesting {
+                    pb::ErrorCode::RuntimeFailure
                 } else {
                     pb::ErrorCode::CheckFailed
                 };
@@ -1380,7 +1363,7 @@ fn recursive_fail_matches_native_checks_in_every_execution_mode() {
                 response.error
             );
             assert!(
-                response.outputs.is_empty(),
+                response.output.outputs.is_empty(),
                 "{mode:?} {case}: Fail leaked a requested output"
             );
             if let Some(error) = &response.error {
@@ -1397,7 +1380,7 @@ fn recursive_fail_matches_native_checks_in_every_execution_mode() {
                     i32::from(if preparation {
                         pb::ErrorCode::InvalidProgram
                     } else {
-                        pb::ErrorCode::EvaluationFailed
+                        pb::ErrorCode::RuntimeFailure
                     })
                 );
             }
@@ -1459,10 +1442,13 @@ fn double_fail_suppresses_successful_proof_without_erasing_prior_output() {
         program.commands.extend(nested.commands);
         let response = run(&mut engine, id, program);
         assert_eq!(response.error, None);
-        assert_eq!(response.outputs.len(), 1);
-        assert_eq!(response.outputs[0].location.as_ref().unwrap().path, [0]);
+        assert_eq!(response.output.outputs.len(), 1);
+        assert_eq!(
+            response.output.outputs[0].location.as_ref().unwrap().path,
+            [0]
+        );
         assert!(matches!(
-            response.outputs[0].kind,
+            response.output.outputs[0].kind,
             Some(pb::command_output::Kind::Proof(_))
         ));
     }
@@ -1541,6 +1527,7 @@ fn binary_source_unions_keep_native_modes_and_checked_proof_attribution() {
                 let response = run(&mut engine, id, phase);
                 assert_eq!(response.error, None, "{case} {mode:?}: {text}");
                 let actual: Vec<_> = response
+                    .output
                     .outputs
                     .iter()
                     .map(|output| {
@@ -1600,6 +1587,7 @@ fn set_collapse_proof_and_get_validator_boundary_survive_bytes() {
             let response = run(&mut engine, id, phase.unwrap());
             assert_eq!(response.error, None, "{mode:?}");
             proofs += response
+                .output
                 .outputs
                 .iter()
                 .filter(|o| matches!(o.kind, Some(pb::command_output::Kind::Proof(_))))
@@ -1631,7 +1619,7 @@ fn logical_table_rows_match_native_views_in_every_mode() {
     fn sort_shape(sorts: &[pb::Sort], index: u32) -> String {
         match sorts[index as usize].kind.as_ref().unwrap() {
             pb::sort::Kind::Eq(name) => format!("Eq({name})"),
-            pb::sort::Kind::Family(family) => format!(
+            pb::sort::Kind::Application(family) => format!(
                 "{}({})",
                 family.name,
                 family
@@ -1645,8 +1633,8 @@ fn logical_table_rows_match_native_views_in_every_mode() {
         }
     }
 
-    fn wire_term(response: &pb::RunProgramResponse, index: u32) -> String {
-        match response.nodes[index as usize].kind.as_ref().unwrap() {
+    fn wire_term(response: &Observed, index: u32) -> String {
+        match response.output.nodes[index as usize].kind.as_ref().unwrap() {
             pb::node::Kind::Call(call) => format!(
                 "({}{})",
                 call.func,
@@ -1672,7 +1660,7 @@ fn logical_table_rows_match_native_views_in_every_mode() {
         }
     }
 
-    fn wire_rows(response: &pb::RunProgramResponse, table: &pb::PrintedFunction) -> ObservedRows {
+    fn wire_rows(response: &Observed, table: &pb::PrintedFunction) -> ObservedRows {
         table
             .rows
             .iter()
@@ -1683,11 +1671,14 @@ fn logical_table_rows_match_native_views_in_every_mode() {
                     .chain(row.output.iter())
                     .map(|cell| match cell.kind.unwrap() {
                         pb::table_cell::Kind::Term(term) => (
-                            sort_shape(&response.sorts, response.nodes[term as usize].sort_id),
+                            sort_shape(
+                                &response.output.sorts,
+                                response.output.nodes[term as usize].sort_id,
+                            ),
                             Some(wire_term(response, term)),
                         ),
                         pb::table_cell::Kind::UnavailableSort(sort) => {
-                            (sort_shape(&response.sorts, sort), None)
+                            (sort_shape(&response.output.sorts, sort), None)
                         }
                     })
                     .collect::<Vec<_>>();
@@ -1867,8 +1858,8 @@ fn logical_table_rows_match_native_views_in_every_mode() {
             }
             let response = run(&mut engine, id, phase);
             assert_eq!(response.error, None, "{mode:?}");
-            assert_eq!(response.outputs.len(), requests.len());
-            for (output, request) in response.outputs.iter().zip(requests) {
+            assert_eq!(response.output.outputs.len(), requests.len());
+            for (output, request) in response.output.outputs.iter().zip(requests) {
                 let Some(pb::command_output::Kind::PrintedFunction(table)) = &output.kind else {
                     panic!("table observation")
                 };
@@ -1890,7 +1881,7 @@ fn logical_table_rows_match_native_views_in_every_mode() {
                     assert_eq!(actual[0].0, [("Eq(E)".into(), Some(capture_value.clone()))]);
                 }
                 assert!(
-                    response.sorts.iter().all(
+                    response.output.sorts.iter().all(
                         |sort| !matches!(&sort.kind, Some(pb::sort::Kind::Eq(name)) if name != "E")
                     ),
                     "private classes/witnesses must stay private"
@@ -1957,8 +1948,9 @@ fn logical_table_rows_match_native_views_in_every_mode() {
             },
         );
         assert_eq!(response.error, None, "failed initializer table/{mode:?}");
-        assert_eq!(response.outputs.len(), 1);
-        let Some(pb::command_output::Kind::PrintedFunction(table)) = &response.outputs[0].kind
+        assert_eq!(response.output.outputs.len(), 1);
+        let Some(pb::command_output::Kind::PrintedFunction(table)) =
+            &response.output.outputs[0].kind
         else {
             panic!("failed initializer observation")
         };
@@ -2032,7 +2024,7 @@ fn table_observation_keeps_completed_prefix_and_encoding_errors_are_not_unavaila
         let response = run(&mut engine, id, program);
         assert!(response.error.is_some());
         assert!(
-            matches!(&response.outputs[..], [output] if matches!(&output.kind, Some(pb::command_output::Kind::PrintedFunction(table)) if table.rows.len() == 1))
+            matches!(&response.output.outputs[..], [output] if matches!(&output.kind, Some(pb::command_output::Kind::PrintedFunction(table)) if table.rows.len() == 1))
         );
 
         let provider = Arc::new(RejectEncoding::default());
@@ -2066,7 +2058,7 @@ fn table_observation_keeps_completed_prefix_and_encoding_errors_are_not_unavaila
                 .contains("deliberate table encoding failure")
         );
         assert!(
-            matches!(&response.outputs[..], [output] if matches!(output.kind, Some(pb::command_output::Kind::Sizes(_))))
+            matches!(&response.output.outputs[..], [output] if matches!(output.kind, Some(pb::command_output::Kind::Sizes(_))))
         );
         assert!(provider.encodings.load(Ordering::SeqCst) > 0);
         let encoded = provider.encodings.load(Ordering::SeqCst);
@@ -2078,9 +2070,9 @@ fn table_observation_keeps_completed_prefix_and_encoding_errors_are_not_unavaila
         let response = run(&mut engine, id, program);
         assert_eq!(response.error, None);
         assert!(
-            matches!(&response.outputs[..], [output] if matches!(&output.kind, Some(pb::command_output::Kind::PrintedFunction(table)) if table.rows.is_empty()))
+            matches!(&response.output.outputs[..], [output] if matches!(&output.kind, Some(pb::command_output::Kind::PrintedFunction(table)) if table.rows.is_empty()))
         );
-        assert!(response.nodes.is_empty() && response.sorts.is_empty());
+        assert!(response.output.nodes.is_empty() && response.output.sorts.is_empty());
         assert_eq!(provider.encodings.load(Ordering::SeqCst), encoded);
         assert_eq!(provider.initializations.load(Ordering::SeqCst), initialized);
     }
@@ -2091,7 +2083,7 @@ fn create(engine: &mut Engine, mode: pb::ExecutionMode) -> u64 {
         .create(
             &pb::CreateEGraphRequest {
                 sorts: vec![pb::Sort {
-                    kind: Some(pb::sort::Kind::Family(pb::HostSort {
+                    kind: Some(pb::sort::Kind::Application(pb::SortApplication {
                         name: "i64".into(),
                         args: vec![],
                     })),
@@ -2113,7 +2105,7 @@ fn create(engine: &mut Engine, mode: pb::ExecutionMode) -> u64 {
         .egraph_id
 }
 
-fn run(engine: &mut Engine, id: u64, program: pb::Program) -> pb::RunProgramResponse {
+fn run(engine: &mut Engine, id: u64, program: pb::Program) -> Observed {
     let bytes = engine
         .run(
             &pb::RunProgramRequest {
@@ -2124,9 +2116,11 @@ fn run(engine: &mut Engine, id: u64, program: pb::Program) -> pb::RunProgramResp
             .encode_to_vec(),
         )
         .unwrap();
-    let response = pb::RunProgramResponse::decode(bytes.as_slice()).unwrap();
-    assert_eq!(response.encode_to_vec(), bytes);
-    response
+    Observed::from_frames(bytes.iter().map(|bytes| {
+        let frame = pb::RunProgramResponse::decode(bytes.as_slice()).unwrap();
+        assert_eq!(frame.encode_to_vec(), *bytes);
+        frame
+    }))
 }
 
 fn diagnostic_json(output: &pb::CommandOutput) -> serde_json::Value {
@@ -2134,7 +2128,7 @@ fn diagnostic_json(output: &pb::CommandOutput) -> serde_json::Value {
         panic!("expected a diagnostic document")
     };
     assert_eq!(document.format, "application/vnd.egglog.run-report+json");
-    let value: serde_json::Value = serde_json::from_str(&document.content).unwrap();
+    let value: serde_json::Value = serde_json::from_slice(&document.content).unwrap();
     assert!(value.get("updated").is_none() && value.get("can_stop").is_none());
     value
 }
@@ -2181,7 +2175,7 @@ fn fixture() -> pb::Program {
     pb::Program {
         sorts: vec![
             pb::Sort {
-                kind: Some(pb::sort::Kind::Family(pb::HostSort {
+                kind: Some(pb::sort::Kind::Application(pb::SortApplication {
                     name: "i64".into(),
                     args: vec![],
                 })),
@@ -2361,6 +2355,7 @@ fn shared_content_resupply_groups_and_clone_keep_native_proofs_and_cursors() {
             let response = run(&mut engine, id, program.clone());
             assert_eq!(response.error, None, "{mode:?}, {iteration}");
             let outcomes: Vec<_> = response
+                .output
                 .outputs
                 .iter()
                 .filter_map(|o| match &o.kind {
@@ -2374,6 +2369,7 @@ fn shared_content_resupply_groups_and_clone_keep_native_proofs_and_cursors() {
                 [iteration == 0, false, false]
             );
             let proofs: Vec<_> = response
+                .output
                 .outputs
                 .iter()
                 .filter_map(|o| match &o.kind {
@@ -2428,7 +2424,7 @@ fn shared_content_resupply_groups_and_clone_keep_native_proofs_and_cursors() {
             "clone additions do not create groups in the original"
         );
         assert!(matches!(
-            &unknown.outputs[0].kind,
+            &unknown.output.outputs[0].kind,
             Some(pb::command_output::Kind::Run(outcome)) if !outcome.updated
         ));
         let Some(pb::command::Kind::Run(r)) = &mut name_only.commands[0].kind else {
@@ -2454,14 +2450,14 @@ fn shared_content_resupply_groups_and_clone_keep_native_proofs_and_cursors() {
         for target in [clone, id] {
             let response = run(&mut engine, target, program.clone());
             assert_eq!(response.error, None);
-            let Some(pb::command_output::Kind::Run(outcome)) = &response.outputs[0].kind else {
+            let Some(pb::command_output::Kind::Run(outcome)) = &response.output.outputs[0].kind
+            else {
                 unreachable!()
             };
             assert!(
                 outcome.updated,
                 "clone cursor must not consume the other's new input"
             );
-            assert!(response.rules.is_empty());
         }
     }
 }
@@ -2520,7 +2516,7 @@ fn all_modes_return_requested_proofs_control_and_optional_diagnostics() {
             );
             assert_eq!(native_result.is_ok(), proof_mode);
             let native_report = native_report.unwrap();
-            let response = pb::RunProgramResponse::decode(
+            let response = Observed::from_frames(
                 engine
                     .run(
                         &pb::RunProgramRequest {
@@ -2531,10 +2527,11 @@ fn all_modes_return_requested_proofs_control_and_optional_diagnostics() {
                         .encode_to_vec(),
                     )
                     .unwrap()
-                    .as_slice(),
-            )
-            .unwrap();
-            let Some(pb::command_output::Kind::Run(result)) = &response.outputs[0].kind else {
+                    .iter()
+                    .map(|bytes| pb::RunProgramResponse::decode(bytes.as_slice()).unwrap()),
+            );
+            let Some(pb::command_output::Kind::Run(result)) = &response.output.outputs[0].kind
+            else {
                 panic!("missing requested control result")
             };
             assert_eq!(
@@ -2542,6 +2539,7 @@ fn all_modes_return_requested_proofs_control_and_optional_diagnostics() {
                 (native_report.updated, native_report.can_stop)
             );
             let documents = response
+                .output
                 .outputs
                 .iter()
                 .filter(|output| {
@@ -2551,7 +2549,7 @@ fn all_modes_return_requested_proofs_control_and_optional_diagnostics() {
             assert_eq!(documents.len(), usize::from(diagnostics));
             if diagnostics {
                 let document = diagnostic_json(documents[0]);
-                assert_eq!(documents[0].location, response.outputs[0].location);
+                assert_eq!(documents[0].location, response.output.outputs[0].location);
                 assert_eq!(
                     document["iterations"].as_array().unwrap().len(),
                     native_report.iterations.len()
@@ -2567,6 +2565,7 @@ fn all_modes_return_requested_proofs_control_and_optional_diagnostics() {
                 );
             }
             let requested = response
+                .output
                 .outputs
                 .iter()
                 .filter(|output| {
@@ -2597,17 +2596,9 @@ fn all_modes_return_requested_proofs_control_and_optional_diagnostics() {
             } else {
                 assert_eq!(paths, [vec![2]]);
                 let error = response.error.unwrap();
-                assert_eq!(error.code, i32::from(pb::ErrorCode::ProofFailed));
-                assert_eq!(
-                    error.proof_failure.unwrap().reason,
-                    i32::from(pb::ProofFailureReason::ProofsNotEnabled)
-                );
+                assert_eq!(error.code, i32::from(pb::ErrorCode::RuntimeFailure));
                 assert_eq!(error.location.unwrap().path, [4]);
             }
-            assert!(
-                response.rules.is_empty(),
-                "metrics are opaque diagnostic data"
-            );
         }
     }
 }
@@ -2671,18 +2662,12 @@ fn proof_failure_preserves_owned_prefix_clone_mode_and_native_error_order() {
         }
         let response = run(&mut engine, id, program.clone());
         let error = response.error.as_ref().unwrap();
-        assert_eq!(error.code, i32::from(pb::ErrorCode::ProofFailed));
-        let failure = error.proof_failure.as_ref().unwrap();
-        assert_eq!(
-            failure.reason,
-            i32::from(pb::ProofFailureReason::QueryDidNotMatch)
-        );
-        assert_eq!(failure.constructor.as_deref(), Some("Absent"));
+        assert_eq!(error.code, i32::from(pb::ErrorCode::RuntimeFailure));
         assert_eq!(
             error.location.as_ref().unwrap().path,
             [if proofs { 2 } else { 1 }]
         );
-        assert_eq!(response.outputs.len(), usize::from(proofs));
+        assert_eq!(response.output.outputs.len(), usize::from(proofs));
         for (handle, node, succeeds) in [(id, 7, true), (id, 9, false), (clone, 7, false)] {
             let mut check = program.clone();
             check.commands = vec![pb::Command {
@@ -2697,8 +2682,8 @@ fn proof_failure_preserves_owned_prefix_clone_mode_and_native_error_order() {
         assert_eq!(copied.error.is_none(), proofs);
         if !proofs {
             assert_eq!(
-                copied.error.unwrap().proof_failure.unwrap().reason,
-                i32::from(pb::ProofFailureReason::ProofsNotEnabled)
+                copied.error.unwrap().code,
+                i32::from(pb::ErrorCode::RuntimeFailure)
             );
         }
         for handle in [id, clone] {
@@ -2706,10 +2691,11 @@ fn proof_failure_preserves_owned_prefix_clone_mode_and_native_error_order() {
                 .destroy(&pb::DestroyEGraphRequest { egraph_id: handle }.encode_to_vec())
                 .unwrap();
         }
-        let retained = pb::RunProgramResponse::decode(response.encode_to_vec().as_slice()).unwrap();
-        assert_eq!(retained, response);
+        drop(engine);
+        let retained = response;
         if proofs {
-            let Some(pb::command_output::Kind::Proof(proof)) = &retained.outputs[0].kind else {
+            let Some(pb::command_output::Kind::Proof(proof)) = &retained.output.outputs[0].kind
+            else {
                 panic!("retained proof")
             };
             let root = &proof.proofs[proof.root.unwrap() as usize];
@@ -2764,12 +2750,14 @@ fn malformed_later_commands_unused_rules_and_observations_are_atomic_preparation
                 4 | 5 => {
                     if invalid == 5 {
                         program.declarations.push(pb::Declaration {
-                            kind: Some(pb::declaration::Kind::Primitive(pb::Primitive {
-                                name: "computed".into(),
-                                inputs: vec![],
-                                output: 0,
-                                body: Some(0),
-                            })),
+                            kind: Some(pb::declaration::Kind::UserDefinedPrimitive(
+                                pb::UserDefinedPrimitive {
+                                    name: "computed".into(),
+                                    inputs: vec![],
+                                    output: 0,
+                                    body: Some(0),
+                                },
+                            )),
                             ..Default::default()
                         });
                     }
@@ -2816,7 +2804,7 @@ fn malformed_later_commands_unused_rules_and_observations_are_atomic_preparation
                         .contains("relation rows cannot be Subsumed")
                 );
             }
-            assert!(failed.outputs.is_empty());
+            assert!(failed.output.outputs.is_empty());
             // The same definitions still install, and the rejected action left no N(1).
             let mut retry = fixture();
             retry.commands = vec![pb::Command {
@@ -2896,6 +2884,7 @@ fn source_and_renderer_keep_proof_commands_authored() {
             );
             assert_eq!(response.error, None, "{text}");
             let actual: Vec<_> = response
+                .output
                 .outputs
                 .iter()
                 .map(|o| match o.kind {
@@ -2940,8 +2929,8 @@ fn encoded_authoring_builtins_resolve_scalar_and_result_only_calls() {
             let response = run(&mut engine, id, phase);
             if proves && mode == pb::ExecutionMode::TermEncoding {
                 assert_eq!(
-                    response.error.unwrap().proof_failure.unwrap().reason,
-                    i32::from(pb::ProofFailureReason::ProofsNotEnabled)
+                    response.error.unwrap().code,
+                    i32::from(pb::ErrorCode::RuntimeFailure)
                 );
             } else {
                 assert_eq!(response.error, None);
@@ -3054,6 +3043,7 @@ fn scalar_variadic_prove_and_prove_exists_keep_boundary_arities_and_requested_ou
                 let response = run(&mut engine, id, decoded);
                 assert_eq!(response.error, None, "mode={mode:?}, arity={arity}: {text}");
                 let actual = response
+                    .output
                     .outputs
                     .iter()
                     .map(|output| {
@@ -3094,7 +3084,7 @@ fn scalar_variadic_prove_and_prove_exists_keep_boundary_arities_and_requested_ou
 #[test]
 fn schedule_controls_match_native_flags_and_execution_in_every_mode() {
     use egglog::ast::{Command, RunConfig, Schedule};
-    use egglog::{ExecutionEvent, ExecutionOrigin, RepeatContinuation};
+    use egglog::{ExecutionEvent, ExecutionOrigin};
     for mode in [
         pb::ExecutionMode::Normal,
         pb::ExecutionMode::TermEncoding,
@@ -3148,7 +3138,7 @@ fn schedule_controls_match_native_flags_and_execution_in_every_mode() {
                 body = vec![
                     run_leaf.clone(),
                     pb::Command {
-                        kind: Some(pb::command::Kind::Saturate(pb::Saturate {
+                        kind: Some(pb::command::Kind::Loop(pb::Loop {
                             body: vec![run_leaf],
                             ..Default::default()
                         })),
@@ -3165,8 +3155,8 @@ fn schedule_controls_match_native_flags_and_execution_in_every_mode() {
             }
             if case == 8 {
                 body = vec![pb::Command {
-                    kind: Some(pb::command::Kind::Repeat(pb::Repeat {
-                        times: Some(2),
+                    kind: Some(pb::command::Kind::Loop(pb::Loop {
+                        max_iterations: Some(2),
                         body,
                         ..Default::default()
                     })),
@@ -3181,15 +3171,15 @@ fn schedule_controls_match_native_flags_and_execution_in_every_mode() {
             let native_body = Box::new(Schedule::Sequence(egglog::span!(), native_body));
             let (kind, schedule) = match case {
                 0 | 1 => (
-                    pb::command::Kind::Repeat(pb::Repeat {
-                        times: Some(case),
+                    pb::command::Kind::Loop(pb::Loop {
+                        max_iterations: Some(case),
                         body,
                         ..Default::default()
                     }),
                     Schedule::Repeat(egglog::span!(), case as usize, native_body),
                 ),
                 2 | 3 => (
-                    pb::command::Kind::Saturate(pb::Saturate {
+                    pb::command::Kind::Loop(pb::Loop {
                         max_iterations: Some(case - 1),
                         body,
                         ..Default::default()
@@ -3197,15 +3187,15 @@ fn schedule_controls_match_native_flags_and_execution_in_every_mode() {
                     Schedule::Repeat(egglog::span!(), (case - 1) as usize, native_body),
                 ),
                 7 | 8 => (
-                    pb::command::Kind::Repeat(pb::Repeat {
-                        times: Some(3),
+                    pb::command::Kind::Loop(pb::Loop {
+                        max_iterations: Some(3),
                         body,
                         ..Default::default()
                     }),
                     Schedule::Repeat(egglog::span!(), 3, native_body),
                 ),
                 _ => (
-                    pb::command::Kind::Saturate(pb::Saturate {
+                    pb::command::Kind::Loop(pb::Loop {
                         body,
                         ..Default::default()
                     }),
@@ -3216,7 +3206,7 @@ fn schedule_controls_match_native_flags_and_execution_in_every_mode() {
             let mut expected_report = None;
             let mut native_runs = 0;
             native
-                .run_program_observed_with_repeat_policy(
+                .run_program_observed(
                     vec![Command::RunSchedule(schedule)],
                     &mut |_, origin, output| {
                         if origin == ExecutionOrigin::Requested
@@ -3241,19 +3231,12 @@ fn schedule_controls_match_native_flags_and_execution_in_every_mode() {
                         }
                         _ => (),
                     },
-                    &|_, _| {
-                        if case >= 7 {
-                            RepeatContinuation::ExactCount
-                        } else {
-                            RepeatContinuation::CanStop
-                        }
-                    },
                 )
                 .unwrap();
             let (completed, _stop, _updated) = expected.unwrap();
             if case >= 7 {
-                assert_eq!(completed, 3);
-                assert_eq!(native_runs, if case == 7 { 3 } else { 6 });
+                assert_eq!(completed, 2);
+                assert_eq!(native_runs, if case == 7 { 2 } else { 3 });
             }
             program.commands.truncate(2);
             program.commands.push(pb::Command {
@@ -3262,7 +3245,7 @@ fn schedule_controls_match_native_flags_and_execution_in_every_mode() {
             });
             let mut engine = Engine::default();
             let id = create(&mut engine, mode);
-            let response = pb::RunProgramResponse::decode(
+            let response = Observed::from_frames(
                 engine
                     .run(
                         &pb::RunProgramRequest {
@@ -3273,16 +3256,17 @@ fn schedule_controls_match_native_flags_and_execution_in_every_mode() {
                         .encode_to_vec(),
                     )
                     .unwrap()
-                    .as_slice(),
-            )
-            .unwrap();
+                    .iter()
+                    .map(|bytes| pb::RunProgramResponse::decode(bytes.as_slice()).unwrap()),
+            );
             assert_eq!(response.error, None, "mode {mode:?}, case {case}");
             assert_eq!(
-                response.outputs.len(),
+                response.output.outputs.len(),
                 2,
                 "one result and one diagnostic, no nested control results"
             );
-            let Some(pb::command_output::Kind::Run(outcome)) = &response.outputs[0].kind else {
+            let Some(pb::command_output::Kind::Run(outcome)) = &response.output.outputs[0].kind
+            else {
                 panic!("{response:?}")
             };
             let expected_report = expected_report.unwrap();
@@ -3291,14 +3275,14 @@ fn schedule_controls_match_native_flags_and_execution_in_every_mode() {
                 (expected_report.updated, expected_report.can_stop),
                 "mode {mode:?}, case {case}"
             );
-            let document = diagnostic_json(&response.outputs[1]);
+            let document = diagnostic_json(&response.output.outputs[1]);
             assert_eq!(
                 document["iterations"].as_array().unwrap().len(),
                 expected_report.iterations.len()
             );
             if case == 3 {
                 let mut whole_body = program.clone();
-                let Some(pb::command::Kind::Saturate(saturate)) = &mut whole_body.commands[2].kind
+                let Some(pb::command::Kind::Loop(saturate)) = &mut whole_body.commands[2].kind
                 else {
                     unreachable!()
                 };
@@ -3310,7 +3294,7 @@ fn schedule_controls_match_native_flags_and_execution_in_every_mode() {
                         .all(|phase| phase.is_ok())
                 );
             }
-            // Exact Repeat and general Saturate are representable. Reparse text and
+            // Capped repetition and saturation are representable. Reparse text and
             // retain the independent native count/report oracle above.
             let mut replay_program = program.clone();
             replay_program.commands.push(pb::Command {
@@ -3342,7 +3326,7 @@ fn schedule_controls_match_native_flags_and_execution_in_every_mode() {
                         ..
                     }]
                 );
-                let replay = pb::RunProgramResponse::decode(
+                let replay = Observed::from_frames(
                     engine
                         .run(
                             &pb::RunProgramRequest {
@@ -3353,11 +3337,11 @@ fn schedule_controls_match_native_flags_and_execution_in_every_mode() {
                             .encode_to_vec(),
                         )
                         .unwrap()
-                        .as_slice(),
-                )
-                .unwrap();
+                        .iter()
+                        .map(|bytes| pb::RunProgramResponse::decode(bytes.as_slice()).unwrap()),
+                );
                 assert_eq!(replay.error, None, "{mode:?}/{case}: {rendered}");
-                for output in &replay.outputs {
+                for output in &replay.output.outputs {
                     if let Some(pb::command_output::Kind::Proof(proof)) = &output.kind {
                         assert!(check_phase);
                         assert_eq!(mode, pb::ExecutionMode::ProofTesting);
@@ -3414,7 +3398,7 @@ fn dead_schedule_bodies_are_validated_before_effects_in_every_mode() {
             "fail",
             "stats",
             "repeat-until",
-            "missing",
+            "unbounded",
             "until",
             "scheduler",
             "unknown",
@@ -3432,9 +3416,9 @@ fn dead_schedule_bodies_are_validated_before_effects_in_every_mode() {
                     }
                 }
                 "stats" => invalid.kind = Some(pb::command::Kind::Stats(pb::Unit {})),
-                "repeat-until" | "missing" => {
-                    invalid.kind = Some(pb::command::Kind::Repeat(pb::Repeat {
-                        times: (case == "repeat-until").then_some(2),
+                "repeat-until" | "unbounded" => {
+                    invalid.kind = Some(pb::command::Kind::Loop(pb::Loop {
+                        max_iterations: (case == "repeat-until").then_some(2),
                         until: if case == "repeat-until" {
                             vec![2]
                         } else {
@@ -3444,7 +3428,7 @@ fn dead_schedule_bodies_are_validated_before_effects_in_every_mode() {
                     }))
                 }
                 "until" => {
-                    invalid.kind = Some(pb::command::Kind::Saturate(pb::Saturate {
+                    invalid.kind = Some(pb::command::Kind::Loop(pb::Loop {
                         until: vec![2],
                         ..Default::default()
                     }))
@@ -3469,8 +3453,8 @@ fn dead_schedule_bodies_are_validated_before_effects_in_every_mode() {
             }
             program.commands.truncate(2);
             program.commands.push(pb::Command {
-                kind: Some(pb::command::Kind::Repeat(pb::Repeat {
-                    times: Some(0),
+                kind: Some(pb::command::Kind::Loop(pb::Loop {
+                    max_iterations: Some(0),
                     body: vec![invalid],
                     ..Default::default()
                 })),
@@ -3481,12 +3465,18 @@ fn dead_schedule_bodies_are_validated_before_effects_in_every_mode() {
             let response = run(&mut engine, id, program.clone());
             let valid = matches!(
                 case,
-                "add-rules" | "action" | "fail" | "repeat-until" | "until" | "unknown"
+                "add-rules"
+                    | "action"
+                    | "fail"
+                    | "repeat-until"
+                    | "unbounded"
+                    | "until"
+                    | "unknown"
             ) || case == "stats" && mode == pb::ExecutionMode::Normal;
             if valid {
                 assert_eq!(response.error, None, "{mode:?}/{case}: {response:?}");
-                assert_eq!(response.outputs.len(), 1);
-                let output = &response.outputs[0];
+                assert_eq!(response.output.outputs.len(), 1);
+                let output = &response.output.outputs[0];
                 assert_eq!(output.location.as_ref().unwrap().path, [2]);
                 assert!(output.location.as_ref().unwrap().iterations.is_empty());
                 let Some(pb::command_output::Kind::Run(outcome)) = &output.kind else {
@@ -3498,10 +3488,10 @@ fn dead_schedule_bodies_are_validated_before_effects_in_every_mode() {
                     response.error.as_ref().unwrap().location.is_none(),
                     "{mode:?}/{case}: {response:?}"
                 );
-                assert!(response.outputs.is_empty());
+                assert!(response.output.outputs.is_empty());
             }
             let rendered = Renderer::core().render(&program);
-            if matches!(case, "add-rules" | "unknown") {
+            if matches!(case, "add-rules" | "unknown" | "unbounded") {
                 let rendered = rendered.unwrap();
                 assert!(
                     Source::new_core(None, &rendered)
@@ -3630,11 +3620,11 @@ fn repeated_leaf_failure_has_no_completed_result_and_retains_prefix() {
         program.commands.truncate(3);
         program.commands[2] = pb::Command {
             kind: Some(if exact {
-                pb::command::Kind::Repeat(pb::Repeat {
-                    times: Some(2),
+                pb::command::Kind::Loop(pb::Loop {
+                    max_iterations: Some(2),
                     body: vec![pb::Command {
-                        kind: Some(pb::command::Kind::Repeat(pb::Repeat {
-                            times: Some(1),
+                        kind: Some(pb::command::Kind::Loop(pb::Loop {
+                            max_iterations: Some(1),
                             body: vec![program.commands[2].clone()],
                             ..Default::default()
                         })),
@@ -3643,7 +3633,7 @@ fn repeated_leaf_failure_has_no_completed_result_and_retains_prefix() {
                     ..Default::default()
                 })
             } else {
-                pb::command::Kind::Saturate(pb::Saturate {
+                pb::command::Kind::Loop(pb::Loop {
                     max_iterations: Some(2),
                     body: vec![program.commands[2].clone()],
                     ..Default::default()
@@ -3655,7 +3645,7 @@ fn repeated_leaf_failure_has_no_completed_result_and_retains_prefix() {
         let id = create(&mut engine, mode);
         let response = run(&mut engine, id, program);
         let error = response.error.unwrap();
-        assert_eq!(error.code, i32::from(pb::ErrorCode::EvaluationFailed));
+        assert_eq!(error.code, i32::from(pb::ErrorCode::RuntimeFailure));
         let location = error.location.unwrap();
         let path = if exact { vec![2, 0, 0] } else { vec![2, 0] };
         assert_eq!(location.path, path);
@@ -3663,7 +3653,7 @@ fn repeated_leaf_failure_has_no_completed_result_and_retains_prefix() {
             location.iterations,
             if exact { vec![1, 0] } else { vec![1] }
         );
-        assert!(response.outputs.is_empty());
+        assert!(response.output.outputs.is_empty());
         let mut retained = fixture();
         retained.nodes[0].kind = Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
             value: Some(pb::primitive_value::Value::I64(i64::MAX)),
@@ -3727,9 +3717,9 @@ fn failed_authored_run_has_no_fabricated_result_and_keeps_seed() {
         program.commands.truncate(3);
         let response = run(&mut engine, id, program);
         let error = response.error.unwrap();
-        assert_eq!(error.code, i32::from(pb::ErrorCode::EvaluationFailed));
+        assert_eq!(error.code, i32::from(pb::ErrorCode::RuntimeFailure));
         assert_eq!(error.location.unwrap().path, [2]);
-        assert!(response.outputs.is_empty());
+        assert!(response.output.outputs.is_empty());
         let mut retry = fixture();
         retry.commands = vec![pb::Command {
             kind: Some(pb::command::Kind::Check(pb::Check { facts: vec![2] })),
@@ -3745,7 +3735,11 @@ fn failed_authored_run_has_no_fabricated_result_and_keeps_seed() {
                 .encode_to_vec(),
             )
             .unwrap();
-        let response = pb::RunProgramResponse::decode(response.as_slice()).unwrap();
+        let response = Observed::from_frames(
+            response
+                .iter()
+                .map(|bytes| pb::RunProgramResponse::decode(bytes.as_slice()).unwrap()),
+        );
         assert_eq!(
             response.error, None,
             "completed prefixes remain usable after failure"

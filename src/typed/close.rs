@@ -22,7 +22,7 @@ pub(super) fn binder(roots: &[Record]) -> Result<HashMap<String, String>, TypedE
         if r.capture()?.is_some() {
             continue;
         }
-        let node = &owner.program.nodes[r.index as usize];
+        let node = &owner.program().unwrap().nodes[r.index as usize];
         match &node.kind {
             Some(pb::node::Kind::Var(token)) => {
                 let sort = SortRef(r.resolve(Arena::Sort, node.sort_id)?);

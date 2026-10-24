@@ -1,3 +1,6 @@
+#[path = "common/protobuf.rs"]
+mod fixture;
+use fixture::Observed;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 
@@ -223,8 +226,8 @@ fn extract_command_parts(command: &Command) -> Option<ExtractCheck> {
 
 enum ExtractedExpressions<'a> {
     Native(Vec<Vec<Expr>>),
-    Frozen(&'a pb::RunProgramResponse, Vec<u32>),
-    FrozenGroups(&'a pb::RunProgramResponse, Vec<Vec<u32>>),
+    Frozen(&'a Observed, Vec<u32>),
+    FrozenGroups(&'a Observed, Vec<Vec<u32>>),
 }
 
 // One native local per typed DAG occurrence. Only a node's immediate operands
@@ -967,7 +970,7 @@ impl ProtoRun {
         let mut engine = Engine::default();
         let request = pb::CreateEGraphRequest {
             sorts: vec![pb::Sort {
-                kind: Some(pb::sort::Kind::Family(pb::HostSort {
+                kind: Some(pb::sort::Kind::Application(pb::SortApplication {
                     name: "i64".into(),
                     args: vec![],
                 })),
@@ -1027,9 +1030,15 @@ impl ProtoRun {
                                         }
                                         .encode_to_vec(),
                                     )?;
-                                    Ok(pb::RunProgramResponse::decode(bytes.as_slice())?)
+                                    Ok(bytes
+                                        .iter()
+                                        .map(|bytes| {
+                                            pb::RunProgramResponse::decode(bytes.as_slice())
+                                        })
+                                        .collect::<Result<Vec<_>, _>>()?)
                                 })
                                 .map_err(|error| format!("source table presentation: {error}"))?;
+                            let response = Observed::from_frames(response);
                             if let Some(error) = &response.error {
                                 return Err(format!(
                                     "adapter {:?}: {}",
@@ -1054,7 +1063,7 @@ impl ProtoRun {
                                     .map_err(|error| error.to_string())?
                                     .egraph_id;
                             }
-                            return Ok(pb::RunProgramResponse::default());
+                            return Ok(Observed::default());
                         }
                         Submission::Pop { count, span } => {
                             for _ in 0..count {
@@ -1062,19 +1071,15 @@ impl ProtoRun {
                                     .pop()
                                     .ok_or_else(|| Error::Pop(span.clone()).to_string())?;
                                 let bytes = engine
-                                    .return_to(
-                                        &pb::ReturnToEGraphRequest {
-                                            active_id: egraph_id,
-                                            saved_id,
-                                        }
-                                        .encode_to_vec(),
+                                    .destroy(
+                                        &pb::DestroyEGraphRequest { egraph_id }.encode_to_vec(),
                                     )
-                                    .map_err(|error| format!("scope return: {error}"))?;
-                                pb::ReturnToEGraphResponse::decode(bytes.as_slice())
+                                    .map_err(|error| format!("scope destroy: {error}"))?;
+                                pb::DestroyEGraphResponse::decode(bytes.as_slice())
                                     .map_err(|error| error.to_string())?;
                                 egraph_id = saved_id;
                             }
-                            return Ok(pb::RunProgramResponse::default());
+                            return Ok(Observed::default());
                         }
                     };
                     // Native may install the forward direction before the
@@ -1102,11 +1107,13 @@ impl ProtoRun {
                     let bytes = engine
                         .run(&request.encode_to_vec())
                         .map_err(|error| format!("byte transport: {error}"))?;
-                    let response = pb::RunProgramResponse::decode(bytes.as_slice())
-                        .map_err(|error| format!("response decode: {error}"))?;
+                    let response =
+                        Observed::from_frames(bytes.iter().map(|bytes| {
+                            pb::RunProgramResponse::decode(bytes.as_slice()).unwrap()
+                        }));
                     if grounding && native_ungrounded {
                         if !partial_birewrite
-                            || !response.outputs.is_empty()
+                            || !response.output.outputs.is_empty()
                             || response.error.is_some()
                         {
                             return Err(format!(
@@ -1119,7 +1126,7 @@ impl ProtoRun {
                         if relation_subsumption && index == 5 {
                             if error.code != pb::ErrorCode::InvalidProgram as i32
                                 || error.message != relation_subsumption_error
-                                || !response.outputs.is_empty()
+                                || !response.output.outputs.is_empty()
                             {
                                 return Err(format!(
                                     "relation subsumption rejection differs: {response:?}"
@@ -1163,7 +1170,7 @@ impl ProtoRun {
                     if let Some(extract) = extract {
                         let mut terms = vec![];
                         let mut saw_extract = false;
-                        for output in &response.outputs {
+                        for output in &response.output.outputs {
                             if let Some(pb::command_output::Kind::Extraction(result)) = &output.kind
                             {
                                 if saw_extract {
@@ -1271,7 +1278,7 @@ fn next_native_command(
 // assertions. The byte engine remains the treatment; native evaluation is only
 // the independent oracle used to check the returned terms.
 struct FrozenDecoder<'a> {
-    response: &'a pb::RunProgramResponse,
+    response: &'a Observed,
     remaining: usize,
     bindings: HashMap<u32, VecDeque<String>>,
 }
@@ -1289,6 +1296,7 @@ impl FrozenDecoder<'_> {
         use pb::primitive_value::Value as V;
         let response = self.response;
         let node = response
+            .output
             .nodes
             .get(index as usize)
             .ok_or_else(|| Error::ExtractError("extracted node index out of bounds".into()))?;
@@ -1300,7 +1308,7 @@ impl FrozenDecoder<'_> {
         let sort_index = actions
             .sort_index
             .get_or_insert_with(|| OracleSortIndex::new(graph));
-        let wire_key = sort_index.wire_key(&response.sorts, node.sort_id)?;
+        let wire_key = sort_index.wire_key(&response.output.sorts, node.sort_id)?;
         let sort = expected
             .or_else(|| sort_index.representatives.get(&wire_key).cloned())
             .ok_or_else(|| {
@@ -1493,6 +1501,7 @@ impl FrozenDecoder<'_> {
         }
         let response = self.response;
         let node = response
+            .output
             .nodes
             .get(index as usize)
             .ok_or("extracted node index out of bounds")?;
@@ -1531,11 +1540,10 @@ impl FrozenDecoder<'_> {
                         _ => "Rational",
                     };
                     if !matches!(
-                        self.response
-                            .sorts
+                        self.response.output.sorts
                             .get(node.sort_id as usize)
                             .and_then(|sort| sort.kind.as_ref()),
-                        Some(pb::sort::Kind::Family(family))
+                        Some(pb::sort::Kind::Application(family))
                             if family.name == expected && family.args.is_empty()
                     ) {
                         return Err("extraction oracle exact numeric payload/sort mismatch".into());
@@ -1694,7 +1702,7 @@ impl FrozenDecoder<'_> {
 struct PartialCallOracleCase {
     native: EGraph,
     extract: ExtractCheck,
-    response: pb::RunProgramResponse,
+    response: Observed,
     terms: Vec<u32>,
 }
 
@@ -1712,7 +1720,7 @@ fn partial_call_oracle_case(setup: &str) -> Result<PartialCallOracleCase, String
         .create(
             &pb::CreateEGraphRequest {
                 sorts: vec![pb::Sort {
-                    kind: Some(pb::sort::Kind::Family(pb::HostSort {
+                    kind: Some(pb::sort::Kind::Application(pb::SortApplication {
                         name: "i64".into(),
                         args: vec![],
                     })),
@@ -1744,12 +1752,16 @@ fn partial_call_oracle_case(setup: &str) -> Result<PartialCallOracleCase, String
                 .encode_to_vec(),
             )
             .map_err(|error| error.to_string())?;
-        let response =
-            pb::RunProgramResponse::decode(bytes.as_slice()).map_err(|error| error.to_string())?;
+        let response = Observed::from_frames(
+            bytes
+                .iter()
+                .map(|bytes| pb::RunProgramResponse::decode(bytes.as_slice()).unwrap()),
+        );
         if let Some(error) = &response.error {
             return Err(format!("PartialCall canary byte treatment: {error:?}"));
         }
         if response
+            .output
             .outputs
             .iter()
             .any(|output| matches!(output.kind, Some(pb::command_output::Kind::Extraction(_))))
@@ -1760,6 +1772,7 @@ fn partial_call_oracle_case(setup: &str) -> Result<PartialCallOracleCase, String
     }
     let response = extraction.ok_or("PartialCall canary produced no extraction response")?;
     let terms = response
+        .output
         .outputs
         .iter()
         .filter_map(|output| match &output.kind {
@@ -1773,6 +1786,7 @@ fn partial_call_oracle_case(setup: &str) -> Result<PartialCallOracleCase, String
     if terms.len() != 1
         || !matches!(
             response
+                .output
                 .nodes
                 .get(terms[0] as usize)
                 .and_then(|node| node.kind.as_ref()),
@@ -1826,7 +1840,7 @@ fn partial_call_oracle_trials() -> Vec<Trial> {
         }
         setup.push_str(" (sort Expected (UnstableFn () Item)) (function oracle_root () Expected :merge old) (set (oracle_root) (unstable-fn \"Join\" item18 item18))");
         let mut case = partial_call_oracle_case(&setup)?;
-        assert!(case.response.nodes.len() < 32, "actual extraction must retain sharing");
+        assert!(case.response.output.nodes.len() < 32, "actual extraction must retain sharing");
         validate_extract_outputs(&mut case.native, &case.extract,
             ExtractedExpressions::Frozen(&case.response, case.terms)).map_err(|error| error.to_string())?;
         Ok(())
@@ -1873,7 +1887,7 @@ fn partial_call_oracle_trials() -> Vec<Trial> {
                     .clone();
                 let Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
                     value: Some(pb::primitive_value::Value::PartialCall(call)),
-                })) = &case.response.nodes[case.terms[0] as usize].kind
+                })) = &case.response.output.nodes[case.terms[0] as usize].kind
                 else {
                     unreachable!()
                 };
@@ -1893,7 +1907,7 @@ fn partial_call_oracle_trials() -> Vec<Trial> {
                 if shared {
                     let Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
                         value: Some(pb::primitive_value::Value::PartialCall(call)),
-                    })) = &case.response.nodes[case.terms[0] as usize].kind
+                    })) = &case.response.output.nodes[case.terms[0] as usize].kind
                     else {
                         unreachable!()
                     };
@@ -1912,7 +1926,7 @@ fn partial_call_oracle_trials() -> Vec<Trial> {
                 if name == "zero-captures" {
                     let Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
                         value: Some(pb::primitive_value::Value::PartialCall(call)),
-                    })) = &mut case.response.nodes[case.terms[0] as usize].kind else {
+                    })) = &mut case.response.output.nodes[case.terms[0] as usize].kind else {
                         unreachable!()
                     };
                     call.func = "egglog.core.i64.sub".into();
@@ -1921,7 +1935,7 @@ fn partial_call_oracle_trials() -> Vec<Trial> {
                     let mut floating = partial_call_oracle_case("(sort Expected (UnstableFn (f64 f64) f64)) (function oracle_root () Expected :merge old) (set (oracle_root) (unstable-fn \"+\"))")?;
                     let Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
                         value: Some(pb::primitive_value::Value::PartialCall(call)),
-                    })) = &floating.response.nodes[floating.terms[0] as usize].kind else {
+                    })) = &floating.response.output.nodes[floating.terms[0] as usize].kind else {
                         unreachable!()
                     };
                     assert_eq!(call.func, "egglog.core.f64.add");
@@ -1948,7 +1962,7 @@ fn partial_call_oracle_trials() -> Vec<Trial> {
         validate_extract_outputs(&mut case.native, &case.extract, ExtractedExpressions::Frozen(&case.response, case.terms.clone()))
             .map_err(|error| error.to_string())?;
         let mut changed = false;
-        for sort in &mut case.response.sorts {
+        for sort in &mut case.response.output.sorts {
             if matches!(&sort.kind, Some(pb::sort::Kind::Eq(name)) if name == "A") {
                 sort.kind = Some(pb::sort::Kind::Eq("B".into()));
                 changed = true;
@@ -1978,7 +1992,7 @@ fn partial_call_oracle_trials() -> Vec<Trial> {
         validate_extract_outputs(&mut case.native, &case.extract, ExtractedExpressions::Frozen(&case.response, case.terms.clone()))
             .map_err(|error| error.to_string())?;
         let mut changed = false;
-        for node in &mut case.response.nodes {
+        for node in &mut case.response.output.nodes {
             if let Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
                 value: Some(pb::primitive_value::Value::I64(value)),
             })) = &mut node.kind {
@@ -1997,33 +2011,36 @@ fn partial_call_oracle_trials() -> Vec<Trial> {
     trials.push(Trial::test(
         "oracle/partial-call/legacy-erased-expansion-depth-bounds",
         || {
-            let mut response = pb::RunProgramResponse {
-                sorts: vec![
-                    pb::Sort {
-                        kind: Some(pb::sort::Kind::Family(pb::HostSort {
-                            name: "i64".into(),
-                            args: vec![],
+            let mut response = Observed {
+                output: pb::RunProgramOutput {
+                    sorts: vec![
+                        pb::Sort {
+                            kind: Some(pb::sort::Kind::Application(pb::SortApplication {
+                                name: "i64".into(),
+                                args: vec![],
+                            })),
+                            ..Default::default()
+                        },
+                        pb::Sort {
+                            kind: Some(pb::sort::Kind::Func(pb::FuncSort {
+                                params: vec![0, 0],
+                                result: 0,
+                            })),
+                            ..Default::default()
+                        },
+                    ],
+                    nodes: vec![pb::Node {
+                        sort_id: 1,
+                        kind: Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
+                            value: Some(pb::primitive_value::Value::PartialCall(pb::Call {
+                                func: "+".into(),
+                                args: vec![],
+                            })),
                         })),
                         ..Default::default()
-                    },
-                    pb::Sort {
-                        kind: Some(pb::sort::Kind::Func(pb::FuncSort {
-                            params: vec![0, 0],
-                            result: 0,
-                        })),
-                        ..Default::default()
-                    },
-                ],
-                nodes: vec![pb::Node {
-                    sort_id: 1,
-                    kind: Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
-                        value: Some(pb::primitive_value::Value::PartialCall(pb::Call {
-                            func: "+".into(),
-                            args: vec![],
-                        })),
-                    })),
+                    }],
                     ..Default::default()
-                }],
+                },
                 ..Default::default()
             };
             let mut decoder = FrozenDecoder {
@@ -2049,7 +2066,7 @@ fn partial_call_oracle_trials() -> Vec<Trial> {
             // Adversarial repeated capture edges must count their unfolded size,
             // not just the16 distinct wire nodes. No native evaluation is needed.
             for child in 0..15 {
-                response.nodes.push(pb::Node {
+                response.output.nodes.push(pb::Node {
                     sort_id: 1,
                     kind: Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
                         value: Some(pb::primitive_value::Value::PartialCall(pb::Call {
@@ -2072,7 +2089,7 @@ fn partial_call_oracle_trials() -> Vec<Trial> {
                     .contains("65536 Expr nodes")
             );
             for child in 15..257 {
-                response.nodes.push(pb::Node {
+                response.output.nodes.push(pb::Node {
                     sort_id: 1,
                     kind: Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
                         value: Some(pb::primitive_value::Value::PartialCall(pb::Call {
@@ -2096,29 +2113,32 @@ fn partial_call_oracle_trials() -> Vec<Trial> {
             );
             // A shallow wire Map still reconstructs a deep left-associated
             // insert spine. Its AST depth must not be measured as wire depth.
-            let mut map = pb::RunProgramResponse {
-                sorts: vec![
-                    response.sorts[0].clone(),
-                    pb::Sort {
-                        kind: Some(pb::sort::Kind::Family(pb::HostSort {
-                            name: "Map".into(),
-                            args: vec![0, 0],
-                        })),
-                        ..Default::default()
-                    },
-                ],
-                nodes: (0..257)
-                    .map(|value| pb::Node {
-                        sort_id: 0,
-                        kind: Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
-                            value: Some(pb::primitive_value::Value::I64(value)),
-                        })),
-                        ..Default::default()
-                    })
-                    .collect(),
+            let mut map = Observed {
+                output: pb::RunProgramOutput {
+                    sorts: vec![
+                        response.output.sorts[0].clone(),
+                        pb::Sort {
+                            kind: Some(pb::sort::Kind::Application(pb::SortApplication {
+                                name: "Map".into(),
+                                args: vec![0, 0],
+                            })),
+                            ..Default::default()
+                        },
+                    ],
+                    nodes: (0..257)
+                        .map(|value| pb::Node {
+                            sort_id: 0,
+                            kind: Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
+                                value: Some(pb::primitive_value::Value::I64(value)),
+                            })),
+                            ..Default::default()
+                        })
+                        .collect(),
+                    ..Default::default()
+                },
                 ..Default::default()
             };
-            map.nodes.push(pb::Node {
+            map.output.nodes.push(pb::Node {
                 sort_id: 1,
                 kind: Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
                     value: Some(pb::primitive_value::Value::Map(pb::MapValue {
@@ -2215,7 +2235,7 @@ fn public_callable_oracle_trial() -> Trial {
             .create(
                 &pb::CreateEGraphRequest {
                     sorts: vec![pb::Sort {
-                        kind: Some(pb::sort::Kind::Family(pb::HostSort {
+                        kind: Some(pb::sort::Kind::Application(pb::SortApplication {
                             name: "i64".into(),
                             args: vec![],
                         })),
@@ -2244,7 +2264,7 @@ fn public_callable_oracle_trial() -> Trial {
                     assert_eq!(constructor.inputs.len(), 1);
                     assert!(
                         matches!(&program.sorts[constructor.inputs[0].sort as usize].kind,
-                        Some(pb::sort::Kind::Family(family)) if family.name == "i64" && family.args.is_empty())
+                        Some(pb::sort::Kind::Application(family)) if family.name == "i64" && family.args.is_empty())
                     );
                     assert!(matches!(
                         &program.sorts[constructor.output as usize].kind,
@@ -2269,8 +2289,11 @@ fn public_callable_oracle_trial() -> Trial {
                     .encode_to_vec(),
                 )
                 .map_err(|error| error.to_string())?;
-            let mut response = pb::RunProgramResponse::decode(bytes.as_slice())
-                .map_err(|error| error.to_string())?;
+            let mut response = Observed::from_frames(
+                bytes
+                    .iter()
+                    .map(|bytes| pb::RunProgramResponse::decode(bytes.as_slice()).unwrap()),
+            );
             assert!(response.error.is_none(), "{response:?}");
             let Some(extract) = extract else { continue };
             assert!(!saw_extract);
@@ -2291,6 +2314,7 @@ fn public_callable_oracle_trial() -> Trial {
             }
             assert_eq!(physical[0].1, physical[1].1);
             let terms = response
+                .output
                 .outputs
                 .iter()
                 .filter_map(|output| match &output.kind {
@@ -2303,20 +2327,20 @@ fn public_callable_oracle_trial() -> Trial {
                 .collect::<Vec<_>>();
             assert_eq!(terms.len(), 1);
             let root = terms[0] as usize;
-            let Some(pb::node::Kind::Call(call)) = &response.nodes[root].kind else {
+            let Some(pb::node::Kind::Call(call)) = &response.output.nodes[root].kind else {
                 return Err("canary did not return a constructor Call".into());
             };
             assert_eq!(call.func, constructor_names[0]);
             assert_eq!(call.args.len(), 1);
             assert!(matches!(
-                &response.nodes[call.args[0] as usize].kind,
+                &response.output.nodes[call.args[0] as usize].kind,
                 Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
                     value: Some(pb::primitive_value::Value::I64(0)),
                 }))
             ));
             assert!(
-                matches!(&response.sorts[response.nodes[root].sort_id as usize].kind,
-                Some(pb::sort::Kind::Eq(name)) if name == &physical[0].1)
+                matches!(&response.output.sorts[response.output.nodes[root].sort_id as usize].kind,
+                Some(pb::sort::Kind::Eq(name)) if *name == physical[0].1)
             );
             validate_extract_outputs(
                 &mut validation.clone(),
@@ -2331,7 +2355,7 @@ fn public_callable_oracle_trial() -> Trial {
                 ),
                 ("missing-callable", "Unbound function missing-callable"),
             ] {
-                let Some(pb::node::Kind::Call(call)) = &mut response.nodes[root].kind else {
+                let Some(pb::node::Kind::Call(call)) = &mut response.output.nodes[root].kind else {
                     unreachable!()
                 };
                 call.func = target.into();
@@ -2378,7 +2402,7 @@ fn multi_extract_oracle_trial() -> Trial {
             .create(
                 &pb::CreateEGraphRequest {
                     sorts: vec![pb::Sort {
-                        kind: Some(pb::sort::Kind::Family(pb::HostSort {
+                        kind: Some(pb::sort::Kind::Application(pb::SortApplication {
                             name: "i64".into(),
                             args: vec![],
                         })),
@@ -2407,8 +2431,11 @@ fn multi_extract_oracle_trial() -> Trial {
                     .encode_to_vec(),
                 )
                 .map_err(|e| e.to_string())?;
-            let response =
-                pb::RunProgramResponse::decode(bytes.as_slice()).map_err(|e| e.to_string())?;
+            let response = Observed::from_frames(
+                bytes
+                    .iter()
+                    .map(|bytes| pb::RunProgramResponse::decode(bytes.as_slice()).unwrap()),
+            );
             assert!(response.error.is_none(), "{response:?}");
         }
         let program = pb::Program {
@@ -2418,7 +2445,7 @@ fn multi_extract_oracle_trial() -> Trial {
                     ..Default::default()
                 },
                 pb::Sort {
-                    kind: Some(pb::sort::Kind::Family(pb::HostSort {
+                    kind: Some(pb::sort::Kind::Application(pb::SortApplication {
                         name: "i64".into(),
                         args: vec![],
                     })),
@@ -2463,10 +2490,13 @@ fn multi_extract_oracle_trial() -> Trial {
                 .encode_to_vec(),
             )
             .map_err(|e| e.to_string())?;
-        let response =
-            pb::RunProgramResponse::decode(bytes.as_slice()).map_err(|e| e.to_string())?;
+        let response = Observed::from_frames(
+            bytes
+                .iter()
+                .map(|bytes| pb::RunProgramResponse::decode(bytes.as_slice()).unwrap()),
+        );
         assert!(response.error.is_none(), "{response:?}");
-        let [output] = response.outputs.as_slice() else {
+        let [output] = response.output.outputs.as_slice() else {
             panic!("{response:?}")
         };
         let Some(pb::command_output::Kind::Extraction(result)) = &output.kind else {
@@ -2518,7 +2548,8 @@ fn multi_extract_oracle_trial() -> Trial {
         }
         for target in ["B", "missing-callable"] {
             let mut changed = response.clone();
-            let Some(pb::node::Kind::Call(call)) = &mut changed.nodes[groups[0][0] as usize].kind
+            let Some(pb::node::Kind::Call(call)) =
+                &mut changed.output.nodes[groups[0][0] as usize].kind
             else {
                 unreachable!()
             };

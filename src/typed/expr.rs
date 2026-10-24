@@ -31,7 +31,7 @@ pub trait EgglogValue: Clone + Eq + Hash + std::fmt::Debug + Send + Sync + 'stat
         if owner.observed || owner.capture.is_some_and(|(read, _)| record.index == read) {
             return None;
         }
-        match &owner.program.nodes[record.index as usize].kind {
+        match &owner.program().unwrap().nodes[record.index as usize].kind {
             Some(pb::node::Kind::Call(call)) => Some(&call.func),
             _ => None,
         }
@@ -78,7 +78,14 @@ pub fn var<S: EgglogValue>(name: &str) -> S {
 /// Construction is inert; the returned value reads the established capture.
 pub fn let_<I: ValueInput>(name: impl Into<Arc<str>>, initializer: I) -> I::Owned {
     let initializer = initializer.borrow().expression();
-    let node = &initializer.0.owner.as_ref().unwrap().program.nodes[initializer.0.index as usize];
+    let node = &initializer
+        .0
+        .owner
+        .as_ref()
+        .unwrap()
+        .program()
+        .unwrap()
+        .nodes[initializer.0.index as usize];
     let sort = SortRef(initializer.0.resolve(Arena::Sort, node.sort_id).unwrap());
     let name = name.into();
     let encoded = name
@@ -168,31 +175,38 @@ impl Expr {
 
     pub fn call(callable: &Callable, arguments: Vec<Self>) -> Self {
         let owner = callable.0.owner.as_ref().unwrap();
-        let (name, inputs, output) =
-            match &owner.program.declarations[callable.0.index as usize].kind {
+        let (name, inputs, output) = if callable.0.arena == Arena::Primitive {
+            let primitive = callable.0.primitive().expect("owned builtin primitive");
+            let Some(pb::primitive::Typing::Signature(signature)) = &primitive.typing else {
+                panic!("unsupported callable typing")
+            };
+            assert!(
+                signature.type_params.is_empty() && signature.varargs.is_empty(),
+                "generic primitive calls require an explicit result sort"
+            );
+            (
+                &primitive.name,
+                &signature.inputs,
+                Some(signature.output.expect("callable result sort")),
+            )
+        } else {
+            match &owner.program().expect("owned user callable").declarations
+                [callable.0.index as usize]
+                .kind
+            {
                 Some(pb::declaration::Kind::Constructor(c)) => (&c.name, &c.inputs, Some(c.output)),
                 Some(pb::declaration::Kind::Function(f)) => (&f.name, &f.inputs, Some(f.output)),
-                Some(pb::declaration::Kind::Primitive(p)) => (&p.name, &p.inputs, Some(p.output)),
-                Some(pb::declaration::Kind::Relation(r)) => (&r.name, &r.inputs, None),
-                Some(pb::declaration::Kind::HostPrimitive(p)) => {
-                    let Some(pb::host_primitive::Typing::Signature(signature)) = &p.typing else {
-                        panic!("unsupported callable typing");
-                    };
-                    assert!(
-                        signature.type_params.is_empty() && signature.varargs.is_empty(),
-                        "generic host calls await instantiation support"
-                    );
-                    (
-                        &p.name,
-                        &signature.inputs,
-                        Some(signature.output.expect("callable result sort")),
-                    )
+                Some(pb::declaration::Kind::UserDefinedPrimitive(p)) => {
+                    (&p.name, &p.inputs, Some(p.output))
                 }
+                Some(pb::declaration::Kind::Relation(r)) => (&r.name, &r.inputs, None),
                 _ => panic!("unsupported callable declaration"),
-            };
+            }
+        };
         assert_eq!(inputs.len(), arguments.len(), "callable arity");
         for (arg, expected) in arguments.iter().zip(inputs) {
-            let node = &arg.0.owner.as_ref().unwrap().program.nodes[arg.0.index as usize];
+            let node =
+                &arg.0.owner.as_ref().unwrap().program().unwrap().nodes[arg.0.index as usize];
             assert!(
                 SortRef(arg.0.resolve(Arena::Sort, node.sort_id).unwrap())
                     == SortRef(callable.0.resolve(Arena::Sort, expected.sort).unwrap()),
@@ -216,8 +230,8 @@ impl Expr {
         let sorts = arguments
             .iter()
             .map(|argument| {
-                let node =
-                    &argument.0.owner.as_ref().unwrap().program.nodes[argument.0.index as usize];
+                let node = &argument.0.owner.as_ref().unwrap().program().unwrap().nodes
+                    [argument.0.index as usize];
                 argument.0.resolve(Arena::Sort, node.sort_id).map(SortRef)
             })
             .collect::<Result<Vec<_>, _>>()?;
@@ -265,7 +279,7 @@ impl Expr {
             .enumerate()
             .map(|(i, p)| (key(&p.0), i))
             .collect();
-        let root = &body.0.owner.as_ref().unwrap().program.nodes[body.0.index as usize];
+        let root = &body.0.owner.as_ref().unwrap().program().unwrap().nodes[body.0.index as usize];
         if body.0.capture()?.is_none()
             && let Some(pb::node::Kind::Call(call)) = &root.kind
             && call.args.len() == parameters.len()
@@ -280,12 +294,19 @@ impl Expr {
                 })
         {
             let declaration = body.0.declaration(&call.func, DeclarationKind::Callable)?;
-            if matches!(
-                declaration.owner.as_ref().unwrap().program.declarations
-                    [declaration.index as usize]
-                    .kind,
-                Some(pb::declaration::Kind::Relation(_))
-            ) {
+            if declaration.arena == Arena::Declaration
+                && matches!(
+                    declaration
+                        .owner
+                        .as_ref()
+                        .unwrap()
+                        .program()
+                        .unwrap()
+                        .declarations[declaration.index as usize]
+                        .kind,
+                    Some(pb::declaration::Kind::Relation(_))
+                )
+            {
                 return Err(TypedError::Invalid(
                     "relations are predicates, not function values".into(),
                 ));
@@ -309,8 +330,9 @@ impl Expr {
                 ));
             }
             let id = key(&record);
-            let mut node =
-                record.owner.as_ref().unwrap().program.nodes[record.index as usize].clone();
+            let mut node = record.owner.as_ref().unwrap().program().unwrap().nodes
+                [record.index as usize]
+                .clone();
             if matches!(node.kind, Some(pb::node::Kind::Union(_))) {
                 return Err(TypedError::Invalid(
                     "Unions in callback bodies are not supported yet".into(),
@@ -361,7 +383,8 @@ impl Expr {
         let inputs = parameters
             .iter()
             .map(|value| {
-                let node = &value.0.owner.as_ref().unwrap().program.nodes[value.0.index as usize];
+                let node = &value.0.owner.as_ref().unwrap().program().unwrap().nodes
+                    [value.0.index as usize];
                 let index = slots[Arena::Sort as usize].len() as u32;
                 slots[Arena::Sort as usize]
                     .push(Slot::External(value.0.resolve(Arena::Sort, node.sort_id)?));
@@ -374,12 +397,14 @@ impl Expr {
         let output = program.nodes[0].sort_id;
         let name = format!("__typed_callback_{}", fresh_scope());
         program.declarations.push(pb::Declaration {
-            kind: Some(pb::declaration::Kind::Primitive(pb::Primitive {
-                name: name.clone(),
-                inputs,
-                output,
-                body: Some(0),
-            })),
+            kind: Some(pb::declaration::Kind::UserDefinedPrimitive(
+                pb::UserDefinedPrimitive {
+                    name: name.clone(),
+                    inputs,
+                    output,
+                    body: Some(0),
+                },
+            )),
             ..Default::default()
         });
         slots[Arena::Node as usize] = (0..program.nodes.len() as u32).map(Slot::Local).collect();
@@ -430,7 +455,7 @@ impl Expr {
         family: &str,
     ) -> Result<Vec<Self>, TypedError> {
         let owner = self.0.owner.as_ref().unwrap();
-        let node = &owner.program.nodes[self.0.index as usize];
+        let node = &owner.program().unwrap().nodes[self.0.index as usize];
         let values = match &node.kind {
             Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
                 value: Some(pb::primitive_value::Value::Vec(values)),
@@ -448,9 +473,7 @@ impl Expr {
             }
         };
         let sort = self.0.resolve(Arena::Sort, node.sort_id)?;
-        let Some(pb::sort::Kind::Family(f)) =
-            &sort.owner.as_ref().unwrap().program.sorts[sort.index as usize].kind
-        else {
+        let Some(pb::sort::Kind::Application(f)) = &sort.sort().unwrap().kind else {
             return Err(TypedError::Decode(format!(
                 "{family} payload/sort mismatch"
             )));
@@ -478,11 +501,9 @@ impl Expr {
         [none, some]: [&Callable; 2],
         element: &SortRef,
     ) -> Result<Option<Self>, TypedError> {
-        let node = &self.0.owner.as_ref().unwrap().program.nodes[self.0.index as usize];
+        let node = &self.0.owner.as_ref().unwrap().program().unwrap().nodes[self.0.index as usize];
         let sort = self.0.resolve(Arena::Sort, node.sort_id)?;
-        let Some(pb::sort::Kind::Family(family)) =
-            &sort.owner.as_ref().unwrap().program.sorts[sort.index as usize].kind
-        else {
+        let Some(pb::sort::Kind::Application(family)) = &sort.sort().unwrap().kind else {
             return Err(TypedError::Decode("Maybe payload/sort mismatch".into()));
         };
         if family.name != "Maybe"
@@ -508,7 +529,8 @@ impl Expr {
         child
             .map(|index| {
                 let child = self.0.resolve(Arena::Node, index)?;
-                let node = &child.owner.as_ref().unwrap().program.nodes[child.index as usize];
+                let node =
+                    &child.owner.as_ref().unwrap().program().unwrap().nodes[child.index as usize];
                 if SortRef(child.resolve(Arena::Sort, node.sort_id)?) != *element {
                     return Err(TypedError::Decode("Maybe child sort mismatch".into()));
                 }
@@ -526,11 +548,9 @@ impl Expr {
         second: &SortRef,
     ) -> Result<[Self; 2], TypedError> {
         let owner = self.0.owner.as_ref().unwrap();
-        let node = &owner.program.nodes[self.0.index as usize];
+        let node = &owner.program().unwrap().nodes[self.0.index as usize];
         let sort = self.0.resolve(Arena::Sort, node.sort_id)?;
-        let Some(pb::sort::Kind::Family(family)) =
-            &sort.owner.as_ref().unwrap().program.sorts[sort.index as usize].kind
-        else {
+        let Some(pb::sort::Kind::Application(family)) = &sort.sort().unwrap().kind else {
             return Err(TypedError::Decode("Pair payload/sort mismatch".into()));
         };
         if family.name != "Pair" || family.args.len() != 2 {
@@ -563,7 +583,8 @@ impl Expr {
             Self(self.0.resolve(Arena::Node, right?)?),
         ];
         for (child, expected) in children.iter().zip([first, second]) {
-            let node = &child.0.owner.as_ref().unwrap().program.nodes[child.0.index as usize];
+            let node =
+                &child.0.owner.as_ref().unwrap().program().unwrap().nodes[child.0.index as usize];
             if SortRef(child.0.resolve(Arena::Sort, node.sort_id)?) != *expected {
                 return Err(TypedError::Decode(
                     "Pair payload child sort mismatch".into(),
@@ -581,11 +602,9 @@ impl Expr {
         key: &SortRef,
         value: &SortRef,
     ) -> Result<Vec<[Self; 2]>, TypedError> {
-        let node = &self.0.owner.as_ref().unwrap().program.nodes[self.0.index as usize];
+        let node = &self.0.owner.as_ref().unwrap().program().unwrap().nodes[self.0.index as usize];
         let sort = self.0.resolve(Arena::Sort, node.sort_id)?;
-        let Some(pb::sort::Kind::Family(family)) =
-            &sort.owner.as_ref().unwrap().program.sorts[sort.index as usize].kind
-        else {
+        let Some(pb::sort::Kind::Application(family)) = &sort.sort().unwrap().kind else {
             return Err(TypedError::Decode("Map payload/sort mismatch".into()));
         };
         if family.name != "Map" || family.args.len() != 2 {
@@ -633,11 +652,10 @@ impl Expr {
                     ));
                 }
                 let vector = self.0.resolve(Arena::Node, call.args[0])?;
-                let node = &vector.owner.as_ref().unwrap().program.nodes[vector.index as usize];
+                let node =
+                    &vector.owner.as_ref().unwrap().program().unwrap().nodes[vector.index as usize];
                 let sort = vector.resolve(Arena::Sort, node.sort_id)?;
-                let Some(pb::sort::Kind::Family(family)) =
-                    &sort.owner.as_ref().unwrap().program.sorts[sort.index as usize].kind
-                else {
+                let Some(pb::sort::Kind::Application(family)) = &sort.sort().unwrap().kind else {
                     return Err(TypedError::Decode(
                         "Map input must be a Vec of Pairs".into(),
                     ));
@@ -648,9 +666,7 @@ impl Expr {
                     ));
                 }
                 let pair = sort.resolve(Arena::Sort, family.args[0])?;
-                let Some(pb::sort::Kind::Family(family)) =
-                    &pair.owner.as_ref().unwrap().program.sorts[pair.index as usize].kind
-                else {
+                let Some(pb::sort::Kind::Application(family)) = &pair.sort().unwrap().kind else {
                     return Err(TypedError::Decode("Map input must contain Pairs".into()));
                 };
                 if family.name != "Pair" || family.args.len() != 2 {
@@ -696,7 +712,8 @@ impl Expr {
         }
         for entry in &entries {
             for (child, expected) in entry.iter().zip([key, value]) {
-                let node = &child.0.owner.as_ref().unwrap().program.nodes[child.0.index as usize];
+                let node = &child.0.owner.as_ref().unwrap().program().unwrap().nodes
+                    [child.0.index as usize];
                 if SortRef(child.0.resolve(Arena::Sort, node.sort_id)?) != *expected {
                     return Err(TypedError::Decode("Map payload child sort mismatch".into()));
                 }
@@ -726,7 +743,7 @@ impl Expr {
             }
             colors.insert(key, 1);
             pending.push((record.clone(), true));
-            let node = &owner.program.nodes[record.index as usize];
+            let node = &owner.program().unwrap().nodes[record.index as usize];
             let sort = SortRef(record.resolve(Arena::Sort, node.sort_id)?);
             sort.validate_closed()?;
             let pair_children;
@@ -735,9 +752,7 @@ impl Expr {
                 Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
                     value: Some(pb::primitive_value::Value::Maybe(maybe)),
                 })) => {
-                    let Some(pb::sort::Kind::Family(f)) =
-                        &sort.0.owner.as_ref().unwrap().program.sorts[sort.0.index as usize].kind
-                    else {
+                    let Some(pb::sort::Kind::Application(f)) = &sort.0.sort().unwrap().kind else {
                         return Err(TypedError::Decode("Maybe payload/sort mismatch".into()));
                     };
                     if f.name != "Maybe" || f.args.len() != 1 {
@@ -745,8 +760,8 @@ impl Expr {
                     }
                     if let Some(index) = maybe.value {
                         let child = record.resolve(Arena::Node, index)?;
-                        let node =
-                            &child.owner.as_ref().unwrap().program.nodes[child.index as usize];
+                        let node = &child.owner.as_ref().unwrap().program().unwrap().nodes
+                            [child.index as usize];
                         if SortRef(child.resolve(Arena::Sort, node.sort_id)?)
                             != SortRef(sort.0.resolve(Arena::Sort, f.args[0])?)
                         {
@@ -758,9 +773,7 @@ impl Expr {
                 Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
                     value: Some(pb::primitive_value::Value::Map(map)),
                 })) => {
-                    let Some(pb::sort::Kind::Family(f)) =
-                        &sort.0.owner.as_ref().unwrap().program.sorts[sort.0.index as usize].kind
-                    else {
+                    let Some(pb::sort::Kind::Application(f)) = &sort.0.sort().unwrap().kind else {
                         return Err(TypedError::Decode("Map payload/sort mismatch".into()));
                     };
                     if f.name != "Map" || f.args.len() != 2 {
@@ -776,8 +789,8 @@ impl Expr {
                         .collect::<Result<Vec<_>, _>>()?;
                     for (index, expected) in map_children.iter().zip(f.args.iter().cycle()) {
                         let child = record.resolve(Arena::Node, *index)?;
-                        let node =
-                            &child.owner.as_ref().unwrap().program.nodes[child.index as usize];
+                        let node = &child.owner.as_ref().unwrap().program().unwrap().nodes
+                            [child.index as usize];
                         if SortRef(child.resolve(Arena::Sort, node.sort_id)?)
                             != SortRef(sort.0.resolve(Arena::Sort, *expected)?)
                         {
@@ -791,9 +804,7 @@ impl Expr {
                 Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
                     value: Some(pb::primitive_value::Value::Pair(pair)),
                 })) => {
-                    let Some(pb::sort::Kind::Family(f)) =
-                        &sort.0.owner.as_ref().unwrap().program.sorts[sort.0.index as usize].kind
-                    else {
+                    let Some(pb::sort::Kind::Application(f)) = &sort.0.sort().unwrap().kind else {
                         return Err(TypedError::Decode("Pair payload/sort mismatch".into()));
                     };
                     if f.name != "Pair" || f.args.len() != 2 {
@@ -807,8 +818,8 @@ impl Expr {
                     ];
                     for (index, expected) in pair_children.iter().zip(&f.args) {
                         let child = record.resolve(Arena::Node, *index)?;
-                        let node =
-                            &child.owner.as_ref().unwrap().program.nodes[child.index as usize];
+                        let node = &child.owner.as_ref().unwrap().program().unwrap().nodes
+                            [child.index as usize];
                         if SortRef(child.resolve(Arena::Sort, node.sort_id)?)
                             != SortRef(sort.0.resolve(Arena::Sort, *expected)?)
                         {
@@ -834,9 +845,7 @@ impl Expr {
                     } else {
                         "Vec"
                     };
-                    let Some(pb::sort::Kind::Family(f)) =
-                        &sort.0.owner.as_ref().unwrap().program.sorts[sort.0.index as usize].kind
-                    else {
+                    let Some(pb::sort::Kind::Application(f)) = &sort.0.sort().unwrap().kind else {
                         return Err(TypedError::Decode(format!(
                             "{family} payload/sort mismatch"
                         )));
@@ -849,8 +858,8 @@ impl Expr {
                     let expected = SortRef(sort.0.resolve(Arena::Sort, f.args[0])?);
                     for index in &values.items {
                         let child = record.resolve(Arena::Node, *index)?;
-                        let node =
-                            &child.owner.as_ref().unwrap().program.nodes[child.index as usize];
+                        let node = &child.owner.as_ref().unwrap().program().unwrap().nodes
+                            [child.index as usize];
                         if SortRef(child.resolve(Arena::Sort, node.sort_id)?) != expected {
                             return Err(TypedError::Decode(format!(
                                 "{family} payload element sort mismatch"
@@ -862,9 +871,7 @@ impl Expr {
                 Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
                     value: Some(pb::primitive_value::Value::PartialCall(call)),
                 })) => {
-                    let Some(pb::sort::Kind::Func(function)) =
-                        &sort.0.owner.as_ref().unwrap().program.sorts[sort.0.index as usize].kind
-                    else {
+                    let Some(pb::sort::Kind::Func(function)) = &sort.0.sort().unwrap().kind else {
                         return Err(TypedError::Decode(
                             "partial call requires a function sort".into(),
                         ));
@@ -874,8 +881,8 @@ impl Expr {
                         .iter()
                         .map(|index| {
                             let child = record.resolve(Arena::Node, *index)?;
-                            let node =
-                                &child.owner.as_ref().unwrap().program.nodes[child.index as usize];
+                            let node = &child.owner.as_ref().unwrap().program().unwrap().nodes
+                                [child.index as usize];
                             child.resolve(Arena::Sort, node.sort_id).map(SortRef)
                         })
                         .collect::<Result<Vec<_>, _>>()?;
@@ -896,10 +903,14 @@ impl Expr {
                 }
                 Some(pb::node::Kind::Call(call)) => {
                     let declaration = record.declaration(&call.func, DeclarationKind::Callable)?;
-                    let Some(pb::declaration::Kind::Constructor(constructor)) =
-                        &declaration.owner.as_ref().unwrap().program.declarations
-                            [declaration.index as usize]
-                            .kind
+                    let Some(pb::declaration::Kind::Constructor(constructor)) = declaration
+                        .owner
+                        .as_ref()
+                        .unwrap()
+                        .program()
+                        .ok()
+                        .and_then(|program| program.declarations.get(declaration.index as usize))
+                        .and_then(|declaration| declaration.kind.as_ref())
                     else {
                         return Err(TypedError::Decode(
                             "extracted call is not a constructor".into(),
@@ -915,8 +926,8 @@ impl Expr {
                     }
                     for (index, input) in call.args.iter().zip(&constructor.inputs) {
                         let child = record.resolve(Arena::Node, *index)?;
-                        let node =
-                            &child.owner.as_ref().unwrap().program.nodes[child.index as usize];
+                        let node = &child.owner.as_ref().unwrap().program().unwrap().nodes
+                            [child.index as usize];
                         if SortRef(child.resolve(Arena::Sort, node.sort_id)?)
                             != SortRef(declaration.resolve(Arena::Sort, input.sort)?)
                         {
@@ -954,7 +965,8 @@ impl Expr {
         if self.0.capture()?.is_some() {
             return Ok(None);
         }
-        let p = &pattern.0.owner.as_ref().unwrap().program.nodes[pattern.0.index as usize];
+        let p =
+            &pattern.0.owner.as_ref().unwrap().program().unwrap().nodes[pattern.0.index as usize];
         let Some(pb::node::Kind::Call(call)) = &p.kind else {
             return Err(TypedError::Invalid(
                 "selector must return one direct constructor, function or relation".into(),
@@ -963,15 +975,23 @@ impl Expr {
         let declaration = pattern
             .0
             .declaration(&call.func, DeclarationKind::Callable)?;
-        if !matches!(
-            &declaration.owner.as_ref().unwrap().program.declarations[declaration.index as usize]
-                .kind,
-            Some(
-                pb::declaration::Kind::Constructor(_)
-                    | pb::declaration::Kind::Function(_)
-                    | pb::declaration::Kind::Relation(_)
+        if declaration.arena != Arena::Declaration
+            || !matches!(
+                &declaration
+                    .owner
+                    .as_ref()
+                    .unwrap()
+                    .program()
+                    .unwrap()
+                    .declarations[declaration.index as usize]
+                    .kind,
+                Some(
+                    pb::declaration::Kind::Constructor(_)
+                        | pb::declaration::Kind::Function(_)
+                        | pb::declaration::Kind::Relation(_)
+                )
             )
-        ) {
+        {
             return Err(TypedError::Invalid(
                 "selector must return a constructor, function or relation, not a host operation"
                     .into(),
@@ -988,7 +1008,7 @@ impl Expr {
                 "selector must use its fresh arguments once in declaration order".into(),
             ));
         }
-        let n = &self.0.owner.as_ref().unwrap().program.nodes[self.0.index as usize];
+        let n = &self.0.owner.as_ref().unwrap().program().unwrap().nodes[self.0.index as usize];
         let Some(pb::node::Kind::Call(actual)) = &n.kind else {
             return Ok(None);
         };
@@ -1021,8 +1041,8 @@ impl PartialEq for Expr {
             if ka == kb || !seen.insert((ka, kb)) {
                 continue;
             }
-            let na = &oa.program.nodes[a.index as usize];
-            let nb = &ob.program.nodes[b.index as usize];
+            let na = &oa.program().unwrap().nodes[a.index as usize];
+            let nb = &ob.program().unwrap().nodes[b.index as usize];
             if SortRef(a.resolve(Arena::Sort, na.sort_id).unwrap())
                 != SortRef(b.resolve(Arena::Sort, nb.sort_id).unwrap())
             {
@@ -1186,7 +1206,7 @@ impl Hash for Expr {
             if hashes.contains_key(&key) {
                 continue;
             }
-            let node = &owner.program.nodes[record.index as usize];
+            let node = &owner.program().unwrap().nodes[record.index as usize];
             if let Some(capture) = record.capture().expect("published capture recipe") {
                 if !finish {
                     pending.push((record.clone(), true));
@@ -1385,7 +1405,7 @@ impl Hash for Expr {
 }
 impl std::fmt::Debug for Expr {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let n = &self.0.owner.as_ref().unwrap().program.nodes[self.0.index as usize];
+        let n = &self.0.owner.as_ref().unwrap().program().unwrap().nodes[self.0.index as usize];
         // Deliberately bounded, with no recursive child formatting.
         match &n.kind {
             Some(pb::node::Kind::Call(c)) => write!(f, "Call({:?}, {} args)", c.func, c.args.len()),
@@ -1406,8 +1426,8 @@ pub(super) fn validate_literal(
     use num::Integer as _;
     use pb::primitive_value::Value;
 
-    let kind = &sort.0.owner.as_ref().unwrap().program.sorts[sort.0.index as usize].kind;
-    if let Some(pb::sort::Kind::Family(family)) = kind
+    let kind = &sort.0.sort().unwrap().kind;
+    if let Some(pb::sort::Kind::Application(family)) = kind
         && family.args.is_empty()
     {
         match (&*family.name, &value.value) {

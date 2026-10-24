@@ -9,15 +9,13 @@ pub use egglog::builtin::{
 };
 use egglog::prelude::Span;
 use egglog::*;
-use prost::Message;
-use std::sync::{Arc, LazyLock};
 pub mod definitions;
 /// Resolve the concrete scalar endpoints of a portable signature.
 pub fn signature_sorts(
-    program: &pb::Program,
-    primitive: &pb::HostPrimitive,
+    program: &pb::BuiltinCatalog,
+    primitive: &pb::Primitive,
 ) -> Result<Vec<String>, String> {
-    let Some(pb::host_primitive::Typing::Signature(signature)) = &primitive.typing else {
+    let Some(pb::primitive::Typing::Signature(signature)) = &primitive.typing else {
         return Err("function-application builtin typing is not implemented yet".into());
     };
     if primitive.name.is_empty() || !signature.type_params.is_empty() {
@@ -26,18 +24,18 @@ pub fn signature_sorts(
     signature.inputs.iter().chain(&signature.varargs).map(|arg| arg.sort).chain(std::iter::once(signature.output.ok_or("missing builtin result sort")?)).map(|index| {
         let sort = program.sorts.get(index as usize).ok_or("builtin signature sort index out of bounds")?;
         match &sort.kind {
-            Some(pb::sort::Kind::Family(family)) if family.args.is_empty() && !family.name.is_empty() => Ok(family.name.clone()),
+            Some(pb::sort::Kind::Application(family)) if family.args.is_empty() && !family.name.is_empty() => Ok(family.name.clone()),
             _ => Err("builtin signature requires a symbolic-family compiler beyond this scalar slice".into()),
         }
     }).collect()
 }
 pub mod registration;
-pub use registration::{PortableRegistration, add_pure_with_definition};
+pub use registration::add_pure_with_definition;
 
 /// Portable declarations plus explicit native provider inventory gaps.
 pub struct PortableCatalog {
     /// Portable signatures and authored computations projected from native owners.
-    pub definitions: pb::Program,
+    pub definitions: pb::BuiltinCatalog,
     /// Actual callable registrations without a portable projection.
     pub undescribed_primitives: Vec<String>,
     /// Actual family factories without a native description.
@@ -48,10 +46,27 @@ pub struct PortableCatalog {
     pub undescribed_sorts: Vec<String>,
 }
 
-static LANGUAGE_METADATA: LazyLock<pb::Program> = LazyLock::new(|| {
-    let bytes: &[u8] = include!("builtin/metadata.rs");
-    pb::Program::decode(bytes).expect("valid presentation metadata")
-});
+/// Capture only the configured native environment, rejecting missing machine
+/// descriptions rather than publishing an incomplete ambient contract.
+pub(crate) fn configured_catalog(
+    graph: &EGraph,
+) -> Result<std::sync::Arc<pb::BuiltinCatalog>, String> {
+    let catalog = graph.authoring_type_info().portable_builtin_catalog()?;
+    let gaps = catalog
+        .undescribed_primitives
+        .into_iter()
+        .chain(catalog.undescribed_families)
+        .chain(catalog.undescribed_family_primitives)
+        .chain(catalog.undescribed_sorts)
+        .collect::<Vec<_>>();
+    if !gaps.is_empty() {
+        return Err(format!(
+            "builtin catalog has undescribed native registrations: {}",
+            gaps.join(", ")
+        ));
+    }
+    Ok(std::sync::Arc::new(catalog.definitions))
+}
 
 fn export_pattern(pattern: &SortPattern, sorts: &mut Vec<pb::Sort>) -> Result<u32, String> {
     let kind = match pattern {
@@ -59,7 +74,7 @@ fn export_pattern(pattern: &SortPattern, sorts: &mut Vec<pb::Sort>) -> Result<u3
             pb::sort::Kind::Var(u32::try_from(*index).map_err(|_| "too many parameters")?)
         }
         SortPattern::Eq(name) => pb::sort::Kind::Eq(name.clone()),
-        SortPattern::Family { name, args } => pb::sort::Kind::Family(pb::HostSort {
+        SortPattern::Family { name, args } => pb::sort::Kind::Application(pb::SortApplication {
             name: name.clone(),
             args: args
                 .iter()
@@ -100,7 +115,7 @@ fn native_pattern(sorts: &[pb::Sort], index: u32, depth: usize) -> Result<SortPa
         {
             pb::sort::Kind::Var(index) => SortPattern::Param(*index as usize),
             pb::sort::Kind::Eq(name) => SortPattern::Eq(name.clone()),
-            pb::sort::Kind::Family(family) => SortPattern::Family {
+            pb::sort::Kind::Application(family) => SortPattern::Family {
                 name: family.name.clone(),
                 args: family
                     .args
@@ -121,16 +136,16 @@ fn native_pattern(sorts: &[pb::Sort], index: u32, depth: usize) -> Result<SortPa
 }
 
 fn wire_description(
-    program: &pb::Program,
-    primitive: &pb::HostPrimitive,
+    program: &pb::BuiltinCatalog,
+    primitive: &pb::Primitive,
 ) -> Result<BuiltinDescription, String> {
     let typing = match primitive
         .typing
         .as_ref()
         .ok_or("missing builtin typing form")?
     {
-        pb::host_primitive::Typing::Application(_) => BuiltinTyping::FunctionApplication,
-        pb::host_primitive::Typing::Signature(signature) => {
+        pb::primitive::Typing::Application(_) => BuiltinTyping::FunctionApplication,
+        pb::primitive::Typing::Signature(signature) => {
             if signature
                 .equality_type_params
                 .windows(2)
@@ -182,22 +197,10 @@ fn wire_description(
 
 /// Decode a fixture/provider description into the native semantic model.
 /// Validation and installation remain explicit; helper records are not roots.
-pub fn native_definition(program: &pb::Program) -> Result<BuiltinDescription, String> {
+pub fn native_definition(program: &pb::BuiltinCatalog) -> Result<BuiltinDescription, String> {
     let key = definition_key(program)?;
-    let (declaration, primitive) = definition_root(program, key)?;
-    let mut description = wire_description(program, primitive)?;
-    if let Some(egglog) = declaration
-        .bindings
-        .as_ref()
-        .and_then(|bindings| bindings.egglog.as_ref())
-    {
-        description.aliases = egglog
-            .views
-            .iter()
-            .map(|view| view.symbol.clone())
-            .collect();
-    }
-    Ok(description)
+    let primitive = definition_root(program, key)?;
+    wire_description(program, primitive)
 }
 
 /// Project the native macro's closed signature, without reauthoring its types.
@@ -207,7 +210,7 @@ pub fn closed_signature(
     inputs: &[(&str, ArcSort)],
     tail: &[(&str, ArcSort)],
     output: ArcSort,
-) -> Result<pb::Program, String> {
+) -> Result<pb::BuiltinCatalog, String> {
     project_description(&egglog::builtin::closed_signature(
         key, alias, inputs, tail, output,
     )?)
@@ -219,7 +222,7 @@ pub fn homogeneous_signature(
     alias: &str,
     inputs: &[&str],
     output: ArcSort,
-) -> Result<pb::Program, String> {
+) -> Result<pb::BuiltinCatalog, String> {
     project_description(&egglog::builtin::homogeneous_signature(
         key, alias, inputs, output,
     )?)
@@ -227,27 +230,49 @@ pub fn homogeneous_signature(
 
 /// Native inference for one wire fixture's own canonical registration root.
 pub fn type_constraints(
-    definition: &pb::Program,
+    definition: &pb::BuiltinCatalog,
     span: &Span,
 ) -> Box<dyn constraint::TypeConstraint> {
     let native = native_definition(definition).expect("valid native fixture description");
     egglog::builtin::rooted_type_constraints(&native.key, &native, span)
 }
 
-/// Project a native scheme and attach Experimental-owned language views.
-pub fn project_description(description: &BuiltinDescription) -> Result<pb::Program, String> {
+/// Project the native semantic scheme without frontend presentation.
+pub fn project_description(description: &BuiltinDescription) -> Result<pb::BuiltinCatalog, String> {
+    let mut catalog = pb::BuiltinCatalog::default();
+    let primitive = project_primitive(description, &mut catalog.sorts)?;
+    catalog.primitive_sorts = catalog
+        .sorts
+        .iter()
+        .filter_map(|sort| match &sort.kind {
+            Some(pb::sort::Kind::Application(application)) => {
+                Some((application.name.clone(), application.args.len() as u32))
+            }
+            _ => None,
+        })
+        .collect::<std::collections::BTreeMap<_, _>>()
+        .into_iter()
+        .map(|(name, arity)| pb::PrimitiveSort {
+            name,
+            arity,
+            ..Default::default()
+        })
+        .collect();
+    catalog.primitives.push(primitive);
+    Ok(catalog)
+}
+
+fn project_primitive(
+    description: &BuiltinDescription,
+    sorts: &mut Vec<pb::Sort>,
+) -> Result<pb::Primitive, String> {
     description.validate()?;
-    let mut program = pb::Program {
-        ..Default::default()
-    };
     let typing = match &description.typing {
         BuiltinTyping::FunctionApplication => {
-            pb::host_primitive::Typing::Application(pb::FunctionApplication {})
+            pb::primitive::Typing::Application(pb::FunctionApplication {})
         }
         BuiltinTyping::FunctionConstructor => {
-            return Err(
-                "function construction projects to PartialCall, not a host callable".into(),
-            );
+            return Err("function construction projects to PartialCall, not a primitive".into());
         }
         BuiltinTyping::Signature(signature) => {
             let mut arguments = |args: &[Argument]| {
@@ -255,15 +280,15 @@ pub fn project_description(description: &BuiltinDescription) -> Result<pb::Progr
                     .map(|arg| {
                         Ok(pb::Arg {
                             name: arg.name.clone(),
-                            sort: export_pattern(&arg.sort, &mut program.sorts)?,
+                            sort: export_pattern(&arg.sort, sorts)?,
                         })
                     })
                     .collect::<Result<Vec<_>, String>>()
             };
             let inputs = arguments(&signature.fixed)?;
             let varargs = arguments(&signature.tail)?;
-            let output = export_pattern(&signature.output, &mut program.sorts)?;
-            pb::host_primitive::Typing::Signature(pb::GenericSignature {
+            let output = export_pattern(&signature.output, sorts)?;
+            pb::primitive::Typing::Signature(pb::GenericSignature {
                 type_params: signature.params.iter().map(|p| p.name.clone()).collect(),
                 inputs,
                 varargs,
@@ -277,107 +302,28 @@ pub fn project_description(description: &BuiltinDescription) -> Result<pb::Progr
             })
         }
     };
-    let bindings = Some(pb::CallableBindings {
-        egglog: Some(pb::EgglogBindings {
-            views: description
-                .aliases
-                .iter()
-                .map(|symbol| pb::EgglogCallable {
-                    symbol: symbol.clone(),
-                    datatype_member: false,
-                })
-                .collect(),
-        }),
+    Ok(pb::Primitive {
+        name: description.key.clone(),
+        typing: Some(typing),
         ..Default::default()
-    });
-    let root = pb::Declaration {
-        kind: Some(pb::declaration::Kind::HostPrimitive(pb::HostPrimitive {
-            name: description.key.clone(),
-            typing: Some(typing),
-        })),
-        bindings,
-        ..Default::default()
-    };
-    let families = program
-        .sorts
-        .iter()
-        .filter_map(|sort| match &sort.kind {
-            Some(pb::sort::Kind::Family(family)) => {
-                Some((family.name.clone(), family.args.len() as u32))
-            }
-            _ => None,
-        })
-        .collect::<std::collections::BTreeMap<_, _>>();
-    for (name, arity) in families {
-        program.declarations.push(pb::Declaration {
-            kind: Some(pb::declaration::Kind::HostSortFamily(pb::HostSortFamily {
-                name,
-                arity,
-                ..Default::default()
-            })),
-            ..Default::default()
-        });
-    }
-    program.declarations.push(root);
-    apply_language_metadata(&mut program, &LANGUAGE_METADATA, &description.key)?;
-    Ok(program)
-}
-
-fn apply_language_metadata(
-    program: &mut pb::Program,
-    metadata: &pb::Program,
-    key: &str,
-) -> Result<(), String> {
-    // A signature-only custom registration does not author family presentation.
-    // Its TypeInfo export later supplies the actual registered family records.
-    if !metadata.declarations.iter().any(|declaration| {
-        matches!(&declaration.kind,
-        Some(pb::declaration::Kind::HostPrimitive(primitive)) if primitive.name == key)
-    }) {
-        return Ok(());
-    }
-    let mut decorated = program.clone();
-    for declaration in &mut decorated.declarations {
-        match &mut declaration.kind {
-            Some(pb::declaration::Kind::HostSortFamily(family)) => {
-                family.bindings = metadata.declarations.iter().find_map(|d| match &d.kind { Some(pb::declaration::Kind::HostSortFamily(m)) if m.name == family.name => m.bindings.clone(), _ => None });
-            }
-            Some(pb::declaration::Kind::HostPrimitive(primitive)) if primitive.name == key => {
-                if let Some(source) = metadata.declarations.iter().find(|d| matches!(&d.kind, Some(pb::declaration::Kind::HostPrimitive(p)) if p.name == key)) {
-                    let mut bindings = source.bindings.clone().unwrap_or_default();
-                    let mut import = |index: u32| import_sort(&metadata.sorts, index, &mut program.sorts);
-                    if let Some(python) = &mut bindings.python { for view in &mut python.views { if let Some(pb::binding_owner::Kind::Sort(index)) = view.owner.as_mut().and_then(|owner| owner.kind.as_mut()) { *index = import(*index)?; } } }
-                    if let Some(rust) = &mut bindings.rust { for view in &mut rust.views {
-                        if let Some(pb::binding_owner::Kind::Sort(index)) = view.owner.as_mut().and_then(|owner| owner.kind.as_mut()) { *index = import(*index)?; }
-                        if let Some(trait_impl) = &mut view.trait_impl { for argument in &mut trait_impl.args { if let Some(index) = &mut argument.sort { *index = import(*index)?; } } }
-                    } }
-                    bindings.egglog = declaration.bindings.as_ref().and_then(|b| b.egglog.clone());
-                    declaration.bindings = Some(bindings);
-                }
-            }
-            _ => (),
-        }
-    }
-    decorated.sorts = program.sorts.clone();
-    *program = decorated;
-    Ok(())
+    })
 }
 
 /// Inert wire projection and validation against the actual native registry.
 pub trait PortableTypeInfo {
     /// Export available native declarations and report every remaining gap.
     fn portable_builtin_catalog(&self) -> Result<PortableCatalog, String>;
-    /// Import one actual native owner and its language/default context.
+    /// Project one actual native signature into an independently owned catalog.
     fn export_builtin_definition(
         &self,
         key: &str,
-        destination: &mut pb::Program,
+        destination: &mut pb::BuiltinCatalog,
     ) -> Result<(), String>;
-    /// Check a submitted signature without replacing native authority.
+    /// Check signature evidence against the actual registered provider.
     fn check_portable_builtin_signature(
         &self,
-        program: &pb::Program,
-        primitive: &pb::HostPrimitive,
+        program: &pb::BuiltinCatalog,
+        primitive: &pb::Primitive,
     ) -> Result<(), String>;
     /// Project the exact target selected by native sorts and optional runtime IDs.
     fn export_function_target(
@@ -399,19 +345,6 @@ pub trait PortableTypeInfo {
     ) -> Result<String, String>;
 }
 
-fn primitive_definition(
-    primitive: &dyn Primitive,
-    destination: &mut pb::Program,
-) -> Result<Option<String>, String> {
-    let any: &dyn std::any::Any = primitive;
-    if let Some(defined) = any.downcast_ref::<crate::primitive::DefinedPrimitive>() {
-        let definition = defined.definition.as_ref().map_err(Clone::clone)?;
-        definitions::reconcile_declarations(definition, destination)?;
-        return Ok(Some(defined.name.clone()));
-    }
-    Ok(None)
-}
-
 impl PortableTypeInfo for TypeInfo {
     fn resolve_portable_builtin(
         &self,
@@ -429,6 +362,34 @@ impl PortableTypeInfo for TypeInfo {
                 return Err("native instance binding disagrees with wire sort".into());
             }
         }
+        if self.builtin_description(key).is_err() {
+            let matches = self
+                .get_prims(key)
+                .into_iter()
+                .flatten()
+                .filter(|primitive| {
+                    let any: &dyn std::any::Any = &*primitive.primitive;
+                    any.downcast_ref::<crate::primitive::DefinedPrimitive>()
+                        .is_some_and(|defined| {
+                            defined.input.len() + 1 == native.len()
+                                && defined
+                                    .input
+                                    .iter()
+                                    .chain([&defined.output])
+                                    .zip(native)
+                                    .all(|(expected, actual)| {
+                                        std::sync::Arc::ptr_eq(expected, actual)
+                                    })
+                        })
+                })
+                .count();
+            if matches == 1 {
+                return Ok(key.to_owned());
+            }
+            return Err(format!(
+                "computed primitive {key} has {matches} matching native instances"
+            ));
+        }
         let selected = self.resolve_builtin(key, native).map_err(|error| {
             if error == format!("unknown builtin description {key}") {
                 format!("unknown builtin definition {key}")
@@ -444,10 +405,8 @@ impl PortableTypeInfo for TypeInfo {
     fn portable_builtin_catalog(&self) -> Result<PortableCatalog, String> {
         let native = self.builtin_catalog()?;
         let mut result = PortableCatalog {
-            definitions: pb::Program {
-                ..Default::default()
-            },
-            undescribed_primitives: native.undescribed_primitives,
+            definitions: pb::BuiltinCatalog::default(),
+            undescribed_primitives: Vec::new(),
             undescribed_families: native.undescribed_families,
             undescribed_family_primitives: native.undescribed_family_primitives,
             undescribed_sorts: native.undescribed_sorts,
@@ -458,72 +417,101 @@ impl PortableTypeInfo for TypeInfo {
             {
                 continue;
             }
-            self.export_builtin_definition(&description.key, &mut result.definitions)?;
+            result.definitions.primitives.push(project_primitive(
+                description,
+                &mut result.definitions.sorts,
+            )?);
         }
-        for family in native.families {
-            let family = registration::family_metadata(self, &family)?;
-            definitions::reconcile_declarations(
-                &pb::Program {
-                    declarations: vec![pb::Declaration {
-                        kind: Some(pb::declaration::Kind::HostSortFamily(family)),
-                        ..Default::default()
-                    }],
+        result.definitions.primitive_sorts = native
+            .families
+            .into_iter()
+            .map(|family| {
+                Ok(pb::PrimitiveSort {
+                    name: family.name,
+                    arity: u32::try_from(family.arity)
+                        .map_err(|_| "family arity exceeds wire limits")?,
                     ..Default::default()
-                },
-                &mut result.definitions,
-            )?;
-        }
-        let mut gaps = Vec::new();
-        for name in result.undescribed_primitives {
-            let mut authored = false;
+                })
+            })
+            .collect::<Result<_, String>>()?;
+        for name in native.undescribed_primitives {
+            let mut described = false;
             if let Some(primitives) = self.get_prims(&name) {
                 for primitive in primitives {
-                    authored |=
-                        primitive_definition(&*primitive.primitive, &mut result.definitions)?
-                            .is_some();
+                    let any: &dyn std::any::Any = &*primitive.primitive;
+                    if let Some(defined) = any.downcast_ref::<crate::primitive::DefinedPrimitive>()
+                    {
+                        let inputs = defined
+                            .input
+                            .iter()
+                            .enumerate()
+                            .map(|(index, sort)| {
+                                Ok(pb::Arg {
+                                    name: format!("_{index}"),
+                                    sort: export_pattern(
+                                        &self.native_sort_pattern(sort)?,
+                                        &mut result.definitions.sorts,
+                                    )?,
+                                })
+                            })
+                            .collect::<Result<_, String>>()?;
+                        let output = export_pattern(
+                            &self.native_sort_pattern(&defined.output)?,
+                            &mut result.definitions.sorts,
+                        )?;
+                        let projected = pb::Primitive {
+                            name: defined.name.clone(),
+                            typing: Some(pb::primitive::Typing::Signature(pb::GenericSignature {
+                                inputs,
+                                output: Some(output),
+                                ..Default::default()
+                            })),
+                            ..Default::default()
+                        };
+                        if let Some(previous) = result
+                            .definitions
+                            .primitives
+                            .iter()
+                            .find(|old| old.name == projected.name)
+                        {
+                            let mut sorts = vec![];
+                            if normalized_signature(&result.definitions, previous, &mut sorts)?
+                                != normalized_signature(
+                                    &result.definitions,
+                                    &projected,
+                                    &mut sorts,
+                                )?
+                            {
+                                return Err("computed native contexts disagree on signature".into());
+                            }
+                        } else {
+                            result.definitions.primitives.push(projected);
+                        }
+                        described = true;
+                    }
                 }
             }
-            if !authored {
-                gaps.push(name);
+            if !described {
+                result.undescribed_primitives.push(name);
             }
         }
-        result.undescribed_primitives = gaps;
         Ok(result)
     }
 
     fn export_builtin_definition(
         &self,
         key: &str,
-        destination: &mut pb::Program,
+        destination: &mut pb::BuiltinCatalog,
     ) -> Result<(), String> {
         let description = self.builtin_description(key)?;
-        let mut projected = project_description(description)?;
-        for declaration in &mut projected.declarations {
-            if let Some(pb::declaration::Kind::HostSortFamily(family)) = &mut declaration.kind {
-                *family = registration::family_metadata(
-                    self,
-                    &FamilyDescription {
-                        name: family.name.clone(),
-                        arity: family.arity as usize,
-                    },
-                )?;
-            }
-        }
-        let metadata = self
-            .extension_state::<registration::PortableMetadata>()
-            .and_then(|metadata| metadata.primitives.get(key))
-            .filter(|(owner, _)| std::ptr::eq(owner.as_ref(), description))
-            .map(|(_, metadata)| metadata.clone());
-        if let Some(metadata) = metadata {
-            definitions::reconcile_declarations(&metadata, &mut projected)?;
-        }
-        definitions::reconcile_declarations(&projected, destination).map(|_| ())
+        let projected = project_description(description)?;
+        import_definition(&projected, destination).map(|_| ())
     }
 
     fn check_portable_builtin_signature(
         &self,
-        program: &pb::Program,
-        primitive: &pb::HostPrimitive,
+        program: &pb::BuiltinCatalog,
+        primitive: &pb::Primitive,
     ) -> Result<(), String> {
         self.check_builtin_signature(&wire_description(program, primitive)?)
     }
@@ -545,26 +533,28 @@ impl PortableTypeInfo for TypeInfo {
 }
 
 fn export_target(
-    types: &TypeInfo,
+    _types: &TypeInfo,
     target: egglog::builtin::NativeFunctionTarget,
-    destination: &mut pb::Program,
+    _destination: &mut pb::Program,
 ) -> Result<String, String> {
     match target {
         egglog::builtin::NativeFunctionTarget::Function(name) => Ok(name),
         egglog::builtin::NativeFunctionTarget::Primitive(primitives) => {
             let mut selected = None;
             for primitive in primitives {
-                let key =
-                    if let Some(key) = primitive_definition(&*primitive.primitive, destination)? {
-                        key
-                    } else {
-                        let description = primitive
-                            .primitive
-                            .builtin_description()
-                            .ok_or("function target has no native description")?;
-                        types.export_builtin_definition(&description.key, destination)?;
-                        description.key.clone()
-                    };
+                let any: &dyn std::any::Any = &*primitive.primitive;
+                let key = if let Some(defined) =
+                    any.downcast_ref::<crate::primitive::DefinedPrimitive>()
+                {
+                    defined.name.clone()
+                } else {
+                    primitive
+                        .primitive
+                        .builtin_description()
+                        .ok_or("function target has no native description")?
+                        .key
+                        .clone()
+                };
                 if selected.as_ref().is_some_and(|old| old != &key) {
                     return Err(
                         "function target contexts have different canonical identities".into(),
@@ -653,9 +643,10 @@ pub trait PortablePrimitive {
 }
 
 impl PortablePrimitive for SpecializedPrimitive {
-    fn export_builtin(&self, destination: &mut pb::Program) -> Result<String, String> {
-        if let Some(key) = primitive_definition(&*self.prim_with_id.primitive, destination)? {
-            return Ok(key);
+    fn export_builtin(&self, _destination: &mut pb::Program) -> Result<String, String> {
+        let any: &dyn std::any::Any = &*self.prim_with_id.primitive;
+        if let Some(defined) = any.downcast_ref::<crate::primitive::DefinedPrimitive>() {
+            return Ok(defined.name.clone());
         }
         let description = self
             .prim_with_id
@@ -667,7 +658,7 @@ impl PortablePrimitive for SpecializedPrimitive {
         {
             return Err("source facade requires structural call projection".into());
         }
-        definitions::reconcile_declarations(&project_description(description)?, destination)?;
+        description.validate()?;
         Ok(description.key.clone())
     }
     fn export_builtin_node(
@@ -731,7 +722,9 @@ impl PortablePrimitive for SpecializedPrimitive {
         }
         if description.is_some_and(|d| d.key == "egglog.core.map.flat") {
             // Reject conflicting native authority before extending value arenas.
-            types.export_builtin_definition("egglog.core.map.of", destination)?;
+            types
+                .builtin_description("egglog.core.map.of")?
+                .validate()?;
             let SortPattern::Family {
                 args: parameters, ..
             } = types.native_sort_pattern(self.output())?
@@ -779,9 +772,6 @@ impl PortablePrimitive for SpecializedPrimitive {
             }));
         }
         let func = self.export_builtin(destination)?;
-        if description.is_some() {
-            types.export_builtin_definition(&func, destination)?;
-        }
         Ok(pb::node::Kind::Call(pb::Call {
             func,
             args: args.to_vec(),
@@ -825,7 +815,7 @@ pub fn import_sort(
             .ok_or("sort index out of bounds")?
             .clone();
         match sort.kind.as_mut().ok_or("missing sort kind")? {
-            pb::sort::Kind::Family(family) => {
+            pb::sort::Kind::Application(family) => {
                 if family.name.is_empty() {
                     return Err("empty host family name".into());
                 }
@@ -848,11 +838,6 @@ pub fn import_sort(
             .iter()
             .position(|existing| existing.kind == sort.kind)
         {
-            for alias in sort.egglog_aliases {
-                if !destination[existing].egglog_aliases.contains(&alias) {
-                    destination[existing].egglog_aliases.push(alias);
-                }
-            }
             cache.insert(index, existing as u32);
             return Ok(existing as u32);
         }
@@ -871,16 +856,16 @@ pub fn import_sort(
 }
 
 pub(crate) fn normalized_signature(
-    program: &pb::Program,
-    primitive: &pb::HostPrimitive,
+    program: &pb::BuiltinCatalog,
+    primitive: &pb::Primitive,
     sorts: &mut Vec<pb::Sort>,
-) -> Result<pb::host_primitive::Typing, String> {
+) -> Result<pb::primitive::Typing, String> {
     if primitive.name.is_empty() {
         return Err("builtin definition key must not be empty".into());
     }
     let signature = match &primitive.typing {
-        Some(pb::host_primitive::Typing::Signature(signature)) => signature,
-        Some(typing @ pb::host_primitive::Typing::Application(_)) => return Ok(typing.clone()),
+        Some(pb::primitive::Typing::Signature(signature)) => signature,
+        Some(typing @ pb::primitive::Typing::Application(_)) => return Ok(typing.clone()),
         None => return Err("missing builtin typing form".into()),
     };
     let mut signature = signature.clone();
@@ -927,7 +912,7 @@ pub(crate) fn normalized_signature(
             pb::sort::Kind::Var(index) if (*index as usize) >= signature.type_params.len() => {
                 return Err("unbound builtin type parameter".into());
             }
-            pb::sort::Kind::Family(family) => pending.extend(&family.args),
+            pb::sort::Kind::Application(family) => pending.extend(&family.args),
             pb::sort::Kind::Func(function) => {
                 pending.extend(&function.params);
                 pending.push(function.result);
@@ -935,25 +920,20 @@ pub(crate) fn normalized_signature(
             _ => (),
         }
     }
-    Ok(pb::host_primitive::Typing::Signature(signature))
+    Ok(pb::primitive::Typing::Signature(signature))
 }
 
 fn definition_root<'a>(
-    program: &'a pb::Program,
+    catalog: &'a pb::BuiltinCatalog,
     key: &str,
-) -> Result<(&'a pb::Declaration, &'a pb::HostPrimitive), String> {
+) -> Result<&'a pb::Primitive, String> {
     if key.is_empty() {
         return Err("empty builtin root identity".into());
     }
-    let mut roots = program
-        .declarations
+    let mut roots = catalog
+        .primitives
         .iter()
-        .filter_map(|declaration| match &declaration.kind {
-            Some(pb::declaration::Kind::HostPrimitive(primitive)) if primitive.name == key => {
-                Some((declaration, primitive))
-            }
-            _ => None,
-        });
+        .filter(|primitive| primitive.name == key);
     let root = roots.next().ok_or("missing builtin root definition")?;
     if roots.next().is_some() {
         return Err("duplicate builtin root definition".into());
@@ -961,79 +941,69 @@ fn definition_root<'a>(
     Ok(root)
 }
 
-pub(crate) fn definition_key(program: &pb::Program) -> Result<&str, String> {
-    if !program.commands.is_empty() || !program.rules.is_empty() {
-        return Err("builtin definition must contain only declaration templates".into());
-    }
-    let mut validated = vec![];
-    for index in 0..program.sorts.len() {
-        import_sort(&program.sorts, index as u32, &mut validated)?;
-    }
-    let mut key = None;
-    for declaration in &program.declarations {
-        match &declaration.kind {
-            Some(pb::declaration::Kind::HostPrimitive(primitive)) if key.is_none() => {
-                normalized_signature(program, primitive, &mut vec![])?;
-                key = Some(primitive.name.as_str());
-            }
-            Some(pb::declaration::Kind::HostSortFamily(family)) if !family.name.is_empty() => {}
-            _ => {
-                return Err(
-                    "expected exactly one builtin definition and family descriptors".into(),
-                );
-            }
-        }
-    }
-    definitions::reconcile_declarations(program, &mut pb::Program::default())?;
-    key.ok_or_else(|| "missing builtin definition".into())
+pub(crate) fn definition_key(catalog: &pb::BuiltinCatalog) -> Result<&str, String> {
+    let [primitive] = catalog.primitives.as_slice() else {
+        return Err("expected exactly one builtin definition".into());
+    };
+    normalized_signature(catalog, primitive, &mut vec![])?;
+    Ok(&primitive.name)
 }
 
-/// Import one unambiguous host registration and its referenced closures.
+/// Import an independently owned signature proof, rejecting conflicting native
+/// identities and relocating only its referenced catalog sorts.
 pub fn import_definition(
-    definition: &pb::Program,
-    destination: &mut pb::Program,
+    source: &pb::BuiltinCatalog,
+    destination: &mut pb::BuiltinCatalog,
 ) -> Result<String, String> {
-    let key = definition_key(definition)?.to_owned();
-    definitions::reconcile_declarations(definition, destination)?;
-    Ok(key)
-}
-
-/// Import an explicit registration root without inferring it from record order.
-pub fn import_rooted_definition(
-    key: &str,
-    definition: &pb::Program,
-    destination: &mut pb::Program,
-) -> Result<String, String> {
-    let (_, primitive) = definition_root(definition, key)?;
-    normalized_signature(definition, primitive, &mut vec![])?;
-    definitions::check_builtin_context(definition, key, |_| Ok(definition.clone()))?;
-    definitions::reconcile_declarations(definition, destination)?;
-    Ok(key.into())
-}
-
-#[cfg(test)]
-mod projection_tests {
-    use super::*;
-
-    #[test]
-    fn language_resource_contains_no_callable_signature_authority() {
-        assert!(LANGUAGE_METADATA.nodes.is_empty());
-        assert!(LANGUAGE_METADATA.commands.is_empty());
-        assert!(LANGUAGE_METADATA.rules.is_empty());
-        for declaration in &LANGUAGE_METADATA.declarations {
-            assert!(
-                declaration
-                    .bindings
-                    .as_ref()
-                    .is_none_or(|bindings| bindings.egglog.is_none())
-            );
-            match declaration.kind.as_ref().unwrap() {
-                pb::declaration::Kind::HostPrimitive(primitive) => {
-                    assert!(primitive.typing.is_none())
-                }
-                pb::declaration::Kind::HostSortFamily(family) => assert_eq!(family.arity, 0),
-                _ => panic!("presentation resource contains a semantic declaration"),
+    let key = definition_key(source)?.to_owned();
+    let primitive = definition_root(source, &key)?;
+    if let Some(previous) = destination.primitives.iter().find(|old| old.name == key) {
+        let mut sorts = vec![];
+        if normalized_signature(source, primitive, &mut sorts)?
+            != normalized_signature(destination, previous, &mut sorts)?
+        {
+            return Err("conflicting builtin signature".into());
+        }
+        return Ok(key);
+    }
+    let mut primitive = primitive.clone();
+    if let Some(pb::primitive::Typing::Signature(signature)) = &mut primitive.typing {
+        for argument in signature
+            .inputs
+            .iter_mut()
+            .chain(signature.varargs.iter_mut())
+        {
+            argument.sort = import_sort(&source.sorts, argument.sort, &mut destination.sorts)?;
+        }
+        let result = signature
+            .output
+            .as_mut()
+            .ok_or("missing signature result")?;
+        *result = import_sort(&source.sorts, *result, &mut destination.sorts)?;
+    }
+    for family in &source.primitive_sorts {
+        if let Some(previous) = destination
+            .primitive_sorts
+            .iter()
+            .find(|old| old.name == family.name)
+        {
+            if previous.arity != family.arity {
+                return Err("conflicting primitive sort arity".into());
             }
+        } else {
+            destination.primitive_sorts.push(family.clone());
         }
     }
+    // Generated proof fragments normally omit origins; preserve them when present.
+    let offset =
+        u32::try_from(destination.files.len()).map_err(|_| "too many builtin source files")?;
+    if let Some(span) = &mut primitive.span {
+        span.file = span
+            .file
+            .checked_add(offset)
+            .ok_or("too many builtin source files")?;
+    }
+    destination.files.extend(source.files.iter().cloned());
+    destination.primitives.push(primitive);
+    Ok(key)
 }

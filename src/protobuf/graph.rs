@@ -5,118 +5,6 @@ use prost::Message;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-/// Collect self-contained stream chunks by relocating only the newly received
-/// arenas. Snapshot Programs and proof arenas are already independently owned.
-pub(super) fn append_response(
-    destination: &mut pb::RunProgramResponse,
-    mut chunk: pb::RunProgramResponse,
-    source_files: &mut HashMap<pb::SourceFile, u32>,
-) -> Result<(), String> {
-    let nodes = u32::try_from(destination.nodes.len()).map_err(|_| "too many response nodes")?;
-    let sorts = u32::try_from(destination.sorts.len()).map_err(|_| "too many response sorts")?;
-    let rules = u32::try_from(destination.rules.len()).map_err(|_| "too many response rules")?;
-    let mut files = Vec::with_capacity(chunk.files.len());
-    for file in std::mem::take(&mut chunk.files) {
-        let index = if let Some(index) = source_files.get(&file) {
-            *index
-        } else {
-            let index =
-                u32::try_from(destination.files.len()).map_err(|_| "too many response files")?;
-            source_files.insert(file.clone(), index);
-            destination.files.push(file);
-            index
-        };
-        files.push(index);
-    }
-    let map_span = |span: &mut Option<pb::Span>| -> Result<(), String> {
-        if let Some(span) = span {
-            span.file = *files
-                .get(span.file as usize)
-                .ok_or("invalid response source file")?;
-        }
-        Ok(())
-    };
-    for node in &mut chunk.nodes {
-        map_span(&mut node.span)?;
-    }
-    for sort in &mut chunk.sorts {
-        map_span(&mut sort.span)?;
-    }
-    for rule in &mut chunk.rules {
-        crate::builtin::definitions::rule_refs(rule, |_| Ok(()), map_span)?;
-    }
-    let mut arenas = pb::Program {
-        nodes: std::mem::take(&mut destination.nodes),
-        sorts: std::mem::take(&mut destination.sorts),
-        files: std::mem::take(&mut destination.files),
-        rules: std::mem::take(&mut destination.rules),
-        ..Default::default()
-    };
-    let source = pb::Program {
-        nodes: std::mem::take(&mut chunk.nodes),
-        sorts: std::mem::take(&mut chunk.sorts),
-        files: std::mem::take(&mut chunk.files),
-        rules: std::mem::take(&mut chunk.rules),
-        ..Default::default()
-    };
-    let result = append(&mut arenas, &source, 0);
-    destination.nodes = arenas.nodes;
-    destination.sorts = arenas.sorts;
-    destination.files = arenas.files;
-    destination.rules = arenas.rules;
-    result?;
-    let bump = |index: &mut u32, offset| -> Result<(), String> {
-        *index = index
-            .checked_add(offset)
-            .ok_or("response arena exceeds u32")?;
-        Ok(())
-    };
-    for output in &mut chunk.outputs {
-        match &mut output.kind {
-            Some(pb::command_output::Kind::Extraction(extraction)) => {
-                for term in extraction
-                    .roots
-                    .iter_mut()
-                    .flat_map(|root| &mut root.variants)
-                {
-                    bump(&mut term.term, nodes)?;
-                    if let Some(cost) = &mut term.cost {
-                        bump(cost, nodes)?;
-                    }
-                }
-            }
-            Some(pb::command_output::Kind::PrintedFunction(table)) => {
-                for cell in table
-                    .rows
-                    .iter_mut()
-                    .flat_map(|row| row.args.iter_mut().chain(row.output.iter_mut()))
-                {
-                    match &mut cell.kind {
-                        Some(pb::table_cell::Kind::Term(index)) => bump(index, nodes)?,
-                        Some(pb::table_cell::Kind::UnavailableSort(index)) => bump(index, sorts)?,
-                        None => (),
-                    }
-                }
-            }
-            Some(pb::command_output::Kind::TableStats(tables)) => {
-                for column in tables.stats.iter_mut().flat_map(|table| &mut table.columns) {
-                    bump(&mut column.sort, sorts)?;
-                }
-            }
-            _ => (),
-        }
-    }
-    if let Some(error) = &mut chunk.error {
-        map_span(&mut error.span)?;
-        if let Some(rule) = &mut error.rule {
-            bump(rule, rules)?;
-        }
-    }
-    destination.outputs.append(&mut chunk.outputs);
-    destination.error = chunk.error;
-    Ok(())
-}
-
 /// Append prepared rule/command arenas without identifying their node locations
 /// with another input's locations. Named declarations are reconciled separately,
 /// keeping cumulative command data out of declaration reconciliation.
@@ -167,8 +55,7 @@ pub(super) fn append(
                 }
             }
             Some(pb::command::Kind::Fail(child)) => pending.push(child),
-            Some(pb::command::Kind::Repeat(body)) => pending.extend(&mut body.body),
-            Some(pb::command::Kind::Saturate(body)) => pending.extend(&mut body.body),
+            Some(pb::command::Kind::Loop(body)) => pending.extend(&mut body.body),
             _ => (),
         }
     }
@@ -219,7 +106,7 @@ fn sort_refs(
     mut visit: impl FnMut(&mut u32) -> Result<(), String>,
 ) -> Result<(), String> {
     match &mut sort.kind {
-        Some(pb::sort::Kind::Family(family)) => {
+        Some(pb::sort::Kind::Application(family)) => {
             for index in &mut family.args {
                 visit(index)?;
             }
@@ -297,7 +184,6 @@ pub(super) fn rule(source: &pb::Program, index: u32) -> Result<pb::Program, Stri
         })?;
         let mut semantic = value.clone();
         semantic.span = None;
-        semantic.egglog_aliases.clear();
         let key = semantic.encode_to_vec();
         let next = u32::try_from(result.len()).map_err(|_| "too many rule sorts")?;
         let local = *interned.entry(key).or_insert_with(|| {
@@ -404,7 +290,6 @@ pub(super) fn rule_key(rule: &pb::Program) -> Result<Vec<u8>, String> {
     }
     for sort in &mut key.sorts {
         sort.span = None;
-        sort.egglog_aliases.clear();
     }
     for rule in &mut key.rules {
         rule.name = None;
@@ -482,7 +367,7 @@ mod tests {
     fn fixture(name: &str) -> pb::Program {
         pb::Program {
             sorts: vec![pb::Sort {
-                kind: Some(pb::sort::Kind::Family(pb::HostSort {
+                kind: Some(pb::sort::Kind::Application(pb::SortApplication {
                     name: "i64".into(),
                     args: vec![],
                 })),

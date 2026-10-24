@@ -1,5 +1,6 @@
 #![cfg(feature = "typed")]
 
+use egglog_experimental::proto as pb;
 use egglog_experimental::typed::{
     builtins::{I64, Maybe, Vec as EVec},
     prelude::*,
@@ -47,10 +48,12 @@ fn maybe_calls_values_and_eager_defaults_execute_as_bytes() -> Result<(), TypedE
     assert_eq!(i64::try_from(&graph.extract(some.unwrap_or(2_i64))?)?, 7);
     assert_eq!(i64::try_from(&graph.extract(none.unwrap_or(2_i64))?)?, 2);
     assert!(
-        matches!(graph.extract(none.unwrap()), Err(TypedError::Engine(error)) if error.code == egglog_experimental::proto::ErrorCode::EvaluationFailed as i32)
+        matches!(graph.extract(none.unwrap()), Err(TypedError::Engine(frame)) if matches!(&frame.result, Some(pb::run_program_response::Result::Error(error))
+        if error.code == pb::ErrorCode::RuntimeFailure as i32))
     );
     assert!(
-        matches!(graph.extract(some.unwrap_or(I64::from(1) / I64::from(0))), Err(TypedError::Engine(error)) if error.code == egglog_experimental::proto::ErrorCode::EvaluationFailed as i32)
+        matches!(graph.extract(some.unwrap_or(I64::from(1) / I64::from(0))), Err(TypedError::Engine(frame)) if matches!(&frame.result, Some(pb::run_program_response::Result::Error(error))
+        if error.code == pb::ErrorCode::RuntimeFailure as i32))
     );
     let formed = graph.extract(&some)?;
     assert_ne!(

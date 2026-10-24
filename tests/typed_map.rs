@@ -1,5 +1,6 @@
 #![cfg(feature = "typed")]
 
+use egglog_experimental::proto as pb;
 use egglog_experimental::typed::{
     builtins::{F64, I64, Map, Pair, Vec as EVec},
     prelude::*,
@@ -126,13 +127,13 @@ fn maps_execute_computed_vec_inputs_and_reingest_native_values() -> Result<(), T
     let updated = value.insert(&key, &replacement);
     assert_eq!(graph.extract(updated.get(key))?, replacement);
     let error = graph.extract(value.get(99_i64)).unwrap_err();
-    let TypedError::Engine(error) = error else {
+    let TypedError::Engine(frame) = error else {
         panic!("{error}")
     };
-    assert_eq!(
-        error.code,
-        egglog_experimental::proto::ErrorCode::EvaluationFailed as i32
-    );
+    let Some(pb::run_program_response::Result::Error(error)) = &frame.result else {
+        panic!("expected terminal error frame")
+    };
+    assert_eq!(error.code, pb::ErrorCode::RuntimeFailure as i32);
     assert!(graph.check(eq(value.get(7_i64), F64::from(2.5)))?);
     drop(graph);
     let mut fresh = EGraph::default();

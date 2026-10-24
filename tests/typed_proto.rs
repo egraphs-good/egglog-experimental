@@ -1,11 +1,12 @@
 #![cfg(feature = "typed")]
 
+use egglog_experimental::proto as pb;
 use egglog_experimental::typed::prelude::*;
 use std::hash::{DefaultHasher, Hash, Hasher};
 
 fn diagnostic_matches(diagnostic: &Diagnostic) -> u64 {
     assert_eq!(diagnostic.format, "application/vnd.egglog.run-report+json");
-    let value: serde_json::Value = serde_json::from_str(&diagnostic.content).unwrap();
+    let value: serde_json::Value = serde_json::from_slice(&diagnostic.content).unwrap();
     assert!(value.get("updated").is_none());
     assert!(value.get("can_stop").is_none());
     value["num_matches_per_rule"]
@@ -214,7 +215,11 @@ mod relation_predicates {
                 let error = result.expect_err("relation row used as a value must be rejected");
                 match &error {
                     TypedError::Invalid(_) => {}
-                    TypedError::Engine(error) => {
+                    TypedError::Engine(frame) => {
+                        let Some(pb::run_program_response::Result::Error(error)) = &frame.result
+                        else {
+                            panic!("expected terminal error frame")
+                        };
                         assert_eq!(error.code, pb::ErrorCode::InvalidProgram as i32)
                     }
                     other => panic!("{installed}/{case}: wrong error {other:?}"),
@@ -1218,11 +1223,8 @@ mod lazy_rulesets {
                         Some(egglog_experimental::proto::command::Kind::AddRules(add)) => {
                             found |= add.group == expected
                         }
-                        Some(egglog_experimental::proto::command::Kind::Repeat(repeat)) => {
-                            pending.extend(&repeat.body)
-                        }
-                        Some(egglog_experimental::proto::command::Kind::Saturate(saturate)) => {
-                            pending.extend(&saturate.body)
+                        Some(egglog_experimental::proto::command::Kind::Loop(body)) => {
+                            pending.extend(&body.body)
                         }
                         _ => (),
                     }
@@ -1245,8 +1247,9 @@ mod lazy_rulesets {
     fn lazy_ruleset_failed_preparation_keeps_shared_rule_retryable() -> Result<(), TypedError> {
         let mut graph = EGraph::default();
         assert!(
-            matches!(graph.run(&rejected), Err(TypedError::Engine(error))
-            if error.code == egglog_experimental::proto::ErrorCode::InvalidProgram as i32)
+            matches!(graph.run(&rejected), Err(TypedError::Engine(frame))
+            if matches!(&frame.result, Some(pb::run_program_response::Result::Error(error))
+        if error.code == pb::ErrorCode::InvalidProgram as i32))
         );
         assert!(!graph.check(RuleTerms::Copied(126))?);
         let response = graph.run(&valid)?;
@@ -1368,7 +1371,7 @@ fn typed_union_subsume_invalid_targets_captures_and_occurrences() -> Result<(), 
     graph.register(delete(Read(72)))?;
     assert!(!graph.check(Read(72))?);
     assert!(matches!(graph.run(ruleset(rule((), (&shared, &shared)))),
-        Err(TypedError::Engine(error)) if error.message.contains("repeated action Union occurrence")));
+        Err(TypedError::Engine(frame)) if matches!(&frame.result, Some(pb::run_program_response::Result::Error(error)) if error.message.contains("repeated action Union occurrence"))));
     assert!(!graph.check(Read(72))?);
     graph.register((
         union(input.clone(), copied.clone()),
@@ -1826,7 +1829,7 @@ fn typed_diagnostics_and_stats_keep_cumulative_native_work() -> Result<(), Typed
         let (_, diagnostic) = graph.run_with_diagnostics(&group)?;
         matches += diagnostic_matches(&diagnostic);
         let stats = graph.stats()?;
-        let report: serde_json::Value = serde_json::from_str(&stats.content).unwrap();
+        let report: serde_json::Value = serde_json::from_slice(&stats.content).unwrap();
         let iterations = report["iterations"].as_array().unwrap().len();
         assert!(iterations > previous_history);
         previous_history = iterations;
@@ -1948,8 +1951,9 @@ fn rejected_rule_preparation_does_not_poison_a_later_valid_group() -> Result<(),
     let valid = ruleset(shared);
     let mut graph = EGraph::default();
     let error = graph.run(&rejected).unwrap_err();
-    assert!(matches!(error, TypedError::Engine(error)
-        if error.code == egglog_experimental::proto::ErrorCode::InvalidProgram as i32));
+    assert!(matches!(error, TypedError::Engine(frame)
+        if matches!(&frame.result, Some(pb::run_program_response::Result::Error(error))
+            if error.code == pb::ErrorCode::InvalidProgram as i32)));
     assert!(!graph.check(RuleTerms::Copied(123))?);
     graph.run(&valid)?;
     assert!(graph.check(RuleTerms::Copied(123))?);

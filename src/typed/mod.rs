@@ -1,7 +1,7 @@
 //! Ordinary Rust authoring backed directly by generated protobuf records.
 //!
 //! This initial subset supports equality sorts/constructors, merged functions, relation predicates, exact selectors,
-//! callback rules/rewrites, immutable groups, ordered Run/Repeat/Saturate
+//! callback rules/rewrites, immutable groups, ordered Run/Loop
 //! schedules and byte-backed register/check/extract/freeze observations.
 //! Flat and composed groups lower to ordered AddRules and union Run selections.
 //! Equal rule content shares native registration and cursor state across groups.
@@ -10,8 +10,8 @@
 //! `EGraph::try_clone` clones native state/cursors and binding observations;
 //! subsequent mutations are independent. No definitions or commands are replayed.
 //! `push`/`pop` explicitly save/restore native data, cursors and typed bindings.
-//! Pop retains collected cumulative diagnostics and fresh-name state, and can recover
-//! an uncertain current transport state from its known healthy saved scope.
+//! Pop discards the active graph and resumes the saved data, history and diagnostics.
+//! Fresh-name state survives; a saved scope can recover uncertain transport state.
 //! A clone starts with an empty scope stack, even inside a scope. Dropping a graph
 //! discards its owned handles; it does not pop or merge work into another graph.
 //! `run` returns the backend's `updated` and scheduler-aware `can_stop` flags.
@@ -20,9 +20,11 @@
 //! `Schedule::with_snapshots` chooses the observation cadence; `run_stream`
 //! delivers those owned snapshots during execution and supports cancellation.
 //! I64/F64 arithmetic, String/Bool operations, Unit literals and generic
-//! Vec/Pair/Map operations use engine-owned metadata.
+//! Vec/Pair/Map operation signatures come from the shared semantic catalog.
+//! The generator combines that catalog with a local Rust presentation map;
+//! names, parameter layouts and trait forms are frontend policy.
 //! Ordered container decoding retains child expression ownership. Foreign open
-//! binders, arbitrary declarations and schedule forms beyond Run/Repeat/Saturate
+//! binders, arbitrary declarations and schedule forms beyond Run/Loop
 //! are not accepted; no source/AST execution fallback exists. `Snapshot` retains
 //! exported classes, producers and table rows without evaluating roots. Its
 //! typed observations cannot be submitted as live expressions, even transitively.
@@ -552,7 +554,7 @@
 //!     snapshots.push(snapshot);
 //!     std::ops::ControlFlow::Continue(())
 //! })?;
-//! assert_eq!(snapshots.len(), 2);
+//! assert_eq!(snapshots.len(), 1); // the ready loop stops before its cap
 //! graph.push()?;
 //! graph.register(Term::Input(9))?;
 //! assert!(graph.check(Term::Input(9))?);
@@ -1180,8 +1182,8 @@ pub enum TypedError {
     Invalid(String),
     /// A result does not have the requested concrete representation.
     Decode(String),
-    /// The byte engine returned its structured failure unchanged.
-    Engine(Box<pb::Error>),
+    /// The actual terminal error frame, retaining its source-file owner.
+    Engine(Box<pb::RunProgramResponse>),
     /// An ordered retained root could not be observed or reconstructed.
     UnresolvedRoot {
         /// Position in the caller's ordered root list, when known.
@@ -1194,7 +1196,12 @@ impl std::fmt::Display for TypedError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Invalid(s) | Self::Decode(s) => f.write_str(s),
-            Self::Engine(e) => write!(f, "engine error {}: {}", e.code, e.message),
+            Self::Engine(frame) => match &frame.result {
+                Some(pb::run_program_response::Result::Error(error)) => {
+                    write!(f, "engine error {}: {}", error.code, error.message)
+                }
+                _ => f.write_str("invalid engine error frame"),
+            },
             Self::UnresolvedRoot { index, reason } => {
                 write!(f, "unresolved root {index:?}: {reason}")
             }

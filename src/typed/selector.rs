@@ -20,7 +20,7 @@ pub fn get_args<N: EgglogValue, A>(
     selector: impl Selector<N, A>,
 ) -> Result<Option<A>, TypedError> {
     let record = &node.expression().0;
-    let value = &record.owner.as_ref().unwrap().program.nodes[record.index as usize];
+    let value = &record.owner.as_ref().unwrap().program().unwrap().nodes[record.index as usize];
     if super::SortRef(record.resolve(super::storage::Arena::Sort, value.sort_id)?) != N::sort_ref()
     {
         return Err(TypedError::Invalid(

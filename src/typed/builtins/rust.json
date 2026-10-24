@@ -1,0 +1,4174 @@
+{
+  "sorts": [
+    {
+      "application": {
+        "name": "BigInt"
+      }
+    },
+    {
+      "application": {
+        "name": "bool"
+      }
+    },
+    {
+      "application": {
+        "name": "i64"
+      }
+    },
+    {
+      "application": {
+        "name": "String"
+      }
+    },
+    {
+      "application": {
+        "name": "Unit"
+      }
+    },
+    {
+      "application": {
+        "name": "BigRat"
+      }
+    },
+    {
+      "application": {
+        "name": "f64"
+      }
+    },
+    {
+      "var": 0
+    },
+    {
+      "var": 1
+    },
+    {
+      "application": {
+        "args": [
+          7,
+          8
+        ],
+        "name": "Map"
+      }
+    },
+    {
+      "application": {
+        "args": [
+          7,
+          8
+        ],
+        "name": "Pair"
+      }
+    },
+    {
+      "application": {
+        "args": [
+          10
+        ],
+        "name": "Vec"
+      }
+    },
+    {
+      "application": {
+        "args": [
+          7
+        ],
+        "name": "MultiSet"
+      }
+    },
+    {
+      "func": {
+        "params": [
+          12,
+          7
+        ],
+        "result": 2
+      }
+    },
+    {
+      "func": {
+        "params": [
+          7
+        ],
+        "result": 4
+      }
+    },
+    {
+      "func": {
+        "params": [
+          7
+        ],
+        "result": 12
+      }
+    },
+    {
+      "application": {
+        "args": [
+          8
+        ],
+        "name": "MultiSet"
+      }
+    },
+    {
+      "func": {
+        "params": [
+          7
+        ],
+        "result": 8
+      }
+    },
+    {
+      "func": {
+        "params": [
+          7,
+          7
+        ],
+        "result": 7
+      }
+    },
+    {
+      "application": {
+        "args": [
+          12
+        ],
+        "name": "MultiSet"
+      }
+    },
+    {
+      "application": {
+        "args": [
+          7
+        ],
+        "name": "Set"
+      }
+    },
+    {
+      "application": {
+        "args": [
+          7
+        ],
+        "name": "Vec"
+      }
+    },
+    {
+      "application": {
+        "args": [
+          8
+        ],
+        "name": "Vec"
+      }
+    },
+    {
+      "application": {
+        "args": [
+          2
+        ],
+        "name": "Vec"
+      }
+    },
+    {
+      "var": 2
+    },
+    {
+      "func": {
+        "params": [
+          24,
+          7,
+          8
+        ],
+        "result": 24
+      }
+    },
+    {
+      "application": {
+        "args": [
+          7
+        ],
+        "name": "Maybe"
+      }
+    },
+    {
+      "func": {
+        "result": 7
+      }
+    },
+    {
+      "application": {
+        "name": "Rational"
+      }
+    },
+    {
+      "application": {
+        "args": [
+          8,
+          8
+        ],
+        "name": "Map"
+      }
+    }
+  ],
+  "families": {
+    "Unit": {
+      "path": [
+        "egglog_experimental",
+        "typed",
+        "builtins",
+        "Unit"
+      ]
+    },
+    "String": {
+      "path": [
+        "egglog_experimental",
+        "typed",
+        "builtins",
+        "String"
+      ]
+    },
+    "bool": {
+      "path": [
+        "egglog_experimental",
+        "typed",
+        "builtins",
+        "Bool"
+      ]
+    },
+    "i64": {
+      "path": [
+        "egglog_experimental",
+        "typed",
+        "builtins",
+        "I64"
+      ]
+    },
+    "f64": {
+      "path": [
+        "egglog_experimental",
+        "typed",
+        "builtins",
+        "F64"
+      ]
+    },
+    "BigInt": {
+      "path": [
+        "egglog_experimental",
+        "typed",
+        "builtins",
+        "BigInt"
+      ]
+    },
+    "BigRat": {
+      "path": [
+        "egglog_experimental",
+        "typed",
+        "builtins",
+        "BigRat"
+      ]
+    },
+    "Set": {
+      "path": [
+        "egglog_experimental",
+        "typed",
+        "builtins",
+        "Set"
+      ],
+      "typeParams": [
+        "T"
+      ]
+    },
+    "Vec": {
+      "path": [
+        "egglog_experimental",
+        "typed",
+        "builtins",
+        "Vec"
+      ],
+      "typeParams": [
+        "T"
+      ]
+    },
+    "MultiSet": {
+      "path": [
+        "egglog_experimental",
+        "typed",
+        "builtins",
+        "MultiSet"
+      ],
+      "typeParams": [
+        "T"
+      ]
+    },
+    "Pair": {
+      "path": [
+        "egglog_experimental",
+        "typed",
+        "builtins",
+        "Pair"
+      ],
+      "typeParams": [
+        "L",
+        "R"
+      ]
+    },
+    "Map": {
+      "path": [
+        "egglog_experimental",
+        "typed",
+        "builtins",
+        "Map"
+      ],
+      "typeParams": [
+        "K",
+        "V"
+      ]
+    },
+    "Rational": {
+      "path": [
+        "egglog_experimental",
+        "typed",
+        "builtins",
+        "Rational"
+      ]
+    },
+    "Maybe": {
+      "path": [
+        "egglog_experimental",
+        "typed",
+        "builtins",
+        "Maybe"
+      ],
+      "typeParams": [
+        "T"
+      ]
+    }
+  },
+  "callables": {
+    "egglog.core.bigint.add": [
+      {
+        "ownerSort": 0,
+        "params": [
+          {
+            "coreInput": 1,
+            "name": "rhs"
+          }
+        ],
+        "path": [
+          "add"
+        ],
+        "receiver": {
+          "coreInput": 0
+        },
+        "traitImpl": {
+          "args": [
+            {
+              "sort": 0
+            }
+          ],
+          "outputAssociatedType": "Output",
+          "path": [
+            "core",
+            "ops",
+            "Add"
+          ]
+        }
+      }
+    ],
+    "egglog.core.bigint.bitand": [
+      {
+        "ownerSort": 0,
+        "params": [
+          {
+            "coreInput": 1,
+            "name": "rhs"
+          }
+        ],
+        "path": [
+          "bitand"
+        ],
+        "receiver": {
+          "coreInput": 0
+        },
+        "traitImpl": {
+          "args": [
+            {
+              "sort": 0
+            }
+          ],
+          "outputAssociatedType": "Output",
+          "path": [
+            "core",
+            "ops",
+            "BitAnd"
+          ]
+        }
+      }
+    ],
+    "egglog.core.bigint.bitor": [
+      {
+        "ownerSort": 0,
+        "params": [
+          {
+            "coreInput": 1,
+            "name": "rhs"
+          }
+        ],
+        "path": [
+          "bitor"
+        ],
+        "receiver": {
+          "coreInput": 0
+        },
+        "traitImpl": {
+          "args": [
+            {
+              "sort": 0
+            }
+          ],
+          "outputAssociatedType": "Output",
+          "path": [
+            "core",
+            "ops",
+            "BitOr"
+          ]
+        }
+      }
+    ],
+    "egglog.core.bigint.bits": [
+      {
+        "ownerSort": 0,
+        "path": [
+          "bits"
+        ],
+        "receiver": {
+          "borrowed": true,
+          "coreInput": 0
+        }
+      }
+    ],
+    "egglog.core.bigint.bitxor": [
+      {
+        "ownerSort": 0,
+        "params": [
+          {
+            "coreInput": 1,
+            "name": "rhs"
+          }
+        ],
+        "path": [
+          "bitxor"
+        ],
+        "receiver": {
+          "coreInput": 0
+        },
+        "traitImpl": {
+          "args": [
+            {
+              "sort": 0
+            }
+          ],
+          "outputAssociatedType": "Output",
+          "path": [
+            "core",
+            "ops",
+            "BitXor"
+          ]
+        }
+      }
+    ],
+    "egglog.core.bigint.bool_eq": [
+      {
+        "ownerSort": 0,
+        "params": [
+          {
+            "coreInput": 1,
+            "name": "other"
+          }
+        ],
+        "path": [
+          "bool_eq"
+        ],
+        "receiver": {
+          "borrowed": true,
+          "coreInput": 0
+        }
+      }
+    ],
+    "egglog.core.bigint.bool_ge": [
+      {
+        "ownerSort": 0,
+        "params": [
+          {
+            "coreInput": 1,
+            "name": "other"
+          }
+        ],
+        "path": [
+          "bool_ge"
+        ],
+        "receiver": {
+          "borrowed": true,
+          "coreInput": 0
+        }
+      }
+    ],
+    "egglog.core.bigint.bool_gt": [
+      {
+        "ownerSort": 0,
+        "params": [
+          {
+            "coreInput": 1,
+            "name": "other"
+          }
+        ],
+        "path": [
+          "bool_gt"
+        ],
+        "receiver": {
+          "borrowed": true,
+          "coreInput": 0
+        }
+      }
+    ],
+    "egglog.core.bigint.bool_le": [
+      {
+        "ownerSort": 0,
+        "params": [
+          {
+            "coreInput": 1,
+            "name": "other"
+          }
+        ],
+        "path": [
+          "bool_le"
+        ],
+        "receiver": {
+          "borrowed": true,
+          "coreInput": 0
+        }
+      }
+    ],
+    "egglog.core.bigint.bool_lt": [
+      {
+        "ownerSort": 0,
+        "params": [
+          {
+            "coreInput": 1,
+            "name": "other"
+          }
+        ],
+        "path": [
+          "bool_lt"
+        ],
+        "receiver": {
+          "borrowed": true,
+          "coreInput": 0
+        }
+      }
+    ],
+    "egglog.core.bigint.div": [
+      {
+        "ownerSort": 0,
+        "params": [
+          {
+            "coreInput": 1,
+            "name": "rhs"
+          }
+        ],
+        "path": [
+          "div"
+        ],
+        "receiver": {
+          "coreInput": 0
+        },
+        "traitImpl": {
+          "args": [
+            {
+              "sort": 0
+            }
+          ],
+          "outputAssociatedType": "Output",
+          "path": [
+            "core",
+            "ops",
+            "Div"
+          ]
+        }
+      }
+    ],
+    "egglog.core.bigint.from_i64": [
+      {
+        "ownerSort": 0,
+        "params": [
+          {
+            "coreInput": 0,
+            "name": "value"
+          }
+        ],
+        "path": [
+          "new"
+        ]
+      }
+    ],
+    "egglog.core.bigint.from_string": [
+      {
+        "ownerSort": 0,
+        "params": [
+          {
+            "coreInput": 0,
+            "name": "s"
+          }
+        ],
+        "path": [
+          "from_string"
+        ]
+      }
+    ],
+    "egglog.core.bigint.ge": [
+      {
+        "ownerSort": 0,
+        "params": [
+          {
+            "coreInput": 1,
+            "name": "other"
+          }
+        ],
+        "path": [
+          "ge"
+        ],
+        "receiver": {
+          "borrowed": true,
+          "coreInput": 0
+        }
+      }
+    ],
+    "egglog.core.bigint.gt": [
+      {
+        "ownerSort": 0,
+        "params": [
+          {
+            "coreInput": 1,
+            "name": "other"
+          }
+        ],
+        "path": [
+          "gt"
+        ],
+        "receiver": {
+          "borrowed": true,
+          "coreInput": 0
+        }
+      }
+    ],
+    "egglog.core.bigint.le": [
+      {
+        "ownerSort": 0,
+        "params": [
+          {
+            "coreInput": 1,
+            "name": "other"
+          }
+        ],
+        "path": [
+          "le"
+        ],
+        "receiver": {
+          "borrowed": true,
+          "coreInput": 0
+        }
+      }
+    ],
+    "egglog.core.bigint.lt": [
+      {
+        "ownerSort": 0,
+        "params": [
+          {
+            "coreInput": 1,
+            "name": "other"
+          }
+        ],
+        "path": [
+          "lt"
+        ],
+        "receiver": {
+          "borrowed": true,
+          "coreInput": 0
+        }
+      }
+    ],
+    "egglog.core.bigint.max": [
+      {
+        "ownerSort": 0,
+        "params": [
+          {
+            "coreInput": 1,
+            "name": "other"
+          }
+        ],
+        "path": [
+          "max"
+        ],
+        "receiver": {
+          "borrowed": true,
+          "coreInput": 0
+        }
+      }
+    ],
+    "egglog.core.bigint.min": [
+      {
+        "ownerSort": 0,
+        "params": [
+          {
+            "coreInput": 1,
+            "name": "other"
+          }
+        ],
+        "path": [
+          "min"
+        ],
+        "receiver": {
+          "borrowed": true,
+          "coreInput": 0
+        }
+      }
+    ],
+    "egglog.core.bigint.mul": [
+      {
+        "ownerSort": 0,
+        "params": [
+          {
+            "coreInput": 1,
+            "name": "rhs"
+          }
+        ],
+        "path": [
+          "mul"
+        ],
+        "receiver": {
+          "coreInput": 0
+        },
+        "traitImpl": {
+          "args": [
+            {
+              "sort": 0
+            }
+          ],
+          "outputAssociatedType": "Output",
+          "path": [
+            "core",
+            "ops",
+            "Mul"
+          ]
+        }
+      }
+    ],
+    "egglog.core.bigint.not": [
+      {
+        "ownerSort": 0,
+        "path": [
+          "not"
+        ],
+        "receiver": {
+          "coreInput": 0
+        },
+        "traitImpl": {
+          "outputAssociatedType": "Output",
+          "path": [
+            "core",
+            "ops",
+            "Not"
+          ]
+        }
+      }
+    ],
+    "egglog.core.bigint.rem": [
+      {
+        "ownerSort": 0,
+        "params": [
+          {
+            "coreInput": 1,
+            "name": "rhs"
+          }
+        ],
+        "path": [
+          "rem"
+        ],
+        "receiver": {
+          "coreInput": 0
+        },
+        "traitImpl": {
+          "args": [
+            {
+              "sort": 0
+            }
+          ],
+          "outputAssociatedType": "Output",
+          "path": [
+            "core",
+            "ops",
+            "Rem"
+          ]
+        }
+      }
+    ],
+    "egglog.core.bigint.shl": [
+      {
+        "ownerSort": 0,
+        "params": [
+          {
+            "coreInput": 1,
+            "name": "rhs"
+          }
+        ],
+        "path": [
+          "shl"
+        ],
+        "receiver": {
+          "coreInput": 0
+        },
+        "traitImpl": {
+          "args": [
+            {
+              "sort": 2
+            }
+          ],
+          "outputAssociatedType": "Output",
+          "path": [
+            "core",
+            "ops",
+            "Shl"
+          ]
+        }
+      }
+    ],
+    "egglog.core.bigint.shr": [
+      {
+        "ownerSort": 0,
+        "params": [
+          {
+            "coreInput": 1,
+            "name": "rhs"
+          }
+        ],
+        "path": [
+          "shr"
+        ],
+        "receiver": {
+          "coreInput": 0
+        },
+        "traitImpl": {
+          "args": [
+            {
+              "sort": 2
+            }
+          ],
+          "outputAssociatedType": "Output",
+          "path": [
+            "core",
+            "ops",
+            "Shr"
+          ]
+        }
+      }
+    ],
+    "egglog.core.bigint.sub": [
+      {
+        "ownerSort": 0,
+        "params": [
+          {
+            "coreInput": 1,
+            "name": "rhs"
+          }
+        ],
+        "path": [
+          "sub"
+        ],
+        "receiver": {
+          "coreInput": 0
+        },
+        "traitImpl": {
+          "args": [
+            {
+              "sort": 0
+            }
+          ],
+          "outputAssociatedType": "Output",
+          "path": [
+            "core",
+            "ops",
+            "Sub"
+          ]
+        }
+      }
+    ],
+    "egglog.core.bigint.to_string": [
+      {
+        "ownerSort": 0,
+        "path": [
+          "to_string"
+        ],
+        "receiver": {
+          "borrowed": true,
+          "coreInput": 0
+        }
+      }
+    ],
+    "egglog.core.bigrat.abs": [
+      {
+        "ownerSort": 5,
+        "path": [
+          "abs"
+        ],
+        "receiver": {
+          "borrowed": true,
+          "coreInput": 0
+        }
+      }
+    ],
+    "egglog.core.bigrat.add": [
+      {
+        "ownerSort": 5,
+        "params": [
+          {
+            "coreInput": 1,
+            "name": "rhs"
+          }
+        ],
+        "path": [
+          "add"
+        ],
+        "receiver": {
+          "coreInput": 0
+        },
+        "traitImpl": {
+          "args": [
+            {
+              "sort": 5
+            }
+          ],
+          "outputAssociatedType": "Output",
+          "path": [
+            "core",
+            "ops",
+            "Add"
+          ]
+        }
+      }
+    ],
+    "egglog.core.bigrat.cbrt": [
+      {
+        "ownerSort": 5,
+        "path": [
+          "cbrt"
+        ],
+        "receiver": {
+          "borrowed": true,
+          "coreInput": 0
+        }
+      }
+    ],
+    "egglog.core.bigrat.ceil": [
+      {
+        "ownerSort": 5,
+        "path": [
+          "ceil"
+        ],
+        "receiver": {
+          "borrowed": true,
+          "coreInput": 0
+        }
+      }
+    ],
+    "egglog.core.bigrat.denom": [
+      {
+        "ownerSort": 5,
+        "path": [
+          "denom"
+        ],
+        "receiver": {
+          "borrowed": true,
+          "coreInput": 0
+        }
+      }
+    ],
+    "egglog.core.bigrat.div": [
+      {
+        "ownerSort": 5,
+        "params": [
+          {
+            "coreInput": 1,
+            "name": "rhs"
+          }
+        ],
+        "path": [
+          "div"
+        ],
+        "receiver": {
+          "coreInput": 0
+        },
+        "traitImpl": {
+          "args": [
+            {
+              "sort": 5
+            }
+          ],
+          "outputAssociatedType": "Output",
+          "path": [
+            "core",
+            "ops",
+            "Div"
+          ]
+        }
+      }
+    ],
+    "egglog.core.bigrat.floor": [
+      {
+        "ownerSort": 5,
+        "path": [
+          "floor"
+        ],
+        "receiver": {
+          "borrowed": true,
+          "coreInput": 0
+        }
+      }
+    ],
+    "egglog.core.bigrat.ge": [
+      {
+        "ownerSort": 5,
+        "params": [
+          {
+            "coreInput": 1,
+            "name": "other"
+          }
+        ],
+        "path": [
+          "ge"
+        ],
+        "receiver": {
+          "borrowed": true,
+          "coreInput": 0
+        }
+      }
+    ],
+    "egglog.core.bigrat.gt": [
+      {
+        "ownerSort": 5,
+        "params": [
+          {
+            "coreInput": 1,
+            "name": "other"
+          }
+        ],
+        "path": [
+          "gt"
+        ],
+        "receiver": {
+          "borrowed": true,
+          "coreInput": 0
+        }
+      }
+    ],
+    "egglog.core.bigrat.le": [
+      {
+        "ownerSort": 5,
+        "params": [
+          {
+            "coreInput": 1,
+            "name": "other"
+          }
+        ],
+        "path": [
+          "le"
+        ],
+        "receiver": {
+          "borrowed": true,
+          "coreInput": 0
+        }
+      }
+    ],
+    "egglog.core.bigrat.log": [
+      {
+        "ownerSort": 5,
+        "path": [
+          "log"
+        ],
+        "receiver": {
+          "borrowed": true,
+          "coreInput": 0
+        }
+      }
+    ],
+    "egglog.core.bigrat.lt": [
+      {
+        "ownerSort": 5,
+        "params": [
+          {
+            "coreInput": 1,
+            "name": "other"
+          }
+        ],
+        "path": [
+          "lt"
+        ],
+        "receiver": {
+          "borrowed": true,
+          "coreInput": 0
+        }
+      }
+    ],
+    "egglog.core.bigrat.make": [
+      {
+        "ownerSort": 5,
+        "params": [
+          {
+            "coreInput": 0,
+            "name": "num"
+          },
+          {
+            "coreInput": 1,
+            "name": "den"
+          }
+        ],
+        "path": [
+          "new"
+        ]
+      }
+    ],
+    "egglog.core.bigrat.max": [
+      {
+        "ownerSort": 5,
+        "params": [
+          {
+            "coreInput": 1,
+            "name": "other"
+          }
+        ],
+        "path": [
+          "max"
+        ],
+        "receiver": {
+          "borrowed": true,
+          "coreInput": 0
+        }
+      }
+    ],
+    "egglog.core.bigrat.min": [
+      {
+        "ownerSort": 5,
+        "params": [
+          {
+            "coreInput": 1,
+            "name": "other"
+          }
+        ],
+        "path": [
+          "min"
+        ],
+        "receiver": {
+          "borrowed": true,
+          "coreInput": 0
+        }
+      }
+    ],
+    "egglog.core.bigrat.mul": [
+      {
+        "ownerSort": 5,
+        "params": [
+          {
+            "coreInput": 1,
+            "name": "rhs"
+          }
+        ],
+        "path": [
+          "mul"
+        ],
+        "receiver": {
+          "coreInput": 0
+        },
+        "traitImpl": {
+          "args": [
+            {
+              "sort": 5
+            }
+          ],
+          "outputAssociatedType": "Output",
+          "path": [
+            "core",
+            "ops",
+            "Mul"
+          ]
+        }
+      }
+    ],
+    "egglog.core.bigrat.neg": [
+      {
+        "ownerSort": 5,
+        "path": [
+          "neg"
+        ],
+        "receiver": {
+          "coreInput": 0
+        },
+        "traitImpl": {
+          "outputAssociatedType": "Output",
+          "path": [
+            "core",
+            "ops",
+            "Neg"
+          ]
+        }
+      }
+    ],
+    "egglog.core.bigrat.numer": [
+      {
+        "ownerSort": 5,
+        "path": [
+          "numer"
+        ],
+        "receiver": {
+          "borrowed": true,
+          "coreInput": 0
+        }
+      }
+    ],
+    "egglog.core.bigrat.pow": [
+      {
+        "ownerSort": 5,
+        "params": [
+          {
+            "coreInput": 1,
+            "name": "other"
+          }
+        ],
+        "path": [
+          "pow"
+        ],
+        "receiver": {
+          "borrowed": true,
+          "coreInput": 0
+        }
+      }
+    ],
+    "egglog.core.bigrat.round": [
+      {
+        "ownerSort": 5,
+        "path": [
+          "round"
+        ],
+        "receiver": {
+          "borrowed": true,
+          "coreInput": 0
+        }
+      }
+    ],
+    "egglog.core.bigrat.sqrt": [
+      {
+        "ownerSort": 5,
+        "path": [
+          "sqrt"
+        ],
+        "receiver": {
+          "borrowed": true,
+          "coreInput": 0
+        }
+      }
+    ],
+    "egglog.core.bigrat.sub": [
+      {
+        "ownerSort": 5,
+        "params": [
+          {
+            "coreInput": 1,
+            "name": "rhs"
+          }
+        ],
+        "path": [
+          "sub"
+        ],
+        "receiver": {
+          "coreInput": 0
+        },
+        "traitImpl": {
+          "args": [
+            {
+              "sort": 5
+            }
+          ],
+          "outputAssociatedType": "Output",
+          "path": [
+            "core",
+            "ops",
+            "Sub"
+          ]
+        }
+      }
+    ],
+    "egglog.core.bigrat.to_f64": [
+      {
+        "ownerSort": 5,
+        "path": [
+          "to_f64"
+        ],
+        "receiver": {
+          "borrowed": true,
+          "coreInput": 0
+        }
+      }
+    ],
+    "egglog.core.bigrat.to_i64": [
+      {
+        "ownerSort": 5,
+        "path": [
+          "to_i64"
+        ],
+        "receiver": {
+          "borrowed": true,
+          "coreInput": 0
+        }
+      }
+    ],
+    "egglog.core.bool.and": [
+      {
+        "ownerSort": 1,
+        "params": [
+          {
+            "coreInput": 1,
+            "name": "rhs"
+          }
+        ],
+        "path": [
+          "bitand"
+        ],
+        "receiver": {
+          "coreInput": 0
+        },
+        "traitImpl": {
+          "args": [
+            {
+              "sort": 1
+            }
+          ],
+          "outputAssociatedType": "Output",
+          "path": [
+            "core",
+            "ops",
+            "BitAnd"
+          ]
+        }
+      }
+    ],
+    "egglog.core.bool.guard": [
+      {
+        "ownerSort": 1,
+        "path": [
+          "guard"
+        ],
+        "receiver": {
+          "borrowed": true,
+          "coreInput": 0
+        }
+      }
+    ],
+    "egglog.core.bool.implies": [
+      {
+        "ownerSort": 1,
+        "params": [
+          {
+            "coreInput": 1,
+            "name": "other"
+          }
+        ],
+        "path": [
+          "implies"
+        ],
+        "receiver": {
+          "borrowed": true,
+          "coreInput": 0
+        }
+      }
+    ],
+    "egglog.core.bool.not": [
+      {
+        "ownerSort": 1,
+        "path": [
+          "not"
+        ],
+        "receiver": {
+          "coreInput": 0
+        },
+        "traitImpl": {
+          "outputAssociatedType": "Output",
+          "path": [
+            "core",
+            "ops",
+            "Not"
+          ]
+        }
+      }
+    ],
+    "egglog.core.bool.or": [
+      {
+        "ownerSort": 1,
+        "params": [
+          {
+            "coreInput": 1,
+            "name": "rhs"
+          }
+        ],
+        "path": [
+          "bitor"
+        ],
+        "receiver": {
+          "coreInput": 0
+        },
+        "tailRepetitions": 2,
+        "traitImpl": {
+          "args": [
+            {
+              "sort": 1
+            }
+          ],
+          "outputAssociatedType": "Output",
+          "path": [
+            "core",
+            "ops",
+            "BitOr"
+          ]
+        }
+      }
+    ],
+    "egglog.core.bool.xor": [
+      {
+        "ownerSort": 1,
+        "params": [
+          {
+            "coreInput": 1,
+            "name": "rhs"
+          }
+        ],
+        "path": [
+          "bitxor"
+        ],
+        "receiver": {
+          "coreInput": 0
+        },
+        "traitImpl": {
+          "args": [
+            {
+              "sort": 1
+            }
+          ],
+          "outputAssociatedType": "Output",
+          "path": [
+            "core",
+            "ops",
+            "BitXor"
+          ]
+        }
+      }
+    ],
+    "egglog.core.bool_ne": [
+      {
+        "params": [
+          {
+            "coreInput": 0,
+            "name": "a"
+          },
+          {
+            "coreInput": 1,
+            "name": "b"
+          }
+        ],
+        "path": [
+          "egglog_experimental",
+          "typed",
+          "builtins",
+          "bool_ne"
+        ]
+      }
+    ],
+    "egglog.core.f64.abs": [
+      {
+        "ownerSort": 6,
+        "path": [
+          "abs"
+        ],
+        "receiver": {
+          "borrowed": true,
+          "coreInput": 0
+        }
+      }
+    ],
+    "egglog.core.f64.add": [
+      {
+        "ownerSort": 6,
+        "params": [
+          {
+            "coreInput": 1,
+            "name": "rhs"
+          }
+        ],
+        "path": [
+          "add"
+        ],
+        "receiver": {
+          "coreInput": 0
+        },
+        "traitImpl": {
+          "args": [
+            {
+              "sort": 6
+            }
+          ],
+          "outputAssociatedType": "Output",
+          "path": [
+            "core",
+            "ops",
+            "Add"
+          ]
+        }
+      }
+    ],
+    "egglog.core.f64.div": [
+      {
+        "ownerSort": 6,
+        "params": [
+          {
+            "coreInput": 1,
+            "name": "rhs"
+          }
+        ],
+        "path": [
+          "div"
+        ],
+        "receiver": {
+          "coreInput": 0
+        },
+        "traitImpl": {
+          "args": [
+            {
+              "sort": 6
+            }
+          ],
+          "outputAssociatedType": "Output",
+          "path": [
+            "core",
+            "ops",
+            "Div"
+          ]
+        }
+      }
+    ],
+    "egglog.core.f64.exp": [
+      {
+        "ownerSort": 6,
+        "path": [
+          "exp"
+        ],
+        "receiver": {
+          "borrowed": true,
+          "coreInput": 0
+        }
+      }
+    ],
+    "egglog.core.f64.from_i64": [
+      {
+        "ownerSort": 6,
+        "params": [
+          {
+            "coreInput": 0,
+            "name": "i"
+          }
+        ],
+        "path": [
+          "from_i64"
+        ]
+      }
+    ],
+    "egglog.core.f64.ge": [
+      {
+        "ownerSort": 6,
+        "params": [
+          {
+            "coreInput": 1,
+            "name": "other"
+          }
+        ],
+        "path": [
+          "ge"
+        ],
+        "receiver": {
+          "borrowed": true,
+          "coreInput": 0
+        }
+      }
+    ],
+    "egglog.core.f64.gt": [
+      {
+        "ownerSort": 6,
+        "params": [
+          {
+            "coreInput": 1,
+            "name": "other"
+          }
+        ],
+        "path": [
+          "gt"
+        ],
+        "receiver": {
+          "borrowed": true,
+          "coreInput": 0
+        }
+      }
+    ],
+    "egglog.core.f64.le": [
+      {
+        "ownerSort": 6,
+        "params": [
+          {
+            "coreInput": 1,
+            "name": "other"
+          }
+        ],
+        "path": [
+          "le"
+        ],
+        "receiver": {
+          "borrowed": true,
+          "coreInput": 0
+        }
+      }
+    ],
+    "egglog.core.f64.log": [
+      {
+        "ownerSort": 6,
+        "path": [
+          "log"
+        ],
+        "receiver": {
+          "borrowed": true,
+          "coreInput": 0
+        }
+      }
+    ],
+    "egglog.core.f64.lt": [
+      {
+        "ownerSort": 6,
+        "params": [
+          {
+            "coreInput": 1,
+            "name": "other"
+          }
+        ],
+        "path": [
+          "lt"
+        ],
+        "receiver": {
+          "borrowed": true,
+          "coreInput": 0
+        }
+      }
+    ],
+    "egglog.core.f64.max": [
+      {
+        "ownerSort": 6,
+        "params": [
+          {
+            "coreInput": 1,
+            "name": "other"
+          }
+        ],
+        "path": [
+          "max"
+        ],
+        "receiver": {
+          "borrowed": true,
+          "coreInput": 0
+        }
+      }
+    ],
+    "egglog.core.f64.min": [
+      {
+        "ownerSort": 6,
+        "params": [
+          {
+            "coreInput": 1,
+            "name": "other"
+          }
+        ],
+        "path": [
+          "min"
+        ],
+        "receiver": {
+          "borrowed": true,
+          "coreInput": 0
+        }
+      }
+    ],
+    "egglog.core.f64.mul": [
+      {
+        "ownerSort": 6,
+        "params": [
+          {
+            "coreInput": 1,
+            "name": "rhs"
+          }
+        ],
+        "path": [
+          "mul"
+        ],
+        "receiver": {
+          "coreInput": 0
+        },
+        "traitImpl": {
+          "args": [
+            {
+              "sort": 6
+            }
+          ],
+          "outputAssociatedType": "Output",
+          "path": [
+            "core",
+            "ops",
+            "Mul"
+          ]
+        }
+      }
+    ],
+    "egglog.core.f64.neg": [
+      {
+        "ownerSort": 6,
+        "path": [
+          "neg"
+        ],
+        "receiver": {
+          "coreInput": 0
+        },
+        "traitImpl": {
+          "outputAssociatedType": "Output",
+          "path": [
+            "core",
+            "ops",
+            "Neg"
+          ]
+        }
+      }
+    ],
+    "egglog.core.f64.pow": [
+      {
+        "ownerSort": 6,
+        "params": [
+          {
+            "coreInput": 1,
+            "name": "other"
+          }
+        ],
+        "path": [
+          "pow"
+        ],
+        "receiver": {
+          "borrowed": true,
+          "coreInput": 0
+        }
+      }
+    ],
+    "egglog.core.f64.rem": [
+      {
+        "ownerSort": 6,
+        "params": [
+          {
+            "coreInput": 1,
+            "name": "rhs"
+          }
+        ],
+        "path": [
+          "rem"
+        ],
+        "receiver": {
+          "coreInput": 0
+        },
+        "traitImpl": {
+          "args": [
+            {
+              "sort": 6
+            }
+          ],
+          "outputAssociatedType": "Output",
+          "path": [
+            "core",
+            "ops",
+            "Rem"
+          ]
+        }
+      }
+    ],
+    "egglog.core.f64.sqrt": [
+      {
+        "ownerSort": 6,
+        "path": [
+          "sqrt"
+        ],
+        "receiver": {
+          "borrowed": true,
+          "coreInput": 0
+        }
+      }
+    ],
+    "egglog.core.f64.sub": [
+      {
+        "ownerSort": 6,
+        "params": [
+          {
+            "coreInput": 1,
+            "name": "rhs"
+          }
+        ],
+        "path": [
+          "sub"
+        ],
+        "receiver": {
+          "coreInput": 0
+        },
+        "traitImpl": {
+          "args": [
+            {
+              "sort": 6
+            }
+          ],
+          "outputAssociatedType": "Output",
+          "path": [
+            "core",
+            "ops",
+            "Sub"
+          ]
+        }
+      }
+    ],
+    "egglog.core.f64.to_i64": [
+      {
+        "ownerSort": 6,
+        "path": [
+          "to_i64"
+        ],
+        "receiver": {
+          "borrowed": true,
+          "coreInput": 0
+        }
+      }
+    ],
+    "egglog.core.f64.to_string": [
+      {
+        "ownerSort": 6,
+        "path": [
+          "to_string"
+        ],
+        "receiver": {
+          "borrowed": true,
+          "coreInput": 0
+        }
+      }
+    ],
+    "egglog.core.fn.apply": [
+      {
+        "params": [
+          {
+            "coreInput": 1,
+            "name": "args"
+          }
+        ],
+        "path": [
+          "call"
+        ],
+        "receiver": {
+          "borrowed": true,
+          "coreInput": 0
+        }
+      }
+    ],
+    "egglog.core.i64.abs": [
+      {
+        "ownerSort": 2,
+        "path": [
+          "abs"
+        ],
+        "receiver": {
+          "borrowed": true,
+          "coreInput": 0
+        }
+      }
+    ],
+    "egglog.core.i64.add": [
+      {
+        "ownerSort": 2,
+        "params": [
+          {
+            "coreInput": 1,
+            "name": "rhs"
+          }
+        ],
+        "path": [
+          "add"
+        ],
+        "receiver": {
+          "coreInput": 0
+        },
+        "traitImpl": {
+          "args": [
+            {
+              "sort": 2
+            }
+          ],
+          "outputAssociatedType": "Output",
+          "path": [
+            "core",
+            "ops",
+            "Add"
+          ]
+        }
+      }
+    ],
+    "egglog.core.i64.bitand": [
+      {
+        "ownerSort": 2,
+        "params": [
+          {
+            "coreInput": 1,
+            "name": "rhs"
+          }
+        ],
+        "path": [
+          "bitand"
+        ],
+        "receiver": {
+          "coreInput": 0
+        },
+        "traitImpl": {
+          "args": [
+            {
+              "sort": 2
+            }
+          ],
+          "outputAssociatedType": "Output",
+          "path": [
+            "core",
+            "ops",
+            "BitAnd"
+          ]
+        }
+      }
+    ],
+    "egglog.core.i64.bitor": [
+      {
+        "ownerSort": 2,
+        "params": [
+          {
+            "coreInput": 1,
+            "name": "rhs"
+          }
+        ],
+        "path": [
+          "bitor"
+        ],
+        "receiver": {
+          "coreInput": 0
+        },
+        "traitImpl": {
+          "args": [
+            {
+              "sort": 2
+            }
+          ],
+          "outputAssociatedType": "Output",
+          "path": [
+            "core",
+            "ops",
+            "BitOr"
+          ]
+        }
+      }
+    ],
+    "egglog.core.i64.bitxor": [
+      {
+        "ownerSort": 2,
+        "params": [
+          {
+            "coreInput": 1,
+            "name": "rhs"
+          }
+        ],
+        "path": [
+          "bitxor"
+        ],
+        "receiver": {
+          "coreInput": 0
+        },
+        "traitImpl": {
+          "args": [
+            {
+              "sort": 2
+            }
+          ],
+          "outputAssociatedType": "Output",
+          "path": [
+            "core",
+            "ops",
+            "BitXor"
+          ]
+        }
+      }
+    ],
+    "egglog.core.i64.bool_eq": [
+      {
+        "ownerSort": 2,
+        "params": [
+          {
+            "coreInput": 1,
+            "name": "other"
+          }
+        ],
+        "path": [
+          "bool_eq"
+        ],
+        "receiver": {
+          "borrowed": true,
+          "coreInput": 0
+        }
+      }
+    ],
+    "egglog.core.i64.bool_ge": [
+      {
+        "ownerSort": 2,
+        "params": [
+          {
+            "coreInput": 1,
+            "name": "other"
+          }
+        ],
+        "path": [
+          "bool_ge"
+        ],
+        "receiver": {
+          "borrowed": true,
+          "coreInput": 0
+        }
+      }
+    ],
+    "egglog.core.i64.bool_gt": [
+      {
+        "ownerSort": 2,
+        "params": [
+          {
+            "coreInput": 1,
+            "name": "other"
+          }
+        ],
+        "path": [
+          "bool_gt"
+        ],
+        "receiver": {
+          "borrowed": true,
+          "coreInput": 0
+        }
+      }
+    ],
+    "egglog.core.i64.bool_le": [
+      {
+        "ownerSort": 2,
+        "params": [
+          {
+            "coreInput": 1,
+            "name": "other"
+          }
+        ],
+        "path": [
+          "bool_le"
+        ],
+        "receiver": {
+          "borrowed": true,
+          "coreInput": 0
+        }
+      }
+    ],
+    "egglog.core.i64.bool_lt": [
+      {
+        "ownerSort": 2,
+        "params": [
+          {
+            "coreInput": 1,
+            "name": "other"
+          }
+        ],
+        "path": [
+          "bool_lt"
+        ],
+        "receiver": {
+          "borrowed": true,
+          "coreInput": 0
+        }
+      }
+    ],
+    "egglog.core.i64.div": [
+      {
+        "ownerSort": 2,
+        "params": [
+          {
+            "coreInput": 1,
+            "name": "rhs"
+          }
+        ],
+        "path": [
+          "div"
+        ],
+        "receiver": {
+          "coreInput": 0
+        },
+        "traitImpl": {
+          "args": [
+            {
+              "sort": 2
+            }
+          ],
+          "outputAssociatedType": "Output",
+          "path": [
+            "core",
+            "ops",
+            "Div"
+          ]
+        }
+      }
+    ],
+    "egglog.core.i64.ge": [
+      {
+        "ownerSort": 2,
+        "params": [
+          {
+            "coreInput": 1,
+            "name": "other"
+          }
+        ],
+        "path": [
+          "ge"
+        ],
+        "receiver": {
+          "borrowed": true,
+          "coreInput": 0
+        }
+      }
+    ],
+    "egglog.core.i64.gt": [
+      {
+        "ownerSort": 2,
+        "params": [
+          {
+            "coreInput": 1,
+            "name": "other"
+          }
+        ],
+        "path": [
+          "gt"
+        ],
+        "receiver": {
+          "borrowed": true,
+          "coreInput": 0
+        }
+      }
+    ],
+    "egglog.core.i64.le": [
+      {
+        "ownerSort": 2,
+        "params": [
+          {
+            "coreInput": 1,
+            "name": "other"
+          }
+        ],
+        "path": [
+          "le"
+        ],
+        "receiver": {
+          "borrowed": true,
+          "coreInput": 0
+        }
+      }
+    ],
+    "egglog.core.i64.log2": [
+      {
+        "ownerSort": 2,
+        "path": [
+          "log2"
+        ],
+        "receiver": {
+          "borrowed": true,
+          "coreInput": 0
+        }
+      }
+    ],
+    "egglog.core.i64.lt": [
+      {
+        "ownerSort": 2,
+        "params": [
+          {
+            "coreInput": 1,
+            "name": "other"
+          }
+        ],
+        "path": [
+          "lt"
+        ],
+        "receiver": {
+          "borrowed": true,
+          "coreInput": 0
+        }
+      }
+    ],
+    "egglog.core.i64.max": [
+      {
+        "ownerSort": 2,
+        "params": [
+          {
+            "coreInput": 1,
+            "name": "other"
+          }
+        ],
+        "path": [
+          "max"
+        ],
+        "receiver": {
+          "borrowed": true,
+          "coreInput": 0
+        }
+      }
+    ],
+    "egglog.core.i64.min": [
+      {
+        "ownerSort": 2,
+        "params": [
+          {
+            "coreInput": 1,
+            "name": "other"
+          }
+        ],
+        "path": [
+          "min"
+        ],
+        "receiver": {
+          "borrowed": true,
+          "coreInput": 0
+        }
+      }
+    ],
+    "egglog.core.i64.mul": [
+      {
+        "ownerSort": 2,
+        "params": [
+          {
+            "coreInput": 1,
+            "name": "rhs"
+          }
+        ],
+        "path": [
+          "mul"
+        ],
+        "receiver": {
+          "coreInput": 0
+        },
+        "traitImpl": {
+          "args": [
+            {
+              "sort": 2
+            }
+          ],
+          "outputAssociatedType": "Output",
+          "path": [
+            "core",
+            "ops",
+            "Mul"
+          ]
+        }
+      }
+    ],
+    "egglog.core.i64.not": [
+      {
+        "ownerSort": 2,
+        "path": [
+          "not"
+        ],
+        "receiver": {
+          "coreInput": 0
+        },
+        "traitImpl": {
+          "outputAssociatedType": "Output",
+          "path": [
+            "core",
+            "ops",
+            "Not"
+          ]
+        }
+      }
+    ],
+    "egglog.core.i64.rem": [
+      {
+        "ownerSort": 2,
+        "params": [
+          {
+            "coreInput": 1,
+            "name": "rhs"
+          }
+        ],
+        "path": [
+          "rem"
+        ],
+        "receiver": {
+          "coreInput": 0
+        },
+        "traitImpl": {
+          "args": [
+            {
+              "sort": 2
+            }
+          ],
+          "outputAssociatedType": "Output",
+          "path": [
+            "core",
+            "ops",
+            "Rem"
+          ]
+        }
+      }
+    ],
+    "egglog.core.i64.shl": [
+      {
+        "ownerSort": 2,
+        "params": [
+          {
+            "coreInput": 1,
+            "name": "rhs"
+          }
+        ],
+        "path": [
+          "shl"
+        ],
+        "receiver": {
+          "coreInput": 0
+        },
+        "traitImpl": {
+          "args": [
+            {
+              "sort": 2
+            }
+          ],
+          "outputAssociatedType": "Output",
+          "path": [
+            "core",
+            "ops",
+            "Shl"
+          ]
+        }
+      }
+    ],
+    "egglog.core.i64.shr": [
+      {
+        "ownerSort": 2,
+        "params": [
+          {
+            "coreInput": 1,
+            "name": "rhs"
+          }
+        ],
+        "path": [
+          "shr"
+        ],
+        "receiver": {
+          "coreInput": 0
+        },
+        "traitImpl": {
+          "args": [
+            {
+              "sort": 2
+            }
+          ],
+          "outputAssociatedType": "Output",
+          "path": [
+            "core",
+            "ops",
+            "Shr"
+          ]
+        }
+      }
+    ],
+    "egglog.core.i64.sub": [
+      {
+        "ownerSort": 2,
+        "params": [
+          {
+            "coreInput": 1,
+            "name": "rhs"
+          }
+        ],
+        "path": [
+          "sub"
+        ],
+        "receiver": {
+          "coreInput": 0
+        },
+        "traitImpl": {
+          "args": [
+            {
+              "sort": 2
+            }
+          ],
+          "outputAssociatedType": "Output",
+          "path": [
+            "core",
+            "ops",
+            "Sub"
+          ]
+        }
+      }
+    ],
+    "egglog.core.i64.to_string": [
+      {
+        "ownerSort": 2,
+        "path": [
+          "to_string"
+        ],
+        "receiver": {
+          "borrowed": true,
+          "coreInput": 0
+        }
+      }
+    ],
+    "egglog.core.map.contains": [
+      {
+        "ownerSort": 9,
+        "params": [
+          {
+            "coreInput": 1,
+            "name": "key"
+          }
+        ],
+        "path": [
+          "contains"
+        ],
+        "receiver": {
+          "borrowed": true,
+          "coreInput": 0
+        }
+      }
+    ],
+    "egglog.core.map.empty": [
+      {
+        "ownerSort": 9,
+        "path": [
+          "empty"
+        ]
+      }
+    ],
+    "egglog.core.map.get": [
+      {
+        "ownerSort": 9,
+        "params": [
+          {
+            "coreInput": 1,
+            "name": "key"
+          }
+        ],
+        "path": [
+          "get"
+        ],
+        "receiver": {
+          "borrowed": true,
+          "coreInput": 0
+        }
+      }
+    ],
+    "egglog.core.map.insert": [
+      {
+        "ownerSort": 9,
+        "params": [
+          {
+            "coreInput": 1,
+            "name": "key"
+          },
+          {
+            "coreInput": 2,
+            "name": "value"
+          }
+        ],
+        "path": [
+          "insert"
+        ],
+        "receiver": {
+          "borrowed": true,
+          "coreInput": 0
+        }
+      }
+    ],
+    "egglog.core.map.length": [
+      {
+        "ownerSort": 9,
+        "path": [
+          "length"
+        ],
+        "receiver": {
+          "borrowed": true,
+          "coreInput": 0
+        }
+      }
+    ],
+    "egglog.core.map.not_contains": [
+      {
+        "ownerSort": 9,
+        "params": [
+          {
+            "coreInput": 1,
+            "name": "key"
+          }
+        ],
+        "path": [
+          "not_contains"
+        ],
+        "receiver": {
+          "borrowed": true,
+          "coreInput": 0
+        }
+      }
+    ],
+    "egglog.core.map.of": [
+      {
+        "ownerSort": 9,
+        "params": [
+          {
+            "coreInput": 0,
+            "name": "entries"
+          }
+        ],
+        "path": [
+          "from_pairs"
+        ]
+      }
+    ],
+    "egglog.core.map.remove": [
+      {
+        "ownerSort": 9,
+        "params": [
+          {
+            "coreInput": 1,
+            "name": "key"
+          }
+        ],
+        "path": [
+          "remove"
+        ],
+        "receiver": {
+          "borrowed": true,
+          "coreInput": 0
+        }
+      }
+    ],
+    "egglog.core.multiset.clear_index": [
+      {
+        "ownerSort": 12,
+        "params": [
+          {
+            "coreInput": 1,
+            "name": "f"
+          }
+        ],
+        "path": [
+          "clear_index"
+        ],
+        "receiver": {
+          "borrowed": true,
+          "coreInput": 0
+        }
+      }
+    ],
+    "egglog.core.multiset.contains": [
+      {
+        "ownerSort": 12,
+        "params": [
+          {
+            "coreInput": 1,
+            "name": "value"
+          }
+        ],
+        "path": [
+          "contains"
+        ],
+        "receiver": {
+          "borrowed": true,
+          "coreInput": 0
+        }
+      }
+    ],
+    "egglog.core.multiset.contains_swapped": [
+      {
+        "params": [
+          {
+            "coreInput": 0,
+            "name": "x"
+          },
+          {
+            "coreInput": 1,
+            "name": "xs"
+          }
+        ],
+        "path": [
+          "egglog_experimental",
+          "typed",
+          "builtins",
+          "multiset_contains_swapped"
+        ]
+      }
+    ],
+    "egglog.core.multiset.count": [
+      {
+        "ownerSort": 12,
+        "params": [
+          {
+            "coreInput": 1,
+            "name": "value"
+          }
+        ],
+        "path": [
+          "count"
+        ],
+        "receiver": {
+          "borrowed": true,
+          "coreInput": 0
+        }
+      }
+    ],
+    "egglog.core.multiset.fill_index": [
+      {
+        "ownerSort": 12,
+        "params": [
+          {
+            "coreInput": 1,
+            "name": "f"
+          }
+        ],
+        "path": [
+          "fill_index"
+        ],
+        "receiver": {
+          "borrowed": true,
+          "coreInput": 0
+        }
+      }
+    ],
+    "egglog.core.multiset.filter": [
+      {
+        "ownerSort": 12,
+        "params": [
+          {
+            "coreInput": 0,
+            "name": "f"
+          }
+        ],
+        "path": [
+          "filter"
+        ],
+        "receiver": {
+          "borrowed": true,
+          "coreInput": 1
+        }
+      }
+    ],
+    "egglog.core.multiset.filter_not": [
+      {
+        "ownerSort": 12,
+        "params": [
+          {
+            "coreInput": 0,
+            "name": "f"
+          }
+        ],
+        "path": [
+          "filter_not"
+        ],
+        "receiver": {
+          "borrowed": true,
+          "coreInput": 1
+        }
+      }
+    ],
+    "egglog.core.multiset.flat_map": [
+      {
+        "params": [
+          {
+            "coreInput": 0,
+            "name": "f"
+          },
+          {
+            "coreInput": 1,
+            "name": "xs"
+          }
+        ],
+        "path": [
+          "egglog_experimental",
+          "typed",
+          "builtins",
+          "multiset_flat_map"
+        ]
+      }
+    ],
+    "egglog.core.multiset.insert": [
+      {
+        "ownerSort": 12,
+        "params": [
+          {
+            "coreInput": 1,
+            "name": "value"
+          }
+        ],
+        "path": [
+          "insert"
+        ],
+        "receiver": {
+          "borrowed": true,
+          "coreInput": 0
+        }
+      }
+    ],
+    "egglog.core.multiset.intersection": [
+      {
+        "ownerSort": 12,
+        "params": [
+          {
+            "coreInput": 1,
+            "name": "other"
+          }
+        ],
+        "path": [
+          "intersection"
+        ],
+        "receiver": {
+          "borrowed": true,
+          "coreInput": 0
+        }
+      }
+    ],
+    "egglog.core.multiset.length": [
+      {
+        "ownerSort": 12,
+        "path": [
+          "length"
+        ],
+        "receiver": {
+          "borrowed": true,
+          "coreInput": 0
+        }
+      }
+    ],
+    "egglog.core.multiset.map": [
+      {
+        "ownerSort": 12,
+        "params": [
+          {
+            "coreInput": 0,
+            "name": "f"
+          }
+        ],
+        "path": [
+          "map"
+        ],
+        "receiver": {
+          "borrowed": true,
+          "coreInput": 1
+        }
+      }
+    ],
+    "egglog.core.multiset.not_contains": [
+      {
+        "ownerSort": 12,
+        "params": [
+          {
+            "coreInput": 1,
+            "name": "value"
+          }
+        ],
+        "path": [
+          "not_contains"
+        ],
+        "receiver": {
+          "borrowed": true,
+          "coreInput": 0
+        }
+      }
+    ],
+    "egglog.core.multiset.not_contains_swapped": [
+      {
+        "params": [
+          {
+            "coreInput": 0,
+            "name": "x"
+          },
+          {
+            "coreInput": 1,
+            "name": "xs"
+          }
+        ],
+        "path": [
+          "egglog_experimental",
+          "typed",
+          "builtins",
+          "multiset_not_contains_swapped"
+        ]
+      }
+    ],
+    "egglog.core.multiset.of": [
+      {
+        "ownerSort": 12,
+        "params": [
+          {
+            "coreInput": 0,
+            "name": "args"
+          }
+        ],
+        "path": [
+          "new"
+        ]
+      }
+    ],
+    "egglog.core.multiset.pick": [
+      {
+        "ownerSort": 12,
+        "path": [
+          "pick"
+        ],
+        "receiver": {
+          "borrowed": true,
+          "coreInput": 0
+        }
+      }
+    ],
+    "egglog.core.multiset.pick_max": [
+      {
+        "ownerSort": 12,
+        "path": [
+          "pick_max"
+        ],
+        "receiver": {
+          "borrowed": true,
+          "coreInput": 0
+        }
+      }
+    ],
+    "egglog.core.multiset.reduce": [
+      {
+        "params": [
+          {
+            "coreInput": 0,
+            "name": "f"
+          },
+          {
+            "coreInput": 1,
+            "name": "initial"
+          },
+          {
+            "coreInput": 2,
+            "name": "xs"
+          }
+        ],
+        "path": [
+          "egglog_experimental",
+          "typed",
+          "builtins",
+          "multiset_fold"
+        ]
+      }
+    ],
+    "egglog.core.multiset.remove": [
+      {
+        "ownerSort": 12,
+        "params": [
+          {
+            "coreInput": 1,
+            "name": "value"
+          }
+        ],
+        "path": [
+          "remove"
+        ],
+        "receiver": {
+          "borrowed": true,
+          "coreInput": 0
+        }
+      }
+    ],
+    "egglog.core.multiset.remove_swapped": [
+      {
+        "params": [
+          {
+            "coreInput": 0,
+            "name": "x"
+          },
+          {
+            "coreInput": 1,
+            "name": "xs"
+          }
+        ],
+        "path": [
+          "egglog_experimental",
+          "typed",
+          "builtins",
+          "multiset_remove_swapped"
+        ]
+      }
+    ],
+    "egglog.core.multiset.reset_counts": [
+      {
+        "ownerSort": 12,
+        "path": [
+          "reset_counts"
+        ],
+        "receiver": {
+          "borrowed": true,
+          "coreInput": 0
+        }
+      }
+    ],
+    "egglog.core.multiset.single": [
+      {
+        "ownerSort": 12,
+        "params": [
+          {
+            "coreInput": 0,
+            "name": "x"
+          },
+          {
+            "coreInput": 1,
+            "name": "i"
+          }
+        ],
+        "path": [
+          "single"
+        ]
+      }
+    ],
+    "egglog.core.multiset.subtract": [
+      {
+        "ownerSort": 12,
+        "params": [
+          {
+            "coreInput": 1,
+            "name": "other"
+          }
+        ],
+        "path": [
+          "subtract"
+        ],
+        "receiver": {
+          "borrowed": true,
+          "coreInput": 0
+        }
+      }
+    ],
+    "egglog.core.multiset.subtract_swapped": [
+      {
+        "params": [
+          {
+            "coreInput": 0,
+            "name": "x"
+          },
+          {
+            "coreInput": 1,
+            "name": "xs"
+          }
+        ],
+        "path": [
+          "egglog_experimental",
+          "typed",
+          "builtins",
+          "multiset_subtract_swapped"
+        ]
+      }
+    ],
+    "egglog.core.multiset.sum": [
+      {
+        "ownerSort": 12,
+        "params": [
+          {
+            "coreInput": 1,
+            "name": "other"
+          }
+        ],
+        "path": [
+          "sum"
+        ],
+        "receiver": {
+          "borrowed": true,
+          "coreInput": 0
+        }
+      }
+    ],
+    "egglog.core.multiset.sum_multisets": [
+      {
+        "ownerSort": 12,
+        "params": [
+          {
+            "coreInput": 0,
+            "name": "xs"
+          }
+        ],
+        "path": [
+          "sum_multisets"
+        ]
+      }
+    ],
+    "egglog.core.multiset.union_values": [
+      {
+        "ownerSort": 12,
+        "path": [
+          "union_values"
+        ],
+        "receiver": {
+          "borrowed": true,
+          "coreInput": 0
+        }
+      }
+    ],
+    "egglog.core.ne": [
+      {
+        "params": [
+          {
+            "coreInput": 0,
+            "name": "a"
+          },
+          {
+            "coreInput": 1,
+            "name": "b"
+          }
+        ],
+        "path": [
+          "egglog_experimental",
+          "typed",
+          "builtins",
+          "ne"
+        ]
+      }
+    ],
+    "egglog.core.pair.first": [
+      {
+        "ownerSort": 10,
+        "path": [
+          "first"
+        ],
+        "receiver": {
+          "borrowed": true,
+          "coreInput": 0
+        }
+      }
+    ],
+    "egglog.core.pair.make": [
+      {
+        "ownerSort": 10,
+        "params": [
+          {
+            "coreInput": 0,
+            "name": "left"
+          },
+          {
+            "coreInput": 1,
+            "name": "right"
+          }
+        ],
+        "path": [
+          "new"
+        ]
+      }
+    ],
+    "egglog.core.pair.second": [
+      {
+        "ownerSort": 10,
+        "path": [
+          "second"
+        ],
+        "receiver": {
+          "borrowed": true,
+          "coreInput": 0
+        }
+      }
+    ],
+    "egglog.core.set.contains": [
+      {
+        "ownerSort": 20,
+        "params": [
+          {
+            "coreInput": 1,
+            "name": "value"
+          }
+        ],
+        "path": [
+          "contains"
+        ],
+        "receiver": {
+          "borrowed": true,
+          "coreInput": 0
+        }
+      }
+    ],
+    "egglog.core.set.diff": [
+      {
+        "ownerSort": 20,
+        "params": [
+          {
+            "coreInput": 1,
+            "name": "other"
+          }
+        ],
+        "path": [
+          "diff"
+        ],
+        "receiver": {
+          "borrowed": true,
+          "coreInput": 0
+        }
+      }
+    ],
+    "egglog.core.set.empty": [
+      {
+        "ownerSort": 20,
+        "path": [
+          "empty"
+        ]
+      }
+    ],
+    "egglog.core.set.get": [
+      {
+        "ownerSort": 20,
+        "params": [
+          {
+            "coreInput": 1,
+            "name": "index"
+          }
+        ],
+        "path": [
+          "get"
+        ],
+        "receiver": {
+          "borrowed": true,
+          "coreInput": 0
+        }
+      }
+    ],
+    "egglog.core.set.insert": [
+      {
+        "ownerSort": 20,
+        "params": [
+          {
+            "coreInput": 1,
+            "name": "value"
+          }
+        ],
+        "path": [
+          "insert"
+        ],
+        "receiver": {
+          "borrowed": true,
+          "coreInput": 0
+        }
+      }
+    ],
+    "egglog.core.set.intersect": [
+      {
+        "ownerSort": 20,
+        "params": [
+          {
+            "coreInput": 1,
+            "name": "other"
+          }
+        ],
+        "path": [
+          "intersect"
+        ],
+        "receiver": {
+          "borrowed": true,
+          "coreInput": 0
+        }
+      }
+    ],
+    "egglog.core.set.length": [
+      {
+        "ownerSort": 20,
+        "path": [
+          "length"
+        ],
+        "receiver": {
+          "borrowed": true,
+          "coreInput": 0
+        }
+      }
+    ],
+    "egglog.core.set.not_contains": [
+      {
+        "ownerSort": 20,
+        "params": [
+          {
+            "coreInput": 1,
+            "name": "value"
+          }
+        ],
+        "path": [
+          "not_contains"
+        ],
+        "receiver": {
+          "borrowed": true,
+          "coreInput": 0
+        }
+      }
+    ],
+    "egglog.core.set.of": [
+      {
+        "ownerSort": 20,
+        "params": [
+          {
+            "coreInput": 0,
+            "name": "args"
+          }
+        ],
+        "path": [
+          "of"
+        ]
+      }
+    ],
+    "egglog.core.set.remove": [
+      {
+        "ownerSort": 20,
+        "params": [
+          {
+            "coreInput": 1,
+            "name": "value"
+          }
+        ],
+        "path": [
+          "remove"
+        ],
+        "receiver": {
+          "borrowed": true,
+          "coreInput": 0
+        }
+      }
+    ],
+    "egglog.core.set.union": [
+      {
+        "ownerSort": 20,
+        "params": [
+          {
+            "coreInput": 1,
+            "name": "other"
+          }
+        ],
+        "path": [
+          "union"
+        ],
+        "receiver": {
+          "borrowed": true,
+          "coreInput": 0
+        }
+      }
+    ],
+    "egglog.core.string.concat": [
+      {
+        "params": [
+          {
+            "coreInput": 0,
+            "name": "strings"
+          }
+        ],
+        "path": [
+          "egglog_experimental",
+          "typed",
+          "builtins",
+          "join"
+        ]
+      },
+      {
+        "ownerSort": 3,
+        "params": [
+          {
+            "coreInput": 1,
+            "name": "rhs"
+          }
+        ],
+        "path": [
+          "add"
+        ],
+        "receiver": {
+          "coreInput": 0
+        },
+        "tailRepetitions": 2,
+        "traitImpl": {
+          "args": [
+            {
+              "sort": 3
+            }
+          ],
+          "outputAssociatedType": "Output",
+          "path": [
+            "core",
+            "ops",
+            "Add"
+          ]
+        }
+      }
+    ],
+    "egglog.core.string.count_matches": [
+      {
+        "params": [
+          {
+            "coreInput": 0,
+            "name": "s"
+          },
+          {
+            "coreInput": 1,
+            "name": "pattern"
+          }
+        ],
+        "path": [
+          "egglog_experimental",
+          "typed",
+          "builtins",
+          "count_matches"
+        ]
+      }
+    ],
+    "egglog.core.string.replace": [
+      {
+        "ownerSort": 3,
+        "params": [
+          {
+            "coreInput": 1,
+            "name": "old"
+          },
+          {
+            "coreInput": 2,
+            "name": "new"
+          }
+        ],
+        "path": [
+          "replace"
+        ],
+        "receiver": {
+          "borrowed": true,
+          "coreInput": 0
+        }
+      }
+    ],
+    "egglog.core.value_eq": [
+      {
+        "params": [
+          {
+            "coreInput": 0,
+            "name": "a"
+          },
+          {
+            "coreInput": 1,
+            "name": "b"
+          }
+        ],
+        "path": [
+          "egglog_experimental",
+          "typed",
+          "builtins",
+          "value_eq"
+        ]
+      }
+    ],
+    "egglog.core.vec.append": [
+      {
+        "ownerSort": 21,
+        "params": [
+          {
+            "coreInput": 1,
+            "name": "others"
+          }
+        ],
+        "path": [
+          "append"
+        ],
+        "receiver": {
+          "borrowed": true,
+          "coreInput": 0
+        }
+      }
+    ],
+    "egglog.core.vec.contains": [
+      {
+        "ownerSort": 21,
+        "params": [
+          {
+            "coreInput": 1,
+            "name": "value"
+          }
+        ],
+        "path": [
+          "contains"
+        ],
+        "receiver": {
+          "borrowed": true,
+          "coreInput": 0
+        }
+      }
+    ],
+    "egglog.core.vec.empty": [
+      {
+        "ownerSort": 21,
+        "path": [
+          "empty"
+        ]
+      }
+    ],
+    "egglog.core.vec.get": [
+      {
+        "ownerSort": 21,
+        "params": [
+          {
+            "coreInput": 1,
+            "name": "index"
+          }
+        ],
+        "path": [
+          "get"
+        ],
+        "receiver": {
+          "borrowed": true,
+          "coreInput": 0
+        }
+      }
+    ],
+    "egglog.core.vec.length": [
+      {
+        "ownerSort": 21,
+        "path": [
+          "length"
+        ],
+        "receiver": {
+          "borrowed": true,
+          "coreInput": 0
+        }
+      }
+    ],
+    "egglog.core.vec.map": [
+      {
+        "ownerSort": 21,
+        "params": [
+          {
+            "coreInput": 0,
+            "name": "callback"
+          }
+        ],
+        "path": [
+          "map"
+        ],
+        "receiver": {
+          "borrowed": true,
+          "coreInput": 1
+        }
+      }
+    ],
+    "egglog.core.vec.not_contains": [
+      {
+        "ownerSort": 21,
+        "params": [
+          {
+            "coreInput": 1,
+            "name": "value"
+          }
+        ],
+        "path": [
+          "not_contains"
+        ],
+        "receiver": {
+          "borrowed": true,
+          "coreInput": 0
+        }
+      }
+    ],
+    "egglog.core.vec.of": [
+      {
+        "ownerSort": 21,
+        "params": [
+          {
+            "coreInput": 0,
+            "name": "values"
+          }
+        ],
+        "path": [
+          "of"
+        ]
+      }
+    ],
+    "egglog.core.vec.pop": [
+      {
+        "ownerSort": 21,
+        "path": [
+          "pop"
+        ],
+        "receiver": {
+          "borrowed": true,
+          "coreInput": 0
+        }
+      }
+    ],
+    "egglog.core.vec.push": [
+      {
+        "ownerSort": 21,
+        "params": [
+          {
+            "coreInput": 1,
+            "name": "value"
+          }
+        ],
+        "path": [
+          "push"
+        ],
+        "receiver": {
+          "borrowed": true,
+          "coreInput": 0
+        }
+      }
+    ],
+    "egglog.core.vec.range": [
+      {
+        "ownerSort": 2,
+        "path": [
+          "range"
+        ],
+        "receiver": {
+          "borrowed": true,
+          "coreInput": 0
+        }
+      }
+    ],
+    "egglog.core.vec.remove": [
+      {
+        "ownerSort": 21,
+        "params": [
+          {
+            "coreInput": 1,
+            "name": "index"
+          }
+        ],
+        "path": [
+          "remove"
+        ],
+        "receiver": {
+          "borrowed": true,
+          "coreInput": 0
+        }
+      }
+    ],
+    "egglog.core.vec.set": [
+      {
+        "ownerSort": 21,
+        "params": [
+          {
+            "coreInput": 1,
+            "name": "index"
+          },
+          {
+            "coreInput": 2,
+            "name": "value"
+          }
+        ],
+        "path": [
+          "set"
+        ],
+        "receiver": {
+          "borrowed": true,
+          "coreInput": 0
+        }
+      }
+    ],
+    "egglog.core.vec.union": [
+      {
+        "ownerSort": 21,
+        "params": [
+          {
+            "coreInput": 1,
+            "name": "other"
+          }
+        ],
+        "path": [
+          "union"
+        ],
+        "receiver": {
+          "borrowed": true,
+          "coreInput": 0
+        }
+      }
+    ],
+    "egglog.experimental.f64.is_finite": [
+      {
+        "ownerSort": 6,
+        "path": [
+          "is_finite"
+        ],
+        "receiver": {
+          "borrowed": true,
+          "coreInput": 0
+        }
+      }
+    ],
+    "egglog.experimental.map.fold_kv": [
+      {
+        "ownerSort": 9,
+        "params": [
+          {
+            "coreInput": 0,
+            "name": "callback"
+          },
+          {
+            "coreInput": 1,
+            "name": "initial"
+          }
+        ],
+        "path": [
+          "fold_kv"
+        ],
+        "receiver": {
+          "borrowed": true,
+          "coreInput": 2
+        }
+      }
+    ],
+    "egglog.experimental.maybe.catch": [
+      {
+        "ownerSort": 26,
+        "params": [
+          {
+            "coreInput": 0,
+            "name": "thunk"
+          }
+        ],
+        "path": [
+          "catch"
+        ]
+      }
+    ],
+    "egglog.experimental.maybe.match": [
+      {
+        "ownerSort": 26,
+        "params": [
+          {
+            "coreInput": 1,
+            "name": "on_some"
+          },
+          {
+            "coreInput": 2,
+            "name": "default"
+          }
+        ],
+        "path": [
+          "match_"
+        ],
+        "receiver": {
+          "borrowed": true,
+          "coreInput": 0
+        }
+      }
+    ],
+    "egglog.experimental.maybe.none": [
+      {
+        "ownerSort": 26,
+        "path": [
+          "none"
+        ]
+      }
+    ],
+    "egglog.experimental.maybe.some": [
+      {
+        "ownerSort": 26,
+        "params": [
+          {
+            "coreInput": 0,
+            "name": "value"
+          }
+        ],
+        "path": [
+          "some"
+        ]
+      }
+    ],
+    "egglog.experimental.maybe.unwrap": [
+      {
+        "ownerSort": 26,
+        "path": [
+          "unwrap"
+        ],
+        "receiver": {
+          "borrowed": true,
+          "coreInput": 0
+        }
+      }
+    ],
+    "egglog.experimental.maybe.unwrap_or": [
+      {
+        "ownerSort": 26,
+        "params": [
+          {
+            "coreInput": 1,
+            "name": "default"
+          }
+        ],
+        "path": [
+          "unwrap_or"
+        ],
+        "receiver": {
+          "borrowed": true,
+          "coreInput": 0
+        }
+      }
+    ],
+    "egglog.experimental.rational.abs": [
+      {
+        "ownerSort": 28,
+        "path": [
+          "abs"
+        ],
+        "receiver": {
+          "borrowed": true,
+          "coreInput": 0
+        }
+      }
+    ],
+    "egglog.experimental.rational.add": [
+      {
+        "ownerSort": 28,
+        "params": [
+          {
+            "coreInput": 1,
+            "name": "rhs"
+          }
+        ],
+        "path": [
+          "add"
+        ],
+        "receiver": {
+          "coreInput": 0
+        },
+        "traitImpl": {
+          "args": [
+            {
+              "sort": 28
+            }
+          ],
+          "outputAssociatedType": "Output",
+          "path": [
+            "core",
+            "ops",
+            "Add"
+          ]
+        }
+      }
+    ],
+    "egglog.experimental.rational.cbrt": [
+      {
+        "ownerSort": 28,
+        "path": [
+          "cbrt"
+        ],
+        "receiver": {
+          "borrowed": true,
+          "coreInput": 0
+        }
+      }
+    ],
+    "egglog.experimental.rational.ceil": [
+      {
+        "ownerSort": 28,
+        "path": [
+          "ceil"
+        ],
+        "receiver": {
+          "borrowed": true,
+          "coreInput": 0
+        }
+      }
+    ],
+    "egglog.experimental.rational.denom": [
+      {
+        "ownerSort": 28,
+        "path": [
+          "denom"
+        ],
+        "receiver": {
+          "borrowed": true,
+          "coreInput": 0
+        }
+      }
+    ],
+    "egglog.experimental.rational.div": [
+      {
+        "ownerSort": 28,
+        "params": [
+          {
+            "coreInput": 1,
+            "name": "rhs"
+          }
+        ],
+        "path": [
+          "div"
+        ],
+        "receiver": {
+          "coreInput": 0
+        },
+        "traitImpl": {
+          "args": [
+            {
+              "sort": 28
+            }
+          ],
+          "outputAssociatedType": "Output",
+          "path": [
+            "core",
+            "ops",
+            "Div"
+          ]
+        }
+      }
+    ],
+    "egglog.experimental.rational.floor": [
+      {
+        "ownerSort": 28,
+        "path": [
+          "floor"
+        ],
+        "receiver": {
+          "borrowed": true,
+          "coreInput": 0
+        }
+      }
+    ],
+    "egglog.experimental.rational.ge": [
+      {
+        "ownerSort": 28,
+        "params": [
+          {
+            "coreInput": 1,
+            "name": "other"
+          }
+        ],
+        "path": [
+          "ge"
+        ],
+        "receiver": {
+          "borrowed": true,
+          "coreInput": 0
+        }
+      }
+    ],
+    "egglog.experimental.rational.gt": [
+      {
+        "ownerSort": 28,
+        "params": [
+          {
+            "coreInput": 1,
+            "name": "other"
+          }
+        ],
+        "path": [
+          "gt"
+        ],
+        "receiver": {
+          "borrowed": true,
+          "coreInput": 0
+        }
+      }
+    ],
+    "egglog.experimental.rational.le": [
+      {
+        "ownerSort": 28,
+        "params": [
+          {
+            "coreInput": 1,
+            "name": "other"
+          }
+        ],
+        "path": [
+          "le"
+        ],
+        "receiver": {
+          "borrowed": true,
+          "coreInput": 0
+        }
+      }
+    ],
+    "egglog.experimental.rational.log": [
+      {
+        "ownerSort": 28,
+        "path": [
+          "log"
+        ],
+        "receiver": {
+          "borrowed": true,
+          "coreInput": 0
+        }
+      }
+    ],
+    "egglog.experimental.rational.lt": [
+      {
+        "ownerSort": 28,
+        "params": [
+          {
+            "coreInput": 1,
+            "name": "other"
+          }
+        ],
+        "path": [
+          "lt"
+        ],
+        "receiver": {
+          "borrowed": true,
+          "coreInput": 0
+        }
+      }
+    ],
+    "egglog.experimental.rational.make": [
+      {
+        "ownerSort": 28,
+        "params": [
+          {
+            "coreInput": 0,
+            "name": "num"
+          },
+          {
+            "coreInput": 1,
+            "name": "den"
+          }
+        ],
+        "path": [
+          "new"
+        ]
+      }
+    ],
+    "egglog.experimental.rational.max": [
+      {
+        "ownerSort": 28,
+        "params": [
+          {
+            "coreInput": 1,
+            "name": "other"
+          }
+        ],
+        "path": [
+          "max"
+        ],
+        "receiver": {
+          "borrowed": true,
+          "coreInput": 0
+        }
+      }
+    ],
+    "egglog.experimental.rational.min": [
+      {
+        "ownerSort": 28,
+        "params": [
+          {
+            "coreInput": 1,
+            "name": "other"
+          }
+        ],
+        "path": [
+          "min"
+        ],
+        "receiver": {
+          "borrowed": true,
+          "coreInput": 0
+        }
+      }
+    ],
+    "egglog.experimental.rational.mul": [
+      {
+        "ownerSort": 28,
+        "params": [
+          {
+            "coreInput": 1,
+            "name": "rhs"
+          }
+        ],
+        "path": [
+          "mul"
+        ],
+        "receiver": {
+          "coreInput": 0
+        },
+        "traitImpl": {
+          "args": [
+            {
+              "sort": 28
+            }
+          ],
+          "outputAssociatedType": "Output",
+          "path": [
+            "core",
+            "ops",
+            "Mul"
+          ]
+        }
+      }
+    ],
+    "egglog.experimental.rational.neg": [
+      {
+        "ownerSort": 28,
+        "path": [
+          "neg"
+        ],
+        "receiver": {
+          "coreInput": 0
+        },
+        "traitImpl": {
+          "outputAssociatedType": "Output",
+          "path": [
+            "core",
+            "ops",
+            "Neg"
+          ]
+        }
+      }
+    ],
+    "egglog.experimental.rational.numer": [
+      {
+        "ownerSort": 28,
+        "path": [
+          "numer"
+        ],
+        "receiver": {
+          "borrowed": true,
+          "coreInput": 0
+        }
+      }
+    ],
+    "egglog.experimental.rational.pow": [
+      {
+        "ownerSort": 28,
+        "params": [
+          {
+            "coreInput": 1,
+            "name": "other"
+          }
+        ],
+        "path": [
+          "pow"
+        ],
+        "receiver": {
+          "borrowed": true,
+          "coreInput": 0
+        }
+      }
+    ],
+    "egglog.experimental.rational.round": [
+      {
+        "ownerSort": 28,
+        "path": [
+          "round"
+        ],
+        "receiver": {
+          "borrowed": true,
+          "coreInput": 0
+        }
+      }
+    ],
+    "egglog.experimental.rational.sqrt": [
+      {
+        "ownerSort": 28,
+        "path": [
+          "sqrt"
+        ],
+        "receiver": {
+          "borrowed": true,
+          "coreInput": 0
+        }
+      }
+    ],
+    "egglog.experimental.rational.sub": [
+      {
+        "ownerSort": 28,
+        "params": [
+          {
+            "coreInput": 1,
+            "name": "rhs"
+          }
+        ],
+        "path": [
+          "sub"
+        ],
+        "receiver": {
+          "coreInput": 0
+        },
+        "traitImpl": {
+          "args": [
+            {
+              "sort": 28
+            }
+          ],
+          "outputAssociatedType": "Output",
+          "path": [
+            "core",
+            "ops",
+            "Sub"
+          ]
+        }
+      }
+    ],
+    "egglog.experimental.rational.to_f64": [
+      {
+        "ownerSort": 28,
+        "path": [
+          "to_f64"
+        ],
+        "receiver": {
+          "borrowed": true,
+          "coreInput": 0
+        }
+      }
+    ],
+    "egglog.experimental.size.nodes": [
+      {
+        "path": [
+          "egglog_experimental",
+          "typed",
+          "builtins",
+          "get_node_size"
+        ]
+      }
+    ],
+    "egglog.experimental.size.tables": [
+      {
+        "params": [
+          {
+            "coreInput": 0,
+            "name": "tables"
+          }
+        ],
+        "path": [
+          "egglog_experimental",
+          "typed",
+          "builtins",
+          "get_table_size"
+        ]
+      }
+    ],
+    "egglog.experimental.subst": [
+      {
+        "params": [
+          {
+            "coreInput": 0,
+            "name": "root"
+          },
+          {
+            "coreInput": 1,
+            "name": "map"
+          }
+        ],
+        "path": [
+          "egglog_experimental",
+          "typed",
+          "builtins",
+          "subst"
+        ]
+      }
+    ]
+  }
+}

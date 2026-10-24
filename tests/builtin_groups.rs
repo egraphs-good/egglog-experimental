@@ -2,10 +2,8 @@ use egglog::{
     sort::{F, MapContainer, MapSort, PairContainer, Presort, VecContainer},
     *,
 };
-use egglog_experimental::builtin::{PortableEGraph, PortableRegistration, PortableTypeInfo};
-use egglog_experimental::{
-    add_literal_prim, add_primitive, add_primitive_with_validator, builtin, proto as pb,
-};
+use egglog_experimental::builtin::{PortableEGraph, PortableTypeInfo};
+use egglog_experimental::{add_primitive, add_primitive_with_validator, builtin, proto as pb};
 use std::{
     any::TypeId,
     sync::atomic::{AtomicUsize, Ordering},
@@ -18,16 +16,16 @@ mod native_signature {
     // An owner for test descriptors only; no production family/primitive is added.
     struct Provider<const CASE: u8>;
     impl<const CASE: u8> Provider<CASE> {
-        fn wire_definitions() -> Vec<pb::Program> {
+        fn wire_definitions() -> Vec<pb::BuiltinCatalog> {
             use pb::sort::Kind;
             let sorts = vec![
                 Kind::Var(0),
                 Kind::Var(1),
-                Kind::Family(pb::HostSort {
+                Kind::Application(pb::SortApplication {
                     name: "Vec".into(),
                     args: vec![0],
                 }),
-                Kind::Family(pb::HostSort {
+                Kind::Application(pb::SortApplication {
                     name: "Vec".into(),
                     args: vec![1],
                 }),
@@ -39,19 +37,19 @@ mod native_signature {
                     params: vec![2],
                     result: 3,
                 }),
-                Kind::Family(pb::HostSort {
+                Kind::Application(pb::SortApplication {
                     name: "Vec".into(),
                     args: vec![2],
                 }),
-                Kind::Family(pb::HostSort {
+                Kind::Application(pb::SortApplication {
                     name: "Vec".into(),
                     args: vec![3],
                 }),
-                Kind::Family(pb::HostSort {
+                Kind::Application(pb::SortApplication {
                     name: "i64".into(),
                     args: vec![],
                 }),
-                Kind::Family(pb::HostSort {
+                Kind::Application(pb::SortApplication {
                     name: "String".into(),
                     args: vec![],
                 }),
@@ -66,7 +64,26 @@ mod native_signature {
                 8 => (vec![10], 10, 0),
                 _ => unreachable!(),
             };
-            vec![pb::Program {
+            vec![pb::BuiltinCatalog {
+                primitive_sorts: vec![],
+                primitives: vec![pb::Primitive {
+                    name: "test.native_signature".into(),
+                    typing: Some(pb::primitive::Typing::Signature(pb::GenericSignature {
+                        type_params: (0..binders).map(|i| format!("T{i}")).collect(),
+                        equality_type_params: if CASE == 6 { vec![0] } else { vec![] },
+                        inputs: inputs
+                            .into_iter()
+                            .enumerate()
+                            .map(|(i, sort)| pb::Arg {
+                                name: format!("arg{i}"),
+                                sort,
+                            })
+                            .collect(),
+                        output: Some(output),
+                        ..Default::default()
+                    })),
+                    ..Default::default()
+                }],
                 sorts: sorts
                     .into_iter()
                     .map(|kind| pb::Sort {
@@ -74,28 +91,6 @@ mod native_signature {
                         ..Default::default()
                     })
                     .collect(),
-                declarations: vec![pb::Declaration {
-                    kind: Some(pb::declaration::Kind::HostPrimitive(pb::HostPrimitive {
-                        name: "test.native_signature".into(),
-                        typing: Some(pb::host_primitive::Typing::Signature(
-                            pb::GenericSignature {
-                                type_params: (0..binders).map(|i| format!("T{i}")).collect(),
-                                equality_type_params: if CASE == 6 { vec![0] } else { vec![] },
-                                inputs: inputs
-                                    .into_iter()
-                                    .enumerate()
-                                    .map(|(i, sort)| pb::Arg {
-                                        name: format!("arg{i}"),
-                                        sort,
-                                    })
-                                    .collect(),
-                                output: Some(output),
-                                ..Default::default()
-                            },
-                        )),
-                    })),
-                    ..Default::default()
-                }],
                 ..Default::default()
             }]
         }
@@ -1000,8 +995,42 @@ impl sort::Sort for FixtureMap {
 // Production Map registration and catalog definitions remain untouched.
 struct Grouped;
 impl Grouped {
-    fn wire_definitions() -> Vec<pb::Program> {
-        vec![pb::Program {
+    fn wire_definitions() -> Vec<pb::BuiltinCatalog> {
+        vec![pb::BuiltinCatalog {
+            primitive_sorts: vec![
+                pb::PrimitiveSort {
+                    name: "TestGrouped".into(),
+                    arity: 2,
+                    ..Default::default()
+                },
+                pb::PrimitiveSort {
+                    name: "i64".into(),
+                    ..Default::default()
+                },
+            ],
+            primitives: vec![pb::Primitive {
+                name: "test.grouped".into(),
+                typing: Some(pb::primitive::Typing::Signature(pb::GenericSignature {
+                    type_params: vec!["K".into(), "V".into()],
+                    inputs: vec![pb::Arg {
+                        name: "prefix".into(),
+                        sort: 3,
+                    }],
+                    varargs: vec![
+                        pb::Arg {
+                            name: "key".into(),
+                            sort: 0,
+                        },
+                        pb::Arg {
+                            name: "value".into(),
+                            sort: 1,
+                        },
+                    ],
+                    output: Some(2),
+                    ..Default::default()
+                })),
+                ..Default::default()
+            }],
             sorts: vec![
                 pb::Sort {
                     kind: Some(pb::sort::Kind::Var(0)),
@@ -1012,70 +1041,17 @@ impl Grouped {
                     ..Default::default()
                 },
                 pb::Sort {
-                    kind: Some(pb::sort::Kind::Family(pb::HostSort {
+                    kind: Some(pb::sort::Kind::Application(pb::SortApplication {
                         name: "TestGrouped".into(),
                         args: vec![0, 1],
                     })),
                     ..Default::default()
                 },
                 pb::Sort {
-                    kind: Some(pb::sort::Kind::Family(pb::HostSort {
+                    kind: Some(pb::sort::Kind::Application(pb::SortApplication {
                         name: "i64".into(),
                         args: vec![],
                     })),
-                    ..Default::default()
-                },
-            ],
-            declarations: vec![
-                pb::Declaration {
-                    kind: Some(pb::declaration::Kind::HostSortFamily(pb::HostSortFamily {
-                        name: "TestGrouped".into(),
-                        arity: 2,
-                        ..Default::default()
-                    })),
-                    ..Default::default()
-                },
-                pb::Declaration {
-                    kind: Some(pb::declaration::Kind::HostSortFamily(pb::HostSortFamily {
-                        name: "i64".into(),
-                        ..Default::default()
-                    })),
-                    ..Default::default()
-                },
-                pb::Declaration {
-                    kind: Some(pb::declaration::Kind::HostPrimitive(pb::HostPrimitive {
-                        name: "test.grouped".into(),
-                        typing: Some(pb::host_primitive::Typing::Signature(
-                            pb::GenericSignature {
-                                type_params: vec!["K".into(), "V".into()],
-                                inputs: vec![pb::Arg {
-                                    name: "prefix".into(),
-                                    sort: 3,
-                                }],
-                                varargs: vec![
-                                    pb::Arg {
-                                        name: "key".into(),
-                                        sort: 0,
-                                    },
-                                    pb::Arg {
-                                        name: "value".into(),
-                                        sort: 1,
-                                    },
-                                ],
-                                output: Some(2),
-                                ..Default::default()
-                            },
-                        )),
-                    })),
-                    bindings: Some(pb::CallableBindings {
-                        egglog: Some(pb::EgglogBindings {
-                            views: vec![pb::EgglogCallable {
-                                symbol: "grouped".into(),
-                                datatype_member: false,
-                            }],
-                        }),
-                        ..Default::default()
-                    }),
                     ..Default::default()
                 },
             ],
@@ -1101,7 +1077,11 @@ impl Presort for Grouped {
     fn builtin_definitions() -> Vec<builtin::BuiltinDescription> {
         Self::wire_definitions()
             .iter()
-            .map(|program| builtin::native_definition(program).unwrap())
+            .map(|program| {
+                let mut description = builtin::native_definition(program).unwrap();
+                description.aliases = vec!["grouped".into()];
+                description
+            })
             .collect()
     }
     fn make_sort(
@@ -1123,44 +1103,35 @@ static VALIDATOR: AtomicUsize = AtomicUsize::new(0);
 // This fixture exercises binding only. It does not implement Map construction.
 struct Foreign<const INPUT: u32 = 5, const SWAP: bool = false>;
 impl<const INPUT: u32, const SWAP: bool> Foreign<INPUT, SWAP> {
-    fn wire_definitions() -> Vec<pb::Program> {
+    fn wire_definitions() -> Vec<pb::BuiltinCatalog> {
         let mut definition = Grouped::wire_definitions().remove(0);
-        let Some(pb::sort::Kind::Family(owner)) = &mut definition.sorts[2].kind else {
+        let Some(pb::sort::Kind::Application(owner)) = &mut definition.sorts[2].kind else {
             unreachable!()
         };
         owner.name = "TestForeign".into();
-        let Some(pb::declaration::Kind::HostSortFamily(owner)) =
-            &mut definition.declarations[0].kind
-        else {
-            unreachable!()
-        };
+        let owner = &mut definition.primitive_sorts[0];
         owner.name = "TestForeign".into();
         for (name, args) in [
             ("Pair", if SWAP { vec![1, 0] } else { vec![0, 1] }),
             ("Vec", vec![4]),
         ] {
-            definition.declarations.push(pb::Declaration {
-                kind: Some(pb::declaration::Kind::HostSortFamily(pb::HostSortFamily {
-                    name: name.into(),
-                    arity: args.len() as u32,
-                    ..Default::default()
-                })),
+            definition.primitive_sorts.push(pb::PrimitiveSort {
+                name: name.into(),
+                arity: args.len() as u32,
                 ..Default::default()
             });
             definition.sorts.push(pb::Sort {
-                kind: Some(pb::sort::Kind::Family(pb::HostSort {
+                kind: Some(pb::sort::Kind::Application(pb::SortApplication {
                     name: name.into(),
                     args,
                 })),
                 ..Default::default()
             });
         }
-        let declaration = &mut definition.declarations[2];
-        let Some(pb::declaration::Kind::HostPrimitive(primitive)) = &mut declaration.kind else {
-            unreachable!()
-        };
+        let declaration = &mut definition.primitives[0];
+        let primitive = declaration;
         primitive.name = "test.foreign".into();
-        let Some(pb::host_primitive::Typing::Signature(signature)) = &mut primitive.typing else {
+        let Some(pb::primitive::Typing::Signature(signature)) = &mut primitive.typing else {
             unreachable!()
         };
         signature.inputs = vec![pb::Arg {
@@ -1168,15 +1139,6 @@ impl<const INPUT: u32, const SWAP: bool> Foreign<INPUT, SWAP> {
             sort: INPUT,
         }];
         signature.varargs.clear();
-        declaration
-            .bindings
-            .as_mut()
-            .unwrap()
-            .egglog
-            .as_mut()
-            .unwrap()
-            .views[0]
-            .symbol = "foreign".into();
         vec![definition]
     }
 }
@@ -1198,7 +1160,11 @@ impl<const INPUT: u32, const SWAP: bool> Presort for Foreign<INPUT, SWAP> {
     fn builtin_definitions() -> Vec<builtin::BuiltinDescription> {
         Self::wire_definitions()
             .iter()
-            .map(|program| builtin::native_definition(program).unwrap())
+            .map(|program| {
+                let mut description = builtin::native_definition(program).unwrap();
+                description.aliases = vec!["foreign".into()];
+                description
+            })
             .collect()
     }
     fn make_sort(
@@ -1526,9 +1492,7 @@ fn foreign_descriptor_mutations_control_nested_matching_and_converter_abi() {
         graph.resolve_command_before_proofs(command).unwrap();
     }
     let mut stale = Foreign::<5, false>::wire_definitions().remove(0);
-    let Some(pb::declaration::Kind::HostPrimitive(primitive)) = &stale.declarations[2].kind else {
-        unreachable!()
-    };
+    let primitive = &stale.primitives[0];
     assert!(
         graph
             .type_info()
@@ -1551,11 +1515,11 @@ fn foreign_descriptor_mutations_control_nested_matching_and_converter_abi() {
             )
             .is_ok()
     );
-    let Some(pb::sort::Kind::Family(vec)) = &wire.sorts[arg as usize].kind else {
+    let Some(pb::sort::Kind::Application(vec)) = &wire.sorts[arg as usize].kind else {
         unreachable!()
     };
     let pair = vec.args[0];
-    let Some(pb::sort::Kind::Family(pair)) = &mut wire.sorts[pair as usize].kind else {
+    let Some(pb::sort::Kind::Application(pair)) = &mut wire.sorts[pair as usize].kind else {
         unreachable!()
     };
     pair.args.reverse();
@@ -1566,13 +1530,11 @@ fn foreign_descriptor_mutations_control_nested_matching_and_converter_abi() {
             .is_err()
     );
     // A supplied descriptor must agree even when every runtime cast is unchanged.
-    let Some(pb::sort::Kind::Family(pair)) = &mut stale.sorts[4].kind else {
+    let Some(pb::sort::Kind::Application(pair)) = &mut stale.sorts[4].kind else {
         unreachable!()
     };
     pair.args.reverse();
-    let Some(pb::declaration::Kind::HostPrimitive(primitive)) = &stale.declarations[2].kind else {
-        unreachable!()
-    };
+    let primitive = &stale.primitives[0];
     graph
         .type_info()
         .check_portable_builtin_signature(&stale, primitive)
@@ -1820,24 +1782,20 @@ fn grouped_abi_checks_every_prefix_pattern_and_result_conversion() {
 fn grouped_signature_identity_preserves_width_and_order_after_relocation() {
     let mut graph = grouped_graph();
     let mut definition = Grouped::wire_definitions().remove(0);
-    let mut destination = pb::Program::default();
+    let mut destination = pb::BuiltinCatalog::default();
     builtin::import_definition(&definition, &mut destination).unwrap();
     let before = destination.clone();
     // Rotate the arena and alpha-rename every diagnostic label, not the binder.
     definition.sorts.rotate_left(1);
     for sort in &mut definition.sorts {
-        if let Some(pb::sort::Kind::Family(family)) = &mut sort.kind {
+        if let Some(pb::sort::Kind::Application(family)) = &mut sort.kind {
             for index in &mut family.args {
                 *index = (*index + 3) % 4;
             }
         }
     }
-    let Some(pb::declaration::Kind::HostPrimitive(primitive)) =
-        &mut definition.declarations[2].kind
-    else {
-        unreachable!()
-    };
-    let Some(pb::host_primitive::Typing::Signature(signature)) = &mut primitive.typing else {
+    let primitive = &mut definition.primitives[0];
+    let Some(pb::primitive::Typing::Signature(signature)) = &mut primitive.typing else {
         unreachable!()
     };
     signature.type_params = vec!["Renamed".into(), "Renamed".into()];
@@ -1848,22 +1806,15 @@ fn grouped_signature_identity_preserves_width_and_order_after_relocation() {
     }
     builtin::import_definition(&definition, &mut destination).unwrap();
     assert_eq!(destination, before);
-    let Some(pb::declaration::Kind::HostPrimitive(primitive)) = &definition.declarations[2].kind
-    else {
-        unreachable!()
-    };
+    let primitive = &definition.primitives[0];
     graph
         .type_info()
         .check_portable_builtin_signature(&definition, primitive)
         .unwrap();
     for mutation in 0..4 {
         let mut invalid = definition.clone();
-        let Some(pb::declaration::Kind::HostPrimitive(primitive)) =
-            &mut invalid.declarations[2].kind
-        else {
-            unreachable!()
-        };
-        let Some(pb::host_primitive::Typing::Signature(signature)) = &mut primitive.typing else {
+        let primitive = &mut invalid.primitives[0];
+        let Some(pb::primitive::Typing::Signature(signature)) = &mut primitive.typing else {
             unreachable!()
         };
         match mutation {
@@ -1874,10 +1825,7 @@ fn grouped_signature_identity_preserves_width_and_order_after_relocation() {
             2 => signature.varargs.push(signature.varargs[0].clone()),
             _ => signature.varargs[1] = signature.varargs[0].clone(),
         }
-        let Some(pb::declaration::Kind::HostPrimitive(primitive)) = &invalid.declarations[2].kind
-        else {
-            unreachable!()
-        };
+        let primitive = &invalid.primitives[0];
         assert!(
             graph
                 .type_info()
@@ -1888,24 +1836,16 @@ fn grouped_signature_identity_preserves_width_and_order_after_relocation() {
         assert_eq!(destination, before);
     }
     // Repeating the same type twice is not a homogeneous one-position tail.
-    let Some(pb::declaration::Kind::HostPrimitive(primitive)) =
-        &mut definition.declarations[2].kind
-    else {
-        unreachable!()
-    };
-    let Some(pb::host_primitive::Typing::Signature(signature)) = &mut primitive.typing else {
+    let primitive = &mut definition.primitives[0];
+    let Some(pb::primitive::Typing::Signature(signature)) = &mut primitive.typing else {
         unreachable!()
     };
     signature.varargs[1] = signature.varargs[0].clone();
-    let mut equal_positions = pb::Program::default();
+    let mut equal_positions = pb::BuiltinCatalog::default();
     builtin::import_definition(&definition, &mut equal_positions).unwrap();
     let frozen = equal_positions.clone();
-    let Some(pb::declaration::Kind::HostPrimitive(primitive)) =
-        &mut definition.declarations[2].kind
-    else {
-        unreachable!()
-    };
-    let Some(pb::host_primitive::Typing::Signature(signature)) = &mut primitive.typing else {
+    let primitive = &mut definition.primitives[0];
+    let Some(pb::primitive::Typing::Signature(signature)) = &mut primitive.typing else {
         unreachable!()
     };
     signature.varargs.pop();
@@ -1913,179 +1853,14 @@ fn grouped_signature_identity_preserves_width_and_order_after_relocation() {
     assert_eq!(equal_positions, frozen);
 }
 
-#[test]
-fn grouped_defaults_and_surface_slots_validate_without_evaluation() {
-    let mut source = Grouped::wire_definitions().remove(0);
-    source.sorts.extend([
-        pb::Sort {
-            kind: Some(pb::sort::Kind::Family(pb::HostSort {
-                name: "f64".into(),
-                args: vec![],
-            })),
-            ..Default::default()
-        },
-        pb::Sort {
-            kind: Some(pb::sort::Kind::Family(pb::HostSort {
-                name: "TestGrouped".into(),
-                args: vec![3, 4],
-            })),
-            ..Default::default()
-        },
-    ]);
-    source.nodes = vec![
-        pb::Node {
-            sort_id: 3,
-            kind: Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
-                value: Some(pb::primitive_value::Value::I64(7)),
-            })),
-            ..Default::default()
-        },
-        pb::Node {
-            sort_id: 4,
-            kind: Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
-                value: Some(pb::primitive_value::Value::F64Bits(2.0f64.to_bits())),
-            })),
-            ..Default::default()
-        },
-        pb::Node {
-            sort_id: 5,
-            kind: Some(pb::node::Kind::Call(pb::Call {
-                func: "test.grouped".into(),
-                args: vec![0, 0, 1, 0, 1],
-            })),
-            ..Default::default()
-        },
-    ];
-    source.declarations[2].bindings.as_mut().unwrap().python = Some(pb::PythonBindings {
-        views: vec![pb::PythonCallable {
-            kind: pb::PythonCallKind::Function.into(),
-            path: vec!["test".into(), "pairs".into()],
-            params: vec![
-                pb::PythonParameter {
-                    core_input: Some(0),
-                    name: "prefix".into(),
-                    ..Default::default()
-                },
-                pb::PythonParameter {
-                    core_input: Some(1),
-                    name: "pairs".into(),
-                    ..Default::default()
-                },
-            ],
-            ..Default::default()
-        }],
-    });
-    source.declarations[2].bindings.as_mut().unwrap().rust = Some(pb::RustBindings {
-        views: vec![pb::RustCallable {
-            path: vec!["test".into(), "pairs".into()],
-            params: vec![
-                pb::RustParameter {
-                    core_input: Some(0),
-                    name: "prefix".into(),
-                    borrowed: false,
-                },
-                pb::RustParameter {
-                    core_input: Some(1),
-                    name: "pairs".into(),
-                    borrowed: false,
-                },
-            ],
-            ..Default::default()
-        }],
-    });
-    source.declarations.push(pb::Declaration {
-        kind: Some(pb::declaration::Kind::Function(pb::Function {
-            name: "consume".into(),
-            inputs: vec![pb::Arg {
-                sort: 5,
-                name: "value".into(),
-            }],
-            output: 3,
-            ..Default::default()
-        })),
-        bindings: Some(pb::CallableBindings {
-            python: Some(pb::PythonBindings {
-                views: vec![pb::PythonCallable {
-                    kind: pb::PythonCallKind::Function.into(),
-                    path: vec!["test".into(), "consume".into()],
-                    params: vec![pb::PythonParameter {
-                        core_input: Some(0),
-                        name: "value".into(),
-                        default_expr: Some(2),
-                    }],
-                    ..Default::default()
-                }],
-            }),
-            ..Default::default()
-        }),
-        ..Default::default()
-    });
-    for args in [vec![0], vec![0, 0, 1], vec![0, 0, 1, 0, 1]] {
-        let Some(pb::node::Kind::Call(call)) = &mut source.nodes[2].kind else {
-            unreachable!()
-        };
-        call.args = args;
-        builtin::definitions::reconcile_declarations(&source, &mut pb::Program::default()).unwrap();
-    }
-    for mutation in 0..12 {
-        let mut invalid = source.clone();
-        match mutation {
-            0..=3 => {
-                let Some(pb::node::Kind::Call(call)) = &mut invalid.nodes[2].kind else {
-                    unreachable!()
-                };
-                call.args =
-                    [vec![], vec![0, 0], vec![0, 1, 0], vec![0, 0, 1, 0, 0]][mutation].clone();
-            }
-            4 => invalid.nodes[2].sort_id = 3,
-            5 => {
-                let Some(pb::declaration::Kind::HostPrimitive(primitive)) =
-                    &mut invalid.declarations[2].kind
-                else {
-                    unreachable!()
-                };
-                let Some(pb::host_primitive::Typing::Signature(signature)) = &mut primitive.typing
-                else {
-                    unreachable!()
-                };
-                signature.type_params.push("Undetermined".into());
-            }
-            _ => {
-                let binding = invalid.declarations[2].bindings.as_mut().unwrap();
-                match mutation {
-                    6 => binding.python.as_mut().unwrap().views[0].params[1].default_expr = Some(0),
-                    7 => binding.python.as_mut().unwrap().views[0].params[1].core_input = Some(2),
-                    8 => binding.python.as_mut().unwrap().views[0].params.reverse(),
-                    9 => binding.rust.as_mut().unwrap().views[0].params[1].core_input = Some(2),
-                    10 => binding.rust.as_mut().unwrap().views[0].params.reverse(),
-                    _ => binding.python.as_mut().unwrap().views[0].receiver = Some(1),
-                }
-            }
-        }
-        let mut destination = pb::Program::default();
-        assert!(
-            builtin::definitions::reconcile_declarations(&invalid, &mut destination).is_err(),
-            "mutation {mutation}"
-        );
-        assert_eq!(destination, pb::Program::default());
-    }
-    assert_eq!(BODY.load(Ordering::SeqCst), 0);
-    assert_eq!(VALIDATOR.load(Ordering::SeqCst), 0);
-}
-
-mod manual_root_context {
+mod manual_registration {
     use super::*;
-
-    const ROOT: &str = "test.manual_context_root";
-    const HELPER: &str = "test.manual_context_helper";
-    static HELPER_CALLS: AtomicUsize = AtomicUsize::new(0);
-
+    const ROOT: &str = "test.manual_root";
     #[derive(Clone)]
     struct Manual(builtin::BuiltinDescription);
-
     impl Primitive for Manual {
         fn name(&self) -> &str {
-            "manual-context-root"
+            "manual-root"
         }
         fn get_type_constraints(&self, span: &ast::Span) -> Box<dyn constraint::TypeConstraint> {
             egglog::builtin::rooted_type_constraints(ROOT, &self.0, span)
@@ -2094,364 +1869,70 @@ mod manual_root_context {
             Some(&self.0)
         }
     }
-
     impl PurePrim for Manual {
-        fn apply<'a, 'db>(&self, _: PureState<'a, 'db>, _: &[Value]) -> Option<Value> {
-            panic!("manual context validation must not execute the root")
+        fn apply<'a, 'db>(&self, _: PureState<'a, 'db>, args: &[Value]) -> Option<Value> {
+            args.first().copied()
         }
     }
-
-    struct Template;
-    impl Template {
-        fn wire_definitions() -> Vec<pb::Program> {
-            vec![pb::Program {
-                sorts: vec![pb::Sort {
-                    kind: Some(pb::sort::Kind::Family(pb::HostSort {
-                        name: "i64".into(),
-                        args: vec![],
-                    })),
-                    ..Default::default()
-                }],
-                declarations: vec![pb::Declaration {
-                    kind: Some(pb::declaration::Kind::HostPrimitive(pb::HostPrimitive {
-                        name: HELPER.into(),
-                        typing: Some(pb::host_primitive::Typing::Signature(
-                            pb::GenericSignature {
-                                output: Some(0),
-                                ..Default::default()
-                            },
-                        )),
-                    })),
-                    ..Default::default()
-                }],
-                ..Default::default()
-            }]
-        }
-    }
-
-    impl Presort for Template {
-        fn presort_name() -> &'static str {
-            "ManualContextTemplate"
-        }
-        fn reserved_primitives() -> Vec<&'static str> {
-            vec![]
-        }
-        fn builtin_definitions() -> Vec<builtin::BuiltinDescription> {
-            Self::wire_definitions()
-                .iter()
-                .map(|program| builtin::native_definition(program).unwrap())
-                .collect()
-        }
-        fn make_sort(
-            _: &TypeInfo,
-            _: String,
-            _: &[ast::Expr],
-            _: ast::Span,
-        ) -> Result<ArcSort, TypeError> {
-            panic!("default context validation must not instantiate the template")
-        }
-    }
-
-    fn prepare(types: &TypeInfo) -> Result<(builtin::BuiltinDescription, pb::Program), String> {
-        let integer = types.get_sort_by_name("i64").unwrap().clone();
+    #[test]
+    fn semantic_evidence_is_checked_before_native_publication() {
+        let mut graph = EGraph::default();
+        let integer = graph.get_sort_by_name("i64").unwrap().clone();
         let description = egglog::builtin::closed_signature(
             ROOT,
-            "manual-context-root",
+            "manual-root",
             &[("value", integer.clone())],
             &[],
             integer,
-        )?;
-        let generated = builtin::project_description(&description)?;
-        types.prepare_builtin_context(ROOT, "manual-context-root", generated, |types, key, draft| {
-            let mut context = pb::Program::default();
-            types.export_builtin_definition(HELPER, &mut context)?;
-            let root = draft.declarations.iter_mut().find(|declaration| {
-                matches!(&declaration.kind, Some(pb::declaration::Kind::HostPrimitive(primitive)) if primitive.name == key)
-            }).unwrap();
-            let Some(pb::declaration::Kind::HostPrimitive(primitive)) = &root.kind else {
-                unreachable!()
-            };
-            let Some(pb::host_primitive::Typing::Signature(signature)) = &primitive.typing else {
-                unreachable!()
-            };
-            let default = draft.nodes.len() as u32;
-            draft.nodes.push(pb::Node {
-                sort_id: signature.output.unwrap(),
-                kind: Some(pb::node::Kind::Call(pb::Call {
-                    func: HELPER.into(),
-                    args: vec![],
-                })),
-                ..Default::default()
-            });
-            root.bindings.as_mut().unwrap().python = Some(pb::PythonBindings {
-                views: vec![pb::PythonCallable {
-                    kind: pb::PythonCallKind::Function.into(),
-                    path: vec!["test".into(), "manual_context_root".into()],
-                    params: vec![pb::PythonParameter {
-                        core_input: Some(0),
-                        name: "value".into(),
-                        default_expr: Some(default),
-                    }],
-                    ..Default::default()
-                }],
-            });
-            builtin::definitions::reconcile_declarations(draft, &mut context)?;
-            *draft = context;
-            Ok(())
-        }).map(|definition| (description, definition))
-    }
-
-    #[test]
-    fn explicit_manual_root_follows_helper_first_evidence() {
-        let mut graph = EGraph::default();
-        add_literal_prim!(
-            &mut graph,
-            "manual-context-helper"[id = "test.manual_context_helper"] = || -> i64 {
-                {
-                    HELPER_CALLS.fetch_add(1, Ordering::SeqCst);
-                    17
-                }
-            }
-        );
-        let integer = graph.get_sort_by_name("i64").unwrap().clone();
-        let helper = ResolvedCall::from_resolution(
-            "manual-context-helper",
-            std::slice::from_ref(&integer),
-            graph.type_info(),
-            Context::Pure,
-            &ast::Span::Panic,
         )
         .unwrap();
-        let (description, definition) = prepare(graph.type_info()).unwrap();
-        let order = definition
-            .declarations
-            .iter()
-            .filter_map(|declaration| match &declaration.kind {
-                Some(pb::declaration::Kind::HostPrimitive(primitive)) => {
-                    Some(primitive.name.as_str())
-                }
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(order, [HELPER, ROOT]);
-        let mut destination = pb::Program::default();
-        assert!(builtin::import_definition(&definition, &mut destination).is_err());
-        assert_eq!(destination, pb::Program::default());
-
-        let registration = builtin::add_pure_with_definition(
-            &mut graph,
-            Manual(description),
-            ROOT,
-            &definition,
-            None,
-        );
-        registration.unwrap();
-        let signature = [integer.clone(), integer.clone()];
-        for context in [Context::Pure, Context::Read, Context::Write, Context::Full] {
-            let root = ResolvedCall::from_resolution(
-                ROOT,
-                &signature,
-                graph.type_info(),
-                context,
-                &ast::Span::Panic,
-            );
-            let alias = ResolvedCall::from_resolution(
-                "manual-context-root",
-                &signature,
-                graph.type_info(),
-                context,
-                &ast::Span::Panic,
-            );
-            match (root, alias) {
-                (Ok(root), Ok(alias)) => assert_eq!(root, alias),
-                (Err(_), Err(_)) => (),
-                _ => panic!("explicit root changed native context availability"),
-            }
-        }
-        assert!(
-            ResolvedCall::from_resolution(
-                ROOT,
-                &signature,
-                graph.type_info(),
-                Context::Pure,
-                &ast::Span::Panic,
-            )
-            .is_ok()
-        );
-        assert!(
-            ResolvedCall::from_resolution(
-                ROOT,
-                std::slice::from_ref(&integer),
-                graph.type_info(),
-                Context::Pure,
-                &ast::Span::Panic,
-            )
-            .is_err()
-        );
-        assert_eq!(
-            helper,
-            ResolvedCall::from_resolution(
-                "manual-context-helper",
-                std::slice::from_ref(&integer),
-                graph.type_info(),
-                Context::Pure,
-                &ast::Span::Panic,
-            )
-            .unwrap()
-        );
-        assert_eq!(
-            graph
-                .type_info()
-                .get_prims("manual-context-helper")
-                .unwrap()
-                .len(),
-            1
-        );
-        graph
+        let definition = builtin::project_description(&description).unwrap();
+        let before = graph
             .type_info()
-            .export_builtin_definition(ROOT, &mut destination)
-            .unwrap();
-        assert!(destination.nodes.iter().any(|node| {
-            matches!(&node.kind, Some(pb::node::Kind::Call(call)) if call.func == HELPER)
-        }));
-        assert!(graph.type_info().portable_builtin_catalog().is_ok());
-        assert_eq!(HELPER_CALLS.load(Ordering::SeqCst), 0);
-    }
-
-    #[test]
-    fn malformed_manual_contexts_fail_before_alias_publication() {
-        for mutation in [
-            "unknown",
-            "forged",
-            "duplicate",
-            "root",
-            "family",
-            "node",
-            "unreachable",
-        ] {
-            let mut graph = EGraph::default();
-            add_literal_prim!(
-                &mut graph,
-                "manual-context-helper"[id = "test.manual_context_helper"] = || -> i64 {
-                    {
-                        HELPER_CALLS.fetch_add(1, Ordering::SeqCst);
-                        17
-                    }
-                }
-            );
-            let before = graph
-                .type_info()
-                .portable_builtin_catalog()
-                .unwrap()
-                .definitions;
-            let (description, mut definition) = prepare(graph.type_info()).unwrap();
-            let helper = definition.declarations.iter().position(|declaration| {
-                matches!(&declaration.kind, Some(pb::declaration::Kind::HostPrimitive(primitive)) if primitive.name == HELPER)
-            }).unwrap();
-            let root = definition.declarations.iter().position(|declaration| {
-                matches!(&declaration.kind, Some(pb::declaration::Kind::HostPrimitive(primitive)) if primitive.name == ROOT)
-            }).unwrap();
-            match mutation {
-                "unknown" => {
-                    let Some(pb::declaration::Kind::HostPrimitive(primitive)) =
-                        &mut definition.declarations[helper].kind
-                    else {
-                        unreachable!()
-                    };
-                    primitive.name = "test.unregistered_manual_helper".into();
-                    for node in &mut definition.nodes {
-                        if let Some(pb::node::Kind::Call(call)) = &mut node.kind {
-                            call.func = "test.unregistered_manual_helper".into();
-                        }
-                    }
-                }
-                "forged" => definition.declarations[helper].doc = Some("forged helper".into()),
-                "duplicate" => definition
-                    .declarations
-                    .push(definition.declarations[helper].clone()),
-                "root" => {
-                    let Some(pb::declaration::Kind::HostPrimitive(primitive)) =
-                        &mut definition.declarations[root].kind
-                    else {
-                        unreachable!()
-                    };
-                    primitive.name = "test.wrong_manual_root".into();
-                }
-                "family" => {
-                    let family = definition
-                        .declarations
-                        .iter_mut()
-                        .find_map(|declaration| match &mut declaration.kind {
-                            Some(pb::declaration::Kind::HostSortFamily(family)) => Some(family),
-                            _ => None,
-                        })
-                        .unwrap();
-                    family.arity += 1;
-                }
-                "node" => definition.nodes.clear(),
-                "unreachable" => {
-                    definition.declarations[root]
-                        .bindings
-                        .as_mut()
-                        .unwrap()
-                        .python = None
-                }
-                _ => unreachable!(),
+            .portable_builtin_catalog()
+            .unwrap()
+            .definitions;
+        for wrong_key in [false, true] {
+            let mut invalid = definition.clone();
+            let root = &mut invalid.primitives.last_mut().unwrap();
+            if wrong_key {
+                root.name = "other.root".into();
+            } else {
+                let Some(pb::primitive::Typing::Signature(s)) = &mut root.typing else {
+                    unreachable!()
+                };
+                s.inputs.clear();
             }
-            let registration = builtin::add_pure_with_definition(
-                &mut graph,
-                Manual(description),
-                ROOT,
-                &definition,
-                None,
-            );
-            assert!(registration.is_err(), "{mutation}");
             assert!(
-                !graph.type_info().is_primitive("manual-context-root"),
-                "{mutation}"
+                builtin::add_pure_with_definition(
+                    &mut graph,
+                    Manual(description.clone()),
+                    ROOT,
+                    &invalid,
+                    None
+                )
+                .is_err()
             );
-            assert!(!graph.type_info().is_primitive(ROOT), "{mutation}");
             assert_eq!(
                 graph
                     .type_info()
                     .portable_builtin_catalog()
                     .unwrap()
                     .definitions,
-                before,
-                "{mutation}: rejected portable metadata must not change the native catalog",
+                before
             );
-            assert_eq!(
-                graph
-                    .type_info()
-                    .get_prims("manual-context-helper")
-                    .unwrap()
-                    .len(),
-                1
-            );
-            assert_eq!(HELPER_CALLS.load(Ordering::SeqCst), 0);
+            assert!(graph.type_info().get_prims(ROOT).is_none());
         }
-    }
-
-    #[test]
-    fn template_only_helper_cannot_supply_native_default_authority() {
-        let mut graph = EGraph::default();
+        builtin::add_pure_with_definition(&mut graph, Manual(description), ROOT, &definition, None)
+            .unwrap();
+        graph
+            .parse_and_run_program(None, "(check (= (manual-root 7) 7))")
+            .unwrap();
+        let mut exported = pb::BuiltinCatalog::default();
         graph
             .type_info()
-            .add_presort::<Template>(ast::Span::Panic)
+            .export_builtin_definition(ROOT, &mut exported)
             .unwrap();
-        let mut exported = pb::Program::default();
-        graph
-            .type_info()
-            .export_builtin_definition(HELPER, &mut exported)
-            .unwrap();
-        assert!(exported.declarations.iter().any(|declaration| {
-            matches!(&declaration.kind, Some(pb::declaration::Kind::HostPrimitive(primitive)) if primitive.name == HELPER)
-        }));
-        assert!(graph.type_info().get_prims(HELPER).is_none());
-        let error = prepare(graph.type_info()).unwrap_err();
-        assert!(error.contains("no registered implementation"), "{error}");
-        assert!(!graph.type_info().is_primitive("manual-context-root"));
-        assert!(!graph.type_info().is_primitive(ROOT));
-        assert!(graph.type_info().portable_builtin_catalog().is_ok());
+        assert_eq!(exported, definition);
     }
 }

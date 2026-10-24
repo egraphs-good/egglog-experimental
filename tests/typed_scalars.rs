@@ -1,5 +1,6 @@
 #![cfg(feature = "typed")]
 
+use egglog_experimental::proto as pb;
 use egglog_experimental::typed::{
     builtins::{Bool, F64, I64, Map, Pair, String as EString, Unit, join},
     prelude::*,
@@ -558,14 +559,13 @@ fn closed_i64_arithmetic_failures_match_native_evaluation() {
                 .is_err(),
             "{source}"
         );
-        let TypedError::Engine(error) = EGraph::default().extract(value).unwrap_err() else {
+        let TypedError::Engine(frame) = EGraph::default().extract(value).unwrap_err() else {
             panic!("expected a decoded native evaluation error for {source}");
         };
-        assert_eq!(
-            error.code,
-            egglog_experimental::proto::ErrorCode::EvaluationFailed as i32,
-            "{source}"
-        );
+        let Some(pb::run_program_response::Result::Error(error)) = &frame.result else {
+            panic!("expected terminal error frame")
+        };
+        assert_eq!(error.code, pb::ErrorCode::RuntimeFailure as i32, "{source}");
     }
 }
 
@@ -753,13 +753,13 @@ fn overflow_is_native_evaluation_failure_not_authoring_arithmetic() {
     let value = I64::from(i64::MAX) + I64::from(1);
     assert!(i64::try_from(&value).is_err());
     let error = EGraph::default().extract(&value).unwrap_err();
-    let TypedError::Engine(error) = error else {
+    let TypedError::Engine(frame) = error else {
         panic!("expected structured engine failure: {error}");
     };
-    assert_eq!(
-        error.code,
-        egglog_experimental::proto::ErrorCode::EvaluationFailed as i32
-    );
+    let Some(pb::run_program_response::Result::Error(error)) = &frame.result else {
+        panic!("expected terminal error frame")
+    };
+    assert_eq!(error.code, pb::ErrorCode::RuntimeFailure as i32);
 }
 
 #[test]
