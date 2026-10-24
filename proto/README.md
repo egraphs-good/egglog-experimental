@@ -6,8 +6,8 @@ the wire format may change.
 
 [egglog.proto](egglog/v1/egglog.proto) is the reference: its comments and validation
 annotations define the contract. This overview explains the model. Execution
-prototypes are being tested separately; this PR contains the schema, generated
-messages and wire-validation tests.
+prototypes are being tested separately; this PR contains the schema, generation
+tooling and wire-validation tests.
 
 ## Programs, definitions and execution
 
@@ -148,9 +148,11 @@ a binary roundtrip alone does not establish frontend or execution conformance.
 
 ## Generated messages and checks
 
-Checked-in [Python](../gen/python/egglog/v1/egglog_pb.py) messages use
-`protobuf-py`; [Rust](../gen/rust/egglog/v1/egglog.v1.rs) uses `prost` in the
-`egglog-proto` crate. No gRPC transport is generated or required. Consumers must
+Generated Python messages use `protobuf-py`; Rust uses `prost` in the
+`egglog-proto` crate. Message sources are ignored build outputs under
+`gen/python` and `gen/rust`; package manifests, root modules and licenses remain
+versioned. Run `make proto-gen` before building either SDK. No gRPC transport is
+generated or required. Consumers must
 select matching schema revisions: the `egglog.v1` package name is not a version
 handshake in raw bytes.
 
@@ -169,11 +171,13 @@ make proto-lint
 make proto-test
 ```
 
-Commit generated sources with schema comment changes too. `make proto-drift`
-checks regeneration drift. `make proto-test` validates wire/CEL behavior; it does
-not execute Egglog or independently check proofs.
+`make proto-test` regenerates its inputs before validating wire/CEL behavior;
+it does not execute Egglog or independently check proofs. `make proto-clean`
+removes generated sources while preserving the package scaffolding. The protobuf
+CI job generates from a fresh checkout, runs validation tests and compiles the
+Rust SDK.
 
-A wire-validation example, after `uv sync --locked`:
+A wire-validation example, after `make proto-gen`:
 
 ```sh
 uv run python - <<'PY'

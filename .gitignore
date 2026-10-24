@@ -1,5 +1,13 @@
 /target
 .DS_Store
 
-# Generated protobuf sources in gen/ are versioned; see proto/README.md.
+# Generated protobuf sources; package scaffolding remains versioned.
+/gen/python/egglog/
+/gen/python/buf/
+/gen/python/build/
+/gen/python/*.egg-info/
+/gen/rust/egglog/
+/gen/rust/buf/
+/gen/rust/target/
+/gen/rust/Cargo.lock
 __pycache__/

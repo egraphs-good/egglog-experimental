@@ -29,25 +29,21 @@ docs:
 # Protobuf IR codegen. See proto/README.md.
 # ---------------------------------------------------------------------------
 
-.PHONY: proto-gen proto-lint proto-test proto-clean proto-drift
+.PHONY: proto-gen proto-lint proto-test proto-clean
 
 # Include the validation descriptors referenced by the Python bindings.
-proto-gen:
-	uv sync --quiet
-	buf generate --include-imports
+proto-gen: proto-clean
+	uv sync --locked --quiet
+	buf generate
 
 proto-lint:
 	buf lint
 	buf format --diff --exit-code
 	buf build
 
-proto-test:
+proto-test: proto-gen
 	uv run python -m unittest discover -s proto/tests -v
 
 proto-clean:
 	# Preserve the handwritten Python/Rust package metadata and root modules.
 	rm -rf gen/python/egglog gen/python/buf gen/rust/egglog gen/rust/buf
-
-# `gen/` is committed, so it can drift from the schema. This fails if it has.
-proto-drift: proto-gen
-	git diff --exit-code -- gen

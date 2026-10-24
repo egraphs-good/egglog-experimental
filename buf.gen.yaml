@@ -1,6 +1,6 @@
 # Local codegen plugins; setup and tested versions are in proto/README.md.
-# `make proto-gen` syncs Python tools and passes --include-imports so Python's
-# references to the validation descriptors resolve. Dependencies may need
+# `make proto-gen` syncs Python tools. Only Python needs imported validation
+# descriptors; Rust generates just the Egglog messages. Dependencies may need
 # network access on first use. No tonic client/server code is generated.
 version: v2
 inputs:
@@ -8,6 +8,7 @@ inputs:
 plugins:
   - local: ["uv", "run", "protoc-gen-py"]
     out: gen/python
+    include_imports: true
 
   # Keep well-known types in prost-types rather than generating duplicate types.
   - local: protoc-gen-prost

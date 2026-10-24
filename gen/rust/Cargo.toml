@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 description = "Generated protobuf messages for the experimental Egglog IR"
 license = "MIT"
+include = ["Cargo.toml", "lib.rs", "egglog/v1/egglog.v1.rs"]
 
 [lib]
 path = "lib.rs"
