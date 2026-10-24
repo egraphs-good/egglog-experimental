@@ -1487,11 +1487,12 @@ message Command {
     // Adds no binder, command list, Union identity scope, or loop iteration.
     Command fail = 16;
 
-    // Observe the actual cumulative native RunReport here. No file destination;
-    // this observation composes with other commands and follows Fail suppression.
+    // Observe previously collected cumulative backend diagnostics. No file
+    // destination; follows ordinary observation ordering and Fail suppression.
     Unit stats = 17;
 
     AddRules add_rules = 18;
+    Explain explain = 19;
   }
 
   // Origin. Locates a failure attributed to a command rather than an
@@ -1542,7 +1543,7 @@ message AddRules {
 // default group. Traverse groups and first-registration membership in order,
 // selecting shared content once. Separate Runs still select independently and
 // retain the selected rules' execution state; this does not override eval_mode
-// or scheduler decisions. A completed top-level Run returns RunOutcome.
+// or scheduler decisions. A completed top-level Run returns RunResult.
 message Run {
   repeated string groups = 1;
   // Empty means no scheduler; otherwise names a BindScheduler instance.
@@ -1730,7 +1731,7 @@ message PrintTableStats {
 
 // Execute `body` exactly `times` times, unless `until` matches or execution
 // fails. Does not stop early when the database is unchanged. A completed
-// top-level Repeat returns LoopOutcome.
+// top-level Repeat returns RunResult.
 message Repeat {
   repeated Command body = 1;
 
@@ -1744,7 +1745,7 @@ message Repeat {
 // Repeat `body` until a complete iteration can stop, or a bound or `until`
 // condition ends it. Stop only when the iteration made no changes and every
 // consulted scheduler permits stopping. An unbounded body may diverge.
-// A completed top-level Saturate returns LoopOutcome.
+// A completed top-level Saturate returns RunResult.
 //
 // Progress is recomputed each iteration over every mutation in the body:
 // actions, `keep_best`, extraction-root evaluation, and nested loops. Row
@@ -1760,11 +1761,17 @@ message Saturate {
   optional uint64 max_iterations = 3 [(buf.validate.field).uint64.gte = 1];
 }
 
+// Inspect selected registered rule query plans without executing or advancing
+// cursors. Unknown groups select no rules, as for Run. Returns Diagnostic.
+message Explain {
+  repeated string groups = 1;
+}
+
 // ---------------------------------------------------------------------------
 // SERVICE — the operations, their request/response types, and failure.
 // ---------------------------------------------------------------------------
 
-// E-graph lifecycle, runtime resources, and program execution. Logical
+// E-graph lifecycle and program execution. Logical
 // operations compose inside a `Program`, rather than one rpc per command.
 // Intended for an in-process typed/bytes adapter; no network transport is
 // required. The bounded compatibility adapter implements only part of this
@@ -1774,7 +1781,7 @@ service EgglogService {
   rpc CloneEGraph(CloneEGraphRequest) returns (CloneEGraphResponse);
   rpc DestroyEGraph(DestroyEGraphRequest) returns (DestroyEGraphResponse);
   rpc ReturnToEGraph(ReturnToEGraphRequest) returns (ReturnToEGraphResponse);
-  rpc RunProgram(RunProgramRequest) returns (RunProgramResponse);
+  rpc RunProgram(RunProgramRequest) returns (stream RunProgramResponse);
   // buf:lint:ignore RPC_RESPONSE_STANDARD_NAME
   rpc GetHistory(GetHistoryRequest) returns (Program);
 }
@@ -1879,16 +1886,13 @@ message CreateEGraphRequest {
   // replay. Local rule no_decomp=true still applies when this global is false.
   bool no_decomp = 6;
 
-  // Retain structured request/outcome history for this handle. Off by default;
+  // Retain accepted input Programs for this handle. Off by default;
   // not a logical option and never restored by Freeze. Clone inherits this
   // choice. GetHistory specifies retention, observation and lifecycle behavior.
   bool record_history = 7;
 
-  // Creation-only native collection detail; absent retains the host default.
-  optional ReportLevel report_level = 8 [(buf.validate.field).enum = {
-    defined_only: true
-    not_in: [0]
-  }];
+  reserved 8;
+  reserved "report_level";
 }
 
 message CreateEGraphResponse {
@@ -1977,33 +1981,24 @@ message GetHistoryRequest {
   uint64 egraph_id = 1;
 }
 
-// Native collection detail, independent of optional report serialization.
-enum ReportLevel {
-  REPORT_LEVEL_UNSPECIFIED = 0;
-  REPORT_LEVEL_TIME_ONLY = 1;
-  REPORT_LEVEL_WITH_PLAN = 2;
-  REPORT_LEVEL_STAGE_INFO = 3;
-}
-
 // Execute a program against an existing e-graph.
 message RunProgramRequest {
   uint64 egraph_id = 1;
   Program program = 2;
 
-  // Off by default and scoped to this request. False disables optional profile
-  // collection/retention, not just serialization. Scheduler-required counters,
-  // progress and stopping checks remain. Outcomes and requested observations
-  // are independent of this flag. Collection-off needs runtime implementation.
-  bool profile = 3;
-
-  // Emit actual native detail alongside completed requested top-level controls.
-  // Emission only: omission does not disable collection/retention. Explicit Stats
-  // observations always return their full report, independently of this flag.
-  bool include_run_reports = 4;
+  // Collect backend-specific detail for each completed control. Off disables
+  // optional timing, per-rule metrics and retained iteration detail, without
+  // changing scheduler-required counts or readiness decisions.
+  bool diagnostics = 3;
+  reserved 4;
+  reserved "profile", "include_run_reports";
 }
 
-// Results have their own concrete arenas, independent of the request. Nested
-// exported Programs own separate arenas and may contain signature patterns.
+// Each streamed chunk owns complete local arenas, independent of every other
+// chunk and the request. Nested Programs own their own arenas. Observations are
+// delivered during loops; a final completion/error chunk precedes stream end.
+// Cancellation preserves completed effects and outputs. It is cooperative at
+// command boundaries and does not roll back.
 message RunProgramResponse {
   option (buf.validate.message).cel = {
     id: "run_program_response.closed_sorts"
@@ -2089,38 +2084,16 @@ message RunProgramResponse {
 
   option (buf.validate.message).cel = {
     id: "run_program_response.rule_refs_in_range"
-    message: "error and profile rule references must index response rules"
-    expression:
-      "(!has(this.error) || !has(this.error.rule) || this.error.rule < uint(size(this.rules))) && "
-      "(!has(this.profile) || this.profile.runs.all(s, "
-      "s.rules.all(r, r.rule < uint(size(this.rules)))))"
-  };
-  option (buf.validate.message).cel = {
-    id: "run_program_response.profile_completion"
-    message: "a present profile is complete exactly when the request succeeded"
-    expression: "!has(this.profile) || this.profile.complete == !has(this.error)"
-  };
-  option (buf.validate.message).cel = {
-    id: "run_program_response.report_rule_refs_in_range"
-    message: "report rule references must index response rules"
-    expression:
-      "this.outputs.all(o, !(has(o.run_report) || has(o.statistics)) || "
-      "[has(o.run_report) ? o.run_report : o.statistics].all(r, "
-      "r.search_and_apply_time_per_rule.all(e, !has(e.rule) || e.rule < uint(size(this.rules))) && "
-      "r.num_matches_per_rule.all(e, !has(e.rule) || e.rule < uint(size(this.rules))) && "
-      "r.iterations.all(i, i.rule_set_report.rule_reports.all(e, "
-      "!has(e.rule) || e.rule < uint(size(this.rules))))))"
+    message: "error rule references must index response rules"
+    expression: "!has(this.error) || !has(this.error.rule) || this.error.rule < uint(size(this.rules))"
   };
 
   repeated Node nodes = 1;
   repeated Sort sorts = 2;
 
-  // Completion order. Each completed TOP-LEVEL Run/Repeat/Saturate contributes
-  // one compact outcome; nested control commands contribute none. Every
-  // requested observation contributes its output, including repeated executions
-  // inside loops. Successful proof requests contribute their proof. Native
-  // helper/maintenance Runs contribute no outcomes; their measured work belongs
-  // in optional profiling. See CommandOutput.
+  // Completion order. Completed top-level Run/Repeat/Saturate commands return
+  // RunResult; observations are emitted at every depth, including during loops.
+  // Native maintenance contributes no requested output.
   repeated CommandOutput outputs = 3;
 
   // Origins for this response's nodes, sorts, rules and errors, including
@@ -2133,14 +2106,13 @@ message RunProgramResponse {
   // native result completed before a trailing maintenance failure remains here.
   Error error = 5;
 
-  // Canonical registered rule content referenced by errors/profile/reports.
+  // Canonical registered rule content referenced by errors.
   // Rule node/sort/span references use this response's arenas. Equivalent
   // content has one catalog entry; first-registration diagnostics represent it.
   repeated Rule rules = 6;
 
-  // Present iff requested, including when no Run was entered or validation
-  // failed. Summary only: no dynamic iteration coordinates or event history.
-  ProfileSummary profile = 7;
+  reserved 7;
+  reserved "profile";
 
   reserved 8;
   reserved "ruleset_publication";
@@ -2201,7 +2173,7 @@ message Error {
   CommandLocation location = 4;
 
   // Supplied structurally for an attributed rule/rewrite failure, never parsed
-  // from message text. Presence is independent of profile collection.
+  // from message text. Presence is independent of diagnostic collection.
   optional uint32 rule = 5; // index into RunProgramResponse.rules
 
   // Engine-internal origin as `file:line:col`; empty when there is none.
@@ -2267,241 +2239,38 @@ enum ProofFailureReason {
 // COMMAND OUTPUTS — the `CommandOutput.kind` arms, in arm order.
 // ---------------------------------------------------------------------------
 
-// For authored commands, completed top-level controls return compact outcomes;
-// observations return their matching arm at every nesting depth. Actions,
-// ordinary checks, scheduler bindings, and keep_best have no requested output.
-// Successful Prove/ProveExists and PROOF_TESTING Check return a proof at their
-// own location. These requested outputs must match the located command,
-// resolving through Fail wrappers subject to their suppression below. Nested
-// authored control outcomes are folded, never appended here. Fail itself has
-// no requested output and suppresses every requested output from its child,
-// including on unexpected success. Earlier outputs outside that child remain.
-// Native helper/maintenance Runs never contribute public outcomes. Their
-// measured work is attributed in optional ProfileSummary. This changes neither
-// their execution/effects nor native stopping/error behavior. A requested native
-// result completed before trailing maintenance fails remains in the prefix.
-// Request/output matching remains an adapter obligation.
-// Execution errors are `RunProgramResponse.error`, not an arm here.
+// Observations match the located command, including inside loops. Only completed
+// top-level Run/Repeat/Saturate commands emit RunResult. Fail suppresses every
+// requested output from its child. Errors appear in the final chunk; completed
+// prefixes remain observable.
 message CommandOutput {
   option (buf.validate.message).cel = {
-    id: "command_output.top_level_control_outcome"
-    message: "run and loop outcomes are only emitted for top-level commands"
-    expression: "!(has(this.run) || has(this.loop)) || size(this.location.path) == 1"
+    id: "command_output.top_level_run_result"
+    message: "control results are only emitted for top-level commands"
+    expression: "!has(this.run) || size(this.location.path) == 1"
   };
-  option (buf.validate.message).cel = {
-    id: "command_output.report_matches_control"
-    message: "a companion report requires a matching control outcome"
-    expression:
-      "!has(this.run_report) || "
-      "(has(this.run) && this.run.updated == this.run_report.updated && "
-      "this.run.can_stop == this.run_report.can_stop) || "
-      "(has(this.loop) && this.loop.updated == this.run_report.updated)"
-  };
-
   oneof kind {
     option (buf.validate.oneof).required = true;
-
-    RunOutcome run = 1;
+    RunResult run = 1;
     ExtractResult extraction = 2;
     EGraphSnapshot snapshot = 3;
     TableSizes sizes = 4;
     PrintedFunction printed_function = 5;
     TableStatsResult table_stats = 6;
-    LoopOutcome loop = 8;
     ProofResult proof = 9;
-    NativeRunReport statistics = 11;
+    Diagnostic diagnostic = 11;
   }
-
   CommandLocation location = 7 [(buf.validate.field).required = true];
-
-  // Present exactly when requested for a completed top-level Run/Loop. This is
-  // the native complete report, not ProfileSummary or a history reconstruction.
-  // Internal outputs and Fail children remain suppressed. A native failure has
-  // no complete report. Loop termination is not historical aggregate can_stop.
-  NativeRunReport run_report = 10;
+  reserved 8, 10;
+  reserved "loop", "run_report", "statistics";
 }
 
-// Exact native Duration range. Zero is measured zero; absent required durations
-// are invalid, never an availability signal or an implicit zero.
-message ReportDuration {
-  uint64 seconds = 1;
-  uint32 nanos = 2 [(buf.validate.field).uint32.lt = 1000000000];
+// Opaque backend-specific presentation; format identifies the content.
+message Diagnostic {
+  string format = 1 [(buf.validate.field).string.min_len = 1];
+  string content = 2;
 }
 
-enum NativeRuleDirection {
-  NATIVE_RULE_DIRECTION_UNSPECIFIED = 0;
-  NATIVE_RULE_DIRECTION_SINGLE = 1;
-  NATIVE_RULE_DIRECTION_FORWARD = 2;
-  NATIVE_RULE_DIRECTION_REVERSE = 3;
-}
-
-// One original native map entry. Direct canonical attribution is optional only
-// when unavailable; native_name is exact diagnostic/fallback data, never parsed
-// for identity. Unknown attribution must not be silently dropped in projection.
-// Keep distinct rows even when canonical references agree; Python conversion
-// and grouping order depends on the original native aggregate boundaries.
-message RuleDurationEntry {
-  option (buf.validate.message).cel = {
-    id: "rule_duration_entry.paired_attribution"
-    message: "rule and direction must be present together"
-    expression: "has(this.rule) == has(this.direction)"
-  };
-  optional uint32 rule = 1;
-  optional NativeRuleDirection direction = 2 [(buf.validate.field).enum = {
-    defined_only: true
-    not_in: [0]
-  }];
-  string native_name = 3;
-  ReportDuration value = 4 [(buf.validate.field).required = true];
-}
-
-message RuleCountEntry {
-  option (buf.validate.message).cel = {
-    id: "rule_count_entry.paired_attribution"
-    message: "rule and direction must be present together"
-    expression: "has(this.rule) == has(this.direction)"
-  };
-  optional uint32 rule = 1;
-  optional NativeRuleDirection direction = 2 [(buf.validate.field).enum = {
-    defined_only: true
-    not_in: [0]
-  }];
-  string native_name = 3;
-  uint64 value = 4;
-}
-
-// Known wire groups selected for this native aggregate. Empty also covers
-// unclassified/internal native work; preserve native_name instead of guessing.
-// These are native report entries, not wire group declarations.
-message RulesetDurationEntry {
-  repeated string groups = 1;
-  string native_name = 2;
-  ReportDuration value = 3 [(buf.validate.field).required = true];
-}
-
-message NativeRuleReport {
-  ReportPlan plan = 1; // None differs from a present empty plan
-  ReportDuration search_and_apply_time = 2 [(buf.validate.field).required = true];
-  uint64 num_matches = 3;
-}
-
-message NativeRuleReportsEntry {
-  option (buf.validate.message).cel = {
-    id: "native_rule_reports_entry.paired_attribution"
-    message: "rule and direction must be present together"
-    expression: "has(this.rule) == has(this.direction)"
-  };
-  optional uint32 rule = 1;
-  optional NativeRuleDirection direction = 2 [(buf.validate.field).enum = {
-    defined_only: true
-    not_in: [0]
-  }];
-  string native_name = 3;
-  repeated NativeRuleReport reports = 4; // native list order and multiplicity
-}
-
-message NativeRuleSetReport {
-  option (buf.validate.message).cel = {
-    id: "native_rule_set_report.unique_names"
-    message: "native rule map keys must be unique"
-    expression: "this.rule_reports.all(e, this.rule_reports.filter(f, f.native_name == e.native_name).size() == 1)"
-  };
-  bool changed = 1;
-  repeated NativeRuleReportsEntry rule_reports = 2;
-  ReportDuration search_and_apply_time = 3 [(buf.validate.field).required = true];
-  ReportDuration merge_time = 4 [(buf.validate.field).required = true];
-}
-
-message NativeIterationReport {
-  NativeRuleSetReport rule_set_report = 1 [(buf.validate.field).required = true];
-  ReportDuration rebuild_time = 2 [(buf.validate.field).required = true];
-}
-
-// Actual native history and all five authoritative maps. Scheduler histories
-// need not sum to these maps. Do not add ProfileSummary/maintenance totals.
-// Map rows retain captured enumeration; no order across native runs is promised.
-// This payload does not promise stronger retention or attribution after pop.
-message NativeRunReport {
-  option (buf.validate.message).cel = {
-    id: "native_run_report.can_stop"
-    message: "an updated report cannot permit stopping"
-    expression: "!this.updated || !this.can_stop"
-  };
-  option (buf.validate.message).cel = {
-    id: "native_run_report.unique_names"
-    message: "each native map must have unique keys, independently of other maps"
-    expression:
-      "this.search_and_apply_time_per_rule.all(e, this.search_and_apply_time_per_rule.filter(f, f.native_name == e.native_name).size() == 1) && "
-      "this.num_matches_per_rule.all(e, this.num_matches_per_rule.filter(f, f.native_name == e.native_name).size() == 1) && "
-      "this.search_and_apply_time_per_ruleset.all(e, this.search_and_apply_time_per_ruleset.filter(f, f.native_name == e.native_name).size() == 1) && "
-      "this.merge_time_per_ruleset.all(e, this.merge_time_per_ruleset.filter(f, f.native_name == e.native_name).size() == 1) && "
-      "this.rebuild_time_per_ruleset.all(e, this.rebuild_time_per_ruleset.filter(f, f.native_name == e.native_name).size() == 1)"
-  };
-  repeated NativeIterationReport iterations = 1;
-  bool updated = 2;
-  bool can_stop = 3;
-  repeated RuleDurationEntry search_and_apply_time_per_rule = 4;
-  repeated RuleCountEntry num_matches_per_rule = 5;
-  repeated RulesetDurationEntry search_and_apply_time_per_ruleset = 6;
-  repeated RulesetDurationEntry merge_time_per_ruleset = 7;
-  repeated RulesetDurationEntry rebuild_time_per_ruleset = 8;
-}
-
-// Plan strings/columns are inert native presentation, not executable Node IDs.
-message ReportColumn {
-  string variable = 1;
-  sint64 column = 2;
-}
-message ReportScan {
-  string table = 1;
-  repeated ReportColumn columns = 2;
-}
-message ReportIntersect {
-  option (buf.validate.message).cel = {
-    id: "report_intersect.single_columns"
-    message: "each native SingleScan must have exactly one column"
-    expression: "this.scans.all(s, size(s.columns) == 1)"
-  };
-  repeated ReportScan scans = 1;
-}
-message ReportFusedIntersect {
-  ReportScan cover = 1 [(buf.validate.field).required = true];
-  repeated ReportScan to_intersect = 2;
-}
-message ReportStageStats {
-  uint64 num_candidates = 1;
-  uint64 num_succeeded = 2;
-}
-message ReportStage {
-  oneof kind {
-    option (buf.validate.oneof).required = true;
-    ReportIntersect intersect = 1;
-    ReportFusedIntersect fused_intersect = 2;
-  }
-  ReportStageStats stats = 3; // absent means unavailable, not zero
-  repeated uint64 next = 4; // indices in this ReportPlan.stages
-}
-message ReportPlan {
-  option (buf.validate.message).cel = {
-    id: "report_plan.stage_bounds"
-    message: "successors must index this plan's stages"
-    expression: "this.stages.all(s, s.next.all(i, i < uint(size(this.stages))))"
-  };
-  repeated ReportStage stages = 1;
-}
-
-// An inert export of the existing engine's checked/simplified proof. These
-// arenas belong only to this result, not to the response's typed Node arena.
-// IDs are remapped local indices, never native TermId/ProofId or live handles.
-// Retain shared subterms/subproofs and premise order; export only the closure
-// reachable from root through proof premises, propositions and substitutions.
-// Both graphs must be acyclic. CEL checks direct presence/oneofs/bounds only:
-// shared decoders must check cycles and reachability with bounded-stack graph
-// traversal before exposing the result. Producers also traverse iteratively
-// and range-check index conversion; arbitrary arena order is allowed.
-// This is a certificate relative to the original program and its compatible
-// host validators/normalizers. They are not serialized, and this message does
-// not define a new checker or imply standalone proof validity from CEL checks.
 message ProofResult {
   option (buf.validate.message).cel = {
     id: "proof_result.root_in_range"
@@ -2619,191 +2388,28 @@ message ProofCongr {
   optional uint32 child_proof = 3 [(buf.validate.field).required = true];
 }
 
-// One completed requested run, independent of optional profiling. Preserve the
-// requested native schedule's updated/can_stop flags, including inline helper
-// work; do not recompute them from exclusive profiling measurements.
-message RunOutcome {
+// One completed top-level Run/Repeat/Saturate, independent of diagnostics.
+// Preserve native updated/can_stop, including conservative compound aggregation
+// and helper work; do not recompute stopping from diagnostic history.
+message RunResult {
   option (buf.validate.message).cel = {
-    id: "run_outcome.can_stop"
+    id: "run_result.can_stop"
     message: "a Run that updated the database cannot also permit stopping"
     expression: "!this.updated || !this.can_stop"
   };
 
   bool updated = 1;
 
-  // This Run made no changes and its scheduler, if any, permits stopping.
-  // Does not by itself prove saturation under a resource-limited scheduler.
+  // Execution made no changes and its schedulers permit stopping. Compound
+  // calls preserve conservative aggregation. Completion of a bound, or resource
+  // policy permission to stop, does not by itself prove saturation.
   bool can_stop = 2;
-}
-
-// One completed Repeat/Saturate, including zero-body-execution completion.
-// No historical can_stop aggregate: termination states why this loop ended.
-message LoopOutcome {
-  option (buf.validate.message).cel = {
-    id: "loop_outcome.zero_iterations"
-    message: "zero iterations cannot update data or establish saturation"
-    expression:
-      "this.iterations > 0 || (!this.updated && "
-      "this.termination in [2, 4])"
-  };
-
-  bool updated = 1; // any mutation across the whole loop, including nested work
-  uint64 iterations = 2; // completed executions of this loop's body
-
-  optional TerminationReason termination = 3 [
-    (buf.validate.field).required = true,
-    (buf.validate.field).enum = {
-      defined_only: true
-      not_in: [0]
-    }
-  ];
-}
-
-// Why a loop ended. Execution failure is not a reason here; it is reported as
-// `RunProgramResponse.error`.
-enum TerminationReason {
-  TERMINATION_REASON_UNSPECIFIED = 0;
-
-  // A complete body iteration made no progress and left no deferred work
-  // requiring another.
-  TERMINATION_REASON_SATURATED = 1;
-
-  // Repeat completed its count; does not imply saturation.
-  TERMINATION_REASON_COUNT_REACHED = 2;
-
-  // Saturate exhausted its bound before proving saturation.
-  TERMINATION_REASON_ITERATION_LIMIT = 3;
-
-  // The until query matched at a pre-check.
-  TERMINATION_REASON_UNTIL_MATCHED = 4;
-
-  // A scheduler permitted stopping under its OWN resource policy while rules
-  // still had applicable matches. Not saturation: more work would change the
-  // database. NORMATIVE: if a loop would otherwise report SATURATED after a
-  // no-progress iteration with scheduler permission to stop, but cannot rule
-  // out a consulted scheduler's resource limit, report this value instead.
-  // This does not override COUNT_REACHED, ITERATION_LIMIT, or UNTIL_MATCHED.
-  TERMINATION_REASON_SCHEDULER_LIMIT = 5;
 }
 
 // One table's row count.
 message TableSize {
   string table = 1;
   uint64 rows = 2;
-}
-
-// Aggregate coverage of this request, not a trace. Complete iff the whole
-// request succeeded; false includes work observed before failure, including
-// a failing Run or installation helper. Each entered static authored Run site
-// has one runs entry; each site with entered internal Run/query work has one
-// maintenance entry. No unentered site appears. Completion says nothing about
-// availability of individual optional metrics. No collection budget/truncation
-// or per-iteration history is defined here.
-// Each measured native Run/query invocation contributes to exactly one bucket:
-// authored or maintenance. Do not also sum an enclosing schedule's aggregate.
-// These phase measurements do not cover all command/helper CPU work or partition
-// wall time; no proof reconstruction/checking/serialization time is inferred.
-message ProfileSummary {
-  option (buf.validate.message).cel = {
-    id: "profile_summary.unique_sites"
-    message: "each static Run site has one aggregate"
-    expression: "this.runs.all(r, this.runs.filter(s, s.command_path == r.command_path).size() == 1)"
-  };
-  option (buf.validate.message).cel = {
-    id: "profile_summary.unique_maintenance_sites"
-    message: "each maintenance site has one aggregate"
-    expression: "this.maintenance.all(r, this.maintenance.filter(s, s.site == r.site).size() == 1)"
-  };
-
-  bool complete = 1;
-  repeated RunSummary runs = 2;
-  repeated MaintenanceSummary maintenance = 3;
-}
-
-// All invocations of one static authored Run command, across enclosing loop
-// iterations. Path uses CommandLocation.path without dynamic coordinates; the
-// site resolves through any Fail wrappers to that Run command. Timings exclude
-// separately attributed internal Run/query invocations, including inline and
-// trailing maintenance.
-// Native backend rebuilding measured within an authored invocation remains in
-// its rebuild_nanos; it is not an additional maintenance invocation.
-// Each selected occurrence contributes once per
-// Run's selection, not once per group membership; BiRewrite directions share
-// one authored occurrence. No nested-loop or ruleset totals duplicate this work.
-// Optional metrics total the observed work across these invocations. Omit a
-// total if any required measurement is unavailable or cannot be faithfully
-// attributed; do not serialize only its known subset.
-// Present zero means measured zero, never unavailable. Per-rule timing is a
-// breakdown of Run timing, not additional elapsed time to add to it. These
-// phase measurements need not partition wall time; no total elapsed is given.
-message RunSummary {
-  option (buf.validate.message).cel = {
-    id: "run_summary.unique_rules"
-    message: "each rule occurrence has one aggregate per Run site"
-    expression: "this.rules.all(r, this.rules.filter(s, s.rule == r.rule).size() == 1)"
-  };
-
-  repeated uint32 command_path = 1 [(buf.validate.field).repeated.min_items = 1];
-  optional uint64 search_and_apply_nanos = 2;
-  optional uint64 merge_nanos = 3;
-  optional uint64 rebuild_nanos = 4;
-  repeated RuleSummary rules = 5;
-  uint64 invocations = 6 [(buf.validate.field).uint64.gte = 1]; // entered Runs, including a failing final invocation
-}
-
-// A static command site in the submitted Program, with CommandLocation.path's
-// indexing and transparent Fail wrappers, but no dynamic iteration coordinates.
-// Bounds and intermediate loop kinds require the submitted Program;
-// response-local CEL cannot check them.
-message StaticCommandPath {
-  repeated uint32 path = 1 [(buf.validate.field).repeated.min_items = 1];
-}
-
-// The authored cause of internal work, not a generated helper identity. All
-// indices refer to the ORIGINAL submitted Program before filtering/lowering.
-// Bounds and target kinds are checked against that request, not this response.
-// Definition work has no fabricated command path. A helper created by Prove
-// belongs to its command site, not to a synthetic Program declaration.
-message MaintenanceSite {
-  reserved 4;
-  reserved "ruleset";
-  oneof target {
-    option (buf.validate.oneof).required = true;
-
-    StaticCommandPath command = 1;
-    uint32 declaration = 2; // index into Program.declarations
-    uint32 sort = 3; // newly materialized instance in Program.sorts
-  }
-}
-
-// Internal native Run/query work caused by one static site, aggregated across
-// all enclosing loop iterations. Compatible resupply that executes no native
-// installation contributes no entry. Identify internal work by native origin,
-// never ruleset-name patterns or output positions. Generated rules are not
-// invented authored occurrences in RunProgramResponse.rules.
-// Phase totals are exclusive of RunSummary and other maintenance entries.
-// Omit a total if any required measurement is unavailable, including a failed
-// invocation without a report or work that cannot be faithfully attributed;
-// never report just the known subset. Present zero means measured zero.
-message MaintenanceSummary {
-  MaintenanceSite site = 1 [(buf.validate.field).required = true];
-  uint64 invocations = 2 [(buf.validate.field).uint64.gte = 1]; // entered internal Runs/queries, including failure
-  optional uint64 search_and_apply_nanos = 3;
-  optional uint64 merge_nanos = 4;
-  optional uint64 rebuild_nanos = 5;
-}
-
-// Statistics for one response-local authored occurrence at one static Run site.
-// Both BiRewrite directions and internal decomposition contribute here only
-// when the engine can attribute the measurement faithfully to that occurrence.
-// Otherwise leave it absent rather than fabricating a count or timing.
-message RuleSummary {
-  optional uint32 rule = 1 [(buf.validate.field).required = true]; // index into RunProgramResponse.rules
-
-  // Observed complete source-query matches, not changed rows or internal
-  // decomposition matches. Does not count potential matches beyond a limit.
-  optional uint64 matches = 2;
-  optional uint64 search_and_apply_nanos = 3;
 }
 
 // One result per requested root, in request order.

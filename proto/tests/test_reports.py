@@ -40,129 +40,57 @@ class ReportSchemaTests(unittest.TestCase):
             self.assertEqual(decoded, response)
             self.assertEqual(decoded.rules[0].kind.value.query, [0])
 
-    def test_duration_preserves_native_range(self):
-        for seconds, nanos in ((0, 0), (0, 600), (2**64 - 1, 999_999_999)):
-            value = ir.ReportDuration(seconds=seconds, nanos=nanos)
-            validate(value)
-            self.assertEqual(type(value).from_binary(value.to_binary()), value)
-        with self.assertRaises(ValidationError):
-            validate(ir.ReportDuration(nanos=1_000_000_000))
-
-    def test_direction_rows_are_distinct_and_presence_is_paired(self):
-        rows = [
-            ir.RuleDurationEntry(
-                rule=0, direction=direction, native_name=name,
-                value=ir.ReportDuration(nanos=600),
-            )
-            for direction, name in (
-                (ir.NativeRuleDirection.FORWARD, "forward"),
-                (ir.NativeRuleDirection.REVERSE, "reverse"),
-            )
-        ]
-        report = ir.NativeRunReport(can_stop=True, search_and_apply_time_per_rule=rows)
-        validate(report)
-        self.assertEqual(type(report).from_binary(report.to_binary()), report)
-        for row in (
-            ir.RuleDurationEntry(rule=0, value=ir.ReportDuration()),
-            ir.RuleDurationEntry(direction=ir.NativeRuleDirection.SINGLE, value=ir.ReportDuration()),
-            ir.RuleDurationEntry(rule=0, direction=0, value=ir.ReportDuration()),
-            ir.RuleDurationEntry(),
+    def test_small_run_result_has_only_control_flags(self):
+        for result in (
+            ir.RunResult(), ir.RunResult(updated=True), ir.RunResult(can_stop=True),
         ):
-            with self.subTest(row=row), self.assertRaises(ValidationError):
-                validate(row)
+            validate(result)
+            self.assertEqual(type(result).from_binary(result.to_binary()), result)
         with self.assertRaises(ValidationError):
-            validate(ir.NativeRunReport(search_and_apply_time_per_rule=[rows[0], rows[0]]))
+            validate(ir.RunResult(updated=True, can_stop=True))
 
-    def test_complete_maps_do_not_require_the_same_keys(self):
-        report = ir.NativeRunReport(
-            can_stop=True,
-            search_and_apply_time_per_rule=[
-                ir.RuleDurationEntry(native_name="query", value=ir.ReportDuration())
-            ],
-            num_matches_per_rule=[],
-            merge_time_per_ruleset=[
-                ir.RulesetDurationEntry(groups=["", "other"], native_name="", value=ir.ReportDuration())
-            ],
+    def test_diagnostic_is_one_opaque_document_at_any_observation_depth(self):
+        diagnostic = ir.Diagnostic(
+            format="application/vnd.egglog.run-report+json",
+            content='{"iterations":[],"num_matches_per_rule":{}}',
         )
-        validate(report)
-        self.assertEqual(type(report).from_binary(report.to_binary()), report)
-
-    def test_plans_preserve_optional_stats_and_check_local_bounds(self):
-        stage = ir.ReportStage(
-            kind=Oneof("intersect", ir.ReportIntersect(scans=[
-                ir.ReportScan(table="t", columns=[ir.ReportColumn(variable="x", column=-1)])
-            ])),
-            next=[1],
-        )
-        final = ir.ReportStage(kind=Oneof("fused_intersect", ir.ReportFusedIntersect(
-            cover=ir.ReportScan(table="u"), to_intersect=[]
-        )))
-        plan = ir.ReportPlan(stages=[stage, final])
-        validate(plan)
-        decoded = type(plan).from_binary(plan.to_binary())
-        self.assertEqual(decoded, plan)
-        self.assertIsNone(decoded.stages[0].stats)
-        for invalid in (
-            ir.ReportPlan(stages=[stage]),
-            ir.ReportPlan(stages=[ir.ReportStage()]),
-            ir.ReportPlan(stages=[ir.ReportStage(kind=Oneof(
-                "intersect", ir.ReportIntersect(scans=[ir.ReportScan()])
-            ))]),
-            ir.ReportPlan(stages=[ir.ReportStage(kind=Oneof(
-                "fused_intersect", ir.ReportFusedIntersect()
-            ))]),
+        for location in (
+            ir.CommandLocation(path=[0]),
+            ir.CommandLocation(path=[0, 1], iterations=[2]),
         ):
-            with self.subTest(invalid=invalid), self.assertRaises(ValidationError):
-                validate(invalid)
-        for plan in (None, ir.ReportPlan()):
-            report = ir.NativeRuleReport(plan=plan, search_and_apply_time=ir.ReportDuration())
-            validate(report)
-            self.assertEqual(type(report).from_binary(report.to_binary()).plan, plan)
+            output = ir.CommandOutput(kind=Oneof("diagnostic", diagnostic), location=location)
+            validate(output)
+            self.assertEqual(type(output).from_binary(output.to_binary()), output)
+            self.assertEqual(type(output).from_json(output.to_json()), output)
+        with self.assertRaises(ValidationError):
+            validate(ir.Diagnostic(content="backend text"))
 
-    def test_statistics_is_an_observation_and_detail_is_control_only(self):
-        report = ir.NativeRunReport(can_stop=True)
-        statistics = ir.CommandOutput(
-            kind=Oneof("statistics", report), location=ir.CommandLocation(path=[0, 0], iterations=[0])
-        )
-        response = ir.RunProgramResponse(outputs=[statistics])
+    def test_run_then_diagnostic_share_a_location_without_duplicate_flags(self):
+        location = ir.CommandLocation(path=[0])
+        response = ir.RunProgramResponse(outputs=[
+            ir.CommandOutput(kind=Oneof("run", ir.RunResult(updated=True)), location=location),
+            ir.CommandOutput(kind=Oneof("diagnostic", ir.Diagnostic(
+                format="text/plain", content="backend-specific detail",
+            )), location=location),
+        ])
         validate(response)
         self.assertEqual(type(response).from_binary(response.to_binary()), response)
-        statistics.run_report = report
-        with self.assertRaises(ValidationError):
-            validate(response)
-        output = ir.CommandOutput(
-            kind=Oneof("run", ir.RunOutcome(can_stop=True)),
-            location=ir.CommandLocation(path=[0]), run_report=report,
-        )
-        validate(output)
-        output.run_report.updated = True
-        with self.assertRaises(ValidationError):
-            validate(output)
-        command = ir.Command(kind=Oneof("fail", ir.Command(kind=Oneof("stats", ir.Unit()))))
+        self.assertEqual(ir.RunProgramResponse(), ir.RunProgramResponse.from_binary(b""))
+
+    def test_diagnostics_default_off_and_explain_selects_groups(self):
+        request = ir.RunProgramRequest(egraph_id=7, program=ir.Program())
+        self.assertFalse(request.diagnostics)
+        request.diagnostics = True
+        self.assertEqual(type(request).from_binary(request.to_binary()), request)
+        command = ir.Command(kind=Oneof("explain", ir.Explain(groups=["", "unknown", "a"])))
         validate(command)
         self.assertEqual(type(command).from_binary(command.to_binary()), command)
 
-    def test_all_report_rule_references_use_response_catalog(self):
-        report = ir.NativeRunReport(
-            can_stop=True, num_matches_per_rule=[ir.RuleCountEntry(
-                rule=0, direction=ir.NativeRuleDirection.SINGLE, native_name="r", value=1
-            )]
-        )
-        response = ir.RunProgramResponse(
-            outputs=[ir.CommandOutput(
-                kind=Oneof("statistics", report), location=ir.CommandLocation(path=[0])
-            )]
-        )
+    def test_error_rule_reference_uses_its_chunk_local_catalog(self):
         with self.assertRaises(ValidationError):
-            validate(response)
-        response.rules.append(ir.Rule(kind=Oneof("rule", ir.RuleBody()), eval_mode=ir.RuleEvalMode.SEMINAIVE))
-        validate(response)
-        response.outputs[0].kind = Oneof("run", ir.RunOutcome(can_stop=True))
-        response.outputs[0].run_report = report
-        validate(response)
-        response.rules.clear()
-        with self.assertRaises(ValidationError):
-            validate(response)
+            validate(ir.RunProgramResponse(error=ir.Error(
+                code=ir.ErrorCode.PANIC, message="failed rule", rule=0,
+            )))
 
 
 if __name__ == "__main__":
