@@ -18,5 +18,3 @@ plugins:
       - 'type_attribute=.egglog.v1.MapValue=#[derive(Eq\, Hash)]'
       - 'type_attribute=.egglog.v1.PrimitiveValue=#[derive(Eq\, Hash)]'
       - 'type_attribute=.egglog.v1.Node=#[derive(Eq\, Hash)]'
-      # Keep prost's unboxed API for this generated response oneof.
-      - 'enum_attribute=.egglog.v1.HistoryEntry.outcome=#[allow(clippy::large_enum_variant)]'

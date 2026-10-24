@@ -9,14 +9,36 @@ from gen.python.egglog.v1 import egglog_pb as ir
 
 
 class ReportSchemaTests(unittest.TestCase):
-    def test_rule_attribution_position_keeps_tag_three(self):
-        attribution = ir.RuleAttribution(
-            root=ir.RulesetRef(kind=Oneof("name", "root")),
-            children=[1, 2], position=3,
+    def test_rule_catalog_roots_must_index_response_nodes(self):
+        for kind in (
+            Oneof("rule", ir.RuleBody(query=[99])),
+            Oneof("rule", ir.RuleBody(head=[ir.Action(kind=Oneof("term", 99))])),
+            Oneof("rewrite", ir.Rewrite(lhs=99, rhs=99)),
+        ):
+            with self.subTest(kind=kind):
+                with self.assertRaises(ValidationError):
+                    validate(ir.RunProgramResponse(rules=[ir.Rule(
+                        kind=kind, eval_mode=ir.RuleEvalMode.SEMINAIVE,
+                    )]))
+
+    def test_rule_catalog_retains_full_rule_values_and_response_arenas(self):
+        rule = ir.Rule(
+            kind=Oneof("rule", ir.RuleBody(query=[0], head=[ir.Action(kind=Oneof("term", 0))])),
+            eval_mode=ir.RuleEvalMode.SEMINAIVE, name="diagnostic", span=ir.Span(start=0, end=1),
         )
-        validate(attribution)
-        self.assertEqual(attribution.to_binary(), bytes.fromhex("0a061204726f6f74120201021803"))
-        self.assertEqual(ir.RuleAttribution.from_binary(attribution.to_binary()), attribution)
+        response = ir.RunProgramResponse(
+            rules=[rule], files=[ir.SourceFile(name="rule.egg", contents="x")],
+            sorts=[ir.Sort(kind=Oneof("family", ir.HostSort(name="i64")))],
+            nodes=[ir.Node(kind=Oneof("primitive_value", ir.PrimitiveValue(value=Oneof("i64", 1))))],
+        )
+        validate(response)
+        for decoded in (
+            ir.RunProgramResponse.from_binary(response.to_binary()),
+            ir.RunProgramResponse.from_json(response.to_json()),
+        ):
+            validate(decoded)
+            self.assertEqual(decoded, response)
+            self.assertEqual(decoded.rules[0].kind.value.query, [0])
 
     def test_duration_preserves_native_range(self):
         for seconds, nanos in ((0, 0), (0, 600), (2**64 - 1, 999_999_999)):
@@ -59,7 +81,7 @@ class ReportSchemaTests(unittest.TestCase):
             ],
             num_matches_per_rule=[],
             merge_time_per_ruleset=[
-                ir.RulesetDurationEntry(native_name="", value=ir.ReportDuration())
+                ir.RulesetDurationEntry(groups=["", "other"], native_name="", value=ir.ReportDuration())
             ],
         )
         validate(report)
@@ -102,9 +124,7 @@ class ReportSchemaTests(unittest.TestCase):
         statistics = ir.CommandOutput(
             kind=Oneof("statistics", report), location=ir.CommandLocation(path=[0, 0], iterations=[0])
         )
-        response = ir.RunProgramResponse(
-            outputs=[statistics], ruleset_publication=ir.RulesetPublication()
-        )
+        response = ir.RunProgramResponse(outputs=[statistics])
         validate(response)
         self.assertEqual(type(response).from_binary(response.to_binary()), response)
         statistics.run_report = report
@@ -131,11 +151,11 @@ class ReportSchemaTests(unittest.TestCase):
         response = ir.RunProgramResponse(
             outputs=[ir.CommandOutput(
                 kind=Oneof("statistics", report), location=ir.CommandLocation(path=[0])
-            )], ruleset_publication=ir.RulesetPublication()
+            )]
         )
         with self.assertRaises(ValidationError):
             validate(response)
-        response.rules.append(ir.RuleAttribution(root=ir.RulesetRef(kind=Oneof("name", "kept"))))
+        response.rules.append(ir.Rule(kind=Oneof("rule", ir.RuleBody()), eval_mode=ir.RuleEvalMode.SEMINAIVE))
         validate(response)
         response.outputs[0].kind = Oneof("run", ir.RunOutcome(can_stop=True))
         response.outputs[0].run_report = report

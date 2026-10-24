@@ -70,7 +70,7 @@ def tail_view_program(language, *, repetitions=2, prefix=(), tail=(0,), slots=(0
 
 
 class BindingSchemaTests(unittest.TestCase):
-    def test_global_compilation_options_and_explicit_no_decomp_operations(self):
+    def test_global_compilation_options_and_creation_no_decomp(self):
         for seminaive in (None, False, True):
             for no_decomp in (False, True):
                 options = ir.EGraphOptions(cost_sort=0, seminaive=seminaive)
@@ -85,20 +85,6 @@ class BindingSchemaTests(unittest.TestCase):
                 )
                 validate(creation)
                 self.assertEqual(ir.CreateEGraphRequest.from_binary(creation.to_binary()), creation)
-        query = ir.ConfigureEGraphResourcesRequest(egraph_id=1, operation=Oneof("query", ir.Unit()))
-        disabled = ir.ConfigureEGraphResourcesRequest(egraph_id=1, operation=Oneof("no_decomp", False))
-        enabled = ir.ConfigureEGraphResourcesRequest(egraph_id=1, operation=Oneof("no_decomp", True))
-        self.assertEqual(len({item.to_binary() for item in (query, disabled, enabled)}), 3)
-        for request in (query, disabled, enabled):
-            validate(request)
-            self.assertEqual(ir.ConfigureEGraphResourcesRequest.from_binary(request.to_binary()), request)
-        for request in (
-            ir.ConfigureEGraphResourcesRequest(egraph_id=1),
-            ir.ConfigureEGraphResourcesRequest.from_binary(bytes.fromhex("08013001")),
-        ):
-            with self.assertRaises(ValidationError):
-                validate(request)
-
     def test_structural_sort_text_aliases_are_optional_wire_metadata(self):
         for symbols in ([], ["A"], ["A", "Z"]):
             program = ir.Program(sorts=[
