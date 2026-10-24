@@ -4,7 +4,7 @@ use super::{
     pb,
     rule::{Actions, Facts, ensure_sort},
     storage::{
-        Arena, DeclarationKind, Key, Packer, Record, Slot, closure, publish, visit, visit_action,
+        Arena, DeclarationKind, Packer, Record, Slot, closure, publish, visit, visit_action,
     },
 };
 use prost::Message;
@@ -12,15 +12,6 @@ use std::{
     collections::{HashMap, HashSet},
     sync::{Arc, Mutex},
 };
-
-// Locations and binding observations only. Canonical records remain the sole
-// definition of bodies, composition, and sharing; no failed Program is retained.
-#[derive(Clone, Default)]
-struct Publication {
-    reserved: HashMap<Key, String>,
-    confirmed: HashMap<Key, (Record, String)>,
-    anchors: HashMap<Key, Key>,
-}
 
 // A request plan retains locations and destination bindings only. Generated
 // actions/initializers remain the sole execution recipe, and nothing is cached.
@@ -234,169 +225,10 @@ impl CapturePlan {
     }
 }
 
-// Walk group edges, including empty groups and distinct equal rule occurrences.
-// Node/declaration bodies are left to the existing canonical packer.
-fn occurrences(root: &Record) -> Result<Vec<Record>, TypedError> {
-    let mut pending = vec![root.clone()];
-    let mut seen = HashSet::new();
-    let mut result = vec![];
-    while let Some(record) = pending.pop() {
-        let owner = record.owner.as_ref().unwrap();
-        if !seen.insert(record.key()) {
-            continue;
-        }
-        if record.arena == Arena::Ruleset {
-            let mut one = pb::Program {
-                rulesets: vec![owner.program.rulesets[record.index as usize].clone()],
-                ..Default::default()
-            };
-            let mut children = vec![];
-            super::storage::visit(&mut one, Arena::Ruleset, 0, |arena, index| {
-                children.push(record.resolve(arena, index)?);
-                Ok(index)
-            })?;
-            pending.extend(children.into_iter().rev());
-        }
-        result.push(record);
-    }
-    Ok(result)
-}
-
-impl Publication {
-    fn prepare_run(&mut self, root: &Record) -> Result<Packer, TypedError> {
-        let target = occurrences(root)?;
-        let target_keys: HashSet<_> = target.iter().map(|r| r.key()).collect();
-        let root_key = root.key();
-        // Reserve every authored name before choosing a private root name.
-        for record in &target {
-            let owner = record.owner.as_ref().unwrap();
-            if record.arena == Arena::Ruleset
-                && let Some(name) = &owner.program.rulesets[record.index as usize].name
-            {
-                self.reserved.insert(record.key(), name.clone());
-            }
-        }
-        if !self.reserved.contains_key(&root_key) {
-            let mut ordinal = self.reserved.len();
-            let name = loop {
-                let name = format!("__typed_ruleset_{ordinal}");
-                if !self.reserved.values().any(|reserved| reserved == &name) {
-                    break name;
-                }
-                ordinal += 1;
-            };
-            self.reserved.insert(root_key, name);
-        }
-        let name = self.reserved[&root_key].clone();
-        let mut packer = Packer::default();
-        let root_index = packer.intern(root.clone(), 0);
-        let mut covered = HashSet::new();
-        for record in &target {
-            let key = record.key();
-            if covered.contains(&key) {
-                continue;
-            }
-            if let Some(anchor) = self.anchors.get(&key) {
-                let (anchor, _) = &self.confirmed[anchor];
-                packer.intern(anchor.clone(), 0);
-                covered.extend(occurrences(anchor)?.iter().map(|r| r.key()));
-            }
-        }
-        packer.finish()?;
-        for (index, record) in packer.rulesets.iter().enumerate() {
-            let key = record.key();
-            let confirmed = self.confirmed.get(&key).map(|(_, name)| name.clone());
-            let packed = &mut packer.program.rulesets[index];
-            if target_keys.contains(&key) {
-                // An explicit empty name remains a flat default RuleList.
-                packed.name = packed.name.take().or(confirmed);
-            } else {
-                // An anchor is evidence, not a retry of uncompleted descendant
-                // first-name proposals in its retained source closure.
-                packed.name = confirmed;
-            }
-        }
-        packer.program.rulesets[root_index as usize].name = Some(name.clone());
-        packer.program.commands.push(pb::Command {
-            kind: Some(pb::command::Kind::Run(pb::Run {
-                ruleset: Some(pb::RulesetRef {
-                    kind: Some(pb::ruleset_ref::Kind::Name(name)),
-                }),
-                ..Default::default()
-            })),
-            ..Default::default()
-        });
-        Ok(packer)
-    }
-
-    fn observe(
-        &mut self,
-        packer: &Packer,
-        response: &pb::RunProgramResponse,
-    ) -> Result<(), TypedError> {
-        let receipt = response.ruleset_publication.as_ref().ok_or_else(|| {
-            TypedError::Decode("missing ruleset publication receipt; publication unknown".into())
-        })?;
-        if packer.program.rulesets.len() != packer.rulesets.len() {
-            return Err(TypedError::Invalid(
-                "missing source ruleset locations".into(),
-            ));
-        }
-        let mut submitted: HashMap<&str, Vec<&Record>> = HashMap::new();
-        for (ruleset, record) in packer.program.rulesets.iter().zip(&packer.rulesets) {
-            if let Some(name) = &ruleset.name {
-                submitted.entry(name).or_default().push(record);
-            }
-        }
-        let mut names = HashSet::new();
-        for name in &receipt.names {
-            if !names.insert(name.as_str()) || !submitted.contains_key(name.as_str()) {
-                return Err(TypedError::Decode(
-                    "duplicate or unsubmitted ruleset publication name".into(),
-                ));
-            }
-        }
-        let complete = response.error.as_ref().is_none_or(|e| e.location.is_some());
-        if complete && names.len() != submitted.len() {
-            return Err(TypedError::Decode(
-                "incomplete ruleset publication receipt".into(),
-            ));
-        }
-        if response
-            .error
-            .as_ref()
-            .is_some_and(|e| e.code == pb::ErrorCode::InvalidProgram as i32)
-            && !names.is_empty()
-        {
-            return Err(TypedError::Decode(
-                "invalid-program response confirms ruleset publication".into(),
-            ));
-        }
-        // Validate all locations before any promotion. Arena indices are used
-        // only to decode this request; retained identities are source locations.
-        let mut confirmed = vec![];
-        for name in &receipt.names {
-            for record in &submitted[name.as_str()] {
-                confirmed.push(((*record).clone(), name.clone(), occurrences(record)?));
-            }
-        }
-        for (record, name, closure) in confirmed {
-            let key = record.key();
-            for child in closure {
-                self.anchors.entry(child.key()).or_insert(key);
-            }
-            self.anchors.insert(key, key);
-            self.confirmed.insert(key, (record, name));
-        }
-        Ok(())
-    }
-}
-
 // Saved handles are private and never executed while on the stack. Push only
 // saves healthy state, so restoring these observations also restores health.
 struct SavedScope {
     handle: u64,
-    publication: Publication,
     declarations: HashMap<String, Record>,
     captures: HashMap<String, (Record, String)>,
     private_slots: HashSet<String>,
@@ -406,9 +238,8 @@ struct SavedScope {
 pub struct EGraph {
     engine: Arc<Mutex<crate::protobuf::Engine>>,
     handle: u64,
-    // An uncertain response cannot be repaired by guessing fresh identities.
+    // An uncertain response cannot establish the completed action prefix.
     usable: bool,
-    publication: Publication,
     declarations: HashMap<String, Record>,
     scopes: Vec<SavedScope>,
     captures: HashMap<String, (Record, String)>,
@@ -444,7 +275,7 @@ impl EGraph {
         Self::with_recording(false)
     }
 
-    /// Create a byte engine with optional structured execution history.
+    /// Create a byte engine with optional input Program history.
     /// Recording is unbounded when enabled and independent of logical Freeze.
     pub fn with_recording(record_history: bool) -> Result<Self, TypedError> {
         let mut engine = crate::protobuf::Engine::default();
@@ -476,7 +307,6 @@ impl EGraph {
             engine: Arc::new(Mutex::new(engine)),
             handle,
             usable: true,
-            publication: Publication::default(),
             declarations: HashMap::new(),
             scopes: vec![],
             captures: HashMap::new(),
@@ -494,7 +324,7 @@ impl EGraph {
     pub fn try_clone(&self) -> Result<Self, TypedError> {
         if !self.usable {
             return Err(TypedError::Invalid(
-                "session publication state is unknown".into(),
+                "session transport state is unknown".into(),
             ));
         }
         let bytes = self
@@ -515,7 +345,6 @@ impl EGraph {
             engine: self.engine.clone(),
             handle,
             usable: true,
-            publication: self.publication.clone(),
             declarations: self.declarations.clone(),
             scopes: vec![],
             captures: self.captures.clone(),
@@ -527,14 +356,13 @@ impl EGraph {
         })
     }
 
-    /// Save native data, cursors and typed publication state in a new scope.
+    /// Save native data, cursors and typed binding state in a new scope.
     pub fn push(&mut self) -> Result<(), TypedError> {
         if !self.usable {
             return Err(TypedError::Invalid(
-                "session publication state is unknown".into(),
+                "session transport state is unknown".into(),
             ));
         }
-        let publication = self.publication.clone();
         let declarations = self.declarations.clone();
         let bytes = self
             .engine
@@ -552,7 +380,6 @@ impl EGraph {
             .egraph_id;
         self.scopes.push(SavedScope {
             handle: std::mem::replace(&mut self.handle, handle),
-            publication: std::mem::replace(&mut self.publication, publication),
             declarations: std::mem::replace(&mut self.declarations, declarations),
             captures: self.captures.clone(),
             private_slots: self.private_slots.clone(),
@@ -560,7 +387,7 @@ impl EGraph {
         Ok(())
     }
 
-    /// Restore the latest scope, including known publication state and health.
+    /// Restore the latest scope, including typed bindings and health.
     /// Cumulative native statistics and fresh-name state survive the pop.
     /// An empty stack or rejected native return leaves this session unchanged.
     pub fn pop(&mut self) -> Result<(), TypedError> {
@@ -584,7 +411,6 @@ impl EGraph {
         // before decoding its empty acknowledgement; never destroy that child.
         let saved = self.scopes.pop().unwrap();
         self.handle = saved.handle;
-        self.publication = saved.publication;
         self.declarations = saved.declarations;
         self.captures = saved.captures;
         self.private_slots = saved.private_slots;
@@ -603,7 +429,7 @@ impl EGraph {
     ) -> Result<pb::RunProgramResponse, TypedError> {
         if !self.usable {
             return Err(TypedError::Invalid(
-                "session publication state is unknown".into(),
+                "session transport state is unknown".into(),
             ));
         }
         packer.finish()?;
@@ -654,7 +480,7 @@ impl EGraph {
     }
 
     // The effect boundary: reject uncertain replies without inventing recovery,
-    // but promote valid receipts before returning ordinary native errors.
+    // and retain completed capture initializations before ordinary native errors.
     fn accept_response(
         &mut self,
         packer: Packer,
@@ -703,10 +529,6 @@ impl EGraph {
                 }
             },
         };
-        if let Err(error) = self.publication.observe(&packer, &response) {
-            self.usable = false;
-            return Err(error);
-        }
         if response.error.as_ref().is_none_or(|e| e.location.is_some()) {
             self.declarations.extend(packer.declarations);
         }
@@ -767,7 +589,7 @@ impl EGraph {
     }
 
     /// Execute an authored schedule and return its exact native report with
-    /// validated rule attribution, profiling and publication observations.
+    /// validated rule attribution and profiling.
     pub fn run(
         &mut self,
         schedule: impl Into<super::Schedule>,
@@ -779,47 +601,27 @@ impl EGraph {
         &mut self,
         schedule: impl Into<super::Schedule>,
     ) -> Result<pb::RunProgramResponse, TypedError> {
-        let mut schedule = schedule.into();
-        if !self.usable {
-            return Err(TypedError::Invalid(
-                "session publication state is unknown".into(),
-            ));
-        }
-        for ruleset in &schedule.rulesets {
-            if let Some(error) = &ruleset.1 {
-                return Err(TypedError::Invalid(error.clone()));
+        let schedule = schedule.into();
+        let mut packer = Packer::default();
+        for ruleset in schedule.rulesets {
+            if let Some(error) = ruleset.1 {
+                return Err(TypedError::Invalid(error));
+            }
+            for addition in ruleset.0 {
+                packer.intern(addition, 0);
             }
         }
-        let root = if schedule.rulesets.len() == 1 {
-            schedule.rulesets[0].clone()
-        } else {
-            super::rule::ruleset(schedule.rulesets.clone())
-        };
-        let mut packer = self.publication.prepare_run(&root.0)?;
-        packer.program.commands.clear();
-        let indices: Vec<_> = schedule
-            .rulesets
-            .iter()
-            .map(|ruleset| packer.intern(ruleset.0.clone(), 0))
-            .collect();
-        super::schedule::relocate(&mut schedule.commands, |index| {
-            let index = indices[index as usize];
-            match &packer.program.rulesets[index as usize].name {
-                Some(name) => pb::ruleset_ref::Kind::Name(name.clone()),
-                None => pb::ruleset_ref::Kind::Index(index),
-            }
-        });
-        if schedule.commands.len() == 1 {
-            packer.program.commands = schedule.commands;
-        } else {
-            packer.program.commands.push(pb::Command {
+        packer.finish()?;
+        packer.program.commands.extend(schedule.commands);
+        if packer.program.commands.len() != 1 {
+            packer.program.commands = vec![pb::Command {
                 kind: Some(pb::command::Kind::Repeat(pb::Repeat {
-                    body: schedule.commands,
+                    body: std::mem::take(&mut packer.program.commands),
                     times: Some(1),
                     ..Default::default()
                 })),
                 ..Default::default()
-            });
+            }];
         }
         self.execute(packer, true)
     }
@@ -862,10 +664,9 @@ impl EGraph {
         super::Snapshot::from_export(snapshot, self.captures.values().cloned().collect())
     }
 
-    /// Retrieve structured request/outcome history; errors when recording is off.
-    /// Retrieval adds no entry and does not require healthy publication state.
-    /// A poisoned native engine remains inspectable through this read-only audit.
-    pub fn history(&self) -> Result<pb::GetHistoryResponse, TypedError> {
+    /// Retrieve accumulated accepted inputs; errors when recording is off.
+    /// Retrieval adds no commands. Pop restores the saved history prefix.
+    pub fn history(&self) -> Result<pb::Program, TypedError> {
         let bytes = self
             .engine
             .lock()
@@ -877,8 +678,7 @@ impl EGraph {
                 .encode_to_vec(),
             )
             .map_err(|error| TypedError::Invalid(error.to_string()))?;
-        pb::GetHistoryResponse::decode(bytes.as_slice())
-            .map_err(|error| TypedError::Decode(error.to_string()))
+        pb::Program::decode(bytes.as_slice()).map_err(|error| TypedError::Decode(error.to_string()))
     }
 
     /// Count visible portable table rows without evaluating any expression.
@@ -974,7 +774,6 @@ fn select_report(
 ) -> Result<super::RunReport, TypedError> {
     let rules = response.rules;
     let profile = response.profile;
-    let ruleset_publication = response.ruleset_publication;
     let mut outputs = response.outputs.into_iter();
     let output = outputs
         .next()
@@ -1094,8 +893,10 @@ fn select_report(
     Ok(super::RunReport {
         detail: report,
         rules,
+        nodes: response.nodes,
+        sorts: response.sorts,
+        files: response.files,
         profile,
-        ruleset_publication,
     })
 }
 
@@ -1276,31 +1077,39 @@ mod tests {
     use super::*;
     use crate::typed::Ruleset;
 
+    fn pack_run(group: &Ruleset) -> Packer {
+        let schedule = super::super::Schedule::from(group);
+        let mut packer = Packer::default();
+        for addition in &group.0 {
+            packer.intern(addition.clone(), 0);
+        }
+        packer.finish().unwrap();
+        packer.program.commands.extend(schedule.commands);
+        packer
+    }
+
     #[test]
-    fn structured_history_is_opt_in_and_tracks_typed_observations_and_clones() {
+    fn input_history_is_opt_in_and_scopes_restore_the_saved_prefix() {
         assert!(EGraph::new().unwrap().history().is_err());
         let mut graph = EGraph::with_recording(true).unwrap();
-        assert_eq!(graph.history().unwrap().entries.len(), 1);
+        assert_eq!(graph.history().unwrap().commands.len(), 0);
         graph.stats().unwrap();
         let mut cloned = graph.try_clone().unwrap();
-        assert_eq!(graph.history().unwrap().entries.len(), 3);
-        assert_eq!(cloned.history().unwrap().entries.len(), 3);
+        assert_eq!(graph.history().unwrap().commands.len(), 1);
+        assert_eq!(cloned.history().unwrap().commands.len(), 1);
         cloned.freeze().unwrap();
-        assert_eq!(cloned.history().unwrap().entries.len(), 4);
-        assert_eq!(graph.history().unwrap().entries.len(), 3);
+        assert_eq!(cloned.history().unwrap().commands.len(), 2);
+        assert_eq!(graph.history().unwrap().commands.len(), 1);
         graph.push().unwrap();
         graph.stats().unwrap();
         graph.pop().unwrap();
         let history = graph.history().unwrap();
-        assert!(history.entries.iter().any(|entry| matches!(
-            entry.outcome,
-            Some(pb::history_entry::Outcome::ReturnToResponse(_))
-        )));
+        assert_eq!(history.commands.len(), 1);
         assert_eq!(graph.history().unwrap(), history);
     }
 
     #[test]
-    fn structured_history_remains_readable_after_engine_mutex_is_poisoned() {
+    fn input_history_remains_readable_after_engine_mutex_is_poisoned() {
         let graph = EGraph::with_recording(true).unwrap();
         let engine = graph.engine.clone();
         assert!(
@@ -1311,7 +1120,7 @@ mod tests {
             .join()
             .is_err()
         );
-        assert_eq!(graph.history().unwrap().entries.len(), 1);
+        assert_eq!(graph.history().unwrap().commands.len(), 0);
         assert!(graph.try_clone().is_err());
     }
 
@@ -1764,7 +1573,7 @@ mod tests {
                     response
                         .outputs
                         .iter()
-                        .any(|out| matches!(&out.kind, Some(pb::command_output::Kind::Run(_))))
+                        .any(|out| matches!(&out.kind, Some(pb::command_output::Kind::Loop(_))))
                 );
             }
             let program = request.program.as_mut().unwrap();
@@ -1873,7 +1682,7 @@ mod tests {
                 Err(TypedError::Decode(_))
             ));
             assert!(
-                matches!(graph.register(union(&left, &right)), Err(TypedError::Invalid(message)) if message == "session publication state is unknown")
+                matches!(graph.register(union(&left, &right)), Err(TypedError::Invalid(message)) if message == "session transport state is unknown")
             );
         }
     }
@@ -2072,7 +1881,6 @@ mod tests {
                 .run_response(ruleset(rule((), set(&forged, 7))))
                 .is_err()
         );
-        assert!(graph.publication.confirmed.is_empty());
         assert!(!graph.check(CaptureRead(9)).unwrap());
         let prefix = I64::from_expression(Expr::call(
             &super::super::decl::Callable::function(
@@ -2175,7 +1983,7 @@ mod tests {
             let mut graph = EGraph::default();
             graph.push().unwrap();
             let group = ruleset(());
-            let mut packer = graph.publication.prepare_run(&group.0).unwrap();
+            let mut packer = pack_run(&group);
             let run = packer.program.commands.pop().unwrap();
             let roots = [
                 let_("a", I64::from(1)).expression().0.clone(),
@@ -2191,14 +1999,6 @@ mod tests {
                     location: Some(pb::CommandLocation { path, iterations }),
                     ..Default::default()
                 }),
-                ruleset_publication: Some(pb::RulesetPublication {
-                    names: packer
-                        .program
-                        .rulesets
-                        .iter()
-                        .filter_map(|r| r.name.clone())
-                        .collect(),
-                }),
                 ..Default::default()
             };
             assert!(matches!(
@@ -2208,7 +2008,6 @@ mod tests {
             assert!(!graph.usable);
             assert!(graph.captures.is_empty());
             assert!(graph.declarations.is_empty());
-            assert!(graph.publication.confirmed.is_empty());
             assert!(graph.register(I64::from(3)).is_err());
             graph.pop().unwrap();
             assert!(graph.usable);
@@ -2296,22 +2095,11 @@ mod tests {
     fn typed_scope_restores_all_observations_and_drops_only_owned_handles() {
         use super::super::{builtins::I64, rule, rule::Fact, ruleset};
         let observations = |graph: &EGraph| {
-            let identity = |record: &Record| record.key();
-            (
-                graph.publication.reserved.clone(),
-                graph
-                    .publication
-                    .confirmed
-                    .iter()
-                    .map(|(key, (record, name))| (*key, (identity(record), name.clone())))
-                    .collect::<HashMap<_, _>>(),
-                graph.publication.anchors.clone(),
-                graph
-                    .declarations
-                    .iter()
-                    .map(|(name, record)| (name.clone(), identity(record)))
-                    .collect::<HashMap<_, _>>(),
-            )
+            graph
+                .declarations
+                .iter()
+                .map(|(name, record)| (name.clone(), record.key()))
+                .collect::<HashMap<_, _>>()
         };
         let base = ruleset(());
         let value = Expr::call(
@@ -2338,7 +2126,7 @@ mod tests {
         let middle = graph.handle;
         assert_eq!(graph.scopes[0].handle, original);
         graph.run_response(&child).unwrap();
-        assert!(graph.declarations.len() > baseline.3.len());
+        assert!(graph.declarations.len() > baseline.len());
         let child_state = observations(&graph);
         graph.push().unwrap();
         let active = graph.handle;
@@ -2366,7 +2154,7 @@ mod tests {
             );
         }
         graph.run_response(&inner).unwrap();
-        assert!(graph.publication.confirmed.len() > baseline.1.len());
+        assert!(graph.declarations.len() > baseline.len());
         graph.push().unwrap();
         graph.push().unwrap();
         let owned = std::iter::once(graph.handle)
@@ -2399,14 +2187,6 @@ mod tests {
         graph.run_response(&group).unwrap();
         let active = graph.handle;
         let saved = graph.scopes[0].handle;
-        let reserved = graph.publication.reserved.clone();
-        let anchors = graph.publication.anchors.clone();
-        let confirmed = graph
-            .publication
-            .confirmed
-            .iter()
-            .map(|(key, (_, name))| (*key, name.clone()))
-            .collect::<HashMap<_, _>>();
         // Test-only access violates the private saved-frame invariant, exercising
         // the adapter's rejection without exposing a public handle escape hatch.
         let bytes = graph
@@ -2436,29 +2216,18 @@ mod tests {
         assert_eq!(graph.handle, active);
         assert_eq!(graph.scopes.len(), 1);
         assert_eq!(graph.scopes[0].handle, saved);
-        assert_eq!(graph.publication.reserved, reserved);
-        assert_eq!(graph.publication.anchors, anchors);
-        assert_eq!(
-            graph
-                .publication
-                .confirmed
-                .iter()
-                .map(|(key, (_, name))| (*key, name.clone()))
-                .collect::<HashMap<_, _>>(),
-            confirmed
-        );
         assert!(graph.usable);
         graph.run_response(&group).unwrap();
     }
 
     #[test]
-    fn typed_scope_recovers_uncertain_receipts_but_not_a_poisoned_mutex() {
+    fn typed_scope_recovers_uncertain_transport_but_not_a_poisoned_mutex() {
         use super::super::ruleset;
         let group = ruleset(());
         let mut graph = EGraph::default();
         graph.run_response(&group).unwrap();
         graph.push().unwrap();
-        let pending = graph.publication.prepare_run(&ruleset(()).0).unwrap();
+        let pending = pack_run(&ruleset(()));
         assert!(matches!(
             graph.accept_response(pending, &[0xff]),
             Err(TypedError::Decode(_))
@@ -2469,7 +2238,7 @@ mod tests {
             graph.try_clone().err().expect("unusable cannot clone"),
         ] {
             assert!(matches!(error, TypedError::Invalid(message)
-                if message == "session publication state is unknown"));
+                if message == "session transport state is unknown"));
         }
         assert_eq!(graph.scopes.len(), 1);
         graph.pop().unwrap();
@@ -2517,7 +2286,7 @@ mod tests {
                 graph.run_response(&group).unwrap();
             }
             graph.push().unwrap();
-            let mut packer = graph.publication.prepare_run(&group.0).unwrap();
+            let mut packer = pack_run(&group);
             let root = packer.intern(value.0.clone(), 0);
             packer.program.commands.insert(
                 0,
@@ -2540,8 +2309,8 @@ mod tests {
                 panic!("expected scoped execution failure after actual work")
             };
             assert_eq!(error.code, pb::ErrorCode::Panic as i32);
-            assert_eq!(error.location.as_ref().unwrap().path, [2]);
-            assert!(graph.usable, "ordinary error retains valid receipts");
+            assert_eq!(error.location.as_ref().unwrap().path, [3]);
+            assert!(graph.usable, "ordinary error remains retryable");
             assert!(graph.check(Fact(value.clone())).unwrap());
             let before = graph.stats_response().unwrap();
             let Some(pb::command_output::Kind::Statistics(before_report)) = &before.outputs[0].kind
@@ -2625,18 +2394,15 @@ mod tests {
         let [output] = response.outputs.as_slice() else {
             panic!("one requested Run output")
         };
-        let Some(pb::command_output::Kind::Run(outcome)) = &output.kind else {
-            panic!("missing Run outcome")
+        let Some(pb::command_output::Kind::Loop(outcome)) = &output.kind else {
+            panic!("missing registration/schedule outcome")
         };
         let report = output
             .run_report
             .as_ref()
             .expect("typed Run requests actual native detail");
         assert!(request.include_run_reports);
-        assert_eq!(
-            (report.updated, report.can_stop),
-            (outcome.updated, outcome.can_stop)
-        );
+        assert_eq!(report.updated, outcome.updated);
         assert!(!report.iterations.is_empty());
         assert_eq!(
             report
@@ -2649,19 +2415,18 @@ mod tests {
         for row in &report.num_matches_per_rule {
             let attribution =
                 &response.rules[row.rule.expect("authored rule attribution") as usize];
-            assert_eq!(attribution.position, 0);
-            assert!(attribution.children.is_empty());
-            let Some(pb::ruleset_ref::Kind::Name(name)) = &attribution.root.as_ref().unwrap().kind
-            else {
-                panic!("named publication root")
-            };
-            assert_eq!(
-                name,
-                &graph.publication.confirmed.values().next().unwrap().1
-            );
+            assert!(matches!(attribution.kind, Some(pb::rule::Kind::Rule(_))));
             assert_eq!(row.direction, Some(pb::NativeRuleDirection::Single as i32));
         }
-        let packer = detail_off.publication.prepare_run(&group.0).unwrap();
+        let mut packer = pack_run(&group);
+        packer.program.commands = vec![pb::Command {
+            kind: Some(pb::command::Kind::Repeat(pb::Repeat {
+                body: std::mem::take(&mut packer.program.commands),
+                times: Some(1),
+                ..Default::default()
+            })),
+            ..Default::default()
+        }];
         let off = detail_off.execute(packer, false).unwrap();
         assert_eq!(off.outputs[0].kind, output.kind);
         assert!(off.outputs[0].run_report.is_none());
@@ -2713,7 +2478,7 @@ mod tests {
             vec![],
         );
         let mut graph = EGraph::default();
-        let mut packer = graph.publication.prepare_run(&group.0).unwrap();
+        let mut packer = pack_run(&group);
         let root = packer.intern(value.0.clone(), 0);
         packer.program.commands.insert(
             0,
@@ -2736,7 +2501,7 @@ mod tests {
             panic!("expected execution failure after prefix")
         };
         assert_eq!(error.code, pb::ErrorCode::Panic as i32);
-        assert_eq!(error.location.as_ref().unwrap().path, [2]);
+        assert_eq!(error.location.as_ref().unwrap().path, [3]);
         let prefix =
             pb::RunProgramResponse::decode(graph.last_wire.as_ref().unwrap().1.as_slice()).unwrap();
         assert!(!prefix.profile.as_ref().unwrap().complete);
@@ -2749,7 +2514,6 @@ mod tests {
                 .is_empty()
         );
         assert!(graph.usable);
-        assert_eq!(graph.publication.confirmed.len(), 1);
         assert!(graph.check(super::super::rule::Fact(value)).unwrap());
         let observed = graph.stats_response().unwrap();
         let (request, output) = graph.last_wire.as_ref().unwrap();
@@ -2828,682 +2592,45 @@ mod tests {
     }
 
     #[test]
-    fn publication_receipts_are_request_scoped_atomic_and_required() {
-        use super::super::ruleset;
-        let mut state = Publication::default();
-        let old = state.prepare_run(&ruleset(()).0).unwrap();
-        let old_name = old.program.rulesets[0].name.clone().unwrap();
-        state
-            .observe(
-                &old,
-                &pb::RunProgramResponse {
-                    ruleset_publication: Some(pb::RulesetPublication {
-                        names: vec![old_name],
-                    }),
-                    ..Default::default()
-                },
-            )
-            .unwrap();
-        let next = state.prepare_run(&ruleset(()).0).unwrap();
-        let name = next.program.rulesets[0].name.clone().unwrap();
-        for (receipt, error) in [
-            (None, None),
-            (Some(vec![name.clone(), name.clone()]), None),
-            (Some(vec!["unsubmitted".into()]), None),
-            (Some(vec![]), None),
-            (
-                Some(vec![]),
-                Some(pb::Error {
-                    code: pb::ErrorCode::Panic as i32,
-                    message: "command failed".into(),
-                    location: Some(pb::CommandLocation {
-                        path: vec![0],
-                        iterations: vec![],
-                    }),
-                    ..Default::default()
-                }),
-            ),
-            (
-                Some(vec![name.clone()]),
-                Some(pb::Error {
-                    code: pb::ErrorCode::InvalidProgram as i32,
-                    message: "preparation failed".into(),
-                    ..Default::default()
-                }),
-            ),
-        ] {
-            let response = pb::RunProgramResponse {
-                ruleset_publication: receipt.map(|names| pb::RulesetPublication { names }),
-                error,
-                ..Default::default()
-            };
-            assert!(matches!(
-                state.observe(&next, &response),
-                Err(TypedError::Decode(_))
-            ));
-            assert_eq!(state.confirmed.len(), 1, "reject before promoting anything");
-            assert_eq!(state.anchors.len(), 1, "old confirmations survive");
-        }
-        state
-            .observe(
-                &next,
-                &pb::RunProgramResponse {
-                    ruleset_publication: Some(pb::RulesetPublication { names: vec![name] }),
-                    ..Default::default()
-                },
-            )
-            .unwrap();
-        assert_eq!(state.confirmed.len(), 2);
-    }
-
-    #[test]
-    fn empty_group_first_naming_requires_its_own_confirmation() {
-        use super::super::ruleset;
-        let empty = ruleset(());
-        let parent = ruleset(&empty);
-        let mut state = Publication::default();
-        let first = state.prepare_run(&parent.0).unwrap();
-        let parent_name = first.program.rulesets[0].name.clone().unwrap();
-        state
-            .observe(
-                &first,
-                &pb::RunProgramResponse {
-                    ruleset_publication: Some(pb::RulesetPublication {
-                        names: vec![parent_name.clone()],
-                    }),
-                    ..Default::default()
-                },
-            )
-            .unwrap();
-        let naming = state.prepare_run(&empty.0).unwrap();
-        let empty_name = naming.program.rulesets[0].name.clone().unwrap();
-        assert_eq!(
-            naming.program.rulesets.len(),
-            2,
-            "empty occurrence needs its parent anchor"
-        );
-        state
-            .observe(
-                &naming,
-                &pb::RunProgramResponse {
-                    ruleset_publication: Some(pb::RulesetPublication {
-                        names: vec![parent_name.clone()],
-                    }),
-                    error: Some(pb::Error {
-                        code: pb::ErrorCode::EvaluationFailed as i32,
-                        message: "first naming did not complete".into(),
-                        ..Default::default()
-                    }),
-                    ..Default::default()
-                },
-            )
-            .unwrap();
-        assert_eq!(state.confirmed.len(), 1);
-        let next = state.prepare_run(&ruleset(&empty).0).unwrap();
-        assert_eq!(next.program.rulesets.len(), 3);
-        let empty_index = next
-            .rulesets
-            .iter()
-            .position(|r| r.owner.as_ref().unwrap().id == empty.0.owner.as_ref().unwrap().id)
-            .unwrap();
-        assert!(
-            next.program.rulesets[empty_index].name.is_none(),
-            "a reservation is not publication"
-        );
-        for group in &next.program.rulesets {
-            if let Some(pb::ruleset::Kind::Combined(children)) = &group.kind {
-                assert_eq!(
-                    children.rulesets[0].kind,
-                    Some(pb::ruleset_ref::Kind::Index(empty_index as u32))
-                );
-            }
-        }
-        let retry = state.prepare_run(&empty.0).unwrap();
-        assert_eq!(
-            retry.program.rulesets[0].name.as_deref(),
-            Some(empty_name.as_str())
-        );
-        state
-            .observe(
-                &retry,
-                &pb::RunProgramResponse {
-                    ruleset_publication: Some(pb::RulesetPublication {
-                        names: vec![empty_name, parent_name],
-                    }),
-                    ..Default::default()
-                },
-            )
-            .unwrap();
-        assert_eq!(
-            state.prepare_run(&empty.0).unwrap().program.rulesets.len(),
-            1,
-            "confirmed first naming is now a direct anchor"
-        );
-    }
-
-    #[test]
-    fn empty_child_first_naming_executes_and_becomes_a_direct_anchor() {
-        use super::super::ruleset;
-        let empty = ruleset(());
-        let parent = ruleset(&empty);
-        let empty_key = (
-            empty.0.owner.as_ref().unwrap().id,
-            Arena::Ruleset,
-            empty.0.index,
-        );
-        let parent_key = (
-            parent.0.owner.as_ref().unwrap().id,
-            Arena::Ruleset,
-            parent.0.index,
-        );
+    fn compatible_registration_retries_keep_content_cursors_and_clone_independence() {
+        use super::super::{builtins::I64, rule, ruleset};
+        let group = ruleset(rule((), I64::from(7)).label("first"));
+        let equal = ruleset(rule((), I64::from(7)).label("later"));
         let mut graph = EGraph::default();
-        let first = graph.run_response(&parent).unwrap();
-        let parent_name = graph.publication.confirmed[&parent_key].1.clone();
-        assert_eq!(
-            first.ruleset_publication.unwrap().names,
-            std::slice::from_ref(&parent_name)
-        );
-        assert_eq!(graph.publication.anchors[&empty_key], parent_key);
-        let first_request =
-            pb::RunProgramRequest::decode(graph.last_wire.as_ref().unwrap().0.as_slice()).unwrap();
-        let first_program = first_request.program.unwrap();
-        assert_eq!(first_program.rulesets.len(), 2);
-        assert!(first_program.rulesets[1].name.is_none());
-
-        let naming = graph.run_response(&empty).unwrap();
-        let empty_name = graph.publication.confirmed[&empty_key].1.clone();
-        let request =
-            pb::RunProgramRequest::decode(graph.last_wire.as_ref().unwrap().0.as_slice()).unwrap();
-        let program = request.program.unwrap();
-        assert_eq!(program.rulesets.len(), 2);
-        assert_eq!(
-            program.rulesets[0].name.as_deref(),
-            Some(empty_name.as_str())
-        );
-        assert!(
-            matches!(&program.rulesets[0].kind, Some(pb::ruleset::Kind::Rules(r)) if r.rules.is_empty())
-        );
-        assert_eq!(
-            program.rulesets[1].name.as_deref(),
-            Some(parent_name.as_str())
-        );
-        assert!(
-            matches!(&program.rulesets[1].kind, Some(pb::ruleset::Kind::Combined(c))
-            if c.rulesets.len() == 1 && c.rulesets[0].kind == Some(pb::ruleset_ref::Kind::Index(0)))
-        );
-        assert_eq!(
-            naming
-                .ruleset_publication
-                .unwrap()
-                .names
-                .into_iter()
-                .collect::<HashSet<_>>(),
-            HashSet::from([parent_name.clone(), empty_name.clone()])
-        );
-        assert_eq!(graph.publication.anchors[&empty_key], empty_key);
-        assert_eq!(graph.publication.anchors[&parent_key], parent_key);
-        assert!(Arc::ptr_eq(
-            graph.publication.confirmed[&parent_key]
-                .0
-                .owner
-                .as_ref()
-                .unwrap(),
-            parent.0.owner.as_ref().unwrap()
-        ));
-
-        let fresh_parent = ruleset(&empty);
-        let response = graph.run_response(&fresh_parent).unwrap();
-        let request =
-            pb::RunProgramRequest::decode(graph.last_wire.as_ref().unwrap().0.as_slice()).unwrap();
-        let program = request.program.unwrap();
-        assert_eq!(
-            program.rulesets.len(),
-            2,
-            "the old parent is no longer needed"
-        );
-        assert!(
-            program
-                .rulesets
-                .iter()
-                .all(|r| r.name.as_deref() != Some(parent_name.as_str()))
-        );
-        assert_eq!(
-            program.rulesets[1].name.as_deref(),
-            Some(empty_name.as_str())
-        );
-        assert!(
-            matches!(&program.rulesets[0].kind, Some(pb::ruleset::Kind::Combined(c))
-            if c.rulesets.len() == 1 && c.rulesets[0].kind == Some(pb::ruleset_ref::Kind::Index(1)))
-        );
-        assert_eq!(
-            response
-                .ruleset_publication
-                .unwrap()
-                .names
-                .into_iter()
-                .collect::<HashSet<_>>(),
-            HashSet::from([program.rulesets[0].name.clone().unwrap(), empty_name])
-        );
-        assert_eq!(graph.publication.anchors[&empty_key], empty_key);
-        assert_eq!(graph.publication.confirmed[&parent_key].1, parent_name);
-    }
-
-    #[test]
-    fn anchor_only_packing_omits_unconfirmed_authored_descendant_names() {
-        use super::super::{rule, ruleset};
-        let shared = rule((), ());
-        let mut slots = std::array::from_fn(|_| vec![]);
-        slots[Arena::Rule as usize] = vec![Slot::External(shared.0.clone())];
-        let named = Ruleset(
-            publish(
-                pb::Program {
-                    rulesets: vec![pb::Ruleset {
-                        name: Some("unfinished-child".into()),
-                        kind: Some(pb::ruleset::Kind::Rules(pb::RuleList { rules: vec![0] })),
-                        ..Default::default()
-                    }],
-                    ..Default::default()
-                },
-                slots,
-                vec![],
-                Arena::Ruleset,
-                0,
-            )
-            .unwrap(),
-            None,
-        );
-        let parent = ruleset(&named);
-        let mut state = Publication::default();
-        let first = state.prepare_run(&parent.0).unwrap();
-        let parent_name = first.program.rulesets[0].name.clone().unwrap();
-        state
-            .observe(
-                &first,
-                &pb::RunProgramResponse {
-                    ruleset_publication: Some(pb::RulesetPublication {
-                        names: vec![parent_name.clone()],
-                    }),
-                    error: Some(pb::Error {
-                        code: pb::ErrorCode::EvaluationFailed as i32,
-                        message: "partial publication".into(),
-                        ..Default::default()
-                    }),
-                    ..Default::default()
-                },
-            )
-            .unwrap();
-        let next = state.prepare_run(&ruleset(&shared).0).unwrap();
-        assert_eq!(
-            next.program.rules.len(),
-            1,
-            "one shared canonical occurrence"
-        );
-        assert_eq!(next.program.rulesets.len(), 3);
-        assert!(
-            next.program
-                .rulesets
-                .iter()
-                .any(|r| r.name.as_deref() == Some(parent_name.as_str()))
-        );
-        assert!(
-            !next
-                .program
-                .rulesets
-                .iter()
-                .any(|r| r.name.as_deref() == Some("unfinished-child"))
-        );
-        assert_eq!(next.program.commands.len(), 1, "never replay old commands");
-        let retry = state.prepare_run(&named.0).unwrap();
-        assert_eq!(
-            retry.program.rulesets[0].name.as_deref(),
-            Some("unfinished-child"),
-            "explicitly requesting the child retries its first naming"
-        );
-    }
-
-    #[test]
-    fn rejected_candidates_never_anchor_later_shared_rules() {
-        use super::super::{
-            builtins::{F64, I64},
-            rule, ruleset, var,
-        };
-        let shared = rule((), ());
-        let bad = rule((), var::<I64>("unbound"));
-        let rejected = ruleset((&shared, bad));
-        let valid = ruleset(&shared);
-        let mut state = Publication::default();
-        let first = state.prepare_run(&rejected.0).unwrap();
-        for code in [
-            pb::ErrorCode::InvalidProgram,
-            pb::ErrorCode::UnknownName,
-            pb::ErrorCode::EvaluationFailed,
-        ] {
-            state
-                .observe(
-                    &first,
-                    &pb::RunProgramResponse {
-                        ruleset_publication: Some(pb::RulesetPublication { names: vec![] }),
-                        error: Some(pb::Error {
-                            code: code as i32,
-                            message: "rejected".into(),
-                            ..Default::default()
-                        }),
-                        ..Default::default()
-                    },
-                )
-                .unwrap();
-            let next = state.prepare_run(&valid.0).unwrap();
-            assert_eq!(next.program.rulesets.len(), 1);
-            assert_eq!(next.program.rules.len(), 1);
-            assert!(
-                next.program.nodes.is_empty(),
-                "unrelated rejected closure omitted"
-            );
-            assert!(state.confirmed.is_empty());
-        }
-        let retry = state.prepare_run(&rejected.0).unwrap();
-        assert_eq!(
-            first.program.rulesets[0].name,
-            retry.program.rulesets[0].name
-        );
-        let locally_rejected = ruleset((
-            &shared,
-            rule((var::<I64>("conflict"), var::<F64>("conflict")), ()),
-        ));
-        assert!(matches!(
-            state.prepare_run(&locally_rejected.0),
-            Err(TypedError::Invalid(_))
-        ));
-        assert_eq!(state.prepare_run(&valid.0).unwrap().program.rules.len(), 1);
-        assert!(
-            state.confirmed.is_empty(),
-            "local preparation never adds anchors either"
-        );
-    }
-
-    #[test]
-    fn completed_definitions_are_confirmed_before_command_error_and_retry() {
-        use super::super::{rule::Rule, ruleset};
-        let constructor = Callable::constructor(
-            "Published.Value",
-            vec![],
-            SortRef::equality("Published"),
-            None,
-            false,
-        );
-        let mut slots = std::array::from_fn(|_| vec![]);
-        slots[Arena::Node as usize] = vec![Slot::External(Expr::call(&constructor, vec![]).0)];
-        let group = ruleset(Rule(
-            publish(
-                pb::Program {
-                    rules: vec![pb::Rule {
-                        kind: Some(pb::rule::Kind::Rule(pb::RuleBody {
-                            query: vec![],
-                            head: vec![pb::Action {
-                                kind: Some(pb::action::Kind::Term(0)),
-                                ..Default::default()
-                            }],
-                        })),
-                        eval_mode: pb::RuleEvalMode::Seminaive as i32,
-                        ..Default::default()
-                    }],
-                    ..Default::default()
-                },
-                slots,
-                vec![],
-                Arena::Rule,
-                0,
-            )
-            .unwrap(),
-            None,
-        ));
-        let mut graph = EGraph::default();
-        let mut request = graph.publication.prepare_run(&group.0).unwrap();
-        request.program.commands.insert(
-            0,
-            pb::Command {
-                kind: Some(pb::command::Kind::Action(pb::Action {
-                    kind: Some(pb::action::Kind::Panic("after definitions".into())),
-                    ..Default::default()
-                })),
-                ..Default::default()
-            },
-        );
-        assert!(
-            matches!(graph.execute(request, false), Err(TypedError::Engine(error))
-            if error.code == pb::ErrorCode::Panic as i32)
-        );
-        assert_eq!(graph.publication.confirmed.len(), 1);
-        assert_eq!(
-            graph.declarations.len(),
-            1,
-            "completed constructor metadata survives too"
-        );
-        assert!(
-            graph.usable,
-            "ordinary engine errors do not poison the handle"
-        );
-        for expected in [1, 0] {
-            let response = graph.run_response(&group).unwrap();
-            let matches: u64 = response
-                .profile
-                .unwrap()
-                .runs
-                .iter()
-                .flat_map(|run| &run.rules)
-                .map(|rule| rule.matches.unwrap())
-                .sum();
+        graph.run(&group).unwrap();
+        let mut cloned = graph.try_clone().unwrap();
+        for current in [&mut graph, &mut cloned] {
+            let report = current.run(&equal).unwrap();
             assert_eq!(
-                matches, expected,
-                "command error must not reset or consume rule cursors"
+                report
+                    .detail
+                    .num_matches_per_rule
+                    .iter()
+                    .map(|r| r.value)
+                    .sum::<u64>(),
+                0
             );
+            let cumulative = current.stats().unwrap();
+            assert_eq!(cumulative.rules.len(), 1);
+            assert_eq!(cumulative.rules[0].name.as_deref(), Some("first"));
         }
-    }
-
-    #[test]
-    fn fail_checks_keep_actual_bytes_receipts_and_recovery() {
-        use super::super::ruleset;
-
-        let constructor = Callable::constructor(
-            "FailPublished.Value",
-            vec![],
-            SortRef::equality("FailPublished"),
-            None,
-            false,
-        );
-        let value = Expr::call(&constructor, vec![]);
-        let group = ruleset(());
-        for depth in [1, 2] {
-            let mut graph = EGraph::default();
-            let mut request = graph.publication.prepare_run(&group.0).unwrap();
-            let name = request.program.rulesets[0].name.clone().unwrap();
-            let root = request.intern(value.0.clone(), 0);
-            let mut command = pb::Command {
-                kind: Some(pb::command::Kind::Check(pb::Check { facts: vec![root] })),
-                ..Default::default()
-            };
-            for _ in 0..depth {
-                command = pb::Command {
-                    kind: Some(pb::command::Kind::Fail(Box::new(command))),
-                    ..Default::default()
-                };
-            }
-            request.program.commands.insert(0, command);
-            let result = graph.execute(request, false);
-            let (input, output) = graph.last_wire.as_ref().unwrap();
-            let request = pb::RunProgramRequest::decode(input.as_slice()).unwrap();
-            let response = pb::RunProgramResponse::decode(output.as_slice()).unwrap();
-            let program = request.program.unwrap();
-            let mut command = &program.commands[0];
-            for _ in 0..depth {
-                let Some(pb::command::Kind::Fail(child)) = &command.kind else {
-                    panic!("encoded request lost a Fail wrapper")
-                };
-                command = child;
-            }
-            assert_eq!(
-                command.kind,
-                Some(pb::command::Kind::Check(pb::Check { facts: vec![root] }))
-            );
-            assert!(matches!(
-                &program.nodes[root as usize].kind,
-                Some(pb::node::Kind::Call(call)) if call.func == "FailPublished.Value"
-            ));
-            if depth == 1 {
-                assert_eq!(result.unwrap(), response);
-                assert!(response.error.is_none());
-            } else {
-                let Err(TypedError::Engine(error)) = result else {
-                    panic!("outer Fail must reject the successful inner Fail")
-                };
-                assert_eq!(response.error.as_ref(), Some(error.as_ref()));
-                assert_eq!(error.code, pb::ErrorCode::EvaluationFailed as i32);
-                assert_eq!(
-                    error.location,
-                    Some(pb::CommandLocation {
-                        path: vec![0],
-                        iterations: vec![],
-                    })
-                );
-            }
-            assert_eq!(
-                response.ruleset_publication.unwrap().names.as_slice(),
-                std::slice::from_ref(&name)
-            );
-            assert_eq!(graph.publication.confirmed.len(), 1);
-            assert_eq!(graph.publication.confirmed.values().next().unwrap().1, name);
-            assert!(graph.declarations.contains_key("FailPublished.Value"));
-            assert!(graph.usable);
-
-            let mut recovery = Packer::default();
-            let root = recovery.intern(value.0.clone(), 0);
-            recovery.program.commands = vec![
-                pb::Command {
-                    kind: Some(pb::command::Kind::Action(pb::Action {
-                        kind: Some(pb::action::Kind::Term(root)),
-                        ..Default::default()
-                    })),
-                    ..Default::default()
-                },
-                pb::Command {
-                    kind: Some(pb::command::Kind::Check(pb::Check { facts: vec![root] })),
-                    ..Default::default()
-                },
-            ];
-            assert!(graph.execute(recovery, false).unwrap().error.is_none());
-            assert!(graph.run_response(&group).unwrap().error.is_none());
-        }
-    }
-
-    #[test]
-    fn uncertain_response_blocks_later_engine_calls_and_clone() {
-        use super::super::{builtins::I64, ruleset};
-        for malformed in 0..4 {
-            let group = ruleset(());
-            let mut graph = EGraph::default();
-            graph.run_response(&group).unwrap();
-            let pending = graph.publication.prepare_run(&ruleset(()).0).unwrap();
-            let name = pending.program.rulesets[0].name.clone().unwrap();
-            // Inject only at the response boundary; this is not a claim that
-            // the native producer emits malformed replies.
-            let bytes = match malformed {
-                0 => vec![0xff],
-                1 => pb::RunProgramResponse::default().encode_to_vec(),
-                2 | 3 => pb::RunProgramResponse {
-                    ruleset_publication: Some(pb::RulesetPublication {
-                        names: if malformed == 2 {
-                            vec![name.clone(), name]
-                        } else {
-                            vec![]
-                        },
-                    }),
-                    ..Default::default()
-                }
-                .encode_to_vec(),
-                _ => unreachable!(),
-            };
-            assert!(matches!(
-                graph.accept_response(pending, &bytes),
-                Err(TypedError::Decode(_))
-            ));
-            assert_eq!(graph.publication.confirmed.len(), 1);
-            // Invalidate the native handle: reaching the engine would return
-            // an unknown-handle transport error instead of our state error.
-            graph
-                .engine
-                .lock()
-                .unwrap()
-                .destroy(
-                    &pb::DestroyEGraphRequest {
-                        egraph_id: graph.handle,
-                    }
-                    .encode_to_vec(),
-                )
-                .unwrap();
-            for error in [
-                graph.register(()).unwrap_err(),
-                graph.run_response(&group).unwrap_err(),
-                graph.stats_response().unwrap_err(),
-                graph.check(()).unwrap_err(),
-                graph.extract(I64::from(0)).unwrap_err(),
-                graph
-                    .try_clone()
-                    .err()
-                    .expect("uncertain handles cannot clone"),
-            ] {
-                assert!(matches!(error, TypedError::Invalid(message)
-                    if message == "session publication state is unknown"));
-            }
-        }
-    }
-
-    #[test]
-    fn clone_owns_a_native_handle_and_independent_publication_maps() {
-        use super::super::ruleset;
-        let group = ruleset(());
-        let mut graph = EGraph::default();
-        graph.run_response(&group).unwrap();
-        let engine = graph.engine.clone();
-        let original_handle = graph.handle;
-        let mut clone = graph.try_clone().unwrap();
-        assert_ne!(clone.handle, original_handle);
-        assert!(Arc::ptr_eq(&graph.engine, &clone.engine));
-        assert_eq!(clone.publication.confirmed.len(), 1);
-        let new_group = ruleset((&group, ruleset(())));
-        clone.run_response(&new_group).unwrap();
-        assert_eq!(graph.publication.confirmed.len(), 1);
-        assert!(clone.publication.confirmed.len() > 1);
-        assert_eq!(graph.publication.reserved.len(), 1);
-        assert!(clone.publication.reserved.len() > 1);
         drop(graph);
-        assert!(
-            engine
-                .lock()
-                .unwrap()
-                .clone_egraph(
-                    &pb::CloneEGraphRequest {
-                        egraph_id: original_handle
-                    }
-                    .encode_to_vec()
-                )
-                .is_err(),
-            "dropping one wrapper destroys only its handle"
-        );
-        clone.run_response(&group).unwrap();
-        let clone_handle = clone.handle;
-        drop(clone);
-        assert!(
-            engine
-                .lock()
-                .unwrap()
-                .clone_egraph(
-                    &pb::CloneEGraphRequest {
-                        egraph_id: clone_handle
-                    }
-                    .encode_to_vec()
-                )
-                .is_err()
-        );
+        cloned.run(&group).unwrap();
+    }
+
+    #[test]
+    fn undecodable_response_blocks_calls_and_saved_scope_recovers() {
+        use super::super::{builtins::I64, ruleset};
+        let mut graph = EGraph::default();
+        graph.push().unwrap();
+        assert!(matches!(
+            graph.accept_response(Packer::default(), &[0xff]),
+            Err(TypedError::Decode(_))
+        ));
+        assert!(graph.register(I64::from(3)).is_err());
+        assert!(graph.try_clone().is_err());
+        graph.pop().unwrap();
+        graph.run(ruleset(())).unwrap();
     }
 
     #[test]
@@ -5248,13 +4375,13 @@ mod tests {
         observe(&mut graph, ne(I64::from(17), 23), true);
 
         // Corrupt bytes cannot turn failed checks into success or permit a
-        // subsequent call on a session with unknown publication state.
+        // subsequent call on a session with unknown transport state.
         assert!(matches!(
             graph.accept_response(Packer::default(), &[0xff]),
             Err(TypedError::Decode(_))
         ));
         assert!(matches!(graph.check(ne(I64::from(17), 23)),
-            Err(TypedError::Invalid(message)) if message == "session publication state is unknown"));
+            Err(TypedError::Invalid(message)) if message == "session transport state is unknown"));
     }
 
     #[test]
@@ -5356,53 +4483,30 @@ mod tests {
     }
 
     #[test]
-    fn explicit_ruleset_names_are_preserved_and_generated_names_do_not_capture() {
-        let root = |name: Option<&str>| {
-            Ruleset(
-                publish(
-                    pb::Program {
-                        rulesets: vec![pb::Ruleset {
-                            name: name.map(str::to_owned),
-                            kind: Some(pb::ruleset::Kind::Rules(pb::RuleList { rules: vec![] })),
-                            ..Default::default()
-                        }],
-                        ..Default::default()
-                    },
-                    std::array::from_fn(|_| vec![]),
-                    vec![],
-                    Arena::Ruleset,
-                    0,
-                )
-                .unwrap(),
-                None,
-            )
-        };
+    fn explicit_group_names_and_named_captures_lower_to_additions() {
+        use super::super::{builtins::I64, rule, rule::named_ruleset, ruleset};
+        let child = ruleset(rule((), I64::from(7)));
         let mut graph = EGraph::default();
         for explicit in ["chosen", "", "__typed_ruleset_3"] {
-            graph.run_response(root(Some(explicit))).unwrap();
+            let group = named_ruleset(|| Some(explicit.into()), (&child, &child));
+            graph.run_response(group).unwrap();
             let request =
                 pb::RunProgramRequest::decode(graph.last_wire.as_ref().unwrap().0.as_slice())
                     .unwrap();
             let program = request.program.unwrap();
-            assert_eq!(program.rulesets[0].name.as_deref(), Some(explicit));
-            assert!(matches!(
-                program.rulesets[0].kind,
-                Some(pb::ruleset::Kind::Rules(_))
-            ));
-            let Some(pb::command::Kind::Run(run)) = &program.commands[0].kind else {
-                panic!()
+            assert_eq!(program.rules.len(), 1);
+            let Some(pb::command::Kind::Repeat(repeat)) = &program.commands[0].kind else {
+                panic!("one report scope")
             };
-            assert_eq!(
-                run.ruleset.as_ref().unwrap().kind,
-                Some(pb::ruleset_ref::Kind::Name(explicit.into()))
-            );
+            let Some(pb::command::Kind::AddRules(add)) = &repeat.body[0].kind else {
+                panic!("ordered registration")
+            };
+            assert_eq!(add.group, explicit);
+            assert_eq!(add.rules, [0, 0]);
+            let Some(pb::command::Kind::Run(run)) = &repeat.body[1].kind else {
+                panic!("group selection")
+            };
+            assert_eq!(run.groups, [explicit]);
         }
-        graph.run_response(root(None)).unwrap();
-        let request =
-            pb::RunProgramRequest::decode(graph.last_wire.as_ref().unwrap().0.as_slice()).unwrap();
-        assert_eq!(
-            request.program.unwrap().rulesets[0].name.as_deref(),
-            Some("__typed_ruleset_4")
-        );
     }
 }

@@ -211,7 +211,7 @@ fn snapshot_keeps_cycles_empty_classes_and_observation_provenance() -> Result<()
 }
 
 #[test]
-fn composed_schedules_return_exact_reports_and_publish_zero_repeat() -> Result<(), TypedError> {
+fn composed_schedules_return_exact_reports_and_register_zero_repeat() -> Result<(), TypedError> {
     let root = let_("root", Node::Number(3));
     let copy = ruleset(|value: &egg::I64| {
         rewrite(Node::Number(value), Node::Link(Node::Number(value))).label("copy")
@@ -249,7 +249,7 @@ fn composed_schedules_return_exact_reports_and_publish_zero_repeat() -> Result<(
 }
 
 #[test]
-fn diagnostic_labels_keep_shared_occurrences_and_consumed_cursors() -> Result<(), TypedError> {
+fn diagnostic_labels_share_content_and_consumed_cursors() -> Result<(), TypedError> {
     let shared = rule((), Node::Number(4));
     let first = ruleset((&shared, shared.clone().label("first presentation")));
     let later = ruleset(shared.label("later presentation"));

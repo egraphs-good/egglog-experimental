@@ -3,17 +3,15 @@
 //! This initial subset supports equality sorts/constructors, merged functions, relation predicates, exact selectors,
 //! callback rules/rewrites, immutable groups, ordered Run/Repeat/Saturate
 //! schedules and byte-backed register/check/extract/freeze observations.
-//! Flat and composed groups retain shared rule/group occurrences through
-//! request-scoped publication receipts. Names reserved for a failed submission
-//! are not evidence of publication; only confirmed canonical roots anchor reuse.
-//! Peers without publication receipts are rejected, not treated as empty receipts.
+//! Flat and composed groups lower to ordered AddRules and union Run selections.
+//! Equal rule content shares native registration and cursor state across groups.
 //! An undecodable or malformed reply makes that handle unusable; ordinary engine
-//! failures with valid receipts retain confirmed definitions and permit retry.
+//! failures retain completed prefixes and permit compatible retries.
 //! `EGraph::try_clone` clones native state/cursors and binding observations;
 //! subsequent mutations are independent. No definitions or commands are replayed.
-//! `push`/`pop` explicitly save/restore native data, cursors and publication state.
+//! `push`/`pop` explicitly save/restore native data, cursors and typed bindings.
 //! Pop retains cumulative native statistics and fresh-name state, and can recover
-//! an uncertain current publication state from its known healthy saved scope.
+//! an uncertain current transport state from its known healthy saved scope.
 //! A clone starts with an empty scope stack, even inside a scope. Dropping a graph
 //! discards its owned handles; it does not pop or merge work into another graph.
 //! `run` includes actual native detail beside its outcome/profile; `stats` returns
@@ -221,11 +219,11 @@
 //! rules through the existing callback, with up to 64 immutable borrowed inputs.
 //! The default native binding name is the module-qualified function name;
 //! `#[ruleset(name = expression)]` uses that exact name expression once, after
-//! the body and before root publication. Names are native bindings, not mutable
-//! diagnostic labels.
-//! Cloning a group or composing `&LazyLock<Ruleset>` inputs keeps its original
-//! rule/group occurrences and native cursors; a second graph installs the same
-//! authored group into its own independent native state.
+//! the body. Named composition captures the explicitly authored rule values
+//! into that group; later runtime additions to child groups do not change the
+//! captured membership. Anonymous composition selects the union of its groups.
+//! Cloning or composing `&LazyLock<Ruleset>` inputs preserves rule content and
+//! native cursors. A second graph registers that content in independent state.
 //! The generated item is a static, so normal Rust restrictions on shadowing its
 //! name with a parameter or local binding still apply. Opaque `impl Trait`
 //! callback inputs/outputs are not supported; concrete and inferred outputs are.
@@ -1169,10 +1167,7 @@ pub use snapshot::{ClassRef, ProducerRef, Snapshot, TableRowRef, ValueRef};
 /// Exact reports returned by high-level run/statistics observations.
 pub mod report {
     pub use crate::proto::report_stage::Kind as ReportStageKind;
-    pub use crate::proto::{
-        NativeRunReport as NativeReport, ProfileSummary, ReportDuration, RuleAttribution,
-        RulesetPublication,
-    };
+    pub use crate::proto::{NativeRunReport as NativeReport, ProfileSummary, ReportDuration};
 
     /// Exact native metrics together with their response-local attribution.
     /// A successful high-level observation has validated all referenced rule
@@ -1181,12 +1176,16 @@ pub mod report {
     pub struct RunReport {
         /// Native history and authoritative aggregate maps.
         pub detail: NativeReport,
-        /// Rule occurrence descriptions indexed by optional metric attribution.
-        pub rules: Vec<RuleAttribution>,
+        /// Registered rule values indexed by optional metric attribution.
+        pub rules: Vec<crate::proto::Rule>,
+        /// Response-local node arena referenced by the rule catalog.
+        pub nodes: Vec<crate::proto::Node>,
+        /// Response-local sort arena referenced by the rule catalog.
+        pub sorts: Vec<crate::proto::Sort>,
+        /// Source files referenced by diagnostic spans in the rule catalog.
+        pub files: Vec<crate::proto::SourceFile>,
         /// Exclusive work attribution requested by this typed session.
         pub profile: Option<ProfileSummary>,
-        /// Confirmed publication of the submitted named rulesets.
-        pub ruleset_publication: Option<RulesetPublication>,
     }
 }
 pub use report::RunReport;

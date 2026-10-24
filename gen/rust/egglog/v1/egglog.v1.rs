@@ -26,10 +26,10 @@
 /// its groundedness failures, occurs during execution; generated helper/rule
 /// validation remains preparation.
 /// Sorts are acyclic; expression cycles must pass through a `Union` node.
-/// Install all declarations and named ruleset bindings before commands,
-/// order-independently and without executing their bodies.
+/// Install declarations before commands, order-independently and without
+/// executing their bodies. Rules register only when AddRules executes.
 /// Definitions installed on this handle may be referenced by name without
-/// resending them. Node, sort, rule and ruleset indices refer to this Program's
+/// resending them. Node, sort and rule indices refer to this Program's
 /// arenas, not previous requests; all referenced entries must be included here.
 /// Execute only commands, in order, and the expressions they demand. Unused
 /// arena entries are not executed; arena membership is not an execution root.
@@ -63,14 +63,9 @@ pub struct Program {
     /// Optional provenance. Omit spans for a normalized/unlocated program.
     #[prost(message, repeated, tag = "6")]
     pub files: ::prost::alloc::vec::Vec<SourceFile>,
-    /// Ruleset occurrences, shared by index within this submission. Named roots
-    /// retain their reachable occurrences; see Ruleset for cross-request reuse.
-    #[prost(message, repeated, tag = "7")]
-    pub rulesets: ::prost::alloc::vec::Vec<Ruleset>,
-    /// Rule occurrences, shared across rule lists by index. Equal entries remain
-    /// distinct occurrences; labels never identify them. Unused entries do not
-    /// execute. Only named ruleset roots retain reachable rules across requests;
-    /// other rules are request-local and omitted by Freeze.
+    /// Immutable rule values. Arena membership alone does not register a rule.
+    /// AddRules selects entries by index; equal semantic content shares one
+    /// compiled rule and its state across all groups and submissions.
     #[prost(message, repeated, tag = "9")]
     pub rules: ::prost::alloc::vec::Vec<Rule>,
 }
@@ -1168,108 +1163,13 @@ pub struct EgglogCallable {
     pub datatype_member: bool,
 }
 // ---------------------------------------------------------------------------
-// RULES AND RULESETS — shared occurrences and named roots.
+// RULE DEFINITIONS — immutable content, registered by ordered commands.
 // ---------------------------------------------------------------------------
 
-/// An immutable ruleset occurrence: an ordered rule list or composition.
-/// An absent name adds no binding and leaves an unmatched occurrence anonymous.
-/// A present empty name denotes the default rule list.
-/// A present name binds this occurrence on the e-graph handle. Names are
-/// immutable: compatible resends retain the occurrence and all reachable
-/// children, including anonymous ones, with their rule state. Changes to body
-/// kind, ordered contents, rule definitions/options or sharing are conflicts.
-/// Compare expression subgraphs as in Declaration; rule labels and provenance
-/// are not identity.
-/// Frontends may build mutably before emitting a complete definition.
-///
-/// Compare same-name presentations' bodies and internal rule/ruleset sharing
-/// before identifying entries. Compatible presentations identify corresponding
-/// ruleset occurrences, but cannot collapse distinct local rule-arena entries:
-/// duplicate named-root presentations must reuse the required rule indices.
-/// One consistent match must preserve BOTH rule and ruleset sharing across all
-/// named-root closures: no merging distinct occurrences or splitting shared ones.
-/// In particular \[r,r\] cannot match \[s,t\] by merging distinct equal rules s/t.
-/// Conflicting identity
-/// requirements from installed roots are errors.
-/// A matched local entry reuses its retained occurrence everywhere, including
-/// a direct Run of that index. Unmatched occurrences are fresh for each
-/// submission; equal anonymous bodies alone never imply shared state.
-/// Repeated references to one entry share its rule state, including across loop
-/// iterations in this Program.
-/// Named roots retain their entire reachable closure across requests; a later
-/// name-only reference does not need to resend those entries or their bodies.
-/// A resend anchored by an already-installed named parent may give a matched
-/// anonymous child its first name, retaining that occurrence and its rule state.
-/// Compare bodies and sharing before applying this new binding; names are not
-/// part of the child's body. Each ruleset occurrence has at most one assigned name:
-/// renaming an already-named occurrence, proposing two different names for one
-/// matched occurrence, or binding an occupied name to another occurrence is an
-/// error. Repeating the same compatible binding is a no-op. Omitting a matched
-/// child's name does not remove its installed binding. Name assignments must be
-/// consistent across all matches; equal anonymous bodies alone are not anchors.
-/// A matched rule entry reuses that retained occurrence in every referencing
-/// leaf, including new/unmatched leaves. No leaf owns a rule exclusively.
-/// Equal bodies or labels alone never establish a match. Cyclic compositions are
-/// invalid, including cycles through names; these are normative semantic checks.
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct Ruleset {
-    #[prost(string, optional, tag = "1")]
-    pub name: ::core::option::Option<::prost::alloc::string::String>,
-    /// Optional origin and documentation; excluded from semantic identity.
-    #[prost(message, optional, tag = "4")]
-    pub span: ::core::option::Option<Span>,
-    #[prost(string, tag = "5")]
-    pub doc: ::prost::alloc::string::String,
-    #[prost(oneof = "ruleset::Kind", tags = "2, 3")]
-    pub kind: ::core::option::Option<ruleset::Kind>,
-}
-/// Nested message and enum types in `Ruleset`.
-pub mod ruleset {
-    #[derive(Clone, PartialEq, ::prost::Oneof)]
-    pub enum Kind {
-        #[prost(message, tag = "2")]
-        Rules(super::RuleList),
-        #[prost(message, tag = "3")]
-        Combined(super::CombinedRuleset),
-    }
-}
-/// An ordered selection of rule occurrences. May be empty or repeat an index;
-/// Run retains each occurrence only at its first inclusion. Different leaves
-/// may share entries without copying them or creating separate rule state.
-#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct RuleList {
-    /// indices into Program.rules
-    #[prost(uint32, repeated, tag = "1")]
-    pub rules: ::prost::alloc::vec::Vec<u32>,
-}
-/// A request-local occurrence or a named binding on the e-graph handle.
-/// Names may be installed by this Program or an earlier one. Missing names
-/// and out-of-range indices are errors. An explicitly empty name selects the
-/// default ruleset; an unset reference does not implicitly select it.
-/// In RuleAttribution, indices refer to the associated request's Program,
-/// and names resolve on the handle used by that request.
-#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct RulesetRef {
-    #[prost(oneof = "ruleset_ref::Kind", tags = "1, 2")]
-    pub kind: ::core::option::Option<ruleset_ref::Kind>,
-}
-/// Nested message and enum types in `RulesetRef`.
-pub mod ruleset_ref {
-    #[derive(Clone, PartialEq, Eq, Hash, ::prost::Oneof)]
-    pub enum Kind {
-        /// index into Program.rulesets
-        #[prost(uint32, tag = "1")]
-        Index(u32),
-        #[prost(string, tag = "2")]
-        Name(::prost::alloc::string::String),
-    }
-}
-/// A rule occurrence, or a directional/bidirectional rewrite occurrence, with
-/// immutable body/options and diagnostic metadata. Its Program.rules entry is
-/// the request-local identity, not structural equality or a label. References
-/// share the occurrence and its rule-owned execution state across groups/Run
-/// sites. This does not identify distinct scheduler instances or combine their
-/// scheduler-owned state.
+/// An immutable rule/rewrite value. Content identity includes its resolved typed
+/// body, ordered query/head, options and represented graph sharing; arena IDs,
+/// labels, documentation and provenance do not identify it. AddRules interns
+/// content globally on the handle, so equivalent resupply never resets its state.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct Rule {
     /// Optional diagnostic label; may repeat and never binds or identifies a rule.
@@ -1347,14 +1247,6 @@ pub struct BiRewrite {
     #[prost(uint32, repeated, tag = "4")]
     pub conditions: ::prost::alloc::vec::Vec<u32>,
 }
-/// The composition body of a Ruleset: an ordered list of fixed child references.
-/// May be empty. Contains no rules directly; name and provenance belong to the
-/// enclosing Ruleset. Repeated/shared children retain their occurrence identity.
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct CombinedRuleset {
-    #[prost(message, repeated, tag = "1")]
-    pub rulesets: ::prost::alloc::vec::Vec<RulesetRef>,
-}
 // ---------------------------------------------------------------------------
 // COMMANDS — the `Command.kind` arms after `action`, in arm order.
 // ---------------------------------------------------------------------------
@@ -1364,11 +1256,11 @@ pub struct CombinedRuleset {
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct Command {
     /// Origin. Locates a failure attributed to a command rather than an
-    /// expression: an unknown ruleset, a failed `check`, a failed extraction.
+    /// expression: a failed `check`, registration or extraction.
     /// Surfaces as `Error.span`.
     #[prost(message, optional, tag = "13")]
     pub span: ::core::option::Option<Span>,
-    #[prost(oneof = "command::Kind", tags = "1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 14, 15, 16, 17")]
+    #[prost(oneof = "command::Kind", tags = "1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 14, 15, 16, 17, 18")]
     pub kind: ::core::option::Option<command::Kind>,
 }
 /// Nested message and enum types in `Command`.
@@ -1419,6 +1311,8 @@ pub mod command {
         /// this observation composes with other commands and follows Fail suppression.
         #[prost(message, tag = "17")]
         Stats(super::Unit),
+        #[prost(message, tag = "18")]
+        AddRules(super::AddRules),
     }
 }
 /// One conjunctive query. All facts share the same variable bindings.
@@ -1452,19 +1346,31 @@ pub struct ProveExists {
     #[prost(string, tag = "1")]
     pub constructor: ::prost::alloc::string::String,
 }
-/// Execute one ruleset step, optionally using a bound scheduler. A completed
-/// top-level Run returns RunOutcome; nested Runs contribute to their loop.
-/// Flatten the selected ruleset transitively in inclusion order, retaining each
-/// rule occurrence only at its first inclusion in this complete Run. Identity,
-/// not name or structural equality, determines duplication; distinct equal
-/// rules remain independent. This only deduplicates selection within one Run:
-/// separate Runs and loop iterations select independently. It does not limit
-/// firings from query matches or override scheduler decisions.
+/// Add immutable rule content to one group in this command's execution order.
+/// Empty additions are harmless. First registration determines membership order;
+/// re-adding the same content is a no-op, with compiled state/cursors retained.
+/// The same content in several groups shares one compiled rule. Labels/spans are
+/// representative diagnostics, not identity. Failures retain completed native
+/// registration prefixes; compatible retry is safe. No group declaration exists.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct AddRules {
+    #[prost(string, tag = "1")]
+    pub group: ::prost::alloc::string::String,
+    /// index into Program.rules
+    #[prost(uint32, repeated, tag = "2")]
+    pub rules: ::prost::alloc::vec::Vec<u32>,
+}
+/// Execute one step of the ordered union of groups, optionally using a scheduler.
+/// Unknown groups are empty. \[\] selects nothing; \[""\] explicitly selects the
+/// default group. Traverse groups and first-registration membership in order,
+/// selecting shared content once. Separate Runs still select independently and
+/// retain the selected rules' execution state; this does not override eval_mode
+/// or scheduler decisions. A completed top-level Run returns RunOutcome.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct Run {
-    #[prost(message, optional, tag = "1")]
-    pub ruleset: ::core::option::Option<RulesetRef>,
-    /// Empty means no scheduler; otherwise names a `BindScheduler` instance.
+    #[prost(string, repeated, tag = "1")]
+    pub groups: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    /// Empty means no scheduler; otherwise names a BindScheduler instance.
     #[prost(string, tag = "2")]
     pub scheduler: ::prost::alloc::string::String,
 }
@@ -1565,13 +1471,10 @@ pub struct Extract {
 /// original derivations or promise equivalent proof results.
 ///
 /// Include every installed declaration and sort, even unused or empty tables;
-/// every installed named ruleset and its retained closure, preserving occurrence
-/// sharing and assigned ruleset names; and all builtin
-/// declaration descriptors, including generic families and every distinct core
-/// callable. Export each retained rule and ruleset occurrence once, even if
-/// multiple roots/leaves reach it. Remap RuleList indices into exported rules,
-/// preserving shared and distinct rule occurrences independently of labels.
-/// Omit transient rules/rulesets not retained through named roots.
+/// every registered rule content once and group membership in first-registration
+/// order. Reconstruct membership with AddRules commands referencing Program.rules;
+/// omit never-registered rule values. Host builtin declaration descriptors,
+/// including generic families and distinct core callables, remain included.
 /// Include saved code and its dependencies without executing it.
 /// Include supplied language bindings and all bindings-only sort/default-node
 /// dependencies, remapping their arena references. Do not export derived wrapper
@@ -1588,8 +1491,8 @@ pub struct Extract {
 /// installation follows Program's normal rules; scheduler/seminaive history
 /// is not resumed.
 ///
-/// The export's commands are one ordered list of ordinary Actions, with no
-/// queries, Runs, loops or other commands. Emit exactly one direct Action.term
+/// The export's commands contain ordinary data Actions followed by AddRules
+/// membership reconstruction, with no queries, Runs or loops. Emit exactly one direct Action.term
 /// for each canonical equality class, naming its unique Union location whose
 /// members are all its constructor rows. Include empty/unreachable classes.
 /// Emit relation rows as direct Action.term Calls; write every function row,
@@ -1741,11 +1644,17 @@ pub struct CreateEGraphRequest {
     /// choice. GetHistory specifies retention, observation and lifecycle behavior.
     #[prost(bool, tag = "7")]
     pub record_history: bool,
+    /// Creation-only native collection detail; absent retains the host default.
+    #[prost(enumeration = "ReportLevel", optional, tag = "8")]
+    pub report_level: ::core::option::Option<i32>,
 }
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct CreateEGraphResponse {
     #[prost(uint64, tag = "1")]
     pub egraph_id: u64,
+    /// Actual effective count, including resolution of automatic/default requests.
+    #[prost(uint64, tag = "2")]
+    pub threads: u64,
 }
 /// Portable logical state, not an execution checkpoint. The Program owns all
 /// arenas/files, including the C selected by options. Only C's reachable sort
@@ -1793,8 +1702,8 @@ pub struct DestroyEGraphResponse {
 /// other saved logical/resource state. Do not sum the saved report prefix twice.
 ///
 /// Both handles must be live, distinct and directly paired by Clone. Reject if
-/// the saved handle has accepted a Program or resource setter since that Clone;
-/// a resource Query or rejected request does not invalidate pairing. Validate
+/// the saved handle has accepted a Program since that Clone; rejected requests
+/// do not invalidate pairing. Validate
 /// before mutation. Ordinary Clone/Destroy retain independent copy/discard
 /// semantics. Invalid pairing is a lifecycle error, not RunProgram.error.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
@@ -1807,145 +1716,22 @@ pub struct ReturnToEGraphRequest {
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ReturnToEGraphResponse {
 }
-/// Query thread/planner resources or update runtime/collection settings on a handle, never logical
-/// settings or Program state. Completed updates affect subsequent calls; they
-/// do not reconfigure an in-flight Run. Clone inherits effective resources and
-/// later updates are handle-local. Resources are not part of a frozen snapshot.
-///
-/// Reject malformed, missing/unknown operations, invalid handles and unsupported
-/// requests before changing resources or execution state. In particular, an
-/// update must not reset rule cursors or otherwise act like cloning/restoration.
-/// Resource allocation failures retain the receiver's native failure boundary;
-/// this contract does not require native allocation panics to be recoverable.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct ConfigureEGraphResourcesRequest {
-    #[prost(uint64, tag = "1")]
-    pub egraph_id: u64,
-    #[prost(oneof = "configure_e_graph_resources_request::Operation", tags = "2, 3, 4, 5")]
-    pub operation: ::core::option::Option<configure_e_graph_resources_request::Operation>,
-}
-/// Nested message and enum types in `ConfigureEGraphResourcesRequest`.
-pub mod configure_e_graph_resources_request {
-    #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Oneof)]
-    pub enum Operation {
-        /// Observe current thread count and global no_decomp without changing settings.
-        #[prost(message, tag = "2")]
-        Query(super::Unit),
-        /// Zero requests automatic parallelism resolved at this update; positive
-        /// requests that exact count. Unsupported requests fail, never clamp or
-        /// silently succeed. This has the same request domain as creation. An
-        /// explicit operation distinguishes query from setting automatic zero.
-        #[prost(uint32, tag = "3")]
-        Threads(u32),
-        /// Set future native report detail. Does not disable collection or retrofit
-        /// existing statistics. Clone inherits this setting; updates are handle-local.
-        /// Query does not observe report level.
-        #[prost(enumeration = "super::ReportLevel", tag = "4")]
-        ReportLevel(i32),
-        /// Change only the native global default for future query planning. This
-        /// affects neither typing/admission nor already compiled rules/plans. An
-        /// explicit false is an update, not an absent operation. No cursor/report
-        /// reset, cloning or definition reinstall is implied. Planning policy may
-        /// change match ordering, work and profiling; logical replay does not retain it.
-        #[prost(bool, tag = "5")]
-        NoDecomp(bool),
-    }
-}
-#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct ConfigureEGraphResourcesResponse {
-    /// Actual effective native count after query/update, never the requested zero
-    /// or a frontend estimate. uint64 accommodates the receiver's native count
-    /// without narrowing to the uint32 request domain.
-    #[prost(uint64, tag = "1")]
-    pub threads: u64,
-    /// Actual current native planning default after query/update, not an estimate.
-    #[prost(bool, tag = "2")]
-    pub no_decomp: bool,
-}
-/// Retrieve the audit selected at successful creation. Disabled recording and
-/// unknown handles are lifecycle errors, distinct from an empty history.
-/// Record decoded Create, Clone, Destroy, ReturnTo, ConfigureResources and Run
-/// requests, including resource queries and every Program observation such as
-/// Freeze. Preserve known fields of decoded requests before normalization, local
-/// arenas, and actual responses (including errors and completed-prefix outputs).
-/// This is not a raw-byte record: decoders may discard unknown protobuf fields.
-/// GetHistory is never recorded and cannot recursively retain its own export.
-/// Undecodable requests and failed creation have no addressable typed history.
-///
-/// Clone shares its immutable past and then retains independent continuations.
-/// A successful ReturnTo joins both audits in service submission order, retaining
-/// each shared exchange once; restoring logical state never rolls history back.
-/// Consumed/destroyed handles retain a closed audit until their owning service
-/// instance is dropped. Later rejected requests addressing them may be recorded.
-/// Recording off retains no accumulating request log. Recording on is unbounded.
-/// Native host implementations remain external. This is neither an engine
-/// checkpoint nor a guarantee of deterministic or side-effect-free replay.
+/// Retrieve one accumulated input Program for this live graph. Recording is
+/// selected at creation and off by default; disabled or unknown handles error.
+/// Retain original decoded authored Programs only after successful preparation,
+/// before installation/commands. Rejected preparation contributes no input;
+/// later execution failure retains the accepted input, including its suffix.
+/// This records inputs only: no outcomes, resource/lifecycle events or raw bytes.
+/// Remap arenas while preserving command order, graph sharing and distinct Union
+/// locations. Declarations are cumulative, so earlier Freeze observations may
+/// contain extra definition metadata. This is not exact replay after failure.
+/// GetHistory itself contributes no input. Clone retains its own shared past;
+/// ReturnTo restores the saved history prefix and discards the consumed branch.
+/// Destroy releases its graph's history. Host implementations remain external.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct GetHistoryRequest {
     #[prost(uint64, tag = "1")]
     pub egraph_id: u64,
-}
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct GetHistoryResponse {
-    #[prost(message, repeated, tag = "1")]
-    pub entries: ::prost::alloc::vec::Vec<HistoryEntry>,
-    /// Effective resources immediately after the original successful creation,
-    /// before subsequent exchanges. Clone inherits this same initial context.
-    #[prost(message, optional, tag = "2")]
-    pub initial_resources: ::core::option::Option<ConfigureEGraphResourcesResponse>,
-    /// True when the addressed native handle has been destroyed or consumed.
-    #[prost(bool, tag = "3")]
-    pub closed: bool,
-}
-/// One submission and its actual outcome. The response kind must match the
-/// request kind. Lifecycle/transport rejection has no fabricated typed response.
-/// An interrupted operation retained its request but returned no response (for
-/// example a native host callback unwound); no outputs or effects are inferred.
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct HistoryEntry {
-    #[prost(oneof = "history_entry::Request", tags = "1, 2, 3, 4, 5, 6")]
-    pub request: ::core::option::Option<history_entry::Request>,
-    #[prost(oneof = "history_entry::Outcome", tags = "11, 12, 13, 14, 15, 16, 17, 18")]
-    pub outcome: ::core::option::Option<history_entry::Outcome>,
-}
-/// Nested message and enum types in `HistoryEntry`.
-pub mod history_entry {
-    #[derive(Clone, PartialEq, ::prost::Oneof)]
-    pub enum Request {
-        /// Preserve invalid submissions as audit data, not permission to execute them.
-        #[prost(message, tag = "1")]
-        Create(super::CreateEGraphRequest),
-        #[prost(message, tag = "2")]
-        Clone(super::CloneEGraphRequest),
-        #[prost(message, tag = "3")]
-        Destroy(super::DestroyEGraphRequest),
-        #[prost(message, tag = "4")]
-        ReturnTo(super::ReturnToEGraphRequest),
-        #[prost(message, tag = "5")]
-        ConfigureResources(super::ConfigureEGraphResourcesRequest),
-        #[prost(message, tag = "6")]
-        RunProgram(super::RunProgramRequest),
-    }
-    #[allow(clippy::large_enum_variant)]
-    #[derive(Clone, PartialEq, ::prost::Oneof)]
-    pub enum Outcome {
-        #[prost(message, tag = "11")]
-        CreateResponse(super::CreateEGraphResponse),
-        #[prost(message, tag = "12")]
-        CloneResponse(super::CloneEGraphResponse),
-        #[prost(message, tag = "13")]
-        DestroyResponse(super::DestroyEGraphResponse),
-        #[prost(message, tag = "14")]
-        ReturnToResponse(super::ReturnToEGraphResponse),
-        #[prost(message, tag = "15")]
-        ConfigureResourcesResponse(super::ConfigureEGraphResourcesResponse),
-        #[prost(message, tag = "16")]
-        RunProgramResponse(super::RunProgramResponse),
-        #[prost(string, tag = "17")]
-        TransportError(::prost::alloc::string::String),
-        #[prost(message, tag = "18")]
-        Interrupted(super::Unit),
-    }
 }
 /// Execute a program against an existing e-graph.
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -1992,64 +1778,15 @@ pub struct RunProgramResponse {
     /// native result completed before a trailing maintenance failure remains here.
     #[prost(message, optional, tag = "5")]
     pub error: ::core::option::Option<Error>,
-    /// Only occurrence identities referenced by errors/profile/reports, not global IDs or
-    /// definition copies. Shared occurrences reuse one index; distinct equal
-    /// occurrences have distinct indices even when diagnostics coincide. Include
-    /// attribution needed by errors or requested reports even with profiling off.
+    /// Canonical registered rule content referenced by errors/profile/reports.
+    /// Rule node/sort/span references use this response's arenas. Equivalent
+    /// content has one catalog entry; first-registration diagnostics represent it.
     #[prost(message, repeated, tag = "6")]
-    pub rules: ::prost::alloc::vec::Vec<RuleAttribution>,
+    pub rules: ::prost::alloc::vec::Vec<Rule>,
     /// Present iff requested, including when no Run was entered or validation
     /// failed. Summary only: no dynamic iteration coordinates or event history.
     #[prost(message, optional, tag = "7")]
     pub profile: ::core::option::Option<ProfileSummary>,
-    /// Present on every valid engine response, independently of profile or error.
-    /// Absent means unavailable/unknown (for example an older peer), never empty;
-    /// such a response does not satisfy this contract.
-    #[prost(message, optional, tag = "8")]
-    pub ruleset_publication: ::core::option::Option<RulesetPublication>,
-}
-/// Exhaustive confirmation of submitted named ruleset presentations for this
-/// request, not a list of all installed names. Each name confirms that all its
-/// submitted presentations passed full compatibility preparation and its binding
-/// is retained at response time. Include compatible already-published resupplies;
-/// new bindings and first-name enrichments require completed publication.
-/// Preparation failure yields no names, even if some already exist. Success,
-/// or completed definition installation followed by a command error, confirms
-/// every distinct submitted name. Omission on failure neither revokes an earlier
-/// confirmation nor establishes global absence. List order has no meaning.
-/// Readers reject duplicate or unsubmitted names. Request correspondence and
-/// truthful completion require the request/engine state; response-only CEL
-/// cannot check them. This carries no occurrence IDs, bodies, or history.
-#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct RulesetPublication {
-    /// The empty string confirms the explicitly named default ruleset.
-    #[prost(string, repeated, tag = "1")]
-    pub names: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
-}
-/// One authored Rule occurrence, including both directions of a BiRewrite.
-/// Pick one valid route from the request's ruleset arena or an installed named
-/// root, following composition-child positions (and resolving their refs), to
-/// a leaf RuleList. `position` is its ordinal, NOT a Program.rules index;
-/// the selected entry resolves to its rule occurrence. This also locates retained
-/// rules/leaves absent from the request. A rule shared by multiple leaves or
-/// repeated positions still has one response-local catalog entry.
-/// Bounds, name resolution and terminal-leaf checks are normative. Multiple
-/// routes to the same occurrence do not create additional catalog entries.
-#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct RuleAttribution {
-    #[prost(message, optional, tag = "1")]
-    pub root: ::core::option::Option<RulesetRef>,
-    #[prost(uint32, repeated, tag = "2")]
-    pub children: ::prost::alloc::vec::Vec<u32>,
-    /// ordinal within the selected RuleList
-    #[prost(uint32, tag = "3")]
-    pub position: u32,
-    /// A supplied diagnostic label from this occurrence, absent if it has none.
-    /// Representative provenance only, never an invented or lookup identity.
-    #[prost(string, optional, tag = "4")]
-    pub name: ::core::option::Option<::prost::alloc::string::String>,
-    #[prost(message, optional, tag = "5")]
-    pub span: ::core::option::Option<Span>,
 }
 /// One dynamic command execution in the submitted Program. path\[0\] indexes
 /// Program.commands; each later component indexes the previous Repeat/Saturate
@@ -2209,14 +1946,13 @@ pub struct RuleCountEntry {
     #[prost(uint64, tag = "4")]
     pub value: u64,
 }
-/// The actual selected logical Run target, not a rule's representative route.
-/// Names may locate retained definitions; indices refer to the current request.
-/// Omit ruleset if unknown, never reuse dangling prior-request indices or infer
-/// a logical target from a generated holder name.
+/// Known wire groups selected for this native aggregate. Empty also covers
+/// unclassified/internal native work; preserve native_name instead of guessing.
+/// These are native report entries, not wire group declarations.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct RulesetDurationEntry {
-    #[prost(message, optional, tag = "1")]
-    pub ruleset: ::core::option::Option<RulesetRef>,
+    #[prost(string, repeated, tag = "1")]
+    pub groups: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
     #[prost(string, tag = "2")]
     pub native_name: ::prost::alloc::string::String,
     #[prost(message, optional, tag = "3")]
@@ -2588,7 +2324,7 @@ pub struct StaticCommandPath {
 /// belongs to its command site, not to a synthetic Program declaration.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct MaintenanceSite {
-    #[prost(oneof = "maintenance_site::Target", tags = "1, 2, 3, 4")]
+    #[prost(oneof = "maintenance_site::Target", tags = "1, 2, 3")]
     pub target: ::core::option::Option<maintenance_site::Target>,
 }
 /// Nested message and enum types in `MaintenanceSite`.
@@ -2603,9 +2339,6 @@ pub mod maintenance_site {
         /// newly materialized instance in Program.sorts
         #[prost(uint32, tag = "3")]
         Sort(u32),
-        /// installation in Program.rulesets, including its rules
-        #[prost(uint32, tag = "4")]
-        Ruleset(u32),
     }
 }
 /// Internal native Run/query work caused by one static site, aggregated across
@@ -2998,7 +2731,7 @@ pub enum ErrorCode {
     /// obtain one.
     /// Extract instead returns empty variants when a root has no finite term.
     ExtractionFailed = 5,
-    /// A named ruleset, scheduler, table or cost model does not exist.
+    /// A named scheduler, table or cost model does not exist.
     UnknownName = 6,
     /// A proof request failed; proof_failure distinguishes its native cause.
     ProofFailed = 7,

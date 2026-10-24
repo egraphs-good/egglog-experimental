@@ -8,8 +8,8 @@
 //! authoring and are absent from protobuf, retaining successful definitions.
 //! Scope-aware callers use [`Source::next_submission`] and the existing clone /
 //! return requests; the Program iterator deliberately rejects scope operations.
-//! Selected rulesets are immutable snapshots; later source additions publish
-//! occurrence-preserving prefix/delta versions. Uncatalogued primitives, effectful local lets,
+//! Rules emit ordered AddRules commands; combined text names select their live
+//! leaf-group union. Uncatalogued primitives, effectful local lets,
 //! named cost models remain unsupported. Experimental constructor annotations use
 //! the native cost macros with their actual provenance. The explicit Core
 //! frontend also admits Run-only sequence/repeat/saturate controls. Proof requests keep
@@ -211,11 +211,9 @@ impl PrintFunction {
 }
 
 #[derive(Clone)]
-struct SourceRuleset {
-    kind: pb::ruleset::Kind,
-    span: Option<pb::Span>,
-    version: Option<usize>,
-    published_rules: usize,
+enum SourceRuleset {
+    Rules(Vec<u32>),
+    Combined(Vec<String>),
 }
 
 struct SourceScope {
@@ -247,8 +245,6 @@ pub struct Source {
     // Names only: the producer must never instantiate or run a scheduler.
     schedulers: HashSet<String>,
     local_prefix: String,
-    // Native fresh names survive Pop; never reuse a discarded version's name.
-    next_ruleset: u64,
     cost_origins: std::sync::Arc<std::sync::Mutex<crate::set_cost::CostOrigins>>,
     pending_error: Option<String>,
 }
@@ -458,6 +454,7 @@ pub(super) fn source_phase_refs(
             }
             Some(
                 pb::command::Kind::Run(_)
+                | pb::command::Kind::AddRules(_)
                 | pb::command::Kind::BindScheduler(_)
                 | pb::command::Kind::KeepBest(_)
                 | pb::command::Kind::Freeze(_)
@@ -473,8 +470,8 @@ pub(super) fn source_phase_refs(
     Ok(())
 }
 
-// Keep the private arena for later rule publication, but copy only this phase's
-// fresh validation obligations and reachable occurrences. Allocate an identity
+// Keep the private authoring arena, but copy only this phase's fresh validation
+// obligations and reachable nodes. Allocate an identity
 // before following edges: shared and distinct Unions, including cycles, survive.
 fn project_source_nodes(
     arena: &[pb::Node],
@@ -604,10 +601,7 @@ pub fn produce_input(
     fact_directory: Option<&Path>,
     extension: Option<Arc<dyn NativeExtension>>,
 ) -> Result<pb::Program, TransportError> {
-    if !descriptor.commands.is_empty()
-        || !descriptor.rulesets.is_empty()
-        || !descriptor.rules.is_empty()
-    {
+    if !descriptor.commands.is_empty() || !descriptor.rules.is_empty() {
         return Err(TransportError(
             "input descriptor must contain declarations only".into(),
         ));
@@ -739,7 +733,6 @@ pub(crate) fn primitive_definition(
             relations: HashSet::new(),
             schedulers: HashSet::new(),
             local_prefix: String::new(),
-            next_ruleset: 0,
             cost_origins: Default::default(),
             pending_error: None,
         },
@@ -846,19 +839,10 @@ impl Source {
             program: pb::Program {
                 ..Default::default()
             },
-            rulesets: HashMap::from([(
-                String::new(),
-                SourceRuleset {
-                    kind: pb::ruleset::Kind::Rules(pb::RuleList::default()),
-                    span: None,
-                    version: None,
-                    published_rules: 0,
-                },
-            )]),
+            rulesets: HashMap::from([(String::new(), SourceRuleset::Rules(vec![]))]),
             relations: HashSet::new(),
             schedulers: HashSet::new(),
             local_prefix,
-            next_ruleset: 0,
             cost_origins,
             pending_error: None,
         })
@@ -1153,7 +1137,7 @@ impl Source {
             }
             Err(error) => {
                 // Native retains the constructor if its later rule fails. Do
-                // not export any nodes or publication state from that child.
+                // not export any nodes or group additions from that child.
                 self.program = program;
                 self.rulesets = rulesets;
                 self.pending_error = Some(error);
@@ -1289,7 +1273,6 @@ impl Source {
                 );
             }
         }
-        let mut publish = vec![];
         for mut command in expanded {
             let mut fail_spans = vec![];
             while let Command::Fail(span, child) = command {
@@ -1818,57 +1801,19 @@ impl Source {
                         });
                     }
                     command @ (N::AddRuleset(..) | N::UnstableCombinedRuleset(..)) => {
-                        let (span, name, kind) = match command {
-                            N::AddRuleset(span, name) => (
-                                span,
-                                name,
-                                pb::ruleset::Kind::Rules(pb::RuleList::default()),
-                            ),
-                            N::UnstableCombinedRuleset(span, name, children) => (
-                                span,
-                                name,
-                                pb::ruleset::Kind::Combined(pb::CombinedRuleset {
-                                    // Native declarations retain names, including
-                                    // children declared before the first Run.
-                                    rulesets: children
-                                        .into_iter()
-                                        .map(|name| pb::RulesetRef {
-                                            kind: Some(pb::ruleset_ref::Kind::Name(name)),
-                                        })
-                                        .collect(),
-                                }),
-                            ),
+                        let (name, kind) = match command {
+                            N::AddRuleset(_, name) => (name, SourceRuleset::Rules(vec![])),
+                            N::UnstableCombinedRuleset(_, name, children) => {
+                                (name, SourceRuleset::Combined(children))
+                            }
                             _ => unreachable!(),
                         };
-                        if self.rulesets.contains_key(&name)
-                            || self
-                                .program
-                                .rulesets
-                                .iter()
-                                .any(|set| set.name.as_ref() == Some(&name))
-                        {
+                        if self.rulesets.insert(name.clone(), kind).is_some() {
                             return Err(format!("ruleset {name} is already declared"));
-                        }
-                        let span = self.span(&span)?;
-                        self.rulesets.insert(
-                            name.clone(),
-                            SourceRuleset {
-                                kind,
-                                span,
-                                version: None,
-                                published_rules: 0,
-                            },
-                        );
-                        if frontend_fail || definition_error.is_some() {
-                            self.publish_ruleset(&name, &mut publish)?;
                         }
                     }
                     N::NormRule { rule } => {
-                        let target = rule.ruleset.clone();
                         self.rule(rule, rewrite)?;
-                        if frontend_fail || definition_error.is_some() {
-                            self.publish_ruleset(&target, &mut publish)?;
-                        }
                     }
                     N::CoreAction(ResolvedAction::Let(span, var, expr)) => {
                         let value = self.expr(&expr, None, 0)?;
@@ -2040,7 +1985,7 @@ impl Source {
                                 },
                                 other => other,
                             };
-                            let command = self.schedule(schedule, &mut publish)?;
+                            let command = self.schedule(schedule)?;
                             self.program.commands.push(command);
                             continue;
                         }
@@ -2058,7 +2003,7 @@ impl Source {
                                 }
                             };
                         }
-                        let command = self.schedule(schedule, &mut publish)?;
+                        let command = self.schedule(schedule)?;
                         self.program.commands.push(command);
                     }
                     N::UserDefined(span, name, args) if name == "let-scheduler" => {
@@ -2076,7 +2021,7 @@ impl Source {
                         let mut locals = HashSet::new();
                         let body = args
                             .iter()
-                            .map(|arg| self.extended_schedule(arg, &mut locals, &mut publish, 0))
+                            .map(|arg| self.extended_schedule(arg, &mut locals, 0))
                             .collect::<Result<Vec<_>, _>>()?;
                         let command = match body.as_slice() {
                             // Only control roots can lose the implicit list.
@@ -2132,84 +2077,37 @@ impl Source {
             }
         }
         self.pending_error = definition_error;
-        let program = self.phase(publish, first_rule)?;
+        let program = self.phase(first_rule)?;
         Ok(program)
     }
 
-    // One phase owns exactly its completed command prefix and new definitions;
-    // immutable rule cursors remain publication-local, including failed macros.
-    fn phase(&mut self, publish: Vec<usize>, first_rule: usize) -> Result<pb::Program, String> {
-        // The private arena retains every authored occurrence for later
-        // publication. A packet needs only its new validation obligations and
-        // occurrences referenced by the versions being published now.
-        let mut rule_indices: Vec<_> = (first_rule..self.program.rules.len()).collect();
-        for &index in &publish {
-            if let Some(pb::ruleset::Kind::Rules(list)) = &self.program.rulesets[index].kind {
-                rule_indices.extend(list.rules.iter().map(|index| *index as usize));
+    // Each packet carries the newly authored bodies and ordered additions.
+    fn phase(&mut self, first_rule: usize) -> Result<pb::Program, String> {
+        let mut commands = std::mem::take(&mut self.program.commands);
+        let mut pending: Vec<_> = commands.iter_mut().collect();
+        while let Some(command) = pending.pop() {
+            match &mut command.kind {
+                Some(pb::command::Kind::AddRules(add)) => {
+                    for index in &mut add.rules {
+                        *index = index
+                            .checked_sub(u32::try_from(first_rule).map_err(|_| "too many rules")?)
+                            .ok_or("source addition escaped its authored phase")?;
+                    }
+                }
+                Some(pb::command::Kind::Fail(child)) => pending.push(child),
+                Some(pb::command::Kind::Repeat(body)) => pending.extend(&mut body.body),
+                Some(pb::command::Kind::Saturate(body)) => pending.extend(&mut body.body),
+                _ => (),
             }
         }
-        rule_indices.sort_unstable();
-        rule_indices.dedup();
-        let local_rules: HashMap<usize, u32> = rule_indices
-            .iter()
-            .enumerate()
-            .map(|(local, global)| {
-                Ok((
-                    *global,
-                    u32::try_from(local).map_err(|_| "too many source rules")?,
-                ))
-            })
-            .collect::<Result<_, String>>()?;
-        let rules = rule_indices
-            .into_iter()
-            .map(|index| self.program.rules[index].clone())
-            .collect();
-        let local_rulesets: HashMap<usize, u32> = publish
-            .iter()
-            .enumerate()
-            .map(|(local, global)| {
-                Ok((
-                    *global,
-                    u32::try_from(local).map_err(|_| "too many source rulesets")?,
-                ))
-            })
-            .collect::<Result<_, String>>()?;
-        let rulesets = publish
-            .into_iter()
-            .map(|index| {
-                let mut ruleset = self.program.rulesets[index].clone();
-                match &mut ruleset.kind {
-                    Some(pb::ruleset::Kind::Rules(list)) => {
-                        for index in &mut list.rules {
-                            *index = local_rules[&(*index as usize)];
-                        }
-                    }
-                    Some(pb::ruleset::Kind::Combined(combined)) => {
-                        for child in &mut combined.rulesets {
-                            if let Some(pb::ruleset_ref::Kind::Index(index)) = &mut child.kind {
-                                *index = *local_rulesets.get(&(*index as usize)).expect(
-                                    "new anonymous deltas are published with their version",
-                                );
-                            }
-                        }
-                    }
-                    None => unreachable!("source versions always have a kind"),
-                }
-                ruleset
-            })
-            .collect();
-        let program = pb::Program {
+        Ok(pb::Program {
             sorts: self.program.sorts.clone(),
-            // Node references stay private until advance joins any successful
-            // macro prefix, then projects the complete authored phase once.
-            nodes: Vec::new(),
+            nodes: vec![],
             files: self.program.files.clone(),
             declarations: std::mem::take(&mut self.program.declarations),
-            commands: std::mem::take(&mut self.program.commands),
-            rules,
-            rulesets,
-        };
-        Ok(program)
+            commands,
+            rules: self.program.rules[first_rule..].to_vec(),
+        })
     }
 
     fn cost_phase(
@@ -2290,7 +2188,7 @@ impl Source {
                     }
                     self.program.commands.extend(prefix);
                     self.pending_error = Some(error.to_string());
-                    return self.phase(Vec::new(), first_rule);
+                    return self.phase(first_rule);
                 }
             };
             let [N::CoreAction(action)] = resolved.as_slice() else {
@@ -2395,154 +2293,47 @@ impl Source {
                 }),
             })),
         });
-        self.phase(Vec::new(), first_rule)
+        self.phase(first_rule)
     }
 
-    // Resolve the current authored closure into immutable wire versions. A new
-    // leaf suffix references its old named prefix, never reinstalls old rules.
-    fn publish_ruleset(&mut self, name: &str, publish: &mut Vec<usize>) -> Result<usize, String> {
+    // Text combined groups are live frontend selectors; the wire directly
+    // selects their ordered leaf union and contains no combined declaration.
+    fn select_groups(&self, name: &str) -> Result<Vec<String>, String> {
         let mut pending = vec![(name.to_owned(), false)];
         let mut active = HashSet::new();
-        let mut completed: HashMap<String, usize> = HashMap::new();
-        while let Some((logical, leaving)) = pending.pop() {
-            if completed.contains_key(&logical) {
+        let mut seen = HashSet::new();
+        let mut groups = vec![];
+        while let Some((name, leaving)) = pending.pop() {
+            if leaving {
+                active.remove(&name);
                 continue;
             }
-            let ruleset = self
-                .rulesets
-                .get(&logical)
-                .ok_or_else(|| format!("unknown ruleset {logical}"))?
-                .clone();
-            if !leaving {
-                if !active.insert(logical.clone()) {
-                    return Err(format!("cyclic source ruleset {logical}"));
-                }
-                pending.push((logical.clone(), true));
-                if let pb::ruleset::Kind::Combined(combined) = ruleset.kind {
-                    for child in combined.rulesets.into_iter().rev() {
-                        let Some(pb::ruleset_ref::Kind::Name(name)) = child.kind else {
-                            unreachable!("authored dependencies retain logical names")
-                        };
-                        pending.push((name, false));
-                    }
-                }
+            if active.contains(&name) {
+                return Err(format!("cyclic source ruleset {name}"));
+            }
+            if !seen.insert(name.clone()) {
                 continue;
             }
-            active.remove(&logical);
-            let mut published_rules = ruleset.published_rules;
-            let kind = match ruleset.kind {
-                pb::ruleset::Kind::Rules(list) => {
-                    if let Some(version) = ruleset.version
-                        && ruleset.published_rules == list.rules.len()
-                    {
-                        completed.insert(logical, version);
-                        continue;
-                    }
-                    published_rules = list.rules.len();
-                    if let Some(previous) = ruleset.version {
-                        let delta = u32::try_from(self.program.rulesets.len())
-                            .map_err(|_| "too many source rulesets")?;
-                        self.program.rulesets.push(pb::Ruleset {
-                            kind: Some(pb::ruleset::Kind::Rules(pb::RuleList {
-                                rules: list.rules[ruleset.published_rules..].to_vec(),
-                            })),
-                            span: ruleset.span,
-                            ..Default::default()
-                        });
-                        publish.push(delta as usize);
-                        pb::ruleset::Kind::Combined(pb::CombinedRuleset {
-                            rulesets: vec![
-                                pb::RulesetRef {
-                                    kind: Some(pb::ruleset_ref::Kind::Name(
-                                        self.program.rulesets[previous].name.clone().unwrap(),
-                                    )),
-                                },
-                                pb::RulesetRef {
-                                    kind: Some(pb::ruleset_ref::Kind::Index(delta)),
-                                },
-                            ],
-                        })
-                    } else {
-                        pb::ruleset::Kind::Rules(list)
-                    }
-                }
-                pb::ruleset::Kind::Combined(combined) => {
-                    pb::ruleset::Kind::Combined(pb::CombinedRuleset {
-                        rulesets: combined
-                            .rulesets
-                            .into_iter()
-                            .map(|child| {
-                                let Some(pb::ruleset_ref::Kind::Name(name)) = child.kind else {
-                                    unreachable!()
-                                };
-                                let version = completed[&name];
-                                pb::RulesetRef {
-                                    kind: Some(pb::ruleset_ref::Kind::Name(
-                                        self.program.rulesets[version].name.clone().unwrap(),
-                                    )),
-                                }
-                            })
-                            .collect(),
-                    })
-                }
-            };
-            if let Some(version) = ruleset.version
-                && self.program.rulesets[version].kind.as_ref() == Some(&kind)
-            {
-                completed.insert(logical, version);
-                continue;
-            }
-            let physical = if ruleset.version.is_none() {
-                logical.clone()
+            if let Some(SourceRuleset::Combined(children)) = self.rulesets.get(&name) {
+                active.insert(name.clone());
+                pending.push((name, true));
+                pending.extend(children.iter().rev().map(|name| (name.clone(), false)));
             } else {
-                loop {
-                    let candidate = format!("{}ruleset_{}", self.local_prefix, self.next_ruleset);
-                    self.next_ruleset = self
-                        .next_ruleset
-                        .checked_add(1)
-                        .ok_or("source ruleset version identity space exhausted")?;
-                    if !self.rulesets.contains_key(&candidate)
-                        && !self
-                            .program
-                            .rulesets
-                            .iter()
-                            .any(|set| set.name.as_ref() == Some(&candidate))
-                    {
-                        break candidate;
-                    }
-                }
-            };
-            let version = self.program.rulesets.len();
-            self.program.rulesets.push(pb::Ruleset {
-                name: Some(physical),
-                kind: Some(kind),
-                span: ruleset.span,
-                ..Default::default()
-            });
-            let authored = self.rulesets.get_mut(&logical).unwrap();
-            authored.version = Some(version);
-            authored.published_rules = published_rules;
-            completed.insert(logical, version);
-            publish.push(version);
+                groups.push(name);
+            }
         }
-        Ok(completed[name])
+        Ok(groups)
     }
 
     fn schedule(
         &mut self,
         schedule: ast::GenericSchedule<ResolvedCall, ast::ResolvedVar>,
-        publish: &mut Vec<usize>,
     ) -> Result<pb::Command, String> {
         use ast::GenericSchedule as S;
         let (span, kind) = match schedule {
             S::Run(span, config) => {
-                let version = self.publish_ruleset(&config.ruleset, publish)?;
                 let kind = pb::command::Kind::Run(pb::Run {
-                    ruleset: Some(pb::RulesetRef {
-                        kind: Some(pb::ruleset_ref::Kind::Name(
-                            self.program.rulesets[version].name.clone().unwrap(),
-                        )),
-                    }),
+                    groups: self.select_groups(&config.ruleset)?,
                     ..Default::default()
                 });
                 if let Some(until) = config.until {
@@ -2571,7 +2362,7 @@ impl Source {
             S::Sequence(span, children) => {
                 let body = children
                     .into_iter()
-                    .map(|child| self.schedule(child, publish))
+                    .map(|child| self.schedule(child))
                     .collect::<Result<_, _>>()?;
                 (
                     span,
@@ -2596,7 +2387,7 @@ impl Source {
                 };
                 let body = children
                     .into_iter()
-                    .map(|child| self.schedule(child, publish))
+                    .map(|child| self.schedule(child))
                     .collect::<Result<_, _>>()?;
                 let kind = if count == Some(0) {
                     pb::command::Kind::Repeat(pb::Repeat {
@@ -2628,7 +2419,6 @@ impl Source {
         &mut self,
         expr: &Expr,
         locals: &mut HashSet<String>,
-        publish: &mut Vec<usize>,
         depth: usize,
     ) -> Result<pb::Command, String> {
         if depth > 256 {
@@ -2656,7 +2446,7 @@ impl Source {
             let body = header
                 .body
                 .iter()
-                .map(|child| self.extended_schedule(child, &mut nested, publish, depth + 1))
+                .map(|child| self.extended_schedule(child, &mut nested, depth + 1))
                 .collect::<Result<Vec<_>, _>>()?;
             return Ok(pb::Command {
                 span: self.span(&span)?,
@@ -2680,7 +2470,7 @@ impl Source {
                 let [child] = args.as_slice() else {
                     return Err("source fail requires one schedule step".into());
                 };
-                let child = self.extended_schedule(child, locals, publish, depth + 1)?;
+                let child = self.extended_schedule(child, locals, depth + 1)?;
                 return Ok(pb::Command {
                     span: self.span(&span)?,
                     kind: Some(pb::command::Kind::Fail(Box::new(child))),
@@ -2784,7 +2574,7 @@ impl Source {
                 let mut nested = locals.clone();
                 let body = args
                     .iter()
-                    .map(|child| self.extended_schedule(child, &mut nested, publish, depth + 1))
+                    .map(|child| self.extended_schedule(child, &mut nested, depth + 1))
                     .collect::<Result<Vec<_>, _>>()?;
                 let kind = if head == "saturate" {
                     pb::command::Kind::Saturate(pb::Saturate {
@@ -2816,15 +2606,10 @@ impl Source {
             }
             _ => return Err("source schedule body has no supported native projection".into()),
         };
-        let version = self.publish_ruleset(ruleset, publish)?;
         let run = pb::Command {
             span: self.span(&span)?,
             kind: Some(pb::command::Kind::Run(pb::Run {
-                ruleset: Some(pb::RulesetRef {
-                    kind: Some(pb::ruleset_ref::Kind::Name(
-                        self.program.rulesets[version].name.clone().unwrap(),
-                    )),
-                }),
+                groups: self.select_groups(ruleset)?,
                 scheduler: scheduler.into(),
             })),
         };
@@ -2864,7 +2649,7 @@ impl Source {
             .rulesets
             .get(&rule.ruleset)
             .ok_or_else(|| format!("unknown ruleset {}", rule.ruleset))?;
-        let pb::ruleset::Kind::Rules(list) = &ruleset.kind else {
+        let SourceRuleset::Rules(list) = ruleset else {
             return Err(egglog::Error::CombinedRulesetError(rule.ruleset, rule.span).to_string());
         };
         let names = if matches!(rewrite, Some(RewriteKind::Bidirectional)) {
@@ -2872,7 +2657,7 @@ impl Source {
         } else {
             vec![rule.name.clone()]
         };
-        if let Some(duplicate) = list.rules.iter().find_map(|index| {
+        if let Some(duplicate) = list.iter().find_map(|index| {
             let previous = &self.program.rules[*index as usize];
             let previous_name = previous.name.as_ref()?;
             names
@@ -3211,12 +2996,17 @@ impl Source {
             span,
             ..Default::default()
         });
-        let pb::ruleset::Kind::Rules(list) =
-            &mut self.rulesets.get_mut(&ruleset_name).unwrap().kind
-        else {
+        let SourceRuleset::Rules(list) = self.rulesets.get_mut(&ruleset_name).unwrap() else {
             unreachable!()
         };
-        list.rules.push(index);
+        list.push(index);
+        self.program.commands.push(pb::Command {
+            span,
+            kind: Some(pb::command::Kind::AddRules(pb::AddRules {
+                group: ruleset_name,
+                rules: vec![index],
+            })),
+        });
         Ok(())
     }
 
@@ -3677,7 +3467,7 @@ impl Iterator for Source {
 /// Experimental output can be reparsed by [`Source`] into a fresh engine, with
 /// bounded aliases for nominal declarations and prepared ruleset selections.
 /// Core keeps literal sort/callable names; rule holders and selectors have
-/// private presentation aliases, preserving shared occurrences rather than
+/// private presentation aliases, preserving shared rule content rather than
 /// literal `:ruleset`/default spellings. Reuse one renderer for the whole stream:
 /// aliases are stable across phases, but do not recover original keys
 /// for same-engine resupply. Execution names and structural-sort limits are unchanged.
@@ -3688,7 +3478,8 @@ pub struct Renderer {
     dialect: Dialect,
     session: Session,
     sort_names: HashMap<String, String>,
-    scopes: Vec<(Session, HashMap<String, String>)>,
+    private_selectors: HashSet<String>,
+    scopes: Vec<(Session, HashMap<String, String>, HashSet<String>)>,
 }
 
 impl Default for Renderer {
@@ -3718,6 +3509,7 @@ impl Renderer {
         Self {
             dialect,
             sort_names: HashMap::new(),
+            private_selectors: HashSet::new(),
             scopes: Vec::new(),
             session: Session {
                 graph: match dialect {
@@ -3731,8 +3523,7 @@ impl Renderer {
                 names: NativeNames::default(),
                 request: 0,
                 clone_parent: None,
-                rulesets: Vec::new(),
-                rules: Vec::new(),
+                registry: rules::Registry::default(),
                 sorts: HashSet::new(),
                 cost_models: HashMap::new(),
             },
@@ -3766,14 +3557,17 @@ impl Renderer {
             }
             Submission::Push(count) => {
                 for _ in 0..*count {
-                    self.scopes
-                        .push((self.session.clone(), self.sort_names.clone()));
+                    self.scopes.push((
+                        self.session.clone(),
+                        self.sort_names.clone(),
+                        self.private_selectors.clone(),
+                    ));
                 }
                 Ok(format!("(push {count})\n"))
             }
             Submission::Pop { count, span } => {
                 for _ in 0..*count {
-                    let Some((saved, names)) = self.scopes.pop() else {
+                    let Some((saved, names, selectors)) = self.scopes.pop() else {
                         return Err(TransportError(egglog::Error::Pop(span.clone()).to_string()));
                     };
                     let active = std::mem::replace(&mut self.session, saved);
@@ -3781,6 +3575,7 @@ impl Renderer {
                     self.session.graph.restore_from(saved_graph);
                     self.session.request = active.request;
                     self.sort_names = names;
+                    self.private_selectors = selectors;
                 }
                 Ok(format!("(pop {count})\n"))
             }
@@ -4072,21 +3867,23 @@ impl Renderer {
             // selector from this or an earlier phase. No new identity registry:
             // aliases are derived only from the existing prepared handles.
             let private: HashSet<_> = prepared
-                .rulesets
+                .context
+                .candidates
                 .iter()
-                .filter(|name| !name.is_empty())
-                .cloned()
                 .chain(
                     prepared
+                        .context
+                        .registry
                         .rules
                         .iter()
-                        .filter(|name| !name.is_empty())
-                        .map(|name| format!("{name}_holder")),
+                        .map(|rule| &rule.candidate),
                 )
-                .map(|name| native_name("source_ruleset", &name))
+                .map(|candidate| {
+                    native_name("source_ruleset", &format!("{}_holder", candidate.name))
+                })
                 .collect();
             for name in authored.sorts.values().chain(authored.callables.values()) {
-                if private.contains(name) {
+                if private.contains(name) || self.private_selectors.contains(name) {
                     return Err(TransportError(format!(
                         "authored Core name {name:?} collides with a private source ruleset"
                     )));
@@ -4161,22 +3958,24 @@ impl Renderer {
                 authored.callables.insert(helper.clone(), alias);
             }
         }
+        let mut private_selectors = self.private_selectors.clone();
         let source = render_prepared(
             &lowered,
-            &definitions,
+            &lowered,
             &prepared,
             self.dialect,
             &authored,
             &declaration_order,
             &constructor_cost_tables,
             self.session.extension.as_deref(),
+            &mut private_selectors,
         )?;
         // The renderer's graph is always NORMAL and receives inert definitions
         // only: registration compiles rules/merges, but no action/helper runs.
         // Installation can partially register definitions before an error.
         // Adopt neither that state nor its private-name stamp on failed render.
         let mut session = self.session.clone();
-        session
+        let mut context = session
             .install(
                 prepared,
                 &mut pb::RunProgramResponse {
@@ -4188,6 +3987,10 @@ impl Renderer {
         // Retain inert definitions only, never scheduler work. Preparation of
         // the next phase reads this same native binding metadata. The cloned
         // Session is adopted only after text and all registrations succeeded.
+        let mut response = pb::RunProgramResponse {
+            profile: Some(pb::ProfileSummary::default()),
+            ..Default::default()
+        };
         for command in &lowered.commands {
             if let Some(pb::command::Kind::BindScheduler(bind)) = &command.kind {
                 let (scheduler, resource_limited) =
@@ -4205,8 +4008,44 @@ impl Renderer {
                     );
             }
         }
+        let mut pending: Vec<_> = lowered
+            .commands
+            .iter()
+            .enumerate()
+            .rev()
+            .map(|(index, command)| (vec![index as u32], command))
+            .collect();
+        while let Some((path, command)) = pending.pop() {
+            match &command.kind {
+                Some(pb::command::Kind::AddRules(_)) => {
+                    session
+                        .execute(
+                            &lowered,
+                            command,
+                            &mut context,
+                            &pb::CommandLocation {
+                                path,
+                                iterations: vec![],
+                            },
+                            &mut response,
+                            &mut None,
+                        )
+                        .map_err(|error| TransportError(error.to_string()))?;
+                }
+                Some(pb::command::Kind::Repeat(body)) if body.times == Some(1) => {
+                    pending.extend(body.body.iter().enumerate().rev().map(|(index, command)| {
+                        let mut path = path.clone();
+                        path.push(index as u32);
+                        (path, command)
+                    }));
+                }
+                _ => (),
+            }
+        }
+        session.registry = context.registry;
         self.session = session;
         self.sort_names = sort_names;
+        self.private_selectors = private_selectors;
         Ok(source)
     }
 }
@@ -4450,6 +4289,7 @@ fn render_prepared(
     declaration_order: &[usize],
     constructor_cost_tables: &HashMap<String, String>,
     extension: Option<&dyn NativeExtension>,
+    private_selectors: &mut HashSet<String>,
 ) -> Result<String, TransportError> {
     let native_spans = &prepared.context.native_spans;
     // Canonical rules and the submitted program have independent file indices.
@@ -4527,7 +4367,10 @@ fn render_prepared(
         }
         let mut occupied: HashSet<_> = names.iter().map(|name| (*name).to_string()).collect();
         // Logical ruleset names are relocated, not interpolated as atoms.
-        occupied.extend(program.rulesets.iter().filter_map(|ruleset| ruleset.name.clone()));
+        occupied.extend(super::command_tree(&program.commands).flat_map(|command| match &command.kind {
+            Some(pb::command::Kind::AddRules(add)) => vec![add.group.clone()],
+            Some(pb::command::Kind::Run(run)) => run.groups.clone(), _ => vec![],
+        }));
         occupied.extend(authored.sorts.values().cloned());
         occupied.extend(authored.callables.values().cloned());
         let mut parser = std::mem::take(&mut native.parser);
@@ -4619,14 +4462,15 @@ fn render_prepared(
                 },
             );
         }
+        let prepared_rules: Vec<_> = prepared.context.candidates.iter().map(|candidate| candidate.name.clone()).collect();
         {
             // Native handles and canonical rules are aligned by occurrence, not
             // label/body equality. Change presentation only, never Prepared.
-            let labels: HashMap<_, _> = prepared.rules.iter().zip(&prepared.definitions.rules)
+            let labels: HashMap<_, _> = prepared_rules.iter().zip(&program.rules)
                 .map(|(native, rule)| (native.as_str(), rule.name.as_deref().unwrap_or("")))
                 .collect();
             let mut rule_indices = HashMap::new();
-            for (index, name) in prepared.rules.iter().enumerate() {
+            for (index, name) in prepared_rules.iter().enumerate() {
                 rule_indices.insert(name.clone(), index);
                 if matches!(rule_program.rules[index].kind, Some(pb::rule::Kind::Birewrite(_))) {
                     rule_indices.insert(format!("{name}=>"), index);
@@ -4642,18 +4486,17 @@ fn render_prepared(
                 .map(|name| name
                     .map(|name| egglog::sort::FunctionSort::constructor_alias(&name)))
                 .collect::<Result<_, _>>()?;
-            for installation in &prepared.installations {
-                if !matches!(installation.site, pb::maintenance_site::Target::Ruleset(_)) {
-                    continue;
-                }
-                let Some(mut command) = installation.command.clone() else { continue };
+            let mut emitted = HashSet::new();
+            for candidate in &prepared.context.candidates {
+                if prepared.context.registry.keys.contains_key(&candidate.key) || !emitted.insert(candidate.key.clone()) { continue; }
+                for mut command in candidate.commands.clone() {
                 if let Command::Rule { rule } = &command {
                     let index = *rule_indices.get(&rule.name).ok_or("missing prepared rule occurrence")?;
                     // Execution plans use physical symbols. Reuse the same
                     // planner with text aliases occupied before presentation,
                     // keeping the rewrite witness and head references aligned.
                     command = lower_rule(rule_program, &rule_program.rules[index], &rule.ruleset,
-                        &prepared.rules[index], &rule_spans, &query_occupied)?
+                        &prepared_rules[index], &rule_spans, &query_occupied)?
                         .into_iter().find(|candidate| matches!(candidate,
                             Command::Rule { rule: candidate } if candidate.name == rule.name))
                         .ok_or("missing prepared rule direction")?;
@@ -4685,7 +4528,7 @@ fn render_prepared(
                         }
                         if readable {
                             if !rendered_sugar.insert(index) { continue; }
-                            let rewrite = ast::Rewrite { span: rule.span.clone(), lhs: expression(rule_program, lhs, &mut HashSet::new(), &rule_spans)?.map_symbols(&mut |h| h, &mut |v: String| native_name("var", &v)), rhs: expression(rule_program, rhs, &mut HashSet::new(), &rule_spans)?.map_symbols(&mut |h| h, &mut |v: String| native_name("var", &v)), conditions: facts(rule_program, conditions, &rule_spans, None, &query_occupied)?.0, name: prepared.rules[index].clone() };
+                            let rewrite = ast::Rewrite { span: rule.span.clone(), lhs: expression(rule_program, lhs, &mut HashSet::new(), &rule_spans)?.map_symbols(&mut |h| h, &mut |v: String| native_name("var", &v)), rhs: expression(rule_program, rhs, &mut HashSet::new(), &rule_spans)?.map_symbols(&mut |h| h, &mut |v: String| native_name("var", &v)), conditions: facts(rule_program, conditions, &rule_spans, None, &query_occupied)?.0, name: prepared_rules[index].clone() };
                             command = if let Some(subsume) = subsume { Command::Rewrite(rule.ruleset.clone(), rewrite, subsume) } else { Command::BiRewrite(rule.ruleset.clone(), rewrite) };
                         }
                     }
@@ -4743,9 +4586,71 @@ fn render_prepared(
                     expr
                 });
                 commands.push(command);
+                }
             }
         }
-        for (position, mut command) in program.commands.iter().enumerate() {
+        // Native source uses immutable selectors. Resolve ordered additions into
+        // private selection commands while retaining the authored command order.
+        let mut render_registry = prepared.context.registry.clone();
+        let mut render_program = program.clone();
+        let mut selectors = HashMap::new();
+        fn project_controls(
+            commands: &mut Vec<pb::Command>, registry: &mut rules::Registry,
+            candidates: &[rules::Candidate], selectors: &mut HashMap<Vec<usize>, String>,
+            definitions: &mut Vec<Command>, request: u64, repeated: bool,
+        ) -> Result<Vec<usize>, String> {
+            let mut retained = vec![];
+            let mut positions = vec![];
+            for (position, mut command) in std::mem::take(commands).into_iter().enumerate() {
+                match &mut command.kind {
+                    Some(pb::command::Kind::AddRules(add)) => {
+                        if repeated { return Err("source cannot render AddRules inside a repeated loop".into()); }
+                        for &index in &add.rules {
+                            let index = registry.intern(&candidates[index as usize]);
+                            let group = registry.groups.entry(add.group.clone()).or_default();
+                            if !group.contains(&index) { group.push(index); }
+                        }
+                        continue;
+                    }
+                    Some(pb::command::Kind::Run(run)) => {
+                        let indices = registry.ordered_union(&run.groups);
+                        let next = selectors.len();
+                        let name = selectors.entry(indices.clone()).or_insert_with(|| {
+                            let name = format!("__protobuf_source_selection_{request}_{next}");
+                            definitions.push(Command::UnstableCombinedRuleset(ast::Span::Panic, name.clone(),
+                                indices.iter().map(|index| format!("{}_holder", registry.rules[*index].candidate.name)).collect()));
+                            name
+                        });
+                        run.groups = vec![name.clone()];
+                    }
+                    Some(pb::command::Kind::Repeat(body)) => {
+                        if body.times == Some(0) {
+                            // No additions execute, but every Run still needs a
+                            // valid empty/private selector for native compilation.
+                            let mut shadow = registry.clone();
+                            project_controls(&mut body.body,&mut shadow,candidates,selectors,definitions,request,false)?;
+                        } else {
+                            project_controls(&mut body.body,registry,candidates,selectors,definitions,request,repeated || body.times != Some(1))?;
+                        }
+                    }
+                    Some(pb::command::Kind::Saturate(body)) => { project_controls(&mut body.body,registry,candidates,selectors,definitions,request,true)?; }
+                    Some(pb::command::Kind::Fail(child)) => {
+                        let mut body = vec![(**child).clone()];
+                        project_controls(&mut body,registry,candidates,selectors,definitions,request,repeated)?;
+                        let [replacement]: [pb::Command; 1] = body.try_into().map_err(|_| "source Fail cannot wrap AddRules")?;
+                        **child = replacement;
+                    }
+                    _ => (),
+                }
+                positions.push(position);
+                retained.push(command);
+            }
+            *commands = retained;
+            Ok(positions)
+        }
+        let positions = project_controls(&mut render_program.commands,&mut render_registry,&prepared.context.candidates,&mut selectors,&mut commands,prepared.request,false)?;
+        for (projected_position, mut command) in render_program.commands.iter().enumerate() {
+            let position = positions[projected_position];
             let mut fail_spans = vec![];
             while let Some(pb::command::Kind::Fail(child)) = &command.kind {
                 fail_spans.push(native_span(program, command.span.as_ref(), native_spans)?);
@@ -4891,7 +4796,7 @@ fn render_prepared(
                         ]));
                     } else {
                         commands.push(Command::RunSchedule(source_schedule(
-                            program, command, Some(&prepared.context), native_spans, &query_occupied,
+                            program, command, native_spans, &query_occupied,
                         )?));
                     }
                 }
@@ -5063,6 +4968,17 @@ fn render_prepared(
                 };
                 if actual.is_none_or(|expr| expr.to_string() != expected.to_string()) {
                     return Err(format!("expression action {action} changes meaning when parsed as source"));
+                }
+            }
+        }
+        if dialect == Dialect::Core {
+            let authored_names: HashSet<_> = authored.sorts.values().chain(authored.callables.values()).collect();
+            for command in &commands {
+                if let Command::AddRuleset(_, name) | Command::UnstableCombinedRuleset(_, name, _) = command {
+                    if authored_names.contains(name) {
+                        return Err(format!("authored Core name {name:?} collides with a private source ruleset"));
+                    }
+                    private_selectors.insert(name.clone());
                 }
             }
         }
@@ -5252,16 +5168,9 @@ fn source_extended_schedule(
             }
         }
         pb::command::Kind::Run(run) => {
-            let name = match run
-                .ruleset
-                .as_ref()
-                .and_then(|r| r.kind.as_ref())
-                .ok_or("missing ruleset reference")?
-            {
-                pb::ruleset_ref::Kind::Name(name) => context.names.get(name),
-                pb::ruleset_ref::Kind::Index(index) => context.rulesets.get(*index as usize),
-            }
-            .ok_or("invalid source ruleset reference")?;
+            let [name] = run.groups.as_slice() else {
+                return Err("source Run needs a resolved private selection".into());
+            };
             if name == ":until" {
                 return Err("experimental run cannot spell a ruleset named :until".into());
             }
@@ -5375,7 +5284,6 @@ fn source_extended_schedule(
 fn source_schedule(
     program: &pb::Program,
     command: &pb::Command,
-    context: Option<&RequestOccurrences>,
     native_spans: &NativeSpans,
     occupied: &dyn Fn(&str) -> bool,
 ) -> Result<ast::Schedule, String> {
@@ -5391,7 +5299,7 @@ fn source_schedule(
             return Err("source loop-until requires one conditional Run without scheduler".into());
         }
         let ast::Schedule::Run(_, mut config) =
-            source_schedule(program, child, context, native_spans, occupied)?
+            source_schedule(program, child, native_spans, occupied)?
         else {
             unreachable!("conditional child is a Run")
         };
@@ -5400,26 +5308,8 @@ fn source_schedule(
     }
     let (body, bound, sequence) = match command.kind.as_ref().ok_or("missing schedule")? {
         pb::command::Kind::Run(run) if run.scheduler.is_empty() => {
-            let reference = run
-                .ruleset
-                .as_ref()
-                .and_then(|r| r.kind.as_ref())
-                .ok_or("missing ruleset reference")?;
-            let name = match (context, reference) {
-                (Some(context), pb::ruleset_ref::Kind::Name(name)) => context
-                    .names
-                    .get(name)
-                    .ok_or("invalid source ruleset reference")?,
-                (Some(context), pb::ruleset_ref::Kind::Index(index)) => context
-                    .rulesets
-                    .get(*index as usize)
-                    .ok_or("invalid source ruleset reference")?,
-                (None, pb::ruleset_ref::Kind::Name(name)) => name,
-                (None, pb::ruleset_ref::Kind::Index(index)) => program
-                    .rulesets
-                    .get(*index as usize)
-                    .and_then(|ruleset| ruleset.name.as_ref())
-                    .ok_or("invalid source ruleset reference")?,
+            let [name] = run.groups.as_slice() else {
+                return Err("source Run needs a resolved private selection".into());
             };
             return Ok(ast::Schedule::Run(
                 span,
@@ -5448,7 +5338,7 @@ fn source_schedule(
     };
     let children = body
         .iter()
-        .map(|child| source_schedule(program, child, context, native_spans, occupied))
+        .map(|child| source_schedule(program, child, native_spans, occupied))
         .collect::<Result<_, _>>()?;
     let body = ast::Schedule::Sequence(span.clone(), children);
     Ok(if sequence {
@@ -5781,13 +5671,8 @@ mod node_projection_tests {
                 }))),
                 ..Default::default()
             }],
-            rulesets: vec![pb::Ruleset {
-                kind: Some(pb::ruleset::Kind::Rules(pb::RuleList { rules: vec![26] })),
-                ..Default::default()
-            }],
             ..Default::default()
         };
-        let sets = program.rulesets.clone();
         let mut visited = HashSet::new();
         source_phase_refs(&mut program, |index| {
             assert!(visited.insert(*index));
@@ -5796,10 +5681,6 @@ mod node_projection_tests {
         })
         .unwrap();
         assert_eq!(visited, (1..=25).collect());
-        assert_eq!(
-            program.rulesets, sets,
-            "rule occurrence indices are not node references"
-        );
         source_phase_refs(&mut program, |index| {
             assert!(*index >= 1000);
             Ok(())

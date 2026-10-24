@@ -283,7 +283,10 @@ impl<K: Eq + Hash, F: Fn(&ArcSort, Value) -> K> Export<'_, K, F> {
     }
 }
 
-pub(super) fn export(session: &Session) -> Result<pb::EGraphSnapshot, egglog::Error> {
+pub(super) fn export(
+    session: &Session,
+    registry: &rules::Registry,
+) -> Result<pb::EGraphSnapshot, egglog::Error> {
     let mut observation = observation(session, &[])?;
     let mut sorts = Vec::new();
     let cost_sort = session
@@ -291,6 +294,9 @@ pub(super) fn export(session: &Session) -> Result<pb::EGraphSnapshot, egglog::Er
         .export_sort(session.graph.get_sort_by_name("i64").unwrap(), &mut sorts)
         .map_err(egglog::Error::BackendError)?;
     let cost_sort = crate::builtin::import_sort(&sorts, cost_sort, &mut observation.program.sorts)
+        .map_err(egglog::Error::BackendError)?;
+    registry
+        .reconstruct(&mut observation.program)
         .map_err(egglog::Error::BackendError)?;
     Ok(pb::EGraphSnapshot {
         options: Some(pb::EGraphOptions {
@@ -1007,11 +1013,6 @@ mod tests {
                 ..Default::default()
             }])
             .collect(),
-            rulesets: vec![pb::Ruleset {
-                name: Some("retained_empty".into()),
-                kind: Some(pb::ruleset::Kind::Rules(pb::RuleList { rules: vec![] })),
-                ..Default::default()
-            }],
             ..Default::default()
         }
     }
@@ -1022,12 +1023,6 @@ mod tests {
         assert_eq!(
             snapshot.options.as_ref().unwrap().execution_mode,
             pb::ExecutionMode::Normal as i32
-        );
-        assert!(
-            program
-                .rulesets
-                .iter()
-                .any(|r| r.name.as_deref() == Some("retained_empty"))
         );
         assert_eq!(
             program

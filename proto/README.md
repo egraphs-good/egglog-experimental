@@ -7,8 +7,8 @@ feedback, not as a finished API. The wire format may change during review.
 Start with [egglog.proto](egglog/v1/egglog.proto). Its validation annotations
 and comments are the specification. The main pieces are:
 
-- Flat expression, sort, rule, and ruleset arenas, with shared references.
-- Immutable declarations and rulesets, separate from ordered commands.
+- Flat expression, sort, and rule arenas, with shared references.
+- Immutable declarations and rule values; ordered commands add rules to groups.
 - Native scalar, container, and function values. Custom values carry opaque
   bytes and explicit child references; symbolic computation remains a call.
 - Complete current-state export as a snapshot of logical options and an ordinary
@@ -39,9 +39,9 @@ carried in raw protobuf bytes and do not negotiate a schema. Unknown-field
 handling alone cannot establish semantic compatibility. Removed Program tag 1
 and its old name are reserved to avoid reinterpreting existing draft artifacts.
 
-`Rule` is an authored rule or rewrite occurrence, including its options and
+`Rule` is an authored rule or rewrite value, including its options and
 diagnostic metadata. Its `rule` arm contains a `RuleBody`: the query and ordered
-actions. `RuleList` references occurrences by index; a label is never identity.
+actions. `AddRules` references values by index; labels are diagnostic.
 
 ### Shared builtin definitions and type checking
 
@@ -87,7 +87,7 @@ It is excluded from semantic identity; compatible resupply retains the first
 stored documentation. Rust uses `Option<String>`. Python accepts `None` as unset
 but its scalar getter returns `""` when absent: use `has_field("doc")`, not
 truthiness, to recover absence. ProtoJSON distinguishes omission from `"doc":""`.
-Rule and ruleset docs retain ordinary implicit-string semantics.
+Rule docs retain ordinary implicit-string semantics.
 
 `HostPrimitive` selects an ordinary `GenericSignature` or the dedicated
 `FunctionApplication` typing form. A signature has an ordered type-parameter
@@ -204,7 +204,10 @@ target-language generation and name normalization remain frontend work.
 
 **Decided:** without a Python/Rust presentation block for a definition, generate
 plain symbolic types and free functions with API identifiers derived from core
-names. Missing bindings never hide a definition; explicit hiding is outside
+names. Prefer readable Python/Rust API identifiers. Reject invalid or colliding
+generated identifiers; explicit presentation metadata resolves these cases,
+without automatic injective encoding or silent disambiguation.
+Missing bindings never hide a definition in the protocol; explicit hiding is outside
 this draft's scope, with no special meaning assigned to an empty block.
 Behind those identifiers, preserve exact core names, signatures, and
 argument order; do not infer operators or receivers. Cross-declaration Python/Rust
@@ -214,8 +217,8 @@ must error, not fall back, overwrite, or rename bindings. Engine installation st
 rejects malformed individual bindings and conflicting resupply of one declaration's
 fixed language block. These defaults are derived output, not supplied bindings:
 they install or freeze no block, so later explicit bindings
-remain that language's first supply. The exact naming/normalization algorithm
-is undecided; high-level generation remains frontend work.
+remain that language's first supply. Exact normalization and general metadata-free
+generation remain frontend work; current generators may defer unsupported definitions.
 
 Python views distinguish free functions, initializers, methods, class methods,
 properties, class variables, and ownerless constants. Free functions and constants
@@ -291,101 +294,55 @@ arbitrary method bodies. A useful end-to-end test: export Luminal's Rust-defined
 IR, generate its Python API, author a Python rewrite, and consume that rule in
 Rust without duplicating the IR declarations.
 
-### Unnamed rulesets and declaration reuse
+### Additive rule groups and declaration reuse
 
-`RunProgramResponse.ruleset_publication` is required independently of profiling
-and errors. Its unique names confirm exactly the submitted compatible ruleset
-presentations whose bindings are retained, including old compatible resupplies
-and completed first naming; `""` denotes the explicit default name. Preparation
-failure confirms none; success or completed definitions followed by command
-error confirms every submitted name. Failure omissions neither revoke earlier
-confirmation nor establish global absence. Readers must also check membership
-against the exact request; response-only validation checks presence/uniqueness.
-Legacy absence means unavailable/unknown, never an empty confirmation, and
-fails this draft's new response contract. This observation is not a state export.
+`Program.rules` contains immutable typed rule values. Arena membership alone
+installs nothing. Ordered `AddRules{group,rules}` commands add one or more values
+to a graph-owned group; there is no ruleset declaration or ruleset arena.
 
-- **Ruleset identity — decided:** immutable rulesets have optional names and
-  share state by occurrence identity. The wire layout uses
-  `Program.rulesets`, with a rule-list or composition body. Runs and composition
-  children use an arena index or an installed name. An absent name adds no
-  binding; an unmatched entry without a name is anonymous. A present empty name
-  retains the default ruleset. Named roots retain their
-  reachable anonymous children and rule state across requests. Compatible
-  presentations of the same name compare internal sharing before identifying
-  corresponding occurrences. Resends must then preserve both rule and ruleset
-  sharing across all named roots, without merging distinct occurrences or
-  splitting shared ones. Rule labels do not participate in matching.
-  Duplicate named-root presentations cannot collapse distinct rule-arena entries.
-  Conflicting identity requirements are errors. A matched index reuses the
-  retained occurrence everywhere it is referenced.
-  Other anonymous entries are fresh per submission, even when their bodies
-  are equal. Repeated references and loop iterations within one submission
-  share state. Composition cycles are invalid.
+```text
+rules[0] = fold_zero
+rules[1] = fold_constants
+commands = [AddRules("opt", [0]), Run(["opt"]),
+            AddRules("opt", [1]), Run(["opt", "cleanup"])]
+```
 
-  ```text
-  request 1: rulesets[0] = unnamed rule list
-             rulesets[1] = name "opt", composition [index 0]
-             run(index 1)
-  request 2: run(name "opt")  # retains the same unnamed child and rule state
-  request 3: rulesets[0] = equal unnamed rule list; run(index 0)  # fresh
-  ```
+Content establishes rule identity across groups and submissions: resolved typed
+body, ordered query/actions, execution options and represented sharing, with
+normalized query binders. Labels, documentation, source locations and arena
+indices do not identify rules. Re-adding the same content is a no-op and never
+resets its native cursor. `Run.groups` selects the ordered union of group
+members, considering shared content once. Separate Runs and loop iterations
+select independently; query matches and schedulers retain their normal meaning.
+Unknown groups are empty, `[]` selects nothing, and `[""]` selects the default
+group. Compatible additions may be retried after a partial installation failure.
 
-  This is the same indirection principle as a persistent top-level capture:
-  its name survives while arena indices remain local. Existing captures lower
-  to nullary functions and sets; this does not add general expression bindings.
-  Resending an already-installed named parent may give a matched anonymous
-  child its first name, preserving that occurrence and its rule state. Match
-  bodies and sharing before applying the new binding. Each ruleset occurrence may have
-  only one name: renaming it, assigning two different names to one occurrence,
-  or reusing a name bound to another occurrence is an error. An omitted name
-  does not remove an existing binding. Equal anonymous bodies alone never
-  establish a match; complete export preserves each occurrence's assigned name.
-- **Once per Run — decided:** flatten transitive inclusion in order, considering
-  each rule occurrence only at its first inclusion. Distinct equal rules remain
-  independent. Separate Runs and loop iterations select independently; this
-  does not limit firings from query matches or override the scheduler.
-- **Rule-level sharing — decided:** `Program.rules` holds `Rule` occurrences;
-  each `RuleList.rules` is an ordered list of arena indices. Different leaves
-  and repeated positions may reference the same occurrence; equal separate
-  entries remain distinct. Names are optional diagnostic labels, may repeat,
-  and provide no rule lookup or identity. A rule matched through an installed
-  named root is reused even in a newly added leaf that references its index.
-  A wholly unanchored resubmission remains fresh. References share the rule and
-  its rule-owned state across groups/Run sites; distinct scheduler instances and
-  their scheduler-owned state remain separate. CEL checks direct indices.
-  Only named roots retain rules across requests; unretained entries are omitted
-  from `Freeze`, and arena membership alone never executes a rule.
-- **Declaration reuse — decided:** programs may refer to definitions already
-  installed on the same e-graph handle without resending them. Builtin calls
-  resolve against implicitly available host primitives without requiring
-  builtin declarations. A call's unique name selects its definition; argument
-  and result sorts check that signature, including any generic instantiation.
-  Missing names and signature mismatches are errors. Full definition resends are
-  optional compatibility checks: identical definitions are no-ops, conflicts
-  are errors. User definitions have no signature-only imports; host descriptors
-  are complete compatibility assertions about external implementations.
-  Each payload still includes every referenced node/sort arena
-  entry; indices are local to that message. Equality sorts are defined by
-  `Declaration.eq_sort`, not by arena references. Standalone
-  exports retain all installed definitions and their dependencies.
+Programs may reference definitions already installed on the same handle without
+resending them. Builtins are implicitly available. A call's unique name selects
+its definition; exact argument/result sorts check the signature. Missing names
+and mismatches are errors. Full definition resends are optional compatibility
+checks: compatible definitions are no-ops and conflicts are errors. Host
+descriptors assert external implementations rather than installing code.
+Every referenced node/sort arena entry remains message-local. Equality sorts
+are defined by `Declaration.eq_sort`, not by arena references.
 
 ### Current-state export and optional recording
 
 **Decided:** `Freeze` returns one `EGraphSnapshot{options,program}`, with complete
 logical settings and an ordinary reconstruction `Program`, without filtering
 or a special loading instruction. Include all
-installed declarations and sorts, named rulesets and their retained anonymous
-children and rules, and builtin descriptors, even when unused. Emit each retained
-rule/ruleset occurrence once, remapping leaf indices and preserving sharing.
+installed declarations, sorts and builtin descriptors, even when unused, plus
+registered rule values and group membership through `AddRules`. Emit each shared
+rule once and remap its group references.
 The commands reconstruct all logical data, including empty/unreachable classes,
 constructor alternatives, function and relation rows, subsumption, captures, and
 assigned row costs. Historical commands, scheduler instances, seminaive cursors,
 reports, caches, and host resources are not part of this export.
 
-The export is an ordered list of ordinary actions: one direct `Action.term` for
+Its data commands are ordered ordinary actions: one direct `Action.term` for
 each canonical equality class (a unique Union containing its constructor rows),
 relation insertions, function `Set`s including Unit outputs, `SetCost`s, then
-constructor subsumption. It contains no queries, runs, loops, or other commands.
+constructor subsumption. Aside from rule-registration commands, it contains no queries, runs or loops.
 Values use exact payloads and shared class references;
 function rows are writes, not calls to evaluate or extraction alternatives.
 There is no need to extract a finite representative to construct a cyclic or
@@ -427,12 +384,10 @@ one. An absent field leaves the native default unchanged. Creation's existing
 i64 cost-sort and no-declaration limits still apply; native thread-pool resource
 allocation behavior is unchanged.
 
-`ConfigureEGraphResources` queries the effective thread count and `no_decomp`, or
-updates threads, future-rule decomposition policy, or native report detail through
-`report_level`. Zero threads requests automatic parallelism; a positive count is
-exact. Updates preserve logical state and rule cursors. Clone inherits resources,
-later changes are handle-local, and Freeze omits them. Invalid or unsupported
-requests fail explicitly; the native thread-pool allocation boundary is unchanged.
+Threads, `no_decomp` and native `report_level` are creation-time choices.
+`CreateEGraphResponse.threads` acknowledges the effective positive thread count.
+Clone inherits resources; Freeze omits them. There is no resource-configuration
+RPC or Python live setter in this interface.
 
 Restore by remapping C's reachable closed sort graph and needed sort declarations
 into a creation request, then executing the exported Program on that fresh handle
@@ -447,33 +402,32 @@ No ordinary native pure non-equality self-cycle has been established; arbitrary 
 cycles remain unproven. `Freeze` must fail when required state cannot be
 represented, not silently omit it or claim a complete export.
 
-**Execution history:** set `CreateEGraphRequest.record_history=true` at creation
-and retrieve `GetHistoryResponse` through `GetHistory` (`Engine::get_history`).
+**Input history:** set `CreateEGraphRequest.record_history=true` and call
+`GetHistory` (`Engine::get_history`) to obtain one accumulated `Program`.
 Recording is off by default; disabled retrieval errors and retains no growing
-request log. History keeps known fields of decoded typed requests before
-normalization and actual responses, including preparation errors, completed-prefix
-outputs, resource queries and Freeze.
-Transport errors and interrupted/no-response operations are distinct outcomes.
-Audit requests may be invalid inputs; inspecting them does not authorize execution.
-This is not a raw-byte record: decoders may discard unknown protobuf fields.
-Retrieval itself adds nothing to history.
+log. Inputs rejected during validation/preparation are omitted. Accepted inputs
+are retained before installation/execution, including those that subsequently
+fail. Outcomes, resource/lifecycle requests and retrieval itself are not recorded.
+This records decoded known fields, not raw bytes.
 
-Clone shares its recorded past and then diverges independently. Successful
-`ReturnToEGraph` restores the saved logical scope while joining both ordered
-audits in service submission order, counting shared exchanges once. Destroyed or
-consumed handles retain a closed audit until the Engine is dropped. Enabled
-recording is unbounded; native callbacks/codecs remain external. Keep each
-Program's local arenas separate:
-concatenation changes references and Union identity scopes. History is neither
-a checkpoint nor a promise of deterministic or side-effect-free replay.
+Export remaps local arenas while preserving command order, sharing and distinct
+Union locations. Declarations are cumulative: an earlier recorded Freeze may
+observe later declaration metadata. Logical data remains ordered. History is
+neither a checkpoint nor an exact-replay guarantee after failures.
 
-The typed Rust API offers the same creation-time choice:
+Clone shares its recorded prefix and then diverges. Pop/`ReturnToEGraph`
+restores the saved history prefix, discarding the active branch's inputs.
+Destroy releases that graph's history; live clones retain their own past.
+Recording is unbounded during the graph's lifetime. Host capabilities and
+creation settings remain external.
+
+The typed Rust API exposes the same opt-in choice:
 
 ```rust
 let mut graph = egglog_experimental::typed::EGraph::with_recording(true)?;
 graph.stats()?;
-let history = graph.history()?; // Create and Stats; retrieval adds no entry.
-assert_eq!(history.entries.len(), 2);
+let history = graph.history()?;
+assert_eq!(history.commands.len(), 1); // Stats; retrieval adds nothing.
 ```
 
 ### Reporting and timing attribution
@@ -529,10 +483,11 @@ are unknown, not zero. These measurements do not partition wall time.
 `include_run_reports` additionally returns native `NativeRunReport` detail at
 completed requested control sites; `Stats` observes the cumulative native report.
 This backend-oriented view and the authored exclusive summary have different
-meanings. `report_level` selects future native collection detail. Both views use
-the response's `rules` catalog for occurrence attribution, also used by errors.
-Labels remain diagnostic; shared occurrences stay shared and distinct equal
-occurrences stay distinct. The schema specifies paths, completeness and metrics.
+meanings. Creation-time `report_level` selects native collection detail. Both
+views and errors reference the response's canonical `Rule` catalog and its local
+node/sort/source arenas. Shared content has one catalog entry; first registration
+supplies its diagnostic metadata. Group timings retain selected group names and
+exact native keys. The schema specifies paths, completeness and metrics.
 
 ### Message ownership
 
@@ -614,7 +569,7 @@ SDKs, without these runtime implementations.
 ### Byte adapter
 
 `protobuf::Engine` (`src/protobuf.rs`) accepts encoded requests for creation,
-cloning, destruction, scope return, resource configuration, program execution and
+cloning, destruction, scope return, program execution and
 `GetHistory` retrieval.
 Decode failures and unknown handles are transport errors; program failures are
 returned in `RunProgramResponse.error`. Preparation validates on disposable
@@ -636,6 +591,12 @@ memo per firing; extraction roots evaluate independently in Normal mode.
 Query patterns and rewrite left-hand sides use shallow facts with shared query
 binders; native query normalization and matching retain their own costs.
 Rendering oversized extraction roots to Source remains tree-limited.
+Rule keys normalize outer query names and duplicate Var records. Saved-code and
+shared query/lambda binders retain conservative spelling/sharing distinctions;
+the adapter does not identify every alpha-equivalent graph.
+History export reports a compatibility error if accepted inputs contain
+conflicting declarations after a partial installation failure; it does not
+rewrite either submitted definition to force them into one Program.
 Unsupported modes, values and codecs fail explicitly. These are adapter limits,
 not changes to the schema contract.
 
@@ -662,11 +623,9 @@ ordinary Unit-valued functions retain their output. Cells use the existing
 bounded Source renderer and fail explicitly for unsupported values.
 
 Captures keep their ordered write positions. Rules retain labels and spans;
-publication uses immutable versions without hoisting future rules into earlier
-runs. The first publication binds the authored ruleset name; later publications
-use generated names. Source resolves its current alias when producing each Run.
-A raw `RulesetRef{name: "r"}` continues to select the first immutable publication
-of `r`; use the emitted Run's actual reference to select a later publication.
+source additions emit `AddRules` at the authored position. Combined source
+selections expand to ordered group names. Later additions become visible to
+later Runs without membership versions or publication receipts.
 Query locals remain distinct from persistent captures and later
 declarations. Proof requests retain the authored facts, leaving proof execution
 to the receiving mode. Source extraction counts are literal and bounded;
@@ -675,6 +634,11 @@ aggregate extraction preserves its ordered result groups.
 Source rejects authored `let` bindings inside `fail`, including nested wrappers;
 evaluate an expression or action directly instead. Fail retains completed
 effects and catches the supported operation's evaluation, not preparation errors.
+
+The renderer supports fixed rule-addition preludes and one-time wrappers.
+Dynamic `AddRules` inside a genuinely repeated schedule is not representable in
+the current text schedule syntax and fails explicitly. High-level fixed theories
+place their additions before repeated execution.
 
 Reuse one stateful `Renderer` across the stream; `render_submission` handles
 scope submissions too. Compatible declarations are not emitted twice. Core and

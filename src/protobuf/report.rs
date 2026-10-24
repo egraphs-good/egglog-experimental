@@ -11,24 +11,39 @@ pub(super) fn rule_reference(
     context: &mut RequestOccurrences,
     response: &mut pb::RunProgramResponse,
 ) -> Result<(Option<u32>, Option<i32>), String> {
-    let Some((origin, direction)) = context.origins.get(name) else {
+    let Some((origin, direction)) = context.origins.get(name).cloned() else {
         return Ok((None, None));
     };
-    let index = if let Some(index) = context.response_rules.get(origin) {
+    let index = if let Some(index) = context.response_rules.get(&origin) {
         *index
     } else {
-        let index =
-            u32::try_from(response.rules.len()).map_err(|_| "too many report occurrences")?;
-        response.rules.push(origin.clone());
-        context.response_rules.insert(origin.clone(), index);
+        let record = context
+            .records
+            .get(&origin)
+            .ok_or("missing registered rule record")?;
+        let index = u32::try_from(response.rules.len()).map_err(|_| "too many report rules")?;
+        let mut program = pb::Program {
+            nodes: std::mem::take(&mut response.nodes),
+            sorts: std::mem::take(&mut response.sorts),
+            files: std::mem::take(&mut response.files),
+            rules: std::mem::take(&mut response.rules),
+            ..Default::default()
+        };
+        let result = super::graph::append_rule(&mut program, record, &mut context.file_offsets);
+        response.nodes = program.nodes;
+        response.sorts = program.sorts;
+        response.files = program.files;
+        response.rules = program.rules;
+        result?;
+        context.response_rules.insert(origin, index);
         index
     };
-    Ok((Some(index), Some((*direction).into())))
+    Ok((Some(index), Some(direction.into())))
 }
 
 pub(super) fn export(
     report: &native::RunReport,
-    selected: &[pb::RulesetRef],
+    selected: &[Vec<String>],
     context: &mut RequestOccurrences,
     response: &mut pb::RunProgramResponse,
 ) -> Result<pb::NativeRunReport, String> {
@@ -109,64 +124,22 @@ pub(super) fn export(
             &report.rebuild_time_per_ruleset,
         ]) {
             for (name, duration) in source {
-                // Prefer the actual selection for this output. Otherwise use a
-                // unique live named binding (or unique current-request index).
-                // Multiple aliases cannot reveal historical selection: omit
-                // attribution, retaining the exact native row instead of guessing.
-                let mut chosen = vec![];
-                for reference in selected.iter().filter(|reference| match &reference.kind {
-                    Some(pb::ruleset_ref::Kind::Name(logical)) => context
-                        .names
-                        .get(logical)
-                        .is_some_and(|n| n == name.as_ref()),
-                    Some(pb::ruleset_ref::Kind::Index(index)) => context
-                        .rulesets
-                        .get(*index as usize)
-                        .is_some_and(|n| n == name.as_ref()),
-                    None => false,
-                }) {
-                    if !chosen.contains(&reference) {
-                        chosen.push(reference);
+                let mut groups = vec![];
+                for selection in context
+                    .selections
+                    .get(name.as_ref())
+                    .into_iter()
+                    .flatten()
+                    .filter(|groups| selected.contains(groups))
+                {
+                    for group in selection {
+                        if !groups.contains(group) {
+                            groups.push(group.clone());
+                        }
                     }
                 }
-                let ruleset = if let [chosen] = chosen.as_slice() {
-                    Some((*chosen).clone())
-                } else if !chosen.is_empty() {
-                    // Multiple actually entered aliases are ambiguous even if
-                    // there is only one live named fallback.
-                    None
-                } else {
-                    let names: Vec<_> = context
-                        .names
-                        .iter()
-                        .filter(|(_, physical)| physical.as_str() == name.as_ref())
-                        .collect();
-                    match names.as_slice() {
-                        [(logical, _)] => Some(pb::RulesetRef {
-                            kind: Some(pb::ruleset_ref::Kind::Name((*logical).clone())),
-                        }),
-                        [] => {
-                            let indices: Vec<_> = context
-                                .rulesets
-                                .iter()
-                                .enumerate()
-                                .filter(|(_, physical)| physical.as_str() == name.as_ref())
-                                .collect();
-                            match indices.as_slice() {
-                                [(index, _)] => Some(pb::RulesetRef {
-                                    kind: Some(pb::ruleset_ref::Kind::Index(
-                                        u32::try_from(*index)
-                                            .map_err(|_| "ruleset index exceeds uint32")?,
-                                    )),
-                                }),
-                                _ => None,
-                            }
-                        }
-                        _ => None,
-                    }
-                };
                 destination.push(pb::RulesetDurationEntry {
-                    ruleset,
+                    groups,
                     native_name: name.to_string(),
                     value: Some(pb::ReportDuration {
                         seconds: duration.as_secs(),
@@ -460,6 +433,7 @@ mod tests {
                                 })),
                                 ..Default::default()
                             }],
+                            report_level: Some(level.into()),
                             options: Some(pb::EGraphOptions {
                                 cost_sort: Some(0),
                                 ..Default::default()
@@ -473,19 +447,6 @@ mod tests {
             )
             .unwrap()
             .egraph_id;
-            engine
-                .configure_resources(
-                    &pb::ConfigureEGraphResourcesRequest {
-                        egraph_id: id,
-                        operation: Some(
-                            pb::configure_e_graph_resources_request::Operation::ReportLevel(
-                                level.into(),
-                            ),
-                        ),
-                    }
-                    .encode_to_vec(),
-                )
-                .unwrap();
             let source = Source::new(
                 None,
                 r#"
@@ -524,22 +485,7 @@ mod tests {
                     assert_eq!(response.error, None);
                     continue;
                 }
-                program.rulesets.push(pb::Ruleset {
-                    name: Some("selected".into()),
-                    kind: Some(pb::ruleset::Kind::Combined(pb::CombinedRuleset {
-                        rulesets: vec![pb::RulesetRef {
-                            kind: Some(pb::ruleset_ref::Kind::Name("shared".into())),
-                        }],
-                    })),
-                    ..Default::default()
-                });
-                let selected = pb::RulesetRef {
-                    kind: Some(pb::ruleset_ref::Kind::Name("selected".into())),
-                };
-                let Some(pb::command::Kind::Run(run)) = &mut program.commands[0].kind else {
-                    unreachable!()
-                };
-                run.ruleset = Some(selected.clone());
+                let selected = vec!["shared".to_owned()];
                 if composite {
                     program.commands = vec![pb::Command {
                         kind: Some(pb::command::Kind::Repeat(pb::Repeat {
@@ -554,17 +500,37 @@ mod tests {
                 let prepared = session.prepare(&mut program).unwrap();
                 let mut response = pb::RunProgramResponse {
                     profile: Some(pb::ProfileSummary::default()),
-                    ruleset_publication: Some(pb::RulesetPublication::default()),
                     ..Default::default()
                 };
                 let mut context = session.install(prepared, &mut response).unwrap();
                 // Independent native codec oracle for this known fixture shape,
                 // using the authoritative prepared selector rather than the
                 // adapter's former private control-tree lowering.
+                let mut registry = std::mem::take(&mut context.registry);
+                let name = registry
+                    .selection(
+                        &selected,
+                        &mut super::super::NativeExecutor {
+                            graph: &mut session.graph,
+                            mode: session.mode,
+                            names: &session.names,
+                        },
+                        &pb::CommandLocation {
+                            path: vec![0],
+                            iterations: vec![],
+                        },
+                        &mut context,
+                        &mut response,
+                    )
+                    .unwrap();
+                context.registry = registry;
+                context
+                    .selections
+                    .insert(name.clone(), vec![selected.clone()]);
                 let leaf = egglog::ast::Schedule::Run(
                     egglog::span!(),
                     egglog::ast::RunConfig {
-                        ruleset: context.names["selected"].clone(),
+                        ruleset: name,
                         until: None,
                     },
                 );
@@ -617,18 +583,12 @@ mod tests {
                         .all(|row| row.rule.is_some()
                             && row.direction == Some(pb::NativeRuleDirection::Single.into()))
                 );
-                assert!(
-                    response
-                        .rules
-                        .iter()
-                        .all(|rule| rule.root.as_ref().unwrap().kind
-                            == Some(pb::ruleset_ref::Kind::Name("shared".into())))
-                );
+                assert!(response.rules.iter().all(|rule| rule.kind.is_some()));
                 assert!(
                     decoded
                         .search_and_apply_time_per_ruleset
                         .iter()
-                        .all(|row| row.ruleset.as_ref() == Some(&selected))
+                        .all(|row| row.groups == selected)
                 );
                 let plans: Vec<_> = decoded
                     .iterations
@@ -766,14 +726,14 @@ mod tests {
             )
             .unwrap()
             .egraph_id;
-            // Source publishes a ruleset body only at its first Run. Export
-            // the two remaining definitions, without executing those Runs.
+            // AddRules registers bodies at their authored position. Export the
+            // later source Runs without executing them.
             for program in
                 Source::new(None, &format!("{source} (run bad 1) (run suffix 1)")).unwrap()
             {
                 let mut program = program.unwrap();
                 if program.commands.iter().any(|command| matches!(&command.kind,
-                    Some(pb::command::Kind::Run(run)) if matches!(run.ruleset.as_ref().and_then(|r| r.kind.as_ref()), Some(pb::ruleset_ref::Kind::Name(name)) if name == "bad" || name == "suffix"))) {
+                    Some(pb::command::Kind::Run(run)) if run.groups.iter().any(|name| name == "bad" || name == "suffix"))) {
                     program.commands.clear();
                 }
                 let response = pb::RunProgramResponse::decode(
@@ -795,9 +755,7 @@ mod tests {
             }
             let leaf = |name: &str| pb::Command {
                 kind: Some(pb::command::Kind::Run(pb::Run {
-                    ruleset: Some(pb::RulesetRef {
-                        kind: Some(pb::ruleset_ref::Kind::Name(name.into())),
-                    }),
+                    groups: vec![name.into()],
                     ..Default::default()
                 })),
                 ..Default::default()
@@ -878,7 +836,20 @@ mod tests {
                         &mut pb::RunProgramResponse::default(),
                     )
                     .unwrap();
-                    assert_report(&before, &after);
+                    let session = &engine.graphs[&child];
+                    let actual = session.graph.get_overall_run_report();
+                    // Lazy private selectors may complete native maintenance
+                    // before the failed schedule. Preserve actual native detail
+                    // while the failed whole schedule publishes no authored
+                    // aggregate into cumulative statistics.
+                    for rule in &session.registry.rules {
+                        let name = &rule.candidate.name;
+                        assert_eq!(
+                            before.num_matches_per_rule.get(name.as_str()),
+                            actual.num_matches_per_rule.get(name.as_str())
+                        );
+                    }
+                    assert_report(actual, &after);
                 }
                 let profile = response.profile.unwrap();
                 assert_eq!(profile.complete, wrappers == 1);
@@ -903,72 +874,25 @@ mod tests {
     }
 
     #[test]
-    fn entered_alias_ambiguity_is_not_named_fallback() {
-        let mut report = native::RunReport::default();
-        report
-            .search_and_apply_time_per_ruleset
-            .insert("physical".into(), std::time::Duration::from_nanos(7));
-        report
-            .search_and_apply_time_per_ruleset
-            .insert("other".into(), std::time::Duration::from_nanos(11));
-        let mut context = RequestOccurrences {
-            names: [
-                ("r".into(), "physical".into()),
-                ("s".into(), "other".into()),
-            ]
-            .into(),
-            rulesets: vec!["physical".into()],
-            ..Default::default()
-        };
-        let named = pb::RulesetRef {
-            kind: Some(pb::ruleset_ref::Kind::Name("r".into())),
-        };
-        let indexed = pb::RulesetRef {
-            kind: Some(pb::ruleset_ref::Kind::Index(0)),
-        };
-        for (selected, expected) in [
-            (vec![], Some(named.clone())),
-            (vec![named.clone(), named.clone()], Some(named.clone())),
-            (vec![indexed.clone()], Some(indexed.clone())),
-            (vec![named.clone(), indexed], None),
-        ] {
-            let wire = export(
-                &report,
-                &selected,
-                &mut context,
-                &mut pb::RunProgramResponse::default(),
-            )
-            .unwrap();
-            let row = wire
-                .search_and_apply_time_per_ruleset
-                .iter()
-                .find(|row| row.native_name == "physical")
-                .unwrap();
-            assert_eq!(row.ruleset, expected);
-            assert_eq!(row.value.as_ref().unwrap().nanos, 7);
-            let other = wire
-                .search_and_apply_time_per_ruleset
-                .iter()
-                .find(|row| row.native_name == "other")
-                .unwrap();
-            assert_eq!(
-                other.ruleset.as_ref().unwrap().kind,
-                Some(pb::ruleset_ref::Kind::Name("s".into()))
-            );
-        }
-    }
-
-    #[test]
     fn native_groups_ranges_and_unknown_keys_are_not_coalesced() {
         let mut report = native::RunReport::default();
         let mut context = RequestOccurrences::default();
         let mut response = pb::RunProgramResponse::default();
-        let occurrence = pb::RuleAttribution {
-            root: Some(pb::RulesetRef {
-                kind: Some(pb::ruleset_ref::Kind::Name("live".into())),
-            }),
+        let occurrence = pb::Rule {
+            eval_mode: pb::RuleEvalMode::Seminaive.into(),
+            kind: Some(pb::rule::Kind::Rule(pb::RuleBody::default())),
             ..Default::default()
         };
+        context.records.insert(
+            "live".into(),
+            std::sync::Arc::new(super::super::graph::RuleRecord {
+                program: pb::Program {
+                    rules: vec![occurrence.clone()],
+                    ..Default::default()
+                },
+                files: std::sync::Arc::new(vec![]),
+            }),
+        );
         for (name, direction) in [
             ("forward", pb::NativeRuleDirection::Forward),
             ("reverse", pb::NativeRuleDirection::Reverse),
@@ -978,7 +902,7 @@ mod tests {
                 .insert(name.into(), std::time::Duration::from_nanos(600));
             context
                 .origins
-                .insert(name.into(), (occurrence.clone(), direction));
+                .insert(name.into(), ("live".into(), direction));
         }
         report.search_and_apply_time_per_rule.insert(
             "unknown".into(),

@@ -43,6 +43,20 @@ impl Snapshot {
         let mut rows = Vec::new();
         let mut subsumed_calls = Vec::new();
         for (position, command) in program.commands.iter().enumerate() {
+            if let Some(pb::command::Kind::AddRules(add)) = &command.kind {
+                if add
+                    .rules
+                    .iter()
+                    .any(|rule| *rule as usize >= program.rules.len())
+                {
+                    return Err(TypedError::Decode(
+                        "snapshot rule index out of bounds".into(),
+                    ));
+                }
+                // Membership remains in the inert reconstruction Program. It
+                // contributes no data row to this indexed observation.
+                continue;
+            }
             let Some(pb::command::Kind::Action(action)) = &command.kind else {
                 return Err(TypedError::Decode(
                     "snapshot contains a non-data command".into(),

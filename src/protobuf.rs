@@ -2,7 +2,7 @@
 //!
 //! This executable slice supports concrete equality/scalar/Vec/Pair/Map/Maybe sorts,
 //! constructors, functions, Unit-annotated relation predicates, ordered actions,
-//! shared immutable rulesets, checks, requested proofs, table sizes and logical
+//! content-keyed rule groups, checks, requested proofs, table sizes and logical
 //! table rows in all four modes. Extraction remains ordinary-mode only.
 //! Unsupported forms fail explicitly before installation.
 //! Explicit native extensions may additionally supply inert host-value codecs.
@@ -35,9 +35,11 @@ use prost::Message;
 
 pub mod cost_model;
 mod freeze;
+mod graph;
 mod history;
 mod proof;
 mod report;
+mod rules;
 pub mod source;
 
 // Native input paths paired with the actual wire command and its relative
@@ -49,7 +51,7 @@ type ExecutionFailureSite = (pb::CommandLocation, Option<pb::Span>);
 struct ScheduleMeasurements {
     requested: HashMap<Vec<u32>, LeafSummary>,
     maintenance: HashMap<Option<Vec<u32>>, LeafSummary>,
-    selected: Vec<pb::RulesetRef>,
+    selected: Vec<Vec<String>>,
     failure: Option<ExecutionFailureSite>,
     changed: bool,
 }
@@ -125,9 +127,8 @@ pub struct Engine {
     next_id: u64,
     next_cost_model: u64,
     graphs: HashMap<u64, Session>,
-    // Audit ownership never enters Session's compile-only preparation clones.
+    // Input ownership never enters Session's compile-only preparation clones.
     histories: HashMap<u64, history::HistoryLog>,
-    next_history: u64,
     extension: Option<Arc<dyn NativeExtension>>,
 }
 
@@ -184,9 +185,7 @@ struct Session {
     request: u64,
     // Direct clone source and its mutation/namespace stamp, not an ancestry log.
     clone_parent: Option<(u64, u64)>,
-    // Derived native handles, aligned with the canonical occurrence arenas.
-    rulesets: Vec<String>,
-    rules: Vec<String>,
+    registry: rules::Registry,
     // Successfully registered closed container aliases, including encoded modes
     // where physical TypeInfo is not the authoring type environment.
     sorts: HashSet<String>,
@@ -198,7 +197,6 @@ struct Installation {
     site: pb::maintenance_site::Target,
     span: Option<pb::Span>,
     declaration: Option<usize>,
-    ruleset: Option<usize>,
 }
 
 struct Prepared {
@@ -208,11 +206,6 @@ struct Prepared {
     materialized: Vec<Command>,
     // Canonical declaration indices whose native installation is still pending.
     pending_declarations: HashSet<usize>,
-    rulesets: Vec<String>,
-    rules: Vec<String>,
-    published: HashSet<usize>,
-    // Request-local correspondence, captured only after complete preparation.
-    submitted_names: HashMap<String, usize>,
     context: RequestOccurrences,
 }
 
@@ -221,10 +214,15 @@ struct NativeSpans(RefCell<Vec<Option<Arc<SrcFile>>>>);
 
 #[derive(Default)]
 struct RequestOccurrences {
-    rulesets: Vec<String>,
-    names: HashMap<String, String>,
-    origins: HashMap<String, (pb::RuleAttribution, pb::NativeRuleDirection)>,
-    response_rules: HashMap<pb::RuleAttribution, u32>,
+    request: u64,
+    registry: rules::Registry,
+    candidates: Vec<rules::Candidate>,
+    selection: String,
+    selections: HashMap<String, Vec<Vec<String>>>,
+    records: HashMap<String, Arc<graph::RuleRecord>>,
+    file_offsets: HashMap<usize, u32>,
+    origins: HashMap<String, (String, pb::NativeRuleDirection)>,
+    response_rules: HashMap<String, u32>,
     files: Vec<pb::SourceFile>,
     // Indexed by the execution arena, not the response's merged source files.
     native_spans: NativeSpans,
@@ -518,6 +516,16 @@ impl Engine {
                     .map_err(|_| TransportError("thread count exceeds native usize".into()))?,
             );
         }
+        if let Some(level) = request.report_level {
+            graph.set_report_level(match pb::ReportLevel::try_from(level) {
+                Ok(pb::ReportLevel::TimeOnly) => egglog_reports::ReportLevel::TimeOnly,
+                Ok(pb::ReportLevel::WithPlan) => egglog_reports::ReportLevel::WithPlan,
+                Ok(pb::ReportLevel::StageInfo) => egglog_reports::ReportLevel::StageInfo,
+                _ => return Err(TransportError("unknown report level".into())),
+            });
+        }
+        let threads = u64::try_from(graph.num_threads())
+            .map_err(|_| TransportError("native thread count exceeds uint64".into()))?;
         self.next_id = self
             .next_id
             .checked_add(1)
@@ -533,14 +541,14 @@ impl Engine {
                 names: NativeNames::default(),
                 request: 0,
                 clone_parent: None,
-                rulesets: Vec::new(),
-                rules: Vec::new(),
+                registry: rules::Registry::default(),
                 sorts: HashSet::new(),
                 cost_models: HashMap::new(),
             },
         );
         Ok(pb::CreateEGraphResponse {
             egraph_id: self.next_id,
+            threads,
         })
     }
 
@@ -571,12 +579,12 @@ impl Engine {
         &mut self,
         request: pb::DestroyEGraphRequest,
     ) -> Result<pb::DestroyEGraphResponse, TransportError> {
-        self.graphs
+        let graph = self
+            .graphs
             .remove(&request.egraph_id)
             .ok_or_else(|| TransportError("unknown egraph_id".into()))?;
-        if let Some(history) = self.histories.get_mut(&request.egraph_id) {
-            history.closed = true;
-        }
+        self.histories.remove(&request.egraph_id);
+        drop(graph);
         Ok(pb::DestroyEGraphResponse {})
     }
 
@@ -610,84 +618,24 @@ impl Engine {
         saved.graph = active.graph;
         saved.request = active.request;
         self.graphs.insert(request.saved_id, saved);
-        if let Some(active) = self.histories.get(&request.active_id).cloned() {
-            self.histories
-                .get_mut(&request.saved_id)
-                .expect("paired handles inherit recording")
-                .merge(&active);
-            self.histories.get_mut(&request.active_id).unwrap().closed = true;
-        }
+        self.histories.remove(&request.active_id);
         Ok(pb::ReturnToEGraphResponse {})
-    }
-
-    fn configure_request(
-        &mut self,
-        request: pb::ConfigureEGraphResourcesRequest,
-    ) -> Result<pb::ConfigureEGraphResourcesResponse, TransportError> {
-        let operation = request
-            .operation
-            .ok_or_else(|| TransportError("missing or unknown resource operation".into()))?;
-        let session = self
-            .graphs
-            .get_mut(&request.egraph_id)
-            .ok_or_else(|| TransportError("unknown egraph_id".into()))?;
-        match operation {
-            pb::configure_e_graph_resources_request::Operation::Query(_) => (),
-            pb::configure_e_graph_resources_request::Operation::Threads(threads) => {
-                if cfg!(target_family = "wasm") && threads > 1 {
-                    return Err(TransportError(
-                        "native wasm execution supports at most one thread".into(),
-                    ));
-                }
-                let threads = usize::try_from(threads)
-                    .map_err(|_| TransportError("thread count exceeds native usize".into()))?;
-                let stamp = session
-                    .request
-                    .checked_add(1)
-                    .ok_or_else(|| TransportError("request identity space exhausted".into()))?;
-                session.graph.set_num_threads(threads);
-                session.request = stamp;
-            }
-            pb::configure_e_graph_resources_request::Operation::ReportLevel(level) => {
-                let level = match pb::ReportLevel::try_from(level) {
-                    Ok(pb::ReportLevel::TimeOnly) => egglog_reports::ReportLevel::TimeOnly,
-                    Ok(pb::ReportLevel::WithPlan) => egglog_reports::ReportLevel::WithPlan,
-                    Ok(pb::ReportLevel::StageInfo) => egglog_reports::ReportLevel::StageInfo,
-                    _ => return Err(TransportError("unknown report level".into())),
-                };
-                let stamp = session
-                    .request
-                    .checked_add(1)
-                    .ok_or_else(|| TransportError("request identity space exhausted".into()))?;
-                session.graph.set_report_level(level);
-                session.request = stamp;
-            }
-            pb::configure_e_graph_resources_request::Operation::NoDecomp(enabled) => {
-                let stamp = session
-                    .request
-                    .checked_add(1)
-                    .ok_or_else(|| TransportError("request identity space exhausted".into()))?;
-                session.graph.no_decomp = enabled;
-                session.request = stamp;
-            }
-        }
-        Ok(pb::ConfigureEGraphResourcesResponse {
-            threads: u64::try_from(session.graph.num_threads())
-                .map_err(|_| TransportError("native thread count exceeds uint64".into()))?,
-            no_decomp: session.graph.no_decomp,
-        })
     }
 
     fn run_request(
         &mut self,
         request: pb::RunProgramRequest,
     ) -> Result<pb::RunProgramResponse, TransportError> {
+        let original = self
+            .histories
+            .contains_key(&request.egraph_id)
+            .then(|| request.program.clone())
+            .flatten();
         let session = self
             .graphs
             .get_mut(&request.egraph_id)
             .ok_or_else(|| TransportError("unknown egraph_id".into()))?;
         let mut response = pb::RunProgramResponse {
-            ruleset_publication: Some(pb::RulesetPublication::default()),
             profile: request.profile.then(|| pb::ProfileSummary {
                 complete: false,
                 ..Default::default()
@@ -715,6 +663,12 @@ impl Engine {
                 return Ok(response);
             }
         };
+        if let Some(original) = original {
+            self.histories
+                .get_mut(&request.egraph_id)
+                .unwrap()
+                .append(original);
+        }
         let mut context = match session.install(prepared, &mut response) {
             Ok(context) => context,
             Err(error) => {
@@ -757,7 +711,7 @@ impl Engine {
                 let origin = match &error {
                     egglog::Error::Panic {
                         rule: Some(rule), ..
-                    } => context.origins.get(rule).map(|(origin, _)| origin.clone()),
+                    } => Some(rule.clone()),
                     _ => None,
                 };
                 let mut error = execution_error(
@@ -769,20 +723,15 @@ impl Engine {
                     panic,
                 );
                 if let Some(origin) = origin {
-                    let index =
-                        *context
-                            .response_rules
-                            .entry(origin.clone())
-                            .or_insert_with(|| {
-                                response.rules.push(origin);
-                                (response.rules.len() - 1) as u32
-                            });
-                    error.rule = Some(index);
+                    error.rule = report::rule_reference(&origin, &mut context, &mut response)
+                        .map_err(TransportError)?
+                        .0;
                 }
                 response.error = Some(error);
                 break;
             }
         }
+        session.registry = std::mem::take(&mut context.registry);
         response.profile.as_mut().unwrap().complete = response.error.is_none();
         Ok(response)
     }
@@ -799,10 +748,6 @@ impl Session {
             request,
             installations,
             mut pending_declarations,
-            rulesets,
-            rules,
-            mut published,
-            submitted_names,
             mut context,
             ..
         } = prepared;
@@ -831,9 +776,6 @@ impl Session {
                 if let Some(index) = installation.declaration {
                     pending_declarations.remove(&index);
                 }
-                if let Some(index) = installation.ruleset {
-                    published.insert(index);
-                }
                 if let Some(Command::Sort {
                     name,
                     presort_and_args: Some(_),
@@ -848,37 +790,15 @@ impl Session {
                 break;
             }
         }
-        // Confirm the submitted presentations against completed bindings before
-        // retain_rulesets compacts their canonical occurrence indices.
-        let mut names: Vec<_> = submitted_names
-            .into_iter()
-            .filter_map(|(name, index)| published.contains(&index).then_some(name))
-            .collect();
-        names.sort_unstable();
-        response.ruleset_publication = Some(pb::RulesetPublication { names });
-        // Retain only completed registrations and their canonical closures.
-        // The compiler clone and its IDs are discarded.
+        // Retain only completed declaration registrations. Rule registration
+        // happens in ordered AddRules commands, after preparation.
         definitions.declarations = std::mem::take(&mut definitions.declarations)
             .into_iter()
             .enumerate()
             .filter_map(|(index, d)| (!pending_declarations.contains(&index)).then_some(d))
             .collect();
-        let (definitions, retained_sets, retained_rules) =
-            crate::builtin::definitions::retain_rulesets_owned(
-                definitions,
-                &published.into_iter().collect::<Vec<_>>(),
-            )
-            .expect("validated canonical occurrence closure");
         self.definitions = definitions;
         self.catalog_initialized = true;
-        self.rulesets = retained_sets
-            .into_iter()
-            .map(|i| rulesets[i].clone())
-            .collect();
-        self.rules = retained_rules
-            .into_iter()
-            .map(|i| rules[i].clone())
-            .collect();
         self.names = project_names(&mut pb::Program::default(), &self.definitions);
         match failure {
             Some((error, span)) => Err(Box::new(execution_error(
@@ -897,6 +817,8 @@ impl Session {
     // boundary then registers and compiles the entire request on a disposable
     // clone. Neither clone's runtime state or backend IDs are ever adopted.
     fn prepare(&self, program: &mut pb::Program) -> Result<Prepared, PreparationError> {
+        let mut authored_input = program.clone();
+        let rule_files = Arc::new(std::mem::take(&mut authored_input.files));
         let native_spans = NativeSpans::default();
         validate_relation_uses(program, &self.definitions)?;
         for rule in &program.rules {
@@ -936,8 +858,6 @@ impl Session {
         let mut next_declaration = staged.definitions.declarations.len();
         let added =
             crate::builtin::definitions::reconcile_declarations(program, &mut staged.definitions)?;
-        let occurrences =
-            crate::builtin::definitions::reconcile_rulesets(program, &mut staged.definitions)?;
         let declaration_indices: Vec<_> = added
             .iter()
             .map(|added| {
@@ -1059,7 +979,6 @@ impl Session {
                     site: pb::maintenance_site::Target::Declaration(index as u32),
                     span: declaration.span,
                     declaration: declaration_indices[index],
-                    ruleset: None,
                 });
             }
         }
@@ -1080,7 +999,6 @@ impl Session {
                 site: pb::maintenance_site::Target::Sort(site),
                 span: program.sorts[site as usize].span,
                 declaration: None,
-                ruleset: None,
             });
         }
         for (index, sort) in program.sorts.iter().enumerate() {
@@ -1226,7 +1144,6 @@ impl Session {
                     site: pb::maintenance_site::Target::Declaration(index as u32),
                     span: declaration.span,
                     declaration: None,
-                    ruleset: None,
                 });
             }
             pending_declarations.insert(declaration_indices[index].unwrap());
@@ -1235,7 +1152,6 @@ impl Session {
                 site: pb::maintenance_site::Target::Declaration(index as u32),
                 span: declaration.span,
                 declaration: declaration_indices[index],
-                ruleset: None,
             });
         }
         for (index, node) in program.nodes.iter().enumerate() {
@@ -1344,254 +1260,41 @@ impl Session {
                 }
             }
         }
-        let mut rulesets = self.rulesets.clone();
-        rulesets.resize(staged.definitions.rulesets.len(), String::new());
-        let mut rules = self.rules.clone();
-        rules.resize(staged.definitions.rules.len(), String::new());
-        let named: HashMap<_, _> = staged
-            .definitions
-            .rulesets
-            .iter()
-            .enumerate()
-            .filter_map(|(i, s)| s.name.as_ref().map(|name| (name.clone(), i)))
-            .collect();
-        let published: HashSet<_> = self
-            .definitions
-            .rulesets
-            .iter()
-            .enumerate()
-            .filter_map(|(i, s)| s.name.as_ref().map(|_| i))
-            .collect();
-        let mut roots: Vec<_> = program
-            .rulesets
-            .iter()
-            .enumerate()
-            .filter_map(|(i, s)| s.name.as_ref().map(|_| occurrences.rulesets[i]))
-            .collect();
-        for command in command_tree(&program.commands) {
-            if let Some(pb::command::Kind::Run(run)) = &command.kind {
-                match run
-                    .ruleset
-                    .as_ref()
-                    .and_then(|r| r.kind.as_ref())
-                    .ok_or("missing ruleset reference")?
-                {
-                    pb::ruleset_ref::Kind::Index(i) => roots.push(
-                        *occurrences
-                            .rulesets
-                            .get(*i as usize)
-                            .ok_or("ruleset index out of bounds")?,
-                    ),
-                    pb::ruleset_ref::Kind::Name(name) => {
-                        roots.push(*named.get(name).ok_or_else(|| {
-                            PreparationError(Box::new(pb::Error {
-                                code: pb::ErrorCode::UnknownName.into(),
-                                message: format!("unknown ruleset {name}"),
-                                span: command.span,
-                                ..Default::default()
-                            }))
-                        })?)
-                    }
-                }
-            }
-        }
-        let mut visited = HashSet::new();
-        let mut order = Vec::new();
-        for root in roots {
-            let mut pending = vec![(root, false)];
-            while let Some((index, leaving)) = pending.pop() {
-                if leaving {
-                    order.push(index);
-                    continue;
-                }
-                if !visited.insert(index) {
-                    continue;
-                }
-                pending.push((index, true));
-                if let Some(pb::ruleset::Kind::Combined(c)) =
-                    &staged.definitions.rulesets[index].kind
-                {
-                    pending.extend(c.rulesets.iter().rev().map(|r| {
-                        let Some(pb::ruleset_ref::Kind::Index(i)) = r.kind else {
-                            unreachable!("canonical reference")
-                        };
-                        (i as usize, false)
-                    }));
-                }
-            }
-        }
-        let mut used = HashSet::new();
-        for index in order {
-            if !rulesets[index].is_empty() {
-                if staged.definitions.rulesets[index].name.is_some() && !published.contains(&index)
-                {
-                    let local = occurrences
-                        .rulesets
-                        .iter()
-                        .position(|i| *i == index)
-                        .expect("new binding has a submitted presentation");
-                    installations.push(Installation {
-                        command: None,
-                        site: pb::maintenance_site::Target::Ruleset(local as u32),
-                        span: program.rulesets[local].span,
-                        declaration: None,
-                        ruleset: Some(index),
-                    });
-                }
-                continue;
-            }
-            let local = occurrences
-                .rulesets
-                .iter()
-                .position(|i| *i == index)
-                .expect("new occurrence has a submitted presentation");
-            let site = pb::maintenance_site::Target::Ruleset(local as u32);
-            let span = program.rulesets[local].span;
-            let selection = ruleset_selection(
-                &staged.definitions,
-                [(index, pb::ruleset_ref::Kind::Index(local as u32))],
-            );
-            let mut holders = Vec::new();
-            for (rule_index, _) in selection {
-                if rules[rule_index].is_empty() {
-                    let local_rule = occurrences
-                        .rules
-                        .iter()
-                        .position(|i| *i == rule_index)
-                        .expect("new rule has a submitted presentation");
-                    used.insert(local_rule);
-                    let name = format!("__protobuf_{}_rule_{local_rule}", staged.request);
-                    let holder = format!("{name}_holder");
-                    installations.push(Installation {
-                        command: Some(Command::AddRuleset(
-                            native_span(program, span.as_ref(), &native_spans)?,
-                            holder.clone(),
-                        )),
-                        site: site.clone(),
-                        span,
-                        declaration: None,
-                        ruleset: None,
-                    });
-                    let rule = &program.rules[local_rule];
-                    for command in
-                        lower_rule(program, rule, &holder, &name, &native_spans, |name| {
-                            staged.graph.authoring_type_info().is_global(name)
-                                || staged.graph.get_sort_by_name(name).is_some()
-                                || staged
-                                    .graph
-                                    .authoring_type_info()
-                                    .get_func_type(name)
-                                    .is_some()
-                                || staged.graph.authoring_type_info().is_primitive(name)
-                        })?
-                    {
-                        installations.push(Installation {
-                            command: Some(lower_rule_cost_deletes(
-                                command,
-                                &constructor_targets,
-                                self.mode,
-                            )),
-                            site: site.clone(),
-                            span: rule.span.or(span),
-                            declaration: None,
-                            ruleset: None,
-                        });
-                    }
-                    rules[rule_index] = name;
-                }
-                holders.push(format!("{}_holder", rules[rule_index]));
-            }
-            let name = format!("__protobuf_{}_{}", staged.request, local);
-            installations.push(Installation {
-                command: Some(Command::UnstableCombinedRuleset(
-                    native_span(program, span.as_ref(), &native_spans)?,
-                    name.clone(),
-                    holders,
-                )),
-                site,
-                span,
-                declaration: None,
-                ruleset: staged.definitions.rulesets[index]
-                    .name
-                    .as_ref()
-                    .map(|_| index),
-            });
-            rulesets[index] = name;
-        }
         let mut context = RequestOccurrences {
+            request: staged.request,
+            registry: self.registry.clone(),
             native_spans,
             scoped_actions,
             action_dags,
             extraction_dags,
-            rulesets: occurrences
-                .rulesets
-                .iter()
-                .map(|i| rulesets[*i].clone())
-                .collect(),
-            names: named
-                .iter()
-                .map(|(name, index)| (name.clone(), rulesets[*index].clone()))
-                .collect(),
             files: program.files.clone(),
+            file_offsets: [(Arc::as_ptr(&rule_files) as usize, 0)].into(),
             ..Default::default()
         };
-        let mut routes: Vec<_> = named
-            .iter()
-            .map(|(name, index)| (*index, pb::ruleset_ref::Kind::Name(name.clone())))
-            .collect();
-        routes.sort_by_key(|(index, _)| *index);
-        routes.extend(
-            occurrences
-                .rulesets
-                .iter()
-                .enumerate()
-                .map(|(local, index)| (*index, pb::ruleset_ref::Kind::Index(local as u32))),
-        );
-        for (rule, mut origin) in ruleset_selection(
-            &staged.definitions,
-            routes
-                .into_iter()
-                .filter(|(index, _)| !rulesets[*index].is_empty()),
-        ) {
-            if let Some(span) = &mut origin.span {
-                let file = &staged.definitions.files[span.file as usize];
-                span.file = match context.files.iter().position(|old| old == file) {
-                    Some(index) => index as u32,
-                    None => {
-                        context.files.push(file.clone());
-                        (context.files.len() - 1) as u32
-                    }
-                };
-            }
-            let directions: &[(_, _)] = if matches!(
-                staged.definitions.rules[rule].kind,
-                Some(pb::rule::Kind::Birewrite(_))
-            ) {
-                &[
-                    ("=>", pb::NativeRuleDirection::Forward),
-                    ("<=", pb::NativeRuleDirection::Reverse),
-                ]
-            } else {
-                &[("", pb::NativeRuleDirection::Single)]
-            };
-            for (suffix, direction) in directions {
-                context
-                    .origins
-                    .entry(format!("{}{suffix}", rules[rule]))
-                    .or_insert((origin.clone(), *direction));
-            }
-        }
+        self.registry.origins(&mut context);
         let mut validation: Vec<_> = installations
             .iter()
             .filter_map(|i| i.command.clone())
             .collect();
+        // Resolve real groups only when execution reaches each Run.
+        context.selection = format!("__protobuf_validation_{}", staged.request);
+        validation.push(Command::AddRuleset(
+            ast::Span::Panic,
+            context.selection.clone(),
+        ));
         for (index, rule) in program.rules.iter().enumerate() {
-            if !used.contains(&index) && occurrences.rules[index] >= self.rules.len() {
-                for command in lower_rule(
+            let name = format!("__protobuf_{}_rule_{index}", staged.request);
+            let holder = format!("{name}_holder");
+            let mut commands = vec![Command::AddRuleset(
+                native_span(program, rule.span.as_ref(), &context.native_spans)?,
+                holder.clone(),
+            )];
+            commands.extend(
+                lower_rule(
                     program,
                     rule,
-                    "",
-                    &format!("__protobuf_{}_unused_{index}", staged.request),
+                    &holder,
+                    &name,
                     &context.native_spans,
                     |name| {
                         staged.graph.authoring_type_info().is_global(name)
@@ -1603,14 +1306,21 @@ impl Session {
                                 .is_some()
                             || staged.graph.authoring_type_info().is_primitive(name)
                     },
-                )? {
-                    validation.push(lower_rule_cost_deletes(
-                        command,
-                        &constructor_targets,
-                        self.mode,
-                    ));
-                }
-            }
+                )?
+                .into_iter()
+                .map(|command| lower_rule_cost_deletes(command, &constructor_targets, self.mode)),
+            );
+            validation.extend(commands.clone());
+            let record = graph::rule(&authored_input, index as u32)?;
+            context.candidates.push(rules::Candidate {
+                key: graph::rule_key(&record)?,
+                record: Arc::new(graph::RuleRecord {
+                    program: record,
+                    files: rule_files.clone(),
+                }),
+                name,
+                commands,
+            });
         }
         let mut schedulers: HashSet<_> = self
             .graph
@@ -1716,17 +1426,6 @@ impl Session {
             installations,
             materialized,
             pending_declarations,
-            rulesets,
-            rules,
-            published,
-            submitted_names: program
-                .rulesets
-                .iter()
-                .zip(occurrences.rulesets)
-                .filter_map(|(ruleset, index)| {
-                    ruleset.name.as_ref().map(|name| (name.clone(), index))
-                })
-                .collect(),
             context,
         })
     }
@@ -1899,7 +1598,7 @@ impl Session {
                 stored_table_signature(&self.definitions, logical)?;
                 return Ok(vec![]);
             }
-            pb::command::Kind::Freeze(_) => return Ok(vec![]),
+            pb::command::Kind::Freeze(_) | pb::command::Kind::AddRules(_) => return Ok(vec![]),
             _ => {
                 return Err(
                     "this command kind is not supported by the initial byte adapter".into(),
@@ -1928,6 +1627,16 @@ impl Session {
                 wire_back_off(bind)?;
                 if !schedulers.insert(bind.name.clone()) {
                     return Err(format!("scheduler {} already exists", bind.name).into());
+                }
+                Ok(vec![])
+            }
+            pb::command::Kind::AddRules(add) => {
+                if add
+                    .rules
+                    .iter()
+                    .any(|index| *index as usize >= program.rules.len())
+                {
+                    return Err("rule index out of bounds".into());
                 }
                 Ok(vec![])
             }
@@ -2056,28 +1765,8 @@ impl Session {
         let span = native_span(program, command.span.as_ref(), &context.native_spans)?;
         sites.insert(vec![], (command, vec![]));
         match command.kind.as_ref().ok_or("missing schedule command")? {
-            pb::command::Kind::Run(run) => {
-                let native = match run
-                    .ruleset
-                    .as_ref()
-                    .and_then(|r| r.kind.as_ref())
-                    .ok_or("missing ruleset reference")?
-                {
-                    pb::ruleset_ref::Kind::Name(name) => {
-                        context.names.get(name).ok_or_else(|| {
-                            PreparationError(Box::new(pb::Error {
-                                code: pb::ErrorCode::UnknownName.into(),
-                                message: format!("unknown ruleset {name}"),
-                                span: command.span,
-                                ..Default::default()
-                            }))
-                        })?
-                    }
-                    pb::ruleset_ref::Kind::Index(index) => context
-                        .rulesets
-                        .get(*index as usize)
-                        .ok_or("ruleset index out of bounds")?,
-                };
+            pb::command::Kind::Run(_) => {
+                let native = &context.selection;
                 Ok(ast::Schedule::Run(
                     span,
                     ast::RunConfig {
@@ -2140,7 +1829,10 @@ impl Session {
                     bindings: vec![],
                     partial: ControlReport::default(),
                 };
-                let result = if matches!(kind, pb::command::Kind::BindScheduler(_)) {
+                let result = if matches!(
+                    kind,
+                    pb::command::Kind::BindScheduler(_) | pb::command::Kind::AddRules(_)
+                ) {
                     envelope.execute(&mut self.graph).map(|_| ())
                 } else {
                     self.graph.with_schedule_envelope(
@@ -2171,9 +1863,9 @@ impl Session {
                 result?;
                 None
             }
-            pb::command::Kind::Freeze(_) => {
-                Some(pb::command_output::Kind::Snapshot(freeze::export(self)?))
-            }
+            pb::command::Kind::Freeze(_) => Some(pb::command_output::Kind::Snapshot(
+                freeze::export(self, &context.registry)?,
+            )),
             pb::command::Kind::Action(action)
                 if context.scoped_actions.contains(&location.path) =>
             {
@@ -2818,7 +2510,7 @@ impl ScheduleMeasurements {
                         _,
                     )) = &mapped
                 {
-                    let selected = run.ruleset.as_ref().expect("validated Run");
+                    let selected = &run.groups;
                     if !self.selected.contains(selected) {
                         self.selected.push(selected.clone());
                     }
@@ -2860,7 +2552,7 @@ impl ScheduleMeasurements {
         response: &mut pb::RunProgramResponse,
     ) {
         let measurements = self;
-        let profile = response.profile.as_mut().expect("summary requested");
+        let mut profile = response.profile.take().expect("summary requested");
         let mut requested: Vec<_> = measurements.requested.into_iter().collect();
         requested.sort_unstable_by(|a, b| a.0.cmp(&b.0));
         for (path, requested) in requested {
@@ -2869,15 +2561,9 @@ impl ScheduleMeasurements {
             let mut measured: Vec<_> = requested.rules.into_iter().collect();
             measured.sort_unstable_by(|a, b| a.0.cmp(&b.0));
             for (name, (matches, nanos)) in measured {
-                if let Some((origin, _)) = context.origins.get(&name) {
-                    let index =
-                        *context
-                            .response_rules
-                            .entry(origin.clone())
-                            .or_insert_with(|| {
-                                response.rules.push(origin.clone());
-                                (response.rules.len() - 1) as u32
-                            });
+                if let (Some(index), _) = report::rule_reference(&name, context, response)
+                    .expect("registered rule catalog")
+                {
                     let position = *positions.entry(index).or_insert_with(|| {
                         rules.push(pb::RuleSummary {
                             rule: Some(index),
@@ -2933,6 +2619,7 @@ impl ScheduleMeasurements {
                 });
             }
         }
+        response.profile = Some(profile);
     }
 }
 
@@ -2940,6 +2627,7 @@ fn control_command(command: &pb::Command) -> bool {
     match &command.kind {
         Some(
             pb::command::Kind::Run(_)
+            | pb::command::Kind::AddRules(_)
             | pb::command::Kind::Repeat(_)
             | pb::command::Kind::Saturate(_),
         ) => true,
@@ -3230,6 +2918,46 @@ impl ControlContext for WireSchedule<'_> {
                 self.bindings.push((bind.name.clone(), binding));
             }
             return Ok(ControlReport::default());
+        }
+        if let Some(pb::command::Kind::AddRules(add)) = &node.kind {
+            let candidates = std::mem::take(&mut self.context.candidates);
+            let mut registry = std::mem::take(&mut self.context.registry);
+            let result = registry.add(
+                add,
+                &candidates,
+                &mut self.executor,
+                &location,
+                self.context,
+                self.response,
+            );
+            self.context.candidates = candidates;
+            self.context.registry = registry;
+            if result.is_err() {
+                self.measurements.borrow_mut().failure = Some((location, node.span));
+            }
+            result?;
+            return Ok(ControlReport::default());
+        }
+        if let Some(pb::command::Kind::Run(run)) = &node.kind {
+            let mut registry = std::mem::take(&mut self.context.registry);
+            let result = registry.selection(
+                &run.groups,
+                &mut self.executor,
+                &location,
+                self.context,
+                self.response,
+            );
+            self.context.registry = registry;
+            let selection = result?;
+            let groups = self
+                .context
+                .selections
+                .entry(selection.clone())
+                .or_default();
+            if !groups.contains(&run.groups) {
+                groups.push(run.groups.clone());
+            }
+            self.context.selection = selection;
         }
         let binding = match &node.kind {
             Some(pb::command::Kind::Run(run)) if !run.scheduler.is_empty() => Some(
@@ -6018,62 +5746,6 @@ fn lower_action(
     Ok(vec![lowered])
 }
 
-// The logical graph remains unchanged. Native selection and response routes
-// share this ordered traversal, deduplicating by rule occurrence, not label.
-fn ruleset_selection(
-    definitions: &pb::Program,
-    roots: impl IntoIterator<Item = (usize, pb::ruleset_ref::Kind)>,
-) -> Vec<(usize, pb::RuleAttribution)> {
-    let mut seen_sets = HashSet::new();
-    let mut seen_rules = HashSet::new();
-    let mut result = Vec::new();
-    for (root, reference) in roots {
-        let mut pending = vec![(root, Vec::new())];
-        while let Some((index, children)) = pending.pop() {
-            if !seen_sets.insert(index) {
-                continue;
-            }
-            match definitions.rulesets[index]
-                .kind
-                .as_ref()
-                .expect("validated ruleset")
-            {
-                pb::ruleset::Kind::Rules(list) => {
-                    for (ordinal, &rule) in list.rules.iter().enumerate() {
-                        if !seen_rules.insert(rule) {
-                            continue;
-                        }
-                        let authored = &definitions.rules[rule as usize];
-                        result.push((
-                            rule as usize,
-                            pb::RuleAttribution {
-                                root: Some(pb::RulesetRef {
-                                    kind: Some(reference.clone()),
-                                }),
-                                children: children.clone(),
-                                position: ordinal as u32,
-                                name: authored.name.clone(),
-                                span: authored.span,
-                            },
-                        ));
-                    }
-                }
-                pb::ruleset::Kind::Combined(combined) => {
-                    for (position, child) in combined.rulesets.iter().enumerate().rev() {
-                        let Some(pb::ruleset_ref::Kind::Index(child)) = child.kind else {
-                            unreachable!("canonical reference")
-                        };
-                        let mut path = children.clone();
-                        path.push(position as u32);
-                        pending.push((child as usize, path));
-                    }
-                }
-            }
-        }
-    }
-    result
-}
-
 // Native local bindings preserve the addressed key across deleting the row and
 // its auxiliary annotation. This is the same ordinary action/compiler path;
 // functions and relation predicates have no constructor cost to remove.
@@ -6743,8 +6415,12 @@ mod tests {
         let ast::Span::Egglog(expression_span) = expr.span() else {
             panic!("expression span")
         };
-        assert!(Arc::ptr_eq(&file, &span.file));
-        assert!(Arc::ptr_eq(&file, &expression_span.file));
+        let action_file = prepared.context.native_spans.0.borrow()
+            [action.span.unwrap().file as usize]
+            .clone()
+            .unwrap();
+        assert!(Arc::ptr_eq(&action_file, &span.file));
+        assert!(Arc::ptr_eq(&action_file, &expression_span.file));
         let mut later = pb::Program {
             files: vec![pb::SourceFile {
                 name: "fixture.egg".into(),
@@ -7092,7 +6768,6 @@ mod tests {
                     "{invalid}"
                 );
                 assert!(response.outputs.is_empty());
-                assert!(response.ruleset_publication.unwrap().names.is_empty());
                 assert!(response.profile.unwrap().maintenance.is_empty());
                 assert_eq!(engine.graphs[&id].definitions, definitions);
                 assert_eq!(engine.graphs[&id].request, request);
@@ -7317,7 +6992,6 @@ mod tests {
                     }));
                     assert_eq!(calls.load(Ordering::SeqCst), 0);
                     assert!(response.outputs.is_empty());
-                    assert!(response.ruleset_publication.unwrap().names.is_empty());
                     assert_eq!(engine.graphs[&id].graph.num_tuples(), 0);
                     assert!(
                         engine.graphs[&id]
@@ -7455,7 +7129,6 @@ mod tests {
             );
             assert_eq!(response.error.unwrap().message, expected, "{corrupt}");
             assert!(response.outputs.is_empty());
-            assert!(response.ruleset_publication.unwrap().names.is_empty());
             let profile = response.profile.unwrap();
             assert!(!profile.complete);
             assert!(profile.maintenance.is_empty());
@@ -7516,7 +7189,6 @@ mod tests {
             assert_eq!(error.code, i32::from(pb::ErrorCode::InvalidProgram));
             assert!(error.message.contains("conflicting declaration seed_b"));
             assert!(response.outputs.is_empty());
-            assert!(response.ruleset_publication.unwrap().names.is_empty());
             assert_eq!(engine.graphs[&clone].request, request);
             assert_eq!(engine.graphs[&clone].definitions, before);
             consistent(&mut engine, clone);
@@ -8056,16 +7728,16 @@ mod tests {
                     })),
                     ..Default::default()
                 }];
-                program.rulesets = vec![pb::Ruleset {
-                    name: Some("dag".into()),
-                    kind: Some(pb::ruleset::Kind::Rules(pb::RuleList { rules: vec![0] })),
+                program.commands.push(pb::Command {
+                    kind: Some(pb::command::Kind::AddRules(pb::AddRules {
+                        group: "dag".into(),
+                        rules: vec![0],
+                    })),
                     ..Default::default()
-                }];
+                });
                 program.commands.push(pb::Command {
                     kind: Some(pb::command::Kind::Run(pb::Run {
-                        ruleset: Some(pb::RulesetRef {
-                            kind: Some(pb::ruleset_ref::Kind::Index(0)),
-                        }),
+                        groups: vec!["dag".into()],
                         ..Default::default()
                     })),
                     ..Default::default()
@@ -8675,413 +8347,6 @@ mod tests {
                 }
             }
         }
-    }
-
-    #[test]
-    fn no_decomp_resources_use_live_state_and_scope_stamps() {
-        use pb::configure_e_graph_resources_request::Operation;
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        #[derive(Default)]
-        struct CloneWitness(Arc<AtomicUsize>);
-        impl Clone for CloneWitness {
-            fn clone(&self) -> Self {
-                self.0.fetch_add(1, Ordering::SeqCst);
-                Self(self.0.clone())
-            }
-        }
-        let (mut engine, id) = host_default_engine();
-        let clones = engine
-            .graphs
-            .get_mut(&id)
-            .unwrap()
-            .graph
-            .extension_state_or_default::<CloneWitness>()
-            .0
-            .clone();
-        let symbols = engine.graphs[&id].graph.parser.symbol_gen.clone();
-        let threads = engine.graphs[&id].graph.num_threads();
-        let mut stamp = engine.graphs[&id].request;
-        for operation in [
-            Operation::Query(pb::Unit {}),
-            Operation::NoDecomp(true),
-            Operation::NoDecomp(true),
-            Operation::Query(pb::Unit {}),
-            Operation::NoDecomp(false),
-        ] {
-            let response = pb::ConfigureEGraphResourcesResponse::decode(
-                engine
-                    .configure_resources(
-                        &pb::ConfigureEGraphResourcesRequest {
-                            egraph_id: id,
-                            operation: Some(operation),
-                        }
-                        .encode_to_vec(),
-                    )
-                    .unwrap()
-                    .as_slice(),
-            )
-            .unwrap();
-            if let Operation::NoDecomp(enabled) = operation {
-                stamp += 1;
-                assert_eq!(response.no_decomp, enabled);
-            }
-            assert_eq!(response.no_decomp, engine.graphs[&id].graph.no_decomp);
-            assert_eq!(engine.graphs[&id].request, stamp);
-            assert!(engine.graphs[&id].graph.seminaive);
-            assert_eq!(engine.graphs[&id].graph.num_threads(), threads);
-            assert_eq!(engine.graphs[&id].graph.parser.symbol_gen, symbols);
-            assert_eq!(clones.load(Ordering::SeqCst), 0);
-        }
-        let mut unknown = pb::ConfigureEGraphResourcesRequest {
-            egraph_id: id,
-            operation: None,
-        }
-        .encode_to_vec();
-        unknown.extend([0x30, 0x01]); // Unknown operation field6, never a query.
-        for bytes in [
-            vec![0xff],
-            unknown,
-            pb::ConfigureEGraphResourcesRequest {
-                egraph_id: id,
-                operation: None,
-            }
-            .encode_to_vec(),
-            pb::ConfigureEGraphResourcesRequest {
-                egraph_id: u64::MAX,
-                operation: Some(Operation::NoDecomp(true)),
-            }
-            .encode_to_vec(),
-        ] {
-            assert!(engine.configure_resources(&bytes).is_err());
-            assert!(!engine.graphs[&id].graph.no_decomp);
-            assert_eq!(engine.graphs[&id].request, stamp);
-            assert_eq!(clones.load(Ordering::SeqCst), 0);
-        }
-        for mutate_saved in [false, true] {
-            let active = pb::CloneEGraphResponse::decode(
-                engine
-                    .clone_egraph(&pb::CloneEGraphRequest { egraph_id: id }.encode_to_vec())
-                    .unwrap()
-                    .as_slice(),
-            )
-            .unwrap()
-            .egraph_id;
-            let target = if mutate_saved { id } else { active };
-            engine
-                .configure_resources(
-                    &pb::ConfigureEGraphResourcesRequest {
-                        egraph_id: target,
-                        // Saved false->false still makes the saved pair stale.
-                        operation: Some(Operation::NoDecomp(!mutate_saved)),
-                    }
-                    .encode_to_vec(),
-                )
-                .unwrap();
-            assert_eq!(engine.graphs[&active].graph.no_decomp, !mutate_saved);
-            let before = engine.graphs[&id].request;
-            engine
-                .configure_resources(
-                    &pb::ConfigureEGraphResourcesRequest {
-                        egraph_id: id,
-                        operation: Some(Operation::Query(pb::Unit {})),
-                    }
-                    .encode_to_vec(),
-                )
-                .unwrap();
-            assert_eq!(engine.graphs[&id].request, before);
-            let returned = engine.return_to(
-                &pb::ReturnToEGraphRequest {
-                    active_id: active,
-                    saved_id: id,
-                }
-                .encode_to_vec(),
-            );
-            assert_eq!(returned.is_err(), mutate_saved);
-            assert!(!engine.graphs[&id].graph.no_decomp);
-            assert_eq!(engine.graphs.contains_key(&active), mutate_saved);
-            if mutate_saved {
-                engine
-                    .destroy(&pb::DestroyEGraphRequest { egraph_id: active }.encode_to_vec())
-                    .unwrap();
-            }
-        }
-        engine.graphs.get_mut(&id).unwrap().request = u64::MAX;
-        for enabled in [false, true] {
-            assert!(
-                engine
-                    .configure_resources(
-                        &pb::ConfigureEGraphResourcesRequest {
-                            egraph_id: id,
-                            operation: Some(Operation::NoDecomp(enabled)),
-                        }
-                        .encode_to_vec(),
-                    )
-                    .is_err()
-            );
-            assert!(!engine.graphs[&id].graph.no_decomp);
-            assert_eq!(engine.graphs[&id].request, u64::MAX);
-        }
-        let response = pb::ConfigureEGraphResourcesResponse::decode(
-            engine
-                .configure_resources(
-                    &pb::ConfigureEGraphResourcesRequest {
-                        egraph_id: id,
-                        operation: Some(Operation::Query(pb::Unit {})),
-                    }
-                    .encode_to_vec(),
-                )
-                .unwrap()
-                .as_slice(),
-        )
-        .unwrap();
-        assert!(!response.no_decomp);
-    }
-
-    #[test]
-    fn scope_return_resource_stamps_and_overflow_are_pre_mutation() {
-        use pb::configure_e_graph_resources_request::Operation;
-        let mut engine = Engine::default();
-        let id = pb::CreateEGraphResponse::decode(
-            engine
-                .create(
-                    &pb::CreateEGraphRequest {
-                        sorts: vec![pb::Sort {
-                            kind: Some(pb::sort::Kind::Family(pb::HostSort {
-                                name: "i64".into(),
-                                args: vec![],
-                            })),
-                            ..Default::default()
-                        }],
-                        options: Some(pb::EGraphOptions {
-                            cost_sort: Some(0),
-                            ..Default::default()
-                        }),
-                        threads: Some(1),
-                        ..Default::default()
-                    }
-                    .encode_to_vec(),
-                )
-                .unwrap()
-                .as_slice(),
-        )
-        .unwrap()
-        .egraph_id;
-        for operation in [
-            Operation::Threads(1),
-            Operation::ReportLevel(pb::ReportLevel::TimeOnly.into()),
-        ] {
-            let active = pb::CloneEGraphResponse::decode(
-                engine
-                    .clone_egraph(&pb::CloneEGraphRequest { egraph_id: id }.encode_to_vec())
-                    .unwrap()
-                    .as_slice(),
-            )
-            .unwrap()
-            .egraph_id;
-            let stamp = engine.graphs[&id].request;
-            engine
-                .configure_resources(
-                    &pb::ConfigureEGraphResourcesRequest {
-                        egraph_id: id,
-                        operation: Some(Operation::Query(pb::Unit {})),
-                    }
-                    .encode_to_vec(),
-                )
-                .unwrap();
-            for level in [0, 99, -1] {
-                assert!(
-                    engine
-                        .configure_resources(
-                            &pb::ConfigureEGraphResourcesRequest {
-                                egraph_id: id,
-                                operation: Some(Operation::ReportLevel(level))
-                            }
-                            .encode_to_vec()
-                        )
-                        .is_err()
-                );
-            }
-            assert_eq!(engine.graphs[&id].request, stamp);
-            engine
-                .return_to(
-                    &pb::ReturnToEGraphRequest {
-                        active_id: active,
-                        saved_id: id,
-                    }
-                    .encode_to_vec(),
-                )
-                .unwrap();
-            let active = pb::CloneEGraphResponse::decode(
-                engine
-                    .clone_egraph(&pb::CloneEGraphRequest { egraph_id: id }.encode_to_vec())
-                    .unwrap()
-                    .as_slice(),
-            )
-            .unwrap()
-            .egraph_id;
-            // Successful equal-value setters still invalidate the saved pairing.
-            engine
-                .configure_resources(
-                    &pb::ConfigureEGraphResourcesRequest {
-                        egraph_id: id,
-                        operation: Some(operation),
-                    }
-                    .encode_to_vec(),
-                )
-                .unwrap();
-            assert_eq!(engine.graphs[&id].request, stamp + 1);
-            assert!(
-                engine
-                    .return_to(
-                        &pb::ReturnToEGraphRequest {
-                            active_id: active,
-                            saved_id: id
-                        }
-                        .encode_to_vec()
-                    )
-                    .is_err()
-            );
-            assert!(engine.graphs.contains_key(&active));
-            assert_eq!(engine.graphs[&active].clone_parent, Some((id, stamp)));
-        }
-        for mutate_active in [true, false] {
-            let active = pb::CloneEGraphResponse::decode(
-                engine
-                    .clone_egraph(&pb::CloneEGraphRequest { egraph_id: id }.encode_to_vec())
-                    .unwrap()
-                    .as_slice(),
-            )
-            .unwrap()
-            .egraph_id;
-            let stamp = engine.graphs[&id].request;
-            let target = if mutate_active { active } else { id };
-            let response = pb::RunProgramResponse::decode(
-                engine
-                    .run(
-                        &pb::RunProgramRequest {
-                            egraph_id: target,
-                            program: Some(pb::Program {
-                                commands: vec![pb::Command {
-                                    kind: Some(pb::command::Kind::Action(pb::Action {
-                                        kind: Some(pb::action::Kind::Panic(
-                                            "committed scope failure".into(),
-                                        )),
-                                        ..Default::default()
-                                    })),
-                                    ..Default::default()
-                                }],
-                                ..Default::default()
-                            }),
-                            profile: true,
-                            include_run_reports: false,
-                        }
-                        .encode_to_vec(),
-                    )
-                    .unwrap()
-                    .as_slice(),
-            )
-            .unwrap();
-            assert_eq!(
-                response.error.unwrap().code,
-                i32::from(pb::ErrorCode::Panic)
-            );
-            assert_eq!(engine.graphs[&target].request, stamp + 1);
-            let returned = engine.return_to(
-                &pb::ReturnToEGraphRequest {
-                    active_id: active,
-                    saved_id: id,
-                }
-                .encode_to_vec(),
-            );
-            assert_eq!(returned.is_ok(), mutate_active);
-            assert_eq!(engine.graphs[&id].request, stamp + 1);
-            assert_eq!(engine.graphs.contains_key(&active), !mutate_active);
-        }
-        engine.graphs.get_mut(&id).unwrap().request = u64::MAX;
-        let symbols = engine.graphs[&id].graph.parser.symbol_gen.clone();
-        let handles = engine.graphs.len();
-        for operation in [
-            Operation::Threads(0),
-            Operation::ReportLevel(pb::ReportLevel::WithPlan.into()),
-        ] {
-            let error = engine
-                .configure_resources(
-                    &pb::ConfigureEGraphResourcesRequest {
-                        egraph_id: id,
-                        operation: Some(operation),
-                    }
-                    .encode_to_vec(),
-                )
-                .unwrap_err();
-            assert!(error.0.contains("identity space exhausted"));
-            assert_eq!(engine.graphs[&id].request, u64::MAX);
-            assert_eq!(engine.graphs[&id].graph.num_threads(), 1);
-            assert_eq!(engine.graphs[&id].graph.parser.symbol_gen, symbols);
-        }
-        let invalid = engine
-            .configure_resources(
-                &pb::ConfigureEGraphResourcesRequest {
-                    egraph_id: id,
-                    operation: Some(Operation::ReportLevel(99)),
-                }
-                .encode_to_vec(),
-            )
-            .unwrap_err();
-        assert!(invalid.0.contains("unknown report level"));
-        engine
-            .configure_resources(
-                &pb::ConfigureEGraphResourcesRequest {
-                    egraph_id: id,
-                    operation: Some(Operation::Query(pb::Unit {})),
-                }
-                .encode_to_vec(),
-            )
-            .unwrap();
-        let response = pb::RunProgramResponse::decode(
-            engine
-                .run(
-                    &pb::RunProgramRequest {
-                        egraph_id: id,
-                        program: Some(pb::Program {
-                            ..Default::default()
-                        }),
-                        profile: true,
-                        include_run_reports: false,
-                    }
-                    .encode_to_vec(),
-                )
-                .unwrap()
-                .as_slice(),
-        )
-        .unwrap();
-        assert!(
-            response
-                .error
-                .unwrap()
-                .message
-                .contains("identity space exhausted")
-        );
-        assert_eq!(engine.graphs[&id].request, u64::MAX);
-        assert_eq!(engine.graphs.len(), handles);
-        // The rejected WithPlan setter must not change native collection level.
-        let mut probe = engine.graphs[&id].graph.clone();
-        let output = probe
-            .parse_and_run_program(
-                None,
-                "(datatype M (N i64)) (rule ((N x)) ((N 2))) (N 1) (run 1)",
-            )
-            .unwrap();
-        let egglog::CommandOutput::RunSchedule(report) = output.last().unwrap() else {
-            panic!("missing native run report")
-        };
-        let reports: Vec<_> = report
-            .iterations
-            .iter()
-            .flat_map(|i| i.rule_set_report.rule_reports.values())
-            .flatten()
-            .collect();
-        assert!(!reports.is_empty());
-        assert!(reports.iter().all(|rule| rule.plan.is_none()));
     }
 
     #[test]
@@ -9703,120 +8968,6 @@ mod tests {
     struct ForeignPrimitive(String);
 
     #[test]
-    fn resource_queries_and_updates_use_live_native_state_without_cloning() {
-        use pb::configure_e_graph_resources_request::Operation;
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        #[derive(Default)]
-        struct CloneWitness(Arc<AtomicUsize>);
-        impl Clone for CloneWitness {
-            fn clone(&self) -> Self {
-                self.0.fetch_add(1, Ordering::SeqCst);
-                Self(self.0.clone())
-            }
-        }
-        let mut engine = Engine::default();
-        let request = pb::CreateEGraphRequest {
-            sorts: vec![pb::Sort {
-                kind: Some(pb::sort::Kind::Family(pb::HostSort {
-                    name: "i64".into(),
-                    args: vec![],
-                })),
-                ..Default::default()
-            }],
-            options: Some(pb::EGraphOptions {
-                cost_sort: Some(0),
-                ..Default::default()
-            }),
-            ..Default::default()
-        };
-        let created = engine.create(&request.encode_to_vec()).unwrap();
-        let id = pb::CreateEGraphResponse::decode(created.as_slice())
-            .unwrap()
-            .egraph_id;
-        let clones = engine
-            .graphs
-            .get_mut(&id)
-            .unwrap()
-            .graph
-            .extension_state_or_default::<CloneWitness>()
-            .0
-            .clone();
-        let mut native = crate::new_experimental_egraph();
-        for operation in [
-            Operation::Query(pb::Unit {}),
-            Operation::Threads(0),
-            Operation::Threads(1),
-            Operation::Threads(2),
-            Operation::Query(pb::Unit {}),
-        ] {
-            let request = pb::ConfigureEGraphResourcesRequest {
-                egraph_id: id,
-                operation: Some(operation),
-            };
-            let result = engine.configure_resources(&request.encode_to_vec());
-            if cfg!(target_family = "wasm") && matches!(operation, Operation::Threads(n) if n > 1) {
-                assert!(result.is_err());
-            } else {
-                if let Operation::Threads(n) = operation {
-                    native.set_num_threads(usize::try_from(n).unwrap());
-                }
-                let response =
-                    pb::ConfigureEGraphResourcesResponse::decode(result.unwrap().as_slice())
-                        .unwrap();
-                assert_eq!(
-                    response.threads,
-                    u64::try_from(native.num_threads()).unwrap()
-                );
-                assert_eq!(engine.graphs[&id].graph.num_threads(), native.num_threads());
-            }
-            assert_eq!(
-                clones.load(Ordering::SeqCst),
-                0,
-                "resource access must not clone native state/cursors"
-            );
-        }
-        let previous = engine.graphs[&id].graph.num_threads();
-        let mut unknown = pb::ConfigureEGraphResourcesRequest {
-            egraph_id: id,
-            operation: None,
-        }
-        .encode_to_vec();
-        unknown.extend([0x22, 0x00]); // Unknown operation field4, not a query.
-        for bytes in [
-            vec![0xff],
-            unknown,
-            pb::ConfigureEGraphResourcesRequest {
-                egraph_id: id,
-                operation: None,
-            }
-            .encode_to_vec(),
-            pb::ConfigureEGraphResourcesRequest {
-                egraph_id: u64::MAX,
-                operation: Some(Operation::Threads(1)),
-            }
-            .encode_to_vec(),
-        ] {
-            assert!(engine.configure_resources(&bytes).is_err());
-            assert_eq!(engine.graphs[&id].graph.num_threads(), previous);
-            assert_eq!(clones.load(Ordering::SeqCst), 0);
-        }
-        engine
-            .destroy(&pb::DestroyEGraphRequest { egraph_id: id }.encode_to_vec())
-            .unwrap();
-        assert!(
-            engine
-                .configure_resources(
-                    &pb::ConfigureEGraphResourcesRequest {
-                        egraph_id: id,
-                        operation: Some(Operation::Query(pb::Unit {}))
-                    }
-                    .encode_to_vec()
-                )
-                .is_err()
-        );
-    }
-
-    #[test]
     fn unknown_creation_modes_do_not_allocate_handles() {
         let mut engine = Engine::default();
         for execution_mode in [99, -1] {
@@ -9894,8 +9045,7 @@ mod tests {
                     names: NativeNames::default(),
                     request: 0,
                     clone_parent: None,
-                    rulesets: Vec::new(),
-                    rules: Vec::new(),
+                    registry: rules::Registry::default(),
                     sorts: HashSet::new(),
                     cost_models: HashMap::new(),
                 };
@@ -9941,1396 +9091,6 @@ mod tests {
                 }
             }
         }
-    }
-
-    #[test]
-    fn attribution_forest_preserves_first_routes_files_directions_and_request_locality() {
-        let (mut engine, id) = host_default_engine();
-        let mut program = inventory_fixture("(datatype E (A) (B)) (birewrite (A) (B))");
-        program.commands.clear();
-        program.rules[0].name = Some("both".into());
-        for file in ["one.egg", "two.egg"] {
-            program.files.push(pb::SourceFile {
-                name: file.into(),
-                contents: Some("x".into()),
-            });
-        }
-        for file in [1, 2, 1] {
-            program.rules.push(pb::Rule {
-                name: Some("same label".into()),
-                span: Some(pb::Span {
-                    file,
-                    start: 0,
-                    end: 1,
-                }),
-                eval_mode: pb::RuleEvalMode::Seminaive.into(),
-                kind: Some(pb::rule::Kind::Rule(pb::RuleBody::default())),
-                ..Default::default()
-            });
-        }
-        // A=[L,R], L=[D], R=[D,E], B=[E,F]; only A/B/empty are named.
-        program.rulesets = [
-            (Some("A"), true, vec![1, 2]),
-            (None, true, vec![3]),
-            (None, true, vec![3, 4]),
-            (None, false, vec![1, 0]),
-            (None, false, vec![0, 2]),
-            (Some("B"), true, vec![4, 7]),
-            (Some("empty"), false, vec![]),
-            (None, false, vec![3]),
-        ]
-        .into_iter()
-        .map(|(name, combined, entries)| pb::Ruleset {
-            name: name.map(str::to_owned),
-            kind: Some(if combined {
-                pb::ruleset::Kind::Combined(pb::CombinedRuleset {
-                    rulesets: entries
-                        .into_iter()
-                        .map(|index| pb::RulesetRef {
-                            kind: Some(pb::ruleset_ref::Kind::Index(index)),
-                        })
-                        .collect(),
-                })
-            } else {
-                pb::ruleset::Kind::Rules(pb::RuleList { rules: entries })
-            }),
-            ..Default::default()
-        })
-        .collect();
-        program.rulesets.push(program.rulesets[0].clone());
-        let routes: Vec<_> = [(0, "A"), (5, "B"), (6, "empty")]
-            .into_iter()
-            .map(|(index, name)| (index, pb::ruleset_ref::Kind::Name(name.into())))
-            .chain(
-                (0..program.rulesets.len())
-                    .map(|index| (index, pb::ruleset_ref::Kind::Index(index as u32))),
-            )
-            .collect();
-        let mut singleton_firsts = HashMap::new();
-        for route in &routes {
-            for (rule, origin) in ruleset_selection(&program, [route.clone()]) {
-                singleton_firsts.entry(rule).or_insert(origin);
-            }
-        }
-        let forest = ruleset_selection(&program, routes);
-        assert_eq!(
-            forest.iter().map(|(rule, _)| *rule).collect::<Vec<_>>(),
-            [1, 0, 2, 3]
-        );
-        assert_eq!(
-            forest.into_iter().collect::<HashMap<_, _>>(),
-            singleton_firsts
-        );
-        let prepared = engine.graphs[&id].prepare(&mut program.clone()).unwrap();
-        let mut expected = HashMap::new();
-        for (rule, root, children, ordinal) in [
-            (1, "A", vec![0, 0], 0),
-            (0, "A", vec![0, 0], 1),
-            (2, "A", vec![1, 1], 1),
-            (3, "B", vec![1], 0),
-        ] {
-            let origin = pb::RuleAttribution {
-                root: Some(pb::RulesetRef {
-                    kind: Some(pb::ruleset_ref::Kind::Name(root.into())),
-                }),
-                children,
-                position: ordinal,
-                name: program.rules[rule].name.clone(),
-                span: program.rules[rule].span,
-            };
-            let directions: &[(_, _)] = if rule == 0 {
-                &[
-                    ("=>", pb::NativeRuleDirection::Forward),
-                    ("<=", pb::NativeRuleDirection::Reverse),
-                ]
-            } else {
-                &[("", pb::NativeRuleDirection::Single)]
-            };
-            for (suffix, direction) in directions {
-                expected.insert(
-                    format!("{}{suffix}", prepared.rules[rule]),
-                    (origin.clone(), *direction),
-                );
-            }
-        }
-        assert_eq!(prepared.context.origins, expected);
-        assert_eq!(prepared.context.files, program.files);
-        // Every installation still needs its entire independent selector.
-        let selectors: HashMap<_, _> = prepared
-            .installations
-            .iter()
-            .filter_map(|installation| match &installation.command {
-                Some(Command::UnstableCombinedRuleset(_, name, children)) => {
-                    Some((name.clone(), children.clone()))
-                }
-                _ => None,
-            })
-            .collect();
-        assert_eq!(
-            selectors[&prepared.rulesets[0]],
-            [1, 0, 2].map(|rule| format!("{}_holder", prepared.rules[rule]))
-        );
-        assert_eq!(
-            selectors[&prepared.rulesets[5]],
-            [0, 2, 3].map(|rule| format!("{}_holder", prepared.rules[rule]))
-        );
-        assert_eq!(
-            run_host_default(&mut engine, id, program.clone()).error,
-            None
-        );
-
-        let current = pb::SourceFile {
-            name: "current.egg".into(),
-            contents: Some("current".into()),
-        };
-        let prepared = engine.graphs[&id]
-            .prepare(&mut pb::Program {
-                files: vec![current.clone()],
-                ..Default::default()
-            })
-            .unwrap();
-        assert!(prepared.installations.is_empty());
-        for (origin, _) in expected.values_mut() {
-            if let Some(span) = &mut origin.span {
-                span.file = match span.file {
-                    0 => 2,
-                    1 => 1,
-                    2 => 3,
-                    _ => unreachable!(),
-                };
-            }
-        }
-        assert_eq!(prepared.context.origins, expected);
-        assert_eq!(
-            prepared.context.files,
-            [
-                current,
-                program.files[1].clone(),
-                program.files[0].clone(),
-                program.files[2].clone()
-            ]
-        );
-    }
-
-    #[test]
-    fn attribution_forest_keeps_deep_shared_traversal_iterative() {
-        let mut program = pb::Program {
-            rules: vec![pb::Rule::default()],
-            rulesets: vec![pb::Ruleset {
-                kind: Some(pb::ruleset::Kind::Rules(pb::RuleList { rules: vec![0] })),
-                ..Default::default()
-            }],
-            ..Default::default()
-        };
-        for child in 0..1024 {
-            program.rulesets.push(pb::Ruleset {
-                kind: Some(pb::ruleset::Kind::Combined(pb::CombinedRuleset {
-                    rulesets: vec![
-                        pb::RulesetRef {
-                            kind: Some(pb::ruleset_ref::Kind::Index(child))
-                        };
-                        2
-                    ],
-                })),
-                ..Default::default()
-            });
-        }
-        let selection = ruleset_selection(
-            &program,
-            (0..=1024)
-                .rev()
-                .map(|root| (root, pb::ruleset_ref::Kind::Index(root as u32))),
-        );
-        let [(rule, origin)] = selection.as_slice() else {
-            panic!("{selection:?}")
-        };
-        assert_eq!(*rule, 0);
-        assert_eq!(
-            origin.root.as_ref().unwrap().kind,
-            Some(pb::ruleset_ref::Kind::Index(1024))
-        );
-        assert_eq!(origin.children, vec![0; 1024]);
-    }
-
-    #[test]
-    fn attribution_routes_skip_uninstalled_occurrences() {
-        let (engine, id) = host_default_engine();
-        let program = pb::Program {
-            rules: vec![pb::Rule {
-                name: Some("shared".into()),
-                kind: Some(pb::rule::Kind::Rule(pb::RuleBody::default())),
-                eval_mode: pb::RuleEvalMode::Seminaive.into(),
-                ..Default::default()
-            }],
-            rulesets: (0..2)
-                .map(|_| pb::Ruleset {
-                    kind: Some(pb::ruleset::Kind::Rules(pb::RuleList { rules: vec![0] })),
-                    ..Default::default()
-                })
-                .collect(),
-            commands: vec![pb::Command {
-                kind: Some(pb::command::Kind::Run(pb::Run {
-                    ruleset: Some(pb::RulesetRef {
-                        kind: Some(pb::ruleset_ref::Kind::Index(1)),
-                    }),
-                    ..Default::default()
-                })),
-                ..Default::default()
-            }],
-            ..Default::default()
-        };
-        let prepared = engine.graphs[&id].prepare(&mut program.clone()).unwrap();
-        assert!(prepared.rulesets[0].is_empty());
-        assert!(!prepared.rulesets[1].is_empty());
-        let (origin, direction) = &prepared.context.origins[&prepared.rules[0]];
-        assert_eq!(
-            origin.root.as_ref().unwrap().kind,
-            Some(pb::ruleset_ref::Kind::Index(1))
-        );
-        assert!(origin.children.is_empty());
-        assert_eq!(origin.position, 0);
-        assert_eq!(*direction, pb::NativeRuleDirection::Single);
-    }
-
-    #[test]
-    fn shared_selectors_keep_exact_native_handles_and_first_inclusion_order() {
-        let (mut engine, id) = host_default_engine();
-        let mut program = pb::Program {
-            rules: (0..2)
-                .map(|_| pb::Rule {
-                    name: Some("equal label".into()),
-                    eval_mode: pb::RuleEvalMode::Seminaive.into(),
-                    kind: Some(pb::rule::Kind::Rule(pb::RuleBody::default())),
-                    ..Default::default()
-                })
-                .collect(),
-            rulesets: vec![
-                pb::Ruleset {
-                    kind: Some(pb::ruleset::Kind::Rules(pb::RuleList { rules: vec![0, 0] })),
-                    ..Default::default()
-                },
-                pb::Ruleset {
-                    kind: Some(pb::ruleset::Kind::Rules(pb::RuleList { rules: vec![1] })),
-                    ..Default::default()
-                },
-                pb::Ruleset {
-                    name: Some("parent".into()),
-                    kind: Some(pb::ruleset::Kind::Combined(pb::CombinedRuleset {
-                        rulesets: [1, 0, 1, 0]
-                            .into_iter()
-                            .map(|i| pb::RulesetRef {
-                                kind: Some(pb::ruleset_ref::Kind::Index(i)),
-                            })
-                            .collect(),
-                    })),
-                    ..Default::default()
-                },
-            ],
-            commands: [2, 0, 1]
-                .into_iter()
-                .map(|i| pb::Command {
-                    kind: Some(pb::command::Kind::Run(pb::Run {
-                        ruleset: Some(pb::RulesetRef {
-                            kind: Some(pb::ruleset_ref::Kind::Index(i)),
-                        }),
-                        ..Default::default()
-                    })),
-                    ..Default::default()
-                })
-                .collect(),
-            ..Default::default()
-        };
-        let prepared = engine.graphs[&id].prepare(&mut program.clone()).unwrap();
-        let native_rules = prepared.rules.clone();
-        let native_sets = prepared.rulesets.clone();
-        assert_ne!(native_rules[0], native_rules[1]);
-        let selectors: HashMap<_, _> = prepared
-            .installations
-            .iter()
-            .filter_map(|i| match &i.command {
-                Some(Command::UnstableCombinedRuleset(_, name, children)) => {
-                    Some((name.clone(), children.clone()))
-                }
-                _ => None,
-            })
-            .collect();
-        assert_eq!(
-            selectors[&native_sets[0]],
-            [format!("{}_holder", native_rules[0])]
-        );
-        assert_eq!(
-            selectors[&native_sets[1]],
-            [format!("{}_holder", native_rules[1])]
-        );
-        assert_eq!(
-            selectors[&native_sets[2]],
-            [
-                format!("{}_holder", native_rules[1]),
-                format!("{}_holder", native_rules[0])
-            ]
-        );
-        let first = run_host_default(&mut engine, id, program.clone());
-        assert_eq!(first.error, None);
-        assert_eq!(
-            first
-                .profile
-                .unwrap()
-                .runs
-                .iter()
-                .map(|r| r.rules.iter().map(|r| r.matches.unwrap()).sum::<u64>())
-                .collect::<Vec<_>>(),
-            [2, 0, 0]
-        );
-        assert_eq!(engine.graphs[&id].rules, native_rules);
-        assert_eq!(engine.graphs[&id].rulesets, native_sets);
-        assert!(
-            engine.graphs[&id]
-                .prepare(&mut program.clone())
-                .unwrap()
-                .installations
-                .is_empty()
-        );
-        let before = engine.graphs[&id].definitions.clone();
-        let serial = engine.graphs[&id].request;
-        let mut conflict = program.clone();
-        conflict.rules[0].no_decomp = true;
-        conflict.declarations.push(pb::Declaration {
-            kind: Some(pb::declaration::Kind::EqSort(pb::EqSort {
-                name: "must-not-register".into(),
-                ..Default::default()
-            })),
-            ..Default::default()
-        });
-        conflict.rulesets.push(pb::Ruleset {
-            name: Some("must-not-publish".into()),
-            kind: Some(pb::ruleset::Kind::Rules(pb::RuleList::default())),
-            ..Default::default()
-        });
-        let rejected = run_host_default(&mut engine, id, conflict);
-        assert!(rejected.error.is_some());
-        assert!(rejected.outputs.is_empty());
-        assert!(rejected.profile.unwrap().maintenance.is_empty());
-        let session = &engine.graphs[&id];
-        assert_eq!(session.definitions, before);
-        assert_eq!(session.request, serial);
-        assert_eq!(session.rules, native_rules);
-        assert_eq!(session.rulesets, native_sets);
-        assert!(
-            session
-                .graph
-                .get_sort_by_name("must-not-register")
-                .is_none()
-        );
-        // A new leaf around the locally matched shared rule gets a selector,
-        // not another rule registration or cursor.
-        program.rulesets.push(pb::Ruleset {
-            name: Some("fresh-leaf".into()),
-            kind: Some(pb::ruleset::Kind::Rules(pb::RuleList { rules: vec![0] })),
-            ..Default::default()
-        });
-        program.commands[0] = pb::Command {
-            kind: Some(pb::command::Kind::Run(pb::Run {
-                ruleset: Some(pb::RulesetRef {
-                    kind: Some(pb::ruleset_ref::Kind::Index(3)),
-                }),
-                ..Default::default()
-            })),
-            ..Default::default()
-        };
-        let prepared = engine.graphs[&id].prepare(&mut program.clone()).unwrap();
-        assert_eq!(prepared.installations.len(), 1);
-        assert!(
-            matches!(&prepared.installations[0].command, Some(Command::UnstableCombinedRuleset(_, _, children)) if children == &[format!("{}_holder", native_rules[0])])
-        );
-        let response = run_host_default(&mut engine, id, program);
-        assert_eq!(response.error, None);
-        assert!(
-            response
-                .profile
-                .unwrap()
-                .runs
-                .iter()
-                .all(|r| r.rules.iter().all(|r| r.matches == Some(0)))
-        );
-        assert_eq!(engine.graphs[&id].rules, native_rules);
-        assert_eq!(
-            &engine.graphs[&id].rulesets[..native_sets.len()],
-            native_sets
-        );
-    }
-
-    #[test]
-    fn installation_moves_retained_descriptor_payloads() {
-        let (mut engine, id) = host_default_engine();
-        let span = Some(pb::Span {
-            file: 0,
-            start: 0,
-            end: 1,
-        });
-        let mut program = pb::Program {
-            sorts: vec![pb::Sort {
-                kind: Some(pb::sort::Kind::Family(pb::HostSort {
-                    name: "i64".into(),
-                    args: vec![],
-                })),
-                ..Default::default()
-            }],
-            files: vec![pb::SourceFile {
-                name: "retained.egg".into(),
-                contents: Some("retained source contents\n".repeat(128)),
-            }],
-            declarations: vec![pb::Declaration {
-                kind: Some(pb::declaration::Kind::Function(pb::Function {
-                    name: "retained-function".into(),
-                    output: 0,
-                    ..Default::default()
-                })),
-                span,
-                ..Default::default()
-            }],
-            rules: vec![pb::Rule {
-                name: Some("retained-rule".into()),
-                eval_mode: pb::RuleEvalMode::Seminaive.into(),
-                kind: Some(pb::rule::Kind::Rule(pb::RuleBody::default())),
-                span,
-                ..Default::default()
-            }],
-            rulesets: vec![pb::Ruleset {
-                name: Some("retained-root".into()),
-                kind: Some(pb::ruleset::Kind::Rules(pb::RuleList { rules: vec![0] })),
-                span,
-                ..Default::default()
-            }],
-            ..Default::default()
-        };
-        let session = engine.graphs.get_mut(&id).unwrap();
-        let prepared = session.prepare(&mut program).unwrap();
-        let payloads = |definitions: &pb::Program| {
-            let file = definitions
-                .files
-                .iter()
-                .find(|file| file.name == "retained.egg")
-                .unwrap();
-            let function = definitions
-                .declarations
-                .iter()
-                .find_map(|declaration| match &declaration.kind {
-                    Some(pb::declaration::Kind::Function(function))
-                        if function.name == "retained-function" =>
-                    {
-                        Some(function)
-                    }
-                    _ => None,
-                })
-                .unwrap();
-            assert_eq!(definitions.rules.len(), 1);
-            assert_eq!(definitions.rules[0].name.as_deref(), Some("retained-rule"));
-            assert_eq!(definitions.rulesets.len(), 1);
-            assert_eq!(
-                definitions.rulesets[0].name.as_deref(),
-                Some("retained-root")
-            );
-            [
-                file.contents.as_ref().unwrap().as_ptr(),
-                function.name.as_ptr(),
-                definitions.rules[0].name.as_ref().unwrap().as_ptr(),
-                definitions.rulesets[0].name.as_ref().unwrap().as_ptr(),
-            ]
-        };
-        let before = payloads(&prepared.definitions);
-        let mut expected = prepared.definitions.clone();
-        assert_eq!(
-            crate::builtin::definitions::retain_rulesets(&mut expected, &[0]).unwrap(),
-            (vec![0], vec![0])
-        );
-        let mut response = pb::RunProgramResponse {
-            profile: Some(pb::ProfileSummary::default()),
-            ..Default::default()
-        };
-        session.install(prepared, &mut response).unwrap();
-        assert_eq!(
-            response.ruleset_publication.unwrap().names,
-            ["retained-root"]
-        );
-        assert!(response.outputs.is_empty());
-        assert_eq!(session.definitions, expected);
-        assert_eq!(
-            payloads(&session.definitions),
-            before,
-            "installation must move retained descriptor payloads"
-        );
-    }
-
-    #[test]
-    fn native_fault_between_installation_steps_retains_only_completed_roots() {
-        // Deliberate in-module fault injection into a genuinely prepared plan:
-        // real native panic execution, not a public-request reachability claim.
-        // The encoded trailing-maintenance-failure tests cover that boundary.
-        for after_first_root in [false, true] {
-            let (mut engine, id) = host_default_engine();
-            let program = pb::Program {
-                rules: vec![pb::Rule {
-                    eval_mode: pb::RuleEvalMode::Seminaive.into(),
-                    kind: Some(pb::rule::Kind::Rule(pb::RuleBody::default())),
-                    ..Default::default()
-                }],
-                rulesets: ["first", "second"]
-                    .into_iter()
-                    .map(|name| pb::Ruleset {
-                        name: Some(name.into()),
-                        kind: Some(pb::ruleset::Kind::Rules(pb::RuleList { rules: vec![0] })),
-                        ..Default::default()
-                    })
-                    .collect(),
-                commands: (0..2)
-                    .map(|i| pb::Command {
-                        kind: Some(pb::command::Kind::Run(pb::Run {
-                            ruleset: Some(pb::RulesetRef {
-                                kind: Some(pb::ruleset_ref::Kind::Index(i)),
-                            }),
-                            ..Default::default()
-                        })),
-                        ..Default::default()
-                    })
-                    .collect(),
-                ..Default::default()
-            };
-            let session = engine.graphs.get_mut(&id).unwrap();
-            let mut prepared = session.prepare(&mut program.clone()).unwrap();
-            let old_rule = prepared.rules[0].clone();
-            let old_first = prepared.rulesets[0].clone();
-            let boundary = prepared
-                .installations
-                .iter()
-                .position(|i| i.ruleset == Some(usize::from(after_first_root)))
-                .unwrap();
-            let commands = session
-                .graph
-                .parse_program(None, "(panic \"installation fault\")")
-                .unwrap();
-            prepared.installations.splice(
-                boundary..boundary,
-                commands.into_iter().map(|command| Installation {
-                    command: Some(command),
-                    site: pb::maintenance_site::Target::Ruleset(0),
-                    span: None,
-                    declaration: None,
-                    ruleset: None,
-                }),
-            );
-            let mut response = pb::RunProgramResponse {
-                profile: Some(pb::ProfileSummary::default()),
-                ..Default::default()
-            };
-            assert!(session.install(prepared, &mut response).is_err());
-            assert_eq!(
-                response.ruleset_publication.unwrap().names,
-                if after_first_root {
-                    vec!["first"]
-                } else {
-                    vec![]
-                }
-            );
-            assert!(response.outputs.is_empty());
-            assert_eq!(
-                session.definitions.rulesets.len(),
-                usize::from(after_first_root)
-            );
-            assert_eq!(
-                session.definitions.rules.len(),
-                usize::from(after_first_root)
-            );
-            assert!(
-                !session
-                    .definitions
-                    .rulesets
-                    .iter()
-                    .any(|s| s.name.as_deref() == Some("second"))
-            );
-            // The orphan native singleton survives, while only a completed
-            // published root authorizes retaining its canonical occurrence.
-            let orphan = session
-                .graph
-                .parse_program(None, &format!("(run {old_rule}_holder 1)"))
-                .unwrap();
-            session.graph.validate_program(orphan).unwrap();
-            if after_first_root {
-                assert_eq!(session.rules, std::slice::from_ref(&old_rule));
-                assert_eq!(session.rulesets, std::slice::from_ref(&old_first));
-                let consume = run_host_default(
-                    &mut engine,
-                    id,
-                    pb::Program {
-                        commands: vec![pb::Command {
-                            kind: Some(pb::command::Kind::Run(pb::Run {
-                                ruleset: Some(pb::RulesetRef {
-                                    kind: Some(pb::ruleset_ref::Kind::Name("first".into())),
-                                }),
-                                ..Default::default()
-                            })),
-                            ..Default::default()
-                        }],
-                        ..Default::default()
-                    },
-                );
-                assert_eq!(consume.error, None);
-                assert!(consume.ruleset_publication.unwrap().names.is_empty());
-                assert_eq!(consume.profile.unwrap().runs[0].rules[0].matches, Some(1));
-            }
-            let retry = run_host_default(&mut engine, id, program);
-            assert_eq!(retry.error, None);
-            assert_eq!(
-                retry.ruleset_publication.unwrap().names,
-                ["first", "second"]
-            );
-            assert_eq!(
-                retry
-                    .profile
-                    .unwrap()
-                    .runs
-                    .iter()
-                    .map(|r| r.rules.iter().map(|r| r.matches.unwrap()).sum::<u64>())
-                    .collect::<Vec<_>>(),
-                [u64::from(!after_first_root), 0]
-            );
-            let session = &engine.graphs[&id];
-            assert_eq!(session.rules[0] == old_rule, after_first_root);
-            assert_eq!(session.rulesets[0] == old_first, after_first_root);
-            assert_eq!(session.definitions.rules.len(), 1);
-            assert_eq!(session.definitions.rulesets.len(), 2);
-        }
-    }
-
-    #[test]
-    fn failed_candidate_closure_is_not_a_transparent_later_dependency() {
-        // Diagnostic for frontend retry policy, using an injected native
-        // installation failure. This does not prove that this failure point is
-        // reachable through the ordinary public typed API without injection.
-        let (mut engine, id) = host_default_engine();
-        let candidate = pb::Program {
-            sorts: vec![pb::Sort {
-                kind: Some(pb::sort::Kind::Eq("Item".into())),
-                ..Default::default()
-            }],
-            declarations: vec![
-                pb::Declaration {
-                    kind: Some(pb::declaration::Kind::EqSort(pb::EqSort {
-                        name: "Item".into(),
-                        ..Default::default()
-                    })),
-                    ..Default::default()
-                },
-                pb::Declaration {
-                    kind: Some(pb::declaration::Kind::Constructor(pb::Constructor {
-                        name: "D".into(),
-                        output: 0,
-                        ..Default::default()
-                    })),
-                    ..Default::default()
-                },
-            ],
-            nodes: vec![pb::Node {
-                sort_id: 0,
-                kind: Some(pb::node::Kind::Call(pb::Call {
-                    func: "D".into(),
-                    args: vec![],
-                })),
-                ..Default::default()
-            }],
-            rules: vec![
-                pb::Rule {
-                    eval_mode: pb::RuleEvalMode::Seminaive.into(),
-                    kind: Some(pb::rule::Kind::Rule(pb::RuleBody::default())),
-                    ..Default::default()
-                },
-                pb::Rule {
-                    eval_mode: pb::RuleEvalMode::Seminaive.into(),
-                    kind: Some(pb::rule::Kind::Rule(pb::RuleBody {
-                        query: vec![],
-                        head: vec![pb::Action {
-                            kind: Some(pb::action::Kind::Term(0)),
-                            ..Default::default()
-                        }],
-                    })),
-                    ..Default::default()
-                },
-            ],
-            rulesets: vec![pb::Ruleset {
-                name: Some("A".into()),
-                kind: Some(pb::ruleset::Kind::Rules(pb::RuleList { rules: vec![0, 1] })),
-                ..Default::default()
-            }],
-            ..Default::default()
-        };
-        let session = engine.graphs.get_mut(&id).unwrap();
-        let mut prepared = session.prepare(&mut candidate.clone()).unwrap();
-        let before_d = prepared
-            .installations
-            .iter()
-            .position(|i| i.site == pb::maintenance_site::Target::Declaration(1))
-            .unwrap();
-        let panic = session
-            .graph
-            .parse_program(None, "(panic \"before D\")")
-            .unwrap()
-            .remove(0);
-        prepared.installations.insert(
-            before_d,
-            Installation {
-                command: Some(panic),
-                site: pb::maintenance_site::Target::Declaration(1),
-                span: None,
-                declaration: None,
-                ruleset: None,
-            },
-        );
-        let mut response = pb::RunProgramResponse {
-            profile: Some(pb::ProfileSummary::default()),
-            ..Default::default()
-        };
-        assert!(session.install(prepared, &mut response).is_err());
-        assert!(response.ruleset_publication.unwrap().names.is_empty());
-        assert!(session.definitions.rulesets.is_empty());
-        assert!(session.definitions.rules.is_empty());
-        assert!(!session.definitions.declarations.iter().any(
-            |d| matches!(&d.kind, Some(pb::declaration::Kind::Constructor(c)) if c.name == "D")
-        ));
-
-        let mut recovery = candidate.clone();
-        recovery.rules.clear();
-        recovery.rulesets.clear();
-        recovery.nodes.clear();
-        let Some(pb::declaration::Kind::Constructor(d)) = &mut recovery.declarations[1].kind else {
-            unreachable!()
-        };
-        d.inputs.push(pb::Arg {
-            sort: 0,
-            ..Default::default()
-        });
-        assert_eq!(run_host_default(&mut engine, id, recovery).error, None);
-
-        let standalone = pb::Program {
-            rules: vec![candidate.rules[0].clone()], // r does not depend on D
-            rulesets: vec![pb::Ruleset {
-                name: Some("B".into()),
-                kind: Some(pb::ruleset::Kind::Rules(pb::RuleList { rules: vec![0] })),
-                ..Default::default()
-            }],
-            commands: vec![pb::Command {
-                kind: Some(pb::command::Kind::Run(pb::Run {
-                    ruleset: Some(pb::RulesetRef {
-                        kind: Some(pb::ruleset_ref::Kind::Name("B".into())),
-                    }),
-                    ..Default::default()
-                })),
-                ..Default::default()
-            }],
-            ..Default::default()
-        };
-        let valid = run_host_default(&mut engine, id, standalone.clone());
-        assert_eq!(valid.error, None);
-        assert_eq!(valid.ruleset_publication.unwrap().names, ["B"]);
-        assert_eq!(valid.profile.unwrap().runs[0].rules[0].matches, Some(1));
-        let before = engine.graphs[&id].definitions.clone();
-        let mut full_retry = candidate;
-        full_retry.rulesets.extend(standalone.rulesets.clone());
-        full_retry.commands = standalone.commands.clone();
-        let conflict = run_host_default(&mut engine, id, full_retry);
-        assert!(conflict.ruleset_publication.unwrap().names.is_empty());
-        assert!(
-            conflict
-                .error
-                .unwrap()
-                .message
-                .contains("conflicting declaration D")
-        );
-        assert!(conflict.outputs.is_empty());
-        assert!(conflict.profile.unwrap().maintenance.is_empty());
-        assert_eq!(engine.graphs[&id].definitions, before);
-        let valid = run_host_default(&mut engine, id, standalone);
-        assert_eq!(valid.error, None);
-        assert_eq!(valid.ruleset_publication.unwrap().names, ["B"]);
-        assert_eq!(
-            valid.profile.unwrap().runs[0]
-                .rules
-                .iter()
-                .map(|r| r.matches.unwrap())
-                .sum::<u64>(),
-            0
-        );
-    }
-
-    #[test]
-    fn publication_receipt_tracks_first_name_completion_before_compaction() {
-        // Inject before/after the metadata-only step, without asserting that
-        // either fault is reachable through an ordinary public request.
-        for complete_name in [false, true] {
-            let (mut engine, id) = host_default_engine();
-            let mut program = pb::Program {
-                rulesets: vec![
-                    pb::Ruleset {
-                        kind: Some(pb::ruleset::Kind::Rules(pb::RuleList::default())),
-                        ..Default::default()
-                    },
-                    pb::Ruleset {
-                        name: Some("parent".into()),
-                        kind: Some(pb::ruleset::Kind::Combined(pb::CombinedRuleset {
-                            rulesets: vec![pb::RulesetRef {
-                                kind: Some(pb::ruleset_ref::Kind::Index(0)),
-                            }],
-                        })),
-                        ..Default::default()
-                    },
-                ],
-                ..Default::default()
-            };
-            let initial = run_host_default(&mut engine, id, program.clone());
-            assert_eq!(initial.error, None);
-            assert_eq!(initial.ruleset_publication.unwrap().names, ["parent"]);
-            let session = engine.graphs.get_mut(&id).unwrap();
-            let native_sets = session.rulesets.clone();
-            assert_eq!(native_sets.len(), 2);
-            assert!(session.rules.is_empty());
-
-            // A relocated empty child has no shared rule to witness identity.
-            // The unused anonymous entry must disappear during compaction.
-            program.rulesets.insert(0, program.rulesets[0].clone());
-            program.rulesets[1].name = Some(String::new());
-            let Some(pb::ruleset::Kind::Combined(parent)) = &mut program.rulesets[2].kind else {
-                unreachable!()
-            };
-            parent.rulesets[0].kind = Some(pb::ruleset_ref::Kind::Index(1));
-            program.rulesets.push(pb::Ruleset {
-                name: Some("failed".into()),
-                kind: Some(pb::ruleset::Kind::Rules(pb::RuleList::default())),
-                ..Default::default()
-            });
-            let mut prepared = session.prepare(&mut program.clone()).unwrap();
-            assert_eq!(prepared.installations.len(), 2);
-            assert!(prepared.installations[0].command.is_none());
-            let boundary = usize::from(complete_name);
-            let command = session
-                .graph
-                .parse_program(None, "(panic \"installation fault\")")
-                .unwrap()
-                .remove(0);
-            prepared.installations.insert(
-                boundary,
-                Installation {
-                    command: Some(command),
-                    site: pb::maintenance_site::Target::Ruleset(3),
-                    span: None,
-                    declaration: None,
-                    ruleset: None,
-                },
-            );
-            let mut response = pb::RunProgramResponse {
-                profile: Some(pb::ProfileSummary::default()),
-                ..Default::default()
-            };
-            assert!(session.install(prepared, &mut response).is_err());
-            assert_eq!(
-                response.ruleset_publication.unwrap().names,
-                if complete_name {
-                    vec!["", "parent"]
-                } else {
-                    vec!["parent"]
-                }
-            );
-            assert_eq!(session.rulesets, native_sets);
-            assert!(session.rules.is_empty());
-            assert_eq!(session.definitions.rulesets.len(), 2);
-            assert_eq!(
-                session.definitions.rulesets[0].name.as_deref(),
-                complete_name.then_some("")
-            );
-            assert_eq!(
-                session.definitions.rulesets[1].name.as_deref(),
-                Some("parent")
-            );
-            let retry = run_host_default(&mut engine, id, program);
-            assert_eq!(retry.error, None);
-            assert_eq!(
-                retry.ruleset_publication.unwrap().names,
-                ["", "failed", "parent"]
-            );
-            let session = &engine.graphs[&id];
-            assert_eq!(&session.rulesets[..2], native_sets);
-            assert_eq!(session.rulesets.len(), 3);
-            assert!(session.rules.is_empty());
-        }
-    }
-
-    #[test]
-    fn first_name_enrichment_waits_for_its_installation_step() {
-        let (mut engine, id) = host_default_engine();
-        let session = engine.graphs.get_mut(&id).unwrap();
-        session.graph = std::mem::take(&mut session.graph).with_proofs_enabled();
-        session.mode = pb::ExecutionMode::Proofs;
-        let commands = session.graph.parse_program(None, "(sort Foreign)").unwrap();
-        let mut helpers = Vec::new();
-        session
-            .graph
-            .run_program_observed(commands, &mut |_, _, _| {}, &mut |_, event| {
-                if let ExecutionEvent::CommandCompleted {
-                    origin: ExecutionOrigin::Internal,
-                    command: ast::ResolvedNCommand::AddRuleset(_, name),
-                } = event
-                {
-                    helpers.push(name.clone());
-                }
-            })
-            .unwrap();
-        let mut definitions = pb::Program {
-            rulesets: vec![
-                pb::Ruleset {
-                    kind: Some(pb::ruleset::Kind::Rules(pb::RuleList::default())),
-                    ..Default::default()
-                },
-                pb::Ruleset {
-                    name: Some("parent".into()),
-                    kind: Some(pb::ruleset::Kind::Combined(pb::CombinedRuleset {
-                        rulesets: vec![pb::RulesetRef {
-                            kind: Some(pb::ruleset_ref::Kind::Index(0)),
-                        }],
-                    })),
-                    ..Default::default()
-                },
-            ],
-            ..Default::default()
-        };
-        let initial = run_host_default(&mut engine, id, definitions.clone());
-        assert_eq!(initial.error, None);
-        assert_eq!(initial.ruleset_publication.unwrap().names, ["parent"]);
-        let before = engine.graphs[&id].rulesets.clone();
-        let session = engine.graphs.get_mut(&id).unwrap();
-        let mut poison = session
-            .graph
-            .parse_program(None, "(rule () ((panic \"maintenance failed\")))")
-            .unwrap();
-        let Command::Rule { rule } = &mut poison[0] else {
-            unreachable!()
-        };
-        rule.ruleset = helpers.last().unwrap().clone();
-        session.graph.run_program(poison).unwrap();
-        definitions.rulesets[0].name = Some("child".into());
-        let Some(pb::ruleset::Kind::Combined(c)) = &mut definitions.rulesets[1].kind else {
-            unreachable!()
-        };
-        c.rulesets[0].kind = Some(pb::ruleset_ref::Kind::Index(1));
-        definitions.rulesets.insert(
-            0,
-            pb::Ruleset {
-                name: Some("first".into()),
-                kind: Some(pb::ruleset::Kind::Rules(pb::RuleList::default())),
-                ..Default::default()
-            },
-        );
-        let failed = run_host_default(&mut engine, id, definitions.clone());
-        assert_eq!(
-            failed.ruleset_publication.unwrap().names,
-            ["first", "parent"]
-        );
-        assert_eq!(failed.error.unwrap().code, i32::from(pb::ErrorCode::Panic));
-        let session = &engine.graphs[&id];
-        assert!(
-            session
-                .definitions
-                .rulesets
-                .iter()
-                .any(|s| s.name.as_deref() == Some("first"))
-        );
-        assert!(
-            !session
-                .definitions
-                .rulesets
-                .iter()
-                .any(|s| s.name.as_deref() == Some("child"))
-        );
-        assert_eq!(&session.rulesets[..before.len()], before);
-        // The failing seminaive helper has consumed its empty-query match.
-        // Retry keeps the completed root and assigns the child without native work.
-        let retried = run_host_default(&mut engine, id, definitions);
-        assert_eq!(retried.error, None);
-        assert_eq!(
-            retried.ruleset_publication.unwrap().names,
-            ["child", "first", "parent"]
-        );
-        assert!(retried.profile.unwrap().maintenance.is_empty());
-        assert!(
-            engine.graphs[&id]
-                .definitions
-                .rulesets
-                .iter()
-                .any(|s| s.name.as_deref() == Some("child"))
-        );
-    }
-
-    #[test]
-    fn definition_registration_and_requested_proof_survive_trailing_maintenance_failure() {
-        let (mut engine, id) = host_default_engine();
-        let session = engine.graphs.get_mut(&id).unwrap();
-        session.graph = std::mem::take(&mut session.graph).with_proofs_enabled();
-        session.mode = pb::ExecutionMode::Proofs;
-        // Discover native identity through the observed registration event, not
-        // a naming convention, before injecting the test-only failing helper.
-        let commands = session.graph.parse_program(None, "(sort Foreign)").unwrap();
-        let mut helpers = vec![];
-        session
-            .graph
-            .run_program_observed(commands, &mut |_, _, _| {}, &mut |_, event| {
-                if let ExecutionEvent::CommandCompleted {
-                    origin: ExecutionOrigin::Internal,
-                    command: ast::ResolvedNCommand::AddRuleset(_, name),
-                } = event
-                {
-                    helpers.push(name.clone());
-                }
-            })
-            .unwrap();
-        assert_eq!(helpers.len(), 6);
-        let mut phases = source::Source::new(None, "(datatype Num (N i64) (Goal i64)) (ruleset r) (rule ((N x)) ((Goal x)) :ruleset r) (N 1) (run r 1) (prove-exists Goal)").unwrap().peekable();
-        let proof_program = loop {
-            let program = phases.next().unwrap().unwrap();
-            if phases.peek().is_none() {
-                break program;
-            }
-            assert_eq!(run_host_default(&mut engine, id, program).error, None);
-        };
-        let session = engine.graphs.get_mut(&id).unwrap();
-        let mut poison = session
-            .graph
-            .parse_program(None, "(rule () ((panic \"maintenance failed\")))")
-            .unwrap();
-        let Command::Rule { rule } = &mut poison[0] else {
-            unreachable!()
-        };
-        rule.ruleset = helpers.last().unwrap().clone();
-        session.graph.run_program(poison).unwrap();
-        let baseline = session.clone();
-
-        let mut definitions = pb::Program {
-            files: vec![pb::SourceFile {
-                name: "install.egg".into(),
-                contents: Some("first second".into()),
-            }],
-            rulesets: vec![
-                pb::Ruleset {
-                    name: Some("first".into()),
-                    span: Some(pb::Span {
-                        file: 0,
-                        start: 0,
-                        end: 5,
-                    }),
-                    kind: Some(pb::ruleset::Kind::Rules(pb::RuleList::default())),
-                    ..Default::default()
-                },
-                pb::Ruleset {
-                    name: Some("second".into()),
-                    span: Some(pb::Span {
-                        file: 0,
-                        start: 6,
-                        end: 12,
-                    }),
-                    kind: Some(pb::ruleset::Kind::Rules(pb::RuleList::default())),
-                    ..Default::default()
-                },
-            ],
-            ..Default::default()
-        };
-        definitions.commands.push(pb::Command {
-            kind: Some(pb::command::Kind::ProveExists(pb::ProveExists {
-                constructor: "unknown".into(),
-            })),
-            ..Default::default()
-        });
-        let invalid = run_host_default(&mut engine, id, definitions.clone());
-        assert!(invalid.ruleset_publication.unwrap().names.is_empty());
-        assert_eq!(
-            invalid.error.unwrap().code,
-            i32::from(pb::ErrorCode::UnknownName)
-        );
-        assert!(invalid.profile.unwrap().maintenance.is_empty());
-        assert!(
-            !engine.graphs[&id]
-                .definitions
-                .rulesets
-                .iter()
-                .any(|s| s.name.as_deref() == Some("first"))
-        );
-        definitions.commands.clear();
-        let failed = run_host_default(&mut engine, id, definitions.clone());
-        assert_eq!(failed.ruleset_publication.unwrap().names, ["first"]);
-        let error = failed.error.unwrap();
-        assert_eq!(error.code, i32::from(pb::ErrorCode::Panic));
-        assert_eq!(error.location, None);
-        assert_eq!(error.span, definitions.rulesets[0].span);
-        assert!(failed.outputs.is_empty());
-        let profile = failed.profile.unwrap();
-        assert!(!profile.complete && profile.runs.is_empty());
-        assert_eq!(profile.maintenance.len(), 1);
-        let maintenance = &profile.maintenance[0];
-        assert_eq!(
-            maintenance.site.as_ref().unwrap().target,
-            Some(pb::maintenance_site::Target::Ruleset(0))
-        );
-        assert!(maintenance.invocations > 1); // includes successes before failure
-        assert_eq!(
-            (
-                maintenance.search_and_apply_nanos,
-                maintenance.merge_nanos,
-                maintenance.rebuild_nanos
-            ),
-            (None, None, None)
-        );
-        let session = engine.graphs.get_mut(&id).unwrap();
-        let first = session
-            .definitions
-            .rulesets
-            .iter()
-            .position(|s| s.name.as_deref() == Some("first"))
-            .unwrap();
-        assert!(
-            !session
-                .definitions
-                .rulesets
-                .iter()
-                .any(|s| s.name.as_deref() == Some("second"))
-        );
-        let native_first = session.rulesets[first].clone();
-        let commands = session
-            .graph
-            .parse_program(None, &format!("(run {native_first} 1)"))
-            .unwrap();
-        session.graph.validate_program(commands).unwrap();
-        definitions.rulesets.remove(0);
-        let prepared = session.prepare(&mut definitions).unwrap();
-        assert_eq!(prepared.installations.len(), 1); // second was never recorded
-
-        engine.graphs.insert(id, baseline.clone());
-        let mut program = proof_program.clone();
-        // Add a distinct native action after the proof, via the actual producer.
-        let mut suffix =
-            source::Source::new(None, "(datatype Num (N i64) (Goal i64)) (N 2)").unwrap();
-        suffix.next().unwrap().unwrap();
-        let suffix = suffix.next().unwrap().unwrap();
-        let original_nodes = program.nodes.len() as u32;
-        program
-            .nodes
-            .extend(suffix.nodes.iter().cloned().map(|mut node| {
-                if let Some(pb::node::Kind::Call(call)) = &mut node.kind {
-                    for index in &mut call.args {
-                        *index += original_nodes;
-                    }
-                }
-                node
-            }));
-        let mut action = suffix.commands[0].clone();
-        let Some(pb::command::Kind::Action(pb::Action {
-            kind: Some(pb::action::Kind::Term(index)),
-            ..
-        })) = &mut action.kind
-        else {
-            unreachable!()
-        };
-        *index += original_nodes;
-        program.commands.push(action);
-        let response = run_host_default(&mut engine, id, program);
-        assert_eq!(
-            response
-                .error
-                .as_ref()
-                .unwrap()
-                .location
-                .as_ref()
-                .unwrap()
-                .path,
-            [0]
-        );
-        assert_eq!(response.outputs.len(), 1);
-        let Some(pb::command_output::Kind::Proof(proof)) = &response.outputs[0].kind else {
-            panic!("completed anchor")
-        };
-        proof::validate(proof).unwrap();
-        assert_eq!(response.profile.as_ref().unwrap().maintenance.len(), 1);
-        assert_eq!(
-            response.profile.as_ref().unwrap().maintenance[0].search_and_apply_nanos,
-            None
-        );
-        let Some(pb::command::Kind::Action(pb::Action {
-            kind: Some(pb::action::Kind::Term(index)),
-            ..
-        })) = suffix.commands[0].kind
-        else {
-            unreachable!()
-        };
-        let mut check = suffix;
-        check.commands = vec![pb::Command {
-            kind: Some(pb::command::Kind::Check(pb::Check { facts: vec![index] })),
-            ..Default::default()
-        }];
-        check.declarations.clear();
-        assert_eq!(
-            run_host_default(&mut engine, id, check).error.unwrap().code,
-            i32::from(pb::ErrorCode::CheckFailed)
-        );
-        // Injected lifecycle controls: no public access to private maintenance
-        // rules is implied. A zero loop completes before trailing maintenance;
-        // a caught inline-helper error must not leak its nested locator into
-        // that later failure or into an outer ExpectFail.
-        let mut loop_baseline = baseline.clone();
-        let mut repeated_poison = loop_baseline
-            .graph
-            .parse_program(None, "(rule () ((panic \"maintenance failed\")) :naive)")
-            .unwrap();
-        let Command::Rule { rule } = &mut repeated_poison[0] else {
-            unreachable!()
-        };
-        rule.ruleset = helpers.last().unwrap().clone();
-        loop_baseline.graph.run_program(repeated_poison).unwrap();
-        for case in [
-            "loop-completed",
-            "loop-caught",
-            "loop-uncaught",
-            "loop-double-fail",
-        ] {
-            engine.graphs.insert(id, loop_baseline.clone());
-            let mut command = pb::Command {
-                kind: Some(pb::command::Kind::Repeat(pb::Repeat {
-                    times: Some(if case == "loop-completed" { 0 } else { 1 }),
-                    body: vec![pb::Command {
-                        kind: Some(pb::command::Kind::Run(pb::Run {
-                            ruleset: Some(pb::RulesetRef {
-                                kind: Some(pb::ruleset_ref::Kind::Name("r".into())),
-                            }),
-                            ..Default::default()
-                        })),
-                        ..Default::default()
-                    }],
-                    ..Default::default()
-                })),
-                ..Default::default()
-            };
-            for _ in 0..match case {
-                "loop-caught" => 1,
-                "loop-double-fail" => 2,
-                _ => 0,
-            } {
-                command = pb::Command {
-                    kind: Some(pb::command::Kind::Fail(Box::new(command))),
-                    ..Default::default()
-                };
-            }
-            let response = run_host_default(
-                &mut engine,
-                id,
-                pb::Program {
-                    commands: vec![command],
-                    ..Default::default()
-                },
-            );
-            let error = response
-                .error
-                .as_ref()
-                .unwrap_or_else(|| panic!("{case}: {response:?}"));
-            let location = error.location.as_ref().unwrap();
-            if case == "loop-uncaught" {
-                assert_eq!(location.path, [0, 0]);
-                assert_eq!(location.iterations, [0]);
-            } else {
-                assert_eq!(location.path, [0]);
-                assert!(location.iterations.is_empty());
-            }
-            assert_eq!(
-                error.message.contains("maintenance failed"),
-                case != "loop-double-fail"
-            );
-            assert_eq!(
-                response.outputs.len(),
-                usize::from(case == "loop-completed")
-            );
-            if case == "loop-completed" {
-                let Some(pb::command_output::Kind::Loop(outcome)) = &response.outputs[0].kind
-                else {
-                    panic!("completed loop output was lost")
-                };
-                assert_eq!(outcome.iterations, 0);
-                assert_eq!(
-                    outcome.termination,
-                    Some(pb::TerminationReason::CountReached.into())
-                );
-            }
-        }
-        // This is an injected lifecycle witness, not public access to private
-        // maintenance rules. Native Fail must keep the anchor/helper boundary.
-        for case in ["caught-anchor", "successful-anchor", "prerequisite"] {
-            engine.graphs.insert(id, baseline.clone());
-            let mut program = proof_program.clone();
-            let integer = program.sorts.iter().position(|sort| matches!(
-                &sort.kind, Some(pb::sort::Kind::Family(f)) if f.name == "i64" && f.args.is_empty()
-            )).unwrap() as u32;
-            let first = program.nodes.len() as u32;
-            for value in [0, 1] {
-                program.nodes.push(pb::Node {
-                    sort_id: integer,
-                    kind: Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
-                        value: Some(pb::primitive_value::Value::I64(value)),
-                    })),
-                    ..Default::default()
-                });
-            }
-            program.nodes.push(pb::Node {
-                sort_id: integer,
-                kind: Some(pb::node::Kind::Union(pb::Union {
-                    members: vec![first, first + 1],
-                })),
-                ..Default::default()
-            });
-            let child = pb::Command {
-                kind: Some(if case == "prerequisite" {
-                    pb::command::Kind::Prove(pb::Prove { facts: vec![] })
-                } else {
-                    pb::command::Kind::Check(pb::Check {
-                        facts: if case == "caught-anchor" {
-                            vec![first + 2]
-                        } else {
-                            vec![]
-                        },
-                    })
-                }),
-                ..Default::default()
-            };
-            program.commands = vec![pb::Command {
-                kind: Some(pb::command::Kind::Fail(Box::new(child))),
-                ..Default::default()
-            }];
-            let response = run_host_default(&mut engine, id, program);
-            let error = response.error.unwrap();
-            assert_eq!(
-                error.code,
-                i32::from(if case == "successful-anchor" {
-                    pb::ErrorCode::EvaluationFailed
-                } else {
-                    pb::ErrorCode::Panic
-                })
-            );
-            assert_eq!(error.location.as_ref().unwrap().path, [0]);
-            assert!(response.outputs.is_empty());
-            assert_eq!(
-                error.message.contains("maintenance failed"),
-                case != "successful-anchor",
-                "{case}: {error:?}"
-            );
-            assert_eq!(
-                error.message.contains("Command should have failed"),
-                case == "successful-anchor",
-                "{case}: {error:?}"
-            );
-        }
-        engine
-            .destroy(&pb::DestroyEGraphRequest { egraph_id: id }.encode_to_vec())
-            .unwrap();
-        proof::validate(proof).unwrap();
     }
 
     #[test]
@@ -11526,78 +9286,6 @@ mod tests {
     }
 
     #[test]
-    fn source_render_and_wire_export_agree_under_exact_authored_rule_mapping() {
-        let (mut engine, id) = host_default_engine();
-        let session = engine.graphs.get_mut(&id).unwrap();
-        session.graph = std::mem::take(&mut session.graph).with_proofs_enabled();
-        session.mode = pb::ExecutionMode::Proofs;
-        let mut native = crate::new_experimental_egraph().with_proofs_enabled();
-        let mut renderer = source::Renderer::default();
-        let mut names = HashMap::new();
-        let mut callable_names = HashMap::new();
-        let mut emitted_names = HashSet::new();
-        let mut compared = 0;
-        let mut mapped_heads = 0;
-        for (request, phase) in source::Source::new(None, "(datatype Num (N i64) (Goal i64)) (ruleset r) (rule ((N x)) ((Goal x)) :ruleset r :name \"derive\") (N 1) (run r 1) (prove-exists Goal)").unwrap().enumerate() {
-            let program = phase.unwrap();
-            for ruleset in &program.rulesets {
-                let Some(pb::ruleset::Kind::Rules(rules)) = &ruleset.kind else { unreachable!() };
-                for index in &rules.rules {
-                    names.insert(format!("__protobuf_{}_rule_{index}", request + 1), program.rules[*index as usize].name.clone().unwrap());
-                }
-            }
-            let text = renderer.render(&program).unwrap();
-            let commands = native.parse_program(None, &text).unwrap();
-            let constructors: Vec<_> = program.declarations.iter().filter_map(|declaration| {
-                match &declaration.kind {
-                    Some(pb::declaration::Kind::Constructor(constructor)) => Some(constructor),
-                    _ => None,
-                }
-            }).collect();
-            let emitted: Vec<_> = commands.iter().filter_map(|command| {
-                match command {
-                    Command::Constructor { name, schema, .. } => Some((name, schema)),
-                    _ => None,
-                }
-            }).collect();
-            assert_eq!(constructors.len(), emitted.len());
-            for (constructor, (name, schema)) in constructors.into_iter().zip(emitted) {
-                assert_eq!(constructor.inputs.len(), schema.input.len());
-                assert!(emitted_names.insert(name.clone()));
-                assert!(callable_names.insert(native_name("call", &constructor.name), name.clone()).is_none());
-            }
-            let mut native_proof = None;
-            native.run_program_observed(commands, &mut |_, origin, output| {
-                if origin == ExecutionOrigin::Requested && let egglog::CommandOutput::ProveExists { proof_store, proof_id } = output {
-                    native_proof = Some(proof::export(&proof_store, proof_id).unwrap());
-                }
-            }, &mut |_, _| {}).unwrap();
-            let response = run_host_default(&mut engine, id, program);
-            assert_eq!(response.error, None);
-            if let Some(native_proof) = native_proof {
-                let Some(pb::command_output::Kind::Proof(mut wire)) = response.outputs.into_iter().next().unwrap().kind else { unreachable!() };
-                for term in &mut wire.terms {
-                    if let Some(pb::proof_term::Kind::App(app)) = &mut term.kind
-                        && let Some(name) = callable_names.get(&app.head)
-                    {
-                        app.head = name.clone();
-                        mapped_heads += 1;
-                    }
-                }
-                for step in &mut wire.proofs {
-                    if let Some(pb::proof_step::Justification::Rule(rule)) = &mut step.justification {
-                        rule.name = names.get(&rule.name).expect("exact published occurrence").clone();
-                    }
-                }
-                assert_eq!(wire, native_proof); // every term, edge, literal and shared local ID
-                compared += 1;
-            }
-        }
-        assert!(compared > 0);
-        assert!(mapped_heads > 0);
-    }
-
-    #[test]
     fn leaf_summary_preserves_measured_zero_and_unavailable_totals_independently() {
         let mut report = egglog_reports::RunReport::default();
         let mut authored = LeafSummary::default();
@@ -11666,11 +9354,6 @@ mod tests {
             })),
             ..Default::default()
         });
-        program.rulesets.push(pb::Ruleset {
-            name: Some("r".into()),
-            kind: Some(pb::ruleset::Kind::Rules(pb::RuleList::default())),
-            ..Default::default()
-        });
         let prepared = session.prepare(&mut program.clone()).unwrap();
         assert_eq!(
             prepared
@@ -11682,19 +9365,13 @@ mod tests {
                 pb::maintenance_site::Target::Declaration(1),
                 pb::maintenance_site::Target::Sort(vector),
                 pb::maintenance_site::Target::Declaration(2),
-                pb::maintenance_site::Target::Ruleset(0),
             ]
         );
         let installed = run_host_default(&mut engine, id, program.clone());
         assert_eq!(installed.error, None);
         assert!(installed.outputs.is_empty());
         let maintenance = installed.profile.unwrap().maintenance;
-        assert_eq!(maintenance.len(), 1); // native Sort/Function registration has no run leaf
-        assert_eq!(
-            maintenance[0].site.as_ref().unwrap().target,
-            Some(pb::maintenance_site::Target::Ruleset(0))
-        );
-        program.rulesets.clear();
+        assert!(maintenance.is_empty(), "declaration resupply runs no rules");
         let cloned = engine
             .clone_egraph(&pb::CloneEGraphRequest { egraph_id: id }.encode_to_vec())
             .unwrap();
@@ -11714,61 +9391,16 @@ mod tests {
     // producer's monotone sort/file arenas remain cumulative in this flat input.
     fn inventory_fixture(source: &str) -> pb::Program {
         let mut program = pb::Program::default();
-        for phase in source::Source::new(Some("fixture.egg".into()), source).unwrap() {
-            let mut phase = phase.unwrap();
-            let node_offset = program.nodes.len() as u32;
-            let rule_offset = program.rules.len() as u32;
-            let set_offset = program.rulesets.len() as u32;
-            let relocate = |index: &mut u32| {
-                *index += node_offset;
-                Ok(())
-            };
-            source::source_phase_refs(&mut phase, relocate).unwrap();
-            for node in &mut phase.nodes {
-                source::source_node_refs(node, relocate).unwrap();
-            }
-            for set in &mut phase.rulesets {
-                match &mut set.kind {
-                    Some(pb::ruleset::Kind::Rules(list)) => {
-                        for index in &mut list.rules {
-                            *index += rule_offset;
-                        }
-                    }
-                    Some(pb::ruleset::Kind::Combined(combined)) => {
-                        for child in &mut combined.rulesets {
-                            if let Some(pb::ruleset_ref::Kind::Index(index)) = &mut child.kind {
-                                *index += set_offset;
-                            }
-                        }
-                    }
-                    None => (),
-                }
-            }
-            let mut pending: Vec<_> = phase.commands.iter_mut().collect();
-            while let Some(command) = pending.pop() {
-                match &mut command.kind {
-                    Some(pb::command::Kind::Run(run)) => {
-                        if let Some(pb::ruleset_ref::Kind::Index(index)) = run
-                            .ruleset
-                            .as_mut()
-                            .and_then(|reference| reference.kind.as_mut())
-                        {
-                            *index += set_offset;
-                        }
-                    }
-                    Some(pb::command::Kind::Repeat(body)) => pending.extend(&mut body.body),
-                    Some(pb::command::Kind::Saturate(body)) => pending.extend(&mut body.body),
-                    Some(pb::command::Kind::Fail(child)) => pending.push(child),
-                    _ => (),
-                }
-            }
-            program.sorts = phase.sorts;
-            program.files = phase.files;
-            program.nodes.append(&mut phase.nodes);
-            program.declarations.append(&mut phase.declarations);
-            program.commands.append(&mut phase.commands);
-            program.rules.append(&mut phase.rules);
-            program.rulesets.append(&mut phase.rulesets);
+        let phases = source::Source::new(None, source)
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        for phase in &phases {
+            crate::builtin::definitions::reconcile_declarations(phase, &mut program).unwrap();
+        }
+        for phase in &phases {
+            let files = program.files.len() as u32;
+            graph::append(&mut program, phase, files).unwrap();
         }
         program
     }
@@ -12015,17 +9647,19 @@ mod tests {
         let (mut engine, id) = host_default_engine();
         let mut program = inventory_fixture(&source);
         let mut definitions = program.clone();
-        definitions.commands.clear();
+        definitions
+            .commands
+            .retain(|command| matches!(command.kind, Some(pb::command::Kind::AddRules(_))));
         assert_eq!(run_host_default(&mut engine, id, definitions).error, None);
         program.declarations.clear();
         program.rules.clear();
-        program.rulesets.clear();
+        program
+            .commands
+            .retain(|command| !matches!(command.kind, Some(pb::command::Kind::AddRules(_))));
         let Some(pb::command::Kind::Run(run)) = &mut program.commands[1].kind else {
             panic!("fixture Run")
         };
-        run.ruleset = Some(pb::RulesetRef {
-            kind: Some(pb::ruleset_ref::Kind::Name("derive".into())),
-        });
+        run.groups = vec!["derive".into()];
         let command_span = pb::Span {
             file: 0,
             start: 0,
@@ -12098,10 +9732,7 @@ mod tests {
         assert_eq!(response.rules.len(), 1);
         let origin = &response.rules[0];
         assert_eq!(origin.name.as_deref(), Some("make-goal"));
-        assert_eq!(
-            origin.root.as_ref().unwrap().kind,
-            Some(pb::ruleset_ref::Kind::Name("derive".into()))
-        );
+        assert!(origin.kind.is_some());
         let profile = response.profile.as_ref().unwrap();
         assert!(!profile.complete);
         assert_eq!(profile.runs.len(), 1);
@@ -12175,9 +9806,7 @@ mod tests {
         );
         assert_eq!(reused.rules.len(), 1);
         let retained = &reused.rules[0];
-        assert_eq!(retained.root, origin.root);
-        assert_eq!(retained.children, origin.children);
-        assert_eq!(retained.position, origin.position);
+        assert_eq!(retained.eval_mode, origin.eval_mode);
         assert_eq!(retained.name, origin.name);
         let (before, after) = (origin.span.unwrap(), retained.span.unwrap());
         assert_eq!((before.start, before.end), (after.start, after.end));
@@ -12750,5 +10379,538 @@ mod tests {
         assert_eq!(graph.materialized_eq_classes().len(), 1);
         assert_eq!(graph.num_tuples(), 3);
         assert_eq!(graph.get_size(&native_name("call", "read")), 1);
+    }
+
+    #[test]
+    fn additive_content_retries_share_global_cursors_and_first_diagnostics() {
+        for mode in [
+            pb::ExecutionMode::Normal,
+            pb::ExecutionMode::TermEncoding,
+            pb::ExecutionMode::Proofs,
+            pb::ExecutionMode::ProofTesting,
+        ] {
+            let (mut engine, id) = host_default_engine();
+            let session = engine.graphs.get_mut(&id).unwrap();
+            session.graph = match mode {
+                pb::ExecutionMode::Normal => std::mem::take(&mut session.graph),
+                pb::ExecutionMode::TermEncoding => {
+                    std::mem::take(&mut session.graph).with_term_encoding_enabled()
+                }
+                pb::ExecutionMode::Proofs => {
+                    std::mem::take(&mut session.graph).with_proofs_enabled()
+                }
+                pb::ExecutionMode::ProofTesting => std::mem::take(&mut session.graph)
+                    .with_proofs_enabled()
+                    .with_proof_testing(),
+            };
+            session.mode = mode;
+            let mut input = inventory_fixture(
+                "(datatype E (N i64) (Goal i64)) (ruleset a) (rule ((N x)) ((Goal x)) :ruleset a :name \"first\") (N 1) (run a 1) (check (Goal 1))",
+            );
+            let first = run_host_default(&mut engine, id, input.clone());
+            assert_eq!(first.error, None);
+            assert_eq!(
+                first.profile.unwrap().runs[0]
+                    .rules
+                    .iter()
+                    .map(|rule| rule.matches.unwrap())
+                    .sum::<u64>(),
+                u64::from(mode == pb::ExecutionMode::Normal),
+                "{mode:?} requested profile"
+            );
+            input.rules[0].name = Some("later".into());
+            input.rules[0].doc = "metadata does not restart a rule".into();
+            for node in &mut input.nodes {
+                if let Some(pb::node::Kind::Var(name)) = &mut node.kind {
+                    *name = "_0".into();
+                }
+            }
+            input.commands = vec![
+                pb::Command {
+                    kind: Some(pb::command::Kind::AddRules(pb::AddRules {
+                        group: "b".into(),
+                        rules: vec![0, 0],
+                    })),
+                    ..Default::default()
+                },
+                pb::Command {
+                    kind: Some(pb::command::Kind::Run(pb::Run {
+                        groups: vec!["a".into(), "missing".into(), "b".into(), "a".into()],
+                        ..Default::default()
+                    })),
+                    ..Default::default()
+                },
+            ];
+            let retry = run_host_default(&mut engine, id, input.clone());
+            assert_eq!(retry.error, None);
+            assert_eq!(
+                retry.profile.unwrap().runs[0]
+                    .rules
+                    .iter()
+                    .map(|rule| rule.matches.unwrap())
+                    .sum::<u64>(),
+                0
+            );
+            let registry = &engine.graphs[&id].registry;
+            assert_eq!(registry.rules.len(), 1);
+            assert_eq!(registry.groups["a"], registry.groups["b"]);
+            let stats = run_host_default(
+                &mut engine,
+                id,
+                pb::Program {
+                    commands: vec![pb::Command {
+                        kind: Some(pb::command::Kind::Stats(pb::Unit {})),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                },
+            );
+            assert_eq!(stats.error, None);
+            let representative = &engine.graphs[&id].registry.rules[0]
+                .candidate
+                .record
+                .program
+                .rules[0];
+            assert_eq!(representative.name.as_deref(), Some("first"));
+            assert!(representative.doc.is_empty());
+            if mode == pb::ExecutionMode::Normal {
+                assert_eq!(stats.rules.len(), 1);
+                assert_eq!(stats.rules[0].name.as_deref(), Some("first"));
+            }
+
+            input.rules[0].no_decomp = true;
+            input.commands.truncate(1);
+            assert_eq!(run_host_default(&mut engine, id, input).error, None);
+            assert_eq!(engine.graphs[&id].registry.rules.len(), 2);
+            for groups in [vec![], vec!["unregistered".into()]] {
+                let empty = run_host_default(
+                    &mut engine,
+                    id,
+                    pb::Program {
+                        commands: vec![pb::Command {
+                            kind: Some(pb::command::Kind::Run(pb::Run {
+                                groups,
+                                ..Default::default()
+                            })),
+                            ..Default::default()
+                        }],
+                        ..Default::default()
+                    },
+                );
+                assert_eq!(empty.error, None);
+                assert!(empty.profile.unwrap().runs[0].rules.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn additive_freeze_reconstructs_membership_and_shared_content_once() {
+        let (mut engine, id) = host_default_engine();
+        let mut input = inventory_fixture(
+            "(datatype E (N i64) (Goal i64)) (ruleset a) (rule ((N x)) ((Goal x)) :ruleset a) (N 1)",
+        );
+        input.commands.push(pb::Command {
+            kind: Some(pb::command::Kind::AddRules(pb::AddRules {
+                group: "b".into(),
+                rules: vec![0],
+            })),
+            ..Default::default()
+        });
+        input.commands.push(pb::Command {
+            kind: Some(pb::command::Kind::Freeze(pb::Freeze {})),
+            ..Default::default()
+        });
+        let response = run_host_default(&mut engine, id, input);
+        assert_eq!(response.error, None);
+        let Some(pb::command_output::Kind::Snapshot(snapshot)) =
+            &response.outputs.last().unwrap().kind
+        else {
+            panic!("snapshot")
+        };
+        let program = snapshot.program.as_ref().unwrap();
+        assert_eq!(program.rules.len(), 1);
+        let additions: Vec<_> = program
+            .commands
+            .iter()
+            .filter_map(|command| match &command.kind {
+                Some(pb::command::Kind::AddRules(add)) => Some(add),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            additions
+                .iter()
+                .map(|add| add.group.as_str())
+                .collect::<Vec<_>>(),
+            ["a", "b"]
+        );
+        assert_eq!(additions[0].rules, additions[1].rules);
+        let (mut restored, fresh) = host_default_engine();
+        assert_eq!(
+            run_host_default(&mut restored, fresh, program.clone()).error,
+            None
+        );
+        let registry = &restored.graphs[&fresh].registry;
+        assert_eq!(registry.rules.len(), 1);
+        assert_eq!(registry.groups["a"], registry.groups["b"]);
+    }
+
+    #[test]
+    fn additive_source_static_wrappers_preserve_content_across_packets() {
+        let mut renderer = source::Renderer::default();
+        let mut native = crate::new_experimental_egraph();
+        let mut input = inventory_fixture(
+            "(datatype E (N i64) (Goal i64)) (ruleset a) (rule ((N x)) ((Goal x)) :ruleset a) (N 1) (run a 1) (check (Goal 1))",
+        );
+        let check = input.commands.pop().unwrap();
+        input.commands = vec![pb::Command {
+            kind: Some(pb::command::Kind::Repeat(pb::Repeat {
+                times: Some(1),
+                body: input.commands,
+                ..Default::default()
+            })),
+            ..Default::default()
+        }];
+        input.commands.push(check);
+        let initial = renderer.render(&input).unwrap();
+        native.parse_and_run_program(None, &initial).unwrap();
+        input.commands = vec![pb::Command {
+            kind: Some(pb::command::Kind::Repeat(pb::Repeat {
+                times: Some(1),
+                body: vec![
+                    pb::Command {
+                        kind: Some(pb::command::Kind::AddRules(pb::AddRules {
+                            group: "a".into(),
+                            rules: vec![0],
+                        })),
+                        ..Default::default()
+                    },
+                    pb::Command {
+                        kind: Some(pb::command::Kind::Run(pb::Run {
+                            groups: vec!["a".into()],
+                            ..Default::default()
+                        })),
+                        ..Default::default()
+                    },
+                ],
+                ..Default::default()
+            })),
+            ..Default::default()
+        }];
+        let retry = renderer.render(&input).unwrap();
+        assert!(!retry.contains("(rule "), "{retry}");
+        native.parse_and_run_program(None, &retry).unwrap();
+    }
+
+    #[test]
+    fn additive_registration_failure_retains_prefix_and_retries_same_content() {
+        // Inject a real native Panic into an otherwise prepared installation
+        // plan. This isolates completed-prefix ownership, not public reachability
+        // of this particular host failure point.
+        let (mut engine, id) = host_default_engine();
+        let first = pb::Rule {
+            name: Some("first".into()),
+            eval_mode: pb::RuleEvalMode::Seminaive.into(),
+            kind: Some(pb::rule::Kind::Rule(pb::RuleBody::default())),
+            ..Default::default()
+        };
+        let mut second = first.clone();
+        second.name = Some("second".into());
+        second.no_decomp = true;
+        let mut input = pb::Program {
+            rules: vec![first, second],
+            commands: vec![pb::Command {
+                kind: Some(pb::command::Kind::AddRules(pb::AddRules {
+                    group: "a".into(),
+                    rules: vec![0, 1],
+                })),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let session = engine.graphs.get_mut(&id).unwrap();
+        let mut prepared = session.prepare(&mut input.clone()).unwrap();
+        prepared.context.candidates[1].commands.insert(
+            1,
+            Command::Action(Action::Panic(ast::Span::Panic, "registration fault".into())),
+        );
+        let mut response = pb::RunProgramResponse {
+            profile: Some(pb::ProfileSummary::default()),
+            ..Default::default()
+        };
+        let mut context = session.install(prepared, &mut response).unwrap();
+        assert!(
+            session
+                .execute(
+                    &input,
+                    &input.commands[0],
+                    &mut context,
+                    &pb::CommandLocation {
+                        path: vec![0],
+                        iterations: vec![]
+                    },
+                    &mut response,
+                    &mut None
+                )
+                .is_err()
+        );
+        session.registry = context.registry;
+        assert_eq!(session.registry.groups["a"], [0]);
+        assert_eq!(session.registry.rules.len(), 2);
+        let first_name = session.registry.rules[0].candidate.name.clone();
+        let second_holder = format!("{}_holder", session.registry.rules[1].candidate.name);
+        session
+            .graph
+            .validate_program(vec![Command::RunSchedule(ast::Schedule::Run(
+                ast::Span::Panic,
+                ast::RunConfig {
+                    ruleset: second_holder,
+                    until: None,
+                },
+            ))])
+            .unwrap();
+
+        let run = pb::Command {
+            kind: Some(pb::command::Kind::Run(pb::Run {
+                groups: vec!["a".into()],
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+        let before_retry = run_host_default(
+            &mut engine,
+            id,
+            pb::Program {
+                commands: vec![run.clone()],
+                ..Default::default()
+            },
+        );
+        assert_eq!(before_retry.error, None);
+        assert_eq!(
+            before_retry.profile.unwrap().runs[0].rules[0].matches,
+            Some(1)
+        );
+        // Remove only the injected host fault. A compatible resupply resumes
+        // after the existing holder and preserves the first rule's cursor.
+        engine.graphs.get_mut(&id).unwrap().registry.rules[1]
+            .candidate
+            .commands
+            .remove(1);
+        input.commands.push(run);
+        let retry = run_host_default(&mut engine, id, input);
+        assert_eq!(retry.error, None);
+        assert_eq!(
+            retry.profile.unwrap().runs[0]
+                .rules
+                .iter()
+                .map(|rule| rule.matches.unwrap())
+                .sum::<u64>(),
+            1
+        );
+        let registry = &engine.graphs[&id].registry;
+        assert_eq!(registry.groups["a"], [0, 1]);
+        assert_eq!(registry.rules.len(), 2);
+        assert_eq!(registry.rules[0].candidate.name, first_name);
+    }
+
+    #[test]
+    fn additive_rule_provenance_is_shared_and_imported_once_per_submission() {
+        let (mut engine, id) = host_default_engine();
+        let first = pb::Rule {
+            name: Some("first".into()),
+            eval_mode: pb::RuleEvalMode::Seminaive.into(),
+            span: Some(pb::Span {
+                file: 0,
+                start: 0,
+                end: 1,
+            }),
+            kind: Some(pb::rule::Kind::Rule(pb::RuleBody {
+                query: vec![],
+                head: vec![pb::Action {
+                    kind: Some(pb::action::Kind::Term(0)),
+                    ..Default::default()
+                }],
+            })),
+            ..Default::default()
+        };
+        let mut second = first.clone();
+        second.name = Some("second".into());
+        second.no_decomp = true;
+        let input = pb::Program {
+            sorts: vec![pb::Sort {
+                kind: Some(pb::sort::Kind::Family(pb::HostSort {
+                    name: "i64".into(),
+                    args: vec![],
+                })),
+                ..Default::default()
+            }],
+            nodes: vec![pb::Node {
+                kind: Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
+                    value: Some(pb::primitive_value::Value::I64(7)),
+                })),
+                ..Default::default()
+            }],
+            files: vec![pb::SourceFile {
+                name: "shared.egg".into(),
+                contents: Some("x".repeat(100_000)),
+            }],
+            rules: vec![first, second],
+            commands: vec![
+                pb::Command {
+                    kind: Some(pb::command::Kind::AddRules(pb::AddRules {
+                        group: "g".into(),
+                        rules: vec![0, 1],
+                    })),
+                    ..Default::default()
+                },
+                pb::Command {
+                    kind: Some(pb::command::Kind::Run(pb::Run {
+                        groups: vec!["g".into()],
+                        ..Default::default()
+                    })),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        let response = run_host_default(&mut engine, id, input);
+        assert_eq!(response.error, None);
+        let rules = &engine.graphs[&id].registry.rules;
+        assert!(Arc::ptr_eq(
+            &rules[0].candidate.record.files,
+            &rules[1].candidate.record.files
+        ));
+        assert!(
+            rules
+                .iter()
+                .all(|rule| rule.candidate.record.program.files.is_empty())
+        );
+        assert_eq!(response.rules.len(), 2);
+        assert_eq!(
+            response.files.len(),
+            1,
+            "reuse the request's provenance arena for all its rules"
+        );
+        for rule in response.rules {
+            let file = &response.files[rule.span.unwrap().file as usize];
+            assert_eq!(file.name, "shared.egg");
+            assert_eq!(file.contents.as_ref().unwrap().len(), 100_000);
+        }
+    }
+
+    #[test]
+    fn additive_source_rejects_dynamic_additions_through_single_iteration_wrappers() {
+        for saturate in [false, true] {
+            let mut input = inventory_fixture(
+                "(datatype E (N i64) (Goal i64)) (ruleset g) (rule ((N x)) ((Goal x)) :ruleset g)",
+            );
+            let run = pb::Command {
+                kind: Some(pb::command::Kind::Run(pb::Run {
+                    groups: vec!["g".into()],
+                    ..Default::default()
+                })),
+                ..Default::default()
+            };
+            let single = pb::Command {
+                kind: Some(pb::command::Kind::Repeat(pb::Repeat {
+                    times: Some(1),
+                    body: vec![run.clone(), input.commands.remove(0), run],
+                    ..Default::default()
+                })),
+                ..Default::default()
+            };
+            input.commands = vec![pb::Command {
+                kind: Some(if saturate {
+                    pb::command::Kind::Saturate(pb::Saturate {
+                        max_iterations: Some(2),
+                        body: vec![single],
+                        ..Default::default()
+                    })
+                } else {
+                    pb::command::Kind::Repeat(pb::Repeat {
+                        times: Some(2),
+                        body: vec![single],
+                        ..Default::default()
+                    })
+                }),
+                ..Default::default()
+            }];
+            let error = source::Renderer::default().render(&input).unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("AddRules inside a repeated loop"),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
+    fn additive_source_preserves_action_dag_sites_after_registration_projection() {
+        let (mut input, _) = closed_value_dag(
+            "(constructor Use (A A) A) (Use (Leaf (vec-empty) (bigrat (from-string \"7\") (from-string \"2\"))) (Leaf (vec-empty) (bigrat (from-string \"7\") (from-string \"2\"))))",
+        );
+        input.commands.insert(
+            0,
+            pb::Command {
+                kind: Some(pb::command::Kind::AddRules(pb::AddRules {
+                    group: "empty".into(),
+                    rules: vec![],
+                })),
+                ..Default::default()
+            },
+        );
+        let text = source::Renderer::default().render(&input).unwrap();
+        assert!(text.contains("(action-scope"), "{text}");
+        let mut native = crate::new_experimental_egraph();
+        native.parse_and_run_program(None, &text).unwrap();
+        assert_eq!(native.materialized_eq_classes().len(), 18);
+    }
+
+    #[test]
+    fn additive_core_source_checks_exact_current_and_retained_selector_names() {
+        let selector = native_name("source_ruleset", "__protobuf_source_selection_1_0");
+        let conflict = pb::Program {
+            sorts: vec![pb::Sort {
+                kind: Some(pb::sort::Kind::Eq(selector.clone())),
+                ..Default::default()
+            }],
+            declarations: vec![pb::Declaration {
+                kind: Some(pb::declaration::Kind::EqSort(pb::EqSort {
+                    name: selector,
+                    ..Default::default()
+                })),
+                ..Default::default()
+            }],
+            commands: vec![pb::Command {
+                kind: Some(pb::command::Kind::Run(pb::Run {
+                    groups: vec!["unknown".into()],
+                    ..Default::default()
+                })),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        assert!(
+            source::Renderer::core()
+                .render(&conflict)
+                .unwrap_err()
+                .to_string()
+                .contains("private source ruleset")
+        );
+        let mut renderer = source::Renderer::core();
+        let run = pb::Program {
+            commands: conflict.commands.clone(),
+            ..Default::default()
+        };
+        renderer.render(&run).unwrap();
+        assert!(
+            renderer
+                .render(&conflict)
+                .unwrap_err()
+                .to_string()
+                .contains("private source ruleset")
+        );
+        renderer.render(&run).unwrap();
     }
 }

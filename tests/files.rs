@@ -1092,7 +1092,9 @@ impl ProtoRun {
                                 ..
                             }]
                         ) if name.ends_with("=>")
-                    ) && phase.commands.is_empty();
+                    ) && phase.commands.iter().all(|command| {
+                        matches!(command.kind, Some(pb::command::Kind::AddRules(_)))
+                    });
                     let request = pb::RunProgramRequest {
                         egraph_id,
                         program: Some(phase),
@@ -1108,10 +1110,6 @@ impl ProtoRun {
                         if !partial_birewrite
                             || !response.outputs.is_empty()
                             || response.error.is_some()
-                            || response
-                                .ruleset_publication
-                                .as_ref()
-                                .is_none_or(|p| p.names != [""])
                         {
                             return Err(format!(
                                 "grounding rejection boundary differs: {response:?}"

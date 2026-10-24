@@ -19,9 +19,7 @@ pub(super) fn builtin_catalog() -> &'static Record {
     CATALOG.get_or_init(|| {
         let program = pb::Program::decode(include_bytes!("builtins/catalog.pb").as_slice())
             .expect("generated catalog is valid protobuf");
-        assert!(
-            program.nodes.is_empty() && program.rules.is_empty() && program.rulesets.is_empty()
-        );
+        assert!(program.nodes.is_empty() && program.rules.is_empty());
         let mut slots = std::array::from_fn(|_| vec![]);
         slots[Arena::Sort as usize] = (0..program.sorts.len() as u32).map(Slot::Local).collect();
         slots[Arena::Declaration as usize] = (0..program.declarations.len() as u32)
@@ -38,7 +36,6 @@ pub(super) enum Arena {
     Sort,
     Declaration,
     Rule,
-    Ruleset,
     Command,
 }
 
@@ -64,7 +61,7 @@ pub(super) enum Slot {
 pub(super) struct Owner {
     pub id: usize,
     pub program: pb::Program,
-    pub slots: [Vec<Slot>; 6],
+    pub slots: [Vec<Slot>; 5],
     // Candidate declaration locations, not names/signatures copied from them.
     pub declarations: Vec<Record>,
     // Locations in this owner's generated records, never an initializer copy.
@@ -73,7 +70,7 @@ pub(super) struct Owner {
     pub merge_parameters: Option<(u32, [u32; 2])>,
     // Snapshot data are inspectable records, never live authoring inputs.
     pub observed: bool,
-    // Diagnostic presentations retain the original rule occurrence identity.
+    // Diagnostic presentations share their underlying authored rule record.
     pub rule_origin: Option<Record>,
 }
 
@@ -289,7 +286,6 @@ pub(super) fn observe(program: pb::Program, root_sort: u32) -> Result<Record, Ty
         program.sorts.len(),
         program.declarations.len(),
         program.rules.len(),
-        program.rulesets.len(),
         program.commands.len(),
     ];
     let slots = lengths.map(|len| (0..len as u32).map(Slot::Local).collect());
@@ -365,9 +361,6 @@ pub(super) fn closure(roots: &[Record]) -> Result<Vec<Record>, TypedError> {
                     .push(owner.program.rules[record.index as usize].clone());
                 pending.extend(owner.declarations.iter().cloned());
             }
-            Arena::Ruleset => one
-                .rulesets
-                .push(owner.program.rulesets[record.index as usize].clone()),
             Arena::Command => {
                 one.commands
                     .push(owner.program.commands[record.index as usize].clone());
@@ -645,36 +638,22 @@ pub(super) fn visit(
                 _ => return Err(invalid()),
             }
         }
-        Arena::Ruleset => {
-            let ruleset = &mut program.rulesets[index as usize];
-            if ruleset.span.is_some() {
-                return Err(invalid());
-            }
-            match ruleset.kind.as_mut().ok_or_else(invalid)? {
-                pb::ruleset::Kind::Rules(r) => {
-                    for i in &mut r.rules {
-                        *i = map(Arena::Rule, *i)?;
-                    }
-                }
-                pb::ruleset::Kind::Combined(r) => {
-                    for reference in &mut r.rulesets {
-                        let Some(pb::ruleset_ref::Kind::Index(index)) = &mut reference.kind else {
-                            return Err(invalid());
-                        };
-                        *index = map(Arena::Ruleset, *index)?;
-                    }
-                }
-            }
-        }
         Arena::Command => {
             let command = &mut program.commands[index as usize];
             if command.span.is_some() {
                 return Err(invalid());
             }
-            let Some(pb::command::Kind::Action(action)) = &mut command.kind else {
-                return Err(invalid());
-            };
-            visit_action(action, |index| map(Arena::Node, index))?;
+            match command.kind.as_mut().ok_or_else(invalid)? {
+                pb::command::Kind::Action(action) => {
+                    visit_action(action, |index| map(Arena::Node, index))?;
+                }
+                pb::command::Kind::AddRules(add) => {
+                    for rule in &mut add.rules {
+                        *rule = map(Arena::Rule, *rule)?;
+                    }
+                }
+                _ => return Err(invalid()),
+            }
         }
     }
     Ok(())
@@ -682,16 +661,18 @@ pub(super) fn visit(
 
 pub(super) fn publish(
     mut program: pb::Program,
-    slots: [Vec<Slot>; 6],
+    slots: [Vec<Slot>; 5],
     declarations: Vec<Record>,
     arena: Arena,
     index: u32,
 ) -> Result<Record, TypedError> {
     if !program.files.is_empty()
-        || program
-            .commands
-            .iter()
-            .any(|c| !matches!(c.kind, Some(pb::command::Kind::Action(_))))
+        || program.commands.iter().any(|c| {
+            !matches!(
+                c.kind,
+                Some(pb::command::Kind::Action(_) | pb::command::Kind::AddRules(_))
+            )
+        })
     {
         return Err(TypedError::Invalid(
             "unsupported typed fragment sections".into(),
@@ -702,7 +683,6 @@ pub(super) fn publish(
         program.sorts.len(),
         program.declarations.len(),
         program.rules.len(),
-        program.rulesets.len(),
         program.commands.len(),
     ];
     if index as usize >= lengths[arena as usize] {
@@ -724,7 +704,6 @@ pub(super) fn publish(
         Arena::Sort,
         Arena::Declaration,
         Arena::Rule,
-        Arena::Ruleset,
         Arena::Command,
     ]
     .into_iter()
@@ -779,8 +758,6 @@ pub(super) fn publish(
 
 pub(super) struct Packer {
     pub program: pb::Program,
-    // Source locations parallel to the packed arena, for request-scoped receipts.
-    pub rulesets: Vec<Record>,
     ids: HashMap<(Key, usize), u32>,
     pending: Vec<(Record, usize, u32)>,
     cursor: usize,
@@ -800,7 +777,6 @@ impl Default for Packer {
             program: pb::Program {
                 ..Default::default()
             },
-            rulesets: vec![],
             ids: HashMap::new(),
             pending: vec![],
             cursor: 0,
@@ -845,11 +821,6 @@ impl Packer {
             Arena::Rule => {
                 self.program.rules.push(pb::Rule::default());
                 self.program.rules.len() - 1
-            }
-            Arena::Ruleset => {
-                self.program.rulesets.push(pb::Ruleset::default());
-                self.rulesets.push(record.clone());
-                self.program.rulesets.len() - 1
             }
             Arena::Command => {
                 self.program.commands.push(pb::Command::default());
@@ -1107,9 +1078,6 @@ impl Packer {
                     binder = self.binders.len();
                     self.binders.push(super::close::binder(&roots)?);
                 }
-                Arena::Ruleset => one
-                    .rulesets
-                    .push(owner.program.rulesets[record.index as usize].clone()),
                 Arena::Command => {
                     let mut command = owner.program.commands[record.index as usize].clone();
                     if let Some(name) = self.captures.get(&(owner.id, record.arena, record.index)) {
@@ -1150,9 +1118,6 @@ impl Packer {
                     self.program.declarations[index as usize] = d;
                 }
                 Arena::Rule => self.program.rules[index as usize] = one.rules.pop().unwrap(),
-                Arena::Ruleset => {
-                    self.program.rulesets[index as usize] = one.rulesets.pop().unwrap()
-                }
                 Arena::Command => {
                     self.program.commands[index as usize] = one.commands.pop().unwrap()
                 }

@@ -1,8 +1,8 @@
 //! Typed composition of the protocol's existing Run, Repeat and Saturate forms.
-use super::{Ruleset, pb, storage::Arena};
+use super::{Ruleset, pb};
 use std::collections::HashSet;
 
-/// An ordered schedule with location-only imports of authored rulesets.
+/// An ordered schedule retaining the generated additions needed by its groups.
 #[derive(Clone)]
 pub struct Schedule {
     pub(super) commands: Vec<pb::Command>,
@@ -11,12 +11,24 @@ pub struct Schedule {
 
 impl From<&Ruleset> for Schedule {
     fn from(ruleset: &Ruleset) -> Self {
+        let mut seen = HashSet::new();
+        let groups = ruleset
+            .0
+            .iter()
+            .filter_map(|record| {
+                let owner = record.owner.as_ref().unwrap();
+                let Some(pb::command::Kind::AddRules(add)) =
+                    &owner.program.commands[record.index as usize].kind
+                else {
+                    unreachable!("typed group addition")
+                };
+                seen.insert(add.group.clone()).then(|| add.group.clone())
+            })
+            .collect();
         Self {
             commands: vec![pb::Command {
                 kind: Some(pb::command::Kind::Run(pb::Run {
-                    ruleset: Some(pb::RulesetRef {
-                        kind: Some(pb::ruleset_ref::Kind::Index(0)),
-                    }),
+                    groups,
                     ..Default::default()
                 })),
                 ..Default::default()
@@ -42,7 +54,7 @@ impl From<&Schedule> for Schedule {
 }
 
 impl Schedule {
-    /// Execute the body exactly this many times; zero still publishes its theory.
+    /// Execute the body exactly this many times; zero still registers its rules.
     pub fn repeat(self, times: u64) -> Self {
         Self {
             commands: vec![pb::Command {
@@ -72,37 +84,23 @@ impl Schedule {
 }
 
 impl Ruleset {
-    /// Repeat this ruleset without changing its rule occurrence identities.
+    /// Repeat this group selection without resetting registered rule state.
     pub fn repeat(&self, times: u64) -> Schedule {
         Schedule::from(self).repeat(times)
     }
-    /// Saturate this exact ruleset occurrence closure.
+    /// Saturate this selection of groups.
     pub fn saturate(&self) -> Schedule {
         Schedule::from(self).saturate()
     }
-    /// Whether the retained group closure contains no rule occurrences.
+    /// Whether the retained additions contain no rules.
     pub fn is_empty(&self) -> bool {
-        let mut pending = vec![self.0.clone()];
-        let mut seen = HashSet::new();
-        while let Some(record) = pending.pop() {
+        for record in &self.0 {
             let owner = record.owner.as_ref().unwrap();
-            if !seen.insert((owner.id, record.index)) {
-                continue;
-            }
-            match &owner.program.rulesets[record.index as usize].kind {
-                Some(pb::ruleset::Kind::Rules(rules)) if !rules.rules.is_empty() => return false,
-                Some(pb::ruleset::Kind::Combined(group)) => {
-                    for child in &group.rulesets {
-                        let Some(pb::ruleset_ref::Kind::Index(index)) = child.kind else {
-                            return false;
-                        };
-                        let Ok(child) = record.resolve(Arena::Ruleset, index) else {
-                            return false;
-                        };
-                        pending.push(child);
-                    }
-                }
-                _ => (),
+            if let Some(pb::command::Kind::AddRules(add)) =
+                &owner.program.commands[record.index as usize].kind
+                && !add.rules.is_empty()
+            {
+                return false;
             }
         }
         self.1.is_none()
@@ -164,39 +162,9 @@ pub fn sequence(source: impl Schedules) -> Schedule {
     source.append(&mut schedules);
     let mut commands = Vec::new();
     let mut rulesets = Vec::new();
-    for mut schedule in schedules {
-        let offset = u32::try_from(rulesets.len()).expect("ruleset arena exceeds u32");
-        relocate(&mut schedule.commands, |index| {
-            pb::ruleset_ref::Kind::Index(
-                index
-                    .checked_add(offset)
-                    .expect("ruleset arena exceeds u32"),
-            )
-        });
+    for schedule in schedules {
         commands.extend(schedule.commands);
         rulesets.extend(schedule.rulesets);
     }
     Schedule { commands, rulesets }
-}
-
-// Only Runs carry imports; loops retain the exact generated command structure.
-pub(super) fn relocate(
-    commands: &mut [pb::Command],
-    mut index: impl FnMut(u32) -> pb::ruleset_ref::Kind,
-) {
-    let mut pending: Vec<_> = commands.iter_mut().collect();
-    while let Some(command) = pending.pop() {
-        match command.kind.as_mut().expect("typed schedule command") {
-            pb::command::Kind::Run(run) => {
-                let Some(pb::ruleset_ref::Kind::Index(old)) = run.ruleset.as_ref().unwrap().kind
-                else {
-                    unreachable!()
-                };
-                run.ruleset.as_mut().unwrap().kind = Some(index(old));
-            }
-            pb::command::Kind::Repeat(repeat) => pending.extend(repeat.body.iter_mut()),
-            pb::command::Kind::Saturate(saturate) => pending.extend(saturate.body.iter_mut()),
-            _ => unreachable!("typed schedule form"),
-        }
-    }
 }

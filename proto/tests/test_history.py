@@ -1,4 +1,4 @@
-"""Structured audit shape, matching outcomes and independent recording choice."""
+"""Per-graph input Program history shapes, independent of native retention."""
 
 import unittest
 
@@ -15,72 +15,50 @@ class HistorySchemaTests(unittest.TestCase):
         self.assertEqual(ir.CreateEGraphRequest(record_history=True).to_binary(), b"\x38\x01")
         self.assertNotIn("record_history", ir.EGraphOptions.__annotations__)
 
-    def test_request_and_actual_response_kinds_must_match(self):
-        requests = [
-            ("create", ir.CreateEGraphRequest(
-                sorts=[ir.Sort(kind=Oneof("family", ir.HostSort(name="i64")))],
-                options=ir.EGraphOptions(cost_sort=0), record_history=True,
-            )),
-            ("clone", ir.CloneEGraphRequest(egraph_id=1)),
-            ("destroy", ir.DestroyEGraphRequest(egraph_id=1)),
-            ("return_to", ir.ReturnToEGraphRequest(active_id=2, saved_id=1)),
-            ("configure_resources", ir.ConfigureEGraphResourcesRequest(
-                egraph_id=1, operation=Oneof("query", ir.Unit()),
-            )),
-            ("run_program", ir.RunProgramRequest(egraph_id=1, program=ir.Program(), profile=True)),
-        ]
-        responses = [
-            ir.CreateEGraphResponse(egraph_id=1), ir.CloneEGraphResponse(egraph_id=2),
-            ir.DestroyEGraphResponse(), ir.ReturnToEGraphResponse(),
-            ir.ConfigureEGraphResourcesResponse(threads=1),
-            ir.RunProgramResponse(ruleset_publication=ir.RulesetPublication()),
-        ]
-        for index, (kind, request) in enumerate(requests):
-            for response_index, response in enumerate(responses):
-                entry = ir.HistoryEntry(
-                    request=Oneof(kind, request),
-                    outcome=Oneof(requests[response_index][0] + "_response", response),
-                )
-                with self.subTest(request=kind, response=requests[response_index][0]):
-                    if index == response_index:
-                        validate(entry)
-                        self.assertEqual(ir.HistoryEntry.from_binary(entry.to_binary()), entry)
-                    else:
-                        with self.assertRaises(ValidationError):
-                            validate(entry)
-            for outcome in [Oneof("transport_error", "rejected"), Oneof("interrupted", ir.Unit())]:
-                entry = ir.HistoryEntry(request=Oneof(kind, request), outcome=outcome)
-                validate(entry)
-                self.assertEqual(ir.HistoryEntry.from_binary(entry.to_binary()), entry)
+    def test_get_history_selects_one_graph(self):
+        for handle in (0, 1, 2**64 - 1):
+            with self.subTest(handle=handle):
+                request = ir.GetHistoryRequest(egraph_id=handle)
+                validate(request)
+                self.assertEqual(type(request).from_binary(request.to_binary()), request)
 
-    def test_entry_requires_request_and_outcome_and_history_requires_resources(self):
-        for entry in [ir.HistoryEntry(), ir.HistoryEntry(
-            request=Oneof("clone", ir.CloneEGraphRequest(egraph_id=1)),
-        )]:
-            with self.assertRaises(ValidationError):
-                validate(entry)
-        with self.assertRaises(ValidationError):
-            validate(ir.GetHistoryResponse())
-        history = ir.GetHistoryResponse(
-            initial_resources=ir.ConfigureEGraphResourcesResponse(threads=2, no_decomp=True),
-            closed=True,
+    def test_history_program_keeps_command_order_and_distinct_union_locations(self):
+        program = ir.Program(
+            sorts=[ir.Sort(kind=Oneof("eq", "E"))],
+            declarations=[ir.Declaration(kind=Oneof("eq_sort", ir.EqSort(name="E")))],
+            nodes=[ir.Node(kind=Oneof("union", ir.Union())) for _ in range(2)],
+            rules=[ir.Rule(
+                kind=Oneof("rule", ir.RuleBody(query=[0], head=[ir.Action(kind=Oneof("term", 1))])),
+                eval_mode=ir.RuleEvalMode.SEMINAIVE,
+            )],
+            commands=[
+                ir.Command(kind=Oneof("action", ir.Action(kind=Oneof("term", 0)))),
+                ir.Command(kind=Oneof("freeze", ir.Freeze())),
+                ir.Command(kind=Oneof("add_rules", ir.AddRules(group="g", rules=[0, 0]))),
+                ir.Command(kind=Oneof("run", ir.Run(groups=["g"]))),
+            ],
         )
-        validate(history)
-        self.assertEqual(ir.GetHistoryResponse.from_binary(history.to_binary()), history)
+        validate(program)
+        for decoded in (
+            ir.Program.from_binary(program.to_binary()),
+            ir.Program.from_json(program.to_json()),
+        ):
+            validate(decoded)
+            self.assertEqual(decoded, program)
+            self.assertEqual([command.kind.field for command in decoded.commands],
+                             ["action", "freeze", "add_rules", "run"])
+            self.assertEqual(decoded.rules[0].kind.value.query, [0])
+            self.assertEqual(decoded.rules[0].kind.value.head[0].kind.value, 1)
+            self.assertEqual(len(decoded.nodes), 2)
 
-    def test_audit_preserves_invalid_requests_without_revalidating_them(self):
-        invalid = ir.RunProgramRequest(program=ir.Program(rules=[ir.Rule()]))
-        with self.assertRaises(ValidationError):
-            validate(invalid)
-        entry = ir.HistoryEntry(
-            request=Oneof("run_program", invalid),
-            outcome=Oneof("run_program_response", ir.RunProgramResponse(
-                ruleset_publication=ir.RulesetPublication(),
-                error=ir.Error(code=ir.ErrorCode.INVALID_PROGRAM, message="missing rule mode"),
-            )),
-        )
-        validate(entry)
-        self.assertEqual(ir.HistoryEntry.from_binary(entry.to_binary()), entry)
+    def test_exported_history_uses_ordinary_program_validation(self):
+        validate(ir.Program())
+        for invalid in (
+            ir.Program(rules=[ir.Rule()]),
+            ir.Program(commands=[ir.Command(kind=Oneof("add_rules", ir.AddRules(rules=[0])))]),
+        ):
+            with self.subTest(program=invalid), self.assertRaises(ValidationError):
+                validate(invalid)
 
 
 if __name__ == "__main__":

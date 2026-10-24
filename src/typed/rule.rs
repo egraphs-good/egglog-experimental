@@ -228,12 +228,12 @@ fn equality_node(left: &Expr, right: &Expr) -> Expr {
     Expr(publish(program, slots, vec![], Arena::Node, 0).unwrap())
 }
 
-/// Each wrapper owns one generated Rule occurrence. Clones retain it.
+/// An immutable authored rule value. Registration deduplicates rule content.
 #[derive(Clone)]
 pub struct Rule(pub(super) Record, pub(super) Option<String>);
-/// An immutable generated ruleset; cloning preserves its occurrence and children.
+/// An ordered collection of generated group additions, reusable across runs.
 #[derive(Clone)]
-pub struct Ruleset(pub(super) Record, pub(super) Option<String>);
+pub struct Ruleset(pub(super) Vec<Record>, pub(super) Option<String>);
 
 /// Match query facts and evaluate ordered expression actions for every match.
 ///
@@ -462,17 +462,14 @@ macro_rules! callbacks {
 }
 callbacks!();
 
-/// Build an immutable group from rules, existing groups or a fresh-variable callback.
+/// Build a reusable selection from rules, groups or a fresh-variable callback.
 /// Fresh arguments may escape the callback and keep their variable identity.
-/// Collections preserve order and sharing; composition never copies child rules.
+/// Collections preserve registration order; selected groups share equal rule content.
 pub fn ruleset<A>(source: impl IntoRules<A>) -> Ruleset {
     named_ruleset(|| None, source)
 }
 
-// Both ordinary authoring and the attribute construct one canonical root here.
-// A name is part of that root before publication, never a relabelled copy with
-// a different occurrence identity. Intermediate leaves stay unnamed. Evaluate
-// the name after the authored body, matching the attribute's original order.
+// Evaluate the name after the authored body, matching the attribute's order.
 #[doc(hidden)]
 pub fn named_ruleset<A>(
     name: impl FnOnce() -> Option<String>,
@@ -488,45 +485,43 @@ pub fn named_ruleset<A>(
     if !rules.is_empty() {
         groups.push(rule_list(rules, None));
     }
-    let mut slots = std::array::from_fn(|_| vec![]);
-    let children = (0..groups.len())
-        .map(|index| pb::RulesetRef {
-            kind: Some(pb::ruleset_ref::Kind::Index(
-                u32::try_from(index).expect("protobuf arena exceeds u32"),
-            )),
-        })
-        .collect();
     let error = groups.iter().find_map(|g| g.1.clone());
-    slots[Arena::Ruleset as usize] = groups.into_iter().map(|g| Slot::External(g.0)).collect();
+    if let Some(name) = name {
+        let mut captured = Vec::new();
+        for group in groups {
+            for addition in group.0 {
+                let owner = addition.owner.as_ref().unwrap();
+                let Some(pb::command::Kind::AddRules(add)) =
+                    &owner.program.commands[addition.index as usize].kind
+                else {
+                    unreachable!("typed group addition")
+                };
+                for index in &add.rules {
+                    captured.push(Rule(addition.resolve(Arena::Rule, *index).unwrap(), None));
+                }
+            }
+        }
+        let mut result = rule_list(captured, Some(name));
+        result.1 = error;
+        return result;
+    }
+    let mut seen = std::collections::HashSet::new();
     Ruleset(
-        publish(
-            pb::Program {
-                rulesets: vec![pb::Ruleset {
-                    name,
-                    kind: Some(pb::ruleset::Kind::Combined(pb::CombinedRuleset {
-                        rulesets: children,
-                    })),
-                    ..Default::default()
-                }],
-                ..Default::default()
-            },
-            slots,
-            vec![],
-            Arena::Ruleset,
-            0,
-        )
-        .unwrap(),
+        groups
+            .into_iter()
+            .flat_map(|g| g.0)
+            .filter(|addition| seen.insert(addition.key()))
+            .collect(),
         error,
     )
 }
 
-// A canonical leaf for contiguous rule inputs; mixed collections preserve their
-// group boundaries instead of flattening/re-authoring existing children.
+// A canonical AddRules command keeps registration order and its rule imports.
 fn rule_list(rules: Vec<Rule>, name: Option<String>) -> Ruleset {
     let program = pb::Program {
-        rulesets: vec![pb::Ruleset {
-            name,
-            kind: Some(pb::ruleset::Kind::Rules(pb::RuleList {
+        commands: vec![pb::Command {
+            kind: Some(pb::command::Kind::AddRules(pb::AddRules {
+                group: name.unwrap_or_else(|| format!("__typed_group_{}", fresh_scope())),
                 rules: (0..rules.len())
                     .map(|i| u32::try_from(i).expect("protobuf arena exceeds u32"))
                     .collect(),
@@ -539,7 +534,7 @@ fn rule_list(rules: Vec<Rule>, name: Option<String>) -> Ruleset {
     let error = rules.iter().find_map(|r| r.1.clone());
     slots[Arena::Rule as usize] = rules.into_iter().map(|r| Slot::External(r.0)).collect();
     Ruleset(
-        publish(program, slots, vec![], Arena::Ruleset, 0).unwrap(),
+        vec![publish(program, slots, vec![], Arena::Command, 0).unwrap()],
         error,
     )
 }

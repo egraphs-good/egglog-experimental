@@ -192,10 +192,7 @@ impl PortableRegistration for TypeInfo {
         definitions::reconcile_declarations(&families, &mut supplied)?;
         definitions::reconcile_declarations(&generated, &mut supplied)?;
         supply(self, key, &mut supplied)?;
-        if !supplied.commands.is_empty()
-            || !supplied.rules.is_empty()
-            || !supplied.rulesets.is_empty()
-        {
+        if !supplied.commands.is_empty() || !supplied.rules.is_empty() {
             return Err("invalid builtin context header".into());
         }
         let (_, primitive) = definition_root(&supplied, key)?;

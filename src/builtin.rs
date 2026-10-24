@@ -962,7 +962,7 @@ fn definition_root<'a>(
 }
 
 pub(crate) fn definition_key(program: &pb::Program) -> Result<&str, String> {
-    if !program.commands.is_empty() || !program.rules.is_empty() || !program.rulesets.is_empty() {
+    if !program.commands.is_empty() || !program.rules.is_empty() {
         return Err("builtin definition must contain only declaration templates".into());
     }
     let mut validated = vec![];
@@ -1020,7 +1020,6 @@ mod projection_tests {
         assert!(LANGUAGE_METADATA.nodes.is_empty());
         assert!(LANGUAGE_METADATA.commands.is_empty());
         assert!(LANGUAGE_METADATA.rules.is_empty());
-        assert!(LANGUAGE_METADATA.rulesets.is_empty());
         for declaration in &LANGUAGE_METADATA.declarations {
             assert!(
                 declaration

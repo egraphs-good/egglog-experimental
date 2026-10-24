@@ -157,7 +157,6 @@ fn generate(program: &pb::Program) -> Result<(String, Vec<String>), String> {
     if !program.nodes.is_empty()
         || !program.commands.is_empty()
         || !program.rules.is_empty()
-        || !program.rulesets.is_empty()
         || !program.files.is_empty()
     {
         return Err("expected a declaration-only catalog".into());

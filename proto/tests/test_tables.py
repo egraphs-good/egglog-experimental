@@ -10,7 +10,7 @@ from gen.python.egglog.v1 import egglog_pb as ir
 
 
 def table_response(rows):
-    """Own both response arenas and the required output/publication locations."""
+    """Own both response arenas and the required output locations."""
     return ir.RunProgramResponse(
         sorts=[
             ir.Sort(kind=Oneof("family", ir.HostSort(name="Unit"))),
@@ -23,7 +23,6 @@ def table_response(rows):
             kind=Oneof("printed_function", ir.PrintedFunction(table="f", rows=rows)),
             location=ir.CommandLocation(path=[0]),
         )],
-        ruleset_publication=ir.RulesetPublication(),
     )
 
 

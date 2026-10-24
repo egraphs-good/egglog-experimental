@@ -1156,13 +1156,7 @@ mod lazy_rulesets {
         for mut graph in [EGraph::default(), EGraph::default()] {
             graph.register(RuleTerms::Input(83))?;
             let response = graph.run(&copy)?;
-            assert!(
-                response
-                    .ruleset_publication
-                    .unwrap()
-                    .names
-                    .contains(&concat!(module_path!(), "::copy").to_owned())
-            );
+            assert_eq!(response.rules.len(), 1);
             assert_eq!(
                 response
                     .profile
@@ -1177,11 +1171,8 @@ mod lazy_rulesets {
 
             let response = graph.run(&nested)?;
             assert!(
-                response
-                    .ruleset_publication
-                    .unwrap()
-                    .names
-                    .contains(&"nested::lazy".into())
+                response.rules.is_empty(),
+                "consumed content has no referenced run rows"
             );
             assert_eq!(
                 response
@@ -1231,7 +1222,7 @@ mod lazy_rulesets {
     #[test]
     fn lazy_ruleset_exact_name_expression_empty_name_and_borrowed_input_limits()
     -> Result<(), TypedError> {
-        for mut graph in [EGraph::default(), EGraph::default()] {
+        for mut graph in [EGraph::with_recording(true)?, EGraph::with_recording(true)?] {
             for (group, expected) in [
                 (&*exact, "exact::lazy-name"),
                 (&*empty_name, ""),
@@ -1240,14 +1231,25 @@ mod lazy_rulesets {
                 (&*borrowed_63, concat!(module_path!(), "::borrowed_63")),
                 (&*borrowed_64, concat!(module_path!(), "::borrowed_64")),
             ] {
-                assert!(
-                    graph
-                        .run(group)?
-                        .ruleset_publication
-                        .unwrap()
-                        .names
-                        .contains(&expected.to_owned())
-                );
+                graph.run(group)?;
+                let history = graph.history()?;
+                let mut pending = history.commands.iter().collect::<Vec<_>>();
+                let mut found = false;
+                while let Some(command) = pending.pop() {
+                    match &command.kind {
+                        Some(egglog_experimental::proto::command::Kind::AddRules(add)) => {
+                            found |= add.group == expected
+                        }
+                        Some(egglog_experimental::proto::command::Kind::Repeat(repeat)) => {
+                            pending.extend(&repeat.body)
+                        }
+                        Some(egglog_experimental::proto::command::Kind::Saturate(saturate)) => {
+                            pending.extend(&saturate.body)
+                        }
+                        _ => (),
+                    }
+                }
+                assert!(found, "authored group name is preserved");
             }
             assert!(graph.check((
                 RuleTerms::Second(84),
@@ -1270,26 +1272,17 @@ mod lazy_rulesets {
         );
         assert!(!graph.check(RuleTerms::Copied(126))?);
         let response = graph.run(&valid)?;
-        assert!(
-            response
-                .ruleset_publication
-                .unwrap()
-                .names
-                .contains(&"lazy::valid".into())
-        );
+        assert_eq!(response.rules.len(), 1);
         assert!(graph.check(RuleTerms::Copied(126))?);
         Ok(())
     }
 
     #[test]
-    fn lazy_ruleset_equal_names_do_not_coalesce_different_occurrences() -> Result<(), TypedError> {
+    fn lazy_ruleset_equal_names_add_distinct_content_to_one_group() -> Result<(), TypedError> {
         let mut graph = EGraph::default();
         graph.run(&collision_first)?;
-        assert!(matches!(
-            graph.run(&collision_other),
-            Err(TypedError::Engine(_))
-        ));
-        assert!(!graph.check(RuleTerms::Second(127))?);
+        graph.run(&collision_other)?;
+        assert!(graph.check(RuleTerms::Second(127))?);
         let response = graph.run(&collision_first)?;
         assert_eq!(
             response
@@ -1939,7 +1932,7 @@ fn term_rule_heads_and_registration_share_ordered_collection_inputs() -> Result<
 }
 
 #[test]
-fn independent_equal_term_rules_have_independent_matches_and_clones_reuse() -> Result<(), TypedError>
+fn independent_equal_term_rules_share_content_matches_and_cloned_cursors() -> Result<(), TypedError>
 {
     let shared = rule((), RuleTerms::Copied(42));
     let independent = rule((), RuleTerms::Copied(42));
@@ -1955,8 +1948,8 @@ fn independent_equal_term_rules_have_independent_matches_and_clones_reuse() -> R
         .map(|rule| rule.matches.expect("normal rule matches measured"))
         .sum();
     assert_eq!(
-        matches, 2,
-        "shared alias once, independent equal occurrence once"
+        matches, 1,
+        "equal rule content is registered and matched once"
     );
     let second = graph.run(group.clone())?;
     let matches: u64 = second
@@ -1975,8 +1968,7 @@ fn independent_equal_term_rules_have_independent_matches_and_clones_reuse() -> R
 }
 
 #[test]
-fn overlapping_groups_and_diamonds_preserve_shared_and_independent_cursors()
--> Result<(), TypedError> {
+fn overlapping_groups_and_diamonds_share_content_cursors() -> Result<(), TypedError> {
     let shared = rule((), RuleTerms::Copied(57));
     let independent = rule((), RuleTerms::Copied(57));
     let leaf = ruleset(&shared);
@@ -1985,7 +1977,7 @@ fn overlapping_groups_and_diamonds_preserve_shared_and_independent_cursors()
     let diamond = ruleset((&left, &right, &leaf));
     let flat_overlap = ruleset(&shared);
     let mut graph = EGraph::default();
-    for (group, expected) in [(&left, 1), (&diamond, 1), (&right, 0), (&flat_overlap, 0)] {
+    for (group, expected) in [(&left, 1), (&diamond, 0), (&right, 0), (&flat_overlap, 0)] {
         let response = graph.run(group)?;
         let matches: u64 = response
             .profile
@@ -1997,7 +1989,7 @@ fn overlapping_groups_and_diamonds_preserve_shared_and_independent_cursors()
             .sum();
         assert_eq!(
             matches, expected,
-            "one cursor per shared occurrence, separate cursor for equal independent rule"
+            "one cursor per rule content across every selected group"
         );
     }
     assert!(graph.check(RuleTerms::Copied(57))?);

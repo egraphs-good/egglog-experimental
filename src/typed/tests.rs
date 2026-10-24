@@ -1037,59 +1037,32 @@ fn nested_fail_keeps_packed_roots_and_fragment_admission() {
 }
 
 #[test]
-fn immutable_composition_preserves_shared_rules_and_empty_group_occurrences() {
+fn additive_composition_packs_shared_rule_records_and_empty_additions() {
     use super::{rule, ruleset};
     let shared = rule((), ());
     let independent = rule((), ());
     let empty = ruleset(());
     let leaf = ruleset(vec![shared.clone(), shared.clone(), independent]);
-    let group = ruleset((&leaf, std::slice::from_ref(&empty), vec![shared.clone()]));
+    let group = ruleset((&leaf, &empty, vec![shared.clone()]));
     let diamond = ruleset((&group, &group, &empty, shared));
     let mut packer = Packer::default();
-    let root = packer.intern(diamond.0, 0);
-    let empty_index = packer.intern(empty.0, 0);
-    let leaf_index = packer.intern(leaf.0, 0);
+    for addition in diamond.0 {
+        packer.intern(addition, 0);
+    }
     packer.finish().unwrap();
     let p = packer.program;
-    assert_eq!(
-        p.rules.len(),
-        2,
-        "equal independent rules must not be interned"
-    );
-    let Some(pb::ruleset::Kind::Combined(root)) = &p.rulesets[root as usize].kind else {
+    // Packing retains distinct authored records; native registration owns content identity.
+    assert_eq!(p.rules.len(), 2);
+    assert_eq!(p.commands.len(), 4);
+    let Some(pb::command::Kind::AddRules(leaf)) = &p.commands[0].kind else {
         panic!()
     };
-    assert_eq!(root.rulesets.len(), 4);
-    assert_eq!(root.rulesets[0], root.rulesets[1]);
-    assert_eq!(
-        root.rulesets[2].kind,
-        Some(pb::ruleset_ref::Kind::Index(empty_index))
-    );
-    assert_eq!(
-        p.rulesets[empty_index as usize].kind,
-        Some(pb::ruleset::Kind::Rules(pb::RuleList { rules: vec![] }))
-    );
-    let Some(pb::ruleset::Kind::Rules(leaf)) = &p.rulesets[leaf_index as usize].kind else {
+    assert_eq!(leaf.rules, [0, 0, 1]);
+    let Some(pb::command::Kind::AddRules(empty)) = &p.commands[1].kind else {
         panic!()
     };
-    assert_eq!(leaf.rules.len(), 3);
-    assert_eq!(leaf.rules[0], leaf.rules[1]);
-    assert_ne!(leaf.rules[0], leaf.rules[2]);
-    let Some(pb::ruleset_ref::Kind::Index(group)) = root.rulesets[0].kind else {
-        panic!()
-    };
-    let Some(pb::ruleset::Kind::Combined(group)) = &p.rulesets[group as usize].kind else {
-        panic!()
-    };
-    assert_eq!(group.rulesets.len(), 3);
-    assert_eq!(
-        group.rulesets[0].kind,
-        Some(pb::ruleset_ref::Kind::Index(leaf_index))
-    );
-    assert_eq!(
-        group.rulesets[1].kind,
-        Some(pb::ruleset_ref::Kind::Index(empty_index))
-    );
+    assert!(empty.rules.is_empty());
+    assert_eq!(super::Schedule::from(&ruleset(())).commands.len(), 1);
 }
 
 #[test]
@@ -1170,7 +1143,9 @@ fn wide_callbacks_author_generated_binders_without_claiming_grounded_execution()
         "composition never re-executes authoring callbacks"
     );
     let mut packed = Packer::default();
-    packed.intern(group.0, 0);
+    for addition in group.0 {
+        packed.intern(addition, 0);
+    }
     packed.finish().unwrap();
     let widths: Vec<_> = packed
         .program
@@ -2945,7 +2920,7 @@ fn retained_leaf_releases_all_parents_with_bounded_immediate_imports() {
 }
 
 #[test]
-fn generated_rule_fields_and_occurrence_locations_are_authoritative() {
+fn generated_rule_fields_and_shared_locations_are_authoritative() {
     let sort = SortRef::equality("M");
     let x = node(
         &sort,
@@ -2995,8 +2970,9 @@ fn generated_rule_fields_and_occurrence_locations_are_authoritative() {
     ];
     let group = publish(
         pb::Program {
-            rulesets: vec![pb::Ruleset {
-                kind: Some(pb::ruleset::Kind::Rules(pb::RuleList {
+            commands: vec![pb::Command {
+                kind: Some(pb::command::Kind::AddRules(pb::AddRules {
+                    group: "fields".into(),
                     rules: vec![0, 1, 2, 3],
                 })),
                 ..Default::default()
@@ -3005,14 +2981,14 @@ fn generated_rule_fields_and_occurrence_locations_are_authoritative() {
         },
         slots,
         vec![],
-        Arena::Ruleset,
+        Arena::Command,
         0,
     )
     .unwrap();
     let mut packer = Packer::default();
     packer.intern(group, 0);
     packer.finish().unwrap();
-    let Some(pb::ruleset::Kind::Rules(rules)) = &packer.program.rulesets[0].kind else {
+    let Some(pb::command::Kind::AddRules(rules)) = &packer.program.commands[0].kind else {
         panic!()
     };
     assert_eq!(rules.rules, [0, 0, 1, 2]);
