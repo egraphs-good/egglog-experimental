@@ -29,7 +29,7 @@
 /// Install declarations before commands, order-independently and without
 /// executing their bodies. Rules register only when AddRules executes.
 /// Definitions installed on this handle may be referenced by name without
-/// resending them. Node, sort and rule indices refer to this Program's
+/// resending them. Node and sort indices refer to this Program's
 /// arenas, not previous requests; all referenced entries must be included here.
 /// Execute only commands, in order, and the expressions they demand. Unused
 /// arena entries are not executed; arena membership is not an execution root.
@@ -62,11 +62,6 @@ pub struct Program {
     /// Optional provenance. Omit spans for a normalized/unlocated program.
     #[prost(message, repeated, tag = "6")]
     pub files: ::prost::alloc::vec::Vec<SourceFile>,
-    /// Immutable rule values. Arena membership alone does not register a rule.
-    /// AddRules selects entries by index; equal semantic content shares one
-    /// compiled rule and its state across all groups and submissions.
-    #[prost(message, repeated, tag = "9")]
-    pub rules: ::prost::alloc::vec::Vec<Rule>,
 }
 /// Source metadata supports diagnostic locations and documentation, not
 /// arbitrary comment attachment, formatting or source round-tripping.
@@ -135,7 +130,7 @@ pub mod sort {
         Application(super::SortApplication),
         #[prost(message, tag = "4")]
         Func(super::FuncSort),
-        /// index into the enclosing GenericSignature.type_params
+        /// index into the enclosing GenericSignature binder
         #[prost(uint32, tag = "7")]
         Var(u32),
     }
@@ -211,7 +206,7 @@ pub struct Node {
     /// Spans never participate in a row's key.
     #[prost(message, optional, tag = "8")]
     pub span: ::core::option::Option<Span>,
-    #[prost(oneof = "node::Kind", tags = "2, 3, 4, 7, 9")]
+    #[prost(oneof = "node::Kind", tags = "2, 3, 4, 10, 7, 9")]
     pub kind: ::core::option::Option<node::Kind>,
 }
 /// Nested message and enum types in `Node`.
@@ -228,6 +223,8 @@ pub mod node {
         PrimitiveValue(super::PrimitiveValue),
         #[prost(message, tag = "4")]
         Call(super::Call),
+        #[prost(message, tag = "10")]
+        Apply(super::Apply),
         /// An explicit identity-bearing class/equality group. See `Union`.
         #[prost(message, tag = "7")]
         Union(super::Union),
@@ -337,7 +334,7 @@ pub struct Union {
 /// that definition's signature. Generic instantiation does not select another
 /// definition. Frontends resolve overloaded surface syntax and conversions
 /// before this boundary. Missing names and signature mismatches are errors.
-/// Primitive's typing form checks all concrete argument AND result sorts;
+/// Primitive signatures check all concrete argument AND result sorts;
 /// every generic parameter must be determined. There are no call-level type args.
 ///
 /// For Node.call, the enclosing node's sort matches the result; relation calls
@@ -355,6 +352,17 @@ pub struct Call {
     #[prost(uint32, repeated, tag = "2")]
     pub args: ::prost::alloc::vec::Vec<u32>,
 }
+/// Apply a concrete function value. Evaluate the function first, followed by
+/// arguments left-to-right. The function's FuncSort supplies the exact parameter
+/// and result sorts. Apply is executable code, never inert value data; deferred
+/// lambda and primitive bodies may contain it.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct Apply {
+    #[prost(uint32, optional, tag = "1")]
+    pub function: ::core::option::Option<u32>,
+    #[prost(uint32, repeated, tag = "2")]
+    pub args: ::prost::alloc::vec::Vec<u32>,
+}
 /// A closed function body with explicit captures. Body variables are _0, _1,
 /// ...: captures first, then parameters. Nested lambdas capture explicitly.
 /// The enclosing node has a concrete FuncSort, which supplies parameter sorts
@@ -363,7 +371,7 @@ pub struct Call {
 /// through _(captures.size + FuncSort.params.size - 1), empty when that sum is zero.
 /// Captures inherit the surrounding use context, including its data restrictions;
 /// the body is separately scoped deferred code, even in a stored/extracted value.
-/// Function values use PrimitiveValue.lambda; application remains a Call.
+/// Function values use PrimitiveValue.lambda; application uses Apply.
 /// Node sharing does not determine function-value equality.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct Lambda {
@@ -392,8 +400,8 @@ pub struct Lambda {
 /// groundedness are unchanged: query child inputs must be grounded; these
 /// payloads do not bind child variables by inverse matching.
 /// Lambda captures are constructed now and its body is separately scoped code.
-/// Symbolic operations such as rational(n,d), vec-of or function application
-/// remain Calls; they are not interchangeable with already-formed value data.
+/// Symbolic operations such as rational(n,d) and vec-of remain Calls; function
+/// application uses Apply. Neither is interchangeable with already-formed data.
 /// Dedicated scalar arms require the nullary applications i64, f64, String,
 /// bool, Unit, BigInt, BigRat and Rational respectively. Vec/Set/MultiSet/Maybe
 /// require their named unary applications; Map and Pair require their named
@@ -445,7 +453,7 @@ pub mod primitive_value {
         /// a dynamic function value. The enclosing node has a closed FuncSort.
         /// Concatenate captured arg sorts with its remaining params and use its result
         /// to check one effective complete call under the callee's typing form,
-        /// including varargs or FunctionApplication. This must determine all generic
+        /// including varargs. This must determine all generic
         /// parameters, even with zero/all args captured. Relations cannot be partially
         /// applied; captured arguments are value positions.
         #[prost(message, tag = "16")]
@@ -665,7 +673,7 @@ pub struct Declaration {
     /// defaults; Public(key) differs from absence. Default(key) is compatible with
     /// absence. Empty strings are valid in either arm. Live public aliases and
     /// live soft defaults are each unique, but an explicit alias may shadow a soft
-    /// default. Structural references (including PrintSize/PrintFunction) use keys.
+    /// default. Structural references (including GetTableSizes/GetTableRows) use keys.
     #[prost(oneof = "declaration::TableName", tags = "12, 13")]
     pub table_name: ::core::option::Option<declaration::TableName>,
 }
@@ -689,7 +697,7 @@ pub mod declaration {
     /// defaults; Public(key) differs from absence. Default(key) is compatible with
     /// absence. Empty strings are valid in either arm. Live public aliases and
     /// live soft defaults are each unique, but an explicit alias may shadow a soft
-    /// default. Structural references (including PrintSize/PrintFunction) use keys.
+    /// default. Structural references (including GetTableSizes/GetTableRows) use keys.
     #[derive(Clone, PartialEq, Eq, Hash, ::prost::Oneof)]
     pub enum TableName {
         #[prost(string, tag = "12")]
@@ -714,16 +722,6 @@ pub struct Arg {
 pub struct EqSort {
     #[prost(string, tag = "1")]
     pub name: ::prost::alloc::string::String,
-    /// Optional non-owning table key for native Tree root extraction's one-hop
-    /// parent lookup. Absence means no lookup and differs from every present key.
-    /// The table may be absent, which leaves the root unchanged; this reference
-    /// does not demand installation or add a declaration-order dependency. When
-    /// present, its first two stored columns (inputs followed by output) must both
-    /// have this equality sort. Relations' private output cannot satisfy a column.
-    /// Tree best/variants inspect the requested root only, including subsumed rows;
-    /// this neither unions classes nor redirects children or GreedyDag extraction.
-    #[prost(string, optional, tag = "3")]
-    pub uf_parent: ::core::option::Option<::prost::alloc::string::String>,
 }
 /// A concrete constructor whose output is an equality sort.
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -837,22 +835,12 @@ pub struct PrimitiveSort {
 pub struct Primitive {
     #[prost(string, tag = "1")]
     pub name: ::prost::alloc::string::String,
+    #[prost(message, optional, tag = "2")]
+    pub signature: ::core::option::Option<GenericSignature>,
     #[prost(message, optional, tag = "4")]
     pub span: ::core::option::Option<Span>,
     #[prost(string, optional, tag = "5")]
     pub doc: ::core::option::Option<::prost::alloc::string::String>,
-    #[prost(oneof = "primitive::Typing", tags = "2, 3")]
-    pub typing: ::core::option::Option<primitive::Typing>,
-}
-/// Nested message and enum types in `Primitive`.
-pub mod primitive {
-    #[derive(Clone, PartialEq, ::prost::Oneof)]
-    pub enum Typing {
-        #[prost(message, tag = "2")]
-        Signature(super::GenericSignature),
-        #[prost(message, tag = "3")]
-        Application(super::FunctionApplication),
-    }
 }
 /// An ordinary primitive signature: a fixed prefix followed by zero or more
 /// repetitions of the ordered varargs pattern. An empty pattern means no tail
@@ -861,8 +849,7 @@ pub mod primitive {
 /// of the pattern width. Pattern order and width are semantic, even \[T, T\];
 /// arguments remain flat, with no tuple/group node. Sort indices reference
 /// BuiltinCatalog.sorts.
-/// Sort.var indices bind by position in type_params; labels do not bind by name
-/// and need not be distinct. All variable uses, including nested SortApplication and
+/// Sort.var indices bind below type_param_count. All variable uses, including nested SortApplication and
 /// FuncSort patterns, must be in this signature's binder. Each actual call
 /// matches all concrete argument and result sorts structurally to obtain one
 /// consistent, complete substitution across all repetitions and the result.
@@ -870,30 +857,19 @@ pub mod primitive {
 /// count<T>(...T)->i64 cannot be called with zero arguments, whereas an empty
 /// vec-of<T>(...T)->Vec<T> determines T from its concrete result sort.
 /// No conversion, subtyping, overload search or heterogeneous type packs.
+/// This describes ordinary structural typing. Native primitive-specific sort
+/// and domain applicability is checked at submission before execution; this
+/// signature does not promise that every structural instantiation is supported.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct GenericSignature {
-    #[prost(string, repeated, tag = "1")]
-    pub type_params: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    #[prost(uint32, tag = "1")]
+    pub type_param_count: u32,
     #[prost(message, repeated, tag = "2")]
     pub inputs: ::prost::alloc::vec::Vec<Arg>,
     #[prost(uint32, optional, tag = "3")]
     pub output: ::core::option::Option<u32>,
     #[prost(message, repeated, tag = "4")]
     pub varargs: ::prost::alloc::vec::Vec<Arg>,
-    /// Binder positions, not Program.sorts indices. Each substituted sort must be
-    /// exactly Sort.eq; a family containing equality sorts does not qualify.
-    /// Strictly increasing and distinct. Absence leaves all binders unrestricted.
-    /// CEL checks range/distinctness; catalog consumers additionally reject a
-    /// non-increasing list before installation or API generation.
-    #[prost(uint32, repeated, tag = "5")]
-    pub equality_type_params: ::prost::alloc::vec::Vec<u32>,
-}
-/// Dedicated typing for a named application primitive, still invoked by Call.
-/// The first effective argument must have a concrete FuncSort; the remaining
-/// arguments exactly match its params, and the call result matches its result.
-/// PrimitiveValue.partial_call supplies an effective complete call; see that field.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct FunctionApplication {
 }
 // ---------------------------------------------------------------------------
 // RULE DEFINITIONS — immutable content, registered by ordered commands.
@@ -1015,11 +991,11 @@ pub mod command {
         #[prost(message, tag = "7")]
         Freeze(super::Freeze),
         #[prost(message, tag = "8")]
-        PrintSize(super::PrintSize),
+        TableSizes(super::GetTableSizes),
         #[prost(message, tag = "9")]
-        PrintFunction(super::PrintFunction),
+        TableRows(super::GetTableRows),
         #[prost(message, tag = "10")]
-        PrintTableStats(super::PrintTableStats),
+        TableStats(super::GetTableStats),
         #[prost(message, tag = "11")]
         Loop(super::Loop),
         #[prost(message, tag = "14")]
@@ -1085,13 +1061,12 @@ pub struct ProveExists {
 /// The same content in several groups shares one compiled rule. Labels/spans are
 /// representative diagnostics, not identity. Failures retain completed native
 /// registration prefixes; compatible retry is safe. No group declaration exists.
-#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+#[derive(Clone, PartialEq, ::prost::Message)]
 pub struct AddRules {
     #[prost(string, tag = "1")]
     pub group: ::prost::alloc::string::String,
-    /// index into Program.rules
-    #[prost(uint32, repeated, tag = "2")]
-    pub rules: ::prost::alloc::vec::Vec<u32>,
+    #[prost(message, repeated, tag = "2")]
+    pub rules: ::prost::alloc::vec::Vec<Rule>,
 }
 /// Execute one step of the ordered union of groups, optionally using a scheduler.
 /// Unknown groups are empty. \[\] selects nothing; \[""\] explicitly selects the
@@ -1115,21 +1090,7 @@ pub struct BindScheduler {
     #[prost(string, tag = "1")]
     pub name: ::prost::alloc::string::String,
     #[prost(message, optional, tag = "2")]
-    pub scheduler: ::core::option::Option<Scheduler>,
-}
-/// Supported scheduler configurations.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct Scheduler {
-    #[prost(oneof = "scheduler::Kind", tags = "1")]
-    pub kind: ::core::option::Option<scheduler::Kind>,
-}
-/// Nested message and enum types in `Scheduler`.
-pub mod scheduler {
-    #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Oneof)]
-    pub enum Kind {
-        #[prost(message, tag = "1")]
-        BackOff(super::BackOff),
-    }
+    pub back_off: ::core::option::Option<BackOff>,
 }
 /// Back-off limits. Absent fields select engine defaults; zero is explicit.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
@@ -1205,7 +1166,7 @@ pub struct Extract {
 ///
 /// Include every installed declaration and sort, even unused or empty tables;
 /// every registered rule content once and group membership in first-registration
-/// order. Reconstruct membership with AddRules commands referencing Program.rules;
+/// order. Reconstruct membership with AddRules commands containing rule values;
 /// omit never-registered rule values. Backend builtin descriptors remain in
 /// GetBuiltins and are never included in the reconstruction Program.
 /// Include saved code and its dependencies without executing it.
@@ -1250,19 +1211,19 @@ pub struct Freeze {
 /// Report sizes of selected tables, or all visible tables. Returns
 /// `TableSizes`.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct PrintSize {
+pub struct GetTableSizes {
     /// Empty selects all visible tables.
     #[prost(string, repeated, tag = "1")]
     pub tables: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
 }
 /// Rows of one table as extracted representative terms, including subsumed
 /// rows. Alternative producers and e-class identity are not preserved. Returns
-/// `PrintedFunction` with each selected cell's finite representative or explicit
+/// `TableRows` with each selected cell's finite representative or explicit
 /// unavailability. No finite extraction is not a command failure; actual
 /// extraction/encoding errors still fail the command without a partial output.
 /// Earlier outputs/effects remain on error, and later commands do not run.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct PrintFunction {
+pub struct GetTableRows {
     #[prost(string, tag = "1")]
     pub table: ::prost::alloc::string::String,
     /// Absent selects every row; present zero selects no rows. The table must
@@ -1273,7 +1234,7 @@ pub struct PrintFunction {
 /// Report structural statistics for selected tables, or all visible tables.
 /// Returns `TableStatsResult`.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct PrintTableStats {
+pub struct GetTableStats {
     /// Empty selects all visible tables.
     #[prost(string, repeated, tag = "1")]
     pub tables: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
@@ -1305,8 +1266,8 @@ pub struct GetBuiltinsRequest {
 }
 /// Immutable logical settings, shared by creation and snapshots. cost_sort
 /// indexes CreateEGraphRequest.sorts or EGraphSnapshot.program.sorts respectively.
-/// C may be any supported, acyclic, recursively closed sort, including a custom
-/// equality sort or a host-family/function type. Frontends may offer an i64
+/// C may be a supported, acyclic, recursively closed backend-provided sort or
+/// composition, including a function type. Frontends may offer an i64
 /// default, but the wire always specifies C. No value codec or extraction model
 /// is required merely to select C. Declared/assigned annotations and GetCost
 /// results must agree with C structurally, never by comparing arena-local indices.
@@ -1324,14 +1285,10 @@ pub struct EGraphOptions {
     #[prost(bool, optional, tag = "3")]
     pub seminaive: ::core::option::Option<bool>,
 }
-/// Create an empty e-graph without executing a Program. Resolve the sort-only
-/// declarations against ambient host definitions, then validate options and this
-/// acyclic, recursively closed sort arena before allocating a handle. Equality
-/// declarations allow custom C without an already-existing handle. Compatible
-/// repeated definitions are allowed; conflicting definitions are errors.
-/// Equality sorts and primitive sorts may have the same name.
-/// Successful creation retains these sort declarations on the new handle, so
-/// later Programs may reference their names without resending definitions.
+/// Create an empty e-graph without executing a Program. Resolve backend-provided
+/// sorts and supported compositions, then validate options and this acyclic,
+/// recursively closed sort arena before allocating a handle. User equality sorts
+/// are not available at creation.
 /// Unsupported options/resources are lifecycle errors, not RunProgram.error.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct CreateEGraphRequest {
@@ -1341,8 +1298,6 @@ pub struct CreateEGraphRequest {
     pub options: ::core::option::Option<EGraphOptions>,
     #[prost(message, repeated, tag = "3")]
     pub files: ::prost::alloc::vec::Vec<SourceFile>,
-    #[prost(message, repeated, tag = "4")]
-    pub declarations: ::prost::alloc::vec::Vec<Declaration>,
     /// Resource request, never exported as logical state. Absent leaves policy to
     /// the receiver; zero requests automatic parallelism; positive requests that
     /// thread count. Reject unsupported requests rather than silently ignoring.
@@ -1371,7 +1326,7 @@ pub struct CreateEGraphResponse {
 /// Portable logical state, not an execution checkpoint. The Program owns all
 /// arenas/files, including the C selected by options. Every sort is concrete;
 /// builtin signature patterns remain in GetBuiltins.
-/// Restore by remapping C's closed sort graph and needed sort declarations into
+/// Restore by remapping C's closed backend sort graph into
 /// a CreateEGraphRequest, selecting receiver resource settings, then executing
 /// program normally on the fresh compatible handle. No creation-time commands
 /// or resumed scheduler/delta state are implied. Options preserve global
@@ -1547,7 +1502,7 @@ pub mod command_output {
         #[prost(message, tag = "4")]
         Sizes(super::TableSizes),
         #[prost(message, tag = "5")]
-        PrintedFunction(super::PrintedFunction),
+        TableRows(super::TableRows),
         #[prost(message, tag = "6")]
         TableStats(super::TableStatsResult),
         #[prost(message, tag = "9")]
@@ -1759,10 +1714,10 @@ pub struct TableSizes {
     #[prost(message, repeated, tag = "1")]
     pub sizes: ::prost::alloc::vec::Vec<TableSize>,
 }
-/// Selected rows from one successful PrintFunction command, in native scan
+/// Selected rows from one successful GetTableRows command, in native scan
 /// order. Unavailable cells do not omit, reorder or deduplicate rows.
 #[derive(Clone, PartialEq, ::prost::Message)]
-pub struct PrintedFunction {
+pub struct TableRows {
     #[prost(string, tag = "1")]
     pub table: ::prost::alloc::string::String,
     #[prost(message, repeated, tag = "2")]
@@ -1770,7 +1725,7 @@ pub struct PrintedFunction {
 }
 /// One selected table row. A relation row's output is `PrimitiveValue.unit`.
 /// Every input and the output retains its position, whether available or not.
-/// The enclosing PrintedFunction.table identifies the table. Available cells
+/// The enclosing TableRows.table identifies the table. Available cells
 /// are ordinary values, not synthetic row-position Calls or re-evaluated lookups.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct FunctionRow {
