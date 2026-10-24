@@ -15,7 +15,7 @@ import "buf/validate/validate.proto";
 // Validation rules and normative comments in this file are the specification.
 // Unknown enum values are errors; Rust consumers must check raw enum values.
 // Producers expand datatype/default-argument/include syntax before this boundary.
-// Clone saves state, including proof state; ReturnToEGraph restores a saved scope.
+// Clone saves state, including proof state. Destroy discards only its handle.
 
 // ---------------------------------------------------------------------------
 // PROGRAM AND PROVENANCE — the request payload and the shared span vocabulary.
@@ -44,11 +44,15 @@ import "buf/validate/validate.proto";
 // firings and other commands' evaluated inputs have their own scopes as in Union.
 // Fail is transparent to these scopes: a wrapped direct Action still belongs
 // to its enclosing command list, and the wrapper adds no Union identity scope.
-// Sort.var is legal only in HostPrimitive signatures and their presentation
-// owner/trait patterns, sharing that signature's binder. Node sorts, lambda
+// Sort.var is legal only in BuiltinCatalog signatures. Node sorts, lambda
 // parameter sorts, cost sorts and concrete declaration signatures must be
 // recursively closed. CEL rejects direct variable roots; closure is normative.
 message Program {
+  option (buf.validate.message).cel = {
+    id: "program.closed_sort_arena"
+    message: "input Programs contain only concrete sorts"
+    expression: "this.sorts.all(s, !has(s.var))"
+  };
   option (buf.validate.message).cel = {
     id: "program.node_sort_in_range"
     message: "every node sort_id must index a non-variable sort"
@@ -80,7 +84,7 @@ message Program {
     message: "sort children must index sorts"
     expression:
       "this.sorts.all(s, "
-      "(has(s.family) ? s.family.args : "
+      "(has(s.application) ? s.application.args : "
       "has(s.func) ? s.func.params + [s.func.result] : [])"
       ".all(i, i < uint(size(this.sorts))))"
   };
@@ -92,7 +96,7 @@ message Program {
       "(has(d.constructor) ? d.constructor.inputs.map(a, a.sort) + [d.constructor.output] : "
       "has(d.function) ? d.function.inputs.map(a, a.sort) + [d.function.output] : "
       "has(d.relation) ? d.relation.inputs.map(a, a.sort) : "
-      "has(d.primitive) ? d.primitive.inputs.map(a, a.sort) + [d.primitive.output] : [])"
+      "has(d.user_defined_primitive) ? d.user_defined_primitive.inputs.map(a, a.sort) + [d.user_defined_primitive.output] : [])"
       ".all(i, i < uint(size(this.sorts)) && !has(this.sorts[int(i)].var)))"
   };
   option (buf.validate.message).cel = {
@@ -103,87 +107,6 @@ message Program {
       "(n.sort_id < uint(size(this.sorts)) && has(this.sorts[int(n.sort_id)].func) && "
       "[this.sorts[int(n.sort_id)].func].all(f, (f.params + [f.result]).all(i, "
       "i < uint(size(this.sorts)) && !has(this.sorts[int(i)].var)))))"
-  };
-  // Bounds and direct variable roots only; follow nested patterns with the
-  // enclosing signature's binder in the semantic verifier.
-  option (buf.validate.message).cel = {
-    id: "program.generic_signature_roots"
-    message: "signature sorts must exist and direct variables must be bound"
-    expression:
-      "this.declarations.all(d, !has(d.host_primitive) || "
-      "!has(d.host_primitive.signature) || [d.host_primitive.signature].all(sig, "
-      "(sig.inputs.map(a, a.sort) + (has(sig.output) ? [sig.output] : []) + "
-      "sig.varargs.map(a, a.sort)).all(i, "
-      "i < uint(size(this.sorts)) && (!has(this.sorts[int(i)].var) || "
-      "this.sorts[int(i)].var < uint(size(sig.type_params))))))"
-  };
-  option (buf.validate.message).cel = {
-    id: "program.bindings_default_roots"
-    message: "presentation defaults must index nodes and cannot be free variable roots"
-    expression:
-      "this.declarations.all(d, !has(d.bindings) || d.bindings.python.views.all(v, "
-      "v.params.all(p, !has(p.default_expr) || (p.default_expr < uint(size(this.nodes)) && "
-      "!has(this.nodes[int(p.default_expr)].var)))))"
-  };
-  option (buf.validate.message).cel = {
-    id: "program.bindings_sort_roots"
-    message: "presentation sort references must exist and direct variables use the callable binder"
-    expression:
-      "this.declarations.all(d, !has(d.bindings) || "
-      "[has(d.host_primitive) && has(d.host_primitive.signature) ? "
-      "size(d.host_primitive.signature.type_params) : 0].all(n, "
-      "d.bindings.python.views.all(v, "
-      "(!has(v.owner) || !has(v.owner.sort)) || [v.owner.sort].all(i, "
-      "i < uint(size(this.sorts)) && (!has(this.sorts[int(i)].var) || this.sorts[int(i)].var < uint(n)))) && "
-      "d.bindings.rust.views.all(v, ((has(v.owner) && has(v.owner.sort) ? [v.owner.sort] : []) + "
-      "(has(v.trait_impl) ? v.trait_impl.args.map(a, a.sort) : [])).all(i, "
-      "i < uint(size(this.sorts)) && (!has(this.sorts[int(i)].var) || this.sorts[int(i)].var < uint(n))))))"
-  };
-  // Direct receiver/owner roots for fixed-tail and consuming-tail views. Variables may be
-  // instantiated; recursive structural matching under the signature's shared
-  // substitution remains normative. Compare shapes, not arena IDs or spans.
-  option (buf.validate.message).cel = {
-    id: "program.presentation_tail_receiver_roots"
-    message: "tail receiver and owner sort roots must agree"
-    expression:
-      "this.declarations.all(d, !has(d.bindings) || !has(d.host_primitive.signature) || "
-      "[d.host_primitive.signature].all(sig, size(sig.varargs) == 0 || "
-      "(d.bindings.python.views.filter(v, has(v.receiver) && has(v.owner.sort) && "
-      "(has(v.tail_repetitions) || (v.kind == 3 && size(sig.varargs) == 1 && v.receiver == uint(size(sig.inputs)))))"
-      ".map(v, [v.owner.sort, v.receiver]) + "
-      "d.bindings.rust.views.filter(v, has(v.receiver) && has(v.owner.sort) && "
-      "(has(v.tail_repetitions) || (size(sig.varargs) == 1 && v.receiver.core_input == uint(size(sig.inputs)))))"
-      ".map(v, [v.owner.sort, v.receiver.core_input])).all(pair, "
-      "[pair[1] < uint(size(sig.inputs)) ? sig.inputs[int(pair[1])].sort : "
-      "sig.varargs[int((pair[1] - uint(size(sig.inputs))) % uint(size(sig.varargs)))].sort].all(i, "
-      "pair[0] < uint(size(this.sorts)) && i < uint(size(this.sorts)) && "
-      "[this.sorts[int(pair[0])]].all(owner, [this.sorts[int(i)]].all(input, "
-      "has(owner.var) || has(input.var) || "
-      "(has(owner.eq) && has(input.eq) && owner.eq == input.eq) || "
-      "(has(owner.family) && has(input.family) && owner.family.name == input.family.name && "
-      "size(owner.family.args) == size(input.family.args)) || "
-      "(has(owner.func) && has(input.func) && size(owner.func.params) == size(input.func.params))))))))"
-  };
-  // Nominal equality sorts and host families have distinct name spaces.
-  // Same-family resends must agree on arity even without an arena use.
-  option (buf.validate.message).cel = {
-    id: "program.sort_declarations"
-    message: "same-name host-family declarations must agree on arity"
-    expression:
-      "this.declarations.all(d, !has(d.host_sort_family) || "
-      "this.declarations.all(e, !has(e.host_sort_family) || "
-      "d.host_sort_family.name != e.host_sort_family.name || "
-      "d.host_sort_family.arity == e.host_sort_family.arity))"
-  };
-  // Ambient/installed resolution remains normative. Check local declarations
-  // against direct references/applications, including signature patterns.
-  option (buf.validate.message).cel = {
-    id: "program.sort_uses"
-    message: "host-family applications must agree with declared family arities"
-    expression:
-      "this.declarations.all(d, !has(d.host_sort_family) || "
-      "this.sorts.all(s, !has(s.family) || s.family.name != d.host_sort_family.name || "
-      "uint(size(s.family.args)) == d.host_sort_family.arity))"
   };
   option (buf.validate.message).cel = {
     id: "program.empty_union_eq_sort"
@@ -247,18 +170,15 @@ message Program {
       ".all(i, i < uint(size(this.nodes)) && "
       "(!has(this.nodes[int(i)].call) || "
       "this.nodes[int(i)].sort_id >= uint(size(this.sorts)) || "
-      "!has(this.sorts[int(this.nodes[int(i)].sort_id)].family) || "
-      "this.sorts[int(this.nodes[int(i)].sort_id)].family.name != 'Unit' || "
-      "size(this.sorts[int(this.nodes[int(i)].sort_id)].family.args) != 0 || "
+      "!has(this.sorts[int(this.nodes[int(i)].sort_id)].application) || "
+      "this.sorts[int(this.nodes[int(i)].sort_id)].application.name != 'Unit' || "
+      "size(this.sorts[int(this.nodes[int(i)].sort_id)].application.args) != 0 || "
       "!this.nodes[int(i)].call.args.all(a, a < uint(size(this.nodes))) || "
       "!this.declarations.exists(d, has(d.relation) && "
       "d.relation.name == this.nodes[int(i)].call.func && "
       "d.relation.inputs.map(a, a.sort) == "
       "this.nodes[int(i)].call.args.map(a, this.nodes[int(a)].sort_id)))))"
   };
-
-  reserved 1, 7;
-  reserved "ir_version", "rulesets";
 
   // Expression arena. Evaluate shared ordinary nodes lazily at first demand,
   // retaining results within one Action command execution (including a loop
@@ -294,7 +214,7 @@ message SourceFile {
 }
 
 // A byte range. Resolve `file` against the nearest arena-owning payload's
-// `files`: `Program`, `CreateEGraphRequest`, `RunProgramResponse`, or
+// `files`: `Program`, `BuiltinCatalog`, `CreateEGraphRequest`, `RunProgramResponse`, or
 // a nested exported `Program`. Re-emission must remap or include those files,
 // or strip spans, including origins from definitions installed by earlier requests;
 // dangling indices are invalid. The range is half-open [start, end), with
@@ -319,15 +239,13 @@ message Span {
 
 // Closed types are structurally interned. Equal container/function shapes
 // denote the same sort.
-// Signatures and their presentation patterns reuse binder-local variables.
+// Signatures reuse binder-local variables.
 // A shared pattern is interpreted independently in each GenericSignature;
 // arena sharing never shares substitutions between signatures or calls.
-// Sorts are acyclic through HostSort.args and FuncSort.params/result. CEL
+// Sorts are acyclic through SortApplication.args and FuncSort.params/result. CEL
 // checks direct indices, not acyclicity or recursive variable scope.
-// References do not declare sorts: resolve equality names and host families
-// against local declarations, installed definitions or ambient host definitions
-// in their respective namespaces: eq only resolves EqSort, family only resolves
-// HostSortFamily. Equal name spellings do not identify or substitute these kinds.
+// References do not declare sorts: eq resolves user EqSort declarations;
+// application resolves a configured-backend PrimitiveSort from GetBuiltins. Equal name spellings do not identify or substitute these kinds.
 // Missing names and family-arity mismatches are errors. Builtin references do
 // not require explicit descriptor declarations. Response references resolve
 // against the associated handle; their arenas do not redeclare definitions.
@@ -336,32 +254,27 @@ message Sort {
     option (buf.validate.oneof).required = true;
 
     string eq = 1 [(buf.validate.field).string.min_len = 1];
-    HostSort family = 2;
+    SortApplication application = 2;
     FuncSort func = 4;
     uint32 var = 7; // index into the enclosing GenericSignature.type_params
   }
 
   // Optional representative type-use origin; excluded from sort identity.
-  // Documentation and family/nominal bindings belong to the defining Declaration.
+  // Documentation belongs to the defining Declaration.
   Span span = 5;
-
-  // Optional text aliases, excluded from identity; other frontends may omit them.
-  // Interning equal sorts collects distinct symbols, without a resupply contract.
-  // Text frontends resolve spelling collisions; aliases declare no semantic sort.
-  repeated EgglogTypeBinding egglog_aliases = 8;
 }
 
 // A host-family application: no args for i64/Unit, or e.g. Vec<i64> and
 // Map<String, Math>. Arg count equals declared family arity, including zero.
-// Args may be patterns only in a GenericSignature or its bindings; otherwise
+// Args may be patterns only in a GenericSignature; otherwise
 // recursively closed. Host-family sorts are not equality sorts.
-message HostSort {
+message SortApplication {
   string name = 1 [(buf.validate.field).string.min_len = 1];
   repeated uint32 args = 2 [packed = true]; // index into the enclosing `sorts`
 }
 
 // A structural function type, not a named host sort family. Its parameter and
-// result sorts may be patterns in a GenericSignature or its presentation;
+// result sorts may be patterns in a GenericSignature;
 // otherwise closed.
 message FuncSort {
   repeated uint32 params = 1 [packed = true]; // index into the enclosing `sorts`
@@ -389,9 +302,6 @@ message FuncSort {
 //  must be legal in that execution context. Hosts publish the capabilities
 //  of ambient primitives; receivers check these obligations. A Union in an
 //  evaluated body can write, even though the body contains only expressions.
-// - Presentation defaults are closed symbolic templates, not evaluated at
-//  installation/export. Lambda bodies keep their own binders; every expanded
-//  use must satisfy its ordinary execution context's typing/effect rules.
 // - Inert values (declared costs and extracted data) contain no variables,
 //  get_cost reads or Union and must be finite. Saved code bodies retain
 //  their own binders, so these are use-site rules, not bans on an entire arena.
@@ -430,7 +340,7 @@ message Node {
     // may bind in the query binder; an absent annotation contributes no match.
     // It has seminaive dependencies like a table lookup, not a Pure-only primitive.
     // When evaluated, evaluate args once each, left-to-right, then read the cost;
-    // absence fails with EVALUATION_FAILED. This requires a read-capable context,
+    // absence fails with RUNTIME_FAILURE. This requires a read-capable context,
     // so is invalid in SEMINAIVE heads or Pure/Write code. Args inherit the use's
     // context/binder. Not inert data; saved code may use it under these rules.
     Call get_cost = 9;
@@ -532,7 +442,7 @@ message Union {
 // that definition's signature. Generic instantiation does not select another
 // definition. Frontends resolve overloaded surface syntax and conversions
 // before this boundary. Missing names and signature mismatches are errors.
-// HostPrimitive's typing form checks all concrete argument AND result sorts;
+// Primitive's typing form checks all concrete argument AND result sorts;
 // every generic parameter must be determined. There are no call-level type args.
 //
 // For Node.call, the enclosing node's sort matches the result; relation calls
@@ -567,7 +477,7 @@ message Lambda {
 // scalar arms retain their exact payloads: f64_bits preserves IEEE-754 bits,
 // while Egglog equality identifies signed zeroes and all NaN bit patterns.
 // BigInt/BigRat/Rational and vec/set/multiset/map/pair/maybe use their matching
-// HostSort family applications; lambda/partial_call use FuncSort.
+// SortApplication family applications; lambda/partial_call use FuncSort.
 // CustomValue supports host sorts, including nullary families with value children.
 // Verify payload/sort agreement and child types; CEL checks their indices only.
 //
@@ -581,6 +491,11 @@ message Lambda {
 // Lambda captures are constructed now and its body is separately scoped code.
 // Symbolic operations such as rational(n,d), vec-of or function application
 // remain Calls; they are not interchangeable with already-formed value data.
+// Dedicated scalar arms require the nullary applications i64, f64, String,
+// bool, Unit, BigInt, BigRat and Rational respectively. Vec/Set/MultiSet/Maybe
+// require their named unary applications; Map and Pair require their named
+// binary applications. Lambda and partial_call require FuncSort. Other backend
+// values use CustomValue rather than overloading these family names.
 message PrimitiveValue {
   oneof value {
     option (buf.validate.oneof).required = true;
@@ -669,7 +584,7 @@ message MaybeValue {
 // For host sorts without a dedicated PrimitiveValue arm. The exact enclosing
 // sort selects the codec and its valid arg arity/sorts; no separate type tag.
 // A nullary family may still have value args (e.g. PyObject); these are not
-// HostSort's type args and need not have the same arity.
+// SortApplication's type args and need not have the same arity.
 // All Egglog references are explicit args. Payload bytes may refer to arg slots,
 // never arena/class indices, engine Value IDs or raw process pointers. Traversal,
 // rebuilding and remapping must rewrite args regardless of sort kind, without
@@ -770,141 +685,41 @@ message SetCost {
 // Order-independent, immutable definitions. New names may be added. Resending
 // a complete definition is optional and checks compatibility: identical
 // definitions are no-ops; conflicting definitions are errors. User tables and
-// computed primitives have complete, concrete definitions, not signature-only
-// imports. Host descriptors instead assert an available compatible provider;
-// they never install native code. Referencing an ambient definition by name
-// does not require resending its descriptor.
+// computed primitives have complete, concrete definitions. Builtin primitives
+// and primitive sorts are resolved by canonical name against GetBuiltins;
+// their descriptors are not input declarations.
 // Compare referenced expression subgraphs structurally, not request-local
-// indices. Provenance, argument labels and language bindings do not
-// participate in semantic identity; bindings have their own resupply checks.
+// indices. Provenance, documentation and argument labels do not participate
+// in semantic identity.
 // Comparison must preserve Union sharing/identity topology; ordinary syntax
 // sharing may differ. One empty Union reused twice is not two fresh Unions.
-// Callable names are unique across Constructor, Function, Relation, Primitive
-// and HostPrimitive, including ambient definitions. EqSort, HostSortFamily and
-// callable names occupy three distinct namespaces, selected by existing kind
-// tags. Equal spellings may coexist across namespaces. Compatible resends retain
+// Callable names are unique across Constructor, Function, Relation and
+// UserDefinedPrimitive, including ambient builtin primitives. Equality sorts
+// and primitive sorts occupy distinct nominal namespaces, selected by Sort's
+// kind. Equal spellings may coexist across namespaces. Compatible resends retain
 // the definition; conflicts within a namespace never shadow definitions.
-// Host descriptor compatibility compares family arity or primitive typing form
-// and structural signature, including ordered binder positions. Parameter
-// labels are diagnostic; alpha-renaming those labels is compatible.
-// Native implementation, codec and execution-capability compatibility remain
-// host obligations; descriptor equality alone does not establish them.
 message Declaration {
   option (buf.validate.message).cel = {
     id: "declaration.table_name"
     message: "a reflective table prefix belongs only on a constructor, function or relation"
     expression: "!(has(this.public_alias) || has(this.default_name)) || has(this.constructor) || has(this.function) || has(this.relation)"
   };
-  option (buf.validate.message).cel = {
-    id: "declaration.hidden_tables"
-    message: "only constructors and functions may be hidden"
-    expression: "!this.hidden || has(this.constructor) || has(this.function)"
-  };
-  option (buf.validate.message).cel = {
-    id: "declaration.callable_bindings"
-    message: "sort bindings belong on EqSort or HostSortFamily"
-    expression: "!(has(this.eq_sort) || has(this.host_sort_family)) || !has(this.bindings)"
-  };
-  option (buf.validate.message).cel = {
-    id: "declaration.presentation_inputs"
-    message: "ordinary surface mappings must cover fixed inputs and any final logical tail exactly once"
-    expression:
-      "!has(this.bindings) || "
-      "[has(this.constructor) ? size(this.constructor.inputs) : "
-      "has(this.function) ? size(this.function.inputs) : "
-      "has(this.relation) ? size(this.relation.inputs) : "
-      "has(this.primitive) ? size(this.primitive.inputs) : "
-      "has(this.host_primitive.signature) ? size(this.host_primitive.signature.inputs) : "
-      "has(this.host_primitive.application) ? 1 : 0].all(n, "
-      "[has(this.host_primitive.application) || size(this.host_primitive.signature.varargs) > 0].all(t, "
-      "this.bindings.python.views.all(v, has(v.tail_repetitions) || "
-      "[n + (has(this.host_primitive.signature) && size(this.host_primitive.signature.varargs) == 1 && "
-      "v.kind == 3 && has(v.receiver) && v.receiver == uint(n) ? 1 : 0)].all(m, "
-      "size(v.params) + (has(v.receiver) ? 1 : 0) == m + (t ? 1 : 0) && "
-      "(!has(v.receiver) || v.receiver < uint(m)) && "
-      "(!has(v.mutates) || v.mutates < uint(n)) && "
-      "v.params.all(p, p.core_input < uint(m + (t ? 1 : 0))) && "
-      "(!t || (size(v.params) > 0 && v.params[size(v.params)-1].core_input == uint(m) && "
-      "!has(v.params[size(v.params)-1].default_expr))))) && "
-      "this.bindings.rust.views.all(v, has(v.tail_repetitions) || "
-      "[n + (has(this.host_primitive.signature) && size(this.host_primitive.signature.varargs) == 1 && "
-      "has(v.receiver) && v.receiver.core_input == uint(n) ? 1 : 0)].all(m, "
-      "size(v.params) + (has(v.receiver) ? 1 : 0) == m + (t ? 1 : 0) && "
-      "(!has(v.receiver) || v.receiver.core_input < uint(m)) && "
-      "v.params.all(p, p.core_input < uint(m + (t ? 1 : 0))) && "
-      "(!t || (size(v.params) > 0 && v.params[size(v.params)-1].core_input == uint(m)))))))"
-  };
-  // Derive R from the supplied mapping count M before visiting its slots:
-  // M >= N, (M-N) % W == 0, R == (M-N) / W. This is N + R*W == M
-  // without overflow-prone multiplication or allocating R repetitions.
-  option (buf.validate.message).cel = {
-    id: "declaration.presentation_tail_repetitions"
-    message: "fixed-tail views require a nonempty host signature tail and exact fixed-slot coverage"
-    expression:
-      "!has(this.bindings) || "
-      "[size(this.host_primitive.signature.inputs)].all(n, "
-      "[size(this.host_primitive.signature.varargs)].all(w, "
-      "this.bindings.python.views.all(v, !has(v.tail_repetitions) || "
-      "(has(this.host_primitive.signature) && w > 0 ? "
-      "[size(v.params) + (has(v.receiver) ? 1 : 0)].all(m, "
-      "m >= n && (m-n) % w == 0 && v.tail_repetitions == uint((m-n) / w) && "
-      "(!has(v.receiver) || v.receiver < uint(m)) && "
-      "(!has(v.mutates) || v.mutates < uint(n)) && "
-      "v.params.all(p, p.core_input < uint(m) && "
-      "(p.core_input < uint(n) || !has(p.default_expr)))) : false)) && "
-      "this.bindings.rust.views.all(v, !has(v.tail_repetitions) || "
-      "(has(this.host_primitive.signature) && w > 0 ? "
-      "[size(v.params) + (has(v.receiver) ? 1 : 0)].all(m, "
-      "m >= n && (m-n) % w == 0 && v.tail_repetitions == uint((m-n) / w) && "
-      "(!has(v.receiver) || v.receiver.core_input < uint(m)) && "
-      "v.params.all(p, p.core_input < uint(m))) : false))))"
-  };
-  option (buf.validate.message).cel = {
-    id: "declaration.constant_signature"
-    message: "constant views require a concrete signature without generic parameters"
-    expression:
-      "!has(this.bindings) || this.bindings.python.views.all(v, v.kind != 7 || "
-      "(!has(this.host_primitive) || (has(this.host_primitive.signature) && "
-      "size(this.host_primitive.signature.type_params) == 0)))"
-  };
-  option (buf.validate.message).cel = {
-    id: "declaration.presentation_special_forms"
-    message: "function-wrapper owners require application receiver zero; datatype members require constructors"
-    expression:
-      "!has(this.bindings) || ("
-      "this.bindings.python.views.all(v, !has(v.owner.function) || "
-      "(has(this.host_primitive.application) && has(v.receiver) && v.receiver == uint(0))) && "
-      "this.bindings.rust.views.all(v, !has(v.owner.function) || "
-      "(has(this.host_primitive.application) && has(v.receiver) && v.receiver.core_input == uint(0))) && "
-      "this.bindings.egglog.views.all(v, !v.datatype_member || has(this.constructor)))"
-  };
-
   oneof kind {
     option (buf.validate.oneof).required = true;
 
     Constructor constructor = 1;
     Function function = 2;
     Relation relation = 3;
-    Primitive primitive = 4;
-    HostSortFamily host_sort_family = 5;
-    HostPrimitive host_primitive = 6;
+    UserDefinedPrimitive user_defined_primitive = 4;
     EqSort eq_sort = 10;
   }
 
   // Optional diagnostic origin; excluded from semantic identity.
   Span span = 7;
 
-  CallableBindings bindings = 8;
-
   // Optional documentation; excluded from semantic identity. Absent and
   // explicitly empty documentation remain distinct.
   optional string doc = 9;
-
-  // Semantic table visibility, valid only for Constructor and Function.
-  // Hidden tables are excluded from PrintSize and visible aggregate counts;
-  // hidden constructors are also excluded from extraction candidates.
-  // Definitions and rows remain present in queries, observations and Freeze.
-  bool hidden = 11;
 
   // Reflective String selector, distinct from the callable key. Absent means a
   // soft default of that key. Explicit public aliases take priority over soft
@@ -926,19 +741,9 @@ message Arg {
 }
 
 // A concrete nullary equality-sort definition. Its nominal namespace is distinct
-// from host families and callables; same-name compatible resends are idempotent.
-// Bindings have SortBindings' separate first-supply/resupply contract.
+// from primitive sorts and callables; same-name compatible resends are idempotent.
 message EqSort {
-  option (buf.validate.message).cel = {
-    id: "eq_sort.presentation_parameters"
-    message: "a nullary equality sort has no presentation type parameters"
-    expression:
-      "!has(this.bindings) || "
-      "(size(this.bindings.python.type_params) == 0 && size(this.bindings.rust.type_params) == 0)"
-  };
-
   string name = 1 [(buf.validate.field).string.min_len = 1];
-  SortBindings bindings = 2;
 
   // Optional non-owning table key for native Tree root extraction's one-hop
   // parent lookup. Absence means no lookup and differs from every present key.
@@ -964,6 +769,9 @@ message Constructor {
   optional uint32 cost = 4; // index into the enclosing `nodes`
 
   bool unextractable = 5;
+  // Exclude this constructor from aggregate observations and extraction;
+  // retain its rows in queries and snapshots.
+  bool hidden = 6;
 }
 
 // A concrete table-backed function.
@@ -972,9 +780,11 @@ message Function {
   repeated Arg inputs = 2;
   uint32 output = 3; // index into the enclosing `sorts`
 
-  // Deferred code bound only over old and new, including in an exported
+  // Deferred code bound only over the literal names old and new, including in an exported
   // declaration. Absent asserts equality on conflict.
   optional uint32 merge = 4; // index into the enclosing `nodes`
+  // Exclude this function from aggregate observations; retain its rows.
+  bool hidden = 5;
 }
 
 // A concrete set of tuples, inserted by an action call and matched by row existence.
@@ -985,12 +795,12 @@ message Relation {
   repeated Arg inputs = 2;
 }
 
-// A concrete program-defined computed function, distinct from HostPrimitive.
+// A concrete program-defined computed function, distinct from Primitive.
 // Its body and transitive callees must be legal at every
-// use, using host-published ambient capabilities; the receiver checks this.
+// use, using backend-published ambient capabilities; the receiver checks this.
 // An expression-only body may still write through Union. No effect-inference
 // algorithm or fallback for recursive definitions is prescribed here.
-message Primitive {
+message UserDefinedPrimitive {
   string name = 1 [(buf.validate.field).string.min_len = 1];
   repeated Arg inputs = 2;
   uint32 output = 3; // index into the enclosing `sorts`
@@ -999,46 +809,65 @@ message Primitive {
   optional uint32 body = 4 [(buf.validate.field).required = true]; // index into the enclosing `nodes`
 }
 
-// A named host sort family, including nullary scalar sorts. Names are immutable;
-// compatible resends agree on arity. Every application uses HostSort, including
-// arity-zero families. No generic user equality
-// sorts or implementation/codec code are declared by this descriptor.
-message HostSortFamily {
+// Read-only configured-backend catalog. Signatures and their sort patterns are
+// authoritative machine data; frontend presentation mappings remain external.
+// All sort and file indices refer to this message. It is independent of graph
+// contents, execution mode and creation settings, and is never part of Program,
+// Freeze or input history. Implementations and value codecs remain external.
+message BuiltinCatalog {
   option (buf.validate.message).cel = {
-    id: "host_sort_family.presentation_parameters"
-    message: "explicit presentation type-parameter labels must match family arity"
+    id: "builtin_catalog.sort_references"
+    message: "sort children must index the catalog sort arena"
     expression:
-      "!has(this.bindings) || [this.bindings.python, this.bindings.rust].all(m, "
-      "size(m.type_params) == 0 || uint(size(m.type_params)) == this.arity)"
+      "this.sorts.all(s, (has(s.application) ? s.application.args : "
+      "has(s.func) ? s.func.params + [s.func.result] : []).all(i, i < uint(size(this.sorts))))"
   };
-
-  string name = 1 [(buf.validate.field).string.min_len = 1];
-  uint32 arity = 2;
-  SortBindings bindings = 3;
+  option (buf.validate.message).cel = {
+    id: "builtin_catalog.signature_roots"
+    message: "signature sorts must exist and direct variables must be bound"
+    expression:
+      "this.primitives.all(p, !has(p.signature) || [p.signature].all(sig, "
+      "(sig.inputs.map(a, a.sort) + (has(sig.output) ? [sig.output] : []) + "
+      "sig.varargs.map(a, a.sort)).all(i, i < uint(size(this.sorts)) && "
+      "(!has(this.sorts[int(i)].var) || this.sorts[int(i)].var < uint(size(sig.type_params))))))"
+  };
+  repeated Sort sorts = 1;
+  repeated PrimitiveSort primitive_sorts = 2;
+  repeated Primitive primitives = 3;
+  repeated SourceFile files = 4;
 }
 
-// A host-implemented callable. Submission asserts that a compatible native
-// implementation is available; it supplies neither a body nor executable code.
-message HostPrimitive {
+// A backend-provided sort family, including nullary scalar sorts. Every
+// application uses SortApplication, with exactly arity arguments.
+message PrimitiveSort {
   string name = 1 [(buf.validate.field).string.min_len = 1];
+  uint32 arity = 2;
+  Span span = 3;
+  optional string doc = 4;
+}
 
+// A backend-provided callable. A Program calls its canonical name without
+// declaring it. Its implementation and context capabilities remain native.
+message Primitive {
+  string name = 1 [(buf.validate.field).string.min_len = 1];
   oneof typing {
     option (buf.validate.oneof).required = true;
-
     GenericSignature signature = 2;
     FunctionApplication application = 3;
   }
+  Span span = 4;
+  optional string doc = 5;
 }
 
-// An ordinary host signature: a fixed prefix followed by zero or more
+// An ordinary primitive signature: a fixed prefix followed by zero or more
 // repetitions of the ordered varargs pattern. An empty pattern means no tail
 // (exact fixed arity); one Arg describes homogeneous varargs. For a nonempty
 // pattern, the actual argument count minus the fixed prefix must be a multiple
 // of the pattern width. Pattern order and width are semantic, even [T, T];
 // arguments remain flat, with no tuple/group node. Sort indices reference
-// Program.sorts.
+// BuiltinCatalog.sorts.
 // Sort.var indices bind by position in type_params; labels do not bind by name
-// and need not be distinct. All variable uses, including nested HostSort and
+// and need not be distinct. All variable uses, including nested SortApplication and
 // FuncSort patterns, must be in this signature's binder. Each actual call
 // matches all concrete argument and result sorts structurally to obtain one
 // consistent, complete substitution across all repetitions and the result.
@@ -1072,300 +901,6 @@ message GenericSignature {
 // arguments exactly match its params, and the call result matches its result.
 // PrimitiveValue.partial_call supplies an effective complete call; see that field.
 message FunctionApplication {}
-
-// ---------------------------------------------------------------------------
-// LANGUAGE BINDINGS — optional views, never additional core definitions.
-// ---------------------------------------------------------------------------
-
-// Each language block is fixed when first supplied for the semantic definition.
-// Absence makes no assertion/removal; another language may first arrive later.
-// Reconcile all supplies order-independently, including repeated same-name
-// declarations, before interning away duplicate presentations.
-// Agreeing supplies are allowed; conflicting supplies are errors. Compare
-// arena references structurally, not by index. Sort comparison excludes attached
-// bindings; default calls identify their core callee, not its presentation.
-// Compare all default roots within each language block together, preserving
-// shared/distinct Union topology.
-// Bindings never change semantic definition identity or duplicate docs/spans.
-//
-// Without a Python/Rust block, generators derive conservative type/free-function
-// wrappers, preserving exact core names, signatures and argument order. Derived
-// wrappers install no bindings. Empty blocks carry no hiding instruction; their
-// generation behavior and identifier normalization are not specified here.
-// Malformed individual bindings and conflicting resupply are installation errors.
-// Cross-definition Python/Rust binding collisions are generation errors for all
-// explicit/derived combinations, never silent fallback, overwrite or renaming.
-message SortBindings {
-  TypeBinding python = 1;
-  TypeBinding rust = 2;
-  EgglogTypeBinding egglog = 3;
-}
-
-// A target-language type path (module/crate segments, then type name), distinct
-// from its core sort/family name. Parameters remain in core family order.
-// Optional labels name those parameters; if supplied, their count equals arity.
-// They introduce no Sort.var binder. Nullary EqSort/families have no parameters.
-message TypeBinding {
-  repeated string path = 1 [(buf.validate.field).repeated.items.string.min_len = 1];
-  repeated string type_params = 2 [(buf.validate.field).repeated.items.string.min_len = 1];
-}
-
-// Surface sort/family symbol; family parameters retain core order.
-message EgglogTypeBinding {
-  string symbol = 1;
-}
-
-// The same per-language lifetime/compatibility contract as SortBindings.
-// No view changes the core signature. A surface call supplies every core input
-// exactly once after receiver mapping, defaults and tail expansion; it emits an
-// ordinary Call in core argument order. Parameter names are surface names, not
-// binders for defaults. Views of generic host primitives share that signature's
-// type binder for owner/trait sort patterns; other views have no type binder.
-// Presentation cannot rescue a core call whose generic substitution is not
-// determined by its concrete argument/result sorts under the usual call rules.
-// Recursive binder/owner/default typing checks are normative.
-// With tail_repetitions absent, a nonempty tail occupies one logical slot.
-// With it present, only a HostPrimitive GenericSignature with a nonempty tail
-// is allowed. For N fixed inputs, tail width W and count R, the view has exactly
-// N + R*W fixed slots, with no logical tail slot. Slot i has the original input
-// sort for i < N, otherwise varargs[(i-N) % W]. Receiver/parameters cover these
-// slots exactly once; receiver owner and all arguments must match these sorts
-// under the canonical signature's substitution. Check count arithmetic and
-// mapped-slot count before expansion. R=0 is valid and distinct from absence.
-// Defaults and Python mutation remain limited to original fixed inputs.
-// This restricts a surface spelling's arity; it introduces no callable, binder,
-// signature, provider or packing node. The emitted Call still checks against
-// the unchanged canonical signature. New consumers preserve absent-field
-// meaning; older consumers that discard this field may widen the surface arity.
-message CallableBindings {
-  PythonBindings python = 1;
-  RustBindings rust = 2;
-  EgglogBindings egglog = 3;
-}
-
-// Owner identity, not a display path. A sort pattern refers to the enclosing
-// callable's signature binder, or must be closed when it has no generic binder.
-// The function marker is only for FunctionApplication's structural function
-// wrapper: receiver core input 0, with tail/result derived from its concrete
-// FuncSort. It introduces neither a named sort family nor a type-pack binder.
-message BindingOwner {
-  oneof kind {
-    option (buf.validate.oneof).required = true;
-
-    uint32 sort = 1; // index into Program.sorts
-    FunctionTypeOwner function = 2;
-  }
-}
-
-message FunctionTypeOwner {}
-
-message PythonBindings {
-  repeated PythonCallable views = 1;
-}
-
-// Free functions and CONSTANT use a qualified path; members use one name on owner.
-// Function/constant paths are nonempty; final names may be empty, qualifiers may not.
-// INITIALIZER instead omits path and derives __init__.
-// METHOD/PROPERTY map a real core input as receiver. INITIALIZER/CLASS_METHOD
-// have no core self/cls input. Only INITIALIZER requires result = owner;
-// class methods and class variables may return a different sort.
-// METHOD/PROPERTY receiver sort must match owner under the same substitution.
-// PROPERTY has only a receiver; CLASS_VARIABLE is a nullary expression view.
-// CONSTANT is an ownerless named expression (C, not C()), backed by a nullary
-// concrete core signature. It has no receiver, parameters or mutated input.
-// It does not change declaration semantics or evaluate a body at installation
-// or export. FUNCTION stays callable even when its core signature is nullary.
-message PythonCallable {
-  option (buf.validate.message).cel = {
-    id: "python_callable.path_components"
-    message: "only a function's or constant's final name may be an empty path component"
-    expression:
-      "this.path.filter(p, p == '').size() == "
-      "(this.kind in [1, 7] && size(this.path) > 0 && this.path[size(this.path)-1] == '' ? 1 : 0)"
-  };
-  option (buf.validate.message).cel = {
-    id: "python_callable.owner_and_receiver"
-    message: "Python callable form determines owner and receiver presence"
-    expression:
-      "(this.kind in [1, 7] ? !has(this.owner) : has(this.owner)) && "
-      "((this.kind in [3, 5]) == has(this.receiver)) && "
-      "(this.kind == 2 ? size(this.path) == 0 : "
-      "this.kind in [1, 7] ? size(this.path) > 0 : size(this.path) == 1) && "
-      "(!(this.kind in [5, 6, 7]) || size(this.params) == 0)"
-  };
-  option (buf.validate.message).cel = {
-    id: "python_callable.unique_inputs"
-    message: "each surface parameter/receiver maps a distinct core input"
-    expression:
-      "this.params.all(p, (!has(this.receiver) || p.core_input != this.receiver) && "
-      "this.params.filter(q, q.core_input == p.core_input).size() == 1)"
-  };
-  option (buf.validate.message).cel = {
-    id: "python_callable.mutated_input"
-    message: "a mutated argument must be a mapped receiver or parameter"
-    expression:
-      "!has(this.mutates) || (this.kind != 2 && "
-      "((has(this.receiver) && this.mutates == this.receiver) || "
-      "this.params.exists(p, p.core_input == this.mutates)))"
-  };
-  option (buf.validate.message).cel = {
-    id: "python_callable.tail_repetitions_form"
-    message: "fixed-tail Python views currently support only functions and methods"
-    expression: "!has(this.tail_repetitions) || this.kind in [1, 3]"
-  };
-
-  PythonCallKind kind = 1 [(buf.validate.field).enum = {
-    defined_only: true
-    not_in: [0]
-  }];
-  repeated string path = 2;
-  BindingOwner owner = 3;
-  optional uint32 receiver = 4; // fixed view input, not implicit Python self/cls
-  repeated PythonParameter params = 5; // surface order, excluding receiver
-
-  // Replace this supplied argument wrapper with the Call result and return
-  // Python None. Applies to free functions as well as methods. The fixed input
-  // and core result sorts must agree; this does not change the core result to
-  // Unit or assert a database effect. Initializers cannot use this convention.
-  optional uint32 mutates = 6;
-
-  // Optional fixed-tail view; see CallableBindings. Supported for FUNCTION and
-  // METHOD only. In particular, zero repetitions do not create a CONSTANT view.
-  optional uint32 tail_repetitions = 7;
-}
-
-enum PythonCallKind {
-  PYTHON_CALL_KIND_UNSPECIFIED = 0;
-  PYTHON_CALL_KIND_FUNCTION = 1;
-  PYTHON_CALL_KIND_INITIALIZER = 2;
-  PYTHON_CALL_KIND_METHOD = 3;
-  PYTHON_CALL_KIND_CLASS_METHOD = 4;
-  PYTHON_CALL_KIND_PROPERTY = 5;
-  PYTHON_CALL_KIND_CLASS_VARIABLE = 6;
-  PYTHON_CALL_KIND_CONSTANT = 7;
-}
-
-// Ordered surface parameter. Without tail_repetitions, fixed core inputs
-// occupy [0, n). A nonempty varargs pattern has one logical tail slot n for the
-// whole flat tail, not one slot per pattern position. It must be last in surface
-// order and have no default. A METHOD receiver at slot n may consume the first
-// operand of a homogeneous (width-one) tail; the remaining tail occupies slot
-// n+1. This view requires at least one actual tail operand, leaves the core
-// signature unchanged, and is unavailable for a zero-tail call. Grouped tails,
-// properties, and FunctionApplication cannot use this convention.
-// FunctionApplication has
-// fixed slot 0 plus tail slot 1, whose heterogeneous sorts come from the actual FuncSort.
-// With tail_repetitions present, every slot is fixed, including expanded tail
-// operands; those operands have no default. See CallableBindings for their sorts.
-// No redundant varargs flag or generic expression template is introduced.
-message PythonParameter {
-  optional uint32 core_input = 1 [(buf.validate.field).required = true];
-  string name = 2 [(buf.validate.field).string.min_len = 1];
-
-  // Typed symbolic syntax, not an evaluated/captured value. It must have no
-  // free/query variables; lambda-local bound variables are allowed. Calls are
-  // allowed and installation/export never evaluates them. Node sorts remain
-  // concrete; a default can constrain a generic call's substitution at use.
-  // Check each use under its binder: sharing a node with a lambda body does
-  // not bind that node in a capture or another default root.
-  // Expand omitted defaults together into the emitted call with fresh Union
-  // identities, preserving sharing within that expansion; no cross-call cache
-  // of classes/values. Check ordinary binding, typing and effect rules at use.
-  optional uint32 default_expr = 3; // index into Program.nodes
-}
-
-message RustBindings {
-  repeated RustCallable views = 1;
-}
-
-// No owner means free function (qualified path); otherwise path is one member
-// name. Owner without receiver is associated; with receiver it is a method.
-// trait_impl selects a trait implementation, which may have either form.
-// Associated-function output need not equal owner. Receiver's core sort matches
-// owner; borrowing only affects wrapper ownership, not that semantic sort.
-message RustCallable {
-  option (buf.validate.message).cel = {
-    id: "rust_callable.owner"
-    message: "Rust member/trait/borrowed-Self forms require an owner"
-    expression:
-      "(!has(this.receiver) || has(this.owner)) && "
-      "(!has(this.trait_impl) || has(this.owner)) && "
-      "(!this.borrowed_self || has(this.trait_impl)) && "
-      "(!has(this.owner) || size(this.path) == 1)"
-  };
-  option (buf.validate.message).cel = {
-    id: "rust_callable.unique_inputs"
-    message: "each surface parameter/receiver maps a distinct core input"
-    expression:
-      "this.params.all(p, (!has(this.receiver) || p.core_input != this.receiver.core_input) && "
-      "this.params.filter(q, q.core_input == p.core_input).size() == 1)"
-  };
-
-  repeated string path = 1 [(buf.validate.field).repeated = {
-    min_items: 1
-    items: {
-      string: {min_len: 1}
-    }
-  }];
-  BindingOwner owner = 2;
-  bool borrowed_self = 3; // impl Trait for &Owner, independent of receiver syntax
-  RustReceiver receiver = 4;
-  repeated RustParameter params = 5; // surface order, excluding receiver
-  RustTrait trait_impl = 6;
-
-  // Optional fixed-tail view; see CallableBindings. Borrowing is unchanged.
-  optional uint32 tail_repetitions = 7;
-}
-
-// Receiver ownership relative to impl Self: self or &self. For an impl on
-// &Owner, by-value self is already &Owner, while &self is &&Owner.
-message RustReceiver {
-  optional uint32 core_input = 1 [(buf.validate.field).required = true];
-  bool borrowed = 2;
-}
-
-// Same fixed/tail input-slot convention as PythonParameter. Borrowing describes
-// a fixed wrapper or the tail's elements, not a new core reference sort.
-// Into/iterator conveniences remain generator policy; no host converter body.
-message RustParameter {
-  optional uint32 core_input = 1 [(buf.validate.field).required = true];
-  string name = 2 [(buf.validate.field).string.min_len = 1];
-  bool borrowed = 3;
-}
-
-// Named trait, explicit type arguments, and an optional associated output such
-// as std::ops::Add<Rhs>::Output. That associated type is the core result wrapper.
-// Types reuse the callable's signature binder, including mixed/concrete owner
-// applications. Trait conformance/coherence is checked during Rust generation.
-// Arbitrary associated types, lifetimes, const generics, mutable borrowing and
-// where-clause/code payloads are not represented by this limited view.
-message RustTrait {
-  repeated string path = 1 [(buf.validate.field).repeated = {
-    min_items: 1
-    items: {
-      string: {min_len: 1}
-    }
-  }];
-  repeated RustType args = 2;
-  optional string output_associated_type = 3 [(buf.validate.field).string.min_len = 1];
-}
-
-message RustType {
-  optional uint32 sort = 1 [(buf.validate.field).required = true]; // index into Program.sorts
-  bool borrowed = 2;
-}
-
-message EgglogBindings {
-  repeated EgglogCallable views = 1;
-}
-
-// Surface symbol in core argument order. datatype_member is valid only for a
-// Constructor: group it under its existing equality output sort's presentation.
-// It does not add a datatype definition or select a text-overload policy.
-message EgglogCallable {
-  string symbol = 1 [(buf.validate.field).string.min_len = 1];
-  bool datatype_member = 2;
-}
 
 // ---------------------------------------------------------------------------
 // RULE DEFINITIONS — immutable content, registered by ordered commands.
@@ -1452,7 +987,7 @@ message BiRewrite {
 // ---------------------------------------------------------------------------
 
 // One command, at top level or in a loop body: every command may appear in
-// `Repeat` or `Saturate`. Declarations are not commands.
+// `Loop`. Declarations are not commands.
 message Command {
   oneof kind {
     option (buf.validate.oneof).required = true;
@@ -1469,17 +1004,16 @@ message Command {
     PrintFunction print_function = 9;
     PrintTableStats print_table_stats = 10;
 
-    Repeat repeat = 11;
-    Saturate saturate = 12;
+    Loop loop = 11;
 
     Prove prove = 14;
     ProveExists prove_exists = 15;
 
     // Expect the supported child's execution to fail. Evaluating an action's
     // arguments belongs to that action, not to a prerequisite outside the
-    // catch. Failure succeeds; success raises EVALUATION_FAILED. Suppress the
-    // child's requested outputs on either outcome, retaining completed effects
-    // and earlier outputs. Preparation/typechecking errors and unsupported
+    // catch. Failure succeeds; success raises RUNTIME_FAILURE. Produce no
+    // requested outputs anywhere inside the child scope, on either outcome;
+    // retain completed effects and outputs preceding that scope. Preparation/typechecking errors and unsupported
     // forms are not caught. Internal maintenance/invariant checks retain their
     // native boundaries.
     // This is not rollback and does not catch process panics. Nested wrappers
@@ -1651,17 +1185,12 @@ enum Extractor {
 // Include every installed declaration and sort, even unused or empty tables;
 // every registered rule content once and group membership in first-registration
 // order. Reconstruct membership with AddRules commands referencing Program.rules;
-// omit never-registered rule values. Host builtin declaration descriptors,
-// including generic families and distinct core callables, remain included.
+// omit never-registered rule values. Backend builtin descriptors remain in
+// GetBuiltins and are never included in the reconstruction Program.
 // Include saved code and its dependencies without executing it.
-// Include supplied language bindings and all bindings-only sort/default-node
-// dependencies, remapping their arena references. Do not export derived wrapper
-// defaults as if they were supplied bindings. Preserve default-root Union
-// sharing without evaluating templates or confusing them with stored classes.
 // Host implementations/codecs remain external.
-// HostSortFamily and HostPrimitive describe the catalog, including generic
-// signatures, presentation patterns and all referenced sorts. These graphs may
-// contain Sort.var; the reconstruction data and concrete definitions may not.
+// Reconstruction sorts are concrete. Generic signature patterns remain solely
+// in GetBuiltins; neither builtin declarations nor their pattern arenas are copied.
 //
 // Return EGraphSnapshot with the handle's logical options and this Program.
 // Do not export resource settings such as threads. See EGraphSnapshot for
@@ -1691,7 +1220,7 @@ enum Extractor {
 // these actions or materializes custom values. Executing them is explicit
 // trusted materialization and requires the appropriate host codecs.
 // If any required state/definition/value cannot be represented,
-// Freeze fails with EVALUATION_FAILED instead of returning a partial export.
+// Freeze fails with RUNTIME_FAILURE instead of returning a partial export.
 // Export completeness, canonical keys and reference preservation are normative
 // obligations, not established by Program's local CEL checks.
 message Freeze {}
@@ -1729,36 +1258,15 @@ message PrintTableStats {
   ];
 }
 
-// Execute `body` exactly `times` times, unless `until` matches or execution
-// fails. Does not stop early when the database is unchanged. A completed
-// top-level Repeat returns RunResult.
-message Repeat {
+// Execute the body in order until its complete iteration reports can_stop,
+// the optional cap is reached, until matches, or execution fails. Run itself
+// remains one round. A completed top-level Loop returns RunResult.
+message Loop {
   repeated Command body = 1;
-
   // Conjunctive pre-check before each iteration. Empty means no condition.
-  repeated uint32 until = 2 [packed = true]; // index into the enclosing `nodes`
-
-  // Required; an explicit zero performs no iterations.
-  optional uint64 times = 3 [(buf.validate.field).required = true];
-}
-
-// Repeat `body` until a complete iteration can stop, or a bound or `until`
-// condition ends it. Stop only when the iteration made no changes and every
-// consulted scheduler permits stopping. An unbounded body may diverge.
-// A completed top-level Saturate returns RunResult.
-//
-// Progress is recomputed each iteration over every mutation in the body:
-// actions, `keep_best`, extraction-root evaluation, and nested loops. Row
-// counts alone do not detect changes. A nested loop contributes its whole run
-// to the parent iteration, not only its final no-op step.
-message Saturate {
-  repeated Command body = 1;
-
-  // Conjunctive pre-check, as on `Repeat`.
-  repeated uint32 until = 2 [packed = true]; // index into the enclosing `nodes`
-
-  // Absent means unbounded; reaching a bound is not proof of saturation.
-  optional uint64 max_iterations = 3 [(buf.validate.field).uint64.gte = 1];
+  repeated uint32 until = 2 [packed = true];
+  // Absent is unbounded; zero executes no body or until check.
+  optional uint64 max_iterations = 3;
 }
 
 // Inspect selected registered rule query plans without executing or advancing
@@ -1777,14 +1285,18 @@ message Explain {
 // required. The bounded compatibility adapter implements only part of this
 // contract; unsupported operations must fail explicitly.
 service EgglogService {
+  // buf:lint:ignore RPC_RESPONSE_STANDARD_NAME
+  rpc GetBuiltins(GetBuiltinsRequest) returns (BuiltinCatalog);
   rpc CreateEGraph(CreateEGraphRequest) returns (CreateEGraphResponse);
   rpc CloneEGraph(CloneEGraphRequest) returns (CloneEGraphResponse);
   rpc DestroyEGraph(DestroyEGraphRequest) returns (DestroyEGraphResponse);
-  rpc ReturnToEGraph(ReturnToEGraphRequest) returns (ReturnToEGraphResponse);
   rpc RunProgram(RunProgramRequest) returns (stream RunProgramResponse);
   // buf:lint:ignore RPC_RESPONSE_STANDARD_NAME
   rpc GetHistory(GetHistoryRequest) returns (Program);
 }
+
+// Inspect the configured backend; no EGraph handle or graph state is involved.
+message GetBuiltinsRequest {}
 
 // Immutable logical settings, shared by creation and snapshots. cost_sort
 // indexes CreateEGraphRequest.sorts or EGraphSnapshot.program.sorts respectively.
@@ -1822,8 +1334,8 @@ enum ExecutionMode {
 // declarations against ambient host definitions, then validate options and this
 // acyclic, recursively closed sort arena before allocating a handle. Equality
 // declarations allow custom C without an already-existing handle. Compatible
-// repeated definitions are allowed; conflicting arity/bindings within a
-// namespace are errors. EqSort and HostSortFamily may have the same name.
+// repeated definitions are allowed; conflicting definitions are errors.
+// Equality sorts and primitive sorts may have the same name.
 // Successful creation retains these sort declarations on the new handle, so
 // later Programs may reference their names without resending definitions.
 // Unsupported options/resources are lifecycle errors, not RunProgram.error.
@@ -1843,33 +1355,15 @@ message CreateEGraphRequest {
     message: "sort children must index sorts"
     expression:
       "this.sorts.all(s, "
-      "(has(s.family) ? s.family.args : "
+      "(has(s.application) ? s.application.args : "
       "has(s.func) ? s.func.params + [s.func.result] : [])"
       ".all(i, i < uint(size(this.sorts))))"
   };
   option (buf.validate.message).cel = {
     id: "create_egraph_request.sort_declarations_only"
-    message: "creation accepts only equality-sort and host sort-family declarations"
-    expression: "this.declarations.all(d, has(d.eq_sort) || has(d.host_sort_family))"
+    message: "creation accepts only equality-sort declarations"
+    expression: "this.declarations.all(d, has(d.eq_sort))"
   };
-  option (buf.validate.message).cel = {
-    id: "create_egraph_request.sort_declarations"
-    message: "same-name host-family declarations must agree on arity"
-    expression:
-      "this.declarations.all(d, !has(d.host_sort_family) || "
-      "this.declarations.all(e, !has(e.host_sort_family) || "
-      "d.host_sort_family.name != e.host_sort_family.name || "
-      "d.host_sort_family.arity == e.host_sort_family.arity))"
-  };
-  option (buf.validate.message).cel = {
-    id: "create_egraph_request.sort_uses"
-    message: "host-family applications must agree with declared family arities"
-    expression:
-      "this.declarations.all(d, !has(d.host_sort_family) || "
-      "this.sorts.all(s, !has(s.family) || s.family.name != d.host_sort_family.name || "
-      "uint(size(s.family.args)) == d.host_sort_family.arity))"
-  };
-
   repeated Sort sorts = 1;
   EGraphOptions options = 2 [(buf.validate.field).required = true];
   repeated SourceFile files = 3;
@@ -1890,9 +1384,6 @@ message CreateEGraphRequest {
   // not a logical option and never restored by Freeze. Clone inherits this
   // choice. GetHistory specifies retention, observation and lifecycle behavior.
   bool record_history = 7;
-
-  reserved 8;
-  reserved "report_level";
 }
 
 message CreateEGraphResponse {
@@ -1902,13 +1393,13 @@ message CreateEGraphResponse {
 }
 
 // Portable logical state, not an execution checkpoint. The Program owns all
-// arenas/files, including the C selected by options. Only C's reachable sort
-// graph must be closed; unrelated generic signature patterns may remain.
+// arenas/files, including the C selected by options. Every sort is concrete;
+// builtin signature patterns remain in GetBuiltins.
 // Restore by remapping C's closed sort graph and needed sort declarations into
 // a CreateEGraphRequest, selecting receiver resource settings, then executing
 // program normally on the fresh compatible handle. No creation-time commands
 // or resumed scheduler/delta state are implied. Options preserve global
-// seminaive admission, not query plans or runtime resource/planner settings.
+// seminaive admission explicitly, not query plans or runtime resource/planner settings.
 // Executing program against
 // an existing handle still has ordinary Program semantics; callers must check
 // option compatibility for any restoration equivalence claim.
@@ -1943,28 +1434,6 @@ message DestroyEGraphRequest {
 
 message DestroyEGraphResponse {}
 
-// Return an active direct clone to its saved scope. The saved handle survives;
-// the active handle is consumed. Retain the active cumulative native report,
-// complete symbol generator and monotonic namespace stamp, but restore all
-// other saved logical/resource state. Do not sum the saved report prefix twice.
-//
-// Both handles must be live, distinct and directly paired by Clone. Reject if
-// the saved handle has accepted a Program since that Clone; rejected requests
-// do not invalidate pairing. Validate
-// before mutation. Ordinary Clone/Destroy retain independent copy/discard
-// semantics. Invalid pairing is a lifecycle error, not RunProgram.error.
-message ReturnToEGraphRequest {
-  option (buf.validate.message).cel = {
-    id: "scope.distinct_handles"
-    message: "active and saved handles must be distinct"
-    expression: "this.active_id != this.saved_id"
-  };
-  uint64 active_id = 1;
-  uint64 saved_id = 2;
-}
-
-message ReturnToEGraphResponse {}
-
 // Retrieve one accumulated input Program for this live graph. Recording is
 // selected at creation and off by default; disabled or unknown handles error.
 // Retain original decoded authored Programs only after successful preparation,
@@ -1975,7 +1444,7 @@ message ReturnToEGraphResponse {}
 // locations. Declarations are cumulative, so earlier Freeze observations may
 // contain extra definition metadata. This is not exact replay after failure.
 // GetHistory itself contributes no input. Clone retains its own shared past;
-// ReturnTo restores the saved history prefix and discards the consumed branch.
+// destroying a branch discards its inputs while a saved clone retains its prefix.
 // Destroy releases its graph's history. Host implementations remain external.
 message GetHistoryRequest {
   uint64 egraph_id = 1;
@@ -1990,8 +1459,6 @@ message RunProgramRequest {
   // optional timing, per-rule metrics and retained iteration detail, without
   // changing scheduler-required counts or readiness decisions.
   bool diagnostics = 3;
-  reserved 4;
-  reserved "profile", "include_run_reports";
 }
 
 // Each streamed chunk owns complete local arenas, independent of every other
@@ -2000,18 +1467,32 @@ message RunProgramRequest {
 // Cancellation preserves completed effects and outputs. It is cooperative at
 // command boundaries and does not roll back.
 message RunProgramResponse {
+  oneof result {
+    option (buf.validate.oneof).required = true;
+    RunProgramOutput output = 1;
+    Error error = 2;
+  }
+  // Origins for this frame's payload, including definitions installed earlier.
+  // Nested exported Programs own their files independently.
+  repeated SourceFile files = 3;
+}
+
+// One completed observation batch with self-contained node and sort arenas.
+// Spans index the enclosing RunProgramResponse.files. Earlier success frames
+// remain valid when a later terminal frame reports an error.
+message RunProgramOutput {
   option (buf.validate.message).cel = {
-    id: "run_program_response.closed_sorts"
+    id: "run_program_output.closed_sorts"
     message: "response sorts cannot contain signature variables"
     expression: "this.sorts.all(s, !has(s.var))"
   };
   option (buf.validate.message).cel = {
-    id: "run_program_response.node_sort_in_range"
+    id: "run_program_output.node_sort_in_range"
     message: "every node sort_id must index sorts"
     expression: "this.nodes.all(n, n.sort_id < uint(size(this.sorts)))"
   };
   option (buf.validate.message).cel = {
-    id: "run_program_response.node_refs_in_range"
+    id: "run_program_output.node_refs_in_range"
     message: "node children must index nodes"
     expression:
       "this.nodes.all(n, "
@@ -2030,30 +1511,30 @@ message RunProgramResponse {
       ".all(i, i < uint(size(this.nodes))))"
   };
   option (buf.validate.message).cel = {
-    id: "run_program_response.sort_refs_in_range"
+    id: "run_program_output.sort_refs_in_range"
     message: "sort children must index sorts"
     expression:
       "this.sorts.all(s, "
-      "(has(s.family) ? s.family.args : "
+      "(has(s.application) ? s.application.args : "
       "has(s.func) ? s.func.params + [s.func.result] : [])"
       ".all(i, i < uint(size(this.sorts))))"
   };
   option (buf.validate.message).cel = {
-    id: "run_program_response.function_value_signature"
+    id: "run_program_output.function_value_signature"
     message: "function values require a function sort"
     expression:
       "this.nodes.all(n, !(has(n.primitive_value.lambda) || has(n.primitive_value.partial_call)) || "
       "(n.sort_id < uint(size(this.sorts)) && has(this.sorts[int(n.sort_id)].func)))"
   };
   option (buf.validate.message).cel = {
-    id: "run_program_response.empty_union_eq_sort"
+    id: "run_program_output.empty_union_eq_sort"
     message: "an empty union requires an equality sort"
     expression:
       "this.nodes.all(n, !has(n.union) || size(n.union.members) > 0 || "
       "(n.sort_id < uint(size(this.sorts)) && has(this.sorts[int(n.sort_id)].eq)))"
   };
   option (buf.validate.message).cel = {
-    id: "run_program_response.table_output_refs_in_range"
+    id: "run_program_output.table_output_refs_in_range"
     message: "printed cells and column sorts must index the response arenas"
     expression:
       "this.outputs.all(o, "
@@ -2064,62 +1545,15 @@ message RunProgramResponse {
       "(!has(o.table_stats) || o.table_stats.stats.all(t, "
       "t.columns.all(c, c.sort < uint(size(this.sorts))))))"
   };
-  option (buf.validate.message).cel = {
-    id: "run_program_response.rule_node_refs_in_range"
-    message: "rule query, head and rewrite roots must index nodes"
-    expression:
-      "this.rules.all(r, "
-      "(has(r.rule) ? r.rule.query : "
-      "has(r.rewrite) ? [r.rewrite.lhs, r.rewrite.rhs] + r.rewrite.conditions : "
-      "has(r.birewrite) ? [r.birewrite.lhs, r.birewrite.rhs] + r.birewrite.conditions : [])"
-      ".all(i, i < uint(size(this.nodes))) && "
-      "(!has(r.rule) || r.rule.head.all(a, "
-      "(has(a.term) ? [a.term] : "
-      "has(a.set) ? a.set.target.args + [a.set.value] : "
-      "has(a.delete) ? a.delete.args : "
-      "has(a.subsume) ? a.subsume.args : "
-      "has(a.set_cost) ? a.set_cost.target.args + [a.set_cost.cost] : [])"
-      ".all(i, i < uint(size(this.nodes))))))"
-  };
-
-  option (buf.validate.message).cel = {
-    id: "run_program_response.rule_refs_in_range"
-    message: "error rule references must index response rules"
-    expression: "!has(this.error) || !has(this.error.rule) || this.error.rule < uint(size(this.rules))"
-  };
-
   repeated Node nodes = 1;
   repeated Sort sorts = 2;
-
-  // Completion order. Completed top-level Run/Repeat/Saturate commands return
-  // RunResult; observations are emitted at every depth, including during loops.
-  // Native maintenance contributes no requested output.
+  // Completion order. Only completed top-level controls return RunResult;
+  // observations are delivered at every depth, including during loops.
   repeated CommandOutput outputs = 3;
-
-  // Origins for this response's nodes, sorts, rules and errors, including
-  // installed definitions from earlier requests. Exported Programs own files.
-  repeated SourceFile files = 4;
-
-  // Absent on success. Present means execution stopped; `outputs` contains
-  // completed outputs, and every entry is valid. A failed loop has
-  // no outcome, but observations completed within it remain here. A requested
-  // native result completed before a trailing maintenance failure remains here.
-  Error error = 5;
-
-  // Canonical registered rule content referenced by errors.
-  // Rule node/sort/span references use this response's arenas. Equivalent
-  // content has one catalog entry; first-registration diagnostics represent it.
-  repeated Rule rules = 6;
-
-  reserved 7;
-  reserved "profile";
-
-  reserved 8;
-  reserved "ruleset_publication";
 }
 
 // One dynamic command execution in the submitted Program. path[0] indexes
-// Program.commands; each later component indexes the previous Repeat/Saturate
+// Program.commands; each later component indexes the previous Loop
 // command's body, resolving through any Fail wrappers at that position.
 // Wrappers add no path component or iteration coordinate. A list-site failure
 // locates the outer wrapper, with the most specific source span in Error.span.
@@ -2147,12 +1581,6 @@ message CommandLocation {
 // Source and command locators are independent: a rule expression can supply
 // the span while its executing Run supplies the command location.
 message Error {
-  option (buf.validate.message).cel = {
-    id: "error.proof_failure"
-    message: "proof failure details are required exactly for PROOF_FAILED"
-    expression: "has(this.proof_failure) == (this.code == 7)"
-  };
-
   ErrorCode code = 1 [(buf.validate.field).enum = {
     defined_only: true
     not_in: [0]
@@ -2171,68 +1599,16 @@ message Error {
   // coordinates. Absent when the failure precedes command execution, including
   // runtime helper failure during definition installation.
   CommandLocation location = 4;
-
-  // Supplied structurally for an attributed rule/rewrite failure, never parsed
-  // from message text. Presence is independent of diagnostic collection.
-  optional uint32 rule = 5; // index into RunProgramResponse.rules
-
-  // Engine-internal origin as `file:line:col`; empty when there is none.
-  // Diagnostic only, and not a `Span`: `Span.file` indexes USER source.
-  string engine_origin = 6;
-
-  // Native runtime proof failure, supplied structurally, never parsed from text.
-  // Earlier parsing/typechecking failures retain their ordinary error class.
-  ProofFailure proof_failure = 7;
 }
 
-// Failure classes: one value per class of remedy, not one per engine error.
+// Failure classes distinguish malformed inputs, failed assertions and execution.
 enum ErrorCode {
   ERROR_CODE_UNSPECIFIED = 0;
-
-  // Malformed or ill-typed program; nothing ran.
+  // Malformed or ill-typed program. Requested Check planning can fail here
+  // during execution, after completed prefix effects.
   ERROR_CODE_INVALID_PROGRAM = 1;
-
-  // A `check` did not hold.
   ERROR_CODE_CHECK_FAILED = 2;
-
-  // An authored `panic` action fired.
-  ERROR_CODE_PANIC = 3;
-
-  // A primitive or merge failed at run time, including unresolvable merges,
-  // a directly evaluated get_cost has no assigned annotation, or Freeze cannot
-  // encode a required value with a supported codec. Also includes an unmet
-  // expected-failure assertion: Fail's child succeeded.
-  ERROR_CODE_EVALUATION_FAILED = 4;
-
-  // The requested extractor/cost-model pair is incompatible, or an operation
-  // requiring a finite representative (KeepBest or PrintFunction) cannot
-  // obtain one.
-  // Extract instead returns empty variants when a root has no finite term.
-  ERROR_CODE_EXTRACTION_FAILED = 5;
-
-  // A named scheduler, table or cost model does not exist.
-  ERROR_CODE_UNKNOWN_NAME = 6;
-
-  // A proof request failed; proof_failure distinguishes its native cause.
-  ERROR_CODE_PROOF_FAILED = 7;
-}
-
-// Causes from the current engine's ProveExistsError, not proof-checker verdicts.
-message ProofFailure {
-  ProofFailureReason reason = 1 [(buf.validate.field).enum = {
-    defined_only: true
-    not_in: [0]
-  }];
-  // Present when supplied by the native failure, such as a missing witness.
-  optional string constructor = 2 [(buf.validate.field).string.min_len = 1];
-}
-
-enum ProofFailureReason {
-  PROOF_FAILURE_REASON_UNSPECIFIED = 0;
-  PROOF_FAILURE_REASON_REQUIRES_CONSTRUCTOR = 1;
-  PROOF_FAILURE_REASON_PRIMITIVES_UNSUPPORTED = 2;
-  PROOF_FAILURE_REASON_QUERY_DID_NOT_MATCH = 3;
-  PROOF_FAILURE_REASON_PROOFS_NOT_ENABLED = 4;
+  ERROR_CODE_RUNTIME_FAILURE = 3;
 }
 
 // ---------------------------------------------------------------------------
@@ -2240,7 +1616,7 @@ enum ProofFailureReason {
 // ---------------------------------------------------------------------------
 
 // Observations match the located command, including inside loops. Only completed
-// top-level Run/Repeat/Saturate commands emit RunResult. Fail suppresses every
+// top-level Run/Loop commands emit RunResult. Fail suppresses every
 // requested output from its child. Errors appear in the final chunk; completed
 // prefixes remain observable.
 message CommandOutput {
@@ -2261,14 +1637,12 @@ message CommandOutput {
     Diagnostic diagnostic = 11;
   }
   CommandLocation location = 7 [(buf.validate.field).required = true];
-  reserved 8, 10;
-  reserved "loop", "run_report", "statistics";
 }
 
 // Opaque backend-specific presentation; format identifies the content.
 message Diagnostic {
   string format = 1 [(buf.validate.field).string.min_len = 1];
-  string content = 2;
+  bytes content = 2;
 }
 
 message ProofResult {
@@ -2388,7 +1762,7 @@ message ProofCongr {
   optional uint32 child_proof = 3 [(buf.validate.field).required = true];
 }
 
-// One completed top-level Run/Repeat/Saturate, independent of diagnostics.
+// One completed top-level Run/Loop, independent of diagnostics.
 // Preserve native updated/can_stop, including conservative compound aggregation
 // and helper work; do not recompute stopping from diagnostic history.
 message RunResult {

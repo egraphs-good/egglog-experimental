@@ -11,9 +11,9 @@ from gen.python.egglog.v1 import egglog_pb as ir
 
 def table_response(rows):
     """Own both response arenas and the required output locations."""
-    return ir.RunProgramResponse(
+    return ir.RunProgramOutput(
         sorts=[
-            ir.Sort(kind=Oneof("family", ir.HostSort(name="Unit"))),
+            ir.Sort(kind=Oneof("application", ir.SortApplication(name="Unit"))),
             ir.Sort(kind=Oneof("eq", "E")),
         ],
         nodes=[ir.Node(sort_id=0, kind=Oneof(
@@ -58,24 +58,18 @@ class TableSchemaTests(unittest.TestCase):
         with self.assertRaises(ValidationError):
             validate(ir.EqSort(name="S", uf_parent=""))
 
-    def test_hidden_is_semantic_table_metadata_only(self):
+    def test_hidden_is_owned_by_constructor_or_function(self):
         for tag, table in (
-            ("constructor", ir.Constructor(name="C", output=0)),
-            ("function", ir.Function(name="f", output=0)),
+            ("constructor", ir.Constructor(name="C", output=0, hidden=True)),
+            ("function", ir.Function(name="f", output=0, hidden=True)),
         ):
-            declaration = ir.Declaration(kind=Oneof(tag, table), hidden=True)
+            declaration = ir.Declaration(kind=Oneof(tag, table))
             validate(declaration)
-            self.assertTrue(ir.Declaration.from_binary(declaration.to_binary()).hidden)
-            self.assertTrue(ir.Declaration.from_json(declaration.to_json()).hidden)
-        for tag, value in (
-            ("eq_sort", ir.EqSort(name="E")),
-            ("relation", ir.Relation(name="R")),
-            ("primitive", ir.Primitive(name="p", body=0)),
-            ("host_sort_family", ir.HostSortFamily(name="F")),
-            ("host_primitive", ir.HostPrimitive(name="h", typing=Oneof("signature", ir.GenericSignature(output=0)))),
-        ):
-            with self.subTest(tag=tag), self.assertRaises(ValidationError):
-                validate(ir.Declaration(kind=Oneof(tag, value), hidden=True))
+            self.assertTrue(ir.Declaration.from_binary(declaration.to_binary()).kind.value.hidden)
+            self.assertTrue(ir.Declaration.from_json(declaration.to_json()).kind.value.hidden)
+        for message in (ir.Declaration, ir.Relation, ir.EqSort, ir.UserDefinedPrimitive):
+            with self.subTest(message=message), self.assertRaises(TypeError):
+                message(hidden=True)
 
     def test_limit_presence_distinguishes_all_zero_and_positive(self):
         for limit, encoded in (
@@ -126,8 +120,8 @@ class TableSchemaTests(unittest.TestCase):
         response.nodes.append(ir.Node(sort_id=1, kind=Oneof("call", ir.Call(func="C"))))
         validate(response)
         for decoded in (
-            ir.RunProgramResponse.from_binary(response.to_binary()),
-            ir.RunProgramResponse.from_json(response.to_json()),
+            ir.RunProgramOutput.from_binary(response.to_binary()),
+            ir.RunProgramOutput.from_json(response.to_json()),
         ):
             self.assertEqual(decoded, response)
             self.assertEqual(decoded.outputs[0].kind.value.rows[0].args, [available, unavailable, available])
@@ -165,7 +159,7 @@ class TableSchemaTests(unittest.TestCase):
         response.nodes.clear()
         response.sorts.clear()
         validate(response)
-        self.assertEqual(ir.RunProgramResponse.from_binary(response.to_binary()), response)
+        self.assertEqual(ir.RunProgramOutput.from_binary(response.to_binary()), response)
 
     def test_shared_bounds_rule_still_checks_table_statistics(self):
         response = table_response([])

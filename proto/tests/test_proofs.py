@@ -64,8 +64,8 @@ class ExpectedFailureSchemaTests(unittest.TestCase):
     def test_fail_and_loop_nesting_keep_existing_location_shape(self):
         leaf = ir.Command(kind=Oneof("fail", ir.Command(kind=Oneof("check", ir.Check()))))
         for kind in (
-            Oneof("repeat", ir.Repeat(body=[leaf], times=1)),
-            Oneof("saturate", ir.Saturate(body=[leaf], max_iterations=1)),
+            Oneof("loop", ir.Loop(body=[leaf], max_iterations=1)),
+            Oneof("loop", ir.Loop(body=[leaf])),
         ):
             with self.subTest(kind=kind.field):
                 program = ir.Program(commands=[
@@ -76,7 +76,7 @@ class ExpectedFailureSchemaTests(unittest.TestCase):
         # Wrappers add no list indices or loop coordinates. Request matching,
         # catch behavior, and output suppression still require the adapter.
         error = ir.Error(
-            code=ir.ErrorCode.EVALUATION_FAILED, message="expected failure did not occur",
+            code=ir.ErrorCode.RUNTIME_FAILURE, message="expected failure did not occur",
             location=ir.CommandLocation(path=[0, 0], iterations=[0]),
         )
         validate(error)
@@ -103,8 +103,7 @@ class ExpectedFailureSchemaTests(unittest.TestCase):
             ("print_size", ir.PrintSize(), "4200"),
             ("print_function", ir.PrintFunction(table="C"), "4a030a0143"),
             ("print_table_stats", ir.PrintTableStats(), "5200"),
-            ("repeat", ir.Repeat(times=0), "5a021800"),
-            ("saturate", ir.Saturate(), "6200"),
+            ("loop", ir.Loop(max_iterations=0), "5a021800"),
             ("prove", ir.Prove(), "7200"),
             ("prove_exists", ir.ProveExists(constructor="C"), "7a030a0143"),
         ]
@@ -161,10 +160,10 @@ class AdditiveSchemaTests(unittest.TestCase):
         self.assertEqual(program.commands, [])
 
     def test_successful_response_needs_no_registration_confirmation(self):
-        response = ir.RunProgramResponse()
+        response = ir.RunProgramOutput()
         validate(response)
         self.assertEqual(response.to_binary(), b"")
-        self.assertEqual(ir.RunProgramResponse.from_json(response.to_json()), response)
+        self.assertEqual(ir.RunProgramOutput.from_json(response.to_json()), response)
 
 
 class ProofSchemaTests(unittest.TestCase):
@@ -172,7 +171,7 @@ class ProofSchemaTests(unittest.TestCase):
         for mode in ir.ExecutionMode:
             with self.subTest(mode=mode):
                 options = ir.EGraphOptions(cost_sort=0, execution_mode=mode)
-                sorts = [ir.Sort(kind=Oneof("family", ir.HostSort(name="i64")))]
+                sorts = [ir.Sort(kind=Oneof("application", ir.SortApplication(name="i64")))]
                 request = ir.CreateEGraphRequest(options=options, sorts=sorts)
                 snapshot = ir.EGraphSnapshot(
                     options=options, program=ir.Program(sorts=sorts)
@@ -230,13 +229,13 @@ class ProofSchemaTests(unittest.TestCase):
             proofs=[ir.ProofStep(lhs=6, rhs=6, justification=j) for j in justifications],
             root=8,
         )
-        response = ir.RunProgramResponse(
+        response = ir.RunProgramOutput(
             outputs=[ir.CommandOutput(
                 kind=Oneof("proof", result), location=ir.CommandLocation(path=[0]),
             )],
         )
         validate(response)
-        decoded = ir.RunProgramResponse.from_binary(response.to_binary())
+        decoded = ir.RunProgramOutput.from_binary(response.to_binary())
         self.assertEqual(decoded, response)
         self.assertEqual(decoded.outputs[0].kind.value.terms[1].kind.value, 0x7FF8000000000042)
 
@@ -311,14 +310,14 @@ class ProofSchemaTests(unittest.TestCase):
             proofs=[ir.ProofStep(lhs=0, rhs=0, justification=Oneof("fiat", ir.Unit()))],
             root=0,
         )
-        response = ir.RunProgramResponse(
+        response = ir.RunProgramOutput(
             outputs=[ir.CommandOutput(
                 kind=Oneof("proof", proof),
                 location=ir.CommandLocation(path=[0, 1], iterations=[2]),
             )],
         )
         validate(response)
-        self.assertEqual(ir.RunProgramResponse.from_binary(response.to_binary()), response)
+        self.assertEqual(ir.RunProgramOutput.from_binary(response.to_binary()), response)
         for kind in (
             Oneof("run", ir.RunResult(updated=True)),
         ):
@@ -331,45 +330,14 @@ class ProofSchemaTests(unittest.TestCase):
                     location=ir.CommandLocation(path=[0, 1], iterations=[2]),
                 ))
 
-    def test_failure_preserves_completed_result_prefix(self):
-        response = ir.RunProgramResponse(
-            outputs=[ir.CommandOutput(
-                kind=Oneof("run", ir.RunResult(updated=True)),
-                location=ir.CommandLocation(path=[0]),
-            )],
-            error=ir.Error(
-                code=ir.ErrorCode.PROOF_FAILED, message="missing witness",
-                location=ir.CommandLocation(path=[1]),
-                proof_failure=ir.ProofFailure(
-                    reason=ir.ProofFailureReason.QUERY_DID_NOT_MATCH,
-                ),
-            ),
-
-        )
-        validate(response)
-        self.assertEqual(ir.RunProgramResponse.from_binary(response.to_binary()), response)
-
-    def test_proof_failure_classification(self):
-        for reason in ir.ProofFailureReason:
-            if reason == ir.ProofFailureReason.UNSPECIFIED:
-                continue
-            with self.subTest(reason=reason):
-                error = ir.Error(
-                    code=ir.ErrorCode.PROOF_FAILED, message="native diagnostic",
-                    proof_failure=ir.ProofFailure(reason=reason, constructor="Goal"),
-                )
-                validate(error)
-                self.assertEqual(ir.Error.from_binary(error.to_binary()), error)
-        invalid = [
-            ir.ProofFailure(), ir.ProofFailure(reason=99),
-            ir.Error(code=ir.ErrorCode.PROOF_FAILED, message="missing detail"),
-            ir.Error(code=ir.ErrorCode.CHECK_FAILED, message="wrong detail", proof_failure=ir.ProofFailure(
-                reason=ir.ProofFailureReason.PROOFS_NOT_ENABLED,
-            )),
-        ]
-        for message in invalid:
-            with self.subTest(message=message), self.assertRaises(ValidationError):
-                validate(message)
+    def test_minimal_error_preserves_class_and_location(self):
+        for code in (ir.ErrorCode.INVALID_PROGRAM, ir.ErrorCode.CHECK_FAILED, ir.ErrorCode.RUNTIME_FAILURE):
+            error = ir.Error(code=code, message="native diagnostic", location=ir.CommandLocation(path=[1]))
+            validate(error)
+            self.assertEqual(ir.Error.from_binary(error.to_binary()), error)
+        for code in (ir.ErrorCode.UNSPECIFIED, 99):
+            with self.assertRaises(ValidationError):
+                validate(ir.Error(code=code, message="invalid class"))
 
 
 if __name__ == "__main__":

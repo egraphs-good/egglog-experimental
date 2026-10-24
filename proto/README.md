@@ -36,8 +36,8 @@ comments and annotations remain the normative contract.
 and frontends select the same schema revision; incompatible draft changes migrate
 together. The `egglog.v1` package and service names identify this API, but are not
 carried in raw protobuf bytes and do not negotiate a schema. Unknown-field
-handling alone cannot establish semantic compatibility. Removed Program tag 1
-and its old name are reserved to avoid reinterpreting existing draft artifacts.
+handling alone cannot establish semantic compatibility. This unpublished draft
+has no backward-compatibility reservations.
 
 `Rule` is an authored rule or rewrite value, including its options and
 diagnostic metadata. Its `rule` arm contains a `RuleBody`: the query and ordered
@@ -45,34 +45,25 @@ actions. `AddRules` references values by index; labels are diagnostic.
 
 ### Shared builtin definitions and type checking
 
-**Decided:** generic definitions are limited to host primitive signatures and
-host sort families. Tables, computed `Primitive` bodies, and user equality
-sorts remain concrete; frontends may specialize generic user code before this
-boundary. Host descriptors assert an available compatible implementation;
-they do not supply native code. Builtins remain implicitly available, so calls
-do not have to resend their descriptors.
+**Decided:** `GetBuiltins` returns a separate, read-only `BuiltinCatalog` for
+the configured backend, without an EGraph handle. It describes primitive sorts
+and primitive signatures, including generics; it does not supply implementation
+code. Clients can fetch/cache it independently of graph state.
 
-`Declaration` has `EqSort`, `HostSortFamily`, and `HostPrimitive` arms, sharing
-documentation and provenance fields. `Sort.eq` references an equality-sort name;
-`Sort.family` applies a host family through `HostSort{name,args}`, with exactly
-its declared arity, including zero for `i64` or `Unit`. References never declare
-definitions. Builtin families and installed sorts need not be redeclared.
-Function types remain structural `FuncSort`s. Nominal equality-sort names,
-host-family names and callable names occupy three distinct namespaces, selected
-by their existing oneof tags. Thus EqSort `Pair`, HostSortFamily `Pair` and a
-callable `Pair` may coexist without changing their names. `Sort.eq` resolves only
-an EqSort; `Sort.family` resolves only a HostSortFamily, never a same-spelled
-definition of another kind. Missing definitions remain errors checked against
-local, installed and ambient definitions. Same-family resends and applications
-must still agree on arity; all callable kinds still share one namespace.
-Type-use spans and optional `egglog_aliases` may remain on `Sort`; neither affects
-type identity. Equal applications collect their text aliases, so `A` and `Z` can
-both name `Maybe<i64>`. Other frontends may omit them. Text frontends handle name
-collisions; docs and family/nominal bindings belong to definitions.
-Text rendering chooses one stable alias; binary records retain all aliases.
+Programs declare only user entities: equality sorts, constructors, functions,
+relations and `UserDefinedPrimitive` bodies. These remain concrete; frontends
+may specialize generic user code before this boundary. Builtin descriptions
+are neither input declarations nor snapshot/history contents. Calls reference
+their available canonical names without importing descriptors.
 
-CEL checks local family arity; installed-name resolution and compatible resupply
-remain semantic checks.
+`Sort.eq` references a user equality-sort name. `Sort.application` applies a
+`PrimitiveSort` through `SortApplication{name,args}`, with its declared arity,
+including zero for `i64` or `Unit`. Function types are structural `FuncSort`s.
+Equality-sort, primitive-sort and callable names occupy distinct namespaces;
+all callable kinds share one namespace. References do not declare definitions.
+Missing names and incompatible signatures remain errors. Type-use spans do not
+affect identity. Transparent aliases such as two names for `Maybe<i64>` belong
+to the text frontend; documentation belongs to definitions.
 
 Evaluated ordinary expression nodes retain their lazy first-demand result within
 one Action command execution, including inside loops, or one rule firing's
@@ -89,7 +80,7 @@ but its scalar getter returns `""` when absent: use `has_field("doc")`, not
 truthiness, to recover absence. ProtoJSON distinguishes omission from `"doc":""`.
 Rule docs retain ordinary implicit-string semantics.
 
-`HostPrimitive` selects an ordinary `GenericSignature` or the dedicated
+`Primitive` selects an ordinary `GenericSignature` or the dedicated
 `FunctionApplication` typing form. A signature has an ordered type-parameter
 binder, fixed inputs, a required output, and an ordered `varargs` pattern.
 An empty pattern means no tail; a one-element pattern means homogeneous varargs;
@@ -102,14 +93,12 @@ definition. A shared pattern is interpreted independently in each signature's
 binder; neither arena sharing nor export combines binders or substitutions.
 Compatibility compares ordered binder positions and structural signatures.
 
-Python already separates generic declarations from concrete expression types.
-Its [signatures](https://github.com/egraphs-good/egglog-python/blob/ff72f601a972ca1eb7cb0a1d299813f5d65b1a14/python/egglog/declarations.py#L752-L791)
-support type variables and a repeated argument type. Useful test cases are:
+Examples of shared signatures:
 
 ```text
 map-get<K,V>(Map<K,V>, K) -> V
 map-empty<K,V>() -> Map<K,V>
-map-of<K,V>((K,V)...) -> Map<K,V>  # flat key,value arguments, not tuple values
+map-from-pairs<K,V>(Vec<Pair<K,V>>) -> Map<K,V>
 vec-of<T>(T...) -> Vec<T>
 vec-map<T,U>((T) -> U, Vec<T>) -> Vec<U>
 ```
@@ -123,11 +112,10 @@ rejected. There is no call-level type-argument list, implicit conversion,
 subtyping, or overload search.
 
 Node/value sorts, lambda parameter sorts, cost sorts, and concrete declaration
-signatures must be recursively closed. Creation and ordinary response sort
-arenas contain no variables; a nested exported `Program` may include signature
-patterns. CEL checks direct bounds, variable roots, and declared family uses.
+signatures must be recursively closed. Only the separate builtin catalog
+contains signature-bound sort variables. CEL checks direct bounds and variable roots.
 Recursive closedness, binder scope, signature matching, family resolution, and
-compatible descriptor resends are semantic checks.
+installed definition compatibility are semantic checks.
 
 **Decided:** each wire callable has one unique name across user and host
 definitions; the wire IR does not select from same-name overloads. Frontends lower
@@ -139,8 +127,7 @@ naming convention is chosen here.
 `FunctionApplication` describes a named primitive called through normal `Call`:
 the first argument has a concrete function type, remaining arguments match its
 parameter sorts, and the call has its result sort. It needs no heterogeneous
-type packs. This follows Python's
-[application special case](https://github.com/egraphs-good/egglog-python/blob/ff72f601a972ca1eb7cb0a1d299813f5d65b1a14/python/egglog/runtime.py#L522-L538).
+type packs or language-specific owner marker.
 For `PrimitiveValue.partial_call`, captured argument sorts plus the resulting
 `FuncSort.params` form the effective complete argument list; `FuncSort.result`
 supplies its result.
@@ -149,150 +136,51 @@ function application, and require every generic parameter to be determined.
 The existing relation-capability restriction still applies. A `Lambda` stores only
 captures and its body; its enclosing `FuncSort` supplies parameter and result sorts.
 
-Complete `Freeze` exports include these descriptors and their signature patterns,
-even when unused; freezing a fresh empty handle therefore exposes its ambient
-catalog. Definitions-only filtering is deferred. Saved catalogs can support
-binding generation, but native implementation, codec, and execution-capability
-compatibility must be established by the host; matching descriptors alone cannot
-establish it.
+`Freeze` does not repeat the backend catalog. Typed inspection or reconstruction
+uses the matching catalog fetched separately. Saved catalogs can support binding
+generation, but matching descriptions do not establish implementation, codec or
+execution-capability compatibility.
 
-### High-level language bindings
+### Frontend APIs and generation
 
-Protobuf codegen produces message classes, not ergonomic Egglog APIs. Planned
-high-level generators use builtin and user declarations to produce Python/Rust
-symbolic APIs and Egglog source. For example, one signature might be presented
-as Python `m[k]` and Rust `m.get(k)`, with the same underlying call.
+The shared catalog describes canonical identities, sort families, generic
+signatures and constraints. Frontends own names, operators, methods/properties,
+keyword parameters, defaults and host conversions. None of that presentation is
+installed in the engine or included in Freeze/history.
 
-Public Python APIs must be statically checkable with MyPy; typed Rust APIs must
-enforce their types at compilation. Test accepted calls and rejected wrong-sort
-or arity cases, not only runtime validation. A wire signature need not dictate
-the public argument shape. Current Python uses `Map.empty`, `insert`, and
-indexing; Rust's existing `Map::of` accepts typed key/value tuples. The shared bulk
-wire interface is one `Vec<Pair<K, V>>`; frontends may accept typed host tuple
-collections or lower flat text arguments while preserving that core shape.
-Default generated bindings must also preserve static types: report unsupported
-generation rather than weakening types to expose a primitive.
+Generators combine the catalog with local frontend mappings. For example,
+`egglog.core.i64.add` has signature `(i64, i64) -> i64`; Python may expose
+`i64.__add__`, Rust `core::ops::Add`, and text `+`. Their types come from the same
+native description. Borrowing and language argument shapes are frontend policy,
+not another copy of the signature.
 
-**Decided:** start with typed bindings for Rust, Python, and Egglog source only;
-defer arbitrary extension payloads and other languages. Egglog presentation
-bindings are where datatype grouping and related surface syntax belong, rather
-than adding a second semantic datatype declaration. This describes how to
-present definitions, not original formatting or source round-tripping.
+Protobuf message codegen alone does not create those ergonomic APIs. Python
+APIs must remain statically checkable with MyPy, and Rust APIs at compilation.
+A generator must report unsupported generation instead of weakening types.
+A missing local mapping does not hide a semantic declaration; a frontend may
+provide a generic wrapper or require an explicit mapping for its public API.
+Identifier and surface-name collisions are frontend errors, not engine
+redefinition conflicts.
 
-Python's [declarations](https://github.com/egraphs-good/egglog-python/blob/ff72f601a972ca1eb7cb0a1d299813f5d65b1a14/python/egglog/declarations.py#L311-L324)
-distinguish constructors, methods, class methods, properties, and preserved host
-methods. `SortBindings` now attaches to `EqSort` and `HostSortFamily`;
-`CallableBindings` attaches to callable `Declaration` arms through `bindings`.
-Both have optional Python, Rust, and Egglog blocks, without duplicating
-locations/documentation.
-Type bindings carry qualified display paths and optional parameter labels in
-core family order. Callable views carry explicit surface-to-core input mappings;
-owner sort patterns identify semantic types, not their display paths.
+The shared bulk Map constructor takes one `Vec<Pair<K,V>>`. Python/Rust may
+accept typed host tuple collections; text may lower flat `map-of` arguments.
+These choices emit the same concrete calls.
 
-**Decided:** freeze each language's bindings block when first supplied for a
-definition. An absent language on a later compatible redeclaration makes no
-assertion and removes nothing; another language may first be supplied later.
-A subsequent block for an already-supplied language must match the fixed block.
-Adding or changing a same-language alias after that first block is rejected.
-Presentation bindings are independent of semantic definition identity.
-Repeated same-name supplies in one Program are reconciled before interning;
-agreeing blocks are allowed. Compare referenced sort/default structures after
-arena remapping, without recursively comparing their presentation bindings.
-Default-root comparison preserves shared versus distinct `Union` occurrences.
-The supported adapter declarations implement this runtime matching;
-target-language generation and name normalization remain frontend work.
+Defaults are closed symbolic expressions owned by the frontend. Free/query
+variables are invalid; lambda-bound variables are allowed. Do not evaluate a
+default while defining a wrapper. Import omitted default roots together when
+building the call, preserving internal sharing and fresh Union identities
+between calls. Their required semantic declarations enter the request when used;
+unused default templates are not graph state. Local owner/default references
+must retain their expression/type graph, not rely on another message's indices.
 
-**Decided:** without a Python/Rust presentation block for a definition, generate
-plain symbolic types and free functions with API identifiers derived from core
-names. Prefer readable Python/Rust API identifiers. Reject invalid or colliding
-generated identifiers; explicit presentation metadata resolves these cases,
-without automatic injective encoding or silent disambiguation.
-Missing bindings never hide a definition in the protocol; explicit hiding is outside
-this draft's scope, with no special meaning assigned to an empty block.
-Behind those identifiers, preserve exact core names, signatures, and
-argument order; do not infer operators or receivers. Cross-declaration Python/Rust
-binding collisions (explicit/explicit, explicit/derived, or derived/derived) are
-target-language generation errors, not declaration-installation errors. Generators
-must error, not fall back, overwrite, or rename bindings. Engine installation still
-rejects malformed individual bindings and conflicting resupply of one declaration's
-fixed language block. These defaults are derived output, not supplied bindings:
-they install or freeze no block, so later explicit bindings
-remain that language's first supply. Exact normalization and general metadata-free
-generation remain frontend work; current generators may defer unsupported definitions.
-
-Python views distinguish free functions, initializers, methods, class methods,
-properties, class variables, and ownerless constants. Free functions and constants
-have nonempty qualified paths whose final component may be empty; preceding
-components stay nonempty. A `CONSTANT` view names a nullary concrete expression
-(`C`), with no owner, receiver, parameters or mutated input.
-It does not evaluate a body during installation or
-export. A nullary `FUNCTION` remains callable (`C()`); arity never implies a
-constant view.
-Ordered parameter records give core-input
-positions, names, and optional default expressions. Initializers derive `__init__`
-without storing a path. Receivers are mapped inputs; initializers/class methods
-introduce no core `self`/`cls` argument. Only an
-initializer requires its result to match its owner. An optional mutated-input
-index also supports free functions: replace that wrapper with the core result
-and return Python `None`, without changing the core signature or effects.
-
-**Decided:** defaults are closed symbolic expressions, not captured runtime
-values: calls and lambda-bound variables are allowed, but free/query variables
-are not. Never evaluate defaults during installation or export. Their node sorts
-are concrete and may constrain generic call substitution when used. Expand an
-emitted call's omitted defaults together, with fresh `Union` identities and
-preserved internal sharing; then check the actual use's binding/effect rules.
-
-Rust views distinguish free/associated/receiver/trait forms through their fields.
-Borrowed impl `Self` and receiver borrowing are separate: `impl Add for &T` with
-`self` differs from `impl Trait for T` with `&self`. Parameters and trait arguments
-record wrapper ownership; an optional associated output name such as `Output`
-maps to the core result. Arbitrary associated types, lifetimes, const generics,
-mutable borrowing, and executable host bodies are outside this limited layout.
-
-Ordinary varargs use one final logical parameter slot for the whole flat tail,
-regardless of pattern width, with no default, receiver, or redundant varargs flag.
-An optional `tail_repetitions` on a Python/Rust view instead gives a
-`HostPrimitive` signature with N fixed inputs and a nonempty width-W tail
-exactly N + R*W fixed view slots. Slot i derives its sort from fixed input i
-or tail position (i-N) % W. There is no remaining logical tail slot. Receivers
-and parameters cover all slots once, with matching sorts; defaults and Python
-mutation remain limited to original fixed inputs. CEL checks the count against
-the supplied mappings by division, without multiplying or expanding R, and
-checks direct receiver/owner sort roots. Recursive structural typing still
-requires the semantic verifier. Python currently admits this field only on
-FUNCTION and METHOD; unused specialized property/constant and other forms
-are explicitly unsupported. The canonical signature/provider and emitted Call
-are unchanged, and ordinary canonical call checking still applies.
-
-Presence matters: absent retains the logical-tail convention, while present
-zero maps only the fixed prefix. Python's scalar getter returns zero in both
-cases; use `has_field("tail_repetitions")`, not truthiness. New consumers preserve
-all valid absent-field encodings and meanings. This is not an old-reader guarantee for new views:
-discarding the field can widen a fixed-arity view back to a variadic surface.
-Preserving these views requires a coordinated schema/consumer epoch; generated
-message bindings and schema validation alone do not establish frontend support.
-
-`FunctionApplication` instead has a function input and a heterogeneous tail
-derived from its concrete `FuncSort`, and cannot use `tail_repetitions`.
-A structural-function owner marker represents `__call__` without a fake family
-or new type-pack binder. Other owner/trait patterns use only the enclosing
-callable's existing generic binder; bindings cannot introduce generic nodes.
-Egglog views carry symbols and constructor datatype membership, grouped by the
-existing output equality sort, without new datatype or text-overload semantics.
-
-`Freeze` retains supplied blocks and their bindings-only dependencies, remapping
-arenas without executing defaults or freezing derived wrapper choices. CEL checks
-direct shapes, positions and bounds. Recursive default closure, owner/receiver
-typing, bindings compatibility, and target-language generation are additional
-semantic requirements.
-
-**Decided:** initially generate the symbolic declarations and expression-building
-API. Host methods such as `Map.value` and host conversions remain ordinary
-handwritten Python. Descriptors do not transport native implementations or
-arbitrary method bodies. A useful end-to-end test: export Luminal's Rust-defined
-IR, generate its Python API, author a Python rewrite, and consume that rule in
-Rust without duplicating the IR declarations.
+Builtin catalog exports and logical snapshots contain semantic definitions,
+not enough information to reproduce an author's exact language API. Recreating
+that API requires its frontend mapping. A Rust-defined Luminal IR can still be
+used from generated Python wrappers to author rules consumed in Rust, sharing
+the same semantic declarations throughout. Literal/container codecs, `.value`
+accessors and preserved host methods remain frontend behavior; native provider
+implementations are registered separately.
 
 ### Additive rule groups and declaration reuse
 
@@ -321,8 +209,7 @@ Programs may reference definitions already installed on the same handle without
 resending them. Builtins are implicitly available. A call's unique name selects
 its definition; exact argument/result sorts check the signature. Missing names
 and mismatches are errors. Full definition resends are optional compatibility
-checks: compatible definitions are no-ops and conflicts are errors. Host
-descriptors assert external implementations rather than installing code.
+checks: compatible definitions are no-ops and conflicts are errors.
 Every referenced node/sort arena entry remains message-local. Equality sorts
 are defined by `Declaration.eq_sort`, not by arena references.
 
@@ -331,13 +218,13 @@ are defined by `Declaration.eq_sort`, not by arena references.
 **Decided:** `Freeze` returns one `EGraphSnapshot{options,program}`, with complete
 logical settings and an ordinary reconstruction `Program`, without filtering
 or a special loading instruction. Include all
-installed declarations, sorts and builtin descriptors, even when unused, plus
+installed user declarations and their sorts, even when unused, plus
 registered rule values and group membership through `AddRules`. Emit each shared
 rule once and remap its group references.
 The commands reconstruct all logical data, including empty/unreachable classes,
 constructor alternatives, function and relation rows, subsumption, captures, and
-assigned row costs. Historical commands, scheduler instances, seminaive cursors,
-reports, caches, and host resources are not part of this export.
+assigned row costs. Builtin descriptions, historical commands, scheduler instances,
+seminaive cursors, reports, caches and host resources are not part of this export.
 
 Its data commands are ordered ordinary actions: one direct `Action.term` for
 each canonical equality class (a unique Union containing its constructor rows),
@@ -391,8 +278,7 @@ RPC or Python live setter in this interface.
 
 Restore by remapping C's reachable closed sort graph and needed sort declarations
 into a creation request, then executing the exported Program on that fresh handle
-with compatible host capabilities. Unrelated generic signature patterns may stay
-in the snapshot; do not copy its entire sort arena into the closed creation arena.
+with compatible primitive implementations/codecs and the matching builtin catalog.
 Rules start with fresh execution state. Against an existing handle the Program
 still uses ordinary action semantics; callers must check options for any
 restoration-equivalence guarantee.
@@ -415,8 +301,8 @@ Union locations. Declarations are cumulative: an earlier recorded Freeze may
 observe later declaration metadata. Logical data remains ordered. History is
 neither a checkpoint nor an exact-replay guarantee after failures.
 
-Clone shares its recorded prefix and then diverges. Pop/`ReturnToEGraph`
-restores the saved history prefix, discarding the active branch's inputs.
+Clone shares its recorded prefix and then diverges. Scope pop destroys the
+active branch and resumes the saved graph with its recorded prefix.
 Destroy releases that graph's history; live clones retain their own past.
 Recording is unbounded during the graph's lifetime. Host capabilities and
 creation settings remain external.
@@ -432,11 +318,17 @@ assert_eq!(history.commands.len(), 1); // Stats; retrieval adds nothing.
 
 ### Execution results, diagnostics and streaming
 
-Ordinary `Run`, `Repeat` and `Saturate` return the same small `RunResult`:
+Ordinary `Run` and compound loops return the same small `RunResult`:
 `updated` reports any database change; scheduler-aware `can_stop` preserves the
 backend's existing conservative aggregation across compound schedules. A bounded
 run finishing does not itself prove saturation. Readiness is computed during
 execution, never by calling the scheduler again from a client.
+
+`Loop` repeats a body until it can stop, an `until` pre-check matches, or its
+optional maximum is reached. No maximum means unbounded; zero does nothing.
+Text repetition uses this capped behavior too, rather than forcing quiet
+iterations solely to reach a count. With zero iterations, `updated` is false
+and `can_stop` is true.
 
 `RunProgramRequest.diagnostics` defaults to false. Off skips optional timers,
 per-rule metric maps and retained iteration reports while leaving scheduler
@@ -445,7 +337,8 @@ after a completed top-level control result at the same `CommandLocation`.
 `Stats` uses the same document type for previously collected cumulative detail;
 it does not retroactively collect runs executed with diagnostics off.
 
-The current native format is `application/vnd.egglog.run-report+json`. Its JSON
+`Diagnostic` contains a format identifier and opaque bytes. The current native
+format is `application/vnd.egglog.run-report+json`. Its JSON
 contains `iterations` and the native `search_and_apply_time_per_rule`,
 `num_matches_per_rule`, `search_and_apply_time_per_ruleset`,
 `merge_time_per_ruleset` and `rebuild_time_per_ruleset` maps. Native durations are
@@ -459,12 +352,16 @@ mapping; unavailable structured `stages` are omitted, rather than shown as empty
 current selected rule query plans without executing or advancing their cursors,
 returning `application/vnd.egglog.query-plan+json` as native `[name,plan]` pairs.
 
-`RunProgram` is canonically streaming. `Engine::run_stream` synchronously calls
-an output callback with owned, self-contained response chunks, in observation
-order, including inside loops. Each chunk has its own complete local arenas;
-Freeze Programs and proof arenas remain independently owned. A final completion
-or error chunk precedes stream completion, including an empty success chunk.
-`Engine::run` buffers this same executor and relocates chunk-local references.
+`RunProgram` is canonically streaming. Each response contains either an output
+payload or a terminal error, with its own source files. `Engine::run_stream`
+synchronously delivers owned frames in observation order, including inside loops.
+Output frames own their node/sort arenas; Freeze Programs and proof arenas remain
+independent. Completion emits an empty success frame; failure emits an error
+after any completed observations. `Engine::run` buffers this same frame sequence.
+
+One `Error` carries its class (invalid program, failed check or runtime failure),
+human message, optional source span and command location. It does not duplicate
+the failing rule or successful proof records. Completed effects remain committed.
 
 The synchronous callback supplies backpressure without a growing queue. Returning
 `ControlFlow::Break(())` on an observation chunk cancels at a safe boundary and returns a
@@ -538,11 +435,10 @@ native proof propositions can describe a function row with inputs and output as
 children. All eight native justifications are represented, including explicit
 substitutions, shared premises, container normalization, and the `Eval` side
 condition placeholder. Native IDs are remapped to result-local indices, so
-inspection does not require a live e-graph. A native proof failure carries a
-structured reason, independently of its diagnostic text.
+inspection does not require a live e-graph. Proof failures use the ordinary Error.
 
-CEL checks required fields, oneofs, direct reference bounds, unique substitution
-names, and error-detail consistency. Shared decoders must additionally check
+CEL checks required fields, oneofs, direct reference bounds and unique substitution
+names. Shared decoders must additionally check
 acyclicity and reachability with bounded-stack traversal. This is transport for
 the existing checked/simplified proof, not a new proof engine or a standalone
 checker; rule context and compatible host validators remain external. The
@@ -585,19 +481,19 @@ SDKs, without these runtime implementations.
 ### Byte adapter
 
 `protobuf::Engine` (`src/protobuf.rs`) accepts encoded requests for creation,
-cloning, destruction, scope return, program execution and
-`GetHistory` retrieval. `run_stream` is the canonical execution path; `run`
+cloning, destruction, program execution, `GetHistory` and `GetBuiltins` retrieval.
+`run_stream` is the canonical execution path; `run`
 collects its owned response chunks.
 Decode failures and unknown handles are transport errors; program failures are
-returned in `RunProgramResponse.error`. Preparation validates on disposable
+returned in the error arm of `RunProgramResponse`. Preparation validates on disposable
 native state without running user actions. Installation and execution retain
 their actual completed prefix on failure, not an atomic rollback guarantee.
 All supplied rules, including unused rules, are compile-validated.
 
-Canonical records retain logical identities and optional metadata. Compatible
-resupply asserts the installed definition; it does not replace a host
-implementation. Defaults are checked without evaluation; omitted-argument
-expansion belongs to the frontend.
+Canonical records retain logical identities, documentation and origins.
+Compatible resupply asserts the installed semantic definition; it does not
+replace a native implementation. Wrapper defaults and presentation validation
+belong to the frontend.
 
 Current limits include Normal-only Extract/Freeze, native proof-mode restrictions on non-global
 no-merge functions, and context-specific lowering/expansion budgets. Evaluated
@@ -660,7 +556,9 @@ Reuse one stateful `Renderer` across the stream; `render_submission` handles
 scope submissions too. Compatible declarations are not emitted twice. Core and
 Experimental renderings have different native naming constraints and reject
 unrepresentable forms explicitly. Reparsed text is an execution comparison, not
-an export of the original logical keys or language presentation metadata.
+a guarantee of the original logical spellings or source formatting. Text
+frontends retain their own scoped aliases; detached Programs use canonical valid
+syntax without transporting those hints.
 Derived native aliases are reversed through exact owned mappings, never by
 recognizing a prefix. Private-looking spellings remain valid logical names;
 free-form diagnostic prose may still expose implementation names.
@@ -669,10 +567,11 @@ free-form diagnostic prose may still expose implementation names.
 
 Core owns each primitive's signature, implementation, contexts and validator.
 `TypeInfo::builtin_catalog()` describes those registrations; Experimental's
-`portable_builtin_catalog()` projects them without a second signature table.
+`portable_builtin_catalog()` projects them into a separate `BuiltinCatalog`
+without a second signature table.
 Generic instances select the same native implementation after checking exact
-argument/result sorts. Optional Python/Rust presentation records describe
-wrappers, not executable host code or proof certificates.
+argument/result sorts. Python/Rust/text mappings remain local to their
+frontends and generators; exported descriptors contain no language view.
 
 Surface overloads are resolved before protobuf: i64 and f64 addition select
 distinct keys such as `egglog.core.i64.add` and `egglog.core.f64.add`. Today's
@@ -713,7 +612,7 @@ from protobuf import Oneof
 from protovalidate import validate
 
 program = ir.Program(
-    sorts=[ir.Sort(kind=Oneof("family", ir.HostSort(name="i64")))],
+    sorts=[ir.Sort(kind=Oneof("application", ir.SortApplication(name="i64")))],
     nodes=[ir.Node(sort_id=0, kind=Oneof("primitive_value",
         ir.PrimitiveValue(value=Oneof("i64", 42))))],
 )
