@@ -31,11 +31,13 @@ class HistorySchemaTests(unittest.TestCase):
             sorts=[ir.Sort(kind=Oneof("eq", "E"))],
             declarations=[ir.Declaration(kind=Oneof("eq_sort", ir.EqSort(name="E")))],
             nodes=[ir.Node(kind=Oneof("union", ir.Union())) for _ in range(2)],
+            rulesets=[ir.RulesetBinding(name="g", value=ir.Ruleset(rules=[rule, rule]))],
             commands=[
                 ir.Command(kind=Oneof("action", ir.Action(kind=Oneof("term", 0)))),
                 ir.Command(kind=Oneof("freeze", ir.Freeze())),
-                ir.Command(kind=Oneof("add_rules", ir.AddRules(group="g", rules=[rule, rule]))),
-                ir.Command(kind=Oneof("run", ir.Run(groups=["g"]))),
+                ir.Command(kind=Oneof("run", ir.Run(rulesets=[
+                    ir.RulesetSelection(kind=Oneof("ruleset", ir.Ruleset(rules=[rule, rule]))),
+                ]))),
             ],
         )
         validate(program)
@@ -46,9 +48,11 @@ class HistorySchemaTests(unittest.TestCase):
             validate(decoded)
             self.assertEqual(decoded, program)
             self.assertEqual([command.kind.field for command in decoded.commands],
-                             ["action", "freeze", "add_rules", "run"])
-            self.assertEqual(decoded.commands[2].kind.value.rules[0].kind.value.query, [0])
-            self.assertEqual(decoded.commands[2].kind.value.rules[0].kind.value.head[0].kind.value, 1)
+                             ["action", "freeze", "run"])
+            self.assertEqual(decoded.rulesets[0].value.rules[0].kind.value.query, [0])
+            self.assertEqual(decoded.rulesets[0].value.rules[0].kind.value.head[0].kind.value, 1)
+            self.assertEqual(decoded.commands[2].kind.value.rulesets[0].kind.value.rules,
+                             decoded.rulesets[0].value.rules)
             self.assertEqual(len(decoded.nodes), 2)
 
     def test_exported_history_uses_ordinary_program_validation(self):
@@ -56,7 +60,7 @@ class HistorySchemaTests(unittest.TestCase):
         with self.assertRaises(TypeError):
             ir.Program(rules=[])
         with self.assertRaises(ValidationError):
-            validate(ir.Program(commands=[ir.Command(kind=Oneof("add_rules", ir.AddRules(rules=[ir.Rule()])))]))
+            validate(ir.Program(rulesets=[ir.RulesetBinding(value=ir.Ruleset(rules=[ir.Rule()]))]))
 
 
 

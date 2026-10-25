@@ -31,8 +31,10 @@ import "buf/validate/validate.proto";
 // Declarations form one batch for the whole Program. Install them before any
 // command, order-independently and without executing their bodies. Resolving
 // declaration dependencies is not loop execution: loop bodies contain only
-// commands and never repeat declaration installation. Rules register only when
-// AddRules executes.
+// commands and never repeat declaration installation. Ruleset bindings are also
+// setup: install complete replacements before commands, retaining omitted names.
+// Prepare all rule values before execution, including literals in zero-iteration
+// loop bodies. Native installation failures need not roll back completed setup.
 // Definitions installed on this handle may be referenced by name without
 // resending them. Node and sort indices refer to this Program's
 // arenas, not previous requests; all referenced entries must be included here.
@@ -124,13 +126,21 @@ message Program {
       "this.declarations.all(d, !has(d.constructor) || "
       "!has(d.constructor.cost) || d.constructor.cost < uint(size(this.nodes)))"
   };
-  // Direct rule roots only; binding, typing, effects and occurrence matching
-  // remain normative. Node-child bounds are checked separately above.
+  option (buf.validate.message).cel = {
+    id: "program.unique_ruleset_names"
+    message: "ruleset binding names must be unique within a Program"
+    expression: "this.rulesets.all(b, this.rulesets.filter(other, other.name == b.name).size() == 1)"
+  };
+  // Bound and top-level literal rule roots only; nested command bounds, binding,
+  // typing, effects and occurrence matching remain normative.
   option (buf.validate.message).cel = {
     id: "program.rule_node_refs_in_range"
     message: "rule query, head and rewrite roots must index nodes"
     expression:
-      "this.commands.all(c, !has(c.add_rules) || c.add_rules.rules.all(r, "
+      "([this.rulesets.map(b, b.value)] + "
+      "this.commands.filter(c, has(c.run)).map(c, "
+      "c.run.rulesets.filter(s, has(s.ruleset)).map(s, s.ruleset)))"
+      ".all(sets, sets.all(rs, rs.rules.all(r, "
       "(has(r.rule) ? r.rule.query : "
       "has(r.rewrite) ? [r.rewrite.lhs, r.rewrite.rhs] + r.rewrite.conditions : "
       "has(r.birewrite) ? [r.birewrite.lhs, r.birewrite.rhs] + r.birewrite.conditions : [])"
@@ -141,7 +151,7 @@ message Program {
       "has(a.delete) ? a.delete.args : "
       "has(a.subsume) ? a.subsume.args : "
       "has(a.set_cost) ? a.set_cost.target.args + [a.set_cost.cost] : [])"
-      ".all(i, i < uint(size(this.nodes)))))))"
+      ".all(i, i < uint(size(this.nodes))))))))"
   };
   // Reject relation children with matching argument sort IDs and Unit result.
   // Structural-sort equivalence and complete declared/ambient resolution
@@ -193,6 +203,12 @@ message Program {
 
   // Optional provenance. Omit spans for a normalized/unlocated program.
   repeated SourceFile files = 6;
+
+  // Complete persistent binding replacements, with unique names in this batch.
+  // Empty values clear membership; omission leaves a binding unchanged.
+  // Publish bindings together after successful setup installation. Native
+  // effects completed before a setup failure remain.
+  repeated RulesetBinding rulesets = 7;
 }
 
 // A source file shared by diagnostic/documentation spans in the enclosing
@@ -838,13 +854,14 @@ message GenericSignature {
 }
 
 // ---------------------------------------------------------------------------
-// RULE DEFINITIONS — immutable content, registered by ordered commands.
+// RULE DEFINITIONS — immutable content and replaceable named collections.
 // ---------------------------------------------------------------------------
 
 // An immutable rule/rewrite value. Content identity includes its resolved typed
 // body, ordered query/head, options and represented graph sharing; arena IDs,
-// labels, documentation and provenance do not identify it. AddRules interns
-// content globally on the handle, so equivalent resupply never resets its state.
+// labels, documentation and provenance do not identify it. Intern content on the
+// handle independently of collection names, retaining its compiled state and
+// cursors through replacement, omission and readdition. Old effects remain.
 message Rule {
   oneof kind {
     option (buf.validate.oneof).required = true;
@@ -917,12 +934,37 @@ message BiRewrite {
   repeated uint32 conditions = 4 [packed = true]; // index into the enclosing `nodes`
 }
 
+// An immutable ordered collection of inline rule values; no rule arena or
+// collection identity. A direct Rule input is a singleton collection here.
+message Ruleset {
+  repeated Rule rules = 1;
+}
+
+// Program setup, never an executable command. The empty name is the default
+// group. Resupplying the same value is harmless; an empty value clears it.
+// Membership is captured in value, not a live dependency on other bindings.
+message RulesetBinding {
+  string name = 1;
+  Ruleset value = 2 [(buf.validate.field).required = true];
+}
+
+// A literal captures its members; a name resolves the persistent post-setup
+// binding throughout this Program. Unknown names select an empty collection.
+message RulesetSelection {
+  oneof kind {
+    option (buf.validate.oneof).required = true;
+
+    Ruleset ruleset = 1;
+    string name = 2;
+  }
+}
+
 // ---------------------------------------------------------------------------
 // COMMANDS — the `Command.kind` arms after `action`, in arm order.
 // ---------------------------------------------------------------------------
 
 // One command, at top level or in a loop body: every command may appear in
-// `Loop`. Declarations are installed once at Program scope, outside commands.
+// `Loop`. Declarations and ruleset bindings are installed at Program scope.
 message Command {
   oneof kind {
     option (buf.validate.oneof).required = true;
@@ -960,12 +1002,11 @@ message Command {
     // destination; follows ordinary observation ordering and Fail suppression.
     Unit stats = 17;
 
-    AddRules add_rules = 18;
     Explain explain = 19;
   }
 
   // Origin. Locates a failure attributed to a command rather than an
-  // expression: a failed `check`, registration or extraction.
+  // expression: a failed `check`, run or extraction.
   // Surfaces as `Error.span`.
   Span span = 13;
 }
@@ -996,25 +1037,14 @@ message ProveExists {
   string constructor = 1 [(buf.validate.field).string.min_len = 1];
 }
 
-// Add immutable rule content to one group in this command's execution order.
-// Empty additions are harmless. First registration determines membership order;
-// re-adding the same content is a no-op, with compiled state/cursors retained.
-// The same content in several groups shares one compiled rule. Labels/spans are
-// representative diagnostics, not identity. Failures retain completed native
-// registration prefixes; compatible retry is safe. No group declaration exists.
-message AddRules {
-  string group = 1;
-  repeated Rule rules = 2;
-}
-
-// Execute one step of the ordered union of groups, optionally using a scheduler.
-// Unknown groups are empty. [] selects nothing; [""] explicitly selects the
-// default group. Traverse groups and first-registration membership in order,
-// selecting shared content once. Separate Runs still select independently and
-// retain the selected rules' execution state; this does not override eval_mode
-// or scheduler decisions. A completed top-level Run returns RunResult.
+// Execute one step of the ordered union of selections with one scheduler.
+// Traverse selections left to right and each collection in order, selecting
+// shared rule content once. [] selects nothing; name "" selects the default
+// group. Separate Runs select independently and retain rule execution state;
+// this does not override eval_mode or scheduler decisions. A completed top-level
+// Run returns RunResult.
 message Run {
-  repeated string groups = 1;
+  repeated RulesetSelection rulesets = 1;
   // Empty means no scheduler; otherwise names a BindScheduler instance.
   string scheduler = 2;
 }
@@ -1108,10 +1138,10 @@ enum Extractor {
 // original derivations or promise equivalent proof results.
 //
 // Include every installed declaration and sort, even unused or empty tables,
-// and preserve registered rule content and each group's first-registration
-// membership order. Reconstruct membership with AddRules containing rule values;
-// a value shared by groups appears in each group's addition. Omit unregistered
-// rule values. Backend builtin descriptors remain in GetBuiltins.
+// and preserve current named ruleset bindings and their ordered rule values,
+// including empty bindings. A shared value appears in each relevant binding.
+// Omit rules retained only in private registration caches. Backend builtin
+// descriptors remain in GetBuiltins.
 // Include saved code and its dependencies without executing it.
 // Host implementations/codecs remain external. Reconstruction sorts are
 // concrete; builtin declarations and signature-pattern arenas are not copied.
@@ -1122,8 +1152,8 @@ enum Extractor {
 // installation follows Program's normal rules; scheduler/seminaive history
 // is not resumed.
 //
-// Export commands contain data Actions followed by AddRules, with no queries,
-// Runs or loops. Emit exactly one direct Action.term for each canonical equality
+// Export commands contain only data Actions, with no queries, Runs or loops.
+// Emit exactly one direct Action.term for each canonical equality
 // class, naming its unique Union location with all its constructor rows as
 // members. Include empty/unreachable classes.
 // Emit relation rows as direct Action.term Calls; write every function row,
@@ -1345,13 +1375,15 @@ message DestroyEGraphResponse {}
 
 // Retrieve one accumulated input Program for this live graph. Recording is
 // selected at creation and off by default; disabled or unknown handles error.
-// Retain original decoded authored Programs only after successful preparation,
+// Retain decoded authored inputs only after successful preparation,
 // before installation/commands. Rejected preparation contributes no input;
 // later execution failure retains the accepted input, including its suffix.
 // This records inputs only: no outcomes, resource/lifecycle events or raw bytes.
 // Remap arenas while preserving command order, graph sharing and distinct Union
 // locations. Declarations are cumulative, so earlier Freeze observations may
 // contain extra definition metadata. This is not exact replay after failure.
+// Capture historic named Run selections as needed when combining inputs, also
+// inside nested commands: later binding replacements must not retarget them.
 // GetHistory contributes no input. Clone retains the shared past independently;
 // Destroy releases only its graph's history. Host implementations remain external.
 message GetHistoryRequest {

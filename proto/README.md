@@ -19,7 +19,7 @@ references from an earlier request cannot be reused without importing them.
 | --- | --- |
 | `Sort`, `Node` | Explicit types and shared expression graphs |
 | `Declaration` | Immutable equality-sort, constructor, function, relation or program-defined primitive definitions |
-| `Rule`, `AddRules` | Inline rule values added to named groups |
+| `Rule`, `Ruleset`, `RulesetBinding` | Immutable inline rule collections and replaceable named bindings |
 | `Command`, `Action`, `Loop` | Ordered execution and repeated command bodies |
 | `BuiltinCatalog` | Backend-provided primitive sorts and signatures |
 | `EGraphSnapshot` | Logical creation options and a reconstruction Program |
@@ -35,19 +35,30 @@ is harmless; conflicting definitions do not replace installed ones. A later
 Program can use an installed definition without resending it. Callables share
 one namespace; equality sorts and primitive sorts have distinct namespaces.
 
-`AddRules{group,rules}` contains rules directly, with no rule arena or separate
-group declaration:
+`Ruleset{rules}` is an immutable ordered collection containing inline rule
+values, with no rule arena. `Program.rulesets` supplies complete named binding
+replacements before commands. Names must be unique within a Program; omitted
+bindings remain unchanged, and an explicit empty collection clears membership:
 
 ```text
-AddRules("opt", [fold_zero])
-Run(["opt"])
-AddRules("opt", [fold_constants])
-Run(["opt", "cleanup"])
+Program(rulesets=[RulesetBinding("opt", Ruleset([fold_zero]))],
+        commands=[Run([name("opt")])])
+Program(rulesets=[RulesetBinding("opt", Ruleset([fold_constants]))],
+        commands=[Run([name("opt"), ruleset(Ruleset([cleanup]))])])
 ```
 
-Groups grow by content identity. The same rule in several groups shares compiled
-state; re-adding it does not reset its cursor. Labels, documentation and source
-locations are diagnostic metadata. Unknown groups are empty.
+Run selections are an ordered union of literal collections and persistent names;
+shared rule content executes once in the same step under the same scheduler.
+The empty name selects the default group; unknown names are empty. All inline
+rules are prepared before execution, including literals in zero-iteration bodies.
+Bindings are setup, so they cannot execute inside loops or Fail. They publish
+only after setup installation succeeds; completed native effects survive failure.
+
+Rule content identity and incremental state are independent of collection names.
+Replacement, omission and readdition retain existing cursors and effects.
+Labels, documentation and source locations are diagnostic metadata. Overlapping
+named memberships can represent basic tags; frontends assemble each complete
+collection without a stored dependency graph between bindings.
 
 ## Typed expression graphs
 
@@ -114,10 +125,10 @@ reconstruction preserves the selected execution mode, not original derivations.
 ## Logical state and input history
 
 `Freeze` returns `EGraphSnapshot{options,program}`. Its Program includes installed
-user declarations, inline rule additions, and ordinary actions reconstructing
-classes, rows, captures, costs and subsumption. Shared rule values are repeated
-in each relevant group's addition; content identity preserves sharing of their
-compiled rule. No special loading instruction is needed.
+user declarations, current named ruleset bindings, and ordinary actions
+reconstructing classes, rows, captures, costs and subsumption. Shared rule values
+are repeated in each relevant binding. Private registration caches are omitted.
+No special loading instruction is needed.
 
 Reconstruction on a fresh compatible engine uses all snapshot logical options,
 including `execution_mode` and `seminaive`, with `cost_sort` remapped into the
@@ -129,7 +140,9 @@ reports and caches are not restored: this is logical state, not a checkpoint.
 Input recording is separately enabled at creation. `GetHistory` returns one
 accumulated Program of accepted inputs, including inputs that later failed during
 execution. It omits outcomes and validation-rejected inputs. Declaration metadata
-is cumulative, so it is not an exact replay guarantee. Clones retain their
+is cumulative, so it is not an exact replay guarantee. Historic named Run
+selections are captured as needed so later replacements cannot retarget earlier
+inputs, including nested commands. Clones retain their
 prefix and then diverge; destroying a handle releases its history.
 
 ## Prototype integrations
