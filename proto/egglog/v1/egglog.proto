@@ -1,0 +1,1832 @@
+syntax = "proto3";
+
+package egglog.v1;
+
+import "buf/validate/validate.proto";
+
+// Typed, language-neutral Egglog IR. Overview: proto/README.md.
+// Consumers must select the same schema revision; package and service names
+// identify the API, not raw protobuf bytes. Validation rules and normative
+// comments in this file define the contract.
+// Every arena index must name an entry in its enclosing arena-owning message.
+// CEL checks direct node/sort edges; remaining references, including command
+// and output roots, are normative verifier obligations.
+// A fact is a node index; equality `(= a b)` names a `Union` of a and b.
+// Unknown enum values are errors; Rust consumers must check raw enum values.
+// Producers expand datatype/default-argument/include syntax before this boundary.
+
+// ---------------------------------------------------------------------------
+// PROGRAM AND PROVENANCE — the request payload and the shared span vocabulary.
+// ---------------------------------------------------------------------------
+
+// A typed program against one e-graph handle. CEL rules are executable reference
+// predicates; evaluators may exhaust their budgets on large valid inputs.
+// Implementations may enforce equivalent checks in a scalable verifier. Budget
+// exhaustion is inconclusive, not validity or invalidity. A verifier must also
+// check remaining bounds, types, binding, arity, declarations, and groundedness
+// where required during preparation. Requested Check query planning, including
+// its groundedness failures, occurs during execution; generated helper/rule
+// validation remains preparation.
+// Sorts are acyclic; expression cycles must pass through a `Union` node.
+// Declarations form one batch for the whole Program. Install them before any
+// command, order-independently and without executing their bodies. Resolving
+// declaration dependencies is not loop execution: loop bodies contain only
+// commands and never repeat declaration installation. Ruleset bindings are also
+// setup: install complete replacements before commands, retaining omitted names.
+// Prepare all rule values before execution, including literals in zero-iteration
+// loop bodies. Native installation failures need not roll back completed setup.
+// Definitions installed on this handle may be referenced by name without
+// resending them. Node and sort indices refer to this Program's
+// arenas, not previous requests; all referenced entries must be included here.
+// Execute only commands, in order, and the expressions they demand. Unused
+// arena entries are not executed; arena membership is not an execution root.
+// Direct Actions in one execution of a command list share a Union identity
+// scope, even across intervening non-Action commands. Program.commands is one
+// such list. Each loop-body iteration starts an independent scope; nested lists
+// never inherit the outer mapping, which resumes after they return. Rule
+// firings and other commands' evaluated inputs have their own scopes as in Union.
+// Fail is transparent to these scopes: a wrapped direct Action still belongs
+// to its enclosing command list, and the wrapper adds no Union identity scope.
+// Sort.var is legal only in BuiltinCatalog signatures. Node sorts, lambda
+// parameter sorts, cost sorts and concrete declaration signatures must be
+// recursively closed. CEL rejects direct variable roots; closure is normative.
+message Program {
+  option (buf.validate.message).cel = {
+    id: "program.closed_sort_arena"
+    message: "input Programs contain only concrete sorts"
+    expression: "this.sorts.all(s, !has(s.var))"
+  };
+  option (buf.validate.message).cel = {
+    id: "program.node_sort_in_range"
+    message: "every node sort_id must index a non-variable sort"
+    expression:
+      "this.nodes.all(n, n.sort_id < uint(size(this.sorts)) && "
+      "!has(this.sorts[int(n.sort_id)].var))"
+  };
+  option (buf.validate.message).cel = {
+    id: "program.node_refs_in_range"
+    message: "node children must index nodes"
+    expression:
+      "this.nodes.all(n, "
+      "(has(n.apply) ? [n.apply.function] + n.apply.args : "
+      "has(n.call) ? n.call.args : "
+      "has(n.get_cost) ? n.get_cost.args : "
+      "has(n.union) ? n.union.members : "
+      "has(n.primitive_value) ? [n.primitive_value].map(v, "
+      "has(v.lambda) ? v.lambda.captures + [v.lambda.body] : "
+      "has(v.partial_call) ? v.partial_call.args : "
+      "has(v.vec) ? v.vec.items : has(v.set) ? v.set.items : "
+      "has(v.multiset) ? v.multiset.items : "
+      "has(v.map) ? v.map.entries.map(e, e.key) + v.map.entries.map(e, e.value) : "
+      "has(v.pair) ? [v.pair.first, v.pair.second] : "
+      "has(v.maybe) && has(v.maybe.value) ? [v.maybe.value] : "
+      "has(v.custom) ? v.custom.args : [])[0] : [])"
+      ".all(i, i < uint(size(this.nodes))))"
+  };
+  option (buf.validate.message).cel = {
+    id: "program.sort_refs_in_range"
+    message: "sort children must index sorts"
+    expression:
+      "this.sorts.all(s, "
+      "(has(s.application) ? s.application.args : "
+      "has(s.func) ? s.func.params + [s.func.result] : [])"
+      ".all(i, i < uint(size(this.sorts))))"
+  };
+  option (buf.validate.message).cel = {
+    id: "program.concrete_signature_roots"
+    message: "concrete declaration signatures must index non-variable sorts"
+    expression:
+      "this.declarations.all(d, "
+      "(has(d.constructor) ? d.constructor.inputs.map(a, a.sort) + [d.constructor.output] : "
+      "has(d.function) ? d.function.inputs.map(a, a.sort) + [d.function.output] : "
+      "has(d.relation) ? d.relation.inputs.map(a, a.sort) : "
+      "has(d.user_defined_primitive) ? d.user_defined_primitive.inputs.map(a, a.sort) + [d.user_defined_primitive.output] : [])"
+      ".all(i, i < uint(size(this.sorts)) && !has(this.sorts[int(i)].var)))"
+  };
+  option (buf.validate.message).cel = {
+    id: "program.function_value_signature"
+    message: "function values require a function sort with non-variable parameter/result roots"
+    expression:
+      "this.nodes.all(n, !(has(n.primitive_value.lambda) || has(n.primitive_value.partial_call)) || "
+      "(n.sort_id < uint(size(this.sorts)) && has(this.sorts[int(n.sort_id)].func) && "
+      "[this.sorts[int(n.sort_id)].func].all(f, (f.params + [f.result]).all(i, "
+      "i < uint(size(this.sorts)) && !has(this.sorts[int(i)].var)))))"
+  };
+  option (buf.validate.message).cel = {
+    id: "program.empty_union_eq_sort"
+    message: "an empty union requires an equality sort"
+    expression:
+      "this.nodes.all(n, !has(n.union) || size(n.union.members) > 0 || "
+      "(n.sort_id < uint(size(this.sorts)) && has(this.sorts[int(n.sort_id)].eq)))"
+  };
+  option (buf.validate.message).cel = {
+    id: "program.constructor_cost_in_range"
+    message: "declared constructor costs must index nodes"
+    expression:
+      "this.declarations.all(d, !has(d.constructor) || "
+      "!has(d.constructor.cost) || d.constructor.cost < uint(size(this.nodes)))"
+  };
+  option (buf.validate.message).cel = {
+    id: "program.unique_ruleset_names"
+    message: "ruleset binding names must be unique within a Program"
+    expression: "this.rulesets.all(b, this.rulesets.filter(other, other.name == b.name).size() == 1)"
+  };
+  // Bound and top-level literal rule roots only; nested command bounds, binding,
+  // typing, effects and occurrence matching remain normative.
+  option (buf.validate.message).cel = {
+    id: "program.rule_node_refs_in_range"
+    message: "rule query, head and rewrite roots must index nodes"
+    expression:
+      "([this.rulesets.map(b, b.value)] + "
+      "this.commands.filter(c, has(c.run)).map(c, "
+      "c.run.rulesets.filter(s, has(s.ruleset)).map(s, s.ruleset)))"
+      ".all(sets, sets.all(rs, rs.rules.all(r, "
+      "(has(r.rule) ? r.rule.query : "
+      "has(r.rewrite) ? [r.rewrite.lhs, r.rewrite.rhs] + r.rewrite.conditions : "
+      "has(r.birewrite) ? [r.birewrite.lhs, r.birewrite.rhs] + r.birewrite.conditions : [])"
+      ".all(i, i < uint(size(this.nodes))) && "
+      "(!has(r.rule) || r.rule.head.all(a, "
+      "(has(a.term) ? [a.term] : "
+      "has(a.set) ? a.set.target.args + [a.set.value] : "
+      "has(a.delete) ? a.delete.args : "
+      "has(a.subsume) ? a.subsume.args : "
+      "has(a.set_cost) ? a.set_cost.target.args + [a.set_cost.cost] : [])"
+      ".all(i, i < uint(size(this.nodes))))))))"
+  };
+  // Reject relation children with matching argument sort IDs and Unit result.
+  // Structural-sort equivalence and complete declared/ambient resolution
+  // remain normative: different IDs for equivalent sorts can escape this rule.
+  option (buf.validate.message).cel = {
+    id: "program.relation_children"
+    message: "a declared relation call cannot be a value child"
+    expression:
+      "this.nodes.all(n, "
+      "(has(n.apply) ? [n.apply.function] + n.apply.args : "
+      "has(n.call) ? n.call.args : "
+      "has(n.get_cost) ? n.get_cost.args : "
+      "has(n.union) ? n.union.members : "
+      "has(n.primitive_value) ? [n.primitive_value].map(v, "
+      "has(v.lambda) ? v.lambda.captures + [v.lambda.body] : "
+      "has(v.partial_call) ? v.partial_call.args : "
+      "has(v.vec) ? v.vec.items : has(v.set) ? v.set.items : "
+      "has(v.multiset) ? v.multiset.items : "
+      "has(v.map) ? v.map.entries.map(e, e.key) + v.map.entries.map(e, e.value) : "
+      "has(v.pair) ? [v.pair.first, v.pair.second] : "
+      "has(v.maybe) && has(v.maybe.value) ? [v.maybe.value] : "
+      "has(v.custom) ? v.custom.args : [])[0] : [])"
+      ".all(i, i < uint(size(this.nodes)) && "
+      "(!has(this.nodes[int(i)].call) || "
+      "this.nodes[int(i)].sort_id >= uint(size(this.sorts)) || "
+      "!has(this.sorts[int(this.nodes[int(i)].sort_id)].application) || "
+      "this.sorts[int(this.nodes[int(i)].sort_id)].application.name != 'Unit' || "
+      "size(this.sorts[int(this.nodes[int(i)].sort_id)].application.args) != 0 || "
+      "!this.nodes[int(i)].call.args.all(a, a < uint(size(this.nodes))) || "
+      "!this.declarations.exists(d, has(d.relation) && "
+      "d.relation.name == this.nodes[int(i)].call.func && "
+      "d.relation.inputs.map(a, a.sort) == "
+      "this.nodes[int(i)].call.args.map(a, this.nodes[int(a)].sort_id)))))"
+  };
+
+  // Expression arena. Evaluate shared ordinary nodes lazily at first demand,
+  // retaining results within one Action command execution (including actions
+  // in loops) or one rule firing's ordered head. Start a fresh ordinary memo for
+  // each such execution. Query patterns do not use this evaluation memo.
+  // `Union` locations have separate identity scopes; see `Union`.
+  repeated Node nodes = 2;
+
+  // Sort arena, separate from expression nodes.
+  repeated Sort sorts = 3;
+
+  repeated Declaration declarations = 4;
+
+  repeated Command commands = 5;
+
+  // Optional provenance. Omit spans for a normalized/unlocated program.
+  repeated SourceFile files = 6;
+
+  // Complete persistent binding replacements, with unique names in this batch.
+  // Empty values clear membership; omission leaves a binding unchanged.
+  // Publish bindings together after successful setup installation. Native
+  // effects completed before a setup failure remain.
+  repeated RulesetBinding rulesets = 7;
+}
+
+// A source file shared by diagnostic/documentation spans in the enclosing
+// payload. Source metadata does not preserve formatting or arbitrary comments.
+message SourceFile {
+  string name = 1;
+  // Optional contents for diagnostic excerpts when the source is unavailable.
+  // In-process consumers may use name as a file path.
+  optional string contents = 2;
+}
+
+// A byte range. Resolve `file` against the nearest arena-owning payload's
+// `files`: `Program`, `BuiltinCatalog`, `CreateEGraphRequest`, `RunProgramResponse`, or
+// a nested exported `Program`. Re-emission must remap or include those files,
+// or strip spans, including origins from definitions installed by earlier requests;
+// dangling indices are invalid. The range is half-open [start, end), with
+// start <= end. If contents are present, both offsets must be UTF-8 character
+// boundaries within their byte length, including for an explicitly empty
+// source. File bounds, content length and character boundaries are normative.
+message Span {
+  option (buf.validate.message).cel = {
+    id: "span.ordered_range"
+    message: "span start must not exceed end"
+    expression: "this.start <= this.end"
+  };
+
+  uint32 file = 1; // index into the enclosing message's `files`
+  uint32 start = 2; // byte offset
+  uint32 end = 3; // byte offset
+}
+
+// ---------------------------------------------------------------------------
+// SORTS — shared concrete types and signature patterns.
+// ---------------------------------------------------------------------------
+
+// Closed sorts are structurally interned: equal container/function shapes
+// denote the same sort. GenericSignature variables are binder-local; shared
+// patterns never share substitutions between signatures or calls.
+// Sorts are acyclic through SortApplication.args and FuncSort.params/result.
+// CEL checks direct indices, not acyclicity or nested variable scope.
+// References do not declare sorts: eq resolves a user EqSort; application
+// resolves a configured-backend PrimitiveSort from GetBuiltins. These nominal
+// namespaces are distinct even when names have the same spelling.
+// Missing names and family-arity mismatches are errors. Builtin references need
+// no descriptor declarations. Output references resolve against the associated
+// handle; output arenas do not redeclare definitions.
+message Sort {
+  oneof kind {
+    option (buf.validate.oneof).required = true;
+
+    string eq = 1 [(buf.validate.field).string.min_len = 1];
+    SortApplication application = 2;
+    FuncSort func = 4;
+    uint32 var = 7; // index into the enclosing GenericSignature binder
+  }
+
+  // Optional representative type-use origin; excluded from sort identity.
+  // Documentation belongs to the defining Declaration or catalog entry.
+  Span span = 5;
+}
+
+// A primitive-sort application: no args for i64/Unit, or e.g. Vec<i64> and
+// Map<String, Math>. Arg count equals declared family arity, including zero.
+// Args may be patterns only in a GenericSignature; otherwise
+// recursively closed. Primitive sorts are not equality sorts.
+message SortApplication {
+  string name = 1 [(buf.validate.field).string.min_len = 1];
+  repeated uint32 args = 2 [packed = true]; // index into the enclosing `sorts`
+}
+
+// A structural function type, not a PrimitiveSort application. Its parameter and
+// result sorts may be patterns in a GenericSignature;
+// otherwise closed.
+message FuncSort {
+  repeated uint32 params = 1 [packed = true]; // index into the enclosing `sorts`
+  uint32 result = 2; // index into the enclosing `sorts`
+}
+
+// ---------------------------------------------------------------------------
+// EXPRESSIONS — the node arena, `Union`, and the other `Node.kind` payloads.
+// ---------------------------------------------------------------------------
+
+// Typed syntax. The producer supplies the resolved sort; the verifier checks
+// it against the value payload, binding, or callable signature.
+//
+// Every use must be valid independently, even when a node is shared between
+// code and data. The contexts are query, action, deferred code and inert data:
+// Rule queries, rewrite LHSs/conditions, checks, and loop-until facts are queries.
+// Rule heads, rewrite RHSs, top-level actions, and operations' evaluated inputs
+// use the action context.
+// - Queries share one binder across all facts. Rule heads and rewrite RHSs may
+//   use that binder; top-level evaluated inputs have no free variables.
+//   Every variable must belong to its use's binder.
+// - Function merges, primitives and lambda bodies use only their own binders
+//   (see those messages). Their bodies and transitive callees must be legal in
+//   each execution context. Hosts publish ambient primitive capabilities;
+//   receivers check them. An evaluated Union can write even in an expression body.
+// - Inert values (declared costs and extracted data) must be finite and contain
+//   no variables, get_cost reads or Union. Saved code retains its own binders;
+//   these restrictions apply at each use, not to the entire arena.
+//
+// Scalar values are inert. Child-bearing values follow the surrounding
+// context; constructing a value does not grant inverse query matching or
+// relax groundedness. Calls and host value materialization must obey their
+// enclosing execution context's capabilities, including query-mode restrictions.
+//
+// Call/get_cost arguments, Apply's function/arguments, Union members and
+// PrimitiveValue children inherit the surrounding context and binder. Each is
+// a value position; row positions never propagate to children. A lambda body
+// starts its own code context and binder, also in a value position. See Call
+// for relation rows.
+// CEL does not propagate these contexts or check binding and effects.
+message Node {
+  uint32 sort_id = 1; // index into the enclosing `sorts`
+
+  oneof kind {
+    option (buf.validate.oneof).required = true;
+
+    // A variable name. Generated names must be deterministic and fresh across
+    // the whole binder, avoiding user names and the positional
+    // lambda/primitive parameters _0, _1, ....
+    string var = 2 [(buf.validate.field).string.min_len = 1];
+    PrimitiveValue primitive_value = 3;
+    Call call = 4;
+    Apply apply = 10;
+
+    // An explicit identity-bearing class/equality group. See `Union`.
+    Union union = 7;
+
+    // Read a Constructor row's explicitly assigned per-row cost, yielding C.
+    // The target addresses the row without evaluating/inserting the constructor.
+    // Functions, Relations and primitives are invalid targets. No declared-cost
+    // or model fallback occurs; assigned zero differs from absent annotation.
+    // In queries this is a relational pattern over assigned costs: key variables
+    // may bind in the query binder; an absent annotation contributes no match.
+    // It has seminaive dependencies like a table lookup, not a Pure-only primitive.
+    // When evaluated, evaluate args once each, left-to-right, then read the cost;
+    // absence fails with RUNTIME_FAILURE. This requires a read-capable context,
+    // so is invalid in SEMINAIVE heads or Pure/Write code. Args inherit the use's
+    // context/binder. Not inert data; saved code may use it under these rules.
+    Call get_cost = 9;
+  }
+
+  // One optional origin. Producers may share ordinary syntax with one chosen
+  // location or emit separate nodes for distinct locations, sharing children.
+  // Do not duplicate identity-bearing Union locations merely to attach spans.
+  // Spans never participate in a row's key.
+  Span span = 8;
+}
+
+// A class/equality group identified by its node index and typed by sort_id.
+// A constructor Call member is a stored extraction alternative; a function Call
+// is a lookup whose result participates in the equality, never an alternative.
+// A PrimitiveValue member contributes its exact concrete value. Exports recreate
+// function rows with Set, including Unit outputs, rather than Call members.
+// Relation rows use bare Calls and cannot be Union members.
+//
+// Context propagates through nested expressions, including call arguments:
+// - In queries, members constrain one common value without mutation. Nonempty
+//   unions may have primitive sorts; empty unions are invalid.
+// - In actions, merge the members' classes and yield that class. The sort must
+//   be an equality sort; primitive-sort writes require directional Set instead.
+//   An empty Union allocates a fresh class without a temporary constructor row.
+// Top-level nodes run only when a command demands them. Nesting never permits
+// reordering around reads, effects or row conflicts. Extracted data forbids
+// unions; deferred code follows Node's execution-context rules.
+//
+// During one rule firing, a Union location identifies one class across the
+// whole ordered head. Direct Actions in an executed command list share one
+// unit as specified on Program; each loop iteration uses a fresh unit.
+// Each primitive/lambda invocation starts a fresh unit. All evaluated inputs
+// of another command share one independent unit for that command execution.
+// On first action use, establish the class identity before evaluating members;
+// references and backedges reuse it without reevaluating those members. Later
+// units may allocate fresh classes. Retained mappings follow canonical class
+// identity through intervening unions, rebuilds and Runs. Queries, including
+// Check and loop-until facts, neither read nor populate this evaluation mapping;
+// they remain nonallocating constraints.
+// This identity rule does not memoize ordinary calls.
+//
+// Canonicalization may identify distinct locations: a row belongs to exactly
+// one class, so groups sharing a member denote the same class afterwards.
+// Distinct empty Unions initially allocate distinct classes. A row's identity
+// is its callable and canonical arguments, not its Call node index; duplicate
+// Call nodes cannot be subsumed independently.
+//
+// Every expression cycle must pass through Union. Removing its outgoing edges
+// must leave an acyclic graph of Call/get_cost arguments, Apply's function and
+// arguments, and every PrimitiveValue child, including custom args and lambda
+// bodies/captures. Union members retain their inherited use context and bounds.
+// Self-reaching calls without a Union boundary are invalid. CEL does not check
+// cycles; consumers must track visited nodes when traversing the graph.
+// Producers must append Union nodes positionally, never hash-cons or deduplicate
+// them: equal-looking locations may denote distinct classes.
+message Union {
+  repeated uint32 members = 1 [packed = true]; // index into the enclosing `nodes`
+}
+
+// A callable name and positional arguments. The enclosing field determines
+// whether it is an application, row address, cost read, or partial application.
+// The callable is declared in the enclosing payload,
+// already installed on the handle, or implicitly provided by the host.
+// The name identifies one callable across installed and ambient definitions;
+// there are no same-name overload sets. Check argument and result sorts against
+// that definition's signature. Generic instantiation does not select another
+// definition. Frontends resolve overloaded surface syntax and conversions
+// before this boundary. Missing names and signature mismatches are errors.
+// Primitive signatures check all concrete argument AND result sorts;
+// every generic parameter must be determined. There are no call-level type args.
+//
+// For Node.call, the enclosing node's sort matches the result; relation calls
+// use Unit. Relation calls are restricted to row positions: a query fact,
+// `Action.term`, or `Action.delete`. They cannot be value
+// arguments, `Set.value`, `Union` members, lambda captures/results, or deferred
+// code. This restriction covers installed, ambient and locally declared names.
+// A relation row is the bare `Call` node itself.
+message Call {
+  string func = 1 [(buf.validate.field).string.min_len = 1];
+  repeated uint32 args = 2 [packed = true]; // index into the enclosing `nodes`
+}
+
+// Intrinsic application of a concrete function value, not a named primitive.
+// Evaluate the function first, then arguments left-to-right. Its FuncSort
+// supplies the exact parameter and result sorts. Apply is executable code,
+// never inert value data; deferred lambda and primitive bodies may contain it.
+message Apply {
+  optional uint32 function = 1 [(buf.validate.field).required = true];
+  repeated uint32 args = 2 [packed = true];
+}
+
+// A closed function body with explicit captures. Body variables are _0, _1,
+// ...: captures first, then parameters. Nested lambdas capture explicitly.
+// The enclosing node has a concrete FuncSort, which supplies parameter sorts
+// and the required body result sort; the Lambda does not repeat that signature.
+// The body cannot use the surrounding binder: its complete binder is _0
+// through _(captures.size + FuncSort.params.size - 1), empty when that sum is zero.
+// Captures inherit the surrounding use context, including its data restrictions;
+// the body is separately scoped deferred code, even in a stored/extracted value.
+// Function values use PrimitiveValue.lambda; application uses Apply.
+// Node sharing does not determine function-value equality.
+message Lambda {
+  // Evaluated when the lambda is constructed; bound as _0 through _(k-1).
+  repeated uint32 captures = 1 [packed = true]; // index into the enclosing `nodes`
+  uint32 body = 3; // index into the enclosing `nodes`
+}
+
+// Native values, selected and typed by the enclosing Node.sort_id. Scalar
+// arms retain their exact payloads: f64_bits preserves IEEE-754 bits,
+// while Egglog equality identifies signed zeroes and all NaN bit patterns.
+// BigInt/BigRat/Rational and vec/set/multiset/map/pair/maybe use their matching
+// SortApplication family applications; lambda/partial_call use FuncSort.
+// CustomValue supports other primitive sorts, including nullary families with value children.
+// Verify payload/sort agreement and child types; CEL checks their indices only.
+//
+// Evaluated children run left-to-right in field/list order (map key then value
+// per entry). Sets deduplicate; maps use the last value for an equal key.
+// Exported/extracted value payloads encode semantic contents: Set elements and Map
+// keys are unique, MultiSet repeats preserve multiplicity, and their enumeration
+// order is unspecified. Vec/Pair order is significant. Query capabilities and
+// groundedness are unchanged: query child inputs must be grounded; these
+// payloads do not bind child variables by inverse matching.
+// Lambda captures are constructed now and its body is separately scoped code.
+// Symbolic operations such as rational(n,d) and vec-of remain Calls; function
+// application uses Apply. Neither is interchangeable with already-formed data.
+// Dedicated scalar arms require the nullary applications i64, f64, String,
+// bool, Unit, BigInt, BigRat and Rational respectively. Vec/Set/MultiSet/Maybe
+// require their named unary applications; Map and Pair require their named
+// binary applications. Lambda and partial_call require FuncSort. Other backend
+// values use CustomValue rather than overloading these family names.
+message PrimitiveValue {
+  oneof value {
+    option (buf.validate.oneof).required = true;
+
+    int64 i64 = 1;
+    fixed64 f64_bits = 2;
+    string string = 3;
+    bool bool = 4;
+    Unit unit = 5;
+    // Canonical signed decimal: no leading +/zeroes or negative zero.
+    string big_int = 6 [(buf.validate.field).string.pattern = "^(0|-?[1-9][0-9]*)$"];
+    BigRat big_rat = 7;
+    Rational rational = 8;
+    ValueList vec = 9;
+    ValueList set = 10;
+    ValueList multiset = 11;
+    MapValue map = 12;
+    PairValue pair = 13;
+    MaybeValue maybe = 14;
+    Lambda lambda = 15;
+    // A function value with a named callable's argument prefix captured, never
+    // a dynamic function value. The enclosing node has a closed FuncSort.
+    // Concatenate captured arg sorts with its remaining params and use its result
+    // to check one effective complete call under the callee's typing form,
+    // including varargs. This must determine all generic
+    // parameters, even with zero/all args captured. Relations cannot be partially
+    // applied; captured arguments are value positions.
+    Call partial_call = 16;
+    CustomValue custom = 17;
+  }
+}
+
+// Reduced fraction with arbitrary integer components in canonical decimal:
+// no leading +/zeroes or negative zero; positive denominator; zero is 0/1.
+// Coprimality is normative, not checked by CEL. Malformed value data is invalid;
+// it does not request symbolic rational construction or its failure behavior.
+message BigRat {
+  option (buf.validate.message).cel = {
+    id: "big_rat.canonical_zero"
+    message: "zero must have denominator one"
+    expression: "this.numerator != '0' || this.denominator == '1'"
+  };
+
+  string numerator = 1 [(buf.validate.field).string.pattern = "^(0|-?[1-9][0-9]*)$"];
+  string denominator = 2 [(buf.validate.field).string.pattern = "^[1-9][0-9]*$"];
+}
+
+// Experimental Rational's reduced i64 fraction. The denominator is positive;
+// zero is 0/1. Coprimality is normative. No reduction or numeric cast is implied.
+message Rational {
+  option (buf.validate.message).cel = {
+    id: "rational.canonical_zero"
+    message: "zero must have denominator one"
+    expression: "this.numerator != 0 || this.denominator == 1"
+  };
+
+  int64 numerator = 1;
+  int64 denominator = 2 [(buf.validate.field).int64.gt = 0];
+}
+
+// Ordered child slots for Vec, Set or MultiSet; the selected arm fixes semantics.
+message ValueList {
+  repeated uint32 items = 1 [packed = true]; // index into the enclosing `nodes`
+}
+
+message MapValue {
+  repeated MapEntry entries = 1;
+}
+
+// An explicit key/value association; both fields are required and zero is valid.
+message MapEntry {
+  optional uint32 key = 1 [(buf.validate.field).required = true]; // index into the enclosing `nodes`
+  optional uint32 value = 2 [(buf.validate.field).required = true]; // index into the enclosing `nodes`
+}
+
+message PairValue {
+  optional uint32 first = 1 [(buf.validate.field).required = true]; // index into the enclosing `nodes`
+  optional uint32 second = 2 [(buf.validate.field).required = true]; // index into the enclosing `nodes`
+}
+
+// Absent is None; present is Some, including a child at index zero.
+message MaybeValue {
+  optional uint32 value = 1; // index into the enclosing `nodes`
+}
+
+// For primitive sorts without a dedicated PrimitiveValue arm. The exact enclosing
+// sort selects the codec and its valid arg arity/sorts; no separate type tag.
+// A nullary family may still have value args (e.g. PyObject); these are not
+// SortApplication's type args and need not have the same arity.
+// All Egglog references are explicit args. Payload bytes may refer to arg slots,
+// never arena/class indices, engine Value IDs or raw process pointers. Traversal,
+// rebuilding and remapping must rewrite args regardless of sort kind, without
+// altering bytes or arg slots/order/multiplicity; generic sorting/dedup is invalid.
+// Backend equality uses payload plus canonical args, not necessarily byte equality.
+// The codec reconstructs the native value preserving references and obeying
+// the enclosing execution capabilities; trust is not an effect exemption.
+// Code evaluates args in order. Generic transport, inspection and remapping
+// never materialize/unpickle or invoke host Debug hooks. Opaque bytes/args may
+// be retained without a codec; explicit trusted materialization, evaluation or
+// Freeze encoding requires a reference-preserving codec or fails. Nullary-family
+// rebuilding must also preserve explicit value references.
+message CustomValue {
+  bytes payload = 1;
+  repeated uint32 args = 2 [packed = true]; // index into the enclosing `nodes`
+}
+
+// The single value of the Unit sort.
+message Unit {}
+
+// ---------------------------------------------------------------------------
+// ACTIONS — mutations, usable in a rule head or as a command.
+// ---------------------------------------------------------------------------
+
+// An ordered mutation or expression evaluation. Shared ordinary nodes retain
+// their first-demand result within this Action or the enclosing rule firing's
+// ordered head. No evaluation moves before its first demand. Persistent
+// top-level captures lower to nullary functions plus sets.
+// Set, delete, subsume and SetCost are standalone actions, not value expressions.
+// Execute action lists in order; each Set uses the function's conflict policy
+// if that write conflicts. Rule matches and rebuilds have no global order here.
+// Ordinary memos reset for each Action command execution, including inside loops.
+// Writes commit in command order; Union has its own separate identity lifetime.
+message Action {
+  oneof kind {
+    option (buf.validate.oneof).required = true;
+
+    // Evaluate/materialize this expression, insert a relation row, or — when
+    // it names a `Union` node — merge the group's members.
+    uint32 term = 1; // index into the enclosing `nodes`
+
+    // Write a function row. Directional, unlike the symmetric `Union`, and so
+    // NOT subsumable into one: it chooses which row is written.
+    Set set = 2;
+
+    // Delete a Constructor, Function or Relation row without constructing it.
+    // Deleting a constructor row also deletes its per-row cost annotation.
+    Call delete = 3;
+
+    // Subsume only a Constructor row without constructing it, retaining its
+    // row and cost annotation. Function and Relation targets are invalid.
+    Call subsume = 7;
+    string panic = 4;
+    SetCost set_cost = 5;
+  }
+
+  // Optional origin; omit for an unlocated program. When present, this is the
+  // authoritative action location, since a shared node's span may be dropped
+  // or merged. A located `panic` needs this span because it has no operand node.
+  Span span = 6;
+}
+
+// Write a function row at this action's position, applying its merge on
+// conflict. The target addresses a row without evaluating that lookup;
+// the row need not already exist.
+message Set {
+  Call target = 1 [(buf.validate.field).required = true];
+  optional uint32 value = 2 [(buf.validate.field).required = true]; // index into the enclosing `nodes`
+}
+
+// Write one constructor row's extraction cost. Usable in rule heads.
+//
+// Names a row and a value, not a table: where the engine stores the cost is not
+// part of this contract. The cost expression has the handle's immutable cost
+// sort C, selected at creation. Whether a model consults declared costs, per-row
+// costs, both or neither is the model's choice.
+// Evaluate target arguments left-to-right, once each, then evaluate the target
+// constructor lookup/insertion. Next evaluate cost and write it for that row.
+// Sequential writes use merge-new: the new cost replaces the previous cost
+// for that row. A canonicalization collision also keeps the incoming value;
+// either cost may survive depending on conflict processing order. This is not
+// global chronological last-write-wins: no timestamps order canonicalization
+// or rule matches. Earlier effects persist if a later step fails. Only
+// Constructor targets are valid; Functions, Relations and primitives have no
+// per-row costs. Deleting a target row deletes its annotation as well.
+message SetCost {
+  Call target = 1 [(buf.validate.field).required = true];
+
+  // An expression yielding a value of C, not necessarily a literal integer:
+  // `(set-cost (Num x) (+ (* x 100) 5))`.
+  optional uint32 cost = 2 [(buf.validate.field).required = true]; // index into the enclosing `nodes`
+}
+
+// ---------------------------------------------------------------------------
+// DECLARATIONS — immutable sort and callable definitions.
+// ---------------------------------------------------------------------------
+
+// Order-independent, immutable definitions. New names may be added. Resending
+// a complete definition is optional and checks compatibility: identical
+// definitions are no-ops; conflicting definitions are errors. User tables and
+// computed primitives have complete, concrete definitions. Builtin primitives
+// and primitive sorts are resolved by canonical name against GetBuiltins;
+// their descriptors are not input declarations.
+// Compare referenced expression subgraphs structurally, not request-local
+// indices. Provenance, documentation and argument labels do not participate
+// in semantic identity.
+// Comparison must preserve Union sharing/identity topology; ordinary syntax
+// sharing may differ. One empty Union reused twice is not two fresh Unions.
+// Callable names are unique across Constructor, Function, Relation and
+// UserDefinedPrimitive, including ambient builtin primitives. Equality sorts
+// and primitive sorts occupy distinct nominal namespaces, selected by Sort's
+// kind. Equal spellings may coexist across namespaces. Compatible resends retain
+// the definition; conflicts within a namespace never shadow definitions.
+message Declaration {
+  option (buf.validate.message).cel = {
+    id: "declaration.table_name"
+    message: "a reflective table prefix belongs only on a constructor, function or relation"
+    expression: "!(has(this.public_alias) || has(this.default_name)) || has(this.constructor) || has(this.function) || has(this.relation)"
+  };
+  oneof kind {
+    option (buf.validate.oneof).required = true;
+
+    Constructor constructor = 1;
+    Function function = 2;
+    Relation relation = 3;
+    UserDefinedPrimitive user_defined_primitive = 4;
+    EqSort eq_sort = 10;
+  }
+
+  // Optional diagnostic origin; excluded from semantic identity.
+  Span span = 7;
+
+  // Optional documentation; excluded from semantic identity. Absent and
+  // explicitly empty documentation remain distinct.
+  optional string doc = 9;
+
+  // Reflective String selector, distinct from the callable key. Absent means a
+  // soft default of that key. Explicit public aliases take priority over soft
+  // defaults; public_alias=key differs from absence, while default_name=key
+  // is compatible with absence. Empty strings are valid in either arm. Live
+  // public aliases and live soft defaults are each unique; an alias may shadow a soft
+  // default. Structural references, including table observation commands, use keys.
+  oneof table_name {
+    string public_alias = 12;
+    string default_name = 13;
+  }
+}
+
+// An argument's sort and optional label. Calls are positional; labels are not
+// part of declaration identity.
+message Arg {
+  uint32 sort = 1; // index into the enclosing `sorts`
+  string name = 2;
+}
+
+// A concrete nullary equality-sort definition. Its nominal namespace is distinct
+// from primitive sorts and callables; same-name compatible resends are idempotent.
+message EqSort {
+  string name = 1 [(buf.validate.field).string.min_len = 1];
+}
+
+// A concrete constructor whose output is an equality sort.
+message Constructor {
+  string name = 1 [(buf.validate.field).string.min_len = 1];
+  repeated Arg inputs = 2;
+  uint32 output = 3; // index into the enclosing `sorts`
+  // Optional static cost: a finite, closed, inert value of the handle's cost
+  // sort C. Decode it structurally; never evaluate a primitive/table lookup or
+  // depend on declaration installation order. PrimitiveValue payloads encode
+  // base/container data directly. Absent leaves the model's fallback policy
+  // in control.
+  optional uint32 cost = 4; // index into the enclosing `nodes`
+
+  bool unextractable = 5;
+  // Exclude this constructor from aggregate observations and extraction;
+  // retain its rows in queries and snapshots.
+  bool hidden = 6;
+}
+
+// A concrete table-backed function.
+message Function {
+  string name = 1 [(buf.validate.field).string.min_len = 1];
+  repeated Arg inputs = 2;
+  uint32 output = 3; // index into the enclosing `sorts`
+
+  // Deferred code bound only over old and new, including in exported
+  // declarations. Absent asserts equality on conflict.
+  optional uint32 merge = 4; // index into the enclosing `nodes`
+  // Exclude this function from aggregate observations; retain its rows.
+  bool hidden = 5;
+}
+
+// A concrete set of tuples, inserted by an action call and matched by row existence.
+// The declaration has no output field; typed calls have implicit sort Unit.
+// It has no merge body and is not a valid `Set` target.
+message Relation {
+  string name = 1 [(buf.validate.field).string.min_len = 1];
+  repeated Arg inputs = 2;
+}
+
+// A concrete program-defined computed function, distinct from Primitive.
+// Its body and transitive callees must be legal at every use, using
+// backend-published ambient capabilities checked by the receiver. Union may
+// write even in an expression-only body. No effect-inference algorithm or
+// fallback for recursive definitions is prescribed.
+message UserDefinedPrimitive {
+  string name = 1 [(buf.validate.field).string.min_len = 1];
+  repeated Arg inputs = 2;
+  uint32 output = 3; // index into the enclosing `sorts`
+  // Deferred code bound only over _0, _1, ... for the inputs in declaration
+  // order, including in an exported declaration.
+  optional uint32 body = 4 [(buf.validate.field).required = true]; // index into the enclosing `nodes`
+}
+
+// Read-only configured-backend catalog. Signatures and their sort patterns are
+// authoritative machine data; frontend presentation mappings remain external.
+// All sort and file indices refer to this message. It is independent of graph
+// contents, execution mode and creation settings, and is never part of Program,
+// Freeze or input history. Implementations and value codecs remain external.
+message BuiltinCatalog {
+  option (buf.validate.message).cel = {
+    id: "builtin_catalog.sort_references"
+    message: "sort children must index the catalog sort arena"
+    expression:
+      "this.sorts.all(s, (has(s.application) ? s.application.args : "
+      "has(s.func) ? s.func.params + [s.func.result] : []).all(i, i < uint(size(this.sorts))))"
+  };
+  option (buf.validate.message).cel = {
+    id: "builtin_catalog.signature_roots"
+    message: "signature sorts must exist and direct variables must be bound"
+    expression:
+      "this.primitives.all(p, !has(p.signature) || [p.signature].all(sig, "
+      "(sig.inputs.map(a, a.sort) + (has(sig.output) ? [sig.output] : []) + "
+      "sig.varargs.map(a, a.sort)).all(i, i < uint(size(this.sorts)) && "
+      "(!has(this.sorts[int(i)].var) || this.sorts[int(i)].var < sig.type_param_count))))"
+  };
+  repeated Sort sorts = 1;
+  repeated PrimitiveSort primitive_sorts = 2;
+  repeated Primitive primitives = 3;
+  repeated SourceFile files = 4;
+}
+
+// A backend-provided sort family, including nullary scalar sorts. Every
+// application uses SortApplication, with exactly arity arguments.
+message PrimitiveSort {
+  string name = 1 [(buf.validate.field).string.min_len = 1];
+  uint32 arity = 2;
+  Span span = 3;
+  optional string doc = 4;
+}
+
+// A backend-provided callable. A Program calls its canonical name without
+// declaring it. Its implementation and context capabilities remain native.
+message Primitive {
+  string name = 1 [(buf.validate.field).string.min_len = 1];
+  GenericSignature signature = 2 [(buf.validate.field).required = true];
+  Span span = 4;
+  optional string doc = 5;
+}
+
+// An ordinary primitive signature: a fixed prefix followed by zero or more
+// repetitions of the ordered varargs pattern. An empty pattern means no tail
+// (exact fixed arity); one Arg describes homogeneous varargs. For a nonempty
+// pattern, the actual argument count minus the fixed prefix must be a multiple
+// of the pattern width. Pattern order and width are semantic, even [T, T];
+// arguments remain flat, with no tuple/group node. Sort indices reference
+// BuiltinCatalog.sorts.
+// Sort.var indices bind in [0, type_param_count), without parameter names or
+// kind constraints. All uses, including nested SortApplication and FuncSort
+// patterns, must be in this signature's binder. Each actual call
+// matches all concrete argument and result sorts structurally to obtain one
+// consistent, complete substitution across all repetitions and the result.
+// Reject undetermined parameters: e.g.
+// count<T>(...T)->i64 cannot be called with zero arguments, whereas an empty
+// vec-of<T>(...T)->Vec<T> determines T from its concrete result sort.
+// No conversion, subtyping, overload search or heterogeneous type packs.
+// This describes ordinary structural typing. Native primitive-specific sort
+// and domain applicability is checked at submission before execution; this
+// signature does not promise that every structural instantiation is supported.
+message GenericSignature {
+  uint32 type_param_count = 1;
+  repeated Arg inputs = 2;
+  optional uint32 output = 3 [(buf.validate.field).required = true];
+  repeated Arg varargs = 4;
+}
+
+// ---------------------------------------------------------------------------
+// RULE DEFINITIONS — immutable content and replaceable named collections.
+// ---------------------------------------------------------------------------
+
+// An immutable rule/rewrite value. Content identity includes its resolved typed
+// body, ordered query/head, options and represented graph sharing; arena IDs,
+// labels, documentation and provenance do not identify it. Intern content on the
+// handle independently of collection names, retaining its compiled state and
+// cursors through replacement, omission and readdition. Old effects remain.
+message Rule {
+  oneof kind {
+    option (buf.validate.oneof).required = true;
+
+    RuleBody rule = 1;
+    Rewrite rewrite = 2;
+    BiRewrite birewrite = 3;
+  }
+
+  // Optional diagnostic label; may repeat and never binds or identifies a rule.
+  // Changing/omitting it does not affect compatible occurrence matching.
+  optional string name = 4 [(buf.validate.field).string.min_len = 1];
+
+  // Required for every rule and rewrite; no implicit default.
+  RuleEvalMode eval_mode = 5 [
+    (buf.validate.field).required = true,
+    (buf.validate.field).enum.defined_only = true
+  ];
+  bool no_decomp = 6;
+  bool include_subsumed = 7;
+
+  // Origin and documentation of the whole rule/rewrite form; excluded from
+  // semantic identity. The span attributes a runtime panic to this occurrence.
+  Span span = 8;
+  string doc = 9;
+}
+
+// A stored query and ordered action list.
+message RuleBody {
+  repeated uint32 query = 2 [packed = true]; // index into the enclosing `nodes`
+  repeated Action head = 3;
+}
+
+// Rule evaluation strategies; UNSPECIFIED is invalid.
+enum RuleEvalMode {
+  RULE_EVAL_MODE_UNSPECIFIED = 0;
+
+  // Delta matching. Query primitives use Pure context (no database reads or
+  // writes); head primitives use Write context (writes but no database reads).
+  RULE_EVAL_MODE_SEMINAIVE = 1;
+
+  // Match the whole database each iteration. Query primitives use Read
+  // context; head primitives use Full context (both database reads and writes).
+  RULE_EVAL_MODE_NAIVE = 2;
+
+  // Delta matching with the same Read/Full contexts as NAIVE. Unsafe: a head
+  // read sees the database mid-iteration; changes to the value read do not
+  // by themselves trigger reevaluation.
+  RULE_EVAL_MODE_UNSAFE_SEMINAIVE = 3;
+}
+
+// A guarded directional rewrite, optionally subsuming its left side.
+// Match lhs and conditions together in one query binder. For each match,
+// evaluate rhs in that binder and unify its value with the matched lhs value.
+message Rewrite {
+  uint32 lhs = 2; // index into the enclosing `nodes`
+  uint32 rhs = 3; // index into the enclosing `nodes`
+  repeated uint32 conditions = 4 [packed = true]; // index into the enclosing `nodes`
+  // Requires lhs to address a Constructor row. Functions and Relations cannot
+  // be subsumed; the constructor's per-row cost is retained.
+  bool subsume = 5;
+}
+
+// Two guarded rewrites: lhs -> rhs and rhs -> lhs, each with these conditions
+// and its own query binder, following Rewrite's match/evaluate/unify semantics.
+// Neither direction subsumes.
+message BiRewrite {
+  uint32 lhs = 2; // index into the enclosing `nodes`
+  uint32 rhs = 3; // index into the enclosing `nodes`
+  repeated uint32 conditions = 4 [packed = true]; // index into the enclosing `nodes`
+}
+
+// An immutable ordered collection of inline rule values; no rule arena or
+// collection identity. A direct Rule input is a singleton collection here.
+message Ruleset {
+  repeated Rule rules = 1;
+}
+
+// Program setup, never an executable command. The empty name is the default
+// group. Resupplying the same value is harmless; an empty value clears it.
+// Membership is captured in value, not a live dependency on other bindings.
+message RulesetBinding {
+  string name = 1;
+  Ruleset value = 2 [(buf.validate.field).required = true];
+}
+
+// A literal captures its members; a name resolves the persistent post-setup
+// binding throughout this Program. Unknown names select an empty collection.
+message RulesetSelection {
+  oneof kind {
+    option (buf.validate.oneof).required = true;
+
+    Ruleset ruleset = 1;
+    string name = 2;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// COMMANDS — the `Command.kind` arms after `action`, in arm order.
+// ---------------------------------------------------------------------------
+
+// One command, at top level or in a loop body: every command may appear in
+// `Loop`. Declarations and ruleset bindings are installed at Program scope.
+message Command {
+  oneof kind {
+    option (buf.validate.oneof).required = true;
+
+    Action action = 1;
+    Check check = 2;
+    Run run = 3;
+    BindScheduler bind_scheduler = 4;
+    KeepBest keep_best = 5;
+
+    Extract extract = 6;
+    Freeze freeze = 7;
+    GetTableSizes table_sizes = 8;
+    GetTableRows table_rows = 9;
+    GetTableStats table_stats = 10;
+
+    Loop loop = 11;
+
+    Prove prove = 14;
+    ProveExists prove_exists = 15;
+
+    // Expect the supported child's execution to fail. Evaluating an action's
+    // arguments belongs to that action, not to a prerequisite outside the
+    // catch. Failure succeeds; success raises RUNTIME_FAILURE. Produce no
+    // requested outputs anywhere inside the child scope, on either outcome;
+    // retain completed effects and outputs preceding that scope. Preparation
+    // and typechecking errors, and unsupported forms, are not caught. Internal
+    // maintenance/invariant checks retain their native boundaries.
+    // This is not rollback and does not catch process panics. Nested wrappers
+    // retain their distinct expectations and output suppression.
+    // Adds no binder, command list, Union identity scope, or loop iteration.
+    Command fail = 16;
+
+    // Observe previously collected cumulative backend diagnostics. No file
+    // destination; follows ordinary observation ordering and Fail suppression.
+    Unit stats = 17;
+
+    Explain explain = 19;
+  }
+
+  // Origin. Locates a failure attributed to a command rather than an
+  // expression: a failed `check`, run or extraction.
+  // Surfaces as `Error.span`.
+  Span span = 13;
+}
+
+// One conjunctive query. All facts share the same variable bindings.
+// Resolve names and types during preparation, but plan the requested query
+// during execution; failure of that requested query is catchable by Fail.
+// Generated proof rules retain their preparation-time admission, and internal
+// maintenance/invariant failures do not become expected query failures.
+message Check {
+  repeated uint32 facts = 1 [packed = true]; // index into the enclosing `nodes`
+}
+
+// Prove one conjunctive query with Check's typing and variable-binding rules.
+// Uses the existing proof engine: this installs/runs a helper rule before proof
+// extraction, so it can mutate state and fail after completing helper effects.
+// PROOF_TESTING treats Check the same way. Only the requested proof is an
+// output; helper work is attributed in optional profiling. See CommandOutput.
+// Do not reject solely because proofs are disabled before running the native
+// command: witness failure and completed effects follow native execution order.
+message Prove {
+  repeated uint32 facts = 1 [packed = true]; // index into the enclosing `nodes`
+}
+
+// Request a proof for an existing witness of this declared constructor. The
+// target is a name, not an evaluated call or arguments that insert a witness.
+message ProveExists {
+  string constructor = 1 [(buf.validate.field).string.min_len = 1];
+}
+
+// Execute one step of the ordered union of selections with one scheduler.
+// Traverse selections left to right and each collection in order, selecting
+// shared rule content once. [] selects nothing; name "" selects the default
+// group. Separate Runs select independently and retain rule execution state;
+// this does not override eval_mode or scheduler decisions. A completed top-level
+// Run returns RunResult.
+message Run {
+  repeated RulesetSelection rulesets = 1;
+  // Empty means no scheduler; otherwise names a BindScheduler instance.
+  string scheduler = 2;
+}
+
+// Bind a stateful scheduler. Rebinding an in-scope name is an error.
+// A binding inside a loop body expires each iteration; a top-level binding
+// survives the request. Name expiry does not destroy the scheduler instance.
+message BindScheduler {
+  string name = 1 [(buf.validate.field).string.min_len = 1];
+  BackOff back_off = 2 [(buf.validate.field).required = true];
+}
+
+// Back-off limits. Absent fields select engine defaults; zero is explicit.
+message BackOff {
+  optional uint64 match_limit = 1; // engine default 1000
+  optional uint64 ban_length = 2; // engine default 5
+  optional uint64 node_limit = 3; // no default; unset means unbounded
+}
+
+// Extract each cell of the named tables, then clear ALL tables, including
+// tables not named here. Reinstall the selected rows and any constructor rows
+// needed to represent their extracted values. Produces no output.
+// Rank candidates in the selected model's result sort D (see Extract).
+// Preserve assigned costs, including absence versus zero, from selected source
+// constructor rows onto corresponding reconstructed rows. This includes named
+// table rows and nested extracted producers. Never substitute extraction totals
+// or declared/model defaults. Preserve/remap cost values and needed data for
+// the full sort C, including class references, across the internal clear.
+// Discarded rows lose annotations; static declaration costs remain unchanged.
+// Reconstruction/canonicalization collisions retain existing merge-new rules.
+// Repeated calls have no universal stability guarantee or additional
+// model/extractor precondition.
+message KeepBest {
+  repeated string tables = 1 [
+    packed = false,
+    (buf.validate.field).repeated.min_items = 1,
+    (buf.validate.field).repeated.items.string.min_len = 1
+  ];
+  Extractor extractor = 2 [
+    (buf.validate.field).required = true,
+    (buf.validate.field).enum.defined_only = true
+  ];
+
+  // Host-registered model name, subject to Extract's C/D/algorithm contract.
+  // Empty requests the host default, which need not support every C.
+  string cost_model = 3;
+}
+
+// Extract ordered roots using the selected algorithm and host cost model.
+// Returns `ExtractResult`; a root with no finite extraction has an empty
+// variants list, which is a successful result.
+message Extract {
+  // Ordered roots.
+  repeated uint32 roots = 1 [
+    packed = true,
+    (buf.validate.field).repeated.min_items = 1
+  ]; // index into the enclosing `nodes`
+
+  // Literal maximum variants per root; one requests the best result.
+  uint32 variants = 2 [(buf.validate.field).uint32.gte = 1];
+
+  Extractor extractor = 3 [
+    (buf.validate.field).required = true,
+    (buf.validate.field).enum.defined_only = true
+  ];
+
+  // Host-registered name, not serialized callback code. Empty selects the
+  // host default. A registration must accept the handle's stored-cost sort C
+  // and selected algorithm, or Extract/KeepBest fails. It declares a supported,
+  // recursively closed result sort D, which may differ from C. Selecting another
+  // model may change D without changing stored annotations. The host defines
+  // result codecs and arithmetic, order, NaN and overflow policies. No implicit
+  // numeric casts or automatic domain adapters occur; a default model is not
+  // promised for every C. The host default also specifies its accepted C,
+  // result D and supported algorithms.
+  string cost_model = 4;
+}
+
+// Extraction algorithms; UNSPECIFIED is invalid.
+enum Extractor {
+  EXTRACTOR_UNSPECIFIED = 0;
+  EXTRACTOR_TREE = 1;
+  EXTRACTOR_GREEDY_DAG = 2;
+}
+
+// Export complete logical options and a reconstruction Program; no filtering.
+// Returns CommandOutput.snapshot; its Program owns nodes, sorts and source files.
+// This is current state, not request history or an engine checkpoint: omit
+// scheduler instances, execution cursors, caches, reports, proof history and
+// host resources. Preserve execution_mode, but reconstruction does not preserve
+// original derivations or promise equivalent proof results.
+//
+// Include every installed declaration and sort, even unused or empty tables,
+// and preserve current named ruleset bindings and their ordered rule values,
+// including empty bindings. A shared value appears in each relevant binding.
+// Omit rules retained only in private registration caches. Backend builtin
+// descriptors remain in GetBuiltins.
+// Include saved code and its dependencies without executing it.
+// Host implementations/codecs remain external. Reconstruction sorts are
+// concrete; builtin declarations and signature-pattern arenas are not copied.
+//
+// Return EGraphSnapshot with the handle's logical options and this Program.
+// Do not export resource settings such as threads. See EGraphSnapshot for
+// fresh-handle restoration with compatible C and host capabilities. Definition
+// installation follows Program's normal rules; scheduler/seminaive history
+// is not resumed.
+//
+// Export commands contain only data Actions, with no queries, Runs or loops.
+// Emit exactly one direct Action.term for each canonical equality
+// class, naming its unique Union location with all its constructor rows as
+// members. Include empty/unreachable classes.
+// Emit relation rows as direct Action.term Calls; write every function row,
+// including Unit outputs, with Set. Then emit SetCost annotations, then subsume
+// for subsumed constructor rows; no delete or panic actions.
+// These explicit roots inventory stored classes, not arbitrary arena nodes or
+// Union locations in saved code. Shared Union locations preserve references
+// across this list. Keep all canonical rows and extant cost/subsumption
+// annotations. A row is its typed callee and canonical arguments, not a Call
+// node's identity. Each constructor/relation row has one inventory occurrence;
+// each function/cost key is written once. A canonical export restored into empty
+// data must not depend on replaying conflict merges.
+//
+// Exported values use exact PrimitiveValue payloads and shared class references,
+// not primitive calls, function lookups or extraction. Lambda bodies and saved
+// definitions remain deferred code; captures, partial arguments, custom args
+// and costs preserve their references. Generic inspection never evaluates
+// these actions or materializes custom values. Executing them is explicit
+// trusted materialization and requires the appropriate host codecs.
+// If any required state/definition/value cannot be represented,
+// Freeze fails with RUNTIME_FAILURE instead of returning a partial export.
+// Export completeness, canonical keys and reference preservation are normative
+// obligations, not established by Program's local CEL checks.
+message Freeze {}
+
+// Report sizes of selected tables, or all visible tables. Returns
+// `TableSizes`.
+message GetTableSizes {
+  // Empty selects all visible tables.
+  repeated string tables = 1 [
+    packed = false,
+    (buf.validate.field).repeated.items.string.min_len = 1
+  ];
+}
+
+// Rows of one table as extracted representative terms, including subsumed
+// rows. Alternative producers and e-class identity are not preserved. Returns
+// `TableRows` with each selected cell's finite representative or explicit
+// unavailability. No finite extraction is not a command failure; actual
+// extraction/encoding errors still fail the command without a partial output.
+// Earlier outputs/effects remain on error, and later commands do not run.
+message GetTableRows {
+  string table = 1 [(buf.validate.field).string.min_len = 1];
+  // Absent selects every row; present zero selects no rows. The table must
+  // exist even when no rows are selected.
+  optional uint64 max_rows = 2;
+}
+
+// Report structural statistics for selected tables, or all visible tables.
+// Returns `TableStatsResult`.
+message GetTableStats {
+  // Empty selects all visible tables.
+  repeated string tables = 1 [
+    packed = false,
+    (buf.validate.field).repeated.items.string.min_len = 1
+  ];
+}
+
+// Execute the body in order until its complete iteration reports can_stop,
+// the optional cap is reached, until matches, or execution fails. Run itself
+// remains one round. A completed top-level Loop returns RunResult.
+message Loop {
+  repeated Command body = 1;
+  // Conjunctive pre-check before each iteration. Empty means no condition.
+  repeated uint32 until = 2 [packed = true];
+  // Absent is unbounded; zero executes no body or until check.
+  optional uint64 max_iterations = 3;
+}
+
+// Inspect selected registered rule query plans without executing or advancing
+// cursors. Unknown groups select no rules, as for Run. Returns Diagnostic.
+message Explain {
+  repeated string groups = 1;
+}
+
+// ---------------------------------------------------------------------------
+// SERVICE — the operations, their request/response types, and failure.
+// ---------------------------------------------------------------------------
+
+// E-graph lifecycle and program execution. Logical operations compose inside
+// Program. An in-process typed/bytes adapter suffices; no network transport is
+// required. Unsupported operations must fail explicitly.
+service EgglogService {
+  // buf:lint:ignore RPC_RESPONSE_STANDARD_NAME
+  rpc GetBuiltins(GetBuiltinsRequest) returns (BuiltinCatalog);
+  rpc CreateEGraph(CreateEGraphRequest) returns (CreateEGraphResponse);
+  rpc CloneEGraph(CloneEGraphRequest) returns (CloneEGraphResponse);
+  rpc DestroyEGraph(DestroyEGraphRequest) returns (DestroyEGraphResponse);
+  rpc RunProgram(RunProgramRequest) returns (stream RunProgramResponse);
+  // buf:lint:ignore RPC_RESPONSE_STANDARD_NAME
+  rpc GetHistory(GetHistoryRequest) returns (Program);
+}
+
+// Inspect the configured backend; no EGraph handle or graph state is involved.
+message GetBuiltinsRequest {}
+
+// Immutable logical settings, shared by creation and snapshots. cost_sort
+// indexes CreateEGraphRequest.sorts or EGraphSnapshot.program.sorts respectively.
+// C may be a supported, acyclic, recursively closed backend-provided sort or
+// composition, including a function type. Frontends may offer an i64
+// default, but the wire always specifies C. No value codec or extraction model
+// is required merely to select C. Declared/assigned annotations and GetCost
+// results must agree with C structurally, never by comparing arena-local indices.
+// Extraction objectives use the selected model's result sort D (see Extract).
+message EGraphOptions {
+  optional uint32 cost_sort = 1 [(buf.validate.field).required = true];
+
+  // Select before installing user declarations. Host providers must be installed
+  // before term encoding captures their typechecking/validation environment.
+  ExecutionMode execution_mode = 2 [(buf.validate.field).enum.defined_only = true];
+
+  // Absent retains the native default true. False selects native global naive
+  // evaluation, including internally generated rules, not only authored rules.
+  optional bool seminaive = 3;
+}
+
+// Existing engine treatments; NORMAL is the default when the field is absent.
+enum ExecutionMode {
+  // buf:lint:ignore ENUM_ZERO_VALUE_SUFFIX
+  EXECUTION_MODE_NORMAL = 0;
+  // Instrument terms without generating proofs.
+  EXECUTION_MODE_TERM_ENCODING = 1;
+  // Generate proofs for explicit Prove and ProveExists requests.
+  EXECUTION_MODE_PROOFS = 2;
+  // Generate proofs and execute each Check as Prove.
+  EXECUTION_MODE_PROOF_TESTING = 3;
+}
+
+// Create an empty e-graph without executing a Program. Resolve backend-provided
+// sorts and supported compositions, then validate options and this acyclic,
+// recursively closed sort arena before allocating a handle. User equality sorts
+// are not available at creation.
+// Unsupported options/resources are lifecycle errors, not RunProgram.error.
+message CreateEGraphRequest {
+  option (buf.validate.message).cel = {
+    id: "create_egraph_request.closed_sorts"
+    message: "creation sorts cannot contain signature variables"
+    expression: "this.sorts.all(s, !has(s.var) && !has(s.eq))"
+  };
+  option (buf.validate.message).cel = {
+    id: "create_egraph_request.cost_sort_in_range"
+    message: "options.cost_sort must index sorts"
+    expression: "has(this.options.cost_sort) && this.options.cost_sort < uint(size(this.sorts))"
+  };
+  option (buf.validate.message).cel = {
+    id: "create_egraph_request.sort_refs_in_range"
+    message: "sort children must index sorts"
+    expression:
+      "this.sorts.all(s, "
+      "(has(s.application) ? s.application.args : "
+      "has(s.func) ? s.func.params + [s.func.result] : [])"
+      ".all(i, i < uint(size(this.sorts))))"
+  };
+  repeated Sort sorts = 1;
+  EGraphOptions options = 2 [(buf.validate.field).required = true];
+  repeated SourceFile files = 3;
+
+  // Resource request, never exported as logical state. Absent leaves policy to
+  // the receiver; zero requests automatic parallelism; positive requests that
+  // thread count. Reject unsupported requests rather than silently ignoring.
+  optional uint32 threads = 5;
+
+  // Runtime query-planning policy, false by default. True skips tree
+  // decomposition for future compiled rules; it does not recompile installed
+  // rules or change typing/admission. Not part of logical snapshots or source
+  // replay. Local rule no_decomp=true still applies when this global is false.
+  bool no_decomp = 6;
+
+  // Retain accepted input Programs for this handle. Off by default;
+  // not a logical option and never restored by Freeze. Clone inherits this
+  // choice. GetHistory specifies retention, observation and lifecycle behavior.
+  bool record_history = 7;
+}
+
+message CreateEGraphResponse {
+  uint64 egraph_id = 1;
+  // Actual effective count, including resolution of automatic/default requests.
+  uint64 threads = 2 [(buf.validate.field).uint64.gte = 1];
+}
+
+// Portable logical state with all arenas/files owned by program, including
+// the concrete cost sort C selected by options. Builtin patterns remain in
+// GetBuiltins. For fresh-handle restoration, remap C's closed backend sort graph
+// into CreateEGraphRequest, choose receiver resources, then execute program on
+// the compatible handle. Creation executes no commands. Global seminaive
+// admission is preserved; scheduler/delta state, query plans and runtime
+// resource/planner settings are not resumed. Execution against an existing
+// handle follows ordinary Program semantics; restoration equivalence requires
+// compatible options.
+message EGraphSnapshot {
+  option (buf.validate.message).cel = {
+    id: "egraph_snapshot.cost_sort_in_range"
+    message: "options.cost_sort must index a non-variable sort in program"
+    expression:
+      "has(this.options.cost_sort) && this.options.cost_sort < uint(size(this.program.sorts)) && "
+      "!has(this.program.sorts[int(this.options.cost_sort)].var)"
+  };
+
+  EGraphOptions options = 1 [(buf.validate.field).required = true];
+  Program program = 2 [(buf.validate.field).required = true];
+}
+
+// Clone the addressed e-graph, retaining C, logical options, resources and
+// proof state. No complexity guarantee.
+message CloneEGraphRequest {
+  uint64 egraph_id = 1;
+}
+
+message CloneEGraphResponse {
+  uint64 egraph_id = 1;
+}
+
+// Destroy the addressed e-graph.
+message DestroyEGraphRequest {
+  uint64 egraph_id = 1;
+}
+
+message DestroyEGraphResponse {}
+
+// Retrieve one accumulated input Program for this live graph. Recording is
+// selected at creation and off by default; disabled or unknown handles error.
+// Retain decoded authored inputs only after successful preparation,
+// before installation/commands. Rejected preparation contributes no input;
+// later execution failure retains the accepted input, including its suffix.
+// This records inputs only: no outcomes, resource/lifecycle events or raw bytes.
+// Remap arenas while preserving command order, graph sharing and distinct Union
+// locations. Declarations are cumulative, so earlier Freeze observations may
+// contain extra definition metadata. This is not exact replay after failure.
+// Capture historic named Run selections as needed when combining inputs, also
+// inside nested commands: later binding replacements must not retarget them.
+// GetHistory contributes no input. Clone retains the shared past independently;
+// Destroy releases only its graph's history. Host implementations remain external.
+message GetHistoryRequest {
+  uint64 egraph_id = 1;
+}
+
+// Execute a program against an existing e-graph.
+message RunProgramRequest {
+  uint64 egraph_id = 1;
+  Program program = 2;
+
+  // Collect backend-specific detail for each completed control. Off disables
+  // optional timing, per-rule metrics and retained iteration detail, without
+  // changing scheduler-required counts or readiness decisions.
+  bool diagnostics = 3;
+}
+
+// Each output chunk owns complete local node/sort arenas in RunProgramOutput,
+// independent of other chunks and the request. Nested Programs own their arenas.
+// Observations are delivered during loops; a final completion/error chunk
+// precedes stream end.
+// Cancellation preserves completed effects and outputs. It is cooperative at
+// command boundaries and does not roll back.
+message RunProgramResponse {
+  oneof result {
+    option (buf.validate.oneof).required = true;
+    RunProgramOutput output = 1;
+    Error error = 2;
+  }
+  // Origins for this frame's payload, including definitions installed earlier.
+  // Nested exported Programs own their files independently.
+  repeated SourceFile files = 3;
+}
+
+// One completed output batch with self-contained node and sort arenas.
+// Spans index the enclosing RunProgramResponse.files. Earlier success frames
+// remain valid when a later terminal frame reports an error.
+message RunProgramOutput {
+  option (buf.validate.message).cel = {
+    id: "run_program_output.closed_sorts"
+    message: "response sorts cannot contain signature variables"
+    expression: "this.sorts.all(s, !has(s.var))"
+  };
+  option (buf.validate.message).cel = {
+    id: "run_program_output.node_sort_in_range"
+    message: "every node sort_id must index sorts"
+    expression: "this.nodes.all(n, n.sort_id < uint(size(this.sorts)))"
+  };
+  option (buf.validate.message).cel = {
+    id: "run_program_output.node_refs_in_range"
+    message: "node children must index nodes"
+    expression:
+      "this.nodes.all(n, "
+      "(has(n.apply) ? [n.apply.function] + n.apply.args : "
+      "has(n.call) ? n.call.args : "
+      "has(n.get_cost) ? n.get_cost.args : "
+      "has(n.union) ? n.union.members : "
+      "has(n.primitive_value) ? [n.primitive_value].map(v, "
+      "has(v.lambda) ? v.lambda.captures + [v.lambda.body] : "
+      "has(v.partial_call) ? v.partial_call.args : "
+      "has(v.vec) ? v.vec.items : has(v.set) ? v.set.items : "
+      "has(v.multiset) ? v.multiset.items : "
+      "has(v.map) ? v.map.entries.map(e, e.key) + v.map.entries.map(e, e.value) : "
+      "has(v.pair) ? [v.pair.first, v.pair.second] : "
+      "has(v.maybe) && has(v.maybe.value) ? [v.maybe.value] : "
+      "has(v.custom) ? v.custom.args : [])[0] : [])"
+      ".all(i, i < uint(size(this.nodes))))"
+  };
+  option (buf.validate.message).cel = {
+    id: "run_program_output.sort_refs_in_range"
+    message: "sort children must index sorts"
+    expression:
+      "this.sorts.all(s, "
+      "(has(s.application) ? s.application.args : "
+      "has(s.func) ? s.func.params + [s.func.result] : [])"
+      ".all(i, i < uint(size(this.sorts))))"
+  };
+  option (buf.validate.message).cel = {
+    id: "run_program_output.function_value_signature"
+    message: "function values require a function sort"
+    expression:
+      "this.nodes.all(n, !(has(n.primitive_value.lambda) || has(n.primitive_value.partial_call)) || "
+      "(n.sort_id < uint(size(this.sorts)) && has(this.sorts[int(n.sort_id)].func)))"
+  };
+  option (buf.validate.message).cel = {
+    id: "run_program_output.empty_union_eq_sort"
+    message: "an empty union requires an equality sort"
+    expression:
+      "this.nodes.all(n, !has(n.union) || size(n.union.members) > 0 || "
+      "(n.sort_id < uint(size(this.sorts)) && has(this.sorts[int(n.sort_id)].eq)))"
+  };
+  option (buf.validate.message).cel = {
+    id: "run_program_output.table_output_refs_in_range"
+    message: "printed cells and column sorts must index the response arenas"
+    expression:
+      "this.outputs.all(o, "
+      "(!has(o.table_rows) || o.table_rows.rows.all(r, "
+      "(r.args + [r.output]).all(c, "
+      "(has(c.term) && c.term < uint(size(this.nodes))) || "
+      "(has(c.unavailable_sort) && c.unavailable_sort < uint(size(this.sorts)))))) && "
+      "(!has(o.table_stats) || o.table_stats.stats.all(t, "
+      "t.columns.all(c, c.sort < uint(size(this.sorts))))))"
+  };
+  repeated Node nodes = 1;
+  repeated Sort sorts = 2;
+  // Completion order. Only completed top-level controls return RunResult;
+  // observations are delivered at every depth, including during loops.
+  repeated CommandOutput outputs = 3;
+}
+
+// One dynamic command execution in the submitted Program. path[0] indexes
+// Program.commands; each later component indexes the previous Loop
+// command's body, resolving through any Fail wrappers at that position.
+// Wrappers add no path component or iteration coordinate. A list-site failure
+// locates the outer wrapper, with the most specific source span in Error.span.
+// iterations gives the zero-based iteration of each enclosing
+// loop, outermost first. It does not include the target loop's own iteration.
+// Bounds and command kinds are checked against the request, not this response.
+message CommandLocation {
+  option (buf.validate.message).cel = {
+    id: "command_location.iteration_depth"
+    message: "one iteration coordinate is required per enclosing loop"
+    expression: "size(this.path) == size(this.iterations) + 1"
+  };
+
+  repeated uint32 path = 1 [(buf.validate.field).repeated.min_items = 1];
+  repeated uint64 iterations = 2;
+}
+
+// A failure that ended the program. Effects completed before it are retained —
+// there is no rollback — and no later command runs; a caller needing
+// transactionality clones the e-graph first.
+//
+// Engine failures only. A decode fault, an unknown method and an unknown
+// `egraph_id` are transport faults and never appear here.
+//
+// Source and command locators are independent: a rule expression can supply
+// the span while its executing Run supplies the command location.
+message Error {
+  ErrorCode code = 1 [(buf.validate.field).enum = {
+    defined_only: true
+    not_in: [0]
+  }];
+
+  // Engine text, formatted for humans. NEVER parsed; wording is not contract.
+  string message = 2 [(buf.validate.field).string.min_len = 1];
+
+  // Most specific known user-source origin: failing expression, then Action,
+  // then rule; fall back to the active command's span. Absent if none is known,
+  // never represented by a fabricated zero offset.
+  Span span = 3;
+
+  // Innermost active command, not its enclosing top-level loop. A failure in
+  // a loop's own pre-check locates that loop, with only its enclosing iteration
+  // coordinates. Absent when the failure precedes command execution, including
+  // runtime helper failure during definition installation.
+  CommandLocation location = 4;
+}
+
+// Failure classes distinguish malformed inputs, failed assertions and execution.
+enum ErrorCode {
+  ERROR_CODE_UNSPECIFIED = 0;
+  // Malformed or ill-typed program. Requested Check planning can fail here
+  // during execution, after completed prefix effects.
+  ERROR_CODE_INVALID_PROGRAM = 1;
+  ERROR_CODE_CHECK_FAILED = 2;
+  ERROR_CODE_RUNTIME_FAILURE = 3;
+}
+
+// ---------------------------------------------------------------------------
+// COMMAND OUTPUTS — the `CommandOutput.kind` arms, in arm order.
+// ---------------------------------------------------------------------------
+
+// Observations match the located command, including inside loops. Only completed
+// top-level Run/Loop commands emit RunResult. Fail suppresses every
+// requested output from its child. Errors appear in the final chunk; completed
+// prefixes remain observable.
+message CommandOutput {
+  option (buf.validate.message).cel = {
+    id: "command_output.top_level_run_result"
+    message: "control results are only emitted for top-level commands"
+    expression: "!has(this.run) || size(this.location.path) == 1"
+  };
+  oneof kind {
+    option (buf.validate.oneof).required = true;
+    RunResult run = 1;
+    ExtractResult extraction = 2;
+    EGraphSnapshot snapshot = 3;
+    TableSizes sizes = 4;
+    TableRows table_rows = 5;
+    TableStatsResult table_stats = 6;
+    ProofResult proof = 9;
+    Diagnostic diagnostic = 11;
+  }
+  CommandLocation location = 7 [(buf.validate.field).required = true];
+}
+
+// Opaque backend-specific presentation; format identifies the content.
+message Diagnostic {
+  string format = 1 [(buf.validate.field).string.min_len = 1];
+  bytes content = 2;
+}
+
+message ProofResult {
+  option (buf.validate.message).cel = {
+    id: "proof_result.root_in_range"
+    message: "root must index proofs"
+    expression: "has(this.root) && this.root < uint(size(this.proofs))"
+  };
+  option (buf.validate.message).cel = {
+    id: "proof_result.term_refs_in_range"
+    message: "term children, propositions and substitutions must index terms"
+    expression:
+      "this.terms.all(t, !has(t.app) || t.app.children.all(i, i < uint(size(this.terms)))) && "
+      "this.proofs.all(p, [p.lhs, p.rhs].all(i, i < uint(size(this.terms))) && "
+      "(!has(p.rule) || p.rule.substitution.all(b, b.term < uint(size(this.terms)))))"
+  };
+  option (buf.validate.message).cel = {
+    id: "proof_result.proof_refs_in_range"
+    message: "justification premises must index proofs"
+    expression:
+      "this.proofs.all(p, "
+      "(has(p.rule) ? p.rule.premise_proofs : "
+      "has(p.merge_fn) ? [p.merge_fn.old_proof, p.merge_fn.new_proof] : "
+      "has(p.trans) ? [p.trans.left, p.trans.right] : "
+      "has(p.sym) ? [p.sym] : "
+      "has(p.congr) ? [p.congr.proof, p.congr.child_proof] : "
+      "has(p.container_normalize) ? [p.container_normalize] : [])"
+      ".all(i, i < uint(size(this.proofs))))"
+  };
+
+  repeated ProofTerm terms = 1;
+  repeated ProofStep proofs = 2;
+  optional uint32 root = 3 [(buf.validate.field).required = true];
+}
+
+// The native TermDag syntax, without invented sorts or executable call typing.
+// A function-row proposition may include both inputs and output as children.
+message ProofTerm {
+  oneof kind {
+    option (buf.validate.oneof).required = true;
+
+    int64 i64 = 1;
+    // Preserve all IEEE-754 bits, including signed zero and NaN payloads.
+    fixed64 f64_bits = 2;
+    string string = 3;
+    bool bool = 4;
+    Unit unit = 5;
+    string var = 6;
+    ProofApp app = 7;
+  }
+}
+
+message ProofApp {
+  string head = 1;
+  repeated uint32 children = 2 [packed = true]; // indices into ProofResult.terms
+}
+
+// One proposition lhs = rhs paired with exactly one native justification.
+// This is not general reflexivity: native Fiat justifies asserted terms and
+// primitive reflexive equalities; arbitrary t = t is not assumed.
+message ProofStep {
+  optional uint32 lhs = 1 [(buf.validate.field).required = true];
+  optional uint32 rhs = 2 [(buf.validate.field).required = true];
+
+  oneof justification {
+    option (buf.validate.oneof).required = true;
+
+    Unit fiat = 3;
+    ProofRule rule = 4;
+    ProofMergeFn merge_fn = 5;
+    ProofTrans trans = 6;
+    uint32 sym = 7; // proof index
+    ProofCongr congr = 8;
+    uint32 container_normalize = 9; // proof index; native checker normalizes rhs
+    // Placeholder for a container side condition re-evaluated against its rule
+    // body by the native checker. Its proposition proves nothing on its own.
+    Unit eval = 10;
+  }
+}
+
+message ProofRule {
+  option (buf.validate.message).cel = {
+    id: "proof_rule.unique_substitution"
+    message: "substitution variable names must be unique"
+    expression: "this.substitution.all(b, this.substitution.filter(c, c.name == b.name).size() == 1)"
+  };
+
+  string name = 1;
+  repeated uint32 premise_proofs = 2 [packed = true]; // indices into ProofResult.proofs
+  // Emit in name order for deterministic encoding. Names identify native rule
+  // variables; values index ProofResult.terms. No duplicate keys are allowed.
+  repeated ProofBinding substitution = 3;
+}
+
+message ProofBinding {
+  string name = 1;
+  optional uint32 term = 2 [(buf.validate.field).required = true];
+}
+
+message ProofMergeFn {
+  string function = 1;
+  optional uint32 old_proof = 2 [(buf.validate.field).required = true];
+  optional uint32 new_proof = 3 [(buf.validate.field).required = true];
+}
+
+message ProofTrans {
+  optional uint32 left = 1 [(buf.validate.field).required = true];
+  optional uint32 right = 2 [(buf.validate.field).required = true];
+}
+
+// The first proof's rhs must be an application; child_index addresses one of
+// its children, and child_proof proves its replacement. Term shape/child bounds
+// and proposition agreement are semantic proof checks, not CEL validation.
+message ProofCongr {
+  optional uint32 proof = 1 [(buf.validate.field).required = true];
+  optional uint32 child_index = 2 [(buf.validate.field).required = true];
+  optional uint32 child_proof = 3 [(buf.validate.field).required = true];
+}
+
+// One completed top-level Run/Loop, independent of diagnostics.
+// Preserve native updated/can_stop, including conservative compound aggregation
+// and helper work; do not recompute stopping from diagnostic history.
+message RunResult {
+  option (buf.validate.message).cel = {
+    id: "run_result.can_stop"
+    message: "a Run that updated the database cannot also permit stopping"
+    expression: "!this.updated || !this.can_stop"
+  };
+
+  bool updated = 1;
+
+  // Execution made no changes and its schedulers permit stopping. Compound
+  // calls preserve conservative aggregation. Completion of a bound, or resource
+  // policy permission to stop, does not by itself prove saturation.
+  bool can_stop = 2;
+}
+
+// One table's row count.
+message TableSize {
+  string table = 1;
+  uint64 rows = 2;
+}
+
+// One result per requested root, in request order.
+message ExtractResult {
+  repeated ExtractedRoot roots = 1;
+}
+
+// Variants ranked best first, up to the requested count. Empty means there
+// is no finite extraction, not an error.
+message ExtractedRoot {
+  repeated ExtractedTerm variants = 1;
+}
+
+// One extracted variant; its sort is carried by its response-arena node.
+// The term and any cost are finite, closed data, with no `Union` class groups
+// in data positions. Lambda bodies are separately scoped code.
+message ExtractedTerm {
+  uint32 term = 1; // index into `RunProgramOutput.nodes`
+
+  // Finite, closed inert PrimitiveValue data, never an evaluated expression.
+  // Its sort_id selects the model's result sort D in RunProgramOutput.sorts,
+  // which may differ from stored C, and the corresponding representation/codec.
+  // No implicit numeric cast or promotion occurs. The host cost_model defines
+  // cost comparison, combination and identity; this field only encodes its value.
+  // Absent means no portable cost encoding, including when D has no codec;
+  // it must remain distinguishable from an encoded zero.
+  optional uint32 cost = 2; // index into `RunProgramOutput.nodes`
+}
+
+// Named table sizes.
+message TableSizes {
+  repeated TableSize sizes = 1;
+}
+
+// Selected rows from one successful GetTableRows command, in native scan
+// order. Unavailable cells do not omit, reorder or deduplicate rows.
+message TableRows {
+  string table = 1;
+  repeated FunctionRow rows = 2;
+}
+
+// One selected table row. A relation row's output is `PrimitiveValue.unit`.
+// Every input and the output retains its position, whether available or not.
+// The enclosing TableRows.table identifies the table. Available cells
+// are ordinary values, not synthetic row-position Calls or re-evaluated lookups.
+message FunctionRow {
+  repeated TableCell args = 1;
+  TableCell output = 2 [(buf.validate.field).required = true];
+  bool subsumed = 3;
+}
+
+// A finite extracted representative, or its concrete sort when no finite
+// representative exists. Unavailability is not a fabricated term or a general
+// error fallback: extraction/encoding errors remain command errors.
+// An unavailable cell carries no e-class identity; sharing its sort does not
+// imply equality with another unavailable cell.
+message TableCell {
+  oneof kind {
+    option (buf.validate.oneof).required = true;
+    // Index into RunProgramOutput.nodes; that Node carries the cell's sort.
+    uint32 term = 1;
+    // Index into RunProgramOutput.sorts, preserving the unavailable cell's
+    // type without allocating a dummy Node. The sort must be recursively closed.
+    uint32 unavailable_sort = 2;
+  }
+}
+
+// Per-table statistics.
+message TableStatsResult {
+  repeated TableStats stats = 1;
+}
+
+// Per-column statistics in input declaration order, then output (Unit for a
+// relation). PairOutDegree indices address this columns list.
+message TableStats {
+  string table = 1;
+  uint64 rows = 2;
+  repeated ColumnStats columns = 3;
+  repeated PairOutDegree out_degrees = 5;
+}
+
+// Exact column type and its distinct-value count; no textual type reconstruction.
+message ColumnStats {
+  uint32 sort = 1; // index into `RunProgramOutput.sorts`
+  uint64 distinct_count = 2;
+}
+
+// Every ordered pair of distinct columns, plus output -> combined inputs
+// for tables with at least two input columns.
+message PairOutDegree {
+  repeated uint32 source = 1 [packed = true]; // column index
+  repeated uint32 target = 2 [packed = true]; // column index
+  OutDegreeStats stats = 3;
+}
+
+// Out-degree distribution statistics.
+message OutDegreeStats {
+  uint64 min = 1;
+  uint64 max = 2;
+  double mean = 3;
+  double p25 = 4;
+  double median = 5;
+  double p75 = 6;
+}

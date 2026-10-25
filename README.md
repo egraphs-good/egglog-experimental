@@ -26,3 +26,7 @@ egglog-experimental = "3.0"
 
 Check out the crate documentation (built locally) for the current list of implemented extensions, API details, and demo links.
 Releases are coordinated with compatible releases of egglog.
+
+The [protobuf IR draft](proto/README.md) explores a shared representation for
+text, Python, and Rust frontends. It is a design proposal, not an implemented
+engine interface.
