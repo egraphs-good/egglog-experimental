@@ -111,10 +111,7 @@ impl<K: Eq + Hash, F: Fn(&ArcSort, Value) -> K> Export<'_, K, F> {
                 match family {
                     Some(pb::sort::Kind::Func(_))
                         if actual == Some(TypeId::of::<egglog::sort::FunctionContainer>())
-                            && sort.clone().as_arc_any().is::<egglog::sort::FunctionSort>() =>
-                    {
-                        ()
-                    }
+                            && sort.clone().as_arc_any().is::<egglog::sort::FunctionSort>() => {}
                     Some(pb::sort::Kind::Application(_)) => {
                         value::container_kind(
                             &sort,

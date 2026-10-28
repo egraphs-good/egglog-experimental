@@ -7484,35 +7484,36 @@ mod tests {
             kind: Some(pb::action::Kind::Term(2)),
             ..Default::default()
         };
+        let mut memo = HashMap::new();
         let (actions, evaluated) = action_dag_actions(
             &program,
             &action,
             |_| false,
             &NativeSpans::default(),
-            &mut HashMap::new(),
+            &mut memo,
             &mut 0,
         )
         .unwrap();
-        assert_eq!(evaluated, [1, 1, 1, 1, 1, 0, 2]);
-        assert_eq!(actions.len(), 8);
-        let Action::Let(_, _, Expr::Lit(_, Literal::String(numerator))) = &actions[0] else {
-            panic!("numerator payload is bound once before its builder")
+        // Each authored payload is already native data: no numeric constructor
+        // component temporaries precede its one first-demand binding.
+        assert_eq!(evaluated, [1, 0, 2]);
+        assert_eq!(actions.len(), 4);
+        let Action::Let(_, number, Expr::Lit(_, literal @ Literal::Native(_))) = &actions[0] else {
+            panic!("one native BigRat payload is bound at first demand")
         };
-        assert_eq!(numerator, "7");
-        let Action::Let(_, _, Expr::Lit(_, Literal::String(denominator))) = &actions[2] else {
-            panic!("denominator follows the numerator builder")
-        };
-        assert_eq!(denominator, "2");
-        let Action::Let(_, number, Expr::Call(_, target, _)) = &actions[4] else {
-            panic!("one compound-number binding")
-        };
-        assert_eq!(target, "egglog.core.bigrat.make");
-        let Action::Let(_, text_binding, Expr::Lit(_, Literal::String(actual))) = &actions[5]
+        let expected_number = num::BigRational::new(7.into(), 2.into());
+        assert_eq!(
+            egglog::sort::downcast_base_literal::<egglog::sort::Q>(literal)
+                .unwrap()
+                .0,
+            expected_number
+        );
+        let Action::Let(_, text_binding, Expr::Lit(_, Literal::String(actual))) = &actions[1]
         else {
-            panic!("one shared string payload")
+            panic!("one shared string payload follows the number")
         };
         assert_eq!(actual, &text);
-        let Action::Let(_, _, Expr::Call(_, target, arguments)) = &actions[6] else {
+        let Action::Let(_, root, Expr::Call(_, target, arguments)) = &actions[2] else {
             panic!("constructor binding")
         };
         assert_eq!(target, "Leaf");
@@ -7520,32 +7521,35 @@ mod tests {
         assert_eq!(arguments[0], arguments[2]);
         assert!(matches!(&arguments[1], Expr::Var(_, name) if name == text_binding));
         assert_eq!(arguments[1], arguments[3]);
+        assert!(matches!(&actions[3], Action::Expr(_, Expr::Var(_, name)) if name == root));
+        assert_eq!(memo.len(), 3);
+        for (index, name) in [(1, number), (0, text_binding), (2, root)] {
+            assert!(matches!(&memo[&index], Expr::Var(_, actual) if actual == name));
+        }
 
         let (query, references) = facts(&program, &[2, 2], &NativeSpans::default(), None, |name| {
             name == "__egglog_proto_query_0"
         })
         .unwrap();
-        assert_eq!(query.len(), 7);
-        let mut payloads = Vec::new();
-        for fact in &query {
-            let expressions = match fact {
-                Fact::Eq(_, lhs, rhs) => vec![lhs, rhs],
-                Fact::Fact(value) => vec![value],
-            };
-            for expression in expressions {
-                if let Expr::Lit(_, Literal::String(value)) = expression {
-                    payloads.push(value.as_str());
-                }
-                if let Expr::Call(_, _, args) = expression {
-                    assert!(args.iter().all(|arg| !matches!(arg, Expr::Call(..))));
-                }
-            }
-        }
-        assert_eq!(payloads.iter().filter(|value| **value == text).count(), 1);
-        assert!(matches!(&references[&0], Expr::Var(_, name) if name != "__egglog_proto_query_0"));
-        let Fact::Fact(Expr::Call(_, name, args)) = query.last().unwrap() else {
-            panic!("root remains a predicate")
+        let [
+            Fact::Eq(_, Expr::Lit(_, literal @ Literal::Native(_)), number_reference),
+            Fact::Eq(_, Expr::Lit(_, Literal::String(actual)), text_reference),
+            Fact::Fact(Expr::Call(_, name, args)),
+        ] = query.as_slice()
+        else {
+            panic!("one definition per payload, then one shallow predicate")
         };
+        assert_eq!(
+            egglog::sort::downcast_base_literal::<egglog::sort::Q>(literal)
+                .unwrap()
+                .0,
+            expected_number
+        );
+        assert_eq!(actual, &text);
+        assert!(matches!(number_reference, Expr::Var(..)));
+        assert_eq!(number_reference, &references[&1]);
+        assert_eq!(text_reference, &references[&0]);
+        assert!(matches!(&references[&0], Expr::Var(_, name) if name != "__egglog_proto_query_0"));
         assert_eq!(name, "Leaf");
         assert_eq!(
             args,

@@ -820,7 +820,7 @@
 //! let _: Unit = s.contains(&x);
 //! let _: Unit = s.not_contains(&x);
 //! let _: Set<I64> = s.union(&s).diff(&s).intersect(&s).insert(&x).remove(&x);
-//! assert!(inspect(&s).is_err());
+//! assert_eq!(inspect(&s).unwrap(), [x.clone(), x]);
 //! ```
 //!
 //! Set input, output and fixed arity errors are rejected by the Rust compiler:
@@ -891,7 +891,7 @@
 //! evaluate computed vectors or insert chains. Empty inputs need a type context.
 //!
 //! ```
-//! use egglog_experimental::typed::{builtins::{F64, I64, Map, Pair, Vec as EVec}, EgglogValue};
+//! use egglog_experimental::typed::{builtins::{F64, I64, Map, Pair, Vec as EVec}, EGraph, EgglogValue};
 //! fn map<K: EgglogValue, V: EgglogValue>(pairs: impl Into<EVec<Pair<K, V>>>) -> Map<K, V> {
 //!     Map::from_pairs(pairs)
 //! }
@@ -903,6 +903,8 @@
 //! let _: Map<I64, F64> = vec![(7_i64, 1.5_f64)].into();
 //! let _: F64 = values.get(&I64::from(7));
 //! let _: Map<I64, F64> = values.insert(7_i64, &F64::from(2.5));
+//! let mut graph = EGraph::default();
+//! let values = graph.extract(values)?;
 //! let _: Vec<(I64, F64)> = values.entries()?;
 //! let _: Vec<(I64, F64)> = (&values).try_into()?;
 //! let _: Vec<(I64, F64)> = values.try_into()?;
