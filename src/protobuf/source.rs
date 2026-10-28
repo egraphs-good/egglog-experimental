@@ -3943,7 +3943,6 @@ impl Renderer {
         let mut private_selectors = self.private_selectors.clone();
         let source = render_prepared(
             &lowered,
-            &lowered,
             &prepared,
             self.dialect,
             &authored,
@@ -4220,7 +4219,6 @@ fn source_cost_actions(
 #[allow(clippy::too_many_arguments)]
 fn render_prepared(
     program: &pb::Program,
-    rule_program: &pb::Program,
     prepared: &Prepared,
     dialect: Dialect,
     authored: &NativeNames,
@@ -4401,7 +4399,7 @@ fn render_prepared(
             );
         }
         let prepared_rules: Vec<_> = prepared.context.candidates.iter().map(|candidate| candidate.name.clone()).collect();
-        let rule_values: Vec<_> = graph::rules(rule_program).collect();
+        let rule_values: Vec<_> = graph::rules(program).collect();
         {
             // Native handles and canonical rules are aligned by occurrence, not
             // label/body equality. Change presentation only, never Prepared.
@@ -4434,7 +4432,7 @@ fn render_prepared(
                     // Execution plans use physical symbols. Reuse the same
                     // planner with text aliases occupied before presentation,
                     // keeping the rewrite witness and head references aligned.
-                    command = lower_rule(rule_program, rule_values.get(index).copied().ok_or("missing inline rule")?, &rule.ruleset,
+                    command = lower_rule(program, rule_values.get(index).copied().ok_or("missing inline rule")?, &rule.ruleset,
                         &prepared_rules[index], &rule_spans, &query_occupied)?
                         .into_iter().find(|candidate| matches!(candidate,
                             Command::Rule { rule: candidate } if candidate.name == rule.name))
@@ -4457,7 +4455,7 @@ fn render_prepared(
                         while let Some((index, depth)) = pending.pop() {
                             if remaining == 0 || depth >= 64 { readable = false; break; }
                             remaining -= 1;
-                            let children = match &rule_program.nodes[index as usize].kind {
+                            let children = match &program.nodes[index as usize].kind {
                                 Some(pb::node::Kind::Call(call) | pb::node::Kind::GetCost(call)) => &call.args,
                                 Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue { value: Some(pb::primitive_value::Value::PartialCall(call)) })) => &call.args,
                                 Some(pb::node::Kind::Union(_)) => { readable = false; break; }
@@ -4467,7 +4465,7 @@ fn render_prepared(
                         }
                         if readable {
                             if !rendered_sugar.insert(index) { continue; }
-                            let rewrite = ast::Rewrite { span: rule.span.clone(), lhs: expression(rule_program, lhs, &mut HashSet::new(), &rule_spans)?.map_symbols(&mut |h| h, &mut |v: String| native_name("var", &v)), rhs: expression(rule_program, rhs, &mut HashSet::new(), &rule_spans)?.map_symbols(&mut |h| h, &mut |v: String| native_name("var", &v)), conditions: facts(rule_program, conditions, &rule_spans, None, &query_occupied)?.0, name: prepared_rules[index].clone() };
+                            let rewrite = ast::Rewrite { span: rule.span.clone(), lhs: expression(program, lhs, &mut HashSet::new(), &rule_spans)?.map_symbols(&mut |h| h, &mut |v: String| native_name("var", &v)), rhs: expression(program, rhs, &mut HashSet::new(), &rule_spans)?.map_symbols(&mut |h| h, &mut |v: String| native_name("var", &v)), conditions: facts(program, conditions, &rule_spans, None, &query_occupied)?.0, name: prepared_rules[index].clone() };
                             command = if let Some(subsume) = subsume { Command::Rewrite(rule.ruleset.clone(), rewrite, subsume) } else { Command::BiRewrite(rule.ruleset.clone(), rewrite) };
                         }
                     }
@@ -4479,9 +4477,9 @@ fn render_prepared(
                         let mut memo = HashMap::new();
                         let mut next = 0;
                         let mut bindings = HashMap::new();
-                        check_variables(rule_program, &body.query, &mut bindings, true)?;
+                        check_variables(program, &body.query, &mut bindings, true)?;
                         for action in &body.head {
-                            let (mut actions, _) = action_dag_actions(rule_program, action, |name| bindings.contains_key(name), &rule_spans, &mut memo, &mut next)?;
+                            let (mut actions, _) = action_dag_actions(program, action, |name| bindings.contains_key(name), &rule_spans, &mut memo, &mut next)?;
                             if let Some(pb::action::Kind::SetCost(set)) = &action.kind {
                                 if dialect == Dialect::Core { return Err("Core source has no assigned-cost storage".into()); }
                                 let Action::Set(span, _, args, cost) = actions.pop().unwrap() else { unreachable!() };
