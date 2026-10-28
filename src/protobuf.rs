@@ -216,6 +216,8 @@ struct Prepared {
     request: u64,
     installations: Vec<Installation>,
     materialized: Vec<Command>,
+    // Exact native bindings already selected while lowering this request.
+    builtin_instances: HashMap<String, egglog::builtin::BuiltinInstance>,
     // Canonical declaration indices whose native installation is still pending.
     pending_declarations: HashSet<usize>,
     context: RequestOccurrences,
@@ -1046,7 +1048,7 @@ impl Session {
         }
         action_dags.retain(|path, _| !scoped_actions.contains(path));
         scoped_actions.extend(action_dags.keys().cloned());
-        lower_builtin_calls(program, &staged.graph, &signatures)?;
+        let builtin_instances = lower_builtin_calls(program, &staged.graph, &signatures)?;
         for index in declaration_order(program, &mut staged.graph)? {
             let declaration = &program.declarations[index];
             if !added[index] {
@@ -1474,6 +1476,7 @@ impl Session {
             request: staged.request,
             installations,
             materialized,
+            builtin_instances,
             pending_declarations,
             context,
             bindings: program.rulesets.clone(),
@@ -3719,8 +3722,9 @@ fn lower_builtin_calls(
     program: &mut pb::Program,
     graph: &EGraph,
     signatures: &HashMap<String, (ast::Schema, Option<ast::FunctionSubtype>)>,
-) -> Result<(), String> {
+) -> Result<HashMap<String, egglog::builtin::BuiltinInstance>, String> {
     let mut replacements = vec![];
+    let mut instances = HashMap::new();
     for (index, node) in program.nodes.iter().enumerate() {
         let (call, function) = match &node.kind {
             Some(pb::node::Kind::Call(call)) => (call, None),
@@ -3778,16 +3782,27 @@ fn lower_builtin_calls(
                 }
                 continue;
             }
-            replacements.push((
-                index,
-                graph.resolve_builtin_call(
-                    program,
-                    &call.func,
-                    &args,
-                    output,
-                    &sorts.iter().map(String::as_str).collect::<Vec<_>>(),
-                )?,
-            ));
+            let name = graph.resolve_builtin_call(
+                program,
+                &call.func,
+                &args,
+                output,
+                &sorts.iter().map(String::as_str).collect::<Vec<_>>(),
+            )?;
+            // Exact dispatch registrations share one structural identity. This
+            // is metadata retention after selection, not another acceptance pass.
+            if let Some(instance) = graph
+                .authoring_type_info()
+                .get_prims(&name)
+                .and_then(|registered| registered.first())
+                .and_then(|registered| registered.primitive.builtin_instance())
+                .filter(|instance| instance.dispatch_name == name)
+            {
+                instances
+                    .entry(name.clone())
+                    .or_insert_with(|| instance.clone());
+            }
+            replacements.push((index, name));
         }
     }
     for (index, name) in replacements {
@@ -3800,7 +3815,7 @@ fn lower_builtin_calls(
         };
         call.func = name;
     }
-    Ok(())
+    Ok(instances)
 }
 
 // Lower only an ephemeral projection: canonical definitions keep their opaque

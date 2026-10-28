@@ -19853,9 +19853,8 @@ mod source_provider_context {
         let mut renderer = Renderer::with_extension(provider.clone()).unwrap();
         assert_eq!(provider.initializations.load(Ordering::SeqCst), 1);
         let rendered = renderer.render(&program).unwrap();
-        // The session plus two truly fresh metadata graphs. text_native clones
-        // an already initialized temporary rather than registering twice.
-        assert_eq!(provider.initializations.load(Ordering::SeqCst), 3);
+        // Rendering reuses the initialized typing/parser context.
+        assert_eq!(provider.initializations.load(Ordering::SeqCst), 1);
         assert_eq!(provider.lowerings.load(Ordering::SeqCst), 1);
         assert_eq!(provider.evaluations.load(Ordering::SeqCst), 0);
         assert_eq!(program.encode_to_vec(), authored);
@@ -19863,7 +19862,7 @@ mod source_provider_context {
             .unwrap()
             .collect::<Result<Vec<_>, _>>()
             .unwrap();
-        assert_eq!(provider.initializations.load(Ordering::SeqCst), 4);
+        assert_eq!(provider.initializations.load(Ordering::SeqCst), 2);
         assert_eq!(provider.evaluations.load(Ordering::SeqCst), 0);
 
         // Both actual Custom bytes and freshly produced bytes check assigned C=9.
@@ -19896,7 +19895,7 @@ mod source_provider_context {
             renderer.render(&packet()).unwrap(),
             cloned.render(&packet()).unwrap()
         );
-        assert_eq!(provider.initializations.load(Ordering::SeqCst), 5);
+        assert_eq!(provider.initializations.load(Ordering::SeqCst), 1);
         assert_eq!(provider.evaluations.load(Ordering::SeqCst), 0);
 
         let owner = Arc::new(Provider::default());
@@ -19945,27 +19944,12 @@ mod source_provider_context {
             );
             assert_eq!(provider.evaluations.load(Ordering::SeqCst), 0);
         }
-        for failure in [
-            "temporary-init",
-            "validation-init",
-            "lower",
-            "forged",
-            "malformed",
-            "children",
-            "freeze",
-        ] {
+        for failure in ["lower", "forged", "malformed", "children", "freeze"] {
             let provider = Arc::new(Provider::default());
             *provider.exception_latch.lock().unwrap() = Some("original provider exception");
             let mut renderer = Renderer::with_extension(provider.clone()).unwrap();
             let mut bad = packet();
             let expected = match failure {
-                "temporary-init" | "validation-init" => {
-                    provider.fail_initialize_at.store(
-                        if failure == "temporary-init" { 2 } else { 3 },
-                        Ordering::SeqCst,
-                    );
-                    "provider initialization rejected"
-                }
                 "lower" => {
                     provider.fail_lower.store(true, Ordering::SeqCst);
                     "provider lowering rejected after helper append"
@@ -20020,13 +20004,7 @@ mod source_provider_context {
                 *provider.exception_latch.lock().unwrap(),
                 Some("original provider exception")
             );
-            if failure.ends_with("init") {
-                assert_eq!(
-                    provider.initializations.load(Ordering::SeqCst),
-                    if failure == "temporary-init" { 2 } else { 3 }
-                );
-            }
-            provider.fail_initialize_at.store(0, Ordering::SeqCst);
+            assert_eq!(provider.initializations.load(Ordering::SeqCst), 1);
             provider.fail_lower.store(false, Ordering::SeqCst);
             let actual = renderer.render(&packet()).unwrap();
             let expected = Renderer::with_extension(provider.clone())

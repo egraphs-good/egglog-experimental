@@ -3755,64 +3755,16 @@ impl Renderer {
         // PartialCall targets become the literals emitted in source.
         let declaration_order =
             declaration_order(&lowered, &mut self.session.graph).map_err(TransportError)?;
-        let mut native = match self.dialect {
-            Dialect::Experimental => crate::new_experimental_egraph(),
-            Dialect::Core => EGraph::default(),
-        };
-        if let Some(extension) = &self.session.extension {
-            extension.initialize(&mut native).map_err(TransportError)?;
+        for (native, instance) in &prepared.builtin_instances {
+            let text = instance.project_name(|sort| {
+                authored
+                    .sorts
+                    .get(sort)
+                    .cloned()
+                    .unwrap_or_else(|| sort.to_owned())
+            });
+            authored.callables.insert(native.clone(), text);
         }
-        let mut text_native = native.clone();
-        for declaration in &definitions.declarations {
-            if let Some(pb::declaration::Kind::EqSort(sort)) = &declaration.kind {
-                let mut command = Command::Sort {
-                    span: ast::Span::Panic,
-                    name: sort.name.clone(),
-                    presort_and_args: None,
-                    uf: None,
-                    proof_func: None,
-                    container_rebuild: None,
-                    proof_constructors: None,
-                    unionable: true,
-                };
-                native
-                    .compile_program_observed(vec![command.clone()], &mut |_, _| {})
-                    .map_err(|error| TransportError(error.to_string()))?;
-                source_sort_names(&mut command, &authored);
-                command = command.map_symbols(
-                    &mut |name: String| authored.callables.get(&name).cloned().unwrap_or(name),
-                    &mut |name| name,
-                );
-                text_native
-                    .compile_program_observed(vec![command], &mut |_, _| {})
-                    .map_err(|error| TransportError(error.to_string()))?;
-            }
-        }
-        for (_, mut command) in materialize_sorts(
-            &lowered,
-            &mut native,
-            &mut HashSet::new(),
-            &prepared.context.native_spans,
-        )
-        .map_err(TransportError)?
-        {
-            source_sort_names(&mut command, &authored);
-            text_native
-                .compile_program_observed(vec![command], &mut |_, _| {})
-                .map_err(|error| TransportError(error.to_string()))?;
-        }
-        // Rule heads are reprojected for native cost roles below. Normalize
-        // this private canonical copy just like the execution copy, using the
-        // initialized provider and nominal context, not raw Custom payloads.
-        lower_custom_values(
-            &mut definitions,
-            &mut native,
-            self.session.extension.as_deref(),
-        )
-        .map_err(TransportError)?;
-        lower_container_values(&mut definitions).map_err(TransportError)?;
-        source_builtin_names(&lowered, &mut native, &mut text_native, &mut authored)
-            .map_err(TransportError)?;
         // Target literals are callable references only in PartialCall.
         // Remap them before lowering; ordinary String values stay data.
         for node in &mut lowered.nodes {
@@ -3928,7 +3880,7 @@ impl Renderer {
             &authored,
             &declaration_order,
             &constructor_cost_tables,
-            self.session.extension.as_deref(),
+            &self.session.graph,
             &mut private_selectors,
         )?;
         // The renderer's graph is always NORMAL and receives inert definitions
@@ -3965,106 +3917,6 @@ impl Renderer {
         self.private_selectors = private_selectors;
         Ok(source)
     }
-}
-
-// A text type alias changes native specialization keys. Recover the exact core
-// definition, then select its text-native instance, including output-only calls.
-// Neither step decodes or manufactures private dispatch names.
-fn source_builtin_names(
-    program: &pb::Program,
-    graph: &mut EGraph,
-    text_graph: &mut EGraph,
-    authored: &mut NativeNames,
-) -> Result<(), String> {
-    let mut text_program = pb::Program {
-        sorts: program.sorts.clone(),
-        ..Default::default()
-    };
-    for sort in &mut text_program.sorts {
-        if let Some(pb::sort::Kind::Eq(name)) = &mut sort.kind
-            && let Some(text) = authored.sorts.get(name)
-        {
-            *name = text.clone();
-        }
-    }
-    for node in &program.nodes {
-        let (call, function) = match &node.kind {
-            Some(pb::node::Kind::Call(call)) => (call, None),
-            Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
-                value: Some(pb::primitive_value::Value::PartialCall(call)),
-            })) => {
-                let Some(pb::sort::Kind::Func(function)) =
-                    &program.sorts[node.sort_id as usize].kind
-                else {
-                    return Err("partial call requires a function sort".into());
-                };
-                (call, Some(function))
-            }
-            _ => continue,
-        };
-        if call.func == "unstable-app" || authored.callables.contains_key(&call.func) {
-            continue;
-        }
-        let mut arguments = call
-            .args
-            .iter()
-            .map(|arg| program.nodes[*arg as usize].sort_id)
-            .collect::<Vec<_>>();
-        let output = if let Some(function) = function {
-            arguments.extend(&function.params);
-            function.result
-        } else {
-            node.sort_id
-        };
-        let sorts = arguments
-            .iter()
-            .copied()
-            .chain([output])
-            .map(|index| {
-                let name = sort_name(&program.sorts, index)?;
-                graph
-                    .get_sort_by_name(&name)
-                    .cloned()
-                    .ok_or_else(|| format!("unknown source sort {name}"))
-            })
-            .collect::<Result<Vec<_>, String>>()?;
-        let resolved = ResolvedCall::from_resolution(
-            &call.func,
-            &sorts,
-            graph.type_info(),
-            egglog::Context::Full,
-            &ast::Span::Panic,
-        )
-        .map_err(|error| error.to_string())?;
-        if let ResolvedCall::Primitive(primitive) = resolved {
-            // Data input lowers MapValue to the native flat builder. Here we
-            // select its source alias, not publish a callable in the wire catalog.
-            let core = match primitive.prim_with_id.primitive.builtin_description() {
-                Some(description) if description.key == "egglog.core.map.flat" => {
-                    description.key.clone()
-                }
-                _ => primitive.export_builtin(&mut pb::Program::default())?,
-            };
-            let sorts = sorts
-                .iter()
-                .map(|sort| {
-                    authored
-                        .sorts
-                        .get(sort.name())
-                        .map_or(sort.name(), String::as_str)
-                })
-                .collect::<Vec<_>>();
-            let text = text_graph.resolve_builtin_call(
-                &text_program,
-                &core,
-                &arguments,
-                output,
-                &sorts,
-            )?;
-            authored.callables.insert(call.func.clone(), text);
-        }
-    }
-    Ok(())
 }
 
 fn source_sort_names(command: &mut Command, authored: &NativeNames) {
@@ -4211,19 +4063,12 @@ fn render_prepared(
     authored: &NativeNames,
     declaration_order: &[usize],
     constructor_cost_tables: &HashMap<String, String>,
-    extension: Option<&dyn NativeExtension>,
+    native: &EGraph,
     private_selectors: &mut HashSet<String>,
 ) -> Result<String, TransportError> {
     let native_spans = &prepared.context.native_spans;
     let result = (|| -> Result<Vec<Command>, String> {
         validate_union_occurrences(program)?;
-        let mut native = match dialect {
-            Dialect::Experimental => crate::new_experimental_egraph(),
-            Dialect::Core => EGraph::default(),
-        };
-        if let Some(extension) = extension {
-            extension.initialize(&mut native)?;
-        }
         // Native AST Display assumes symbols are source atoms; protobuf names
         // need not be. Validate every interpolated identifier before formatting,
         // using the native parser rather than maintaining another token grammar.
@@ -4295,7 +4140,7 @@ fn render_prepared(
         }));
         occupied.extend(authored.sorts.values().cloned());
         occupied.extend(authored.callables.values().cloned());
-        let mut parser = std::mem::take(&mut native.parser);
+        let mut parser = native.parser.clone();
         for name in names {
             if !matches!(parser.get_expr_from_string(None, name), Ok(Expr::Var(_, parsed)) if parsed == name) {
                 return Err(format!("identifier {name:?} cannot be rendered as one native source atom"));
