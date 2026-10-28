@@ -558,20 +558,13 @@ fn append_input_rows(
                 .copied()
                 .chain(target.custom.then_some(target.output)),
         ) {
-            let value = match literal {
-                Literal::Int(value) => pb::primitive_value::Value::I64(value),
-                Literal::Float(value) => pb::primitive_value::Value::F64Bits(value.0.to_bits()),
-                Literal::String(value) => pb::primitive_value::Value::String(value),
-                Literal::Bool(value) => pb::primitive_value::Value::Bool(value),
-                Literal::Unit => pb::primitive_value::Value::Unit(pb::Unit {}),
-            };
+            let (_, scalar) = super::value::Scalar::from_literal(&literal)?;
+            let value = scalar.encode()?;
             values.push(u32::try_from(program.nodes.len()).map_err(|_| "too many input nodes")?);
             program.nodes.push(pb::Node {
                 sort_id,
                 span,
-                kind: Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
-                    value: Some(value),
-                })),
+                kind: Some(pb::node::Kind::PrimitiveValue(value)),
             });
         }
         let value = target
@@ -3296,22 +3289,8 @@ impl Source {
         }
         let (sort, kind) = match expr {
             ResolvedExpr::Lit(_, literal) => {
-                let (sort, value) = match literal {
-                    Literal::Int(value) => ("i64", pb::primitive_value::Value::I64(*value)),
-                    Literal::Float(value) => (
-                        "f64",
-                        pb::primitive_value::Value::F64Bits(value.0.to_bits()),
-                    ),
-                    Literal::String(value) => {
-                        ("String", pb::primitive_value::Value::String(value.clone()))
-                    }
-                    Literal::Bool(value) => ("bool", pb::primitive_value::Value::Bool(*value)),
-                    Literal::Unit => ("Unit", pb::primitive_value::Value::Unit(pb::Unit {})),
-                };
-                (
-                    sort,
-                    pb::node::Kind::PrimitiveValue(pb::PrimitiveValue { value: Some(value) }),
-                )
+                let (sort, scalar) = super::value::Scalar::from_literal(literal)?;
+                (sort, pb::node::Kind::PrimitiveValue(scalar.encode()?))
             }
             ResolvedExpr::Var(_, var) => {
                 if var.is_global_ref
@@ -4852,16 +4831,31 @@ fn render_prepared(
                 };
                 // Display alone cannot distinguish literal kinds or NaN payloads.
                 // Parse the whole lexical context, then compare exact literals.
-                let literals = |actions: &ast::Actions| {
+                let literals = |actions: &ast::Actions, parser: &mut egglog::ast::Parser| -> Result<Vec<Literal>, String> {
                     let mut values = Vec::new();
+                    let mut error = None;
                     actions.clone().visit_exprs(&mut |expr| {
-                        if let Expr::Lit(_, value) = &expr { values.push(value.clone()); }
+                        if let Expr::Lit(_, value) = &expr {
+                            if matches!(value, Literal::Native(_)) {
+                                // Explicit source serialization uses the sort's
+                                // presentation. Compare its lexical literals;
+                                // no call name is recognized or evaluated.
+                                match parser.get_expr_from_string(None, &value.to_string()) {
+                                    Ok(rendered) => { rendered.visit_exprs(&mut |child| {
+                                        if let Expr::Lit(_, value) = &child { values.push(value.clone()); }
+                                        child
+                                    }); }
+                                    Err(failure) => error = Some(failure.to_string()),
+                                }
+                            } else { values.push(value.clone()); }
+                        }
                         expr
                     });
-                    values
+                    if let Some(error) = error { return Err(error); }
+                    Ok(values)
                 };
-                let left = literals(expected);
-                let right = literals(actual);
+                let left = literals(expected, &mut parser)?;
+                let right = literals(actual, &mut parser)?;
                 if command.to_string() != parsed[0].to_string()
                     || left.len() != right.len()
                     || !left.iter().zip(&right).all(|(left, right)| match (left, right) {

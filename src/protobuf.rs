@@ -30,7 +30,6 @@ use egglog::ast::{self, Action, Command, Expr, Fact, Literal};
 use egglog::{ArcSort, EGraph, Term, TermDag, TermId, Value, span};
 use egglog::{ExecutionEvent, ExecutionOrigin, RepeatContinuation};
 use egglog_ast::span::{EgglogSpan, SrcFile};
-use num::{BigInt, Integer, One, Zero};
 #[cfg(test)]
 use prost::Message;
 
@@ -42,6 +41,7 @@ mod proof;
 mod report;
 mod rules;
 pub mod source;
+pub mod value;
 
 // Native input paths paired with the actual wire command and its relative
 // list path. This is request-local correspondence, not another control tree.
@@ -174,17 +174,8 @@ pub trait NativeExtension: Send + Sync {
         destination: &mut pb::Program,
     ) -> Result<pb::Call, String>;
 
-    /// Return None for other native value types; reject malformed reconstruction
-    /// of a recognized type. Neither branch may execute or materialize payloads.
-    fn encode_custom_value(
-        &self,
-        native_sort: &ArcSort,
-        terms: &TermDag,
-        term: TermId,
-    ) -> Result<Option<pb::CustomValue>, String>;
-
     /// Inspect a recognized native value without invoking arbitrary native
-    /// reconstruction. Used by owned callback observations and Freeze.
+    /// reconstruction. Used by extraction, owned callback observations and Freeze.
     fn encode_observed_custom_value(
         &self,
         _graph: &EGraph,
@@ -3867,7 +3858,12 @@ fn lower_container_values(program: &mut pb::Program) -> Result<Vec<u32>, String>
                 {
                     return Err(format!("{expected} payload/sort mismatch"));
                 }
-                validate_exact_number(value)?;
+                value::Scalar::decode(
+                    Some(expected),
+                    &pb::PrimitiveValue {
+                        value: Some(value.clone()),
+                    },
+                )?;
                 continue; // authored value data stays inert in the protobuf arena
             }
             let (name, arity, key, args) = match value {
@@ -4080,45 +4076,6 @@ fn expression(
     lower_expression(program, index, visiting, &mut 65_536, native_spans)
 }
 
-// These checks never normalize malformed wire data. Native constructors remain
-// separate symbolic operations with their original partial/panic behavior.
-fn canonical_decimal(text: &str) -> Result<BigInt, String> {
-    let value: BigInt = text.parse().map_err(|_| "invalid decimal integer")?;
-    if value.to_string() != text {
-        return Err("noncanonical decimal integer".into());
-    }
-    Ok(value)
-}
-
-fn validate_exact_number(value: &pb::primitive_value::Value) -> Result<(), String> {
-    use pb::primitive_value::Value as V;
-    match value {
-        V::BigInt(text) => {
-            canonical_decimal(text)?;
-        }
-        V::BigRat(ratio) => {
-            let numerator = canonical_decimal(&ratio.numerator)?;
-            let denominator = canonical_decimal(&ratio.denominator)?;
-            if denominator <= BigInt::zero() || numerator.gcd(&denominator) != BigInt::one() {
-                return Err("BigRat value must be reduced with a positive denominator".into());
-            }
-        }
-        V::Rational(ratio) => {
-            if ratio.denominator <= 0
-                || ratio
-                    .numerator
-                    .unsigned_abs()
-                    .gcd(&(ratio.denominator as u64))
-                    != 1
-            {
-                return Err("Rational value must be reduced with a positive denominator".into());
-            }
-        }
-        _ => return Err("expected an exact numeric value".into()),
-    }
-    Ok(())
-}
-
 fn lower_expression(
     program: &pb::Program,
     index: u32,
@@ -4204,69 +4161,10 @@ fn lower_expression(
                 args,
             )
         }
-        pb::node::Kind::PrimitiveValue(pb::PrimitiveValue { value: Some(value) })
-            if matches!(
-                value,
-                pb::primitive_value::Value::BigInt(_)
-                    | pb::primitive_value::Value::BigRat(_)
-                    | pb::primitive_value::Value::Rational(_)
-            ) =>
-        {
-            validate_exact_number(value)?;
-            let (name, arguments, extra_nodes) = match value {
-                pb::primitive_value::Value::BigInt(text) if sort == "BigInt" => (
-                    "egglog.core.bigint.from_string",
-                    vec![Expr::Lit(span.clone(), Literal::String(text.clone()))],
-                    1,
-                ),
-                pb::primitive_value::Value::Rational(ratio) if sort == "Rational" => (
-                    "egglog.experimental.rational.make",
-                    vec![
-                        Expr::Lit(span.clone(), Literal::Int(ratio.numerator)),
-                        Expr::Lit(span.clone(), Literal::Int(ratio.denominator)),
-                    ],
-                    2,
-                ),
-                pb::primitive_value::Value::BigRat(ratio) if sort == "BigRat" => (
-                    "egglog.core.bigrat.make",
-                    [&ratio.numerator, &ratio.denominator]
-                        .into_iter()
-                        .map(|text| {
-                            Expr::Call(
-                                span.clone(),
-                                "egglog.core.bigint.from_string".into(),
-                                vec![Expr::Lit(span.clone(), Literal::String(text.clone()))],
-                            )
-                        })
-                        .collect(),
-                    4,
-                ),
-                _ => return Err("exact numeric payload/sort mismatch".into()),
-            };
-            *remaining = remaining
-                .checked_sub(extra_nodes)
-                .ok_or("native expression expansion exceeds 65536 nodes")?;
-            Expr::Call(span, name.into(), arguments)
-        }
-        pb::node::Kind::PrimitiveValue(value) => {
-            let literal = match value.value.as_ref() {
-                Some(pb::primitive_value::Value::I64(value)) if sort == "i64" => {
-                    Literal::Int(*value)
-                }
-                Some(pb::primitive_value::Value::F64Bits(value)) if sort == "f64" => {
-                    Literal::Float(f64::from_bits(*value).into())
-                }
-                Some(pb::primitive_value::Value::String(value)) if sort == "String" => {
-                    Literal::String(value.clone())
-                }
-                Some(pb::primitive_value::Value::Bool(value)) if sort == "bool" => {
-                    Literal::Bool(*value)
-                }
-                Some(pb::primitive_value::Value::Unit(_)) if sort == "Unit" => Literal::Unit,
-                _ => return Err("unsupported value or scalar payload/sort mismatch".into()),
-            };
-            Expr::Lit(span, literal)
-        }
+        pb::node::Kind::PrimitiveValue(value) => Expr::Lit(
+            span,
+            value::Scalar::decode(Some(&sort), value)?.into_literal()?,
+        ),
         _ => return Err("this node kind is unsupported in a value position".into()),
     };
     visiting.remove(&index);
@@ -5095,37 +4993,6 @@ fn action_dag_actions(
                             ),
                     }) => {
                         let value = expression(program, index, &mut HashSet::new(), native_spans)?;
-                        // Exact-number leaves have a fixed native construction:
-                        // literals, or BigRat's two one-argument BigInt builders.
-                        // Bind those components too so Source scope replay sees
-                        // the same first-demand locals, without nested payloads.
-                        let value = match value {
-                            Expr::Call(span, target, arguments) => {
-                                let mut bound = Vec::with_capacity(arguments.len());
-                                for argument in arguments {
-                                    let argument = match argument {
-                                        Expr::Call(span, target, literals) => {
-                                            let literals = literals
-                                                .into_iter()
-                                                .map(|literal| {
-                                                    bind_value(index, literal)
-                                                        .map(|(_, value)| value)
-                                                })
-                                                .collect::<Result<_, _>>()?;
-                                            let value = Expr::Call(span, target, literals);
-                                            bind_value(index, value)?.1
-                                        }
-                                        Expr::Lit(span, literal) => {
-                                            bind_value(index, Expr::Lit(span, literal))?.1
-                                        }
-                                        value => value,
-                                    };
-                                    bound.push(argument);
-                                }
-                                Expr::Call(span, target, bound)
-                            }
-                            literal => literal,
-                        };
                         if matches!(value, Expr::Var(..)) {
                             memo.insert(index, value.clone());
                             results.push(value);
@@ -6020,186 +5887,85 @@ fn encode_term(
     encoded: &mut HashMap<pb::Node, u32>,
 ) -> Result<u32, egglog::Error> {
     let (graph, names) = (&session.graph, &session.names);
-    let exact_value =
-        encode_exact_number(terms, term, sort).map_err(egglog::Error::ExtractError)?;
+    let scalar = value::Scalar::reflect(graph, sort, native_value)
+        .map(|value| value.encode())
+        .transpose()
+        .map_err(egglog::Error::ExtractError)?;
     let custom = session
         .extension
         .as_ref()
-        .map(|extension| extension.encode_custom_value(sort, terms, term))
+        .map(|extension| extension.encode_observed_custom_value(graph, sort, native_value))
         .transpose()
         .map_err(egglog::Error::ExtractError)?
         .flatten();
-    let kind = match terms.get(term) {
-        _ if custom.is_some() => pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
-            value: custom.map(pb::primitive_value::Value::Custom),
-        }),
-        _ if exact_value.is_some() => {
-            pb::node::Kind::PrimitiveValue(pb::PrimitiveValue { value: exact_value })
-        }
-        _ if sort.clone().as_arc_any().is::<egglog::sort::FunctionSort>() => {
-            let value = graph
-                .value_to_container::<egglog::sort::FunctionContainer>(native_value)
-                .ok_or_else(|| {
-                    egglog::Error::ExtractError("missing native function value".into())
-                })?;
-            if children.len() != value.1.len() {
-                return Err(egglog::Error::ExtractError(
-                    "function capture arity mismatch".into(),
-                ));
-            }
-            drop(value);
-            let target = graph
-                .export_function_value_target(sort, native_value)
-                .map_err(egglog::Error::ExtractError)?;
-            pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
-                value: Some(pb::primitive_value::Value::PartialCall(pb::Call {
-                    func: names.callables.get(&target).unwrap_or(&target).clone(),
-                    args: children.to_vec(),
-                })),
-            })
-        }
-        Term::Lit(literal) => pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
-            value: Some(match literal {
-                Literal::Int(value) => pb::primitive_value::Value::I64(*value),
-                Literal::Float(value) => pb::primitive_value::Value::F64Bits(value.0.to_bits()),
-                Literal::String(value) => pb::primitive_value::Value::String(value.clone()),
-                Literal::Bool(value) => pb::primitive_value::Value::Bool(*value),
-                Literal::Unit => pb::primitive_value::Value::Unit(pb::Unit {}),
-            }),
-        }),
-        Term::App(name, native_children) if name == "multiset-of" && sort.is_container_sort() => {
-            let sort_id = encode_sort(graph, names, sort, response)?;
-            if sort.value_type() != Some(std::any::TypeId::of::<egglog::sort::MultiSetContainer>())
-                || !matches!(&response.sorts[sort_id as usize].kind, Some(pb::sort::Kind::Application(family)) if family.name == "MultiSet" && family.args.len() == 1)
-                || native_children.len() != children.len()
-                || sort.inner_sorts().len() != 1
-            {
-                return Err(egglog::Error::ExtractError(
-                    "MultiSet term/sort/arity mismatch".into(),
-                ));
-            }
-            let Some(pb::sort::Kind::Application(family)) = &response.sorts[sort_id as usize].kind
-            else {
-                unreachable!("validated MultiSet family")
-            };
-            if children.iter().any(|child| {
-                response
-                    .nodes
-                    .get(*child as usize)
-                    .is_none_or(|node| node.sort_id != family.args[0])
-            }) {
-                return Err(egglog::Error::ExtractError(
-                    "MultiSet child sort mismatch".into(),
-                ));
-            }
-            pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
-                value: Some(pb::primitive_value::Value::Multiset(pb::ValueList {
-                    items: children.to_vec(),
-                })),
-            })
-        }
-        Term::App(name, _)
-            if matches!(name.as_str(), "vec-of" | "vec-empty" | "set-of")
-                && sort.is_container_sort() =>
-        {
-            let expected = if name == "set-of" { "Set" } else { "Vec" };
-            let sort_id = encode_sort(graph, names, sort, response)?;
-            let inner = sort.inner_sorts();
-            if !matches!(&response.sorts[sort_id as usize].kind, Some(pb::sort::Kind::Application(family)) if family.name == expected && family.args.len() == 1)
-                || inner.len() != 1
-            {
-                return Err(egglog::Error::ExtractError(format!(
-                    "{expected} term/sort mismatch"
-                )));
-            }
-            pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
-                value: Some(if expected == "Set" {
-                    pb::primitive_value::Value::Set(pb::ValueList {
-                        items: children.to_vec(),
-                    })
-                } else {
-                    pb::primitive_value::Value::Vec(pb::ValueList {
-                        items: children.to_vec(),
-                    })
-                }),
-            })
-        }
-        Term::App(name, native_children)
-            if matches!(name.as_str(), "maybe-none" | "maybe-some") && sort.is_container_sort() =>
-        {
-            let sort_id = encode_sort(graph, names, sort, response)?;
-            if sort.value_type() != Some(std::any::TypeId::of::<crate::maybe::MaybeContainer>())
-                || !matches!(&response.sorts[sort_id as usize].kind, Some(pb::sort::Kind::Application(family)) if family.name == "Maybe" && family.args.len() == 1)
-                || children.len() != usize::from(name == "maybe-some")
-                || native_children.len() != children.len()
-                || sort.inner_sorts().len() != 1
-            {
-                return Err(egglog::Error::ExtractError(
-                    "Maybe term/sort/arity mismatch".into(),
-                ));
-            }
-            pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
-                value: Some(pb::primitive_value::Value::Maybe(pb::MaybeValue {
-                    value: children.first().copied(),
-                })),
-            })
-        }
-        Term::App(name, _) if name == "pair" && sort.is_container_sort() => {
-            let sort_id = encode_sort(graph, names, sort, response)?;
-            let inner = sort.inner_sorts();
-            if !matches!(&response.sorts[sort_id as usize].kind, Some(pb::sort::Kind::Application(family)) if family.name == "Pair" && family.args.len() == 2)
-                || children.len() != 2
-                || inner.len() != 2
-            {
-                return Err(egglog::Error::ExtractError(
-                    "Pair term/sort/arity mismatch".into(),
-                ));
-            }
-            pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
-                value: Some(pb::primitive_value::Value::Pair(pb::PairValue {
-                    first: Some(children[0]),
-                    second: Some(children[1]),
-                })),
-            })
-        }
-        Term::App(name, _) if name == "map-of" && sort.is_container_sort() => {
-            let sort_id = encode_sort(graph, names, sort, response)?;
-            let inner = sort.inner_sorts();
-            if !matches!(&response.sorts[sort_id as usize].kind, Some(pb::sort::Kind::Application(family)) if family.name == "Map" && family.args.len() == 2)
-                || !children.len().is_multiple_of(2)
-                || inner.len() != 2
-            {
-                return Err(egglog::Error::ExtractError(
-                    "Map term/sort/arity mismatch".into(),
-                ));
-            }
-            let entries = children
-                .chunks_exact(2)
-                .map(|fields| pb::MapEntry {
-                    key: Some(fields[0]),
-                    value: Some(fields[1]),
-                })
-                .collect();
-            pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
-                value: Some(pb::primitive_value::Value::Map(pb::MapValue { entries })),
-            })
-        }
-        Term::App(name, _) => {
-            graph.get_function(name).ok_or_else(|| {
-                egglog::Error::ExtractError(format!("unsupported extracted host value {name}"))
-            })?;
-            pb::node::Kind::Call(pb::Call {
-                func: names.callables.get(name).unwrap_or(name).clone(),
-                args: children.to_vec(),
-            })
-        }
-        Term::Var(_) => {
+    let sort_id = encode_sort(graph, names, sort, response)?;
+    let kind = if let Some(value) = custom {
+        pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
+            value: Some(pb::primitive_value::Value::Custom(value)),
+        })
+    } else if let Some(scalar) = scalar {
+        let Some(pb::sort::Kind::Application(family)) = &response.sorts[sort_id as usize].kind
+        else {
             return Err(egglog::Error::ExtractError(
-                "extracted variable is not closed data".into(),
+                "native scalar has a non-application sort".into(),
+            ));
+        };
+        if !family.args.is_empty() {
+            return Err(egglog::Error::ExtractError(
+                "native scalar sort is not nullary".into(),
             ));
         }
+        value::Scalar::decode(Some(&family.name), &scalar).map_err(egglog::Error::ExtractError)?;
+        pb::node::Kind::PrimitiveValue(scalar)
+    } else if sort.clone().as_arc_any().is::<egglog::sort::FunctionSort>() {
+        let value = graph
+            .value_to_container::<egglog::sort::FunctionContainer>(native_value)
+            .ok_or_else(|| egglog::Error::ExtractError("missing native function value".into()))?;
+        if children.len() != value.1.len() {
+            return Err(egglog::Error::ExtractError(
+                "function capture arity mismatch".into(),
+            ));
+        }
+        drop(value);
+        let target = graph
+            .export_function_value_target(sort, native_value)
+            .map_err(egglog::Error::ExtractError)?;
+        pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
+            value: Some(pb::primitive_value::Value::PartialCall(pb::Call {
+                func: names.callables.get(&target).unwrap_or(&target).clone(),
+                args: children.to_vec(),
+            })),
+        })
+    } else if sort.is_container_sort() {
+        pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
+            value: Some(
+                value::container_payload(
+                    sort,
+                    &response.sorts[sort_id as usize],
+                    children,
+                    &response.nodes,
+                )
+                .map_err(egglog::Error::ExtractError)?,
+            ),
+        })
+    } else {
+        match terms.get(term) {
+            Term::App(name, _) if sort.is_eq_sort() => {
+                graph.get_function(name).ok_or_else(|| {
+                    egglog::Error::ExtractError(format!("unsupported extracted constructor {name}"))
+                })?;
+                pb::node::Kind::Call(pb::Call {
+                    func: names.callables.get(name).unwrap_or(name).clone(),
+                    args: children.to_vec(),
+                })
+            }
+            _ => {
+                return Err(egglog::Error::ExtractError(
+                    "native value requires an explicit custom codec".into(),
+                ));
+            }
+        }
     };
-    let sort_id = encode_sort(graph, names, sort, response)?;
     let node = pb::Node {
         sort_id,
         kind: Some(kind),
@@ -6212,64 +5978,6 @@ fn encode_term(
     encoded.insert(node.clone(), index);
     response.nodes.push(node);
     Ok(index)
-}
-
-// Native reconstruction is trusted only with its actual runtime value type and
-// exact term shape. A nominal constructor with the same printed head is not a
-// numeric value. No native primitive is executed to inspect these terms.
-fn encode_exact_number(
-    terms: &TermDag,
-    term: TermId,
-    sort: &ArcSort,
-) -> Result<Option<pb::primitive_value::Value>, String> {
-    fn bigint_text(terms: &TermDag, term: TermId) -> Result<String, String> {
-        let Term::App(name, children) = terms.get(term) else {
-            return Err("BigInt reconstruction is not an application".into());
-        };
-        if name != "from-string" || children.len() != 1 {
-            return Err("invalid BigInt reconstruction shape".into());
-        }
-        let Term::Lit(Literal::String(text)) = terms.get(children[0]) else {
-            return Err("BigInt reconstruction requires a string literal".into());
-        };
-        Ok(text.clone())
-    }
-    use pb::primitive_value::Value as V;
-    let actual = sort.value_type();
-    let value = if actual == Some(std::any::TypeId::of::<egglog::sort::Z>()) {
-        V::BigInt(bigint_text(terms, term)?)
-    } else if actual == Some(std::any::TypeId::of::<egglog::sort::Q>()) {
-        let Term::App(name, children) = terms.get(term) else {
-            return Err("BigRat reconstruction is not an application".into());
-        };
-        if name != "bigrat" || children.len() != 2 {
-            return Err("invalid BigRat reconstruction shape".into());
-        }
-        V::BigRat(pb::BigRat {
-            numerator: bigint_text(terms, children[0])?,
-            denominator: bigint_text(terms, children[1])?,
-        })
-    } else if actual == Some(std::any::TypeId::of::<crate::rational::R>()) {
-        let Term::App(name, children) = terms.get(term) else {
-            return Err("Rational reconstruction is not an application".into());
-        };
-        if name != "rational" || children.len() != 2 {
-            return Err("invalid Rational reconstruction shape".into());
-        }
-        let (Term::Lit(Literal::Int(numerator)), Term::Lit(Literal::Int(denominator))) =
-            (terms.get(children[0]), terms.get(children[1]))
-        else {
-            return Err("Rational reconstruction requires i64 literals".into());
-        };
-        V::Rational(pb::Rational {
-            numerator: *numerator,
-            denominator: *denominator,
-        })
-    } else {
-        return Ok(None);
-    };
-    validate_exact_number(&value)?;
-    Ok(Some(value))
 }
 
 #[cfg(test)]
@@ -8720,55 +8428,36 @@ mod tests {
     }
 
     #[test]
-    fn exact_number_reconstruction_requires_runtime_type_and_canonical_shape() {
-        let mut graph = crate::new_experimental_egraph();
-        graph.parse_and_run_program(None, "(sort Nominal)").unwrap();
-        let mut terms = TermDag::default();
-        let one = terms.lit(Literal::Int(1));
-        let two = terms.lit(Literal::Int(2));
-        let text = terms.lit(Literal::String("1".into()));
-        let integer = terms.app("from-string".into(), vec![text]);
-        let rational = terms.app("rational".into(), vec![one, two]);
-        let bigrat = terms.app("bigrat".into(), vec![integer, integer]);
-        for (name, term) in [
-            ("BigInt", integer),
-            ("BigRat", bigrat),
-            ("Rational", rational),
-        ] {
-            let sort = graph.get_sort_by_name(name).unwrap();
-            assert!(encode_exact_number(&terms, term, sort).unwrap().is_some());
-            for foreign in ["Nominal", "i64", "String"] {
-                assert_eq!(
-                    encode_exact_number(&terms, term, graph.get_sort_by_name(foreign).unwrap())
-                        .unwrap(),
-                    None
-                );
-            }
-            for bad in [
-                one,
-                text,
-                terms.app("wrong-head".into(), vec![one, two]),
-                terms.app(name.to_lowercase(), vec![]),
-            ] {
-                assert!(encode_exact_number(&terms, bad, sort).is_err());
-            }
+    fn scalar_reflection_reads_actual_native_values_without_terms() {
+        let graph = crate::new_experimental_egraph();
+        let values = [
+            (
+                "BigInt",
+                graph.base_to_value(egglog::sort::Z::new(123.into())),
+                value::Scalar::BigInt(123.into()),
+            ),
+            (
+                "BigRat",
+                graph.base_to_value(egglog::sort::Q::new(num::BigRational::new(
+                    1.into(),
+                    3.into(),
+                ))),
+                value::Scalar::BigRat(num::BigRational::new(1.into(), 3.into())),
+            ),
+            (
+                "Rational",
+                graph.base_to_value(crate::rational::R::new(num::rational::Rational64::new(
+                    2, 3,
+                ))),
+                value::Scalar::Rational(num::rational::Rational64::new(2, 3)),
+            ),
+        ];
+        for (family, native, expected) in values {
+            assert_eq!(
+                value::Scalar::reflect(&graph, graph.get_sort_by_name(family).unwrap(), native),
+                Some(expected)
+            );
         }
-        let rational_sort = graph.get_sort_by_name("Rational").unwrap();
-        for children in [vec![one], vec![text, two], vec![two, two]] {
-            let malformed = terms.app("rational".into(), children);
-            assert!(encode_exact_number(&terms, malformed, rational_sort).is_err());
-        }
-        let noncanonical = terms.lit(Literal::String("01".into()));
-        let malformed = terms.app("from-string".into(), vec![noncanonical]);
-        assert!(
-            encode_exact_number(&terms, malformed, graph.get_sort_by_name("BigInt").unwrap())
-                .is_err()
-        );
-        let malformed = terms.app("bigrat".into(), vec![one, integer]);
-        assert!(
-            encode_exact_number(&terms, malformed, graph.get_sort_by_name("BigRat").unwrap())
-                .is_err()
-        );
     }
 
     static HOST_DEFAULT_BODY_CALLS: std::sync::atomic::AtomicUsize =
@@ -8865,13 +8554,10 @@ mod tests {
 
     #[test]
     fn extracted_node_interning_preserves_exact_float_bits() {
-        let (mut engine, id) = host_default_engine();
-        let session = engine.graphs.get_mut(&id).unwrap();
-        let sort = session.graph.get_sort_by_name("f64").unwrap();
         let mut response = pb::RunProgramOutput::default();
         let mut encoded = HashMap::new();
-        // Separate native term arenas avoid OrderedFloat's own NaN/zero equality;
-        // this regression concerns only the emitted protobuf node key.
+        // Separate native graphs avoid OrderedFloat's own NaN/zero equality;
+        // this regression concerns actual scalar reflection and protobuf keys.
         for (bits, expected) in [
             (0, 0),
             (1u64 << 63, 1),
@@ -8880,6 +8566,9 @@ mod tests {
             (0x7ff8_0000_0000_0001, 2),
             (0, 0),
         ] {
+            let (mut engine, id) = host_default_engine();
+            let session = engine.graphs.get_mut(&id).unwrap();
+            let sort = session.graph.get_sort_by_name("f64").unwrap();
             let mut terms = TermDag::default();
             let term = terms.lit(Literal::Float(f64::from_bits(bits).into()));
             let index = encode_term(
@@ -8887,7 +8576,9 @@ mod tests {
                 &terms,
                 term,
                 sort,
-                session.graph.base_to_value(0i64),
+                session
+                    .graph
+                    .base_to_value(egglog::sort::F::new(f64::from_bits(bits).into())),
                 &[],
                 &mut response,
                 &mut encoded,
@@ -8905,80 +8596,61 @@ mod tests {
     }
 
     #[test]
-    fn map_encoder_rejects_odd_native_terms_and_wrong_container_provenance() {
+    fn container_codec_checks_native_family_child_sorts_and_arity_without_terms() {
         let (mut engine, id) = host_default_engine();
         let session = engine.graphs.get_mut(&id).unwrap();
-        session
-            .graph
-            .parse_and_run_program(None, "(sort M (Map i64 i64)) (sort V (Vec i64))")
-            .unwrap();
-        let mut terms = TermDag::default();
-        let child = terms.lit(Literal::Int(7));
-        let odd = terms.app("map-of".into(), vec![child]);
-        let even = terms.app("map-of".into(), vec![child, child]);
-        for (term, sort) in [(odd, "M"), (even, "V")] {
-            let mut response = pb::RunProgramOutput::default();
-            let children = match terms.get(term) {
-                Term::App(_, children) => vec![0; children.len()],
-                _ => unreachable!(),
-            };
-            let result = encode_term(
-                session,
-                &terms,
-                term,
-                session.graph.get_sort_by_name(sort).unwrap(),
-                session.graph.base_to_value(0i64),
-                &children,
-                &mut response,
-                &mut HashMap::new(),
-            );
-            assert!(matches!(result, Err(egglog::Error::ExtractError(_))));
-            assert!(response.nodes.is_empty());
-        }
-    }
-
-    #[test]
-    fn maybe_encoder_checks_exact_native_provenance_and_optional_arity() {
-        let (mut engine, id) = host_default_engine();
-        let session = engine.graphs.get_mut(&id).unwrap();
-        session
-            .graph
-            .parse_and_run_program(None, "(sort M (Maybe i64)) (sort V (Vec i64))")
-            .unwrap();
-        let mut terms = TermDag::default();
-        let child = terms.lit(Literal::Int(7));
-        for (name, sort, children) in [
-            ("maybe-none", "M", vec![child]),
-            ("maybe-some", "M", vec![]),
-            ("maybe-some", "M", vec![child, child]),
-            ("maybe-none", "V", vec![]),
-            ("maybe-some", "V", vec![child]),
-            ("vec-of", "M", vec![child]),
+        session.graph.parse_and_run_program(None, "(sort V (Vec i64)) (sort S (Set i64)) (sort T (MultiSet i64)) (sort M (Map i64 i64)) (sort P (Pair i64 i64)) (sort O (Maybe i64))").unwrap();
+        let mut response = pb::RunProgramOutput::default();
+        let scalar = encode_sort(
+            &session.graph,
+            &session.names,
+            session.graph.get_sort_by_name("i64").unwrap(),
+            &mut response,
+        )
+        .unwrap();
+        response.nodes.push(pb::Node {
+            sort_id: scalar,
+            ..Default::default()
+        });
+        for (name, valid, invalid) in [
+            ("V", vec![0, 1, 3], vec![]),
+            ("S", vec![0, 1, 3], vec![]),
+            ("T", vec![0, 1, 3], vec![]),
+            ("M", vec![0, 2, 4], vec![1, 3]),
+            ("P", vec![2], vec![0, 1, 3]),
+            ("O", vec![0, 1], vec![2, 3]),
         ] {
-            let term = terms.app(name.into(), children);
-            for observed_count in 0..=2 {
-                let mut response = pb::RunProgramOutput::default();
+            let sort = session.graph.get_sort_by_name(name).unwrap();
+            let index = encode_sort(&session.graph, &session.names, sort, &mut response).unwrap();
+            let wire = &response.sorts[index as usize];
+            for count in valid {
                 assert!(
-                    encode_term(
-                        session,
-                        &terms,
-                        term,
-                        session.graph.get_sort_by_name(sort).unwrap(),
-                        session.graph.base_to_value(0i64),
-                        &vec![0; observed_count],
-                        &mut response,
-                        &mut HashMap::new(),
-                    )
-                    .is_err(),
-                    "{name}/{sort}, observed {observed_count}"
+                    value::container_payload(sort, wire, &vec![0; count], &response.nodes).is_ok(),
+                    "{name}/{count}"
                 );
-                assert!(response.nodes.is_empty());
             }
+            for count in invalid {
+                assert!(
+                    value::container_payload(sort, wire, &vec![0; count], &response.nodes).is_err(),
+                    "{name}/{count}"
+                );
+            }
+            let wrong_nodes = vec![pb::Node {
+                sort_id: index,
+                ..Default::default()
+            }];
+            assert!(value::container_payload(sort, wire, &[0, 0], &wrong_nodes).is_err());
+            let mut wrong_family = wire.clone();
+            let Some(pb::sort::Kind::Application(family)) = &mut wrong_family.kind else {
+                unreachable!()
+            };
+            family.name = "Foreign".into();
+            assert!(value::container_payload(sort, &wrong_family, &[], &response.nodes).is_err());
         }
     }
 
     #[test]
-    fn set_codec_preserves_authored_children_and_checks_native_provenance() {
+    fn set_codec_preserves_authored_child_evaluation_order() {
         let mut program = pb::Program {
             sorts: vec![
                 pb::Sort {
@@ -9033,32 +8705,6 @@ mod tests {
                 args: vec![0, 1, 0]
             }))
         );
-        let (mut engine, id) = host_default_engine();
-        let session = engine.graphs.get_mut(&id).unwrap();
-        session
-            .graph
-            .parse_and_run_program(None, "(sort S (Set i64)) (sort V (Vec i64))")
-            .unwrap();
-        let mut terms = TermDag::default();
-        let child = terms.lit(Literal::Int(7));
-        for (name, sort) in [("set-of", "V"), ("vec-of", "S")] {
-            let term = terms.app(name.into(), vec![child]);
-            let mut response = pb::RunProgramOutput::default();
-            assert!(
-                encode_term(
-                    session,
-                    &terms,
-                    term,
-                    session.graph.get_sort_by_name(sort).unwrap(),
-                    session.graph.base_to_value(0i64),
-                    &[0],
-                    &mut response,
-                    &mut HashMap::new(),
-                )
-                .is_err()
-            );
-            assert!(response.nodes.is_empty());
-        }
     }
 
     #[test]

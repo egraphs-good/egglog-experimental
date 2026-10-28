@@ -346,14 +346,6 @@ fn source_definition_and_global_let_intake_does_not_clone_accumulated_native_bod
         ) -> Result<pb::Call, String> {
             Err("no custom values".into())
         }
-        fn encode_custom_value(
-            &self,
-            _: &egglog::ArcSort,
-            _: &egglog::TermDag,
-            _: egglog::TermId,
-        ) -> Result<Option<pb::CustomValue>, String> {
-            Ok(None)
-        }
     }
     for count in [8, 32] {
         let mut text = "(datatype E (N i64)) (ruleset r)".to_owned();
@@ -2320,14 +2312,6 @@ mod constructor_action_dags {
             ) -> Result<pb::Call, String> {
                 Err("this provider registers only an inert sort".into())
             }
-            fn encode_custom_value(
-                &self,
-                _: &egglog::ArcSort,
-                _: &egglog::TermDag,
-                _: egglog::TermId,
-            ) -> Result<Option<pb::CustomValue>, String> {
-                Ok(None)
-            }
         }
         let provider = std::sync::Arc::new(AmbientName);
         let mut original = set_program(28, false);
@@ -4004,15 +3988,6 @@ mod source_fresh_macro {
             _: &mut pb::Program,
         ) -> Result<pb::Call, String> {
             Err("fresh-macro test has no custom values".into())
-        }
-
-        fn encode_custom_value(
-            &self,
-            _: &egglog::ArcSort,
-            _: &egglog::TermDag,
-            _: egglog::TermId,
-        ) -> Result<Option<pb::CustomValue>, String> {
-            Ok(None)
         }
     }
 
@@ -11668,6 +11643,154 @@ fn malformed_exact_values_reject_before_earlier_actions() {
 }
 
 #[test]
+fn formed_scalar_values_use_literal_data_in_every_execution_mode_and_proof() {
+    use pb::primitive_value::Value as V;
+    let values = [
+        ("i64", V::I64(i64::MIN)),
+        ("f64", V::F64Bits(0x8000_0000_0000_0000)),
+        ("String", V::String("λ\0\"".into())),
+        ("bool", V::Bool(false)),
+        ("Unit", V::Unit(pb::Unit {})),
+        (
+            "BigInt",
+            V::BigInt("12345678901234567890123456789012345678901".into()),
+        ),
+        (
+            "BigRat",
+            V::BigRat(pb::BigRat {
+                numerator: "-7".into(),
+                denominator: "3".into(),
+            }),
+        ),
+        (
+            "Rational",
+            V::Rational(pb::Rational {
+                numerator: i64::MIN,
+                denominator: 3,
+            }),
+        ),
+    ];
+    let mut program = pb::Program::default();
+    for (family, value) in &values {
+        let sort_id = program.sorts.len() as u32;
+        program.sorts.push(pb::Sort {
+            kind: Some(pb::sort::Kind::Application(pb::SortApplication {
+                name: (*family).into(),
+                args: vec![],
+            })),
+            ..Default::default()
+        });
+        program.nodes.push(pb::Node {
+            sort_id,
+            kind: Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
+                value: Some(value.clone()),
+            })),
+            ..Default::default()
+        });
+    }
+    let mut facts = vec![];
+    for index in 0..values.len() as u32 {
+        facts.push(program.nodes.len() as u32);
+        program.nodes.push(pb::Node {
+            sort_id: index,
+            kind: Some(pb::node::Kind::Union(pb::Union {
+                members: vec![index, index],
+            })),
+            ..Default::default()
+        });
+    }
+    for mode in [
+        pb::ExecutionMode::Normal,
+        pb::ExecutionMode::TermEncoding,
+        pb::ExecutionMode::Proofs,
+        pb::ExecutionMode::ProofTesting,
+    ] {
+        let mut engine = Engine::default();
+        let id = pb::CreateEGraphResponse::decode(
+            engine
+                .create(
+                    &pb::CreateEGraphRequest {
+                        sorts: program.sorts.clone(),
+                        options: Some(pb::EGraphOptions {
+                            cost_sort: Some(0),
+                            execution_mode: mode.into(),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    }
+                    .encode_to_vec(),
+                )
+                .unwrap()
+                .as_slice(),
+        )
+        .unwrap()
+        .egraph_id;
+        let mut input = program.clone();
+        input.commands.push(pb::Command {
+            kind: Some(
+                if matches!(
+                    mode,
+                    pb::ExecutionMode::Proofs | pb::ExecutionMode::ProofTesting
+                ) {
+                    pb::command::Kind::Prove(pb::Prove {
+                        facts: facts.clone(),
+                    })
+                } else {
+                    pb::command::Kind::Check(pb::Check {
+                        facts: facts.clone(),
+                    })
+                },
+            ),
+            ..Default::default()
+        });
+        let response = run(&mut engine, id, input);
+        assert_eq!(response.error, None, "{mode:?}");
+        if matches!(
+            mode,
+            pb::ExecutionMode::Proofs | pb::ExecutionMode::ProofTesting
+        ) {
+            let literals: Vec<_> = response
+                .output
+                .outputs
+                .iter()
+                .filter_map(|output| match &output.kind {
+                    Some(pb::command_output::Kind::Proof(proof)) => Some(proof),
+                    _ => None,
+                })
+                .flat_map(|proof| &proof.terms)
+                .filter_map(|term| match &term.kind {
+                    Some(pb::proof_term::Kind::PrimitiveValue(value)) => Some(value),
+                    Some(pb::proof_term::Kind::App(app)) => {
+                        assert!(!matches!(
+                            app.head.as_str(),
+                            "from-string" | "bigrat" | "rational"
+                        ));
+                        None
+                    }
+                    _ => None,
+                })
+                .collect();
+            for (family, value) in &values {
+                let expected = egglog_experimental::protobuf::value::Scalar::decode(
+                    Some(family),
+                    &pb::PrimitiveValue {
+                        value: Some(value.clone()),
+                    },
+                )
+                .unwrap();
+                assert!(
+                    literals.iter().any(|value| {
+                        egglog_experimental::protobuf::value::Scalar::decode(None, value).unwrap()
+                            == expected
+                    }),
+                    "missing {family} proof literal in {mode:?}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn formed_exact_values_roundtrip_signed_and_width_boundaries() {
     use pb::primitive_value::Value as V;
     let values = [
@@ -19005,11 +19128,11 @@ mod source_provider_context {
             })
         }
 
-        fn encode_custom_value(
+        fn encode_observed_custom_value(
             &self,
+            _: &egglog::EGraph,
             _: &egglog::ArcSort,
-            _: &egglog::TermDag,
-            _: egglog::TermId,
+            _: egglog::Value,
         ) -> Result<Option<pb::CustomValue>, String> {
             Err("metadata validation must not reconstruct TestOpaque".into())
         }
@@ -23069,14 +23192,6 @@ mod rule_assigned_costs {
                 _: &mut pb::Program,
             ) -> Result<pb::Call, String> {
                 Err("this fixture has no custom values".into())
-            }
-            fn encode_custom_value(
-                &self,
-                _: &egglog::ArcSort,
-                _: &egglog::TermDag,
-                _: egglog::TermId,
-            ) -> Result<Option<pb::CustomValue>, String> {
-                Ok(None)
             }
         }
         CALLS.lock().unwrap().clear();

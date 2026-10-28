@@ -383,12 +383,6 @@ impl Session {
                     {
                         // A first host codec encodes a leaf D. Never accept foreign
                         // arena references as if they belonged to this response.
-                        use pb::primitive_value::Value as V;
-                        if let Some(exact @ (V::BigInt(_) | V::BigRat(_) | V::Rational(_))) =
-                            &value.value
-                        {
-                            validate_exact_number(exact).map_err(egglog::Error::ExtractError)?;
-                        }
                         let family = match &response.sorts[objective as usize].kind {
                             Some(pb::sort::Kind::Application(family)) if family.args.is_empty() => {
                                 &family.name
@@ -399,29 +393,8 @@ impl Session {
                                 ));
                             }
                         };
-                        let sort_agrees = match (family.as_str(), &value.value) {
-                            ("Unit", Some(V::Unit(_)))
-                            | ("bool", Some(V::Bool(_)))
-                            | ("i64", Some(V::I64(_)))
-                            | ("f64", Some(V::F64Bits(_)))
-                            | ("String", Some(V::String(_)))
-                            | ("BigInt", Some(V::BigInt(_)))
-                            | ("BigRat", Some(V::BigRat(_)))
-                            | ("Rational", Some(V::Rational(_))) => true,
-                            (
-                                "Unit" | "bool" | "i64" | "f64" | "String" | "BigInt" | "BigRat"
-                                | "Rational",
-                                _,
-                            ) => false,
-                            (_, Some(V::Custom(custom))) => custom.args.is_empty(),
-                            _ => false,
-                        };
-                        if !sort_agrees {
-                            return Err(egglog::Error::ExtractError(
-                                "host objective codec disagrees with its declared result sort"
-                                    .into(),
-                            ));
-                        }
+                        value::validate_leaf(family, &value)
+                            .map_err(egglog::Error::ExtractError)?;
                         let index = u32::try_from(response.nodes.len()).map_err(|_| {
                             egglog::Error::ExtractError("objective arena exceeds u32".into())
                         })?;

@@ -156,14 +156,6 @@ impl NativeExtension for ComputedProvider {
     ) -> Result<pb::Call, String> {
         Err("no custom values".into())
     }
-    fn encode_custom_value(
-        &self,
-        _sort: &egglog_experimental::ArcSort,
-        _terms: &egglog_experimental::TermDag,
-        _term: egglog_experimental::TermId,
-    ) -> Result<Option<pb::CustomValue>, String> {
-        Ok(None)
-    }
 }
 
 #[test]

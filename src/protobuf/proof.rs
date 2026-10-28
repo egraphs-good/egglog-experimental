@@ -4,7 +4,6 @@
 use super::pb;
 use egglog::{
     Term,
-    ast::Literal,
     proof::{Justification, ProofId, ProofStore},
 };
 #[cfg(test)]
@@ -123,13 +122,10 @@ pub fn export(store: &ProofStore, root: ProofId) -> Result<pb::ProofResult, Stri
     cursor = 0;
     while cursor < term_ids.queue.len() {
         let kind = match store.term_dag().get(term_ids.queue[cursor]) {
-            Term::Lit(lit) => match lit {
-                Literal::Int(x) => T::I64(*x),
-                Literal::Float(x) => T::F64Bits(x.0.to_bits()),
-                Literal::String(x) => T::String(x.clone()),
-                Literal::Bool(x) => T::Bool(*x),
-                Literal::Unit => T::Unit(pb::Unit {}),
-            },
+            Term::Lit(literal) => {
+                let (_, scalar) = super::value::Scalar::from_literal(literal)?;
+                T::PrimitiveValue(scalar.encode()?)
+            }
             Term::Var(name) => T::Var(name.clone()),
             Term::App(head, children) => T::App(pb::ProofApp {
                 head: head.clone(),
@@ -204,7 +200,11 @@ pub fn validate(result: &pb::ProofResult) -> Result<(), String> {
     for term in &result.terms {
         term_edges.push(match term.kind.as_ref().ok_or("missing term kind")? {
             T::App(app) => app.children.iter().map(|x| *x as usize).collect(),
-            _ => Vec::new(),
+            T::PrimitiveValue(value) => {
+                super::value::Scalar::decode(None, value)?;
+                Vec::new()
+            }
+            T::Var(_) => Vec::new(),
         });
     }
     closed_dag(&term_edges, &term_roots, "term")
@@ -257,7 +257,7 @@ mod tests {
         CommandOutput, EGraph,
         proof::{ProofId, ProofStore},
     };
-    use egglog::{Term, TermId, ast::Literal, proof::Justification};
+    use egglog::{Term, TermId, proof::Justification};
     use prost::Message;
     use std::collections::{BTreeSet, HashMap};
 
@@ -533,11 +533,14 @@ mod tests {
                 store.term_dag().get(native),
                 wire.terms[wire_id as usize].kind.as_ref().unwrap(),
             ) {
-                (Term::Lit(Literal::Int(a)), T::I64(b)) => assert_eq!(a, b),
-                (Term::Lit(Literal::Float(a)), T::F64Bits(b)) => assert_eq!(a.0.to_bits(), *b),
-                (Term::Lit(Literal::String(a)), T::String(b)) => assert_eq!(a, b),
-                (Term::Lit(Literal::Bool(a)), T::Bool(b)) => assert_eq!(a, b),
-                (Term::Lit(Literal::Unit), T::Unit(_)) => {}
+                (Term::Lit(literal), T::PrimitiveValue(value)) => {
+                    assert_eq!(
+                        super::super::value::Scalar::from_literal(literal)
+                            .unwrap()
+                            .1,
+                        super::super::value::Scalar::decode(None, value).unwrap()
+                    );
+                }
                 (Term::Var(a), T::Var(b)) => assert_eq!(a, b),
                 (Term::App(a, children), T::App(app)) => {
                     assert_eq!(a, &app.head);

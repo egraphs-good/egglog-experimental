@@ -1989,11 +1989,11 @@ fn table_observation_keeps_completed_prefix_and_encoding_errors_are_not_unavaila
         ) -> Result<pb::Call, String> {
             Err("unused custom lowering".into())
         }
-        fn encode_custom_value(
+        fn encode_observed_custom_value(
             &self,
+            _: &egglog::EGraph,
             _: &egglog::ArcSort,
-            _: &egglog::TermDag,
-            _: egglog::TermId,
+            _: egglog::Value,
         ) -> Result<Option<pb::CustomValue>, String> {
             self.encodings.fetch_add(1, Ordering::SeqCst);
             Err("deliberate table encoding failure".into())

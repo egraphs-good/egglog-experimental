@@ -258,11 +258,11 @@ class ProofSchemaTests(unittest.TestCase):
 
     def test_all_native_terms_and_justifications_roundtrip(self):
         terms = [
-            ir.ProofTerm(kind=Oneof("i64", -(2**63))),
-            ir.ProofTerm(kind=Oneof("f64_bits", 0x7FF8000000000042)),
-            ir.ProofTerm(kind=Oneof("string", "")),
-            ir.ProofTerm(kind=Oneof("bool", False)),
-            ir.ProofTerm(kind=Oneof("unit", ir.Unit())),
+            ir.ProofTerm(kind=Oneof("primitive_value", ir.PrimitiveValue(value=Oneof("i64", -(2**63))))),
+            ir.ProofTerm(kind=Oneof("primitive_value", ir.PrimitiveValue(value=Oneof("f64_bits", 0x7FF8000000000042)))),
+            ir.ProofTerm(kind=Oneof("primitive_value", ir.PrimitiveValue(value=Oneof("string", "")))),
+            ir.ProofTerm(kind=Oneof("primitive_value", ir.PrimitiveValue(value=Oneof("bool", False)))),
+            ir.ProofTerm(kind=Oneof("primitive_value", ir.PrimitiveValue(value=Oneof("unit", ir.Unit())))),
             ir.ProofTerm(kind=Oneof("var", "x")),
             ir.ProofTerm(kind=Oneof("app", ir.ProofApp(head="f", children=[0, 0, 1, 2, 3, 4, 5]))),
         ]
@@ -293,7 +293,24 @@ class ProofSchemaTests(unittest.TestCase):
         validate(response)
         decoded = ir.RunProgramOutput.from_binary(response.to_binary())
         self.assertEqual(decoded, response)
-        self.assertEqual(decoded.outputs[0].kind.value.terms[1].kind.value, 0x7FF8000000000042)
+        self.assertEqual(decoded.outputs[0].kind.value.terms[1].kind.value.value.value, 0x7FF8000000000042)
+
+    def test_proof_literals_reuse_scalar_values_and_reject_child_bearing_data(self):
+        for payload in [
+            Oneof("big_int", "1234567890123456789012345678901234567890"),
+            Oneof("big_rat", ir.BigRat(numerator="-1", denominator="3")),
+            Oneof("rational", ir.Rational(numerator=-(2**63), denominator=1)),
+        ]:
+            term = ir.ProofTerm(kind=Oneof("primitive_value", ir.PrimitiveValue(value=payload)))
+            validate(term)
+            self.assertEqual(ir.ProofTerm.from_binary(term.to_binary()), term)
+        for payload in [
+            Oneof("vec", ir.ValueList(items=[])),
+            Oneof("maybe", ir.MaybeValue()),
+            Oneof("custom", ir.CustomValue()),
+        ]:
+            with self.assertRaises(ValidationError):
+                validate(ir.ProofTerm(kind=Oneof("primitive_value", ir.PrimitiveValue(value=payload))))
 
     def test_required_proof_indices_and_oneofs(self):
         invalid = [
@@ -314,7 +331,7 @@ class ProofSchemaTests(unittest.TestCase):
                 validate(message)
 
     def test_root_term_and_substitution_bounds(self):
-        term = ir.ProofTerm(kind=Oneof("i64", 0))
+        term = ir.ProofTerm(kind=Oneof("primitive_value", ir.PrimitiveValue(value=Oneof("i64", 0))))
         fiat = Oneof("fiat", ir.Unit())
         invalid = [
             ir.ProofResult(terms=[term], proofs=[ir.ProofStep(lhs=0, rhs=0, justification=fiat)], root=1),
@@ -348,7 +365,7 @@ class ProofSchemaTests(unittest.TestCase):
         ]
         for justification in invalid:
             message = ir.ProofResult(
-                terms=[ir.ProofTerm(kind=Oneof("i64", 0))],
+                terms=[ir.ProofTerm(kind=Oneof("primitive_value", ir.PrimitiveValue(value=Oneof("i64", 0))))],
                 proofs=[ir.ProofStep(lhs=0, rhs=0, justification=justification)], root=0,
             )
             with self.subTest(justification=justification), self.assertRaises(ValidationError):
@@ -362,7 +379,7 @@ class ProofSchemaTests(unittest.TestCase):
 
     def test_nested_proofs_are_allowed_but_control_outcomes_are_top_level(self):
         proof = ir.ProofResult(
-            terms=[ir.ProofTerm(kind=Oneof("i64", 0))],
+            terms=[ir.ProofTerm(kind=Oneof("primitive_value", ir.PrimitiveValue(value=Oneof("i64", 0))))],
             proofs=[ir.ProofStep(lhs=0, rhs=0, justification=Oneof("fiat", ir.Unit()))],
             root=0,
         )

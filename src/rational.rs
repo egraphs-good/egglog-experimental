@@ -22,7 +22,6 @@ use num::traits::{CheckedAdd, CheckedDiv, CheckedMul, CheckedSub, One, Signed, T
 
 /// Rust representation of an egglog `Rational` value.
 pub type R = Boxed<Rational64>;
-use crate::ast::Literal;
 
 use super::*;
 
@@ -122,13 +121,19 @@ impl BaseSort for RationalSort {
         termdag: &mut TermDag,
     ) -> TermId {
         let rat = base_values.unwrap::<R>(value);
+        termdag.lit(
+            egglog::sort::base_literal(RationalSort.to_arcsort(), rat)
+                .expect("Rational native literal type"),
+        )
+    }
 
-        let numer = rat.0.numer();
-        let denom = rat.0.denom();
-
-        let numer = termdag.lit(Literal::Int(*numer));
-        let denom = termdag.lit(Literal::Int(*denom));
-
-        termdag.app("rational".into(), vec![numer, denom])
+    fn fmt_value(
+        &self,
+        values: &BaseValues,
+        value: Value,
+        f: &mut std::fmt::Formatter<'_>,
+    ) -> std::fmt::Result {
+        let rat = values.unwrap::<R>(value);
+        write!(f, "(rational {} {})", rat.numer(), rat.denom())
     }
 }

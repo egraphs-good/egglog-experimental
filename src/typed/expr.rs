@@ -1517,72 +1517,19 @@ impl std::fmt::Debug for Expr {
     }
 }
 
-// The schema defines these codecs. This checks a literal invariant, not a
-// callable signature or native numeric equivalence (f64 payloads are bits).
+// The shared wire codec owns scalar validity and sort agreement.
 pub(super) fn validate_literal(
     sort: &SortRef,
     value: &pb::PrimitiveValue,
 ) -> Result<(), TypedError> {
-    use num::Integer as _;
-    use pb::primitive_value::Value;
-
-    let kind = &sort.0.sort().unwrap().kind;
-    if let Some(pb::sort::Kind::Application(family)) = kind
+    if let Some(pb::sort::Kind::Application(family)) = &sort.0.sort().unwrap().kind
         && family.args.is_empty()
     {
-        match (&*family.name, &value.value) {
-            ("i64", Some(Value::I64(_)))
-            | ("f64", Some(Value::F64Bits(_)))
-            | ("String", Some(Value::String(_)))
-            | ("bool", Some(Value::Bool(_)))
-            | ("Unit", Some(Value::Unit(_))) => return Ok(()),
-            ("BigInt", Some(Value::BigInt(text))) => {
-                canonical_integer(text)?;
-                return Ok(());
-            }
-            ("BigRat", Some(Value::BigRat(ratio))) => {
-                let numerator = canonical_integer(&ratio.numerator)?;
-                let denominator = canonical_integer(&ratio.denominator)?;
-                if denominator > num::BigInt::from(0)
-                    && numerator.gcd(&denominator) == num::BigInt::from(1)
-                {
-                    return Ok(());
-                }
-                return Err(TypedError::Decode(
-                    "BigRat payload must be reduced with a positive denominator".into(),
-                ));
-            }
-            ("Rational", Some(Value::Rational(ratio))) => {
-                // unsigned_abs covers MIN without signed negation/overflow.
-                if ratio.denominator > 0
-                    && ratio
-                        .numerator
-                        .unsigned_abs()
-                        .gcd(&(ratio.denominator as u64))
-                        == 1
-                {
-                    return Ok(());
-                }
-                return Err(TypedError::Decode(
-                    "Rational payload must be reduced with a positive denominator".into(),
-                ));
-            }
-            _ => (),
-        }
+        return crate::protobuf::value::Scalar::decode(Some(&family.name), value)
+            .map(|_| ())
+            .map_err(TypedError::Decode);
     }
     Err(TypedError::Decode(
         "scalar payload does not match its sort".into(),
     ))
-}
-
-// Parsing alone admits alternate spellings. The wire requires one decimal
-// representation, independently of a symbolic from_string call's behavior.
-fn canonical_integer(text: &str) -> Result<num::BigInt, TypedError> {
-    let value: num::BigInt = text
-        .parse()
-        .map_err(|_| TypedError::Decode("invalid integer payload".into()))?;
-    if value.to_string() != text {
-        return Err(TypedError::Decode("noncanonical integer payload".into()));
-    }
-    Ok(value)
 }

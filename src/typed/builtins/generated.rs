@@ -39,13 +39,9 @@ impl ::core::convert::From<::num::BigInt> for self::BigInt {
         Self(
             crate::typed::expr::Expr::literal(
                 <Self as crate::typed::EgglogValue>::sort_ref(),
-                crate::typed::pb::PrimitiveValue {
-                    value: ::core::option::Option::Some(
-                        crate::typed::pb::primitive_value::Value::BigInt(
-                            ::std::string::ToString::to_string(&__egglog_value),
-                        ),
-                    ),
-                },
+                crate::protobuf::value::Scalar::BigInt(__egglog_value)
+                    .encode()
+                    .expect("native scalar codec is infallible for this host type"),
             )
             .expect("generated scalar codec and catalog sort disagree"),
         )
@@ -53,16 +49,13 @@ impl ::core::convert::From<::num::BigInt> for self::BigInt {
 }
 impl ::core::convert::From<&::num::BigInt> for self::BigInt {
     fn from(__egglog_value: &::num::BigInt) -> Self {
+        let __egglog_value = ::core::clone::Clone::clone(__egglog_value);
         Self(
             crate::typed::expr::Expr::literal(
                 <Self as crate::typed::EgglogValue>::sort_ref(),
-                crate::typed::pb::PrimitiveValue {
-                    value: ::core::option::Option::Some(
-                        crate::typed::pb::primitive_value::Value::BigInt(
-                            ::std::string::ToString::to_string(&__egglog_value),
-                        ),
-                    ),
-                },
+                crate::protobuf::value::Scalar::BigInt(__egglog_value)
+                    .encode()
+                    .expect("native scalar codec is infallible for this host type"),
             )
             .expect("generated scalar codec and catalog sort disagree"),
         )
@@ -92,32 +85,20 @@ impl ::core::convert::TryFrom<&self::BigInt> for ::num::BigInt {
             __egglog_value,
         )) = &__egglog_node.kind
         {
-            crate::typed::expr::validate_literal(
-                &<self::BigInt as crate::typed::EgglogValue>::sort_ref(),
+            let __egglog_value = crate::protobuf::value::Scalar::decode(
+                ::core::option::Option::Some("BigInt"),
                 __egglog_value,
-            )?;
+            )
+            .map_err(crate::typed::TypedError::Decode)?;
+            if let crate::protobuf::value::Scalar::BigInt(__egglog_value) = __egglog_value {
+                return ::core::result::Result::Ok(__egglog_value);
+            }
         }
-        match &__egglog_node.kind {
-            ::core::option::Option::Some(crate::typed::pb::node::Kind::PrimitiveValue(
-                crate::typed::pb::PrimitiveValue {
-                    value:
-                        ::core::option::Option::Some(crate::typed::pb::primitive_value::Value::BigInt(
-                            __egglog_value,
-                        )),
-                },
-            )) => ::core::result::Result::Ok(__egglog_value.parse::<::num::BigInt>().map_err(
-                |__egglog_error| {
-                    crate::typed::TypedError::Decode(::std::string::ToString::to_string(
-                        &__egglog_error,
-                    ))
-                },
-            )?),
-            _ => ::core::result::Result::Err(crate::typed::TypedError::Decode(
-                ::std::borrow::ToOwned::to_owned(
-                    "expected an exact ::num::BigInt literal, not symbolic syntax",
-                ),
-            )),
-        }
+        ::core::result::Result::Err(crate::typed::TypedError::Decode(
+            ::std::borrow::ToOwned::to_owned(
+                "expected an exact ::num::BigInt literal, not symbolic syntax",
+            ),
+        ))
     }
 }
 
@@ -159,30 +140,21 @@ impl ::core::convert::TryFrom<::num::BigRational> for self::BigRat {
     fn try_from(__egglog_value: ::num::BigRational) -> ::core::result::Result<Self, Self::Error> {
         ::core::result::Result::Ok(Self(crate::typed::expr::Expr::literal(
             <Self as crate::typed::EgglogValue>::sort_ref(),
-            crate::typed::pb::PrimitiveValue {
-                value: ::core::option::Option::Some(
-                    crate::typed::pb::primitive_value::Value::BigRat(crate::typed::pb::BigRat {
-                        numerator: ::std::string::ToString::to_string(__egglog_value.numer()),
-                        denominator: ::std::string::ToString::to_string(__egglog_value.denom()),
-                    }),
-                ),
-            },
+            crate::protobuf::value::Scalar::BigRat(__egglog_value)
+                .encode()
+                .map_err(crate::typed::TypedError::Decode)?,
         )?))
     }
 }
 impl ::core::convert::TryFrom<&::num::BigRational> for self::BigRat {
     type Error = crate::typed::TypedError;
     fn try_from(__egglog_value: &::num::BigRational) -> ::core::result::Result<Self, Self::Error> {
+        let __egglog_value = ::core::clone::Clone::clone(__egglog_value);
         ::core::result::Result::Ok(Self(crate::typed::expr::Expr::literal(
             <Self as crate::typed::EgglogValue>::sort_ref(),
-            crate::typed::pb::PrimitiveValue {
-                value: ::core::option::Option::Some(
-                    crate::typed::pb::primitive_value::Value::BigRat(crate::typed::pb::BigRat {
-                        numerator: ::std::string::ToString::to_string(__egglog_value.numer()),
-                        denominator: ::std::string::ToString::to_string(__egglog_value.denom()),
-                    }),
-                ),
-            },
+            crate::protobuf::value::Scalar::BigRat(__egglog_value)
+                .encode()
+                .map_err(crate::typed::TypedError::Decode)?,
         )?))
     }
 }
@@ -210,43 +182,20 @@ impl ::core::convert::TryFrom<&self::BigRat> for ::num::BigRational {
             __egglog_value,
         )) = &__egglog_node.kind
         {
-            crate::typed::expr::validate_literal(
-                &<self::BigRat as crate::typed::EgglogValue>::sort_ref(),
+            let __egglog_value = crate::protobuf::value::Scalar::decode(
+                ::core::option::Option::Some("BigRat"),
                 __egglog_value,
-            )?;
+            )
+            .map_err(crate::typed::TypedError::Decode)?;
+            if let crate::protobuf::value::Scalar::BigRat(__egglog_value) = __egglog_value {
+                return ::core::result::Result::Ok(__egglog_value);
+            }
         }
-        match &__egglog_node.kind {
-            ::core::option::Option::Some(crate::typed::pb::node::Kind::PrimitiveValue(
-                crate::typed::pb::PrimitiveValue {
-                    value:
-                        ::core::option::Option::Some(crate::typed::pb::primitive_value::Value::BigRat(
-                            __egglog_value,
-                        )),
-                },
-            )) => ::core::result::Result::Ok(::num::BigRational::new_raw(
-                __egglog_value
-                    .numerator
-                    .parse::<::num::BigInt>()
-                    .map_err(|__egglog_error| {
-                        crate::typed::TypedError::Decode(::std::string::ToString::to_string(
-                            &__egglog_error,
-                        ))
-                    })?,
-                __egglog_value
-                    .denominator
-                    .parse::<::num::BigInt>()
-                    .map_err(|__egglog_error| {
-                        crate::typed::TypedError::Decode(::std::string::ToString::to_string(
-                            &__egglog_error,
-                        ))
-                    })?,
-            )),
-            _ => ::core::result::Result::Err(crate::typed::TypedError::Decode(
-                ::std::borrow::ToOwned::to_owned(
-                    "expected an exact ::num::BigRational literal, not symbolic syntax",
-                ),
-            )),
-        }
+        ::core::result::Result::Err(crate::typed::TypedError::Decode(
+            ::std::borrow::ToOwned::to_owned(
+                "expected an exact ::num::BigRational literal, not symbolic syntax",
+            ),
+        ))
     }
 }
 
@@ -712,16 +661,9 @@ impl ::core::convert::TryFrom<::num::rational::Rational64> for self::Rational {
     ) -> ::core::result::Result<Self, Self::Error> {
         ::core::result::Result::Ok(Self(crate::typed::expr::Expr::literal(
             <Self as crate::typed::EgglogValue>::sort_ref(),
-            crate::typed::pb::PrimitiveValue {
-                value: ::core::option::Option::Some(
-                    crate::typed::pb::primitive_value::Value::Rational(
-                        crate::typed::pb::Rational {
-                            numerator: *__egglog_value.numer(),
-                            denominator: *__egglog_value.denom(),
-                        },
-                    ),
-                ),
-            },
+            crate::protobuf::value::Scalar::Rational(__egglog_value)
+                .encode()
+                .map_err(crate::typed::TypedError::Decode)?,
         )?))
     }
 }
@@ -730,18 +672,12 @@ impl ::core::convert::TryFrom<&::num::rational::Rational64> for self::Rational {
     fn try_from(
         __egglog_value: &::num::rational::Rational64,
     ) -> ::core::result::Result<Self, Self::Error> {
+        let __egglog_value = ::core::clone::Clone::clone(__egglog_value);
         ::core::result::Result::Ok(Self(crate::typed::expr::Expr::literal(
             <Self as crate::typed::EgglogValue>::sort_ref(),
-            crate::typed::pb::PrimitiveValue {
-                value: ::core::option::Option::Some(
-                    crate::typed::pb::primitive_value::Value::Rational(
-                        crate::typed::pb::Rational {
-                            numerator: *__egglog_value.numer(),
-                            denominator: *__egglog_value.denom(),
-                        },
-                    ),
-                ),
-            },
+            crate::protobuf::value::Scalar::Rational(__egglog_value)
+                .encode()
+                .map_err(crate::typed::TypedError::Decode)?,
         )?))
     }
 }
@@ -769,29 +705,20 @@ impl ::core::convert::TryFrom<&self::Rational> for ::num::rational::Rational64 {
             __egglog_value,
         )) = &__egglog_node.kind
         {
-            crate::typed::expr::validate_literal(
-                &<self::Rational as crate::typed::EgglogValue>::sort_ref(),
+            let __egglog_value = crate::protobuf::value::Scalar::decode(
+                ::core::option::Option::Some("Rational"),
                 __egglog_value,
-            )?;
+            )
+            .map_err(crate::typed::TypedError::Decode)?;
+            if let crate::protobuf::value::Scalar::Rational(__egglog_value) = __egglog_value {
+                return ::core::result::Result::Ok(__egglog_value);
+            }
         }
-        match &__egglog_node.kind {
-            ::core::option::Option::Some(crate::typed::pb::node::Kind::PrimitiveValue(
-                crate::typed::pb::PrimitiveValue {
-                    value:
-                        ::core::option::Option::Some(
-                            crate::typed::pb::primitive_value::Value::Rational(__egglog_value),
-                        ),
-                },
-            )) => ::core::result::Result::Ok(::num::rational::Rational64::new_raw(
-                __egglog_value.numerator,
-                __egglog_value.denominator,
-            )),
-            _ => ::core::result::Result::Err(crate::typed::TypedError::Decode(
-                ::std::borrow::ToOwned::to_owned(
-                    "expected an exact ::num::rational::Rational64 literal, not symbolic syntax",
-                ),
-            )),
-        }
+        ::core::result::Result::Err(crate::typed::TypedError::Decode(
+            ::std::borrow::ToOwned::to_owned(
+                "expected an exact ::num::rational::Rational64 literal, not symbolic syntax",
+            ),
+        ))
     }
 }
 
@@ -899,11 +826,9 @@ impl ::core::convert::From<::std::string::String> for self::String {
         Self(
             crate::typed::expr::Expr::literal(
                 <Self as crate::typed::EgglogValue>::sort_ref(),
-                crate::typed::pb::PrimitiveValue {
-                    value: ::core::option::Option::Some(
-                        crate::typed::pb::primitive_value::Value::String(__egglog_value),
-                    ),
-                },
+                crate::protobuf::value::Scalar::String(__egglog_value)
+                    .encode()
+                    .expect("native scalar codec is infallible for this host type"),
             )
             .expect("generated scalar codec and catalog sort disagree"),
         )
@@ -915,11 +840,9 @@ impl ::core::convert::From<&::std::string::String> for self::String {
         Self(
             crate::typed::expr::Expr::literal(
                 <Self as crate::typed::EgglogValue>::sort_ref(),
-                crate::typed::pb::PrimitiveValue {
-                    value: ::core::option::Option::Some(
-                        crate::typed::pb::primitive_value::Value::String(__egglog_value),
-                    ),
-                },
+                crate::protobuf::value::Scalar::String(__egglog_value)
+                    .encode()
+                    .expect("native scalar codec is infallible for this host type"),
             )
             .expect("generated scalar codec and catalog sort disagree"),
         )
@@ -945,22 +868,24 @@ impl ::core::convert::TryFrom<&self::String> for ::std::string::String {
                 ::std::borrow::ToOwned::to_owned("literal wrapper has another sort"),
             ));
         }
-
-        match &__egglog_node.kind {
-            ::core::option::Option::Some(crate::typed::pb::node::Kind::PrimitiveValue(
-                crate::typed::pb::PrimitiveValue {
-                    value:
-                        ::core::option::Option::Some(crate::typed::pb::primitive_value::Value::String(
-                            __egglog_value,
-                        )),
-                },
-            )) => ::core::result::Result::Ok(::core::clone::Clone::clone(__egglog_value)),
-            _ => ::core::result::Result::Err(crate::typed::TypedError::Decode(
-                ::std::borrow::ToOwned::to_owned(
-                    "expected an exact ::std::string::String literal, not symbolic syntax",
-                ),
-            )),
+        if let ::core::option::Option::Some(crate::typed::pb::node::Kind::PrimitiveValue(
+            __egglog_value,
+        )) = &__egglog_node.kind
+        {
+            let __egglog_value = crate::protobuf::value::Scalar::decode(
+                ::core::option::Option::Some("String"),
+                __egglog_value,
+            )
+            .map_err(crate::typed::TypedError::Decode)?;
+            if let crate::protobuf::value::Scalar::String(__egglog_value) = __egglog_value {
+                return ::core::result::Result::Ok(__egglog_value);
+            }
         }
+        ::core::result::Result::Err(crate::typed::TypedError::Decode(
+            ::std::borrow::ToOwned::to_owned(
+                "expected an exact ::std::string::String literal, not symbolic syntax",
+            ),
+        ))
     }
 }
 
@@ -1020,11 +945,9 @@ impl ::core::convert::From<()> for self::Unit {
         Self(
             crate::typed::expr::Expr::literal(
                 <Self as crate::typed::EgglogValue>::sort_ref(),
-                crate::typed::pb::PrimitiveValue {
-                    value: ::core::option::Option::Some(
-                        crate::typed::pb::primitive_value::Value::Unit(crate::typed::pb::Unit {}),
-                    ),
-                },
+                crate::protobuf::value::Scalar::Unit
+                    .encode()
+                    .expect("native scalar codec is infallible for this host type"),
             )
             .expect("generated scalar codec and catalog sort disagree"),
         )
@@ -1035,11 +958,9 @@ impl ::core::convert::From<&()> for self::Unit {
         Self(
             crate::typed::expr::Expr::literal(
                 <Self as crate::typed::EgglogValue>::sort_ref(),
-                crate::typed::pb::PrimitiveValue {
-                    value: ::core::option::Option::Some(
-                        crate::typed::pb::primitive_value::Value::Unit(crate::typed::pb::Unit {}),
-                    ),
-                },
+                crate::protobuf::value::Scalar::Unit
+                    .encode()
+                    .expect("native scalar codec is infallible for this host type"),
             )
             .expect("generated scalar codec and catalog sort disagree"),
         )
@@ -1065,22 +986,22 @@ impl ::core::convert::TryFrom<&self::Unit> for () {
                 ::std::borrow::ToOwned::to_owned("literal wrapper has another sort"),
             ));
         }
-
-        match &__egglog_node.kind {
-            ::core::option::Option::Some(crate::typed::pb::node::Kind::PrimitiveValue(
-                crate::typed::pb::PrimitiveValue {
-                    value:
-                        ::core::option::Option::Some(crate::typed::pb::primitive_value::Value::Unit(
-                            __egglog_value,
-                        )),
-                },
-            )) => ::core::result::Result::Ok(()),
-            _ => ::core::result::Result::Err(crate::typed::TypedError::Decode(
-                ::std::borrow::ToOwned::to_owned(
-                    "expected an exact () literal, not symbolic syntax",
-                ),
-            )),
+        if let ::core::option::Option::Some(crate::typed::pb::node::Kind::PrimitiveValue(
+            __egglog_value,
+        )) = &__egglog_node.kind
+        {
+            let __egglog_value = crate::protobuf::value::Scalar::decode(
+                ::core::option::Option::Some("Unit"),
+                __egglog_value,
+            )
+            .map_err(crate::typed::TypedError::Decode)?;
+            if let crate::protobuf::value::Scalar::Unit = __egglog_value {
+                return ::core::result::Result::Ok(());
+            }
         }
+        ::core::result::Result::Err(crate::typed::TypedError::Decode(
+            ::std::borrow::ToOwned::to_owned("expected an exact () literal, not symbolic syntax"),
+        ))
     }
 }
 
@@ -1188,11 +1109,9 @@ impl ::core::convert::From<::core::primitive::bool> for self::Bool {
         Self(
             crate::typed::expr::Expr::literal(
                 <Self as crate::typed::EgglogValue>::sort_ref(),
-                crate::typed::pb::PrimitiveValue {
-                    value: ::core::option::Option::Some(
-                        crate::typed::pb::primitive_value::Value::Bool(__egglog_value),
-                    ),
-                },
+                crate::protobuf::value::Scalar::Bool(__egglog_value)
+                    .encode()
+                    .expect("native scalar codec is infallible for this host type"),
             )
             .expect("generated scalar codec and catalog sort disagree"),
         )
@@ -1200,15 +1119,13 @@ impl ::core::convert::From<::core::primitive::bool> for self::Bool {
 }
 impl ::core::convert::From<&::core::primitive::bool> for self::Bool {
     fn from(__egglog_value: &::core::primitive::bool) -> Self {
-        let __egglog_value = *__egglog_value;
+        let __egglog_value = ::core::clone::Clone::clone(__egglog_value);
         Self(
             crate::typed::expr::Expr::literal(
                 <Self as crate::typed::EgglogValue>::sort_ref(),
-                crate::typed::pb::PrimitiveValue {
-                    value: ::core::option::Option::Some(
-                        crate::typed::pb::primitive_value::Value::Bool(__egglog_value),
-                    ),
-                },
+                crate::protobuf::value::Scalar::Bool(__egglog_value)
+                    .encode()
+                    .expect("native scalar codec is infallible for this host type"),
             )
             .expect("generated scalar codec and catalog sort disagree"),
         )
@@ -1234,22 +1151,24 @@ impl ::core::convert::TryFrom<&self::Bool> for ::core::primitive::bool {
                 ::std::borrow::ToOwned::to_owned("literal wrapper has another sort"),
             ));
         }
-
-        match &__egglog_node.kind {
-            ::core::option::Option::Some(crate::typed::pb::node::Kind::PrimitiveValue(
-                crate::typed::pb::PrimitiveValue {
-                    value:
-                        ::core::option::Option::Some(crate::typed::pb::primitive_value::Value::Bool(
-                            __egglog_value,
-                        )),
-                },
-            )) => ::core::result::Result::Ok(*__egglog_value),
-            _ => ::core::result::Result::Err(crate::typed::TypedError::Decode(
-                ::std::borrow::ToOwned::to_owned(
-                    "expected an exact ::core::primitive::bool literal, not symbolic syntax",
-                ),
-            )),
+        if let ::core::option::Option::Some(crate::typed::pb::node::Kind::PrimitiveValue(
+            __egglog_value,
+        )) = &__egglog_node.kind
+        {
+            let __egglog_value = crate::protobuf::value::Scalar::decode(
+                ::core::option::Option::Some("bool"),
+                __egglog_value,
+            )
+            .map_err(crate::typed::TypedError::Decode)?;
+            if let crate::protobuf::value::Scalar::Bool(__egglog_value) = __egglog_value {
+                return ::core::result::Result::Ok(__egglog_value);
+            }
         }
+        ::core::result::Result::Err(crate::typed::TypedError::Decode(
+            ::std::borrow::ToOwned::to_owned(
+                "expected an exact ::core::primitive::bool literal, not symbolic syntax",
+            ),
+        ))
     }
 }
 
@@ -1291,11 +1210,9 @@ impl ::core::convert::From<::core::primitive::f64> for self::F64 {
         Self(
             crate::typed::expr::Expr::literal(
                 <Self as crate::typed::EgglogValue>::sort_ref(),
-                crate::typed::pb::PrimitiveValue {
-                    value: ::core::option::Option::Some(
-                        crate::typed::pb::primitive_value::Value::F64Bits(__egglog_value.to_bits()),
-                    ),
-                },
+                crate::protobuf::value::Scalar::F64Bits(__egglog_value.to_bits())
+                    .encode()
+                    .expect("native scalar codec is infallible for this host type"),
             )
             .expect("generated scalar codec and catalog sort disagree"),
         )
@@ -1303,15 +1220,13 @@ impl ::core::convert::From<::core::primitive::f64> for self::F64 {
 }
 impl ::core::convert::From<&::core::primitive::f64> for self::F64 {
     fn from(__egglog_value: &::core::primitive::f64) -> Self {
-        let __egglog_value = *__egglog_value;
+        let __egglog_value = ::core::clone::Clone::clone(__egglog_value);
         Self(
             crate::typed::expr::Expr::literal(
                 <Self as crate::typed::EgglogValue>::sort_ref(),
-                crate::typed::pb::PrimitiveValue {
-                    value: ::core::option::Option::Some(
-                        crate::typed::pb::primitive_value::Value::F64Bits(__egglog_value.to_bits()),
-                    ),
-                },
+                crate::protobuf::value::Scalar::F64Bits(__egglog_value.to_bits())
+                    .encode()
+                    .expect("native scalar codec is infallible for this host type"),
             )
             .expect("generated scalar codec and catalog sort disagree"),
         )
@@ -1337,22 +1252,26 @@ impl ::core::convert::TryFrom<&self::F64> for ::core::primitive::f64 {
                 ::std::borrow::ToOwned::to_owned("literal wrapper has another sort"),
             ));
         }
-
-        match &__egglog_node.kind {
-            ::core::option::Option::Some(crate::typed::pb::node::Kind::PrimitiveValue(
-                crate::typed::pb::PrimitiveValue {
-                    value:
-                        ::core::option::Option::Some(crate::typed::pb::primitive_value::Value::F64Bits(
-                            __egglog_value,
-                        )),
-                },
-            )) => ::core::result::Result::Ok(::core::primitive::f64::from_bits(*__egglog_value)),
-            _ => ::core::result::Result::Err(crate::typed::TypedError::Decode(
-                ::std::borrow::ToOwned::to_owned(
-                    "expected an exact ::core::primitive::f64 literal, not symbolic syntax",
-                ),
-            )),
+        if let ::core::option::Option::Some(crate::typed::pb::node::Kind::PrimitiveValue(
+            __egglog_value,
+        )) = &__egglog_node.kind
+        {
+            let __egglog_value = crate::protobuf::value::Scalar::decode(
+                ::core::option::Option::Some("f64"),
+                __egglog_value,
+            )
+            .map_err(crate::typed::TypedError::Decode)?;
+            if let crate::protobuf::value::Scalar::F64Bits(__egglog_value) = __egglog_value {
+                return ::core::result::Result::Ok(::core::primitive::f64::from_bits(
+                    __egglog_value,
+                ));
+            }
         }
+        ::core::result::Result::Err(crate::typed::TypedError::Decode(
+            ::std::borrow::ToOwned::to_owned(
+                "expected an exact ::core::primitive::f64 literal, not symbolic syntax",
+            ),
+        ))
     }
 }
 
@@ -1394,11 +1313,9 @@ impl ::core::convert::From<::core::primitive::i64> for self::I64 {
         Self(
             crate::typed::expr::Expr::literal(
                 <Self as crate::typed::EgglogValue>::sort_ref(),
-                crate::typed::pb::PrimitiveValue {
-                    value: ::core::option::Option::Some(
-                        crate::typed::pb::primitive_value::Value::I64(__egglog_value),
-                    ),
-                },
+                crate::protobuf::value::Scalar::I64(__egglog_value)
+                    .encode()
+                    .expect("native scalar codec is infallible for this host type"),
             )
             .expect("generated scalar codec and catalog sort disagree"),
         )
@@ -1406,15 +1323,13 @@ impl ::core::convert::From<::core::primitive::i64> for self::I64 {
 }
 impl ::core::convert::From<&::core::primitive::i64> for self::I64 {
     fn from(__egglog_value: &::core::primitive::i64) -> Self {
-        let __egglog_value = *__egglog_value;
+        let __egglog_value = ::core::clone::Clone::clone(__egglog_value);
         Self(
             crate::typed::expr::Expr::literal(
                 <Self as crate::typed::EgglogValue>::sort_ref(),
-                crate::typed::pb::PrimitiveValue {
-                    value: ::core::option::Option::Some(
-                        crate::typed::pb::primitive_value::Value::I64(__egglog_value),
-                    ),
-                },
+                crate::protobuf::value::Scalar::I64(__egglog_value)
+                    .encode()
+                    .expect("native scalar codec is infallible for this host type"),
             )
             .expect("generated scalar codec and catalog sort disagree"),
         )
@@ -1455,22 +1370,24 @@ impl ::core::convert::TryFrom<&self::I64> for ::core::primitive::i64 {
                 ::std::borrow::ToOwned::to_owned("literal wrapper has another sort"),
             ));
         }
-
-        match &__egglog_node.kind {
-            ::core::option::Option::Some(crate::typed::pb::node::Kind::PrimitiveValue(
-                crate::typed::pb::PrimitiveValue {
-                    value:
-                        ::core::option::Option::Some(crate::typed::pb::primitive_value::Value::I64(
-                            __egglog_value,
-                        )),
-                },
-            )) => ::core::result::Result::Ok(*__egglog_value),
-            _ => ::core::result::Result::Err(crate::typed::TypedError::Decode(
-                ::std::borrow::ToOwned::to_owned(
-                    "expected an exact ::core::primitive::i64 literal, not symbolic syntax",
-                ),
-            )),
+        if let ::core::option::Option::Some(crate::typed::pb::node::Kind::PrimitiveValue(
+            __egglog_value,
+        )) = &__egglog_node.kind
+        {
+            let __egglog_value = crate::protobuf::value::Scalar::decode(
+                ::core::option::Option::Some("i64"),
+                __egglog_value,
+            )
+            .map_err(crate::typed::TypedError::Decode)?;
+            if let crate::protobuf::value::Scalar::I64(__egglog_value) = __egglog_value {
+                return ::core::result::Result::Ok(__egglog_value);
+            }
         }
+        ::core::result::Result::Err(crate::typed::TypedError::Decode(
+            ::std::borrow::ToOwned::to_owned(
+                "expected an exact ::core::primitive::i64 literal, not symbolic syntax",
+            ),
+        ))
     }
 }
 

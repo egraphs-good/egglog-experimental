@@ -108,29 +108,27 @@ impl<K: Eq + Hash, F: Fn(&ArcSort, Value) -> K> Export<'_, K, F> {
                     [self.program.nodes[index as usize].sort_id as usize]
                     .kind
                     .as_ref();
-                let admitted = match family {
-                    Some(pb::sort::Kind::Func(_)) => {
-                        actual == Some(TypeId::of::<egglog::sort::FunctionContainer>())
-                            && sort.clone().as_arc_any().is::<egglog::sort::FunctionSort>()
+                match family {
+                    Some(pb::sort::Kind::Func(_))
+                        if actual == Some(TypeId::of::<egglog::sort::FunctionContainer>())
+                            && sort.clone().as_arc_any().is::<egglog::sort::FunctionSort>() =>
+                    {
+                        ()
                     }
-                    Some(pb::sort::Kind::Application(f)) => match f.name.as_str() {
-                        "Vec" => actual == Some(TypeId::of::<egglog::sort::VecContainer>()),
-                        "Set" => actual == Some(TypeId::of::<egglog::sort::SetContainer>()),
-                        "MultiSet" => {
-                            actual == Some(TypeId::of::<egglog::sort::MultiSetContainer>())
-                        }
-                        "Pair" => actual == Some(TypeId::of::<egglog::sort::PairContainer>()),
-                        "Map" => actual == Some(TypeId::of::<egglog::sort::MapContainer>()),
-                        "Maybe" => actual == Some(TypeId::of::<crate::maybe::MaybeContainer>()),
-                        _ => false,
-                    },
-                    _ => false,
-                };
-                if !admitted {
-                    return Err(egglog::Error::BackendError(format!(
-                        "Freeze has no inert container codec for {}",
-                        sort.name()
-                    )));
+                    Some(pb::sort::Kind::Application(_)) => {
+                        value::container_kind(
+                            &sort,
+                            &self.program.sorts
+                                [self.program.nodes[index as usize].sort_id as usize],
+                        )
+                        .map_err(egglog::Error::BackendError)?;
+                    }
+                    _ => {
+                        return Err(egglog::Error::BackendError(format!(
+                            "Freeze has no inert container codec for {}",
+                            sort.name()
+                        )));
+                    }
                 }
                 let native_children = self.session.graph.container_inner_values(&sort, value);
                 let children = native_children
@@ -161,56 +159,13 @@ impl<K: Eq + Hash, F: Fn(&ArcSort, Value) -> K> Export<'_, K, F> {
                             args: children,
                         })
                     }
-                    Some(pb::sort::Kind::Application(f)) => match (f.name.as_str(), actual) {
-                        ("Vec", Some(t)) if t == TypeId::of::<egglog::sort::VecContainer>() => {
-                            V::Vec(pb::ValueList { items: children })
-                        }
-                        ("Set", Some(t)) if t == TypeId::of::<egglog::sort::SetContainer>() => {
-                            V::Set(pb::ValueList { items: children })
-                        }
-                        ("MultiSet", Some(t))
-                            if t == TypeId::of::<egglog::sort::MultiSetContainer>() =>
-                        {
-                            V::Multiset(pb::ValueList { items: children })
-                        }
-                        ("Pair", Some(t))
-                            if t == TypeId::of::<egglog::sort::PairContainer>()
-                                && children.len() == 2 =>
-                        {
-                            V::Pair(pb::PairValue {
-                                first: Some(children[0]),
-                                second: Some(children[1]),
-                            })
-                        }
-                        ("Map", Some(t))
-                            if t == TypeId::of::<egglog::sort::MapContainer>()
-                                && children.len().is_multiple_of(2) =>
-                        {
-                            V::Map(pb::MapValue {
-                                entries: children
-                                    .chunks_exact(2)
-                                    .map(|pair| pb::MapEntry {
-                                        key: Some(pair[0]),
-                                        value: Some(pair[1]),
-                                    })
-                                    .collect(),
-                            })
-                        }
-                        ("Maybe", Some(t))
-                            if t == TypeId::of::<crate::maybe::MaybeContainer>()
-                                && children.len() <= 1 =>
-                        {
-                            V::Maybe(pb::MaybeValue {
-                                value: children.first().copied(),
-                            })
-                        }
-                        _ => {
-                            return Err(egglog::Error::BackendError(format!(
-                                "Freeze has no inert container codec for {}",
-                                sort.name()
-                            )));
-                        }
-                    },
+                    Some(pb::sort::Kind::Application(_)) => value::container_payload(
+                        &sort,
+                        &self.program.sorts[self.program.nodes[index as usize].sort_id as usize],
+                        &children,
+                        &self.program.nodes,
+                    )
+                    .map_err(egglog::Error::BackendError)?,
                     _ => {
                         return Err(egglog::Error::BackendError(format!(
                             "Freeze has no inert container codec for {}",
@@ -219,42 +174,22 @@ impl<K: Eq + Hash, F: Fn(&ArcSort, Value) -> K> Export<'_, K, F> {
                     }
                 }
             } else {
-                // Invoke only known inert base reconstructions. An arbitrary
-                // host sort's default reconstruction may panic or materialize.
-                use std::any::TypeId;
-                let actual = sort.value_type();
-                let family = self.program.sorts
+                let family = match &self.program.sorts
                     [self.program.nodes[index as usize].sort_id as usize]
                     .kind
-                    .as_ref();
-                let expected = match family {
-                    Some(pb::sort::Kind::Application(f)) if f.args.is_empty() => {
-                        match f.name.as_str() {
-                            "Unit" => Some(TypeId::of::<()>()),
-                            "bool" => Some(TypeId::of::<bool>()),
-                            "i64" => Some(TypeId::of::<i64>()),
-                            "f64" => Some(TypeId::of::<egglog::sort::F>()),
-                            "String" => Some(TypeId::of::<egglog::sort::S>()),
-                            "BigInt" => Some(TypeId::of::<egglog::sort::Z>()),
-                            "BigRat" => Some(TypeId::of::<egglog::sort::Q>()),
-                            "Rational" => Some(TypeId::of::<crate::rational::R>()),
-                            _ => None,
-                        }
+                {
+                    Some(pb::sort::Kind::Application(family)) if family.args.is_empty() => family,
+                    _ => {
+                        return Err(egglog::Error::BackendError(
+                            "Freeze scalar has a non-leaf sort".into(),
+                        ));
                     }
-                    _ => None,
                 };
-                let registered = match family {
-                    Some(pb::sort::Kind::Application(f)) => {
-                        self.session.graph.get_sort_by_name(&f.name)
-                    }
-                    _ => None,
-                };
-                if expected.is_none()
-                    || expected != actual
-                    || !registered.is_some_and(|registered| {
-                        // Literal resolution creates fresh immutable builtin
-                        // sort objects. Require the exact native implementation,
-                        // rather than the allocation used by the registry.
+                if !self
+                    .session
+                    .graph
+                    .get_sort_by_name(&family.name)
+                    .is_some_and(|registered| {
                         registered.clone().as_arc_any().as_ref().type_id()
                             == sort.clone().as_arc_any().as_ref().type_id()
                     })
@@ -264,29 +199,17 @@ impl<K: Eq + Hash, F: Fn(&ArcSort, Value) -> K> Export<'_, K, F> {
                         sort.name()
                     )));
                 }
-                let mut terms = TermDag::default();
-                let term = self
-                    .session
-                    .graph
-                    .reconstruct_base_value(&sort, value, &mut terms);
-                if let Some(number) =
-                    encode_exact_number(&terms, term, &sort).map_err(egglog::Error::BackendError)?
-                {
-                    number
-                } else if let Term::Lit(literal) = terms.get(term) {
-                    match literal {
-                        Literal::Int(n) => V::I64(*n),
-                        Literal::Float(n) => V::F64Bits(n.0.to_bits()),
-                        Literal::String(s) => V::String(s.clone()),
-                        Literal::Bool(b) => V::Bool(*b),
-                        Literal::Unit => V::Unit(pb::Unit {}),
-                    }
-                } else {
-                    return Err(egglog::Error::BackendError(format!(
-                        "Freeze base reconstruction is not inert data for {}",
-                        sort.name()
-                    )));
-                }
+                let scalar =
+                    value::Scalar::reflect(self.session.graph, &sort, value).ok_or_else(|| {
+                        egglog::Error::BackendError(format!(
+                            "Freeze has no inert value codec for {}",
+                            sort.name()
+                        ))
+                    })?;
+                let encoded = scalar.encode().map_err(egglog::Error::BackendError)?;
+                value::Scalar::decode(Some(&family.name), &encoded)
+                    .map_err(egglog::Error::BackendError)?;
+                encoded.value.expect("scalar codec supplies a value")
             };
             self.program.nodes[index as usize].kind =
                 Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {

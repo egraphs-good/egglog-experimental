@@ -193,7 +193,6 @@ fn generate(
     let value_local = local_name("value", &occupied);
     let record_local = local_name("record", &occupied);
     let node_local = local_name("node", &occupied);
-    let error_local = local_name("error", &occupied);
     let mut identities = HashSet::new();
     for (declaration_index, family) in program.primitive_sorts.iter().enumerate() {
         if family.name.is_empty() || !identities.insert((false, &family.name)) {
@@ -228,59 +227,44 @@ fn generate(
                 "::core::primitive::i64",
                 "I64",
                 value_local.clone(),
-                format!("*{value_local}"),
+                value_local.clone(),
             ),
             "f64" => (
                 "::core::primitive::f64",
                 "F64Bits",
                 format!("{value_local}.to_bits()"),
-                format!("::core::primitive::f64::from_bits(*{value_local})"),
+                format!("::core::primitive::f64::from_bits({value_local})"),
             ),
             "String" => (
                 "::std::string::String",
                 "String",
                 value_local.clone(),
-                format!("::core::clone::Clone::clone({value_local})"),
+                value_local.clone(),
             ),
             "bool" => (
                 "::core::primitive::bool",
                 "Bool",
                 value_local.clone(),
-                format!("*{value_local}"),
+                value_local.clone(),
             ),
-            "Unit" => (
-                "()",
-                "Unit",
-                "crate::typed::pb::Unit {}".into(),
-                "()".into(),
-            ),
+            "Unit" => ("()", "Unit", "()".into(), "()".into()),
             "BigInt" => (
                 "::num::BigInt",
                 "BigInt",
-                format!("::std::string::ToString::to_string(&{value_local})"),
-                format!(
-                    "{value_local}.parse::<::num::BigInt>().map_err(|{error_local}| crate::typed::TypedError::Decode(::std::string::ToString::to_string(&{error_local})))?"
-                ),
+                value_local.clone(),
+                value_local.clone(),
             ),
             "BigRat" => (
                 "::num::BigRational",
                 "BigRat",
-                format!(
-                    "crate::typed::pb::BigRat {{ numerator: ::std::string::ToString::to_string({value_local}.numer()), denominator: ::std::string::ToString::to_string({value_local}.denom()) }}"
-                ),
-                format!(
-                    "::num::BigRational::new_raw({value_local}.numerator.parse::<::num::BigInt>().map_err(|{error_local}| crate::typed::TypedError::Decode(::std::string::ToString::to_string(&{error_local})))?, {value_local}.denominator.parse::<::num::BigInt>().map_err(|{error_local}| crate::typed::TypedError::Decode(::std::string::ToString::to_string(&{error_local})))?)"
-                ),
+                value_local.clone(),
+                value_local.clone(),
             ),
             "Rational" => (
                 "::num::rational::Rational64",
                 "Rational",
-                format!(
-                    "crate::typed::pb::Rational {{ numerator: *{value_local}.numer(), denominator: *{value_local}.denom() }}"
-                ),
-                format!(
-                    "::num::rational::Rational64::new_raw({value_local}.numerator, {value_local}.denominator)"
-                ),
+                value_local.clone(),
+                value_local.clone(),
             ),
             _ => {
                 deferred.push(family.name.clone());
@@ -340,12 +324,15 @@ fn generate(
                 write!(doc, "\nA host ratio may have been built with `new_raw`; use checked `TryFrom`, which rejects nonreduced values and nonpositive denominators without normalization.\n\n```compile_fail,E0277\nuse egglog_experimental::typed::builtins::{name};\nlet _: {name} = {host}::new(1.into(), 2.into()).into();\n```\n").unwrap();
             }
         }
-        let borrowed_value = if matches!(family.name.as_str(), "Unit" | "BigInt") {
+        let borrowed_value = if family.name == "Unit" {
             String::new()
-        } else if family.name == "String" {
-            format!("let {value_local} = ::core::clone::Clone::clone({value_local});")
         } else {
-            format!("let {value_local} = *{value_local};")
+            format!("let {value_local} = ::core::clone::Clone::clone({value_local});")
+        };
+        let scalar = if family.name == "Unit" {
+            "crate::protobuf::value::Scalar::Unit".into()
+        } else {
+            format!("crate::protobuf::value::Scalar::{arm}({encode})")
         };
         writeln!(source, r#"
 #[doc = {doc:?}]
@@ -373,17 +360,14 @@ impl crate::typed::EgglogValue for self::{name} {{
 impl ::core::convert::TryFrom<{host}> for self::{name} {{
     type Error = crate::typed::TypedError;
     fn try_from({value_local}: {host}) -> ::core::result::Result<Self, Self::Error> {{
-        ::core::result::Result::Ok(Self(crate::typed::expr::Expr::literal(<Self as crate::typed::EgglogValue>::sort_ref(), crate::typed::pb::PrimitiveValue {{
-            value: ::core::option::Option::Some(crate::typed::pb::primitive_value::Value::{arm}({encode})),
-        }})?))
+        ::core::result::Result::Ok(Self(crate::typed::expr::Expr::literal(<Self as crate::typed::EgglogValue>::sort_ref(), {scalar}.encode().map_err(crate::typed::TypedError::Decode)?)?))
     }}
 }}
 impl ::core::convert::TryFrom<&{host}> for self::{name} {{
     type Error = crate::typed::TypedError;
     fn try_from({value_local}: &{host}) -> ::core::result::Result<Self, Self::Error> {{
-        ::core::result::Result::Ok(Self(crate::typed::expr::Expr::literal(<Self as crate::typed::EgglogValue>::sort_ref(), crate::typed::pb::PrimitiveValue {{
-            value: ::core::option::Option::Some(crate::typed::pb::primitive_value::Value::{arm}({encode})),
-        }})?))
+        {borrowed_value}
+        ::core::result::Result::Ok(Self(crate::typed::expr::Expr::literal(<Self as crate::typed::EgglogValue>::sort_ref(), {scalar}.encode().map_err(crate::typed::TypedError::Decode)?)?))
     }}
 }}
 "#).unwrap();
@@ -391,17 +375,13 @@ impl ::core::convert::TryFrom<&{host}> for self::{name} {{
             writeln!(source, r#"
 impl ::core::convert::From<{host}> for self::{name} {{
     fn from({value_local}: {host}) -> Self {{
-        Self(crate::typed::expr::Expr::literal(<Self as crate::typed::EgglogValue>::sort_ref(), crate::typed::pb::PrimitiveValue {{
-            value: ::core::option::Option::Some(crate::typed::pb::primitive_value::Value::{arm}({encode})),
-        }}).expect("generated scalar codec and catalog sort disagree"))
+        Self(crate::typed::expr::Expr::literal(<Self as crate::typed::EgglogValue>::sort_ref(), {scalar}.encode().expect("native scalar codec is infallible for this host type")).expect("generated scalar codec and catalog sort disagree"))
     }}
 }}
 impl ::core::convert::From<&{host}> for self::{name} {{
     fn from({value_local}: &{host}) -> Self {{
         {borrowed_value}
-        Self(crate::typed::expr::Expr::literal(<Self as crate::typed::EgglogValue>::sort_ref(), crate::typed::pb::PrimitiveValue {{
-            value: ::core::option::Option::Some(crate::typed::pb::primitive_value::Value::{arm}({encode})),
-        }}).expect("generated scalar codec and catalog sort disagree"))
+        Self(crate::typed::expr::Expr::literal(<Self as crate::typed::EgglogValue>::sort_ref(), {scalar}.encode().expect("native scalar codec is infallible for this host type")).expect("generated scalar codec and catalog sort disagree"))
     }}
 }}
 "#).unwrap();
@@ -420,13 +400,11 @@ impl ::core::convert::From<&::core::primitive::i32> for self::{name} {{
 }}
 "#).unwrap();
         }
-        let decode_validation = if matches!(family.name.as_str(), "BigInt" | "BigRat" | "Rational")
-        {
-            format!(
-                "if let ::core::option::Option::Some(crate::typed::pb::node::Kind::PrimitiveValue({value_local})) = &{node_local}.kind {{ crate::typed::expr::validate_literal(&<self::{name} as crate::typed::EgglogValue>::sort_ref(), {value_local})?; }}"
-            )
+        let family_name = &family.name;
+        let scalar_pattern = if family.name == "Unit" {
+            "crate::protobuf::value::Scalar::Unit".into()
         } else {
-            String::new()
+            format!("crate::protobuf::value::Scalar::{arm}({value_local})")
         };
         writeln!(source, r#"
 impl ::core::convert::TryFrom<&self::{name}> for {host} {{
@@ -437,13 +415,13 @@ impl ::core::convert::TryFrom<&self::{name}> for {host} {{
         if crate::typed::SortRef({record_local}.resolve(crate::typed::storage::Arena::Sort, {node_local}.sort_id)?) != <self::{name} as crate::typed::EgglogValue>::sort_ref() {{
             return ::core::result::Result::Err(crate::typed::TypedError::Decode(::std::borrow::ToOwned::to_owned("literal wrapper has another sort")));
         }}
-        {decode_validation}
-        match &{node_local}.kind {{
-            ::core::option::Option::Some(crate::typed::pb::node::Kind::PrimitiveValue(crate::typed::pb::PrimitiveValue {{
-                value: ::core::option::Option::Some(crate::typed::pb::primitive_value::Value::{arm}({value_local})),
-            }})) => ::core::result::Result::Ok({decode}),
-            _ => ::core::result::Result::Err(crate::typed::TypedError::Decode(::std::borrow::ToOwned::to_owned("expected an exact {host} literal, not symbolic syntax"))),
+        if let ::core::option::Option::Some(crate::typed::pb::node::Kind::PrimitiveValue({value_local})) = &{node_local}.kind {{
+            let {value_local} = crate::protobuf::value::Scalar::decode(::core::option::Option::Some({family_name:?}), {value_local}).map_err(crate::typed::TypedError::Decode)?;
+            if let {scalar_pattern} = {value_local} {{
+                return ::core::result::Result::Ok({decode});
+            }}
         }}
+        ::core::result::Result::Err(crate::typed::TypedError::Decode(::std::borrow::ToOwned::to_owned("expected an exact {host} literal, not symbolic syntax")))
     }}
 }}
 "#).unwrap();
