@@ -240,9 +240,12 @@ fn equality_node(left: &Expr, right: &Expr) -> Expr {
 /// An immutable authored rule value. Registration deduplicates rule content.
 #[derive(Clone)]
 pub struct Rule(pub(super) Record, pub(super) Option<String>);
-/// An ordered collection of generated group additions, reusable across runs.
+/// An immutable ordered collection of rules, optionally published under a name.
 #[derive(Clone)]
-pub struct Ruleset(pub(super) Vec<Record>, pub(super) Option<String>);
+pub struct Ruleset {
+    pub(super) rules: Vec<Rule>,
+    pub(super) name: Option<String>,
+}
 
 /// Match query facts and evaluate ordered expression actions for every match.
 ///
@@ -401,50 +404,47 @@ where
 
 #[doc(hidden)]
 pub trait IntoRules<A> {
-    fn append(self, rules: &mut Vec<Rule>, groups: &mut Vec<Ruleset>);
+    fn append(self, rules: &mut Vec<Rule>);
 }
 impl IntoRules<()> for Rule {
-    fn append(self, rules: &mut Vec<Rule>, _: &mut Vec<Ruleset>) {
+    fn append(self, rules: &mut Vec<Rule>) {
         rules.push(self);
     }
 }
 impl IntoRules<()> for &Rule {
-    fn append(self, rules: &mut Vec<Rule>, _: &mut Vec<Ruleset>) {
+    fn append(self, rules: &mut Vec<Rule>) {
         rules.push(self.clone());
     }
 }
 impl IntoRules<()> for Ruleset {
-    fn append(self, rules: &mut Vec<Rule>, groups: &mut Vec<Ruleset>) {
-        if !rules.is_empty() {
-            groups.push(rule_list(std::mem::take(rules), None));
-        }
-        groups.push(self);
+    fn append(self, rules: &mut Vec<Rule>) {
+        rules.extend(self.rules);
     }
 }
 impl IntoRules<()> for &Ruleset {
-    fn append(self, rules: &mut Vec<Rule>, groups: &mut Vec<Ruleset>) {
-        self.clone().append(rules, groups);
+    fn append(self, rules: &mut Vec<Rule>) {
+        rules.extend(self.rules.iter().cloned());
     }
 }
 impl<F: FnOnce() -> Ruleset> IntoRules<()> for &LazyLock<Ruleset, F> {
-    fn append(self, rules: &mut Vec<Rule>, groups: &mut Vec<Ruleset>) {
-        (&**self).append(rules, groups);
+    fn append(self, rules: &mut Vec<Rule>) {
+        (&**self).append(rules);
     }
 }
 impl IntoRules<()> for () {
-    fn append(self, _: &mut Vec<Rule>, _: &mut Vec<Ruleset>) {}
+    fn append(self, _: &mut Vec<Rule>) {}
 }
 impl<T: IntoRules<()>> IntoRules<()> for Vec<T> {
-    fn append(self, rules: &mut Vec<Rule>, groups: &mut Vec<Ruleset>) {
+    fn append(self, rules: &mut Vec<Rule>) {
         for item in self {
-            item.append(rules, groups);
+            item.append(rules);
         }
     }
 }
 impl<T: IntoRules<()>, const N: usize> IntoRules<()> for [T; N] {
-    fn append(self, rules: &mut Vec<Rule>, groups: &mut Vec<Ruleset>) {
+    fn append(self, rules: &mut Vec<Rule>) {
         for item in self {
-            item.append(rules, groups);
+            item.append(rules);
         }
     }
 }
@@ -452,9 +452,9 @@ impl<'a, T> IntoRules<()> for &'a [T]
 where
     &'a T: IntoRules<()>,
 {
-    fn append(self, rules: &mut Vec<Rule>, groups: &mut Vec<Ruleset>) {
+    fn append(self, rules: &mut Vec<Rule>) {
         for item in self {
-            item.append(rules, groups);
+            item.append(rules);
         }
     }
 }
@@ -463,19 +463,19 @@ macro_rules! callbacks {
     ($($t:ident:$i:tt),*) => {
         impl<F, R, $($t: EgglogValue,)*> IntoRules<fn($($t),*)> for F
         where F: FnOnce($(&$t),*) -> R, R: IntoRules<()> {
-            fn append(self, rules: &mut Vec<Rule>, groups: &mut Vec<Ruleset>) {
+            fn append(self, rules: &mut Vec<Rule>) {
                 let scope = fresh_scope();
                 let _ = scope;
-                self($(&variable::<$t>(scope, $i)),*).append(rules, groups);
+                self($(&variable::<$t>(scope, $i)),*).append(rules);
             }
         }
     };
 }
 callbacks!();
 
-/// Build a reusable selection from rules, groups or a fresh-variable callback.
+/// Build a reusable collection from rules, rulesets or a fresh-variable callback.
 /// Fresh arguments may escape the callback and keep their variable identity.
-/// Collections preserve registration order; selected groups share equal rule content.
+/// Composition captures members in order; execution shares equal rule content.
 pub fn ruleset<A>(source: impl IntoRules<A>) -> Ruleset {
     named_ruleset(|| None, source)
 }
@@ -487,68 +487,11 @@ pub fn named_ruleset<A>(
     source: impl IntoRules<A>,
 ) -> Ruleset {
     let mut rules = vec![];
-    let mut groups = vec![];
-    source.append(&mut rules, &mut groups);
-    let name = name();
-    if groups.is_empty() {
-        return rule_list(rules, name);
+    source.append(&mut rules);
+    Ruleset {
+        rules,
+        name: name(),
     }
-    if !rules.is_empty() {
-        groups.push(rule_list(rules, None));
-    }
-    let error = groups.iter().find_map(|g| g.1.clone());
-    if let Some(name) = name {
-        let mut captured = Vec::new();
-        for group in groups {
-            for addition in group.0 {
-                let owner = addition.owner.as_ref().unwrap();
-                let Some(pb::command::Kind::AddRules(add)) =
-                    &owner.program().unwrap().commands[addition.index as usize].kind
-                else {
-                    unreachable!("typed group addition")
-                };
-                for index in 0..add.rules.len() {
-                    captured.push(Rule(
-                        addition.resolve(Arena::Rule, index as u32).unwrap(),
-                        None,
-                    ));
-                }
-            }
-        }
-        let mut result = rule_list(captured, Some(name));
-        result.1 = error;
-        return result;
-    }
-    let mut seen = std::collections::HashSet::new();
-    Ruleset(
-        groups
-            .into_iter()
-            .flat_map(|g| g.0)
-            .filter(|addition| seen.insert(addition.key()))
-            .collect(),
-        error,
-    )
-}
-
-// A canonical AddRules command keeps registration order and its rule imports.
-fn rule_list(rules: Vec<Rule>, name: Option<String>) -> Ruleset {
-    let program = pb::Program {
-        commands: vec![pb::Command {
-            kind: Some(pb::command::Kind::AddRules(pb::AddRules {
-                group: name.unwrap_or_else(|| format!("__typed_group_{}", fresh_scope())),
-                rules: vec![pb::Rule::default(); rules.len()],
-            })),
-            ..Default::default()
-        }],
-        ..Default::default()
-    };
-    let mut slots = std::array::from_fn(|_| vec![]);
-    let error = rules.iter().find_map(|r| r.1.clone());
-    slots[Arena::Rule as usize] = rules.into_iter().map(|r| Slot::External(r.0)).collect();
-    Ruleset(
-        vec![publish(program, slots, vec![], Arena::Command, 0, vec![]).unwrap()],
-        error,
-    )
 }
 
 #[doc(hidden)]
@@ -731,8 +674,8 @@ macro_rules! tuples {
             }
         }
         impl<$($t: IntoRules<()>),*> IntoRules<()> for ($($t,)*) {
-            fn append(self, rules: &mut Vec<Rule>, groups: &mut Vec<Ruleset>) {
-                $(self.$i.append(rules, groups);)*
+            fn append(self, rules: &mut Vec<Rule>) {
+                $(self.$i.append(rules);)*
             }
         }
     };

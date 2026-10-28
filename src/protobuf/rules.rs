@@ -1,35 +1,55 @@
-//! Content-keyed registration with one native rule state shared by all groups.
+//! Content-keyed registration with rule progress independent of named bindings.
 
 use super::*;
+use std::ops::Range;
 
-// Request-local provenance for each inline addition. Fail wrappers are path
-// transparent, matching CommandLocation; loop bodies add one list coordinate.
-pub(super) fn additions(
-    commands: &[pb::Command],
-) -> impl Iterator<Item = (Vec<u32>, &pb::AddRules)> {
-    let mut pending = commands
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub(super) enum Site {
+    Binding(usize),
+    Selection(Vec<u32>, usize),
+}
+
+// Fail wrappers are path transparent; loop bodies add a list coordinate.
+pub(super) fn collections(program: &pb::Program) -> impl Iterator<Item = (Site, &pb::Ruleset)> {
+    let bindings = program
+        .rulesets
+        .iter()
+        .enumerate()
+        .filter_map(|(index, binding)| {
+            binding
+                .value
+                .as_ref()
+                .map(|value| (Site::Binding(index), value))
+        });
+    let mut pending = program
+        .commands
         .iter()
         .enumerate()
         .rev()
         .map(|(index, command)| (vec![index as u32], command))
         .collect::<Vec<_>>();
-    std::iter::from_fn(move || {
-        loop {
-            let (path, command) = pending.pop()?;
-            match &command.kind {
-                Some(pb::command::Kind::AddRules(add)) => return Some((path, add)),
-                Some(pb::command::Kind::Fail(child)) => pending.push((path, child)),
-                Some(pb::command::Kind::Loop(body)) => {
-                    pending.extend(body.body.iter().enumerate().rev().map(|(index, command)| {
-                        let mut path = path.clone();
-                        path.push(index as u32);
-                        (path, command)
-                    }))
+    let mut literals = vec![];
+    while let Some((path, command)) = pending.pop() {
+        match &command.kind {
+            Some(pb::command::Kind::Run(run)) => {
+                for (index, selection) in run.rulesets.iter().enumerate() {
+                    if let Some(pb::ruleset_selection::Kind::Ruleset(value)) = &selection.kind {
+                        literals.push((Site::Selection(path.clone(), index), value));
+                    }
                 }
-                _ => (),
             }
+            Some(pb::command::Kind::Fail(child)) => pending.push((path, child)),
+            Some(pb::command::Kind::Loop(body)) => {
+                pending.extend(body.body.iter().enumerate().rev().map(|(index, command)| {
+                    let mut path = path.clone();
+                    path.push(index as u32);
+                    (path, command)
+                }));
+            }
+            _ => (),
         }
-    })
+    }
+    bindings.chain(literals)
 }
 
 #[derive(Clone)]
@@ -51,7 +71,6 @@ pub(super) struct Registry {
     pub rules: Vec<Registered>,
     pub keys: HashMap<Vec<u8>, usize>,
     pub groups: HashMap<String, Vec<usize>>,
-    membership: HashSet<(String, usize)>,
     selections: HashMap<Vec<usize>, String>,
 }
 
@@ -71,67 +90,91 @@ impl Registry {
 
     pub(super) fn ordered_union(&self, groups: &[String]) -> Vec<usize> {
         let mut seen = HashSet::new();
-        let mut indices = vec![];
-        for group in groups {
-            if let Some(rules) = self.groups.get(group) {
-                indices.extend(rules.iter().copied().filter(|index| seen.insert(*index)));
-            }
-        }
-        indices
+        groups
+            .iter()
+            .filter_map(|group| self.groups.get(group))
+            .flatten()
+            .copied()
+            .filter(|index| seen.insert(*index))
+            .collect()
     }
 
-    pub(super) fn add(
-        &mut self,
+    pub(super) fn resolve(
+        &self,
+        selections: &[pb::RulesetSelection],
         path: &[u32],
-        add: &pb::AddRules,
+        context: &RequestOccurrences,
+    ) -> Vec<usize> {
+        let mut seen = HashSet::new();
+        let mut result = vec![];
+        for (index, selection) in selections.iter().enumerate() {
+            let indices: &[usize] = match selection.kind.as_ref().expect("validated selection") {
+                pb::ruleset_selection::Kind::Name(name) => {
+                    self.groups.get(name).map_or(&[], Vec::as_slice)
+                }
+                pb::ruleset_selection::Kind::Ruleset(_) => {
+                    &context.literal_rules[&Site::Selection(path.to_vec(), index)]
+                }
+            };
+            result.extend(indices.iter().copied().filter(|index| seen.insert(*index)));
+        }
+        result
+    }
+
+    // Registration may partially succeed in the native backend. Retain each
+    // completed step so a later request resumes its installation safely.
+    pub(super) fn install(
+        &mut self,
         candidates: &[Candidate],
+        ranges: &[(Site, Range<usize>)],
+        bindings: &[pb::RulesetBinding],
         executor: &mut NativeExecutor<'_>,
         context: &mut RequestOccurrences,
         response: &mut pb::RunProgramOutput,
     ) -> Result<(), egglog::Error> {
-        let start = *context
-            .candidate_offsets
-            .get(path)
-            .ok_or_else(|| egglog::Error::BackendError("unprepared inline addition".into()))?;
-        for local in 0..add.rules.len() {
-            let candidate = candidates.get(start + local).ok_or_else(|| {
-                egglog::Error::BackendError("unprepared inline rule occurrence".into())
-            })?;
-            let index = self.intern(candidate);
-            let rule = &mut self.rules[index];
-            while rule.completed < rule.candidate.commands.len() {
-                let (result, registered, _) = executor.run_observed(
-                    vec![rule.candidate.commands[rule.completed].clone()],
-                    None,
-                    context,
-                    response,
-                    None,
-                );
-                // A completed registration survives a later maintenance error.
-                if registered {
-                    rule.completed += 1;
+        let mut replacements = vec![];
+        for (site, range) in ranges {
+            let mut indices = vec![];
+            let mut seen = HashSet::new();
+            for candidate in &candidates[range.clone()] {
+                let index = self.intern(candidate);
+                let rule = &mut self.rules[index];
+                while rule.completed < rule.candidate.commands.len() {
+                    let (result, registered, _) = executor.run_observed(
+                        vec![rule.candidate.commands[rule.completed].clone()],
+                        None,
+                        context,
+                        response,
+                        None,
+                    );
+                    if registered {
+                        rule.completed += 1;
+                    }
+                    result?;
+                    debug_assert!(registered);
                 }
-                result?;
-                debug_assert!(registered);
+                if seen.insert(index) {
+                    indices.push(index);
+                }
             }
-            if self.membership.insert((add.group.clone(), index)) {
-                self.groups
-                    .entry(add.group.clone())
-                    .or_default()
-                    .push(index);
+            match site {
+                Site::Binding(index) => replacements.push((bindings[*index].name.clone(), indices)),
+                Site::Selection(..) => {
+                    context.literal_rules.insert(site.clone(), indices);
+                }
             }
         }
+        self.groups.extend(replacements);
         Ok(())
     }
 
     pub(super) fn selection(
         &mut self,
-        groups: &[String],
+        indices: Vec<usize>,
         executor: &mut NativeExecutor<'_>,
         context: &mut RequestOccurrences,
         response: &mut pb::RunProgramOutput,
     ) -> Result<String, egglog::Error> {
-        let indices = self.ordered_union(groups);
         if let Some(name) = self.selections.get(&indices) {
             return Ok(name.clone());
         }
@@ -183,12 +226,9 @@ impl Registry {
                 };
                 selected.push(rule);
             }
-            destination.commands.push(pb::Command {
-                kind: Some(pb::command::Kind::AddRules(pb::AddRules {
-                    group: group.clone(),
-                    rules: selected,
-                })),
-                ..Default::default()
+            destination.rulesets.push(pb::RulesetBinding {
+                name: group.clone(),
+                value: Some(pb::Ruleset { rules: selected }),
             });
         }
         Ok(())

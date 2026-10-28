@@ -1035,32 +1035,75 @@ impl EGraph {
     }
 }
 
-// Pack one high-level schedule as a single control result, keeping AddRules
-// ordered before its selected groups and snapshots at the authored cadence.
+// Prepare owned rules before commands, publishing complete named collections.
+// Anonymous selections retain their members directly in each Run.
 fn pack_schedule(schedule: super::Schedule, snapshots: bool) -> Result<Packer, TypedError> {
-    let mut pending = schedule.commands.iter().collect::<Vec<_>>();
+    let mut packer = Packer::default();
+    let mut selected = Vec::new();
+    for group in schedule.rulesets {
+        let mut indices = Vec::new();
+        for rule in group.rules {
+            if let Some(error) = rule.1 {
+                return Err(TypedError::Invalid(error));
+            }
+            indices.push(packer.intern(rule.0, 0));
+        }
+        selected.push((group.name, indices));
+    }
+    packer.finish()?;
+    let mut selected = selected.into_iter();
+    let mut commands = schedule.commands;
+    let mut pending = commands.iter_mut().rev().collect::<Vec<_>>();
+    let mut bindings: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
     while let Some(command) = pending.pop() {
-        match &command.kind {
-            Some(pb::command::Kind::Loop(repeat)) => pending.extend(&repeat.body),
+        match &mut command.kind {
+            Some(pb::command::Kind::Loop(body)) => {
+                pending.extend(body.body.iter_mut().rev());
+            }
             Some(pb::command::Kind::Freeze(_)) if !snapshots => {
                 return Err(TypedError::Invalid(
                     "snapshot schedules require run_stream".into(),
                 ));
             }
+            Some(pb::command::Kind::Run(run)) => {
+                let (name, indices) = selected
+                    .next()
+                    .ok_or_else(|| TypedError::Invalid("missing authored rule selection".into()))?;
+                let value = pb::Ruleset {
+                    rules: indices
+                        .into_iter()
+                        .map(|index| packer.rules[index as usize].clone())
+                        .collect(),
+                };
+                let kind = if let Some(name) = name {
+                    let binding = pb::RulesetBinding {
+                        name: name.clone(),
+                        value: Some(value),
+                    };
+                    if let Some(&index) = bindings.get(&name) {
+                        packer.program.rulesets[index]
+                            .value
+                            .as_mut()
+                            .unwrap()
+                            .rules
+                            .extend(binding.value.unwrap().rules);
+                    } else {
+                        bindings.insert(name.clone(), packer.program.rulesets.len());
+                        packer.program.rulesets.push(binding);
+                    }
+                    pb::ruleset_selection::Kind::Name(name)
+                } else {
+                    pb::ruleset_selection::Kind::Ruleset(value)
+                };
+                run.rulesets = vec![pb::RulesetSelection { kind: Some(kind) }];
+            }
             _ => (),
         }
     }
-    let mut packer = Packer::default();
-    for group in schedule.rulesets {
-        if let Some(error) = group.1 {
-            return Err(TypedError::Invalid(error));
-        }
-        for addition in group.0 {
-            packer.intern(addition, 0);
-        }
+    if selected.next().is_some() {
+        return Err(TypedError::Invalid("unused authored rule selection".into()));
     }
-    packer.finish()?;
-    packer.program.commands.extend(schedule.commands);
+    packer.program.commands.extend(commands);
     if packer.program.commands.len() != 1
         || !matches!(
             packer.program.commands[0].kind,
@@ -1334,7 +1377,6 @@ fn adopt(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::typed::Ruleset;
     use crate::typed::tests::observations::Observed;
 
     fn diagnostic_matches(diagnostic: &pb::Diagnostic) -> u64 {
@@ -1348,17 +1390,6 @@ mod tests {
             .values()
             .map(|value| value.as_u64().unwrap())
             .sum()
-    }
-
-    fn pack_run(group: &Ruleset) -> Packer {
-        let schedule = super::super::Schedule::from(group);
-        let mut packer = Packer::default();
-        for addition in &group.0 {
-            packer.intern(addition.clone(), 0);
-        }
-        packer.finish().unwrap();
-        packer.program.commands.extend(schedule.commands);
-        packer
     }
 
     #[test]
@@ -1881,13 +1912,14 @@ mod tests {
             }
             let program = request.program.as_mut().unwrap();
             let actions: Vec<_> = if in_rule {
-                let Some(pb::command::Kind::Loop(schedule)) = &program.commands[0].kind else {
+                let Some(pb::command::Kind::Run(run)) = &program.commands[0].kind else {
                     panic!()
                 };
-                let Some(pb::command::Kind::AddRules(add)) = &schedule.body[0].kind else {
+                let Some(pb::ruleset_selection::Kind::Ruleset(ruleset)) = &run.rulesets[0].kind
+                else {
                     panic!()
                 };
-                let Some(pb::rule::Kind::Rule(body)) = &add.rules[0].kind else {
+                let Some(pb::rule::Kind::Rule(body)) = &ruleset.rules[0].kind else {
                     panic!()
                 };
                 body.head.iter().collect()
@@ -2307,7 +2339,7 @@ mod tests {
             let mut graph = EGraph::default();
             graph.push().unwrap();
             let group = ruleset(());
-            let mut packer = pack_run(&group);
+            let mut packer = pack_schedule((&group).into(), false).unwrap();
             let run = packer.program.commands.pop().unwrap();
             let roots = [
                 let_("a", I64::from(1)).expression().0.clone(),
@@ -2575,7 +2607,7 @@ mod tests {
         let mut graph = EGraph::default();
         graph.run(&group).unwrap();
         graph.push().unwrap();
-        let pending = pack_run(&ruleset(()));
+        let pending = pack_schedule(ruleset(()).into(), false).unwrap();
         assert!(matches!(
             graph.accept_response(pending, &[vec![0xff]]),
             Err(TypedError::Decode(_))
@@ -4997,7 +5029,7 @@ mod tests {
     }
 
     #[test]
-    fn explicit_group_names_and_named_captures_lower_to_additions() {
+    fn explicit_group_names_lower_to_setup_bindings() {
         use super::super::{builtins::I64, rule, rule::named_ruleset, ruleset};
         let child = ruleset(rule((), I64::from(7)));
         let mut graph = EGraph::default();
@@ -5008,19 +5040,17 @@ mod tests {
                 pb::RunProgramRequest::decode(graph.last_wire.as_ref().unwrap().0.as_slice())
                     .unwrap();
             let program = request.program.unwrap();
-            let Some(pb::command::Kind::Loop(repeat)) = &program.commands[0].kind else {
-                panic!("one report scope")
-            };
-            let Some(pb::command::Kind::AddRules(add)) = &repeat.body[0].kind else {
-                panic!("ordered registration")
-            };
-            assert_eq!(add.group, explicit);
-            assert_eq!(add.rules.len(), 2);
-            assert_eq!(add.rules[0], add.rules[1]);
-            let Some(pb::command::Kind::Run(run)) = &repeat.body[1].kind else {
+            assert_eq!(program.rulesets.len(), 1);
+            let binding = &program.rulesets[0];
+            assert_eq!(binding.name, explicit);
+            let rules = &binding.value.as_ref().unwrap().rules;
+            assert_eq!(rules.len(), 2);
+            assert_eq!(rules[0], rules[1]);
+            let Some(pb::command::Kind::Run(run)) = &program.commands[0].kind else {
                 panic!("group selection")
             };
-            assert_eq!(run.groups, [explicit]);
+            assert!(matches!(&run.rulesets[0].kind,
+                Some(pb::ruleset_selection::Kind::Name(name)) if name == explicit));
         }
     }
 }

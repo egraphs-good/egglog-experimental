@@ -1040,7 +1040,7 @@ fn nested_fail_keeps_packed_roots_and_fragment_admission() {
 }
 
 #[test]
-fn additive_composition_packs_shared_rule_records_and_empty_additions() {
+fn collection_composition_packs_shared_rule_records_and_empty_values() {
     use super::{rule, ruleset};
     let shared = rule((), ());
     let independent = rule((), ());
@@ -1048,25 +1048,17 @@ fn additive_composition_packs_shared_rule_records_and_empty_additions() {
     let leaf = ruleset(vec![shared.clone(), shared.clone(), independent]);
     let group = ruleset((&leaf, &empty, vec![shared.clone()]));
     let diamond = ruleset((&group, &group, &empty, shared));
+    assert_eq!(diamond.rules.len(), 9);
     let mut packer = Packer::default();
-    for addition in diamond.0 {
-        packer.intern(addition, 0);
+    for rule in diamond.rules {
+        packer.intern(rule.0, 0);
     }
     packer.finish().unwrap();
     assert_eq!(packer.rules.len(), 2);
-    let p = packer.program;
-    // Inline resupply preserves order; native registration owns content identity.
-    assert_eq!(p.commands.len(), 4);
-    let Some(pb::command::Kind::AddRules(leaf)) = &p.commands[0].kind else {
-        panic!()
-    };
-    assert_eq!(leaf.rules.len(), 3);
-    assert_eq!(leaf.rules[0], leaf.rules[1]);
-    let Some(pb::command::Kind::AddRules(empty)) = &p.commands[1].kind else {
-        panic!()
-    };
-    assert!(empty.rules.is_empty());
-    assert_eq!(super::Schedule::from(&ruleset(())).commands.len(), 1);
+    assert!(packer.program.commands.is_empty());
+    assert!(packer.program.rulesets.is_empty());
+    assert!(empty.is_empty());
+    assert_eq!(super::Schedule::from(&empty).commands.len(), 1);
 }
 
 #[test]
@@ -1147,8 +1139,8 @@ fn wide_callbacks_author_generated_binders_without_claiming_grounded_execution()
         "composition never re-executes authoring callbacks"
     );
     let mut packed = Packer::default();
-    for addition in group.0 {
-        packed.intern(addition, 0);
+    for rule in group.rules {
+        packed.intern(rule.0, 0);
     }
     packed.finish().unwrap();
     let widths: Vec<_> = packed
@@ -2961,39 +2953,13 @@ fn generated_rule_fields_and_shared_locations_are_authoritative() {
     let a = make(1, pb::RuleEvalMode::Seminaive.into());
     let independent_equal = make(1, pb::RuleEvalMode::Seminaive.into());
     let changed = make(0, pb::RuleEvalMode::Naive.into());
-    let mut slots = std::array::from_fn(|_| vec![]);
-    slots[Arena::Rule as usize] = vec![
-        Slot::External(a.clone()),
-        Slot::External(a),
-        Slot::External(independent_equal),
-        Slot::External(changed),
-    ];
-    let group = publish(
-        pb::Program {
-            commands: vec![pb::Command {
-                kind: Some(pb::command::Kind::AddRules(pb::AddRules {
-                    group: "fields".into(),
-                    rules: vec![pb::Rule::default(); 4],
-                })),
-                ..Default::default()
-            }],
-            ..Default::default()
-        },
-        slots,
-        vec![],
-        Arena::Command,
-        0,
-        vec![],
-    )
-    .unwrap();
+    let records = [a.clone(), a, independent_equal, changed];
     let mut packer = Packer::default();
-    packer.intern(group, 0);
+    let indices: Vec<_> = records.into_iter().map(|r| packer.intern(r, 0)).collect();
     packer.finish().unwrap();
-    let Some(pb::command::Kind::AddRules(rules)) = &packer.program.commands[0].kind else {
-        panic!()
-    };
-    assert_eq!(rules.rules.len(), 4);
-    assert_eq!(rules.rules[0], rules.rules[1]);
+    let rules: Vec<_> = indices.iter().map(|i| &packer.rules[*i as usize]).collect();
+    assert_eq!(rules.len(), 4);
+    assert_eq!(rules[0], rules[1]);
     assert_eq!(packer.rules.len(), 3);
     assert_eq!(packer.rules[2].eval_mode, pb::RuleEvalMode::Naive as i32);
     let Some(pb::rule::Kind::Rewrite(rule)) = &packer.rules[2].kind else {

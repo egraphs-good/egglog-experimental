@@ -8,7 +8,7 @@
 //! authoring and are absent from protobuf, retaining successful definitions.
 //! Scope-aware callers use [`Source::next_submission`] and the existing clone /
 //! destroy requests; the Program iterator deliberately rejects scope operations.
-//! Rules emit ordered AddRules commands; combined text names select their live
+//! Rules emit complete setup bindings; combined text names select their live
 //! leaf-group union. Uncatalogued primitives, effectful local lets,
 //! named cost models remain unsupported. Experimental constructor annotations use
 //! the native cost macros with their actual provenance. The explicit Core
@@ -469,7 +469,6 @@ pub(super) fn source_phase_refs(
             }
             Some(
                 pb::command::Kind::Run(_)
-                | pb::command::Kind::AddRules(_)
                 | pb::command::Kind::BindScheduler(_)
                 | pb::command::Kind::KeepBest(_)
                 | pb::command::Kind::Freeze(_)
@@ -1822,8 +1821,15 @@ impl Source {
                             }
                             _ => unreachable!(),
                         };
+                        let leaf = matches!(kind, SourceRuleset::Rules(_));
                         if self.rulesets.insert(name.clone(), kind).is_some() {
                             return Err(format!("ruleset {name} is already declared"));
+                        }
+                        if leaf {
+                            self.program.rulesets.push(pb::RulesetBinding {
+                                name,
+                                value: Some(pb::Ruleset::default()),
+                            });
                         }
                     }
                     N::NormRule { rule } => {
@@ -2091,7 +2097,7 @@ impl Source {
         Ok(program)
     }
 
-    // Each packet carries the newly authored bodies and ordered additions.
+    // Each packet carries new definitions and complete changed ruleset bindings.
     fn phase(&mut self) -> Result<pb::Program, String> {
         let commands = std::mem::take(&mut self.program.commands);
         Ok(pb::Program {
@@ -2100,6 +2106,7 @@ impl Source {
             files: self.program.files.clone(),
             declarations: std::mem::take(&mut self.program.declarations),
             commands,
+            rulesets: std::mem::take(&mut self.program.rulesets),
         })
     }
 
@@ -2325,7 +2332,13 @@ impl Source {
         let (span, kind) = match schedule {
             S::Run(span, config) => {
                 let kind = pb::command::Kind::Run(pb::Run {
-                    groups: self.select_groups(&config.ruleset)?,
+                    rulesets: self
+                        .select_groups(&config.ruleset)?
+                        .into_iter()
+                        .map(|name| pb::RulesetSelection {
+                            kind: Some(pb::ruleset_selection::Kind::Name(name)),
+                        })
+                        .collect(),
                     ..Default::default()
                 });
                 if let Some(until) = config.until {
@@ -2593,7 +2606,13 @@ impl Source {
         let run = pb::Command {
             span: self.span(&span)?,
             kind: Some(pb::command::Kind::Run(pb::Run {
-                groups: self.select_groups(ruleset)?,
+                rulesets: self
+                    .select_groups(ruleset)?
+                    .into_iter()
+                    .map(|name| pb::RulesetSelection {
+                        kind: Some(pb::ruleset_selection::Kind::Name(name)),
+                    })
+                    .collect(),
                 scheduler: scheduler.into(),
             })),
         };
@@ -2982,13 +3001,25 @@ impl Source {
             unreachable!()
         };
         list.push(index);
-        self.program.commands.push(pb::Command {
-            span,
-            kind: Some(pb::command::Kind::AddRules(pb::AddRules {
-                group: ruleset_name,
-                rules: vec![self.rules[index as usize].clone()],
-            })),
-        });
+        let value = pb::Ruleset {
+            rules: list
+                .iter()
+                .map(|index| self.rules[*index as usize].clone())
+                .collect(),
+        };
+        if let Some(binding) = self
+            .program
+            .rulesets
+            .iter_mut()
+            .find(|binding| binding.name == ruleset_name)
+        {
+            binding.value = Some(value);
+        } else {
+            self.program.rulesets.push(pb::RulesetBinding {
+                name: ruleset_name,
+                value: Some(value),
+            });
+        }
         Ok(())
     }
 
@@ -3926,13 +3957,12 @@ impl Renderer {
         // Installation can partially register definitions before an error.
         // Adopt neither that state nor its private-name stamp on failed render.
         let mut session = self.session.clone();
-        let mut context = session
+        let context = session
             .install(prepared, &mut pb::RunProgramOutput::default())
             .map_err(|(error, _)| TransportError(error.message))?;
         // Retain inert definitions only, never scheduler work. Preparation of
         // the next phase reads this same native binding metadata. The cloned
         // Session is adopted only after text and all registrations succeeded.
-        let mut response = pb::RunProgramOutput::default();
         for command in &lowered.commands {
             if let Some(pb::command::Kind::BindScheduler(bind)) = &command.kind {
                 let (scheduler, resource_limited) =
@@ -3948,44 +3978,6 @@ impl Renderer {
                             resource_limited,
                         },
                     );
-            }
-        }
-        let mut pending: Vec<_> = lowered
-            .commands
-            .iter()
-            .enumerate()
-            .rev()
-            .map(|(index, command)| (vec![index as u32], command))
-            .collect();
-        while let Some((path, command)) = pending.pop() {
-            match &command.kind {
-                Some(pb::command::Kind::AddRules(_)) => {
-                    session
-                        .execute(
-                            &lowered,
-                            command,
-                            &mut context,
-                            &pb::CommandLocation {
-                                path,
-                                iterations: vec![],
-                            },
-                            &mut response,
-                            &mut None,
-                            &mut OutputStream {
-                                emit: &mut |_| ControlFlow::Continue(()),
-                                cancelled: false,
-                            },
-                        )
-                        .map_err(|error| TransportError(error.to_string()))?;
-                }
-                Some(pb::command::Kind::Loop(body)) if body.max_iterations == Some(1) => {
-                    pending.extend(body.body.iter().enumerate().rev().map(|(index, command)| {
-                        let mut path = path.clone();
-                        path.push(index as u32);
-                        (path, command)
-                    }));
-                }
-                _ => (),
             }
         }
         session.registry = context.registry;
@@ -4312,9 +4304,11 @@ fn render_prepared(
         }
         let mut occupied: HashSet<_> = names.iter().map(|name| (*name).to_string()).collect();
         // Logical ruleset names are relocated, not interpolated as atoms.
-        occupied.extend(super::command_tree(&program.commands).flat_map(|command| match &command.kind {
-            Some(pb::command::Kind::AddRules(add)) => vec![add.group.clone()],
-            Some(pb::command::Kind::Run(run)) => run.groups.clone(), _ => vec![],
+        occupied.extend(program.rulesets.iter().map(|binding| binding.name.clone()));
+        occupied.extend(super::command_tree(&program.commands).filter_map(|command| match &command.kind {
+            Some(pb::command::Kind::Run(run)) => Some(&run.rulesets), _ => None,
+        }).flatten().filter_map(|selection| match &selection.kind {
+            Some(pb::ruleset_selection::Kind::Name(name)) => Some(name.clone()), _ => None,
         }));
         occupied.extend(authored.sorts.values().cloned());
         occupied.extend(authored.callables.values().cloned());
@@ -4407,6 +4401,7 @@ fn render_prepared(
             );
         }
         let prepared_rules: Vec<_> = prepared.context.candidates.iter().map(|candidate| candidate.name.clone()).collect();
+        let rule_values: Vec<_> = graph::rules(rule_program).collect();
         {
             // Native handles and canonical rules are aligned by occurrence, not
             // label/body equality. Change presentation only, never Prepared.
@@ -4416,7 +4411,7 @@ fn render_prepared(
             let mut rule_indices = HashMap::new();
             for (index, name) in prepared_rules.iter().enumerate() {
                 rule_indices.insert(name.clone(), index);
-                if matches!(graph::rules(rule_program).nth(index).ok_or("missing inline rule")?.kind, Some(pb::rule::Kind::Birewrite(_))) {
+                if matches!(rule_values.get(index).copied().ok_or("missing inline rule")?.kind, Some(pb::rule::Kind::Birewrite(_))) {
                     rule_indices.insert(format!("{name}=>"), index);
                     rule_indices.insert(format!("{name}<="), index);
                 }
@@ -4439,7 +4434,7 @@ fn render_prepared(
                     // Execution plans use physical symbols. Reuse the same
                     // planner with text aliases occupied before presentation,
                     // keeping the rewrite witness and head references aligned.
-                    command = lower_rule(rule_program, graph::rules(rule_program).nth(index).ok_or("missing inline rule")?, &rule.ruleset,
+                    command = lower_rule(rule_program, rule_values.get(index).copied().ok_or("missing inline rule")?, &rule.ruleset,
                         &prepared_rules[index], &rule_spans, &query_occupied)?
                         .into_iter().find(|candidate| matches!(candidate,
                             Command::Rule { rule: candidate } if candidate.name == rule.name))
@@ -4447,7 +4442,7 @@ fn render_prepared(
                 }
                 if let Command::Rule { rule } = &mut command {
                     let index = *rule_indices.get(&rule.name).ok_or("missing prepared rule occurrence")?;
-                    let rewrite = match &graph::rules(rule_program).nth(index).ok_or("missing inline rule")?.kind {
+                    let rewrite = match &rule_values.get(index).copied().ok_or("missing inline rule")?.kind {
                         Some(pb::rule::Kind::Rewrite(rewrite)) => Some((rewrite.lhs, rewrite.rhs, &rewrite.conditions, Some(rewrite.subsume))),
                         Some(pb::rule::Kind::Birewrite(rewrite)) => Some((rewrite.lhs, rewrite.rhs, &rewrite.conditions, None)),
                         _ => None,
@@ -4479,7 +4474,7 @@ fn render_prepared(
                 }
                 if let Command::Rule { rule } = &mut command {
                     let index = *rule_indices.get(&rule.name).ok_or("missing prepared rule occurrence")?;
-                    if let Some(pb::rule::Kind::Rule(body)) = &graph::rules(rule_program).nth(index).ok_or("missing inline rule")?.kind {
+                    if let Some(pb::rule::Kind::Rule(body)) = &rule_values.get(index).copied().ok_or("missing inline rule")?.kind {
                         let mut head = Vec::new();
                         let mut memo = HashMap::new();
                         let mut next = 0;
@@ -4533,69 +4528,63 @@ fn render_prepared(
                 }
             }
         }
-        // Native source uses immutable selectors. Resolve ordered additions into
-        // private selection commands while retaining the authored command order.
-        let mut render_registry = prepared.context.registry.clone();
+        // Capture setup replacements and literal collections into the same
+        // immutable private selectors used for ordinary named Runs.
+        let mut render_context = RequestOccurrences {
+            registry: prepared.context.registry.clone(),
+            ..Default::default()
+        };
+        for (site, _) in rules::collections(program) {
+            let range = prepared.context.candidate_offsets.get(&site).ok_or("missing prepared ruleset occurrence")?;
+            let mut seen = HashSet::new();
+            let indices = prepared.context.candidates[range.clone()].iter()
+                .map(|candidate| render_context.registry.intern(candidate))
+                .filter(|index| seen.insert(*index)).collect();
+            match site {
+                rules::Site::Binding(index) => {
+                    render_context.registry.groups.insert(program.rulesets[index].name.clone(), indices);
+                }
+                rules::Site::Selection(..) => { render_context.literal_rules.insert(site, indices); }
+            }
+        }
         let mut render_program = program.clone();
         let mut selectors = HashMap::new();
         fn project_controls(
-            commands: &mut Vec<pb::Command>, registry: &mut rules::Registry,
-            candidates: &[rules::Candidate], candidate_cursor: &mut usize, selectors: &mut HashMap<Vec<usize>, String>,
-            definitions: &mut Vec<Command>, request: u64, repeated: bool,
-        ) -> Result<Vec<usize>, String> {
-            let mut retained = vec![];
-            let mut positions = vec![];
-            for (position, mut command) in std::mem::take(commands).into_iter().enumerate() {
+            commands: &mut [pb::Command], context: &RequestOccurrences,
+            selectors: &mut HashMap<Vec<usize>, String>, definitions: &mut Vec<Command>,
+            request: u64, path: &mut Vec<u32>,
+        ) {
+            for (position, command) in commands.iter_mut().enumerate() {
+                path.push(position as u32);
+                let mut command = command;
+                while matches!(command.kind, Some(pb::command::Kind::Fail(_))) {
+                    let Some(pb::command::Kind::Fail(child)) = &mut command.kind else { unreachable!() };
+                    command = child;
+                }
                 match &mut command.kind {
-                    Some(pb::command::Kind::AddRules(add)) => {
-                        if repeated { return Err("source cannot render AddRules inside a repeated loop".into()); }
-                        for _ in &add.rules {
-                            let candidate = candidates.get(*candidate_cursor).ok_or("missing prepared inline rule occurrence")?;
-                            *candidate_cursor += 1;
-                            let index = registry.intern(candidate);
-                            let group = registry.groups.entry(add.group.clone()).or_default();
-                            if !group.contains(&index) { group.push(index); }
-                        }
-                        continue;
-                    }
                     Some(pb::command::Kind::Run(run)) => {
-                        let indices = registry.ordered_union(&run.groups);
+                        let indices = context.registry.resolve(&run.rulesets, path, context);
                         let next = selectors.len();
                         let name = selectors.entry(indices.clone()).or_insert_with(|| {
                             let name = format!("__protobuf_source_selection_{request}_{next}");
                             definitions.push(Command::UnstableCombinedRuleset(ast::Span::Panic, name.clone(),
-                                indices.iter().map(|index| format!("{}_holder", registry.rules[*index].candidate.name)).collect()));
+                                indices.iter().map(|index| format!("{}_holder", context.registry.rules[*index].candidate.name)).collect()));
                             name
                         });
-                        run.groups = vec![name.clone()];
+                        run.rulesets = vec![pb::RulesetSelection {
+                            kind: Some(pb::ruleset_selection::Kind::Name(name.clone())),
+                        }];
                     }
                     Some(pb::command::Kind::Loop(body)) => {
-                        if body.max_iterations == Some(0) {
-                            // No additions execute, but every Run still needs a
-                            // valid empty/private selector for native compilation.
-                            let mut shadow = registry.clone();
-                            project_controls(&mut body.body,&mut shadow,candidates,candidate_cursor,selectors,definitions,request,false)?;
-                        } else {
-                            project_controls(&mut body.body,registry,candidates,candidate_cursor,selectors,definitions,request,repeated || body.max_iterations != Some(1))?;
-                        }
-                    }
-                    Some(pb::command::Kind::Fail(child)) => {
-                        let mut body = vec![(**child).clone()];
-                        project_controls(&mut body,registry,candidates,candidate_cursor,selectors,definitions,request,repeated)?;
-                        let [replacement]: [pb::Command; 1] = body.try_into().map_err(|_| "source Fail cannot wrap AddRules")?;
-                        **child = replacement;
+                        project_controls(&mut body.body, context, selectors, definitions, request, path);
                     }
                     _ => (),
                 }
-                positions.push(position);
-                retained.push(command);
+                path.pop();
             }
-            *commands = retained;
-            Ok(positions)
         }
-        let positions = project_controls(&mut render_program.commands,&mut render_registry,&prepared.context.candidates,&mut 0,&mut selectors,&mut commands,prepared.request,false)?;
-        for (projected_position, mut command) in render_program.commands.iter().enumerate() {
-            let position = positions[projected_position];
+        project_controls(&mut render_program.commands, &render_context, &mut selectors, &mut commands, prepared.request, &mut vec![]);
+        for (position, mut command) in render_program.commands.iter().enumerate() {
             let mut fail_spans = vec![];
             while let Some(pb::command::Kind::Fail(child)) = &command.kind {
                 fail_spans.push(native_span(program, command.span.as_ref(), native_spans)?);
@@ -5102,7 +5091,12 @@ fn source_extended_schedule(
             }
         }
         pb::command::Kind::Run(run) => {
-            let [name] = run.groups.as_slice() else {
+            let [
+                pb::RulesetSelection {
+                    kind: Some(pb::ruleset_selection::Kind::Name(name)),
+                },
+            ] = run.rulesets.as_slice()
+            else {
                 return Err("source Run needs a resolved private selection".into());
             };
             if name == ":until" {
@@ -5202,7 +5196,12 @@ fn source_schedule(
     }
     let (body, bound, sequence) = match command.kind.as_ref().ok_or("missing schedule")? {
         pb::command::Kind::Run(run) if run.scheduler.is_empty() => {
-            let [name] = run.groups.as_slice() else {
+            let [
+                pb::RulesetSelection {
+                    kind: Some(pb::ruleset_selection::Kind::Name(name)),
+                },
+            ] = run.rulesets.as_slice()
+            else {
                 return Err("source Run needs a resolved private selection".into());
             };
             return Ok(ast::Schedule::Run(
@@ -5272,19 +5271,116 @@ mod node_projection_tests {
     use super::*;
 
     #[test]
+    fn renderer_replaces_membership_and_replays_literal_named_unions() {
+        let source = r#"
+            (relation Seed (i64)) (relation Seen (i64)) (ruleset r)
+            (rule ((Seed x)) ((Seen x)) :ruleset r :name "mark")
+            (Seed 1) (fail (check (Seen 1))) (check (Seen 1))
+            (Seed 2) (check (Seen 2))
+        "#;
+        for core in [false, true] {
+            let phases = if core {
+                Source::new_core(None, source)
+            } else {
+                Source::new(None, source)
+            }
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+            let mut renderer = if core {
+                Renderer::core()
+            } else {
+                Renderer::default()
+            };
+            let mut native = if core {
+                EGraph::default()
+            } else {
+                crate::new_experimental_egraph()
+            };
+            assert_eq!(phases.len(), 9);
+            for phase in &phases[..5] {
+                let text = renderer.render(phase).unwrap();
+                native.parse_and_run_program(None, &text).unwrap();
+            }
+            let empty = pb::Program {
+                rulesets: vec![pb::RulesetBinding {
+                    name: "r".into(),
+                    value: Some(pb::Ruleset::default()),
+                }],
+                commands: vec![pb::Command {
+                    kind: Some(pb::command::Kind::Run(pb::Run {
+                        rulesets: vec![pb::RulesetSelection {
+                            kind: Some(pb::ruleset_selection::Kind::Name("r".into())),
+                        }],
+                        ..Default::default()
+                    })),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            };
+            native
+                .parse_and_run_program(None, &renderer.render(&empty).unwrap())
+                .unwrap();
+            native
+                .parse_and_run_program(None, &renderer.render(&phases[5]).unwrap())
+                .unwrap();
+
+            let mut literal = phases[3].clone();
+            let ruleset = literal.rulesets.pop().unwrap().value.unwrap();
+            literal.commands = vec![pb::Command {
+                kind: Some(pb::command::Kind::Run(pb::Run {
+                    rulesets: vec![
+                        pb::RulesetSelection {
+                            kind: Some(pb::ruleset_selection::Kind::Name("unknown".into())),
+                        },
+                        pb::RulesetSelection {
+                            kind: Some(pb::ruleset_selection::Kind::Ruleset(ruleset.clone())),
+                        },
+                        pb::RulesetSelection {
+                            kind: Some(pb::ruleset_selection::Kind::Name("r".into())),
+                        },
+                        pb::RulesetSelection {
+                            kind: Some(pb::ruleset_selection::Kind::Ruleset(ruleset)),
+                        },
+                    ],
+                    ..Default::default()
+                })),
+                ..Default::default()
+            }];
+            native
+                .parse_and_run_program(None, &renderer.render(&literal).unwrap())
+                .unwrap();
+            native
+                .parse_and_run_program(None, &renderer.render(&phases[6]).unwrap())
+                .unwrap();
+
+            let mut restored = phases[3].clone();
+            restored.commands = empty.commands;
+            native
+                .parse_and_run_program(None, &renderer.render(&phases[7]).unwrap())
+                .unwrap();
+            native
+                .parse_and_run_program(None, &renderer.render(&restored).unwrap())
+                .unwrap();
+            native
+                .parse_and_run_program(None, &renderer.render(&phases[8]).unwrap())
+                .unwrap();
+        }
+    }
+
+    #[test]
     fn renderer_keeps_backend_catalog_separate_from_transactional_user_definitions() {
         let mut renderer = Renderer::default();
         let builtins = renderer.session.builtins.clone();
         assert!(
             renderer
                 .render(&pb::Program {
-                    commands: vec![pb::Command {
-                        kind: Some(pb::command::Kind::AddRules(pb::AddRules {
-                            group: String::new(),
+                    rulesets: vec![pb::RulesetBinding {
+                        name: String::new(),
+                        value: Some(pb::Ruleset {
                             rules: vec![pb::Rule::default()]
-                        })),
-                        ..Default::default()
-                    },],
+                        }),
+                    }],
 
                     ..Default::default()
                 })
@@ -5436,130 +5532,127 @@ mod node_projection_tests {
                 },
             ],
 
-            commands: vec![
-                pb::Command {
-                    kind: Some(pb::command::Kind::AddRules(pb::AddRules {
-                        group: String::new(),
-                        rules: vec![
-                            pb::Rule {
-                                kind: Some(pb::rule::Kind::Rule(pb::RuleBody {
-                                    query: vec![5],
-                                    head: vec![
-                                        pb::Action {
+            rulesets: vec![pb::RulesetBinding {
+                name: String::new(),
+                value: Some(pb::Ruleset {
+                    rules: vec![
+                        pb::Rule {
+                            kind: Some(pb::rule::Kind::Rule(pb::RuleBody {
+                                query: vec![5],
+                                head: vec![
+                                    pb::Action {
+                                        kind: Some(pb::action::Kind::Set(pb::Set {
+                                            target: Some(pb::Call {
+                                                args: vec![6],
+                                                ..Default::default()
+                                            }),
+                                            value: Some(7),
+                                        })),
+                                        ..Default::default()
+                                    },
+                                    pb::Action {
+                                        kind: Some(pb::action::Kind::SetCost(pb::SetCost {
+                                            target: Some(pb::Call {
+                                                args: vec![8],
+                                                ..Default::default()
+                                            }),
+                                            cost: Some(9),
+                                        })),
+                                        ..Default::default()
+                                    },
+                                    pb::Action {
+                                        kind: Some(pb::action::Kind::Delete(pb::Call {
+                                            args: vec![10],
+                                            ..Default::default()
+                                        })),
+                                        ..Default::default()
+                                    },
+                                    pb::Action {
+                                        kind: Some(pb::action::Kind::Subsume(pb::Call {
+                                            args: vec![11],
+                                            ..Default::default()
+                                        })),
+                                        ..Default::default()
+                                    },
+                                    pb::Action {
+                                        kind: Some(pb::action::Kind::Term(12)),
+                                        ..Default::default()
+                                    },
+                                ],
+                            })),
+                            ..Default::default()
+                        },
+                        pb::Rule {
+                            kind: Some(pb::rule::Kind::Rewrite(pb::Rewrite {
+                                lhs: 13,
+                                rhs: 14,
+                                conditions: vec![15],
+                                ..Default::default()
+                            })),
+                            ..Default::default()
+                        },
+                        pb::Rule {
+                            kind: Some(pb::rule::Kind::Birewrite(pb::BiRewrite {
+                                lhs: 16,
+                                rhs: 17,
+                                conditions: vec![18],
+                            })),
+                            ..Default::default()
+                        },
+                    ],
+                }),
+            }],
+            commands: vec![pb::Command {
+                kind: Some(pb::command::Kind::Fail(Box::new(pb::Command {
+                    kind: Some(pb::command::Kind::Loop(pb::Loop {
+                        until: vec![19],
+                        body: vec![pb::Command {
+                            kind: Some(pb::command::Kind::Loop(pb::Loop {
+                                until: vec![20],
+                                body: vec![
+                                    pb::Command {
+                                        kind: Some(pb::command::Kind::Check(pb::Check {
+                                            facts: vec![21],
+                                        })),
+                                        ..Default::default()
+                                    },
+                                    pb::Command {
+                                        kind: Some(pb::command::Kind::Prove(pb::Prove {
+                                            facts: vec![22],
+                                        })),
+                                        ..Default::default()
+                                    },
+                                    pb::Command {
+                                        kind: Some(pb::command::Kind::Extract(pb::Extract {
+                                            roots: vec![23],
+                                            ..Default::default()
+                                        })),
+                                        ..Default::default()
+                                    },
+                                    pb::Command {
+                                        kind: Some(pb::command::Kind::Action(pb::Action {
                                             kind: Some(pb::action::Kind::Set(pb::Set {
                                                 target: Some(pb::Call {
-                                                    args: vec![6],
+                                                    args: vec![24],
                                                     ..Default::default()
                                                 }),
-                                                value: Some(7),
+                                                value: Some(25),
                                             })),
                                             ..Default::default()
-                                        },
-                                        pb::Action {
-                                            kind: Some(pb::action::Kind::SetCost(pb::SetCost {
-                                                target: Some(pb::Call {
-                                                    args: vec![8],
-                                                    ..Default::default()
-                                                }),
-                                                cost: Some(9),
-                                            })),
-                                            ..Default::default()
-                                        },
-                                        pb::Action {
-                                            kind: Some(pb::action::Kind::Delete(pb::Call {
-                                                args: vec![10],
-                                                ..Default::default()
-                                            })),
-                                            ..Default::default()
-                                        },
-                                        pb::Action {
-                                            kind: Some(pb::action::Kind::Subsume(pb::Call {
-                                                args: vec![11],
-                                                ..Default::default()
-                                            })),
-                                            ..Default::default()
-                                        },
-                                        pb::Action {
-                                            kind: Some(pb::action::Kind::Term(12)),
-                                            ..Default::default()
-                                        },
-                                    ],
-                                })),
+                                        })),
+                                        ..Default::default()
+                                    },
+                                ],
                                 ..Default::default()
-                            },
-                            pb::Rule {
-                                kind: Some(pb::rule::Kind::Rewrite(pb::Rewrite {
-                                    lhs: 13,
-                                    rhs: 14,
-                                    conditions: vec![15],
-                                    ..Default::default()
-                                })),
-                                ..Default::default()
-                            },
-                            pb::Rule {
-                                kind: Some(pb::rule::Kind::Birewrite(pb::BiRewrite {
-                                    lhs: 16,
-                                    rhs: 17,
-                                    conditions: vec![18],
-                                })),
-                                ..Default::default()
-                            },
-                        ],
+                            })),
+                            ..Default::default()
+                        }],
+                        ..Default::default()
                     })),
                     ..Default::default()
-                },
-                pb::Command {
-                    kind: Some(pb::command::Kind::Fail(Box::new(pb::Command {
-                        kind: Some(pb::command::Kind::Loop(pb::Loop {
-                            until: vec![19],
-                            body: vec![pb::Command {
-                                kind: Some(pb::command::Kind::Loop(pb::Loop {
-                                    until: vec![20],
-                                    body: vec![
-                                        pb::Command {
-                                            kind: Some(pb::command::Kind::Check(pb::Check {
-                                                facts: vec![21],
-                                            })),
-                                            ..Default::default()
-                                        },
-                                        pb::Command {
-                                            kind: Some(pb::command::Kind::Prove(pb::Prove {
-                                                facts: vec![22],
-                                            })),
-                                            ..Default::default()
-                                        },
-                                        pb::Command {
-                                            kind: Some(pb::command::Kind::Extract(pb::Extract {
-                                                roots: vec![23],
-                                                ..Default::default()
-                                            })),
-                                            ..Default::default()
-                                        },
-                                        pb::Command {
-                                            kind: Some(pb::command::Kind::Action(pb::Action {
-                                                kind: Some(pb::action::Kind::Set(pb::Set {
-                                                    target: Some(pb::Call {
-                                                        args: vec![24],
-                                                        ..Default::default()
-                                                    }),
-                                                    value: Some(25),
-                                                })),
-                                                ..Default::default()
-                                            })),
-                                            ..Default::default()
-                                        },
-                                    ],
-                                    ..Default::default()
-                                })),
-                                ..Default::default()
-                            }],
-                            ..Default::default()
-                        })),
-                        ..Default::default()
-                    }))),
-                    ..Default::default()
-                },
-            ],
+                }))),
+                ..Default::default()
+            }],
             ..Default::default()
         };
         let mut visited = HashSet::new();

@@ -1,8 +1,7 @@
 //! Typed composition of the protocol's Run and capped Loop forms.
-use super::{Ruleset, pb};
-use std::collections::HashSet;
+use super::{Rule, Ruleset, pb};
 
-/// An ordered schedule retaining the generated additions needed by its groups.
+/// An ordered schedule retaining the rule values used by each Run.
 #[derive(Clone)]
 pub struct Schedule {
     pub(super) commands: Vec<pb::Command>,
@@ -11,26 +10,9 @@ pub struct Schedule {
 
 impl From<&Ruleset> for Schedule {
     fn from(ruleset: &Ruleset) -> Self {
-        let mut seen = HashSet::new();
-        let groups = ruleset
-            .0
-            .iter()
-            .filter_map(|record| {
-                let owner = record.owner.as_ref().unwrap();
-                let Some(pb::command::Kind::AddRules(add)) =
-                    &owner.program().unwrap().commands[record.index as usize].kind
-                else {
-                    unreachable!("typed group addition")
-                };
-                seen.insert(add.group.clone()).then(|| add.group.clone())
-            })
-            .collect();
         Self {
             commands: vec![pb::Command {
-                kind: Some(pb::command::Kind::Run(pb::Run {
-                    groups,
-                    ..Default::default()
-                })),
+                kind: Some(pb::command::Kind::Run(pb::Run::default())),
                 ..Default::default()
             }],
             rulesets: vec![ruleset.clone()],
@@ -40,6 +22,16 @@ impl From<&Ruleset> for Schedule {
 impl From<Ruleset> for Schedule {
     fn from(ruleset: Ruleset) -> Self {
         Self::from(&ruleset)
+    }
+}
+impl From<Rule> for Schedule {
+    fn from(rule: Rule) -> Self {
+        Self::from(super::ruleset(rule))
+    }
+}
+impl From<&Rule> for Schedule {
+    fn from(rule: &Rule) -> Self {
+        Self::from(super::ruleset(rule))
     }
 }
 impl From<&std::sync::LazyLock<Ruleset>> for Schedule {
@@ -65,7 +57,7 @@ impl Schedule {
     }
 
     /// Execute at most this many iterations, stopping when the body can stop.
-    /// Zero still registers the schedule's rules.
+    /// Zero still prepares the schedule's rules and publishes named bindings.
     pub fn repeat(self, max_iterations: u64) -> Self {
         Self {
             commands: vec![pb::Command {
@@ -95,26 +87,17 @@ impl Schedule {
 }
 
 impl Ruleset {
-    /// Repeat this group selection without resetting registered rule state.
+    /// Repeat this selection without resetting existing rule state.
     pub fn repeat(&self, max_iterations: u64) -> Schedule {
         Schedule::from(self).repeat(max_iterations)
     }
-    /// Saturate this selection of groups.
+    /// Saturate this rule selection.
     pub fn saturate(&self) -> Schedule {
         Schedule::from(self).saturate()
     }
-    /// Whether the retained additions contain no rules.
+    /// Whether this collection contains no rules.
     pub fn is_empty(&self) -> bool {
-        for record in &self.0 {
-            let owner = record.owner.as_ref().unwrap();
-            if let Some(pb::command::Kind::AddRules(add)) =
-                &owner.program().unwrap().commands[record.index as usize].kind
-                && !add.rules.is_empty()
-            {
-                return false;
-            }
-        }
-        self.1.is_none()
+        self.rules.is_empty()
     }
 }
 
@@ -129,6 +112,8 @@ macro_rules! single {
     })* };
 }
 single!(
+    Rule,
+    &Rule,
     Ruleset,
     &Ruleset,
     &std::sync::LazyLock<Ruleset>,

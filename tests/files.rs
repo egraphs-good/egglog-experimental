@@ -1086,14 +1086,12 @@ impl ProtoRun {
                     // reverse direction's groundedness check fails. Source
                     // exports that real prefix, then yields the original error
                     // without advancing to the next authored command.
-                    let partial_birewrite = matches!(
-                        (rule_kind, phase.commands.as_slice()),
-                        (Some(true), [pb::Command {
-                            kind: Some(pb::command::Kind::AddRules(pb::AddRules { rules, .. })), ..
-                        }]) if matches!(rules.as_slice(), [pb::Rule {
-                            kind: Some(pb::rule::Kind::Rewrite(_)), name: Some(name), ..
-                        }] if name.ends_with("=>"))
-                    );
+                    let partial_birewrite = rule_kind == Some(true)
+                        && phase.rulesets.iter().any(|binding| {
+                            matches!(binding.value.as_ref().unwrap().rules.last(), Some(pb::Rule {
+                                kind: Some(pb::rule::Kind::Rewrite(_)), name: Some(name), ..
+                            }) if name.ends_with("=>"))
+                        });
                     let request = pb::RunProgramRequest {
                         egraph_id,
                         program: Some(phase),

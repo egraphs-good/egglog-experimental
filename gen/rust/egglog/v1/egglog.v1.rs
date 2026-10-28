@@ -27,8 +27,10 @@
 /// Declarations form one batch for the whole Program. Install them before any
 /// command, order-independently and without executing their bodies. Resolving
 /// declaration dependencies is not loop execution: loop bodies contain only
-/// commands and never repeat declaration installation. Rules register only when
-/// AddRules executes.
+/// commands and never repeat declaration installation. Ruleset bindings are also
+/// setup: install complete replacements before commands, retaining omitted names.
+/// Prepare all rule values before execution, including literals in zero-iteration
+/// loop bodies. Native installation failures need not roll back completed setup.
 /// Definitions installed on this handle may be referenced by name without
 /// resending them. Node and sort indices refer to this Program's
 /// arenas, not previous requests; all referenced entries must be included here.
@@ -63,6 +65,12 @@ pub struct Program {
     /// Optional provenance. Omit spans for a normalized/unlocated program.
     #[prost(message, repeated, tag = "6")]
     pub files: ::prost::alloc::vec::Vec<SourceFile>,
+    /// Complete persistent binding replacements, with unique names in this batch.
+    /// Empty values clear membership; omission leaves a binding unchanged.
+    /// Publish bindings together after successful setup installation. Native
+    /// effects completed before a setup failure remain.
+    #[prost(message, repeated, tag = "7")]
+    pub rulesets: ::prost::alloc::vec::Vec<RulesetBinding>,
 }
 /// A source file shared by diagnostic/documentation spans in the enclosing
 /// payload. Source metadata does not preserve formatting or arbitrary comments.
@@ -838,13 +846,14 @@ pub struct GenericSignature {
     pub varargs: ::prost::alloc::vec::Vec<Arg>,
 }
 // ---------------------------------------------------------------------------
-// RULE DEFINITIONS — immutable content, registered by ordered commands.
+// RULE DEFINITIONS — immutable content and replaceable named collections.
 // ---------------------------------------------------------------------------
 
 /// An immutable rule/rewrite value. Content identity includes its resolved typed
 /// body, ordered query/head, options and represented graph sharing; arena IDs,
-/// labels, documentation and provenance do not identify it. AddRules interns
-/// content globally on the handle, so equivalent resupply never resets its state.
+/// labels, documentation and provenance do not identify it. Intern content on the
+/// handle independently of collection names, retaining its compiled state and
+/// cursors through replacement, omission and readdition. Old effects remain.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct Rule {
     /// Optional diagnostic label; may repeat and never binds or identifies a rule.
@@ -922,20 +931,54 @@ pub struct BiRewrite {
     #[prost(uint32, repeated, tag = "4")]
     pub conditions: ::prost::alloc::vec::Vec<u32>,
 }
+/// An immutable ordered collection of inline rule values; no rule arena or
+/// collection identity. A direct Rule input is a singleton collection here.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct Ruleset {
+    #[prost(message, repeated, tag = "1")]
+    pub rules: ::prost::alloc::vec::Vec<Rule>,
+}
+/// Program setup, never an executable command. The empty name is the default
+/// group. Resupplying the same value is harmless; an empty value clears it.
+/// Membership is captured in value, not a live dependency on other bindings.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct RulesetBinding {
+    #[prost(string, tag = "1")]
+    pub name: ::prost::alloc::string::String,
+    #[prost(message, optional, tag = "2")]
+    pub value: ::core::option::Option<Ruleset>,
+}
+/// A literal captures its members; a name resolves the persistent post-setup
+/// binding throughout this Program. Unknown names select an empty collection.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct RulesetSelection {
+    #[prost(oneof = "ruleset_selection::Kind", tags = "1, 2")]
+    pub kind: ::core::option::Option<ruleset_selection::Kind>,
+}
+/// Nested message and enum types in `RulesetSelection`.
+pub mod ruleset_selection {
+    #[derive(Clone, PartialEq, ::prost::Oneof)]
+    pub enum Kind {
+        #[prost(message, tag = "1")]
+        Ruleset(super::Ruleset),
+        #[prost(string, tag = "2")]
+        Name(::prost::alloc::string::String),
+    }
+}
 // ---------------------------------------------------------------------------
 // COMMANDS — the `Command.kind` arms after `action`, in arm order.
 // ---------------------------------------------------------------------------
 
 /// One command, at top level or in a loop body: every command may appear in
-/// `Loop`. Declarations are installed once at Program scope, outside commands.
+/// `Loop`. Declarations and ruleset bindings are installed at Program scope.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct Command {
     /// Origin. Locates a failure attributed to a command rather than an
-    /// expression: a failed `check`, registration or extraction.
+    /// expression: a failed `check`, run or extraction.
     /// Surfaces as `Error.span`.
     #[prost(message, optional, tag = "13")]
     pub span: ::core::option::Option<Span>,
-    #[prost(oneof = "command::Kind", tags = "1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 14, 15, 16, 17, 18, 19")]
+    #[prost(oneof = "command::Kind", tags = "1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 14, 15, 16, 17, 19")]
     pub kind: ::core::option::Option<command::Kind>,
 }
 /// Nested message and enum types in `Command`.
@@ -984,8 +1027,6 @@ pub mod command {
         /// destination; follows ordinary observation ordering and Fail suppression.
         #[prost(message, tag = "17")]
         Stats(super::Unit),
-        #[prost(message, tag = "18")]
-        AddRules(super::AddRules),
         #[prost(message, tag = "19")]
         Explain(super::Explain),
     }
@@ -1021,29 +1062,16 @@ pub struct ProveExists {
     #[prost(string, tag = "1")]
     pub constructor: ::prost::alloc::string::String,
 }
-/// Add immutable rule content to one group in this command's execution order.
-/// Empty additions are harmless. First registration determines membership order;
-/// re-adding the same content is a no-op, with compiled state/cursors retained.
-/// The same content in several groups shares one compiled rule. Labels/spans are
-/// representative diagnostics, not identity. Failures retain completed native
-/// registration prefixes; compatible retry is safe. No group declaration exists.
+/// Execute one step of the ordered union of selections with one scheduler.
+/// Traverse selections left to right and each collection in order, selecting
+/// shared rule content once. \[\] selects nothing; name "" selects the default
+/// group. Separate Runs select independently and retain rule execution state;
+/// this does not override eval_mode or scheduler decisions. A completed top-level
+/// Run returns RunResult.
 #[derive(Clone, PartialEq, ::prost::Message)]
-pub struct AddRules {
-    #[prost(string, tag = "1")]
-    pub group: ::prost::alloc::string::String,
-    #[prost(message, repeated, tag = "2")]
-    pub rules: ::prost::alloc::vec::Vec<Rule>,
-}
-/// Execute one step of the ordered union of groups, optionally using a scheduler.
-/// Unknown groups are empty. \[\] selects nothing; \[""\] explicitly selects the
-/// default group. Traverse groups and first-registration membership in order,
-/// selecting shared content once. Separate Runs still select independently and
-/// retain the selected rules' execution state; this does not override eval_mode
-/// or scheduler decisions. A completed top-level Run returns RunResult.
-#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct Run {
-    #[prost(string, repeated, tag = "1")]
-    pub groups: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    #[prost(message, repeated, tag = "1")]
+    pub rulesets: ::prost::alloc::vec::Vec<RulesetSelection>,
     /// Empty means no scheduler; otherwise names a BindScheduler instance.
     #[prost(string, tag = "2")]
     pub scheduler: ::prost::alloc::string::String,
@@ -1130,10 +1158,10 @@ pub struct Extract {
 /// original derivations or promise equivalent proof results.
 ///
 /// Include every installed declaration and sort, even unused or empty tables,
-/// and preserve registered rule content and each group's first-registration
-/// membership order. Reconstruct membership with AddRules containing rule values;
-/// a value shared by groups appears in each group's addition. Omit unregistered
-/// rule values. Backend builtin descriptors remain in GetBuiltins.
+/// and preserve current named ruleset bindings and their ordered rule values,
+/// including empty bindings. A shared value appears in each relevant binding.
+/// Omit rules retained only in private registration caches. Backend builtin
+/// descriptors remain in GetBuiltins.
 /// Include saved code and its dependencies without executing it.
 /// Host implementations/codecs remain external. Reconstruction sorts are
 /// concrete; builtin declarations and signature-pattern arenas are not copied.
@@ -1144,8 +1172,8 @@ pub struct Extract {
 /// installation follows Program's normal rules; scheduler/seminaive history
 /// is not resumed.
 ///
-/// Export commands contain data Actions followed by AddRules, with no queries,
-/// Runs or loops. Emit exactly one direct Action.term for each canonical equality
+/// Export commands contain only data Actions, with no queries, Runs or loops.
+/// Emit exactly one direct Action.term for each canonical equality
 /// class, naming its unique Union location with all its constructor rows as
 /// members. Include empty/unreachable classes.
 /// Emit relation rows as direct Action.term Calls; write every function row,
@@ -1326,13 +1354,15 @@ pub struct DestroyEGraphResponse {
 }
 /// Retrieve one accumulated input Program for this live graph. Recording is
 /// selected at creation and off by default; disabled or unknown handles error.
-/// Retain original decoded authored Programs only after successful preparation,
+/// Retain decoded authored inputs only after successful preparation,
 /// before installation/commands. Rejected preparation contributes no input;
 /// later execution failure retains the accepted input, including its suffix.
 /// This records inputs only: no outcomes, resource/lifecycle events or raw bytes.
 /// Remap arenas while preserving command order, graph sharing and distinct Union
 /// locations. Declarations are cumulative, so earlier Freeze observations may
 /// contain extra definition metadata. This is not exact replay after failure.
+/// Capture historic named Run selections as needed when combining inputs, also
+/// inside nested commands: later binding replacements must not retarget them.
 /// GetHistory contributes no input. Clone retains the shared past independently;
 /// Destroy releases only its graph's history. Host implementations remain external.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]

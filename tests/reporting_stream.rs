@@ -76,7 +76,9 @@ fn loop_program() -> pb::Program {
                     body: vec![
                         pb::Command {
                             kind: Some(pb::command::Kind::Run(pb::Run {
-                                groups: vec!["step".into()],
+                                rulesets: vec![pb::RulesetSelection {
+                                    kind: Some(pb::ruleset_selection::Kind::Name("step".into())),
+                                }],
                                 ..Default::default()
                             })),
                             ..Default::default()
@@ -453,7 +455,9 @@ fn backoff_quiet_deferred_rounds_preserve_readiness_with_collection_off_and_on()
                 pb::Program {
                     commands: vec![pb::Command {
                         kind: Some(pb::command::Kind::Run(pb::Run {
-                            groups: vec!["copy".into()],
+                            rulesets: vec![pb::RulesetSelection {
+                                kind: Some(pb::ruleset_selection::Kind::Name("copy".into())),
+                            }],
                             scheduler: "bo".into(),
                         })),
                         ..Default::default()
@@ -609,7 +613,9 @@ fn decomposed_diagnostics_keep_actual_text_and_preserve_execution() {
     let request = pb::Program {
         commands: vec![pb::Command {
             kind: Some(pb::command::Kind::Run(pb::Run {
-                groups: vec!["chain".into()],
+                rulesets: vec![pb::RulesetSelection {
+                    kind: Some(pb::ruleset_selection::Kind::Name("chain".into())),
+                }],
                 ..Default::default()
             })),
             ..Default::default()

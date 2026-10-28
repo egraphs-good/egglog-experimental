@@ -1,8 +1,85 @@
 //! Opt-in submitted inputs owned by live graphs, outside preparation clones.
 
-use super::{Engine, TransportError, graph, pb};
+use super::{Engine, TransportError, graph, pb, rules};
 use prost::Message;
+use std::collections::HashMap;
 use std::sync::Arc;
+
+// Resolve historic name selections against this request's post-setup values.
+// A flattened history has one setup phase, so retaining live name references
+// would otherwise retarget older commands after a later replacement.
+pub(super) fn capture(
+    mut program: pb::Program,
+    registry: &rules::Registry,
+) -> Result<pb::Program, String> {
+    let mut bindings: HashMap<_, _> = program
+        .rulesets
+        .iter()
+        .map(|binding| {
+            (
+                binding.name.clone(),
+                binding.value.clone().expect("validated binding"),
+            )
+        })
+        .collect();
+    let names: Vec<_> = super::command_tree(&program.commands)
+        .filter_map(|command| {
+            if let Some(pb::command::Kind::Run(run)) = &command.kind {
+                Some(run)
+            } else {
+                None
+            }
+        })
+        .flat_map(|run| run.rulesets.iter())
+        .filter_map(|selection| {
+            if let Some(pb::ruleset_selection::Kind::Name(name)) = &selection.kind {
+                Some(name.clone())
+            } else {
+                None
+            }
+        })
+        .collect();
+    let mut imported: HashMap<usize, pb::Rule> = HashMap::new();
+    let mut files = HashMap::new();
+    for name in names {
+        if bindings.contains_key(&name) {
+            continue;
+        }
+        let mut selected = vec![];
+        for &index in registry.groups.get(&name).into_iter().flatten() {
+            let rule = if let Some(rule) = imported.get(&index) {
+                rule.clone()
+            } else {
+                let rule = graph::append_rule(
+                    &mut program,
+                    &registry.rules[index].candidate.record,
+                    &mut files,
+                )?;
+                imported.insert(index, rule.clone());
+                rule
+            };
+            selected.push(rule);
+        }
+        bindings.insert(name, pb::Ruleset { rules: selected });
+    }
+    let mut pending: Vec<_> = program.commands.iter_mut().collect();
+    while let Some(command) = pending.pop() {
+        match &mut command.kind {
+            Some(pb::command::Kind::Run(run)) => {
+                for selection in &mut run.rulesets {
+                    if let Some(pb::ruleset_selection::Kind::Name(name)) = &selection.kind {
+                        selection.kind =
+                            Some(pb::ruleset_selection::Kind::Ruleset(bindings[name].clone()));
+                    }
+                }
+            }
+            Some(pb::command::Kind::Fail(child)) => pending.push(child),
+            Some(pb::command::Kind::Loop(body)) => pending.extend(&mut body.body),
+            _ => (),
+        }
+    }
+    Ok(program)
+}
 
 struct Link {
     program: pb::Program,
@@ -50,6 +127,16 @@ impl HistoryLog {
             let files = u32::try_from(result.files.len()).map_err(|_| "too many files")?;
             graph::append(&mut result, program, files)?;
         }
+        let mut latest = HashMap::new();
+        for (index, binding) in result.rulesets.iter().enumerate() {
+            latest.insert(binding.name.clone(), index);
+        }
+        result.rulesets = result
+            .rulesets
+            .into_iter()
+            .enumerate()
+            .filter_map(|(index, binding)| (latest[&binding.name] == index).then_some(binding))
+            .collect();
         Ok(result)
     }
 }
@@ -315,6 +402,77 @@ mod tests {
                 .get_history(&pb::GetHistoryRequest { egraph_id: id }.encode_to_vec())
                 .unwrap(),
             bytes
+        );
+    }
+
+    #[test]
+    fn flattened_history_captures_names_before_later_binding_replacements() {
+        let (mut engine, id) = recorded_engine();
+        for text in [
+            "(datatype E (N i64) (Goal i64) (Other i64)) (ruleset g) (rule ((N x)) ((Goal x)) :ruleset g) (N 1) (run g 1)",
+            "(datatype E (N i64) (Goal i64) (Other i64)) (ruleset g) (rule ((N x)) ((Other x)) :ruleset g) (N 2) (run g 1) (check (Goal 1) (Other 2)) (fail (check (Goal 2)))",
+        ] {
+            for phase in super::super::source::Source::new(None, text).unwrap() {
+                let frames = engine
+                    .run(
+                        &pb::RunProgramRequest {
+                            egraph_id: id,
+                            program: Some(phase.unwrap()),
+                            diagnostics: false,
+                        }
+                        .encode_to_vec(),
+                    )
+                    .unwrap();
+                let observed = Observed::from_frames(
+                    frames
+                        .iter()
+                        .map(|frame| pb::RunProgramResponse::decode(frame.as_slice()).unwrap()),
+                );
+                assert_eq!(observed.error, None);
+            }
+        }
+        let history = pb::Program::decode(
+            engine
+                .get_history(&pb::GetHistoryRequest { egraph_id: id }.encode_to_vec())
+                .unwrap()
+                .as_slice(),
+        )
+        .unwrap();
+        assert_eq!(history.rulesets.len(), 1);
+        assert!(
+            super::super::command_tree(&history.commands)
+                .filter_map(|command| {
+                    if let Some(pb::command::Kind::Run(run)) = &command.kind {
+                        Some(run)
+                    } else {
+                        None
+                    }
+                })
+                .flat_map(|run| &run.rulesets)
+                .all(|selection| matches!(
+                    selection.kind,
+                    Some(pb::ruleset_selection::Kind::Ruleset(_))
+                ))
+        );
+        let (mut replay, fresh) = recorded_engine();
+        let frames = replay
+            .run(
+                &pb::RunProgramRequest {
+                    egraph_id: fresh,
+                    program: Some(history),
+                    diagnostics: false,
+                }
+                .encode_to_vec(),
+            )
+            .unwrap();
+        assert_eq!(
+            Observed::from_frames(
+                frames
+                    .iter()
+                    .map(|frame| pb::RunProgramResponse::decode(frame.as_slice()).unwrap())
+            )
+            .error,
+            None
         );
     }
 

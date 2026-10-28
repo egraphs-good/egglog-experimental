@@ -3,7 +3,7 @@
 //! This initial subset supports equality sorts/constructors, merged functions, relation predicates, exact selectors,
 //! callback rules/rewrites, immutable groups, ordered Run/Loop
 //! schedules and byte-backed register/check/extract/freeze observations.
-//! Flat and composed groups lower to ordered AddRules and union Run selections.
+//! Rule collections lower to literal Run selections or replaceable setup bindings.
 //! Equal rule content shares native registration and cursor state across groups.
 //! An undecodable or malformed reply makes that handle unusable; ordinary engine
 //! failures retain completed prefixes and permit compatible retries.
@@ -228,8 +228,9 @@
 //! The default native binding name is the module-qualified function name;
 //! `#[ruleset(name = expression)]` uses that exact name expression once, after
 //! the body. Named composition captures the explicitly authored rule values
-//! into that group; later runtime additions to child groups do not change the
-//! captured membership. Anonymous composition selects the union of its groups.
+//! into that group. Submitting it replaces the named binding before commands;
+//! existing rule cursors are retained. Anonymous composition captures its rule
+//! values and emits a literal selection, with no generated engine name.
 //! Cloning or composing `&LazyLock<Ruleset>` inputs preserves rule content and
 //! native cursors. A second graph registers that content in independent state.
 //! The generated item is a static, so normal Rust restrictions on shadowing its
@@ -553,7 +554,7 @@
 //! assert!(!graph.check(Term::Seen(8))?);
 //! let stats = graph.stats()?;
 //! assert!(!stats.content.is_empty());
-//! let shared = ruleset((&marks, &marks)); // canonical composition, no rule copies
+//! let shared = ruleset((&marks, &marks)); // shared rule content runs once
 //! graph.run(&shared)?;
 //! let mut snapshots = Vec::new();
 //! graph.run_stream(Schedule::from(&shared).with_snapshots().repeat(2), |snapshot| {

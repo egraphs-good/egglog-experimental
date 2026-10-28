@@ -16,7 +16,7 @@ class ExpectedFailureSchemaTests(unittest.TestCase):
             Oneof("prove", ir.Prove()),
             Oneof("prove_exists", ir.ProveExists(constructor="Goal")),
             Oneof("action", ir.Action(kind=Oneof("panic", "expected"))),
-            Oneof("run", ir.Run(groups=[""])),
+            Oneof("run", ir.Run(rulesets=[ir.RulesetSelection(kind=Oneof("name", ""))])),
         ):
             with self.subTest(kind=kind.field):
                 command = ir.Command(kind=kind, span=ir.Span(start=12, end=19))
@@ -93,7 +93,7 @@ class ExpectedFailureSchemaTests(unittest.TestCase):
         cases = [
             ("action", ir.Action(kind=Oneof("panic", "expected")), "0a0a22086578706563746564"),
             ("check", ir.Check(), "1200"),
-            ("run", ir.Run(groups=[""]), "1a020a00"),
+            ("run", ir.Run(), "1a00"),
             ("bind_scheduler", ir.BindScheduler(
                 name="s", back_off=ir.BackOff(),
             ), "22050a01731200"),
@@ -115,47 +115,103 @@ class ExpectedFailureSchemaTests(unittest.TestCase):
                 self.assertEqual(ir.Command.from_binary(bytes.fromhex(encoded)), command)
 
 
-class AdditiveSchemaTests(unittest.TestCase):
-    def test_add_rules_has_tag_18_and_keeps_bulk_order_and_duplicates(self):
+class RulesetSchemaTests(unittest.TestCase):
+    def test_bindings_use_program_tag_7_and_keep_order_and_duplicates(self):
         rule = ir.Rule(kind=Oneof("rule", ir.RuleBody()), eval_mode=ir.RuleEvalMode.SEMINAIVE)
-        for group, rules in (("", []), ("g", [rule]), ("snowman-☃", [rule, rule, rule])):
-            with self.subTest(group=group, rules=rules):
-                command = ir.Command(kind=Oneof("add_rules", ir.AddRules(group=group, rules=rules)))
-                validate(command)
-                self.assertTrue(command.to_binary().startswith(b"\x92\x01"))
+        for name, rules in (("", []), ("g", [rule]), ("snowman-☃", [rule, rule, rule])):
+            with self.subTest(name=name, rules=rules):
+                program = ir.Program(rulesets=[ir.RulesetBinding(
+                    name=name, value=ir.Ruleset(rules=rules),
+                )])
+                validate(program)
+                self.assertTrue(program.to_binary().startswith(b"\x3a"))
                 for decoded in (
-                    ir.Command.from_binary(command.to_binary()),
-                    ir.Command.from_json(command.to_json()),
+                    ir.Program.from_binary(program.to_binary()),
+                    ir.Program.from_json(program.to_json()),
                 ):
-                    self.assertEqual(decoded, command)
-        self.assertEqual(ir.Command(kind=Oneof("add_rules", ir.AddRules())).to_binary(), b"\x92\x01\x00")
+                    self.assertEqual(decoded, program)
+        self.assertEqual(ir.Program(rulesets=[
+            ir.RulesetBinding(value=ir.Ruleset()),
+        ]).to_binary(), bytes.fromhex("3a021200"))
 
-    def test_add_rules_owns_rule_values_and_validates_their_roots(self):
+    def test_binding_values_are_required_and_names_are_unique_per_program(self):
+        for name in ("", "g"):
+            with self.subTest(name=name):
+                with self.assertRaises(ValidationError):
+                    validate(ir.RulesetBinding(name=name))
+                with self.assertRaises(ValidationError):
+                    validate(ir.Program(rulesets=[
+                        ir.RulesetBinding(name=name, value=ir.Ruleset()),
+                        ir.RulesetBinding(name=name, value=ir.Ruleset()),
+                    ]))
+        validate(ir.Program(rulesets=[
+            ir.RulesetBinding(value=ir.Ruleset()),
+            ir.RulesetBinding(name="g", value=ir.Ruleset()),
+        ]))
+
+    def test_bindings_and_literal_selections_validate_rule_values_and_roots(self):
+        invalid_rules = [
+            ir.Rule(),
+            ir.Rule(kind=Oneof("rule", ir.RuleBody(query=[0])), eval_mode=ir.RuleEvalMode.SEMINAIVE),
+            ir.Rule(kind=Oneof("rule", ir.RuleBody(head=[ir.Action(kind=Oneof("term", 0))])),
+                    eval_mode=ir.RuleEvalMode.SEMINAIVE),
+            ir.Rule(kind=Oneof("rewrite", ir.Rewrite(lhs=0, rhs=0)),
+                    eval_mode=ir.RuleEvalMode.SEMINAIVE),
+            ir.Rule(kind=Oneof("birewrite", ir.BiRewrite(lhs=0, rhs=0)),
+                    eval_mode=ir.RuleEvalMode.SEMINAIVE),
+        ]
+        for rule in invalid_rules:
+            ruleset = ir.Ruleset(rules=[rule])
+            for program in (
+                ir.Program(rulesets=[ir.RulesetBinding(name="g", value=ruleset)]),
+                ir.Program(commands=[ir.Command(kind=Oneof("run", ir.Run(rulesets=[
+                    ir.RulesetSelection(kind=Oneof("ruleset", ruleset)),
+                ])))]),
+            ):
+                with self.subTest(rule=rule, program=program), self.assertRaises(ValidationError):
+                    validate(program)
+
+    def test_run_selections_distinguish_empty_default_unknown_and_literals(self):
         rule = ir.Rule(kind=Oneof("rule", ir.RuleBody()), eval_mode=ir.RuleEvalMode.SEMINAIVE)
-        program = ir.Program(commands=[ir.Command(kind=Oneof("add_rules", ir.AddRules(group="g", rules=[rule, rule])))])
-        validate(program)
-        self.assertEqual(ir.Program.from_binary(program.to_binary()), program)
-        program.commands[0].kind.value.rules.append(ir.Rule())
-        with self.assertRaises(ValidationError):
-            validate(program)
-
-    def test_run_groups_distinguish_empty_default_and_unknown_selections(self):
-        for groups in ([], [""], ["unknown"], ["a", "b", "a"], ["", "snowman-☃"]):
-            with self.subTest(groups=groups):
-                run = ir.Run(groups=groups)
+        names = [ir.RulesetSelection(kind=Oneof("name", name)) for name in ("", "unknown", "a", "b")]
+        literal = ir.RulesetSelection(kind=Oneof("ruleset", ir.Ruleset(rules=[rule, rule])))
+        empty = ir.RulesetSelection(kind=Oneof("ruleset", ir.Ruleset()))
+        for selections in ([], [names[0]], [names[1]], [names[2], names[3], names[2]],
+                           [literal, names[0], empty, literal]):
+            with self.subTest(selections=selections):
+                run = ir.Run(rulesets=selections, scheduler="s")
                 validate(run)
                 for decoded in (ir.Run.from_binary(run.to_binary()), ir.Run.from_json(run.to_json())):
                     self.assertEqual(decoded, run)
-                    self.assertEqual(decoded.groups, groups)
+                    self.assertEqual(decoded.rulesets, selections)
         self.assertEqual(ir.Run().to_binary(), b"")
-        self.assertEqual(ir.Run(groups=[""]).to_binary(), b"\x0a\x00")
+        self.assertEqual(ir.Run(rulesets=[names[0]]).to_binary(), bytes.fromhex("0a021200"))
+        self.assertEqual(ir.Run(rulesets=[empty]).to_binary(), bytes.fromhex("0a020a00"))
+        self.assertEqual(ir.Run(scheduler="s").to_binary(), bytes.fromhex("120173"))
+        with self.assertRaises(ValidationError):
+            validate(ir.Run(rulesets=[ir.RulesetSelection()]))
 
-    def test_standalone_rule_values_need_no_program_arena(self):
+    def test_nested_literal_rule_shapes_validate_even_in_zero_iteration_bodies(self):
+        for rule in (ir.Rule(), ir.Rule(kind=Oneof("rule", ir.RuleBody()))):
+            run = ir.Command(kind=Oneof("run", ir.Run(rulesets=[
+                ir.RulesetSelection(kind=Oneof("ruleset", ir.Ruleset(rules=[rule]))),
+            ])))
+            for command in (
+                ir.Command(kind=Oneof("fail", run)),
+                ir.Command(kind=Oneof("loop", ir.Loop(body=[run], max_iterations=0))),
+            ):
+                with self.subTest(command=command), self.assertRaises(ValidationError):
+                    validate(ir.Program(commands=[command]))
+
+    def test_standalone_rule_values_need_no_program_arena_or_registration_command(self):
         rule = ir.Rule(kind=Oneof("rule", ir.RuleBody()), eval_mode=ir.RuleEvalMode.SEMINAIVE)
         validate(rule)
         self.assertEqual(ir.Rule.from_binary(rule.to_binary()), rule)
         self.assertNotIn("rules", ir.Program.__annotations__)
+        self.assertFalse(hasattr(ir, "AddRules"))
         self.assertFalse(hasattr(ir, "Scheduler"))
+        with self.assertRaises(ValidationError):
+            validate(ir.Command.from_binary(bytes.fromhex("920100")))
         with self.assertRaises(TypeError):
             ir.BindScheduler(name="s", scheduler=ir.BackOff())
 

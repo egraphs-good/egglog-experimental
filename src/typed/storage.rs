@@ -812,13 +812,6 @@ pub(super) fn visit(
                 pb::command::Kind::Action(action) => {
                     visit_action(action, |index| map(Arena::Node, index))?;
                 }
-                pb::command::Kind::AddRules(add) => {
-                    // Inline values are filled from the private owned imports
-                    // after their independent binders have been packed.
-                    for index in 0..add.rules.len() {
-                        map(Arena::Rule, index as u32)?;
-                    }
-                }
                 _ => return Err(invalid()),
             }
         }
@@ -836,12 +829,11 @@ pub(super) fn publish(
     mut rules: Vec<pb::Rule>,
 ) -> Result<Record, TypedError> {
     if !program.files.is_empty()
-        || program.commands.iter().any(|c| {
-            !matches!(
-                c.kind,
-                Some(pb::command::Kind::Action(_) | pb::command::Kind::AddRules(_))
-            )
-        })
+        || !program.rulesets.is_empty()
+        || program
+            .commands
+            .iter()
+            .any(|c| !matches!(c.kind, Some(pb::command::Kind::Action(_))))
     {
         return Err(TypedError::Invalid(
             "unsupported typed fragment sections".into(),
@@ -939,7 +931,6 @@ pub(super) fn publish(
 pub(super) struct Packer {
     pub program: pb::Program,
     pub(super) rules: Vec<pb::Rule>,
-    rule_additions: Vec<(u32, Vec<u32>)>,
     ids: HashMap<(Key, usize), u32>,
     pending: Vec<(Record, usize, u32)>,
     cursor: usize,
@@ -961,7 +952,6 @@ impl Default for Packer {
                 ..Default::default()
             },
             rules: vec![],
-            rule_additions: vec![],
             ids: HashMap::new(),
             pending: vec![],
             cursor: 0,
@@ -1304,21 +1294,11 @@ impl Packer {
                     unreachable!("builtin descriptor cannot enter Program queue")
                 }
             }
-            let mut packed_rules = vec![];
-            let mut relocate = |a, i| {
-                let packed = self.intern(record.resolve(a, i)?, binder);
-                if a == Arena::Rule {
-                    packed_rules.push(packed);
-                }
-                Ok(packed)
-            };
+            let mut relocate = |a, i| Ok(self.intern(record.resolve(a, i)?, binder));
             if record.arena == Arena::Rule {
                 visit_rule(&mut one_rules[0], relocate)?;
             } else {
                 visit(&mut one, record.arena, 0, &mut relocate)?;
-            }
-            if !packed_rules.is_empty() {
-                self.rule_additions.push((index, packed_rules));
             }
             match record.arena {
                 Arena::Node => self.program.nodes[index as usize] = one.nodes.pop().unwrap(),
@@ -1347,17 +1327,6 @@ impl Packer {
                 }
             }
             self.cursor += 1;
-        }
-        for (command, rules) in self.rule_additions.drain(..) {
-            let Some(pb::command::Kind::AddRules(add)) =
-                &mut self.program.commands[command as usize].kind
-            else {
-                return Err(TypedError::Invalid("invalid private rule addition".into()));
-            };
-            add.rules = rules
-                .iter()
-                .map(|index| self.rules[*index as usize].clone())
-                .collect();
         }
         // Independent compatible declarations can have distinct owners. Compare
         // complete node bodies, but keep the original arena references below.

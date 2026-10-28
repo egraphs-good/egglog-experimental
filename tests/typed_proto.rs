@@ -1160,13 +1160,13 @@ mod lazy_rulesets {
     }
 
     #[ruleset(name = "lazy::collision")]
-    fn collision_first() -> Rule {
-        rule((), RuleTerms::Copied(127))
+    fn collision_first(x: &I64) -> Rule {
+        rule(RuleTerms::Input(x), RuleTerms::Copied(x))
     }
 
     #[ruleset(name = "lazy::collision")]
-    fn collision_other() -> Rule {
-        rule((), RuleTerms::Second(127))
+    fn collision_other(x: &I64) -> Rule {
+        rule(RuleTerms::Input(x), RuleTerms::Second(x))
     }
 
     #[test]
@@ -1216,19 +1216,10 @@ mod lazy_rulesets {
             ] {
                 graph.run(group)?;
                 let history = graph.history()?;
-                let mut pending = history.commands.iter().collect::<Vec<_>>();
-                let mut found = false;
-                while let Some(command) = pending.pop() {
-                    match &command.kind {
-                        Some(egglog_experimental::proto::command::Kind::AddRules(add)) => {
-                            found |= add.group == expected
-                        }
-                        Some(egglog_experimental::proto::command::Kind::Loop(body)) => {
-                            pending.extend(&body.body)
-                        }
-                        _ => (),
-                    }
-                }
+                let found = history
+                    .rulesets
+                    .iter()
+                    .any(|binding| binding.name == expected);
                 assert!(found, "authored group name is preserved");
             }
             assert!(graph.check((
@@ -1259,14 +1250,23 @@ mod lazy_rulesets {
     }
 
     #[test]
-    fn lazy_ruleset_equal_names_add_distinct_content_to_one_group() -> Result<(), TypedError> {
+    fn lazy_ruleset_equal_names_replace_content_and_reuse_cursors() -> Result<(), TypedError> {
         let mut graph = EGraph::default();
+        graph.register(RuleTerms::Input(127))?;
         graph.run_with_diagnostics(&collision_first)?;
         graph.run_with_diagnostics(&collision_other)?;
+        assert!(graph.check(RuleTerms::Copied(127))?);
         assert!(graph.check(RuleTerms::Second(127))?);
+        graph.register(RuleTerms::Input(128))?;
+        graph.run_with_diagnostics(&collision_other)?;
+        assert!(graph.check(RuleTerms::Second(128))?);
+        assert!(!graph.check(RuleTerms::Copied(128))?);
+        graph.run_with_diagnostics(&collision_first)?;
+        assert!(graph.check(RuleTerms::Copied(128))?);
         let response = graph.run_with_diagnostics(&collision_first)?;
         assert_eq!(diagnostic_matches(&response.1), 0);
         let mut independent = EGraph::default();
+        independent.register(RuleTerms::Input(127))?;
         independent.run_with_diagnostics(&collision_other)?;
         assert!(independent.check(RuleTerms::Second(127))?);
         Ok(())
@@ -1415,7 +1415,7 @@ fn generated_ne_infers_borrowed_inputs_and_observes_native_merges() -> Result<()
     graph.register((&left, &right, &left_vec, &right_vec))?;
     assert!(graph.check(ne(&left, &right))?);
     assert!(graph.check(ne(&left_vec, &right_vec))?);
-    graph.run(ruleset(rewrite(&left, &right)))?;
+    graph.run(rewrite(&left, &right))?;
     assert!(graph.check(eq(&left, &right))?);
     assert!(!graph.check(ne(&left, &right))?);
     assert!(!graph.check(ne(&left_vec, &right_vec))?);

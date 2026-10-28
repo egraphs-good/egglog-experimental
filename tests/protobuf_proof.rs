@@ -952,7 +952,7 @@ fn scope_pop_restores_proof_state_and_can_prove_again() {
         let mut engine = Engine::default();
         let saved = create(&mut engine, mode);
         let mut setup = fixture();
-        setup.commands.truncate(2);
+        setup.commands.truncate(1);
         assert_eq!(run(&mut engine, saved, setup).error, None);
         let active = pb::CloneEGraphResponse::decode(
             engine
@@ -967,7 +967,7 @@ fn scope_pop_restores_proof_state_and_can_prove_again() {
             pb::ExecutionMode::Proofs | pb::ExecutionMode::ProofTesting
         );
         let mut work = fixture();
-        work.commands.drain(..2);
+        work.commands.drain(..1);
         if !proving {
             work.commands.truncate(2);
         }
@@ -1024,7 +1024,7 @@ fn scope_pop_restores_proof_state_and_can_prove_again() {
         let mut absent = fixture();
         absent.commands = vec![pb::Command {
             kind: Some(pb::command::Kind::Fail(Box::new(
-                absent.commands[3].clone(),
+                absent.commands[2].clone(),
             ))),
             ..Default::default()
         }];
@@ -2008,7 +2008,7 @@ fn table_observation_keeps_completed_prefix_and_encoding_errors_are_not_unavaila
         let mut engine = Engine::default();
         let id = create(&mut engine, mode);
         let mut program = fixture();
-        program.commands.truncate(2);
+        program.commands.truncate(1);
         assert_eq!(run(&mut engine, id, program.clone()).error, None);
         program.commands = vec![
             pb::Command {
@@ -2018,7 +2018,7 @@ fn table_observation_keeps_completed_prefix_and_encoding_errors_are_not_unavaila
                 })),
                 ..Default::default()
             },
-            fixture().commands[3].clone(),
+            fixture().commands[2].clone(),
         ];
         let response = run(&mut engine, id, program);
         assert!(response.error.is_some());
@@ -2031,7 +2031,7 @@ fn table_observation_keeps_completed_prefix_and_encoding_errors_are_not_unavaila
         let id = create(&mut engine, mode);
         let initialized = provider.initializations.load(Ordering::SeqCst);
         let mut program = fixture();
-        program.commands.truncate(2);
+        program.commands.truncate(1);
         assert_eq!(run(&mut engine, id, program.clone()).error, None);
         program.commands = vec![
             pb::Command {
@@ -2183,6 +2183,11 @@ fn fixture() -> pb::Program {
         ..Default::default()
     };
     pb::Program {
+        rulesets: vec![pb::RulesetBinding {
+            name: "rebuilding_ruleset".into(),
+            value: Some(pb::Ruleset { rules: vec![rule] }),
+        }],
+
         sorts: vec![
             pb::Sort {
                 kind: Some(pb::sort::Kind::Application(pb::SortApplication {
@@ -2215,13 +2220,6 @@ fn fixture() -> pb::Program {
         ],
         commands: vec![
             pb::Command {
-                kind: Some(pb::command::Kind::AddRules(pb::AddRules {
-                    group: "rebuilding_ruleset".into(),
-                    rules: vec![rule],
-                })),
-                ..Default::default()
-            },
-            pb::Command {
                 kind: Some(pb::command::Kind::Action(pb::Action {
                     kind: Some(pb::action::Kind::Term(2)),
                     ..Default::default()
@@ -2230,7 +2228,12 @@ fn fixture() -> pb::Program {
             },
             pb::Command {
                 kind: Some(pb::command::Kind::Run(pb::Run {
-                    groups: vec!["rebuilding_ruleset".into()],
+                    rulesets: (vec!["rebuilding_ruleset".into()])
+                        .into_iter()
+                        .map(|name| pb::RulesetSelection {
+                            kind: Some(pb::ruleset_selection::Kind::Name(name)),
+                        })
+                        .collect(),
                     ..Default::default()
                 })),
                 ..Default::default()
@@ -2279,9 +2282,7 @@ fn shared_content_resupply_groups_and_clone_keep_native_proofs_and_cursors() {
                 ..Default::default()
             });
         }
-        let Some(pb::command::Kind::AddRules(registration)) = &mut program.commands[0].kind else {
-            unreachable!()
-        };
+        let registration = program.rulesets[0].value.as_mut().unwrap();
         let original = &mut registration.rules[0];
         let Some(pb::rule::Kind::Rule(rule)) = &mut original.kind else {
             unreachable!()
@@ -2300,22 +2301,22 @@ fn shared_content_resupply_groups_and_clone_keep_native_proofs_and_cursors() {
         same_content.name = Some("another label".into());
         same_content.span = None;
         same_content.doc = "diagnostics do not create another native rule".into();
-        let mut commands = vec![
-            pb::Command {
-                kind: Some(pb::command::Kind::AddRules(pb::AddRules {
-                    group: "left".into(),
+        program.rulesets = vec![
+            pb::RulesetBinding {
+                name: "left".into(),
+                value: Some(pb::Ruleset {
                     rules: vec![original.clone(), original.clone()],
-                })),
-                ..Default::default()
+                }),
             },
-            pb::Command {
-                kind: Some(pb::command::Kind::AddRules(pb::AddRules {
-                    group: "right".into(),
+            pb::RulesetBinding {
+                name: "right".into(),
+                value: Some(pb::Ruleset {
                     rules: vec![same_content],
-                })),
-                ..Default::default()
+                }),
             },
-            program.commands[1].clone(),
+        ];
+        let mut commands = vec![
+            program.commands[0].clone(),
             pb::Command {
                 kind: Some(pb::command::Kind::Action(pb::Action {
                     kind: Some(pb::action::Kind::Term(11)),
@@ -2331,7 +2332,13 @@ fn shared_content_resupply_groups_and_clone_keep_native_proofs_and_cursors() {
         ] {
             commands.push(pb::Command {
                 kind: Some(pb::command::Kind::Run(pb::Run {
-                    groups: groups.into_iter().map(str::to_owned).collect(),
+                    rulesets: groups
+                        .into_iter()
+                        .map(str::to_owned)
+                        .map(|name| pb::RulesetSelection {
+                            kind: Some(pb::ruleset_selection::Kind::Name(name)),
+                        })
+                        .collect(),
                     ..Default::default()
                 })),
                 ..Default::default()
@@ -2341,17 +2348,15 @@ fn shared_content_resupply_groups_and_clone_keep_native_proofs_and_cursors() {
             mode,
             pb::ExecutionMode::Proofs | pb::ExecutionMode::ProofTesting
         ) {
-            commands.extend_from_slice(&program.commands[4..]);
+            commands.extend_from_slice(&program.commands[3..]);
         }
         program.commands = commands;
         let mut engine = Engine::default();
         let id = create(&mut engine, mode);
         for iteration in 0..2 {
             if iteration == 1 {
-                for (index, command) in program.commands[..2].iter_mut().enumerate() {
-                    let Some(pb::command::Kind::AddRules(registration)) = &mut command.kind else {
-                        unreachable!()
-                    };
+                for (index, binding) in program.rulesets.iter_mut().enumerate() {
+                    let registration = binding.value.as_mut().unwrap();
                     for rule in &mut registration.rules {
                         if index == 0 {
                             rule.name = None;
@@ -2410,22 +2415,25 @@ fn shared_content_resupply_groups_and_clone_keep_native_proofs_and_cursors() {
         let clone = pb::CloneEGraphResponse::decode(cloned.as_slice())
             .unwrap()
             .egraph_id;
-        let Some(pb::command::Kind::AddRules(registration)) = &program.commands[1].kind else {
-            unreachable!()
-        };
+        let registration = program.rulesets[1].value.as_ref().unwrap();
         let child_rule = registration.rules[0].clone();
-        program.commands = vec![pb::Command {
-            kind: Some(pb::command::Kind::AddRules(pb::AddRules {
-                group: "child".into(),
+        program.rulesets = vec![pb::RulesetBinding {
+            name: "child".into(),
+            value: Some(pb::Ruleset {
                 rules: vec![child_rule],
-            })),
-            ..Default::default()
+            }),
         }];
+        program.commands = vec![];
         assert_eq!(run(&mut engine, clone, program.clone()).error, None);
         let mut name_only = pb::Program {
             commands: vec![pb::Command {
                 kind: Some(pb::command::Kind::Run(pb::Run {
-                    groups: vec!["child".into()],
+                    rulesets: (vec!["child".into()])
+                        .into_iter()
+                        .map(|name| pb::RulesetSelection {
+                            kind: Some(pb::ruleset_selection::Kind::Name(name)),
+                        })
+                        .collect(),
                     ..Default::default()
                 })),
                 ..Default::default()
@@ -2445,7 +2453,12 @@ fn shared_content_resupply_groups_and_clone_keep_native_proofs_and_cursors() {
         let Some(pb::command::Kind::Run(r)) = &mut name_only.commands[0].kind else {
             unreachable!()
         };
-        r.groups = vec!["right".into(), "left".into(), "right".into()];
+        r.rulesets = (vec!["right".into(), "left".into(), "right".into()])
+            .into_iter()
+            .map(|name| pb::RulesetSelection {
+                kind: Some(pb::ruleset_selection::Kind::Name(name)),
+            })
+            .collect();
         program.files = vec![pb::SourceFile {
             name: "later.egg".into(),
             contents: None,
@@ -2595,9 +2608,9 @@ fn all_modes_return_requested_proofs_control_and_optional_diagnostics() {
                 assert_eq!(
                     paths,
                     if mode == pb::ExecutionMode::ProofTesting {
-                        vec![vec![2], vec![3], vec![4], vec![5]]
+                        vec![vec![1], vec![2], vec![3], vec![4]]
                     } else {
-                        vec![vec![2], vec![4], vec![5]]
+                        vec![vec![1], vec![3], vec![4]]
                     }
                 );
                 for output in requested.iter().skip(1) {
@@ -2608,10 +2621,10 @@ fn all_modes_return_requested_proofs_control_and_optional_diagnostics() {
                     assert!(!proof.terms.is_empty());
                 }
             } else {
-                assert_eq!(paths, [vec![2]]);
+                assert_eq!(paths, [vec![1]]);
                 let error = response.error.unwrap();
                 assert_eq!(error.code, i32::from(pb::ErrorCode::RuntimeFailure));
-                assert_eq!(error.location.unwrap().path, [4]);
+                assert_eq!(error.location.unwrap().path, [3]);
             }
         }
     }
@@ -2628,7 +2641,7 @@ fn proof_failure_preserves_owned_prefix_clone_mode_and_native_error_order() {
         let mut engine = Engine::default();
         let id = create(&mut engine, mode);
         let mut setup = fixture();
-        setup.commands.truncate(4);
+        setup.commands.truncate(3);
         assert_eq!(run(&mut engine, id, setup).error, None);
         let cloned = engine
             .clone_egraph(&pb::CloneEGraphRequest { egraph_id: id }.encode_to_vec())
@@ -2690,7 +2703,7 @@ fn proof_failure_preserves_owned_prefix_clone_mode_and_native_error_order() {
             assert_eq!(run(&mut engine, handle, check).error.is_none(), succeeds);
         }
         let mut proof = program;
-        proof.commands = vec![fixture().commands[5].clone()];
+        proof.commands = vec![fixture().commands[4].clone()];
         let copied = run(&mut engine, clone, proof);
         assert_eq!(copied.error.is_none(), proofs);
         if !proofs {
@@ -2745,14 +2758,20 @@ fn malformed_later_commands_unentered_rules_and_observations_are_atomic_preparat
                     ..Default::default()
                 }),
                 2 => {
-                    let mut registration = program.commands.remove(0);
-                    let Some(pb::command::Kind::AddRules(add)) = &mut registration.kind else {
+                    let mut literal = program.rulesets.remove(0).value.unwrap();
+                    let Some(pb::rule::Kind::Rule(rule)) = &mut literal.rules[0].kind else {
                         unreachable!()
                     };
-                    let Some(pb::rule::Kind::Rule(rule)) = &mut add.rules[0].kind else {
-                        unreachable!()
+                    rule.query.clear();
+                    let registration = pb::Command {
+                        kind: Some(pb::command::Kind::Run(pb::Run {
+                            rulesets: vec![pb::RulesetSelection {
+                                kind: Some(pb::ruleset_selection::Kind::Ruleset(literal)),
+                            }],
+                            ..Default::default()
+                        })),
+                        ..Default::default()
                     };
-                    rule.query.clear(); // x in the unentered rule head is ungrounded
                     program.commands.push(pb::Command {
                         kind: Some(pb::command::Kind::Loop(pb::Loop {
                             body: vec![registration],
@@ -2862,13 +2881,15 @@ fn source_and_renderer_keep_proof_commands_authored() {
         let mut proofs = 0;
         for phase in Source::new(Some("proof.egg".into()), source).unwrap() {
             let phase = phase.unwrap();
+            if !phase.rulesets.is_empty() {
+                kinds.push("add");
+            }
             for command in &phase.commands {
                 kinds.push(match &command.kind {
                     Some(pb::command::Kind::Prove(_)) => "prove",
                     Some(pb::command::Kind::ProveExists(_)) => "exists",
                     Some(pb::command::Kind::Check(_)) => "check",
                     Some(pb::command::Kind::Run(_)) => "run",
-                    Some(pb::command::Kind::AddRules(_)) => "add",
                     _ => "action",
                 });
             }
@@ -2921,7 +2942,10 @@ fn source_and_renderer_keep_proof_commands_authored() {
                 .collect();
             assert_eq!(actual, requested);
         }
-        assert_eq!(kinds, ["add", "action", "run", "check", "prove", "exists"]);
+        assert_eq!(
+            kinds,
+            ["add", "add", "action", "run", "check", "prove", "exists"]
+        );
         assert_eq!(
             proofs,
             if mode == pb::ExecutionMode::ProofTesting {
@@ -3150,7 +3174,7 @@ fn schedule_controls_match_native_flags_and_execution_in_every_mode() {
                 },
             );
             let mut program = fixture();
-            let run_leaf = program.commands[2].clone();
+            let run_leaf = program.commands[1].clone();
             let mut body = vec![run_leaf.clone()];
             let mut native_body = vec![leaf.clone()];
             if case == 5 {
@@ -3261,7 +3285,7 @@ fn schedule_controls_match_native_flags_and_execution_in_every_mode() {
                 assert_eq!(completed, 2);
                 assert_eq!(native_runs, if case == 7 { 2 } else { 3 });
             }
-            program.commands.truncate(2);
+            program.commands.truncate(1);
             program.commands.push(pb::Command {
                 kind: Some(kind),
                 ..Default::default()
@@ -3305,7 +3329,7 @@ fn schedule_controls_match_native_flags_and_execution_in_every_mode() {
             );
             if case == 3 {
                 let mut whole_body = program.clone();
-                let Some(pb::command::Kind::Loop(saturate)) = &mut whole_body.commands[2].kind
+                let Some(pb::command::Kind::Loop(saturate)) = &mut whole_body.commands[1].kind
                 else {
                     unreachable!()
                 };
@@ -3416,7 +3440,7 @@ fn dead_schedule_bodies_are_validated_before_effects_in_every_mode() {
         pb::ExecutionMode::ProofTesting,
     ] {
         for case in [
-            "add-rules",
+            "literal",
             "action",
             "fail",
             "stats",
@@ -3428,10 +3452,22 @@ fn dead_schedule_bodies_are_validated_before_effects_in_every_mode() {
             "span",
         ] {
             let mut program = fixture();
-            let mut invalid = program.commands[2].clone();
+            let mut invalid = program.commands[1].clone();
             match case {
-                "add-rules" => invalid = program.commands[0].clone(),
-                "action" => invalid = program.commands[1].clone(),
+                "literal" => {
+                    invalid = pb::Command {
+                        kind: Some(pb::command::Kind::Run(pb::Run {
+                            rulesets: vec![pb::RulesetSelection {
+                                kind: Some(pb::ruleset_selection::Kind::Ruleset(
+                                    program.rulesets[0].value.clone().unwrap(),
+                                )),
+                            }],
+                            ..Default::default()
+                        })),
+                        ..Default::default()
+                    }
+                }
+                "action" => invalid = program.commands[0].clone(),
                 "fail" => {
                     invalid = pb::Command {
                         kind: Some(pb::command::Kind::Fail(Box::new(invalid))),
@@ -3470,11 +3506,16 @@ fn dead_schedule_bodies_are_validated_before_effects_in_every_mode() {
                     if case == "scheduler" {
                         run.scheduler = "custom".into();
                     } else {
-                        run.groups = vec!["unknown".into()];
+                        run.rulesets = (vec!["unknown".into()])
+                            .into_iter()
+                            .map(|name| pb::RulesetSelection {
+                                kind: Some(pb::ruleset_selection::Kind::Name(name)),
+                            })
+                            .collect();
                     }
                 }
             }
-            program.commands.truncate(2);
+            program.commands.truncate(1);
             program.commands.push(pb::Command {
                 kind: Some(pb::command::Kind::Loop(pb::Loop {
                     max_iterations: Some(0),
@@ -3488,19 +3529,13 @@ fn dead_schedule_bodies_are_validated_before_effects_in_every_mode() {
             let response = run(&mut engine, id, program.clone());
             let valid = matches!(
                 case,
-                "add-rules"
-                    | "action"
-                    | "fail"
-                    | "repeat-until"
-                    | "unbounded"
-                    | "until"
-                    | "unknown"
+                "literal" | "action" | "fail" | "repeat-until" | "unbounded" | "until" | "unknown"
             ) || case == "stats" && mode == pb::ExecutionMode::Normal;
             if valid {
                 assert_eq!(response.error, None, "{mode:?}/{case}: {response:?}");
                 assert_eq!(response.output.outputs.len(), 1);
                 let output = &response.output.outputs[0];
-                assert_eq!(output.location.as_ref().unwrap().path, [2]);
+                assert_eq!(output.location.as_ref().unwrap().path, [1]);
                 assert!(output.location.as_ref().unwrap().iterations.is_empty());
                 let Some(pb::command_output::Kind::Run(outcome)) = &output.kind else {
                     panic!("{mode:?}/{case}: {output:?}")
@@ -3514,7 +3549,7 @@ fn dead_schedule_bodies_are_validated_before_effects_in_every_mode() {
                 assert!(response.output.outputs.is_empty());
             }
             let rendered = Renderer::core().render(&program);
-            if matches!(case, "add-rules" | "unknown" | "unbounded") {
+            if matches!(case, "literal" | "unknown" | "unbounded") {
                 let rendered = rendered.unwrap();
                 assert!(
                     Source::new_core(None, &rendered)
@@ -3524,6 +3559,7 @@ fn dead_schedule_bodies_are_validated_before_effects_in_every_mode() {
             } else {
                 assert!(rendered.is_err(), "dead Core source body {case}");
             }
+            program.rulesets.clear();
             // Valid dead controls retain the authored seed prefix, but neither
             // execute their bodies nor derive Goal. Invalid dead bodies reject
             // during preparation, before even that seed can have effects.
@@ -3538,9 +3574,9 @@ fn dead_schedule_bodies_are_validated_before_effects_in_every_mode() {
                 ..Default::default()
             }];
             assert!(run(&mut engine, id, program.clone()).error.is_some());
-            // Successful preparation retained the AddRules prefix. Its group
+            // Successful preparation installed the setup binding. Its group
             // can now derive Goal; rejected dead bodies installed no rule.
-            program.commands = vec![fixture().commands[2].clone(), program.commands[0].clone()];
+            program.commands = vec![fixture().commands[1].clone(), program.commands[0].clone()];
             assert_eq!(
                 run(&mut engine, id, program).error.is_none(),
                 valid,
@@ -3640,15 +3676,15 @@ fn repeated_leaf_failure_has_no_completed_result_and_retains_prefix() {
             func: "N".into(),
             args: vec![sum],
         }));
-        program.commands.truncate(3);
-        program.commands[2] = pb::Command {
+        program.commands.truncate(2);
+        program.commands[1] = pb::Command {
             kind: Some(if exact {
                 pb::command::Kind::Loop(pb::Loop {
                     max_iterations: Some(2),
                     body: vec![pb::Command {
                         kind: Some(pb::command::Kind::Loop(pb::Loop {
                             max_iterations: Some(1),
-                            body: vec![program.commands[2].clone()],
+                            body: vec![program.commands[1].clone()],
                             ..Default::default()
                         })),
                         ..Default::default()
@@ -3658,7 +3694,7 @@ fn repeated_leaf_failure_has_no_completed_result_and_retains_prefix() {
             } else {
                 pb::command::Kind::Loop(pb::Loop {
                     max_iterations: Some(2),
-                    body: vec![program.commands[2].clone()],
+                    body: vec![program.commands[1].clone()],
                     ..Default::default()
                 })
             }),
@@ -3670,7 +3706,7 @@ fn repeated_leaf_failure_has_no_completed_result_and_retains_prefix() {
         let error = response.error.unwrap();
         assert_eq!(error.code, i32::from(pb::ErrorCode::RuntimeFailure));
         let location = error.location.unwrap();
-        let path = if exact { vec![2, 0, 0] } else { vec![2, 0] };
+        let path = if exact { vec![1, 0, 0] } else { vec![1, 0] };
         assert_eq!(location.path, path);
         assert_eq!(
             location.iterations,
@@ -3730,9 +3766,7 @@ fn failed_authored_run_has_no_fabricated_result_and_keeps_seed() {
             })),
             ..Default::default()
         });
-        let Some(pb::command::Kind::AddRules(registration)) = &mut program.commands[0].kind else {
-            unreachable!()
-        };
+        let registration = program.rulesets[0].value.as_mut().unwrap();
         let Some(pb::rule::Kind::Rule(rule)) = &mut registration.rules[0].kind else {
             unreachable!()
         };
@@ -3740,11 +3774,11 @@ fn failed_authored_run_has_no_fabricated_result_and_keeps_seed() {
             kind: Some(pb::action::Kind::Term(goal)),
             ..Default::default()
         }];
-        program.commands.truncate(3);
+        program.commands.truncate(2);
         let response = run(&mut engine, id, program);
         let error = response.error.unwrap();
         assert_eq!(error.code, i32::from(pb::ErrorCode::RuntimeFailure));
-        assert_eq!(error.location.unwrap().path, [2]);
+        assert_eq!(error.location.unwrap().path, [1]);
         assert!(response.output.outputs.is_empty());
         let mut retry = fixture();
         retry.commands = vec![pb::Command {

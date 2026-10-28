@@ -5,21 +5,29 @@ use prost::Message;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-/// Visit inline rule values in command order, including nested command lists.
+/// Visit setup bindings, then literal selections in command-tree order.
 pub(crate) fn rules(program: &pb::Program) -> impl Iterator<Item = &pb::Rule> {
-    super::command_tree(&program.commands).flat_map(|command| match &command.kind {
-        Some(pb::command::Kind::AddRules(add)) => add.rules.as_slice(),
-        _ => &[],
-    })
+    super::rules::collections(program).flat_map(|(_, ruleset)| ruleset.rules.iter())
 }
 
-/// Mutable traversal of inline rule values, preserving enclosing command order.
+/// Mutable traversal matching the immutable rule order.
 pub(crate) fn rules_mut(program: &mut pb::Program) -> Vec<&mut pb::Rule> {
     let mut result = vec![];
+    for binding in &mut program.rulesets {
+        if let Some(value) = &mut binding.value {
+            result.extend(&mut value.rules);
+        }
+    }
     let mut pending: Vec<_> = program.commands.iter_mut().rev().collect();
     while let Some(command) = pending.pop() {
         match &mut command.kind {
-            Some(pb::command::Kind::AddRules(add)) => result.extend(add.rules.iter_mut()),
+            Some(pb::command::Kind::Run(run)) => {
+                for selection in &mut run.rulesets {
+                    if let Some(pb::ruleset_selection::Kind::Ruleset(value)) = &mut selection.kind {
+                        result.extend(&mut value.rules);
+                    }
+                }
+            }
             Some(pb::command::Kind::Fail(child)) => pending.push(child),
             Some(pb::command::Kind::Loop(body)) => pending.extend(body.body.iter_mut().rev()),
             _ => (),
@@ -79,6 +87,7 @@ pub(super) fn append(
     destination.sorts.append(&mut source.sorts);
     destination.nodes.append(&mut source.nodes);
     destination.files.append(&mut source.files);
+    destination.rulesets.append(&mut source.rulesets);
     destination.commands.append(&mut source.commands);
     Ok(())
 }
@@ -108,14 +117,14 @@ pub(super) fn append_rule(
         offset
     };
     append(destination, &record.program, offset)?;
-    let command = destination
-        .commands
+    let binding = destination
+        .rulesets
         .pop()
-        .ok_or("missing owned rule command")?;
-    let Some(pb::command::Kind::AddRules(mut add)) = command.kind else {
-        return Err("owned rule requires one AddRules command".into());
-    };
-    add.rules.pop().ok_or_else(|| "missing owned rule".into())
+        .ok_or("missing owned rule binding")?;
+    binding
+        .value
+        .and_then(|mut value| value.rules.pop())
+        .ok_or_else(|| "missing owned rule".into())
 }
 
 fn relocate_span(span: &mut Option<pb::Span>, offset: u32) -> Result<(), String> {
@@ -224,12 +233,9 @@ pub(super) fn rule(source: &pb::Program, rule: &pb::Rule) -> Result<pb::Program,
             &mut interned,
         )?;
     }
-    result.commands.push(pb::Command {
-        kind: Some(pb::command::Kind::AddRules(pb::AddRules {
-            group: String::new(),
-            rules: vec![rule],
-        })),
-        ..Default::default()
+    result.rulesets.push(pb::RulesetBinding {
+        name: String::new(),
+        value: Some(pb::Ruleset { rules: vec![rule] }),
     });
     Ok(result)
 }
@@ -395,6 +401,23 @@ mod tests {
 
     fn fixture(name: &str) -> pb::Program {
         pb::Program {
+            rulesets: vec![pb::RulesetBinding {
+                name: String::new(),
+                value: Some(pb::Ruleset {
+                    rules: vec![pb::Rule {
+                        eval_mode: pb::RuleEvalMode::Seminaive.into(),
+                        kind: Some(pb::rule::Kind::Rule(pb::RuleBody {
+                            query: vec![0],
+                            head: vec![pb::Action {
+                                kind: Some(pb::action::Kind::Term(1)),
+                                ..Default::default()
+                            }],
+                        })),
+                        ..Default::default()
+                    }],
+                }),
+            }],
+
             sorts: vec![pb::Sort {
                 kind: Some(pb::sort::Kind::Application(pb::SortApplication {
                     name: "i64".into(),
@@ -415,23 +438,7 @@ mod tests {
                     ..Default::default()
                 },
             ],
-            commands: vec![pb::Command {
-                kind: Some(pb::command::Kind::AddRules(pb::AddRules {
-                    group: String::new(),
-                    rules: vec![pb::Rule {
-                        eval_mode: pb::RuleEvalMode::Seminaive.into(),
-                        kind: Some(pb::rule::Kind::Rule(pb::RuleBody {
-                            query: vec![0],
-                            head: vec![pb::Action {
-                                kind: Some(pb::action::Kind::Term(1)),
-                                ..Default::default()
-                            }],
-                        })),
-                        ..Default::default()
-                    }],
-                })),
-                ..Default::default()
-            }],
+            commands: vec![],
             ..Default::default()
         }
     }
