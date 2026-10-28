@@ -15,7 +15,8 @@
 
 use crate::builtin::{PortableEGraph, PortablePrimitive, PortableTypeInfo};
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
+use std::cmp::Reverse;
+use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::fmt;
 use std::ops::ControlFlow;
 use std::sync::Arc;
@@ -3184,28 +3185,12 @@ fn map_callable_names(
             project_call(&mut call.func);
         }
     }
-    for rule in graph::rules_mut(program) {
-        if let Some(pb::rule::Kind::Rule(body)) = &mut rule.kind {
-            for action in &mut body.head {
-                match &mut action.kind {
-                    Some(pb::action::Kind::Set(set)) => {
-                        if let Some(call) = &mut set.target {
-                            project_call(&mut call.func);
-                        }
-                    }
-                    Some(pb::action::Kind::SetCost(set)) => {
-                        if let Some(call) = &mut set.target {
-                            project_call(&mut call.func);
-                        }
-                    }
-                    Some(pb::action::Kind::Delete(call) | pb::action::Kind::Subsume(call)) => {
-                        project_call(&mut call.func)
-                    }
-                    _ => (),
-                }
-            }
-        }
-    }
+    let mut rules: Vec<_> = program
+        .rulesets
+        .iter_mut()
+        .filter_map(|binding| binding.value.as_mut())
+        .flat_map(|ruleset| &mut ruleset.rules)
+        .collect();
     let mut commands: Vec<_> = program.commands.iter_mut().collect();
     let mut actions = vec![];
     while let Some(command) = commands.pop() {
@@ -3213,6 +3198,13 @@ fn map_callable_names(
             Some(pb::command::Kind::Fail(child)) => commands.push(child.as_mut()),
             Some(pb::command::Kind::Loop(body)) => commands.extend(body.body.iter_mut()),
             Some(pb::command::Kind::Action(action)) => actions.push(action),
+            Some(pb::command::Kind::Run(run)) => {
+                for selection in &mut run.rulesets {
+                    if let Some(pb::ruleset_selection::Kind::Ruleset(value)) = &mut selection.kind {
+                        rules.extend(&mut value.rules);
+                    }
+                }
+            }
             Some(pb::command::Kind::TableSizes(print)) => {
                 for table in &mut print.tables {
                     project_size(table);
@@ -3228,7 +3220,14 @@ fn map_callable_names(
             _ => (),
         }
     }
-    for action in actions {
+    let rule_actions = rules
+        .into_iter()
+        .filter_map(|rule| match &mut rule.kind {
+            Some(pb::rule::Kind::Rule(body)) => Some(&mut body.head),
+            _ => None,
+        })
+        .flatten();
+    for action in rule_actions.chain(actions) {
         match &mut action.kind {
             Some(pb::action::Kind::Set(set)) => {
                 if let Some(call) = &mut set.target {
@@ -3473,21 +3472,53 @@ fn declaration_order(program: &pb::Program, graph: &mut EGraph) -> Result<Vec<us
         }
         pending.push((i, dependencies));
     }
-    while !pending.is_empty() {
-        let Some(position) = pending
-            .iter()
-            .position(|(_, dependencies)| dependencies.is_subset(&installed))
-        else {
-            return Err(
-                "recursive program-defined primitives or function merges are not supported yet"
-                    .into(),
-            );
-        };
-        let (index, _) = pending.remove(position);
-        installed.insert(index);
-        order.push(index);
-    }
+    extend_declaration_order(pending, installed, &mut order)?;
     Ok(order)
+}
+
+fn extend_declaration_order(
+    pending: Vec<(usize, HashSet<usize>)>,
+    installed: HashSet<usize>,
+    order: &mut Vec<usize>,
+) -> Result<(), String> {
+    let count = order.len() + pending.len();
+    let mut dependents = vec![vec![]; count];
+    let mut remaining = vec![0usize; count];
+    let mut ready = BinaryHeap::new();
+    for (index, dependencies) in pending {
+        #[cfg(test)]
+        tests::DECLARATION_ORDER_WORK.with(|work| work.set(work.get() + 1));
+        for dependency in dependencies {
+            #[cfg(test)]
+            tests::DECLARATION_ORDER_WORK.with(|work| work.set(work.get() + 1));
+            if !installed.contains(&dependency) {
+                dependents[dependency].push(index);
+                remaining[index] += 1;
+            }
+        }
+        if remaining[index] == 0 {
+            ready.push(Reverse(index));
+        }
+    }
+    while let Some(Reverse(index)) = ready.pop() {
+        #[cfg(test)]
+        tests::DECLARATION_ORDER_WORK.with(|work| work.set(work.get() + 1));
+        order.push(index);
+        for &dependent in &dependents[index] {
+            #[cfg(test)]
+            tests::DECLARATION_ORDER_WORK.with(|work| work.set(work.get() + 1));
+            remaining[dependent] -= 1;
+            if remaining[dependent] == 0 {
+                ready.push(Reverse(dependent));
+            }
+        }
+    }
+    if order.len() != count {
+        return Err(
+            "recursive program-defined primitives or function merges are not supported yet".into(),
+        );
+    }
+    Ok(())
 }
 
 fn primitive_command(
@@ -6257,6 +6288,205 @@ pub(crate) mod fixtures;
 mod tests {
     use super::*;
     use crate::protobuf::fixtures::Observed;
+
+    thread_local! {
+        pub(super) static DECLARATION_ORDER_WORK: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
+    #[test]
+    fn declaration_order_matches_legacy_graphs_and_prefixes() {
+        for edges in 0..1usize << 9 {
+            for resupplied in 0..1usize << 3 {
+                // Declaration zero is an initial non-function. Resupplied
+                // computed declarations precede even earlier ready new ones.
+                let installed: HashSet<_> = (1..=3)
+                    .filter(|index| resupplied & (1 << (index - 1)) != 0)
+                    .collect();
+                let mut prefix = vec![0];
+                prefix.extend((1..=3).filter(|index| installed.contains(index)));
+                let pending: Vec<_> = (1..=3)
+                    .filter(|index| !installed.contains(index))
+                    .map(|index| {
+                        let dependencies: HashSet<usize> = (1..=3)
+                            .filter(|dependency| {
+                                edges & (1 << ((index - 1) * 3 + dependency - 1)) != 0
+                            })
+                            .collect();
+                        (index, dependencies)
+                    })
+                    .collect();
+                let mut old_pending = pending.clone();
+                let mut old_installed = installed.clone();
+                let mut expected = prefix.clone();
+                let valid = loop {
+                    if old_pending.is_empty() {
+                        break true;
+                    }
+                    let Some(position) = old_pending
+                        .iter()
+                        .position(|(_, dependencies)| dependencies.is_subset(&old_installed))
+                    else {
+                        break false;
+                    };
+                    let (index, _) = old_pending.remove(position);
+                    old_installed.insert(index);
+                    expected.push(index);
+                };
+                let result = extend_declaration_order(pending, installed, &mut prefix);
+                assert_eq!(prefix, expected, "edges={edges}, resupplied={resupplied}");
+                assert_eq!(result.is_ok(), valid);
+                if !valid {
+                    assert_eq!(
+                        result.unwrap_err(),
+                        "recursive program-defined primitives or function merges are not supported yet"
+                    );
+                }
+            }
+        }
+        let mut order = vec![];
+        extend_declaration_order(
+            vec![
+                (0, HashSet::from([1])),
+                (1, HashSet::new()),
+                (2, HashSet::new()),
+            ],
+            HashSet::new(),
+            &mut order,
+        )
+        .unwrap();
+        assert_eq!(order, [1, 0, 2], "newly ready earlier index wins");
+    }
+
+    #[test]
+    fn declaration_order_work_scales_with_vertices_and_edges() {
+        for chain in [false, true] {
+            let mut measurements = vec![];
+            for count in [32, 64, 128] {
+                let pending = (0..count)
+                    .map(|index| {
+                        let dependencies = if chain && index + 1 < count {
+                            HashSet::from([index + 1])
+                        } else {
+                            HashSet::new()
+                        };
+                        (index, dependencies)
+                    })
+                    .collect();
+                DECLARATION_ORDER_WORK.set(0);
+                let mut order = vec![];
+                extend_declaration_order(pending, HashSet::new(), &mut order).unwrap();
+                let expected: Vec<_> = if chain {
+                    (0..count).rev().collect()
+                } else {
+                    (0..count).collect()
+                };
+                assert_eq!(order, expected);
+                measurements.push((count, DECLARATION_ORDER_WORK.get()));
+            }
+            eprintln!("declaration ordering chain={chain}: {measurements:?}");
+            assert!(measurements.iter().all(|(count, work)| *work <= 4 * count));
+            assert!(
+                measurements
+                    .windows(2)
+                    .all(|pair| pair[1].1 <= 2 * pair[0].1 + 2)
+            );
+        }
+    }
+
+    #[test]
+    fn callable_name_projection_maps_all_action_targets_once() {
+        let target = pb::Call {
+            func: "logical".into(),
+            args: vec![],
+        };
+        let actions: Vec<_> = [
+            pb::action::Kind::Set(pb::Set {
+                target: Some(target.clone()),
+                value: Some(0),
+            }),
+            pb::action::Kind::SetCost(pb::SetCost {
+                target: Some(target.clone()),
+                cost: Some(0),
+            }),
+            pb::action::Kind::Delete(target.clone()),
+            pb::action::Kind::Subsume(target),
+            pb::action::Kind::Panic("logical".into()),
+        ]
+        .into_iter()
+        .map(|kind| pb::Action {
+            kind: Some(kind),
+            ..Default::default()
+        })
+        .collect();
+        let rule = pb::Rule {
+            kind: Some(pb::rule::Kind::Rule(pb::RuleBody {
+                head: actions.clone(),
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+        let mut body: Vec<_> = actions
+            .into_iter()
+            .map(|action| pb::Command {
+                kind: Some(pb::command::Kind::Action(action)),
+                ..Default::default()
+            })
+            .collect();
+        body.push(pb::Command {
+            kind: Some(pb::command::Kind::Fail(Box::new(pb::Command {
+                kind: Some(pb::command::Kind::Run(pb::Run {
+                    rulesets: vec![pb::RulesetSelection {
+                        kind: Some(pb::ruleset_selection::Kind::Ruleset(pb::Ruleset {
+                            rules: vec![rule.clone()],
+                        })),
+                    }],
+                    ..Default::default()
+                })),
+                ..Default::default()
+            }))),
+            ..Default::default()
+        });
+        let mut program = pb::Program {
+            rulesets: vec![pb::RulesetBinding {
+                name: "logical".into(),
+                value: Some(pb::Ruleset { rules: vec![rule] }),
+            }],
+            commands: vec![pb::Command {
+                kind: Some(pb::command::Kind::Loop(pb::Loop {
+                    body,
+                    ..Default::default()
+                })),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let mut projected = 0;
+        map_callable_names(
+            &mut program,
+            |name| {
+                assert_eq!(
+                    name, "logical",
+                    "each structural target projects exactly once"
+                );
+                *name = "native".into();
+                projected += 1;
+            },
+            |_| panic!("no table-size selector"),
+        );
+        assert_eq!(projected, 12);
+        assert_eq!(program.rulesets[0].name, "logical");
+        for rule in graph::rules(&program) {
+            let Some(pb::rule::Kind::Rule(body)) = &rule.kind else {
+                panic!("rule body")
+            };
+            assert!(
+                matches!(&body.head[4].kind, Some(pb::action::Kind::Panic(message)) if message == "logical")
+            );
+        }
+        assert!(action_sites(&program.commands).any(|(_, action)| {
+            matches!(&action.kind, Some(pb::action::Kind::Panic(message)) if message == "logical")
+        }));
+    }
 
     #[test]
     fn native_spans_share_files_and_preserve_validation_boundaries() {
