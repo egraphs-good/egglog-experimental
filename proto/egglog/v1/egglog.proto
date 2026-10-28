@@ -448,7 +448,10 @@ message Apply {
 // Captures inherit the surrounding use context, including its data restrictions;
 // the body is separately scoped deferred code, even in a stored/extracted value.
 // Function values use PrimitiveValue.lambda; application uses Apply.
-// Node sharing does not determine function-value equality.
+// Code identity uses the typed body and capture/parameter/result sorts, excluding
+// arena numbering, sharing of the Lambda node itself, and diagnostic metadata.
+// Evaluated Lambda values compare by code identity and captured values;
+// capture expressions are not part of code identity.
 message Lambda {
   // Evaluated when the lambda is constructed; bound as _0 through _(k-1).
   repeated uint32 captures = 1 [packed = true]; // index into the enclosing `nodes`
@@ -498,8 +501,9 @@ message PrimitiveValue {
     PairValue pair = 13;
     MaybeValue maybe = 14;
     Lambda lambda = 15;
-    // A function value with a named callable's argument prefix captured, never
-    // a dynamic function value. The enclosing node has a closed FuncSort.
+    // A named function value with its leading arguments bound (possibly none),
+    // not a general Partial operation on a function-valued expression. Its code
+    // identity is the named callable's identity. The node has a closed FuncSort.
     // Concatenate captured arg sorts with its remaining params and use its result
     // to check one effective complete call under the callee's typing form,
     // including varargs. This must determine all generic
