@@ -452,6 +452,8 @@ message Apply {
 // arena numbering, sharing of the Lambda node itself, and diagnostic metadata.
 // Evaluated Lambda values compare by code identity and captured values;
 // capture expressions are not part of code identity.
+// Observations of anonymous functions retain this code and actual captured
+// values as Lambda data, never implementation-generated helper names.
 message Lambda {
   // Evaluated when the lambda is constructed; bound as _0 through _(k-1).
   repeated uint32 captures = 1 [packed = true]; // index into the enclosing `nodes`
