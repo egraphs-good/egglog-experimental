@@ -189,7 +189,8 @@ impl RustPresentation {
                     .get("receiver")
                     .map(|r| {
                         Ok::<_, String>(Receiver {
-                            core_input: index(r, "coreInput")?,
+                            core_input: index(r, "coreInput")?
+                                .or_else(|| r.is_object().then_some(0)),
                             borrowed: r["borrowed"].as_bool().unwrap_or(false),
                         })
                     })
@@ -199,9 +200,21 @@ impl RustPresentation {
                         .as_array()
                         .ok_or("Rust parameters must be an array")?
                         .iter()
-                        .map(|p| {
+                        .enumerate()
+                        .map(|(position, p)| {
+                            let slot = position
+                                + usize::from(
+                                    receiver
+                                        .and_then(|r| r.core_input)
+                                        .is_some_and(|receiver| position >= receiver as usize),
+                                );
                             Ok(Parameter {
-                                core_input: index(p, "coreInput")?,
+                                core_input: Some(
+                                    index(p, "coreInput")?.unwrap_or(
+                                        u32::try_from(slot)
+                                            .map_err(|_| "Rust parameter slot exceeds u32")?,
+                                    ),
+                                ),
                                 name: p["name"]
                                     .as_str()
                                     .ok_or("missing Rust parameter name")?
@@ -237,7 +250,11 @@ impl RustPresentation {
                     })
                     .transpose()?;
                 views.push(CallableView {
-                    path: strings(value, "path")?,
+                    path: if value.get("path").is_some() {
+                        strings(value, "path")?
+                    } else {
+                        vec![name.rsplit('.').next().unwrap().into()]
+                    },
                     owner_sort: owned_sort(value, "ownerSort", &graph)?,
                     borrowed_self: value["borrowedSelf"].as_bool().unwrap_or(false),
                     receiver,
