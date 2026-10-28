@@ -1623,17 +1623,22 @@ message ProofResult {
 // The native TermDag syntax, without invented sorts or executable call typing.
 // A function-row proposition may include both inputs and output as children.
 message ProofTerm {
+  option (buf.validate.message).cel = {
+    id: "proof_term.scalar_value"
+    message: "proof literal values must be scalar data"
+    expression:
+      "!has(this.primitive_value) || [this.primitive_value].all(v, "
+      "has(v.i64) || has(v.f64_bits) || has(v.string) || has(v.bool) || "
+      "has(v.unit) || has(v.big_int) || has(v.big_rat) || has(v.rational))"
+  };
+
   oneof kind {
     option (buf.validate.oneof).required = true;
 
-    int64 i64 = 1;
-    // Preserve all IEEE-754 bits, including signed zero and NaN payloads.
-    fixed64 f64_bits = 2;
-    string string = 3;
-    bool bool = 4;
-    Unit unit = 5;
     string var = 6;
     ProofApp app = 7;
+    // The same inert scalar payloads as Node values, with no child arena.
+    PrimitiveValue primitive_value = 8;
   }
 }
 
