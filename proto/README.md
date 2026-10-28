@@ -144,6 +144,9 @@ is cumulative, so it is not an exact replay guarantee. Historic named Run
 selections are captured as needed so later replacements cannot retarget earlier
 inputs, including nested commands. Clones retain their
 prefix and then diverge; destroying a handle releases its history.
+Saved source is an on-demand rendering of this input history. Restoring a prior
+graph uses its recorded prefix, omitting abandoned branches. Push/pop remain
+frontend scope operations, not Program commands.
 
 ## Prototype integrations
 
@@ -152,7 +155,8 @@ encoded requests, a stateful Source producer/renderer for the text frontend,
 and high-level Python/Rust APIs that emit the same records. Source yields
 Programs or scope operations; callers submit each one and decode its successful
 response before advancing, stopping on errors. Text-only formatting and file
-output stay in the frontend.
+output stay in the frontend. Python's prototype chronological recorder has not
+yet been migrated to the history-backed saved-source view described above.
 
 Current adapter limits include i64 cost annotations, Normal-only Extract/Freeze,
 native proof-mode restrictions and context-specific expansion budgets. These are
