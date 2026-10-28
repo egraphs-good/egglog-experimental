@@ -14130,6 +14130,47 @@ fn map_flat_and_computed_source_calls_execute_through_bytes() {
     }
     assert_eq!(map_calls, 3);
     assert!(saw_bitor);
+
+    // Recorded data factories use action-local plans too. Their structured
+    // Pair/Vec children must pass the same admission as ordinary wire data.
+    for text in [
+        r#"(sort M (Map i64 BigRat))
+            (action-scope ((let local (map-of)) local))
+            (check (= (map-length (map-empty)) 0))"#,
+        r#"(sort M (Map i64 String))
+            (action-scope ((let local (map-of 1 "one" 2 "two")) local))
+            (check (= (map-length (map-of 1 "one" 2 "two")) 2))"#,
+    ] {
+        new_experimental_egraph()
+            .parse_and_run_program(None, text)
+            .unwrap();
+        let mut engine = Engine::default();
+        let id = create(&mut engine);
+        let mut renderer = Renderer::default();
+        let mut recorded = String::new();
+        let mut saw_data = false;
+        for phase in Source::new(None, text).unwrap() {
+            let phase = phase.unwrap();
+            saw_data |= phase.nodes.iter().any(|node| {
+                matches!(
+                    &node.kind,
+                    Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
+                        value: Some(pb::primitive_value::Value::Vec(_))
+                    }))
+                )
+            });
+            let authored = phase.encode_to_vec();
+            recorded.push_str(&renderer.render(&phase).unwrap());
+            assert_eq!(phase.encode_to_vec(), authored);
+            assert_eq!(run(&mut engine, id, phase).error, None);
+        }
+        assert!(saw_data, "source must preserve structured value helpers");
+        let mut replay = Engine::default();
+        let replay_id = create(&mut replay);
+        for phase in Source::new(None, &recorded).unwrap() {
+            assert_eq!(run(&mut replay, replay_id, phase.unwrap()).error, None);
+        }
+    }
 }
 
 #[test]

@@ -3109,22 +3109,23 @@ impl Source {
         let action = self.action(terminal, Some(&aliases))?;
         if !constructor_only {
             let native_spans = NativeSpans::default();
-            validate_node_graph(&self.program, &native_spans)?;
+            // Keep authored data intact while sharing receiver admission.
+            let mut admission = self.program.clone();
+            lower_container_values(&mut admission)?;
+            validate_node_graph(&admission, &native_spans)?;
             // Reuse admission and first-demand lowering. Inlining locals must
             // reproduce their actual order once.
-            let position = self.program.commands.len() as u32;
-            self.program.commands.push(pb::Command {
+            let position = admission.commands.len() as u32;
+            admission.commands.push(pb::Command {
                 kind: Some(pb::command::Kind::Action(action.clone())),
                 ..Default::default()
             });
-            let selected = classify_action_dags(&self.program);
-            self.program.commands.pop();
-            let selected = selected?;
+            let selected = classify_action_dags(&admission)?;
             let _reachable = selected
                 .get(&vec![position])
                 .ok_or("source action scope is not an admitted ordered constructor DAG")?;
             let (_, expected) = action_dag_actions(
-                &self.program,
+                &admission,
                 &action,
                 |_| false,
                 &native_spans,
