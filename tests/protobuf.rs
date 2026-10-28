@@ -2292,7 +2292,7 @@ mod constructor_action_dags {
                 let commands = graph
                     .parse_program(
                         Some("ambient-provider.egg".into()),
-                        "(sort __egglog_proto_action_0) (sort __egglog_proto_query_0)",
+                        "(sort __egglog_proto_action_0) (sort __egglog_proto_query_0) (sort __egglog_source_var_0)",
                     )
                     .map_err(|error| error.to_string())?;
                 for command in commands {
@@ -2322,6 +2322,19 @@ mod constructor_action_dags {
             })),
             ..Default::default()
         });
+        original.rulesets.push(pb::RulesetBinding {
+            name: "unused".into(),
+            value: Some(pb::Ruleset {
+                rules: vec![pb::Rule {
+                    kind: Some(pb::rule::Kind::Rule(pb::RuleBody {
+                        query: vec![original.nodes.len() as u32 - 1],
+                        head: vec![],
+                    })),
+                    eval_mode: pb::RuleEvalMode::Seminaive.into(),
+                    ..Default::default()
+                }],
+            }),
+        });
         let text = Renderer::with_extension(provider.clone())
             .unwrap()
             .render(&original)
@@ -2336,6 +2349,7 @@ mod constructor_action_dags {
         }
         assert!(!text.contains("(let __egglog_proto_action_0 "));
         assert!(!text.contains(" __egglog_proto_query_0)"));
+        assert!(!text.contains(" __egglog_source_var_0)"));
     }
 
     #[test]
@@ -3109,8 +3123,19 @@ mod constructor_action_dags {
     fn query_graphs_drive_rules_rewrite_directions_and_source_replay() {
         use egglog_experimental::protobuf::source::{Renderer, Source};
 
-        for kind in ["rule", "rewrite", "birewrite"] {
-            let mut input = program(28, 1);
+        for (kind, wraps, share_every) in [
+            ("rule", 28, 1),
+            ("rewrite", 28, 1),
+            ("birewrite", 28, 1),
+            // Former depth and expanded-visit readability thresholds now use
+            // the same prepared flat rules as small authored rewrites.
+            ("rewrite", 0, 0),
+            ("rewrite", 63, 0),
+            ("rewrite", 64, 0),
+            ("rewrite", 8, 1),
+            ("rewrite", 9, 1),
+        ] {
+            let mut input = program(wraps, share_every);
             let root = input.nodes.len() as u32 - 1;
             input.declarations.push(pb::Declaration {
                 kind: Some(pb::declaration::Kind::Constructor(pb::Constructor {
@@ -3206,6 +3231,16 @@ mod constructor_action_dags {
                 rendered.len() < 100_000,
                 "shared query must not become a tree"
             );
+            assert!(!rendered.contains("(rewrite ") && !rendered.contains("(birewrite "));
+            assert_eq!(
+                rendered.matches("(rule ").count(),
+                match kind {
+                    "rule" => 1,
+                    "rewrite" => 2,
+                    "birewrite" => 3,
+                    _ => unreachable!(),
+                }
+            );
             let replay = Source::new(None, &rendered)
                 .unwrap()
                 .collect::<Result<Vec<_>, _>>()
@@ -3216,6 +3251,9 @@ mod constructor_action_dags {
                 pb::ExecutionMode::Proofs,
                 pb::ExecutionMode::ProofTesting,
             ] {
+                if wraps != 28 && mode != pb::ExecutionMode::Normal {
+                    continue;
+                }
                 for source in [false, true] {
                     let mut engine = Engine::default();
                     let bytes = engine
@@ -20767,13 +20805,20 @@ fn source_combined_rulesets_preserve_shared_occurrences_and_cursors() {
     let mut fresh = Engine::default();
     let id = create(&mut fresh);
     let mut replayed = vec![];
+    let mut replayed_labels = vec![];
     for phase in Source::new(None, &rendered).unwrap() {
+        let phase = phase.unwrap();
+        replayed_labels.extend(
+            inline_rules(&phase)
+                .into_iter()
+                .filter_map(|rule| rule.name.clone()),
+        );
         let mut response = Observed::from_frames(
             (fresh
                 .run(
                     &pb::RunProgramRequest {
                         egraph_id: id,
-                        program: Some(phase.unwrap()),
+                        program: Some(phase),
                         diagnostics: true,
                     }
                     .encode_to_vec(),
@@ -20788,14 +20833,11 @@ fn source_combined_rulesets_preserve_shared_occurrences_and_cursors() {
             let Some(pb::command_output::Kind::Run(outcome)) = &output.kind else {
                 continue;
             };
-            if replayed.is_empty() {
-                let counts = diagnostics[0]["num_matches_per_rule"].as_object().unwrap();
-                assert!(counts.keys().any(|name| name.ends_with("=>")));
-                assert!(counts.keys().any(|name| name.ends_with("<=")));
-            }
             replayed.push((outcome.updated, diagnostic_matches(&diagnostics)));
         }
     }
+    assert!(replayed_labels.contains(&"both \"quoted\" \\ λ=>".to_string()));
+    assert!(replayed_labels.contains(&"both \"quoted\" \\ λ<=".to_string()));
     assert_eq!(replayed, actual);
 }
 
@@ -21641,7 +21683,8 @@ fn birewrite_source_guards_and_roundtrip_keep_one_authored_rule() {
             assert_eq!(run(&mut engine, id, phase).error, None);
         }
         assert!(saw_rule);
-        assert_eq!(rendered.matches("(birewrite ").count(), 1);
+        assert_eq!(rendered.matches("(birewrite ").count(), 0);
+        assert_eq!(rendered.matches("(rule ").count(), 2);
         let replay = if core {
             Source::new_core(None, &rendered)
         } else {

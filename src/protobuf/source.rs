@@ -3456,6 +3456,7 @@ impl Iterator for Source {
 /// across phases; callers submit each result in order and stop on an error.
 /// Experimental output can be reparsed by [`Source`] into a fresh engine, with
 /// bounded aliases for nominal declarations and prepared ruleset selections.
+/// Rules use the prepared flat native form at every size, with hygienic locals.
 /// Core keeps literal sort/callable names; rule holders and selectors have
 /// private presentation aliases, preserving shared rule content rather than
 /// literal `:ruleset`/default spellings. Reuse one renderer for the whole stream:
@@ -4214,8 +4215,6 @@ fn render_prepared(
     private_selectors: &mut HashSet<String>,
 ) -> Result<String, TransportError> {
     let native_spans = &prepared.context.native_spans;
-    // Canonical rules and the submitted program have independent file indices.
-    let rule_spans = NativeSpans::default();
     let result = (|| -> Result<Vec<Command>, String> {
         validate_union_occurrences(program)?;
         let mut native = match dialect {
@@ -4384,23 +4383,11 @@ fn render_prepared(
                 },
             );
         }
-        let prepared_rules: Vec<_> = prepared.context.candidates.iter().map(|candidate| candidate.name.clone()).collect();
-        let rule_values: Vec<_> = graph::rules(program).collect();
         {
-            // Native handles and canonical rules are aligned by occurrence, not
-            // label/body equality. Change presentation only, never Prepared.
-            let labels: HashMap<_, _> = prepared_rules.iter().zip(graph::rules(program))
-                .map(|(native, rule)| (native.as_str(), rule.name.as_deref().unwrap_or("")))
+            // Candidate identity and direction labels survive presentation.
+            let labels: HashMap<_, _> = prepared.context.candidates.iter().zip(graph::rules(program))
+                .map(|(candidate, rule)| (candidate.name.as_str(), rule.name.as_deref().unwrap_or("")))
                 .collect();
-            let mut rule_indices = HashMap::new();
-            for (index, name) in prepared_rules.iter().enumerate() {
-                rule_indices.insert(name.clone(), index);
-                if matches!(rule_values.get(index).copied().ok_or("missing inline rule")?.kind, Some(pb::rule::Kind::Birewrite(_))) {
-                    rule_indices.insert(format!("{name}=>"), index);
-                    rule_indices.insert(format!("{name}<="), index);
-                }
-            }
-            let mut rendered_sugar = HashSet::new();
             let function_constructors: HashSet<_> = program.sorts.iter().enumerate()
                 .filter(|(_, sort)| matches!(sort.kind, Some(pb::sort::Kind::Func(_))))
                 // Signature patterns have no native constructor. Only closed
@@ -4410,91 +4397,48 @@ fn render_prepared(
                     .map(|name| egglog::sort::FunctionSort::constructor_alias(&name)))
                 .collect::<Result<_, _>>()?;
             let mut emitted = HashSet::new();
+            let mut next_variable = 0;
             for candidate in &prepared.context.candidates {
                 if prepared.context.registry.keys.contains_key(&candidate.key) || !emitted.insert(candidate.key.clone()) { continue; }
                 for mut command in candidate.commands.clone() {
-                if let Command::Rule { rule } = &command {
-                    let index = *rule_indices.get(&rule.name).ok_or("missing prepared rule occurrence")?;
-                    // Execution plans use physical symbols. Reuse the same
-                    // planner with text aliases occupied before presentation,
-                    // keeping the rewrite witness and head references aligned.
-                    command = lower_rule(program, rule_values.get(index).copied().ok_or("missing inline rule")?, &rule.ruleset,
-                        &prepared_rules[index], &rule_spans, &query_occupied)?
-                        .into_iter().find(|candidate| matches!(candidate,
-                            Command::Rule { rule: candidate } if candidate.name == rule.name))
-                        .ok_or("missing prepared rule direction")?;
-                }
-                if let Command::Rule { rule } = &mut command {
-                    let index = *rule_indices.get(&rule.name).ok_or("missing prepared rule occurrence")?;
-                    let rewrite = match &rule_values.get(index).copied().ok_or("missing inline rule")?.kind {
-                        Some(pb::rule::Kind::Rewrite(rewrite)) => Some((rewrite.lhs, rewrite.rhs, &rewrite.conditions, Some(rewrite.subsume))),
-                        Some(pb::rule::Kind::Birewrite(rewrite)) => Some((rewrite.lhs, rewrite.rhs, &rewrite.conditions, None)),
-                        _ => None,
+                if let Command::Rule { rule } = command {
+                    // Reuse the checked flat plan. Only local names change:
+                    // text aliases may occupy names that were free in preparation.
+                    let mut fresh = || loop {
+                        let name = format!("__egglog_source_var_{next_variable}");
+                        next_variable += 1;
+                        if !query_occupied(&name) { break name; }
                     };
-                    if let Some((lhs, rhs, conditions, subsume)) = rewrite {
-                        // Keep small authored rewrites readable. This bounded
-                        // presentation-only walk never expands a large RHS;
-                        // those use the already-flat native Rule instead.
-                        let mut pending = vec![(lhs, 0), (rhs, 0)];
-                        let mut remaining = 1024usize;
-                        let mut readable = true;
-                        while let Some((index, depth)) = pending.pop() {
-                            if remaining == 0 || depth >= 64 { readable = false; break; }
-                            remaining -= 1;
-                            let children = match &program.nodes[index as usize].kind {
-                                Some(pb::node::Kind::Call(call) | pb::node::Kind::GetCost(call)) => &call.args,
-                                Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue { value: Some(pb::primitive_value::Value::PartialCall(call)) })) => &call.args,
-                                Some(pb::node::Kind::Union(_)) => { readable = false; break; }
-                                _ => continue,
-                            };
-                            pending.extend(children.iter().map(|child| (*child, depth + 1)));
-                        }
-                        if readable {
-                            if !rendered_sugar.insert(index) { continue; }
-                            let rewrite = ast::Rewrite { span: rule.span.clone(), lhs: expression(program, lhs, &mut HashSet::new(), &rule_spans)?.map_symbols(&mut |h| h, &mut |v: String| native_name("var", &v)), rhs: expression(program, rhs, &mut HashSet::new(), &rule_spans)?.map_symbols(&mut |h| h, &mut |v: String| native_name("var", &v)), conditions: facts(program, conditions, &rule_spans, None, &query_occupied)?.0, name: prepared_rules[index].clone() };
-                            command = if let Some(subsume) = subsume { Command::Rewrite(rule.ruleset.clone(), rewrite, subsume) } else { Command::BiRewrite(rule.ruleset.clone(), rewrite) };
-                        }
-                    }
-                }
-                if let Command::Rule { rule } = &mut command {
-                    let index = *rule_indices.get(&rule.name).ok_or("missing prepared rule occurrence")?;
-                    if let Some(pb::rule::Kind::Rule(body)) = &rule_values.get(index).copied().ok_or("missing inline rule")?.kind {
-                        let mut head = Vec::new();
-                        let mut memo = HashMap::new();
-                        let mut next = 0;
-                        let mut bindings = HashMap::new();
-                        check_variables(program, &body.query, &mut bindings, true)?;
-                        for action in &body.head {
-                            let (mut actions, _) = action_dag_actions(program, action, |name| bindings.contains_key(name), &rule_spans, &mut memo, &mut next)?;
-                            if let Some(pb::action::Kind::SetCost(set)) = &action.kind {
+                    let mut locals = HashMap::new();
+                    let mut rule = rule.map_symbols(&mut |name| name, &mut |name| {
+                        locals.entry(name).or_insert_with(&mut fresh).clone()
+                    });
+                    let mut head = Vec::with_capacity(rule.head.0.len());
+                    for action in rule.head.0 {
+                        head.push(match action {
+                            Action::Set(span, target, args, cost)
+                                if constructor_cost_tables.contains_key(&target) => {
                                 if dialect == Dialect::Core { return Err("Core source has no assigned-cost storage".into()); }
-                                let Action::Set(span, _, args, cost) = actions.pop().unwrap() else { unreachable!() };
-                                actions.push(Action::Expr(span.clone(), Expr::Call(span.clone(), "set-cost".into(), vec![Expr::Call(span, set.target.as_ref().unwrap().func.clone(), args), cost])));
-                            } else if dialect == Dialect::Experimental
-                                && let Some(Action::Change(span, ast::Change::Delete, target, args)) = actions.last()
-                                && let Some((helper, _)) = constructor_cost_tables.iter().find(|(_, constructor)| *constructor == target)
-                            {
-                                actions.push(Action::Change(span.clone(), ast::Change::Delete, helper.clone(), args.clone()));
+                                let constructor = constructor_cost_tables[&target].clone();
+                                Action::Expr(span.clone(), Expr::Call(span.clone(), "set-cost".into(),
+                                    vec![Expr::Call(span, constructor, args), cost]))
                             }
-                            head.extend(ast::GenericActions(actions).map_symbols(&mut |name| name, &mut |name: String| native_name("var", &name)).0);
-                        }
-                        rule.head.0 = head;
+                            // Core constructors do not install Experimental's
+                            // assigned-cost helper. The captured delete key and
+                            // constructor deletion still come from the same plan.
+                            Action::Change(_, ast::Change::Delete, target, _)
+                                if dialect == Dialect::Core && constructor_cost_tables.contains_key(&target) => continue,
+                            Action::Expr(span, expr) if !matches!(expr, Expr::Call(..)) =>
+                                Action::Let(span, fresh(), expr),
+                            action => action,
+                        });
                     }
-                    for (index, action) in rule.head.0.iter_mut().enumerate() {
-                        if let Action::Expr(span, expr) = action
-                            && !matches!(expr, Expr::Call(..))
-                        {
-                            *action = Action::Let(span.clone(), format!("__egglog_proto_term_{index}"), expr.clone());
-                        }
-                    }
-                }
-                let name = match &mut command {
-                    Command::Rule { rule } => Some(&mut rule.name),
-                    Command::Rewrite(_, rewrite, _) | Command::BiRewrite(_, rewrite) => Some(&mut rewrite.name),
-                    _ => None,
-                };
-                if let Some(name) = name {
-                    *name = if let Some(label) = labels.get(name.as_str()) { label.to_string() } else if let Some((base, suffix)) = name.strip_suffix("=>").map(|base| (base, "=>")).or_else(|| name.strip_suffix("<=").map(|base| (base, "<="))) { format!("{}{suffix}", labels.get(base).ok_or("missing prepared rule label")?) } else { return Err("missing prepared rule label".into()); };
+                    rule.head.0 = head;
+                    rule.name = if let Some(label) = labels.get(rule.name.as_str()) { label.to_string() }
+                        else if let Some((base, suffix)) = rule.name.strip_suffix("=>").map(|base| (base, "=>")).or_else(|| rule.name.strip_suffix("<=").map(|base| (base, "<="))) {
+                            format!("{}{suffix}", labels.get(base).ok_or("missing prepared rule label")?)
+                        } else { return Err("missing prepared rule label".into()); };
+                    command = Command::Rule { rule };
                 }
                 // PartialCall's first String is a typed callable reference.
                 // Other String literals, including identical spellings, are data.
