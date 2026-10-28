@@ -4097,6 +4097,81 @@ mod source_fresh_macro {
     }
 
     #[test]
+    fn declaration_free_validation_keeps_provider_macro_type_context() {
+        use egglog::ast::{Command, Expr, Fact};
+
+        struct Inspect(Arc<AtomicUsize>);
+        impl egglog::CommandMacro for Inspect {
+            fn transform(
+                &self,
+                command: Command,
+                _: &mut egglog::util::SymbolGen,
+                types: &egglog::TypeInfo,
+            ) -> Result<Vec<Command>, egglog::Error> {
+                if let Command::Check(_, facts) = &command {
+                    let mut pending: Vec<_> = facts
+                        .iter()
+                        .flat_map(|fact| match fact {
+                            Fact::Fact(expr) => vec![expr],
+                            Fact::Eq(_, left, right) => vec![left, right],
+                        })
+                        .collect();
+                    while let Some(expr) = pending.pop() {
+                        if let Expr::Call(_, head, args) = expr {
+                            assert!(
+                                types.get_func_type(head).is_some() || types.is_primitive(head)
+                            );
+                            self.0.fetch_add(1, Ordering::SeqCst);
+                            pending.extend(args);
+                        }
+                    }
+                }
+                Ok(vec![command])
+            }
+        }
+        for mode in [
+            pb::ExecutionMode::Normal,
+            pb::ExecutionMode::TermEncoding,
+            pb::ExecutionMode::Proofs,
+            pb::ExecutionMode::ProofTesting,
+        ] {
+            let calls = Arc::new(AtomicUsize::new(0));
+            let provider = Arc::new(Provider {
+                macro_probe: Some(Arc::new(Inspect(calls.clone()))),
+                ..Default::default()
+            });
+            let mut engine = Engine::with_extension(provider.clone());
+            let created = engine
+                .create(
+                    &pb::CreateEGraphRequest {
+                        sorts: fixture().sorts[..1].to_vec(),
+                        options: Some(pb::EGraphOptions {
+                            cost_sort: Some(0),
+                            execution_mode: mode.into(),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    }
+                    .encode_to_vec(),
+                )
+                .unwrap();
+            let id = pb::CreateEGraphResponse::decode(created.as_slice())
+                .unwrap()
+                .egraph_id;
+            for phase in
+                Source::new(None, "(datatype A (Target)) (Target) (check (Target))").unwrap()
+            {
+                assert_eq!(run(&mut engine, id, phase.unwrap()).error, None);
+            }
+            assert!(
+                calls.load(Ordering::SeqCst) > 0,
+                "the macro inspected a previously installed callable"
+            );
+            assert_eq!(provider.evaluations.load(Ordering::SeqCst), 0);
+        }
+    }
+
+    #[test]
     fn registry_runs_once_and_arbitrary_vectors_stay_unsupported() {
         let text = "(datatype FreshValue (Seed)) (rule ((Seed)) ((unstable-fresh! FreshValue)))";
         let probe = Arc::new(MacroProbe {

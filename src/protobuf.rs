@@ -779,9 +779,8 @@ impl Session {
         }
     }
 
-    // Authoring resolution selects annotated calls; the native compile-only
-    // boundary then registers and compiles the entire request on a disposable
-    // clone. Neither clone's runtime state or backend IDs are ever adopted.
+    // One disposable native compiler owns setup, rule and command validation.
+    // Its runtime state and backend IDs are never adopted by the live graph.
     fn prepare(&self, program: &mut pb::Program) -> Result<Prepared, PreparationError> {
         let mut binding_names = HashSet::new();
         for binding in &program.rulesets {
@@ -982,7 +981,7 @@ impl Session {
                 };
                 staged
                     .graph
-                    .resolve_command_before_proofs(command.clone())
+                    .compile_program_observed(vec![command.clone()], &mut |_, _| {})
                     .map_err(|error| error.to_string())?;
                 pending_declarations.insert(declaration_indices[index].unwrap());
                 installations.push(Installation {
@@ -1170,14 +1169,6 @@ impl Session {
                         .collect::<Result<_, _>>()?,
                 },
             };
-            // Computed bodies close in the final compile-only pass, after
-            // preceding table declarations have actual disposable backends.
-            if !matches!(command, Command::Function { .. } | Command::UserDefined(..)) {
-                staged
-                    .graph
-                    .resolve_command_before_proofs(command.clone())
-                    .map_err(|error| error.to_string())?;
-            }
             if self.mode == pb::ExecutionMode::Normal
                 && let Command::Constructor { name, schema, .. } = &command
             {
@@ -1205,7 +1196,7 @@ impl Session {
                 };
                 staged
                     .graph
-                    .resolve_command_before_proofs(cost_table.clone())
+                    .compile_program_observed(vec![cost_table.clone()], &mut |_, _| {})
                     .map_err(|error| error.to_string())?;
                 installations.push(Installation {
                     command: Some(cost_table),
@@ -1214,6 +1205,10 @@ impl Session {
                     declaration: None,
                 });
             }
+            staged
+                .graph
+                .compile_program_observed(vec![command.clone()], &mut |_, _| {})
+                .map_err(|error| error.to_string())?;
             pending_declarations.insert(declaration_indices[index].unwrap());
             installations.push(Installation {
                 command: Some(command),
@@ -1338,16 +1333,13 @@ impl Session {
             files: program.files.clone(),
             ..Default::default()
         };
-        let mut validation: Vec<_> = installations
-            .iter()
-            .filter_map(|i| i.command.clone())
-            .collect();
-        // Validation compiles every literal, including unentered loop bodies.
+        // Setup already compiled on this context. Compile every rule literal
+        // and command, including unentered loop bodies, without replaying it.
         context.selection = format!("__protobuf_validation_{}", staged.request);
-        validation.push(Command::AddRuleset(
+        let mut validation = vec![Command::AddRuleset(
             ast::Span::Panic,
             context.selection.clone(),
-        ));
+        )];
         let mut offset = 0;
         for (site, value) in rules::collections(program) {
             let end = offset + value.rules.len();
@@ -1417,20 +1409,21 @@ impl Session {
                 &[index as u32],
             )?);
         }
-        let mut compiler = self
+        staged
             .graph
-            .validate_program(validation)
+            .compile_program_observed(validation, &mut |_, _| {})
             .map_err(|error| error.to_string())?;
         for (span, facts) in conditions {
-            compiler
-                .validate_condition(span, facts)
+            staged
+                .graph
+                .compile_condition(span, facts)
                 .map_err(|error| error.to_string())?;
         }
         let mut values = HashMap::new();
         for (path, action) in action_sites(&program.commands) {
             if context.scoped_actions.contains(&path) && !context.action_dags.contains_key(&path) {
                 eval_scoped_action(
-                    &mut compiler,
+                    &mut staged.graph,
                     program,
                     action,
                     &mut values,
@@ -1447,7 +1440,7 @@ impl Session {
                 for root in &extract.roots {
                     if let Some(closed) = context.extraction_dags.get(root) {
                         eval_extract_root(
-                            &mut compiler,
+                            &mut staged.graph,
                             program,
                             *root,
                             Some(closed),
@@ -1459,9 +1452,8 @@ impl Session {
                 }
             }
         }
-        // Model metadata must see the same fully compiled context, including
-        // authored Primitive projections. This graph never enters Prepared.
-        staged.graph = compiler;
+        // Model metadata sees the same fully compiled context. The graph
+        // remains disposable and never enters Prepared.
         for command in command_tree(&program.commands) {
             let (model, extractor) = match &command.kind {
                 Some(pb::command::Kind::Extract(extract)) => {
@@ -3653,7 +3645,7 @@ fn materialize_sorts(
             unionable: true,
         };
         graph
-            .resolve_command_before_proofs(command.clone())
+            .compile_program_observed(vec![command.clone()], &mut |_, _| {})
             .map_err(|e| e.to_string())?;
         commands.push((index, command));
         Ok(())
@@ -7263,6 +7255,254 @@ mod tests {
         program.declarations.clear();
         program.commands = commands;
         assert_eq!(run_host_default(&mut engine, id, program).error, None);
+    }
+
+    #[derive(Default)]
+    struct NativeCloneProbe(Arc<std::sync::atomic::AtomicUsize>);
+    impl Clone for NativeCloneProbe {
+        fn clone(&self) -> Self {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Self(self.0.clone())
+        }
+    }
+
+    #[test]
+    fn preparation_compiles_cold_mixed_theory_in_one_context() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let mut program = inventory_fixture(
+            r#"
+            (sort Items (Vec i64))
+            (datatype E (Keep Items))
+            (primitive constant () i64 (+ 10 20))
+            (function merged () i64 :merge (constant))
+            (primitive observe () i64 (merged))
+            (ruleset r) (rule ((Keep xs)) ((Keep xs)) :ruleset r)
+            (Keep (vec-empty)) (set (merged) 1) (set (merged) 2)
+            (run r 1) (check (Keep (vec-empty))) (check (= (observe) 30))
+        "#,
+        );
+        program.declarations.reverse();
+        let (mut engine, id) = host_default_engine();
+        let clones = Arc::new(AtomicUsize::new(0));
+        *engine
+            .graphs
+            .get_mut(&id)
+            .unwrap()
+            .graph
+            .extension_state_or_default::<NativeCloneProbe>() = NativeCloneProbe(clones.clone());
+        let mut input = program.clone();
+        let prepared = engine.graphs[&id].prepare(&mut input).unwrap();
+        assert_eq!(clones.load(Ordering::SeqCst), 1);
+        assert!(!prepared.installations.is_empty());
+        assert!(!prepared.materialized.is_empty());
+        assert!(engine.graphs[&id].definitions.declarations.is_empty());
+        assert_eq!(engine.graphs[&id].graph.num_tuples(), 0);
+        drop(prepared);
+        for _ in 0..3 {
+            clones.store(0, Ordering::SeqCst);
+            let response = run_host_default(&mut engine, id, program.clone());
+            assert_eq!(response.error, None);
+            assert_eq!(clones.load(Ordering::SeqCst), 1);
+        }
+    }
+
+    #[cfg(feature = "typed")]
+    #[test]
+    fn preparation_accepts_resupplied_typed_function_check_packets() {
+        use crate::typed::{
+            __private::{Callable, Expr},
+            EGraph, EgglogValue,
+            builtins::I64,
+            eq, set,
+        };
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        // Use the same declaration/expression constructors as #[function];
+        // packets below still come from the public register/check recording.
+        let declaration = Callable::function(
+            "single_preparation_slot",
+            vec![],
+            I64::sort_ref(),
+            None::<fn(Expr, Expr) -> Expr>,
+        );
+        let slot = I64::from_expression(Expr::call(&declaration, vec![]));
+
+        let mut writer = EGraph::with_recording(true).unwrap();
+        writer.register(set(&slot, 7_i64)).unwrap();
+        let setup = writer.history().unwrap();
+        let mut reader = EGraph::with_recording(true).unwrap();
+        assert!(!reader.check(eq(&slot, 7_i64)).unwrap());
+        let check = reader.history().unwrap();
+        assert_eq!(check.commands.len(), 1);
+        assert!(matches!(
+            check.commands[0].kind,
+            Some(pb::command::Kind::Check(_))
+        ));
+        assert!(!setup.declarations.is_empty());
+        assert!(!check.declarations.is_empty());
+
+        let (mut engine, id) = host_default_engine();
+        let clones = Arc::new(AtomicUsize::new(0));
+        *engine
+            .graphs
+            .get_mut(&id)
+            .unwrap()
+            .graph
+            .extension_state_or_default::<NativeCloneProbe>() = NativeCloneProbe(clones.clone());
+        assert_eq!(run_host_default(&mut engine, id, setup).error, None);
+        assert_eq!(clones.load(Ordering::SeqCst), 1);
+        let tuples = engine.graphs[&id].graph.num_tuples();
+        for _ in 0..3 {
+            clones.store(0, Ordering::SeqCst);
+            assert_eq!(run_host_default(&mut engine, id, check.clone()).error, None);
+            assert_eq!(clones.load(Ordering::SeqCst), 1);
+            assert_eq!(engine.graphs[&id].graph.num_tuples(), tuples);
+        }
+    }
+
+    #[test]
+    fn preparation_uses_one_compiler_for_cold_warm_and_resupplied_metadata() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        for mode in [
+            pb::ExecutionMode::Normal,
+            pb::ExecutionMode::TermEncoding,
+            pb::ExecutionMode::Proofs,
+            pb::ExecutionMode::ProofTesting,
+        ] {
+            let scalar = pb::Sort {
+                kind: Some(pb::sort::Kind::Application(pb::SortApplication {
+                    name: "i64".into(),
+                    args: vec![],
+                })),
+                ..Default::default()
+            };
+            let mut engine = Engine::default();
+            let id = engine
+                .create_request(pb::CreateEGraphRequest {
+                    sorts: vec![scalar.clone()],
+                    options: Some(pb::EGraphOptions {
+                        cost_sort: Some(0),
+                        execution_mode: mode.into(),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                })
+                .unwrap()
+                .egraph_id;
+            let clones = Arc::new(AtomicUsize::new(0));
+            let session = engine.graphs.get_mut(&id).unwrap();
+            // Install after mode selection so the original proof typechecking
+            // graph has no probe: count only outer native graph clones.
+            *session
+                .graph
+                .extension_state_or_default::<NativeCloneProbe>() =
+                NativeCloneProbe(clones.clone());
+            for kind in [
+                pb::sort::Kind::Application(pb::SortApplication {
+                    name: "Vec".into(),
+                    args: vec![0],
+                }),
+                pb::sort::Kind::Func(pb::FuncSort {
+                    params: vec![0],
+                    result: 0,
+                }),
+            ] {
+                let mut program = pb::Program {
+                    sorts: vec![
+                        scalar.clone(),
+                        pb::Sort {
+                            kind: Some(kind),
+                            ..Default::default()
+                        },
+                    ],
+                    ..Default::default()
+                };
+                clones.store(0, Ordering::SeqCst);
+                let prepared = session.prepare(&mut program).unwrap();
+                assert_eq!(
+                    clones.load(Ordering::SeqCst),
+                    1,
+                    "new shape uses the single staging compiler: {mode:?}"
+                );
+                assert_eq!(prepared.materialized.len(), 1);
+                assert!(!prepared.installations.is_empty());
+                let name = sort_name(&program.sorts, 1).unwrap();
+                assert!(session.graph.get_sort_by_name(&name).is_none());
+                session
+                    .install(prepared, &mut pb::RunProgramOutput::default())
+                    .unwrap();
+                assert!(session.graph.get_sort_by_name(&name).is_some());
+
+                clones.store(0, Ordering::SeqCst);
+                let prepared = session.prepare(&mut program).unwrap();
+                assert!(prepared.installations.is_empty());
+                assert_eq!(
+                    clones.load(Ordering::SeqCst),
+                    1,
+                    "known shape reuses staging: {mode:?}"
+                );
+            }
+            let mut declarations = inventory_fixture("(datatype E (N i64))");
+            clones.store(0, Ordering::SeqCst);
+            let prepared = session.prepare(&mut declarations).unwrap();
+            assert_eq!(clones.load(Ordering::SeqCst), 1);
+            session
+                .install(prepared, &mut pb::RunProgramOutput::default())
+                .unwrap();
+            clones.store(0, Ordering::SeqCst);
+            let prepared = session
+                .prepare(&mut inventory_fixture("(datatype E (N i64))"))
+                .unwrap();
+            assert!(prepared.installations.is_empty());
+            assert_eq!(
+                clones.load(Ordering::SeqCst),
+                1,
+                "resupply uses the same staging path"
+            );
+            let tuples = session.graph.num_tuples();
+            clones.store(0, Ordering::SeqCst);
+            session.prepare(&mut pb::Program::default()).unwrap();
+            assert_eq!(clones.load(Ordering::SeqCst), 1);
+            assert_eq!(session.graph.num_tuples(), tuples);
+            for bound in [0, 1] {
+                let mut condition = inventory_fixture("(check (= 1 1))");
+                let Some(pb::command::Kind::Check(check)) = condition.commands.pop().unwrap().kind
+                else {
+                    unreachable!()
+                };
+                condition.commands.push(pb::Command {
+                    kind: Some(pb::command::Kind::Loop(pb::Loop {
+                        until: check.facts,
+                        max_iterations: Some(bound),
+                        ..Default::default()
+                    })),
+                    ..Default::default()
+                });
+                clones.store(0, Ordering::SeqCst);
+                session.prepare(&mut condition).unwrap();
+                assert_eq!(
+                    clones.load(Ordering::SeqCst),
+                    1,
+                    "internal conditions share the staging compiler: {mode:?}, bound {bound}"
+                );
+                assert_eq!(session.graph.num_tuples(), tuples);
+            }
+
+            let mut failure = inventory_fixture("(panic \"single-preparation\")");
+            failure.files[0].name = "single-preparation.egg".into();
+            let span = failure.commands[0].span;
+            let response = run_host_default(&mut engine, id, failure);
+            let error = response.error.unwrap();
+            assert_eq!(error.code, i32::from(pb::ErrorCode::RuntimeFailure));
+            assert_eq!(error.span, span);
+            assert_eq!(error.location.unwrap().path, [0]);
+            assert_eq!(
+                response.files[span.unwrap().file as usize].name,
+                "single-preparation.egg"
+            );
+            assert!(error.message.contains("single-preparation"));
+        }
     }
 
     #[test]

@@ -3796,7 +3796,7 @@ impl Renderer {
                     unionable: true,
                 };
                 native
-                    .resolve_command_before_proofs(command.clone())
+                    .compile_program_observed(vec![command.clone()], &mut |_, _| {})
                     .map_err(|error| TransportError(error.to_string()))?;
                 source_sort_names(&mut command, &authored);
                 command = command.map_symbols(
@@ -3804,7 +3804,7 @@ impl Renderer {
                     &mut |name| name,
                 );
                 text_native
-                    .resolve_command_before_proofs(command)
+                    .compile_program_observed(vec![command], &mut |_, _| {})
                     .map_err(|error| TransportError(error.to_string()))?;
             }
         }
@@ -3818,7 +3818,7 @@ impl Renderer {
         {
             source_sort_names(&mut command, &authored);
             text_native
-                .resolve_command_before_proofs(command)
+                .compile_program_observed(vec![command], &mut |_, _| {})
                 .map_err(|error| TransportError(error.to_string()))?;
         }
         // Rule heads are reprojected for native cost roles below. Normalize
