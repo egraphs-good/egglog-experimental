@@ -1,5 +1,6 @@
 #![cfg(feature = "typed")]
 
+use egglog_experimental::proto as pb;
 use egglog_experimental::typed::{
     builtins::{F64, I64, Pair, Vec as EVec},
     prelude::*,
@@ -25,6 +26,7 @@ fn pair_fields_preserve_symbolic_children_and_tuple_conversions() -> Result<(), 
     let symbolic = I64::from(2) + I64::from(3);
     let right = F64::from(1.5);
     let pair = Pair::<I64, F64>::new(&symbolic, &right);
+    assert_eq!(pair.call_name(), None);
     assert_eq!(pair, generic(&symbolic, &right));
     assert_eq!(
         Pair::<I64, F64>::from((7_i64, 2.5_f64)).fields()?,
@@ -44,12 +46,18 @@ fn pair_fields_preserve_symbolic_children_and_tuple_conversions() -> Result<(), 
 #[test]
 fn pair_calls_values_and_projections_execute_through_bytes() -> Result<(), TypedError> {
     let pair = Pair::<I64, F64>::new(I64::from(2) + I64::from(3), 1.5_f64);
-    let mut graph = EGraph::default();
+    let mut graph = EGraph::with_recording(true)?;
     graph.register(&pair)?;
+    assert!(graph.history()?.nodes.iter().any(|node| matches!(
+        &node.kind,
+        Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
+            value: Some(pb::primitive_value::Value::Pair(_))
+        }))
+    )));
     assert_eq!(i64::try_from(&graph.extract(pair.first())?)?, 5);
     assert_eq!(f64::try_from(&graph.extract(pair.second())?)?, 1.5);
     let value = graph.extract(&pair)?;
-    assert_ne!(pair, value, "authored Call remains distinct from PairValue");
+    assert_ne!(pair, value, "extraction evaluates the symbolic child");
     assert!(graph.check(eq(&pair, &value))?);
     assert_eq!(value.fields()?, (I64::from(5), F64::from(1.5)));
     let ordered = Pair::<I64, I64>::new(7_i64, 11_i64);

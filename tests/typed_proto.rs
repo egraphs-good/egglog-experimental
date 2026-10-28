@@ -2277,6 +2277,11 @@ mod function_values {
     #[test]
     fn captured_prefixes_address_only_the_selected_index_rows() -> Result<(), TypedError> {
         let values = MultiSet::<I64>::new([1, 1, 2]);
+        assert_eq!(values.call_name(), None);
+        assert_eq!(
+            Vec::<I64>::try_from(&values)?,
+            [I64::from(1), I64::from(1), I64::from(2)]
+        );
         let selected = Function::<(MultiSet<I64>, I64), I64>::with_captures(
             (I64::from(41),),
             |(key,), xs, x| prefixed_index(key, xs, x),

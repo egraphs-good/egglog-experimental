@@ -1812,7 +1812,11 @@ fn set_values_relocate_without_changing_order_multiplicity_or_occurrences() {
         vec![1, 0, 1],
         vec![named.expression().0.clone(), fresh.expression().0.clone()],
     );
-    assert!(Vec::<I64>::try_from(&open).is_err());
+    assert_eq!(
+        Vec::<I64>::try_from(&open).unwrap(),
+        [fresh.clone(), named, fresh]
+    );
+    assert!(open.expression().validate_inert().is_err());
     let packed = packed_query(&[open.expression().0.clone()]);
     let Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
         value: Some(pb::primitive_value::Value::Set(items)),
@@ -2090,8 +2094,8 @@ fn map_inspection_rejects_same_headed_user_calls_and_wrong_children() {
         assert!(malformed.entries().is_err());
         assert!(malformed.expression().validate_inert().is_err());
     }
-    // Direct Vec/PairValue inspection is intentionally separate from the
-    // public Vec inert-only decoder and retains symbolic child records.
+    // Data inspection retains symbolic child records; from_pairs remains an
+    // operation even when its argument is a direct Vec of Pair data.
     let key = super::var::<I64>("k");
     let value = F64::from(2.5);
     let pair = node(
@@ -2115,11 +2119,10 @@ fn map_inspection_rejects_same_headed_user_calls_and_wrong_children() {
         vec![pair],
         vec![],
     )));
-    assert!(Vec::<Pair<I64, F64>>::try_from(&vector).is_err());
-    assert_eq!(
-        Map::<I64, F64>::from_pairs(vector).entries().unwrap(),
-        [(key.clone(), value.clone()), (key, value)]
-    );
+    let children = Vec::<Pair<I64, F64>>::try_from(&vector).unwrap();
+    assert_eq!(children.len(), 2);
+    assert_eq!(children[0].fields().unwrap(), (key, value));
+    assert!(Map::<I64, F64>::from_pairs(vector).entries().is_err());
 }
 
 #[test]
@@ -2217,11 +2220,6 @@ fn pair_fields_relocate_preserve_aliases_and_reject_impostors() {
     let family = catalog
         .declaration("Pair", DeclarationKind::PrimitiveSort)
         .unwrap();
-    let make = Callable(
-        catalog
-            .declaration("egglog.core.pair.make", DeclarationKind::Callable)
-            .unwrap(),
-    );
     let sort = SortRef::family(&family, vec![I64::sort_ref(), I64::sort_ref()]).unwrap();
     let value = |indices: [u32; 2], children| {
         Expr(node(
@@ -2255,7 +2253,7 @@ fn pair_fields_relocate_preserve_aliases_and_reject_impostors() {
     let repeated = value([0, 0], vec![first]);
     let parent = Arc::downgrade(repeated.0.owner.as_ref().unwrap());
     let [left, right] = repeated
-        .pair_fields(&make, &I64::sort_ref(), &I64::sort_ref())
+        .pair_fields(&I64::sort_ref(), &I64::sort_ref())
         .unwrap();
     assert!(Arc::ptr_eq(
         left.0.owner.as_ref().unwrap(),
@@ -2278,10 +2276,7 @@ fn pair_fields_relocate_preserve_aliases_and_reject_impostors() {
             fresh.expression().0.clone(),
         ],
     );
-    assert!(
-        open.pair_fields(&make, &I64::sort_ref(), &I64::sort_ref())
-            .is_ok()
-    );
+    assert!(open.pair_fields(&I64::sort_ref(), &I64::sort_ref()).is_ok());
     assert!(open.validate_inert().is_err());
     let closed = packed_query(&[open.0]);
     assert!(
@@ -2296,10 +2291,7 @@ fn pair_fields_relocate_preserve_aliases_and_reject_impostors() {
             .iter()
             .any(|n| matches!(&n.kind, Some(pb::node::Kind::Var(v)) if v == "__typed_v_0"))
     );
-    assert!(
-        a.pair_fields(&make, &F64::sort_ref(), &I64::sort_ref())
-            .is_err()
-    );
+    assert!(a.pair_fields(&F64::sort_ref(), &I64::sort_ref()).is_err());
     let wrong_child = value(
         [0, 1],
         vec![
@@ -2309,7 +2301,7 @@ fn pair_fields_relocate_preserve_aliases_and_reject_impostors() {
     );
     assert!(
         wrong_child
-            .pair_fields(&make, &I64::sort_ref(), &I64::sort_ref())
+            .pair_fields(&I64::sort_ref(), &I64::sort_ref())
             .is_err()
     );
     assert!(wrong_child.validate_inert().is_err());
@@ -2329,7 +2321,7 @@ fn pair_fields_relocate_preserve_aliases_and_reject_impostors() {
             ],
         );
         assert!(
-            call.pair_fields(&make, &I64::sort_ref(), &I64::sort_ref())
+            call.pair_fields(&I64::sort_ref(), &I64::sort_ref())
                 .is_err()
         );
     }
@@ -2339,7 +2331,7 @@ fn pair_fields_relocate_preserve_aliases_and_reject_impostors() {
         vec![],
     );
     assert!(
-        fake.pair_fields(&make, &I64::sort_ref(), &I64::sort_ref())
+        fake.pair_fields(&I64::sort_ref(), &I64::sort_ref())
             .is_err()
     );
 }
@@ -2394,11 +2386,6 @@ fn pair_values_keep_union_allocation_identity() {
         .declaration("Pair", DeclarationKind::PrimitiveSort)
         .unwrap();
     let sort = SortRef::family(&family, vec![atom.clone(), atom.clone()]).unwrap();
-    let make = Callable(
-        catalog
-            .declaration("egglog.core.pair.make", DeclarationKind::Callable)
-            .unwrap(),
-    );
     let union = || {
         node(
             &atom,
@@ -2426,7 +2413,7 @@ fn pair_values_keep_union_allocation_identity() {
     let distinct = value(vec![first, union()]);
     assert_eq!(shared, same);
     assert_ne!(shared, distinct);
-    let [left, right] = shared.pair_fields(&make, &atom, &atom).unwrap();
+    let [left, right] = shared.pair_fields(&atom, &atom).unwrap();
     assert_eq!(left, right);
     let packed = packed_query(&[shared.0]);
     let Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
@@ -2452,13 +2439,15 @@ fn vec_calls_and_values_preserve_actual_ordered_child_records() {
     let vector = EVec::<I64>::of([leaf.clone(), I64::from(11), leaf.clone()]);
     let weak = Arc::downgrade(vector.expression().0.owner.as_ref().unwrap());
     let p = packed_query(&[vector.expression().0.clone()]);
-    let Some(pb::node::Kind::Call(call)) = &p.nodes[0].kind else {
+    let Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
+        value: Some(pb::primitive_value::Value::Vec(values)),
+    })) = &p.nodes[0].kind
+    else {
         panic!()
     };
-    assert_eq!(call.func, "egglog.core.vec.of");
-    assert_eq!(call.args.len(), 3);
-    assert_eq!(call.args[0], call.args[2]);
-    for (index, expected) in call.args.iter().zip([7, 11, 7]) {
+    assert_eq!(values.items.len(), 3);
+    assert_eq!(values.items[0], values.items[2]);
+    for (index, expected) in values.items.iter().zip([7, 11, 7]) {
         assert!(matches!(&p.nodes[*index as usize].kind,
             Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue { value: Some(pb::primitive_value::Value::I64(v)) })) if *v == expected));
     }
@@ -2524,11 +2513,6 @@ fn vec_calls_and_values_preserve_actual_ordered_child_records() {
         .declaration("Vec", DeclarationKind::PrimitiveSort)
         .unwrap();
     let vector_sort = SortRef::family(&family, vec![atom.clone()]).unwrap();
-    let of = Callable(
-        super::storage::builtin_catalog()
-            .declaration("egglog.core.vec.of", DeclarationKind::Callable)
-            .unwrap(),
-    );
     let leaf = Expr::call(
         &Callable::constructor("Leaf", vec![], atom.clone(), None, false),
         vec![],
@@ -2542,11 +2526,11 @@ fn vec_calls_and_values_preserve_actual_ordered_child_records() {
             } else {
                 vec![leaf.clone(), term]
             };
-            let vector = Expr::call_with_result(&of, children, vector_sort.clone()).unwrap();
+            let vector = Expr::container(vector_sort.clone(), children).unwrap();
             let owner = vector.0.owner.as_ref().unwrap();
             assert_eq!(owner.program().unwrap().nodes.len(), 1);
             assert_eq!(owner.slots[Arena::Node as usize].len(), 2);
-            assert_eq!(owner.declarations.len(), 1);
+            assert_eq!(owner.declarations.len(), 0);
             term = Expr::call(&pack, vec![vector]);
         }
         let weak = Arc::downgrade(term.0.owner.as_ref().unwrap());

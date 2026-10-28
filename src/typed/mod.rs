@@ -31,6 +31,12 @@
 //!
 //! Scalar conversions and constructor arguments are checked by Rust. Calls
 //! author symbolic expressions; they do not evaluate those expressions.
+//! Direct Vec/Set/MultiSet, Pair, Maybe and empty Map constructors pack data
+//! with owned symbolic children. `Map::of` packs ordered key/value associations.
+//! Their `TryFrom`, `fields` and `entries` views return typed child expressions
+//! without evaluating them or normalizing set elements/map keys. Operations such
+//! as push, insert and `Map::from_pairs` remain calls for every input; extract
+//! them before inspecting their values. Native execution owns normalization.
 //!
 //! `#[relation]` declares an input-only predicate, including an inherent `&self`
 //! receiver in the first input position. Its existing `builtins::Unit` expression

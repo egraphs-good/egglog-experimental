@@ -51,8 +51,14 @@ fn map_tuple_packing_and_direct_entries_preserve_symbolic_order() -> Result<(), 
         (I64::from(1), F64::from(2.5)),
         (key.clone(), F64::from(3.5)),
     ];
-    let map: Map<I64, F64> = generic(&pairs);
-    assert_eq!(map, Map::from_pairs(pairs.clone()));
+    let from_pairs: Map<I64, F64> = generic(&pairs);
+    assert_eq!(from_pairs, Map::from_pairs(pairs.clone()));
+    assert!(
+        from_pairs.entries().is_err(),
+        "from_pairs is always an operation"
+    );
+    let map = Map::<I64, F64>::of(expected.clone());
+    assert_eq!(map.call_name(), None);
     assert_eq!(map.entries()?, expected);
     assert_eq!(Vec::<(I64, F64)>::try_from(&map)?, expected);
     assert_eq!(Vec::<(I64, F64)>::try_from(map.clone())?, expected);
@@ -62,19 +68,27 @@ fn map_tuple_packing_and_direct_entries_preserve_symbolic_order() -> Result<(), 
         Map::<I64, F64>::of([(&key, &value)]).entries()?,
         [(key, value)]
     );
-    assert!(
-        Vec::<Pair<I64, F64>>::try_from(&pairs).is_err(),
-        "public Vec decoding remains inert-only"
-    );
+    assert_eq!(Vec::<Pair<I64, F64>>::try_from(&pairs)?.len(), 3);
     for empty in [
         Map::<I64, F64>::empty(),
         Map::<I64, F64>::of(std::iter::empty::<(I64, F64)>()),
+    ] {
+        assert!(empty.entries()?.is_empty());
+    }
+    let mut graph = EGraph::with_recording(true)?;
+    graph.register(&map)?;
+    assert!(graph.history()?.nodes.iter().any(|node| matches!(&node.kind,
+        Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue { value: Some(pb::primitive_value::Value::Map(map)) })) if map.entries.len() == 3)));
+    assert!(graph.check(eq(&map, &from_pairs))?);
+    assert_eq!(graph.extract(&from_pairs)?.entries()?.len(), 2);
+    for empty in [
         Map::<I64, F64>::from_pairs(EVec::<Pair<I64, F64>>::empty()),
         Map::<I64, F64>::from_pairs(EVec::<Pair<I64, F64>>::of(
             std::iter::empty::<Pair<I64, F64>>(),
         )),
     ] {
-        assert!(empty.entries()?.is_empty());
+        assert!(empty.entries().is_err());
+        assert!(graph.extract(empty)?.entries()?.is_empty());
     }
     assert!(var::<Map<I64, F64>>("map").entries().is_err());
     assert!(map.insert(9_i64, 4.5_f64).entries().is_err());

@@ -1834,7 +1834,7 @@ mod tests {
             Some(pb::command::Kind::Extract(_))
         ));
         assert!(request.nodes.iter().any(|n| matches!(&n.kind, Some(pb::node::Kind::Call(c)) if c.func == "egglog.experimental.subst" && c.args.len() == 2)));
-        assert!(request.nodes.iter().any(|n| matches!(&n.kind, Some(pb::node::Kind::Call(c)) if c.func == "egglog.core.map.of" && c.args.len() == 1)));
+        assert!(request.nodes.iter().any(|n| matches!(&n.kind, Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue { value: Some(pb::primitive_value::Value::Map(map)) })) if map.entries.len() == 1)));
         assert!(graph.check(eq(copied, replacement)).unwrap());
     }
 
@@ -3326,7 +3326,7 @@ mod tests {
     use crate::typed::{SortRef, decl::Callable};
 
     #[test]
-    fn map_bytes_use_fixed_canonical_calls_and_return_map_values() {
+    fn map_bytes_preserve_authored_entries_and_return_native_map_values() {
         use crate::typed::builtins::{F64, I64, Map};
         let map = Map::<I64, F64>::of([(7_i64, 1.5_f64), (7_i64, 2.5_f64)]);
         let mut graph = EGraph::default();
@@ -3336,28 +3336,33 @@ mod tests {
             .unwrap()
             .program
             .unwrap();
-        for identity in [
-            "egglog.core.map.of",
-            "egglog.core.vec.of",
-            "egglog.core.pair.make",
-        ] {
-            assert!(
-                request.nodes.iter().any(
-                    |n| matches!(&n.kind, Some(pb::node::Kind::Call(c)) if c.func == identity)
-                )
-            );
+        let authored = request
+            .nodes
+            .iter()
+            .find_map(|node| match &node.kind {
+                Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
+                    value: Some(pb::primitive_value::Value::Map(map)),
+                })) => Some(map),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(authored.entries.len(), 2);
+        for (entry, expected) in authored.entries.iter().zip([1.5_f64, 2.5]) {
+            assert!(matches!(
+                &request.nodes[entry.key.unwrap() as usize].kind,
+                Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
+                    value: Some(pb::primitive_value::Value::I64(7))
+                }))
+            ));
+            assert!(matches!(&request.nodes[entry.value.unwrap() as usize].kind,
+                Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue { value: Some(pb::primitive_value::Value::F64Bits(bits)) })) if *bits == expected.to_bits()));
         }
         assert!(
-            request
+            !request
                 .nodes
                 .iter()
-                .filter_map(|n| match &n.kind {
-                    Some(pb::node::Kind::Call(c)) if c.func == "egglog.core.map.of" => Some(c),
-                    _ => None,
-                })
-                .all(|c| c.args.len() == 1)
+                .any(|node| matches!(&node.kind, Some(pb::node::Kind::Call(_))))
         );
-        assert!(!request.nodes.iter().any(|n| matches!(&n.kind, Some(pb::node::Kind::Call(c)) if c.func == "map-of" || c.func == "map-from-pairs")));
         let response = Observed::from_frames(
             response
                 .iter()
@@ -3727,7 +3732,7 @@ mod tests {
     }
 
     #[test]
-    fn pair_bytes_use_canonical_calls_and_return_pair_values() {
+    fn pair_bytes_use_structured_input_and_return_pair_values() {
         use crate::typed::builtins::{F64, I64, Pair};
         let pair = Pair::<I64, F64>::new(7_i64, 1.5_f64);
         let mut graph = EGraph::default();
@@ -3737,7 +3742,12 @@ mod tests {
             .unwrap()
             .program
             .unwrap();
-        assert!(request.nodes.iter().any(|n| matches!(&n.kind, Some(pb::node::Kind::Call(c)) if c.func == "egglog.core.pair.make")));
+        assert!(request.nodes.iter().any(|n| matches!(
+            &n.kind,
+            Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
+                value: Some(pb::primitive_value::Value::Pair(_))
+            }))
+        )));
         assert!(
             !request
                 .nodes
@@ -3761,7 +3771,7 @@ mod tests {
                 value: Some(pb::primitive_value::Value::Pair(_))
             }))
         ));
-        assert_ne!(pair, value);
+        assert_eq!(pair, value);
         drop(graph);
         assert_eq!(value.fields().unwrap(), (I64::from(7), F64::from(1.5)));
     }
@@ -3773,11 +3783,6 @@ mod tests {
             builtins::{F64, I64},
         };
         let catalog = super::super::storage::builtin_catalog();
-        let make = Callable(
-            catalog
-                .declaration("egglog.core.pair.make", DeclarationKind::Callable)
-                .unwrap(),
-        );
         let response = pb::RunProgramOutput {
             sorts: vec![
                 pb::Sort {
@@ -3839,7 +3844,7 @@ mod tests {
         )
         .unwrap();
         let [left, right] = value
-            .pair_fields(&make, &I64::sort_ref(), &F64::sort_ref())
+            .pair_fields(&I64::sort_ref(), &F64::sort_ref())
             .unwrap();
         assert_eq!(i64::try_from(&I64::from_expression(left)).unwrap(), 7);
         assert_eq!(f64::try_from(&F64::from_expression(right)).unwrap(), 1.5);
@@ -3929,7 +3934,7 @@ mod tests {
         )
         .unwrap();
         let [left, right] = shared
-            .pair_fields(&make, &I64::sort_ref(), &I64::sort_ref())
+            .pair_fields(&I64::sort_ref(), &I64::sort_ref())
             .unwrap();
         assert_eq!(left.0.index, right.0.index);
         assert!(std::sync::Arc::ptr_eq(
@@ -5107,16 +5112,17 @@ mod tests {
             panic!()
         };
         let root = &program.nodes[extract.roots[0] as usize];
-        let Some(pb::node::Kind::Call(call)) = &root.kind else {
+        let Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
+            value: Some(pb::primitive_value::Value::Set(values)),
+        })) = &root.kind
+        else {
             panic!()
         };
-        assert_eq!(call.func, "egglog.core.set.of");
-        assert_eq!(call.args.len(), 3);
-        assert_eq!(call.args[0], call.args[2]);
-        for (index, expected) in call.args.iter().zip([2, 1, 2]) {
-            assert!(
-                matches!(&program.nodes[*index as usize].kind, Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue { value: Some(pb::primitive_value::Value::I64(value)) })) if *value == expected)
-            );
+        assert_eq!(values.items.len(), 3);
+        assert_eq!(values.items[0], values.items[2]);
+        for (index, expected) in values.items.iter().zip([2, 1, 2]) {
+            assert!(matches!(&program.nodes[*index as usize].kind,
+                Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue { value: Some(pb::primitive_value::Value::I64(value)) })) if *value == expected));
         }
         let response = Observed::from_frames(
             output

@@ -93,9 +93,22 @@ fn ordinary_vector_methods_preserve_values_and_failures_through_bytes() -> Resul
 #[test]
 fn generated_vec_calls_and_ordered_values_execute_as_bytes() -> Result<(), TypedError> {
     let xs = EVec::<I64>::of([7_i64, 11, 7]);
-    assert!(Vec::<I64>::try_from(&xs).is_err(), "of is symbolic syntax");
-    let mut graph = EGraph::default();
+    assert_eq!(
+        Vec::<I64>::try_from(&xs)?,
+        [I64::from(7), I64::from(11), I64::from(7)]
+    );
+    assert_eq!(xs.call_name(), None);
+    let symbolic = I64::from(1) / I64::from(0);
+    let authored = EVec::<I64>::of([&symbolic]);
+    assert_eq!(Vec::<I64>::try_from(&authored)?, [symbolic]);
+    let mut graph = EGraph::with_recording(true)?;
     graph.register(&xs)?;
+    assert!(graph.history()?.nodes.iter().any(|node| matches!(
+        &node.kind,
+        Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
+            value: Some(pb::primitive_value::Value::Vec(_))
+        }))
+    )));
     assert_eq!(i64::try_from(&graph.extract(xs.get(1_i64))?)?, 11);
     let value = graph.extract(&xs)?;
     let decoded = Vec::<I64>::try_from(&value)?;
@@ -106,7 +119,10 @@ fn generated_vec_calls_and_ordered_values_execute_as_bytes() -> Result<(), Typed
             .collect::<Result<Vec<_>, _>>()?,
         [7, 11, 7]
     );
-    assert_ne!(xs, value, "symbolic Call is not an inert value record");
+    assert_eq!(
+        xs, value,
+        "already literal children retain their data shape"
+    );
     assert!(graph.check(eq(&xs, &value))?);
     for empty in [
         EVec::<I64>::empty(),

@@ -286,7 +286,7 @@ fn exact_number_codecs_leave_constructor_views_and_records_authoritative() {
 }
 
 #[test]
-fn map_codec_uses_actual_nested_records_and_presentation_metadata() {
+fn map_data_codec_and_operations_follow_their_own_typed_records() {
     let (program, mapping) = native_fixture();
     let baseline = checked_source(&program, &mapping);
     assert!(baseline.contains("pub fn entries(&self)"));
@@ -313,7 +313,32 @@ fn map_codec_uses_actual_nested_records_and_presentation_metadata() {
             3 => s.output = Some(s.inputs[0].sort),
             _ => s.varargs.push(s.inputs[0].clone()),
         }
-        assert!(generate(&changed, &mapping).is_err(), "Map negative {case}");
+        if case == 3 {
+            // from_pairs is a catalog operation; its declared result determines
+            // the public return type. The separate Map::of data codec does not
+            // depend on that operation or assume its result is a Map.
+            let source = checked_source(&changed, &mapping);
+            let operation = source
+                .split_once("pub fn from_pairs(")
+                .unwrap()
+                .1
+                .split_once("\n    }\n")
+                .unwrap()
+                .0;
+            assert!(operation.contains("-> self::Vec<self::Pair<"));
+            assert!(operation.contains("Expr::call_with_result("));
+            let data = source
+                .split_once("pub fn of<")
+                .unwrap()
+                .1
+                .split_once("\n    }\n")
+                .unwrap()
+                .0;
+            assert!(data.contains("-> Self"));
+            assert!(data.contains("Expr::container("));
+        } else {
+            assert!(generate(&changed, &mapping).is_err(), "Map negative {case}");
+        }
     }
 }
 
@@ -592,8 +617,8 @@ fn operand_metadata_names_never_become_rust_binding_patterns() {
     }
 }
 
-// Verify declaration indices in their actual method/operator body, independent
-// of emitted order, while references remain owned by the joined semantic graph.
+// Operations retain their selected declaration indices; data constructors pack
+// child fields directly. Neither route depends on public presentation spelling.
 fn assert_locations(program: &pb::BuiltinCatalog, mapping: &RustPresentation, source: &str) {
     let (program, mapping) = mapping.join(program).unwrap();
     for (index, p) in program.primitives.iter().enumerate() {
@@ -603,13 +628,27 @@ fn assert_locations(program: &pb::BuiltinCatalog, mapping: &RustPresentation, so
         for view in views.iter().filter(|v| v.trait_impl.is_none()) {
             let name = view.path.last().unwrap();
             let marker = format!("pub fn {name}");
+            let expected = if matches!(
+                p.name.as_str(),
+                "egglog.core.vec.of"
+                    | "egglog.core.vec.empty"
+                    | "egglog.core.set.of"
+                    | "egglog.core.set.empty"
+                    | "egglog.core.multiset.of"
+                    | "egglog.core.pair.make"
+                    | "egglog.core.map.empty"
+                    | "egglog.experimental.maybe.none"
+                    | "egglog.experimental.maybe.some"
+            ) {
+                "Expr::container(".to_owned()
+            } else {
+                format!(".index = {index};")
+            };
             assert!(
-                source.split(&marker).skip(1).any(|part| {
-                    part.split_once("\n    }\n")
-                        .unwrap()
-                        .0
-                        .contains(&format!(".index = {index};"))
-                }),
+                source
+                    .split(&marker)
+                    .skip(1)
+                    .any(|part| { part.split_once("\n    }\n").unwrap().0.contains(&expected) }),
                 "missing {name} at {index}"
             );
         }

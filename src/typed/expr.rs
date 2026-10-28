@@ -142,6 +142,81 @@ pub fn variable<S: EgglogValue>(scope: u64, slot: usize) -> S {
 }
 
 impl Expr {
+    // Child slots are imported as owned records; their evaluation and container
+    // normalization belong to the receiving engine, never this data factory.
+    pub(super) fn container(sort: SortRef, children: Vec<Self>) -> Result<Self, TypedError> {
+        use pb::primitive_value::Value as V;
+        let Some(pb::sort::Kind::Application(family)) = &sort.0.sort()?.kind else {
+            return Err(TypedError::Invalid(
+                "container requires a family sort".into(),
+            ));
+        };
+        let count = u32::try_from(children.len())
+            .map_err(|_| TypedError::Invalid("too many container children".into()))?;
+        let value = match (family.name.as_str(), family.args.len()) {
+            ("Vec", 1) => V::Vec(pb::ValueList {
+                items: (0..count).collect(),
+            }),
+            ("Set", 1) => V::Set(pb::ValueList {
+                items: (0..count).collect(),
+            }),
+            ("MultiSet", 1) => V::Multiset(pb::ValueList {
+                items: (0..count).collect(),
+            }),
+            ("Pair", 2) if count == 2 => V::Pair(pb::PairValue {
+                first: Some(0),
+                second: Some(1),
+            }),
+            ("Map", 2) if count.is_multiple_of(2) => V::Map(pb::MapValue {
+                entries: (0..count)
+                    .step_by(2)
+                    .map(|key| pb::MapEntry {
+                        key: Some(key),
+                        value: Some(key + 1),
+                    })
+                    .collect(),
+            }),
+            ("Maybe", 1) if count <= 1 => V::Maybe(pb::MaybeValue {
+                value: (count == 1).then_some(0),
+            }),
+            _ => {
+                return Err(TypedError::Invalid(
+                    "container family/child arity mismatch".into(),
+                ));
+            }
+        };
+        for (child, expected) in children.iter().zip(family.args.iter().cycle()) {
+            let node = &child.0.owner.as_ref().unwrap().program()?.nodes[child.0.index as usize];
+            if SortRef(child.0.resolve(Arena::Sort, node.sort_id)?)
+                != SortRef(sort.0.resolve(Arena::Sort, *expected)?)
+            {
+                return Err(TypedError::Invalid("container child sort mismatch".into()));
+            }
+        }
+        let mut slots = std::array::from_fn(|_| vec![]);
+        slots[Arena::Sort as usize] = vec![Slot::External(sort.0)];
+        slots[Arena::Node as usize] = children
+            .into_iter()
+            .map(|child| Slot::External(child.0))
+            .collect();
+        Ok(Self(publish(
+            pb::Program {
+                nodes: vec![pb::Node {
+                    kind: Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
+                        value: Some(value),
+                    })),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+            slots,
+            vec![],
+            Arena::Node,
+            0,
+            vec![],
+        )?))
+    }
+
     pub(super) fn literal(sort: SortRef, value: pb::PrimitiveValue) -> Result<Self, TypedError> {
         validate_literal(&sort, &value)?;
         let mut slots = std::array::from_fn(|_| vec![]);
@@ -509,8 +584,7 @@ impl Expr {
         )?))
     }
 
-    // Exact container decoding validates the finite inert closure before
-    // exposing child wrappers. It never evaluates a symbolic vec-of/get Call.
+    // Inspect the data shape without evaluating or traversing symbolic children.
     pub(super) fn sequence_elements(
         &self,
         element: &SortRef,
@@ -548,21 +622,23 @@ impl Expr {
                 "{family} element sort mismatch"
             )));
         }
-        self.validate_inert()?;
         values
             .items
             .iter()
-            .map(|i| self.0.resolve(Arena::Node, *i).map(Self))
+            .map(|i| {
+                let child = self.0.resolve(Arena::Node, *i)?;
+                let node = &child.owner.as_ref().unwrap().program()?.nodes[child.index as usize];
+                if SortRef(child.resolve(Arena::Sort, node.sort_id)?) != *element {
+                    return Err(TypedError::Decode(format!("{family} child sort mismatch")));
+                }
+                Ok(Self(child))
+            })
             .collect()
     }
 
     // Inspect optional presence without evaluating a symbolic child or making
-    // a temporary call. Canonical constructor identities come from the catalog.
-    pub(super) fn maybe_value(
-        &self,
-        [none, some]: [&Callable; 2],
-        element: &SortRef,
-    ) -> Result<Option<Self>, TypedError> {
+    // a temporary call.
+    pub(super) fn maybe_value(&self, element: &SortRef) -> Result<Option<Self>, TypedError> {
         let node = &self.0.owner.as_ref().unwrap().program().unwrap().nodes[self.0.index as usize];
         let sort = self.0.resolve(Arena::Sort, node.sort_id)?;
         let Some(pb::sort::Kind::Application(family)) = &sort.sort().unwrap().kind else {
@@ -578,14 +654,6 @@ impl Expr {
             Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
                 value: Some(pb::primitive_value::Value::Maybe(maybe)),
             })) => maybe.value,
-            Some(pb::node::Kind::Call(call)) if call.args.len() <= 1 => {
-                let actual = self.0.declaration(&call.func, DeclarationKind::Callable)?;
-                let expected = if call.args.is_empty() { none } else { some };
-                if !super::decl::same_callable(&actual, &expected.0)? {
-                    return Err(TypedError::Decode("not a catalog Maybe constructor".into()));
-                }
-                call.args.first().copied()
-            }
             _ => return Err(TypedError::Decode("expected a direct Maybe value".into())),
         };
         child
@@ -602,10 +670,9 @@ impl Expr {
     }
 
     // Inspect exactly two direct children, never evaluate them. The schema
-    // owns the PairValue layout; the catalog owns authored make-call identity.
+    // owns the PairValue layout.
     pub(super) fn pair_fields(
         &self,
-        make: &Callable,
         first: &SortRef,
         second: &SortRef,
     ) -> Result<[Self; 2], TypedError> {
@@ -628,15 +695,6 @@ impl Expr {
                 value: Some(pb::primitive_value::Value::Pair(pair)),
             })) => [pair.first, pair.second]
                 .map(|child| child.ok_or_else(|| TypedError::Decode("missing Pair child".into()))),
-            Some(pb::node::Kind::Call(call)) if call.args.len() == 2 => {
-                let actual = self.0.declaration(&call.func, DeclarationKind::Callable)?;
-                if !super::decl::same_callable(&actual, &make.0)? {
-                    return Err(TypedError::Decode(
-                        "not the catalog Pair constructor".into(),
-                    ));
-                }
-                [Ok(call.args[0]), Ok(call.args[1])]
-            }
             _ => return Err(TypedError::Decode("expected direct Pair fields".into())),
         };
         let [left, right] = indices;
@@ -656,11 +714,10 @@ impl Expr {
         Ok(children)
     }
 
-    // Map inspection admits only direct canonical construction, not arbitrary
-    // Vec computations. Keep Vec's public inert-only decoder separate.
+    // Map data retains ordered associations; native key equality and last-write
+    // normalization are established only by execution.
     pub(super) fn map_entries(
         &self,
-        [empty, of, vec_empty, vec_of, pair_make]: [&Callable; 5],
         key: &SortRef,
         value: &SortRef,
     ) -> Result<Vec<[Self; 2]>, TypedError> {
@@ -701,73 +758,6 @@ impl Expr {
                             )?,
                         ),
                     ]);
-                }
-            }
-            Some(pb::node::Kind::Call(call)) => {
-                let actual = self.0.declaration(&call.func, DeclarationKind::Callable)?;
-                if call.args.is_empty() && super::decl::same_callable(&actual, &empty.0)? {
-                    return Ok(entries);
-                }
-                if call.args.len() != 1 || !super::decl::same_callable(&actual, &of.0)? {
-                    return Err(TypedError::Decode(
-                        "expected direct catalog Map construction".into(),
-                    ));
-                }
-                let vector = self.0.resolve(Arena::Node, call.args[0])?;
-                let node =
-                    &vector.owner.as_ref().unwrap().program().unwrap().nodes[vector.index as usize];
-                let sort = vector.resolve(Arena::Sort, node.sort_id)?;
-                let Some(pb::sort::Kind::Application(family)) = &sort.sort().unwrap().kind else {
-                    return Err(TypedError::Decode(
-                        "Map input must be a Vec of Pairs".into(),
-                    ));
-                };
-                if family.name != "Vec" || family.args.len() != 1 {
-                    return Err(TypedError::Decode(
-                        "Map input must be a Vec of Pairs".into(),
-                    ));
-                }
-                let pair = sort.resolve(Arena::Sort, family.args[0])?;
-                let Some(pb::sort::Kind::Application(family)) = &pair.sort().unwrap().kind else {
-                    return Err(TypedError::Decode("Map input must contain Pairs".into()));
-                };
-                if family.name != "Pair" || family.args.len() != 2 {
-                    return Err(TypedError::Decode("Map input must contain Pairs".into()));
-                }
-                for (arg, expected) in family.args.iter().zip([key, value]) {
-                    if SortRef(pair.resolve(Arena::Sort, *arg)?) != *expected {
-                        return Err(TypedError::Decode(
-                            "Map input Pair component sort mismatch".into(),
-                        ));
-                    }
-                }
-                let children = match &node.kind {
-                    Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
-                        value: Some(pb::primitive_value::Value::Vec(values)),
-                    })) => &values.items,
-                    Some(pb::node::Kind::Call(call)) => {
-                        let actual = vector.declaration(&call.func, DeclarationKind::Callable)?;
-                        if !(call.args.is_empty()
-                            && super::decl::same_callable(&actual, &vec_empty.0)?
-                            || super::decl::same_callable(&actual, &vec_of.0)?)
-                        {
-                            return Err(TypedError::Decode(
-                                "Map entries require a direct catalog Vec construction".into(),
-                            ));
-                        }
-                        &call.args
-                    }
-                    _ => {
-                        return Err(TypedError::Decode(
-                            "Map entries require a direct Vec value".into(),
-                        ));
-                    }
-                };
-                for child in children {
-                    entries.push(
-                        Self(vector.resolve(Arena::Node, *child)?)
-                            .pair_fields(pair_make, key, value)?,
-                    );
                 }
             }
             _ => return Err(TypedError::Decode("expected direct Map entries".into())),

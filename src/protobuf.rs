@@ -3837,7 +3837,7 @@ fn lower_custom_values(
 // Validate contents first; the resulting calls are internal compatibility code,
 // never a claim that the wire value payload was a symbolic authored Call.
 fn lower_container_values(program: &mut pb::Program) -> Result<Vec<u32>, String> {
-    let mut sites: Vec<_> = (0..program.sorts.len() as u32).collect();
+    let sites: Vec<_> = (0..program.sorts.len() as u32).collect();
     let mut replacements = vec![];
     for (index, node) in program.nodes.iter().enumerate() {
         if let Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue { value: Some(value) })) =
@@ -3901,7 +3901,7 @@ fn lower_container_values(program: &mut pb::Program) -> Result<Vec<u32>, String>
                 pb::primitive_value::Value::Map(map) => (
                     "Map",
                     2,
-                    "egglog.core.map.of",
+                    "egglog.core.map.flat",
                     map.entries
                         .iter()
                         .map(|entry| {
@@ -3937,59 +3937,10 @@ fn lower_container_values(program: &mut pb::Program) -> Result<Vec<u32>, String>
                     return Err(format!("{name} payload element sort mismatch"));
                 }
             }
-            replacements.push((
-                index,
-                key,
-                args,
-                (name == "Map").then(|| family.args.clone()),
-            ));
+            replacements.push((index, key, args));
         }
     }
-    for (index, key, mut args, map_parameters) in replacements {
-        if let Some(parameters) = map_parameters {
-            let mut sorts = program.sorts.clone();
-            let pair_sort = u32::try_from(sorts.len()).map_err(|_| "too many sorts")?;
-            sorts.push(pb::Sort {
-                kind: Some(pb::sort::Kind::Application(pb::SortApplication {
-                    name: "Pair".into(),
-                    args: parameters,
-                })),
-                ..Default::default()
-            });
-            let vector_sort = u32::try_from(sorts.len()).map_err(|_| "too many sorts")?;
-            sorts.push(pb::Sort {
-                kind: Some(pb::sort::Kind::Application(pb::SortApplication {
-                    name: "Vec".into(),
-                    args: vec![pair_sort],
-                })),
-                ..Default::default()
-            });
-            let pair_sort = crate::builtin::import_sort(&sorts, pair_sort, &mut program.sorts)?;
-            let vector_sort = crate::builtin::import_sort(&sorts, vector_sort, &mut program.sorts)?;
-            sites.resize(program.sorts.len(), program.nodes[index].sort_id);
-            let mut pairs = vec![];
-            for fields in args.chunks_exact(2) {
-                pairs.push(u32::try_from(program.nodes.len()).map_err(|_| "too many nodes")?);
-                program.nodes.push(pb::Node {
-                    sort_id: pair_sort,
-                    kind: Some(pb::node::Kind::Call(pb::Call {
-                        func: "egglog.core.pair.make".into(),
-                        args: fields.to_vec(),
-                    })),
-                    span: program.nodes[index].span,
-                });
-            }
-            let entries = u32::try_from(program.nodes.len()).map_err(|_| "too many nodes")?;
-            program.nodes.push(pb::Node {
-                sort_id: vector_sort,
-                kind: Some(pb::node::Kind::Call(pb::Call {
-                    func: "egglog.core.vec.of".into(),
-                    args: pairs,
-                })),
-                span: program.nodes[index].span,
-            });
-            args = vec![entries];
-        }
+    for (index, key, args) in replacements {
         program.nodes[index].kind = Some(pb::node::Kind::Call(pb::Call {
             func: key.into(),
             args,

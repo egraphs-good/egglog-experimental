@@ -989,64 +989,15 @@ impl<{generics}> crate::typed::EgglogValue for self::{name}<{types}> {{
 }}
 "#).unwrap();
     if family.name == "Map" {
-        emit_map_codec(program, presentation, name, &parameters, source, occupied)?;
+        emit_map_codec(presentation, name, &parameters, source, occupied)?;
     } else if family.name == "Maybe" {
-        let mut constructors = vec![];
         let owner = format!("self::{name}<{types}>");
-        for (key, arity) in [("none", 0), ("some", 1)] {
-            let identity = format!("egglog.experimental.maybe.{key}");
-            let (index, signature) = program
-                .primitives
-                .iter()
-                .enumerate()
-                .find_map(|(i, p)| {
-                    if p.name != identity {
-                        return None;
-                    }
-                    let Some(s) = &p.signature else {
-                        return None;
-                    };
-                    Some((i, s))
-                })
-                .ok_or("missing catalog Maybe constructor")?;
-            if signature.type_param_count as usize != 1
-                || signature.inputs.len() != arity
-                || !signature.varargs.is_empty()
-                || rust_type(
-                    program,
-                    presentation,
-                    signature.output.ok_or("missing Maybe result")?,
-                    &parameters,
-                )? != owner
-                || signature.inputs.iter().any(|a| {
-                    rust_type(program, presentation, a.sort, &parameters).as_ref()
-                        != Ok(&parameters[0])
-                })
-            {
-                return Err(
-                    "catalog Maybe constructor does not match the optional-child codec".into(),
-                );
-            }
-            constructors.push(index);
-        }
         let t = &parameters[0];
-        let none = local_name("none", occupied);
-        let some = local_name("some", occupied);
-        let [none_index, some_index] = constructors.as_slice() else {
-            unreachable!()
-        };
         writeln!(source, r#"
 impl<{t}: crate::typed::EgglogValue> ::core::convert::TryFrom<&{owner}> for ::core::option::Option<{t}> {{
     type Error = crate::typed::TypedError;
     fn try_from({value}: &{owner}) -> ::core::result::Result<Self, Self::Error> {{
-        let mut {none} = ::core::clone::Clone::clone(crate::typed::storage::builtin_catalog());
-        {none}.arena = crate::typed::storage::Arena::Primitive;
-        {none}.index = {none_index};
-        let mut {some} = ::core::clone::Clone::clone(crate::typed::storage::builtin_catalog());
-        {some}.arena = crate::typed::storage::Arena::Primitive;
-        {some}.index = {some_index};
         ::core::result::Result::Ok({value}.0.maybe_value(
-            [&crate::typed::decl::Callable({none}), &crate::typed::decl::Callable({some})],
             &<{t} as crate::typed::EgglogValue>::sort_ref(),
         )?.map(<{t} as crate::typed::EgglogValue>::from_expression))
     }}
@@ -1068,38 +1019,7 @@ impl<{t}: crate::typed::EgglogValue> ::core::convert::TryFrom<&self::{name}<{t}>
 }}
 "#).unwrap();
     } else {
-        // This identity is the schema Pair codec's native constructor, not a
-        // presentation name. Check its actual scheme before emitting tuples.
-        let (make, signature) = program
-            .primitives
-            .iter()
-            .enumerate()
-            .find_map(|(index, p)| {
-                if p.name != "egglog.core.pair.make" {
-                    return None;
-                }
-                let Some(s) = &p.signature else {
-                    return None;
-                };
-                Some((index, s))
-            })
-            .ok_or("missing catalog Pair constructor")?;
         let owner = format!("self::{name}<{types}>");
-        if signature.type_param_count as usize != arity
-            || signature.inputs.len() != arity
-            || !signature.varargs.is_empty()
-            || rust_type(
-                program,
-                presentation,
-                signature.output.ok_or("missing Pair output")?,
-                &parameters,
-            )? != owner
-            || signature.inputs.iter().zip(&parameters).any(|(arg, ty)| {
-                rust_type(program, presentation, arg.sort, &parameters).as_ref() != Ok(ty)
-            })
-        {
-            return Err("catalog Pair constructor does not match the two-child codec".into());
-        }
         let left = local_name("left", occupied);
         let right = local_name("right", occupied);
         let l = &parameters[0];
@@ -1111,10 +1031,7 @@ impl<{t}: crate::typed::EgglogValue> ::core::convert::TryFrom<&self::{name}<{t}>
 impl<{generics}> {owner} {{
     /// Inspect direct ordered fields without evaluating symbolic children.
     pub fn fields(&self) -> ::core::result::Result<({types}), crate::typed::TypedError> {{
-        let mut {record} = ::core::clone::Clone::clone(crate::typed::storage::builtin_catalog());
-        {record}.arena = crate::typed::storage::Arena::Primitive;
-        {record}.index = {make};
-        let [{left}, {right}] = self.0.pair_fields(&crate::typed::decl::Callable({record}), &<{l} as crate::typed::EgglogValue>::sort_ref(), &<{r} as crate::typed::EgglogValue>::sort_ref())?;
+        let [{left}, {right}] = self.0.pair_fields(&<{l} as crate::typed::EgglogValue>::sort_ref(), &<{r} as crate::typed::EgglogValue>::sort_ref())?;
         ::core::result::Result::Ok((<{l} as crate::typed::EgglogValue>::from_expression({left}), <{r} as crate::typed::EgglogValue>::from_expression({right})))
     }}
 }}
@@ -1122,12 +1039,9 @@ impl<{generics}, {a}: ::core::convert::Into<{l}>, {b}: ::core::convert::Into<{r}
     fn from({value}: ({a}, {b})) -> Self {{
         let {left}: {l} = ::core::convert::Into::into({value}.0);
         let {right}: {r} = ::core::convert::Into::into({value}.1);
-        let mut {record} = ::core::clone::Clone::clone(crate::typed::storage::builtin_catalog());
-        {record}.arena = crate::typed::storage::Arena::Primitive;
-        {record}.index = {make};
-        <Self as crate::typed::EgglogValue>::from_expression(crate::typed::expr::Expr::call_with_result(
-            &crate::typed::decl::Callable({record}), ::std::vec![::core::clone::Clone::clone(<{l} as crate::typed::EgglogValue>::expression(&{left})), ::core::clone::Clone::clone(<{r} as crate::typed::EgglogValue>::expression(&{right}))],
+        <Self as crate::typed::EgglogValue>::from_expression(crate::typed::expr::Expr::container(
             <Self as crate::typed::EgglogValue>::sort_ref(),
+            ::std::vec![::core::clone::Clone::clone(<{l} as crate::typed::EgglogValue>::expression(&{left})), ::core::clone::Clone::clone(<{r} as crate::typed::EgglogValue>::expression(&{right}))],
         ).expect("generated Pair codec disagrees with its descriptor"))
     }}
 }}
@@ -1144,140 +1058,16 @@ impl<{generics}> ::core::convert::TryFrom<{owner}> for ({types}) {{
     Ok(())
 }
 
-// Map's host tuple packing and direct inspection share the actual catalog
-// constructors. Validate their nested codec shapes, independently of public
-// presentation names and physical declaration/sort locations.
+// Schema-owned Map association packing preserves symbolic children and order.
 fn emit_map_codec(
-    program: &pb::BuiltinCatalog,
     presentation: &RustPresentation,
     name: &str,
     parameters: &[String],
     source: &mut String,
     occupied: &HashSet<&str>,
 ) -> Result<(), String> {
-    let mut constructors = vec![];
-    for identity in [
-        "egglog.core.map.empty",
-        "egglog.core.map.of",
-        "egglog.core.vec.empty",
-        "egglog.core.vec.of",
-        "egglog.core.pair.make",
-    ] {
-        let constructor = program
-            .primitives
-            .iter()
-            .enumerate()
-            .find_map(|(i, p)| {
-                let Some(s) = &p.signature else {
-                    return None;
-                };
-                (p.name == identity).then_some((i, s))
-            })
-            .ok_or_else(|| format!("missing catalog Map codec constructor {identity}"))?;
-        constructors.push(constructor);
-    }
-    let [
-        (_, empty),
-        (of_index, of),
-        (_, vec_empty),
-        (vec_of_index, vec_of),
-        (_, pair_make),
-    ] = constructors.as_slice()
-    else {
-        unreachable!()
-    };
     let types = parameters.join(", ");
     let owner = format!("self::{name}<{types}>");
-    let pair_type = rust_type(
-        program,
-        presentation,
-        pair_make.output.ok_or("missing Pair output")?,
-        parameters,
-    )?;
-    let Some(pb::sort::Kind::Application(pair_family)) = program
-        .sorts
-        .get(pair_make.output.unwrap() as usize)
-        .and_then(|s| s.kind.as_ref())
-    else {
-        return Err("Map codec requires a Pair family result".into());
-    };
-    if pair_family.name != "Pair"
-        || pair_family.args.len() != 2
-        || pair_make.type_param_count as usize != 2
-        || pair_make.inputs.len() != 2
-        || !pair_make.varargs.is_empty()
-        || pair_make.inputs.iter().zip(parameters).any(|(arg, ty)| {
-            rust_type(program, presentation, arg.sort, parameters).as_ref() != Ok(ty)
-        })
-        || pair_family
-            .args
-            .iter()
-            .zip(parameters)
-            .any(|(arg, ty)| rust_type(program, presentation, *arg, parameters).as_ref() != Ok(ty))
-    {
-        return Err("catalog Pair constructor does not match Map's tuple codec".into());
-    }
-    let vec_type = rust_type(
-        program,
-        presentation,
-        vec_of.output.ok_or("missing Vec output")?,
-        std::slice::from_ref(&pair_type),
-    )?;
-    let Some(pb::sort::Kind::Application(vec_family)) = program
-        .sorts
-        .get(vec_of.output.unwrap() as usize)
-        .and_then(|s| s.kind.as_ref())
-    else {
-        return Err("Map codec requires a Vec family result".into());
-    };
-    if vec_family.name != "Vec"
-        || vec_family.args.len() != 1
-        || vec_of.type_param_count as usize != 1
-        || !vec_of.inputs.is_empty()
-        || vec_of.varargs.len() != 1
-        || rust_type(
-            program,
-            presentation,
-            vec_family.args[0],
-            std::slice::from_ref(&pair_type),
-        )? != pair_type
-        || rust_type(
-            program,
-            presentation,
-            vec_of.varargs[0].sort,
-            std::slice::from_ref(&pair_type),
-        )? != pair_type
-        || vec_empty.type_param_count as usize != 1
-        || !vec_empty.inputs.is_empty()
-        || !vec_empty.varargs.is_empty()
-        || rust_type(
-            program,
-            presentation,
-            vec_empty.output.ok_or("missing Vec empty output")?,
-            std::slice::from_ref(&pair_type),
-        )? != vec_type
-        || empty.type_param_count as usize != 2
-        || !empty.inputs.is_empty()
-        || !empty.varargs.is_empty()
-        || rust_type(
-            program,
-            presentation,
-            empty.output.ok_or("missing Map empty output")?,
-            parameters,
-        )? != owner
-        || of.type_param_count as usize != 2
-        || of.inputs.len() != 1
-        || !of.varargs.is_empty()
-        || rust_type(
-            program,
-            presentation,
-            of.output.ok_or("missing Map output")?,
-            parameters,
-        )? != owner
-        || rust_type(program, presentation, of.inputs[0].sort, parameters)? != vec_type
-    {
-        return Err("catalog Map constructor does not match the Vec-of-Pair codec".into());
-    }
     let generics = parameters
         .iter()
         .map(|t| format!("{t}: crate::typed::EgglogValue"))
@@ -1292,45 +1082,24 @@ fn emit_map_codec(
         &inputs[4],
     );
     let value = local_name("value", occupied);
-    let record = local_name("record", occupied);
     let items = local_name("items", occupied);
     let left = local_name("left", occupied);
     let right = local_name("right", occupied);
-    let pair = local_name("pair", occupied);
-    let index = local_name("index", occupied);
-    let callables = local_name("constructors", occupied);
-    let indices = constructors
-        .iter()
-        .map(|(i, _)| i.to_string())
-        .collect::<Vec<_>>()
-        .join(", ");
     writeln!(source, r#"
 impl<{generics}> {owner} {{
     /// Pack tuples once in iterator order, preserving symbolic children and duplicates.
     pub fn of<{i}, {a}, {b}>({value}: {i}) -> Self
     where {i}: ::core::iter::IntoIterator<Item = ({a}, {b})>, {a}: ::core::convert::Into<{k}>, {b}: ::core::convert::Into<{v}> {{
-        let {items} = ::core::iter::IntoIterator::into_iter({value}).map(|({left}, {right})| {{
-            let {pair}: {pair_type} = ::core::convert::From::from(({left}, {right}));
-            ::core::clone::Clone::clone(<{pair_type} as crate::typed::EgglogValue>::expression(&{pair}))
+        let {items} = ::core::iter::IntoIterator::into_iter({value}).flat_map(|({left}, {right})| {{
+            let {left}: {k} = ::core::convert::Into::into({left});
+            let {right}: {v} = ::core::convert::Into::into({right});
+            [::core::clone::Clone::clone(<{k} as crate::typed::EgglogValue>::expression(&{left})), ::core::clone::Clone::clone(<{v} as crate::typed::EgglogValue>::expression(&{right}))]
         }}).collect();
-        let mut {record} = ::core::clone::Clone::clone(crate::typed::storage::builtin_catalog());
-        {record}.arena = crate::typed::storage::Arena::Primitive;
-        {record}.index = {vec_of_index};
-        let {value} = crate::typed::expr::Expr::call_with_result(&crate::typed::decl::Callable({record}), {items}, <{vec_type} as crate::typed::EgglogValue>::sort_ref()).expect("generated Map Vec packing disagrees with its descriptor");
-        let mut {record} = ::core::clone::Clone::clone(crate::typed::storage::builtin_catalog());
-        {record}.arena = crate::typed::storage::Arena::Primitive;
-        {record}.index = {of_index};
-        <Self as crate::typed::EgglogValue>::from_expression(crate::typed::expr::Expr::call_with_result(&crate::typed::decl::Callable({record}), ::std::vec![{value}], <Self as crate::typed::EgglogValue>::sort_ref()).expect("generated Map packing disagrees with its descriptor"))
+        <Self as crate::typed::EgglogValue>::from_expression(crate::typed::expr::Expr::container(<Self as crate::typed::EgglogValue>::sort_ref(), {items}).expect("generated Map data codec disagrees with its family"))
     }}
     /// Inspect direct entries without evaluating computations or normalizing keys.
     pub fn entries(&self) -> ::core::result::Result<::std::vec::Vec<({types})>, crate::typed::TypedError> {{
-        let {callables} = [{indices}].map(|{index}| {{
-            let mut {record} = ::core::clone::Clone::clone(crate::typed::storage::builtin_catalog());
-            {record}.arena = crate::typed::storage::Arena::Primitive;
-            {record}.index = {index};
-            crate::typed::decl::Callable({record})
-        }});
-        ::core::result::Result::Ok(self.0.map_entries({callables}.each_ref(), &<{k} as crate::typed::EgglogValue>::sort_ref(), &<{v} as crate::typed::EgglogValue>::sort_ref())?.into_iter().map(|[{left}, {right}]| (<{k} as crate::typed::EgglogValue>::from_expression({left}), <{v} as crate::typed::EgglogValue>::from_expression({right}))).collect())
+        ::core::result::Result::Ok(self.0.map_entries(&<{k} as crate::typed::EgglogValue>::sort_ref(), &<{v} as crate::typed::EgglogValue>::sort_ref())?.into_iter().map(|[{left}, {right}]| (<{k} as crate::typed::EgglogValue>::from_expression({left}), <{v} as crate::typed::EgglogValue>::from_expression({right}))).collect())
     }}
 }}
 impl<{generics}, {a}: ::core::convert::Into<{k}>, {b}: ::core::convert::Into<{v}>> ::core::convert::From<::std::vec::Vec<({a}, {b})>> for {owner} {{
@@ -1673,7 +1442,66 @@ fn emit_generic_views(
             ),
             None => (String::new(), "", format!("<{}>", generics.join(", "))),
         };
-        writeln!(source, r#"
+        let data_family = match primitive.name.as_str() {
+            "egglog.core.vec.of" | "egglog.core.vec.empty" => Some("Vec"),
+            "egglog.core.set.of" | "egglog.core.set.empty" => Some("Set"),
+            "egglog.core.multiset.of" => Some("MultiSet"),
+            "egglog.core.pair.make" => Some("Pair"),
+            "egglog.core.map.empty" => Some("Map"),
+            "egglog.experimental.maybe.none" | "egglog.experimental.maybe.some" => Some("Maybe"),
+            _ => None,
+        };
+        if let Some(expected) = data_family {
+            let Some(pb::sort::Kind::Application(family)) =
+                &program.sorts[signature.output.unwrap() as usize].kind
+            else {
+                return Err("data constructor must return a family application".into());
+            };
+            let fixed = if primitive.name == "egglog.core.pair.make"
+                || primitive.name == "egglog.experimental.maybe.some"
+            {
+                family.args.as_slice()
+            } else {
+                &[]
+            };
+            let repeated = if matches!(
+                primitive.name.as_str(),
+                "egglog.core.vec.of" | "egglog.core.set.of" | "egglog.core.multiset.of"
+            ) {
+                family.args.as_slice()
+            } else {
+                &[]
+            };
+            if family.name != expected
+                || signature
+                    .inputs
+                    .iter()
+                    .map(|arg| arg.sort)
+                    .ne(fixed.iter().copied())
+                || signature
+                    .varargs
+                    .iter()
+                    .map(|arg| arg.sort)
+                    .ne(repeated.iter().copied())
+            {
+                return Err(
+                    "data constructor signature disagrees with its container layout".into(),
+                );
+            }
+            writeln!(source, r#"
+{prefix}
+    /// Pack container data without evaluating its symbolic children.
+    pub fn {method}{method_generics}({params}) -> {output} {{
+        let {mutability}{args} = ::std::vec![{inputs}];
+        {tail_code}
+        <{output} as crate::typed::EgglogValue>::from_expression(crate::typed::expr::Expr::container(
+            <{output} as crate::typed::EgglogValue>::sort_ref(), {args},
+        ).expect("generated container data disagrees with its family"))
+    }}
+{suffix}
+"#).unwrap();
+        } else {
+            writeln!(source, r#"
 {prefix}
     /// Author a catalog-defined call without evaluating its arguments.
     pub fn {method}{method_generics}({params}) -> {output} {{
@@ -1689,6 +1517,7 @@ fn emit_generic_views(
     }}
 {suffix}
 "#).unwrap();
+        }
     }
     Ok(())
 }

@@ -259,26 +259,26 @@ impl<__EgglogType0: crate::typed::EgglogValue, __EgglogType1: crate::typed::Eggl
         __EgglogType2: ::core::convert::Into<__EgglogType0>,
         __EgglogType3: ::core::convert::Into<__EgglogType1>,
     {
-        let __egglog_items = ::core::iter::IntoIterator::into_iter(__egglog_value).map(|(__egglog_left, __egglog_right)| {
-            let __egglog_pair: self::Pair<__EgglogType0, __EgglogType1> = ::core::convert::From::from((__egglog_left, __egglog_right));
-            ::core::clone::Clone::clone(<self::Pair<__EgglogType0, __EgglogType1> as crate::typed::EgglogValue>::expression(&__egglog_pair))
-        }).collect();
-        let mut __egglog_record =
-            ::core::clone::Clone::clone(crate::typed::storage::builtin_catalog());
-        __egglog_record.arena = crate::typed::storage::Arena::Primitive;
-        __egglog_record.index = 163;
-        let __egglog_value = crate::typed::expr::Expr::call_with_result(&crate::typed::decl::Callable(__egglog_record), __egglog_items, <self::Vec<self::Pair<__EgglogType0, __EgglogType1>> as crate::typed::EgglogValue>::sort_ref()).expect("generated Map Vec packing disagrees with its descriptor");
-        let mut __egglog_record =
-            ::core::clone::Clone::clone(crate::typed::storage::builtin_catalog());
-        __egglog_record.arena = crate::typed::storage::Arena::Primitive;
-        __egglog_record.index = 108;
+        let __egglog_items = ::core::iter::IntoIterator::into_iter(__egglog_value)
+            .flat_map(|(__egglog_left, __egglog_right)| {
+                let __egglog_left: __EgglogType0 = ::core::convert::Into::into(__egglog_left);
+                let __egglog_right: __EgglogType1 = ::core::convert::Into::into(__egglog_right);
+                [
+                    ::core::clone::Clone::clone(
+                        <__EgglogType0 as crate::typed::EgglogValue>::expression(&__egglog_left),
+                    ),
+                    ::core::clone::Clone::clone(
+                        <__EgglogType1 as crate::typed::EgglogValue>::expression(&__egglog_right),
+                    ),
+                ]
+            })
+            .collect();
         <Self as crate::typed::EgglogValue>::from_expression(
-            crate::typed::expr::Expr::call_with_result(
-                &crate::typed::decl::Callable(__egglog_record),
-                ::std::vec![__egglog_value],
+            crate::typed::expr::Expr::container(
                 <Self as crate::typed::EgglogValue>::sort_ref(),
+                __egglog_items,
             )
-            .expect("generated Map packing disagrees with its descriptor"),
+            .expect("generated Map data codec disagrees with its family"),
         )
     }
     /// Inspect direct entries without evaluating computations or normalizing keys.
@@ -288,17 +288,9 @@ impl<__EgglogType0: crate::typed::EgglogValue, __EgglogType1: crate::typed::Eggl
         ::std::vec::Vec<(__EgglogType0, __EgglogType1)>,
         crate::typed::TypedError,
     > {
-        let __egglog_constructors = [103, 108, 158, 163, 139].map(|__egglog_index| {
-            let mut __egglog_record =
-                ::core::clone::Clone::clone(crate::typed::storage::builtin_catalog());
-            __egglog_record.arena = crate::typed::storage::Arena::Primitive;
-            __egglog_record.index = __egglog_index;
-            crate::typed::decl::Callable(__egglog_record)
-        });
         ::core::result::Result::Ok(
             self.0
                 .map_entries(
-                    __egglog_constructors.each_ref(),
                     &<__EgglogType0 as crate::typed::EgglogValue>::sort_ref(),
                     &<__EgglogType1 as crate::typed::EgglogValue>::sort_ref(),
                 )?
@@ -405,24 +397,10 @@ impl<__EgglogType0: crate::typed::EgglogValue> ::core::convert::TryFrom<&self::M
     fn try_from(
         __egglog_value: &self::Maybe<__EgglogType0>,
     ) -> ::core::result::Result<Self, Self::Error> {
-        let mut __egglog_none =
-            ::core::clone::Clone::clone(crate::typed::storage::builtin_catalog());
-        __egglog_none.arena = crate::typed::storage::Arena::Primitive;
-        __egglog_none.index = 174;
-        let mut __egglog_some =
-            ::core::clone::Clone::clone(crate::typed::storage::builtin_catalog());
-        __egglog_some.arena = crate::typed::storage::Arena::Primitive;
-        __egglog_some.index = 175;
         ::core::result::Result::Ok(
             __egglog_value
                 .0
-                .maybe_value(
-                    [
-                        &crate::typed::decl::Callable(__egglog_none),
-                        &crate::typed::decl::Callable(__egglog_some),
-                    ],
-                    &<__EgglogType0 as crate::typed::EgglogValue>::sort_ref(),
-                )?
+                .maybe_value(&<__EgglogType0 as crate::typed::EgglogValue>::sort_ref())?
                 .map(<__EgglogType0 as crate::typed::EgglogValue>::from_expression),
         )
     }
@@ -551,12 +529,7 @@ impl<__EgglogType0: crate::typed::EgglogValue, __EgglogType1: crate::typed::Eggl
     pub fn fields(
         &self,
     ) -> ::core::result::Result<(__EgglogType0, __EgglogType1), crate::typed::TypedError> {
-        let mut __egglog_record =
-            ::core::clone::Clone::clone(crate::typed::storage::builtin_catalog());
-        __egglog_record.arena = crate::typed::storage::Arena::Primitive;
-        __egglog_record.index = 139;
         let [__egglog_left, __egglog_right] = self.0.pair_fields(
-            &crate::typed::decl::Callable(__egglog_record),
             &<__EgglogType0 as crate::typed::EgglogValue>::sort_ref(),
             &<__EgglogType1 as crate::typed::EgglogValue>::sort_ref(),
         )?;
@@ -577,13 +550,9 @@ impl<
     fn from(__egglog_value: (__EgglogType2, __EgglogType3)) -> Self {
         let __egglog_left: __EgglogType0 = ::core::convert::Into::into(__egglog_value.0);
         let __egglog_right: __EgglogType1 = ::core::convert::Into::into(__egglog_value.1);
-        let mut __egglog_record =
-            ::core::clone::Clone::clone(crate::typed::storage::builtin_catalog());
-        __egglog_record.arena = crate::typed::storage::Arena::Primitive;
-        __egglog_record.index = 139;
         <Self as crate::typed::EgglogValue>::from_expression(
-            crate::typed::expr::Expr::call_with_result(
-                &crate::typed::decl::Callable(__egglog_record),
+            crate::typed::expr::Expr::container(
+                <Self as crate::typed::EgglogValue>::sort_ref(),
                 ::std::vec![
                     ::core::clone::Clone::clone(
                         <__EgglogType0 as crate::typed::EgglogValue>::expression(&__egglog_left)
@@ -592,7 +561,6 @@ impl<
                         <__EgglogType1 as crate::typed::EgglogValue>::expression(&__egglog_right)
                     )
                 ],
-                <Self as crate::typed::EgglogValue>::sort_ref(),
             )
             .expect("generated Pair codec disagrees with its descriptor"),
         )
@@ -5293,21 +5261,16 @@ impl<__EgglogType0: crate::typed::EgglogValue, __EgglogType1: crate::typed::Eggl
 impl<__EgglogType0: crate::typed::EgglogValue, __EgglogType1: crate::typed::EgglogValue>
     self::Map<__EgglogType0, __EgglogType1>
 {
-    /// Author a catalog-defined call without evaluating its arguments.
+    /// Pack container data without evaluating its symbolic children.
     pub fn empty() -> self::Map<__EgglogType0, __EgglogType1> {
         let __egglog_args = ::std::vec![];
 
-        let mut __egglog_record =
-            ::core::clone::Clone::clone(crate::typed::storage::builtin_catalog());
-        __egglog_record.arena = crate::typed::storage::Arena::Primitive;
-        __egglog_record.index = 103;
         <self::Map<__EgglogType0, __EgglogType1> as crate::typed::EgglogValue>::from_expression(
-            crate::typed::expr::Expr::call_with_result(
-                &crate::typed::decl::Callable(__egglog_record),
-                __egglog_args,
+            crate::typed::expr::Expr::container(
                 <self::Map<__EgglogType0, __EgglogType1> as crate::typed::EgglogValue>::sort_ref(),
+                __egglog_args,
             )
-            .expect("generated generic call disagrees with its descriptor"),
+            .expect("generated container data disagrees with its family"),
         )
     }
 }
@@ -5881,7 +5844,7 @@ pub fn multiset_not_contains_swapped<__EgglogType0: crate::typed::expr::ValueInp
 }
 
 impl<__EgglogType0: crate::typed::EgglogValue> self::MultiSet<__EgglogType0> {
-    /// Author a catalog-defined call without evaluating its arguments.
+    /// Pack container data without evaluating its symbolic children.
     pub fn new(
         __egglog_arg_0: impl ::core::iter::IntoIterator<
             Item = impl ::core::convert::Into<__EgglogType0>,
@@ -5894,17 +5857,12 @@ impl<__EgglogType0: crate::typed::EgglogValue> self::MultiSet<__EgglogType0> {
                 <__EgglogType0 as crate::typed::EgglogValue>::expression(&__egglog_value),
             ));
         }
-        let mut __egglog_record =
-            ::core::clone::Clone::clone(crate::typed::storage::builtin_catalog());
-        __egglog_record.arena = crate::typed::storage::Arena::Primitive;
-        __egglog_record.index = 124;
         <self::MultiSet<__EgglogType0> as crate::typed::EgglogValue>::from_expression(
-            crate::typed::expr::Expr::call_with_result(
-                &crate::typed::decl::Callable(__egglog_record),
-                __egglog_args,
+            crate::typed::expr::Expr::container(
                 <self::MultiSet<__EgglogType0> as crate::typed::EgglogValue>::sort_ref(),
+                __egglog_args,
             )
-            .expect("generated generic call disagrees with its descriptor"),
+            .expect("generated container data disagrees with its family"),
         )
     }
 }
@@ -6262,7 +6220,7 @@ impl<__EgglogType0: crate::typed::EgglogValue, __EgglogType1: crate::typed::Eggl
 impl<__EgglogType0: crate::typed::EgglogValue, __EgglogType1: crate::typed::EgglogValue>
     self::Pair<__EgglogType0, __EgglogType1>
 {
-    /// Author a catalog-defined call without evaluating its arguments.
+    /// Pack container data without evaluating its symbolic children.
     pub fn new(
         __egglog_arg_0: impl ::core::convert::Into<__EgglogType0>,
         __egglog_arg_1: impl ::core::convert::Into<__EgglogType1>,
@@ -6282,17 +6240,12 @@ impl<__EgglogType0: crate::typed::EgglogValue, __EgglogType1: crate::typed::Eggl
             }
         ];
 
-        let mut __egglog_record =
-            ::core::clone::Clone::clone(crate::typed::storage::builtin_catalog());
-        __egglog_record.arena = crate::typed::storage::Arena::Primitive;
-        __egglog_record.index = 139;
         <self::Pair<__EgglogType0, __EgglogType1> as crate::typed::EgglogValue>::from_expression(
-            crate::typed::expr::Expr::call_with_result(
-                &crate::typed::decl::Callable(__egglog_record),
-                __egglog_args,
+            crate::typed::expr::Expr::container(
                 <self::Pair<__EgglogType0, __EgglogType1> as crate::typed::EgglogValue>::sort_ref(),
+                __egglog_args,
             )
-            .expect("generated generic call disagrees with its descriptor"),
+            .expect("generated container data disagrees with its family"),
         )
     }
 }
@@ -6379,21 +6332,16 @@ impl<__EgglogType0: crate::typed::EgglogValue> self::Set<__EgglogType0> {
 }
 
 impl<__EgglogType0: crate::typed::EgglogValue> self::Set<__EgglogType0> {
-    /// Author a catalog-defined call without evaluating its arguments.
+    /// Pack container data without evaluating its symbolic children.
     pub fn empty() -> self::Set<__EgglogType0> {
         let __egglog_args = ::std::vec![];
 
-        let mut __egglog_record =
-            ::core::clone::Clone::clone(crate::typed::storage::builtin_catalog());
-        __egglog_record.arena = crate::typed::storage::Arena::Primitive;
-        __egglog_record.index = 143;
         <self::Set<__EgglogType0> as crate::typed::EgglogValue>::from_expression(
-            crate::typed::expr::Expr::call_with_result(
-                &crate::typed::decl::Callable(__egglog_record),
-                __egglog_args,
+            crate::typed::expr::Expr::container(
                 <self::Set<__EgglogType0> as crate::typed::EgglogValue>::sort_ref(),
+                __egglog_args,
             )
-            .expect("generated generic call disagrees with its descriptor"),
+            .expect("generated container data disagrees with its family"),
         )
     }
 }
@@ -6531,7 +6479,7 @@ impl<__EgglogType0: crate::typed::EgglogValue> self::Set<__EgglogType0> {
 }
 
 impl<__EgglogType0: crate::typed::EgglogValue> self::Set<__EgglogType0> {
-    /// Author a catalog-defined call without evaluating its arguments.
+    /// Pack container data without evaluating its symbolic children.
     pub fn of(
         __egglog_arg_0: impl ::core::iter::IntoIterator<
             Item = impl ::core::convert::Into<__EgglogType0>,
@@ -6544,17 +6492,12 @@ impl<__EgglogType0: crate::typed::EgglogValue> self::Set<__EgglogType0> {
                 <__EgglogType0 as crate::typed::EgglogValue>::expression(&__egglog_value),
             ));
         }
-        let mut __egglog_record =
-            ::core::clone::Clone::clone(crate::typed::storage::builtin_catalog());
-        __egglog_record.arena = crate::typed::storage::Arena::Primitive;
-        __egglog_record.index = 149;
         <self::Set<__EgglogType0> as crate::typed::EgglogValue>::from_expression(
-            crate::typed::expr::Expr::call_with_result(
-                &crate::typed::decl::Callable(__egglog_record),
-                __egglog_args,
+            crate::typed::expr::Expr::container(
                 <self::Set<__EgglogType0> as crate::typed::EgglogValue>::sort_ref(),
+                __egglog_args,
             )
-            .expect("generated generic call disagrees with its descriptor"),
+            .expect("generated container data disagrees with its family"),
         )
     }
 }
@@ -6869,21 +6812,16 @@ impl<__EgglogType0: crate::typed::EgglogValue> self::Vec<__EgglogType0> {
 }
 
 impl<__EgglogType0: crate::typed::EgglogValue> self::Vec<__EgglogType0> {
-    /// Author a catalog-defined call without evaluating its arguments.
+    /// Pack container data without evaluating its symbolic children.
     pub fn empty() -> self::Vec<__EgglogType0> {
         let __egglog_args = ::std::vec![];
 
-        let mut __egglog_record =
-            ::core::clone::Clone::clone(crate::typed::storage::builtin_catalog());
-        __egglog_record.arena = crate::typed::storage::Arena::Primitive;
-        __egglog_record.index = 158;
         <self::Vec<__EgglogType0> as crate::typed::EgglogValue>::from_expression(
-            crate::typed::expr::Expr::call_with_result(
-                &crate::typed::decl::Callable(__egglog_record),
-                __egglog_args,
+            crate::typed::expr::Expr::container(
                 <self::Vec<__EgglogType0> as crate::typed::EgglogValue>::sort_ref(),
+                __egglog_args,
             )
-            .expect("generated generic call disagrees with its descriptor"),
+            .expect("generated container data disagrees with its family"),
         )
     }
 }
@@ -6985,7 +6923,7 @@ impl<__EgglogType0: crate::typed::EgglogValue> self::Vec<__EgglogType0> {
 }
 
 impl<__EgglogType0: crate::typed::EgglogValue> self::Vec<__EgglogType0> {
-    /// Author a catalog-defined call without evaluating its arguments.
+    /// Pack container data without evaluating its symbolic children.
     pub fn of(
         __egglog_arg_0: impl ::core::iter::IntoIterator<
             Item = impl ::core::convert::Into<__EgglogType0>,
@@ -6998,17 +6936,12 @@ impl<__EgglogType0: crate::typed::EgglogValue> self::Vec<__EgglogType0> {
                 <__EgglogType0 as crate::typed::EgglogValue>::expression(&__egglog_value),
             ));
         }
-        let mut __egglog_record =
-            ::core::clone::Clone::clone(crate::typed::storage::builtin_catalog());
-        __egglog_record.arena = crate::typed::storage::Arena::Primitive;
-        __egglog_record.index = 163;
         <self::Vec<__EgglogType0> as crate::typed::EgglogValue>::from_expression(
-            crate::typed::expr::Expr::call_with_result(
-                &crate::typed::decl::Callable(__egglog_record),
-                __egglog_args,
+            crate::typed::expr::Expr::container(
                 <self::Vec<__EgglogType0> as crate::typed::EgglogValue>::sort_ref(),
+                __egglog_args,
             )
-            .expect("generated generic call disagrees with its descriptor"),
+            .expect("generated container data disagrees with its family"),
         )
     }
 }
@@ -7293,27 +7226,22 @@ impl<__EgglogType0: crate::typed::EgglogValue> self::Maybe<__EgglogType0> {
 }
 
 impl<__EgglogType0: crate::typed::EgglogValue> self::Maybe<__EgglogType0> {
-    /// Author a catalog-defined call without evaluating its arguments.
+    /// Pack container data without evaluating its symbolic children.
     pub fn none() -> self::Maybe<__EgglogType0> {
         let __egglog_args = ::std::vec![];
 
-        let mut __egglog_record =
-            ::core::clone::Clone::clone(crate::typed::storage::builtin_catalog());
-        __egglog_record.arena = crate::typed::storage::Arena::Primitive;
-        __egglog_record.index = 174;
         <self::Maybe<__EgglogType0> as crate::typed::EgglogValue>::from_expression(
-            crate::typed::expr::Expr::call_with_result(
-                &crate::typed::decl::Callable(__egglog_record),
-                __egglog_args,
+            crate::typed::expr::Expr::container(
                 <self::Maybe<__EgglogType0> as crate::typed::EgglogValue>::sort_ref(),
+                __egglog_args,
             )
-            .expect("generated generic call disagrees with its descriptor"),
+            .expect("generated container data disagrees with its family"),
         )
     }
 }
 
 impl<__EgglogType0: crate::typed::EgglogValue> self::Maybe<__EgglogType0> {
-    /// Author a catalog-defined call without evaluating its arguments.
+    /// Pack container data without evaluating its symbolic children.
     pub fn some(
         __egglog_arg_0: impl ::core::convert::Into<__EgglogType0>,
     ) -> self::Maybe<__EgglogType0> {
@@ -7324,17 +7252,12 @@ impl<__EgglogType0: crate::typed::EgglogValue> self::Maybe<__EgglogType0> {
             ))
         }];
 
-        let mut __egglog_record =
-            ::core::clone::Clone::clone(crate::typed::storage::builtin_catalog());
-        __egglog_record.arena = crate::typed::storage::Arena::Primitive;
-        __egglog_record.index = 175;
         <self::Maybe<__EgglogType0> as crate::typed::EgglogValue>::from_expression(
-            crate::typed::expr::Expr::call_with_result(
-                &crate::typed::decl::Callable(__egglog_record),
-                __egglog_args,
+            crate::typed::expr::Expr::container(
                 <self::Maybe<__EgglogType0> as crate::typed::EgglogValue>::sort_ref(),
+                __egglog_args,
             )
-            .expect("generated generic call disagrees with its descriptor"),
+            .expect("generated container data disagrees with its family"),
         )
     }
 }

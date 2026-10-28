@@ -22,6 +22,7 @@ fn maybe_inspection_preserves_none_and_symbolic_children() -> Result<(), TypedEr
     let none = Maybe::<I64>::none();
     let symbolic = I64::from(7) / I64::from(0);
     let some = Maybe::<I64>::some(&symbolic);
+    assert_eq!(some.call_name(), None);
     assert_eq!(Option::<I64>::try_from(&none)?, None);
     assert_eq!(Option::<I64>::try_from(&some)?, Some(symbolic));
     let nested = Maybe::<Maybe<I64>>::some(&none);
@@ -56,10 +57,7 @@ fn maybe_calls_values_and_eager_defaults_execute_as_bytes() -> Result<(), TypedE
         if error.code == pb::ErrorCode::RuntimeFailure as i32))
     );
     let formed = graph.extract(&some)?;
-    assert_ne!(
-        some, formed,
-        "authored Call and formed payload remain distinct"
-    );
+    assert_eq!(some, formed);
     assert_eq!(Option::<I64>::try_from(&formed)?, Some(I64::from(7)));
     let nested = graph.extract(Maybe::<Maybe<I64>>::some(&none))?;
     let child = Option::<Maybe<I64>>::try_from(&nested)?.unwrap();

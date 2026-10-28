@@ -21,7 +21,8 @@ fn generated_set_methods_execute_as_bytes_without_local_deduplication() -> Resul
     let x = I64::from(2);
     let inputs = [x.clone(), I64::from(1), x];
     let s: Set<I64> = Set::of(inputs.iter());
-    assert!(Vec::<I64>::try_from(&s).is_err(), "of remains symbolic");
+    assert_eq!(Vec::<I64>::try_from(&s)?, inputs);
+    assert_eq!(s.call_name(), None);
     let mut graph = EGraph::default();
     graph.register(&s)?;
     let value = graph.extract(&s)?;
@@ -89,7 +90,10 @@ fn set_iterator_conversions_preserve_input_order_and_duplicates() {
     let seen = Rc::new(RefCell::new(vec![]));
     let s = Set::<I64>::of([2, 1, 2].into_iter().map(|x| Counted(x, seen.clone())));
     assert_eq!(*seen.borrow(), [2, 1, 2]);
-    assert!(Vec::<I64>::try_from(&s).is_err());
+    assert_eq!(
+        Vec::<I64>::try_from(&s).unwrap(),
+        [I64::from(2), I64::from(1), I64::from(2)]
+    );
     assert_eq!(*seen.borrow(), [2, 1, 2]);
 }
 

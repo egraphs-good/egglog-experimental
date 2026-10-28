@@ -4036,7 +4036,14 @@ fn source_builtin_names(
         )
         .map_err(|error| error.to_string())?;
         if let ResolvedCall::Primitive(primitive) = resolved {
-            let core = primitive.export_builtin(&mut pb::Program::default())?;
+            // Data input lowers MapValue to the native flat builder. Here we
+            // select its source alias, not publish a callable in the wire catalog.
+            let core = match primitive.prim_with_id.primitive.builtin_description() {
+                Some(description) if description.key == "egglog.core.map.flat" => {
+                    description.key.clone()
+                }
+                _ => primitive.export_builtin(&mut pb::Program::default())?,
+            };
             let sorts = sorts
                 .iter()
                 .map(|sort| {
