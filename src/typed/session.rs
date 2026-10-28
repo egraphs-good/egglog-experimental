@@ -1379,6 +1379,186 @@ mod tests {
     use super::*;
     use crate::typed::tests::observations::Observed;
 
+    #[test]
+    fn declaration_rich_adoption_and_selectors_bind_once_without_retaining_catalogs() {
+        use crate::typed::{
+            builtins::I64,
+            decl::Callable,
+            expr::{fresh_scope, variable},
+            storage::{LINK_WORK, OwnedGraph, publish_catalog},
+        };
+        // Executable former lookup, used only to compare cold/warm work on this
+        // declaration-rich input. It resolves the same exact target locations.
+        fn former_lookup(root: &Record, name: &str, probes: &mut usize) -> Record {
+            let mut pending = vec![root.clone()];
+            let mut seen = HashSet::new();
+            while let Some(record) = pending.pop() {
+                let owner = record.owner.as_ref().unwrap();
+                if !seen.insert(owner.id) {
+                    continue;
+                }
+                let found = match &owner.graph {
+                    OwnedGraph::BuiltinCatalog(catalog) => catalog
+                        .primitives
+                        .iter()
+                        .position(|p| {
+                            *probes += 1;
+                            p.name == name
+                        })
+                        .map(|i| (Arena::Primitive, i)),
+                    OwnedGraph::Program(program) => program
+                        .declarations
+                        .iter()
+                        .position(|d| {
+                            *probes += 1;
+                            match &d.kind {
+                                Some(pb::declaration::Kind::Constructor(d)) => d.name == name,
+                                Some(pb::declaration::Kind::Function(d)) => d.name == name,
+                                Some(pb::declaration::Kind::Relation(d)) => d.name == name,
+                                Some(pb::declaration::Kind::UserDefinedPrimitive(d)) => {
+                                    d.name == name
+                                }
+                                _ => false,
+                            }
+                        })
+                        .map(|i| (Arena::Declaration, i)),
+                };
+                if let Some((arena, index)) = found {
+                    return Record {
+                        owner: record.owner.clone(),
+                        arena,
+                        index: index as u32,
+                    };
+                }
+                pending.extend(owner.declarations.iter().rev().cloned());
+                if let Some(ambient) = &owner.ambient {
+                    pending.push(Record {
+                        owner: Some(ambient.clone()),
+                        arena: Arena::PrimitiveSort,
+                        index: 0,
+                    });
+                }
+            }
+            panic!("fixture declaration unavailable")
+        }
+
+        let mut previous_work = None;
+        for size in [32, 64, 128, 256] {
+            let sort = super::super::SortRef::equality("AdoptionWitness");
+            let declarations = (0..size)
+                .map(|i| {
+                    Callable::constructor(
+                        &format!("Choice{i}"),
+                        vec![I64::sort_ref()],
+                        sort.clone(),
+                        None,
+                        false,
+                    )
+                    .0
+                })
+                .collect::<Vec<_>>();
+            let selected = declarations.last().unwrap().clone();
+            let name = format!("Choice{}", size - 1);
+            let catalog =
+                pb::BuiltinCatalog::decode(include_bytes!("builtins/catalog.pb").as_slice())
+                    .unwrap();
+            let catalog_size = catalog.primitives.len() + catalog.primitive_sorts.len();
+            let builtins = publish_catalog(catalog).unwrap();
+            let mut output = pb::RunProgramOutput {
+                sorts: vec![
+                    pb::Sort {
+                        kind: Some(pb::sort::Kind::Eq("AdoptionWitness".into())),
+                        ..Default::default()
+                    },
+                    pb::Sort {
+                        kind: Some(pb::sort::Kind::Application(pb::SortApplication {
+                            name: "i64".into(),
+                            args: vec![],
+                        })),
+                        ..Default::default()
+                    },
+                    pb::Sort {
+                        kind: Some(pb::sort::Kind::Application(pb::SortApplication {
+                            name: "Vec".into(),
+                            args: vec![0],
+                        })),
+                        ..Default::default()
+                    },
+                ],
+                nodes: vec![pb::Node {
+                    sort_id: 2,
+                    kind: Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
+                        value: Some(pb::primitive_value::Value::Vec(pb::ValueList {
+                            items: (1..=size).collect(),
+                        })),
+                    })),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            };
+            output.nodes.extend((0..size).map(|i| pb::Node {
+                sort_id: 0,
+                kind: Some(pb::node::Kind::Call(pb::Call {
+                    func: name.clone(),
+                    args: vec![size + 1 + i],
+                })),
+                ..Default::default()
+            }));
+            output.nodes.extend((0..size).map(|i| pb::Node {
+                sort_id: 1,
+                kind: Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
+                    value: Some(pb::primitive_value::Value::I64(i64::from(i))),
+                })),
+                ..Default::default()
+            }));
+            LINK_WORK.with(|work| work.set([0; 5]));
+            let adopted = adopt(&output, 0, declarations, &builtins).unwrap();
+            let cold = LINK_WORK.with(std::cell::Cell::get);
+            let retained = adopted
+                .0
+                .owner
+                .as_ref()
+                .unwrap()
+                .retained_definition_links();
+            assert_eq!(retained, [size as usize + 2, size as usize + 2, 0]);
+            assert!(cold.iter().sum::<usize>() <= 32 * (size as usize + catalog_size));
+
+            let parameter = variable::<I64>(fresh_scope(), 0).expression().clone();
+            let pattern = Expr::call(&Callable(selected.clone()), vec![parameter.clone()]);
+            LINK_WORK.with(|work| work.set([0; 5]));
+            let mut former_probes = 0;
+            for i in 1..=size {
+                let node = adopted.0.resolve(Arena::Node, i).unwrap();
+                let actual = node.declaration(&name, DeclarationKind::Callable).unwrap();
+                assert_eq!(actual.key(), selected.key());
+                assert_eq!(
+                    former_lookup(&node, &name, &mut former_probes).key(),
+                    actual.key()
+                );
+                let children = Expr(node)
+                    .select(&pattern, std::slice::from_ref(&parameter))
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(children.len(), 1);
+            }
+            let warm = LINK_WORK.with(std::cell::Cell::get);
+            assert!(
+                warm.iter().take(4).sum::<usize>() < 16,
+                "selectors must not rebind the adopted declaration environment: {warm:?}"
+            );
+            assert!(warm[4] <= 4 * size as usize);
+            let total = cold.iter().chain(&warm).sum::<usize>();
+            if let Some((prior, old)) = previous_work {
+                assert!(total <= prior * 2 + 16);
+                assert!(former_probes > old * 2);
+            }
+            previous_work = Some((total, former_probes));
+            eprintln!(
+                "N=D={size}, cold={cold:?}, selectors={warm:?}, retained={retained:?}, former_probes={former_probes}"
+            );
+        }
+    }
+
     fn diagnostic_matches(diagnostic: &pb::Diagnostic) -> u64 {
         assert_eq!(diagnostic.format, "application/vnd.egglog.run-report+json");
         let value: serde_json::Value = serde_json::from_slice(&diagnostic.content).unwrap();

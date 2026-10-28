@@ -53,6 +53,31 @@ pub(super) enum Slot {
     External(Record),
 }
 
+type Definitions = hashbrown::HashMap<(DeclarationKind, String), (Arena, u32)>;
+type Bindings = hashbrown::HashMap<(DeclarationKind, String), DefinitionLink>;
+
+#[derive(Hash)]
+struct DefinitionName<'a>(DeclarationKind, &'a str);
+
+impl hashbrown::Equivalent<(DeclarationKind, String)> for DefinitionName<'_> {
+    fn equivalent(&self, key: &(DeclarationKind, String)) -> bool {
+        self.0 == key.0 && self.1 == key.1
+    }
+}
+
+enum DefinitionLink {
+    Imported(usize, Arena, u32),
+    Ambient(Arena, u32),
+    External(Record),
+}
+
+#[cfg(test)]
+thread_local! {
+    // Local definition records, named records/imports, dependency owners,
+    // cold name probes, and public lookup probes. No wall-clock thresholds.
+    pub(super) static LINK_WORK: std::cell::Cell<[usize; 5]> = const { std::cell::Cell::new([0; 5]) };
+}
+
 pub(super) struct Owner {
     pub id: usize,
     pub graph: OwnedGraph,
@@ -70,6 +95,11 @@ pub(super) struct Owner {
     pub observed: bool,
     // Diagnostic presentations share their underlying authored rule record.
     pub rule_origin: Option<Record>,
+    // First access seals names after the fresh owner has received capture,
+    // merge, origin and ambient metadata. Links retain locations, not signatures
+    // or copied transitive environments. Ordinary direct imports need no new Arc.
+    definitions: OnceLock<Definitions>,
+    bindings: OnceLock<Bindings>,
 }
 
 pub(super) enum OwnedGraph {
@@ -78,6 +108,210 @@ pub(super) enum OwnedGraph {
 }
 
 impl Owner {
+    #[cfg(test)]
+    pub(super) fn retained_definition_links(&self) -> [usize; 3] {
+        let bindings = self.bindings.get().expect("bindings already resolved");
+        [
+            self.declarations.len(),
+            bindings.len(),
+            bindings
+                .values()
+                .filter(|link| matches!(link, DefinitionLink::External(_)))
+                .count(),
+        ]
+    }
+
+    fn definitions(&self) -> &Definitions {
+        self.definitions.get_or_init(|| {
+            let mut definitions = Definitions::default();
+            match &self.graph {
+                OwnedGraph::Program(program) => {
+                    for (index, declaration) in program.declarations.iter().enumerate() {
+                        if let Some(key) = declaration.kind.as_ref().map(declaration_name) {
+                            definitions
+                                .entry((key.0, key.1.to_owned()))
+                                .or_insert((Arena::Declaration, index as u32));
+                        }
+                    }
+                    #[cfg(test)]
+                    LINK_WORK.with(|work| {
+                        let mut n = work.get();
+                        n[0] += program.declarations.len();
+                        work.set(n);
+                    });
+                }
+                OwnedGraph::BuiltinCatalog(catalog) => {
+                    for (index, family) in catalog.primitive_sorts.iter().enumerate() {
+                        definitions.insert(
+                            (DeclarationKind::PrimitiveSort, family.name.clone()),
+                            (Arena::PrimitiveSort, index as u32),
+                        );
+                    }
+                    for (index, primitive) in catalog.primitives.iter().enumerate() {
+                        definitions.insert(
+                            (DeclarationKind::Callable, primitive.name.clone()),
+                            (Arena::Primitive, index as u32),
+                        );
+                    }
+                    #[cfg(test)]
+                    LINK_WORK.with(|work| {
+                        let mut n = work.get();
+                        n[0] += catalog.primitive_sorts.len() + catalog.primitives.len();
+                        work.set(n);
+                    });
+                }
+            }
+            definitions
+        })
+    }
+
+    fn bindings(&self) -> &Bindings {
+        self.bindings.get_or_init(|| {
+            let mut wanted = hashbrown::HashSet::new();
+            if let OwnedGraph::Program(program) = &self.graph {
+                for node in &program.nodes {
+                    let call = match &node.kind {
+                        Some(pb::node::Kind::Call(call)) => Some(call),
+                        Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
+                            value: Some(pb::primitive_value::Value::PartialCall(call)),
+                        })) => Some(call),
+                        _ => None,
+                    };
+                    if let Some(call) = call {
+                        wanted.insert((DeclarationKind::Callable, call.func.clone()));
+                    }
+                }
+                for sort in &program.sorts {
+                    match &sort.kind {
+                        Some(pb::sort::Kind::Eq(name)) => {
+                            wanted.insert((DeclarationKind::EqSort, name.clone()));
+                        }
+                        Some(pb::sort::Kind::Application(family)) => {
+                            wanted.insert((DeclarationKind::PrimitiveSort, family.name.clone()));
+                        }
+                        _ => (),
+                    }
+                }
+                #[cfg(test)]
+                LINK_WORK.with(|work| {
+                    let mut n = work.get();
+                    n[1] += program.nodes.len() + program.sorts.len();
+                    work.set(n);
+                });
+            }
+            let mut direct = HashMap::new();
+            for (index, record) in self.declarations.iter().enumerate() {
+                let owner = record.owner.as_ref().unwrap();
+                direct.entry(owner.id).or_insert(index);
+                let key = match record.arena {
+                    Arena::Declaration => owner.program().unwrap().declarations
+                        [record.index as usize]
+                        .kind
+                        .as_ref()
+                        .map(declaration_name),
+                    Arena::Primitive => Some((
+                        DeclarationKind::Callable,
+                        record.primitive().unwrap().name.as_str(),
+                    )),
+                    Arena::PrimitiveSort => Some((
+                        DeclarationKind::PrimitiveSort,
+                        record.primitive_sort().unwrap().name.as_str(),
+                    )),
+                    _ => None,
+                };
+                if let Some((kind, name)) = key {
+                    wanted.insert((kind, name.to_owned()));
+                }
+            }
+            #[cfg(test)]
+            LINK_WORK.with(|work| {
+                let mut n = work.get();
+                n[1] += self.declarations.len();
+                work.set(n);
+            });
+            wanted.retain(|key| !self.definitions().contains_key(key));
+            let mut result = Bindings::default();
+            let mut pending = self.declarations.iter().rev().cloned().collect::<Vec<_>>();
+            if let Some(ambient) = &self.ambient {
+                pending.push(Record {
+                    owner: Some(ambient.clone()),
+                    arena: Arena::PrimitiveSort,
+                    index: 0,
+                });
+            }
+            let mut seen = std::collections::HashSet::new();
+            while !wanted.is_empty() {
+                let Some(context) = pending.pop() else {
+                    break;
+                };
+                let owner = context.owner.as_ref().unwrap();
+                if !seen.insert(owner.id) {
+                    continue;
+                }
+                #[cfg(test)]
+                LINK_WORK.with(|work| {
+                    let mut n = work.get();
+                    n[2] += 1;
+                    work.set(n);
+                });
+                let definitions = owner.definitions();
+                // Probe the smaller set: a single call never scans the whole
+                // catalog, and a declaration-rich Program visits each small
+                // imported definition table once rather than once per use.
+                let candidates = if wanted.len() < definitions.len() {
+                    wanted
+                        .iter()
+                        .filter_map(|key| {
+                            definitions
+                                .get(key)
+                                .map(|location| (key.clone(), *location))
+                        })
+                        .collect::<Vec<_>>()
+                } else {
+                    definitions
+                        .iter()
+                        .filter(|(key, _)| wanted.contains(*key))
+                        .map(|(key, location)| (key.clone(), *location))
+                        .collect()
+                };
+                #[cfg(test)]
+                LINK_WORK.with(|work| {
+                    let mut n = work.get();
+                    n[3] += wanted.len().min(definitions.len());
+                    work.set(n);
+                });
+                for (key, (arena, index)) in candidates {
+                    wanted.remove(&key);
+                    let location = if self
+                        .ambient
+                        .as_ref()
+                        .is_some_and(|ambient| ambient.id == owner.id)
+                    {
+                        DefinitionLink::Ambient(arena, index)
+                    } else if let Some(import) = direct.get(&owner.id) {
+                        DefinitionLink::Imported(*import, arena, index)
+                    } else {
+                        DefinitionLink::External(Record {
+                            owner: Some(owner.clone()),
+                            arena,
+                            index,
+                        })
+                    };
+                    result.insert(key, location);
+                }
+                pending.extend(owner.declarations.iter().rev().cloned());
+                if let Some(ambient) = &owner.ambient {
+                    pending.push(Record {
+                        owner: Some(ambient.clone()),
+                        arena: Arena::PrimitiveSort,
+                        index: 0,
+                    });
+                }
+            }
+            result
+        })
+    }
+
     // A catalog is never implicitly converted to a user Program. Callers that
     // require executable/user arenas cross this checked ownership boundary.
     pub fn program(&self) -> Result<&pb::Program, TypedError> {
@@ -91,12 +325,24 @@ impl Owner {
 
     #[cfg(test)]
     pub fn program_mut(&mut self) -> Result<&mut pb::Program, TypedError> {
+        self.definitions.take();
+        self.bindings.take();
         match &mut self.graph {
             OwnedGraph::Program(program) => Ok(program),
             OwnedGraph::BuiltinCatalog(_) => Err(TypedError::Invalid(
                 "builtin catalog is not a user Program".into(),
             )),
         }
+    }
+}
+
+fn declaration_name(kind: &pb::declaration::Kind) -> (DeclarationKind, &str) {
+    match kind {
+        pb::declaration::Kind::EqSort(d) => (DeclarationKind::EqSort, &d.name),
+        pb::declaration::Kind::Constructor(d) => (DeclarationKind::Callable, &d.name),
+        pb::declaration::Kind::Function(d) => (DeclarationKind::Callable, &d.name),
+        pb::declaration::Kind::Relation(d) => (DeclarationKind::Callable, &d.name),
+        pb::declaration::Kind::UserDefinedPrimitive(d) => (DeclarationKind::Callable, &d.name),
     }
 }
 
@@ -128,6 +374,15 @@ impl Drop for Record {
                 for record in &mut owner.declarations {
                     if let Some(child) = record.owner.take() {
                         pending.push(child);
+                    }
+                }
+                if let Some(bindings) = owner.bindings.get_mut() {
+                    for location in bindings.values_mut() {
+                        if let DefinitionLink::External(record) = location
+                            && let Some(child) = record.owner.take()
+                        {
+                            pending.push(child);
+                        }
                     }
                 }
                 if let Some(ambient) = owner.ambient.take() {
@@ -305,65 +560,36 @@ impl Record {
     }
 
     pub fn declaration(&self, name: &str, kind: DeclarationKind) -> Result<Self, TypedError> {
-        let mut pending = vec![self.clone()];
-        let mut seen = std::collections::HashSet::new();
-        while let Some(context) = pending.pop() {
-            let owner = context.owner.as_ref().unwrap();
-            if !seen.insert(owner.id) {
-                continue;
-            }
-            let found = match &owner.graph {
-                OwnedGraph::BuiltinCatalog(catalog) => match kind {
-                    DeclarationKind::PrimitiveSort => catalog
-                        .primitive_sorts
-                        .iter()
-                        .position(|p| p.name == name)
-                        .map(|i| (Arena::PrimitiveSort, i)),
-                    DeclarationKind::Callable => catalog
-                        .primitives
-                        .iter()
-                        .position(|p| p.name == name)
-                        .map(|i| (Arena::Primitive, i)),
-                    DeclarationKind::EqSort => None,
-                },
-                OwnedGraph::Program(program) => program
-                    .declarations
-                    .iter()
-                    .position(|d| match &d.kind {
-                        Some(pb::declaration::Kind::EqSort(d)) => {
-                            kind == DeclarationKind::EqSort && d.name == name
-                        }
-                        Some(pb::declaration::Kind::Constructor(d)) => {
-                            kind == DeclarationKind::Callable && d.name == name
-                        }
-                        Some(pb::declaration::Kind::Function(d)) => {
-                            kind == DeclarationKind::Callable && d.name == name
-                        }
-                        Some(pb::declaration::Kind::Relation(d)) => {
-                            kind == DeclarationKind::Callable && d.name == name
-                        }
-                        Some(pb::declaration::Kind::UserDefinedPrimitive(d)) => {
-                            kind == DeclarationKind::Callable && d.name == name
-                        }
-                        _ => false,
-                    })
-                    .map(|i| (Arena::Declaration, i)),
+        // Resolve local/recorded/direct dependencies, not arbitrary unused
+        // transitive siblings: sealing never copies a transitive environment.
+        #[cfg(test)]
+        LINK_WORK.with(|work| {
+            let mut n = work.get();
+            n[4] += 1;
+            work.set(n);
+        });
+        let owner = self.owner.as_ref().unwrap();
+        let key = DefinitionName(kind, name);
+        if let Some((arena, index)) = owner.definitions().get(&key) {
+            return Ok(Self {
+                owner: self.owner.clone(),
+                arena: *arena,
+                index: *index,
+            });
+        }
+        if let Some(location) = owner.bindings().get(&key) {
+            let (owner, arena, index) = match location {
+                DefinitionLink::Imported(import, arena, index) => {
+                    (&owner.declarations[*import].owner, *arena, *index)
+                }
+                DefinitionLink::Ambient(arena, index) => (&owner.ambient, *arena, *index),
+                DefinitionLink::External(record) => return Ok(record.clone()),
             };
-            if let Some((arena, index)) = found {
-                return Ok(Self {
-                    owner: context.owner.clone(),
-                    arena,
-                    index: index as u32,
-                });
-            }
-            pending.extend(owner.declarations.iter().rev().cloned());
-            if let Some(ambient) = &owner.ambient {
-                pending.push(Self {
-                    owner: Some(ambient.clone()),
-                    arena: Arena::PrimitiveSort,
-                    index: 0,
-                });
-            }
+            return Ok(Self {
+                owner: owner.clone(),
+                arena,
+                index,
+            });
         }
         Err(TypedError::Invalid(format!(
             "{kind:?} definition unavailable: {name}"
@@ -445,6 +671,8 @@ pub(super) fn publish_catalog(catalog: pb::BuiltinCatalog) -> Result<Record, Typ
             merge_parameters: None,
             observed: false,
             rule_origin: None,
+            definitions: OnceLock::new(),
+            bindings: OnceLock::new(),
         })),
         arena: Arena::Sort,
         index: 0,
@@ -487,6 +715,8 @@ pub(super) fn observe(
             merge_parameters: None,
             observed: true,
             rule_origin: None,
+            definitions: OnceLock::new(),
+            bindings: OnceLock::new(),
         })),
         arena: Arena::Sort,
         index: root_sort,
@@ -922,6 +1152,8 @@ pub(super) fn publish(
             merge_parameters: None,
             observed: false,
             rule_origin: None,
+            definitions: OnceLock::new(),
+            bindings: OnceLock::new(),
         })),
         arena,
         index,
@@ -1574,6 +1806,68 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn sealed_links_keep_local_then_ambient_then_import_precedence() {
+        use crate::typed::{EgglogValue, builtins::I64, decl::Callable, expr::Expr};
+        let key = "egglog.core.i64.add";
+        let catalog =
+            pb::BuiltinCatalog::decode(include_bytes!("builtins/catalog.pb").as_slice()).unwrap();
+        let ambient = publish_catalog(catalog).unwrap();
+        let imported = Callable::constructor(
+            key,
+            vec![I64::sort_ref(), I64::sort_ref()],
+            I64::sort_ref(),
+            None,
+            false,
+        );
+        let mut call = Expr::call(
+            &imported,
+            vec![
+                I64::from(1).expression().clone(),
+                I64::from(2).expression().clone(),
+            ],
+        );
+        Arc::get_mut(call.0.owner.as_mut().unwrap())
+            .unwrap()
+            .ambient = ambient.owner.clone();
+        let selected = call.0.declaration(key, DeclarationKind::Callable).unwrap();
+        assert_eq!(selected.arena, Arena::Primitive);
+        assert!(Arc::ptr_eq(
+            selected.owner.as_ref().unwrap(),
+            ambient.owner.as_ref().unwrap()
+        ));
+
+        let mut slots = std::array::from_fn(|_| vec![]);
+        slots[Arena::Sort as usize].push(Slot::External(I64::sort_ref().0));
+        let mut local = publish(
+            pb::Program {
+                declarations: vec![pb::Declaration {
+                    kind: Some(pb::declaration::Kind::Constructor(pb::Constructor {
+                        name: key.into(),
+                        inputs: vec![],
+                        output: 0,
+                        ..Default::default()
+                    })),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+            slots,
+            vec![imported.0],
+            Arena::Declaration,
+            0,
+            vec![],
+        )
+        .unwrap();
+        Arc::get_mut(local.owner.as_mut().unwrap()).unwrap().ambient = ambient.owner.clone();
+        let selected = local.declaration(key, DeclarationKind::Callable).unwrap();
+        assert_eq!(selected.arena, Arena::Declaration);
+        assert!(Arc::ptr_eq(
+            selected.owner.as_ref().unwrap(),
+            local.owner.as_ref().unwrap()
+        ));
+    }
 
     #[test]
     fn actual_catalog_retains_signatures_without_a_public_application_primitive() {
