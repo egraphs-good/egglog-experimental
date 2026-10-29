@@ -155,11 +155,11 @@ encoded requests, a stateful Source producer/renderer for the text frontend,
 and high-level Python/Rust APIs that emit the same records. Source yields
 Programs or scope operations; callers submit each one and decode its successful
 response before advancing, stopping on errors. Text-only formatting and file
-output stay in the frontend. Python's prototype chronological recorder has not
-yet been migrated to the history-backed saved-source view described above.
+output stay in the frontend.
 
 Current adapter limits include i64 cost annotations, Normal-only Extract/Freeze,
-native proof-mode restrictions and context-specific expansion budgets. These are
+native proof-mode restrictions and context-specific expansion budgets. Deferred
+Union bodies and self-referential closures are not yet lowered. These are
 prototype limits, not additional restrictions on the schema. Text export fails
 explicitly when current text syntax cannot preserve a value or graph, such as
 an exact NaN payload or some fresh/cyclic class frames. It never substitutes
