@@ -36,7 +36,7 @@ impl super::EgglogValue for ActionTerm {
 impl super::EqualitySort for ActionTerm {}
 
 #[test]
-fn function_values_compile_callbacks_to_existing_primitives_and_partial_calls() {
+fn function_values_author_computed_lambda_bodies_without_helper_declarations() {
     use super::{
         EgglogValue,
         builtins::{Function, I64},
@@ -45,11 +45,21 @@ fn function_values_compile_callbacks_to_existing_primitives_and_partial_calls() 
     let plus_one = Function::<(I64,), I64>::new(|x| x + I64::from(1)).unwrap();
     let double = Function::<(I64,), I64>::new(|x| x + x).unwrap();
     let constant = Function::<(), I64>::new(|| I64::from(7)).unwrap();
+    let independent = Function::<(), Function<(I64,), I64>>::new(|| {
+        Function::<(I64,), I64>::new(|y| y + I64::from(1)).unwrap()
+    })
+    .unwrap();
+    let nested_capture = Function::<(I64,), Function<(I64,), I64>>::new(|x| {
+        Function::<(I64,), I64>::with_captures((x.clone(),), |(captured,), y| y + captured).unwrap()
+    })
+    .unwrap();
     let mut graph = super::EGraph::default();
     for (result, expected) in [
         (plus_one.call(4), 5),
         (double.call(4), 8),
         (constant.call(), 7),
+        (independent.call().call(5), 6),
+        (nested_capture.call(10).call(5), 15),
     ] {
         let program =
             pb::Program::decode(action_program(&result).encode_to_vec().as_slice()).unwrap();
@@ -66,14 +76,12 @@ fn function_values_compile_callbacks_to_existing_primitives_and_partial_calls() 
         assert!(program.nodes.iter().any(|node| matches!(
             &node.kind,
             Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
-                value: Some(pb::primitive_value::Value::PartialCall(_))
-            }))
-        )));
-        assert!(!program.nodes.iter().any(|node| matches!(
-            &node.kind,
-            Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
                 value: Some(pb::primitive_value::Value::Lambda(_))
             }))
+        )));
+        assert!(!program.declarations.iter().any(|declaration| matches!(
+            &declaration.kind,
+            Some(pb::declaration::Kind::UserDefinedPrimitive(_))
         )));
     }
     assert!(graph.check(eq(plus_one.call(5), 6)).unwrap());

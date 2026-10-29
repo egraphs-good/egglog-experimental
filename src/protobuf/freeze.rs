@@ -9,6 +9,7 @@ pub(super) struct View<'a> {
     pub graph: &'a EGraph,
     pub names: &'a NativeNames,
     pub definitions: &'a pb::Program,
+    pub lambdas: &'a lambda::Registry,
     pub mode: pb::ExecutionMode,
     pub extension: Option<&'a Arc<dyn NativeExtension>>,
 }
@@ -145,16 +146,18 @@ impl<K: Eq + Hash, F: Fn(&ArcSort, Value) -> K> Export<'_, K, F> {
                             .graph
                             .export_function_value_target(&sort, value)
                             .map_err(egglog::Error::BackendError)?;
-                        V::PartialCall(pb::Call {
-                            func: self
-                                .session
-                                .names
-                                .callables
-                                .get(&name)
-                                .unwrap_or(&name)
-                                .clone(),
-                            args: children,
-                        })
+                        let name = self.session.names.callables.get(&name).unwrap_or(&name);
+                        self.session
+                            .lambdas
+                            .observe(name, &children, &mut self.program)
+                            .map_err(egglog::Error::BackendError)?
+                            .and_then(|value| value.value)
+                            .unwrap_or_else(|| {
+                                V::PartialCall(pb::Call {
+                                    func: name.clone(),
+                                    args: children,
+                                })
+                            })
                     }
                     Some(pb::sort::Kind::Application(_)) => value::container_payload(
                         &sort,
@@ -253,7 +256,10 @@ pub(super) fn observation(
     }
     // Builtins are a backend environment, not graph state. The session retains
     // every installed user body, including dependencies and exact diagnostics.
-    let definitions = session.definitions.clone();
+    let definitions = session
+        .lambdas
+        .export_definitions(session.definitions)
+        .map_err(egglog::Error::BackendError)?;
     let mut export = Export {
         session,
         program: definitions,
@@ -526,6 +532,7 @@ mod tests {
                 graph: &session.graph,
                 names: &session.names,
                 definitions: &session.definitions,
+                lambdas: &session.lambdas,
                 mode: session.mode,
                 extension: session.extension.as_ref(),
             },
@@ -579,6 +586,7 @@ mod tests {
                     graph: &session.graph,
                     names: &session.names,
                     definitions: &session.definitions,
+                    lambdas: &session.lambdas,
                     mode: session.mode,
                     extension: session.extension.as_ref(),
                 },

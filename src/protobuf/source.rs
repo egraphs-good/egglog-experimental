@@ -3522,6 +3522,7 @@ impl Renderer {
                 registry: rules::Registry::default(),
                 sorts: HashSet::new(),
                 cost_models: HashMap::new(),
+                lambdas: super::lambda::Registry::default(),
             },
         }
     }
@@ -4386,6 +4387,7 @@ fn render_prepared(
             let first_command = commands.len();
             let span = native_span(program, command.span.as_ref(), native_spans)?;
             match command.kind.as_ref().ok_or("missing command kind")? {
+                pb::command::Kind::Freeze(_) => continue,
                 pb::command::Kind::Action(action) => {
                     if prepared.context.action_dags.contains_key(&vec![position as u32]) {
                         commands.push(Command::ActionScope(span, ast::GenericActions(
@@ -4621,10 +4623,19 @@ fn render_prepared(
             while let Command::Fail(_, child) = command {
                 command = child;
             }
-            if let Command::ActionScope(_, expected) = command {
+            let expected = match command {
+                Command::ActionScope(_, actions) => Some(actions.clone()),
+                Command::UserDefined(span, name, args) if name == "primitive" && args.len() == 4 =>
+                    Some(ast::GenericActions(vec![Action::Expr(span.clone(), args[3].clone())])),
+                _ => None,
+            };
+            if let Some(expected) = expected {
                 let parsed = parser.get_program_from_string(None, &command.to_string()).map_err(|error| error.to_string())?;
-                let [Command::ActionScope(_, actual)] = parsed.as_slice() else {
-                    return Err("action scope changes meaning when parsed as source".into());
+                let actual = match parsed.as_slice() {
+                    [Command::ActionScope(_, actions)] => actions.clone(),
+                    [Command::UserDefined(span, name, args)] if name == "primitive" && args.len() == 4 =>
+                        ast::GenericActions(vec![Action::Expr(span.clone(), args[3].clone())]),
+                    _ => return Err("source scope or primitive body changes meaning when parsed".into()),
                 };
                 // Display alone cannot distinguish literal kinds or NaN payloads.
                 // Parse the whole lexical context, then compare exact literals.
@@ -4651,8 +4662,8 @@ fn render_prepared(
                     if let Some(error) = error { return Err(error); }
                     Ok(values)
                 };
-                let left = literals(expected, &mut parser)?;
-                let right = literals(actual, &mut parser)?;
+                let left = literals(&expected, &mut parser)?;
+                let right = literals(&actual, &mut parser)?;
                 if command.to_string() != parsed[0].to_string()
                     || left.len() != right.len()
                     || !left.iter().zip(&right).all(|(left, right)| match (left, right) {
@@ -4831,6 +4842,7 @@ fn source_extended_schedule(
             span.clone(),
             "body".into(),
             body.iter()
+                .filter(|child| !matches!(child.kind, Some(pb::command::Kind::Freeze(_))))
                 .map(|child| {
                     source_extended_schedule(program, child, context, authored, depth + 1, occupied)
                 })
@@ -4969,7 +4981,12 @@ fn source_schedule(
         && repeat.max_iterations == Some(1)
         && !repeat.until.is_empty()
     {
-        let [child] = repeat.body.as_slice() else {
+        let children: Vec<_> = repeat
+            .body
+            .iter()
+            .filter(|child| !matches!(child.kind, Some(pb::command::Kind::Freeze(_))))
+            .collect();
+        let [child] = children.as_slice() else {
             return Err("source loop-until requires one conditional Run".into());
         };
         if !matches!(&child.kind, Some(pb::command::Kind::Run(run)) if run.scheduler.is_empty()) {
@@ -5012,6 +5029,7 @@ fn source_schedule(
     };
     let children = body
         .iter()
+        .filter(|child| !matches!(child.kind, Some(pb::command::Kind::Freeze(_))))
         .map(|child| source_schedule(program, child, native_spans, occupied))
         .collect::<Result<_, _>>()?;
     let body = ast::Schedule::Sequence(span.clone(), children);

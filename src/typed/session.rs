@@ -206,6 +206,17 @@ impl CapturePlan {
                 }
                 _ => (),
             }
+            if let Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
+                value: Some(pb::primitive_value::Value::Lambda(lambda)),
+            })) = &node.kind
+            {
+                // Constructing a closure evaluates its environment, never its
+                // body. Nested body captures are reached when that code runs.
+                for capture in lambda.captures.iter().rev() {
+                    pending.push(record.resolve(Arena::Node, *capture)?);
+                }
+                continue;
+            }
             let mut one = pb::Program {
                 nodes: vec![node.clone()],
                 ..Default::default()
@@ -1236,11 +1247,20 @@ fn adopt(
             *child = ids[child];
         };
         match &mut node.kind {
-            Some(pb::node::Kind::Call(call)) => call.args.iter_mut().for_each(&mut relocate),
+            Some(pb::node::Kind::Call(call) | pb::node::Kind::GetCost(call)) => {
+                call.args.iter_mut().for_each(&mut relocate)
+            }
             Some(pb::node::Kind::Apply(apply)) => {
                 apply.function.iter_mut().for_each(&mut relocate);
                 apply.args.iter_mut().for_each(&mut relocate);
             }
+            Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
+                value: Some(pb::primitive_value::Value::Lambda(lambda)),
+            })) => {
+                lambda.captures.iter_mut().for_each(&mut relocate);
+                relocate(&mut lambda.body);
+            }
+            Some(pb::node::Kind::Var(_)) => {} // Valid only in separately scoped code below.
             Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
                 value: Some(pb::primitive_value::Value::PartialCall(call)),
             })) => call.args.iter_mut().for_each(&mut relocate),

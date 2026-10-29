@@ -13,7 +13,7 @@ pub trait FunctionArgs: Clone + Debug + Eq + Hash + Send + Sync + 'static {
 }
 
 /// A typed symbolic function, represented by the shared structural Func sort.
-/// Callbacks compile to computed primitives with explicit evaluated captures.
+/// Computed callbacks author Lambda code with explicit evaluated captures.
 /// `new` defers its complete symbolic body; `with_captures` retains supplied
 /// values at function-value construction. Union bodies are currently rejected.
 /// Parameter and capture tuples support up to twelve values.

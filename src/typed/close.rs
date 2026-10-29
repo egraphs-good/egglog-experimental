@@ -74,6 +74,15 @@ pub(super) fn binder(roots: &[Record]) -> Result<HashMap<String, String>, TypedE
                 }
             }
             Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
+                value: Some(pb::primitive_value::Value::Lambda(lambda)),
+            })) => {
+                // A Lambda's environment belongs to this binder; its deferred
+                // body owns positional parameters and is closed separately.
+                for capture in lambda.captures.iter().rev() {
+                    pending.push(r.resolve(Arena::Node, *capture)?);
+                }
+            }
+            Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
                 value: Some(pb::primitive_value::Value::PartialCall(c)),
             })) => {
                 for i in c.args.iter().rev() {

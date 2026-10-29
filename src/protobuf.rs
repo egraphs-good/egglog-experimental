@@ -37,6 +37,7 @@ pub mod cost_model;
 mod freeze;
 pub(crate) mod graph;
 mod history;
+mod lambda;
 mod proof;
 mod report;
 mod rules;
@@ -202,6 +203,7 @@ struct Session {
     // where physical TypeInfo is not the authoring type environment.
     sorts: HashSet<String>,
     cost_models: HashMap<String, Arc<dyn cost_model::NativeCostModel>>,
+    lambdas: lambda::Registry,
 }
 
 struct Installation {
@@ -212,6 +214,7 @@ struct Installation {
 }
 
 struct Prepared {
+    lambdas: lambda::Registry,
     definitions: pb::Program,
     request: u64,
     installations: Vec<Installation>,
@@ -469,6 +472,7 @@ impl Engine {
                 registry: rules::Registry::default(),
                 sorts: HashSet::new(),
                 cost_models: HashMap::new(),
+                lambdas: lambda::Registry::default(),
             },
         );
         Ok(pb::CreateEGraphResponse {
@@ -679,6 +683,7 @@ impl Session {
     ) -> Result<RequestOccurrences, (Box<pb::Error>, Vec<pb::SourceFile>)> {
         let Prepared {
             mut definitions,
+            lambdas,
             request,
             installations,
             mut pending_declarations,
@@ -730,6 +735,7 @@ impl Session {
             .filter_map(|(index, d)| (!pending_declarations.contains(&index)).then_some(d))
             .collect();
         self.definitions = definitions;
+        self.lambdas = lambdas;
         self.names = project_names(
             &mut pb::Program::default(),
             &self.definitions,
@@ -858,6 +864,7 @@ impl Session {
                 return Err(format!("user callable conflicts with builtin {name}").into());
             }
         }
+        staged.lambdas.lower(program, &staged.definitions)?;
         let mut next_declaration = staged.definitions.declarations.len();
         let added =
             crate::builtin::definitions::reconcile_declarations(program, &mut staged.definitions)?;
@@ -1472,6 +1479,7 @@ impl Session {
             .filter_map(|(declaration, added)| added.then_some(declaration))
             .collect();
         Ok(Prepared {
+            lambdas: staged.lambdas,
             definitions: staged.definitions,
             request: staged.request,
             installations,
@@ -1868,6 +1876,7 @@ impl Session {
                     root: location,
                     stream,
                     definitions: &self.definitions,
+                    lambdas: &self.lambdas,
                     extension: self.extension.as_ref(),
                     measurements: &measurements,
                     export_error: None,
@@ -1906,6 +1915,7 @@ impl Session {
                         graph: &self.graph,
                         names: &self.names,
                         definitions: &self.definitions,
+                        lambdas: &self.lambdas,
                         mode: self.mode,
                         extension: self.extension.as_ref(),
                     },
@@ -2617,6 +2627,7 @@ struct WireSchedule<'a, 'stream> {
     root: &'a pb::CommandLocation,
     stream: &'a mut OutputStream<'stream>,
     definitions: &'a pb::Program,
+    lambdas: &'a lambda::Registry,
     extension: Option<&'a Arc<dyn NativeExtension>>,
     measurements: &'a RefCell<ScheduleMeasurements>,
     bindings: Vec<(String, SchedulerBinding)>,
@@ -2633,6 +2644,7 @@ struct WireEnvelope<'a, 'stream> {
     root: &'a pb::CommandLocation,
     stream: &'a mut OutputStream<'stream>,
     definitions: &'a pb::Program,
+    lambdas: &'a lambda::Registry,
     extension: Option<&'a Arc<dyn NativeExtension>>,
     measurements: &'a RefCell<ScheduleMeasurements>,
     export_error: Option<egglog::Error>,
@@ -2656,6 +2668,7 @@ impl WireEnvelope<'_, '_> {
             root: self.root,
             stream: self.stream,
             definitions: self.definitions,
+            lambdas: self.lambdas,
             extension: self.extension,
             measurements: self.measurements,
             bindings: self.bindings.clone(),
@@ -2770,6 +2783,7 @@ impl ControlContext for WireSchedule<'_, '_> {
                 root: &location,
                 stream: self.stream,
                 definitions: self.definitions,
+                lambdas: self.lambdas,
                 extension: self.extension,
                 measurements: self.measurements,
                 export_error: None,
@@ -2840,6 +2854,7 @@ impl ControlContext for WireSchedule<'_, '_> {
                         graph: self.executor.graph,
                         names: self.executor.names,
                         definitions: self.definitions,
+                        lambdas: self.lambdas,
                         mode: self.executor.mode,
                         extension: self.extension,
                     },
@@ -5896,12 +5911,24 @@ fn encode_term(
         let target = graph
             .export_function_value_target(sort, native_value)
             .map_err(egglog::Error::ExtractError)?;
-        pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
-            value: Some(pb::primitive_value::Value::PartialCall(pb::Call {
-                func: names.callables.get(&target).unwrap_or(&target).clone(),
-                args: children.to_vec(),
-            })),
-        })
+        let name = names.callables.get(&target).unwrap_or(&target);
+        let mut code = pb::Program {
+            nodes: std::mem::take(&mut response.nodes),
+            sorts: std::mem::take(&mut response.sorts),
+            ..Default::default()
+        };
+        let anonymous = session.lambdas.observe(name, children, &mut code);
+        response.nodes = code.nodes;
+        response.sorts = code.sorts;
+        let value = anonymous
+            .map_err(egglog::Error::ExtractError)?
+            .unwrap_or_else(|| pb::PrimitiveValue {
+                value: Some(pb::primitive_value::Value::PartialCall(pb::Call {
+                    func: name.clone(),
+                    args: children.to_vec(),
+                })),
+            });
+        pb::node::Kind::PrimitiveValue(value)
     } else if sort.is_container_sort() {
         pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
             value: Some(
@@ -8814,6 +8841,7 @@ mod tests {
                     registry: rules::Registry::default(),
                     sorts: HashSet::new(),
                     cost_models: HashMap::new(),
+                    lambdas: lambda::Registry::default(),
                 };
                 let mut program = pb::Program {
                     sorts: vec![pb::Sort {
@@ -10807,4 +10835,6 @@ mod tests {
             assert_eq!(engine.graphs[&id].request, 0);
         }
     }
+
+    include!("protobuf/lambda_tests.rs");
 }

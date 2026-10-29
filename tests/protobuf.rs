@@ -2390,9 +2390,31 @@ mod constructor_action_dags {
                 unreachable!()
             };
             leaf.args.push(input);
+            let mut body = original.clone();
+            body.commands.clear();
+            body.declarations.push(pb::Declaration {
+                kind: Some(pb::declaration::Kind::UserDefinedPrimitive(
+                    pb::UserDefinedPrimitive {
+                        name: "float_body".into(),
+                        inputs: vec![],
+                        output: float,
+                        body: Some(input),
+                    },
+                )),
+                ..Default::default()
+            });
+            let rendered_body = Renderer::default().render(&body);
             if f64::from_bits(bits).is_nan() {
                 let error = Renderer::default().render(&original).unwrap_err();
                 assert!(!error.to_string().is_empty());
+                assert!(
+                    rendered_body
+                        .unwrap_err()
+                        .to_string()
+                        .contains("scalar payload")
+                );
+            } else {
+                rendered_body.unwrap();
             }
             original.commands.push(pb::Command {
                 kind: Some(pb::command::Kind::Extract(pb::Extract {
@@ -9562,6 +9584,21 @@ fn source_scheduler_until_preserves_queries_and_has_no_internal_proof_output() {
                     let span = phase.commands[0].span.as_ref().unwrap();
                     let source = phase.files[span.file as usize].contents.as_ref().unwrap();
                     assert!(source[span.start as usize..span.end as usize].contains(":until"));
+                    let mut observed = phase.clone();
+                    let Some(pb::command::Kind::Loop(body)) = &mut observed.commands[0].kind else {
+                        unreachable!()
+                    };
+                    body.body.insert(
+                        0,
+                        pb::Command {
+                            kind: Some(pb::command::Kind::Freeze(pb::Freeze {})),
+                            ..Default::default()
+                        },
+                    );
+                    assert_eq!(
+                        renderer.clone().render(&observed).unwrap(),
+                        renderer.clone().render(&phase).unwrap()
+                    );
                     let mut rejected = phase.clone();
                     let Some(pb::command::Kind::Loop(repeat)) = &mut rejected.commands[0].kind
                     else {
@@ -19985,7 +20022,7 @@ mod source_provider_context {
             );
             assert_eq!(provider.evaluations.load(Ordering::SeqCst), 0);
         }
-        for failure in ["lower", "forged", "malformed", "children", "freeze"] {
+        for failure in ["lower", "forged", "malformed", "children"] {
             let provider = Arc::new(Provider::default());
             *provider.exception_latch.lock().unwrap() = Some("original provider exception");
             let mut renderer = Renderer::with_extension(provider.clone()).unwrap();
@@ -20027,13 +20064,6 @@ mod source_provider_context {
                     }
                     "malformed TestOpaque payload"
                 }
-                "freeze" => {
-                    bad.commands = vec![pb::Command {
-                        kind: Some(pb::command::Kind::Freeze(pb::Freeze {})),
-                        ..Default::default()
-                    }];
-                    "unsupported source command"
-                }
                 _ => unreachable!(),
             };
             let authored = bad.encode_to_vec();
@@ -20053,6 +20083,50 @@ mod source_provider_context {
                 .render(&packet())
                 .unwrap();
             assert_eq!(actual, expected, "{failure}: failed render published state");
+            assert_eq!(provider.evaluations.load(Ordering::SeqCst), 0);
+            assert_eq!(
+                *provider.exception_latch.lock().unwrap(),
+                Some("original provider exception")
+            );
+        }
+        let provider = Arc::new(Provider::default());
+        *provider.exception_latch.lock().unwrap() = Some("original provider exception");
+        let mut setup = packet();
+        setup.commands.clear();
+        let expected = Renderer::with_extension(provider.clone())
+            .unwrap()
+            .render(&setup)
+            .unwrap();
+        for nested in [false, true] {
+            let freeze = pb::Command {
+                kind: Some(pb::command::Kind::Freeze(pb::Freeze {})),
+                ..Default::default()
+            };
+            let mut observed = setup.clone();
+            observed.commands.push(if nested {
+                pb::Command {
+                    kind: Some(pb::command::Kind::Loop(pb::Loop {
+                        body: vec![freeze],
+                        max_iterations: Some(3),
+                        until: vec![],
+                    })),
+                    ..Default::default()
+                }
+            } else {
+                freeze
+            });
+            let authored = observed.encode_to_vec();
+            let text = Renderer::with_extension(provider.clone())
+                .unwrap()
+                .render(&observed)
+                .unwrap();
+            assert!(text.starts_with(&expected));
+            assert_eq!(observed.encode_to_vec(), authored);
+            let mut engine = Engine::with_extension(provider.clone());
+            let id = create(&mut engine);
+            for phase in Source::with_extension(None, &text, provider.clone()).unwrap() {
+                assert_eq!(run(&mut engine, id, phase.unwrap()).error, None);
+            }
             assert_eq!(provider.evaluations.load(Ordering::SeqCst), 0);
             assert_eq!(
                 *provider.exception_latch.lock().unwrap(),

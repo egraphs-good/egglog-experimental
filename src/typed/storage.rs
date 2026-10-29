@@ -171,7 +171,9 @@ impl Owner {
             if let OwnedGraph::Program(program) = &self.graph {
                 for node in &program.nodes {
                     let call = match &node.kind {
-                        Some(pb::node::Kind::Call(call)) => Some(call),
+                        Some(pb::node::Kind::Call(call) | pb::node::Kind::GetCost(call)) => {
+                            Some(call)
+                        }
                         Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
                             value: Some(pb::primitive_value::Value::PartialCall(call)),
                         })) => Some(call),
@@ -771,7 +773,8 @@ pub(super) fn closure(roots: &[Record]) -> Result<Vec<Record>, TypedError> {
                 if let Some(capture) = record.capture()? {
                     pending.push(capture.initializer);
                 }
-                if let Some(pb::node::Kind::Call(call)) = &node.kind {
+                if let Some(pb::node::Kind::Call(call) | pb::node::Kind::GetCost(call)) = &node.kind
+                {
                     pending.push(record.declaration(&call.func, DeclarationKind::Callable)?);
                 } else if let Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
                     value: Some(pb::primitive_value::Value::PartialCall(call)),
@@ -894,7 +897,7 @@ pub(super) fn visit(
             }
             n.sort_id = map(Arena::Sort, n.sort_id)?;
             match n.kind.as_mut().ok_or_else(invalid)? {
-                pb::node::Kind::Call(c) => {
+                pb::node::Kind::Call(c) | pb::node::Kind::GetCost(c) => {
                     for a in &mut c.args {
                         *a = map(Arena::Node, *a)?;
                     }
@@ -948,6 +951,14 @@ pub(super) fn visit(
                     for child in &mut values.items {
                         *child = map(Arena::Node, *child)?;
                     }
+                }
+                pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
+                    value: Some(pb::primitive_value::Value::Lambda(lambda)),
+                }) => {
+                    for capture in &mut lambda.captures {
+                        *capture = map(Arena::Node, *capture)?;
+                    }
+                    lambda.body = map(Arena::Node, lambda.body)?;
                 }
                 pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
                     value: Some(pb::primitive_value::Value::PartialCall(call)),
@@ -1290,7 +1301,7 @@ impl Packer {
                                 TypedError::Invalid("free variable in evaluated input".into())
                             })?;
                         }
-                        Some(pb::node::Kind::Call(call)) => {
+                        Some(pb::node::Kind::Call(call) | pb::node::Kind::GetCost(call)) => {
                             self.intern(
                                 record.declaration(&call.func, DeclarationKind::Callable)?,
                                 0,
@@ -1418,6 +1429,17 @@ impl Packer {
                                             "function merge variables must be owned old or new of the output sort".into(),
                                         ));
                                     }
+                                    if let Some(pb::node::Kind::PrimitiveValue(
+                                        pb::PrimitiveValue {
+                                            value: Some(pb::primitive_value::Value::Lambda(lambda)),
+                                        },
+                                    )) = &node.kind
+                                    {
+                                        for capture in &lambda.captures {
+                                            pending.push(child.resolve(Arena::Node, *capture)?);
+                                        }
+                                        continue;
+                                    }
                                     visit(
                                         &mut pb::Program {
                                             nodes: vec![node.clone()],
@@ -1526,11 +1548,48 @@ impl Packer {
                     unreachable!("builtin descriptor cannot enter Program queue")
                 }
             }
-            let mut relocate = |a, i| Ok(self.intern(record.resolve(a, i)?, binder));
-            if record.arena == Arena::Rule {
-                visit_rule(&mut one_rules[0], relocate)?;
+            if record.arena == Arena::Node
+                && matches!(
+                    &one.nodes[0].kind,
+                    Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
+                        value: Some(pb::primitive_value::Value::Lambda(_)),
+                    }))
+                )
+            {
+                let node = &mut one.nodes[0];
+                let sort = record.resolve(Arena::Sort, node.sort_id)?;
+                let Some(pb::sort::Kind::Func(function)) = &sort.sort()?.kind else {
+                    return Err(TypedError::Invalid(
+                        "Lambda requires a function sort".into(),
+                    ));
+                };
+                let Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
+                    value: Some(pb::primitive_value::Value::Lambda(lambda)),
+                })) = &mut node.kind
+                else {
+                    unreachable!()
+                };
+                let body_binder = self.binders.len();
+                self.binders.push(
+                    (0..lambda.captures.len() + function.params.len())
+                        .map(|i| {
+                            let name = format!("_{i}");
+                            (name.clone(), name)
+                        })
+                        .collect(),
+                );
+                node.sort_id = self.intern(sort, 0);
+                for capture in &mut lambda.captures {
+                    *capture = self.intern(record.resolve(Arena::Node, *capture)?, binder);
+                }
+                lambda.body = self.intern(record.resolve(Arena::Node, lambda.body)?, body_binder);
             } else {
-                visit(&mut one, record.arena, 0, &mut relocate)?;
+                let mut relocate = |a, i| Ok(self.intern(record.resolve(a, i)?, binder));
+                if record.arena == Arena::Rule {
+                    visit_rule(&mut one_rules[0], relocate)?;
+                } else {
+                    visit(&mut one, record.arena, 0, &mut relocate)?;
+                }
             }
             match record.arena {
                 Arena::Node => self.program.nodes[index as usize] = one.nodes.pop().unwrap(),

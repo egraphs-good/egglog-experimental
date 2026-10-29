@@ -394,9 +394,9 @@ impl Expr {
         )
     }
 
-    // Lift one typed callback into the existing computed-function declaration.
-    // Captures are explicit; all body syntax remains deferred, including fresh
-    // Union allocation and parameter-independent reads or effects.
+    // Author deferred typed code; the shared receiver owns native lifting.
+    // Captures are explicit; parameter-independent reads and effects remain
+    // deferred. Fresh Union bodies are rejected until they have a native scope.
     pub(super) fn function(
         body: Self,
         parameters: Vec<Self>,
@@ -457,6 +457,7 @@ impl Expr {
         let mut ids = HashMap::from([(key(&body.0), 0)]);
         let mut pending = vec![body.0];
         program.nodes.push(pb::Node::default());
+        slots[Arena::Node as usize].push(Slot::Local(0));
         let mut cursor = 0;
         while cursor < pending.len() {
             let record = pending[cursor].clone();
@@ -486,7 +487,7 @@ impl Expr {
                     ));
                 }
                 let call = match &node.kind {
-                    Some(pb::node::Kind::Call(call)) => Some(call),
+                    Some(pb::node::Kind::Call(call) | pb::node::Kind::GetCost(call)) => Some(call),
                     Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
                         value: Some(pb::primitive_value::Value::PartialCall(call)),
                     })) => Some(call),
@@ -499,53 +500,79 @@ impl Expr {
                     nodes: vec![node],
                     ..Default::default()
                 };
-                super::storage::visit(&mut one, Arena::Node, 0, |arena, index| {
-                    if arena != Arena::Node {
-                        return Ok(index);
+                let deferred_body = {
+                    let mut relocate = |arena, index| {
+                        if arena != Arena::Node {
+                            return Ok(index);
+                        }
+                        let child = record.resolve(arena, index)?;
+                        Ok(*ids.entry(key(&child)).or_insert_with(|| {
+                            let slot = slots[Arena::Node as usize].len() as u32;
+                            slots[Arena::Node as usize].push(Slot::Local(pending.len() as u32));
+                            pending.push(child);
+                            program.nodes.push(pb::Node::default());
+                            slot
+                        }))
+                    };
+                    if let Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
+                        value: Some(pb::primitive_value::Value::Lambda(lambda)),
+                    })) = &mut one.nodes[0].kind
+                    {
+                        for capture in &mut lambda.captures {
+                            *capture = relocate(Arena::Node, *capture)?;
+                        }
+                        Some(record.resolve(Arena::Node, lambda.body)?)
+                    } else {
+                        super::storage::visit(&mut one, Arena::Node, 0, relocate)?;
+                        None
                     }
-                    let child = record.resolve(arena, index)?;
-                    Ok(*ids.entry(key(&child)).or_insert_with(|| {
-                        let index = pending.len() as u32;
-                        pending.push(child);
-                        program.nodes.push(pb::Node::default());
-                        index
-                    }))
-                })?;
+                };
+                if let Some(body) = deferred_body {
+                    let Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
+                        value: Some(pb::primitive_value::Value::Lambda(lambda)),
+                    })) = &mut one.nodes[0].kind
+                    else {
+                        unreachable!()
+                    };
+                    // Its code already has its own positional binder. Only
+                    // its construction environment belongs to this callback.
+                    lambda.body = slots[Arena::Node as usize].len() as u32;
+                    slots[Arena::Node as usize].push(Slot::External(body));
+                }
                 node = one.nodes.pop().unwrap();
             }
             program.nodes[cursor] = node;
             cursor += 1;
         }
-        let inputs = parameters
-            .iter()
+        let body_count = program.nodes.len() as u32;
+        let captured = captures
+            .into_iter()
             .map(|value| {
-                let node = &value.0.owner.as_ref().unwrap().program().unwrap().nodes
-                    [value.0.index as usize];
-                let index = slots[Arena::Sort as usize].len() as u32;
-                slots[Arena::Sort as usize]
-                    .push(Slot::External(value.0.resolve(Arena::Sort, node.sort_id)?));
-                Ok(pb::Arg {
-                    sort: index,
-                    name: String::new(),
-                })
+                let index = slots[Arena::Node as usize].len() as u32;
+                slots[Arena::Node as usize].push(Slot::External(value.0));
+                index
             })
-            .collect::<Result<Vec<_>, TypedError>>()?;
-        let output = program.nodes[0].sort_id;
-        let name = format!("__typed_callback_{}", fresh_scope());
-        program.declarations.push(pb::Declaration {
-            kind: Some(pb::declaration::Kind::UserDefinedPrimitive(
-                pb::UserDefinedPrimitive {
-                    name: name.clone(),
-                    inputs,
-                    output,
-                    body: Some(0),
-                },
-            )),
+            .collect();
+        let function_sort = slots[Arena::Sort as usize].len() as u32;
+        slots[Arena::Sort as usize].push(Slot::External(sort.0));
+        program.nodes.push(pb::Node {
+            sort_id: function_sort,
+            kind: Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
+                value: Some(pb::primitive_value::Value::Lambda(pb::Lambda {
+                    captures: captured,
+                    body: 0,
+                })),
+            })),
             ..Default::default()
         });
-        slots[Arena::Node as usize] = (0..program.nodes.len() as u32).map(Slot::Local).collect();
-        let callable = publish(program, slots, declarations, Arena::Declaration, 0, vec![])?;
-        Self::partial_call(callable, name, captures, sort)
+        Ok(Self(publish(
+            program,
+            slots,
+            declarations,
+            Arena::Node,
+            body_count,
+            vec![],
+        )?))
     }
 
     // Publish the named callable and its evaluated prefix as one inert value.
@@ -919,6 +946,26 @@ impl Expr {
                         }
                     }
                     &values.items
+                }
+                Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
+                    value: Some(pb::primitive_value::Value::Lambda(lambda)),
+                })) => {
+                    let Some(pb::sort::Kind::Func(function)) = &sort.0.sort().unwrap().kind else {
+                        return Err(TypedError::Decode("Lambda requires a function sort".into()));
+                    };
+                    // The body is deferred code, not a data child. Shared native
+                    // admission owns binder/call validation when it is submitted.
+                    let body = record.resolve(Arena::Node, lambda.body)?;
+                    let node =
+                        &body.owner.as_ref().unwrap().program().unwrap().nodes[body.index as usize];
+                    if SortRef(body.resolve(Arena::Sort, node.sort_id)?)
+                        != SortRef(sort.0.resolve(Arena::Sort, function.result)?)
+                    {
+                        return Err(TypedError::Decode(
+                            "Lambda body result sort mismatch".into(),
+                        ));
+                    }
+                    &lambda.captures
                 }
                 Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
                     value: Some(pb::primitive_value::Value::PartialCall(call)),
