@@ -160,8 +160,11 @@ yet been migrated to the history-backed saved-source view described above.
 
 Current adapter limits include i64 cost annotations, Normal-only Extract/Freeze,
 native proof-mode restrictions and context-specific expansion budgets. These are
-prototype limits, not additional restrictions on the schema. Wire validation or
-a binary roundtrip alone does not establish frontend or execution conformance.
+prototype limits, not additional restrictions on the schema. Text export fails
+explicitly when current text syntax cannot preserve a value or graph, such as
+an exact NaN payload or some fresh/cyclic class frames. It never substitutes
+lossy literals or artificial constructors. Wire validation or a binary roundtrip
+alone does not establish frontend or execution conformance.
 
 ## Generated messages and checks
 
