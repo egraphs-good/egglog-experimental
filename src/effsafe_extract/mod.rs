@@ -429,7 +429,7 @@ struct RegionsAnnotation {
 }
 
 // `Sexp` does not implement `Clone`.
-fn clone_sexp(sexp: &Sexp) -> Sexp {
+fn clone_sexp<'a>(sexp: &Sexp<'a>) -> Sexp<'a> {
     match sexp {
         Sexp::Literal(lit, span) => Sexp::Literal(lit.clone(), span.clone()),
         Sexp::Atom(atom, span) => Sexp::Atom(atom.clone(), span.clone()),
@@ -439,7 +439,7 @@ fn clone_sexp(sexp: &Sexp) -> Sexp {
 
 /// Remove `:regions (...)` from a declaration's option list. Returns the
 /// remaining s-expressions and the positions, if the option was present.
-fn strip_regions(items: &[Sexp]) -> Result<(Vec<Sexp>, Option<Vec<i64>>), ParseError> {
+fn strip_regions<'a>(items: &[Sexp<'a>]) -> Result<(Vec<Sexp<'a>>, Option<Vec<i64>>), ParseError> {
     let Some(i) = items
         .iter()
         .position(|s| matches!(s, Sexp::Atom(a, _) if a == ":regions"))
@@ -479,11 +479,11 @@ fn regions_command(span: Span, constructor: &str, positions: &[i64]) -> Command 
 
 /// Strip `:regions` from the variant lists in `items[skip..]`, collecting an
 /// `effsafe-regions` command for each annotated variant.
-fn strip_variants(
-    items: &[Sexp],
+fn strip_variants<'a>(
+    items: &[Sexp<'a>],
     skip: usize,
     region_commands: &mut Vec<Command>,
-) -> Result<Vec<Sexp>, ParseError> {
+) -> Result<Vec<Sexp<'a>>, ParseError> {
     let mut rest = Vec::with_capacity(items.len());
     for (i, item) in items.iter().enumerate() {
         match item {
@@ -542,7 +542,7 @@ impl Macro<Vec<Command>> for RegionsAnnotation {
         };
         // Parse the plain declaration with a macro-free parser, so this macro
         // does not recurse into itself.
-        let mut items = vec![Sexp::Atom(self.head.to_string(), span.clone())];
+        let mut items = vec![Sexp::Atom(self.head.into(), span.clone())];
         items.extend(stripped);
         let mut commands = Parser::default().parse_command(&Sexp::List(items, span))?;
         commands.extend(region_commands);

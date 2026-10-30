@@ -22,7 +22,7 @@ use crate::{
     },
 };
 use egglog::{
-    ArcSort, CommandOutput, EGraph, Enode, RawValues, Read, TermId, UserDefinedCommand, Value,
+    ArcSort, CommandOutput, EGraph, Enode, Read, TermId, UserDefinedCommand, Value,
     ast::*,
     extract::{DEFAULT_COST_MODEL, DagCostModel, DefaultCost, TreeCostModelFromDag},
     span,
@@ -62,7 +62,7 @@ impl Macro<Vec<Action>> for SetCost {
         match args {
             [call, value] => {
                 let (func, args, call_span) = call.expect_call("table lookup")?;
-                let cost_table_name = get_cost_table_name(&func);
+                let cost_table_name = get_cost_table_name(func);
                 let args = map_fallible(args, parser, Parser::parse_expr)?;
                 let value = parser.parse_expr(value)?;
 
@@ -81,7 +81,7 @@ impl Macro<Vec<Action>> for SetCost {
                 // We don't create costs for nodes that don't exist.
                 actions.push(Action::Expr(
                     span.clone(),
-                    Expr::Call(call_span.clone(), func, args.clone()),
+                    Expr::Call(call_span.clone(), func.to_owned(), args.clone()),
                 ));
                 actions.push(Action::Set(span, cost_table_name, args, value));
                 Ok(actions)
@@ -239,7 +239,7 @@ impl DagCostModel<DefaultCost> for DynamicCostModel {
         let name = get_cost_table_name(func.name());
         if egraph.get_function(&name).is_some() {
             egraph
-                .read(|state| state.lookup(&name, RawValues(enode.children.to_vec())))
+                .read(|state| state.lookup(&name, enode.children))
                 .ok()
                 .flatten()
                 .map(|c| {
