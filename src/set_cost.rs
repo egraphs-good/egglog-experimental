@@ -62,7 +62,7 @@ impl Macro<Vec<Action>> for SetCost {
         match args {
             [call, value] => {
                 let (func, args, call_span) = call.expect_call("table lookup")?;
-                let cost_table_name = get_cost_table_name(&func);
+                let cost_table_name = get_cost_table_name(func);
                 let args = map_fallible(args, parser, Parser::parse_expr)?;
                 let value = parser.parse_expr(value)?;
 
@@ -81,7 +81,7 @@ impl Macro<Vec<Action>> for SetCost {
                 // We don't create costs for nodes that don't exist.
                 actions.push(Action::Expr(
                     span.clone(),
-                    Expr::Call(call_span.clone(), func, args.clone()),
+                    Expr::Call(call_span.clone(), func.to_owned(), args.clone()),
                 ));
                 actions.push(Action::Set(span, cost_table_name, args, value));
                 Ok(actions)
