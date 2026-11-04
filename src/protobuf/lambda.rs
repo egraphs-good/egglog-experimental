@@ -225,7 +225,6 @@ fn append_code(
             }
         } else {
             sort.span = None;
-            sort.doc = None;
         }
     }
     let mut sorts = vec![];

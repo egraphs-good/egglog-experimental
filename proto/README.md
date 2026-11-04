@@ -112,7 +112,8 @@ no permission to evaluate a node.
 ## Results and observations
 
 `RunProgram` streams output frames followed by completion, or a terminal error.
-Each frame owns its source files; output frames also own their node/sort arenas.
+Output frames own their node/sort arenas, without source spans or files.
+Located errors carry only their referenced file, with the span remapped to it.
 Completed outputs and effects remain visible if a later operation fails.
 Preparation checks precede execution; execution is not an atomic transaction.
 
@@ -146,6 +147,11 @@ rule values are repeated in each relevant binding. The sort arena includes all
 installed equality sorts and referenced primitive/structural types, without unused
 backend sorts. Private registration caches are omitted. No loading instruction is
 needed. Native `keep_best` compaction may unset globals; their slot types remain.
+
+Snapshots omit source spans/files, including from saved code and declarations.
+These input origins do not describe e-node derivations. A restored graph loses
+the original source locations; live input diagnostics and recorded history keep
+them.
 
 Reconstruction on a fresh compatible engine uses all snapshot logical options,
 including `execution_mode` and `seminaive`, with `cost_sort` remapped into the

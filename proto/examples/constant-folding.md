@@ -28,8 +28,9 @@ commands. Nodes, names, spans and source files are retained as emitted.
 
 Arena indices are zero-based and local to each message. Omitted scalar
 fields have protobuf defaults: for example, an omitted `sort_id` or
-span `file` means index 0. Spans use byte offsets into `files`. Comments
-label entries and are not fields. Builtins come from the backend catalog.
+span `file` means index 0. Input spans use byte offsets into `files`; successful
+results omit source metadata. Comments label entries and are not fields.
+Builtins come from the backend catalog.
 
 Create a graph with i64 cost annotations (`CreateEGraphRequest`):
 
@@ -48,7 +49,7 @@ egraph_id: 1
 threads: 1
 ```
 
-Submit the named `RunProgramRequest`:
+Submit the sourcefree `RunProgramRequest`:
 
 ```textproto
 egraph_id: 1
@@ -59,26 +60,26 @@ program {
   nodes { call { func: "Num" args: 2 } span { start: 106 end: 113 } } # nodes[3]
   nodes { call { func: "Add" args: 1 args: 3 } span { start: 93 end: 114 } } # nodes[4]
   nodes { span { start: 84 end: 115 } binding: "sum" } # nodes[5]
-  nodes { var: "__proto_source_local_0_0" span { start: 126 end: 127 } } # nodes[6]
-  nodes { sort_id: 1 var: "__proto_source_local_0_1" span { start: 138 end: 139 } } # nodes[7]
+  nodes { var: "e" span { start: 126 end: 127 } } # nodes[6]
+  nodes { sort_id: 1 var: "a" span { start: 138 end: 139 } } # nodes[7]
   nodes { call { func: "Num" args: 7 } span { start: 133 end: 140 } } # nodes[8]
-  nodes { sort_id: 1 var: "__proto_source_local_0_2" span { start: 146 end: 147 } } # nodes[9]
+  nodes { sort_id: 1 var: "b" span { start: 146 end: 147 } } # nodes[9]
   nodes { call { func: "Num" args: 9 } span { start: 141 end: 148 } } # nodes[10]
   nodes { call { func: "Add" args: 8 args: 10 } span { start: 128 end: 149 } } # nodes[11]
   nodes { union { members: 6 members: 11 } span { start: 123 end: 150 } } # nodes[12]
-  nodes { var: "__proto_source_local_0_0" span { start: 166 end: 167 } } # nodes[13]
-  nodes { sort_id: 1 var: "__proto_source_local_0_1" span { start: 176 end: 177 } } # nodes[14]
-  nodes { sort_id: 1 var: "__proto_source_local_0_2" span { start: 178 end: 179 } } # nodes[15]
+  nodes { var: "e" span { start: 166 end: 167 } } # nodes[13]
+  nodes { sort_id: 1 var: "a" span { start: 176 end: 177 } } # nodes[14]
+  nodes { sort_id: 1 var: "b" span { start: 178 end: 179 } } # nodes[15]
   nodes { sort_id: 1 call { func: "egglog.core.i64.add" args: 14 args: 15 } span { start: 173 end: 180 } } # nodes[16]
   nodes { call { func: "Num" args: 16 } span { start: 168 end: 181 } } # nodes[17]
   nodes { union { members: 13 members: 17 } span { start: 159 end: 182 } } # nodes[18]
-  nodes { var: "__proto_source_local_0_0" span { start: 202 end: 203 } } # nodes[19]
-  nodes { sort_id: 1 var: "__proto_source_local_0_1" span { start: 208 end: 209 } } # nodes[20]
-  nodes { sort_id: 1 var: "__proto_source_local_0_2" span { start: 210 end: 211 } } # nodes[21]
+  nodes { var: "e" span { start: 202 end: 203 } } # nodes[19]
+  nodes { sort_id: 1 var: "a" span { start: 208 end: 209 } } # nodes[20]
+  nodes { sort_id: 1 var: "b" span { start: 210 end: 211 } } # nodes[21]
   nodes { sort_id: 1 call { func: "egglog.core.i64.add" args: 20 args: 21 } span { start: 205 end: 212 } } # nodes[22]
-  nodes { sort_id: 1 var: "__proto_source_local_0_1" span { start: 240 end: 241 } } # nodes[23]
+  nodes { sort_id: 1 var: "a" span { start: 240 end: 241 } } # nodes[23]
   nodes { call { func: "Num" args: 23 } span { start: 235 end: 242 } } # nodes[24]
-  nodes { sort_id: 1 var: "__proto_source_local_0_2" span { start: 248 end: 249 } } # nodes[25]
+  nodes { sort_id: 1 var: "b" span { start: 248 end: 249 } } # nodes[25]
   nodes { call { func: "Num" args: 25 } span { start: 243 end: 250 } } # nodes[26]
   nodes { span { start: 292 end: 295 } binding: "sum" } # nodes[27]
   nodes { sort_id: 1 primitive_value { i64: 5 } span { start: 301 end: 302 } } # nodes[28]
@@ -187,9 +188,6 @@ output {
     }
   }
 }
-files {
-  contents: "(datatype Math\n  (Num i64)\n  (Add Math Math))\n(function value (Math) i64 :no-merge)\n(let sum (Add (Num 2) (Num 3)))\n(rule ((= e (Add (Num a) (Num b))))\n      ((union e (Num (+ a b)))\n       (set (value e) (+ a b))\n       (subsume (Add (Num a) (Num b))))\n      :name \"fold\")\n(run 1)\n(check (= sum (Num 5)) (= (value sum) 5))\n(extract sum 2)\n"
-}
 ```
 
 Extraction returns `(Num 5)` at cost 2. The request's
@@ -216,17 +214,13 @@ output {
     }
   }
 }
-files {
-  contents: "(datatype Math\n  (Num i64)\n  (Add Math Math))\n(function value (Math) i64 :no-merge)\n(let sum (Add (Num 2) (Num 3)))\n(rule ((= e (Add (Num a) (Num b))))\n      ((union e (Num (+ a b)))\n       (set (value e) (+ a b))\n       (subsume (Add (Num a) (Num b))))\n      :name \"fold\")\n(run 1)\n(check (= sum (Num 5)) (= (value sum) 5))\n(extract sum 2)\n"
-}
 ```
 
 Freeze includes declarations, saved rules, and ordinary commands
 reconstructing the data. Union nodes preserve classes and their alternatives;
 Set restores function rows, Let restores the global sum binding, and Subsume
 marks the retained Add row. The sort arena contains Math/i64. Saved code retains
-its variable binders, spans and source files. Appending saved code can repeat
-sort and source-file entries.
+its variable binders, without source spans or files.
 
 ```textproto
 output {
@@ -237,7 +231,7 @@ output {
         seminaive: true
       }
       program {
-        nodes { span { start: 84 end: 115 } binding: "sum" } # nodes[0]
+        nodes { binding: "sum" } # nodes[0]
         nodes { union { members: 5 } } # nodes[1]
         nodes { union { members: 7 } } # nodes[2]
         nodes { union { members: 9 members: 10 } } # nodes[3]
@@ -248,62 +242,51 @@ output {
         nodes { sort_id: 1 primitive_value { i64: 5 } } # nodes[8]
         nodes { call { func: "Num" args: 8 } } # nodes[9]
         nodes { call { func: "Add" args: 1 args: 2 } } # nodes[10]
-        nodes { sort_id: 2 union { members: 17 members: 18 } span { file: 1 start: 123 end: 150 } } # nodes[11]
-        nodes { sort_id: 2 union { members: 19 members: 20 } span { file: 1 start: 159 end: 182 } } # nodes[12]
-        nodes { sort_id: 3 call { func: "egglog.core.i64.add" args: 21 args: 22 } span { file: 1 start: 205 end: 212 } } # nodes[13]
-        nodes { sort_id: 2 var: "__proto_source_local_0_0" span { file: 1 start: 202 end: 203 } } # nodes[14]
-        nodes { sort_id: 2 call { func: "Num" args: 23 } span { file: 1 start: 235 end: 242 } } # nodes[15]
-        nodes { sort_id: 2 call { func: "Num" args: 24 } span { file: 1 start: 243 end: 250 } } # nodes[16]
-        nodes { sort_id: 2 var: "__proto_source_local_0_0" span { file: 1 start: 126 end: 127 } } # nodes[17]
-        nodes { sort_id: 2 call { func: "Add" args: 25 args: 26 } span { file: 1 start: 128 end: 149 } } # nodes[18]
-        nodes { sort_id: 2 var: "__proto_source_local_0_0" span { file: 1 start: 166 end: 167 } } # nodes[19]
-        nodes { sort_id: 2 call { func: "Num" args: 27 } span { file: 1 start: 168 end: 181 } } # nodes[20]
-        nodes { sort_id: 3 var: "__proto_source_local_0_1" span { file: 1 start: 208 end: 209 } } # nodes[21]
-        nodes { sort_id: 3 var: "__proto_source_local_0_2" span { file: 1 start: 210 end: 211 } } # nodes[22]
-        nodes { sort_id: 3 var: "__proto_source_local_0_1" span { file: 1 start: 240 end: 241 } } # nodes[23]
-        nodes { sort_id: 3 var: "__proto_source_local_0_2" span { file: 1 start: 248 end: 249 } } # nodes[24]
-        nodes { sort_id: 2 call { func: "Num" args: 28 } span { file: 1 start: 133 end: 140 } } # nodes[25]
-        nodes { sort_id: 2 call { func: "Num" args: 29 } span { file: 1 start: 141 end: 148 } } # nodes[26]
-        nodes { sort_id: 3 call { func: "egglog.core.i64.add" args: 30 args: 31 } span { file: 1 start: 173 end: 180 } } # nodes[27]
-        nodes { sort_id: 3 var: "__proto_source_local_0_1" span { file: 1 start: 138 end: 139 } } # nodes[28]
-        nodes { sort_id: 3 var: "__proto_source_local_0_2" span { file: 1 start: 146 end: 147 } } # nodes[29]
-        nodes { sort_id: 3 var: "__proto_source_local_0_1" span { file: 1 start: 176 end: 177 } } # nodes[30]
-        nodes { sort_id: 3 var: "__proto_source_local_0_2" span { file: 1 start: 178 end: 179 } } # nodes[31]
-        sorts { eq: "Math" span { end: 45 } } # sorts[0]
+        nodes { sort_id: 2 union { members: 17 members: 18 } } # nodes[11]
+        nodes { sort_id: 2 union { members: 19 members: 20 } } # nodes[12]
+        nodes { sort_id: 3 call { func: "egglog.core.i64.add" args: 21 args: 22 } } # nodes[13]
+        nodes { sort_id: 2 var: "e" } # nodes[14]
+        nodes { sort_id: 2 call { func: "Num" args: 23 } } # nodes[15]
+        nodes { sort_id: 2 call { func: "Num" args: 24 } } # nodes[16]
+        nodes { sort_id: 2 var: "e" } # nodes[17]
+        nodes { sort_id: 2 call { func: "Add" args: 25 args: 26 } } # nodes[18]
+        nodes { sort_id: 2 var: "e" } # nodes[19]
+        nodes { sort_id: 2 call { func: "Num" args: 27 } } # nodes[20]
+        nodes { sort_id: 3 var: "a" } # nodes[21]
+        nodes { sort_id: 3 var: "b" } # nodes[22]
+        nodes { sort_id: 3 var: "a" } # nodes[23]
+        nodes { sort_id: 3 var: "b" } # nodes[24]
+        nodes { sort_id: 2 call { func: "Num" args: 28 } } # nodes[25]
+        nodes { sort_id: 2 call { func: "Num" args: 29 } } # nodes[26]
+        nodes { sort_id: 3 call { func: "egglog.core.i64.add" args: 30 args: 31 } } # nodes[27]
+        nodes { sort_id: 3 var: "a" } # nodes[28]
+        nodes { sort_id: 3 var: "b" } # nodes[29]
+        nodes { sort_id: 3 var: "a" } # nodes[30]
+        nodes { sort_id: 3 var: "b" } # nodes[31]
+        sorts { eq: "Math" } # sorts[0]
         sorts { primitive { name: "i64" } } # sorts[1]
-        sorts { eq: "Math" span { file: 1 end: 45 } } # sorts[2]
+        sorts { eq: "Math" } # sorts[2]
         sorts { primitive { name: "i64" } } # sorts[3]
-        declarations { constructor { name: "Num" inputs { sort: 1 } } span { start: 17 end: 26 } }
-        declarations { constructor { name: "Add" inputs { } inputs { } } span { start: 29 end: 44 } }
-        declarations { function { name: "value" inputs { } output: 1 } span { start: 46 end: 83 } }
+        declarations { constructor { name: "Num" inputs { sort: 1 } } }
+        declarations { constructor { name: "Add" inputs { } inputs { } } }
+        declarations { function { name: "value" inputs { } output: 1 } }
         commands { action { term: 1 } }
         commands { action { term: 2 } }
         commands { action { term: 3 } }
         commands { action { set { target { func: "value" args: 3 } value: 8 } } }
         commands { action { subsume { func: "Add" args: 1 args: 2 } } }
         commands { let { binding: 0 value: 3 } }
-        files {
-          contents: "(datatype Math\n  (Num i64)\n  (Add Math Math))\n(function value (Math) i64 :no-merge)\n(let sum (Add (Num 2) (Num 3)))\n(rule ((= e (Add (Num a) (Num b))))\n      ((union e (Num (+ a b)))\n       (set (value e) (+ a b))\n       (subsume (Add (Num a) (Num b))))\n      :name \"fold\")\n(run 1)\n(check (= sum (Num 5)) (= (value sum) 5))\n(extract sum 2)\n"
-        }
-        files {
-          contents: "(datatype Math\n  (Num i64)\n  (Add Math Math))\n(function value (Math) i64 :no-merge)\n(let sum (Add (Num 2) (Num 3)))\n(rule ((= e (Add (Num a) (Num b))))\n      ((union e (Num (+ a b)))\n       (set (value e) (+ a b))\n       (subsume (Add (Num a) (Num b))))\n      :name \"fold\")\n(run 1)\n(check (= sum (Num 5)) (= (value sum) 5))\n(extract sum 2)\n"
-        }
         rulesets {
           value {
             rules {
               rule {
                 query: 11
-                head { term: 12 span { file: 1 start: 159 end: 182 } }
-                head { set { target { func: "value" args: 14 } value: 13 } span { file: 1 start: 190 end: 213 } }
-                head { span { file: 1 start: 221 end: 252 } subsume { func: "Add" args: 15 args: 16 } }
+                head { term: 12 }
+                head { set { target { func: "value" args: 14 } value: 13 } }
+                head { subsume { func: "Add" args: 15 args: 16 } }
               }
               name: "fold"
               eval_mode: RULE_EVAL_MODE_SEMINAIVE
-              span {
-                file: 1
-                start: 116
-                end: 273
-              }
             }
           }
         }
@@ -313,9 +296,6 @@ output {
       path: 4
     }
   }
-}
-files {
-  contents: "(datatype Math\n  (Num i64)\n  (Add Math Math))\n(function value (Math) i64 :no-merge)\n(let sum (Add (Num 2) (Num 3)))\n(rule ((= e (Add (Num a) (Num b))))\n      ((union e (Num (+ a b)))\n       (set (value e) (+ a b))\n       (subsume (Add (Num a) (Num b))))\n      :name \"fold\")\n(run 1)\n(check (= sum (Num 5)) (= (value sum) 5))\n(extract sum 2)\n"
 }
 ```
 

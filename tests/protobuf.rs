@@ -21975,14 +21975,16 @@ fn source_rule_locals_do_not_escape_into_later_declarations() {
     let text = r#"
         (datatype E (Num i64))
         (function observed () i64 :merge new)
+        (function observed_second () i64 :merge new)
         (let captured 7)
         (ruleset r)
         (rule ((= e (Num x)) (= x captured)) ((set (observed) x)) :ruleset r :name "keep")
+        (rule ((= e (Num a)) (= b (+ a 1))) ((set (observed_second) b)) :ruleset r :name "second")
         (function x () i64 :merge new)
         (function __proto_source_local_0_0 () i64 :merge new)
         (Num 7)
         (run r 1)
-        (check (= (observed) 7))
+        (check (= (observed) 7) (= (observed_second) 8))
         (extract (observed))
     "#;
     new_experimental_egraph()
@@ -21995,14 +21997,34 @@ fn source_rule_locals_do_not_escape_into_later_declarations() {
     let mut extracted = None;
     for program in Source::new(Some("locals.egg".into()), text).unwrap() {
         let program = pb::Program::decode(program.unwrap().encode_to_vec().as_slice()).unwrap();
+        let names = program
+            .nodes
+            .iter()
+            .filter_map(|node| match &node.kind {
+                Some(pb::node::Kind::Var(name)) => Some(name.as_str()),
+                _ => None,
+            })
+            .collect::<std::collections::HashSet<_>>();
+        for name in ["e", "x", "a", "b"] {
+            assert!(
+                names.contains(name),
+                "authored variable {name} remains readable"
+            );
+        }
+        assert!(
+            !names
+                .iter()
+                .any(|name| name.starts_with("__proto_source_local_"))
+        );
+        assert_eq!(program.rulesets[0].value.as_ref().unwrap().rules.len(), 2);
         let response = run(&mut engine, id, program.clone());
         assert_eq!(response.error, None);
         rendered
             .parse_and_run_program(None, &renderer.render(&program).unwrap())
             .unwrap();
-        if let Some(rule) = inline_rules(&program).first() {
-            assert_eq!(rule.name.as_deref(), Some("keep"));
-            assert!(rule.span.is_some());
+        for rule in inline_rules(&program) {
+            assert!(matches!(rule.name.as_deref(), Some("keep" | "second")));
+            assert!(rule.span.is_some(), "input origins remain intact");
         }
         for output in &response.output.outputs {
             if let Some(pb::command_output::Kind::Extraction(result)) = &output.kind {

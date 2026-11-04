@@ -252,7 +252,6 @@ struct SourceScope {
     rulesets: HashMap<String, SourceRuleset>,
     relations: HashSet<String>,
     schedulers: HashSet<String>,
-    local_prefix: String,
 }
 
 /// A source stream whose authored declarations, expressions and rules become
@@ -275,7 +274,6 @@ pub struct Source {
     relations: HashSet<String>,
     // Names only: the producer must never instantiate or run a scheduler.
     schedulers: HashSet<String>,
-    local_prefix: String,
     cost_origins: std::sync::Arc<std::sync::Mutex<crate::set_cost::CostOrigins>>,
     // Expanded once, then retained across an ambient-binding boundary.
     pending_expansion: Option<(Vec<Command>, Option<String>, bool)>,
@@ -743,7 +741,6 @@ pub(crate) fn primitive_definition(
             rulesets: HashMap::new(),
             relations: HashSet::new(),
             schedulers: HashSet::new(),
-            local_prefix: String::new(),
             cost_origins: Default::default(),
             pending_expansion: None,
             ambient_runs: HashSet::new(),
@@ -824,23 +821,6 @@ impl Source {
             .into_iter()
             .map(|command| (command, 0))
             .collect();
-        // Rules are revalidated when their fixed theory is published. A local
-        // source name may legally become a function name in the meantime. Pick
-        // a namespace disjoint from parsed declarations and variable bindings,
-        // not from a raw-source substring test (strings are not identifiers).
-        let mut local_prefix = "__proto_source_local_".to_string();
-        for (command, _) in &commands {
-            let mut avoid = |name: String| {
-                while name.starts_with(&local_prefix) {
-                    local_prefix.push('_');
-                }
-                name
-            };
-            command
-                .clone()
-                .map_string_symbols(&mut avoid)
-                .map_symbols(&mut |head| head, &mut avoid);
-        }
         Ok(Self {
             dialect,
             mode: None,
@@ -863,7 +843,6 @@ impl Source {
             )]),
             relations: HashSet::new(),
             schedulers: HashSet::new(),
-            local_prefix,
             cost_origins,
             pending_expansion: None,
             ambient_runs: HashSet::new(),
@@ -973,18 +952,6 @@ impl Source {
                         Ok(commands) => commands,
                         Err(error) => break Err(error.to_string()),
                     };
-                    for command in &commands {
-                        let mut avoid = |name: String| {
-                            while name.starts_with(&self.local_prefix) {
-                                self.local_prefix.push('_');
-                            }
-                            name
-                        };
-                        command
-                            .clone()
-                            .map_string_symbols(&mut avoid)
-                            .map_symbols(&mut |head| head, &mut avoid);
-                    }
                     for command in commands.into_iter().rev() {
                         self.commands.push_front((command, depth + 1));
                     }
@@ -999,7 +966,6 @@ impl Source {
                             rulesets: self.rulesets.clone(),
                             relations: self.relations.clone(),
                             schedulers: self.schedulers.clone(),
-                            local_prefix: self.local_prefix.clone(),
                         });
                     }
                     break Ok(Submission::Push(count));
@@ -1018,7 +984,6 @@ impl Source {
                         self.rulesets = saved.rulesets;
                         self.relations = saved.relations;
                         self.schedulers = saved.schedulers;
-                        self.local_prefix = saved.local_prefix;
                     }
                     break Ok(Submission::Pop { count, span });
                 }
@@ -2640,21 +2605,8 @@ impl Source {
         }) {
             return Err(egglog::Error::RuleAlreadyExists(duplicate, rule.span).to_string());
         }
-        // Native source-position shadowing checks have already run. Rename only
-        // resolved locals, consistently across query/head; globals are captured
-        // separately below. ResolvedVar equality ignores is_global_ref,
-        // so it must not be used as the key for this derived lowering map.
-        let mut locals = HashMap::new();
-        let rule = rule.map_symbols(&mut |call| call, &mut |mut var| {
-            if !var.is_global_ref {
-                let next = locals.len();
-                var.name = locals
-                    .entry(var.name)
-                    .or_insert_with(|| format!("{}{}_{next}", self.local_prefix, self.rules.len()))
-                    .clone();
-            }
-            var
-        });
+        // Keep the authored local names in the portable rule. The shared
+        // wire-to-native lowering makes binders private at their native use.
         // Binding reads remain explicit globals. The common backend lowering
         // retains their pre-head values for every producer.
         let mut aliases = HashMap::new();

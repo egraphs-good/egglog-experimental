@@ -215,7 +215,7 @@ message Program {
 
   repeated Command commands = 5;
 
-  // Optional provenance. Omit spans for a normalized/unlocated program.
+  // Input/history provenance. Snapshot Programs omit spans and files.
   repeated SourceFile files = 6;
 
   // Complete persistent binding replacements, with unique names in this batch.
@@ -235,8 +235,8 @@ message SourceFile {
 }
 
 // A byte range. Resolve `file` against the nearest arena-owning payload's
-// `files`: `Program`, `BuiltinCatalog`, `CreateEGraphRequest`, `RunProgramResponse`, or
-// a nested exported `Program`. Re-emission must remap or include those files,
+// `files`: an input/history `Program`, `BuiltinCatalog`, `CreateEGraphRequest`,
+// or an error `RunProgramResponse`. Re-emission must remap or include those files,
 // or strip spans, including origins from definitions installed by earlier requests;
 // dangling indices are invalid. The range is half-open [start, end), with
 // start <= end. If contents are present, both offsets must be UTF-8 character
@@ -1175,7 +1175,8 @@ enum Extractor {
 }
 
 // Export complete logical options and a reconstruction Program; no filtering.
-// Returns CommandOutput.snapshot; its Program owns nodes, sorts and source files.
+// Returns CommandOutput.snapshot; its Program owns nodes and sorts, without
+// source spans or files, including in saved code and definitions.
 // This is current state, not request history or an engine checkpoint: omit
 // scheduler instances, execution cursors, caches, reports, proof history and
 // host resources. Preserve execution_mode, but reconstruction does not preserve
@@ -1383,7 +1384,7 @@ message CreateEGraphResponse {
   uint64 threads = 2 [(buf.validate.field).uint64.gte = 1];
 }
 
-// Portable logical state with all arenas/files owned by program, including
+// Portable logical state with all arenas owned by program, including
 // the concrete cost sort C selected by options. Builtin patterns remain in
 // GetBuiltins. For fresh-handle restoration, remap C's closed backend sort graph
 // into CreateEGraphRequest, choose receiver resources, then execute program on
@@ -1391,8 +1392,21 @@ message CreateEGraphResponse {
 // admission is preserved; scheduler/delta state, query plans and runtime
 // resource/planner settings are not resumed. Execution against an existing
 // handle follows ordinary Program semantics; restoration equivalence requires
-// compatible options.
+// compatible options. Original input spans/files are omitted: this is not
+// derivation provenance, and restoration does not restore source locations.
 message EGraphSnapshot {
+  option (buf.validate.message).cel = {
+    id: "egraph_snapshot.source_free"
+    message: "snapshots omit source spans and files"
+    expression:
+      "size(this.program.files) == 0 && "
+      "this.program.nodes.all(n, !has(n.span)) && "
+      "this.program.sorts.all(s, !has(s.span)) && "
+      "this.program.declarations.all(d, !has(d.span)) && "
+      "this.program.commands.all(c, !has(c.span) && (!has(c.action) || !has(c.action.span))) && "
+      "this.program.rulesets.all(b, b.value.rules.all(r, !has(r.span) && "
+      "(!has(r.rule) || r.rule.head.all(a, !has(a.span)))))"
+  };
   option (buf.validate.message).cel = {
     id: "egraph_snapshot.cost_sort_in_range"
     message: "options.cost_sort must index a non-variable sort in program"
@@ -1457,20 +1471,32 @@ message RunProgramRequest {
 // Cancellation preserves completed effects and outputs. It is cooperative at
 // command boundaries and does not roll back.
 message RunProgramResponse {
+  option (buf.validate.message).cel = {
+    id: "run_program_response.error_source"
+    message: "only a located error carries its one referenced source file"
+    expression:
+      "has(this.error) && has(this.error.span) ? "
+      "size(this.files) == 1 && this.error.span.file == uint(0) : size(this.files) == 0"
+  };
   oneof result {
     option (buf.validate.oneof).required = true;
     RunProgramOutput output = 1;
     Error error = 2;
   }
-  // Origins for this frame's payload, including definitions installed earlier.
-  // Nested exported Programs own their files independently.
+  // A located error's source file, including definitions installed earlier.
+  // Error.span.file is remapped to zero. Successful frames carry no files.
   repeated SourceFile files = 3;
 }
 
 // One completed output batch with self-contained node and sort arenas.
-// Spans index the enclosing RunProgramResponse.files. Earlier success frames
-// remain valid when a later terminal frame reports an error.
+// Successful data and saved code carry no source spans or files. Earlier
+// success frames remain valid when a later terminal frame reports an error.
 message RunProgramOutput {
+  option (buf.validate.message).cel = {
+    id: "run_program_output.source_free"
+    message: "successful observations omit source spans"
+    expression: "this.nodes.all(n, !has(n.span)) && this.sorts.all(s, !has(s.span))"
+  };
   option (buf.validate.message).cel = {
     id: "run_program_output.closed_sorts"
     message: "response sorts cannot contain signature variables"

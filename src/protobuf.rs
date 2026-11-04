@@ -38,6 +38,7 @@ mod freeze;
 pub(crate) mod graph;
 mod history;
 mod lambda;
+mod output;
 mod proof;
 mod report;
 mod rules;
@@ -61,17 +62,13 @@ struct OutputStream<'a> {
 }
 
 impl OutputStream<'_> {
-    fn flush(
-        &mut self,
-        response: &mut pb::RunProgramOutput,
-        context: &RequestOccurrences,
-    ) -> Result<(), egglog::Error> {
+    fn flush(&mut self, response: &mut pb::RunProgramOutput) -> Result<(), egglog::Error> {
         if !response.outputs.is_empty() {
             self.cancelled = (self.emit)(pb::RunProgramResponse {
                 result: Some(pb::run_program_response::Result::Output(std::mem::take(
                     response,
                 ))),
-                files: context.files.clone(),
+                files: vec![],
             })
             .is_break();
         }
@@ -539,6 +536,7 @@ impl Engine {
         request: pb::RunProgramRequest,
         emit: &mut dyn FnMut(pb::RunProgramResponse) -> ControlFlow<()>,
     ) -> Result<(), TransportError> {
+        let mut emit = |frame| emit(output::source_free_response(frame));
         let original = self
             .histories
             .contains_key(&request.egraph_id)
@@ -593,7 +591,7 @@ impl Engine {
                 if !response.outputs.is_empty() {
                     let _ = emit(pb::RunProgramResponse {
                         result: Some(pb::run_program_response::Result::Output(response)),
-                        files: files.clone(),
+                        files: vec![],
                     });
                 }
                 let _ = emit(pb::RunProgramResponse {
@@ -605,7 +603,7 @@ impl Engine {
         };
         context.diagnostics = request.diagnostics;
         let mut stream = OutputStream {
-            emit,
+            emit: &mut emit,
             cancelled: false,
         };
         let mut failure = None;
@@ -659,7 +657,7 @@ impl Engine {
                 // the actual error or invalidate the already-completed prefix.
                 let _ = (stream.emit)(pb::RunProgramResponse {
                     result: Some(pb::run_program_response::Result::Output(response)),
-                    files: context.files.clone(),
+                    files: vec![],
                 });
             }
             let _ = (stream.emit)(pb::RunProgramResponse {
@@ -667,14 +665,9 @@ impl Engine {
                 files: context.files,
             });
         } else {
-            let files = if response.outputs.is_empty() {
-                vec![]
-            } else {
-                context.files
-            };
             let _ = (stream.emit)(pb::RunProgramResponse {
                 result: Some(pb::run_program_response::Result::Output(response)),
-                files,
+                files: vec![],
             });
         }
         Ok(())
@@ -2338,7 +2331,7 @@ impl Session {
                 location: Some(location.clone()),
             });
         }
-        stream.flush(response, context)
+        stream.flush(response)
     }
 }
 
@@ -2928,7 +2921,7 @@ impl ControlContext for WireSchedule<'_, '_> {
                     kind: Some(pb::command_output::Kind::Snapshot(snapshot)),
                     location: Some(location),
                 });
-                self.stream.flush(self.response, self.context)?;
+                self.stream.flush(self.response)?;
             }
             return Ok(ControlReport::default());
         }
@@ -2940,7 +2933,7 @@ impl ControlContext for WireSchedule<'_, '_> {
                     kind: Some(pb::command_output::Kind::Diagnostic(diagnostic)),
                     location: Some(location),
                 });
-                self.stream.flush(self.response, self.context)?;
+                self.stream.flush(self.response)?;
             }
             return Ok(ControlReport::default());
         }
@@ -3035,7 +3028,7 @@ impl ControlContext for WireSchedule<'_, '_> {
             }),
         );
         if !self.suppressed {
-            self.stream.flush(self.response, self.context)?;
+            self.stream.flush(self.response)?;
         }
         if result.is_err() && self.measurements.borrow().failure.is_none() {
             let span = match &node.kind {
@@ -10934,6 +10927,15 @@ mod tests {
             &rules[0].candidate.record.files,
             &rules[1].candidate.record.files
         ));
+        assert_eq!(rules[0].candidate.record.files[0].name, "shared.egg");
+        assert_eq!(
+            rules[0].candidate.record.files[0]
+                .contents
+                .as_ref()
+                .unwrap()
+                .len(),
+            100_000
+        );
         assert!(
             rules
                 .iter()
@@ -10956,15 +10958,10 @@ mod tests {
         };
         let program = snapshot.program.as_ref().unwrap();
         assert_eq!(graph::rules(program).count(), 2);
-        assert_eq!(
-            program.files.len(),
-            1,
-            "all rules reuse their owned submission provenance"
-        );
+        assert!(program.files.is_empty());
         for rule in graph::rules(program) {
-            let file = &program.files[rule.span.unwrap().file as usize];
-            assert_eq!(file.name, "shared.egg");
-            assert_eq!(file.contents.as_ref().unwrap().len(), 100_000);
+            assert!(rule.span.is_none());
+            assert!(matches!(rule.name.as_deref(), Some("first" | "second")));
         }
     }
 
