@@ -3711,7 +3711,7 @@ impl Renderer {
         for sorts in [&definitions.sorts, &lowered.sorts] {
             for (index, sort) in sorts.iter().enumerate() {
                 if !matches!(&sort.kind,
-                Some(pb::sort::Kind::Application(family)) if !family.args.is_empty())
+                Some(pb::sort::Kind::Primitive(family)) if !family.args.is_empty())
                     && !matches!(&sort.kind, Some(pb::sort::Kind::Func(_)))
                 {
                     continue;
@@ -4078,7 +4078,7 @@ fn render_prepared(
         for sort in &program.sorts {
             match &sort.kind {
                 Some(pb::sort::Kind::Eq(name)) => names.push(name.as_str()),
-                Some(pb::sort::Kind::Application(family)) => names.push(family.name.as_str()),
+                Some(pb::sort::Kind::Primitive(family)) => names.push(family.name.as_str()),
                 Some(pb::sort::Kind::Var(_) | pb::sort::Kind::Func(_)) => (),
                 _ => return Err("unsupported source sort".into()),
             }

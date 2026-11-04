@@ -64,7 +64,7 @@ impl SortRef {
         Ok(Self(publish(
             pb::Program {
                 sorts: vec![pb::Sort {
-                    kind: Some(pb::sort::Kind::Application(pb::SortApplication {
+                    kind: Some(pb::sort::Kind::Primitive(pb::PrimitiveSortRef {
                         name: definition.name.clone(),
                         args,
                     })),
@@ -99,7 +99,7 @@ impl SortRef {
             pending.push((record.clone(), true));
             match &record.sort().unwrap().kind {
                 Some(pb::sort::Kind::Eq(_)) => {}
-                Some(pb::sort::Kind::Application(f)) => {
+                Some(pb::sort::Kind::Primitive(f)) => {
                     let declaration =
                         record.declaration(&f.name, DeclarationKind::PrimitiveSort)?;
                     let d = declaration.primitive_sort()?;
@@ -156,7 +156,7 @@ impl SortRef {
                     bindings.insert(*index, actual);
                 }
                 (Some(pb::sort::Kind::Eq(p)), Some(pb::sort::Kind::Eq(a))) if p == a => {}
-                (Some(pb::sort::Kind::Application(p)), Some(pb::sort::Kind::Application(a)))
+                (Some(pb::sort::Kind::Primitive(p)), Some(pb::sort::Kind::Primitive(a)))
                     if p.name == a.name && p.args.len() == a.args.len() =>
                 {
                     for (p, a) in p.args.iter().zip(&a.args) {
@@ -230,7 +230,7 @@ impl PartialEq for SortRef {
             match (&a.sort().unwrap().kind, &b.sort().unwrap().kind) {
                 (Some(pb::sort::Kind::Eq(a)), Some(pb::sort::Kind::Eq(b))) if a == b => {}
                 (Some(pb::sort::Kind::Var(a)), Some(pb::sort::Kind::Var(b))) if a == b => {}
-                (Some(pb::sort::Kind::Application(fa)), Some(pb::sort::Kind::Application(fb)))
+                (Some(pb::sort::Kind::Primitive(fa)), Some(pb::sort::Kind::Primitive(fb)))
                     if fa.name == fb.name && fa.args.len() == fb.args.len() =>
                 {
                     for (ia, ib) in fa.args.iter().zip(&fb.args) {
@@ -278,7 +278,7 @@ impl Hash for SortRef {
             if !finish {
                 assert!(active.insert(key), "cyclic sort");
                 pending.push((record.clone(), true));
-                if let pb::sort::Kind::Application(f) = kind {
+                if let pb::sort::Kind::Primitive(f) = kind {
                     for child in f.args.iter().rev() {
                         pending.push((record.resolve(Arena::Sort, *child).unwrap(), false));
                     }
@@ -299,7 +299,7 @@ impl Hash for SortRef {
                     1u8.hash(&mut hash);
                     index.hash(&mut hash);
                 }
-                pb::sort::Kind::Application(f) => {
+                pb::sort::Kind::Primitive(f) => {
                     2u8.hash(&mut hash);
                     f.name.hash(&mut hash);
                     f.args.len().hash(&mut hash);

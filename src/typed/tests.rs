@@ -567,7 +567,7 @@ fn typed_table_actions_preserve_exact_wire_operands_and_real_execution() {
         .create(
             &pb::CreateEGraphRequest {
                 sorts: vec![pb::Sort {
-                    kind: Some(pb::sort::Kind::Application(pb::SortApplication {
+                    kind: Some(pb::sort::Kind::Primitive(pb::PrimitiveSortRef {
                         name: "i64".into(),
                         args: vec![],
                     })),
@@ -1217,7 +1217,7 @@ fn namespace_fragment(imported: bool, reversed: bool, missing: Option<Declaratio
                 ..Default::default()
             },
             pb::Sort {
-                kind: Some(pb::sort::Kind::Application(pb::SortApplication {
+                kind: Some(pb::sort::Kind::Primitive(pb::PrimitiveSortRef {
                     name: "Shared".into(),
                     args: vec![0],
                 })),
@@ -1468,7 +1468,7 @@ fn family_sort_comparison_resolves_slots_not_raw_indices() {
         publish(
             pb::Program {
                 sorts: vec![pb::Sort {
-                    kind: Some(pb::sort::Kind::Application(pb::SortApplication {
+                    kind: Some(pb::sort::Kind::Primitive(pb::PrimitiveSortRef {
                         name: "Vec".into(),
                         args: vec![1],
                     })),
@@ -1757,7 +1757,7 @@ fn grouped_builtin_demands_retain_every_tail_position() {
             assert_eq!(arg.name, format!("item{position}"));
             assert!(
                 matches!(&demand.resolve(Arena::Sort,arg.sort).unwrap().sort().unwrap().kind,
-                Some(pb::sort::Kind::Application(f)) if f.name == name)
+                Some(pb::sort::Kind::Primitive(f)) if f.name == name)
             );
         }
     }

@@ -288,10 +288,10 @@ fn generate(
         }
         let concrete = program.sorts.iter().take(native_sort_count).position(|s| {
             matches!(&s.kind,
-            Some(pb::sort::Kind::Application(f)) if f.name == family.name && f.args.is_empty())
+            Some(pb::sort::Kind::Primitive(f)) if f.name == family.name && f.args.is_empty())
         });
         for (i, sort) in program.sorts.iter().enumerate() {
-            if matches!(&sort.kind, Some(pb::sort::Kind::Application(f)) if f.name == family.name && f.args.is_empty())
+            if matches!(&sort.kind, Some(pb::sort::Kind::Primitive(f)) if f.name == family.name && f.args.is_empty())
             {
                 types.insert(i as u32, name.clone());
             }
@@ -806,7 +806,7 @@ fn rust_type(
                 return Err("cyclic Rust sort pattern".into());
             }
             pending.push((index, true));
-            if let pb::sort::Kind::Application(f) = kind {
+            if let pb::sort::Kind::Primitive(f) = kind {
                 pending.extend(f.args.iter().rev().map(|child| (*child, false)));
             } else if let pb::sort::Kind::Func(f) = kind {
                 pending.extend(
@@ -824,7 +824,7 @@ fn rust_type(
                 .get(*i as usize)
                 .ok_or("unbound Rust type parameter")?
                 .clone(),
-            pb::sort::Kind::Application(f) => {
+            pb::sort::Kind::Primitive(f) => {
                 if !matches!(
                     f.name.as_str(),
                     "i64"
@@ -1162,7 +1162,7 @@ fn emit_generic_views(
                 referenced.insert(*index);
             }
             pb::sort::Kind::Var(_) => return Err("unbound generic parameter".into()),
-            pb::sort::Kind::Application(family) => pending.extend(&family.args),
+            pb::sort::Kind::Primitive(family) => pending.extend(&family.args),
             pb::sort::Kind::Func(function) => {
                 pending.extend(&function.params);
                 pending.push(function.result);
@@ -1239,7 +1239,7 @@ fn emit_generic_views(
                                 .get_mut(*i as usize)
                                 .ok_or("unbound Rust type parameter")? = true
                         }
-                        Some(pb::sort::Kind::Application(f)) => pending.extend(&f.args),
+                        Some(pb::sort::Kind::Primitive(f)) => pending.extend(&f.args),
                         Some(pb::sort::Kind::Func(f)) => {
                             pending.extend(f.params.iter().chain([&f.result]))
                         }
@@ -1280,12 +1280,12 @@ fn emit_generic_views(
             let Some(owner) = view.owner_sort.as_ref() else {
                 return Err("generic Rust view requires a family owner".into());
             };
-            let Some(pb::sort::Kind::Application(family)) = program
+            let Some(pb::sort::Kind::Primitive(family)) = program
                 .sorts
                 .get(owner.root as usize)
                 .and_then(|s| s.kind.as_ref())
             else {
-                return Err("generic Rust owner must be a family application".into());
+                return Err("generic Rust owner must be a primitive sort reference".into());
             };
             if !matches!(
                 family.name.as_str(),
@@ -1452,10 +1452,10 @@ fn emit_generic_views(
             _ => None,
         };
         if let Some(expected) = data_family {
-            let Some(pb::sort::Kind::Application(family)) =
+            let Some(pb::sort::Kind::Primitive(family)) =
                 &program.sorts[signature.output.unwrap() as usize].kind
             else {
-                return Err("data constructor must return a family application".into());
+                return Err("data constructor must return a primitive sort reference".into());
             };
             let fixed = if primitive.name == "egglog.core.pair.make"
                 || primitive.name == "egglog.experimental.maybe.some"

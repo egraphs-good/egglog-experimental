@@ -13,7 +13,7 @@ fn create(engine: &mut Engine, recording: bool) -> u64 {
         .create(
             &pb::CreateEGraphRequest {
                 sorts: vec![pb::Sort {
-                    kind: Some(pb::sort::Kind::Application(pb::SortApplication {
+                    kind: Some(pb::sort::Kind::Primitive(pb::PrimitiveSortRef {
                         name: "i64".into(),
                         args: vec![],
                     })),
@@ -216,7 +216,7 @@ fn stream_and_buffer_preserve_prefix_before_exclusive_terminal_error() {
         sorts: ["i64", "Unit"]
             .into_iter()
             .map(|name| pb::Sort {
-                kind: Some(pb::sort::Kind::Application(pb::SortApplication {
+                kind: Some(pb::sort::Kind::Primitive(pb::PrimitiveSortRef {
                     name: name.into(),
                     args: vec![],
                 })),

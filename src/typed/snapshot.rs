@@ -544,7 +544,7 @@ impl fmt::Display for SortRef {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match &self.0.sort().unwrap().kind {
             Some(pb::sort::Kind::Eq(name)) => f.write_str(name),
-            Some(pb::sort::Kind::Application(family)) => {
+            Some(pb::sort::Kind::Primitive(family)) => {
                 if family.args.is_empty() {
                     return f.write_str(&family.name);
                 }
@@ -619,7 +619,7 @@ mod tests {
                 program: Some(pb::Program {
                     sorts: vec![
                         pb::Sort {
-                            kind: Some(pb::sort::Kind::Application(pb::SortApplication {
+                            kind: Some(pb::sort::Kind::Primitive(pb::PrimitiveSortRef {
                                 name: "i64".into(),
                                 args: vec![],
                             })),
@@ -630,7 +630,7 @@ mod tests {
                             ..Default::default()
                         },
                         pb::Sort {
-                            kind: Some(pb::sort::Kind::Application(pb::SortApplication {
+                            kind: Some(pb::sort::Kind::Primitive(pb::PrimitiveSortRef {
                                 name: "Opaque".into(),
                                 args: vec![],
                             })),

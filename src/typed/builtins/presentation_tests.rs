@@ -654,7 +654,7 @@ fn assert_locations(program: &pb::BuiltinCatalog, mapping: &RustPresentation, so
         }
     }
     for (index, sort) in program.sorts.iter().enumerate() {
-        let Some(pb::sort::Kind::Application(f)) = &sort.kind else {
+        let Some(pb::sort::Kind::Primitive(f)) = &sort.kind else {
             continue;
         };
         if !f.args.is_empty()
@@ -746,7 +746,7 @@ fn native_records_determine_paths_locations_and_argument_order() {
     changed.sorts.reverse();
     for sort in &mut changed.sorts {
         match &mut sort.kind {
-            Some(pb::sort::Kind::Application(f)) => {
+            Some(pb::sort::Kind::Primitive(f)) => {
                 for i in &mut f.args {
                     *i = last - *i
                 }
@@ -838,21 +838,21 @@ fn local_type_fragments_import_missing_closures_and_reject_invalid_graphs() {
     let graph = Arc::new(pb::BuiltinCatalog {
         sorts: vec![
             pb::Sort {
-                kind: Some(pb::sort::Kind::Application(pb::SortApplication {
+                kind: Some(pb::sort::Kind::Primitive(pb::PrimitiveSortRef {
                     name: "i64".into(),
                     args: vec![],
                 })),
                 ..Default::default()
             },
             pb::Sort {
-                kind: Some(pb::sort::Kind::Application(pb::SortApplication {
+                kind: Some(pb::sort::Kind::Primitive(pb::PrimitiveSortRef {
                     name: "f64".into(),
                     args: vec![],
                 })),
                 ..Default::default()
             },
             pb::Sort {
-                kind: Some(pb::sort::Kind::Application(pb::SortApplication {
+                kind: Some(pb::sort::Kind::Primitive(pb::PrimitiveSortRef {
                     name: "Pair".into(),
                     args: vec![0, 1],
                 })),
@@ -876,7 +876,7 @@ fn local_type_fragments_import_missing_closures_and_reject_invalid_graphs() {
     drop(joined);
     drop(local);
     assert!(
-        matches!(&owner.graph.sorts[owner.root as usize].kind, Some(pb::sort::Kind::Application(f)) if f.name == "Pair" && f.args.len() == 2)
+        matches!(&owner.graph.sorts[owner.root as usize].kind, Some(pb::sort::Kind::Primitive(f)) if f.name == "Pair" && f.args.len() == 2)
     );
     mapping.callables.get_mut("egglog.core.i64.abs").unwrap()[0]
         .owner_sort
@@ -891,7 +891,7 @@ fn local_type_fragments_import_missing_closures_and_reject_invalid_graphs() {
     );
     let cyclic = Arc::new(pb::BuiltinCatalog {
         sorts: vec![pb::Sort {
-            kind: Some(pb::sort::Kind::Application(pb::SortApplication {
+            kind: Some(pb::sort::Kind::Primitive(pb::PrimitiveSortRef {
                 name: "Vec".into(),
                 args: vec![0],
             })),
@@ -968,7 +968,7 @@ fn native_vec_views_drive_generic_members_and_relocated_declarations() {
         .core_input = Some(1);
     assert!(generate(&program, &local).is_err());
     let mut changed = program.clone();
-    let integer=changed.sorts.iter().position(|s|matches!(&s.kind,Some(pb::sort::Kind::Application(f))if f.name=="i64"&&f.args.is_empty())).unwrap()as u32;
+    let integer=changed.sorts.iter().position(|s|matches!(&s.kind,Some(pb::sort::Kind::Primitive(f))if f.name=="i64"&&f.args.is_empty())).unwrap()as u32;
     let p = changed
         .primitives
         .iter_mut()
@@ -979,7 +979,7 @@ fn native_vec_views_drive_generic_members_and_relocated_declarations() {
     assert!(checked_source(&changed, &mapping).contains("-> self::I64"));
     let graph = Arc::new(pb::BuiltinCatalog {
         sorts: vec![pb::Sort {
-            kind: Some(pb::sort::Kind::Application(pb::SortApplication {
+            kind: Some(pb::sort::Kind::Primitive(pb::PrimitiveSortRef {
                 name: "i64".into(),
                 args: vec![],
             })),

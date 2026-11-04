@@ -5,7 +5,7 @@ fn anonymous_arithmetic(captured: i64) -> pb::Program {
     pb::Program {
         sorts: vec![
             pb::Sort {
-                kind: Some(pb::sort::Kind::Application(pb::SortApplication {
+                kind: Some(pb::sort::Kind::Primitive(pb::PrimitiveSortRef {
                     name: "i64".into(),
                     args: vec![],
                 })),
@@ -578,9 +578,13 @@ fn anonymous_lambda_bodies_retain_native_context_admission() {
             panic!("body fixture")
         };
         let body = *body;
-        let integer = program.sorts.iter().position(|sort| {
-            matches!(&sort.kind, Some(pb::sort::Kind::Application(a)) if a.name == "i64")
-        }).unwrap() as u32;
+        let integer = program
+            .sorts
+            .iter()
+            .position(
+                |sort| matches!(&sort.kind, Some(pb::sort::Kind::Primitive(a)) if a.name == "i64"),
+            )
+            .unwrap() as u32;
         let function = program.sorts.len() as u32;
         program.sorts.push(pb::Sort {
             kind: Some(pb::sort::Kind::Func(pb::FuncSort {

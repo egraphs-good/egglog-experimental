@@ -546,7 +546,7 @@ fn remaining_scalar_catalog_preserves_closed_providers() {
                 s.inputs[0].sort
             };
             let other = catalog.sorts.iter().position(|sort| matches!(&sort.kind,
-                Some(proto::sort::Kind::Application(f)) if f.args.is_empty() && f.name != names[if mutation == "output" {names.len()-1} else {0}])).unwrap() as u32;
+                Some(proto::sort::Kind::Primitive(f)) if f.args.is_empty() && f.name != names[if mutation == "output" {names.len()-1} else {0}])).unwrap() as u32;
             assert_ne!(other, index);
             match mutation {
                 "input" => s.inputs[0].sort = other,
@@ -602,7 +602,7 @@ fn remaining_scalar_generic_catalog_preserves_homogeneous_providers() {
             Some(proto::sort::Kind::Var(0))
         );
         assert!(
-            matches!(&catalog.sorts[signature.output.unwrap() as usize].kind, Some(proto::sort::Kind::Application(f)) if f.name == output && f.args.is_empty())
+            matches!(&catalog.sorts[signature.output.unwrap() as usize].kind, Some(proto::sort::Kind::Primitive(f)) if f.name == output && f.args.is_empty())
         );
         for name in [
             "i64", "bool", "f64", "String", "BigInt", "BigRat", "Unit", "Item", "Items", "Ints",
@@ -766,7 +766,7 @@ fn inequality_catalog_uses_one_generic_registration() {
     );
     assert!(
         matches!(&catalog.definitions.sorts[signature.output.unwrap() as usize].kind,
-        Some(proto::sort::Kind::Application(f)) if f.name == "Unit" && f.args.is_empty())
+        Some(proto::sort::Kind::Primitive(f)) if f.name == "Unit" && f.args.is_empty())
     );
     assert!(
         !catalog
@@ -1012,7 +1012,7 @@ fn closed_i64_catalog_preserves_signatures_aliases_and_borrowed_views() {
     let float = program
         .sorts
         .iter()
-        .position(|s| matches!(&s.kind, Some(proto::sort::Kind::Application(f)) if f.name == "f64"))
+        .position(|s| matches!(&s.kind, Some(proto::sort::Kind::Primitive(f)) if f.name == "f64"))
         .unwrap() as u32;
     for (key, alias, output) in [
         ("sub", "-", "i64"),
@@ -1327,7 +1327,7 @@ fn exact_integer_families_and_constructors_use_actual_native_providers() {
             .zip(inputs.iter().copied().chain([output]))
         {
             assert!(
-                matches!(&catalog.definitions.sorts[sort as usize].kind, Some(proto::sort::Kind::Application(f)) if f.name == name && f.args.is_empty())
+                matches!(&catalog.definitions.sorts[sort as usize].kind, Some(proto::sort::Kind::Primitive(f)) if f.name == name && f.args.is_empty())
             );
         }
         let sorts = inputs
@@ -1385,14 +1385,14 @@ fn annotated_builtins_resolve_in_the_nonexecuting_authoring_context() {
         let program = proto::Program {
             sorts: vec![
                 proto::Sort {
-                    kind: Some(proto::sort::Kind::Application(proto::SortApplication {
+                    kind: Some(proto::sort::Kind::Primitive(proto::PrimitiveSortRef {
                         name: "i64".into(),
                         args: vec![],
                     })),
                     ..Default::default()
                 },
                 proto::Sort {
-                    kind: Some(proto::sort::Kind::Application(proto::SortApplication {
+                    kind: Some(proto::sort::Kind::Primitive(proto::PrimitiveSortRef {
                         name: "Vec".into(),
                         args: vec![0],
                     })),
@@ -1579,20 +1579,19 @@ fn flat_map_export_packs_existing_refs_without_native_pair_vec_aliases() {
         assert_eq!(signature.type_param_count, 2);
         assert_eq!(signature.inputs.len(), 1);
         assert!(signature.varargs.is_empty());
-        let Some(proto::sort::Kind::Application(vector)) =
+        let Some(proto::sort::Kind::Primitive(vector)) =
             &catalog.sorts[signature.inputs[0].sort as usize].kind
         else {
             panic!("Vec<Pair<K, V>> signature input")
         };
         assert_eq!(vector.name, "Vec");
         assert_eq!(vector.args.len(), 1);
-        let Some(proto::sort::Kind::Application(pair)) =
-            &catalog.sorts[vector.args[0] as usize].kind
+        let Some(proto::sort::Kind::Primitive(pair)) = &catalog.sorts[vector.args[0] as usize].kind
         else {
             panic!("Pair<K, V> signature element")
         };
         assert_eq!(pair.name, "Pair");
-        let Some(proto::sort::Kind::Application(map)) =
+        let Some(proto::sort::Kind::Primitive(map)) =
             &catalog.sorts[signature.output.unwrap() as usize].kind
         else {
             panic!("Map<K, V> signature result")
@@ -1630,14 +1629,13 @@ fn map_catalog_precedes_instances_and_uses_one_vec_of_pairs_input() {
             };
             assert_eq!(signature.inputs.len(), 1);
             assert!(signature.varargs.is_empty());
-            let Some(proto::sort::Kind::Application(vec)) =
+            let Some(proto::sort::Kind::Primitive(vec)) =
                 &before.sorts[signature.inputs[0].sort as usize].kind
             else {
                 panic!("Vec")
             };
             assert_eq!(vec.name, "Vec");
-            let Some(proto::sort::Kind::Application(pair)) =
-                &before.sorts[vec.args[0] as usize].kind
+            let Some(proto::sort::Kind::Primitive(pair)) = &before.sorts[vec.args[0] as usize].kind
             else {
                 panic!("Pair")
             };
@@ -1791,11 +1789,11 @@ fn resolved_call_export_checks_direct_annotations_and_preserves_ordinary_calls()
         for wrong in [
             proto::sort::Kind::Eq("i64".into()),
             proto::sort::Kind::Var(0),
-            proto::sort::Kind::Application(proto::SortApplication {
+            proto::sort::Kind::Primitive(proto::PrimitiveSortRef {
                 name: "f64".into(),
                 args: vec![],
             }),
-            proto::sort::Kind::Application(proto::SortApplication {
+            proto::sort::Kind::Primitive(proto::PrimitiveSortRef {
                 name: "Vec".into(),
                 args: vec![0],
             }),
@@ -1833,7 +1831,7 @@ fn resolved_call_export_checks_direct_annotations_and_preserves_ordinary_calls()
     };
     let mut source = proto::Program {
         sorts: vec![proto::Sort {
-            kind: Some(proto::sort::Kind::Application(proto::SortApplication {
+            kind: Some(proto::sort::Kind::Primitive(proto::PrimitiveSortRef {
                 name: "i64".into(),
                 args: vec![],
             })),
@@ -2387,12 +2385,12 @@ fn family_registration_uses_presort_despite_same_named_nominal_sort() {
         wrong.sorts[index as usize].kind =
             Some(match wrong.sorts[index as usize].kind.as_ref().unwrap() {
                 proto::sort::Kind::Eq(name) => {
-                    proto::sort::Kind::Application(proto::SortApplication {
+                    proto::sort::Kind::Primitive(proto::PrimitiveSortRef {
                         name: name.clone(),
                         args: vec![],
                     })
                 }
-                proto::sort::Kind::Application(f) => proto::sort::Kind::Eq(f.name.clone()),
+                proto::sort::Kind::Primitive(f) => proto::sort::Kind::Eq(f.name.clone()),
                 _ => unreachable!(),
             });
         assert!(
@@ -2688,7 +2686,7 @@ fn pair_definitions_precede_instances_and_preserve_nominal_overloads() {
                 .sorts
                 .iter()
                 .position(
-                    |s| matches!(&s.kind, Some(proto::sort::Kind::Application(f)) if f.name == "Pair"),
+                    |s| matches!(&s.kind, Some(proto::sort::Kind::Primitive(f)) if f.name == "Pair"),
                 )
                 .unwrap() as u32,
         ];
@@ -2697,7 +2695,7 @@ fn pair_definitions_precede_instances_and_preserve_nominal_overloads() {
             inputs.into_iter().map(|i| patterns[i]).collect::<Vec<_>>()
         );
         assert_eq!(s.output, Some(patterns[output]));
-        let Some(proto::sort::Kind::Application(f)) = &definition.sorts[patterns[2] as usize].kind
+        let Some(proto::sort::Kind::Primitive(f)) = &definition.sorts[patterns[2] as usize].kind
         else {
             unreachable!()
         };
@@ -2757,7 +2755,7 @@ fn pair_definitions_precede_instances_and_preserve_nominal_overloads() {
         .export_sort(graph.get_sort_by_name("Nested").unwrap(), &mut sorts)
         .unwrap();
     assert!(
-        matches!(&sorts[nested as usize].kind, Some(proto::sort::Kind::Application(f)) if f.name == "Pair" && f.args.len() == 2)
+        matches!(&sorts[nested as usize].kind, Some(proto::sort::Kind::Primitive(f)) if f.name == "Pair" && f.args.len() == 2)
     );
     let i = graph.get_sort_by_name("i64").unwrap();
     let s = graph.get_sort_by_name("String").unwrap();
@@ -3425,7 +3423,7 @@ fn generic_signature_import_remaps_children_and_ignores_binder_labels() {
 fn program_primitive_reconciliation_checks_body_scope_and_identity() {
     let source = proto::Program {
         sorts: vec![proto::Sort {
-            kind: Some(proto::sort::Kind::Application(proto::SortApplication {
+            kind: Some(proto::sort::Kind::Primitive(proto::PrimitiveSortRef {
                 name: "i64".into(),
                 args: vec![],
             })),
@@ -3492,7 +3490,7 @@ fn program_primitive_reconciliation_checks_body_scope_and_identity() {
             "noncanonical" => candidate.nodes[0].kind = Some(proto::node::Kind::Var("_00".into())),
             "sort" => {
                 candidate.sorts.push(proto::Sort {
-                    kind: Some(proto::sort::Kind::Application(proto::SortApplication {
+                    kind: Some(proto::sort::Kind::Primitive(proto::PrimitiveSortRef {
                         name: "bool".into(),
                         args: vec![],
                     })),

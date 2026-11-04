@@ -970,7 +970,7 @@ impl ProtoRun {
         let mut engine = Engine::default();
         let request = pb::CreateEGraphRequest {
             sorts: vec![pb::Sort {
-                kind: Some(pb::sort::Kind::Application(pb::SortApplication {
+                kind: Some(pb::sort::Kind::Primitive(pb::PrimitiveSortRef {
                     name: "i64".into(),
                     args: vec![],
                 })),
@@ -1536,7 +1536,7 @@ impl FrozenDecoder<'_> {
                         self.response.output.sorts
                             .get(node.sort_id as usize)
                             .and_then(|sort| sort.kind.as_ref()),
-                        Some(pb::sort::Kind::Application(family))
+                        Some(pb::sort::Kind::Primitive(family))
                             if family.name == expected && family.args.is_empty()
                     ) {
                         return Err("extraction oracle exact numeric payload/sort mismatch".into());
@@ -1714,7 +1714,7 @@ fn partial_call_oracle_case(setup: &str) -> Result<PartialCallOracleCase, String
         .create(
             &pb::CreateEGraphRequest {
                 sorts: vec![pb::Sort {
-                    kind: Some(pb::sort::Kind::Application(pb::SortApplication {
+                    kind: Some(pb::sort::Kind::Primitive(pb::PrimitiveSortRef {
                         name: "i64".into(),
                         args: vec![],
                     })),
@@ -1915,7 +1915,7 @@ fn partial_call_oracle_trials() -> Vec<Trial> {
                         assert!(matches!(&adapter.nodes[index as usize].kind, Some(pb::node::Kind::Var(actual)) if actual == name));
                     }
                     assert_eq!(call.args.len(), 2);
-                    assert!(matches!(&adapter.sorts[primitive.output as usize].kind, Some(pb::sort::Kind::Application(family)) if family.name == "i64" && family.args.is_empty()));
+                    assert!(matches!(&adapter.sorts[primitive.output as usize].kind, Some(pb::sort::Kind::Primitive(family)) if family.name == "i64" && family.args.is_empty()));
                     // The checked concrete helper is installed in the independent native oracle.
                     let text = format!("(primitive {} (Unary i64) i64 (unstable-app _0 _1))", primitive.name);
                     case.native.parse_and_run_program(None, &text).map_err(|error| error.to_string())?;
@@ -2047,7 +2047,7 @@ fn partial_call_oracle_trials() -> Vec<Trial> {
                 output: pb::RunProgramOutput {
                     sorts: vec![
                         pb::Sort {
-                            kind: Some(pb::sort::Kind::Application(pb::SortApplication {
+                            kind: Some(pb::sort::Kind::Primitive(pb::PrimitiveSortRef {
                                 name: "i64".into(),
                                 args: vec![],
                             })),
@@ -2150,7 +2150,7 @@ fn partial_call_oracle_trials() -> Vec<Trial> {
                     sorts: vec![
                         response.output.sorts[0].clone(),
                         pb::Sort {
-                            kind: Some(pb::sort::Kind::Application(pb::SortApplication {
+                            kind: Some(pb::sort::Kind::Primitive(pb::PrimitiveSortRef {
                                 name: "Map".into(),
                                 args: vec![0, 0],
                             })),
@@ -2267,7 +2267,7 @@ fn public_callable_oracle_trial() -> Trial {
             .create(
                 &pb::CreateEGraphRequest {
                     sorts: vec![pb::Sort {
-                        kind: Some(pb::sort::Kind::Application(pb::SortApplication {
+                        kind: Some(pb::sort::Kind::Primitive(pb::PrimitiveSortRef {
                             name: "i64".into(),
                             args: vec![],
                         })),
@@ -2296,7 +2296,7 @@ fn public_callable_oracle_trial() -> Trial {
                     assert_eq!(constructor.inputs.len(), 1);
                     assert!(
                         matches!(&program.sorts[constructor.inputs[0].sort as usize].kind,
-                        Some(pb::sort::Kind::Application(family)) if family.name == "i64" && family.args.is_empty())
+                        Some(pb::sort::Kind::Primitive(family)) if family.name == "i64" && family.args.is_empty())
                     );
                     assert!(matches!(
                         &program.sorts[constructor.output as usize].kind,
@@ -2434,7 +2434,7 @@ fn multi_extract_oracle_trial() -> Trial {
             .create(
                 &pb::CreateEGraphRequest {
                     sorts: vec![pb::Sort {
-                        kind: Some(pb::sort::Kind::Application(pb::SortApplication {
+                        kind: Some(pb::sort::Kind::Primitive(pb::PrimitiveSortRef {
                             name: "i64".into(),
                             args: vec![],
                         })),
@@ -2477,7 +2477,7 @@ fn multi_extract_oracle_trial() -> Trial {
                     ..Default::default()
                 },
                 pb::Sort {
-                    kind: Some(pb::sort::Kind::Application(pb::SortApplication {
+                    kind: Some(pb::sort::Kind::Primitive(pb::PrimitiveSortRef {
                         name: "i64".into(),
                         args: vec![],
                     })),

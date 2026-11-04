@@ -139,7 +139,7 @@ fn sort_refs(
     mut visit: impl FnMut(&mut u32) -> Result<(), String>,
 ) -> Result<(), String> {
     match &mut sort.kind {
-        Some(pb::sort::Kind::Application(family)) => {
+        Some(pb::sort::Kind::Primitive(family)) => {
             for index in &mut family.args {
                 visit(index)?;
             }
@@ -419,7 +419,7 @@ mod tests {
             }],
 
             sorts: vec![pb::Sort {
-                kind: Some(pb::sort::Kind::Application(pb::SortApplication {
+                kind: Some(pb::sort::Kind::Primitive(pb::PrimitiveSortRef {
                     name: "i64".into(),
                     args: vec![],
                 })),

@@ -365,8 +365,8 @@ pub(super) fn container_kind(
     sort: &ArcSort,
     wire_sort: &pb::Sort,
 ) -> Result<ContainerKind, String> {
-    let Some(pb::sort::Kind::Application(family)) = &wire_sort.kind else {
-        return Err("container requires an application sort".into());
+    let Some(pb::sort::Kind::Primitive(family)) = &wire_sort.kind else {
+        return Err("container requires a primitive sort".into());
     };
     let (kind, arity) = match (family.name.as_str(), sort.value_type()) {
         ("Vec", Some(t)) if t == TypeId::of::<egglog::sort::VecContainer>() => {
@@ -405,8 +405,8 @@ pub(super) fn container_payload(
 ) -> Result<pb::primitive_value::Value, String> {
     use pb::primitive_value::Value as V;
     let kind = container_kind(sort, wire_sort)?;
-    let Some(pb::sort::Kind::Application(family)) = &wire_sort.kind else {
-        unreachable!("admitted application sort")
+    let Some(pb::sort::Kind::Primitive(family)) = &wire_sort.kind else {
+        unreachable!("admitted primitive sort")
     };
     let arity = family.args.len();
     if children.iter().enumerate().any(|(index, child)| {

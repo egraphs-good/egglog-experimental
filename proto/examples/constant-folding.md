@@ -40,7 +40,7 @@ Create a graph with i64 cost annotations (`CreateEGraphRequest`):
 
 ```textproto
 sorts {
-  application {
+  primitive {
     name: "i64"
   }
 }
@@ -65,7 +65,7 @@ The empty ruleset name selects the default group.
 # Manually authored equivalent request; this is not a raw Source dump.
 egraph_id: 1
 program {
-  sorts { application { name: "i64" } } # sorts[0]
+  sorts { primitive { name: "i64" } } # sorts[0]
   sorts { eq: "Math" }                  # sorts[1]
 
   nodes { primitive_value { i64: 2 } }                           # nodes[0]
@@ -150,7 +150,7 @@ output {
   nodes { primitive_value { i64: 5 } } # nodes[0]
   nodes { sort_id: 1 call { func: "Num" args: 0 } } # nodes[1]
   nodes { primitive_value { i64: 2 } } # nodes[2]
-  sorts { application { name: "i64" } } # sorts[0]
+  sorts { primitive { name: "i64" } } # sorts[0]
   sorts { eq: "Math" } # sorts[1]
   outputs {
     extraction {
@@ -212,18 +212,18 @@ output {
         nodes { sort_id: 10 call { func: "Num" args: 12 } } # nodes[17]
         nodes { sort_id: 11 var: "a" } # nodes[18]
         nodes { sort_id: 11 var: "b" } # nodes[19]
-        sorts { application { name: "i64" } } # sorts[0]
+        sorts { primitive { name: "i64" } } # sorts[0]
         sorts { eq: "Math" } # sorts[1]
-        sorts { application { name: "String" } } # sorts[2]
-        sorts { application { name: "PyObject" } } # sorts[3]
-        sorts { application { name: "Unit" } } # sorts[4]
-        sorts { application { name: "BigRat" } } # sorts[5]
-        sorts { application { name: "bool" } } # sorts[6]
-        sorts { application { name: "f64" } } # sorts[7]
-        sorts { application { name: "Rational" } } # sorts[8]
-        sorts { application { name: "BigInt" } } # sorts[9]
+        sorts { primitive { name: "String" } } # sorts[2]
+        sorts { primitive { name: "PyObject" } } # sorts[3]
+        sorts { primitive { name: "Unit" } } # sorts[4]
+        sorts { primitive { name: "BigRat" } } # sorts[5]
+        sorts { primitive { name: "bool" } } # sorts[6]
+        sorts { primitive { name: "f64" } } # sorts[7]
+        sorts { primitive { name: "Rational" } } # sorts[8]
+        sorts { primitive { name: "BigInt" } } # sorts[9]
         sorts { eq: "Math" } # sorts[10]
-        sorts { application { name: "i64" } } # sorts[11]
+        sorts { primitive { name: "i64" } } # sorts[11]
         declarations { eq_sort { name: "Math" } }
         declarations { constructor { name: "Num" inputs { } output: 1 } }
         declarations { constructor { name: "Add" inputs { sort: 1 } inputs { sort: 1 } output: 1 } }

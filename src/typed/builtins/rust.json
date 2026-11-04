@@ -1,37 +1,37 @@
 {
   "sorts": [
     {
-      "application": {
+      "primitive": {
         "name": "BigInt"
       }
     },
     {
-      "application": {
+      "primitive": {
         "name": "bool"
       }
     },
     {
-      "application": {
+      "primitive": {
         "name": "i64"
       }
     },
     {
-      "application": {
+      "primitive": {
         "name": "String"
       }
     },
     {
-      "application": {
+      "primitive": {
         "name": "Unit"
       }
     },
     {
-      "application": {
+      "primitive": {
         "name": "BigRat"
       }
     },
     {
-      "application": {
+      "primitive": {
         "name": "f64"
       }
     },
@@ -42,7 +42,7 @@
       "var": 1
     },
     {
-      "application": {
+      "primitive": {
         "args": [
           7,
           8
@@ -51,7 +51,7 @@
       }
     },
     {
-      "application": {
+      "primitive": {
         "args": [
           7,
           8
@@ -60,7 +60,7 @@
       }
     },
     {
-      "application": {
+      "primitive": {
         "args": [
           10
         ],
@@ -68,7 +68,7 @@
       }
     },
     {
-      "application": {
+      "primitive": {
         "args": [
           7
         ],
@@ -101,7 +101,7 @@
       }
     },
     {
-      "application": {
+      "primitive": {
         "args": [
           8
         ],
@@ -126,7 +126,7 @@
       }
     },
     {
-      "application": {
+      "primitive": {
         "args": [
           12
         ],
@@ -134,7 +134,7 @@
       }
     },
     {
-      "application": {
+      "primitive": {
         "args": [
           7
         ],
@@ -142,7 +142,7 @@
       }
     },
     {
-      "application": {
+      "primitive": {
         "args": [
           7
         ],
@@ -150,7 +150,7 @@
       }
     },
     {
-      "application": {
+      "primitive": {
         "args": [
           8
         ],
@@ -158,7 +158,7 @@
       }
     },
     {
-      "application": {
+      "primitive": {
         "args": [
           2
         ],
@@ -179,7 +179,7 @@
       }
     },
     {
-      "application": {
+      "primitive": {
         "args": [
           7
         ],
@@ -192,12 +192,12 @@
       }
     },
     {
-      "application": {
+      "primitive": {
         "name": "Rational"
       }
     },
     {
-      "application": {
+      "primitive": {
         "args": [
           8,
           8

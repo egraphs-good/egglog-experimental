@@ -88,7 +88,7 @@ message Program {
     message: "sort children must index sorts"
     expression:
       "this.sorts.all(s, "
-      "(has(s.application) ? s.application.args : "
+      "(has(s.primitive) ? s.primitive.args : "
       "has(s.func) ? s.func.params + [s.func.result] : [])"
       ".all(i, i < uint(size(this.sorts))))"
   };
@@ -177,9 +177,9 @@ message Program {
       ".all(i, i < uint(size(this.nodes)) && "
       "(!has(this.nodes[int(i)].call) || "
       "this.nodes[int(i)].sort_id >= uint(size(this.sorts)) || "
-      "!has(this.sorts[int(this.nodes[int(i)].sort_id)].application) || "
-      "this.sorts[int(this.nodes[int(i)].sort_id)].application.name != 'Unit' || "
-      "size(this.sorts[int(this.nodes[int(i)].sort_id)].application.args) != 0 || "
+      "!has(this.sorts[int(this.nodes[int(i)].sort_id)].primitive) || "
+      "this.sorts[int(this.nodes[int(i)].sort_id)].primitive.name != 'Unit' || "
+      "size(this.sorts[int(this.nodes[int(i)].sort_id)].primitive.args) != 0 || "
       "!this.nodes[int(i)].call.args.all(a, a < uint(size(this.nodes))) || "
       "!this.declarations.exists(d, has(d.relation) && "
       "d.relation.name == this.nodes[int(i)].call.func && "
@@ -247,9 +247,9 @@ message Span {
 // Closed sorts are structurally interned: equal container/function shapes
 // denote the same sort. GenericSignature variables are binder-local; shared
 // patterns never share substitutions between signatures or calls.
-// Sorts are acyclic through SortApplication.args and FuncSort.params/result.
+// Sorts are acyclic through PrimitiveSortRef.args and FuncSort.params/result.
 // CEL checks direct indices, not acyclicity or nested variable scope.
-// References do not declare sorts: eq resolves a user EqSort; application
+// References do not declare sorts: eq resolves a user EqSort; primitive
 // resolves a configured-backend PrimitiveSort from GetBuiltins. These nominal
 // namespaces are distinct even when names have the same spelling.
 // Missing names and family-arity mismatches are errors. Builtin references need
@@ -260,7 +260,7 @@ message Sort {
     option (buf.validate.oneof).required = true;
 
     string eq = 1 [(buf.validate.field).string.min_len = 1];
-    SortApplication application = 2;
+    PrimitiveSortRef primitive = 2;
     FuncSort func = 4;
     uint32 var = 7; // index into the enclosing GenericSignature binder
   }
@@ -270,16 +270,16 @@ message Sort {
   Span span = 5;
 }
 
-// A primitive-sort application: no args for i64/Unit, or e.g. Vec<i64> and
+// A primitive-sort reference: no args for i64/Unit, or e.g. Vec<i64> and
 // Map<String, Math>. Arg count equals declared family arity, including zero.
 // Args may be patterns only in a GenericSignature; otherwise
 // recursively closed. Primitive sorts are not equality sorts.
-message SortApplication {
+message PrimitiveSortRef {
   string name = 1 [(buf.validate.field).string.min_len = 1];
   repeated uint32 args = 2 [packed = true]; // index into the enclosing `sorts`
 }
 
-// A structural function type, not a PrimitiveSort application. Its parameter and
+// A structural function type, separate from PrimitiveSortRef. Its parameter and
 // result sorts may be patterns in a GenericSignature;
 // otherwise closed.
 message FuncSort {
@@ -464,7 +464,7 @@ message Lambda {
 // arms retain their exact payloads: f64_bits preserves IEEE-754 bits,
 // while Egglog equality identifies signed zeroes and all NaN bit patterns.
 // BigInt/BigRat/Rational and vec/set/multiset/map/pair/maybe use their matching
-// SortApplication family applications; lambda/partial_call use FuncSort.
+// PrimitiveSortRef family applications; lambda/partial_call use FuncSort.
 // CustomValue supports other primitive sorts, including nullary families with value children.
 // Verify payload/sort agreement and child types; CEL checks their indices only.
 //
@@ -572,7 +572,7 @@ message MaybeValue {
 // For primitive sorts without a dedicated PrimitiveValue arm. The exact enclosing
 // sort selects the codec and its valid arg arity/sorts; no separate type tag.
 // A nullary family may still have value args (e.g. PyObject); these are not
-// SortApplication's type args and need not have the same arity.
+// PrimitiveSortRef's type args and need not have the same arity.
 // All Egglog references are explicit args. Payload bytes may refer to arg slots,
 // never arena/class indices, engine Value IDs or raw process pointers. Traversal,
 // rebuilding and remapping must rewrite args regardless of sort kind, without
@@ -797,7 +797,7 @@ message BuiltinCatalog {
     id: "builtin_catalog.sort_references"
     message: "sort children must index the catalog sort arena"
     expression:
-      "this.sorts.all(s, (has(s.application) ? s.application.args : "
+      "this.sorts.all(s, (has(s.primitive) ? s.primitive.args : "
       "has(s.func) ? s.func.params + [s.func.result] : []).all(i, i < uint(size(this.sorts))))"
   };
   option (buf.validate.message).cel = {
@@ -816,7 +816,7 @@ message BuiltinCatalog {
 }
 
 // A backend-provided sort family, including nullary scalar sorts. Every
-// application uses SortApplication, with exactly arity arguments.
+// reference uses PrimitiveSortRef, with exactly arity arguments.
 message PrimitiveSort {
   string name = 1 [(buf.validate.field).string.min_len = 1];
   uint32 arity = 2;
@@ -841,7 +841,7 @@ message Primitive {
 // arguments remain flat, with no tuple/group node. Sort indices reference
 // BuiltinCatalog.sorts.
 // Sort.var indices bind in [0, type_param_count), without parameter names or
-// kind constraints. All uses, including nested SortApplication and FuncSort
+// kind constraints. All uses, including nested PrimitiveSortRef and FuncSort
 // patterns, must be in this signature's binder. Each actual call
 // matches all concrete argument and result sorts structurally to obtain one
 // consistent, complete substitution across all repetitions and the result.
@@ -1309,7 +1309,7 @@ message CreateEGraphRequest {
     message: "sort children must index sorts"
     expression:
       "this.sorts.all(s, "
-      "(has(s.application) ? s.application.args : "
+      "(has(s.primitive) ? s.primitive.args : "
       "has(s.func) ? s.func.params + [s.func.result] : [])"
       ".all(i, i < uint(size(this.sorts))))"
   };
@@ -1463,7 +1463,7 @@ message RunProgramOutput {
     message: "sort children must index sorts"
     expression:
       "this.sorts.all(s, "
-      "(has(s.application) ? s.application.args : "
+      "(has(s.primitive) ? s.primitive.args : "
       "has(s.func) ? s.func.params + [s.func.result] : [])"
       ".all(i, i < uint(size(this.sorts))))"
   };

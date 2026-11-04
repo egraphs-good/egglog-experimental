@@ -146,7 +146,7 @@ impl Expr {
     // normalization belong to the receiving engine, never this data factory.
     pub(super) fn container(sort: SortRef, children: Vec<Self>) -> Result<Self, TypedError> {
         use pb::primitive_value::Value as V;
-        let Some(pb::sort::Kind::Application(family)) = &sort.0.sort()?.kind else {
+        let Some(pb::sort::Kind::Primitive(family)) = &sort.0.sort()?.kind else {
             return Err(TypedError::Invalid(
                 "container requires a family sort".into(),
             ));
@@ -636,7 +636,7 @@ impl Expr {
             }
         };
         let sort = self.0.resolve(Arena::Sort, node.sort_id)?;
-        let Some(pb::sort::Kind::Application(f)) = &sort.sort().unwrap().kind else {
+        let Some(pb::sort::Kind::Primitive(f)) = &sort.sort().unwrap().kind else {
             return Err(TypedError::Decode(format!(
                 "{family} payload/sort mismatch"
             )));
@@ -668,7 +668,7 @@ impl Expr {
     pub(super) fn maybe_value(&self, element: &SortRef) -> Result<Option<Self>, TypedError> {
         let node = &self.0.owner.as_ref().unwrap().program().unwrap().nodes[self.0.index as usize];
         let sort = self.0.resolve(Arena::Sort, node.sort_id)?;
-        let Some(pb::sort::Kind::Application(family)) = &sort.sort().unwrap().kind else {
+        let Some(pb::sort::Kind::Primitive(family)) = &sort.sort().unwrap().kind else {
             return Err(TypedError::Decode("Maybe payload/sort mismatch".into()));
         };
         if family.name != "Maybe"
@@ -706,7 +706,7 @@ impl Expr {
         let owner = self.0.owner.as_ref().unwrap();
         let node = &owner.program().unwrap().nodes[self.0.index as usize];
         let sort = self.0.resolve(Arena::Sort, node.sort_id)?;
-        let Some(pb::sort::Kind::Application(family)) = &sort.sort().unwrap().kind else {
+        let Some(pb::sort::Kind::Primitive(family)) = &sort.sort().unwrap().kind else {
             return Err(TypedError::Decode("Pair payload/sort mismatch".into()));
         };
         if family.name != "Pair" || family.args.len() != 2 {
@@ -750,7 +750,7 @@ impl Expr {
     ) -> Result<Vec<[Self; 2]>, TypedError> {
         let node = &self.0.owner.as_ref().unwrap().program().unwrap().nodes[self.0.index as usize];
         let sort = self.0.resolve(Arena::Sort, node.sort_id)?;
-        let Some(pb::sort::Kind::Application(family)) = &sort.sort().unwrap().kind else {
+        let Some(pb::sort::Kind::Primitive(family)) = &sort.sort().unwrap().kind else {
             return Err(TypedError::Decode("Map payload/sort mismatch".into()));
         };
         if family.name != "Map" || family.args.len() != 2 {
@@ -831,7 +831,7 @@ impl Expr {
                 Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
                     value: Some(pb::primitive_value::Value::Maybe(maybe)),
                 })) => {
-                    let Some(pb::sort::Kind::Application(f)) = &sort.0.sort().unwrap().kind else {
+                    let Some(pb::sort::Kind::Primitive(f)) = &sort.0.sort().unwrap().kind else {
                         return Err(TypedError::Decode("Maybe payload/sort mismatch".into()));
                     };
                     if f.name != "Maybe" || f.args.len() != 1 {
@@ -852,7 +852,7 @@ impl Expr {
                 Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
                     value: Some(pb::primitive_value::Value::Map(map)),
                 })) => {
-                    let Some(pb::sort::Kind::Application(f)) = &sort.0.sort().unwrap().kind else {
+                    let Some(pb::sort::Kind::Primitive(f)) = &sort.0.sort().unwrap().kind else {
                         return Err(TypedError::Decode("Map payload/sort mismatch".into()));
                     };
                     if f.name != "Map" || f.args.len() != 2 {
@@ -883,7 +883,7 @@ impl Expr {
                 Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
                     value: Some(pb::primitive_value::Value::Pair(pair)),
                 })) => {
-                    let Some(pb::sort::Kind::Application(f)) = &sort.0.sort().unwrap().kind else {
+                    let Some(pb::sort::Kind::Primitive(f)) = &sort.0.sort().unwrap().kind else {
                         return Err(TypedError::Decode("Pair payload/sort mismatch".into()));
                     };
                     if f.name != "Pair" || f.args.len() != 2 {
@@ -924,7 +924,7 @@ impl Expr {
                     } else {
                         "Vec"
                     };
-                    let Some(pb::sort::Kind::Application(f)) = &sort.0.sort().unwrap().kind else {
+                    let Some(pb::sort::Kind::Primitive(f)) = &sort.0.sort().unwrap().kind else {
                         return Err(TypedError::Decode(format!(
                             "{family} payload/sort mismatch"
                         )));
@@ -1559,7 +1559,7 @@ pub(super) fn validate_literal(
     sort: &SortRef,
     value: &pb::PrimitiveValue,
 ) -> Result<(), TypedError> {
-    if let Some(pb::sort::Kind::Application(family)) = &sort.0.sort().unwrap().kind
+    if let Some(pb::sort::Kind::Primitive(family)) = &sort.0.sort().unwrap().kind
         && family.args.is_empty()
     {
         return crate::protobuf::value::Scalar::decode(Some(&family.name), value)

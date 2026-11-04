@@ -13,7 +13,7 @@ def table_response(rows):
     """Own both response arenas and the required output locations."""
     return ir.RunProgramOutput(
         sorts=[
-            ir.Sort(kind=Oneof("application", ir.SortApplication(name="Unit"))),
+            ir.Sort(kind=Oneof("primitive", ir.PrimitiveSortRef(name="Unit"))),
             ir.Sort(kind=Oneof("eq", "E")),
         ],
         nodes=[ir.Node(sort_id=0, kind=Oneof(

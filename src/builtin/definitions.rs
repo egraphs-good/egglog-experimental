@@ -557,7 +557,7 @@ fn retain_imported_closures(p: &mut pb::Program, previous: &pb::Program) -> Resu
         if let Some(s) = s.span {
             files.insert(s.file);
         }
-        if let Some(pb::sort::Kind::Application(f)) = &s.kind {
+        if let Some(pb::sort::Kind::Primitive(f)) = &s.kind {
             pending.extend(&f.args);
         } else if let Some(pb::sort::Kind::Func(f)) = &s.kind {
             pending.extend(&f.params);
@@ -609,7 +609,7 @@ fn retain_imported_closures(p: &mut pb::Program, previous: &pb::Program) -> Resu
         if let Some(span) = &mut s.span {
             span.file = file_map[span.file as usize].unwrap();
         }
-        if let Some(pb::sort::Kind::Application(f)) = &mut s.kind {
+        if let Some(pb::sort::Kind::Primitive(f)) = &mut s.kind {
             for i in &mut f.args {
                 *i = sort_map[*i as usize].unwrap();
             }
@@ -669,7 +669,7 @@ fn pattern_scope(p: &pb::Program, index: u32, parameters: usize) -> Result<(), S
             pb::sort::Kind::Var(i) if *i as usize >= parameters => {
                 return Err("unbound signature sort parameter".into());
             }
-            pb::sort::Kind::Application(f) => {
+            pb::sort::Kind::Primitive(f) => {
                 pending.extend(&f.args);
             }
             pb::sort::Kind::Eq(_) | pb::sort::Kind::Var(_) => (),

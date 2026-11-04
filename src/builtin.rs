@@ -25,7 +25,7 @@ pub fn signature_sorts(
     signature.inputs.iter().chain(&signature.varargs).map(|arg| arg.sort).chain(std::iter::once(signature.output.ok_or("missing builtin result sort")?)).map(|index| {
         let sort = program.sorts.get(index as usize).ok_or("builtin signature sort index out of bounds")?;
         match &sort.kind {
-            Some(pb::sort::Kind::Application(family)) if family.args.is_empty() && !family.name.is_empty() => Ok(family.name.clone()),
+            Some(pb::sort::Kind::Primitive(family)) if family.args.is_empty() && !family.name.is_empty() => Ok(family.name.clone()),
             _ => Err("builtin signature requires a symbolic-family compiler beyond this scalar slice".into()),
         }
     }).collect()
@@ -75,7 +75,7 @@ fn export_pattern(pattern: &SortPattern, sorts: &mut Vec<pb::Sort>) -> Result<u3
             pb::sort::Kind::Var(u32::try_from(*index).map_err(|_| "too many parameters")?)
         }
         SortPattern::Eq(name) => pb::sort::Kind::Eq(name.clone()),
-        SortPattern::Family { name, args } => pb::sort::Kind::Application(pb::SortApplication {
+        SortPattern::Family { name, args } => pb::sort::Kind::Primitive(pb::PrimitiveSortRef {
             name: name.clone(),
             args: args
                 .iter()
@@ -116,7 +116,7 @@ fn native_pattern(sorts: &[pb::Sort], index: u32, depth: usize) -> Result<SortPa
         {
             pb::sort::Kind::Var(index) => SortPattern::Param(*index as usize),
             pb::sort::Kind::Eq(name) => SortPattern::Eq(name.clone()),
-            pb::sort::Kind::Application(family) => SortPattern::Family {
+            pb::sort::Kind::Primitive(family) => SortPattern::Family {
                 name: family.name.clone(),
                 args: family
                     .args
@@ -240,8 +240,8 @@ pub fn project_description(description: &BuiltinDescription) -> Result<pb::Built
         .sorts
         .iter()
         .filter_map(|sort| match &sort.kind {
-            Some(pb::sort::Kind::Application(application)) => {
-                Some((application.name.clone(), application.args.len() as u32))
+            Some(pb::sort::Kind::Primitive(primitive)) => {
+                Some((primitive.name.clone(), primitive.args.len() as u32))
             }
             _ => None,
         })
@@ -902,7 +902,7 @@ pub fn import_sort(
             .ok_or("sort index out of bounds")?
             .clone();
         match sort.kind.as_mut().ok_or("missing sort kind")? {
-            pb::sort::Kind::Application(family) => {
+            pb::sort::Kind::Primitive(family) => {
                 if family.name.is_empty() {
                     return Err("empty host family name".into());
                 }
@@ -983,7 +983,7 @@ pub(crate) fn normalized_signature(
             pb::sort::Kind::Var(index) if *index >= signature.type_param_count => {
                 return Err("unbound builtin type parameter".into());
             }
-            pb::sort::Kind::Application(family) => pending.extend(&family.args),
+            pb::sort::Kind::Primitive(family) => pending.extend(&family.args),
             pb::sort::Kind::Func(function) => {
                 pending.extend(&function.params);
                 pending.push(function.result);

@@ -132,8 +132,8 @@ impl RustPresentation {
             .ok_or("missing presentation type graph")?
             .iter()
             .map(|sort| {
-                let kind = if let Some(family) = sort.get("application") {
-                    pb::sort::Kind::Application(pb::SortApplication {
+                let kind = if let Some(family) = sort.get("primitive") {
+                    pb::sort::Kind::Primitive(pb::PrimitiveSortRef {
                         name: family["name"]
                             .as_str()
                             .ok_or("missing presentation family name")?
@@ -372,7 +372,7 @@ fn sort_keys(
                 }
                 pending.push((index, true));
                 match &kind {
-                    pb::sort::Kind::Application(f) => {
+                    pb::sort::Kind::Primitive(f) => {
                         pending.extend(f.args.iter().rev().map(|&i| (i, false)))
                     }
                     pb::sort::Kind::Func(f) => pending.extend(
@@ -387,7 +387,7 @@ fn sort_keys(
                 continue;
             }
             match &mut kind {
-                pb::sort::Kind::Application(f) => {
+                pb::sort::Kind::Primitive(f) => {
                     for child in &mut f.args {
                         *child = keys[*child as usize].unwrap();
                     }
@@ -437,7 +437,7 @@ fn import_sort(
         if !finish {
             pending.push((index, true));
             match kind {
-                pb::sort::Kind::Application(f) => {
+                pb::sort::Kind::Primitive(f) => {
                     pending.extend(f.args.iter().rev().map(|&i| (i, false)))
                 }
                 pb::sort::Kind::Func(f) => pending.extend(
@@ -452,7 +452,7 @@ fn import_sort(
             continue;
         }
         match kind {
-            pb::sort::Kind::Application(f) => {
+            pb::sort::Kind::Primitive(f) => {
                 for child in &mut f.args {
                     *child = installed[&keys[*child as usize]];
                 }

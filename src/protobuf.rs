@@ -393,7 +393,7 @@ impl Engine {
             .options
             .and_then(|options| options.cost_sort)
             .and_then(|index| request.sorts.get(index as usize));
-        if !matches!(cost.and_then(|sort| sort.kind.as_ref()), Some(pb::sort::Kind::Application(family)) if family.name == "i64" && family.args.is_empty())
+        if !matches!(cost.and_then(|sort| sort.kind.as_ref()), Some(pb::sort::Kind::Primitive(family)) if family.name == "i64" && family.args.is_empty())
         {
             return Err(TransportError(
                 "this adapter currently requires the i64 cost sort".into(),
@@ -3276,7 +3276,7 @@ fn structural_sort_name(
             }
             Ok(Some(name))
         }
-        Some(pb::sort::Kind::Application(family))
+        Some(pb::sort::Kind::Primitive(family))
             if matches!(family.name.as_str(), "Vec" | "Set" | "MultiSet" | "Maybe")
                 && family.args.len() == 1 =>
         {
@@ -3296,7 +3296,7 @@ fn structural_sort_name(
                     .transpose()
             })
         }
-        Some(pb::sort::Kind::Application(family))
+        Some(pb::sort::Kind::Primitive(family))
             if matches!(family.name.as_str(), "Pair" | "Map") && family.args.len() == 2 =>
         {
             let first = structural_sort_name(sorts, family.args[0], active)?;
@@ -3318,7 +3318,7 @@ fn structural_sort_name(
                 })
                 .transpose()
         }
-        Some(pb::sort::Kind::Application(family))
+        Some(pb::sort::Kind::Primitive(family))
             if family.args.is_empty() && !family.name.is_empty() =>
         {
             Ok(Some(family.name.clone()))
@@ -3334,7 +3334,7 @@ fn structural_sort_name(
 // A wire spelling alone cannot introduce a native host sort, or reinterpret a
 // native equality/container sort as a nullary host value.
 fn validate_nullary_family(types: &egglog::TypeInfo, sort: &pb::Sort) -> Result<(), String> {
-    let Some(pb::sort::Kind::Application(family)) = &sort.kind else {
+    let Some(pb::sort::Kind::Primitive(family)) = &sort.kind else {
         return Ok(());
     };
     if !family.args.is_empty() {
@@ -3588,7 +3588,7 @@ fn materialize_sorts(
             return Ok(());
         };
         let (presort, children) = match &program.sorts[index as usize].kind {
-            Some(pb::sort::Kind::Application(family)) if !family.args.is_empty() => {
+            Some(pb::sort::Kind::Primitive(family)) if !family.args.is_empty() => {
                 (family.name.as_str(), family.args.clone())
             }
             Some(pb::sort::Kind::Func(function)) => (
@@ -3884,7 +3884,7 @@ fn lower_container_values(program: &mut pb::Program) -> Result<Vec<u32>, String>
                     pb::primitive_value::Value::BigRat(_) => "BigRat",
                     _ => "Rational",
                 };
-                if !matches!(program.sorts.get(node.sort_id as usize).and_then(|s| s.kind.as_ref()), Some(pb::sort::Kind::Application(f)) if f.name == expected && f.args.is_empty())
+                if !matches!(program.sorts.get(node.sort_id as usize).and_then(|s| s.kind.as_ref()), Some(pb::sort::Kind::Primitive(f)) if f.name == expected && f.args.is_empty())
                 {
                     return Err(format!("{expected} payload/sort mismatch"));
                 }
@@ -3947,7 +3947,7 @@ fn lower_container_values(program: &mut pb::Program) -> Result<Vec<u32>, String>
                 ),
                 _ => continue,
             };
-            let Some(pb::sort::Kind::Application(family)) = program
+            let Some(pb::sort::Kind::Primitive(family)) = program
                 .sorts
                 .get(node.sort_id as usize)
                 .and_then(|s| s.kind.as_ref())
@@ -4397,7 +4397,7 @@ fn validate_relation_uses(program: &pb::Program, saved: &pb::Program) -> Result<
                 if relations.contains(call.func.as_str())
                     && !matches!(
                         program.sorts.get(node.sort_id as usize).and_then(|sort| sort.kind.as_ref()),
-                        Some(pb::sort::Kind::Application(family)) if family.name == "Unit" && family.args.is_empty()
+                        Some(pb::sort::Kind::Primitive(family)) if family.name == "Unit" && family.args.is_empty()
                     )
                 {
                     return Err("relation calls require the Unit predicate annotation".into());
@@ -5885,10 +5885,9 @@ fn encode_term(
             value: Some(pb::primitive_value::Value::Custom(value)),
         })
     } else if let Some(scalar) = scalar {
-        let Some(pb::sort::Kind::Application(family)) = &response.sorts[sort_id as usize].kind
-        else {
+        let Some(pb::sort::Kind::Primitive(family)) = &response.sorts[sort_id as usize].kind else {
             return Err(egglog::Error::ExtractError(
-                "native scalar has a non-application sort".into(),
+                "native scalar has a non-primitive sort".into(),
             ));
         };
         if !family.args.is_empty() {
@@ -6348,7 +6347,7 @@ mod tests {
                 self.calls.fetch_add(1, Ordering::SeqCst);
                 let sort = |name: &str| ModelSort {
                     sorts: vec![pb::Sort {
-                        kind: Some(pb::sort::Kind::Application(pb::SortApplication {
+                        kind: Some(pb::sort::Kind::Primitive(pb::PrimitiveSortRef {
                             name: name.into(),
                             args: vec![],
                         })),
@@ -6594,7 +6593,7 @@ mod tests {
             for invalid in ["unknown", "arity", "argument", "output"] {
                 let mut program = program.clone();
                 let capture = program.nodes.len() as u32;
-                let scalar = program.sorts.iter().position(|sort| matches!(&sort.kind, Some(pb::sort::Kind::Application(family)) if family.name == "i64")).unwrap() as u32;
+                let scalar = program.sorts.iter().position(|sort| matches!(&sort.kind, Some(pb::sort::Kind::Primitive(family)) if family.name == "i64")).unwrap() as u32;
                 program.nodes.push(pb::Node {
                     sort_id: scalar,
                     kind: Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
@@ -7072,7 +7071,7 @@ mod tests {
             pb::ExecutionMode::ProofTesting,
         ] {
             let scalar = pb::Sort {
-                kind: Some(pb::sort::Kind::Application(pb::SortApplication {
+                kind: Some(pb::sort::Kind::Primitive(pb::PrimitiveSortRef {
                     name: "i64".into(),
                     args: vec![],
                 })),
@@ -7100,7 +7099,7 @@ mod tests {
                 .extension_state_or_default::<NativeCloneProbe>() =
                 NativeCloneProbe(clones.clone());
             for kind in [
-                pb::sort::Kind::Application(pb::SortApplication {
+                pb::sort::Kind::Primitive(pb::PrimitiveSortRef {
                     name: "Vec".into(),
                     args: vec![0],
                 }),
@@ -7475,14 +7474,14 @@ mod tests {
         let program = pb::Program {
             sorts: vec![
                 pb::Sort {
-                    kind: Some(pb::sort::Kind::Application(pb::SortApplication {
+                    kind: Some(pb::sort::Kind::Primitive(pb::PrimitiveSortRef {
                         name: "String".into(),
                         args: vec![],
                     })),
                     ..Default::default()
                 },
                 pb::Sort {
-                    kind: Some(pb::sort::Kind::Application(pb::SortApplication {
+                    kind: Some(pb::sort::Kind::Primitive(pb::PrimitiveSortRef {
                         name: "BigRat".into(),
                         args: vec![],
                     })),
@@ -7701,7 +7700,7 @@ mod tests {
         ).unwrap() as u32;
         let sort_id = program.nodes[root as usize].sort_id;
         let vector = program.sorts.iter().position(|sort|
-            matches!(&sort.kind, Some(pb::sort::Kind::Application(family)) if family.name == "Vec")
+            matches!(&sort.kind, Some(pb::sort::Kind::Primitive(family)) if family.name == "Vec")
         ).unwrap() as u32;
         for _ in 0..16 {
             let children = program.nodes.len() as u32;
@@ -8116,7 +8115,7 @@ mod tests {
         fn contract(&self) -> cost_model::CostModelContract {
             let sort = cost_model::ModelSort {
                 sorts: vec![pb::Sort {
-                    kind: Some(pb::sort::Kind::Application(pb::SortApplication {
+                    kind: Some(pb::sort::Kind::Primitive(pb::PrimitiveSortRef {
                         name: "i64".into(),
                         args: vec![],
                     })),
@@ -8306,7 +8305,7 @@ mod tests {
                     let mut engine = Engine::default();
                     let request = pb::CreateEGraphRequest {
                         sorts: vec![pb::Sort {
-                            kind: Some(pb::sort::Kind::Application(pb::SortApplication {
+                            kind: Some(pb::sort::Kind::Primitive(pb::PrimitiveSortRef {
                                 name: "i64".into(),
                                 args: vec![],
                             })),
@@ -8466,7 +8465,7 @@ mod tests {
         let mut engine = Engine::default();
         let request = pb::CreateEGraphRequest {
             sorts: vec![pb::Sort {
-                kind: Some(pb::sort::Kind::Application(pb::SortApplication {
+                kind: Some(pb::sort::Kind::Primitive(pb::PrimitiveSortRef {
                     name: "i64".into(),
                     args: vec![],
                 })),
@@ -8638,7 +8637,7 @@ mod tests {
             }];
             assert!(value::container_payload(sort, wire, &[0, 0], &wrong_nodes).is_err());
             let mut wrong_family = wire.clone();
-            let Some(pb::sort::Kind::Application(family)) = &mut wrong_family.kind else {
+            let Some(pb::sort::Kind::Primitive(family)) = &mut wrong_family.kind else {
                 unreachable!()
             };
             family.name = "Foreign".into();
@@ -8651,14 +8650,14 @@ mod tests {
         let mut program = pb::Program {
             sorts: vec![
                 pb::Sort {
-                    kind: Some(pb::sort::Kind::Application(pb::SortApplication {
+                    kind: Some(pb::sort::Kind::Primitive(pb::PrimitiveSortRef {
                         name: "i64".into(),
                         args: vec![],
                     })),
                     ..Default::default()
                 },
                 pb::Sort {
-                    kind: Some(pb::sort::Kind::Application(pb::SortApplication {
+                    kind: Some(pb::sort::Kind::Primitive(pb::PrimitiveSortRef {
                         name: "Set".into(),
                         args: vec![0],
                     })),
@@ -8709,7 +8708,7 @@ mod tests {
         for threads in [None, Some(0), Some(1), Some(2)] {
             let request = pb::CreateEGraphRequest {
                 sorts: vec![pb::Sort {
-                    kind: Some(pb::sort::Kind::Application(pb::SortApplication {
+                    kind: Some(pb::sort::Kind::Primitive(pb::PrimitiveSortRef {
                         name: "i64".into(),
                         args: vec![],
                     })),
@@ -8766,7 +8765,7 @@ mod tests {
         for execution_mode in [99, -1] {
             let request = pb::CreateEGraphRequest {
                 sorts: vec![pb::Sort {
-                    kind: Some(pb::sort::Kind::Application(pb::SortApplication {
+                    kind: Some(pb::sort::Kind::Primitive(pb::PrimitiveSortRef {
                         name: "i64".into(),
                         args: vec![],
                     })),
@@ -8845,7 +8844,7 @@ mod tests {
                 };
                 let mut program = pb::Program {
                     sorts: vec![pb::Sort {
-                        kind: Some(pb::sort::Kind::Application(pb::SortApplication {
+                        kind: Some(pb::sort::Kind::Primitive(pb::PrimitiveSortRef {
                             name: "i64".into(),
                             args: vec![],
                         })),
@@ -8922,7 +8921,7 @@ mod tests {
             let mut program = pb::Program {
                 sorts: vec![
                     pb::Sort {
-                        kind: Some(pb::sort::Kind::Application(pb::SortApplication {
+                        kind: Some(pb::sort::Kind::Primitive(pb::PrimitiveSortRef {
                             name: "i64".into(),
                             args: vec![],
                         })),
@@ -9107,12 +9106,10 @@ mod tests {
         let i64_sort = program
             .sorts
             .iter()
-            .position(
-                |s| matches!(&s.kind, Some(pb::sort::Kind::Application(f)) if f.name == "i64"),
-            )
+            .position(|s| matches!(&s.kind, Some(pb::sort::Kind::Primitive(f)) if f.name == "i64"))
             .unwrap() as u32;
         program.sorts.push(pb::Sort {
-            kind: Some(pb::sort::Kind::Application(pb::SortApplication {
+            kind: Some(pb::sort::Kind::Primitive(pb::PrimitiveSortRef {
                 name: "Vec".into(),
                 args: vec![i64_sort],
             })),
@@ -9664,7 +9661,7 @@ mod tests {
             .sorts
             .iter()
             .position(|sort| {
-                matches!(&sort.kind, Some(pb::sort::Kind::Application(family)) if family.name == "Vec")
+                matches!(&sort.kind, Some(pb::sort::Kind::Primitive(family)) if family.name == "Vec")
             })
             .unwrap() as u32;
         assert!(program.nodes.is_empty());
@@ -10082,7 +10079,7 @@ mod tests {
             .iter()
             .position(|sort| matches!(&sort.kind, Some(pb::sort::Kind::Eq(name)) if name == "A"))
             .unwrap() as u32;
-        let integer = program.sorts.iter().position(|sort| matches!(&sort.kind, Some(pb::sort::Kind::Application(family)) if family.name == "i64")).unwrap() as u32;
+        let integer = program.sorts.iter().position(|sort| matches!(&sort.kind, Some(pb::sort::Kind::Primitive(family)) if family.name == "i64")).unwrap() as u32;
         let union = program.nodes.len() as u32;
         program.nodes.push(pb::Node {
             sort_id,
@@ -10501,7 +10498,7 @@ mod tests {
             }],
 
             sorts: vec![pb::Sort {
-                kind: Some(pb::sort::Kind::Application(pb::SortApplication {
+                kind: Some(pb::sort::Kind::Primitive(pb::PrimitiveSortRef {
                     name: "i64".into(),
                     args: vec![],
                 })),

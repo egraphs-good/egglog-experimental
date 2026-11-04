@@ -11,7 +11,7 @@ use std::ops::ControlFlow;
 fn create(engine: &mut Engine, recording: bool) -> u64 {
     let request = pb::CreateEGraphRequest {
         sorts: vec![pb::Sort {
-            kind: Some(pb::sort::Kind::Application(pb::SortApplication {
+            kind: Some(pb::sort::Kind::Primitive(pb::PrimitiveSortRef {
                 name: "i64".into(),
                 args: vec![],
             })),
@@ -57,7 +57,7 @@ fn seed(engine: &mut Engine, id: u64) {
 fn loop_program() -> pb::Program {
     pb::Program {
         sorts: vec![pb::Sort {
-            kind: Some(pb::sort::Kind::Application(pb::SortApplication {
+            kind: Some(pb::sort::Kind::Primitive(pb::PrimitiveSortRef {
                 name: "i64".into(),
                 args: vec![],
             })),

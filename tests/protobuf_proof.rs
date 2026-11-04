@@ -886,7 +886,7 @@ fn core_source_failed_control_and_fail_wrappers_keep_prefixes_in_every_mode() {
                     pb::Program {
                         sorts: vec![
                             pb::Sort {
-                                kind: Some(pb::sort::Kind::Application(pb::SortApplication {
+                                kind: Some(pb::sort::Kind::Primitive(pb::PrimitiveSortRef {
                                     name: "i64".into(),
                                     args: vec![],
                                 })),
@@ -1245,7 +1245,7 @@ fn recursive_fail_matches_native_checks_in_every_execution_mode() {
                     let right = union.members[1] as usize;
                     phase.nodes[right].sort_id = phase.sorts.len() as u32;
                     phase.sorts.push(pb::Sort {
-                        kind: Some(pb::sort::Kind::Application(pb::SortApplication {
+                        kind: Some(pb::sort::Kind::Primitive(pb::PrimitiveSortRef {
                             name: "String".into(),
                             args: vec![],
                         })),
@@ -1269,7 +1269,7 @@ fn recursive_fail_matches_native_checks_in_every_execution_mode() {
                 phase.commands[0].kind,
                 Some(pb::command::Kind::Fail(_))
             ));
-            let integer = phase.sorts.iter().position(|s| matches!(&s.kind, Some(pb::sort::Kind::Application(f)) if f.name == "i64" && f.args.is_empty())).unwrap() as u32;
+            let integer = phase.sorts.iter().position(|s| matches!(&s.kind, Some(pb::sort::Kind::Primitive(f)) if f.name == "i64" && f.args.is_empty())).unwrap() as u32;
             let mark = phase
                 .sorts
                 .iter()
@@ -1619,7 +1619,7 @@ fn logical_table_rows_match_native_views_in_every_mode() {
     fn sort_shape(sorts: &[pb::Sort], index: u32) -> String {
         match sorts[index as usize].kind.as_ref().unwrap() {
             pb::sort::Kind::Eq(name) => format!("Eq({name})"),
-            pb::sort::Kind::Application(family) => format!(
+            pb::sort::Kind::Primitive(family) => format!(
                 "{}({})",
                 family.name,
                 family
@@ -2082,7 +2082,7 @@ fn create(engine: &mut Engine, mode: pb::ExecutionMode) -> u64 {
         .create(
             &pb::CreateEGraphRequest {
                 sorts: vec![pb::Sort {
-                    kind: Some(pb::sort::Kind::Application(pb::SortApplication {
+                    kind: Some(pb::sort::Kind::Primitive(pb::PrimitiveSortRef {
                         name: "i64".into(),
                         args: vec![],
                     })),
@@ -2190,7 +2190,7 @@ fn fixture() -> pb::Program {
 
         sorts: vec![
             pb::Sort {
-                kind: Some(pb::sort::Kind::Application(pb::SortApplication {
+                kind: Some(pb::sort::Kind::Primitive(pb::PrimitiveSortRef {
                     name: "i64".into(),
                     args: vec![],
                 })),

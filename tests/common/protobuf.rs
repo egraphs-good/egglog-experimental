@@ -54,8 +54,8 @@ impl Observed {
             for sort in &mut output.sorts {
                 span(&mut sort.span);
                 match &mut sort.kind {
-                    Some(pb::sort::Kind::Application(application)) => {
-                        for child in &mut application.args {
+                    Some(pb::sort::Kind::Primitive(primitive)) => {
+                        for child in &mut primitive.args {
                             bump(child, sorts);
                         }
                     }

@@ -188,7 +188,7 @@ impl Owner {
                         Some(pb::sort::Kind::Eq(name)) => {
                             wanted.insert((DeclarationKind::EqSort, name.clone()));
                         }
-                        Some(pb::sort::Kind::Application(family)) => {
+                        Some(pb::sort::Kind::Primitive(family)) => {
                             wanted.insert((DeclarationKind::PrimitiveSort, family.name.clone()));
                         }
                         _ => (),
@@ -790,7 +790,7 @@ pub(super) fn closure(roots: &[Record]) -> Result<Vec<Record>, TypedError> {
                     Some(pb::sort::Kind::Eq(name)) => {
                         pending.push(record.declaration(name, DeclarationKind::EqSort)?)
                     }
-                    Some(pb::sort::Kind::Application(f)) => {
+                    Some(pb::sort::Kind::Primitive(f)) => {
                         pending.push(record.declaration(&f.name, DeclarationKind::PrimitiveSort)?)
                     }
                     _ => (),
@@ -990,7 +990,7 @@ pub(super) fn visit(
             }
             match s.kind.as_mut().ok_or_else(invalid)? {
                 pb::sort::Kind::Eq(_) | pb::sort::Kind::Var(_) => {}
-                pb::sort::Kind::Application(f) => {
+                pb::sort::Kind::Primitive(f) => {
                     for arg in &mut f.args {
                         *arg = map(Arena::Sort, *arg)?;
                     }
@@ -1332,7 +1332,7 @@ impl Packer {
                         Some(pb::sort::Kind::Eq(name)) => {
                             self.intern(record.declaration(name, DeclarationKind::EqSort)?, 0);
                         }
-                        Some(pb::sort::Kind::Application(f)) => {
+                        Some(pb::sort::Kind::Primitive(f)) => {
                             self.intern(
                                 record.declaration(&f.name, DeclarationKind::PrimitiveSort)?,
                                 0,

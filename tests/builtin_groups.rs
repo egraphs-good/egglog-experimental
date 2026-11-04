@@ -21,11 +21,11 @@ mod native_signature {
             let sorts = vec![
                 Kind::Var(0),
                 Kind::Var(1),
-                Kind::Application(pb::SortApplication {
+                Kind::Primitive(pb::PrimitiveSortRef {
                     name: "Vec".into(),
                     args: vec![0],
                 }),
-                Kind::Application(pb::SortApplication {
+                Kind::Primitive(pb::PrimitiveSortRef {
                     name: "Vec".into(),
                     args: vec![1],
                 }),
@@ -37,19 +37,19 @@ mod native_signature {
                     params: vec![2],
                     result: 3,
                 }),
-                Kind::Application(pb::SortApplication {
+                Kind::Primitive(pb::PrimitiveSortRef {
                     name: "Vec".into(),
                     args: vec![2],
                 }),
-                Kind::Application(pb::SortApplication {
+                Kind::Primitive(pb::PrimitiveSortRef {
                     name: "Vec".into(),
                     args: vec![3],
                 }),
-                Kind::Application(pb::SortApplication {
+                Kind::Primitive(pb::PrimitiveSortRef {
                     name: "i64".into(),
                     args: vec![],
                 }),
-                Kind::Application(pb::SortApplication {
+                Kind::Primitive(pb::PrimitiveSortRef {
                     name: "String".into(),
                     args: vec![],
                 }),
@@ -1056,14 +1056,14 @@ impl Grouped {
                     ..Default::default()
                 },
                 pb::Sort {
-                    kind: Some(pb::sort::Kind::Application(pb::SortApplication {
+                    kind: Some(pb::sort::Kind::Primitive(pb::PrimitiveSortRef {
                         name: "TestGrouped".into(),
                         args: vec![0, 1],
                     })),
                     ..Default::default()
                 },
                 pb::Sort {
-                    kind: Some(pb::sort::Kind::Application(pb::SortApplication {
+                    kind: Some(pb::sort::Kind::Primitive(pb::PrimitiveSortRef {
                         name: "i64".into(),
                         args: vec![],
                     })),
@@ -1120,7 +1120,7 @@ struct Foreign<const INPUT: u32 = 5, const SWAP: bool = false>;
 impl<const INPUT: u32, const SWAP: bool> Foreign<INPUT, SWAP> {
     fn wire_definitions() -> Vec<pb::BuiltinCatalog> {
         let mut definition = Grouped::wire_definitions().remove(0);
-        let Some(pb::sort::Kind::Application(owner)) = &mut definition.sorts[2].kind else {
+        let Some(pb::sort::Kind::Primitive(owner)) = &mut definition.sorts[2].kind else {
             unreachable!()
         };
         owner.name = "TestForeign".into();
@@ -1136,7 +1136,7 @@ impl<const INPUT: u32, const SWAP: bool> Foreign<INPUT, SWAP> {
                 ..Default::default()
             });
             definition.sorts.push(pb::Sort {
-                kind: Some(pb::sort::Kind::Application(pb::SortApplication {
+                kind: Some(pb::sort::Kind::Primitive(pb::PrimitiveSortRef {
                     name: name.into(),
                     args,
                 })),
@@ -1530,11 +1530,11 @@ fn foreign_descriptor_mutations_control_nested_matching_and_converter_abi() {
             )
             .is_ok()
     );
-    let Some(pb::sort::Kind::Application(vec)) = &wire.sorts[arg as usize].kind else {
+    let Some(pb::sort::Kind::Primitive(vec)) = &wire.sorts[arg as usize].kind else {
         unreachable!()
     };
     let pair = vec.args[0];
-    let Some(pb::sort::Kind::Application(pair)) = &mut wire.sorts[pair as usize].kind else {
+    let Some(pb::sort::Kind::Primitive(pair)) = &mut wire.sorts[pair as usize].kind else {
         unreachable!()
     };
     pair.args.reverse();
@@ -1545,7 +1545,7 @@ fn foreign_descriptor_mutations_control_nested_matching_and_converter_abi() {
             .is_err()
     );
     // A supplied descriptor must agree even when every runtime cast is unchanged.
-    let Some(pb::sort::Kind::Application(pair)) = &mut stale.sorts[4].kind else {
+    let Some(pb::sort::Kind::Primitive(pair)) = &mut stale.sorts[4].kind else {
         unreachable!()
     };
     pair.args.reverse();
@@ -1803,7 +1803,7 @@ fn grouped_signature_identity_preserves_width_and_order_after_relocation() {
     // Rotate the arena and alpha-rename every diagnostic label, not the binder.
     definition.sorts.rotate_left(1);
     for sort in &mut definition.sorts {
-        if let Some(pb::sort::Kind::Application(family)) = &mut sort.kind {
+        if let Some(pb::sort::Kind::Primitive(family)) = &mut sort.kind {
             for index in &mut family.args {
                 *index = (*index + 3) % 4;
             }

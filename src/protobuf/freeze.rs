@@ -113,7 +113,7 @@ impl<K: Eq + Hash, F: Fn(&ArcSort, Value) -> K> Export<'_, K, F> {
                     Some(pb::sort::Kind::Func(_))
                         if actual == Some(TypeId::of::<egglog::sort::FunctionContainer>())
                             && sort.clone().as_arc_any().is::<egglog::sort::FunctionSort>() => {}
-                    Some(pb::sort::Kind::Application(_)) => {
+                    Some(pb::sort::Kind::Primitive(_)) => {
                         value::container_kind(
                             &sort,
                             &self.program.sorts
@@ -159,7 +159,7 @@ impl<K: Eq + Hash, F: Fn(&ArcSort, Value) -> K> Export<'_, K, F> {
                                 })
                             })
                     }
-                    Some(pb::sort::Kind::Application(_)) => value::container_payload(
+                    Some(pb::sort::Kind::Primitive(_)) => value::container_payload(
                         &sort,
                         &self.program.sorts[self.program.nodes[index as usize].sort_id as usize],
                         &children,
@@ -178,7 +178,7 @@ impl<K: Eq + Hash, F: Fn(&ArcSort, Value) -> K> Export<'_, K, F> {
                     [self.program.nodes[index as usize].sort_id as usize]
                     .kind
                 {
-                    Some(pb::sort::Kind::Application(family)) if family.args.is_empty() => family,
+                    Some(pb::sort::Kind::Primitive(family)) if family.args.is_empty() => family,
                     _ => {
                         return Err(egglog::Error::BackendError(
                             "Freeze scalar has a non-leaf sort".into(),
@@ -477,7 +477,7 @@ mod tests {
     fn create(engine: &mut Engine, mode: pb::ExecutionMode) -> u64 {
         let request = pb::CreateEGraphRequest {
             sorts: vec![pb::Sort {
-                kind: Some(pb::sort::Kind::Application(pb::SortApplication {
+                kind: Some(pb::sort::Kind::Primitive(pb::PrimitiveSortRef {
                     name: "i64".into(),
                     args: vec![],
                 })),
@@ -616,35 +616,35 @@ mod tests {
                     ..Default::default()
                 },
                 pb::Sort {
-                    kind: Some(pb::sort::Kind::Application(pb::SortApplication {
+                    kind: Some(pb::sort::Kind::Primitive(pb::PrimitiveSortRef {
                         name: "i64".into(),
                         args: vec![],
                     })),
                     ..Default::default()
                 },
                 pb::Sort {
-                    kind: Some(pb::sort::Kind::Application(pb::SortApplication {
+                    kind: Some(pb::sort::Kind::Primitive(pb::PrimitiveSortRef {
                         name: "Unit".into(),
                         args: vec![],
                     })),
                     ..Default::default()
                 },
                 pb::Sort {
-                    kind: Some(pb::sort::Kind::Application(pb::SortApplication {
+                    kind: Some(pb::sort::Kind::Primitive(pb::PrimitiveSortRef {
                         name: "Vec".into(),
                         args: vec![0],
                     })),
                     ..Default::default()
                 },
                 pb::Sort {
-                    kind: Some(pb::sort::Kind::Application(pb::SortApplication {
+                    kind: Some(pb::sort::Kind::Primitive(pb::PrimitiveSortRef {
                         name: "f64".into(),
                         args: vec![],
                     })),
                     ..Default::default()
                 },
                 pb::Sort {
-                    kind: Some(pb::sort::Kind::Application(pb::SortApplication {
+                    kind: Some(pb::sort::Kind::Primitive(pb::PrimitiveSortRef {
                         name: "Vec".into(),
                         args: vec![1],
                     })),

@@ -6,7 +6,7 @@ fn relation_definition_fixture(reversed: bool) -> pb::Program {
         ..Default::default()
     };
     let number = pb::Sort {
-        kind: Some(pb::sort::Kind::Application(pb::SortApplication {
+        kind: Some(pb::sort::Kind::Primitive(pb::PrimitiveSortRef {
             name: "i64".into(),
             args: vec![],
         })),
@@ -90,7 +90,7 @@ fn relation_definitions_reconcile_and_relocate_input_only_records() {
     ));
     assert!(matches!(
         &destination.sorts[relation.inputs[1].sort as usize].kind,
-        Some(pb::sort::Kind::Application(family)) if family.name == "i64" && family.args.is_empty()
+        Some(pb::sort::Kind::Primitive(family)) if family.name == "i64" && family.args.is_empty()
     ));
     assert!(
         destination.nodes.is_empty(),
@@ -281,7 +281,7 @@ fn box_definition() -> pb::Program {
     pb::Program {
         sorts: vec![
             pb::Sort {
-                kind: Some(pb::sort::Kind::Application(pb::SortApplication {
+                kind: Some(pb::sort::Kind::Primitive(pb::PrimitiveSortRef {
                     name: "i64".into(),
                     args: vec![],
                 })),

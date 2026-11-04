@@ -74,8 +74,8 @@ Programs, snapshots and history do not include builtin descriptions. The catalog
 supports offline authoring and binding generation, but does not ship primitive
 implementations or codecs.
 
-Primitive sorts include scalars and containers. `SortApplication` represents
-compositions such as `Vec<i64>`; function types use structural `FuncSort` values.
+`PrimitiveSortRef` names a primitive sort and its type arguments: `i64`,
+`Vec<i64>` or `Map<String, Math>`. Function types use structural `FuncSort` values.
 Generic signatures specify a parameter count, fixed inputs, output and an
 optional repeating argument pattern. Actual calls are concrete. Native
 primitive-specific applicability checks remain necessary even when the
@@ -205,7 +205,7 @@ from protobuf import Oneof
 from protovalidate import validate
 
 program = ir.Program(
-    sorts=[ir.Sort(kind=Oneof("application", ir.SortApplication(name="i64")))],
+    sorts=[ir.Sort(kind=Oneof("primitive", ir.PrimitiveSortRef(name="i64")))],
     nodes=[ir.Node(sort_id=0, kind=Oneof("primitive_value",
         ir.PrimitiveValue(value=Oneof("i64", 42))))],
 )

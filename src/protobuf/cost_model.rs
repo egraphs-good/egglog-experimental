@@ -277,7 +277,7 @@ impl Session {
             return Err("cost model objective sort must be closed".into());
         }
         let objective_sort = &objective[objective_root as usize];
-        if !matches!(&objective_sort.kind, Some(pb::sort::Kind::Application(family)) if family.args.is_empty())
+        if !matches!(&objective_sort.kind, Some(pb::sort::Kind::Primitive(family)) if family.args.is_empty())
         {
             return Err("host model objectives currently require a registered leaf sort".into());
         }
@@ -385,7 +385,7 @@ impl Session {
                         // A first host codec encodes a leaf D. Never accept foreign
                         // arena references as if they belonged to this response.
                         let family = match &response.sorts[objective as usize].kind {
-                            Some(pb::sort::Kind::Application(family)) if family.args.is_empty() => {
+                            Some(pb::sort::Kind::Primitive(family)) if family.args.is_empty() => {
                                 &family.name
                             }
                             _ => {
@@ -489,7 +489,7 @@ mod tests {
             let sorts = ["i64", self.0]
                 .into_iter()
                 .map(|name| pb::Sort {
-                    kind: Some(pb::sort::Kind::Application(pb::SortApplication {
+                    kind: Some(pb::sort::Kind::Primitive(pb::PrimitiveSortRef {
                         name: name.into(),
                         args: vec![],
                     })),
@@ -518,7 +518,7 @@ mod tests {
             .create(
                 &pb::CreateEGraphRequest {
                     sorts: vec![pb::Sort {
-                        kind: Some(pb::sort::Kind::Application(pb::SortApplication {
+                        kind: Some(pb::sort::Kind::Primitive(pb::PrimitiveSortRef {
                             name: "i64".into(),
                             args: vec![],
                         })),
@@ -546,7 +546,7 @@ mod tests {
                 diagnostics: false,
                 program: Some(pb::Program {
                     sorts: vec![pb::Sort {
-                        kind: Some(pb::sort::Kind::Application(pb::SortApplication {
+                        kind: Some(pb::sort::Kind::Primitive(pb::PrimitiveSortRef {
                             name: "i64".into(),
                             args: vec![],
                         })),
