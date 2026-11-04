@@ -395,7 +395,16 @@ mod tests {
             .collect();
         assert_eq!(roots.len(), 2);
         assert_ne!(roots[0], roots[1]);
-        assert_eq!(history.declarations.len(), 1);
+        assert!(history.declarations.is_empty());
+        // Each accepted input retains its own self-declaring Eq arena root.
+        assert_eq!(
+            history
+                .sorts
+                .iter()
+                .filter(|sort| matches!(&sort.kind, Some(pb::sort::Kind::Eq(name)) if name == "E"))
+                .count(),
+            4
+        );
         engine.graphs[&id].prepare(&mut history).unwrap();
         assert_eq!(
             engine

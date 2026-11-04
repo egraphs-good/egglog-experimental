@@ -207,6 +207,7 @@ struct Session {
 }
 
 struct Installation {
+    binding: Option<(String, String)>,
     command: Option<Command>,
     source_declaration: Option<u32>,
     span: Option<pb::Span>,
@@ -379,6 +380,11 @@ impl Engine {
             .and_then(|options| options.seminaive)
             .unwrap_or(true);
         let no_decomp = request.no_decomp;
+        if request.sorts.iter().any(|sort| sort.doc.is_some()) {
+            return Err(TransportError(
+                "creation sort docs require an equality sort".into(),
+            ));
+        }
         if request.sorts.iter().any(|sort| {
             matches!(
                 sort.kind,
@@ -694,7 +700,13 @@ impl Session {
         self.request = request;
         let mut failure = None;
         for installation in installations {
-            let (result, registered, _) = if let Some(command) = &installation.command {
+            let (result, registered, _) = if let Some((name, sort)) = &installation.binding {
+                let result =
+                    self.graph
+                        .declare_mutable_binding(span!(), name.clone(), sort.clone(), true);
+                let registered = result.is_ok();
+                (result, registered, None)
+            } else if let Some(command) = &installation.command {
                 NativeExecutor {
                     graph: &mut self.graph,
                     mode: self.mode,
@@ -883,7 +895,7 @@ impl Session {
         staged.names = project_names(program, &staged.definitions, &self.builtins);
         let mut authored = staged.definitions.clone();
         project_names(&mut authored, &staged.definitions, &self.builtins);
-        let signatures: HashMap<_, _> = authored
+        let mut signatures: HashMap<_, _> = authored
             .declarations
             .iter()
             .filter_map(|d| match &d.kind {
@@ -932,6 +944,17 @@ impl Session {
                 ))
             })
             .collect::<Result<_, String>>()?;
+        for node in &authored.nodes {
+            if let Some(pb::node::Kind::Binding(name)) = &node.kind {
+                signatures.insert(
+                    native_name("binding", name),
+                    (
+                        ast::Schema::new(vec![], sort_name(&authored.sorts, node.sort_id)?),
+                        Some(ast::FunctionSubtype::Custom),
+                    ),
+                );
+            }
+        }
         let constructor_targets: HashSet<_> = authored
             .declarations
             .iter()
@@ -947,7 +970,6 @@ impl Session {
                 continue;
             }
             let name = match &declaration.kind {
-                Some(pb::declaration::Kind::EqSort(s)) => &s.name,
                 Some(pb::declaration::Kind::Constructor(f)) => &f.name,
                 Some(pb::declaration::Kind::Function(f)) => &f.name,
                 Some(pb::declaration::Kind::Relation(r)) => &r.name,
@@ -961,36 +983,44 @@ impl Session {
                 return Err(format!("native declaration namespace collision: {name}").into());
             }
         }
-        for (index, (declaration, added)) in program.declarations.iter().zip(&added).enumerate() {
-            if !added {
+        let mut installed_eq: HashSet<_> = self.names.sorts.keys().cloned().collect();
+        for sort in &program.sorts {
+            let Some(pb::sort::Kind::Eq(name)) = &sort.kind else {
+                continue;
+            };
+            if name.is_empty() {
+                return Err("equality sort name must not be empty".into());
+            }
+            if !installed_eq.insert(name.clone()) {
                 continue;
             }
-            if let Some(pb::declaration::Kind::EqSort(sort)) = &declaration.kind {
-                if sort.name.is_empty() {
-                    return Err("equality sort name must not be empty".into());
-                }
-                let command = Command::Sort {
-                    span: native_span(program, declaration.span.as_ref(), &native_spans)?,
-                    name: sort.name.clone(),
-                    presort_and_args: None,
-                    uf: None,
-                    proof_func: None,
-                    container_rebuild: None,
-                    proof_constructors: None,
-                    unionable: true,
-                };
-                staged
-                    .graph
-                    .compile_program_observed(vec![command.clone()], &mut |_, _| {})
-                    .map_err(|error| error.to_string())?;
-                pending_declarations.insert(declaration_indices[index].unwrap());
-                installations.push(Installation {
-                    command: Some(command),
-                    source_declaration: Some(index as u32),
-                    span: declaration.span,
-                    declaration: declaration_indices[index],
-                });
+            if staged.graph.get_sort_by_name(name).is_some()
+                || staged.graph.get_function(name).is_some()
+                || staged.graph.authoring_type_info().is_primitive(name)
+            {
+                return Err(format!("native declaration namespace collision: {name}").into());
             }
+            let command = Command::Sort {
+                span: native_span(program, sort.span.as_ref(), &native_spans)?,
+                name: name.clone(),
+                presort_and_args: None,
+                uf: None,
+                proof_func: None,
+                container_rebuild: None,
+                proof_constructors: None,
+                unionable: true,
+            };
+            staged
+                .graph
+                .compile_program_observed(vec![command.clone()], &mut |_, _| {})
+                .map_err(|error| error.to_string())?;
+            installations.push(Installation {
+                binding: None,
+                command: Some(command),
+                source_declaration: None,
+                span: sort.span,
+                declaration: None,
+            });
         }
         // Canonical definitions above retain the submitted Custom records.
         // Only this execution copy receives provider-owned inert helper nodes.
@@ -1005,6 +1035,7 @@ impl Session {
             materialized.push(command.clone());
             let site = sort_sites[index as usize];
             installations.push(Installation {
+                binding: None,
                 command: Some(command),
                 source_declaration: None,
                 span: program.sorts[site as usize].span,
@@ -1030,6 +1061,37 @@ impl Session {
                 return Err(format!("sort kind mismatch for {name}").into());
             }
         }
+        let mut installed_bindings: HashSet<_> = self
+            .definitions
+            .nodes
+            .iter()
+            .filter_map(|node| match &node.kind {
+                Some(pb::node::Kind::Binding(name)) => Some(native_name("binding", name)),
+                _ => None,
+            })
+            .collect();
+        for node in &program.nodes {
+            let Some(pb::node::Kind::Binding(name)) = &node.kind else {
+                continue;
+            };
+            let name = native_name("binding", name);
+            let sort = sort_name(&program.sorts, node.sort_id)?;
+            staged
+                .graph
+                .declare_mutable_binding(span!(), name.clone(), sort.clone(), false)
+                .map_err(|error| error.to_string())?;
+            if !installed_bindings.insert(name.clone()) {
+                continue;
+            }
+            installations.push(Installation {
+                binding: Some((name, sort)),
+                command: None,
+                source_declaration: None,
+                span: node.span,
+                declaration: None,
+            });
+        }
+        lower_binding_writes(program)?;
         lower_applications(program)?;
         validate_node_graph(program, &native_spans)?;
         let mut action_dags = classify_action_dags(program)?;
@@ -1067,7 +1129,6 @@ impl Session {
                 .as_ref()
                 .ok_or("missing declaration kind")?
             {
-                pb::declaration::Kind::EqSort(_) => continue,
                 pb::declaration::Kind::Constructor(constructor) => {
                     if constructor.name.is_empty() {
                         return Err("constructor name must not be empty".into());
@@ -1199,6 +1260,7 @@ impl Session {
                     .compile_program_observed(vec![cost_table.clone()], &mut |_, _| {})
                     .map_err(|error| error.to_string())?;
                 installations.push(Installation {
+                    binding: None,
                     command: Some(cost_table),
                     source_declaration: Some(index as u32),
                     span: declaration.span,
@@ -1211,6 +1273,7 @@ impl Session {
                 .map_err(|error| error.to_string())?;
             pending_declarations.insert(declaration_indices[index].unwrap());
             installations.push(Installation {
+                binding: None,
                 command: Some(command),
                 source_declaration: Some(index as u32),
                 span: declaration.span,
@@ -1375,6 +1438,7 @@ impl Session {
                     },
                 )?
                 .into_iter()
+                .map(|command| capture_rule_bindings(command, program))
                 .map(|command| lower_rule_cost_deletes(command, &constructor_targets, self.mode)),
             );
             validation.extend(commands.clone());
@@ -3110,13 +3174,13 @@ fn project_names(
         .iter()
         .map(|p| p.name.as_str())
         .collect();
+    for sort in &definitions.sorts {
+        if let Some(pb::sort::Kind::Eq(name)) = &sort.kind {
+            names.sorts.insert(native_name("sort", name), name.clone());
+        }
+    }
     for declaration in &definitions.declarations {
         match &declaration.kind {
-            Some(pb::declaration::Kind::EqSort(s)) => {
-                names
-                    .sorts
-                    .insert(native_name("sort", &s.name), s.name.clone());
-            }
             Some(pb::declaration::Kind::Constructor(f)) => {
                 names
                     .callables
@@ -3148,11 +3212,6 @@ fn project_names(
     for sort in &mut program.sorts {
         if let Some(pb::sort::Kind::Eq(name)) = &mut sort.kind {
             *name = native_name("sort", name);
-        }
-    }
-    for declaration in &mut program.declarations {
-        if let Some(pb::declaration::Kind::EqSort(sort)) = &mut declaration.kind {
-            sort.name = native_name("sort", &sort.name);
         }
     }
     // PrintSize selects logical tables until lower_native_observation projects
@@ -4046,6 +4105,50 @@ fn signature(
     })
 }
 
+// Runtime Let initializers remain in the enclosing command-list Union frame.
+// Only this ephemeral program receives private Sets; canonical/history IR keeps Let.
+fn lower_binding_writes(program: &mut pb::Program) -> Result<(), String> {
+    let mut commands: Vec<_> = program.commands.iter_mut().collect();
+    while let Some(command) = commands.pop() {
+        if let Some(pb::command::Kind::Let(write)) = &command.kind {
+            let binding = program
+                .nodes
+                .get(write.binding.ok_or("missing Let binding")? as usize)
+                .ok_or("Let binding out of bounds")?;
+            let Some(pb::node::Kind::Binding(name)) = &binding.kind else {
+                return Err("Let target must be a Binding node".into());
+            };
+            let value = write.value.ok_or("missing Let value")?;
+            let value_node = program
+                .nodes
+                .get(value as usize)
+                .ok_or("Let value out of bounds")?;
+            if sort_name(&program.sorts, binding.sort_id)?
+                != sort_name(&program.sorts, value_node.sort_id)?
+            {
+                return Err("Let value sort mismatch".into());
+            }
+            command.kind = Some(pb::command::Kind::Action(pb::Action {
+                kind: Some(pb::action::Kind::Set(pb::Set {
+                    target: Some(pb::Call {
+                        func: native_name("binding", name),
+                        args: vec![],
+                    }),
+                    value: Some(value),
+                })),
+                span: command.span,
+            }));
+            continue;
+        }
+        match &mut command.kind {
+            Some(pb::command::Kind::Fail(child)) => commands.push(child),
+            Some(pb::command::Kind::Loop(body)) => commands.extend(body.body.iter_mut()),
+            _ => (),
+        }
+    }
+    Ok(())
+}
+
 fn expression(
     program: &pb::Program,
     index: u32,
@@ -4081,6 +4184,7 @@ fn lower_expression(
     let span = native_span(program, node.span.as_ref(), native_spans)?;
     let result = match node.kind.as_ref().ok_or("missing node kind")? {
         pb::node::Kind::Var(name) if !name.is_empty() => Expr::Var(span, name.clone()),
+        pb::node::Kind::Binding(name) => Expr::Call(span, native_name("binding", name), vec![]),
         pb::node::Kind::Apply(apply) => {
             let call = native_apply(program, node, apply)?;
             Expr::Call(
@@ -4198,7 +4302,7 @@ fn facts(
                 values.insert(index);
                 &union.members
             }
-            pb::node::Kind::PrimitiveValue(_) => continue,
+            pb::node::Kind::Binding(_) | pb::node::Kind::PrimitiveValue(_) => continue,
             _ => return Err("unsupported query graph node".into()),
         };
         values.extend(children.iter().copied());
@@ -4274,6 +4378,9 @@ fn facts(
                 continue;
             }
             pb::node::Kind::Var(_) => references[&index].clone(),
+            pb::node::Kind::Binding(name) => {
+                Expr::Call(span.clone(), native_name("binding", name), vec![])
+            }
             pb::node::Kind::Call(call)
             | pb::node::Kind::GetCost(call)
             | pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
@@ -4538,6 +4645,9 @@ fn validate_relation_uses(program: &pb::Program, saved: &pb::Program) -> Result<
     for command in command_tree(&program.commands) {
         match &command.kind {
             Some(pb::command::Kind::Action(head)) => action(head)?,
+            Some(pb::command::Kind::Let(write)) => {
+                value(write.value.ok_or("missing binding value")?)?;
+            }
             Some(pb::command::Kind::Extract(extract)) => {
                 for root in &extract.roots {
                     value(*root)?;
@@ -4680,7 +4790,7 @@ fn classify_value_dags<K: Eq + std::hash::Hash>(
                     continue;
                 }
                 pb::node::Kind::Union(union) if root_union == Some(index) => &union.members[..],
-                pb::node::Kind::Var(_) => &[],
+                pb::node::Kind::Var(_) | pb::node::Kind::Binding(_) => &[],
                 pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
                     value:
                         Some(
@@ -4960,6 +5070,7 @@ fn action_dag_actions(
                         continue;
                     }
                     pb::node::Kind::Var(_)
+                    | pb::node::Kind::Binding(_)
                     | pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
                         value:
                             Some(
@@ -5613,6 +5724,61 @@ fn lower_rule_cost_deletes(
     command
 }
 
+// Native globals are query captures in rule heads. Capture evaluated slot reads
+// once per logical slot; deferred Lambda bodies keep their own read context.
+fn capture_rule_bindings(mut command: Command, program: &pb::Program) -> Command {
+    let Command::Rule { rule } = &mut command else {
+        return command;
+    };
+    let slots: HashSet<_> = program
+        .nodes
+        .iter()
+        .filter_map(|node| match &node.kind {
+            Some(pb::node::Kind::Binding(name)) => Some(native_name("binding", name)),
+            _ => None,
+        })
+        .collect();
+    let mut used = HashSet::new();
+    rule.head.visit_vars(&mut |_, name| {
+        used.insert(name.clone());
+    });
+    for fact in &rule.body {
+        fact.visit_vars(&mut |_, name| {
+            used.insert(name.clone());
+        });
+    }
+    let mut captures = HashMap::new();
+    let mut facts = vec![];
+    let mut next = 0;
+    rule.head = std::mem::take(&mut rule.head).visit_exprs(&mut |expr| {
+        if let Expr::Call(span, name, args) = &expr
+            && args.is_empty()
+            && slots.contains(name)
+        {
+            let variable = captures.entry(name.clone()).or_insert_with(|| {
+                let variable = loop {
+                    let variable = format!("__egglog_proto_binding_capture_{next}");
+                    next += 1;
+                    if used.insert(variable.clone()) {
+                        break variable;
+                    }
+                };
+                facts.push(Fact::Eq(
+                    span.clone(),
+                    Expr::Var(span.clone(), variable.clone()),
+                    expr.clone(),
+                ));
+                variable
+            });
+            Expr::Var(span.clone(), variable.clone())
+        } else {
+            expr
+        }
+    });
+    rule.body.extend(facts);
+    command
+}
+
 fn lower_rule(
     program: &pb::Program,
     rule: &pb::Rule,
@@ -5829,7 +5995,7 @@ fn check_variables(
                 value: Some(pb::primitive_value::Value::PartialCall(call)),
             }) => pending.extend(&call.args),
             pb::node::Kind::Union(union) => pending.extend(&union.members),
-            pb::node::Kind::PrimitiveValue(_) => (),
+            pb::node::Kind::Binding(_) | pb::node::Kind::PrimitiveValue(_) => (),
         }
     }
     Ok(())
@@ -7912,6 +8078,7 @@ mod tests {
                             })
                             .unwrap();
                         let proof_sort = definitions.sorts[pair.output as usize].clone();
+                        let proof_files = definitions.files.clone();
                         let pair_name = pair.name.clone();
                         // Direct construction has a Fiat justification; native
                         // ProveExists expects a rule justification. The shallow
@@ -7929,6 +8096,7 @@ mod tests {
                             id,
                             pb::Program {
                                 sorts: vec![proof_sort],
+                                files: proof_files,
                                 nodes: vec![
                                     pb::Node {
                                         sort_id: 0,
@@ -8850,22 +9018,26 @@ mod tests {
                         })),
                         ..Default::default()
                     }],
-                    declarations: vec![pb::Declaration {
-                        kind: Some(if namespace == "sort" {
-                            pb::declaration::Kind::EqSort(pb::EqSort {
-                                name: "Public".into(),
-                            })
-                        } else {
-                            pb::declaration::Kind::Function(pb::Function {
+                    declarations: if namespace == "sort" {
+                        vec![]
+                    } else {
+                        vec![pb::Declaration {
+                            kind: Some(pb::declaration::Kind::Function(pb::Function {
                                 name: "Public".into(),
                                 output: 0,
                                 ..Default::default()
-                            })
-                        }),
-                        ..Default::default()
-                    }],
+                            })),
+                            ..Default::default()
+                        }]
+                    },
                     ..Default::default()
                 };
+                if namespace == "sort" {
+                    program.sorts.push(pb::Sort {
+                        kind: Some(pb::sort::Kind::Eq("Public".into())),
+                        ..Default::default()
+                    });
+                }
                 let error = session.prepare(&mut program).err().unwrap();
                 assert!(
                     error
@@ -8932,26 +9104,18 @@ mod tests {
                         ..Default::default()
                     },
                 ],
-                declarations: vec![
-                    pb::Declaration {
-                        kind: Some(pb::declaration::Kind::EqSort(pb::EqSort {
-                            name: "Num".into(),
-                        })),
+                declarations: vec![pb::Declaration {
+                    kind: Some(pb::declaration::Kind::Constructor(pb::Constructor {
+                        name: "N".into(),
+                        inputs: vec![pb::Arg {
+                            name: "x".into(),
+                            sort: 0,
+                        }],
+                        output: 1,
                         ..Default::default()
-                    },
-                    pb::Declaration {
-                        kind: Some(pb::declaration::Kind::Constructor(pb::Constructor {
-                            name: "N".into(),
-                            inputs: vec![pb::Arg {
-                                name: "x".into(),
-                                sort: 0,
-                            }],
-                            output: 1,
-                            ..Default::default()
-                        })),
-                        ..Default::default()
-                    },
-                ],
+                    })),
+                    ..Default::default()
+                }],
                 nodes: vec![
                     pb::Node {
                         sort_id: 0,
@@ -9089,16 +9253,251 @@ mod tests {
     }
 
     #[test]
+    fn binding_commands_replace_and_capture_reads_in_every_mode() {
+        for mode in [
+            pb::ExecutionMode::Normal,
+            pb::ExecutionMode::TermEncoding,
+            pb::ExecutionMode::Proofs,
+            pb::ExecutionMode::ProofTesting,
+        ] {
+            let (mut engine, id) = host_default_engine();
+            let session = engine.graphs.get_mut(&id).unwrap();
+            let graph = std::mem::take(&mut session.graph);
+            session.graph = match mode {
+                pb::ExecutionMode::Normal => graph,
+                pb::ExecutionMode::TermEncoding => graph.with_term_encoding_enabled(),
+                pb::ExecutionMode::Proofs => graph.with_proofs_enabled(),
+                _ => graph.with_proofs_enabled().with_proof_testing(),
+            };
+            session.mode = mode;
+            let input = inventory_fixture(
+                "(datatype E (N i64)) (function copy () E :merge new) (let $e (N 1)) (let $i 7) (let $e (N 2)) (let $i (+ $i 1)) (check (= $e (N 2))) (check (= $i 8)) (fail (check (= (N 1) (N 2)))) (set (copy) $e) (check (= (copy) (N 2)))",
+            );
+            let mut input = input;
+            let binding = input
+                .nodes
+                .iter()
+                .position(
+                    |n| matches!(&n.kind, Some(pb::node::Kind::Binding(name)) if name == "$e"),
+                )
+                .unwrap() as u32;
+            let query = input
+                .nodes
+                .iter()
+                .position(
+                    |n| matches!(&n.kind, Some(pb::node::Kind::Call(call)) if call.func == "N"),
+                )
+                .unwrap() as u32;
+            input.commands.push(pb::Command {
+                kind: Some(pb::command::Kind::Run(pb::Run {
+                    rulesets: vec![pb::RulesetSelection {
+                        kind: Some(pb::ruleset_selection::Kind::Ruleset(pb::Ruleset {
+                            rules: vec![pb::Rule {
+                                kind: Some(pb::rule::Kind::Rule(pb::RuleBody {
+                                    query: vec![query],
+                                    head: vec![pb::Action {
+                                        kind: Some(pb::action::Kind::Set(pb::Set {
+                                            target: Some(pb::Call {
+                                                func: "copy".into(),
+                                                args: vec![],
+                                            }),
+                                            value: Some(binding),
+                                        })),
+                                        ..Default::default()
+                                    }],
+                                })),
+                                eval_mode: pb::RuleEvalMode::Seminaive.into(),
+                                ..Default::default()
+                            }],
+                        })),
+                    }],
+                    ..Default::default()
+                })),
+                ..Default::default()
+            });
+            let response = run_host_default(&mut engine, id, input);
+            assert_eq!(response.error, None, "mode {mode:?}");
+            assert_eq!(
+                engine.graphs[&id].definitions.declarations.len(),
+                2,
+                "slots are not public callables"
+            );
+        }
+    }
+
+    #[test]
+    fn binding_snapshot_keeps_unset_types_and_shared_empty_classes() {
+        let (mut engine, id) = host_default_engine();
+        let input = pb::Program {
+            sorts: vec![
+                pb::Sort {
+                    kind: Some(pb::sort::Kind::Eq("A".into())),
+                    doc: Some("nominal docs".into()),
+                    ..Default::default()
+                },
+                pb::Sort {
+                    kind: Some(pb::sort::Kind::Primitive(pb::PrimitiveSortRef {
+                        name: "i64".into(),
+                        args: vec![],
+                    })),
+                    ..Default::default()
+                },
+                pb::Sort {
+                    kind: Some(pb::sort::Kind::Eq("Unused".into())),
+                    ..Default::default()
+                },
+            ],
+            nodes: vec![
+                pb::Node {
+                    sort_id: 0,
+                    kind: Some(pb::node::Kind::Binding("".into())),
+                    ..Default::default()
+                },
+                pb::Node {
+                    sort_id: 0,
+                    kind: Some(pb::node::Kind::Union(pb::Union { members: vec![] })),
+                    ..Default::default()
+                },
+                pb::Node {
+                    sort_id: 1,
+                    kind: Some(pb::node::Kind::Binding("未実行".into())),
+                    ..Default::default()
+                },
+                pb::Node {
+                    sort_id: 1,
+                    kind: Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
+                        value: Some(pb::primitive_value::Value::I64(4)),
+                    })),
+                    ..Default::default()
+                },
+            ],
+            commands: vec![
+                pb::Command {
+                    kind: Some(pb::command::Kind::Action(pb::Action {
+                        kind: Some(pb::action::Kind::Term(1)),
+                        ..Default::default()
+                    })),
+                    ..Default::default()
+                },
+                pb::Command {
+                    kind: Some(pb::command::Kind::Let(pb::Let {
+                        binding: Some(0),
+                        value: Some(1),
+                    })),
+                    ..Default::default()
+                },
+                pb::Command {
+                    kind: Some(pb::command::Kind::Loop(pb::Loop {
+                        max_iterations: Some(0),
+                        body: vec![pb::Command {
+                            kind: Some(pb::command::Kind::Let(pb::Let {
+                                binding: Some(2),
+                                value: Some(3),
+                            })),
+                            ..Default::default()
+                        }],
+                        ..Default::default()
+                    })),
+                    ..Default::default()
+                },
+                pb::Command {
+                    kind: Some(pb::command::Kind::Freeze(pb::Freeze {})),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        let response = run_host_default(&mut engine, id, input);
+        assert_eq!(response.error, None);
+        assert_eq!(
+            engine.graphs[&id].graph.materialized_eq_classes().len(),
+            1,
+            "Let reuses the command-list Union identity"
+        );
+        let snapshot = response
+            .output
+            .outputs
+            .iter()
+            .find_map(|output| match &output.kind {
+                Some(pb::command_output::Kind::Snapshot(snapshot)) => Some(snapshot),
+                _ => None,
+            })
+            .expect("snapshot");
+        let frozen = snapshot.program.as_ref().unwrap();
+        assert!(frozen.declarations.is_empty());
+        assert_eq!(
+            frozen
+                .nodes
+                .iter()
+                .filter(|n| matches!(n.kind, Some(pb::node::Kind::Binding(_))))
+                .count(),
+            2
+        );
+        assert_eq!(
+            frozen
+                .commands
+                .iter()
+                .filter(|c| matches!(c.kind, Some(pb::command::Kind::Let(_))))
+                .count(),
+            1
+        );
+        assert!(
+            frozen
+                .sorts
+                .iter()
+                .any(|s| matches!(&s.kind, Some(pb::sort::Kind::Eq(name)) if name == "Unused"))
+        );
+        assert!(
+            frozen
+                .sorts
+                .iter()
+                .any(|s| s.doc.as_deref() == Some("nominal docs"))
+        );
+        let (mut restored, restored_id) = host_default_engine();
+        assert_eq!(
+            run_host_default(&mut restored, restored_id, frozen.clone()).error,
+            None
+        );
+        assert_eq!(
+            restored.graphs[&restored_id]
+                .graph
+                .materialized_eq_classes()
+                .len(),
+            1
+        );
+        let mut wrong = pb::Program::default();
+        wrong.sorts.push(pb::Sort {
+            kind: Some(pb::sort::Kind::Eq("A".into())),
+            ..Default::default()
+        });
+        wrong.nodes.push(pb::Node {
+            sort_id: 0,
+            kind: Some(pb::node::Kind::Binding("未実行".into())),
+            ..Default::default()
+        });
+        assert!(
+            run_host_default(&mut restored, restored_id, wrong)
+                .error
+                .unwrap()
+                .message
+                .contains("conflicting binding sort")
+        );
+    }
+
+    #[test]
     fn installation_sites_use_original_indices_and_resupply_executes_nothing() {
         let (mut engine, id) = host_default_engine();
         let session = engine.graphs.get_mut(&id).unwrap();
         session.graph = std::mem::take(&mut session.graph).with_proofs_enabled();
         session.mode = pb::ExecutionMode::Proofs;
-        let mut program = source::Source::new(None, "(datatype Num (N i64))")
-            .unwrap()
-            .next()
-            .unwrap()
-            .unwrap();
+        let mut program = source::Source::new(
+            None,
+            "(datatype Num (N i64)) (function f () i64 :merge new)",
+        )
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap();
         program
             .declarations
             .insert(0, program.declarations[0].clone());
@@ -9122,7 +9521,7 @@ mod tests {
                 .iter()
                 .map(|i| i.source_declaration)
                 .collect::<Vec<_>>(),
-            [Some(0), None, Some(2),]
+            [None, None, Some(0), Some(2)]
         );
         let installed = run_host_default(&mut engine, id, program.clone());
         assert_eq!(installed.error, None);
@@ -10617,10 +11016,6 @@ mod tests {
         let conflict = pb::Program {
             sorts: vec![pb::Sort {
                 kind: Some(pb::sort::Kind::Eq(selector.clone())),
-                ..Default::default()
-            }],
-            declarations: vec![pb::Declaration {
-                kind: Some(pb::declaration::Kind::EqSort(pb::EqSort { name: selector })),
                 ..Default::default()
             }],
             commands: vec![pb::Command {

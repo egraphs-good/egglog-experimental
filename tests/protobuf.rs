@@ -54,6 +54,60 @@ mod source_blocks {
     }
 
     #[test]
+    fn globals_use_binding_nodes_and_renderer_reports_unset_slots_explicitly() {
+        use egglog_experimental::protobuf::source::Renderer;
+        let text = "(sort Unused) (datatype E (N i64)) (let cap (N 1)) (extract cap)";
+        let program = Source::new(None, text).unwrap().next().unwrap().unwrap();
+        assert!(program.sorts.iter().any(
+            |sort| matches!(&sort.kind, Some(pb::sort::Kind::Eq(name)) if name == "Unused")
+                && sort.span.is_some()
+        ));
+        assert!(program.nodes.iter().any(
+            |node| matches!(&node.kind, Some(pb::node::Kind::Binding(name)) if name == "cap")
+                && node.span.is_some()
+        ));
+        assert!(program.declarations.iter().all(|declaration| !matches!(&declaration.kind, Some(pb::declaration::Kind::Function(function)) if function.name == "cap")));
+        let rendered = Renderer::default().render(&program).unwrap();
+        assert!(rendered.contains("(let "));
+        assert!(!rendered.contains("__egglog_proto_binding_"));
+        new_experimental_egraph()
+            .parse_and_run_program(None, &rendered)
+            .unwrap();
+        let mut unset = pb::Program {
+            sorts: fixture().sorts[..1].to_vec(),
+            nodes: vec![pb::Node {
+                kind: Some(pb::node::Kind::Binding("unset".into())),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let mut renderer = Renderer::default();
+        assert!(
+            renderer
+                .render(&unset)
+                .unwrap_err()
+                .to_string()
+                .contains("unset")
+        );
+        unset.nodes.push(pb::Node {
+            kind: Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
+                value: Some(pb::primitive_value::Value::I64(1)),
+            })),
+            ..Default::default()
+        });
+        unset.commands.push(pb::Command {
+            kind: Some(pb::command::Kind::Let(pb::Let {
+                binding: Some(0),
+                value: Some(1),
+            })),
+            ..Default::default()
+        });
+        new_experimental_egraph()
+            .parse_and_run_program(None, &renderer.render(&unset).unwrap())
+            .unwrap();
+    }
+
+    #[test]
     fn ambient_default_and_combined_leaves_flush_before_replacement() {
         for named in [false, true] {
             let declaration = if named { "(ruleset leaf)" } else { "" };
@@ -545,7 +599,7 @@ fn source_definition_and_global_let_intake_does_not_clone_accumulated_native_bod
             phase
                 .commands
                 .iter()
-                .any(|command| matches!(command.kind, Some(pb::command::Kind::Action(_))))
+                .any(|command| matches!(command.kind, Some(pb::command::Kind::Let(_))))
         }));
     }
 }
@@ -1942,12 +1996,6 @@ mod constructor_action_dags {
     fn program(wraps: usize, share_every: usize) -> pb::Program {
         let mut program = pb::Program {
             sorts: fixture().sorts,
-            declarations: vec![pb::Declaration {
-                kind: Some(pb::declaration::Kind::EqSort(pb::EqSort {
-                    name: "Math".into(),
-                })),
-                ..Default::default()
-            }],
             ..Default::default()
         };
         for (name, arity) in [("Leaf", 0), ("Wrap", 1), ("Pair", 2)] {
@@ -2284,7 +2332,6 @@ mod constructor_action_dags {
 
         for body in [
             "(let dead (A)) (A)",
-            "(let x $captured) x",
             "(let x (read)) (let y (A)) (Pair y x)",
         ] {
             let text = format!(
@@ -2353,7 +2400,7 @@ mod constructor_action_dags {
         let mut original = set_program(28, false);
         original.commands.truncate(1);
         let Some(pb::declaration::Kind::Constructor(constructor)) =
-            &mut original.declarations[2].kind
+            &mut original.declarations[1].kind
         else {
             unreachable!()
         };
@@ -2504,7 +2551,7 @@ mod constructor_action_dags {
                 })),
                 ..Default::default()
             });
-            let Some(pb::declaration::Kind::Constructor(leaf)) = &mut original.declarations[1].kind
+            let Some(pb::declaration::Kind::Constructor(leaf)) = &mut original.declarations[0].kind
             else {
                 unreachable!()
             };
@@ -2631,6 +2678,7 @@ mod constructor_action_dags {
             for phase in Source::new(Some("scope-conflict.egg".into()), &text).unwrap() {
                 let phase = phase.unwrap();
                 inspect.sorts = phase.sorts.clone();
+                inspect.files = phase.files.clone();
                 for declaration in &phase.declarations {
                     if let Some(pb::declaration::Kind::Constructor(constructor)) = &declaration.kind
                     {
@@ -2851,7 +2899,7 @@ mod constructor_action_dags {
                         ..Default::default()
                     });
                     let Some(pb::declaration::Kind::Constructor(leaf)) =
-                        &mut program.declarations[1].kind
+                        &mut program.declarations[0].kind
                     else {
                         unreachable!()
                     };
@@ -3931,20 +3979,10 @@ mod reflective_headers {
                 })),
                 ..Default::default()
             }],
-            declarations: vec![
-                pb::Declaration {
-                    kind: Some(Kind::EqSort(pb::EqSort { name: "S".into() })),
-                    ..Default::default()
-                },
-                pb::Declaration {
-                    kind: Some(Kind::EqSort(pb::EqSort { name: "U".into() })),
-                    ..Default::default()
-                },
-                pb::Declaration {
-                    kind: Some(table),
-                    ..Default::default()
-                },
-            ],
+            declarations: vec![pb::Declaration {
+                kind: Some(table),
+                ..Default::default()
+            }],
             ..Default::default()
         }
     }
@@ -3963,15 +4001,15 @@ mod reflective_headers {
         let mut saved = pb::Program::default();
         egglog_experimental::builtin::definitions::reconcile_declarations(&program, &mut saved)
             .unwrap();
-        program.declarations[2].table_name =
+        program.declarations[0].table_name =
             Some(pb::declaration::TableName::DefaultName("P".into()));
         assert_eq!(
             egglog_experimental::builtin::definitions::reconcile_declarations(&program, &mut saved)
                 .unwrap(),
-            [false; 3]
+            [false; 1]
         );
         assert_eq!(
-            saved.declarations[2].table_name, None,
+            saved.declarations[0].table_name, None,
             "first descriptor stays exact"
         );
         let mut explicit_first = pb::Program::default();
@@ -3981,31 +4019,31 @@ mod reflective_headers {
         )
         .unwrap();
         let mut implicit = program.clone();
-        implicit.declarations[2].table_name = None;
+        implicit.declarations[0].table_name = None;
         egglog_experimental::builtin::definitions::reconcile_declarations(
             &implicit,
             &mut explicit_first,
         )
         .unwrap();
         assert_eq!(
-            explicit_first.declarations[2].table_name,
-            program.declarations[2].table_name
+            explicit_first.declarations[0].table_name,
+            program.declarations[0].table_name
         );
-        program.declarations[2].table_name =
+        program.declarations[0].table_name =
             Some(pb::declaration::TableName::PublicAlias("P".into()));
         assert!(
             egglog_experimental::builtin::definitions::reconcile_declarations(&program, &mut saved)
                 .unwrap_err()
                 .contains("conflicting declaration")
         );
-        program.declarations[2].table_name =
+        program.declarations[0].table_name =
             Some(pb::declaration::TableName::PublicAlias(String::new()));
         assert!(
             egglog_experimental::builtin::definitions::reconcile_declarations(&program, &mut saved)
                 .unwrap_err()
                 .contains("conflicting declaration")
         );
-        program.declarations[2].table_name = None;
+        program.declarations[0].table_name = None;
     }
 }
 
@@ -5005,12 +5043,6 @@ mod relation_predicates {
                 },
             ],
             declarations: vec![
-                pb::Declaration {
-                    kind: Some(pb::declaration::Kind::EqSort(pb::EqSort {
-                        name: "RelationPayload".into(),
-                    })),
-                    ..Default::default()
-                },
                 pb::Declaration {
                     kind: Some(pb::declaration::Kind::Relation(pb::Relation {
                         name: "R".into(),
@@ -6180,12 +6212,6 @@ mod relation_predicates {
                         invalid.nodes[2].sort_id = invalid.sorts.len() as u32;
                         invalid.sorts.push(pb::Sort {
                             kind: Some(pb::sort::Kind::Eq("Unit".into())),
-                            ..Default::default()
-                        });
-                        invalid.declarations.push(pb::Declaration {
-                            kind: Some(pb::declaration::Kind::EqSort(pb::EqSort {
-                                name: "Unit".into(),
-                            })),
                             ..Default::default()
                         });
                     }
@@ -10446,15 +10472,13 @@ fn core_source_nominal_and_nested_families_reimport_across_phases() {
     let mut family = false;
     for phase in Source::new_core(None, &rendered).unwrap() {
         let phase = phase.unwrap();
+        names.extend(phase.sorts.iter().filter_map(|sort| match &sort.kind {
+            Some(pb::sort::Kind::Eq(name)) => Some(name.clone()),
+            _ => None,
+        }));
         for declaration in &phase.declarations {
-            match &declaration.kind {
-                Some(pb::declaration::Kind::EqSort(sort)) => {
-                    names.insert(sort.name.clone());
-                }
-                Some(pb::declaration::Kind::Constructor(call)) => {
-                    names.insert(call.name.clone());
-                }
-                _ => (),
+            if let Some(pb::declaration::Kind::Constructor(call)) = &declaration.kind {
+                names.insert(call.name.clone());
             }
         }
         family |= phase.sorts.iter().any(|sort| {
@@ -11238,7 +11262,7 @@ fn core_renderer_rejects_unrepresentable_names_before_publication() {
         ] {
             let mut invalid = base.clone();
             let Some(pb::declaration::Kind::Constructor(constructor)) =
-                &mut invalid.declarations[1].kind
+                &mut invalid.declarations[0].kind
             else {
                 unreachable!()
             };
@@ -11257,7 +11281,7 @@ fn core_renderer_rejects_unrepresentable_names_before_publication() {
         assert!(renderer.render(&base).unwrap().is_empty());
         let mut private = base.clone();
         let Some(pb::declaration::Kind::Constructor(constructor)) =
-            &mut private.declarations[1].kind
+            &mut private.declarations[0].kind
         else {
             unreachable!()
         };
@@ -11273,16 +11297,13 @@ fn core_renderer_rejects_unrepresentable_names_before_publication() {
         let mut renderer = Renderer::core();
         renderer.render(&base).unwrap();
         let sort = pb::Program {
-            declarations: vec![pb::Declaration {
-                kind: Some(pb::declaration::Kind::EqSort(pb::EqSort {
-                    name: "Shared".into(),
-                })),
+            sorts: vec![pb::Sort {
+                kind: Some(pb::sort::Kind::Eq("Shared".into())),
                 ..Default::default()
             }],
             ..Default::default()
         };
         let mut callable = base.clone();
-        callable.declarations.remove(0);
         let Some(pb::declaration::Kind::Constructor(constructor)) =
             &mut callable.declarations[0].kind
         else {
@@ -12619,22 +12640,14 @@ fn shared_rules_fixture() -> pb::Program {
             })),
             ..Default::default()
         }],
-        declarations: vec![
-            pb::Declaration {
-                kind: Some(pb::declaration::Kind::EqSort(pb::EqSort {
-                    name: "Item".into(),
-                })),
+        declarations: vec![pb::Declaration {
+            kind: Some(pb::declaration::Kind::Constructor(pb::Constructor {
+                name: "Fired".into(),
+                output: 0,
                 ..Default::default()
-            },
-            pb::Declaration {
-                kind: Some(pb::declaration::Kind::Constructor(pb::Constructor {
-                    name: "Fired".into(),
-                    output: 0,
-                    ..Default::default()
-                })),
-                ..Default::default()
-            },
-        ],
+            })),
+            ..Default::default()
+        }],
         ..Default::default()
     };
     program.commands = vec![
@@ -13268,6 +13281,11 @@ fn declaration_doc_presence_survives_bytes_without_changing_execution_or_resuppl
         for declaration in &mut program.declarations {
             declaration.doc = first.map(str::to_owned);
         }
+        for sort in &mut program.sorts {
+            if matches!(sort.kind, Some(pb::sort::Kind::Eq(_))) {
+                sort.doc = first.map(str::to_owned);
+            }
+        }
         let encoded = program.encode_to_vec();
         let decoded = pb::Program::decode(encoded.as_slice()).unwrap();
         assert_eq!(decoded, program);
@@ -13276,6 +13294,13 @@ fn declaration_doc_presence_survives_bytes_without_changing_execution_or_resuppl
                 .declarations
                 .iter()
                 .all(|d| d.doc.as_deref() == first)
+        );
+        assert!(
+            decoded
+                .sorts
+                .iter()
+                .filter(|sort| matches!(sort.kind, Some(pb::sort::Kind::Eq(_))))
+                .all(|sort| sort.doc.as_deref() == first)
         );
         encodings.push(encoded);
         let mut engine = Engine::default();
@@ -13299,6 +13324,11 @@ fn declaration_doc_presence_survives_bytes_without_changing_execution_or_resuppl
             for declaration in &mut resupply.declarations {
                 declaration.doc = later.map(str::to_owned);
             }
+            for sort in &mut resupply.sorts {
+                if matches!(sort.kind, Some(pb::sort::Kind::Eq(_))) {
+                    sort.doc = later.map(str::to_owned);
+                }
+            }
             for handle in [id, clone] {
                 let response = run(&mut engine, handle, resupply.clone());
                 assert_eq!(response.error, None);
@@ -13313,7 +13343,7 @@ fn declaration_doc_presence_survives_bytes_without_changing_execution_or_resuppl
                 .parse_and_run_program(None, &renderer.render(&resupply).unwrap())
                 .unwrap();
             let Some(pb::declaration::Kind::Constructor(constructor)) =
-                &mut resupply.declarations[1].kind
+                &mut resupply.declarations[0].kind
             else {
                 unreachable!()
             };
@@ -13447,7 +13477,7 @@ fn constant_signature_conflicts_reject_before_writes_and_clone_keeps_prefix_stat
         let mut invalid = program.clone();
         match bad {
             6 | 7 => {
-                let Some(pb::declaration::Kind::Function(f)) = &mut invalid.declarations[3].kind
+                let Some(pb::declaration::Kind::Function(f)) = &mut invalid.declarations[2].kind
                 else {
                     unreachable!()
                 };
@@ -13753,26 +13783,18 @@ fn wire_namespace_same_request_sort_and_constructor() {
     let mut p = fixture();
     p.rulesets.clear();
     p.sorts[1].kind = Some(pb::sort::Kind::Eq("Shared".into()));
-    p.declarations = vec![
-        pb::Declaration {
-            kind: Some(pb::declaration::Kind::EqSort(pb::EqSort {
-                name: "Shared".into(),
-            })),
+    p.declarations = vec![pb::Declaration {
+        kind: Some(pb::declaration::Kind::Constructor(pb::Constructor {
+            name: "Shared".into(),
+            inputs: vec![pb::Arg {
+                sort: 0,
+                name: "value".into(),
+            }],
+            output: 1,
             ..Default::default()
-        },
-        pb::Declaration {
-            kind: Some(pb::declaration::Kind::Constructor(pb::Constructor {
-                name: "Shared".into(),
-                inputs: vec![pb::Arg {
-                    sort: 0,
-                    name: "value".into(),
-                }],
-                output: 1,
-                ..Default::default()
-            })),
-            ..Default::default()
-        },
-    ];
+        })),
+        ..Default::default()
+    }];
     p.nodes.truncate(1);
     p.nodes.push(pb::Node {
         sort_id: 1,
@@ -13858,7 +13880,6 @@ fn wire_namespace_same_request_sort_and_constructor() {
         .unwrap();
     // An authored name equal to the first emitted alias is still a new key.
     let mut later = p.clone();
-    later.declarations.remove(0);
     let Some(pb::declaration::Kind::Constructor(constructor)) = &mut later.declarations[0].kind
     else {
         unreachable!()
@@ -13870,7 +13891,7 @@ fn wire_namespace_same_request_sort_and_constructor() {
     call.func = alias;
     later.commands.pop();
     let mut invalid = later.clone();
-    invalid.declarations.push(p.declarations[1].clone());
+    invalid.declarations.push(p.declarations[0].clone());
     let Some(pb::declaration::Kind::Constructor(constructor)) = &mut invalid.declarations[1].kind
     else {
         unreachable!()
@@ -13905,10 +13926,8 @@ fn wire_namespace_same_request_sort_and_constructor() {
 
 fn check_cross_request_namespaces(sort_first: bool, name: &str) {
     let sort = pb::Program {
-        declarations: vec![pb::Declaration {
-            kind: Some(pb::declaration::Kind::EqSort(pb::EqSort {
-                name: name.into(),
-            })),
+        sorts: vec![pb::Sort {
+            kind: Some(pb::sort::Kind::Eq(name.into())),
             ..Default::default()
         }],
         ..Default::default()
@@ -14053,12 +14072,7 @@ fn wire_namespace_host_aliases_unicode_and_nested_result_sorts() {
             ..Default::default()
         });
     }
-    p.declarations.push(pb::Declaration {
-        kind: Some(pb::declaration::Kind::EqSort(pb::EqSort {
-            name: "Shared".into(),
-        })),
-        ..Default::default()
-    });
+
     p.nodes = vec![pb::Node {
         sort_id: scalar,
         kind: Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
@@ -15288,32 +15302,24 @@ fn pair_nested_values_rebuild_and_keep_user_constructor_provenance() {
         kind: Some(pb::sort::Kind::Eq("Pair".into())),
         ..Default::default()
     });
-    user.declarations.extend([
-        pb::Declaration {
-            kind: Some(pb::declaration::Kind::EqSort(pb::EqSort {
-                name: "Pair".into(),
-            })),
+    user.declarations.extend([pb::Declaration {
+        kind: Some(pb::declaration::Kind::Constructor(pb::Constructor {
+            name: "pair".into(),
+            inputs: vec![
+                pb::Arg {
+                    name: "first".into(),
+                    sort: 0,
+                },
+                pb::Arg {
+                    name: "second".into(),
+                    sort: 1,
+                },
+            ],
+            output: 3,
             ..Default::default()
-        },
-        pb::Declaration {
-            kind: Some(pb::declaration::Kind::Constructor(pb::Constructor {
-                name: "pair".into(),
-                inputs: vec![
-                    pb::Arg {
-                        name: "first".into(),
-                        sort: 0,
-                    },
-                    pb::Arg {
-                        name: "second".into(),
-                        sort: 1,
-                    },
-                ],
-                output: 3,
-                ..Default::default()
-            })),
-            ..Default::default()
-        },
-    ]);
+        })),
+        ..Default::default()
+    }]);
     user.nodes.push(pb::Node {
         sort_id: 3,
         kind: Some(pb::node::Kind::Call(pb::Call {
@@ -15367,10 +15373,10 @@ fn nominal_pair_source_preserves_names_through_bytes_and_rendering() {
     let mut nominal_declared = false;
     for phase in Source::new(None, text).unwrap() {
         let program = pb::Program::decode(phase.unwrap().encode_to_vec().as_slice()).unwrap();
-        nominal_declared |= program.declarations.iter().any(|d| {
-            matches!(
-            &d.kind, Some(pb::declaration::Kind::EqSort(s)) if s.name == "Pair")
-        });
+        nominal_declared |= program
+            .sorts
+            .iter()
+            .any(|sort| matches!(&sort.kind, Some(pb::sort::Kind::Eq(name)) if name == "Pair"));
         let response = run(&mut engine, id, program.clone());
         assert_eq!(response.error, None);
         reparsed
@@ -15439,12 +15445,6 @@ fn nominal_pair_fixture() -> pb::Program {
     };
     f.args = vec![1, 0];
     p.declarations.extend([
-        pb::Declaration {
-            kind: Some(pb::declaration::Kind::EqSort(pb::EqSort {
-                name: "Pair".into(),
-            })),
-            ..Default::default()
-        },
         pb::Declaration {
             kind: Some(pb::declaration::Kind::Constructor(pb::Constructor {
                 name: "Pair".into(),
@@ -15537,14 +15537,14 @@ fn nominal_pair_resupply_orders_clone_conflicts_and_prefixes() {
         let mut renderer = Renderer::default();
         let mut reparsed = new_experimental_egraph();
         // Exercise both incremental sort arrival orders, then complete
-        // resupply; ambient family availability never supplies the EqSort.
-        for d in program
-            .declarations
+        // resupply; the Eq entry defines the nominal type independently of ambient families.
+        for sort in program
+            .sorts
             .iter()
-            .filter(|d| matches!(d.kind, Some(pb::declaration::Kind::EqSort(_))))
+            .filter(|sort| matches!(sort.kind, Some(pb::sort::Kind::Eq(_))))
         {
             let phase = pb::Program {
-                declarations: vec![d.clone()],
+                sorts: vec![sort.clone()],
                 ..Default::default()
             };
             assert_eq!(run(&mut engine, id, phase.clone()).error, None);
@@ -15610,7 +15610,7 @@ fn nominal_pair_resupply_orders_clone_conflicts_and_prefixes() {
                 }
                 2 => {
                     let Some(pb::declaration::Kind::Constructor(c)) =
-                        &mut conflict.declarations[1].kind
+                        &mut conflict.declarations[0].kind
                     else {
                         unreachable!()
                     };
@@ -15618,7 +15618,7 @@ fn nominal_pair_resupply_orders_clone_conflicts_and_prefixes() {
                 }
                 _ => {
                     let Some(pb::declaration::Kind::Function(f)) =
-                        &mut conflict.declarations[2].kind
+                        &mut conflict.declarations[1].kind
                     else {
                         unreachable!()
                     };
@@ -15698,6 +15698,17 @@ fn nominal_pair_wrong_kind_names_reject_before_earlier_writes() {
         assert_eq!(run(&mut engine, id, phase.clone()).error, None);
         renderer.render(phase).unwrap();
     }
+    for name in ["Pair", "i64"] {
+        let standalone = pb::Program {
+            sorts: vec![pb::Sort {
+                kind: Some(pb::sort::Kind::Eq(name.into())),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        assert_eq!(run(&mut engine, id, standalone.clone()).error, None);
+        renderer.render(&standalone).unwrap();
+    }
     for bad in 0..3 {
         let mut invalid = phases[1].clone();
         let literal = invalid
@@ -15717,13 +15728,16 @@ fn nominal_pair_wrong_kind_names_reject_before_earlier_writes() {
         }));
         let expected = match bad {
             0 | 1 => {
+                // Eq establishes a real nominal type. Using its index as the
+                // type of scalar i64 data still fails before the earlier write.
+                literal.sort_id = invalid.sorts.len() as u32;
                 invalid.sorts.push(pb::Sort {
                     kind: Some(pb::sort::Kind::Eq(
                         if bad == 0 { "Pair" } else { "i64" }.into(),
                     )),
                     ..Default::default()
                 });
-                "unknown sort"
+                None
             }
             _ => {
                 invalid.sorts.push(pb::Sort {
@@ -15735,20 +15749,24 @@ fn nominal_pair_wrong_kind_names_reject_before_earlier_writes() {
                 });
                 // Nullary host families now require actual native registration;
                 // a nominal equality sort is not an available host provider.
-                "unknown host sort family OnlyNominal"
+                Some("unknown host sort family OnlyNominal")
             }
         };
         let response = run(&mut engine, id, invalid.clone());
         let error = response.error.unwrap();
         assert_eq!(error.code, pb::ErrorCode::InvalidProgram as i32);
-        assert!(
-            error.message.contains(expected),
-            "bad {bad}: {}",
-            error.message
-        );
+        if let Some(expected) = expected {
+            assert!(
+                error.message.contains(expected),
+                "bad {bad}: {}",
+                error.message
+            );
+        }
         assert!(response.output.outputs.is_empty());
         let render_error = renderer.render(&invalid).unwrap_err();
-        assert!(render_error.to_string().contains(expected));
+        if let Some(expected) = expected {
+            assert!(render_error.to_string().contains(expected));
+        }
         assert_eq!(run(&mut engine, id, phases[2].clone()).error, None);
     }
 }
@@ -17809,7 +17827,7 @@ fn recursive_fail_keeps_native_run_effects_and_source_shape() {
 }
 
 #[test]
-fn source_fail_rejects_authored_let_before_registration() {
+fn source_fail_preserves_runtime_prefix_and_rejects_invalid_binding_initializers() {
     use egglog_experimental::protobuf::source::Source;
     for core in [false, true] {
         for (prefix, tail, errors) in [
@@ -17839,8 +17857,8 @@ fn source_fail_rejects_authored_let_before_registration() {
             // its binding survives, just as earlier argument effects do on failure.
             native.parse_and_run_program(None, tail).unwrap();
         }
-        // Let is an authoring binder, not a wire action. Reject it before its
-        // header or initializer can be registered, regardless of nesting.
+        // A malformed initializer still rejects the whole unsent block,
+        // including when Fail would surround the runtime binding write.
         for depth in 1..=3 {
             let mut child = "(let $cap (unknown))".to_owned();
             for _ in 0..depth {
@@ -17862,10 +17880,7 @@ fn source_fail_rejects_authored_let_before_registration() {
                 .unwrap();
             assert_eq!(run(&mut engine, id, baseline).error, None);
             let error = source.next().unwrap().unwrap_err();
-            assert_eq!(
-                error.to_string(),
-                "source Fail does not support authored let bindings"
-            );
+            assert!(error.to_string().contains("unknown"));
             assert!(source.next().is_none());
             let observation = pb::Program {
                 commands: vec![pb::Command {
@@ -18026,9 +18041,12 @@ fn source_fail_definitions_are_frontend_only_and_keep_installed_prefixes() {
                         ))
                     );
                     rules += inline_rules(&phase).len();
+                    definitions.extend(phase.sorts.iter().filter_map(|sort| match &sort.kind {
+                        Some(pb::sort::Kind::Eq(name)) => Some(name.clone()),
+                        _ => None,
+                    }));
                     definitions.extend(phase.declarations.iter().filter_map(|declaration| {
                         match &declaration.kind {
-                            Some(pb::declaration::Kind::EqSort(sort)) => Some(sort.name.clone()),
                             Some(pb::declaration::Kind::Constructor(function)) => {
                                 Some(function.name.clone())
                             }
@@ -18955,7 +18973,7 @@ fn nondefault_rewrite_options_remain_an_explicit_adapter_limit() {
 }
 
 #[test]
-fn source_rule_head_globals_become_retained_query_bindings() {
+fn source_rule_head_globals_remain_binding_nodes_for_shared_backend_lowering() {
     use egglog_experimental::protobuf::source::{Renderer, Source};
     let text = r#"
         (datatype E (Num i64))
@@ -18998,19 +19016,12 @@ fn source_rule_head_globals_become_retained_query_bindings() {
                 let Some(pb::rule::Kind::Rule(rule)) = &rule.kind else {
                     panic!("plain rule")
                 };
-                assert_eq!(rule.query.len(), 2); // Trigger plus one shared global capture.
-                let Some(pb::node::Kind::Union(capture)) =
-                    &phase.nodes[rule.query[1] as usize].kind
-                else {
-                    panic!("query equality")
-                };
-                assert!(
-                    matches!(&phase.nodes[capture.members[0] as usize].kind, Some(pb::node::Kind::Call(call)) if call.func == "captured" && call.args.is_empty())
+                assert_eq!(
+                    rule.query.len(),
+                    1,
+                    "Source preserves authored membership; the backend captures global head reads"
                 );
-                assert!(matches!(
-                    &phase.nodes[capture.members[1] as usize].kind,
-                    Some(pb::node::Kind::Var(_))
-                ));
+                assert!(phase.nodes.iter().any(|node| matches!(&node.kind, Some(pb::node::Kind::Binding(name)) if name == "captured")));
                 saw_capture = true;
             }
             replay
@@ -20201,7 +20212,7 @@ mod source_provider_context {
             (primitive read_saved () i64 $captured)
             (function merged () i64 :merge (test-counted (+ old new)))
             (sort F (UnstableFn () i64))
-            (primitive factory () F (unstable-fn \"$captured\"))
+            (primitive factory () F (unstable-fn \"read_saved\"))
             (primitive body_factory () F (unstable-fn \"read_saved\"))
             (function slot () F :no-merge) (set (slot) (factory))
             (function body_slot () F :no-merge) (set (body_slot) (body_factory))
@@ -20230,7 +20241,7 @@ mod source_provider_context {
         assert_eq!(provider.evaluations.load(Ordering::SeqCst), 2);
         assert_eq!(provider.validations.load(Ordering::SeqCst), 0);
         // Reimport uses the same provider, with captured globals still authored
-        // as Function+Set; no saved native value or initialized graph is copied.
+        // as Binding+Let; no saved native value or initialized graph is copied.
         let before = provider.evaluations.load(Ordering::SeqCst);
         let phases = Source::with_extension(None, &rendered, provider.clone())
             .unwrap()
@@ -20250,7 +20261,7 @@ mod source_provider_context {
              (let $unreached (test-counted (missing)))
              (primitive read_unreached () i64 $unreached)
              (sort F (UnstableFn () i64))
-             (primitive missing_factory () F (unstable-fn \"$unreached\"))",
+             (primitive missing_factory () F (unstable-fn \"read_unreached\"))",
             provider.clone(),
         )
         .unwrap()
@@ -20599,7 +20610,7 @@ fn source_core_renderer_rejects_assigned_cost_reads_and_writes_without_state_cha
                     }),
                     "merge-read" => {
                         let Some(pb::declaration::Kind::Function(function)) =
-                            &mut program.declarations[3].kind
+                            &mut program.declarations[2].kind
                         else {
                             unreachable!()
                         };
@@ -21585,12 +21596,6 @@ fn core_renderer_private_selectors_reject_literal_global_collisions_inertly() {
                 kind: Some(pb::sort::Kind::Eq(private.clone())),
                 ..Default::default()
             });
-            conflict.declarations.push(pb::Declaration {
-                kind: Some(pb::declaration::Kind::EqSort(pb::EqSort {
-                    name: private.clone(),
-                })),
-                ..Default::default()
-            });
         } else {
             conflict.sorts.push(pb::Sort {
                 kind: Some(pb::sort::Kind::Primitive(pb::PrimitiveSortRef {
@@ -21840,7 +21845,7 @@ fn source_renderer_prevents_identifier_injection() {
         match target {
             0 => {
                 let Some(pb::declaration::Kind::Function(function)) =
-                    &mut program.declarations[3].kind
+                    &mut program.declarations[2].kind
                 else {
                     panic!("expected function")
                 };
@@ -21863,11 +21868,6 @@ fn source_renderer_prevents_identifier_injection() {
             }
             1 => {
                 program.sorts[1].kind = Some(pb::sort::Kind::Eq(injected.into()));
-                let Some(pb::declaration::Kind::EqSort(sort)) = &mut program.declarations[0].kind
-                else {
-                    unreachable!()
-                };
-                sort.name = injected.into();
             }
             2 => program.nodes[3].kind = Some(pb::node::Kind::Var(injected.into())),
             3 => {
@@ -22360,12 +22360,6 @@ fn fixture() -> pb::Program {
         ],
         declarations: vec![
             pb::Declaration {
-                kind: Some(declaration::Kind::EqSort(pb::EqSort {
-                    name: "Math".into(),
-                })),
-                ..Default::default()
-            },
-            pb::Declaration {
                 kind: Some(declaration::Kind::Constructor(pb::Constructor {
                     name: "Num".into(),
                     inputs: vec![pb::Arg {
@@ -22612,7 +22606,7 @@ fn assigned_costs_keep_zero_overwrites_deletion_and_freeze_restore() {
     let mut program = fixture();
     program.commands.clear();
     program.rulesets.clear();
-    let Some(pb::declaration::Kind::Constructor(constructor)) = &mut program.declarations[1].kind
+    let Some(pb::declaration::Kind::Constructor(constructor)) = &mut program.declarations[0].kind
     else {
         unreachable!()
     };
@@ -23282,24 +23276,21 @@ fn source_assigned_cost_delete_temps_do_not_capture_authored_binders() {
                 ..Default::default()
             },
         ],
-        declarations: vec![
-            fixture().declarations[0].clone(),
-            pb::Declaration {
-                kind: Some(pb::declaration::Kind::Constructor(pb::Constructor {
-                    name: "C".into(),
-                    inputs: vec![
-                        pb::Arg {
-                            sort: 0,
-                            name: String::new()
-                        };
-                        2
-                    ],
-                    output: 1,
-                    ..Default::default()
-                })),
+        declarations: vec![pb::Declaration {
+            kind: Some(pb::declaration::Kind::Constructor(pb::Constructor {
+                name: "C".into(),
+                inputs: vec![
+                    pb::Arg {
+                        sort: 0,
+                        name: String::new()
+                    };
+                    2
+                ],
+                output: 1,
                 ..Default::default()
-            },
-        ],
+            })),
+            ..Default::default()
+        }],
         commands: vec![
             pb::Command {
                 kind: Some(pb::command::Kind::Action(pb::Action {
@@ -24730,26 +24721,18 @@ fn default_extraction_negative_compatibility_is_scoped_to_the_sort_domain() {
                 kind: Some(pb::sort::Kind::Eq("Unrelated".into())),
                 ..Default::default()
             });
-            program.declarations.extend([
-                pb::Declaration {
-                    kind: Some(pb::declaration::Kind::EqSort(pb::EqSort {
-                        name: "Unrelated".into(),
-                    })),
+            program.declarations.extend([pb::Declaration {
+                kind: Some(pb::declaration::Kind::Constructor(pb::Constructor {
+                    name: "UnrelatedNum".into(),
+                    inputs: vec![pb::Arg {
+                        name: "n".into(),
+                        sort: 0,
+                    }],
+                    output: 2,
                     ..Default::default()
-                },
-                pb::Declaration {
-                    kind: Some(pb::declaration::Kind::Constructor(pb::Constructor {
-                        name: "UnrelatedNum".into(),
-                        inputs: vec![pb::Arg {
-                            name: "n".into(),
-                            sort: 0,
-                        }],
-                        output: 2,
-                        ..Default::default()
-                    })),
-                    ..Default::default()
-                },
-            ]);
+                })),
+                ..Default::default()
+            }]);
             let target = pb::Call {
                 func: "Num".into(),
                 args: vec![1],
@@ -25624,7 +25607,7 @@ fn keep_best_objective_overflow_is_reported_before_clear() {
 
 fn birewrite_fixture() -> pb::Program {
     let mut program = fixture();
-    let mut other = program.declarations[2].clone();
+    let mut other = program.declarations[1].clone();
     let Some(pb::declaration::Kind::Constructor(constructor)) = &mut other.kind else {
         unreachable!()
     };
@@ -25871,7 +25854,7 @@ fn birewrite_proofs_execute_both_directions_through_bytes() {
         .unwrap()
         .egraph_id;
         let mut program = birewrite_fixture();
-        let Some(pb::declaration::Kind::Function(captured)) = &mut program.declarations[4].kind
+        let Some(pb::declaration::Kind::Function(captured)) = &mut program.declarations[3].kind
         else {
             unreachable!()
         };
@@ -26313,7 +26296,7 @@ fn unavailable_table_cells_keep_rows_and_execute_suffix() {
     let mut engine = Engine::default();
     let id = create(&mut engine);
     let mut program = fixture();
-    let Some(pb::declaration::Kind::Constructor(constructor)) = &mut program.declarations[1].kind
+    let Some(pb::declaration::Kind::Constructor(constructor)) = &mut program.declarations[0].kind
     else {
         unreachable!()
     };
@@ -27508,12 +27491,6 @@ fn inert_exact_number_payloads_use_closed_action_and_extract_dags() {
         });
         program.declarations.extend([
             pb::Declaration {
-                kind: Some(pb::declaration::Kind::EqSort(pb::EqSort {
-                    name: "ExactNode".into(),
-                })),
-                ..Default::default()
-            },
-            pb::Declaration {
                 kind: Some(pb::declaration::Kind::Constructor(pb::Constructor {
                     name: "ExactLeaf".into(),
                     inputs: vec![
@@ -27980,9 +27957,7 @@ fn print_size_native_counts_modes_names_and_stats() {
     program.rulesets.clear();
     program.nodes.clear();
     program.commands.clear();
-    program
-        .declarations
-        .retain(|d| matches!(d.kind, Some(pb::declaration::Kind::EqSort(_))));
+    program.declarations.clear();
     for name in ["z alias", "a/alias", "é"] {
         program.declarations.push(pb::Declaration {
             kind: Some(pb::declaration::Kind::Constructor(pb::Constructor {

@@ -73,9 +73,33 @@ pub fn var<S: EgglogValue>(name: &str) -> S {
     S::from_expression(Expr::variable(S::sort_ref(), format!("@typed:n:{encoded}")))
 }
 
-/// Capture an initializer once at its ordered registration or extraction point.
-/// Equal labels require equal sorts and initializer syntax in one live scope.
-/// Construction is inert; the returned value reads the established capture.
+/// A typed global-slot lookup. Construction establishes no value; a submitted
+/// Let or `set` supplies one. The slot namespace is separate from lexical vars.
+pub fn binding<S: EgglogValue>(name: impl Into<String>) -> S {
+    let mut slots = std::array::from_fn(|_| vec![]);
+    slots[Arena::Sort as usize] = vec![Slot::External(S::sort_ref().0)];
+    S::from_expression(Expr(
+        publish(
+            pb::Program {
+                nodes: vec![pb::Node {
+                    kind: Some(pb::node::Kind::Binding(name.into())),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+            slots,
+            vec![],
+            Arena::Node,
+            0,
+            vec![],
+        )
+        .expect("typed binding fragment"),
+    ))
+}
+
+/// Initialize a portable named binding once at its ordered registration or
+/// extraction point. Explicit `set` writes replace its value without rerunning
+/// this recipe; construction itself is inert.
 pub fn let_<I: ValueInput>(name: impl Into<Arc<str>>, initializer: I) -> I::Owned {
     let initializer = initializer.borrow().expression();
     let node = &initializer
@@ -86,42 +110,27 @@ pub fn let_<I: ValueInput>(name: impl Into<Arc<str>>, initializer: I) -> I::Owne
         .program()
         .unwrap()
         .nodes[initializer.0.index as usize];
-    let sort = SortRef(initializer.0.resolve(Arena::Sort, node.sort_id).unwrap());
-    let name = name.into();
-    let encoded = name
-        .as_bytes()
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect::<String>();
-    let name = format!("__typed_capture_recipe_{encoded}");
-    let callable = Callable::function(&name, vec![], sort.clone(), None::<fn(Expr, Expr) -> Expr>);
-    let call = pb::Call {
-        func: name,
-        args: vec![],
-    };
+    let sort = initializer.0.resolve(Arena::Sort, node.sort_id).unwrap();
     let mut slots = std::array::from_fn(|_| vec![]);
-    slots[Arena::Sort as usize] = vec![Slot::External(sort.0)];
-    slots[Arena::Node as usize] = vec![Slot::External(initializer.0.clone())];
+    slots[Arena::Sort as usize] = vec![Slot::External(sort)];
+    slots[Arena::Node as usize] = vec![Slot::External(initializer.0.clone()), Slot::Local(0)];
     let mut record = publish(
         pb::Program {
             nodes: vec![pb::Node {
-                kind: Some(pb::node::Kind::Call(call.clone())),
+                kind: Some(pb::node::Kind::Binding(name.into().to_string())),
                 ..Default::default()
             }],
             commands: vec![pb::Command {
-                kind: Some(pb::command::Kind::Action(pb::Action {
-                    kind: Some(pb::action::Kind::Set(pb::Set {
-                        target: Some(call),
-                        value: Some(0),
-                    })),
-                    ..Default::default()
+                kind: Some(pb::command::Kind::Let(pb::Let {
+                    binding: Some(1),
+                    value: Some(0),
                 })),
                 ..Default::default()
             }],
             ..Default::default()
         },
         slots,
-        vec![callable.0],
+        vec![],
         Arena::Node,
         0,
         vec![],
@@ -1156,7 +1165,9 @@ impl PartialEq for Expr {
                 _ => return false,
             }
             match (&na.kind, &nb.kind) {
-                (Some(pb::node::Kind::Var(a)), Some(pb::node::Kind::Var(b))) if a == b => {}
+                (Some(pb::node::Kind::Var(a)), Some(pb::node::Kind::Var(b)))
+                | (Some(pb::node::Kind::Binding(a)), Some(pb::node::Kind::Binding(b)))
+                    if a == b => {}
                 (
                     Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
                         value: Some(pb::primitive_value::Value::Map(ma)),
@@ -1400,6 +1411,10 @@ impl Hash for Expr {
             let mut h = DefaultHasher::new();
             SortRef(record.resolve(Arena::Sort, node.sort_id).unwrap()).hash(&mut h);
             match &node.kind {
+                Some(pb::node::Kind::Binding(v)) => {
+                    17u8.hash(&mut h);
+                    v.hash(&mut h);
+                }
                 Some(pb::node::Kind::Var(v)) => {
                     0u8.hash(&mut h);
                     v.hash(&mut h);
@@ -1547,6 +1562,7 @@ impl std::fmt::Debug for Expr {
             Some(pb::node::Kind::Call(c)) => write!(f, "Call({:?}, {} args)", c.func, c.args.len()),
             Some(pb::node::Kind::Apply(apply)) => write!(f, "Apply({} args)", apply.args.len()),
             Some(pb::node::Kind::Var(v)) => write!(f, "Var({v:?})"),
+            Some(pb::node::Kind::Binding(v)) => write!(f, "Binding({v:?})"),
             Some(pb::node::Kind::Union(u)) => write!(f, "Union({} members)", u.members.len()),
             Some(pb::node::Kind::PrimitiveValue(v)) => write!(f, "Literal({:?})", v.value),
             _ => f.write_str("unsupported node"),

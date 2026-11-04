@@ -19,14 +19,13 @@ pub struct Snapshot {
     classes: Vec<u32>,
     membership: HashMap<u32, u32>,
     subsumed: HashSet<u32>,
-    captures: Vec<(Record, u32)>,
+    bindings: HashMap<String, (u32, Option<u32>)>,
     rows: Vec<u32>,
 }
 
 impl Snapshot {
     pub(super) fn from_export(
         export: pb::EGraphSnapshot,
-        captures: Vec<(Record, String)>,
         builtins: &Record,
     ) -> Result<Self, TypedError> {
         let root = export
@@ -40,10 +39,39 @@ impl Snapshot {
         let program = &source.owner.as_ref().unwrap().program().unwrap();
         let mut classes = Vec::new();
         let mut membership = HashMap::new();
-        let mut capture_rows = Vec::new();
+        let mut bindings = HashMap::new();
+        for (index, node) in program.nodes.iter().enumerate() {
+            if let Some(pb::node::Kind::Binding(name)) = &node.kind
+                && let Some((previous, _)) = bindings.insert(name.clone(), (index as u32, None))
+                && SortRef(source.resolve(Arena::Sort, program.nodes[previous as usize].sort_id)?)
+                    != SortRef(source.resolve(Arena::Sort, node.sort_id)?)
+            {
+                return Err(TypedError::Decode(
+                    "snapshot binding has incompatible sorts".into(),
+                ));
+            }
+        }
         let mut rows = Vec::new();
         let mut subsumed_calls = Vec::new();
         for (position, command) in program.commands.iter().enumerate() {
+            if let Some(pb::command::Kind::Let(value)) = &command.kind {
+                let binding = value.binding.and_then(|i| program.nodes.get(i as usize));
+                let Some(pb::Node {
+                    kind: Some(pb::node::Kind::Binding(name)),
+                    ..
+                }) = binding
+                else {
+                    return Err(TypedError::Decode(
+                        "snapshot Let has no binding target".into(),
+                    ));
+                };
+                let value = value
+                    .value
+                    .filter(|i| (*i as usize) < program.nodes.len())
+                    .ok_or_else(|| TypedError::Decode("snapshot Let has no value".into()))?;
+                bindings.get_mut(name).unwrap().1 = Some(value);
+                continue;
+            }
             let Some(pb::command::Kind::Action(action)) = &command.kind else {
                 return Err(TypedError::Decode(
                     "snapshot contains a non-data command".into(),
@@ -96,7 +124,6 @@ impl Snapshot {
                             "incomplete snapshot function row".into(),
                         ));
                     }
-                    capture_rows.push(set);
                     rows.push(position as u32);
                 }
                 Some(pb::action::Kind::Subsume(call)) => subsumed_calls.push(call),
@@ -115,52 +142,45 @@ impl Snapshot {
             }).ok_or_else(|| TypedError::Decode("subsumed snapshot row is absent".into()))?;
             subsumed.insert(*index);
         }
-        let captures = captures
-            .into_iter()
-            .map(|(capture, slot)| {
-                let row = capture_rows
-                    .iter()
-                    .find(|row| {
-                        row.target
-                            .as_ref()
-                            .is_some_and(|target| target.func == slot && target.args.is_empty())
-                    })
-                    .ok_or_else(|| {
-                        TypedError::Decode("established capture missing from snapshot".into())
-                    })?;
-                let value = row
-                    .value
-                    .ok_or_else(|| TypedError::Decode("capture row has no value".into()))?;
-                if value as usize >= program.nodes.len() {
-                    return Err(TypedError::Decode("capture value is out of bounds".into()));
-                }
-                Ok((capture, value))
-            })
-            .collect::<Result<_, TypedError>>()?;
         Ok(Self {
             source,
             classes,
             membership,
             subsumed,
-            captures,
+            bindings,
             rows,
         })
     }
 
-    /// Resolve an established capture without evaluating its initializer.
+    /// Read a global by name and exact sort without evaluating an initializer.
     pub fn lookup<S: EgglogValue>(&self, capture: &S) -> Result<S, TypedError> {
         let record = &capture.expression().0;
         if record.owner.as_ref().unwrap().id == self.source.owner.as_ref().unwrap().id {
             return Ok(capture.clone());
         }
-        let index = self
-            .captures
-            .iter()
-            .find(|(known, _)| Expr(known.clone()) == *capture.expression())
-            .map(|(_, index)| *index)
-            .ok_or_else(|| {
-                TypedError::Decode("capture was not established in this snapshot".into())
-            })?;
+        let program = record.owner.as_ref().unwrap().program()?;
+        let node = &program.nodes[record.index as usize];
+        let Some(pb::node::Kind::Binding(name)) = &node.kind else {
+            return Err(TypedError::Decode(
+                "lookup requires a global binding".into(),
+            ));
+        };
+        let (binding, value) = self
+            .bindings
+            .get(name)
+            .ok_or_else(|| TypedError::Decode("binding is absent from this snapshot".into()))?;
+        let source_program = self.source.owner.as_ref().unwrap().program()?;
+        if SortRef(record.resolve(Arena::Sort, node.sort_id)?)
+            != SortRef(
+                self.source
+                    .resolve(Arena::Sort, source_program.nodes[*binding as usize].sort_id)?,
+            )
+        {
+            return Err(TypedError::Decode(
+                "snapshot binding has a different sort".into(),
+            ));
+        }
+        let index = value.ok_or_else(|| TypedError::Decode("snapshot binding is unset".into()))?;
         ensure_sort(Expr(self.source.resolve(Arena::Node, index)?))
     }
 
@@ -172,7 +192,7 @@ impl Snapshot {
         })
     }
 
-    /// Stored relation and function rows in export order, including captures.
+    /// Stored relation and function rows in export order.
     /// These are table observations, never runtime constructor producers.
     pub fn rows(&self) -> impl ExactSizeIterator<Item = TableRowRef<'_>> + Clone {
         self.rows.iter().map(|index| TableRowRef {
@@ -689,7 +709,6 @@ mod tests {
                     ..Default::default()
                 }),
             },
-            vec![],
             &builtins,
         )
         .unwrap();

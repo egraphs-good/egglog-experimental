@@ -333,15 +333,20 @@
 //! # Ok::<_, TypedError>(())
 //! ```
 //!
-//! `let_(label, initializer)` is an inert, structurally comparable capture recipe.
-//! Registering or extracting a fresh capture initializes it once at that ordered
-//! evaluation point; subsequent uses read its saved value. The same label in a
-//! live scope must retain the same sort and initializer. Empty and UTF-8 labels
-//! are supported. Captures are opaque to call selectors and cannot be row targets.
-//! Check requires captures already established; rules, rewrites and conditions
-//! reject them. Clone copies observations, and pop restores the saved captures
-//! without recycling private names. Failed commands confirm only earlier completed
-//! initializers; uncertain receipts require recovery through a saved scope.
+//! `let_(name, initializer)` is an inert, structurally comparable binding recipe.
+//! Registering or extracting it initializes the slot once at that ordered point.
+//! Later uses read the saved value; `set(&binding, value)` explicitly replaces it.
+//! Lazy recipes with one name retain their initializer until an explicit write.
+//! Empty and UTF-8 global names are supported, independently of lexical variables
+//! and callable names. `binding::<S>(name)` directly names a typed slot without
+//! supplying an initializer; an unset direct read fails and a query matches none.
+//! Binding reads in rules and schedules are lookups: linking code initializes
+//! nothing. Binding writes can be composed with `sequence(...).repeat(n)` and
+//! are rejected in rule heads. A zero-iteration body executes no initializer or
+//! assignment. Clone copies values and pop restores the saved binding scope.
+//! Failed commands confirm only completed writes; uncertain transport receipts
+//! require recovery through a saved scope. Snapshot lookup uses name and exact
+//! sort, so an explicit rebind does not require the original initializer recipe.
 //!
 //! ```
 //! use egglog_experimental::typed::{builtins::I64, prelude::*};
@@ -1181,7 +1186,7 @@ pub use decl::SortRef;
 pub use egglog_experimental_typed_macros::{
     constructor, declarations, function, relation, ruleset, sort,
 };
-pub use expr::{EgglogValue, EqualitySort, let_, var};
+pub use expr::{EgglogValue, EqualitySort, binding, let_, var};
 pub use rule::{
     Action, Fact, Rule, Ruleset, delete, eq, rewrite, rule, ruleset, set, subsume, union,
 };
@@ -1229,8 +1234,9 @@ impl std::error::Error for TypedError {}
 pub mod prelude {
     pub use super::{
         Action, Diagnostic, EGraph, EgglogValue, EqualitySort, Fact, Rule, Ruleset, RunResult,
-        Schedule, Snapshot, TypedError, constructor, declarations, delete, eq, function, get_args,
-        let_, ne, relation, rewrite, rule, ruleset, sequence, set, sort, subsume, union, var,
+        Schedule, Snapshot, TypedError, binding, constructor, declarations, delete, eq, function,
+        get_args, let_, ne, relation, rewrite, rule, ruleset, sequence, set, sort, subsume, union,
+        var,
     };
 }
 

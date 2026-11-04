@@ -297,6 +297,20 @@ pub(super) fn observation(
             }
         }
     }
+    let bindings: Vec<_> = export
+        .program
+        .nodes
+        .iter()
+        .enumerate()
+        .filter_map(|(index, node)| {
+            if let Some(pb::node::Kind::Binding(name)) = &node.kind {
+                Some((index as u32, native_name("binding", name)))
+            } else {
+                None
+            }
+        })
+        .collect();
+    tables.extend(bindings.iter().map(|(_, name)| name.clone()));
     for (name, _) in session.graph.functions_iter() {
         if !tables.contains(name) {
             return Err(egglog::Error::BackendError(format!(
@@ -425,6 +439,27 @@ pub(super) fn observation(
             }
         }
     }
+    let mut binding_commands = vec![];
+    for (binding, name) in bindings {
+        let function = session.graph.get_function(&name).ok_or_else(|| {
+            egglog::Error::BackendError(format!("Freeze binding has no native slot {name}"))
+        })?;
+        let sort = function.func_type().output.clone();
+        let mut values = vec![];
+        session
+            .graph
+            .function_entries(&name, |row| values.push(row.output))?;
+        for value in values {
+            let value = export.value(&sort, value)?;
+            binding_commands.push(pb::Command {
+                kind: Some(pb::command::Kind::Let(pb::Let {
+                    binding: Some(binding),
+                    value: Some(value),
+                })),
+                ..Default::default()
+            });
+        }
+    }
     // Evaluated literal/container roots need not occur in any stored row.
     for (sort, value) in roots {
         export.value(sort, *value)?;
@@ -443,6 +478,7 @@ pub(super) fn observation(
                 ..Default::default()
             }),
     );
+    export.program.commands.extend(binding_commands);
     let calls = export
         .program
         .nodes
@@ -743,9 +779,6 @@ mod tests {
                 },
             ],
             declarations: vec![
-                D::EqSort(pb::EqSort {
-                    name: "State".into(),
-                }),
                 D::Constructor(pb::Constructor {
                     name: "Num".into(),
                     inputs: vec![pb::Arg {

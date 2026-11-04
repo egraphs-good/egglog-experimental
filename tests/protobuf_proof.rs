@@ -124,6 +124,135 @@ fn source_receiving_mode_preserves_actual_global_proof_requests() {
 }
 
 #[test]
+fn source_globals_are_typed_ordered_slots_in_every_receiving_mode() {
+    for mode in [
+        pb::ExecutionMode::Normal,
+        pb::ExecutionMode::TermEncoding,
+        pb::ExecutionMode::Proofs,
+        pb::ExecutionMode::ProofTesting,
+    ] {
+        let mut engine = Engine::default();
+        let id = create(&mut engine, mode);
+        for text in [
+            "(datatype E (N i64)) (let $cap (N 1)) (let $cap (N 2)) (check (= $cap (N 2))) (fail (check (= $cap (N 1))))",
+            "(let $n 1) (let $n (+ $n 1)) (check (= $n 2)) (fail (let $n (/ 1 0))) (check (= $n 2))",
+            "(function same () i64 :merge new) (set (same) 7) (let same 1) (let same (+ same 1)) (check (= same 2) (= (same) 7))",
+        ] {
+            let programs = Source::new(None, text)
+                .unwrap()
+                .with_execution_mode(mode)
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            assert_eq!(programs.len(), 1);
+            let program = &programs[0];
+            assert!(
+                program
+                    .nodes
+                    .iter()
+                    .any(|node| matches!(node.kind, Some(pb::node::Kind::Binding(_))))
+            );
+            assert!(
+                program
+                    .commands
+                    .iter()
+                    .any(|command| matches!(command.kind, Some(pb::command::Kind::Let(_))))
+            );
+            for program in programs {
+                assert_eq!(run(&mut engine, id, program).error, None, "{mode:?}/{text}");
+            }
+        }
+        for (tail, diagnostic, initial, runtime_failure) in [
+            ("(print-size $cap)", "Unbound function $cap", 1, true),
+            ("(print-function $cap)", "unknown table", 3, false),
+        ] {
+            let text = format!("(datatype E (N i64)) (let $cap (N {initial})) {tail}");
+            let mut source = Source::new(None, &text)
+                .unwrap()
+                .with_execution_mode(mode)
+                .unwrap();
+            let program = source.next().unwrap().unwrap();
+            assert!(source.next().is_none());
+            let response = run(&mut engine, id, program.clone());
+            let error = response.error.expect("slot has no public table");
+            assert_eq!(error.code, pb::ErrorCode::RuntimeFailure as i32);
+            assert!(
+                error.message.contains(diagnostic),
+                "{mode:?}/{tail}: {}",
+                error.message
+            );
+            if runtime_failure {
+                assert_eq!(
+                    error.location.unwrap().path,
+                    [1],
+                    "native print-size validates at its command boundary"
+                );
+            } else {
+                assert!(
+                    error.location.is_none(),
+                    "TableRows validates its public selector before execution"
+                );
+            }
+            assert!(response.output.outputs.is_empty());
+            // PrintSize keeps its earlier Let; failed TableRows must not replace
+            // that value with its pending N(3) initializer.
+            let mut observation = program;
+            let binding = observation.nodes.iter().position(|node| matches!(&node.kind, Some(pb::node::Kind::Binding(name)) if name == "$cap")).unwrap() as u32;
+            let sort_id = observation.nodes[binding as usize].sort_id;
+            let scalar_sort = observation.sorts.iter().position(|sort| matches!(&sort.kind, Some(pb::sort::Kind::Primitive(primitive)) if primitive.name == "i64" && primitive.args.is_empty())).unwrap() as u32;
+            let value = observation.nodes.len() as u32;
+            observation.nodes.extend([
+                pb::Node {
+                    sort_id: scalar_sort,
+                    kind: Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
+                        value: Some(pb::primitive_value::Value::I64(1)),
+                    })),
+                    ..Default::default()
+                },
+                pb::Node {
+                    sort_id,
+                    kind: Some(pb::node::Kind::Call(pb::Call {
+                        func: "N".into(),
+                        args: vec![value],
+                    })),
+                    ..Default::default()
+                },
+                pb::Node {
+                    sort_id,
+                    kind: Some(pb::node::Kind::Union(pb::Union {
+                        members: vec![binding, value + 1],
+                    })),
+                    ..Default::default()
+                },
+            ]);
+            observation.commands = vec![pb::Command {
+                kind: Some(pb::command::Kind::Check(pb::Check {
+                    facts: vec![value + 2],
+                })),
+                ..Default::default()
+            }];
+            assert_eq!(
+                run(&mut engine, id, observation).error,
+                None,
+                "{mode:?}/{tail}: surviving slot value"
+            );
+        }
+        for tail in ["(set ($cap) (N 3))", "(delete ($cap))"] {
+            let text = format!("(datatype E (N i64)) (let $cap (N 1)) {tail}");
+            let mut source = Source::new(None, &text)
+                .unwrap()
+                .with_execution_mode(mode)
+                .unwrap();
+            assert!(
+                source.next().unwrap().is_err(),
+                "slot is not a public callable: {mode:?}/{tail}"
+            );
+            assert!(source.next().is_none());
+        }
+    }
+}
+
+#[test]
 fn source_receiving_mode_preserves_native_global_boundaries() {
     for mode in [
         pb::ExecutionMode::TermEncoding,
@@ -132,22 +261,8 @@ fn source_receiving_mode_preserves_native_global_boundaries() {
     ] {
         for (case, tail) in [
             ("sizes", "(let $cap (N 1)) (print-size)"),
-            ("explicit-size", "(let $cap (N 1)) (print-size $cap)"),
-            (
-                "explicit-function",
-                "(let $cap (N 1)) (print-function $cap)",
-            ),
-            ("set", "(let $cap (N 1)) (set ($cap) (N 2))"),
-            ("delete", "(let $cap (N 1)) (delete ($cap))"),
-            ("repeated-let", "(let $cap (N 1)) (let $cap (N 2))"),
-            ("failed-init", "(fail (let $cap (N (/ 1 0)))) (print-size)"),
-            (
-                "failed-init-function",
-                "(fail (let $cap (N (/ 1 0)))) (print-function $cap)",
-            ),
             ("failed-expression", "(fail (N (/ 1 0))) (print-size)"),
             ("ordinary-function", "(function f () E :no-merge)"),
-            ("primitive-let", "(let $base 1)"),
             ("presort-alias", "(sort V (Vec i64)) (sort W (Vec i64))"),
             (
                 "different-shapes",
@@ -174,8 +289,7 @@ fn source_receiving_mode_preserves_native_global_boundaries() {
             let commands = native.parse_program(None, &text).unwrap();
             let mut native_outputs = vec![];
             let mut native_result = Ok(());
-            let mut native_boundary = None;
-            for (position, mut command) in commands.into_iter().enumerate() {
+            for mut command in commands {
                 // Whole-action evaluation uses the existing native scoped
                 // boundary, not legacy term encoding's last-instruction catch.
                 if case == "failed-expression"
@@ -195,7 +309,6 @@ fn source_receiving_mode_preserves_native_global_boundaries() {
                 if let Err(error) =
                     native.run_program_with_outputs(vec![command], &mut native_outputs)
                 {
-                    native_boundary = Some(position);
                     native_result = Err(error);
                     break;
                 }
@@ -298,43 +411,30 @@ fn source_receiving_mode_preserves_native_global_boundaries() {
                 "{case}/{mode:?}: native={:?}; bytes={byte_error:?}; sizes={byte_sizes:?}",
                 native_result.as_ref().err().map(ToString::to_string)
             );
-            if matches!(case, "failed-init" | "failed-init-function") {
-                // Preserve the legacy Core failure/prefix witness independently.
-                // Source does not expose an authored binder as a Fail child.
-                assert!(native_result.is_err(), "{case}/{mode:?}");
-                assert_eq!(native_boundary, Some(1), "{case}/{mode:?}");
-                assert_eq!(
-                    byte_error.as_deref(),
-                    Some("source Fail does not support authored let bindings"),
-                    "{case}/{mode:?}"
+
+            assert_eq!(
+                byte_error.is_some(),
+                native_result.is_err(),
+                "{case}/{mode:?}"
+            );
+            assert_eq!(
+                byte_boundary,
+                native_result.is_err().then_some(0),
+                "{case}/{mode:?}"
+            );
+            if setup_rejected {
+                assert!(
+                    byte_sizes.is_empty(),
+                    "rejected block emitted an observation: {case}/{mode:?}"
                 );
-                assert_eq!(byte_boundary, Some(0), "{case}/{mode:?}");
-                assert!(byte_sizes.is_empty());
-                assert!(source.next_submission().is_none());
             } else {
-                assert_eq!(
-                    byte_error.is_some(),
-                    native_result.is_err(),
-                    "{case}/{mode:?}"
-                );
-                assert_eq!(
-                    byte_boundary,
-                    native_result.is_err().then_some(0),
-                    "{case}/{mode:?}"
-                );
-                if setup_rejected {
-                    assert!(
-                        byte_sizes.is_empty(),
-                        "rejected block emitted an observation: {case}/{mode:?}"
-                    );
-                } else {
-                    assert_eq!(byte_sizes, native_sizes, "{case}/{mode:?}");
-                }
-                if case == "failed-expression" {
-                    assert!(native_result.is_ok());
-                    assert_eq!(byte_sizes, [vec![("N".into(), 0)]]);
-                }
+                assert_eq!(byte_sizes, native_sizes, "{case}/{mode:?}");
             }
+            if case == "failed-expression" {
+                assert!(native_result.is_ok());
+                assert_eq!(byte_sizes, [vec![("N".into(), 0)]]);
+            }
+
             // Observe the surviving operand table after failure/recovery without
             // materializing a term or reading a hidden global by default.
             let egglog::CommandOutput::PrintFunctionSize(native_n) =
@@ -637,7 +737,7 @@ fn source_receiving_mode_aggregate_values_match_native_exactly() {
 }
 
 #[test]
-fn source_receiving_mode_is_fixed_before_first_submission_and_normal_stays_function_set() {
+fn source_receiving_mode_is_fixed_before_first_submission_and_globals_stay_binding_let() {
     let text = "(datatype E (N i64)) (let $cap (N 1))";
     let mut source = Source::new(None, text).unwrap();
     source.next_submission().unwrap().unwrap();
@@ -661,15 +761,18 @@ fn source_receiving_mode_is_fixed_before_first_submission_and_normal_stays_funct
         .unwrap()
         .collect::<Result<Vec<_>, _>>()
         .unwrap();
-    assert!(programs.iter().flat_map(|program| &program.declarations).any(|declaration|
-        matches!(&declaration.kind, Some(pb::declaration::Kind::Function(function))
-            if function.name == "$cap" && function.inputs.is_empty() && function.merge.is_none())
-    ));
-    assert!(programs.iter().flat_map(|program| &program.commands).any(
-        |command| matches!(&command.kind, Some(pb::command::Kind::Action(action))
-            if matches!(&action.kind, Some(pb::action::Kind::Set(set))
-                if set.target.as_ref().is_some_and(|target| target.func == "$cap")))
-    ));
+    assert!(programs.iter().flat_map(|program| &program.declarations).all(|declaration| !matches!(&declaration.kind, Some(pb::declaration::Kind::Function(function)) if function.name == "$cap")));
+    assert!(
+        programs.iter().flat_map(|program| &program.nodes).any(
+            |node| matches!(&node.kind, Some(pb::node::Kind::Binding(name)) if name == "$cap")
+        )
+    );
+    assert!(
+        programs
+            .iter()
+            .flat_map(|program| &program.commands)
+            .any(|command| matches!(&command.kind, Some(pb::command::Kind::Let(_))))
+    );
 }
 
 #[test]
@@ -1856,7 +1959,6 @@ fn logical_table_rows_match_native_views_in_every_mode() {
         "Empty",
         "Nullary",
         "Gone",
-        "$cap",
     ];
     for mode in [
         pb::ExecutionMode::Normal,
@@ -1876,24 +1978,6 @@ fn logical_table_rows_match_native_views_in_every_mode() {
                 .run_program(vec![command])
                 .unwrap_or_else(|error| panic!("native setup/{mode:?}: {error}"));
         }
-        let capture_dump = native
-            .parse_and_run_program(None, "(print-function $cap)")
-            .unwrap();
-        let captures = capture_dump
-            .iter()
-            .filter_map(|output| match output {
-                egglog::CommandOutput::PrintFunction(_, dag, rows, _) => Some((dag, rows)),
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(
-            captures.len(),
-            1,
-            "native explicit hidden capture dump/{mode:?}"
-        );
-        let (dag, capture) = captures[0];
-        assert_eq!(capture.len(), 1);
-        let capture_value = dag.to_string(capture[0].1);
         let mut engine = Engine::default();
         let id = create(&mut engine, mode);
         let mut text = setup.to_owned();
@@ -1950,9 +2034,6 @@ fn logical_table_rows_match_native_views_in_every_mode() {
                     table.table,
                     request.max_rows
                 );
-                if table.table == "$cap" && request.max_rows != Some(0) {
-                    assert_eq!(actual[0].0, [("Eq(E)".into(), Some(capture_value.clone()))]);
-                }
                 assert!(
                     response.output.sorts.iter().all(
                         |sort| !matches!(&sort.kind, Some(pb::sort::Kind::Eq(name)) if name != "E")
@@ -1984,15 +2065,9 @@ fn logical_table_rows_match_native_views_in_every_mode() {
             assert!(live[0].1, "the remaining Row(3) is subsumed");
         }
 
-        // Encoded initialization can allocate its nullary row before failing.
-        // Preserve that native prefix and exact unavailable public type. Stop
-        // its Source stream at the error; observe with a fresh request.
-        assert!(
-            native
-                .parse_and_run_program(None, "(let $bad (Row (/ 1 0)))")
-                .is_err()
-        );
-        let expected = native_rows(&native, "$bad", false, None);
+        // Slots have no public table surface. A failed initializer retains its
+        // typed slot but supplies no value, independently of legacy native
+        // globals' hidden constructor/function representation.
         let mut failed = false;
         for phase in Source::new(None, &format!("{setup} (let $bad (Row (/ 1 0)))"))
             .unwrap()
@@ -2000,37 +2075,166 @@ fn logical_table_rows_match_native_views_in_every_mode() {
             .unwrap()
         {
             let response = run(&mut engine, id, phase.unwrap());
-            if response.error.is_some() {
+            if let Some(error) = response.error {
+                assert_eq!(error.code, pb::ErrorCode::RuntimeFailure as i32);
                 failed = true;
                 break;
             }
         }
         assert!(failed, "failed initializer/{mode:?}");
-        let response = run(
+        let frozen = run(
             &mut engine,
             id,
             pb::Program {
                 commands: vec![pb::Command {
-                    kind: Some(pb::command::Kind::TableRows(pb::GetTableRows {
-                        table: "$bad".into(),
-                        max_rows: None,
-                    })),
+                    kind: Some(pb::command::Kind::Freeze(pb::Freeze {})),
                     ..Default::default()
                 }],
                 ..Default::default()
             },
         );
-        assert_eq!(response.error, None, "failed initializer table/{mode:?}");
-        assert_eq!(response.output.outputs.len(), 1);
-        let Some(pb::command_output::Kind::TableRows(table)) = &response.output.outputs[0].kind
-        else {
-            panic!("failed initializer observation")
+        if mode == pb::ExecutionMode::Normal {
+            assert_eq!(frozen.error, None);
+            let [output] = frozen.output.outputs.as_slice() else {
+                panic!("one snapshot")
+            };
+            let Some(pb::command_output::Kind::Snapshot(snapshot)) = &output.kind else {
+                panic!("snapshot")
+            };
+            let program = snapshot.program.as_ref().unwrap();
+            for (name, populated) in [("$cap", true), ("$bad", false)] {
+                let slots = program
+                    .nodes
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, node)| matches!(&node.kind, Some(pb::node::Kind::Binding(binding)) if binding == name))
+                    .collect::<Vec<_>>();
+                assert_eq!(slots.len(), 1, "one typed slot {name}");
+                let (binding, node) = slots[0];
+                assert_eq!(sort_shape(&program.sorts, node.sort_id), "Eq(E)");
+                let writes = program
+                    .commands
+                    .iter()
+                    .filter_map(|command| match &command.kind {
+                        Some(pb::command::Kind::Let(value))
+                            if value.binding == Some(binding as u32) =>
+                        {
+                            Some(value)
+                        }
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(writes.len(), usize::from(populated), "slot value {name}");
+                if populated {
+                    let value = writes[0].value.expect("populated slot value");
+                    assert_eq!(program.nodes[value as usize].sort_id, node.sort_id);
+                    let Some(pb::node::Kind::Union(class)) = &program.nodes[value as usize].kind
+                    else {
+                        panic!("closed stored class")
+                    };
+                    assert!(class.members.iter().any(|member| matches!(&program.nodes[*member as usize].kind, Some(pb::node::Kind::Call(call)) if call.func == "Visible" && call.args.is_empty())));
+                }
+                assert!(
+                    program
+                        .declarations
+                        .iter()
+                        .all(|declaration| match &declaration.kind {
+                            Some(pb::declaration::Kind::Constructor(row)) => row.name != name,
+                            Some(pb::declaration::Kind::Function(row)) => row.name != name,
+                            _ => true,
+                        }),
+                    "slot {name} has no synthetic public callable"
+                );
+            }
+        } else {
+            let error = frozen.error.expect("Freeze remains normal-only");
+            assert_eq!(error.code, pb::ErrorCode::RuntimeFailure as i32);
+            assert!(error.message.contains("normal execution mode"));
+            assert_eq!(error.location.unwrap().path, [0]);
+            assert!(frozen.output.outputs.is_empty());
+        }
+        let slots = pb::Program {
+            sorts: vec![pb::Sort {
+                kind: Some(pb::sort::Kind::Eq("E".into())),
+                ..Default::default()
+            }],
+            nodes: vec![
+                pb::Node {
+                    kind: Some(pb::node::Kind::Binding("$cap".into())),
+                    ..Default::default()
+                },
+                pb::Node {
+                    kind: Some(pb::node::Kind::Binding("$bad".into())),
+                    ..Default::default()
+                },
+                pb::Node {
+                    kind: Some(pb::node::Kind::Call(pb::Call {
+                        func: "Visible".into(),
+                        args: vec![],
+                    })),
+                    ..Default::default()
+                },
+                pb::Node {
+                    kind: Some(pb::node::Kind::Union(pb::Union {
+                        members: vec![0, 2],
+                    })),
+                    ..Default::default()
+                },
+                pb::Node {
+                    kind: Some(pb::node::Kind::Union(pb::Union {
+                        members: vec![1, 5],
+                    })),
+                    ..Default::default()
+                },
+                pb::Node {
+                    kind: Some(pb::node::Kind::Var("slot_value".into())),
+                    ..Default::default()
+                },
+            ],
+            commands: vec![
+                pb::Command {
+                    kind: Some(pb::command::Kind::Check(pb::Check { facts: vec![3] })),
+                    ..Default::default()
+                },
+                pb::Command {
+                    kind: Some(pb::command::Kind::Fail(Box::new(pb::Command {
+                        kind: Some(pb::command::Kind::Check(pb::Check { facts: vec![4] })),
+                        ..Default::default()
+                    }))),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
         };
         assert_eq!(
-            wire_rows(&response, table),
-            expected,
-            "failed initializer prefix/{mode:?}"
+            run(&mut engine, id, slots).error,
+            None,
+            "populated/unset queries/{mode:?}"
         );
+        for table in ["$cap", "$bad"] {
+            let response = run(
+                &mut engine,
+                id,
+                pb::Program {
+                    commands: vec![pb::Command {
+                        kind: Some(pb::command::Kind::TableRows(pb::GetTableRows {
+                            table: table.into(),
+                            max_rows: None,
+                        })),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                },
+            );
+            let error = response.error.expect("a global slot is not a public table");
+            assert_eq!(error.code, pb::ErrorCode::RuntimeFailure as i32);
+            assert!(error.message.contains("unknown table"));
+            assert!(
+                error.location.is_none(),
+                "unknown table rejects before execution"
+            );
+            assert!(response.output.outputs.is_empty());
+        }
     }
 }
 
@@ -2223,12 +2427,7 @@ fn fixture() -> pb::Program {
         })),
         ..Default::default()
     };
-    let mut declarations = vec![pb::Declaration {
-        kind: Some(pb::declaration::Kind::EqSort(pb::EqSort {
-            name: "Num".into(),
-        })),
-        ..Default::default()
-    }];
+    let mut declarations = vec![];
     for name in ["N", "Goal", "Absent"] {
         declarations.push(pb::Declaration {
             kind: Some(pb::declaration::Kind::Constructor(pb::Constructor {
@@ -2339,7 +2538,7 @@ fn shared_content_resupply_groups_and_clone_keep_native_proofs_and_cursors() {
         pb::ExecutionMode::ProofTesting,
     ] {
         let mut program = fixture();
-        let mut ready = program.declarations[1].clone();
+        let mut ready = program.declarations[0].clone();
         let Some(pb::declaration::Kind::Constructor(c)) = &mut ready.kind else {
             unreachable!()
         };
@@ -2576,7 +2775,7 @@ fn all_modes_return_requested_proofs_control_and_optional_diagnostics() {
             let mut program = fixture();
             // Core sort and callable namespaces can share a wire spelling.
             let Some(pb::declaration::Kind::Constructor(constructor)) =
-                &mut program.declarations[1].kind
+                &mut program.declarations[0].kind
             else {
                 unreachable!()
             };

@@ -26,30 +26,22 @@ fn relation_definition_fixture(reversed: bool) -> pb::Program {
             })),
             ..Default::default()
         }],
-        declarations: vec![
-            pb::Declaration {
-                kind: Some(pb::declaration::Kind::EqSort(pb::EqSort {
-                    name: "IList".into(),
-                })),
-                ..Default::default()
-            },
-            pb::Declaration {
-                kind: Some(pb::declaration::Kind::Relation(pb::Relation {
-                    name: "ordered_inputs".into(),
-                    inputs: vec![
-                        pb::Arg {
-                            sort: list_sort,
-                            name: "list".into(),
-                        },
-                        pb::Arg {
-                            sort: number_sort,
-                            name: "index".into(),
-                        },
-                    ],
-                })),
-                ..Default::default()
-            },
-        ],
+        declarations: vec![pb::Declaration {
+            kind: Some(pb::declaration::Kind::Relation(pb::Relation {
+                name: "ordered_inputs".into(),
+                inputs: vec![
+                    pb::Arg {
+                        sort: list_sort,
+                        name: "list".into(),
+                    },
+                    pb::Arg {
+                        sort: number_sort,
+                        name: "index".into(),
+                    },
+                ],
+            })),
+            ..Default::default()
+        }],
         ..Default::default()
     }
 }
@@ -62,7 +54,7 @@ fn relation_definitions_reconcile_and_relocate_input_only_records() {
         .expect("canonical input-only Relation must participate in declaration reconciliation");
     let installed = destination.clone();
     let mut relocated = relation_definition_fixture(true);
-    let Some(pb::declaration::Kind::Relation(relation)) = &mut relocated.declarations[1].kind
+    let Some(pb::declaration::Kind::Relation(relation)) = &mut relocated.declarations[0].kind
     else {
         unreachable!()
     };
@@ -98,7 +90,7 @@ fn relation_definitions_reconcile_and_relocate_input_only_records() {
     );
     assert_eq!(
         destination.declarations.len(),
-        2,
+        1,
         "no synthetic Function/Constructor output carrier"
     );
 }
@@ -117,7 +109,7 @@ fn relation_definitions_kind_signature_and_reference_conflicts_are_atomic() {
         "empty-name",
     ] {
         let mut conflicting = source.clone();
-        let Some(pb::declaration::Kind::Relation(relation)) = &mut conflicting.declarations[1].kind
+        let Some(pb::declaration::Kind::Relation(relation)) = &mut conflicting.declarations[0].kind
         else {
             unreachable!()
         };
@@ -129,7 +121,7 @@ fn relation_definitions_kind_signature_and_reference_conflicts_are_atomic() {
             "unknown-sort" => relation.inputs[0].sort = 99,
             "empty-name" => relation.name.clear(),
             "function" => {
-                conflicting.declarations[1].kind =
+                conflicting.declarations[0].kind =
                     Some(pb::declaration::Kind::Function(pb::Function {
                         name: relation.name.clone(),
                         inputs: relation.inputs.clone(),
@@ -138,7 +130,7 @@ fn relation_definitions_kind_signature_and_reference_conflicts_are_atomic() {
                     }));
             }
             "constructor" => {
-                conflicting.declarations[1].kind =
+                conflicting.declarations[0].kind =
                     Some(pb::declaration::Kind::Constructor(pb::Constructor {
                         name: relation.name.clone(),
                         inputs: relation.inputs.clone(),
@@ -238,6 +230,7 @@ fn documentation_presence_is_retained_but_not_semantic_identity() {
         for d in &mut source.declarations {
             d.doc = first.map(str::to_owned);
         }
+        source.sorts[1].doc = first.map(str::to_owned);
         let mut destination = pb::Program::default();
         reconcile_declarations(&source, &mut destination).unwrap();
         let installed = destination.clone();
@@ -247,11 +240,22 @@ fn documentation_presence_is_retained_but_not_semantic_identity() {
                 .iter()
                 .all(|d| d.doc.as_deref() == first)
         );
+        assert_eq!(
+            destination
+                .sorts
+                .iter()
+                .find(|sort| matches!(&sort.kind, Some(pb::sort::Kind::Eq(name)) if name == "Box"))
+                .unwrap()
+                .doc
+                .as_deref(),
+            first,
+        );
         for later in [None, Some(""), Some("other")] {
             let mut resupply = source.clone();
             for d in &mut resupply.declarations {
                 d.doc = later.map(str::to_owned);
             }
+            resupply.sorts[1].doc = later.map(str::to_owned);
             let mut independent = destination.clone();
             reconcile_declarations(&resupply, &mut independent).unwrap();
             assert_eq!(
@@ -259,14 +263,14 @@ fn documentation_presence_is_retained_but_not_semantic_identity() {
                 "resupply retains first-record diagnostics"
             );
             assert_eq!(destination, installed);
-            let Some(pb::declaration::Kind::Constructor(c)) = &mut resupply.declarations[1].kind
+            let Some(pb::declaration::Kind::Constructor(c)) = &mut resupply.declarations[0].kind
             else {
                 unreachable!()
             };
             c.unextractable = true;
             assert!(reconcile_declarations(&resupply, &mut independent).is_err());
             assert_eq!(independent, installed);
-            let Some(pb::declaration::Kind::Constructor(c)) = &mut resupply.declarations[1].kind
+            let Some(pb::declaration::Kind::Constructor(c)) = &mut resupply.declarations[0].kind
             else {
                 unreachable!()
             };
@@ -316,12 +320,6 @@ fn box_definition() -> pb::Program {
         ],
         declarations: vec![
             pb::Declaration {
-                kind: Some(pb::declaration::Kind::EqSort(pb::EqSort {
-                    name: "Box".into(),
-                })),
-                ..Default::default()
-            },
-            pb::Declaration {
                 kind: Some(pb::declaration::Kind::Constructor(pb::Constructor {
                     name: "Box".into(),
                     inputs: vec![pb::Arg {
@@ -354,7 +352,7 @@ fn declaration_closures_relocate_and_resupply_structurally() {
     let mut destination = pb::Program::default();
     assert_eq!(
         reconcile_declarations(&source, &mut destination).unwrap(),
-        [true, true, true]
+        [true, true]
     );
     let installed = destination.clone();
     let mut permuted = source.clone();
@@ -363,13 +361,13 @@ fn declaration_closures_relocate_and_resupply_structurally() {
     for n in &mut permuted.nodes {
         n.sort_id = 1 - n.sort_id;
     }
-    let Some(pb::declaration::Kind::Constructor(c)) = &mut permuted.declarations[1].kind else {
+    let Some(pb::declaration::Kind::Constructor(c)) = &mut permuted.declarations[0].kind else {
         unreachable!()
     };
     c.inputs[0].sort = 1;
     c.inputs[0].name = "diagnostic alpha rename".into();
     c.output = 0;
-    let Some(pb::declaration::Kind::Function(f)) = &mut permuted.declarations[2].kind else {
+    let Some(pb::declaration::Kind::Function(f)) = &mut permuted.declarations[1].kind else {
         unreachable!()
     };
     f.output = 1;
@@ -377,7 +375,7 @@ fn declaration_closures_relocate_and_resupply_structurally() {
     permuted.declarations.reverse();
     assert_eq!(
         reconcile_declarations(&permuted, &mut destination).unwrap(),
-        [false, false, false]
+        [false, false]
     );
     assert_eq!(
         destination, installed,

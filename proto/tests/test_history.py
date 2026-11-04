@@ -29,7 +29,6 @@ class HistorySchemaTests(unittest.TestCase):
         )
         program = ir.Program(
             sorts=[ir.Sort(kind=Oneof("eq", "E"))],
-            declarations=[ir.Declaration(kind=Oneof("eq_sort", ir.EqSort(name="E")))],
             nodes=[ir.Node(kind=Oneof("union", ir.Union())) for _ in range(2)],
             rulesets=[ir.RulesetBinding(name="g", value=ir.Ruleset(rules=[rule, rule]))],
             commands=[

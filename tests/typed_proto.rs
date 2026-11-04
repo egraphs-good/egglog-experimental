@@ -1353,11 +1353,10 @@ fn typed_union_subsume_invalid_targets_captures_and_occurrences() -> Result<(), 
         assert!(matches!(graph.run(&nested), Err(TypedError::Invalid(_))));
         assert!(!graph.check(Read(72))?);
     }
-    // Established captures are still forbidden in rules, including union heads.
-    assert!(matches!(
-        graph.run(ruleset(rule((), union(&saved, &copied)))),
-        Err(TypedError::Invalid(_))
-    ));
+    // A global head read is captured before the head's equality effects.
+    let second = RuleTerms::Second(71);
+    graph.run(ruleset(rule((), union(&saved, &second))))?;
+    assert!(graph.check(eq(&saved, &second))?);
     let unbound = ruleset(|x: &I64| rule((), subsume(RuleTerms::Input(x))));
     assert!(graph.run(&unbound).is_err());
     let direct_input = RuleTerms::Input(171);
@@ -1477,13 +1476,15 @@ fn typed_capture_identity_queries_selectors_and_atomic_conflicts() -> Result<(),
             .is_err()
     );
     assert!(!graph.check(Read(9))?);
-    assert!(
-        graph
-            .register((set(Read(9), 9), set(&capture, 30)))
-            .is_err()
-    );
+    graph.register((set(Read(9), 9), set(&capture, 30)))?;
+    assert!(graph.check(eq(Read(9), 9))?);
+    assert_eq!(i64::try_from(&graph.extract(&capture)?)?, 30);
+    assert_eq!(i64::try_from(&graph.extract(&equal)?)?, 30);
+    assert_eq!(i64::try_from(&graph.extract(Read(1))?)?, 20);
+    graph.register(delete(Read(9)))?;
     assert!(graph.register((set(Read(9), 9), delete(&capture))).is_err());
     assert!(!graph.check(Read(9))?);
+    assert_eq!(i64::try_from(&graph.extract(&capture)?)?, 30);
     assert_eq!(i64::try_from(&graph.extract(let_("λ🦀", Read(1)))?)?, 20);
     Ok(())
 }
@@ -1510,15 +1511,45 @@ fn typed_capture_nesting_rules_and_explicit_host_boundary() -> Result<(), TypedE
     assert!(graph.register(I64::from(1) + &host_nested).is_err());
     graph.register(&host_nested)?;
     graph.register(I64::from(1) + &host_nested)?;
-    for group in [
-        ruleset(rule(eq(&first, 3), RuleTerms::Copied(3))),
-        ruleset(rule((), RuleTerms::Copied(&first))),
-        ruleset(rule((), RuleTerms::Copied(3)).when(eq(&first, 3))),
-        ruleset(rewrite(RuleTerms::Input(&first), RuleTerms::Copied(&first))),
-    ] {
-        assert!(graph.run(&group).is_err());
+    graph.run(ruleset(rule(eq(&first, 3), RuleTerms::Copied(301))))?;
+    assert!(graph.check(RuleTerms::Copied(301))?);
+    graph.run(ruleset(rule((), RuleTerms::Copied(&first))))?;
+    assert!(graph.check(RuleTerms::Copied(3))?);
+    graph.run(ruleset(
+        rule((), RuleTerms::Copied(302)).when(eq(&first, 3)),
+    ))?;
+    assert!(graph.check(RuleTerms::Copied(302))?);
+    graph.run(ruleset(rewrite(
+        RuleTerms::Input(&first),
+        RuleTerms::Second(&first),
+    )))?;
+    assert!(graph.check(eq(RuleTerms::Input(3), RuleTerms::Second(3)))?);
+
+    // Linking and running code consults the slot, never the lazy recipe. A
+    // missing initializer read would fail if any rule context materialized it.
+    let code_only = let_("code-only", Read(99));
+    let deferred = ruleset((
+        rule(eq(&code_only, 8), RuleTerms::Copied(308)),
+        rule((), RuleTerms::Copied(&code_only)),
+        rule((), RuleTerms::Copied(309)).when(eq(&code_only, 8)),
+        rewrite(RuleTerms::Input(&code_only), RuleTerms::Second(&code_only)),
+    ));
+    graph.register((RuleTerms::Input(8), RuleTerms::Second(8)))?;
+    graph.run(deferred.repeat(0))?;
+    graph.run(&deferred)?;
+    assert!(!graph.check(eq(binding::<I64>("code-only"), 8))?);
+    assert!(!graph.check(Read(99))?);
+    for value in [8_i64, 308, 309] {
+        assert!(!graph.check(RuleTerms::Copied(value))?);
     }
-    assert!(!graph.check(RuleTerms::Copied(3))?);
+    assert!(graph.check(ne(RuleTerms::Input(8), RuleTerms::Second(8)))?);
+    graph.register(set(&code_only, 8))?;
+    graph.run(&deferred)?;
+    for value in [8_i64, 308, 309] {
+        assert!(graph.check(RuleTerms::Copied(value))?);
+    }
+    assert!(graph.check(eq(RuleTerms::Input(8), RuleTerms::Second(8)))?);
+    assert!(!graph.check(Read(99))?);
     assert!(graph.register(let_("open", var::<I64>("x"))).is_err());
     let left = let_("left-nested", Read(1));
     let right = let_("right-nested", Read(2));

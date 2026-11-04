@@ -5,14 +5,8 @@ type HashMap<K, V> = std::collections::HashMap<K, V>;
 type HashSet<T> = std::collections::HashSet<T>;
 use crate::proto as pb;
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Namespace {
-    EqSort,
-    Callable,
-}
-
-/// Existing declaration tags select two namespaces; spellings may coincide.
-fn declaration_identity(d: &pb::Declaration) -> Result<(Namespace, &str), String> {
+/// Callable spellings share one namespace; sorts and bindings are separate.
+fn declaration_identity(d: &pb::Declaration) -> Result<&str, String> {
     if d.table_name.is_some()
         && !matches!(
             d.kind,
@@ -25,17 +19,16 @@ fn declaration_identity(d: &pb::Declaration) -> Result<(Namespace, &str), String
     {
         return Err("only table declarations may have a reflective table prefix".into());
     }
-    let identity = match d.kind.as_ref().ok_or("missing declaration kind")? {
-        pb::declaration::Kind::EqSort(s) => (Namespace::EqSort, s.name.as_str()),
-        pb::declaration::Kind::Constructor(c) => (Namespace::Callable, c.name.as_str()),
-        pb::declaration::Kind::Function(f) => (Namespace::Callable, f.name.as_str()),
-        pb::declaration::Kind::Relation(r) => (Namespace::Callable, r.name.as_str()),
-        pb::declaration::Kind::UserDefinedPrimitive(p) => (Namespace::Callable, p.name.as_str()),
+    let name = match d.kind.as_ref().ok_or("missing declaration kind")? {
+        pb::declaration::Kind::Constructor(c) => &c.name,
+        pb::declaration::Kind::Function(f) => &f.name,
+        pb::declaration::Kind::Relation(r) => &r.name,
+        pb::declaration::Kind::UserDefinedPrimitive(p) => &p.name,
     };
-    if identity.1.is_empty() {
+    if name.is_empty() {
         return Err("empty declaration name".into());
     }
-    Ok(identity)
+    Ok(name)
 }
 
 /// Visits every node edge in the admitted saved-code/value shapes. Unknown
@@ -64,7 +57,7 @@ fn node_edges(
                 f(i)?;
             }
         }
-        N::Var(_) => (),
+        N::Var(_) | N::Binding(_) => (),
         N::PrimitiveValue(p) => match p.value.as_mut().ok_or("missing primitive value")? {
             V::Vec(v) | V::Set(v) | V::Multiset(v) => {
                 for i in &mut v.items {
@@ -139,7 +132,6 @@ fn declaration_refs(
             sort(&mut p.output)?;
             node(p.body.as_mut().ok_or("missing primitive body")?)?;
         }
-        pb::declaration::Kind::EqSort(_) => (),
     }
     Ok(())
 }
@@ -183,6 +175,12 @@ fn import_arenas(
     }
     let mut input_sorts = source.sorts.clone();
     for sort in &mut input_sorts {
+        if matches!(&sort.kind, Some(pb::sort::Kind::Eq(name)) if name.is_empty()) {
+            return Err("equality sort name must not be empty".into());
+        }
+        if sort.doc.is_some() && !matches!(sort.kind, Some(pb::sort::Kind::Eq(_))) {
+            return Err("sort docs require an equality sort".into());
+        }
         relocate_span(&mut sort.span, source, &files)?;
     }
     let mut sorts = Vec::new();
@@ -382,14 +380,13 @@ fn compatible_semantics(
     let mut declarations = [a.clone(), b.clone()];
     for (d, roots) in declarations.iter_mut().zip(&mut roots) {
         if let Some(pb::declaration::TableName::DefaultName(name)) = &d.table_name
-            && declaration_identity(d)?.1 == name
+            && declaration_identity(d)? == name
         {
             d.table_name = None;
         }
         d.span = None;
         d.doc = None;
         match d.kind.as_mut().unwrap() {
-            pb::declaration::Kind::EqSort(_) => (),
             pb::declaration::Kind::Constructor(c) => {
                 for a in &mut c.inputs {
                     a.name.clear();
@@ -449,6 +446,36 @@ pub fn reconcile_declarations(
         imported: HashMap::default(),
         active: HashSet::default(),
     };
+    // Typed binding leaves are setup metadata, including unused/unset slots.
+    let mut bindings: HashMap<_, _> = importer
+        .nodes
+        .iter()
+        .enumerate()
+        .filter_map(|(i, node)| {
+            if let Some(pb::node::Kind::Binding(name)) = &node.kind {
+                Some((name.clone(), (i as u32, node.sort_id)))
+            } else {
+                None
+            }
+        })
+        .collect();
+    for (index, node) in source.nodes.iter().enumerate() {
+        let Some(pb::node::Kind::Binding(name)) = &node.kind else {
+            continue;
+        };
+        let sort = *sorts
+            .get(node.sort_id as usize)
+            .ok_or("binding sort out of bounds")?;
+        if let Some((old_index, old_sort)) = bindings.get(name) {
+            if *old_sort != sort {
+                return Err(format!("conflicting binding sort for {name}"));
+            }
+            importer.imported.insert(index as u32, *old_index);
+        } else {
+            let imported = importer.import(index as u32)?;
+            bindings.insert(name.clone(), (imported, sort));
+        }
+    }
     let mut incoming = source.declarations.clone();
     for d in &mut incoming {
         declaration_identity(d)?;
@@ -477,7 +504,7 @@ pub fn reconcile_declarations(
         if let Some(i) = existing {
             let old = staged.declarations[i].clone();
             if !compatible_semantics(&staged, &old, &d)? {
-                return Err(format!("conflicting declaration {}", identity.1));
+                return Err(format!("conflicting declaration {}", identity));
             }
             added.push(false);
         } else {
@@ -499,6 +526,15 @@ fn retain_imported_closures(p: &mut pb::Program, previous: &pb::Program) -> Resu
     let mut sorts = (0..previous.sorts.len() as u32).collect::<HashSet<_>>();
     let mut files = (0..previous.files.len() as u32).collect::<HashSet<_>>();
     let mut pending = nodes.iter().copied().collect::<Vec<_>>();
+    pending.extend(p.nodes.iter().enumerate().filter_map(|(i, n)| {
+        matches!(n.kind, Some(pb::node::Kind::Binding(_))).then_some(i as u32)
+    }));
+    sorts.extend(
+        p.sorts
+            .iter()
+            .enumerate()
+            .filter_map(|(i, s)| matches!(s.kind, Some(pb::sort::Kind::Eq(_))).then_some(i as u32)),
+    );
     for d in &mut p.declarations {
         if let Some(s) = d.span {
             files.insert(s.file);
@@ -686,9 +722,6 @@ fn pattern_scope(p: &pb::Program, index: u32, parameters: usize) -> Result<(), S
 fn validate_semantics(p: &pb::Program) -> Result<(), String> {
     for d in &p.declarations {
         let (inputs, output) = match d.kind.as_ref().ok_or("missing declaration kind")? {
-            pb::declaration::Kind::EqSort(_) => {
-                continue;
-            }
             pb::declaration::Kind::Constructor(c) => (&c.inputs, Some(c.output)),
             pb::declaration::Kind::Function(f) => (&f.inputs, Some(f.output)),
             pb::declaration::Kind::Relation(r) => (&r.inputs, None),

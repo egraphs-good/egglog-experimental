@@ -316,7 +316,7 @@ fn typed_capture_recipe_identity_ownership_and_negative_markers() {
     use std::hash::{DefaultHasher, Hash, Hasher};
     let value = let_("λ", I64::from(7));
     let recipe = value.expression().0.capture().unwrap().unwrap();
-    assert_eq!(recipe.name, "__typed_capture_recipe_cebb");
+    assert_eq!(recipe.name, "λ");
     assert_eq!(Expr(recipe.initializer), I64::from(7).expression().clone());
     let plain = I64::from_expression(Expr::call(
         &Callable::function(
@@ -360,17 +360,15 @@ fn typed_capture_recipe_identity_ownership_and_negative_markers() {
             0 => owner.capture = Some((99, 0)),
             1 => owner.capture = Some((0, 99)),
             _ => {
-                let Some(pb::command::Kind::Action(pb::Action {
-                    kind: Some(pb::action::Kind::Set(set)),
-                    ..
-                })) = &mut owner.program_mut().unwrap().commands[0].kind
+                let Some(pb::command::Kind::Let(value)) =
+                    &mut owner.program_mut().unwrap().commands[0].kind
                 else {
                     unreachable!()
                 };
                 match case {
-                    2 => set.value = None,
-                    3 => set.target.as_mut().unwrap().func = "foreign".into(),
-                    _ => set.target.as_mut().unwrap().args.push(0),
+                    2 => value.value = None,
+                    3 => value.binding = None,
+                    _ => value.binding = Some(0),
                 }
             }
         }
@@ -385,20 +383,14 @@ fn action_program(values: impl super::rule::Actions) -> pb::Program {
     let mut actions = vec![];
     let mut declarations = vec![];
     values
-        .append_actions(&mut actions, &mut declarations, &mut |expr| {
+        .append_commands(&mut actions, &mut declarations, &mut |expr| {
             packer.intern(expr.0, 0)
         })
         .unwrap();
     for declaration in declarations {
         packer.intern(declaration.0, 0);
     }
-    packer.program.commands = actions
-        .into_iter()
-        .map(|action| pb::Command {
-            kind: Some(pb::command::Kind::Action(action)),
-            ..Default::default()
-        })
-        .collect();
+    packer.program.commands = actions;
     packer.finish().unwrap();
     packer.program
 }
@@ -1191,22 +1183,14 @@ fn namespace_fragment(imported: bool, reversed: bool, missing: Option<Declaratio
         ..Default::default()
     })
     .unwrap();
-    let mut declarations = vec![
-        (
-            DeclarationKind::EqSort,
-            pb::declaration::Kind::EqSort(pb::EqSort {
-                name: "Shared".into(),
-            }),
-        ),
-        (
-            DeclarationKind::Callable,
-            pb::declaration::Kind::Constructor(pb::Constructor {
-                name: "Shared".into(),
-                output: 0,
-                ..Default::default()
-            }),
-        ),
-    ];
+    let mut declarations = vec![(
+        DeclarationKind::Callable,
+        pb::declaration::Kind::Constructor(pb::Constructor {
+            name: "Shared".into(),
+            output: 0,
+            ..Default::default()
+        }),
+    )];
     if reversed {
         declarations.reverse();
     }
@@ -1279,7 +1263,7 @@ fn nominal_family_and_callable_names_close_independently() {
             assert!(nominal != family);
             assert!(nominal == SortRef::equality("Shared"));
             for kind in [
-                DeclarationKind::EqSort,
+                DeclarationKind::NominalSort,
                 DeclarationKind::PrimitiveSort,
                 DeclarationKind::Callable,
             ] {
@@ -1287,6 +1271,11 @@ fn nominal_family_and_callable_names_close_independently() {
                 if kind == DeclarationKind::PrimitiveSort {
                     assert_eq!(declaration.primitive_sort().unwrap().name, "Shared");
                     assert_eq!(declaration.arena, Arena::PrimitiveSort);
+                } else if kind == DeclarationKind::NominalSort {
+                    assert_eq!(declaration.arena, Arena::Sort);
+                    assert!(
+                        matches!(&declaration.owner.as_ref().unwrap().program().unwrap().sorts[declaration.index as usize].kind, Some(pb::sort::Kind::Eq(name)) if name == "Shared")
+                    );
                 } else {
                     let definition = &declaration
                         .owner
@@ -1296,14 +1285,8 @@ fn nominal_family_and_callable_names_close_independently() {
                         .unwrap()
                         .declarations[declaration.index as usize];
                     assert!(matches!(
-                        (kind, &definition.kind),
-                        (
-                            DeclarationKind::EqSort,
-                            Some(pb::declaration::Kind::EqSort(_))
-                        ) | (
-                            DeclarationKind::Callable,
-                            Some(pb::declaration::Kind::Constructor(_))
-                        )
+                        &definition.kind,
+                        Some(pb::declaration::Kind::Constructor(_))
                     ));
                     // Wrong-kind local records must not shadow the correct import.
                     let mut program = root.owner.as_ref().unwrap().program().unwrap().clone();
@@ -1349,9 +1332,10 @@ fn nominal_family_and_callable_names_close_independently() {
                     packer.intern(record, 0);
                 }
                 packer.finish().unwrap();
-                assert_eq!(packer.program.declarations.len(), 2);
-                assert!(packer.program.declarations.iter().any(|d| matches!(&d.kind,
-                    Some(pb::declaration::Kind::EqSort(d)) if d.name == "Shared")));
+                assert_eq!(packer.program.declarations.len(), 1);
+                assert!(packer.program.sorts.iter().any(
+                    |s| matches!(&s.kind, Some(pb::sort::Kind::Eq(name)) if name == "Shared")
+                ));
                 assert!(packer.program.declarations.iter().any(|d| matches!(&d.kind,
                     Some(pb::declaration::Kind::Constructor(d)) if d.name == "Shared")));
                 assert!(
@@ -1375,21 +1359,19 @@ fn nominal_family_and_callable_names_close_independently() {
 fn missing_declaration_kind_never_uses_a_same_named_other_kind() {
     for imported in [false, true] {
         for reversed in [false, true] {
-            for missing in [
-                DeclarationKind::EqSort,
-                DeclarationKind::PrimitiveSort,
-                DeclarationKind::Callable,
-            ] {
+            for missing in [DeclarationKind::PrimitiveSort, DeclarationKind::Callable] {
                 let root = namespace_fragment(imported, reversed, Some(missing));
                 assert!(root.declaration("Shared", missing).is_err());
                 let required = match missing {
-                    DeclarationKind::EqSort => root.resolve(Arena::Sort, 0).unwrap(),
                     DeclarationKind::PrimitiveSort => {
                         let family = root.resolve(Arena::Sort, 1).unwrap();
                         assert!(SortRef(family.clone()).validate_closed().is_err());
                         family
                     }
                     DeclarationKind::Callable => root,
+                    DeclarationKind::NominalSort => {
+                        unreachable!("an Eq entry declares its own nominal type")
+                    }
                 };
                 let mut packer = Packer::default();
                 packer.intern(required, 0);
@@ -1407,14 +1389,14 @@ fn namespace_split_keeps_same_kind_and_callable_kind_conflicts() {
         let mut imports = root.owner.as_ref().unwrap().declarations.clone();
         match changed {
             1 => {
-                let Some(pb::declaration::Kind::Constructor(d)) = &mut program.declarations[1].kind
+                let Some(pb::declaration::Kind::Constructor(d)) = &mut program.declarations[0].kind
                 else {
                     panic!()
                 };
                 d.unextractable = true;
             }
             2 => {
-                program.declarations[1].kind = Some(pb::declaration::Kind::Function(pb::Function {
+                program.declarations[0].kind = Some(pb::declaration::Kind::Function(pb::Function {
                     name: "Shared".into(),
                     output: 0,
                     ..Default::default()

@@ -213,6 +213,7 @@ pub(super) fn rule(source: &pb::Program, rule: &pb::Rule) -> Result<pb::Program,
         })?;
         let mut semantic = value.clone();
         semantic.span = None;
+        semantic.doc = None;
         let key = semantic.encode_to_vec();
         let next = u32::try_from(result.len()).map_err(|_| "too many rule sorts")?;
         let local = *interned.entry(key).or_insert_with(|| {
@@ -322,6 +323,7 @@ pub(super) fn rule_key(rule: &pb::Program) -> Result<Vec<u8>, String> {
     }
     for sort in &mut key.sorts {
         sort.span = None;
+        sort.doc = None;
     }
     for rule in rules_mut(&mut key) {
         rule.name = None;

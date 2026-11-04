@@ -61,7 +61,7 @@ impl RegisterPrimitive {
         let mut last_error = None;
         let mut typechecked_body = None;
         for context in [Context::Pure, Context::Read, Context::Write, Context::Full] {
-            match egraph.typecheck_expr_with_bindings_and_output(
+            match egraph.resolve_expr_with_bindings_and_output(
                 &args[3],
                 &bindings,
                 output_sort.clone(),
@@ -96,6 +96,12 @@ impl RegisterPrimitive {
             &output_sort,
             &body,
         );
+        let body = egraph.typecheck_expr_with_bindings_and_output(
+            &args[3],
+            &bindings,
+            output_sort.clone(),
+            context,
+        )?;
         let (body, hidden_bindings) = egraph.prepare_unstable_fn_targets_for_eval(&body)?;
         let primitive = DefinedPrimitive {
             name,
@@ -240,6 +246,7 @@ fn resolve_sort(egraph: &EGraph, name: &str, span: &Span) -> Result<ArcSort, Err
 
 fn required_context(egraph: &mut EGraph, expr: &ResolvedExpr) -> Context {
     match expr {
+        ResolvedExpr::Var(_, variable) if variable.is_global_ref => Context::Read,
         ResolvedExpr::Lit(_, _) | ResolvedExpr::Var(_, _) => Context::Pure,
         ResolvedExpr::Call(_, resolved_call, children) => {
             let call_context = match resolved_call {

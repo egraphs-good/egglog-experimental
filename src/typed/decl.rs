@@ -195,12 +195,6 @@ impl SortRef {
                 kind: Some(pb::sort::Kind::Eq(name.into())),
                 ..Default::default()
             }],
-            declarations: vec![pb::Declaration {
-                kind: Some(pb::declaration::Kind::EqSort(pb::EqSort {
-                    name: name.into(),
-                })),
-                ..Default::default()
-            }],
             ..Default::default()
         };
         Self(

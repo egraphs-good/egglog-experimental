@@ -361,7 +361,7 @@ pub(super) fn source_node_refs(
             )
             | None => (),
         },
-        Some(N::Var(_)) | None => (),
+        Some(N::Var(_) | N::Binding(_)) | None => (),
     }
     Ok(())
 }
@@ -409,9 +409,7 @@ pub(super) fn source_phase_refs(
             Some(pb::declaration::Kind::Constructor(constructor)) => constructor.cost.as_mut(),
             Some(pb::declaration::Kind::Function(function)) => function.merge.as_mut(),
             Some(pb::declaration::Kind::UserDefinedPrimitive(primitive)) => primitive.body.as_mut(),
-            Some(pb::declaration::Kind::EqSort(_) | pb::declaration::Kind::Relation(_)) | None => {
-                None
-            }
+            Some(pb::declaration::Kind::Relation(_)) | None => None,
         };
         if let Some(index) = root {
             visit(index)?;
@@ -462,6 +460,11 @@ pub(super) fn source_phase_refs(
             }
             Some(pb::command::Kind::Extract(extract)) => {
                 for index in &mut extract.roots {
+                    visit(index)?;
+                }
+            }
+            Some(pb::command::Kind::Let(value)) => {
+                for index in value.binding.iter_mut().chain(&mut value.value) {
                     visit(index)?;
                 }
             }
@@ -868,8 +871,8 @@ impl Source {
     }
 
     /// Select the immutable receiving mode before producing any submission.
-    /// This follows native source admission and global lowering in that mode;
-    /// it does not change the meaning of an ordinary wire Function.
+    /// Definition admission follows that mode; global values use portable
+    /// typed binding slots independently of ordinary wire Functions.
     pub fn with_execution_mode(mut self, mode: pb::ExecutionMode) -> Result<Self, TransportError> {
         if self.started || self.mode.is_some() {
             return Err(TransportError(
@@ -1235,9 +1238,6 @@ impl Source {
         {
             return Err("manual :internal-uf source is unsupported by the public protocol".into());
         }
-        let encoded = self
-            .mode
-            .is_some_and(|mode| mode != pb::ExecutionMode::Normal);
         let mut installed = None;
         let mut registered_commands = None;
         // Definition registration keeps the native destination context current
@@ -1248,11 +1248,6 @@ impl Source {
             let mut header = command;
             while let Command::Fail(_, child) = header {
                 header = child;
-            }
-            if matches!(command, Command::Fail(..))
-                && matches!(header, Command::Action(Action::Let(..)))
-            {
-                return Err("source Fail does not support authored let bindings".into());
             }
             let definition = matches!(
                 header,
@@ -1327,7 +1322,28 @@ impl Source {
                         },
                     )
                 } else {
-                    graph.compile_program_observed(vec![command.clone()], &mut observe)
+                    let Command::Action(Action::Let(span, name, initializer)) = header else {
+                        unreachable!("Source Let header")
+                    };
+                    graph
+                        .resolve_binding_initializer(
+                            span.clone(),
+                            name.clone(),
+                            initializer.clone(),
+                        )
+                        .and_then(|command| {
+                            let N::CoreAction(ResolvedAction::Let(_, variable, _)) = &command
+                            else {
+                                unreachable!("resolved source binding")
+                            };
+                            graph.register_authoring_binding(
+                                span.clone(),
+                                name.clone(),
+                                variable.sort.name().to_owned(),
+                            )?;
+                            original.push(command);
+                            Ok(())
+                        })
                 };
                 *graph.command_macros_mut() = macros;
                 if definition {
@@ -1749,11 +1765,8 @@ impl Source {
                         unionable: true,
                     } if uf.as_ref().is_none_or(|(_, index)| index.is_none()) => {
                         let span = self.span(&span)?;
-                        self.program.declarations.push(pb::Declaration {
-                            kind: Some(pb::declaration::Kind::EqSort(pb::EqSort { name })),
-                            span,
-                            ..Default::default()
-                        });
+                        let index = self.sort(&name)?;
+                        self.program.sorts[index as usize].span = span;
                     }
                     N::Function(function) => {
                         let constructor = self
@@ -1896,74 +1909,29 @@ impl Source {
                         self.rule(rule, rewrite)?;
                     }
                     N::CoreAction(ResolvedAction::Let(span, var, expr)) => {
+                        if matches!(&expr, ResolvedExpr::Call(_, ResolvedCall::Func(function), _) if self.relations.contains(&function.name))
+                        {
+                            return Err("relations are predicates, not binding values".into());
+                        }
                         let value = self.expr(&expr, None, 0)?;
                         let output = self.program.nodes[value as usize].sort_id;
                         let span = self.span(&span)?;
-                        if encoded {
-                            // Follow native proof_global_remover for an actual Let.
-                            // Native compiler validation above admits only Eq globals.
-                            self.program.declarations.push(pb::Declaration {
-                                kind: Some(pb::declaration::Kind::Constructor(pb::Constructor {
-                                    name: var.name.clone(),
-                                    output,
-                                    unextractable: true,
-                                    hidden: true,
-                                    ..Default::default()
-                                })),
-                                span,
-                                ..Default::default()
-                            });
-                            let anchor = u32::try_from(self.program.nodes.len())
-                                .map_err(|_| "too many source nodes")?;
-                            self.program.nodes.push(pb::Node {
-                                sort_id: output,
-                                kind: Some(pb::node::Kind::Call(pb::Call {
-                                    func: var.name,
-                                    args: vec![],
-                                })),
-                                span,
-                            });
-                            let union = u32::try_from(self.program.nodes.len())
-                                .map_err(|_| "too many source nodes")?;
-                            self.program.nodes.push(pb::Node {
-                                sort_id: output,
-                                kind: Some(pb::node::Kind::Union(pb::Union {
-                                    members: vec![anchor, value],
-                                })),
-                                span,
-                            });
-                            self.program.commands.push(pb::Command {
-                                kind: Some(pb::command::Kind::Action(pb::Action {
-                                    kind: Some(pb::action::Kind::Term(union)),
-                                    span,
-                                })),
-                                span,
-                            });
-                            continue;
-                        }
-                        self.program.declarations.push(pb::Declaration {
-                            kind: Some(pb::declaration::Kind::Function(pb::Function {
-                                name: var.name.clone(),
-                                output,
-                                ..Default::default()
-                            })),
+                        let binding = u32::try_from(self.program.nodes.len())
+                            .map_err(|_| "too many source nodes")?;
+                        self.program.nodes.push(pb::Node {
+                            sort_id: output,
+                            kind: Some(pb::node::Kind::Binding(var.name)),
                             span,
-                            ..Default::default()
                         });
                         self.program.commands.push(pb::Command {
-                            kind: Some(pb::command::Kind::Action(pb::Action {
-                                kind: Some(pb::action::Kind::Set(pb::Set {
-                                    target: Some(pb::Call {
-                                        func: var.name,
-                                        args: vec![],
-                                    }),
-                                    value: Some(value),
-                                })),
-                                span,
+                            kind: Some(pb::command::Kind::Let(pb::Let {
+                                binding: Some(binding),
+                                value: Some(value),
                             })),
                             span,
                         });
                     }
+
                     N::CoreAction(action) => {
                         let action = self.action(&action, None)?;
                         self.program.commands.push(pb::Command {
@@ -2677,7 +2645,7 @@ impl Source {
         // separately below. ResolvedVar equality ignores is_global_ref,
         // so it must not be used as the key for this derived lowering map.
         let mut locals = HashMap::new();
-        let mut rule = rule.map_symbols(&mut |call| call, &mut |mut var| {
+        let rule = rule.map_symbols(&mut |call| call, &mut |mut var| {
             if !var.is_global_ref {
                 let next = locals.len();
                 var.name = locals
@@ -2687,57 +2655,8 @@ impl Source {
             }
             var
         });
-        // Match Core's remove_globals pass: globals used by actions are query
-        // bindings, retained before any head writes. A bidirectional rewrite
-        // also uses its authored LHS as the reverse head.
-        let mut globals = HashMap::new();
-        let mut captures = Vec::new();
-        let mut capture = |expr: ResolvedExpr| {
-            if let ResolvedExpr::Var(span, var) = &expr
-                && var.is_global_ref
-                && !globals.contains_key(&var.name)
-            {
-                let local = ResolvedExpr::Var(
-                    span.clone(),
-                    ast::ResolvedVar {
-                        name: format!(
-                            "{}{}_{}",
-                            self.local_prefix,
-                            self.rules.len(),
-                            locals.len() + globals.len()
-                        ),
-                        sort: var.sort.clone(),
-                        is_global_ref: false,
-                    },
-                );
-                globals.insert(var.name.clone(), local.clone());
-                captures.push(ResolvedFact::Eq(span.clone(), expr.clone(), local));
-            }
-            expr
-        };
-        rule.head.clone().visit_exprs(&mut capture);
-        if matches!(rewrite, Some(RewriteKind::Bidirectional))
-            && let Some(fact) = rule.body.first()
-        {
-            fact.clone().visit_exprs(&mut capture);
-        }
-        let mut replace = |expr: ResolvedExpr| match &expr {
-            ResolvedExpr::Var(_, var) if var.is_global_ref => {
-                globals.get(&var.name).cloned().unwrap_or(expr)
-            }
-            _ => expr,
-        };
-        rule.head = rule.head.visit_exprs(&mut replace);
-        // Canonical rewrites reuse the LHS for a subsume action and for the
-        // reverse direction. Keep those occurrences aligned with the head.
-        if rewrite.is_some() {
-            rule.body = rule
-                .body
-                .into_iter()
-                .map(|fact| fact.visit_exprs(&mut replace))
-                .collect();
-        }
-        rule.body.extend(captures);
+        // Binding reads remain explicit globals. The common backend lowering
+        // retains their pre-head values for every producer.
         let mut aliases = HashMap::new();
         let kind = if let Some(rewrite) = rewrite {
             let subsume = matches!(rewrite, RewriteKind::Directional(true));
@@ -3080,7 +2999,12 @@ impl Source {
             while let Some(expr) = pending.pop() {
                 match expr {
                     ResolvedExpr::Lit(..) => (),
-                    ResolvedExpr::Var(_, var) if !var.is_global_ref && aliases.contains_key(&var.name) => {
+                    ResolvedExpr::Var(_, var) if var.is_global_ref => {
+                        constructor_only = false;
+                    }
+                    ResolvedExpr::Var(_, var)
+                        if !var.is_global_ref && aliases.contains_key(&var.name) =>
+                    {
                         used.insert(var.name.clone());
                     }
                     ResolvedExpr::Call(_, call, args) => {
@@ -3089,7 +3013,12 @@ impl Source {
                                 && !self.relations.contains(&function.name));
                         pending.extend(args);
                     }
-                    _ => return Err("source action scope requires closed constructor/scalar locals, without reads, primitives or globals".into()),
+                    _ => {
+                        return Err(
+                            "source action scope requires closed locals and explicit global reads"
+                                .into(),
+                        );
+                    }
                 }
             }
             if let ResolvedAction::Let(_, var, expr) = action {
@@ -3312,18 +3241,10 @@ impl Source {
                 {
                     return Ok(*node);
                 }
-                if var.is_global_ref && aliases.is_some() {
-                    return Err(
-                        "source globals in rule heads require retained query bindings".into(),
-                    );
-                }
                 (
                     var.sort.name(),
                     if var.is_global_ref {
-                        pb::node::Kind::Call(pb::Call {
-                            func: var.name.clone(),
-                            args: vec![],
-                        })
+                        pb::node::Kind::Binding(var.name.clone())
                     } else {
                         pb::node::Kind::Var(var.name.clone())
                     },
@@ -3476,7 +3397,18 @@ pub struct Renderer {
     session: Session,
     sort_names: HashMap<String, String>,
     private_selectors: HashSet<String>,
-    scopes: Vec<(Session, HashMap<String, String>, HashSet<String>)>,
+    binding_names: HashMap<String, String>,
+    initialized_bindings: HashSet<String>,
+    scopes: Vec<RendererScope>,
+}
+
+#[derive(Clone)]
+struct RendererScope {
+    session: Session,
+    sort_names: HashMap<String, String>,
+    private_selectors: HashSet<String>,
+    binding_names: HashMap<String, String>,
+    initialized_bindings: HashSet<String>,
 }
 
 impl Default for Renderer {
@@ -3515,6 +3447,8 @@ impl Renderer {
             dialect,
             sort_names: HashMap::new(),
             private_selectors: HashSet::new(),
+            binding_names: HashMap::new(),
+            initialized_bindings: HashSet::new(),
             scopes: Vec::new(),
             session: Session {
                 graph,
@@ -3559,25 +3493,29 @@ impl Renderer {
             }
             Submission::Push(count) => {
                 for _ in 0..*count {
-                    self.scopes.push((
-                        self.session.clone(),
-                        self.sort_names.clone(),
-                        self.private_selectors.clone(),
-                    ));
+                    self.scopes.push(RendererScope {
+                        session: self.session.clone(),
+                        sort_names: self.sort_names.clone(),
+                        private_selectors: self.private_selectors.clone(),
+                        binding_names: self.binding_names.clone(),
+                        initialized_bindings: self.initialized_bindings.clone(),
+                    });
                 }
                 Ok(format!("(push {count})\n"))
             }
             Submission::Pop { count, span } => {
                 for _ in 0..*count {
-                    let Some((saved, names, selectors)) = self.scopes.pop() else {
+                    let Some(saved) = self.scopes.pop() else {
                         return Err(TransportError(egglog::Error::Pop(span.clone()).to_string()));
                     };
-                    let active = std::mem::replace(&mut self.session, saved);
+                    let active = std::mem::replace(&mut self.session, saved.session);
                     let saved_graph = std::mem::replace(&mut self.session.graph, active.graph);
                     self.session.graph.restore_from(saved_graph);
                     self.session.request = active.request;
-                    self.sort_names = names;
-                    self.private_selectors = selectors;
+                    self.sort_names = saved.sort_names;
+                    self.private_selectors = saved.private_selectors;
+                    self.binding_names = saved.binding_names;
+                    self.initialized_bindings = saved.initialized_bindings;
                 }
                 Ok(format!("(pop {count})\n"))
             }
@@ -3603,6 +3541,13 @@ impl Renderer {
             .session
             .prepare(&mut lowered)
             .map_err(|e| TransportError(e.0.message))?;
+        let mut authored_commands = program.clone();
+        project_names(
+            &mut authored_commands,
+            &prepared.definitions,
+            &self.session.builtins,
+        );
+        lowered.commands = authored_commands.commands;
         if self.dialect == Dialect::Experimental {
             let unextractable: HashSet<_> = prepared
                 .definitions
@@ -3660,13 +3605,20 @@ impl Renderer {
             names
         } else {
             // Reserve a bounded alias at the first canonical occurrence, even
-            // when an EqSort references a table before its declaration. Later
+            // when a nominal sort references a table before its declaration. Later
             // headers reuse it; append-stable definition order and scope restore
             // preserve earlier aliases without decoding generated spellings.
             let mut names = NativeNames::default();
+            for (index, sort) in prepared.definitions.sorts.iter().enumerate() {
+                if let Some(pb::sort::Kind::Eq(name)) = &sort.kind {
+                    names
+                        .sorts
+                        .entry(native_name("sort", name))
+                        .or_insert_with(|| format!("__egglog_source_sort_{index}"));
+                }
+            }
             for (index, declaration) in prepared.definitions.declarations.iter().enumerate() {
                 let (namespace, logical) = match &declaration.kind {
-                    Some(pb::declaration::Kind::EqSort(sort)) => ("sort", &sort.name),
                     Some(pb::declaration::Kind::Constructor(function)) => ("call", &function.name),
                     Some(pb::declaration::Kind::Function(function)) => ("call", &function.name),
                     Some(pb::declaration::Kind::Relation(relation)) => ("call", &relation.name),
@@ -3880,6 +3832,35 @@ impl Renderer {
             }
         }
         let mut private_selectors = self.private_selectors.clone();
+        let mut binding_names = self.binding_names.clone();
+        for node in &prepared.definitions.nodes {
+            if let Some(pb::node::Kind::Binding(name)) = &node.kind {
+                let next = binding_names.len();
+                binding_names
+                    .entry(name.clone())
+                    .or_insert_with(|| match self.dialect {
+                        Dialect::Core => name.clone(),
+                        Dialect::Experimental => format!("$__egglog_source_binding_{next}"),
+                    });
+            }
+        }
+        if self.dialect == Dialect::Core {
+            for name in binding_names.values() {
+                if authored
+                    .sorts
+                    .values()
+                    .chain(authored.callables.values())
+                    .any(|known| known == name)
+                    || self.session.graph.get_sort_by_name(name).is_some()
+                    || self.session.graph.type_info().is_primitive(name)
+                {
+                    return Err(TransportError(format!(
+                        "Core source cannot represent global {name:?} beside a same-named sort or callable"
+                    )));
+                }
+            }
+        }
+        let mut initialized_bindings = self.initialized_bindings.clone();
         let source = render_prepared(
             &lowered,
             &prepared,
@@ -3889,6 +3870,8 @@ impl Renderer {
             &constructor_cost_tables,
             &self.session.graph,
             &mut private_selectors,
+            &binding_names,
+            &mut initialized_bindings,
         )?;
         // The renderer's graph is always NORMAL and receives inert definitions
         // only: registration compiles rules/merges, but no action/helper runs.
@@ -3922,6 +3905,8 @@ impl Renderer {
         self.session = session;
         self.sort_names = sort_names;
         self.private_selectors = private_selectors;
+        self.binding_names = binding_names;
+        self.initialized_bindings = initialized_bindings;
         Ok(source)
     }
 }
@@ -4072,8 +4057,11 @@ fn render_prepared(
     constructor_cost_tables: &HashMap<String, String>,
     native: &EGraph,
     private_selectors: &mut HashSet<String>,
+    binding_names: &HashMap<String, String>,
+    initialized_bindings: &mut HashSet<String>,
 ) -> Result<String, TransportError> {
     let native_spans = &prepared.context.native_spans;
+    let initial_bindings = initialized_bindings.clone();
     let result = (|| -> Result<Vec<Command>, String> {
         validate_union_occurrences(program)?;
         // Native AST Display assumes symbols are source atoms; protobuf names
@@ -4097,7 +4085,6 @@ fn render_prepared(
         }
         for declaration in &program.declarations {
             match &declaration.kind {
-                Some(pb::declaration::Kind::EqSort(sort)) => names.push(sort.name.as_str()),
                 Some(pb::declaration::Kind::Constructor(constructor)) => names.push(constructor.name.as_str()),
                 Some(pb::declaration::Kind::Function(function)) => names.push(function.name.as_str()),
                 Some(pb::declaration::Kind::Relation(relation)) => names.push(relation.name.as_str()),
@@ -4110,6 +4097,7 @@ fn render_prepared(
         // equal a physical callable key without denoting that callable.
         names.extend(authored.sorts.values().map(String::as_str));
         names.extend(authored.callables.values().map(String::as_str));
+        names.extend(binding_names.values().map(String::as_str));
         for command in super::command_tree(&program.commands) {
             match &command.kind {
                 Some(pb::command::Kind::BindScheduler(_)) if dialect == Dialect::Core =>
@@ -4159,14 +4147,12 @@ fn render_prepared(
             || native.authoring_type_info().get_func_type(name).is_some()
             || native.authoring_type_info().is_primitive(name);
         let mut commands = vec![];
-        for declaration in &program.declarations {
-            if let Some(pb::declaration::Kind::EqSort(sort)) = &declaration.kind {
-                commands.push(Command::Sort {
-                    span: native_span(program, declaration.span.as_ref(), native_spans)?, name: sort.name.clone(), presort_and_args: None,
-                    uf: None, proof_func: None, container_rebuild: None, proof_constructors: None, unionable: true,
-                });
+        commands.extend(prepared.installations.iter().filter_map(|installation| {
+            match &installation.command {
+                Some(command @ Command::Sort { presort_and_args: None, .. }) => Some(command.clone()),
+                _ => None,
             }
-        }
+        }));
         commands.extend(prepared.materialized.iter().cloned());
         let table_names = project_names(&mut pb::Program::default(), &prepared.definitions, &crate::proto::BuiltinCatalog::default()).callables;
         for &index in declaration_order {
@@ -4185,7 +4171,6 @@ fn render_prepared(
                     .as_ref()
                     .ok_or("missing declaration kind")?
                 {
-                    pb::declaration::Kind::EqSort(_) => continue,
                     pb::declaration::Kind::Constructor(constructor) => Command::Constructor {
                         span,
                         name: constructor.name.clone(),
@@ -4377,6 +4362,7 @@ fn render_prepared(
             if !(fail_spans.is_empty() || matches!(
                 &command.kind,
                 Some(pb::command::Kind::Action(_)
+                    | pb::command::Kind::Let(_)
                     | pb::command::Kind::Check(_)
                     | pb::command::Kind::Prove(_)
                     | pb::command::Kind::ProveExists(_)
@@ -4393,6 +4379,13 @@ fn render_prepared(
             let span = native_span(program, command.span.as_ref(), native_spans)?;
             match command.kind.as_ref().ok_or("missing command kind")? {
                 pb::command::Kind::Freeze(_) => continue,
+                pb::command::Kind::Let(value) => {
+                    if !fail_spans.is_empty() { return Err("source rendering does not support Fail-wrapped binding writes".into()); }
+                    let binding = value.binding.and_then(|index| program.nodes.get(index as usize)).ok_or("missing Let binding")?;
+                    let Some(pb::node::Kind::Binding(name)) = &binding.kind else { return Err("Let target is not a binding".into()); };
+                    if !initialized_bindings.insert(name.clone()) { return Err("source rendering does not support global rebinding".into()); }
+                    commands.push(Command::Action(Action::Let(span, binding_names[name].clone(), expression(program, value.value.ok_or("missing Let value")?, &mut HashSet::new(), native_spans)?)));
+                }
                 pb::command::Kind::Action(action) => {
                     if prepared.context.action_dags.contains_key(&vec![position as u32]) {
                         commands.push(Command::ActionScope(span, ast::GenericActions(
@@ -4620,6 +4613,113 @@ fn render_prepared(
                 _ => (),
             }
         }
+        let binding_calls: HashMap<_, _> = binding_names.iter().map(|(name, alias)| (native_name("binding", name), alias.clone())).collect();
+        for command in &mut commands {
+            let mut convert = |expr| match expr {
+                Expr::Call(span, name, args) if args.is_empty() && binding_calls.contains_key(&name) => Expr::Var(span, binding_calls[&name].clone()),
+                expr => expr,
+            };
+            *command = command.clone().visit_exprs(&mut convert);
+            let mut leaf = command;
+            while let Command::Fail(_, child) = leaf { leaf = child; }
+            if let Command::UserDefined(_, _, args) = leaf {
+                for expr in args { *expr = expr.clone().visit_exprs(&mut convert); }
+            }
+        }
+        // Native globals are introduced by their first ordinary Let. A snapshot
+        // may publish saved rules afterwards; no fake initializer is invented.
+        let required: HashSet<_> = program.nodes.iter().filter_map(|node| match &node.kind {
+            Some(pb::node::Kind::Binding(name)) => Some(name.clone()), _ => None,
+        }).collect();
+        if !required.is_subset(initialized_bindings) {
+            return Err("source rendering does not support typed but unset global bindings".into());
+        }
+        let aliases: HashMap<_, _> = binding_names.iter().map(|(name, alias)| (alias, name)).collect();
+        // Preserve the existing definition order. Once a header needs a
+        // global, retain the remaining callable prefix until ordinary Lets
+        // establish it; saved rules follow that same queue. No code executes.
+        let mut pending_setup = VecDeque::new();
+        let mut deferred_headers = false;
+        commands.retain(|command| {
+            let declared = match command {
+                Command::Constructor { name, .. } | Command::Function { name, .. } | Command::Relation { name, .. } => Some(name.clone()),
+                Command::UserDefined(_, name, args) if name == "primitive" => match args.first() { Some(Expr::Var(_, name)) => Some(name.clone()), _ => None },
+                _ => None,
+            };
+            if declared.is_some() || matches!(command, Command::Rule { .. }) {
+                let mut dependencies = HashSet::new();
+                let mut inspect = |expr| {
+                    if let Expr::Var(_, name) = &expr && let Some(logical) = aliases.get(name) { dependencies.insert((*logical).clone()); }
+                    expr
+                };
+                command.clone().visit_exprs(&mut inspect);
+                if let Command::UserDefined(_, _, args) = command { for expr in args { expr.clone().visit_exprs(&mut inspect); } }
+                if declared.is_some() && !dependencies.is_empty() { deferred_headers = true; }
+                if deferred_headers || matches!(command, Command::Rule { .. }) {
+                    pending_setup.push_back((command.clone(), dependencies, declared));
+                    return false;
+                }
+            }
+            true
+        });
+        let mut pending_names: HashSet<_> = pending_setup.iter().filter_map(|(_, _, name)| name.clone()).collect();
+        let function_constructors: HashSet<_> = program.sorts.iter().enumerate()
+            .filter(|(_, sort)| matches!(sort.kind, Some(pb::sort::Kind::Func(_))))
+            .filter_map(|(index, _)| structural_sort_name(&program.sorts, index as u32, &mut HashSet::new()).transpose())
+            .map(|name| name.map(|name| {
+                let name = egglog::sort::FunctionSort::constructor_alias(&name);
+                authored.callables.get(&name).cloned().unwrap_or(name)
+            })).collect::<Result<_, _>>()?;
+        let mut ready = initial_bindings.clone();
+        let mut ordered = Vec::new();
+        for command in commands.into_iter().map(Some).chain(std::iter::once(None)) {
+            let header = command.as_ref().is_some_and(|command| matches!(command,
+                Command::Sort { .. } | Command::Constructor { .. } | Command::Function { .. } | Command::Relation { .. }
+                | Command::AddRuleset(..) | Command::UnstableCombinedRuleset(..))
+                || matches!(command, Command::UserDefined(_, name, _) if name == "primitive"));
+            if !header {
+                while pending_setup.front().is_some_and(|(_, dependencies, _)| dependencies.is_subset(&ready)) {
+                    let (command, _, declared) = pending_setup.pop_front().unwrap();
+                    if let Some(name) = declared { pending_names.remove(&name); }
+                    ordered.push(command);
+                }
+            }
+            let Some(command) = command else { break; };
+            let mut unavailable = None;
+            let mut unavailable_callable = None;
+            let mut read = |expr: Expr| {
+                if let Expr::Var(_, name) = &expr
+                    && let Some(logical) = aliases.get(name)
+                    && !ready.contains(*logical)
+                { unavailable = Some((*logical).clone()); }
+                if let Expr::Call(_, name, args) = &expr {
+                    if pending_names.contains(name) { unavailable_callable = Some(name.clone()); }
+                    if function_constructors.contains(name)
+                        && let Some(Expr::Lit(_, Literal::String(target))) = args.first()
+                        && pending_names.contains(target)
+                    { unavailable_callable = Some(target.clone()); }
+                }
+                expr
+            };
+            command.clone().visit_exprs(&mut read);
+            if let Command::UserDefined(_, _, args) = &command {
+                for expr in args { expr.clone().visit_exprs(&mut read); }
+            }
+            if let Some(name) = unavailable {
+                return Err(format!("source rendering requires global {name:?} to be initialized before it is read"));
+            }
+            if let Some(name) = unavailable_callable {
+                return Err(format!("source definition {name:?} depends on a global initialized after its first required use"));
+            }
+            if let Command::Action(Action::Let(_, name, _)) = &command
+                && let Some(logical) = aliases.get(name)
+            { ready.insert((*logical).clone()); }
+            if matches!(&command, Command::UserDefined(_, name, _) if name == "keep-best") { ready.clear(); }
+            ordered.push(command);
+        }
+        if !pending_setup.is_empty() { return Err("source global initialization must precede dependent definition publication".into()); }
+        *initialized_bindings = ready;
+        let commands = ordered;
         // Atom validity is insufficient in action position: a function named
         // `panic` would print as a Panic action, and `include` becomes a command
         // only at top level. Check the actual parse context, with the current

@@ -99,6 +99,7 @@ impl Code {
         }
         for sort in &mut program.sorts {
             sort.span = None;
+            sort.doc = None;
         }
         let mut key = (self.captures as u64).to_le_bytes().to_vec();
         program
@@ -224,6 +225,7 @@ fn append_code(
             }
         } else {
             sort.span = None;
+            sort.doc = None;
         }
     }
     let mut sorts = vec![];

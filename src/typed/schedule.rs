@@ -1,11 +1,20 @@
-//! Typed composition of the protocol's Run and capped Loop forms.
-use super::{Rule, Ruleset, pb};
+//! Typed composition of ordered actions, Run and capped Loop forms.
+use super::rule::action_input::Actions;
+use super::{
+    Action, Rule, Ruleset, TypedError,
+    expr::Expr,
+    pb,
+    storage::{Record, visit_command},
+};
 
 /// An ordered schedule retaining the rule values used by each Run.
 #[derive(Clone)]
 pub struct Schedule {
     pub(super) commands: Vec<pb::Command>,
     pub(super) rulesets: Vec<Ruleset>,
+    pub(super) operands: Vec<Record>,
+    pub(super) declarations: Vec<Record>,
+    pub(super) error: Option<String>,
 }
 
 impl From<&Ruleset> for Schedule {
@@ -16,9 +25,40 @@ impl From<&Ruleset> for Schedule {
                 ..Default::default()
             }],
             rulesets: vec![ruleset.clone()],
+            operands: vec![],
+            declarations: vec![],
+            error: None,
         }
     }
 }
+impl From<Action> for Schedule {
+    fn from(action: Action) -> Self {
+        let mut commands = vec![];
+        let mut operands = vec![];
+        let mut declarations = vec![];
+        let error = action
+            .append_commands(&mut commands, &mut declarations, &mut |Expr(record)| {
+                let index = u32::try_from(operands.len()).expect("protobuf arena exceeds u32");
+                operands.push(record);
+                index
+            })
+            .err()
+            .map(|error| error.to_string());
+        Self {
+            commands,
+            rulesets: vec![],
+            operands,
+            declarations: declarations.into_iter().map(|d| d.0).collect(),
+            error,
+        }
+    }
+}
+impl From<&Action> for Schedule {
+    fn from(action: &Action) -> Self {
+        Self::from(action.clone())
+    }
+}
+
 impl From<Ruleset> for Schedule {
     fn from(ruleset: Ruleset) -> Self {
         Self::from(&ruleset)
@@ -69,6 +109,9 @@ impl Schedule {
                 ..Default::default()
             }],
             rulesets: self.rulesets,
+            operands: self.operands,
+            declarations: self.declarations,
+            error: self.error,
         }
     }
     /// Repeat until a complete body iteration makes no changes and may stop.
@@ -82,6 +125,9 @@ impl Schedule {
                 ..Default::default()
             }],
             rulesets: self.rulesets,
+            operands: self.operands,
+            declarations: self.declarations,
+            error: self.error,
         }
     }
 }
@@ -112,6 +158,8 @@ macro_rules! single {
     })* };
 }
 single!(
+    Action,
+    &Action,
     Rule,
     &Rule,
     Ruleset,
@@ -158,9 +206,53 @@ pub fn sequence(source: impl Schedules) -> Schedule {
     source.append(&mut schedules);
     let mut commands = Vec::new();
     let mut rulesets = Vec::new();
-    for schedule in schedules {
+    let mut operands = Vec::new();
+    let mut declarations = Vec::new();
+    let mut error = None;
+    for mut schedule in schedules {
+        let base = u32::try_from(operands.len()).expect("protobuf arena exceeds u32");
+        if let Err(problem) = visit_operands(&mut schedule.commands, |index| Ok(base + index)) {
+            error = Some(problem.to_string());
+        }
+        error = error.or(schedule.error);
         commands.extend(schedule.commands);
         rulesets.extend(schedule.rulesets);
+        operands.extend(schedule.operands);
+        declarations.extend(schedule.declarations);
     }
-    Schedule { commands, rulesets }
+    Schedule {
+        commands,
+        rulesets,
+        operands,
+        declarations,
+        error,
+    }
+}
+
+// Traverse control structure while preserving node references in dead bodies.
+// Importing these operands declares slots but never executes their recipes.
+pub(super) fn visit_operands(
+    commands: &mut [pb::Command],
+    mut node: impl FnMut(u32) -> Result<u32, TypedError>,
+) -> Result<(), TypedError> {
+    let mut pending = commands.iter_mut().rev().collect::<Vec<_>>();
+    while let Some(command) = pending.pop() {
+        if matches!(
+            command.kind,
+            Some(pb::command::Kind::Action(_) | pb::command::Kind::Let(_))
+        ) {
+            visit_command(command, &mut node)?;
+        } else {
+            match &mut command.kind {
+                Some(pb::command::Kind::Loop(body)) => pending.extend(body.body.iter_mut().rev()),
+                Some(pb::command::Kind::Run(_) | pb::command::Kind::Freeze(_)) => (),
+                _ => {
+                    return Err(TypedError::Invalid(
+                        "unsupported typed schedule command".into(),
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
 }

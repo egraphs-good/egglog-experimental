@@ -21,7 +21,7 @@ references from an earlier request cannot be reused without importing them.
 | Record | Purpose |
 | --- | --- |
 | `Sort`, `Node` | Explicit types and shared expression graphs |
-| `Declaration` | Immutable equality-sort, constructor, function, relation or program-defined primitive definitions |
+| `Declaration` | Immutable constructor, function, relation or program-defined primitive definitions |
 | `Rule`, `Ruleset`, `RulesetBinding` | Immutable inline rule collections and replaceable named bindings |
 | `Command`, `Action`, `Loop` | Ordered execution and repeated command bodies |
 | `BuiltinCatalog` | Backend-provided primitive sorts and signatures |
@@ -29,6 +29,9 @@ references from an earlier request cannot be reused without importing them.
 
 Declarations establish the vocabulary for the whole Program. They are installed
 before commands, without executing their bodies, and cannot occur in `Loop`.
+Input `Sort.eq` entries establish nominal equality sorts; `Node.binding` entries
+establish typed global slots, including unused entries. Compatible names
+coalesce. Primitive-sort references resolve against the backend catalog.
 Recursive references between definitions are resolved during linking. Commands
 say what executes and in what order; unused arena nodes do not execute.
 Declaration timing between operations can be expressed using separate Programs.
@@ -36,7 +39,15 @@ Declaration timing between operations can be expressed using separate Programs.
 Definitions have canonical names and exact signatures. Compatible resubmission
 is harmless; conflicting definitions do not replace installed ones. A later
 Program can use an installed definition without resending it. Callables share
-one namespace; equality sorts and primitive sorts have distinct namespaces.
+one namespace; equality sorts, primitive sorts and global bindings have their own.
+
+`Node.var` is local to its rule/query or code binder. `Node.binding` reads a global
+slot; the same spelling can appear in both. `Let{binding,value}` addresses a
+binding-node index without reading it, evaluates the value, then assigns it.
+Same-sort rebinding is allowed, including inside loops. An unset slot fails
+direct evaluation and contributes no query match. Its type exists after setup
+even when its Let never executes. Rule-head reads capture globals in the query;
+deferred code follows its own read/effect context.
 
 `Ruleset{rules}` is an immutable ordered collection containing inline rule
 values, with no rule arena. `Program.rulesets` supplies complete named binding
@@ -128,11 +139,13 @@ reconstruction preserves the selected execution mode, not original derivations.
 ## Logical state and input history
 
 `Freeze` returns `EGraphSnapshot{options,program}`. Its Program includes installed
-user declarations, current named ruleset bindings, and ordinary actions
-reconstructing classes, rows, captures, costs and subsumption. Shared rule values
-are repeated in each relevant binding. The sort arena contains referenced types
-and their type arguments, without unused backend sorts. Private registration
-caches are omitted. No special loading instruction is needed.
+user declarations, nominal equality sorts, global slots, named ruleset bindings,
+and ordinary actions reconstructing classes, rows, costs and subsumption, followed
+by Let assignments for populated slots. Unset slots have no assignment. Shared
+rule values are repeated in each relevant binding. The sort arena includes all
+installed equality sorts and referenced primitive/structural types, without unused
+backend sorts. Private registration caches are omitted. No loading instruction is
+needed. Native `keep_best` compaction may unset globals; their slot types remain.
 
 Reconstruction on a fresh compatible engine uses all snapshot logical options,
 including `execution_mode` and `seminaive`, with `cost_sort` remapped into the
@@ -170,8 +183,9 @@ native proof-mode restrictions and context-specific expansion budgets. Deferred
 Union bodies and self-referential closures are not yet lowered. These are
 prototype limits, not additional restrictions on the schema. Text export fails
 explicitly when current text syntax cannot preserve a value or graph, such as
-an exact NaN payload or some fresh/cyclic class frames. It never substitutes
-lossy literals or artificial constructors. Wire validation or a binary roundtrip
+an unset global, mutable rebinding, Let in a loop, an exact NaN payload, or
+some fresh/cyclic class frames. It never substitutes lossy literals or artificial
+constructors. Wire validation or a binary roundtrip
 alone does not establish frontend or execution conformance.
 
 ## Generated messages and checks

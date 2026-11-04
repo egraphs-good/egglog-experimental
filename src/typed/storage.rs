@@ -36,7 +36,7 @@ pub(super) enum Arena {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(super) enum DeclarationKind {
-    EqSort,
+    NominalSort,
     PrimitiveSort,
     Callable,
 }
@@ -126,6 +126,13 @@ impl Owner {
             let mut definitions = Definitions::default();
             match &self.graph {
                 OwnedGraph::Program(program) => {
+                    for (index, sort) in program.sorts.iter().enumerate() {
+                        if let Some(pb::sort::Kind::Eq(name)) = &sort.kind {
+                            definitions
+                                .entry((DeclarationKind::NominalSort, name.clone()))
+                                .or_insert((Arena::Sort, index as u32));
+                        }
+                    }
                     for (index, declaration) in program.declarations.iter().enumerate() {
                         if let Some(key) = declaration.kind.as_ref().map(declaration_name) {
                             definitions
@@ -186,7 +193,7 @@ impl Owner {
                 for sort in &program.sorts {
                     match &sort.kind {
                         Some(pb::sort::Kind::Eq(name)) => {
-                            wanted.insert((DeclarationKind::EqSort, name.clone()));
+                            wanted.insert((DeclarationKind::NominalSort, name.clone()));
                         }
                         Some(pb::sort::Kind::Primitive(family)) => {
                             wanted.insert((DeclarationKind::PrimitiveSort, family.name.clone()));
@@ -206,6 +213,17 @@ impl Owner {
                 let owner = record.owner.as_ref().unwrap();
                 direct.entry(owner.id).or_insert(index);
                 let key = match record.arena {
+                    Arena::Sort => match &owner.graph {
+                        OwnedGraph::Program(program) => {
+                            match &program.sorts[record.index as usize].kind {
+                                Some(pb::sort::Kind::Eq(name)) => {
+                                    Some((DeclarationKind::NominalSort, name.as_str()))
+                                }
+                                _ => None,
+                            }
+                        }
+                        OwnedGraph::BuiltinCatalog(_) => None,
+                    },
                     Arena::Declaration => owner.program().unwrap().declarations
                         [record.index as usize]
                         .kind
@@ -340,7 +358,6 @@ impl Owner {
 
 fn declaration_name(kind: &pb::declaration::Kind) -> (DeclarationKind, &str) {
     match kind {
-        pb::declaration::Kind::EqSort(d) => (DeclarationKind::EqSort, &d.name),
         pb::declaration::Kind::Constructor(d) => (DeclarationKind::Callable, &d.name),
         pb::declaration::Kind::Function(d) => (DeclarationKind::Callable, &d.name),
         pb::declaration::Kind::Relation(d) => (DeclarationKind::Callable, &d.name),
@@ -348,10 +365,9 @@ fn declaration_name(kind: &pb::declaration::Kind) -> (DeclarationKind, &str) {
     }
 }
 
-// A validated, temporary view of the generated Function/Call/Set linkage.
+// A validated, temporary view of a Binding node and its Let initialization.
 pub(super) struct CaptureRecipe {
     pub name: String,
-    pub declaration: Record,
     pub initializer: Record,
     pub initialization: Record,
 }
@@ -455,89 +471,35 @@ impl Record {
             return Ok(None);
         };
         let invalid = || TypedError::Invalid("invalid canonical capture recipe".into());
-        let node = owner
-            .program()
-            .unwrap()
-            .nodes
-            .get(read as usize)
-            .ok_or_else(invalid)?;
-        let command = owner
-            .program()
-            .unwrap()
-            .commands
-            .get(initialization as usize)
-            .ok_or_else(invalid)?;
+        let program = owner.program()?;
+        let node = program.nodes.get(read as usize).ok_or_else(invalid)?;
         if self.arena != Arena::Node || self.index != read {
             return Ok(None);
         }
-        let Some(pb::node::Kind::Call(call)) = &node.kind else {
+        let Some(pb::node::Kind::Binding(name)) = &node.kind else {
             return Err(invalid());
         };
-        let Some(pb::command::Kind::Action(pb::Action {
-            kind: Some(pb::action::Kind::Set(set)),
-            ..
-        })) = &command.kind
-        else {
-            return Err(invalid());
-        };
-        let target = set.target.as_ref().ok_or_else(invalid)?;
-        let value = set.value.ok_or_else(invalid)?;
-        let Some(Slot::External(initializer)) =
-            owner.slots[Arena::Node as usize].get(value as usize)
-        else {
-            return Err(invalid());
-        };
-        let declaration = self.declaration(&call.func, DeclarationKind::Callable)?;
-        let Some(pb::declaration::Kind::Function(function)) = &declaration
-            .owner
-            .as_ref()
-            .unwrap()
-            .program()
-            .unwrap()
-            .declarations[declaration.index as usize]
-            .kind
-        else {
-            return Err(invalid());
-        };
-        let hex = call
-            .func
-            .strip_prefix("__typed_capture_recipe_")
+        let command = program
+            .commands
+            .get(initialization as usize)
             .ok_or_else(invalid)?;
-        if !call.args.is_empty()
-            || target != call
-            || !function.inputs.is_empty()
-            || function.merge.is_some()
-            || hex.len() % 2 != 0
-            || !hex
-                .bytes()
-                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-        {
+        let Some(pb::command::Kind::Let(value)) = &command.kind else {
+            return Err(invalid());
+        };
+        let target = self.resolve(Arena::Node, value.binding.ok_or_else(invalid)?)?;
+        if target.key() != self.key() {
             return Err(invalid());
         }
-        let bytes = (0..hex.len())
-            .step_by(2)
-            .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).map_err(|_| invalid()))
-            .collect::<Result<Vec<_>, _>>()?;
-        String::from_utf8(bytes).map_err(|_| invalid())?;
-        let rhs = initializer
-            .owner
-            .as_ref()
-            .unwrap()
-            .program()
-            .unwrap()
-            .nodes
-            .get(initializer.index as usize)
-            .ok_or_else(invalid)?;
-        let sort = super::SortRef(self.resolve(Arena::Sort, node.sort_id)?);
-        if sort != super::SortRef(declaration.resolve(Arena::Sort, function.output)?)
-            || sort != super::SortRef(initializer.resolve(Arena::Sort, rhs.sort_id)?)
+        let initializer = self.resolve(Arena::Node, value.value.ok_or_else(invalid)?)?;
+        let rhs = &initializer.owner.as_ref().unwrap().program()?.nodes[initializer.index as usize];
+        if super::SortRef(self.resolve(Arena::Sort, node.sort_id)?)
+            != super::SortRef(initializer.resolve(Arena::Sort, rhs.sort_id)?)
         {
             return Err(invalid());
         }
         Ok(Some(CaptureRecipe {
-            name: call.func.clone(),
-            declaration,
-            initializer: initializer.clone(),
+            name: name.clone(),
+            initializer,
             initialization: Record {
                 owner: self.owner.clone(),
                 arena: Arena::Command,
@@ -788,7 +750,7 @@ pub(super) fn closure(roots: &[Record]) -> Result<Vec<Record>, TypedError> {
                 let sort = record.sort()?;
                 match &sort.kind {
                     Some(pb::sort::Kind::Eq(name)) => {
-                        pending.push(record.declaration(name, DeclarationKind::EqSort)?)
+                        pending.push(record.declaration(name, DeclarationKind::NominalSort)?)
                     }
                     Some(pb::sort::Kind::Primitive(f)) => {
                         pending.push(record.declaration(&f.name, DeclarationKind::PrimitiveSort)?)
@@ -850,6 +812,28 @@ pub(super) fn visit_action(
         _ => return Err(invalid()),
     }
     Ok(())
+}
+
+/// Relocate the evaluated operands and binding addresses of an authored command.
+pub(super) fn visit_command(
+    command: &mut pb::Command,
+    mut node: impl FnMut(u32) -> Result<u32, TypedError>,
+) -> Result<(), TypedError> {
+    let invalid = || TypedError::Invalid("unsupported protobuf command in typed subset".into());
+    if command.span.is_some() {
+        return Err(invalid());
+    }
+    match command.kind.as_mut().ok_or_else(invalid)? {
+        pb::command::Kind::Action(action) => visit_action(action, node),
+        pb::command::Kind::Let(value) => {
+            let binding = value.binding.as_mut().ok_or_else(invalid)?;
+            *binding = node(*binding)?;
+            let value = value.value.as_mut().ok_or_else(invalid)?;
+            *value = node(*value)?;
+            Ok(())
+        }
+        _ => Err(invalid()),
+    }
 }
 
 pub(super) fn visit_rule(
@@ -914,7 +898,7 @@ pub(super) fn visit(
                         *a = map(Arena::Node, *a)?;
                     }
                 }
-                pb::node::Kind::Var(_) => {}
+                pb::node::Kind::Var(_) | pb::node::Kind::Binding(_) => {}
                 pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
                     value: Some(pb::primitive_value::Value::Maybe(maybe)),
                 }) => {
@@ -1009,7 +993,6 @@ pub(super) fn visit(
                 return Err(invalid());
             }
             match d.kind.as_mut().ok_or_else(invalid)? {
-                pb::declaration::Kind::EqSort(_) => {}
                 pb::declaration::Kind::Constructor(c) => {
                     for a in &mut c.inputs {
                         a.sort = map(Arena::Sort, a.sort)?;
@@ -1044,18 +1027,9 @@ pub(super) fn visit(
             }
         }
         Arena::Rule => return Err(invalid()),
-        Arena::Command => {
-            let command = &mut program.commands[index as usize];
-            if command.span.is_some() {
-                return Err(invalid());
-            }
-            match command.kind.as_mut().ok_or_else(invalid)? {
-                pb::command::Kind::Action(action) => {
-                    visit_action(action, |index| map(Arena::Node, index))?;
-                }
-                _ => return Err(invalid()),
-            }
-        }
+        Arena::Command => visit_command(&mut program.commands[index as usize], |index| {
+            map(Arena::Node, index)
+        })?,
         Arena::PrimitiveSort | Arena::Primitive => return Err(invalid()),
     }
     Ok(())
@@ -1071,10 +1045,12 @@ pub(super) fn publish(
 ) -> Result<Record, TypedError> {
     if !program.files.is_empty()
         || !program.rulesets.is_empty()
-        || program
-            .commands
-            .iter()
-            .any(|c| !matches!(c.kind, Some(pb::command::Kind::Action(_))))
+        || program.commands.iter().any(|c| {
+            !matches!(
+                c.kind,
+                Some(pb::command::Kind::Action(_) | pb::command::Kind::Let(_))
+            )
+        })
     {
         return Err(TypedError::Invalid(
             "unsupported typed fragment sections".into(),
@@ -1181,10 +1157,7 @@ pub(super) struct Packer {
     pub declarations: HashMap<String, Record>,
     pub builtin_demands: Vec<Record>,
     // Request-local renaming of proven recipe locations, never string aliases.
-    pub captures: HashMap<Key, String>,
-    pub initializations: Vec<(u32, Record, String)>,
-    pub ordinary_callables: std::collections::HashSet<String>,
-    pub capture_counter: Option<u64>,
+    pub initializations: Vec<(u32, Option<Record>, String)>,
     pub observed_data: bool,
 }
 
@@ -1201,10 +1174,7 @@ impl Default for Packer {
             binders: vec![HashMap::new()],
             declarations: HashMap::new(),
             builtin_demands: vec![],
-            captures: HashMap::new(),
             initializations: vec![],
-            ordinary_callables: std::collections::HashSet::new(),
-            capture_counter: None,
             observed_data: false,
         }
     }
@@ -1288,13 +1258,6 @@ impl Packer {
             match record.arena {
                 Arena::Node => {
                     let mut n = owner.program().unwrap().nodes[record.index as usize].clone();
-                    if record.capture()?.is_some()
-                        && !self
-                            .captures
-                            .contains_key(&(owner.id, record.arena, record.index))
-                    {
-                        return Err(TypedError::Invalid("capture requires session materialization; captures are forbidden in rules".into()));
-                    }
                     match &mut n.kind {
                         Some(pb::node::Kind::Var(token)) => {
                             *token = self.binders[binder].get(token).cloned().ok_or_else(|| {
@@ -1306,13 +1269,6 @@ impl Packer {
                                 record.declaration(&call.func, DeclarationKind::Callable)?,
                                 0,
                             );
-                            if let Some(name) =
-                                self.captures.get(&(owner.id, record.arena, record.index))
-                            {
-                                call.func = name.clone();
-                            } else {
-                                self.ordinary_callables.insert(call.func.clone());
-                            }
                         }
                         Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
                             value: Some(pb::primitive_value::Value::PartialCall(call)),
@@ -1330,7 +1286,7 @@ impl Packer {
                     let s = record.sort().unwrap().clone();
                     match &s.kind {
                         Some(pb::sort::Kind::Eq(name)) => {
-                            self.intern(record.declaration(name, DeclarationKind::EqSort)?, 0);
+                            self.intern(record.declaration(name, DeclarationKind::NominalSort)?, 0);
                         }
                         Some(pb::sort::Kind::Primitive(f)) => {
                             self.intern(
@@ -1461,13 +1417,6 @@ impl Packer {
                                     ("new".into(), "new".into()),
                                 ]));
                             }
-                            if let Some(name) =
-                                self.captures.get(&(owner.id, record.arena, record.index))
-                            {
-                                f.name = name.clone();
-                            } else {
-                                self.ordinary_callables.insert(f.name.clone());
-                            }
                         }
                         Some(pb::declaration::Kind::Constructor(c)) => {
                             if let Some(index) = c.cost {
@@ -1489,13 +1438,9 @@ impl Packer {
                                     ));
                                 }
                             }
-                            self.ordinary_callables.insert(c.name.clone());
                         }
-                        Some(pb::declaration::Kind::Relation(r)) => {
-                            self.ordinary_callables.insert(r.name.clone());
-                        }
+                        Some(pb::declaration::Kind::Relation(_)) => {}
                         Some(pb::declaration::Kind::UserDefinedPrimitive(p)) => {
-                            self.ordinary_callables.insert(p.name.clone());
                             binder = self.binders.len();
                             self.binders.push(
                                 (0..p.inputs.len())
@@ -1517,31 +1462,11 @@ impl Packer {
                         roots.push(record.resolve(arena, index)?);
                         Ok(index)
                     })?;
-                    for root in closure(&roots)? {
-                        if root.capture()?.is_some() {
-                            return Err(TypedError::Invalid(
-                                "captures are forbidden in rules, rewrites and conditions".into(),
-                            ));
-                        }
-                    }
                     binder = self.binders.len();
                     self.binders.push(super::close::binder(&roots)?);
                 }
                 Arena::Command => {
-                    let mut command =
-                        owner.program().unwrap().commands[record.index as usize].clone();
-                    if let Some(name) = self.captures.get(&(owner.id, record.arena, record.index)) {
-                        let Some(pb::command::Kind::Action(pb::Action {
-                            kind: Some(pb::action::Kind::Set(set)),
-                            ..
-                        })) = &mut command.kind
-                        else {
-                            return Err(TypedError::Invalid(
-                                "invalid capture initialization".into(),
-                            ));
-                        };
-                        set.target.as_mut().unwrap().func = name.clone();
-                    }
+                    let command = owner.program().unwrap().commands[record.index as usize].clone();
                     one.commands.push(command);
                 }
                 Arena::PrimitiveSort | Arena::Primitive => {
@@ -1625,7 +1550,6 @@ impl Packer {
         let mut kept = vec![];
         for d in &self.program.declarations {
             let (kind, name) = match &d.kind {
-                Some(pb::declaration::Kind::EqSort(d)) => (DeclarationKind::EqSort, &d.name),
                 Some(pb::declaration::Kind::Constructor(d)) => (DeclarationKind::Callable, &d.name),
                 Some(pb::declaration::Kind::Function(d)) => (DeclarationKind::Callable, &d.name),
                 Some(pb::declaration::Kind::Relation(d)) => (DeclarationKind::Callable, &d.name),
@@ -1779,15 +1703,6 @@ mod tests {
             let function =
                 Callable::function("InvalidMerge", vec![], I64::sort_ref(), Some(|_, _| body));
             let mut packer = Packer::default();
-            let record = &capture.expression().0;
-            packer.captures.insert(
-                (
-                    record.owner.as_ref().unwrap().id,
-                    record.arena,
-                    record.index,
-                ),
-                "already-planned".into(),
-            );
             packer.intern(function.0, 0);
             assert!(matches!(packer.finish(), Err(TypedError::Invalid(_))));
         }

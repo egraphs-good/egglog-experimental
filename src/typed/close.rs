@@ -17,13 +17,14 @@ pub(super) fn binder(roots: &[Record]) -> Result<HashMap<String, String>, TypedE
         if !visited.insert((owner.id, r.index)) {
             continue;
         }
-        // Session admission proves these captures established; their recipes
-        // are not part of the query binder. Rules reject them before closing.
+        // A lazy initializer is not part of a query/code binder. Binding reads
+        // remain global lookups; linking code never initializes a recipe.
         if r.capture()?.is_some() {
             continue;
         }
         let node = &owner.program().unwrap().nodes[r.index as usize];
         match &node.kind {
+            Some(pb::node::Kind::Binding(_)) => (),
             Some(pb::node::Kind::Var(token)) => {
                 let sort = SortRef(r.resolve(Arena::Sort, node.sort_id)?);
                 if let Some(old) = vars.insert(token.clone(), sort.clone()) {

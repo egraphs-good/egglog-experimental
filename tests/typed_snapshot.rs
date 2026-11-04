@@ -179,12 +179,23 @@ fn snapshot_keeps_cycles_empty_classes_and_observation_provenance() -> Result<()
         .parse_and_run_program(
             None,
             "(datatype Node (Number i64) (Link Node))
-        (function root () Node :no-merge) (function empty () Node :no-merge)
+        (function root () Node :no-merge :internal-hidden) (function empty () Node :no-merge :internal-hidden)
         (set (root) (Number 7)) (set (empty) (Number 9))
         (union (root) (Link (root))) (delete (Number 9))",
         )
         .unwrap();
-    assert_eq!(before, native.num_tuples());
+    let visible_rows = ["Number", "Link"]
+        .into_iter()
+        .map(|name| {
+            let egglog::CommandOutput::PrintFunctionSize(rows) =
+                native.print_size(Some(name)).unwrap()
+            else {
+                panic!("visible constructor rows")
+            };
+            rows
+        })
+        .sum::<usize>();
+    assert_eq!(before, visible_rows);
     let snapshot = graph.freeze()?;
     assert_eq!(graph.num_tuples()?, before);
     let observed = snapshot.lookup(&root)?;
@@ -232,6 +243,29 @@ fn composed_schedules_return_small_results_and_opt_in_diagnostics() -> Result<()
             .nodes(&graph.freeze()?.lookup(&root)?)
             .is_err()
     );
+    let earlier = binding::<egg::I64>("stream-earlier");
+    let late = let_("stream-late", egg::I64::from(9));
+    let schedule = sequence((sequence(set(&earlier, 1)).with_snapshots(), set(&late, 2)));
+    let mut observed = 0;
+    let result = graph.run_stream(schedule, |snapshot| {
+        observed += 1;
+        assert_eq!(
+            i64::try_from(&snapshot.lookup(&earlier).unwrap()).unwrap(),
+            1
+        );
+        std::ops::ControlFlow::Break(())
+    });
+    assert!(
+        matches!(result, Err(TypedError::Invalid(message)) if message == "execution cancelled")
+    );
+    assert_eq!(observed, 1);
+    assert!(graph.check(eq(&earlier, 1))?);
+    assert!(!graph.check(eq(
+        binding::<egg::I64>("stream-late"),
+        binding::<egg::I64>("stream-late")
+    ))?);
+    graph.register(&late)?;
+    assert_eq!(i64::try_from(&graph.extract(&late)?)?, 9);
     Ok(())
 }
 

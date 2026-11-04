@@ -4,7 +4,7 @@ use super::{
     pb,
     rule::{Actions, Facts, ensure_sort},
     storage::{
-        Arena, DeclarationKind, Packer, Record, Slot, closure, publish, visit, visit_action,
+        Arena, DeclarationKind, Packer, Record, Slot, closure, publish, visit, visit_command,
     },
 };
 use prost::Message;
@@ -17,24 +17,15 @@ use std::{
 // A request plan retains locations and destination bindings only. Generated
 // actions/initializers remain the sole execution recipe, and nothing is cached.
 struct CapturePlan {
-    known: HashMap<String, (Record, String)>,
-    reserved: HashSet<String>,
-    next: u64,
+    // None records an explicit successful write rather than a lazy initializer.
+    known: HashMap<String, Option<Record>>,
 }
 
 impl CapturePlan {
     fn new(graph: &EGraph, roots: &[Record]) -> Result<Self, TypedError> {
-        let records = closure(roots)?;
         let mut recipes = HashMap::new();
-        let mut private_declarations = HashSet::new();
-        for record in &records {
+        for record in closure(roots)? {
             if let Some(capture) = record.capture()? {
-                let key = (
-                    capture.declaration.owner.as_ref().unwrap().id,
-                    capture.declaration.arena,
-                    capture.declaration.index,
-                );
-                private_declarations.insert(key);
                 if let Some(previous) = recipes.insert(capture.name.clone(), record.clone())
                     && Expr(previous) != Expr(record.clone())
                 {
@@ -42,7 +33,7 @@ impl CapturePlan {
                         "conflicting capture label, sort or initializer".into(),
                     ));
                 }
-                if let Some((previous, _)) = graph.captures.get(&capture.name)
+                if let Some(Some(previous)) = graph.captures.get(&capture.name)
                     && Expr(previous.clone()) != Expr(record.clone())
                 {
                     return Err(TypedError::Invalid(
@@ -51,41 +42,8 @@ impl CapturePlan {
                 }
             }
         }
-        let mut reserved = graph.reserved_names.clone();
-        for record in records {
-            let owner = record.owner.as_ref().unwrap();
-            let name = match record.arena {
-                Arena::Declaration if !private_declarations.contains(&record.key()) => {
-                    match &owner.program().unwrap().declarations[record.index as usize].kind {
-                        Some(pb::declaration::Kind::Constructor(c)) => Some(&c.name),
-                        Some(pb::declaration::Kind::Function(f)) => Some(&f.name),
-                        Some(pb::declaration::Kind::Relation(r)) => Some(&r.name),
-                        Some(pb::declaration::Kind::UserDefinedPrimitive(p)) => Some(&p.name),
-                        _ => None,
-                    }
-                }
-                Arena::Primitive => Some(&record.primitive()?.name),
-                Arena::Node if record.capture()?.is_none() => {
-                    match &owner.program().unwrap().nodes[record.index as usize].kind {
-                        Some(pb::node::Kind::Call(c)) => Some(&c.func),
-                        _ => None,
-                    }
-                }
-                _ => None,
-            };
-            if let Some(name) = name {
-                if graph.private_slots.contains(name) {
-                    return Err(TypedError::Invalid(
-                        "ordinary callable collides with private capture storage".into(),
-                    ));
-                }
-                reserved.insert(name.clone());
-            }
-        }
         Ok(Self {
             known: graph.captures.clone(),
-            reserved,
-            next: graph.next_capture,
         })
     }
 
@@ -103,63 +61,32 @@ impl CapturePlan {
             .collect();
         while let Some((record, finish)) = pending.pop() {
             let recipe = record.capture()?.expect("capture frontier");
-            let slot = if let Some((previous, slot)) = self.known.get(&recipe.name) {
-                if Expr(previous.clone()) != Expr(record.clone()) {
+            if let Some(previous) = self.known.get(&recipe.name) {
+                if let Some(previous) = previous
+                    && Expr(previous.clone()) != Expr(record.clone())
+                {
                     return Err(TypedError::Invalid(
                         "conflicting capture label, sort or initializer".into(),
                     ));
                 }
-                slot.clone()
-            } else if !fresh {
+                continue;
+            }
+            if !fresh {
                 return Err(TypedError::Invalid(
                     "check requires an established capture".into(),
                 ));
-            } else if !finish {
+            }
+            if !finish {
                 let children = self.frontier(std::slice::from_ref(&recipe.initializer), true)?;
                 pending.push((record, true));
                 pending.extend(children.into_iter().rev().map(|r| (r, false)));
                 continue;
-            } else {
-                let slot = loop {
-                    let ordinal = self.next;
-                    self.next = self.next.checked_add(1).ok_or_else(|| {
-                        TypedError::Invalid("capture name space exhausted".into())
-                    })?;
-                    let name = format!("__typed_capture_{ordinal}");
-                    if self.reserved.insert(name.clone()) {
-                        break name;
-                    }
-                };
-                self.known
-                    .insert(recipe.name.clone(), (record.clone(), slot.clone()));
-                // Bind all three source locations before importing the Set. No
-                // ordinary call/declaration is renamed merely by its spelling.
-                for source in [&record, &recipe.declaration, &recipe.initialization] {
-                    packer.captures.insert(
-                        (
-                            source.owner.as_ref().unwrap().id,
-                            source.arena,
-                            source.index,
-                        ),
-                        slot.clone(),
-                    );
-                }
-                let index = packer.intern(recipe.initialization.clone(), 0);
-                packer
-                    .initializations
-                    .push((index, record.clone(), slot.clone()));
-                slot
-            };
-            for source in [&record, &recipe.declaration, &recipe.initialization] {
-                packer.captures.insert(
-                    (
-                        source.owner.as_ref().unwrap().id,
-                        source.arena,
-                        source.index,
-                    ),
-                    slot.clone(),
-                );
             }
+            self.known.insert(recipe.name.clone(), Some(record.clone()));
+            let index = packer.intern(recipe.initialization, 0);
+            packer
+                .initializations
+                .push((index, Some(record), recipe.name));
         }
         Ok(())
     }
@@ -249,8 +176,7 @@ impl CapturePlan {
 struct SavedScope {
     handle: u64,
     declarations: HashMap<String, Record>,
-    captures: HashMap<String, (Record, String)>,
-    private_slots: HashSet<String>,
+    captures: HashMap<String, Option<Record>>,
 }
 
 /// A byte-protocol session. No native EGraph or AST execution escape hatch.
@@ -263,10 +189,7 @@ pub struct EGraph {
     usable: bool,
     declarations: HashMap<String, Record>,
     scopes: Vec<SavedScope>,
-    captures: HashMap<String, (Record, String)>,
-    private_slots: HashSet<String>,
-    reserved_names: HashSet<String>,
-    next_capture: u64,
+    captures: HashMap<String, Option<Record>>,
     #[cfg(test)]
     last_wire: Option<(Vec<u8>, Vec<Vec<u8>>)>,
 }
@@ -391,9 +314,6 @@ impl EGraph {
             declarations: HashMap::new(),
             scopes: vec![],
             captures: HashMap::new(),
-            private_slots: HashSet::new(),
-            reserved_names: HashSet::new(),
-            next_capture: 0,
             #[cfg(test)]
             last_wire: None,
         })
@@ -429,9 +349,6 @@ impl EGraph {
             declarations: self.declarations.clone(),
             scopes: vec![],
             captures: self.captures.clone(),
-            private_slots: self.private_slots.clone(),
-            reserved_names: self.reserved_names.clone(),
-            next_capture: self.next_capture,
             #[cfg(test)]
             last_wire: None,
         })
@@ -461,7 +378,6 @@ impl EGraph {
             handle: std::mem::replace(&mut self.handle, handle),
             declarations: std::mem::replace(&mut self.declarations, declarations),
             captures: self.captures.clone(),
-            private_slots: self.private_slots.clone(),
         });
         Ok(())
     }
@@ -493,7 +409,6 @@ impl EGraph {
         self.handle = saved.handle;
         self.declarations = saved.declarations;
         self.captures = saved.captures;
-        self.private_slots = saved.private_slots;
         self.usable = true;
         pb::DestroyEGraphResponse::decode(bytes).map_err(|e| {
             self.usable = false;
@@ -533,26 +448,6 @@ impl EGraph {
             return Err(TypedError::Invalid(
                 "snapshot observations cannot be submitted as live expressions".into(),
             ));
-        }
-        if packer
-            .ordinary_callables
-            .iter()
-            .any(|name| self.private_slots.contains(name))
-        {
-            return Err(TypedError::Invalid(
-                "ordinary callable collides with private capture storage".into(),
-            ));
-        }
-        // These are attempted-name reservations, not evidence of installation.
-        // A no-location or undecodable response must not make a slot reusable.
-        self.reserved_names
-            .extend(packer.ordinary_callables.iter().cloned());
-        for (_, _, name) in &packer.initializations {
-            self.private_slots.insert(name.clone());
-            self.reserved_names.insert(name.clone());
-        }
-        if let Some(next) = packer.capture_counter {
-            self.next_capture = next;
         }
         let message = pb::RunProgramRequest {
             egraph_id: self.handle,
@@ -703,10 +598,54 @@ impl EGraph {
         {
             self.declarations.extend(packer.declarations);
         }
-        for (index, recipe, slot) in packer.initializations {
+        let mut writes =
+            confirmed_binding_writes(&packer.program, &packer.program.commands[..completed]);
+        for (location, leaf_completed) in observed
+            .iter()
+            .filter_map(|output| output.location.as_ref().map(|location| (location, true)))
+            .chain(
+                error
+                    .and_then(|error| error.location.as_ref())
+                    .map(|location| (location, false)),
+            )
+        {
+            let mut commands = packer.program.commands.as_slice();
+            for (depth, position) in location.path.iter().enumerate() {
+                let position = *position as usize;
+                let Some(command) = commands.get(position) else {
+                    break;
+                };
+                writes.extend(confirmed_binding_writes(
+                    &packer.program,
+                    &commands[..position],
+                ));
+                if depth + 1 == location.path.len() {
+                    if leaf_completed {
+                        writes.extend(confirmed_binding_writes(
+                            &packer.program,
+                            std::slice::from_ref(command),
+                        ));
+                    }
+                } else if let Some(pb::command::Kind::Loop(body)) = &command.kind {
+                    if location
+                        .iterations
+                        .get(depth)
+                        .is_some_and(|iteration| *iteration > 0)
+                    {
+                        writes.extend(confirmed_binding_writes(&packer.program, &body.body));
+                    }
+                    commands = &body.body;
+                } else {
+                    break;
+                }
+            }
+        }
+        for name in writes {
+            self.captures.insert(name, None);
+        }
+        for (index, recipe, name) in packer.initializations {
             if (index as usize) < completed {
-                let name = recipe.capture()?.expect("planned capture").name;
-                self.captures.insert(name, (recipe, slot));
+                self.captures.insert(name, recipe);
             }
         }
         Ok(())
@@ -715,10 +654,10 @@ impl EGraph {
     /// Submit expressions and row writes/deletions as ordered top-level actions.
     pub fn register(&mut self, values: impl Actions) -> Result<(), TypedError> {
         let mut packer = Packer::default();
-        let mut actions = vec![];
+        let mut commands = vec![];
         let mut declarations = vec![];
         let mut operands = vec![];
-        values.append_actions(&mut actions, &mut declarations, &mut |expr| {
+        values.append_commands(&mut commands, &mut declarations, &mut |expr| {
             let index = u32::try_from(operands.len()).expect("protobuf arena exceeds u32");
             operands.push(expr.0);
             index
@@ -732,26 +671,43 @@ impl EGraph {
         for declaration in declarations {
             packer.intern(declaration.0, 0);
         }
-        for mut action in actions {
+        for mut command in commands {
             let mut roots = vec![];
-            visit_action(&mut action, |index| {
-                roots.push(operands[index as usize].clone());
-                Ok(index)
-            })?;
+            if let Some(pb::command::Kind::Let(value)) = &command.kind {
+                roots.push(operands[value.value.unwrap() as usize].clone());
+            } else {
+                visit_command(&mut command, |index| {
+                    roots.push(operands[index as usize].clone());
+                    Ok(index)
+                })?;
+            }
             captures.materialize(&roots, true, &mut packer)?;
-            if matches!(&action.kind, Some(pb::action::Kind::Term(index)) if operands[*index as usize].capture()?.is_some())
+            if matches!(&command.kind, Some(pb::command::Kind::Action(pb::Action { kind: Some(pb::action::Kind::Term(index)), .. })) if operands[*index as usize].capture()?.is_some())
             {
                 continue;
             }
-            visit_action(&mut action, |index| {
+            let binding = if let Some(pb::command::Kind::Let(value)) = &command.kind {
+                let record = &operands[value.binding.unwrap() as usize];
+                let Some(pb::node::Kind::Binding(name)) =
+                    &record.owner.as_ref().unwrap().program()?.nodes[record.index as usize].kind
+                else {
+                    unreachable!("binding address")
+                };
+                Some(name.clone())
+            } else {
+                None
+            };
+            visit_command(&mut command, |index| {
                 Ok(packer.intern(operands[index as usize].clone(), 0))
             })?;
-            packer.program.commands.push(pb::Command {
-                kind: Some(pb::command::Kind::Action(action)),
-                ..Default::default()
-            });
+            if let Some(name) = binding {
+                let index = u32::try_from(packer.program.commands.len())
+                    .expect("protobuf arena exceeds u32");
+                packer.initializations.push((index, None, name.clone()));
+                captures.known.insert(name, None);
+            }
+            packer.program.commands.push(command);
         }
-        packer.capture_counter = Some(captures.next);
         self.execute(packer, false)?;
         Ok(())
     }
@@ -788,7 +744,6 @@ impl EGraph {
     ) -> Result<super::RunResult, TypedError> {
         let mut packer = pack_schedule(schedule.into(), true)?;
         let request = self.prepare_request(&mut packer, false)?;
-        let captures = self.captures.values().cloned().collect::<Vec<_>>();
         let builtins = self.builtins.clone();
         let mut prefix = None;
         let mut terminal_error = None;
@@ -804,11 +759,7 @@ impl EGraph {
                         for output in &payload.outputs {
                             match &output.kind {
                                 Some(pb::command_output::Kind::Snapshot(export)) => {
-                                    match super::Snapshot::from_export(
-                                        export.clone(),
-                                        captures.clone(),
-                                        &builtins,
-                                    ) {
+                                    match super::Snapshot::from_export(export.clone(), &builtins) {
                                         Ok(snapshot) => match std::panic::catch_unwind(
                                             std::panic::AssertUnwindSafe(|| observe(snapshot)),
                                         ) {
@@ -929,11 +880,7 @@ impl EGraph {
         if outputs.next().is_some() {
             return Err(TypedError::Decode("extra Freeze observations".into()));
         }
-        super::Snapshot::from_export(
-            snapshot,
-            self.captures.values().cloned().collect(),
-            &self.builtins,
-        )
+        super::Snapshot::from_export(snapshot, &self.builtins)
     }
 
     /// Retrieve accumulated accepted inputs; errors when recording is off.
@@ -1015,7 +962,6 @@ impl EGraph {
         let root = root.borrow().expression().0.clone();
         let mut captures = CapturePlan::new(self, std::slice::from_ref(&root))?;
         captures.materialize(std::slice::from_ref(&root), true, &mut packer)?;
-        packer.capture_counter = Some(captures.next);
         let index = packer.intern(root, 0);
         packer.program.commands.push(pb::Command {
             kind: Some(pb::command::Kind::Extract(pb::Extract {
@@ -1046,10 +992,54 @@ impl EGraph {
     }
 }
 
+// A typed control body has no precondition or Fail wrapper: a completed,
+// nonzero Loop proves at least one full body execution. Located receipts also
+// prove earlier siblings/iterations after cancellation or a runtime failure.
+fn confirmed_binding_writes(program: &pb::Program, commands: &[pb::Command]) -> HashSet<String> {
+    let mut writes = HashSet::new();
+    let mut pending = commands.iter().collect::<Vec<_>>();
+    while let Some(command) = pending.pop() {
+        match &command.kind {
+            Some(pb::command::Kind::Let(value)) => {
+                if let Some(pb::Node {
+                    kind: Some(pb::node::Kind::Binding(name)),
+                    ..
+                }) = value
+                    .binding
+                    .and_then(|index| program.nodes.get(index as usize))
+                {
+                    writes.insert(name.clone());
+                }
+            }
+            Some(pb::command::Kind::Loop(body))
+                if body.max_iterations != Some(0) && body.until.is_empty() =>
+            {
+                pending.extend(&body.body)
+            }
+            _ => (),
+        }
+    }
+    writes
+}
+
 // Prepare owned rules before commands, publishing complete named collections.
 // Anonymous selections retain their members directly in each Run.
 fn pack_schedule(schedule: super::Schedule, snapshots: bool) -> Result<Packer, TypedError> {
+    if let Some(error) = schedule.error {
+        return Err(TypedError::Invalid(error));
+    }
     let mut packer = Packer::default();
+    for declaration in schedule.declarations {
+        packer.intern(declaration, 0);
+    }
+    let mut commands = schedule.commands;
+    super::schedule::visit_operands(&mut commands, |index| {
+        let record = schedule
+            .operands
+            .get(index as usize)
+            .ok_or_else(|| TypedError::Invalid("schedule operand out of bounds".into()))?;
+        Ok(packer.intern(record.clone(), 0))
+    })?;
     let mut selected = Vec::new();
     for group in schedule.rulesets {
         let mut indices = Vec::new();
@@ -1063,7 +1053,6 @@ fn pack_schedule(schedule: super::Schedule, snapshots: bool) -> Result<Packer, T
     }
     packer.finish()?;
     let mut selected = selected.into_iter();
-    let mut commands = schedule.commands;
     let mut pending = commands.iter_mut().rev().collect::<Vec<_>>();
     let mut bindings: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
     while let Some(command) = pending.pop() {
@@ -1260,7 +1249,7 @@ fn adopt(
                 lambda.captures.iter_mut().for_each(&mut relocate);
                 relocate(&mut lambda.body);
             }
-            Some(pb::node::Kind::Var(_)) => {} // Valid only in separately scoped code below.
+            Some(pb::node::Kind::Var(_) | pb::node::Kind::Binding(_)) => {} // Valid only in separately scoped code below.
             Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
                 value: Some(pb::primitive_value::Value::PartialCall(call)),
             })) => call.args.iter_mut().for_each(&mut relocate),
@@ -1330,12 +1319,7 @@ fn adopt(
             .cloned()
             .ok_or_else(|| TypedError::Decode("invalid response sort index".into()))?;
         match &mut sort.kind {
-            Some(pb::sort::Kind::Eq(name)) => program.declarations.push(pb::Declaration {
-                kind: Some(pb::declaration::Kind::EqSort(pb::EqSort {
-                    name: name.clone(),
-                })),
-                ..Default::default()
-            }),
+            Some(pb::sort::Kind::Eq(_)) => (),
             Some(pb::sort::Kind::Primitive(f))
                 if (matches!(f.name.as_str(), "Vec" | "Set" | "MultiSet" | "Maybe")
                     && f.args.len() == 1)
@@ -2294,48 +2278,37 @@ mod tests {
         assert!(response.error.is_none());
         let program = request.program.unwrap();
         assert_eq!(program.commands.len(), 5);
-        let slots = ["__typed_capture_0", "__typed_capture_1"];
-        for (index, target, value) in [
-            (0, "CaptureRead", Some(10)),
-            (1, slots[0], None),
-            (3, "CaptureRead", Some(20)),
-            (4, slots[1], None),
-        ] {
+        for (index, name) in [(1, "before"), (4, "after")] {
+            let Some(pb::command::Kind::Let(value)) = &program.commands[index].kind else {
+                panic!("ordered Let")
+            };
+            assert!(
+                matches!(&program.nodes[value.binding.unwrap() as usize].kind, Some(pb::node::Kind::Binding(actual)) if actual == name)
+            );
+            let Some(pb::node::Kind::Call(read)) =
+                &program.nodes[value.value.unwrap() as usize].kind
+            else {
+                panic!("initializer remains a Read")
+            };
+            assert_eq!(read.func, "CaptureRead");
+        }
+        for (index, expected) in [(0, 10), (3, 20)] {
             let Some(pb::command::Kind::Action(pb::Action {
-                kind: Some(pb::action::Kind::Set(set)),
+                kind: Some(pb::action::Kind::Set(value)),
                 ..
             })) = &program.commands[index].kind
             else {
-                panic!("ordered Set at {index}")
+                panic!("ordered row Set")
             };
-            let call = set.target.as_ref().unwrap();
-            assert_eq!(call.func, target);
-            let rhs = &program.nodes[set.value.unwrap() as usize];
-            if let Some(value) = value {
-                assert!(
-                    matches!(&rhs.kind, Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue { value: Some(pb::primitive_value::Value::I64(actual)) })) if *actual == value)
-                );
-                assert_eq!(call.args.len(), 1);
-            } else {
-                assert!(call.args.is_empty());
-                let Some(pb::node::Kind::Call(read)) = &rhs.kind else {
-                    panic!("initializer remains an actual Read")
-                };
-                assert_eq!(read.func, "CaptureRead");
-                assert!(matches!(
-                    &program.nodes[read.args[0] as usize].kind,
-                    Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
-                        value: Some(pb::primitive_value::Value::I64(1))
-                    }))
-                ));
-            }
+            assert_eq!(value.target.as_ref().unwrap().func, "CaptureRead");
+            assert!(
+                matches!(&program.nodes[value.value.unwrap() as usize].kind, Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue { value: Some(pb::primitive_value::Value::I64(actual)) })) if *actual == expected)
+            );
         }
         assert!(
-            matches!(&program.commands[2].kind, Some(pb::command::Kind::Action(pb::Action { kind: Some(pb::action::Kind::Delete(call)), .. })) if call.func == "CaptureRead" && call.args.len() == 1)
+            matches!(&program.commands[2].kind, Some(pb::command::Kind::Action(pb::Action { kind: Some(pb::action::Kind::Delete(call)), .. })) if call.func == "CaptureRead")
         );
-        for slot in slots {
-            assert!(program.declarations.iter().any(|d| matches!(&d.kind, Some(pb::declaration::Kind::Function(f)) if f.name == slot && f.inputs.is_empty() && f.merge.is_none())));
-        }
+        assert!(program.declarations.iter().all(|d| !matches!(&d.kind, Some(pb::declaration::Kind::Function(f)) if f.name == "before" || f.name == "after")));
         assert_eq!(i64::try_from(&graph.extract(&before).unwrap()).unwrap(), 10);
         assert_eq!(i64::try_from(&graph.extract(&after).unwrap()).unwrap(), 20);
         graph
@@ -2358,126 +2331,115 @@ mod tests {
     }
 
     #[test]
-    fn typed_capture_names_guard_every_route_and_restore_scoped_access() {
-        use super::super::{builtins::I64, delete, let_, rule, ruleset, set};
-        for ordering in 0..3 {
-            let ordinary = I64::from_expression(Expr::call(
-                &super::super::decl::Callable::function(
-                    "__typed_capture_0",
-                    vec![],
-                    I64::sort_ref(),
-                    None::<fn(Expr, Expr) -> Expr>,
-                ),
+    fn typed_binding_namespace_rebinding_and_scopes() {
+        use super::super::{binding, builtins::I64, decl::Callable, let_, set};
+        let slot = let_("value", I64::from(5));
+        let ordinary = I64::from_expression(Expr::call(
+            &Callable::function(
+                "value",
                 vec![],
-            ));
-            let capture = let_("value", I64::from(5));
-            let mut graph = EGraph::default();
-            if ordering == 0 {
-                graph.register((set(&ordinary, 7), &capture)).unwrap();
-            } else if ordering == 1 {
-                graph.register((&capture, set(&ordinary, 7))).unwrap();
-            } else {
-                graph.register(set(&ordinary, 7)).unwrap();
-                graph.register(&capture).unwrap();
-            }
-            assert_eq!(
-                graph.captures.values().next().unwrap().1,
-                "__typed_capture_1"
-            );
-            assert_eq!(
-                i64::try_from(&graph.extract(&ordinary).unwrap()).unwrap(),
-                7
-            );
-        }
+                I64::sort_ref(),
+                None::<fn(Expr, Expr) -> Expr>,
+            ),
+            vec![],
+        ));
         let mut graph = EGraph::default();
+        graph.register((set(&ordinary, 7), &slot)).unwrap();
+        assert_eq!(i64::try_from(&graph.extract(&slot).unwrap()).unwrap(), 5);
+        assert_eq!(
+            i64::try_from(&graph.extract(&ordinary).unwrap()).unwrap(),
+            7
+        );
         graph.push().unwrap();
-        let capture = let_("private", I64::from(5));
-        graph.register(&capture).unwrap();
-        let slot = graph.captures.values().next().unwrap().1.clone();
-        let label_spelling = capture.expression().0.capture().unwrap().unwrap().name;
-        let ordinary_recipe = I64::from_expression(Expr::call(
-            &super::super::decl::Callable::function(
-                &label_spelling,
-                vec![],
-                I64::sort_ref(),
-                None::<fn(Expr, Expr) -> Expr>,
-            ),
-            vec![],
-        ));
-        graph.register(set(&ordinary_recipe, 77)).unwrap();
+        graph.register(set(&slot, 9)).unwrap();
+        assert_eq!(i64::try_from(&graph.extract(&slot).unwrap()).unwrap(), 9);
         assert_eq!(
-            i64::try_from(&graph.extract(&ordinary_recipe).unwrap()).unwrap(),
-            77
+            i64::try_from(
+                &graph
+                    .freeze()
+                    .unwrap()
+                    .lookup(&binding::<I64>("value"))
+                    .unwrap()
+            )
+            .unwrap(),
+            9
         );
-        assert_eq!(i64::try_from(&graph.extract(&capture).unwrap()).unwrap(), 5);
-        let physical = format!(
-            "__egglog_proto_call_{}",
-            slot.as_bytes()
-                .iter()
-                .map(|b| format!("{b:02x}"))
-                .collect::<String>()
-        );
-        let native_spelling = I64::from_expression(Expr::call(
-            &super::super::decl::Callable::function(
-                &physical,
-                vec![],
-                I64::sort_ref(),
-                None::<fn(Expr, Expr) -> Expr>,
-            ),
-            vec![],
-        ));
-        graph.register(set(&native_spelling, 99)).unwrap();
-        assert_eq!(
-            i64::try_from(&graph.extract(&native_spelling).unwrap()).unwrap(),
-            99
-        );
-        assert_eq!(i64::try_from(&graph.extract(&capture).unwrap()).unwrap(), 5);
-        let forged = I64::from_expression(Expr::call(
-            &super::super::decl::Callable::function(
-                &slot,
-                vec![],
-                I64::sort_ref(),
-                None::<fn(Expr, Expr) -> Expr>,
-            ),
-            vec![],
-        ));
-        for action in [set(&forged, 7), delete(&forged)] {
-            assert!(graph.register((set(CaptureRead(9), 9), &action)).is_err());
-            assert!(!graph.check(CaptureRead(9)).unwrap());
-        }
-        assert!(graph.register((set(CaptureRead(9), 9), &forged)).is_err());
-        assert!(graph.extract(&forged).is_err());
-        assert!(graph.check(&forged).is_err());
-        assert!(graph.run(ruleset(rule((), set(&forged, 7)))).is_err());
-        assert!(!graph.check(CaptureRead(9)).unwrap());
-        let prefix = I64::from_expression(Expr::call(
-            &super::super::decl::Callable::function(
-                &format!("{slot}_ordinary"),
-                vec![],
-                I64::sort_ref(),
-                None::<fn(Expr, Expr) -> Expr>,
-            ),
-            vec![],
-        ));
-        graph.register(set(&prefix, 8)).unwrap();
-        assert_eq!(i64::try_from(&graph.extract(&prefix).unwrap()).unwrap(), 8);
-        let mut cloned = graph.try_clone().unwrap();
-        assert!(cloned.check(&forged).is_err());
+        let mut clone = graph.try_clone().unwrap();
         graph.pop().unwrap();
-        graph.register(set(&forged, 7)).unwrap();
-        graph.register(&capture).unwrap();
-        assert_ne!(graph.captures.values().next().unwrap().1, slot);
-        assert_eq!(i64::try_from(&graph.extract(&forged).unwrap()).unwrap(), 7);
-        assert_eq!(i64::try_from(&graph.extract(&capture).unwrap()).unwrap(), 5);
-        let mut overflow = EGraph::default();
-        overflow.next_capture = u64::MAX;
+        assert_eq!(i64::try_from(&graph.extract(&slot).unwrap()).unwrap(), 5);
+        assert_eq!(i64::try_from(&clone.extract(&slot).unwrap()).unwrap(), 9);
+        for name in ["", "λ"] {
+            let slot = binding::<I64>(name);
+            graph.register(set(&slot, 13)).unwrap();
+            assert_eq!(i64::try_from(&graph.extract(&slot).unwrap()).unwrap(), 13);
+        }
+    }
+
+    #[test]
+    fn binding_addresses_and_dead_loop_bodies_never_initialize_recipes() {
+        use super::super::{binding, builtins::I64, eq, let_, sequence, set};
+        let lazy = let_("lazy", CaptureRead(991));
+        let rhs = let_("rhs", CaptureRead(992));
+        let mut graph = EGraph::default();
+        graph.register(set(&lazy, 7)).unwrap();
+        assert_eq!(i64::try_from(&graph.extract(&lazy).unwrap()).unwrap(), 7);
+        let request =
+            pb::RunProgramRequest::decode(graph.last_wire.as_ref().unwrap().0.as_slice()).unwrap();
+        assert!(request.program.unwrap().declarations.iter().all(|declaration| !matches!(&declaration.kind, Some(pb::declaration::Kind::Function(function)) if function.name == "CaptureRead")));
+        let fresh = let_("fresh", CaptureRead(993));
+        graph.run(sequence(set(&fresh, &rhs)).repeat(0)).unwrap();
         assert!(
-            overflow
-                .register((set(CaptureRead(9), 9), &capture))
-                .is_err()
+            !graph
+                .check(eq(binding::<I64>("fresh"), binding::<I64>("fresh")))
+                .unwrap()
         );
-        assert!(overflow.last_wire.is_none());
-        assert!(overflow.private_slots.is_empty());
+        assert!(
+            !graph
+                .check(eq(binding::<I64>("rhs"), binding::<I64>("rhs")))
+                .unwrap()
+        );
+        assert!(graph.freeze().unwrap().lookup(&fresh).is_err());
+        assert!(!graph.captures.contains_key("fresh"));
+        graph.register(set(binding::<I64>("rhs"), 9)).unwrap();
+        graph.run(sequence(set(&fresh, &rhs)).repeat(1)).unwrap();
+        graph.register(&fresh).unwrap();
+        assert_eq!(i64::try_from(&graph.extract(&fresh).unwrap()).unwrap(), 9);
+        assert_eq!(
+            i64::try_from(
+                &graph
+                    .freeze()
+                    .unwrap()
+                    .lookup(&let_("fresh", I64::from(100)))
+                    .unwrap()
+            )
+            .unwrap(),
+            9
+        );
+    }
+
+    #[test]
+    fn binding_writes_repeat_in_order_and_rule_reads_use_global_identity() {
+        use super::super::{binding, builtins::I64, eq, rule, ruleset, sequence, set, var};
+        let slot = binding::<I64>("x");
+        let mut graph = EGraph::default();
+        graph.register(set(&slot, 0)).unwrap();
+        graph
+            .run(sequence(set(&slot, &slot + I64::from(1))).repeat(3))
+            .unwrap();
+        assert_eq!(i64::try_from(&graph.extract(&slot).unwrap()).unwrap(), 3);
+        let local = var::<I64>("x");
+        graph
+            .run(ruleset(rule(
+                eq(&local, &slot),
+                set(CaptureRead(77), &local),
+            )))
+            .unwrap();
+        assert_eq!(
+            i64::try_from(&graph.extract(CaptureRead(77)).unwrap()).unwrap(),
+            3
+        );
+        assert!(graph.run(ruleset(rule((), set(&slot, 4)))).is_err());
+        assert_eq!(i64::try_from(&graph.extract(&slot).unwrap()).unwrap(), 3);
     }
 
     #[test]
@@ -2529,14 +2491,9 @@ mod tests {
                 graph.check(Fact(node.clone())).unwrap(),
                 "failed initializer retained the native constructor prefix"
             );
-            let issued = graph.private_slots.clone();
             graph.register(set(&read, 20)).unwrap();
             graph.register(&right).unwrap();
-            let slot = &graph.captures[&right.expression().0.capture().unwrap().unwrap().name].1;
-            assert!(
-                !issued.contains(slot),
-                "failed initializer slot is never recycled"
-            );
+            assert!(graph.captures.contains_key("right"));
             assert_eq!(i64::try_from(&graph.extract(&right).unwrap()).unwrap(), 20);
             if left_first {
                 assert_eq!(i64::try_from(&graph.extract(&left).unwrap()).unwrap(), 10);
@@ -2590,8 +2547,8 @@ mod tests {
     }
 
     #[test]
-    fn typed_capture_no_location_quarantines_a_possible_installation_without_confirmation() {
-        use super::super::{builtins::I64, decl::Callable, let_, set};
+    fn typed_capture_no_location_confirms_no_initializer_and_retries_same_binding() {
+        use super::super::{binding, builtins::I64, let_};
         let mut graph = EGraph::default();
         graph.push().unwrap();
         let capture = let_("unconfirmed", I64::from(5));
@@ -2599,12 +2556,7 @@ mod tests {
         let mut plan = CapturePlan::new(&graph, &roots).unwrap();
         let mut packer = Packer::default();
         plan.materialize(&roots, true, &mut packer).unwrap();
-        packer.capture_counter = Some(plan.next);
         packer.finish().unwrap();
-        let slot = packer.initializations[0].2.clone();
-        // Inject the possible survivor of a partial installation using actual
-        // bytes on this same handle: the definition exists, its Set never ran.
-        // This is not a claim that normal typed authoring causes that fault.
         let mut definitions = packer.program.clone();
         definitions.commands.clear();
         let installed = graph
@@ -2624,12 +2576,11 @@ mod tests {
             Observed::from_frames(
                 installed
                     .iter()
-                    .map(|bytes| { pb::RunProgramResponse::decode(bytes.as_slice()).unwrap() })
+                    .map(|bytes| pb::RunProgramResponse::decode(bytes.as_slice()).unwrap())
             )
             .error
             .is_none()
         );
-        // The actual failed packet has no command location and no completed Set.
         packer.program.commands.push(pb::Command {
             kind: Some(pb::command::Kind::Check(pb::Check {
                 facts: vec![u32::MAX],
@@ -2643,31 +2594,13 @@ mod tests {
             panic!("terminal error frame")
         };
         assert!(error.location.is_none());
-        assert_eq!(error.code, pb::ErrorCode::InvalidProgram as i32);
         assert!(graph.captures.is_empty());
-        assert!(graph.private_slots.contains(&slot));
         assert!(graph.usable);
-        assert!(graph.check(&capture).is_err());
-        let ordinary = I64::from_expression(Expr::call(
-            &Callable::function(
-                &slot,
-                vec![],
-                I64::sort_ref(),
-                None::<fn(Expr, Expr) -> Expr>,
-            ),
-            vec![],
-        ));
-        assert!(graph.register(set(&ordinary, 8)).is_err());
+        assert!(graph.extract(&binding::<I64>("unconfirmed")).is_err());
         graph.register(&capture).unwrap();
-        assert_ne!(graph.captures.values().next().unwrap().1, slot);
+        assert_eq!(i64::try_from(&graph.extract(&capture).unwrap()).unwrap(), 5);
         graph.pop().unwrap();
         assert!(graph.captures.is_empty());
-        assert!(graph.private_slots.is_empty());
-        graph.register(set(&ordinary, 8)).unwrap();
-        assert_eq!(
-            i64::try_from(&graph.extract(&ordinary).unwrap()).unwrap(),
-            8
-        );
     }
 
     #[test]

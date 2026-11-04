@@ -3,14 +3,14 @@ use super::{
     decl::Callable,
     expr::{Expr, ValueInput, fresh_scope, variable},
     pb,
-    storage::{Arena, DeclarationKind, Record, Slot, publish, visit_action, visit_rule},
+    storage::{Arena, DeclarationKind, Record, Slot, publish, visit_command, visit_rule},
 };
 use std::sync::LazyLock;
 
 /// An owned canonical action, or a deferred authoring diagnostic.
 /// Invalid targets are rejected at submission, before any actions execute.
 #[derive(Clone)]
-pub struct Action(Result<Record, String>);
+pub struct Action(pub(super) Result<Record, String>);
 
 impl<I: ValueInput> From<I> for Action {
     /// Retain an expression as an ordered term action in a heterogeneous list.
@@ -42,8 +42,8 @@ impl<I: ValueInput> From<I> for Action {
     }
 }
 
-/// Write a direct function row without evaluating its target lookup.
-/// With `no_merge`, assigning a different value to an existing row is an error.
+/// Assign a global binding or direct function row without reading its address.
+/// Bindings overwrite; a function with `no_merge` rejects a different existing row.
 pub fn set<I: ValueInput>(target: I, value: impl Into<I::Owned>) -> Action {
     row_action(
         target.borrow().expression(),
@@ -82,13 +82,48 @@ fn row_action(target: &Expr, mut action: pb::action::Kind, value: Option<Expr>) 
                 "snapshot observations cannot be used as live row targets".into(),
             ));
         }
-        if target.0.capture()?.is_some() {
-            return Err(TypedError::Invalid(
-                "capture storage is not an authored row target".into(),
-            ));
-        }
         let node =
             &target.0.owner.as_ref().unwrap().program().unwrap().nodes[target.0.index as usize];
+        if let Some(pb::node::Kind::Binding(name)) = &node.kind {
+            if !matches!(action, pb::action::Kind::Set(_)) {
+                return Err(TypedError::Invalid(
+                    "binding targets support only assignment".into(),
+                ));
+            }
+            let value = value.unwrap();
+            let sort = target.0.resolve(Arena::Sort, node.sort_id)?;
+            let value_node =
+                &value.0.owner.as_ref().unwrap().program()?.nodes[value.0.index as usize];
+            if SortRef(sort.clone()) != SortRef(value.0.resolve(Arena::Sort, value_node.sort_id)?) {
+                return Err(TypedError::Invalid(
+                    "binding assignment requires the same sort".into(),
+                ));
+            }
+            let mut slots = std::array::from_fn(|_| vec![]);
+            slots[Arena::Sort as usize] = vec![Slot::External(sort)];
+            slots[Arena::Node as usize] = vec![Slot::Local(0), Slot::External(value.0)];
+            return publish(
+                pb::Program {
+                    nodes: vec![pb::Node {
+                        kind: Some(pb::node::Kind::Binding(name.clone())),
+                        ..Default::default()
+                    }],
+                    commands: vec![pb::Command {
+                        kind: Some(pb::command::Kind::Let(pb::Let {
+                            binding: Some(0),
+                            value: Some(1),
+                        })),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                },
+                slots,
+                vec![],
+                Arena::Command,
+                0,
+                vec![],
+            );
+        }
         let Some(pb::node::Kind::Call(call)) = &node.kind else {
             return Err(TypedError::Invalid(
                 "row action requires a direct declared call".into(),
@@ -261,16 +296,24 @@ pub fn rule(lhs: impl Facts, rhs: impl Actions) -> Rule {
     let query = (0..slots[Arena::Node as usize].len())
         .map(|i| u32::try_from(i).expect("protobuf arena exceeds u32"))
         .collect();
-    let mut head = vec![];
+    let mut commands = vec![];
     let mut declarations = vec![];
     let error = rhs
-        .append_actions(&mut head, &mut declarations, &mut |expr| {
+        .append_commands(&mut commands, &mut declarations, &mut |expr| {
             let index = slots[Arena::Node as usize].len();
             slots[Arena::Node as usize].push(Slot::External(expr.0));
             u32::try_from(index).expect("protobuf arena exceeds u32")
         })
         .err()
         .map(|error| error.to_string());
+    let mut head = vec![];
+    let mut error = error;
+    for command in commands {
+        match command.kind {
+            Some(pb::command::Kind::Action(action)) => head.push(action),
+            _ => error = Some("global binding writes are not rule actions".into()),
+        }
+    }
     Rule(
         publish(
             pb::Program::default(),
@@ -546,72 +589,69 @@ where
 pub trait Actions: action_input::Actions {}
 impl<T: action_input::Actions> Actions for T {}
 
-mod action_input {
+pub(super) mod action_input {
     use super::super::EgglogValue;
-    use super::{Action, Arena, Callable, Expr, TypedError, ValueInput, pb, visit_action};
+    use super::{Action, Arena, Callable, Expr, TypedError, ValueInput, pb, visit_command};
 
     pub trait Actions {
-        fn append_actions(
+        fn append_commands(
             self,
-            out: &mut Vec<pb::Action>,
+            out: &mut Vec<pb::Command>,
             declarations: &mut Vec<Callable>,
             node: &mut impl FnMut(Expr) -> u32,
         ) -> Result<(), TypedError>;
     }
     impl<T: ValueInput> Actions for T {
-        fn append_actions(
+        fn append_commands(
             self,
-            out: &mut Vec<pb::Action>,
+            out: &mut Vec<pb::Command>,
             _: &mut Vec<Callable>,
             node: &mut impl FnMut(Expr) -> u32,
         ) -> Result<(), TypedError> {
-            out.push(pb::Action {
-                kind: Some(pb::action::Kind::Term(node(
-                    self.borrow().expression().clone(),
-                ))),
+            out.push(pb::Command {
+                kind: Some(pb::command::Kind::Action(pb::Action {
+                    kind: Some(pb::action::Kind::Term(node(
+                        self.borrow().expression().clone(),
+                    ))),
+                    ..Default::default()
+                })),
                 ..Default::default()
             });
             Ok(())
         }
     }
     impl Actions for Action {
-        fn append_actions(
+        fn append_commands(
             self,
-            out: &mut Vec<pb::Action>,
+            out: &mut Vec<pb::Command>,
             declarations: &mut Vec<Callable>,
             node: &mut impl FnMut(Expr) -> u32,
         ) -> Result<(), TypedError> {
             let record = self.0.map_err(TypedError::Invalid)?;
             let owner = record.owner.as_ref().unwrap();
-            let Some(pb::command::Kind::Action(mut action)) = owner.program().unwrap().commands
-                [record.index as usize]
-                .kind
-                .clone()
-            else {
-                unreachable!("owned action record")
-            };
-            visit_action(&mut action, |index| {
+            let mut command = owner.program().unwrap().commands[record.index as usize].clone();
+            visit_command(&mut command, |index| {
                 Ok(node(Expr(record.resolve(Arena::Node, index)?)))
             })?;
             declarations.extend(owner.declarations.iter().cloned().map(Callable));
-            out.push(action);
+            out.push(command);
             Ok(())
         }
     }
     impl Actions for &Action {
-        fn append_actions(
+        fn append_commands(
             self,
-            out: &mut Vec<pb::Action>,
+            out: &mut Vec<pb::Command>,
             declarations: &mut Vec<Callable>,
             node: &mut impl FnMut(Expr) -> u32,
         ) -> Result<(), TypedError> {
-            self.clone().append_actions(out, declarations, node)
+            self.clone().append_commands(out, declarations, node)
         }
     }
     impl Actions for () {
-        fn append_actions(
+        fn append_commands(
             self,
-            _: &mut Vec<pb::Action>,
+            _: &mut Vec<pb::Command>,
             _: &mut Vec<Callable>,
             _: &mut impl FnMut(Expr) -> u32,
         ) -> Result<(), TypedError> {
@@ -619,27 +659,27 @@ mod action_input {
         }
     }
     impl<T: Actions> Actions for Vec<T> {
-        fn append_actions(
+        fn append_commands(
             self,
-            out: &mut Vec<pb::Action>,
+            out: &mut Vec<pb::Command>,
             declarations: &mut Vec<Callable>,
             node: &mut impl FnMut(Expr) -> u32,
         ) -> Result<(), TypedError> {
             for value in self {
-                value.append_actions(out, declarations, node)?;
+                value.append_commands(out, declarations, node)?;
             }
             Ok(())
         }
     }
     impl<T: Actions, const N: usize> Actions for [T; N] {
-        fn append_actions(
+        fn append_commands(
             self,
-            out: &mut Vec<pb::Action>,
+            out: &mut Vec<pb::Command>,
             declarations: &mut Vec<Callable>,
             node: &mut impl FnMut(Expr) -> u32,
         ) -> Result<(), TypedError> {
             for value in self {
-                value.append_actions(out, declarations, node)?;
+                value.append_commands(out, declarations, node)?;
             }
             Ok(())
         }
@@ -648,14 +688,14 @@ mod action_input {
     where
         &'a T: Actions,
     {
-        fn append_actions(
+        fn append_commands(
             self,
-            out: &mut Vec<pb::Action>,
+            out: &mut Vec<pb::Command>,
             declarations: &mut Vec<Callable>,
             node: &mut impl FnMut(Expr) -> u32,
         ) -> Result<(), TypedError> {
             for value in self {
-                value.append_actions(out, declarations, node)?;
+                value.append_commands(out, declarations, node)?;
             }
             Ok(())
         }
@@ -668,8 +708,8 @@ macro_rules! tuples {
             fn append(self, out: &mut Vec<Expr>) { $(self.$i.append(out);)* }
         }
         impl<$($t: action_input::Actions),*> action_input::Actions for ($($t,)*) {
-            fn append_actions(self, out: &mut Vec<pb::Action>, declarations: &mut Vec<Callable>, node: &mut impl FnMut(Expr) -> u32) -> Result<(), TypedError> {
-                $(self.$i.append_actions(out, declarations, node)?;)*
+            fn append_commands(self, out: &mut Vec<pb::Command>, declarations: &mut Vec<Callable>, node: &mut impl FnMut(Expr) -> u32) -> Result<(), TypedError> {
+                $(self.$i.append_commands(out, declarations, node)?;)*
                 Ok(())
             }
         }
