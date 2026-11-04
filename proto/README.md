@@ -9,6 +9,9 @@ annotations define the contract. This overview explains the model. Execution
 prototypes are being tested separately; this PR contains the schema, generation
 tooling and wire-validation tests.
 
+[Worked example: constant folding](examples/constant-folding.md) shows Egglog
+source, a complete protobuf request, and its actual extraction and Freeze responses.
+
 ## Programs, definitions and execution
 
 A `Program` contains expression and sort arenas, declarations, ordered commands,
