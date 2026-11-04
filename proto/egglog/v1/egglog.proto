@@ -35,17 +35,20 @@ import "buf/validate/validate.proto";
 // setup: install complete replacements before commands, retaining omitted names.
 // Prepare all rule values before execution, including literals in zero-iteration
 // loop bodies. Native installation failures need not roll back completed setup.
+// Input Sort.eq entries establish nominal equality sorts; Node.binding entries
+// establish typed global slots, including unused entries. These are setup roots,
+// not value evaluation. Compatible names coalesce; conflicting sorts are errors.
 // Definitions installed on this handle may be referenced by name without
 // resending them. Node and sort indices refer to this Program's
 // arenas, not previous requests; all referenced entries must be included here.
 // Execute only commands, in order, and the expressions they demand. Unused
 // arena entries are not executed; arena membership is not an execution root.
-// Direct Actions in one execution of a command list share a Union identity
+// Direct Actions and Let initializers in one command list share a Union identity
 // scope, even across intervening non-Action commands. Program.commands is one
 // such list. Each loop-body iteration starts an independent scope; nested lists
 // never inherit the outer mapping, which resumes after they return. Rule
 // firings and other commands' evaluated inputs have their own scopes as in Union.
-// Fail is transparent to these scopes: a wrapped direct Action still belongs
+// Fail is transparent to these scopes: a wrapped direct Action or Let belongs
 // to its enclosing command list, and the wrapper adds no Union identity scope.
 // Sort.var is legal only in BuiltinCatalog signatures. Node sorts, lambda
 // parameter sorts, cost sorts and concrete declaration signatures must be
@@ -82,6 +85,16 @@ message Program {
       "has(v.maybe) && has(v.maybe.value) ? [v.maybe.value] : "
       "has(v.custom) ? v.custom.args : [])[0] : [])"
       ".all(i, i < uint(size(this.nodes))))"
+  };
+  // Nested command roots and structural sort equivalence remain normative.
+  option (buf.validate.message).cel = {
+    id: "program.let_roots"
+    message: "Let must address a binding node and an in-range value"
+    expression:
+      "this.commands.all(c, !has(c.let) || "
+      "(c.let.binding < uint(size(this.nodes)) && "
+      "has(this.nodes[int(c.let.binding)].binding) && "
+      "c.let.value < uint(size(this.nodes))))"
   };
   option (buf.validate.message).cel = {
     id: "program.sort_refs_in_range"
@@ -187,14 +200,15 @@ message Program {
       "this.nodes[int(i)].call.args.map(a, this.nodes[int(a)].sort_id)))))"
   };
 
-  // Expression arena. Evaluate shared ordinary nodes lazily at first demand,
+  // Expression arena. Binding nodes also establish typed global slots at setup.
+  // Evaluate shared ordinary nodes lazily at first demand,
   // retaining results within one Action command execution (including actions
   // in loops) or one rule firing's ordered head. Start a fresh ordinary memo for
   // each such execution. Query patterns do not use this evaluation memo.
   // `Union` locations have separate identity scopes; see `Union`.
   repeated Node nodes = 2;
 
-  // Sort arena, separate from expression nodes.
+  // Sort arena. Every equality entry establishes its nominal sort at setup.
   repeated Sort sorts = 3;
 
   repeated Declaration declarations = 4;
@@ -249,13 +263,17 @@ message Span {
 // patterns never share substitutions between signatures or calls.
 // Sorts are acyclic through PrimitiveSortRef.args and FuncSort.params/result.
 // CEL checks direct indices, not acyclicity or nested variable scope.
-// References do not declare sorts: eq resolves a user EqSort; primitive
-// resolves a configured-backend PrimitiveSort from GetBuiltins. These nominal
-// namespaces are distinct even when names have the same spelling.
-// Missing names and family-arity mismatches are errors. Builtin references need
-// no descriptor declarations. Output references resolve against the associated
-// handle; output arenas do not redeclare definitions.
+// In an input Program, eq establishes a nominal equality sort, idempotently by
+// name. Other arena owners describe types without installing them. Primitive
+// references resolve a configured-backend PrimitiveSort from GetBuiltins; missing
+// names and family-arity mismatches are errors. Equality-sort, primitive-sort,
+// callable and global-binding namespaces are distinct.
 message Sort {
+  option (buf.validate.message).cel = {
+    id: "sort.definition_doc"
+    message: "only a nominal equality sort carries definition documentation"
+    expression: "!has(this.doc) || has(this.eq)"
+  };
   oneof kind {
     option (buf.validate.oneof).required = true;
 
@@ -265,9 +283,10 @@ message Sort {
     uint32 var = 7; // index into the enclosing GenericSignature binder
   }
 
-  // Optional representative type-use origin; excluded from sort identity.
-  // Documentation belongs to the defining Declaration or catalog entry.
+  // Optional representative origin; on an establishing equality entry this is
+  // its definition origin. Origins and documentation are not sort identity.
   Span span = 5;
+  optional string doc = 6;
 }
 
 // A primitive-sort reference: no args for i64/Unit, or e.g. Vec<i64> and
@@ -302,12 +321,17 @@ message FuncSort {
 // - Queries share one binder across all facts. Rule heads and rewrite RHSs may
 //   use that binder; top-level evaluated inputs have no free variables.
 //   Every variable must belong to its use's binder.
+// - Binding nodes name global slots, independent of lexical binders. Their
+//   resolved sorts must agree across the input and installed state. Direct reads
+//   of unset slots fail; query reads contribute no match. Evaluated rule-head
+//   references capture globals in the query, as in native global lowering;
+//   deferred code instead obeys its own read/effect context.
 // - Function merges, primitives and lambda bodies use only their own binders
 //   (see those messages). Their bodies and transitive callees must be legal in
 //   each execution context. Hosts publish ambient primitive capabilities;
 //   receivers check them. An evaluated Union can write even in an expression body.
 // - Inert values (declared costs and extracted data) must be finite and contain
-//   no variables, get_cost reads or Union. Saved code retains its own binders;
+//   no variable or binding reads, get_cost reads or Union. Saved code retains its binders;
 //   these restrictions apply at each use, not to the entire arena.
 //
 // Scalar values are inert. Child-bearing values follow the surrounding
@@ -331,6 +355,12 @@ message Node {
     // the whole binder, avoiding user names and the positional
     // lambda/primitive parameters _0, _1, ....
     string var = 2 [(buf.validate.field).string.min_len = 1];
+
+    // In input Programs, establish a typed global slot during setup. Evaluating
+    // this node reads its current value; Let addresses it without reading it.
+    // Names are exact UTF-8, including empty names. Reusing this node does not assign a
+    // value. Unset slots remain represented by these setup roots in Freeze.
+    string binding = 11;
     PrimitiveValue primitive_value = 3;
     Call call = 4;
     Apply apply = 10;
@@ -377,7 +407,7 @@ message Node {
 // unions; deferred code follows Node's execution-context rules.
 //
 // During one rule firing, a Union location identifies one class across the
-// whole ordered head. Direct Actions in an executed command list share one
+// whole ordered head. Direct Actions and Let initializers in a command list share one
 // unit as specified on Program; each loop iteration uses a fresh unit.
 // Each primitive/lambda invocation starts a fresh unit. All evaluated inputs
 // of another command share one independent unit for that command execution.
@@ -600,7 +630,7 @@ message Unit {}
 // An ordered mutation or expression evaluation. Shared ordinary nodes retain
 // their first-demand result within this Action or the enclosing rule firing's
 // ordered head. No evaluation moves before its first demand. Persistent
-// top-level captures lower to nullary functions plus sets.
+// global assignment uses Command.let rather than a rule-head action.
 // Set, delete, subsume and SetCost are standalone actions, not value expressions.
 // Execute action lists in order; each Set uses the function's conflict policy
 // if that write conflicts. Rule matches and rebuilds have no global order here.
@@ -673,7 +703,8 @@ message SetCost {
 // Order-independent, immutable definitions. New names may be added. Resending
 // a complete definition is optional and checks compatibility: identical
 // definitions are no-ops; conflicting definitions are errors. User tables and
-// computed primitives have complete, concrete definitions. Builtin primitives
+// computed primitives have complete, concrete definitions. Equality sorts are
+// established by Program.sorts, not callable declarations. Builtin primitives
 // and primitive sorts are resolved by canonical name against GetBuiltins;
 // their descriptors are not input declarations.
 // Compare referenced expression subgraphs structurally, not request-local
@@ -699,7 +730,6 @@ message Declaration {
     Function function = 2;
     Relation relation = 3;
     UserDefinedPrimitive user_defined_primitive = 4;
-    EqSort eq_sort = 10;
   }
 
   // Optional diagnostic origin; excluded from semantic identity.
@@ -726,12 +756,6 @@ message Declaration {
 message Arg {
   uint32 sort = 1; // index into the enclosing `sorts`
   string name = 2;
-}
-
-// A concrete nullary equality-sort definition. Its nominal namespace is distinct
-// from primitive sorts and callables; same-name compatible resends are idempotent.
-message EqSort {
-  string name = 1 [(buf.validate.field).string.min_len = 1];
 }
 
 // A concrete constructor whose output is an equality sort.
@@ -1009,12 +1033,26 @@ message Command {
     Unit stats = 17;
 
     Explain explain = 19;
+    Let let = 20;
   }
 
   // Origin. Locates a failure attributed to a command rather than an
   // expression: a failed `check`, run or extraction.
   // Surfaces as `Error.span`.
   Span span = 13;
+}
+
+// Assign a global slot at this command's position, including inside Loop or Fail.
+// binding must directly index a Node.binding; value must have the same resolved
+// sort. Evaluate value before replacing the old value. A self-read sees the old
+// value; failed evaluation retains it and any completed prefix effects. Sequential
+// same-sort assignments overwrite.
+// The slot's type exists after setup even if this command never executes.
+// Initializers use the enclosing direct-Action Union scope and a fresh ordinary
+// memo. Reassignment contributes to loop progress through ordinary write tracking.
+message Let {
+  optional uint32 binding = 1 [(buf.validate.field).required = true];
+  optional uint32 value = 2 [(buf.validate.field).required = true];
 }
 
 // One conjunctive query. All facts share the same variable bindings.
@@ -1143,7 +1181,9 @@ enum Extractor {
 // host resources. Preserve execution_mode, but reconstruction does not preserve
 // original derivations or promise equivalent proof results.
 //
-// Include every installed declaration and sort, even unused or empty tables,
+// Include every installed declaration and nominal equality sort, even unused,
+// and every global slot as a binding node, including unset slots. Include only
+// referenced primitive/structural sorts and their children, not backend inventory,
 // and preserve current named ruleset bindings and their ordered rule values,
 // including empty bindings. A shared value appears in each relevant binding.
 // Omit rules retained only in private registration caches. Backend builtin
@@ -1158,13 +1198,16 @@ enum Extractor {
 // installation follows Program's normal rules; scheduler/seminaive history
 // is not resumed.
 //
-// Export commands contain only data Actions, with no queries, Runs or loops.
+// Export commands contain data Actions followed by Let assignments for populated
+// global slots, with no queries, Runs or loops.
 // Emit exactly one direct Action.term for each canonical equality
 // class, naming its unique Union location with all its constructor rows as
 // members. Include empty/unreachable classes.
 // Emit relation rows as direct Action.term Calls; write every function row,
 // including Unit outputs, with Set. Then emit SetCost annotations, then subsume
 // for subsumed constructor rows; no delete or panic actions.
+// Emit one Let for each populated global slot, referencing its exported value;
+// emit no assignment for unset slots. Preserve these binding nodes as setup roots.
 // These explicit roots inventory stored classes, not arbitrary arena nodes or
 // Union locations in saved code. Shared Union locations preserve references
 // across this list. Keep all canonical rows and extant cost/subsumption

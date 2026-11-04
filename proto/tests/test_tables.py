@@ -47,14 +47,15 @@ class TableSchemaTests(unittest.TestCase):
                     self.assertEqual(decoded, declaration)
                     self.assertEqual(decoded.table_name, prefix)
         with self.assertRaises(ValidationError):
-            validate(ir.Declaration(kind=Oneof("eq_sort", ir.EqSort(name="S")), table_name=Oneof("public_alias", "")))
+            validate(ir.Declaration(kind=Oneof("user_defined_primitive",
+                ir.UserDefinedPrimitive(name="p", body=0)), table_name=Oneof("public_alias", "")))
 
     def test_internal_parent_is_not_public_sort_metadata(self):
-        sort = ir.EqSort(name="S")
+        sort = ir.Sort(kind=Oneof("eq", "S"))
         validate(sort)
-        self.assertEqual(ir.EqSort.from_binary(sort.to_binary()), sort)
+        self.assertEqual(ir.Sort.from_binary(sort.to_binary()), sort)
         with self.assertRaises(TypeError):
-            ir.EqSort(name="S", uf_parent="Pending")
+            ir.Sort(kind=Oneof("eq", "S"), uf_parent="Pending")
 
     def test_hidden_is_owned_by_constructor_or_function(self):
         for tag, table in (
@@ -65,7 +66,7 @@ class TableSchemaTests(unittest.TestCase):
             validate(declaration)
             self.assertTrue(ir.Declaration.from_binary(declaration.to_binary()).kind.value.hidden)
             self.assertTrue(ir.Declaration.from_json(declaration.to_json()).kind.value.hidden)
-        for message in (ir.Declaration, ir.Relation, ir.EqSort, ir.UserDefinedPrimitive):
+        for message in (ir.Declaration, ir.Relation, ir.Sort, ir.UserDefinedPrimitive):
             with self.subTest(message=message), self.assertRaises(TypeError):
                 message(hidden=True)
 

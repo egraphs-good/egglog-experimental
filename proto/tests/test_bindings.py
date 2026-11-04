@@ -26,7 +26,6 @@ class SemanticHeaderTests(unittest.TestCase):
 
 
     def test_user_namespaces_resolve_primitive_sort_refs_ambiently(self):
-        nominal = ir.Declaration(kind=Oneof("eq_sort", ir.EqSort(name="Pair")))
         callable_ = ir.Declaration(kind=Oneof("constructor", ir.Constructor(
             name="Pair", inputs=[ir.Arg(sort=1)], output=0,
         )))
@@ -34,10 +33,50 @@ class SemanticHeaderTests(unittest.TestCase):
             ir.Sort(kind=Oneof("eq", "Pair")),
             ir.Sort(kind=Oneof("primitive", ir.PrimitiveSortRef(name="Pair", args=[0, 0]))),
         ]
-        for declarations in ([nominal, callable_], [callable_, nominal]):
-            program = ir.Program(sorts=sorts, declarations=declarations)
-            validate(program)
-            self.assertEqual(ir.Program.from_binary(program.to_binary()), program)
+        program = ir.Program(sorts=sorts, declarations=[callable_])
+        validate(program)
+        self.assertEqual(ir.Program.from_binary(program.to_binary()), program)
+
+    def test_equality_and_global_setup_roots_need_no_declaration(self):
+        program = ir.Program(
+            sorts=[ir.Sort(kind=Oneof("eq", "Math"), doc="A nominal type")],
+            nodes=[ir.Node(kind=Oneof("binding", name)) for name in ("", "x", "λ")],
+        )
+        validate(program)
+        self.assertFalse(program.commands)
+        self.assertFalse(program.declarations)
+        self.assertEqual(ir.Program.from_binary(program.to_binary()), program)
+        self.assertEqual(ir.Program.from_json(program.to_json()), program)
+        self.assertFalse(hasattr(ir, "EqSort"))
+
+    def test_global_lookup_and_lexical_variable_are_distinct(self):
+        local = ir.Node(kind=Oneof("var", "x"))
+        global_ = ir.Node(kind=Oneof("binding", "x"))
+        for node in (local, global_):
+            validate(node)
+            self.assertEqual(ir.Node.from_binary(node.to_binary()), node)
+        self.assertNotEqual(local, global_)
+        self.assertNotEqual(local.to_binary(), global_.to_binary())
+
+    def test_let_addresses_only_binding_nodes_and_requires_both_indices(self):
+        nodes = [
+            ir.Node(kind=Oneof("binding", "x")),
+            ir.Node(kind=Oneof("primitive_value", ir.PrimitiveValue(value=Oneof("i64", 10)))),
+        ]
+        for binding, value, accepted in [(0, 1, True), (1, 0, False), (2, 1, False),
+                                          (0, 2, False), (None, 1, False), (0, None, False)]:
+            program = ir.Program(
+                sorts=[ir.Sort(kind=Oneof("primitive", ir.PrimitiveSortRef(name="i64")))],
+                nodes=nodes,
+                commands=[ir.Command(kind=Oneof("let", ir.Let(binding=binding, value=value)))],
+            )
+            with self.subTest(binding=binding, value=value):
+                if accepted:
+                    validate(program)
+                    self.assertEqual(ir.Program.from_binary(program.to_binary()), program)
+                else:
+                    with self.assertRaises(ValidationError):
+                        validate(program)
 
     def test_open_signature_patterns_belong_only_to_builtin_catalog(self):
         with self.assertRaises(ValidationError):
