@@ -227,7 +227,7 @@ class ProofSchemaTests(unittest.TestCase):
         for mode in ir.ExecutionMode:
             with self.subTest(mode=mode):
                 options = ir.EGraphOptions(cost_sort=0, execution_mode=mode)
-                sorts = [ir.Sort(kind=Oneof("application", ir.SortApplication(name="i64")))]
+                sorts = [ir.Sort(kind=Oneof("primitive", ir.PrimitiveSortRef(name="i64")))]
                 request = ir.CreateEGraphRequest(options=options, sorts=sorts)
                 snapshot = ir.EGraphSnapshot(
                     options=options, program=ir.Program(sorts=sorts)

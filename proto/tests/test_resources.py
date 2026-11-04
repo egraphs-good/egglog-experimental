@@ -11,8 +11,8 @@ from gen.python.egglog.v1 import egglog_pb as ir
 class ResourceSchemaTests(unittest.TestCase):
     def test_creation_accepts_closed_backend_compositions_without_declarations(self):
         request = ir.CreateEGraphRequest(
-            sorts=[ir.Sort(kind=Oneof("application", ir.SortApplication(name="i64"))),
-                   ir.Sort(kind=Oneof("application", ir.SortApplication(name="Pair", args=[0, 0])))],
+            sorts=[ir.Sort(kind=Oneof("primitive", ir.PrimitiveSortRef(name="i64"))),
+                   ir.Sort(kind=Oneof("primitive", ir.PrimitiveSortRef(name="Pair", args=[0, 0])))],
             options=ir.EGraphOptions(cost_sort=1),
         )
         validate(request)
@@ -25,7 +25,7 @@ class ResourceSchemaTests(unittest.TestCase):
 
     def test_creation_resources_can_be_requested_together(self):
         request = ir.CreateEGraphRequest(
-            sorts=[ir.Sort(kind=Oneof("application", ir.SortApplication(name="i64")))],
+            sorts=[ir.Sort(kind=Oneof("primitive", ir.PrimitiveSortRef(name="i64")))],
             options=ir.EGraphOptions(cost_sort=0), threads=0, no_decomp=True,
         )
         validate(request)
@@ -46,7 +46,7 @@ class ResourceSchemaTests(unittest.TestCase):
         for count in (None, 0, 1, 2**32 - 1):
             with self.subTest(count=count):
                 request = ir.CreateEGraphRequest(
-                    sorts=[ir.Sort(kind=Oneof("application", ir.SortApplication(name="i64")))],
+                    sorts=[ir.Sort(kind=Oneof("primitive", ir.PrimitiveSortRef(name="i64")))],
                     options=ir.EGraphOptions(cost_sort=0),
                     threads=count,
                 )

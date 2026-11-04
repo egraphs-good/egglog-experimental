@@ -13,10 +13,10 @@ def signature_program(pattern):
     """Own the signature's sort arena and binder."""
     return ir.BuiltinCatalog(
         sorts=[
-            ir.Sort(kind=Oneof("application", ir.SortApplication(name="i64"))),
+            ir.Sort(kind=Oneof("primitive", ir.PrimitiveSortRef(name="i64"))),
             ir.Sort(kind=Oneof("var", 0)),
             ir.Sort(kind=Oneof("var", 1)),
-            ir.Sort(kind=Oneof("application", ir.SortApplication(name="Map", args=[1, 2]))),
+            ir.Sort(kind=Oneof("primitive", ir.PrimitiveSortRef(name="Map", args=[1, 2]))),
             ir.Sort(kind=Oneof("var", 2)),
         ],
         primitive_sorts=[ir.PrimitiveSort(name="i64"), ir.PrimitiveSort(name="Map", arity=2)],

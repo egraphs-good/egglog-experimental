@@ -1,5 +1,6 @@
 """Semantic declaration namespaces and creation settings."""
 
+import json
 import unittest
 from protobuf import Oneof
 from protovalidate import ValidationError, validate
@@ -17,21 +18,21 @@ class SemanticHeaderTests(unittest.TestCase):
                 self.assertEqual(restored.has_field("seminaive"), seminaive is not None)
                 self.assertIs(restored.seminaive, False if seminaive is None else seminaive)
                 creation = ir.CreateEGraphRequest(
-                    sorts=[ir.Sort(kind=Oneof("application", ir.SortApplication(name="i64")))],
+                    sorts=[ir.Sort(kind=Oneof("primitive", ir.PrimitiveSortRef(name="i64")))],
                     options=options, no_decomp=no_decomp,
                 )
                 validate(creation)
                 self.assertEqual(ir.CreateEGraphRequest.from_binary(creation.to_binary()), creation)
 
 
-    def test_user_namespaces_resolve_primitive_sort_applications_ambiently(self):
+    def test_user_namespaces_resolve_primitive_sort_refs_ambiently(self):
         nominal = ir.Declaration(kind=Oneof("eq_sort", ir.EqSort(name="Pair")))
         callable_ = ir.Declaration(kind=Oneof("constructor", ir.Constructor(
             name="Pair", inputs=[ir.Arg(sort=1)], output=0,
         )))
         sorts = [
             ir.Sort(kind=Oneof("eq", "Pair")),
-            ir.Sort(kind=Oneof("application", ir.SortApplication(name="Pair", args=[0, 0]))),
+            ir.Sort(kind=Oneof("primitive", ir.PrimitiveSortRef(name="Pair", args=[0, 0]))),
         ]
         for declarations in ([nominal, callable_], [callable_, nominal]):
             program = ir.Program(sorts=sorts, declarations=declarations)
@@ -54,13 +55,19 @@ class SemanticHeaderTests(unittest.TestCase):
         # These existing tags already distinguish identical name spellings.
         cases = [
             (ir.Sort(kind=Oneof("eq", "Pair")), b"\x0a\x04Pair"),
-            (ir.Sort(kind=Oneof("application", ir.SortApplication(name="Pair", args=[0, 0]))),
+            (ir.Sort(kind=Oneof("primitive", ir.PrimitiveSortRef(name="i64"))),
+             b"\x12\x05\x0a\x03i64"),
+            (ir.Sort(kind=Oneof("primitive", ir.PrimitiveSortRef(name="Pair", args=[0, 0]))),
              b"\x12\x0a\x0a\x04Pair\x12\x02\x00\x00"),
         ]
         for sort, encoded in cases:
             with self.subTest(sort=sort):
                 self.assertEqual(sort.to_binary(), encoded)
                 self.assertEqual(ir.Sort.from_binary(encoded), sort)
+                if sort.kind.field == "primitive":
+                    fields = json.loads(sort.to_json())
+                    self.assertEqual(fields["primitive"]["name"], sort.kind.value.name)
+                    self.assertEqual(ir.Sort.from_json(sort.to_json()), sort)
 
 
 if __name__ == "__main__":
