@@ -1,11 +1,14 @@
-//! Sequential, typechecking-only source producer for the initial protobuf slice.
+//! Block-oriented, typechecking-only source producer for the protobuf slice.
 //!
 //! Submit each yielded program through the byte adapter before requesting the
 //! next one, and stop on a transport or decoded execution error. Parsing is eager
-//! (like native source execution); resolution is sequential so a later type error
-//! does not erase an executed prefix. Authored data actions and schedules are
+//! (like native source execution); resolution is sequential within each block.
+//! A block is fully authored before submission, so a later authoring error
+//! discards its unsent prefix. Authored data actions and schedules are
 //! never executed here. Declaration-installation expectations are checked during
-//! authoring and are absent from protobuf, retaining successful definitions.
+//! authoring and are absent from protobuf. Successful blocks retain definitions
+//! completed inside caught definition failures. Scope changes, frontend IO and
+//! replacement of an earlier Run's ambient binding end the current block.
 //! Scope-aware callers use [`Source::next_submission`] and the existing clone /
 //! destroy requests; the Program iterator deliberately rejects scope operations.
 //! Rules emit complete setup bindings; combined text names select their live
@@ -238,7 +241,7 @@ impl PrintFunction {
 
 #[derive(Clone)]
 enum SourceRuleset {
-    Rules(Vec<u32>),
+    Rules { rules: Vec<u32>, owned: bool },
     Combined(Vec<String>),
 }
 
@@ -274,7 +277,9 @@ pub struct Source {
     schedulers: HashSet<String>,
     local_prefix: String,
     cost_origins: std::sync::Arc<std::sync::Mutex<crate::set_cost::CostOrigins>>,
-    pending_error: Option<String>,
+    // Expanded once, then retained across an ambient-binding boundary.
+    pending_expansion: Option<(Vec<Command>, Option<String>, bool)>,
+    ambient_runs: HashSet<String>,
 }
 
 // Relocation only, not admission: retain missing fields and out-of-bounds
@@ -737,7 +742,8 @@ pub(crate) fn primitive_definition(
             schedulers: HashSet::new(),
             local_prefix: String::new(),
             cost_origins: Default::default(),
-            pending_error: None,
+            pending_expansion: None,
+            ambient_runs: HashSet::new(),
         },
         destination: graph,
     };
@@ -769,8 +775,8 @@ pub(crate) fn primitive_definition(
 }
 
 impl Source {
-    /// Parses source without executing data actions or schedules. Each item is one ordered
-    /// submission phase; callers must stop after a failed decoded response.
+    /// Parses source without executing data actions or schedules. Each item is one
+    /// authored block; callers must stop after a failed decoded response.
     pub fn new(filename: Option<String>, source: &str) -> Result<Self, TransportError> {
         Self::with_dialect(filename, source, Dialect::Experimental, None)
     }
@@ -845,12 +851,19 @@ impl Source {
                 ..Default::default()
             },
             rules: vec![],
-            rulesets: HashMap::from([(String::new(), SourceRuleset::Rules(vec![]))]),
+            rulesets: HashMap::from([(
+                String::new(),
+                SourceRuleset::Rules {
+                    rules: vec![],
+                    owned: false,
+                },
+            )]),
             relations: HashSet::new(),
             schedulers: HashSet::new(),
             local_prefix,
             cost_origins,
-            pending_error: None,
+            pending_expansion: None,
+            ambient_runs: HashSet::new(),
         })
     }
 
@@ -900,13 +913,47 @@ impl Source {
 
     fn advance(&mut self, scopes: bool) -> Option<Result<Submission, TransportError>> {
         self.started = true;
-        if let Some(error) = self.pending_error.take() {
-            self.commands.clear();
-            return Some(Err(TransportError(error)));
-        }
         let first_node = self.program.nodes.len();
+        let mut authored = false;
         let result = loop {
-            let (command, depth) = self.commands.pop_front()?;
+            if let Some((expanded, alias, input)) = self.pending_expansion.take() {
+                if let Err(error) = self.compile_expanded(expanded, alias) {
+                    break Err(error);
+                }
+                if input {
+                    break self.phase().map(Submission::Program);
+                }
+                authored = true;
+                continue;
+            }
+            let Some((command, depth)) = self.commands.pop_front() else {
+                if authored {
+                    break self.phase().map(Submission::Program);
+                }
+                return None;
+            };
+            let mut header = &command;
+            while let Command::Fail(_, child) = header {
+                header = child;
+            }
+            let input = matches!(header, Command::Input { .. });
+            let boundary = input
+                || matches!(
+                    command,
+                    Command::Include(..) | Command::Push(_) | Command::Pop(..)
+                )
+                || matches!(&command, Command::PrintFunction(_, _, _, file, mode)
+                    if file.is_some() || *mode != ast::PrintFunctionMode::Default);
+            if authored && boundary {
+                self.commands.push_front((command, depth));
+                break self.phase().map(Submission::Program);
+            }
+            if input {
+                break self
+                    .compile(command, false)
+                    .and_then(|_| self.phase())
+                    .map(Submission::Program);
+            }
             match command {
                 Command::Include(span, file) => {
                     if depth >= 256 {
@@ -984,13 +1031,18 @@ impl Source {
                         break Err("source table presentation requires next_submission".into());
                     }
                     let predicate = self.relations.contains(&table);
-                    let program = self.compile(Command::PrintFunction(
-                        span.clone(),
-                        table,
-                        limit,
-                        None,
-                        ast::PrintFunctionMode::Default,
-                    ));
+                    let program = self
+                        .compile(
+                            Command::PrintFunction(
+                                span.clone(),
+                                table,
+                                limit,
+                                None,
+                                ast::PrintFunctionMode::Default,
+                            ),
+                            false,
+                        )
+                        .and_then(|_| self.phase());
                     break program.map(|program| {
                         Submission::PrintFunction(PrintFunction {
                             program,
@@ -1017,9 +1069,11 @@ impl Source {
                         _ => None,
                     };
                     if let Some((span, captures)) = cost_start {
-                        break self
-                            .cost_phase(command, span, captures, None)
-                            .map(Submission::Program);
+                        if let Err(error) = self.cost_phase(command, span, captures, None) {
+                            break Err(error);
+                        }
+                        authored = true;
+                        continue;
                     }
                     if let Command::Action(Action::Let(_, first, _)) = &command {
                         let mut captures = vec![first.clone()];
@@ -1061,9 +1115,13 @@ impl Source {
                         {
                             let constructor = constructor.clone();
                             let span = span.clone();
-                            break self
-                                .cost_phase(command, span, captures, Some(constructor))
-                                .map(Submission::Program);
+                            if let Err(error) =
+                                self.cost_phase(command, span, captures, Some(constructor))
+                            {
+                                break Err(error);
+                            }
+                            authored = true;
+                            continue;
                         }
                     }
                     // A native dynamic helper is separate storage. Admit a
@@ -1088,7 +1146,11 @@ impl Source {
                         }
                         self.commands.pop_front();
                     }
-                    break self.compile(command).map(Submission::Program);
+                    match self.compile(command, authored) {
+                        Ok(true) => authored = true,
+                        Ok(false) => break self.phase().map(Submission::Program),
+                        Err(error) => break Err(error),
+                    }
                 }
             }
         };
@@ -1102,11 +1164,12 @@ impl Source {
         });
         if result.is_err() {
             self.commands.clear();
+            self.pending_expansion = None;
         }
         Some(result.map_err(TransportError))
     }
 
-    fn compile(&mut self, command: Command) -> Result<pb::Program, String> {
+    fn compile(&mut self, command: Command, authored: bool) -> Result<bool, String> {
         let explicit_sort_alias = match &command {
             Command::Sort {
                 name,
@@ -1115,45 +1178,43 @@ impl Source {
             } => Some(name.clone()),
             _ => None,
         };
-        let mut expanded = self
+        let expanded = self
             .graph
             .expand_command_macros(command)
             .map_err(|error| error.to_string())?;
-        if expanded.len() == 1 {
-            return self.compile_expanded(expanded, explicit_sort_alias);
-        }
-        // Native fresh expansion declares its keyed constructor, then installs
-        // the rewritten rule. Both fit one authored phase. Arbitrary vectors
-        // cannot be combined: Program declarations precede runtime commands.
-        if !matches!(
-            expanded.as_slice(),
-            [Command::Constructor { .. }, Command::Rule { .. }]
-        ) {
+        // Retain the supported native fresh constructor/rule expansion without
+        // repeating provider macros when a binding boundary suspends it.
+        if expanded.len() != 1
+            && !matches!(
+                expanded.as_slice(),
+                [Command::Constructor { .. }, Command::Rule { .. }]
+            )
+        {
             return Err(
                 "multi-command source macros require separate ordered submission phases".into(),
             );
         }
-        let rule = expanded.pop().unwrap();
-        let mut prefix = self.compile_expanded(expanded, None)?;
-        let program = self.program.clone();
-        let rules = self.rules.clone();
-        let rulesets = self.rulesets.clone();
-        match self.compile_expanded(vec![rule], None) {
-            Ok(mut complete) => {
-                prefix.declarations.append(&mut complete.declarations);
-                complete.declarations = prefix.declarations;
-                Ok(complete)
+        let mut input = false;
+        let mut replaces_ambient = false;
+        for mut command in &expanded {
+            while let Command::Fail(_, child) = command {
+                command = child;
             }
-            Err(error) => {
-                // Native retains the constructor if its later rule fails. Do
-                // not export any nodes or group additions from that child.
-                self.program = program;
-                self.rules = rules;
-                self.rulesets = rulesets;
-                self.pending_error = Some(error);
-                Ok(prefix)
-            }
+            let group = match command {
+                Command::AddRuleset(_, name) => Some(name),
+                Command::Rule { rule } => Some(&rule.ruleset),
+                Command::Rewrite(name, ..) | Command::BiRewrite(name, _) => Some(name),
+                _ => None,
+            };
+            replaces_ambient |= group.is_some_and(|name| self.ambient_runs.contains(name));
+            input |= matches!(command, Command::Input { .. });
         }
+        if replaces_ambient || input && authored {
+            self.pending_expansion = Some((expanded, explicit_sort_alias, input));
+            return Ok(false);
+        }
+        self.compile_expanded(expanded, explicit_sort_alias)?;
+        Ok(!input)
     }
 
     // Lower already expanded commands without applying user macros again.
@@ -1161,7 +1222,13 @@ impl Source {
         &mut self,
         expanded: Vec<Command>,
         explicit_sort_alias: Option<String>,
-    ) -> Result<pb::Program, String> {
+    ) -> Result<(), String> {
+        if expanded.len() > 1 {
+            for command in expanded {
+                self.compile_expanded(vec![command], None)?;
+            }
+            return Ok(());
+        }
         if expanded
             .iter()
             .any(|command| matches!(command, Command::Sort { uf: Some(_), .. }))
@@ -1172,7 +1239,6 @@ impl Source {
             .mode
             .is_some_and(|mode| mode != pb::ExecutionMode::Normal);
         let mut installed = None;
-        let mut definition_error = None;
         let mut registered_commands = None;
         // Definition registration keeps the native destination context current
         // and supplies empty table backends for later literal function captures.
@@ -1265,12 +1331,7 @@ impl Source {
                 };
                 *graph.command_macros_mut() = macros;
                 if definition {
-                    if let Err(error) = result {
-                        if completed.is_empty() {
-                            return Err(error.to_string());
-                        }
-                        definition_error = Some(error.to_string());
-                    }
+                    result.map_err(|error| error.to_string())?;
                     installed = Some(completed);
                 } else {
                     result.map_err(|error| error.to_string())?;
@@ -1808,13 +1869,19 @@ impl Source {
                     }
                     command @ (N::AddRuleset(..) | N::UnstableCombinedRuleset(..)) => {
                         let (name, kind) = match command {
-                            N::AddRuleset(_, name) => (name, SourceRuleset::Rules(vec![])),
+                            N::AddRuleset(_, name) => (
+                                name,
+                                SourceRuleset::Rules {
+                                    rules: vec![],
+                                    owned: true,
+                                },
+                            ),
                             N::UnstableCombinedRuleset(_, name, children) => {
                                 (name, SourceRuleset::Combined(children))
                             }
                             _ => unreachable!(),
                         };
-                        let leaf = matches!(kind, SourceRuleset::Rules(_));
+                        let leaf = matches!(kind, SourceRuleset::Rules { .. });
                         if self.rulesets.insert(name.clone(), kind).is_some() {
                             return Err(format!("ruleset {name} is already declared"));
                         }
@@ -2085,13 +2152,12 @@ impl Source {
                 self.program.commands.push(command);
             }
         }
-        self.pending_error = definition_error;
-        let program = self.phase()?;
-        Ok(program)
+        Ok(())
     }
 
     // Each packet carries new definitions and complete changed ruleset bindings.
     fn phase(&mut self) -> Result<pb::Program, String> {
+        self.ambient_runs.clear();
         let commands = std::mem::take(&mut self.program.commands);
         Ok(pb::Program {
             sorts: self.program.sorts.clone(),
@@ -2109,7 +2175,7 @@ impl Source {
         span: ast::Span,
         captures: Vec<String>,
         deletion: Option<String>,
-    ) -> Result<pb::Program, String> {
+    ) -> Result<(), String> {
         let deleting = deletion.is_some();
         let (constructor, arity) = if let Some(constructor) = deletion {
             (constructor, captures.len())
@@ -2165,103 +2231,38 @@ impl Source {
         {
             return Err("set-cost requires a declared dynamic-cost constructor".into());
         }
-        let mut prefix = Vec::new();
         let mut arguments = Vec::new();
         let mut cost = None;
         for (index, command) in expansion.into_iter().enumerate() {
-            let resolved = match self.graph.resolve_command_preserving_globals(command) {
-                Ok(resolved) => resolved,
-                Err(error) => {
-                    // Native executes each expanded command before typechecking
-                    // the next. Publish that same completed prefix first; a
-                    // failed prefix execution still wins over this later error.
-                    if prefix.is_empty() {
-                        return Err(error.to_string());
-                    }
-                    self.program.commands.extend(prefix);
-                    self.pending_error = Some(error.to_string());
-                    return self.phase();
-                }
-            };
+            let resolved = self
+                .graph
+                .resolve_command_preserving_globals(command)
+                .map_err(|error| error.to_string())?;
             let [N::CoreAction(action)] = resolved.as_slice() else {
                 return Err("native set-cost resolution shape changed".into());
             };
-            let (action_span, term) = match action {
-                ResolvedAction::Let(action_span, var, expr)
+            match action {
+                ResolvedAction::Let(_, var, expr)
                     if index < arity && var.name == captures[index] =>
                 {
-                    let value = self.expr(expr, None, 0)?;
-                    arguments.push(value);
+                    arguments.push(self.expr(expr, None, 0)?);
                     self.graph
                         .extension_state_or_default::<crate::set_cost::SourceCostRoles>()
                         .1
                         .insert(var.name.clone());
-                    (action_span, Some(value))
                 }
-                ResolvedAction::Expr(
-                    action_span,
-                    ResolvedExpr::Call(_, ResolvedCall::Func(target), _),
-                ) if index == arity && target.name == constructor => {
-                    let sort_id = self.sort(target.output.name())?;
-                    let term = u32::try_from(self.program.nodes.len())
-                        .map_err(|_| "too many source nodes")?;
-                    let node_span = self.span(action_span)?;
-                    self.program.nodes.push(pb::Node {
-                        sort_id,
-                        kind: Some(pb::node::Kind::Call(pb::Call {
-                            func: constructor.clone(),
-                            args: arguments.clone(),
-                        })),
-                        span: node_span,
-                    });
-                    // One target evaluation includes the ordered captures. Do
-                    // not evaluate them once as prefix terms and again as args.
-                    prefix.clear();
-                    (action_span, Some(term))
-                }
-                ResolvedAction::Change(
-                    action_span,
-                    ast::Change::Delete,
-                    ResolvedCall::Func(target),
-                    _,
-                ) if deleting && index == arity && target.name == constructor => {
-                    prefix.clear();
-                    prefix.push(pb::Command {
-                        span: self.span(action_span)?,
-                        kind: Some(pb::command::Kind::Action(pb::Action {
-                            span: self.span(action_span)?,
-                            kind: Some(pb::action::Kind::Delete(pb::Call {
-                                func: constructor.clone(),
-                                args: arguments.clone(),
-                            })),
-                        })),
-                    });
-                    (action_span, None)
-                }
-                ResolvedAction::Change(
-                    action_span,
-                    ast::Change::Delete,
-                    ResolvedCall::Func(function),
-                    _,
-                ) if deleting && index == arity + 1 && function.name == helper => {
-                    (action_span, None)
-                }
-                ResolvedAction::Set(action_span, ResolvedCall::Func(function), _, value)
+                ResolvedAction::Expr(_, ResolvedExpr::Call(_, ResolvedCall::Func(target), _))
+                    if index == arity && target.name == constructor => {}
+                ResolvedAction::Change(_, ast::Change::Delete, ResolvedCall::Func(target), _)
+                    if deleting && index == arity && target.name == constructor => {}
+                ResolvedAction::Change(_, ast::Change::Delete, ResolvedCall::Func(function), _)
+                    if deleting && index == arity + 1 && function.name == helper => {}
+                ResolvedAction::Set(_, ResolvedCall::Func(function), _, value)
                     if index == arity + 1 && function.name == helper =>
                 {
                     cost = Some(self.expr(value, None, 0)?);
-                    (action_span, None)
                 }
                 _ => return Err("native set-cost resolved action order changed".into()),
-            };
-            if let Some(term) = term {
-                prefix.push(pb::Command {
-                    span: self.span(action_span)?,
-                    kind: Some(pb::command::Kind::Action(pb::Action {
-                        span: self.span(action_span)?,
-                        kind: Some(pb::action::Kind::Term(term)),
-                    })),
-                });
             }
         }
         let span = self.span(&span)?;
@@ -2285,12 +2286,12 @@ impl Source {
                 }),
             })),
         });
-        self.phase()
+        Ok(())
     }
 
-    // Text combined groups are live frontend selectors; the wire directly
-    // selects their ordered leaf union and contains no combined declaration.
-    fn select_groups(&self, name: &str) -> Result<Vec<String>, String> {
+    // Snapshot known memberships at the Run's source position. Ambient leaves
+    // remain live names until a later replacement forces a block boundary.
+    fn select_groups(&mut self, name: &str) -> Result<Vec<pb::RulesetSelection>, String> {
         let mut pending = vec![(name.to_owned(), false)];
         let mut active = HashSet::new();
         let mut seen = HashSet::new();
@@ -2311,7 +2312,20 @@ impl Source {
                 pending.push((name, true));
                 pending.extend(children.iter().rev().map(|name| (name.clone(), false)));
             } else {
-                groups.push(name);
+                let kind = if let Some(SourceRuleset::Rules { rules, owned: true }) =
+                    self.rulesets.get(&name)
+                {
+                    pb::ruleset_selection::Kind::Ruleset(pb::Ruleset {
+                        rules: rules
+                            .iter()
+                            .map(|index| self.rules[*index as usize].clone())
+                            .collect(),
+                    })
+                } else {
+                    self.ambient_runs.insert(name.clone());
+                    pb::ruleset_selection::Kind::Name(name)
+                };
+                groups.push(pb::RulesetSelection { kind: Some(kind) });
             }
         }
         Ok(groups)
@@ -2325,13 +2339,7 @@ impl Source {
         let (span, kind) = match schedule {
             S::Run(span, config) => {
                 let kind = pb::command::Kind::Run(pb::Run {
-                    rulesets: self
-                        .select_groups(&config.ruleset)?
-                        .into_iter()
-                        .map(|name| pb::RulesetSelection {
-                            kind: Some(pb::ruleset_selection::Kind::Name(name)),
-                        })
-                        .collect(),
+                    rulesets: self.select_groups(&config.ruleset)?,
                     ..Default::default()
                 });
                 if let Some(until) = config.until {
@@ -2599,13 +2607,7 @@ impl Source {
         let run = pb::Command {
             span: self.span(&span)?,
             kind: Some(pb::command::Kind::Run(pb::Run {
-                rulesets: self
-                    .select_groups(ruleset)?
-                    .into_iter()
-                    .map(|name| pb::RulesetSelection {
-                        kind: Some(pb::ruleset_selection::Kind::Name(name)),
-                    })
-                    .collect(),
+                rulesets: self.select_groups(ruleset)?,
                 scheduler: scheduler.into(),
             })),
         };
@@ -2645,7 +2647,7 @@ impl Source {
             .rulesets
             .get(&rule.ruleset)
             .ok_or_else(|| format!("unknown ruleset {}", rule.ruleset))?;
-        let SourceRuleset::Rules(list) = ruleset else {
+        let SourceRuleset::Rules { rules: list, .. } = ruleset else {
             return Err(egglog::Error::CombinedRulesetError(rule.ruleset, rule.span).to_string());
         };
         let names = if matches!(rewrite, Some(RewriteKind::Bidirectional)) {
@@ -2990,9 +2992,12 @@ impl Source {
             span,
             ..Default::default()
         });
-        let SourceRuleset::Rules(list) = self.rulesets.get_mut(&ruleset_name).unwrap() else {
+        let SourceRuleset::Rules { rules: list, owned } =
+            self.rulesets.get_mut(&ruleset_name).unwrap()
+        else {
             unreachable!()
         };
+        *owned = true;
         list.push(index);
         let value = pb::Ruleset {
             rules: list
@@ -5104,11 +5109,23 @@ mod node_projection_tests {
             } else {
                 crate::new_experimental_egraph()
             };
-            assert_eq!(phases.len(), 9);
-            for phase in &phases[..5] {
-                let text = renderer.render(phase).unwrap();
-                native.parse_and_run_program(None, &text).unwrap();
-            }
+            assert_eq!(phases.len(), 1);
+            let program = &phases[0];
+            let phases = program
+                .commands
+                .iter()
+                .map(|command| pb::Program {
+                    declarations: vec![],
+                    rulesets: vec![],
+                    commands: vec![command.clone()],
+                    ..program.clone()
+                })
+                .collect::<Vec<_>>();
+            let mut setup = program.clone();
+            setup.commands.truncate(1);
+            native
+                .parse_and_run_program(None, &renderer.render(&setup).unwrap())
+                .unwrap();
             let empty = pb::Program {
                 rulesets: vec![pb::RulesetBinding {
                     name: "r".into(),
@@ -5129,10 +5146,10 @@ mod node_projection_tests {
                 .parse_and_run_program(None, &renderer.render(&empty).unwrap())
                 .unwrap();
             native
-                .parse_and_run_program(None, &renderer.render(&phases[5]).unwrap())
+                .parse_and_run_program(None, &renderer.render(&phases[1]).unwrap())
                 .unwrap();
 
-            let mut literal = phases[3].clone();
+            let mut literal = program.clone();
             let ruleset = literal.rulesets.pop().unwrap().value.unwrap();
             literal.commands = vec![pb::Command {
                 kind: Some(pb::command::Kind::Run(pb::Run {
@@ -5158,19 +5175,19 @@ mod node_projection_tests {
                 .parse_and_run_program(None, &renderer.render(&literal).unwrap())
                 .unwrap();
             native
-                .parse_and_run_program(None, &renderer.render(&phases[6]).unwrap())
+                .parse_and_run_program(None, &renderer.render(&phases[2]).unwrap())
                 .unwrap();
 
-            let mut restored = phases[3].clone();
+            let mut restored = program.clone();
             restored.commands = empty.commands;
             native
-                .parse_and_run_program(None, &renderer.render(&phases[7]).unwrap())
+                .parse_and_run_program(None, &renderer.render(&phases[3]).unwrap())
                 .unwrap();
             native
                 .parse_and_run_program(None, &renderer.render(&restored).unwrap())
                 .unwrap();
             native
-                .parse_and_run_program(None, &renderer.render(&phases[8]).unwrap())
+                .parse_and_run_program(None, &renderer.render(&phases[4]).unwrap())
                 .unwrap();
         }
     }

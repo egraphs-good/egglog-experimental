@@ -130,8 +130,9 @@ reconstruction preserves the selected execution mode, not original derivations.
 `Freeze` returns `EGraphSnapshot{options,program}`. Its Program includes installed
 user declarations, current named ruleset bindings, and ordinary actions
 reconstructing classes, rows, captures, costs and subsumption. Shared rule values
-are repeated in each relevant binding. Private registration caches are omitted.
-No special loading instruction is needed.
+are repeated in each relevant binding. The sort arena contains referenced types
+and their type arguments, without unused backend sorts. Private registration
+caches are omitted. No special loading instruction is needed.
 
 Reconstruction on a fresh compatible engine uses all snapshot logical options,
 including `execution_mode` and `seminaive`, with `cost_sort` remapped into the
@@ -155,10 +156,14 @@ frontend scope operations, not Program commands.
 
 The separate execution prototypes use an in-process `protobuf::Engine` for
 encoded requests, a stateful Source producer/renderer for the text frontend,
-and high-level Python/Rust APIs that emit the same records. Source yields
-Programs or scope operations; callers submit each one and decode its successful
-response before advancing, stopping on errors. Text-only formatting and file
-output stay in the frontend.
+and high-level Python/Rust APIs that emit the same records. Source batches
+ordinary statements into one Program, with sequential name resolution and setup
+before execution. Scopes and frontend file I/O end a batch. A batch also ends
+before replacing a previously unknown group selected by an earlier Run; known
+group membership is captured at each Run. Invalid blocks do not execute.
+Callers submit each yielded Program or scope operation and stop on errors;
+RunProgram outputs can stream while the block executes. Text-only formatting
+and file output stay in the frontend.
 
 Current adapter limits include i64 cost annotations, Normal-only Extract/Freeze,
 native proof-mode restrictions and context-specific expansion budgets. Deferred

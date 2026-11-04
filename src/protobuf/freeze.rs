@@ -304,11 +304,6 @@ pub(super) fn observation(
             )));
         }
     }
-    for sort in session.graph.get_arcsorts_by(|_| true) {
-        if !relation_sorts.contains(sort.name()) {
-            export.sort(&sort)?;
-        }
-    }
     // Reserve every class before following any row or container reference.
     for (name, value) in session.graph.materialized_eq_classes() {
         if relation_sorts.contains(name.as_ref()) {
@@ -512,6 +507,36 @@ mod tests {
     }
 
     #[test]
+    fn empty_snapshot_only_keeps_cost_sort() {
+        let mut engine = Engine::default();
+        let id = create(&mut engine, pb::ExecutionMode::Normal);
+        let response = run(
+            &mut engine,
+            id,
+            pb::Program {
+                commands: vec![pb::Command {
+                    kind: Some(pb::command::Kind::Freeze(pb::Freeze {})),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        );
+        assert_eq!(response.error, None);
+        let Some(pb::command_output::Kind::Snapshot(snapshot)) = &response.output.outputs[0].kind
+        else {
+            panic!("missing snapshot")
+        };
+        let program = snapshot.program.as_ref().unwrap();
+        assert_eq!(program.sorts.len(), 1);
+        assert!(matches!(
+            &program.sorts[snapshot.options.as_ref().unwrap().cost_sort.unwrap() as usize].kind,
+            Some(pb::sort::Kind::Primitive(family)) if family.name == "i64" && family.args.is_empty()
+        ));
+        assert!(program.nodes.is_empty());
+        assert!(program.declarations.is_empty());
+    }
+
+    #[test]
     fn hidden_tables_remain_in_custom_cost_observation() {
         let mut engine = Engine::default();
         let id = create(&mut engine, pb::ExecutionMode::Normal);
@@ -540,6 +565,14 @@ mod tests {
         )
         .unwrap();
         let program = &observed.program;
+        assert_eq!(program.sorts.len(), 2);
+        assert!(program.sorts.iter().any(|sort| matches!(
+            &sort.kind, Some(pb::sort::Kind::Eq(name)) if name == "E"
+        )));
+        assert!(program.sorts.iter().any(|sort| matches!(
+            &sort.kind, Some(pb::sort::Kind::Primitive(family))
+                if family.name == "i64" && family.args.is_empty()
+        )));
         assert_eq!(
             program
                 .declarations
@@ -594,6 +627,12 @@ mod tests {
             )
             .unwrap();
             let index = observed.values[&(root.0.name().to_owned(), root.1)];
+            assert_eq!(observed.program.sorts.len(), 1);
+            assert!(matches!(
+                &observed.program.sorts[0].kind,
+                Some(pb::sort::Kind::Primitive(family))
+                    if family.name == root.0.name() && family.args.is_empty()
+            ));
             assert_eq!(
                 observed.program.nodes[index as usize].kind,
                 Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
@@ -601,6 +640,58 @@ mod tests {
                 }))
             );
         }
+
+        session
+            .graph
+            .parse_and_run_program(None, "(sort V (Vec i64)) (sort VV (Vec V))")
+            .unwrap();
+        let root = session
+            .graph
+            .eval_expr(&Expr::Call(
+                span!(),
+                "vec-of".into(),
+                vec![Expr::Call(
+                    span!(),
+                    "vec-of".into(),
+                    vec![Expr::Lit(span!(), Literal::Int(7))],
+                )],
+            ))
+            .unwrap();
+        let observed = observation(
+            View {
+                graph: &session.graph,
+                names: &session.names,
+                definitions: &session.definitions,
+                lambdas: &session.lambdas,
+                mode: session.mode,
+                extension: session.extension.as_ref(),
+            },
+            std::slice::from_ref(&root),
+        )
+        .unwrap();
+        assert_eq!(observed.program.sorts.len(), 3);
+        let index = observed.values[&(root.0.name().to_owned(), root.1)];
+        let Some(pb::sort::Kind::Primitive(outer)) =
+            &observed.program.sorts[observed.program.nodes[index as usize].sort_id as usize].kind
+        else {
+            panic!("outer Vec sort")
+        };
+        assert_eq!(outer.name, "Vec");
+        let [inner] = outer.args.as_slice() else {
+            panic!("one outer Vec type argument")
+        };
+        let Some(pb::sort::Kind::Primitive(inner)) = &observed.program.sorts[*inner as usize].kind
+        else {
+            panic!("inner Vec sort")
+        };
+        assert_eq!(inner.name, "Vec");
+        let [element] = inner.args.as_slice() else {
+            panic!("one inner Vec type argument")
+        };
+        assert!(matches!(
+            &observed.program.sorts[*element as usize].kind,
+            Some(pb::sort::Kind::Primitive(family)) if family.name == "i64" && family.args.is_empty()
+        ));
     }
 
     // Two classes: one has three alternatives and a self-cycle; the other has
@@ -904,6 +995,7 @@ mod tests {
     fn assert_forest(snapshot: &pb::EGraphSnapshot) {
         use pb::{action::Kind as A, node::Kind as N, primitive_value::Value as V};
         let program = snapshot.program.as_ref().unwrap();
+        assert_eq!(program.sorts.len(), 6);
         assert_eq!(
             snapshot.options.as_ref().unwrap().execution_mode,
             pb::ExecutionMode::Normal as i32

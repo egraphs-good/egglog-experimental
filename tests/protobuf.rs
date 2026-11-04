@@ -6,6 +6,158 @@ use egglog_experimental::{new_experimental_egraph, protobuf::Engine};
 use fixture::Observed;
 use prost::Message;
 
+mod source_blocks {
+    use super::*;
+    use egglog_experimental::protobuf::source::{Source, Submission};
+
+    #[test]
+    fn ordinary_statements_share_one_program_and_runs_capture_their_membership() {
+        let text = r#"
+            (relation Seed (i64)) (relation A (i64)) (relation B (i64))
+            (ruleset r)
+            (rule ((Seed x)) ((A x)) :ruleset r :name "a")
+            (Seed 1) (run r 1) (fail (check (B 1)))
+            (rule ((Seed x)) ((B x)) :ruleset r :name "b")
+            (run r 1) (check (A 1) (B 1))
+        "#;
+        let programs = Source::new(None, text)
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(programs.len(), 1);
+        let program = &programs[0];
+        assert_eq!(program.rulesets.len(), 1);
+        assert_eq!(program.rulesets[0].value.as_ref().unwrap().rules.len(), 2);
+        let memberships = program
+            .commands
+            .iter()
+            .filter_map(|command| {
+                let Some(pb::command::Kind::Run(run)) = &command.kind else {
+                    return None;
+                };
+                let [selection] = run.rulesets.as_slice() else {
+                    panic!("one selection")
+                };
+                let Some(pb::ruleset_selection::Kind::Ruleset(value)) = &selection.kind else {
+                    panic!("captured membership")
+                };
+                Some(value.rules.len())
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(memberships, [1, 2]);
+        let mut engine = Engine::default();
+        let id = create(&mut engine);
+        assert_eq!(
+            run(&mut engine, id, programs.into_iter().next().unwrap()).error,
+            None
+        );
+    }
+
+    #[test]
+    fn ambient_default_and_combined_leaves_flush_before_replacement() {
+        for named in [false, true] {
+            let declaration = if named { "(ruleset leaf)" } else { "" };
+            let option = if named { ":ruleset leaf" } else { "" };
+            let selector = if named {
+                "(unstable-combined-ruleset both leaf)"
+            } else {
+                ""
+            };
+            let control = if named { "(run both 1)" } else { "(run 1)" };
+            let definitions = "(relation A ()) (relation B ())";
+            let mut engine = Engine::default();
+            let id = create(&mut engine);
+            for program in Source::new(
+                None,
+                &format!("{definitions} {declaration} (rule () ((A)) {option})"),
+            )
+            .unwrap()
+            {
+                assert_eq!(run(&mut engine, id, program.unwrap()).error, None);
+            }
+            let text = format!(
+                "{definitions} {selector} {control} {declaration} (rule () ((B)) {option}) {control} (check (A) (B))"
+            );
+            let programs = Source::new(None, &text)
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            assert_eq!(programs.len(), 2, "named={named}");
+            assert!(programs[0].rulesets.is_empty());
+            let Some(pb::command::Kind::Run(first)) = &programs[0].commands[0].kind else {
+                panic!("first run")
+            };
+            assert!(matches!(
+                first.rulesets[0].kind,
+                Some(pb::ruleset_selection::Kind::Name(_))
+            ));
+            assert_eq!(programs[1].rulesets.len(), 1);
+            for program in programs {
+                assert_eq!(run(&mut engine, id, program).error, None, "named={named}");
+            }
+        }
+    }
+
+    #[test]
+    fn authoring_errors_discard_the_block_but_runtime_errors_stream_the_prefix() {
+        let mut rejected =
+            Source::new(None, "(function f () i64 :merge new) (set (f) 1) (missing)").unwrap();
+        assert!(rejected.next().unwrap().is_err());
+        assert!(rejected.next().is_none());
+        let mut source = Source::new(
+            None,
+            "(function f () i64 :merge new) (set (f) 1) (extract (f)) (panic \"stop\") (set (f) 2)",
+        )
+        .unwrap();
+        let program = source.next().unwrap().unwrap();
+        assert!(source.next().is_none());
+        let mut engine = Engine::default();
+        let id = create(&mut engine);
+        let request = pb::RunProgramRequest {
+            egraph_id: id,
+            program: Some(program),
+            diagnostics: false,
+        };
+        let mut frames = vec![];
+        engine
+            .run_stream(&request.encode_to_vec(), &mut |frame| {
+                frames.push(frame);
+                std::ops::ControlFlow::Continue(())
+            })
+            .unwrap();
+        assert!(
+            matches!(&frames[0].result, Some(pb::run_program_response::Result::Output(output)) if matches!(output.outputs[0].kind, Some(pb::command_output::Kind::Extraction(_))))
+        );
+        assert!(
+            matches!(&frames.last().unwrap().result, Some(pb::run_program_response::Result::Error(error)) if error.location.as_ref().unwrap().path == [2])
+        );
+        for program in
+            Source::new(None, "(function f () i64 :merge new) (check (= (f) 1))").unwrap()
+        {
+            assert_eq!(run(&mut engine, id, program.unwrap()).error, None);
+        }
+    }
+
+    #[test]
+    fn push_and_pop_each_flush_the_pending_block() {
+        let mut source = Source::new(
+            None,
+            "(function f () i64 :merge new) (set (f) 1) (push) (set (f) 2) (pop) (check (= (f) 1))",
+        )
+        .unwrap();
+        let mut kinds = vec![];
+        while let Some(submission) = source.next_submission() {
+            kinds.push(match submission.unwrap() {
+                Submission::Program(_) => "program",
+                Submission::Push(1) => "push",
+                Submission::Pop { count: 1, .. } => "pop",
+                _ => panic!("unexpected submission"),
+            });
+        }
+        assert_eq!(kinds, ["program", "push", "program", "pop", "program"]);
+    }
+}
+
 // Inline rules may occur beneath loops or failure wrappers. Inspect them in
 // command order, including bodies that execution will never enter.
 fn inline_rules(program: &pb::Program) -> Vec<&pb::Rule> {
@@ -210,14 +362,19 @@ fn source_multi_extract_preserves_one_ordered_batch_and_replays() {
                         }
                     }
                 }
-                if let Some(pb::command::Kind::Extract(extract)) =
-                    phase.commands.first().and_then(|c| c.kind.as_ref())
-                {
-                    assert_eq!(
-                        phase.commands.len(),
-                        1,
-                        "no per-root executable normalization"
-                    );
+                assert_eq!(
+                    phase.commands.len(),
+                    2,
+                    "one union and one extraction batch"
+                );
+                let [prefix, batch] = phase.commands.as_slice() else {
+                    unreachable!()
+                };
+                assert!(matches!(prefix.kind, Some(pb::command::Kind::Action(_))));
+                if let Some(pb::command::Kind::Extract(extract)) = &batch.kind {
+                    let mut prefix = phase.clone();
+                    prefix.commands.truncate(1);
+                    core.render(&prefix).unwrap();
                     assert_eq!(extract.roots.len(), 5);
                     assert_eq!(extract.variants, 2);
                     assert_eq!(
@@ -233,8 +390,7 @@ fn source_multi_extract_preserves_one_ordered_batch_and_replays() {
                         "Core must not split the batch"
                     );
                 } else {
-                    // Tree-compatible prefix establishes the same declaration context.
-                    core.render(&phase).unwrap();
+                    panic!("one aggregate extraction command, without per-root normalization");
                 }
                 rendered.push_str(&renderer.render(&phase).unwrap());
                 let response = run(&mut engine, id, phase);
@@ -373,28 +529,18 @@ fn source_definition_and_global_let_intake_does_not_clone_accumulated_native_bod
             0,
             "{count} definitions copied native context"
         );
+        assert_eq!(phases.len(), 1);
+        assert_eq!(inline_rules(&phases[0]).len(), count);
+        assert_eq!(phases[0].rulesets.len(), 1);
         assert_eq!(
-            phases
-                .iter()
-                .map(|phase| inline_rules(phase).len())
-                .sum::<usize>(),
-            count * (count + 1) / 2
+            phases[0].rulesets[0].value.as_ref().unwrap().rules.len(),
+            count
         );
         assert!(
-            phases
-                .iter()
-                .all(|phase| inline_rules(phase).len() <= count)
+            phases[0].nodes.len() <= 4 * count + 16,
+            "one block duplicated unrelated rule nodes"
         );
-        assert!(
-            phases.iter().map(|phase| phase.nodes.len()).sum::<usize>() <= 4 * count * count + 16,
-            "complete rule snapshots duplicated unrelated nodes"
-        );
-        assert!(
-            phases
-                .iter()
-                .filter(|phase| !phase.commands.is_empty())
-                .all(|phase| inline_rules(phase).is_empty() && phase.nodes.len() <= 3)
-        );
+        assert_eq!(phases[0].commands.len(), 1);
         assert!(phases.iter().any(|phase| {
             phase
                 .commands
@@ -416,7 +562,7 @@ fn source_rule_packets_register_only_new_authored_content() {
         }
         .unwrap();
         let mut snapshots = vec![];
-        let mut runs = 0;
+        let mut runs = vec![];
         for phase in source {
             let phase = phase.unwrap();
             for binding in &phase.rulesets {
@@ -434,23 +580,32 @@ fn source_rule_packets_register_only_new_authored_content() {
             }
             for command in &phase.commands {
                 if let Some(pb::command::Kind::Run(run)) = &command.kind {
-                    assert!(
-                        matches!(&run.rulesets[..], [pb::RulesetSelection { kind: Some(pb::ruleset_selection::Kind::Name(name)) }] if name == "r")
+                    let [selection] = run.rulesets.as_slice() else {
+                        panic!("one captured selection")
+                    };
+                    let Some(pb::ruleset_selection::Kind::Ruleset(ruleset)) = &selection.kind
+                    else {
+                        panic!("Source-owned run membership must be captured")
+                    };
+                    runs.push(
+                        ruleset
+                            .rules
+                            .iter()
+                            .map(|rule| rule.name.clone().unwrap())
+                            .collect::<Vec<_>>(),
                     );
-                    assert!(inline_rules(&phase).is_empty());
-                    runs += 1;
                 }
             }
         }
+        assert_eq!(snapshots, [vec!["first".to_string(), "later".to_string()]]);
         assert_eq!(
-            snapshots,
+            runs,
             [
-                vec![],
                 vec!["first".to_string()],
+                vec!["first".to_string(), "later".to_string()],
                 vec!["first".to_string(), "later".to_string()]
             ]
         );
-        assert_eq!(runs, 3);
     }
 }
 
@@ -524,18 +679,14 @@ fn source_multi_extract_rejects_counts_and_later_roots_inertly() {
         let text = format!("(datatype E (A i64)) (A 1) {command} (A 3)");
         let mut engine = Engine::default();
         let id = create(&mut engine);
+        let baseline = Source::new(None, "(datatype E (A i64)) (A 9)")
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap();
+        assert_eq!(run(&mut engine, id, baseline).error, None);
         let mut source = Source::new(None, &text).unwrap();
-        let mut rejected = false;
-        for phase in source.by_ref() {
-            match phase {
-                Ok(phase) => assert_eq!(run(&mut engine, id, phase).error, None),
-                Err(_) => {
-                    rejected = true;
-                    break;
-                }
-            }
-        }
-        assert!(rejected, "{command}");
+        assert!(source.next().unwrap().is_err(), "{command}");
         assert!(source.next().is_none());
         let response = run(
             &mut engine,
@@ -710,38 +861,9 @@ mod source_loop_header_tests {
             "(saturate () (times 1) (body))",
         ] {
             let text = format!("(relation Seed ()) (Seed) (ruleset r) (run-schedule {control})");
-            let mut engine = Engine::default();
-            let id = create(&mut engine);
-            let mut seed = None;
-            let mut error = None;
             let mut source = Source::new(Some("dead-header.egg".into()), &text).unwrap();
-            for phase in source.by_ref() {
-                let phase = match phase {
-                    Ok(phase) => phase,
-                    Err(found) => {
-                        error = Some(found);
-                        break;
-                    }
-                };
-                for command in &phase.commands {
-                    if let Some(pb::command::Kind::Action(pb::Action {
-                        kind: Some(pb::action::Kind::Term(root)),
-                        ..
-                    })) = &command.kind
-                    {
-                        seed = Some((phase.clone(), *root));
-                    }
-                }
-                assert_eq!(run(&mut engine, id, phase).error, None);
-            }
-            assert!(error.is_some(), "{control}");
+            assert!(source.next().unwrap().is_err(), "{control}");
             assert!(source.next().is_none());
-            let (mut check, root) = seed.expect("the completed source prefix");
-            check.commands = vec![pb::Command {
-                kind: Some(pb::command::Kind::Check(pb::Check { facts: vec![root] })),
-                ..Default::default()
-            }];
-            assert_eq!(run(&mut engine, id, check).error, None, "{control}");
         }
     }
 
@@ -1597,10 +1719,14 @@ fn action_controls_failure_locations_preserve_prefix_and_recovery() {
     for phase in Source::new(None, text).unwrap() {
         let mut program = phase.unwrap();
         let mut authored = None;
-        if let Some(pb::command::Kind::Loop(repeat)) = program
-            .commands
-            .first_mut()
-            .and_then(|command| command.kind.as_mut())
+        if let Some(repeat) =
+            program
+                .commands
+                .iter_mut()
+                .find_map(|command| match &mut command.kind {
+                    Some(pb::command::Kind::Loop(repeat)) => Some(repeat),
+                    _ => None,
+                })
         {
             let leaf = &mut repeat.body[0];
             let Some(pb::command::Kind::Action(action)) = &leaf.kind else {
@@ -1616,7 +1742,7 @@ fn action_controls_failure_locations_preserve_prefix_and_recovery() {
             assert_eq!(
                 error.location,
                 Some(pb::CommandLocation {
-                    path: vec![0, 0],
+                    path: vec![1, 0],
                     iterations: vec![0]
                 })
             );
@@ -2178,7 +2304,7 @@ mod constructor_action_dags {
                     .iter()
                     .map(|phase| phase.commands.len())
                     .sum::<usize>(),
-                1
+                0
             );
             assert!(source.next().is_none());
         }
@@ -2525,11 +2651,16 @@ mod constructor_action_dags {
                         saved_name = Some(set.target.as_ref().unwrap().func.clone());
                     }
                 }
+                assert_eq!(
+                    phase.commands.len(),
+                    2,
+                    "both authored sets share one block"
+                );
                 let response = run(&mut engine, id, phase);
                 if let Some(error) = response.error {
                     assert!(!caught);
                     assert_eq!(error.code, i32::from(pb::ErrorCode::RuntimeFailure));
-                    assert_eq!(error.location.unwrap().path, [0]);
+                    assert_eq!(error.location.unwrap().path, [1]);
                     assert!(response.output.outputs.is_empty());
                     failed = true;
                     break;
@@ -3710,19 +3841,10 @@ mod source_reflection {
         let mut engine = Engine::default();
         let id = create(&mut engine);
         let mut source = Source::new(None, "(datatype T (C i64)) (C 7) (panic \"later\")").unwrap();
-        assert_eq!(
-            run(&mut engine, id, source.next().unwrap().unwrap()).error,
-            None
-        );
-        assert_eq!(
-            run(&mut engine, id, source.next().unwrap().unwrap()).error,
-            None
-        );
-        assert!(
-            run(&mut engine, id, source.next().unwrap().unwrap())
-                .error
-                .is_some()
-        );
+        let response = run(&mut engine, id, source.next().unwrap().unwrap());
+        let error = response.error.unwrap();
+        assert_eq!(error.code, i32::from(pb::ErrorCode::RuntimeFailure));
+        assert_eq!(error.location.unwrap().path, [1]);
         let check = Source::new(None, r#"(check (= (get-size! "C") 1))"#)
             .unwrap()
             .next()
@@ -3735,6 +3857,15 @@ mod source_reflection {
     fn distinct_native_aliases_cannot_coalesce_as_wire_resupply() {
         let mut engine = Engine::default();
         let id = create(&mut engine);
+        let setup = Source::new(
+            None,
+            r#"(sort T) (constructor physical (i64) T :table-name "C") (physical 7)"#,
+        )
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap();
+        assert_eq!(run(&mut engine, id, setup).error, None);
         let mut source = Source::new(
             None,
             r#"
@@ -3745,12 +3876,6 @@ mod source_reflection {
         "#,
         )
         .unwrap();
-        for _ in 0..3 {
-            assert_eq!(
-                run(&mut engine, id, source.next().unwrap().unwrap()).error,
-                None
-            );
-        }
         let error = source.next().unwrap().unwrap_err().to_string();
         assert!(
             error.contains("Table selector C is already bound"),
@@ -3895,11 +4020,11 @@ mod source_fresh_macro {
         atomic::{AtomicUsize, Ordering},
     };
 
-    // Compare one phase per authored command, actual native execution, byte
+    // Compare authored native execution, compiled blocks, byte
     // transport, rendered native execution, and a fresh import of that text.
     fn compare(text: &str) -> Vec<pb::Program> {
         let mut native = new_experimental_egraph();
-        let mut commands = native.parse_program(None, text).unwrap().into_iter();
+        native.parse_and_run_program(None, text).unwrap();
         let mut engine = Engine::default();
         let id = create(&mut engine);
         let mut renderer = Renderer::default();
@@ -3908,7 +4033,6 @@ mod source_fresh_macro {
         let mut phases = Vec::new();
         for phase in Source::new(None, text).unwrap() {
             let phase = phase.unwrap();
-            native.run_program(vec![commands.next().unwrap()]).unwrap();
             let phase = pb::Program::decode(phase.encode_to_vec().as_slice()).unwrap();
             assert_eq!(run(&mut engine, id, phase.clone()).error, None);
             let rendered = renderer.render(&phase).unwrap();
@@ -3916,7 +4040,6 @@ mod source_fresh_macro {
             recorded.push_str(&rendered);
             phases.push(phase);
         }
-        assert!(commands.next().is_none());
         let mut fresh = Engine::default();
         let id = create(&mut fresh);
         for phase in Source::new(None, &recorded).unwrap() {
@@ -3935,15 +4058,55 @@ mod source_fresh_macro {
             let text =
                 format!("{text}\n(check (Let ?x (Var \"y\")) (Let ?y (Var \"y\")) (!= ?x ?y))");
             let phases = compare(&text);
-            let expansion = &phases[1];
-            assert_eq!(expansion.declarations.len(), 1);
-            assert!(matches!(
-                expansion.declarations[0].kind,
-                Some(pb::declaration::Kind::Constructor(_))
-            ));
-            assert_eq!(inline_rules(expansion).len(), 1);
-            assert!(expansion.commands.is_empty());
+            assert_eq!(phases.len(), 1);
+            let expansion = &phases[0];
+            let constructors: Vec<_> = expansion
+                .declarations
+                .iter()
+                .filter_map(|declaration| match &declaration.kind {
+                    Some(pb::declaration::Kind::Constructor(constructor)) => Some(constructor),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                constructors.len(),
+                3,
+                "two authored and one fresh constructor"
+            );
+            assert_eq!(
+                constructors
+                    .iter()
+                    .filter(|constructor| constructor.inputs.len() == 3)
+                    .count(),
+                1,
+                "one fresh constructor keyed by both query variables and the site"
+            );
             assert_eq!(expansion.rulesets.len(), 1);
+            let rules = &expansion.rulesets[0].value.as_ref().unwrap().rules;
+            assert_eq!(rules.len(), 1);
+            assert_eq!(
+                expansion.commands.len(),
+                2 + text.matches("(check ").count()
+            );
+            assert!(matches!(
+                expansion.commands[0].kind,
+                Some(pb::command::Kind::Action(_))
+            ));
+            let Some(pb::command::Kind::Run(run)) = &expansion.commands[1].kind else {
+                panic!("the authored run follows the authored seed action")
+            };
+            assert!(
+                expansion.commands[2..]
+                    .iter()
+                    .all(|command| matches!(command.kind, Some(pb::command::Kind::Check(_))))
+            );
+            let [selection] = run.rulesets.as_slice() else {
+                panic!("one captured source ruleset")
+            };
+            let Some(pb::ruleset_selection::Kind::Ruleset(value)) = &selection.kind else {
+                panic!("the fresh rule is captured at the run")
+            };
+            assert_eq!(&value.rules, rules);
         }
     }
 
@@ -3963,10 +4126,22 @@ mod source_fresh_macro {
             (check (Pair x y) (!= x y))
         "#,
         );
-        let expansion = &phases[3];
-        let Some(pb::declaration::Kind::Constructor(constructor)) = &expansion.declarations[0].kind
-        else {
-            panic!("fresh constructor missing")
+        assert_eq!(phases.len(), 1);
+        let expansion = &phases[0];
+        let constructors: Vec<_> = expansion
+            .declarations
+            .iter()
+            .filter_map(|declaration| match &declaration.kind {
+                Some(pb::declaration::Kind::Constructor(constructor))
+                    if constructor.inputs.len() == 3 =>
+                {
+                    Some(constructor)
+                }
+                _ => None,
+            })
+            .collect();
+        let [constructor] = constructors.as_slice() else {
+            panic!("one generated fresh constructor")
         };
         let inputs: Vec<_> = constructor
             .inputs
@@ -4009,15 +4184,32 @@ mod source_fresh_macro {
             .collect();
         sites.sort_unstable();
         assert_eq!(sites, [0, 1]);
-        let rule = &inline_rules(expansion)[0];
+        assert_eq!(expansion.rulesets.len(), 1);
+        let rules = &expansion.rulesets[0].value.as_ref().unwrap().rules;
+        let [rule] = rules.as_slice() else {
+            panic!("one authored fresh rule")
+        };
         assert_eq!(rule.name.as_deref(), Some("fresh options"));
         assert_eq!(rule.eval_mode, i32::from(pb::RuleEvalMode::Naive));
         assert!(rule.no_decomp && rule.include_subsumed);
-        assert_eq!(expansion.rulesets.len(), 1);
-        assert!(
-            inline_rules(&phases[5]).is_empty(),
-            "Run does not resupply old rule values"
-        );
+        let runs: Vec<_> = expansion
+            .commands
+            .iter()
+            .filter_map(|command| match &command.kind {
+                Some(pb::command::Kind::Run(run)) => Some(run),
+                _ => None,
+            })
+            .collect();
+        let [run] = runs.as_slice() else {
+            panic!("one authored run")
+        };
+        let [selection] = run.rulesets.as_slice() else {
+            panic!("one captured source ruleset")
+        };
+        let Some(pb::ruleset_selection::Kind::Ruleset(value)) = &selection.kind else {
+            panic!("Run captures the expanded rule at its lexical position")
+        };
+        assert_eq!(&value.rules, rules);
     }
 
     #[derive(Default)]
@@ -4087,6 +4279,65 @@ mod source_fresh_macro {
     }
 
     #[test]
+    fn expanded_input_flushes_before_reading_and_runs_its_provider_once() {
+        use egglog::ast::{Action, Command, Expr};
+        struct Import {
+            calls: Arc<AtomicUsize>,
+            file: String,
+        }
+        impl egglog::CommandMacro for Import {
+            fn transform(
+                &self,
+                command: Command,
+                _: &mut egglog::util::SymbolGen,
+                _: &egglog::TypeInfo,
+            ) -> Result<Vec<Command>, egglog::Error> {
+                if let Command::Action(Action::Expr(span, Expr::Call(_, name, _))) = &command
+                    && name == "load-rows"
+                {
+                    self.calls.fetch_add(1, Ordering::SeqCst);
+                    return Ok(vec![Command::Input {
+                        span: span.clone(),
+                        name: "R".into(),
+                        file: self.file.clone(),
+                    }]);
+                }
+                Ok(vec![command])
+            }
+        }
+        let file =
+            std::env::temp_dir().join(format!("source-block-input-{}.tsv", std::process::id()));
+        std::fs::write(&file, "7\n").unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let provider = Arc::new(Provider {
+            macro_probe: Some(Arc::new(Import {
+                calls: calls.clone(),
+                file: file.to_str().unwrap().into(),
+            })),
+            ..Default::default()
+        });
+        let mut source = Source::with_extension(None,
+            "(relation R (i64)) (function marker () i64 :merge new) (set (marker) 1) (load-rows) (missing)",
+            provider).unwrap();
+        let mut engine = Engine::default();
+        let id = create(&mut engine);
+        let prefix = source.next().unwrap().unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(run(&mut engine, id, prefix).error, None);
+        std::fs::write(&file, "8\n").unwrap();
+        let input = source.next().unwrap().unwrap();
+        std::fs::remove_file(&file).unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(run(&mut engine, id, input).error, None);
+        assert!(source.next().unwrap().is_err());
+        assert!(source.next().is_none());
+        let observation = Source::new(None,
+            "(relation R (i64)) (function marker () i64 :merge new) (check (R 8)) (check (= (marker) 1))")
+            .unwrap().next().unwrap().unwrap();
+        assert_eq!(run(&mut engine, id, observation).error, None);
+    }
+
+    #[test]
     fn declaration_compile_context_does_not_reapply_provider_macros() {
         struct Rename(Arc<AtomicUsize>);
         impl egglog::CommandMacro for Rename {
@@ -4118,9 +4369,15 @@ mod source_fresh_macro {
         .unwrap();
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         assert_eq!(provider.evaluations.load(Ordering::SeqCst), 0);
-        let Some(pb::declaration::Kind::Constructor(row)) = &phases[1].declarations[0].kind else {
-            panic!("expanded declaration")
-        };
+        assert_eq!(phases.len(), 1);
+        let row = phases[0]
+            .declarations
+            .iter()
+            .find_map(|declaration| match &declaration.kind {
+                Some(pb::declaration::Kind::Constructor(row)) => Some(row),
+                _ => None,
+            })
+            .expect("expanded declaration");
         assert_eq!(row.name, "Target_m");
         // The selected name is an ordinary exact wire identity; its text macro
         // is neither needed nor re-run by this independent byte consumer.
@@ -4221,13 +4478,57 @@ mod source_fresh_macro {
             .unwrap()
             .collect::<Result<Vec<_>, _>>()
             .unwrap();
-        assert_eq!(phases.len(), 2);
+        assert_eq!(phases.len(), 1);
         assert_eq!(
             probe.rules.load(Ordering::SeqCst),
             1,
             "expanded rule was sent through the registry twice"
         );
         assert_eq!(provider.evaluations.load(Ordering::SeqCst), 0);
+
+        // An earlier ambient default Run flushes before the first generated
+        // rule replaces that membership. Retaining the expanded command over
+        // the barrier must not invoke the provider registry a second time.
+        let barrier_probe = Arc::new(MacroProbe {
+            rules: AtomicUsize::new(0),
+            check_prefix: None,
+        });
+        let barrier_provider = Arc::new(Provider {
+            macro_probe: Some(barrier_probe.clone()),
+            ..Default::default()
+        });
+        let phases = Source::with_extension(
+            None,
+            "(datatype FreshValue (Seed)) (run 1) (rule ((Seed)) ((unstable-fresh! FreshValue)))",
+            barrier_provider.clone(),
+        )
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+        assert_eq!(phases.len(), 2);
+        assert!(phases[0].rulesets.is_empty());
+        let [command] = phases[0].commands.as_slice() else {
+            panic!("one ambient run before the barrier")
+        };
+        let Some(pb::command::Kind::Run(run)) = &command.kind else {
+            panic!("ambient default run")
+        };
+        assert!(matches!(
+            run.rulesets.as_slice(),
+            [pb::RulesetSelection {
+                kind: Some(pb::ruleset_selection::Kind::Name(name))
+            }] if name.is_empty()
+        ));
+        assert_eq!(phases[1].declarations.len(), 1);
+        assert!(matches!(
+            phases[1].declarations[0].kind,
+            Some(pb::declaration::Kind::Constructor(_))
+        ));
+        assert_eq!(inline_rules(&phases[1]).len(), 1);
+        assert!(phases[1].commands.is_empty());
+        assert_eq!(barrier_probe.rules.load(Ordering::SeqCst), 1);
+        assert_eq!(barrier_provider.evaluations.load(Ordering::SeqCst), 0);
+
         for scope in [false, true] {
             let provider = Arc::new(Provider {
                 macro_probe: Some(Arc::new(MacroProbe {
@@ -4306,11 +4607,18 @@ mod source_fresh_macro {
             }
             if native_error {
                 assert!(projection_error.unwrap().contains("missing"));
+                assert!(
+                    phases.is_empty(),
+                    "uncaught authoring failure discards generated setup"
+                );
+                assert_eq!(provider.evaluations.load(Ordering::SeqCst), 0);
+                assert!(source.next().is_none());
+                continue;
             } else {
                 assert!(projection_error.is_none());
                 assert!(phases.iter().any(|phase| !inline_rules(phase).is_empty()));
                 assert!(
-                    matches!(&phases.last().unwrap().commands[0].kind, Some(pb::command::Kind::Action(pb::Action { kind: Some(pb::action::Kind::Panic(message)), .. })) if message == "unreached suffix")
+                    matches!(&phases.last().unwrap().commands.last().unwrap().kind, Some(pb::command::Kind::Action(pb::Action { kind: Some(pb::action::Kind::Panic(message)), .. })) if message == "unreached suffix")
                 );
             }
             assert!(source.next().is_none());
@@ -4324,16 +4632,18 @@ mod source_fresh_macro {
                 .rev()
                 .find(|phase| !phase.declarations.is_empty())
                 .unwrap();
-            if native_error {
-                assert_eq!(phases.len(), 4);
-                assert_eq!(prefix.nodes.len(), 1, "failed rule leaked arena nodes");
-                assert!(inline_rules(prefix).is_empty() && prefix.commands.is_empty());
-            }
-            let Some(pb::declaration::Kind::Constructor(constructor)) =
-                &prefix.declarations[0].kind
-            else {
-                panic!("completed constructor prefix missing")
-            };
+            let constructor = prefix
+                .declarations
+                .iter()
+                .find_map(|declaration| match &declaration.kind {
+                    Some(pb::declaration::Kind::Constructor(constructor))
+                        if constructor.name != "Leaf" =>
+                    {
+                        Some(constructor)
+                    }
+                    _ => None,
+                })
+                .expect("generated constructor retained in successful block");
             let mut engine = Engine::with_extension(provider.clone());
             let id = create(&mut engine);
             let mut renderer = Renderer::with_extension(provider.clone()).unwrap();
@@ -4435,7 +4745,15 @@ mod source_fresh_macro {
         for cycle in 0..2 {
             let mut source = Source::new(None, &text).unwrap();
             let mut native = new_experimental_egraph();
-            let mut commands = native.parse_program(None, &text).unwrap().into_iter();
+            let native_sizes: Vec<_> = native
+                .parse_and_run_program(None, &text)
+                .unwrap()
+                .into_iter()
+                .filter_map(|output| match output {
+                    egglog::CommandOutput::PrintFunctionSize(size) => Some(size),
+                    _ => None,
+                })
+                .collect();
             let mut replay = new_experimental_egraph();
             let mut renderer = Renderer::default();
             let mut recorded = String::new();
@@ -4444,16 +4762,10 @@ mod source_fresh_macro {
             let mut saved = Vec::new();
             let mut generated = std::collections::HashSet::new();
             let mut declarations = 0;
-            let mut native_sizes = Vec::new();
             let mut replay_sizes = Vec::new();
             let mut byte_sizes = Vec::new();
             while let Some(phase) = source.next_submission() {
                 let phase = phase.unwrap();
-                for output in native.run_program(vec![commands.next().unwrap()]).unwrap() {
-                    if let egglog::CommandOutput::PrintFunctionSize(size) = output {
-                        native_sizes.push(size);
-                    }
-                }
                 let rendered = renderer.render_submission(&phase).unwrap();
                 for output in replay.parse_and_run_program(None, &rendered).unwrap() {
                     if let egglog::CommandOutput::PrintFunctionSize(size) = output {
@@ -4517,7 +4829,7 @@ mod source_fresh_macro {
                     }
                 }
             }
-            assert!(commands.next().is_none() && saved.is_empty());
+            assert!(saved.is_empty());
             assert_eq!(declarations, 2);
             if cycle == 0 {
                 assert_eq!(generated.len(), 2);
@@ -6398,13 +6710,29 @@ fn maybe_values_roundtrip_bytes_preserve_optional_child_zero() {
 #[test]
 fn maybe_payload_rejection_precedes_writes_and_undefined_unwrap_keeps_prefix() {
     use egglog_experimental::protobuf::source::{Renderer, Source};
-    let phases = Source::new(
+    // Establish the receiver state before submitting separately mutated Programs.
+    let mut block = Source::new(
         None,
         "(function observed () i64 :merge new) (set (observed) 0) (check (= (observed) 0))",
     )
     .unwrap()
-    .collect::<Result<Vec<_>, _>>()
+    .next()
+    .unwrap()
     .unwrap();
+    let check = block.commands.pop().unwrap();
+    let initialize = block.commands.pop().unwrap();
+    assert!(block.commands.is_empty());
+    let phases = [
+        block.clone(),
+        pb::Program {
+            commands: vec![initialize],
+            ..block.clone()
+        },
+        pb::Program {
+            commands: vec![check],
+            ..block
+        },
+    ];
     let mut engine = Engine::default();
     let id = create(&mut engine);
     for phase in &phases[..2] {
@@ -7039,37 +7367,32 @@ fn source_renderer_later_type_failure_keeps_replayed_prefix() {
         let mut engine = Engine::default();
         let id = create(&mut engine);
         let mut renderer = Renderer::default();
-        let mut rendered = String::new();
-        let mut table = None;
-        let mut failed = false;
-        let mut stream =
+        let program = Source::new(None, &source).unwrap().next().unwrap().unwrap();
+        let table = program
+            .declarations
+            .iter()
+            .find_map(|declaration| match &declaration.kind {
+                Some(pb::declaration::Kind::Function(function)) => Some(function.name.clone()),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(run(&mut engine, id, program.clone()).error, None);
+        let rendered = renderer.render(&program).unwrap();
+        let mut rejected =
             Source::new(None, &format!("{source} (missing) (panic \"suffix\")")).unwrap();
-        while let Some(phase) = stream.next() {
-            let phase = match phase {
-                Ok(phase) => phase,
-                Err(error) => {
-                    assert!(error.to_string().contains("missing"), "{error}");
-                    assert!(stream.next().is_none());
-                    failed = true;
-                    break;
-                }
-            };
-            for declaration in &phase.declarations {
-                if let Some(pb::declaration::Kind::Function(function)) = &declaration.kind {
-                    table = Some(function.name.clone());
-                }
-            }
-            assert_eq!(run(&mut engine, id, phase.clone()).error, None);
-            rendered.push_str(&renderer.render(&phase).unwrap());
-        }
-        assert!(failed, "cycle {cycle}");
+        let error = rejected.next().unwrap().unwrap_err();
+        assert!(
+            error.to_string().contains("missing"),
+            "cycle {cycle}: {error}"
+        );
+        assert!(rejected.next().is_none());
         let response = run(
             &mut engine,
             id,
             pb::Program {
                 commands: vec![pb::Command {
                     kind: Some(pb::command::Kind::TableRows(pb::GetTableRows {
-                        table: table.unwrap(),
+                        table,
                         max_rows: None,
                     })),
                     ..Default::default()
@@ -7080,7 +7403,7 @@ fn source_renderer_later_type_failure_keeps_replayed_prefix() {
         assert_eq!(response.error, None);
         let Some(pb::command_output::Kind::TableRows(table)) = &response.output.outputs[0].kind
         else {
-            panic!("missing retained prefix")
+            panic!("retained earlier block")
         };
         assert_eq!(
             available_table_value(&response, table.rows[0].output.as_ref().unwrap()),
@@ -7148,16 +7471,18 @@ fn named_primitive_source_identity_timing_and_fresh_replay() {
         rendered.push_str(&renderer.render(&phase).unwrap());
         let response = run(&mut engine, id, phase);
         assert_eq!(response.error, None);
-        if let Some(root) = response
-            .output
-            .outputs
-            .iter()
-            .find_map(|output| match &output.kind {
-                Some(pb::command_output::Kind::Extraction(extraction)) => {
-                    Some(extraction.roots[0].variants[0].term)
-                }
-                _ => None,
-            })
+        if let Some(root) =
+            response
+                .output
+                .outputs
+                .iter()
+                .rev()
+                .find_map(|output| match &output.kind {
+                    Some(pb::command_output::Kind::Extraction(extraction)) => {
+                        Some(extraction.roots[0].variants[0].term)
+                    }
+                    _ => None,
+                })
         {
             saved = Some((root, response));
         }
@@ -8002,10 +8327,14 @@ fn function_value_nested_variants_keep_capture_types_and_shared_children() {
         let mut phase = phase.unwrap();
         egglog_experimental::builtin::definitions::reconcile_declarations(&phase, &mut definitions)
             .unwrap();
-        if let Some(pb::command::Kind::Extract(extract)) = phase
-            .commands
-            .last_mut()
-            .and_then(|command| command.kind.as_mut())
+        if let Some(extract) =
+            phase
+                .commands
+                .iter_mut()
+                .find_map(|command| match &mut command.kind {
+                    Some(pb::command::Kind::Extract(extract)) => Some(extract),
+                    _ => None,
+                })
         {
             let root = extract.roots[0];
             extract.roots.push(root);
@@ -9197,7 +9526,12 @@ fn experimental_source_legacy_run_bounds_execute_and_roundtrip() {
             rendered.push_str(&renderer.render(&phase).unwrap());
             let (response, response_diagnostics) = run_diagnosed(&mut engine, id, phase.clone());
             assert_eq!(response.error, None, "{schedule}: {response:?}");
-            let Some(command) = phase.commands.first() else {
+            let Some(command) = phase.commands.iter().find(|command| {
+                matches!(
+                    command.kind,
+                    Some(pb::command::Kind::Run(_) | pb::command::Kind::Loop(_))
+                )
+            }) else {
                 continue;
             };
             let body = match command.kind.as_ref().unwrap() {
@@ -9575,16 +9909,23 @@ fn source_scheduler_until_preserves_queries_and_has_no_internal_proof_output() {
             let mut counts = vec![];
             for phase in source {
                 let phase = phase.unwrap();
-                let conditional = phase.commands.iter().any(|c| {
-                    matches!(&c.kind,
-                    Some(pb::command::Kind::Loop(r)) if !r.until.is_empty())
-                });
-                if conditional {
-                    let span = phase.commands[0].span.as_ref().unwrap();
+                let conditional: Vec<_> = phase
+                    .commands
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(index, command)| {
+                        matches!(&command.kind,
+                    Some(pb::command::Kind::Loop(repeat)) if !repeat.until.is_empty())
+                        .then_some(index)
+                    })
+                    .collect();
+                for &index in &conditional {
+                    let span = phase.commands[index].span.as_ref().unwrap();
                     let source = phase.files[span.file as usize].contents.as_ref().unwrap();
                     assert!(source[span.start as usize..span.end as usize].contains(":until"));
                     let mut observed = phase.clone();
-                    let Some(pb::command::Kind::Loop(body)) = &mut observed.commands[0].kind else {
+                    let Some(pb::command::Kind::Loop(body)) = &mut observed.commands[index].kind
+                    else {
                         unreachable!()
                     };
                     body.body.insert(
@@ -9599,7 +9940,7 @@ fn source_scheduler_until_preserves_queries_and_has_no_internal_proof_output() {
                         renderer.clone().render(&phase).unwrap()
                     );
                     let mut rejected = phase.clone();
-                    let Some(pb::command::Kind::Loop(repeat)) = &mut rejected.commands[0].kind
+                    let Some(pb::command::Kind::Loop(repeat)) = &mut rejected.commands[index].kind
                     else {
                         unreachable!()
                     };
@@ -9618,14 +9959,18 @@ fn source_scheduler_until_preserves_queries_and_has_no_internal_proof_output() {
                 rendered.push_str(&renderer.render(&phase).unwrap());
                 let (response, response_diagnostics) = run_diagnosed(&mut engine, id, phase);
                 assert_eq!(response.error, None);
-                if conditional {
-                    let [output] = response.output.outputs.as_slice() else {
-                        panic!("until leaked output: {response:?}")
-                    };
+                assert_eq!(
+                    response.output.outputs.len(),
+                    conditional.len(),
+                    "until leaked output: {response:?}"
+                );
+                assert_eq!(response_diagnostics.len(), conditional.len());
+                for (output, document) in response.output.outputs.iter().zip(&response_diagnostics)
+                {
                     let Some(pb::command_output::Kind::Run(_outcome)) = &output.kind else {
                         panic!("{output:?}")
                     };
-                    counts.push(diagnostic_iterations(&response_diagnostics));
+                    counts.push(document["iterations"].as_array().unwrap().len() as u64);
                 }
             }
             assert_eq!(
@@ -9647,10 +9992,13 @@ fn source_scheduler_until_preserves_queries_and_has_no_internal_proof_output() {
                 let (response, response_diagnostics) =
                     run_diagnosed(&mut engine, replay, phase.unwrap());
                 assert_eq!(response.error, None, "{mode:?}: {rendered}");
-                for output in response.output.outputs {
-                    if let Some(pb::command_output::Kind::Run(_outcome)) = output.kind {
-                        replay_counts.push(diagnostic_iterations(&response_diagnostics));
-                    }
+                assert_eq!(response.output.outputs.len(), response_diagnostics.len());
+                for (output, document) in response.output.outputs.iter().zip(&response_diagnostics)
+                {
+                    let Some(pb::command_output::Kind::Run(_outcome)) = &output.kind else {
+                        panic!("{output:?}")
+                    };
+                    replay_counts.push(document["iterations"].as_array().unwrap().len() as u64);
                 }
             }
             assert_eq!(replay_counts, counts);
@@ -9684,8 +10032,15 @@ fn source_scheduler_until_preserves_queries_and_has_no_internal_proof_output() {
 #[test]
 fn source_scheduler_renderer_stages_only_successful_top_level_bindings() {
     use egglog_experimental::protobuf::source::{Renderer, Source};
-    let phases = Source::new(None, "(ruleset r) (let-scheduler bo (back-off :match-limit 0 :ban-length 0)) (run-schedule (run-with bo r))").unwrap()
-        .collect::<Result<Vec<_>, _>>().unwrap();
+    let program = Source::new(None, "(ruleset r) (let-scheduler bo (back-off :match-limit 0 :ban-length 0)) (run-schedule (run-with bo r))").unwrap()
+        .next().unwrap().unwrap();
+    assert_eq!(program.commands.len(), 2);
+    let mut phases = vec![program.clone(); 3];
+    phases[0].commands.clear();
+    phases[1].rulesets.clear();
+    phases[1].commands = vec![program.commands[0].clone()];
+    phases[2].rulesets.clear();
+    phases[2].commands = vec![program.commands[1].clone()];
     let mut renderer = Renderer::default();
     let mut fresh = Renderer::default();
     assert_eq!(
@@ -9785,13 +10140,14 @@ fn source_scheduler_scope_and_rejection_preserve_submitted_prefix() {
         let text = format!("(relation Marker (i64)) (Marker 1) (ruleset r) {tail} (Marker 2)");
         let mut engine = Engine::default();
         let id = create(&mut engine);
+        let baseline = Source::new(None, "(relation Marker (i64)) (Marker 9)")
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap();
+        assert_eq!(run(&mut engine, id, baseline).error, None);
         let mut source = Source::new(None, &text).unwrap();
-        let error = loop {
-            match source.next().unwrap() {
-                Ok(phase) => assert_eq!(run(&mut engine, id, phase).error, None),
-                Err(error) => break error,
-            }
-        };
+        let error = source.next().unwrap().unwrap_err();
         assert!(error.to_string().contains(diagnostic), "{error}");
         assert!(source.next().is_none());
         let response = run(
@@ -9832,7 +10188,7 @@ fn source_scheduler_scope_and_rejection_preserve_submitted_prefix() {
             }
         }
         assert_eq!(failure.is_none(), before_push);
-        assert_eq!(programs, if before_push { 3 } else { 2 });
+        assert_eq!(programs, 2);
     }
 }
 
@@ -10016,9 +10372,10 @@ fn source_print_size_projection_preserves_selected_table_in_both_dialects() {
         .unwrap()
         {
             let phase = phase.unwrap();
-            let singleton = matches!(phase.commands.as_slice(), [pb::Command {
-                kind: Some(pb::command::Kind::Loop(repeat)), ..
-            }] if repeat.max_iterations == Some(1));
+            let singleton = phase.commands.iter().any(|command| {
+                matches!(&command.kind, Some(pb::command::Kind::Loop(repeat))
+                    if repeat.max_iterations == Some(1))
+            });
             let response = run(&mut engine, id, phase);
             if singleton {
                 let error = response
@@ -10500,6 +10857,15 @@ fn source_table_observation_boundaries_keep_submitted_prefix() {
             }
             let mut engine = Engine::default();
             let id = create(&mut engine);
+            let baseline = Source::new(
+                None,
+                "(function current () i64 :merge new) (set (current) 10)",
+            )
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap();
+            assert_eq!(run(&mut engine, id, baseline).error, None);
             let mut stream = if core {
                 Source::new_core(Some("print-failure.egg".into()), &text)
             } else {
@@ -10520,7 +10886,7 @@ fn source_table_observation_boundaries_keep_submitted_prefix() {
                     assert!(source_error.is_none(), "{error:?}");
                     assert_eq!(error.code, pb::ErrorCode::RuntimeFailure as i32);
                     // This is command preparation, not a fabricated native
-                    // execution location. Prior source phases have already run.
+                    // execution location. The rejected ordinary block has not run.
                     assert!(error.location.is_none());
                     assert!(response.output.outputs.is_empty());
                     let span = error.span.unwrap();
@@ -10554,7 +10920,11 @@ fn source_table_observation_boundaries_keep_submitted_prefix() {
             };
             assert_eq!(
                 available_table_value(&read, table.rows[0].output.as_ref().unwrap()),
-                "1"
+                if bad.contains(":mode") || bad.contains(":file") {
+                    "1"
+                } else {
+                    "10"
+                }
             );
         }
     }
@@ -10934,10 +11304,8 @@ fn core_renderer_rejects_unrepresentable_names_before_publication() {
     let mut bad =
         Source::new_core(None, "(datatype T (panic String)) (extract (panic \"x\"))").unwrap();
     let mut program = bad.next().unwrap().unwrap();
-    let expression = bad.next().unwrap().unwrap();
-    program.sorts = expression.sorts;
-    program.nodes = expression.nodes;
-    let Some(pb::command::Kind::Extract(extract)) = &expression.commands[0].kind else {
+    assert!(bad.next().is_none());
+    let Some(pb::command::Kind::Extract(extract)) = &program.commands[0].kind else {
         unreachable!()
     };
     program.commands = vec![pb::Command {
@@ -10983,8 +11351,6 @@ fn core_renderer_rejects_unrepresentable_names_before_publication() {
 fn core_source_rejects_malformed_dead_until_without_losing_submitted_prefix() {
     use egglog_experimental::protobuf::source::Source;
     let text = "(datatype Mark (Seed i64)) (Seed 1) (ruleset r) (run-schedule (repeat 0 (run r :until (Missing 1)))) (Seed 2)";
-    // Dead descendants must still resolve. An unknown query cannot be hidden
-    // by Repeat0; earlier completed source submissions remain observable.
     assert!(
         egglog::EGraph::default()
             .parse_and_run_program(None, text)
@@ -10992,13 +11358,14 @@ fn core_source_rejects_malformed_dead_until_without_losing_submitted_prefix() {
     );
     let mut engine = Engine::default();
     let id = create(&mut engine);
+    let baseline = Source::new_core(None, "(datatype Mark (Seed i64)) (Seed 0)")
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap();
+    assert_eq!(run(&mut engine, id, baseline).error, None);
     let mut source = Source::new_core(None, text).unwrap();
-    let error = loop {
-        match source.next().unwrap() {
-            Ok(phase) => assert_eq!(run(&mut engine, id, phase).error, None),
-            Err(error) => break error,
-        }
-    };
+    let error = source.next().unwrap().unwrap_err();
     assert!(error.to_string().contains("Missing"), "{error}");
     assert!(source.next().is_none());
     let read = run(
@@ -11017,10 +11384,10 @@ fn core_source_rejects_malformed_dead_until_without_losing_submitted_prefix() {
     );
     assert_eq!(read.error, None);
     let Some(pb::command_output::Kind::TableRows(table)) = &read.output.outputs[0].kind else {
-        unreachable!()
+        panic!("Seed rows")
     };
     assert_eq!(table.rows.len(), 1);
-    assert_eq!(available_table_value(&read, &table.rows[0].args[0]), "1");
+    assert_eq!(available_table_value(&read, &table.rows[0].args[0]), "0");
 }
 
 #[test]
@@ -11275,10 +11642,11 @@ fn diagnostics_are_opt_in_and_stats_uses_the_same_format() {
         let mut stats = 0;
         for phase in Source::new(None, text).unwrap() {
             let phase = phase.unwrap();
-            let is_stats = phase
+            let stats_count = phase
                 .commands
                 .iter()
-                .any(|command| matches!(command.kind, Some(pb::command::Kind::Stats(_))));
+                .filter(|command| matches!(command.kind, Some(pb::command::Kind::Stats(_))))
+                .count();
             rendered.push_str(&renderer.render(&phase).unwrap());
             let bytes = engine
                 .run(
@@ -11304,22 +11672,26 @@ fn diagnostics_are_opt_in_and_stats_uses_the_same_format() {
                     assert!(result.updated);
                 }
             }
-            if is_stats {
-                stats += 1;
-                assert_eq!(documents.len(), 1);
-            } else if !response.output.outputs.is_empty() {
-                assert_eq!(documents.len(), usize::from(diagnostics));
-            }
-            if diagnostics && raw.len() == 2 {
-                assert!(matches!(
-                    raw[0].kind,
-                    Some(pb::command_output::Kind::Run(_))
-                ));
-                assert!(matches!(
-                    raw[1].kind,
-                    Some(pb::command_output::Kind::Diagnostic(_))
-                ));
-                assert_eq!(raw[0].location, raw[1].location);
+            stats += stats_count;
+            let run_count = raw
+                .iter()
+                .filter(|output| matches!(output.kind, Some(pb::command_output::Kind::Run(_))))
+                .count();
+            assert_eq!(
+                documents.len(),
+                stats_count + usize::from(diagnostics) * run_count
+            );
+            if diagnostics {
+                for pair in raw
+                    .windows(2)
+                    .filter(|pair| matches!(pair[0].kind, Some(pb::command_output::Kind::Run(_))))
+                {
+                    assert!(matches!(
+                        pair[1].kind,
+                        Some(pb::command_output::Kind::Diagnostic(_))
+                    ));
+                    assert_eq!(pair[0].location, pair[1].location);
+                }
             }
             for document in documents {
                 assert_eq!(document.as_object().unwrap().len(), 6);
@@ -11977,18 +12349,21 @@ fn builtin_numeric_identity_collisions_reject_before_actions() {
     ] {
         let mut engine = Engine::default();
         let id = create(&mut engine);
-        let mut source = egglog_experimental::protobuf::source::Source::new(
+        let mut action = egglog_experimental::protobuf::source::Source::new(
             None,
             "(sort Marker) (constructor Fired () Marker) (Fired) (check (Fired))",
         )
+        .unwrap()
+        .next()
+        .unwrap()
         .unwrap();
-        for _ in 0..2 {
-            assert_eq!(
-                run(&mut engine, id, source.next().unwrap().unwrap()).error,
-                None
-            );
-        }
-        let mut action = source.next().unwrap().unwrap();
+        let check = pb::Program {
+            commands: vec![action.commands.pop().unwrap()],
+            ..action.clone()
+        };
+        let mut setup = action.clone();
+        setup.commands.clear();
+        assert_eq!(run(&mut engine, id, setup).error, None);
         assert!(
             catalog
                 .primitives
@@ -12006,7 +12381,6 @@ fn builtin_numeric_identity_collisions_reject_before_actions() {
         let rejected = run(&mut engine, id, action);
         assert!(rejected.error.is_some(), "{key}");
         assert!(rejected.output.outputs.is_empty());
-        let check = source.next().unwrap().unwrap();
         assert_eq!(
             run(&mut engine, id, check).error.unwrap().code,
             i32::from(pb::ErrorCode::CheckFailed)
@@ -12047,33 +12421,24 @@ fn exact_numeric_partial_calls_preserve_native_failure_and_prefix_effects() {
         let text = format!(
             "(sort Marker) (constructor Fired () Marker) (Fired) {expression} (check (Fired))"
         );
-        let mut source = egglog_experimental::protobuf::source::Source::new(None, &text).unwrap();
-        for _ in 0..2 {
-            assert_eq!(
-                run(&mut engine, id, source.next().unwrap().unwrap()).error,
-                None
-            );
-        }
-        let mut prefix = source.next().unwrap().unwrap();
-        let mut failing = source.next().unwrap().unwrap();
-        // The preceding nullary action owns a different node arena. Preserve
-        // its actual Fired root when combining the two execution boundaries.
-        assert_eq!(prefix.nodes.len(), 1);
-        let root = failing.nodes.len() as u32;
-        failing.nodes.append(&mut prefix.nodes);
+        let mut failing = egglog_experimental::protobuf::source::Source::new(None, &text)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap();
+        let check = pb::Program {
+            commands: vec![failing.commands.pop().unwrap()],
+            ..failing.clone()
+        };
         let Some(pb::command::Kind::Action(pb::Action {
             kind: Some(pb::action::Kind::Term(index)),
             ..
-        })) = &mut prefix.commands[0].kind
+        })) = &failing.commands[0].kind
         else {
             panic!("Fired prefix")
         };
-        assert_eq!(*index, 0);
-        *index = root;
-        assert!(
-            matches!(&failing.nodes[*index as usize].kind, Some(pb::node::Kind::Call(call)) if call.func == "Fired" && call.args.is_empty())
-        );
-        failing.commands.splice(0..0, prefix.commands);
+        assert!(matches!(&failing.nodes[*index as usize].kind,
+            Some(pb::node::Kind::Call(call)) if call.func == "Fired" && call.args.is_empty()));
         let response = run(&mut engine, id, failing);
         assert!(
             response
@@ -12082,10 +12447,7 @@ fn exact_numeric_partial_calls_preserve_native_failure_and_prefix_effects() {
                 .message
                 .contains("call of primitive")
         );
-        assert_eq!(
-            run(&mut engine, id, source.next().unwrap().unwrap()).error,
-            None
-        );
+        assert_eq!(run(&mut engine, id, check).error, None);
     }
 }
 
@@ -12673,19 +13035,21 @@ fn set_bad_payloads_and_catalog_conflicts_reject_before_effects() {
     use egglog_experimental::protobuf::source::Source;
     let mut engine = Engine::default();
     let id = create(&mut engine);
-    let mut source = Source::new(
+    let mut action = Source::new(
         None,
         "(sort Marker) (constructor Fired () Marker) (Fired) (check (Fired))",
     )
+    .unwrap()
+    .next()
+    .unwrap()
     .unwrap();
-    for _ in 0..2 {
-        assert_eq!(
-            run(&mut engine, id, source.next().unwrap().unwrap()).error,
-            None
-        );
-    }
-    let action = source.next().unwrap().unwrap();
-    let check = source.next().unwrap().unwrap();
+    let check = pb::Program {
+        commands: vec![action.commands.pop().unwrap()],
+        ..action.clone()
+    };
+    let mut setup = action.clone();
+    setup.commands.clear();
+    assert_eq!(run(&mut engine, id, setup).error, None);
     for bad in 0..6 {
         let mut p = action.clone();
         let scalar = p.sorts.len() as u32;
@@ -12831,33 +13195,22 @@ fn set_partial_operations_preserve_completed_prefixes() {
         let text = format!(
             "(sort S (Set i64)) (sort Marker) (constructor Fired () Marker) (Fired) {expression} (check (Fired))"
         );
-        let mut source = Source::new(None, &text).unwrap();
         let mut engine = Engine::default();
         let id = create(&mut engine);
-        for _ in 0..3 {
-            assert_eq!(
-                run(&mut engine, id, source.next().unwrap().unwrap()).error,
-                None
-            );
-        }
-        let mut prefix = source.next().unwrap().unwrap();
-        let mut failure = source.next().unwrap().unwrap();
-        assert_eq!(prefix.nodes.len(), 1);
-        let root = failure.nodes.len() as u32;
-        failure.nodes.append(&mut prefix.nodes);
+        let mut failure = Source::new(None, &text).unwrap().next().unwrap().unwrap();
+        let check = pb::Program {
+            commands: vec![failure.commands.pop().unwrap()],
+            ..failure.clone()
+        };
         let Some(pb::command::Kind::Action(pb::Action {
             kind: Some(pb::action::Kind::Term(index)),
             ..
-        })) = &mut prefix.commands[0].kind
+        })) = &failure.commands[0].kind
         else {
             panic!("Fired prefix")
         };
-        assert_eq!(*index, 0);
-        *index = root;
-        assert!(
-            matches!(&failure.nodes[*index as usize].kind, Some(pb::node::Kind::Call(call)) if call.func == "Fired" && call.args.is_empty())
-        );
-        failure.commands.splice(0..0, prefix.commands);
+        assert!(matches!(&failure.nodes[*index as usize].kind,
+            Some(pb::node::Kind::Call(call)) if call.func == "Fired" && call.args.is_empty()));
         let response = run(&mut engine, id, failure);
         assert!(
             response
@@ -12867,10 +13220,7 @@ fn set_partial_operations_preserve_completed_prefixes() {
                 .contains("call of primitive"),
             "{expression}"
         );
-        assert_eq!(
-            run(&mut engine, id, source.next().unwrap().unwrap()).error,
-            None
-        );
+        assert_eq!(run(&mut engine, id, check).error, None);
     }
 }
 
@@ -14212,13 +14562,29 @@ fn map_flat_and_computed_source_calls_execute_through_bytes() {
 #[test]
 fn unused_map_payloads_reject_before_earlier_writes_and_zero_refs_are_values() {
     use egglog_experimental::protobuf::source::{Renderer, Source};
-    let phases = Source::new(
+    // Establish the receiver state before submitting separately mutated Programs.
+    let mut block = Source::new(
         None,
         "(function observed () i64 :merge new) (set (observed) 0) (check (= (observed) 0))",
     )
     .unwrap()
-    .collect::<Result<Vec<_>, _>>()
+    .next()
+    .unwrap()
     .unwrap();
+    let check = block.commands.pop().unwrap();
+    let initialize = block.commands.pop().unwrap();
+    assert!(block.commands.is_empty());
+    let phases = [
+        block.clone(),
+        pb::Program {
+            commands: vec![initialize],
+            ..block.clone()
+        },
+        pb::Program {
+            commands: vec![check],
+            ..block
+        },
+    ];
     let mut engine = Engine::default();
     let id = create(&mut engine);
     let mut renderer = Renderer::default();
@@ -14709,13 +15075,29 @@ fn pair_source_calls_execute_through_bytes() {
 #[test]
 fn pair_invalid_payloads_and_annotations_reject_before_mutation() {
     use egglog_experimental::protobuf::source::{Renderer, Source};
-    let phases = Source::new(
+    // Establish the receiver state before submitting separately mutated Programs.
+    let mut block = Source::new(
         None,
         "(function observed () i64 :merge new) (set (observed) 0) (check (= (observed) 0))",
     )
     .unwrap()
-    .collect::<Result<Vec<_>, _>>()
+    .next()
+    .unwrap()
     .unwrap();
+    let check = block.commands.pop().unwrap();
+    let initialize = block.commands.pop().unwrap();
+    assert!(block.commands.is_empty());
+    let phases = [
+        block.clone(),
+        pb::Program {
+            commands: vec![initialize],
+            ..block.clone()
+        },
+        pb::Program {
+            commands: vec![check],
+            ..block
+        },
+    ];
     let mut engine = Engine::default();
     let id = create(&mut engine);
     let mut renderer = Renderer::default();
@@ -15291,18 +15673,33 @@ fn nominal_pair_resupply_orders_clone_conflicts_and_prefixes() {
 #[test]
 fn nominal_pair_wrong_kind_names_reject_before_earlier_writes() {
     use egglog_experimental::protobuf::source::{Renderer, Source};
-    let phases = Source::new(None,
+    // Establish the receiver state before submitting separately mutated Programs.
+    let mut block = Source::new(None,
         "(sort OnlyNominal) (function observed () i64 :merge new) (set (observed) 0) (check (= (observed) 0))")
-        .unwrap().collect::<Result<Vec<_>, _>>().unwrap();
+        .unwrap().next().unwrap().unwrap();
+    let check = block.commands.pop().unwrap();
+    let initialize = block.commands.pop().unwrap();
+    assert!(block.commands.is_empty());
+    let phases = [
+        block.clone(),
+        pb::Program {
+            commands: vec![initialize],
+            ..block.clone()
+        },
+        pb::Program {
+            commands: vec![check],
+            ..block
+        },
+    ];
     let mut engine = Engine::default();
     let id = create(&mut engine);
     let mut renderer = Renderer::default();
-    for phase in &phases[..3] {
+    for phase in &phases[..2] {
         assert_eq!(run(&mut engine, id, phase.clone()).error, None);
         renderer.render(phase).unwrap();
     }
     for bad in 0..3 {
-        let mut invalid = phases[2].clone();
+        let mut invalid = phases[1].clone();
         let literal = invalid
             .nodes
             .iter_mut()
@@ -15352,7 +15749,7 @@ fn nominal_pair_wrong_kind_names_reject_before_earlier_writes() {
         assert!(response.output.outputs.is_empty());
         let render_error = renderer.render(&invalid).unwrap_err();
         assert!(render_error.to_string().contains(expected));
-        assert_eq!(run(&mut engine, id, phases[3].clone()).error, None);
+        assert_eq!(run(&mut engine, id, phases[2].clone()).error, None);
     }
 }
 
@@ -15368,79 +15765,25 @@ fn source_ungrounded_birewrite_keeps_forward_prefix_and_stops() {
         egglog::Error::TypeError(egglog::TypeError::Ungrounded(..))
     ));
     let mut source = Source::new_core(None, &text).unwrap();
-    let mut engine = Engine::default();
-    let id = create(&mut engine);
-    for _ in 0..3 {
-        assert_eq!(
-            run(&mut engine, id, source.next().unwrap().unwrap()).error,
-            None
-        );
-    }
-    let prefix = source.next().unwrap().unwrap();
-    assert!(prefix.commands.is_empty() && inline_rules(&prefix).len() == 1);
-    assert!(matches!(
-        inline_rules(&prefix).as_slice(),
-        [pb::Rule {
-            kind: Some(pb::rule::Kind::Rewrite(_)),
-            name: Some(name),
-            ..
-        }] if name.ends_with("=>")
-    ));
-    let response = run(&mut engine, id, prefix);
-    assert_eq!(response.error, None);
-    assert!(response.output.outputs.is_empty());
     assert_eq!(
         source.next().unwrap().unwrap_err().to_string(),
         expected.to_string()
     );
     assert!(
         source.next().is_none(),
-        "the authored run must not be emitted"
+        "the rejected block publishes no forward rule or Run"
     );
-
-    // Both actual receivers retain the forward rule after the reverse fails;
-    // without that rule this equality is false. This is independent of the
-    // invalid-wire atomicity checks immediately below.
-    let retained = "(S1 (S0)) (run 1) (check (= (S1 (S0)) (S0)))";
-    native.parse_and_run_program(None, retained).unwrap();
-    // A separate Source does not own the installed rule body: its empty default
-    // ruleset would conflict. Bind the witness step to the existing session
-    // ruleset by name, between genuine Source-authored seed and Check packets.
-    let witness = format!("{header} (S1 (S0)) (check (= (S1 (S0)) (S0)))");
-    let mut stepped = false;
-    for phase in Source::new_core(None, &witness).unwrap() {
-        let phase = phase.unwrap();
-        if phase
-            .commands
-            .iter()
-            .any(|command| matches!(command.kind, Some(pb::command::Kind::Check(_))))
-        {
-            assert!(!stepped);
-            let response = run(
-                &mut engine,
-                id,
-                pb::Program {
-                    commands: vec![pb::Command {
-                        kind: Some(pb::command::Kind::Run(pb::Run {
-                            rulesets: (vec![String::new()])
-                                .into_iter()
-                                .map(|name| pb::RulesetSelection {
-                                    kind: Some(pb::ruleset_selection::Kind::Name(name)),
-                                })
-                                .collect(),
-                            ..Default::default()
-                        })),
-                        ..Default::default()
-                    }],
-                    ..Default::default()
-                },
-            );
-            assert_eq!(response.error, None);
-            stepped = true;
-        }
-        assert_eq!(run(&mut engine, id, phase).error, None);
+    // Native sequential execution retains its forward installation. Source's
+    // whole-block authoring intentionally rejects before any request is sent.
+    native
+        .parse_and_run_program(None, "(S1 (S0)) (run 1) (check (= (S1 (S0)) (S0)))")
+        .unwrap();
+    let mut engine = Engine::default();
+    let id = create(&mut engine);
+    let witness = format!("{header} (S1 (S0)) (run 1) (fail (check (= (S1 (S0)) (S0))))");
+    for program in Source::new_core(None, &witness).unwrap() {
+        assert_eq!(run(&mut engine, id, program.unwrap()).error, None);
     }
-    assert!(stepped);
 }
 
 #[test]
@@ -15580,8 +15923,9 @@ fn source_grounding_corrections_execute_and_invalid_rules_are_atomic() {
             let phase = phase.unwrap();
             if !inline_rules(&phase).is_empty() {
                 saw_rule = true;
-                assert_eq!(inline_rules(&phase).len(), 1);
-                match &inline_rules(&phase)[0].kind {
+                let rules = &phase.rulesets[0].value.as_ref().unwrap().rules;
+                assert_eq!(rules.len(), 1);
+                match &rules[0].kind {
                     Some(pb::rule::Kind::Birewrite(rule)) if case == 0 => {
                         assert_eq!(rule.conditions.len(), 1);
                     }
@@ -15643,6 +15987,23 @@ fn pair_value_queries_require_grounded_children() {
     for phase in Source::new(None, text).unwrap() {
         let mut program = phase.unwrap();
         if !inline_rules(&program).is_empty() {
+            // Establish rows before probing a separately admitted malformed rule.
+            let rule_execution = program
+                .commands
+                .iter()
+                .position(|command| {
+                    matches!(
+                        command.kind,
+                        Some(pb::command::Kind::Run(_) | pb::command::Kind::Loop(_))
+                    )
+                })
+                .unwrap();
+            let mut setup = program.clone();
+            setup.rulesets.clear();
+            setup.commands.truncate(rule_execution);
+            assert_eq!(run(&mut engine, id, setup.clone()).error, None);
+            renderer.render(&setup).unwrap();
+            program.commands.drain(..rule_execution);
             for node in &mut program.nodes {
                 if let Some(pb::node::Kind::Call(call)) = &node.kind
                     && call.func == "egglog.core.pair.make"
@@ -16261,6 +16622,16 @@ fn vec_range_preserves_native_proof_limit_and_prefix() {
         let id = pb::CreateEGraphResponse::decode(bytes.as_slice())
             .unwrap()
             .egraph_id;
+        // The prefix is an explicit successful receiver submission before the
+        // later rule-admission failure; a Source block is compiled as a whole.
+        for phase in Source::new(
+            None,
+            "(sort V (Vec i64)) (datatype N (Num i64)) (datatype Held (Hold V)) (Num 5)",
+        )
+        .unwrap()
+        {
+            assert_eq!(run(&mut engine, id, phase.unwrap()).error, None);
+        }
         let mut error = None;
         for phase in Source::new(None, text).unwrap() {
             let response = run(
@@ -16423,16 +16794,17 @@ fn vec_corrupt_annotations_reject_before_mutation() {
     use egglog_experimental::protobuf::source::Source;
     for corrupt in [0, 1, 2, 3, 4, 5, 7, 8] {
         let text = "(sort V (Vec i64)) (function observed () i64 :merge new) (set (observed) 0) (set (observed) (vec-get (vec-of 7) 0)) (extract (observed))";
-        let mut source = Source::new(None, text).unwrap();
         let mut engine = Engine::default();
         let id = create(&mut engine);
-        for _ in 0..3 {
-            assert_eq!(
-                run(&mut engine, id, source.next().unwrap().unwrap()).error,
-                None
-            );
-        }
-        let mut program = source.next().unwrap().unwrap();
+        let mut program = Source::new(None, text).unwrap().next().unwrap().unwrap();
+        let observation = pb::Program {
+            commands: vec![program.commands.pop().unwrap()],
+            ..program.clone()
+        };
+        let mutation = program.commands.pop().unwrap();
+        // The successful initial write is a separate receiver admission boundary.
+        assert_eq!(run(&mut engine, id, program.clone()).error, None);
+        program.commands = vec![mutation];
         let get = program.nodes.iter().position(|n| matches!(&n.kind, Some(pb::node::Kind::Call(c)) if c.func == "egglog.core.vec.get")).unwrap();
         let vec_sort = program.sorts.iter().position(|s| matches!(&s.kind, Some(pb::sort::Kind::Primitive(f)) if f.name == "Vec" && matches!(program.sorts[f.args[0] as usize].kind, Some(pb::sort::Kind::Primitive(_))))).unwrap();
         match corrupt {
@@ -16511,7 +16883,7 @@ fn vec_corrupt_annotations_reject_before_mutation() {
             run(&mut engine, id, program).error.is_some(),
             "corruption {corrupt}"
         );
-        let response = run(&mut engine, id, source.next().unwrap().unwrap());
+        let response = run(&mut engine, id, observation);
         assert_eq!(response.error, None);
         let Some(pb::command_output::Kind::Extraction(result)) = &response.output.outputs[0].kind
         else {
@@ -16528,12 +16900,6 @@ fn vec_lookup_failure_and_source_sort_aliases_preserve_prefixes() {
     let id = create(&mut engine);
     let text = "(sort V (Vec i64)) (function observed () i64 :merge new) (set (observed) 4) (set (observed) (vec-get (vec-of 8) 3)) (extract (observed))";
     let mut source = Source::new(None, text).unwrap();
-    for _ in 0..3 {
-        assert_eq!(
-            run(&mut engine, id, source.next().unwrap().unwrap()).error,
-            None
-        );
-    }
     let failure = run(&mut engine, id, source.next().unwrap().unwrap());
     assert_eq!(
         failure.error.as_ref().unwrap().code,
@@ -16548,41 +16914,34 @@ fn vec_lookup_failure_and_source_sort_aliases_preserve_prefixes() {
             .as_ref()
             .unwrap()
             .path,
-        [0]
+        [1]
     );
-    let response = run(&mut engine, id, source.next().unwrap().unwrap());
+    assert!(source.next().is_none());
+    let observation = Source::new(
+        None,
+        "(function observed () i64 :merge new) (extract (observed))",
+    )
+    .unwrap()
+    .next()
+    .unwrap()
+    .unwrap();
+    let response = run(&mut engine, id, observation);
     let Some(pb::command_output::Kind::Extraction(result)) = &response.output.outputs[0].kind
     else {
-        unreachable!()
+        panic!("retained value")
     };
     assert_eq!(value(&response, result.roots[0].variants[0].term), "4");
-
     let text = "(sort A (Vec i64)) (function a () A :merge new) (set (a) (vec-of 1)) (sort B (Vec i64)) (function b () B :merge new) (set (b) (vec-of 2)) (set (b) (a))";
-    let mut source = Source::new(None, text).unwrap();
     let id = create(&mut engine);
-    for _ in 0..6 {
-        assert_eq!(
-            run(&mut engine, id, source.next().unwrap().unwrap()).error,
-            None
-        );
-    }
-    assert_eq!(
-        run(&mut engine, id, source.next().unwrap().unwrap()).error,
-        None
-    );
+    let program = Source::new(None, text).unwrap().next().unwrap().unwrap();
+    assert_eq!(run(&mut engine, id, program).error, None);
     let text = "(sort A (Vec i64)) (function a () A :merge new) (set (a) (vec-of 1)) (sort B (Vec String)) (function b () B :merge new) (set (b) (vec-of \"two\")) (set (b) (a))";
     let mut source = Source::new(None, text).unwrap();
-    let id = create(&mut engine);
-    for _ in 0..6 {
-        assert_eq!(
-            run(&mut engine, id, source.next().unwrap().unwrap()).error,
-            None
-        );
-    }
     assert!(
         source.next().unwrap().is_err(),
-        "different shapes remain different sorts"
+        "different shapes reject the whole block"
     );
+    assert!(source.next().is_none());
 }
 
 #[test]
@@ -16649,12 +17008,10 @@ fn source_sort_aliases_reject_scope_commands_without_erasing_prefix() {
         let mut source = Source::new(None, &text).unwrap();
         let mut engine = Engine::default();
         let id = create(&mut engine);
-        for _ in 0..2 {
-            assert_eq!(
-                run(&mut engine, id, source.next().unwrap().unwrap()).error,
-                None
-            );
-        }
+        assert_eq!(
+            run(&mut engine, id, source.next().unwrap().unwrap()).error,
+            None
+        );
         assert!(source.next().unwrap().is_err());
         assert!(source.next().is_none());
     }
@@ -16727,14 +17084,13 @@ fn source_scope_submissions_restore_definitions_captures_and_publication() {
             new_experimental_egraph()
         };
         let mut rendered = native.clone();
-        let mut commands = native.parse_program(None, text).unwrap().into_iter();
+        native.parse_and_run_program(None, text).unwrap();
         let mut engine = Engine::default();
         let mut id = create(&mut engine);
         let mut saved = vec![];
         let mut growth_additions = 0;
         while let Some(phase) = source.next_submission() {
             let phase = phase.unwrap();
-            native.run_program(vec![commands.next().unwrap()]).unwrap();
             rendered
                 .parse_and_run_program(None, &renderer.render_submission(&phase).unwrap())
                 .unwrap();
@@ -16772,7 +17128,6 @@ fn source_scope_submissions_restore_definitions_captures_and_publication() {
                 }
             }
         }
-        assert!(commands.next().is_none());
         assert!(saved.is_empty());
         assert!(growth_additions >= 2);
     }
@@ -16863,13 +17218,16 @@ fn map_source_errors_preserve_only_previously_submitted_phases() {
         );
         let mut engine = Engine::default();
         let id = create(&mut engine);
+        let baseline = Source::new(
+            None,
+            "(sort M (Map i64 i64)) (function stored () M :merge new) (set (stored) (map-of 1 9))",
+        )
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap();
+        assert_eq!(run(&mut engine, id, baseline).error, None);
         let mut source = Source::new(None, &text).unwrap();
-        for _ in 0..3 {
-            assert_eq!(
-                run(&mut engine, id, source.next().unwrap().unwrap()).error,
-                None
-            );
-        }
         let failure = source.next().unwrap().unwrap_err();
         assert!(!failure.to_string().is_empty());
         assert!(
@@ -16879,7 +17237,7 @@ fn map_source_errors_preserve_only_previously_submitted_phases() {
         let observation = Source::new(
             None,
             "(sort M (Map i64 i64)) (function stored () M :merge new)
-             (check (= (map-get (stored) 1) 7))",
+             (check (= (map-get (stored) 1) 9))",
         )
         .unwrap()
         .last()
@@ -17170,18 +17528,19 @@ fn source_scalar_builtin_definitions_select_distinct_overloads() {
                 _ => None,
             })
             .collect::<Vec<_>>();
-        assert_eq!(definitions.len(), 1);
+        assert_eq!(definitions.len(), 2);
         keys.extend(definitions);
         reparsed
             .parse_and_run_program(None, &renderer.render(&program).unwrap())
             .unwrap();
         let response = run(&mut engine, id, program);
         assert_eq!(response.error, None);
-        let Some(pb::command_output::Kind::Extraction(result)) = &response.output.outputs[0].kind
-        else {
-            panic!("expected extraction")
-        };
-        observed.push(value(&response, result.roots[0].variants[0].term));
+        for output in &response.output.outputs {
+            let Some(pb::command_output::Kind::Extraction(result)) = &output.kind else {
+                panic!("expected extraction")
+            };
+            observed.push(value(&response, result.roots[0].variants[0].term));
+        }
     }
     assert_eq!(keys, ["egglog.core.i64.add", "egglog.core.f64.add"]);
     assert_eq!(observed, ["3", "3.0"]);
@@ -17193,14 +17552,15 @@ fn builtin_wire_identity_and_descriptor_errors_prevent_mutation() {
     for corrupt in [0, 1, 2, 3, 4, 6] {
         let mut engine = Engine::default();
         let id = create(&mut engine);
-        let mut source = Source::new(None, "(function observed () i64 :merge new) (set (observed) 0) (set (observed) (+ 1 2)) (extract (observed))").unwrap();
-        for _ in 0..2 {
-            assert_eq!(
-                run(&mut engine, id, source.next().unwrap().unwrap()).error,
-                None
-            );
-        }
-        let mut program = source.next().unwrap().unwrap();
+        let mut program = Source::new(None, "(function observed () i64 :merge new) (set (observed) 0) (set (observed) (+ 1 2)) (extract (observed))").unwrap().next().unwrap().unwrap();
+        let observation = pb::Program {
+            commands: vec![program.commands.pop().unwrap()],
+            ..program.clone()
+        };
+        let mutation = program.commands.pop().unwrap();
+        // The successful initial write is a separate receiver admission boundary.
+        assert_eq!(run(&mut engine, id, program.clone()).error, None);
+        program.commands = vec![mutation];
         let index = program.nodes.iter().position(|node| matches!(&node.kind, Some(pb::node::Kind::Call(call)) if call.func == "egglog.core.i64.add")).unwrap();
         match corrupt {
             0 | 1 => {
@@ -17261,7 +17621,7 @@ fn builtin_wire_identity_and_descriptor_errors_prevent_mutation() {
             _ => unreachable!(),
         }
         assert!(run(&mut engine, id, program).error.is_some());
-        let response = run(&mut engine, id, source.next().unwrap().unwrap());
+        let response = run(&mut engine, id, observation);
         assert_eq!(response.error, None);
         let Some(pb::command_output::Kind::Extraction(result)) = &response.output.outputs[0].kind
         else {
@@ -17283,13 +17643,8 @@ fn source_builtin_overflow_preserves_executed_prefix() {
     let mut engine = Engine::default();
     let id = create(&mut engine);
     let mut source = Source::new(None, text).unwrap();
-    for _ in 0..2 {
-        assert_eq!(
-            run(&mut engine, id, source.next().unwrap().unwrap()).error,
-            None
-        );
-    }
-    let failure = run(&mut engine, id, source.next().unwrap().unwrap());
+    let mut observation = source.next().unwrap().unwrap();
+    let failure = run(&mut engine, id, observation.clone());
     assert_eq!(
         failure.error.as_ref().unwrap().code,
         i32::from(pb::ErrorCode::RuntimeFailure)
@@ -17303,13 +17658,13 @@ fn source_builtin_overflow_preserves_executed_prefix() {
             .as_ref()
             .unwrap()
             .path,
-        [0]
+        [1]
     );
-    let mut observation = source.next().unwrap().unwrap();
+    assert!(source.next().is_none());
     let Some(pb::command::Kind::Action(pb::Action {
         kind: Some(pb::action::Kind::Set(set)),
         ..
-    })) = &observation.commands[0].kind
+    })) = &observation.commands.last().unwrap().kind
     else {
         unreachable!()
     };
@@ -17430,13 +17785,15 @@ fn recursive_fail_keeps_native_run_effects_and_source_shape() {
     // out-of-range get fails. This does not widen unsupported rule Panic.
     for phase in Source::new(Some("expected-failure.egg".into()), source).unwrap() {
         let phase = phase.unwrap();
-        if let Some(pb::Command {
-            kind: Some(pb::command::Kind::Fail(child)),
-            span,
-        }) = phase.commands.first()
-        {
-            wrappers += 1;
-            assert!(span.is_some() && child.span.is_some());
+        for command in &phase.commands {
+            if let pb::Command {
+                kind: Some(pb::command::Kind::Fail(child)),
+                span,
+            } = command
+            {
+                wrappers += 1;
+                assert!(span.is_some() && child.span.is_some());
+            }
         }
         let phase = pb::Program::decode(phase.encode_to_vec().as_slice()).unwrap();
         let text = renderer.render(&phase).unwrap();
@@ -17498,14 +17855,12 @@ fn source_fail_rejects_authored_let_before_registration() {
             .unwrap();
             let mut engine = Engine::default();
             let id = create(&mut engine);
-            for _ in 0..2 {
-                let phase = source.next().unwrap().unwrap();
-                assert!(phase.declarations.iter().all(|declaration| !matches!(
-                    &declaration.kind,
-                    Some(pb::declaration::Kind::Function(function)) if function.name == "$cap"
-                )));
-                assert_eq!(run(&mut engine, id, phase).error, None);
-            }
+            let baseline = Source::new(None, "(datatype T (C))")
+                .unwrap()
+                .next()
+                .unwrap()
+                .unwrap();
+            assert_eq!(run(&mut engine, id, baseline).error, None);
             let error = source.next().unwrap().unwrap_err();
             assert_eq!(
                 error.to_string(),
@@ -17527,7 +17882,7 @@ fn source_fail_rejects_authored_let_before_registration() {
             else {
                 panic!("completed prefix observation")
             };
-            assert_eq!(sizes.sizes[0].rows, 1);
+            assert_eq!(sizes.sizes[0].rows, 0);
         }
     }
 }
@@ -17650,6 +18005,9 @@ fn source_fail_definitions_are_frontend_only_and_keep_installed_prefixes() {
                 .unwrap();
                 let mut engine = Engine::default();
                 let id = create(&mut engine);
+                let baseline = Source::new(None, "(relation Installed ()) (relation Earlier ()) (relation Later ()) (relation Pair (i64 i64))")
+                    .unwrap().next().unwrap().unwrap();
+                assert_eq!(run(&mut engine, id, baseline).error, None);
                 let mut error = None;
                 let mut rules = 0;
                 let mut definitions = Vec::new();
@@ -17683,13 +18041,13 @@ fn source_fail_definitions_are_frontend_only_and_keep_installed_prefixes() {
                 assert!(source.next().is_none());
                 assert_eq!(
                     rules != 0,
-                    succeeds && child.starts_with("(rule"),
+                    !failed && succeeds && child.starts_with("(rule"),
                     "rejected bodies are absent: {text}"
                 );
-                if child.starts_with("(sort") {
+                if !failed && child.starts_with("(sort") {
                     assert!(definitions.contains(&"X".into()));
                 }
-                if child.starts_with("(datatype") {
+                if !failed && child.starts_with("(datatype") {
                     for name in ["E", "A", "B"] {
                         assert!(definitions.contains(&name.into()));
                     }
@@ -17697,7 +18055,7 @@ fn source_fail_definitions_are_frontend_only_and_keep_installed_prefixes() {
                 let mut observation = pb::Program {
                     ..Default::default()
                 };
-                if succeeds && child.starts_with("(rule") {
+                if !failed && succeeds && child.starts_with("(rule") {
                     native.parse_and_run_program(None, "(run r 1)").unwrap();
                     observation.commands.push(pb::Command {
                         kind: Some(pb::command::Kind::Run(pb::Run {
@@ -17735,11 +18093,15 @@ fn source_fail_definitions_are_frontend_only_and_keep_installed_prefixes() {
                     .collect();
                 assert_eq!(
                     sizes,
-                    [
-                        native.get_size("Installed"),
-                        native.get_size("Earlier"),
-                        native.get_size("Later")
-                    ],
+                    if failed {
+                        [0, 0, 0]
+                    } else {
+                        [
+                            native.get_size("Installed"),
+                            native.get_size("Earlier"),
+                            native.get_size("Later"),
+                        ]
+                    },
                     "{text}"
                 );
             }
@@ -17897,11 +18259,19 @@ fn source_fail_keeps_encoded_definition_prefixes_and_partial_birewrite() {
                     ..Default::default()
                 },
             );
-            assert_eq!(
-                response.error, None,
-                "successful constructors survive: {mode:?}: {text}"
-            );
-            assert_eq!(response.output.outputs.len(), 2);
+            if failed {
+                assert!(
+                    response.error.is_some(),
+                    "rejected block installed no constructors: {mode:?}: {text}"
+                );
+                assert!(response.output.outputs.is_empty());
+            } else {
+                assert_eq!(
+                    response.error, None,
+                    "caught assertions retain definitions: {mode:?}: {text}"
+                );
+                assert_eq!(response.output.outputs.len(), 2);
+            }
         }
     }
     let text = "(datatype E (A) (B)) (ruleset r) \
@@ -17928,10 +18298,10 @@ fn source_fail_keeps_encoded_definition_prefixes_and_partial_birewrite() {
 fn source_fail_does_not_catch_preparation_errors() {
     use egglog_experimental::protobuf::source::Source;
     for core in [false, true] {
-        for (prefix, child, phases) in [
-            ("", "(fail (unknown))", 0),
-            ("", "(fail (+ 1 \"wrong\"))", 0),
-            ("(let $x 1)", "(fail (check (= $x \"wrong\")))", 1),
+        for (prefix, child) in [
+            ("", "(fail (unknown))"),
+            ("", "(fail (+ 1 \"wrong\"))"),
+            ("(let $x 1)", "(fail (check (= $x \"wrong\")))"),
         ] {
             let text = format!("{prefix} {child} (check (= 1 1))");
             let mut native = if core {
@@ -17947,9 +18317,6 @@ fn source_fail_does_not_catch_preparation_errors() {
                 Source::new(None, &text)
             }
             .unwrap();
-            for _ in 0..phases {
-                source.next().unwrap().unwrap();
-            }
             let error = source.next().unwrap().unwrap_err();
             assert!(!error.to_string().contains("source Fail does not support"));
             assert!(source.next().is_none());
@@ -18225,6 +18592,10 @@ fn source_rule_panics_keep_exact_span_and_prefix_in_every_mode() {
             let mut authored_rules = std::collections::HashMap::new();
             for phase in Source::new(Some(filename.into()), text).unwrap() {
                 let phase = pb::Program::decode(phase.unwrap().encode_to_vec().as_slice()).unwrap();
+                let run_position = phase
+                    .commands
+                    .iter()
+                    .position(|command| matches!(command.kind, Some(pb::command::Kind::Run(_))));
                 for rule in inline_rules(&phase) {
                     authored_rules.insert(rule.name.clone().unwrap(), phase.clone());
                 }
@@ -18236,7 +18607,10 @@ fn source_rule_panics_keep_exact_span_and_prefix_in_every_mode() {
                         "{mode:?}: {error:?}"
                     );
                     assert_eq!(error.message, "Panic: same π");
-                    assert_eq!(error.location.as_ref().unwrap().path, [0]);
+                    assert_eq!(
+                        error.location.as_ref().unwrap().path,
+                        [u32::try_from(run_position.unwrap()).unwrap()]
+                    );
                     let span = error.span.unwrap();
                     let file = &response.files[span.file as usize];
                     assert_eq!(file.name, filename);
@@ -18388,15 +18762,18 @@ fn source_rule_options_preserve_rematching_and_subsumed_queries() {
             let mut occurrence = None;
             for phase in source {
                 let phase = pb::Program::decode(phase.unwrap().encode_to_vec().as_slice()).unwrap();
-                assert!(inline_rules(&phase).len() <= 1);
-                for rule in inline_rules(&phase) {
+                let rules = inline_rules(&phase);
+                if let Some(first) = rules.first() {
+                    assert!(rules.iter().all(|rule| *rule == *first));
+                    assert!(
+                        occurrence.replace(()).is_none(),
+                        "one authored rule with matching lexical Run snapshots"
+                    );
+                }
+                for rule in rules {
                     assert_eq!(rule.eval_mode, i32::from(mode));
                     assert_eq!(rule.no_decomp, no_decomp);
                     assert_eq!(rule.include_subsumed, include_subsumed);
-                    assert!(
-                        occurrence.replace(()).is_none(),
-                        "rule is supplied once at its AddRules command"
-                    );
                 }
                 let rendering = renderer.render(&phase).unwrap();
                 replay.parse_and_run_program(None, &rendering).unwrap();
@@ -18413,15 +18790,18 @@ fn source_rule_options_preserve_rematching_and_subsumed_queries() {
             let mut occurrence = None;
             for phase in source {
                 let phase = phase.unwrap();
-                assert!(inline_rules(&phase).len() <= 1);
-                for rule in inline_rules(&phase) {
+                let rules = inline_rules(&phase);
+                if let Some(first) = rules.first() {
+                    assert!(rules.iter().all(|rule| *rule == *first));
+                    assert!(
+                        occurrence.replace(()).is_none(),
+                        "one authored rule with matching lexical Run snapshots"
+                    );
+                }
+                for rule in rules {
                     assert_eq!(rule.eval_mode, i32::from(mode));
                     assert_eq!(rule.no_decomp, no_decomp);
                     assert_eq!(rule.include_subsumed, include_subsumed);
-                    assert!(
-                        occurrence.replace(()).is_none(),
-                        "rule is supplied once at its AddRules command"
-                    );
                 }
             }
             assert!(occurrence.is_some());
@@ -18614,7 +18994,7 @@ fn source_rule_head_globals_become_retained_query_bindings() {
         let mut saw_capture = false;
         for phase in source {
             let phase = pb::Program::decode(phase.unwrap().encode_to_vec().as_slice()).unwrap();
-            if let [rule] = inline_rules(&phase).as_slice() {
+            for rule in inline_rules(&phase) {
                 let Some(pb::rule::Kind::Rule(rule)) = &rule.kind else {
                     panic!("plain rule")
                 };
@@ -18688,7 +19068,7 @@ fn source_pure_local_aliases_share_nodes_and_retain_ordered_terms() {
         let mut saw_aliases = false;
         for phase in source {
             let phase = pb::Program::decode(phase.unwrap().encode_to_vec().as_slice()).unwrap();
-            if let [rule] = inline_rules(&phase).as_slice() {
+            for rule in inline_rules(&phase) {
                 let Some(pb::rule::Kind::Rule(rule)) = &rule.kind else {
                     panic!("plain rule")
                 };
@@ -19538,9 +19918,20 @@ mod source_provider_context {
                     .unwrap();
                 assert_eq!(provider.evaluations.load(Ordering::SeqCst), 0);
                 assert_eq!(provider.validations.load(Ordering::SeqCst), 0);
+                assert_eq!(phases.len(), 1);
                 assert_eq!(
-                    phases.iter().map(|phase| inline_rules(phase).len()).max(),
-                    Some(1)
+                    phases[0]
+                        .rulesets
+                        .iter()
+                        .filter_map(|binding| binding.value.as_ref())
+                        .map(|ruleset| ruleset.rules.len())
+                        .sum::<usize>(),
+                    program
+                        .rulesets
+                        .iter()
+                        .filter_map(|binding| binding.value.as_ref())
+                        .map(|ruleset| ruleset.rules.len())
+                        .sum::<usize>()
                 );
                 let replay_tables: Vec<_> = ["HostCost", "WithVector"]
                     .into_iter()
@@ -19867,11 +20258,11 @@ mod source_provider_context {
         .unwrap();
         assert_eq!(provider.evaluations.load(Ordering::SeqCst), before);
         let id = create(&mut engine);
-        assert_eq!(run(&mut engine, id, phases[0].clone()).error, None);
-        let response = run(&mut engine, id, phases[1].clone());
+        assert_eq!(phases.len(), 1);
+        let response = run(&mut engine, id, phases[0].clone());
         let error = response.error.unwrap();
         assert_eq!(error.code, i32::from(pb::ErrorCode::RuntimeFailure));
-        assert_eq!(error.span, phases[1].commands[0].span);
+        assert_eq!(error.span, phases[0].commands[0].span);
         assert_eq!(error.location.unwrap().path, [0]);
         assert_eq!(provider.evaluations.load(Ordering::SeqCst), before);
         assert_eq!(provider.validations.load(Ordering::SeqCst), 0);
@@ -20416,6 +20807,15 @@ fn source_relation_value_uses_reject_without_inserting_rows() {
             );
             let mut engine = Engine::default();
             let id = create(&mut engine);
+            let baseline = Source::new(
+                None,
+                "(relation source-row (i64)) (function marker () i64 :merge new) (set (marker) 10)",
+            )
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap();
+            assert_eq!(run(&mut engine, id, baseline).error, None);
             let source = if core {
                 Source::new_core(None, &text)
             } else {
@@ -20440,7 +20840,7 @@ fn source_relation_value_uses_reject_without_inserting_rows() {
                 }
             }
             assert!(rejected, "core={core}/{invalid}");
-            for phase in Source::new(None, "(relation source-row (i64)) (function marker () i64 :merge new) (fail (check (source-row 7))) (check (= (marker) 0))").unwrap() {
+            for phase in Source::new(None, "(relation source-row (i64)) (function marker () i64 :merge new) (fail (check (source-row 7))) (check (= (marker) 10))").unwrap() {
                 let response = run(&mut engine, id, phase.unwrap());
                 assert_eq!(response.error, None, "core={core}/{invalid}");
             }
@@ -20462,6 +20862,12 @@ fn source_binary_unions_are_fresh_and_preserve_prefixes_before_errors() {
         native
             .parse_and_run_program(None, "(check (= (A) (B)))")
             .unwrap();
+        if tail.contains("missing") {
+            let mut source = Source::new(Some("union-prefix.egg".into()), &text).unwrap();
+            assert!(source.next().unwrap().is_err());
+            assert!(source.next().is_none());
+            continue;
+        }
         let mut rendered = new_experimental_egraph();
         let mut renderer = Renderer::default();
         let mut engine = Engine::default();
@@ -20478,24 +20884,29 @@ fn source_binary_unions_are_fresh_and_preserve_prefixes_before_errors() {
                     break;
                 }
             };
-            if let Some(pb::command::Kind::Action(pb::Action {
-                kind: Some(pb::action::Kind::Term(index)),
-                ..
-            })) = phase.commands.first().and_then(|c| c.kind.as_ref())
-            {
-                assert!(matches!(
-                    phase.nodes[*index as usize].kind,
-                    Some(pb::node::Kind::Union(_))
-                ));
-                // Across Programs, occurrence identity includes the owning
-                // arena; local numeric indices may be reused. Preserve the
-                // distinct authored origins instead of comparing bare IDs.
-                occurrences.push((phase.nodes[*index as usize].span, *index));
-                let mut check = phase.clone();
-                check.commands[0].kind = Some(pb::command::Kind::Check(pb::Check {
-                    facts: vec![*index],
-                }));
-                observation = Some(check);
+            for command in &phase.commands {
+                if let Some(pb::command::Kind::Action(pb::Action {
+                    kind: Some(pb::action::Kind::Term(index)),
+                    ..
+                })) = &command.kind
+                {
+                    assert!(matches!(
+                        phase.nodes[*index as usize].kind,
+                        Some(pb::node::Kind::Union(_))
+                    ));
+                    // Across Programs, occurrence identity includes the owning
+                    // arena; local numeric indices may be reused. Preserve the
+                    // distinct authored origins instead of comparing bare IDs.
+                    occurrences.push((phase.nodes[*index as usize].span, *index));
+                    let mut check = phase.clone();
+                    check.commands = vec![pb::Command {
+                        kind: Some(pb::command::Kind::Check(pb::Check {
+                            facts: vec![*index],
+                        })),
+                        ..Default::default()
+                    }];
+                    observation = Some(check);
+                }
             }
             let native_result =
                 rendered.parse_and_run_program(None, &renderer.render(&phase).unwrap());
@@ -20510,7 +20921,7 @@ fn source_binary_unions_are_fresh_and_preserve_prefixes_before_errors() {
                         pb::ErrorCode::RuntimeFailure
                     })
                 );
-                assert_eq!(error.location.unwrap().path, [0]);
+                assert_eq!(error.location.unwrap().path, [2]);
                 failed = true;
                 break;
             }
@@ -20556,7 +20967,8 @@ fn source_binary_union_member_failures_match_native_completed_rows() {
             let phase = pb::Program::decode(phase.unwrap().encode_to_vec().as_slice()).unwrap();
             let rendering = renderer.render(&phase).unwrap();
             let native_result = rendered.parse_and_run_program(None, &rendering);
-            let expected_span = phase.commands.first().and_then(|command| {
+            assert_eq!(phase.commands.len(), 2, "the row prefix precedes the union");
+            let expected_span = phase.commands.last().and_then(|command| {
                 command.span.or(match &command.kind {
                     Some(pb::command::Kind::Action(action)) => action.span,
                     _ => None,
@@ -20571,7 +20983,7 @@ fn source_binary_union_member_failures_match_native_completed_rows() {
                 );
                 assert_eq!(error.code, i32::from(pb::ErrorCode::RuntimeFailure));
                 assert!(error.message.contains("call of primitive"));
-                assert_eq!(error.location.unwrap().path, [0]);
+                assert_eq!(error.location.unwrap().path, [1]);
                 assert_eq!(error.span, expected_span);
                 assert_eq!(
                     response.files[error.span.unwrap().file as usize].name,
@@ -20638,6 +21050,12 @@ fn source_resolution_and_runtime_errors_preserve_only_executed_prefixes() {
             &format!("(function f () i64 :merge new) (set (f) 1) {tail} (set (f) 3)"),
         )
         .unwrap();
+        let baseline = Source::new(None, "(function f () i64 :merge new) (set (f) 10)")
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap();
+        assert_eq!(run(&mut engine, id, baseline).error, None);
         let mut failed = false;
         for program in source.by_ref() {
             let Ok(program) = program else {
@@ -20678,7 +21096,10 @@ fn source_resolution_and_runtime_errors_preserve_only_executed_prefixes() {
         else {
             panic!("missing extraction")
         };
-        assert_eq!(value(&response, result.roots[0].variants[0].term), "1");
+        assert_eq!(
+            value(&response, result.roots[0].variants[0].term),
+            if tail.contains("missing") { "10" } else { "1" }
+        );
     }
 }
 
@@ -20693,10 +21114,21 @@ fn source_byte_mutation_controls_execution() {
     )
     .unwrap();
     let mut renderer = Renderer::default();
-    let declaration = source.next().unwrap().unwrap();
+    let mut program = source.next().unwrap().unwrap();
+    assert!(source.next().is_none());
+    assert_eq!(program.commands.len(), 2);
+    let mut observation = program.clone();
+    observation.commands = program.commands.split_off(1);
+    assert!(matches!(
+        observation.commands[0].kind,
+        Some(pb::command::Kind::Extract(_))
+    ));
+    let mut declaration = program.clone();
+    declaration.commands.clear();
     renderer.render(&declaration).unwrap();
     assert_eq!(run(&mut engine, id, declaration).error, None);
-    let program = source.next().unwrap().unwrap();
+    program.declarations.clear();
+    observation.declarations.clear();
     let mut request = pb::RunProgramRequest {
         egraph_id: id,
         program: Some(program),
@@ -20705,19 +21137,27 @@ fn source_byte_mutation_controls_execution() {
     let mut bytes = request.encode_to_vec();
     bytes.push(0x80);
     assert!(engine.run(&bytes).is_err());
-    let observation = source.next().unwrap().unwrap();
     assert!(
         run(&mut engine, id, observation.clone()).error.is_some(),
         "malformed set must not create the row"
     );
-    for node in &mut request.program.as_mut().unwrap().nodes {
-        if let Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
-            value: Some(pb::primitive_value::Value::I64(value)),
-        })) = &mut node.kind
-        {
-            *value = 7;
-        }
-    }
+    let program = request.program.as_mut().unwrap();
+    let Some(pb::command::Kind::Action(pb::Action {
+        kind: Some(pb::action::Kind::Set(set)),
+        ..
+    })) = &program.commands[0].kind
+    else {
+        panic!("the authored set is the mutated command")
+    };
+    let value_node = set.value.unwrap() as usize;
+    let Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
+        value: Some(pb::primitive_value::Value::I64(literal)),
+    })) = &mut program.nodes[value_node].kind
+    else {
+        panic!("the set value is a literal")
+    };
+    assert_eq!(*literal, 1);
+    *literal = 7;
     assert!(
         renderer
             .render(request.program.as_ref().unwrap())
@@ -20838,7 +21278,10 @@ fn source_combined_rulesets_preserve_shared_occurrences_and_cursors() {
         for command in &phase.commands {
             if let Some(pb::command::Kind::Run(run)) = &command.kind {
                 assert!(!run.rulesets.is_empty());
-                assert!(inline_rules(&phase).is_empty());
+                assert!(run.rulesets.iter().all(|selection| matches!(
+                    selection.kind,
+                    Some(pb::ruleset_selection::Kind::Ruleset(_))
+                )));
             }
         }
         let mut response = Observed::from_frames(
@@ -20856,18 +21299,23 @@ fn source_combined_rulesets_preserve_shared_occurrences_and_cursors() {
             .map(|bytes| pb::RunProgramResponse::decode(bytes.as_slice()).unwrap()),
         );
         assert_eq!(response.error, None);
-        let diagnostics = take_diagnostics(&mut response);
+        let mut diagnostics = take_diagnostics(&mut response).into_iter();
         for output in &response.output.outputs {
             let Some(pb::command_output::Kind::Run(outcome)) = &output.kind else {
                 continue;
             };
+            let diagnostic = diagnostics.next().expect("one document per authored run");
             if actual.is_empty() {
-                let counts = diagnostics[0]["num_matches_per_rule"].as_object().unwrap();
+                let counts = diagnostic["num_matches_per_rule"].as_object().unwrap();
                 assert!(counts.keys().any(|name| name.ends_with("=>")));
                 assert!(counts.keys().any(|name| name.ends_with("<=")));
             }
-            actual.push((outcome.updated, diagnostic_matches(&diagnostics)));
+            actual.push((
+                outcome.updated,
+                diagnostic_matches(std::slice::from_ref(&diagnostic)),
+            ));
         }
+        assert!(diagnostics.next().is_none());
     }
     assert_eq!(
         actual.iter().map(|r| r.0).collect::<Vec<_>>(),
@@ -20917,13 +21365,18 @@ fn source_combined_rulesets_preserve_shared_occurrences_and_cursors() {
             .map(|bytes| pb::RunProgramResponse::decode(bytes.as_slice()).unwrap()),
         );
         assert_eq!(response.error, None);
-        let diagnostics = take_diagnostics(&mut response);
+        let mut diagnostics = take_diagnostics(&mut response).into_iter();
         for output in &response.output.outputs {
             let Some(pb::command_output::Kind::Run(outcome)) = &output.kind else {
                 continue;
             };
-            replayed.push((outcome.updated, diagnostic_matches(&diagnostics)));
+            let diagnostic = diagnostics.next().expect("one document per replayed run");
+            replayed.push((
+                outcome.updated,
+                diagnostic_matches(std::slice::from_ref(&diagnostic)),
+            ));
         }
+        assert!(diagnostics.next().is_none());
     }
     assert!(replayed_labels.contains(&"both \"quoted\" \\ λ=>".to_string()));
     assert!(replayed_labels.contains(&"both \"quoted\" \\ λ<=".to_string()));
@@ -20969,12 +21422,18 @@ fn source_combined_forward_empty_and_compile_only_controls() {
         for phase in source {
             let (response, response_diagnostics) = run_diagnosed(&mut engine, id, phase.unwrap());
             assert_eq!(response.error, None);
+            let mut diagnostics = response_diagnostics.into_iter();
             for output in response.output.outputs {
                 let Some(pb::command_output::Kind::Run(outcome)) = output.kind else {
                     continue;
                 };
-                actual.push((outcome.updated, diagnostic_matches(&response_diagnostics)));
+                let diagnostic = diagnostics.next().expect("one document per authored run");
+                actual.push((
+                    outcome.updated,
+                    diagnostic_matches(std::slice::from_ref(&diagnostic)),
+                ));
             }
+            assert!(diagnostics.next().is_none());
         }
         assert_eq!(actual, expected);
     }
@@ -21031,48 +21490,10 @@ fn source_combined_errors_preserve_the_submitted_prefix() {
         let text = format!(
             "(datatype E (Seed i64) (Out i64)) (Seed 7) (extract (Seed 7)) {tail} (Seed 8)"
         );
-        let mut engine = Engine::default();
-        let id = create(&mut engine);
-        let mut observation = None;
         let mut source = Source::new(Some("combined-error.egg".into()), &text).unwrap();
-        let error = loop {
-            match source.next().expect("expected source rejection") {
-                Ok(phase) => {
-                    if matches!(
-                        phase
-                            .commands
-                            .first()
-                            .and_then(|command| command.kind.as_ref()),
-                        Some(pb::command::Kind::Extract(_))
-                    ) {
-                        observation = Some(phase.clone());
-                    }
-                    assert_eq!(run(&mut engine, id, phase).error, None, "{tail}");
-                }
-                Err(error) => break error,
-            }
-        };
+        let error = source.next().unwrap().unwrap_err();
         assert!(error.to_string().contains(message), "{tail}: {error}");
         assert!(source.next().is_none());
-        let mut observation = observation.unwrap();
-        observation.commands = vec![pb::Command {
-            kind: Some(pb::command::Kind::TableRows(pb::GetTableRows {
-                table: "Seed".into(),
-                max_rows: None,
-            })),
-            ..Default::default()
-        }];
-        let response = run(&mut engine, id, observation);
-        assert_eq!(response.error, None);
-        let Some(pb::command_output::Kind::TableRows(table)) = &response.output.outputs[0].kind
-        else {
-            panic!("missing prefix table")
-        };
-        assert_eq!(table.rows.len(), 1, "rejected suffix must not run: {tail}");
-        assert_eq!(
-            available_table_value(&response, &table.rows[0].args[0]),
-            "7"
-        );
     }
     for rule in [
         "(rule ((Seed x)) ((Out x)) :ruleset parent)",
@@ -21328,7 +21749,7 @@ fn source_includes_preserve_order_and_prefix_before_open_or_parse_errors() {
                     Err(error) => break error,
                 }
             };
-            assert_eq!(phases, 7, "core={core}/{tail}");
+            assert_eq!(phases, 3, "core={core}/{tail}");
             assert!(error.to_string().contains(tail), "{error}");
             assert!(source.next().is_none());
             for phase in Source::new(
@@ -21349,83 +21770,59 @@ fn source_validates_each_rule_before_following_effects() {
     use egglog_experimental::protobuf::source::Source;
     let mut engine = Engine::default();
     let id = create(&mut engine);
+    let baseline = Source::new(
+        None,
+        "(function observed () i64 :merge new) (set (observed) 10)",
+    )
+    .unwrap()
+    .next()
+    .unwrap()
+    .unwrap();
+    assert_eq!(run(&mut engine, id, baseline).error, None);
     let mut source = Source::new(
         None,
         r#"
-        (datatype E (A))
-        (function f (E) E :merge new)
-        (function observed () i64 :merge new)
-        (set (observed) 7)
-        (ruleset r)
-        (rewrite (f x) x :ruleset r :subsume)
-        (set (observed) 1)
-        (run r 1)
+        (datatype E (A)) (function f (E) E :merge new)
+        (function observed () i64 :merge new) (set (observed) 7) (ruleset r)
+        (rewrite (f x) x :ruleset r :subsume) (set (observed) 1) (run r 1)
     "#,
     )
     .unwrap();
-    for _ in 0..5 {
-        assert_eq!(
-            run(&mut engine, id, source.next().unwrap().unwrap()).error,
-            None
-        );
-    }
     assert!(
         source.next().unwrap().is_err(),
-        "invalid rule must fail at its source position, not a future run"
+        "invalid rule rejects the whole unsent block"
     );
     assert!(source.next().is_none());
-    for phase in Source::new(
+    let observation = Source::new(
         None,
-        "(function observed () i64 :merge new) (check (= (observed) 7))",
+        "(function observed () i64 :merge new) (check (= (observed) 10))",
     )
     .unwrap()
-    {
-        assert_eq!(
-            run(&mut engine, id, phase.unwrap()).error,
-            None,
-            "earlier write survives and later write never runs"
-        );
-    }
+    .next()
+    .unwrap()
+    .unwrap();
+    assert_eq!(
+        run(&mut engine, id, observation).error,
+        None,
+        "neither staged write executes"
+    );
 }
 
 #[test]
 fn source_keeps_native_rule_names_and_global_shadowing_checks() {
     use egglog_experimental::protobuf::source::Source;
-    for (text, prefix_len) in [
-        (
-            r#"(datatype E (A) (B)) (ruleset r) (rule () ((A)) :ruleset r :name "dup") (rule () ((B)) :ruleset r :name "dup")"#,
-            3,
-        ),
-        (
-            r#"(datatype E (A) (B)) (ruleset r) (birewrite (A) (B) :ruleset r :name "dup") (rewrite (A) (B) :ruleset r :name "dup=>")"#,
-            3,
-        ),
-        (
-            r#"(datatype E (A) (B)) (ruleset r) (rewrite (A) (B) :ruleset r :name "dup<=") (birewrite (A) (B) :ruleset r :name "dup")"#,
-            // The forward direction installs before the duplicate backward
-            // direction fails; Source yields that prefix before the error.
-            4,
-        ),
-        (
-            r#"(datatype E (A) (B)) (ruleset r) (birewrite (A) (B) :ruleset r :name "dup") (birewrite (A) (B) :ruleset r :name "dup")"#,
-            3,
-        ),
-        (
-            r#"(datatype E (A i64) (B)) (ruleset r) (birewrite (A x) (B) :ruleset r) (A 1)"#,
-            2,
-        ),
-        ("(let $x 0) (check (= x 1))", 1),
-        (
-            "(function f () i64 :no-merge) (set (f) 2) (check (= (f) f) (= f 2))",
-            2,
-        ),
+    for text in [
+        r#"(datatype E (A) (B)) (ruleset r) (rule () ((A)) :ruleset r :name "dup") (rule () ((B)) :ruleset r :name "dup")"#,
+        r#"(datatype E (A) (B)) (ruleset r) (birewrite (A) (B) :ruleset r :name "dup") (rewrite (A) (B) :ruleset r :name "dup=>")"#,
+        r#"(datatype E (A) (B)) (ruleset r) (rewrite (A) (B) :ruleset r :name "dup<=") (birewrite (A) (B) :ruleset r :name "dup")"#,
+        r#"(datatype E (A) (B)) (ruleset r) (birewrite (A) (B) :ruleset r :name "dup") (birewrite (A) (B) :ruleset r :name "dup")"#,
+        r#"(datatype E (A i64) (B)) (ruleset r) (birewrite (A x) (B) :ruleset r) (A 1)"#,
+        "(let $x 0) (check (= x 1))",
+        "(function f () i64 :no-merge) (set (f) 2) (check (= (f) f) (= f 2))",
     ] {
         let mut native = new_experimental_egraph();
         assert!(native.parse_and_run_program(None, text).is_err());
         let mut source = Source::new(None, text).unwrap();
-        for _ in 0..prefix_len {
-            assert!(source.next().unwrap().is_ok());
-        }
         assert!(
             source.next().unwrap().is_err(),
             "native source rejection must survive: {text}"
@@ -21628,14 +22025,16 @@ fn source_renderer_preserves_expression_action_grammar() {
         let mut source = Source::new(None, &text).unwrap();
         let mut rendered = new_experimental_egraph();
         let mut renderer = Renderer::default();
-        for _ in 0..2 {
-            let program = source.next().unwrap().unwrap();
-            rendered
-                .parse_and_run_program(None, &renderer.render(&program).unwrap())
-                .unwrap();
-            assert_eq!(run(&mut engine, id, program).error, None);
-        }
-        let mut program = source.next().unwrap().unwrap();
+        let mut setup = source.next().unwrap().unwrap();
+        let extraction = setup.commands.pop().unwrap();
+        let mut program = setup.clone();
+        program.declarations.clear();
+        program.rulesets.clear();
+        program.commands = vec![extraction];
+        rendered
+            .parse_and_run_program(None, &renderer.render(&setup).unwrap())
+            .unwrap();
+        assert_eq!(run(&mut engine, id, setup).error, None);
         let Some(pb::command::Kind::Extract(extract)) = &program.commands[0].kind else {
             panic!("expected extract")
         };
@@ -21658,14 +22057,17 @@ fn source_renderer_preserves_expression_action_grammar() {
         )
         .unwrap();
         let rule_id = create(&mut engine);
-        let declaration = constructors.next().unwrap().unwrap();
+        let mut rule_program = constructors.next().unwrap().unwrap();
+        let mut declaration = rule_program.clone();
+        declaration.commands.clear();
         let mut rendered_rule = new_experimental_egraph();
         let mut renderer = Renderer::default();
         rendered_rule
             .parse_and_run_program(None, &renderer.render(&declaration).unwrap())
             .unwrap();
         assert_eq!(run(&mut engine, rule_id, declaration).error, None);
-        let mut rule_program = constructors.next().unwrap().unwrap();
+        rule_program.declarations.clear();
+        rule_program.rulesets.clear();
         let Some(pb::command::Kind::Extract(extract)) = &rule_program.commands[0].kind else {
             panic!("expected constructor extract")
         };
@@ -21761,12 +22163,28 @@ fn birewrite_source_guards_and_roundtrip_keep_one_authored_rule() {
         let mut saw_rule = false;
         for phase in source {
             let phase = pb::Program::decode(phase.unwrap().encode_to_vec().as_slice()).unwrap();
-            if let [rule] = inline_rules(&phase).as_slice() {
-                assert!(matches!(rule.kind, Some(pb::rule::Kind::Birewrite(_))));
-                assert_eq!(rule.name.as_deref(), Some("both"));
-                saw_rule = true;
-            } else {
-                assert!(inline_rules(&phase).is_empty());
+            let authored_rules: Vec<_> = phase
+                .rulesets
+                .iter()
+                .flat_map(|binding| &binding.value.as_ref().unwrap().rules)
+                .collect();
+            let [rule] = authored_rules.as_slice() else {
+                panic!("one authored birewrite in the block setup")
+            };
+            assert!(matches!(rule.kind, Some(pb::rule::Kind::Birewrite(_))));
+            assert_eq!(rule.name.as_deref(), Some("both"));
+            assert!(!saw_rule, "the authored rule is published only once");
+            saw_rule = true;
+            for command in &phase.commands {
+                if let Some(pb::command::Kind::Run(run)) = &command.kind {
+                    let [selection] = run.rulesets.as_slice() else {
+                        panic!("one captured source ruleset")
+                    };
+                    let Some(pb::ruleset_selection::Kind::Ruleset(value)) = &selection.kind else {
+                        panic!("the Source-owned run captures its lexical membership")
+                    };
+                    assert_eq!(value.rules.as_slice(), std::slice::from_ref(*rule));
+                }
             }
             rendered.push_str(&renderer.render(&phase).unwrap());
             assert_eq!(run(&mut engine, id, phase).error, None);
@@ -21829,7 +22247,10 @@ fn source_plain_rule_and_subsuming_rewrite_roundtrip() {
             for output in &response.output.outputs {
                 if let Some(pb::command_output::Kind::Extraction(result)) = &output.kind {
                     observed = Some(value(&response, result.roots[0].variants[0].term));
-                    let egglog_experimental::CommandOutput::ExtractBest(dag, _, root) = &outputs[0]
+                    let Some(egglog_experimental::CommandOutput::ExtractBest(dag, _, root)) =
+                        outputs.iter().find(|output| {
+                            matches!(output, egglog_experimental::CommandOutput::ExtractBest(..))
+                        })
                     else {
                         panic!("expected rendered extraction")
                     };
@@ -22483,6 +22904,13 @@ fn source_assigned_cost_late_type_and_runtime_failures_keep_target_prefix() {
             native_result.unwrap();
         }
         assert!(failed);
+        if typed {
+            assert!(
+                prefix.is_none(),
+                "invalid cost type discards all staged target effects"
+            );
+            continue;
+        }
         let mut prefix = prefix.unwrap();
         prefix.commands = vec![pb::Command {
             kind: Some(pb::command::Kind::TableSizes(pb::GetTableSizes {
@@ -22603,7 +23031,8 @@ fn source_assigned_cost_late_error_retains_read_before_later_argument_effect() {
     // Publishing separate argument Terms and reevaluating them at C gives one.
     let text = r#"
         (with-dynamic-cost (datatype Cost (Leaf i64) (C i64 Cost)))
-        (set-cost (C (get-node-size!) (Leaf 7)) "wrong")
+        (function missing () i64 :merge new)
+        (set-cost (C (get-node-size!) (Leaf 7)) (missing))
     "#;
     let mut native = new_experimental_egraph();
     assert!(native.parse_and_run_program(None, text).is_err());
@@ -22631,23 +23060,43 @@ fn source_assigned_cost_late_error_retains_read_before_later_argument_effect() {
                 "one target owns the evaluating prefix unit"
             );
         }
-        replay
-            .parse_and_run_program(None, &renderer.render(&phase).unwrap())
-            .unwrap();
-        assert_eq!(run(&mut engine, id, phase.clone()).error, None);
+        assert!(
+            replay
+                .parse_and_run_program(None, &renderer.render(&phase).unwrap())
+                .is_err()
+        );
+        assert_eq!(
+            run(&mut engine, id, phase.clone()).error.unwrap().code,
+            i32::from(pb::ErrorCode::RuntimeFailure)
+        );
+        late_error = true;
         prefix = Some(phase);
     }
     assert!(late_error);
     let mut prefix = prefix.unwrap();
-    let target = prefix
-        .nodes
+    let Some(pb::command::Kind::Action(pb::Action {
+        kind: Some(pb::action::Kind::SetCost(set)),
+        ..
+    })) = &prefix.commands[0].kind
+    else {
+        panic!("assigned cost")
+    };
+    let target = set.target.clone().unwrap();
+    let output = prefix
+        .declarations
         .iter()
-        .position(|node| {
-            matches!(&node.kind,
-        Some(pb::node::Kind::Call(call)) if call.func == "C")
+        .find_map(|declaration| match &declaration.kind {
+            Some(pb::declaration::Kind::Constructor(constructor)) if constructor.name == "C" => {
+                Some(constructor.output)
+            }
+            _ => None,
         })
         .unwrap();
-    let mut expected = prefix.nodes[target].clone();
+    let mut expected = pb::Node {
+        sort_id: output,
+        kind: Some(pb::node::Kind::Call(target)),
+        ..Default::default()
+    };
     let Some(pb::node::Kind::Call(call)) = &mut expected.kind else {
         unreachable!()
     };
@@ -27228,9 +27677,24 @@ fn shared_syntax_queries_execute_without_tree_expansion() {
     assert_eq!(response.output.nodes, expected.output.nodes);
     assert_eq!(response.output.sorts, expected.output.sorts);
 
-    let phases = egglog_experimental::protobuf::source::Source::new(None,
+    // Establish the receiver state before submitting separately mutated Programs.
+    let mut block = egglog_experimental::protobuf::source::Source::new(None,
         "(function budget-sentinel () i64 :merge new) (set (budget-sentinel) 0) (check (= (budget-sentinel) 0))")
-        .unwrap().collect::<Result<Vec<_>, _>>().unwrap();
+        .unwrap().next().unwrap().unwrap();
+    let check = block.commands.pop().unwrap();
+    let initialize = block.commands.pop().unwrap();
+    assert!(block.commands.is_empty());
+    let phases = [
+        block.clone(),
+        pb::Program {
+            commands: vec![initialize],
+            ..block.clone()
+        },
+        pb::Program {
+            commands: vec![check],
+            ..block
+        },
+    ];
     for setup in &phases[..2] {
         assert_eq!(run(&mut engine, id, setup.clone()).error, None);
     }

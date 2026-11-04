@@ -206,6 +206,15 @@ fn source_receiving_mode_preserves_native_global_boundaries() {
                 .unwrap();
             let mut engine = Engine::default();
             let mut id = create(&mut engine, mode);
+            let baseline = Source::new(None, "(datatype E (N i64))")
+                .unwrap()
+                .with_execution_mode(mode)
+                .unwrap()
+                .next()
+                .unwrap()
+                .unwrap();
+            assert_eq!(run(&mut engine, id, baseline).error, None);
+            let mut setup_rejected = false;
             let mut saved = vec![];
             let mut byte_sizes = vec![];
             let mut byte_error = None;
@@ -217,6 +226,7 @@ fn source_receiving_mode_preserves_native_global_boundaries() {
                 position += 1;
                 match submission {
                     Err(error) => {
+                        setup_rejected = true;
                         byte_error = Some(error.to_string());
                         byte_boundary = Some(current_position);
                         break;
@@ -235,6 +245,7 @@ fn source_receiving_mode_preserves_native_global_boundaries() {
                             }
                         }
                         if let Some(error) = response.error {
+                            setup_rejected = error.location.is_none();
                             byte_error = Some(error.message);
                             byte_boundary = Some(current_position);
                             break;
@@ -297,7 +308,7 @@ fn source_receiving_mode_preserves_native_global_boundaries() {
                     Some("source Fail does not support authored let bindings"),
                     "{case}/{mode:?}"
                 );
-                assert_eq!(byte_boundary, Some(1), "{case}/{mode:?}");
+                assert_eq!(byte_boundary, Some(0), "{case}/{mode:?}");
                 assert!(byte_sizes.is_empty());
                 assert!(source.next_submission().is_none());
             } else {
@@ -306,8 +317,19 @@ fn source_receiving_mode_preserves_native_global_boundaries() {
                     native_result.is_err(),
                     "{case}/{mode:?}"
                 );
-                assert_eq!(byte_boundary, native_boundary, "{case}/{mode:?}");
-                assert_eq!(byte_sizes, native_sizes, "{case}/{mode:?}");
+                assert_eq!(
+                    byte_boundary,
+                    native_result.is_err().then_some(0),
+                    "{case}/{mode:?}"
+                );
+                if setup_rejected {
+                    assert!(
+                        byte_sizes.is_empty(),
+                        "rejected block emitted an observation: {case}/{mode:?}"
+                    );
+                } else {
+                    assert_eq!(byte_sizes, native_sizes, "{case}/{mode:?}");
+                }
                 if case == "failed-expression" {
                     assert!(native_result.is_ok());
                     assert_eq!(byte_sizes, [vec![("N".into(), 0)]]);
@@ -339,7 +361,8 @@ fn source_receiving_mode_preserves_native_global_boundaries() {
                 panic!("wire N observation")
             };
             assert_eq!(
-                sizes.sizes[0].rows, native_n as u64,
+                sizes.sizes[0].rows,
+                if setup_rejected { 0 } else { native_n as u64 },
                 "prefix {case}/{mode:?}"
             );
         }
@@ -718,6 +741,12 @@ fn core_source_controls_keep_native_stopping_flags_and_modes() {
                     if !roundtrip {
                         rendered.push_str(&renderer.render(&phase).unwrap());
                     }
+                    let control_position = phase.commands.iter().position(|command| {
+                        matches!(
+                            command.kind,
+                            Some(pb::command::Kind::Run(_) | pb::command::Kind::Loop(_))
+                        )
+                    });
                     let response = run(&mut engine, id, phase);
                     assert_eq!(
                         response.error, None,
@@ -728,7 +757,10 @@ fn core_source_controls_keep_native_stopping_flags_and_modes() {
                             Some(pb::command_output::Kind::Run(actual)) => {
                                 controls += 1;
                                 assert_eq!((actual.updated, actual.can_stop), expected.unwrap());
-                                assert_eq!(output.location.as_ref().unwrap().path, [0]);
+                                assert_eq!(
+                                    output.location.as_ref().unwrap().path,
+                                    [u32::try_from(control_position.unwrap()).unwrap()]
+                                );
                             }
                             Some(pb::command_output::Kind::Diagnostic(_)) => {
                                 statistics += 1;
@@ -801,6 +833,12 @@ fn core_source_failed_control_and_fail_wrappers_keep_prefixes_in_every_mode() {
                     if !roundtrip {
                         rendered.push_str(&renderer.render(&phase).unwrap());
                     }
+                    let control_position = phase.commands.iter().position(|command| {
+                        matches!(
+                            command.kind,
+                            Some(pb::command::Kind::Loop(_) | pb::command::Kind::Fail(_))
+                        )
+                    });
                     let response = run(&mut engine, id, phase);
                     assert!(
                         response.output.outputs.is_empty(),
@@ -811,7 +849,15 @@ fn core_source_failed_control_and_fail_wrappers_keep_prefixes_in_every_mode() {
                         assert_eq!(error.code, i32::from(pb::ErrorCode::RuntimeFailure));
                         assert!(error.span.is_some());
                         let location = error.location.unwrap();
-                        assert_eq!(location.path, if depth == 0 { vec![0, 0] } else { vec![0] });
+                        let position = u32::try_from(control_position.unwrap()).unwrap();
+                        assert_eq!(
+                            location.path,
+                            if depth == 0 {
+                                vec![position, 0]
+                            } else {
+                                vec![position]
+                            }
+                        );
                         assert_eq!(
                             location.iterations,
                             if depth == 0 { vec![1] } else { vec![] }
@@ -1207,17 +1253,13 @@ fn recursive_fail_matches_native_checks_in_every_execution_mode() {
             );
             let mut engine = Engine::default();
             let id = create(&mut engine, mode);
-            let mut source =
-                Source::new(Some("fail-modes.egg".into()), &format!("{setup} {tested}"))
-                    .unwrap()
-                    .peekable();
-            let last = loop {
-                let phase = source.next().unwrap();
-                if source.peek().is_none() {
-                    break phase;
-                }
+            for phase in Source::new(None, setup).unwrap() {
                 assert_eq!(run(&mut engine, id, phase.unwrap()).error, None);
-            };
+            }
+            let mut source =
+                Source::new(Some("fail-modes.egg".into()), &format!("{setup} {tested}")).unwrap();
+            let last = source.next().unwrap();
+            assert!(source.next().is_none());
             let mut phase = if matches!(case, "wrong-sort" | "unknown") {
                 assert!(
                     last.is_err(),
@@ -1226,11 +1268,17 @@ fn recursive_fail_matches_native_checks_in_every_execution_mode() {
                 // Independently test malformed bytes: Source correctly cannot
                 // author these cases. Only expression records are mutated;
                 // no substitute builtin metadata is introduced.
-                let mut phase = Source::new(None, &format!("{setup} (fail (check (= 1 2)))"))
+                Source::new(None, &format!("{setup} (fail (check (= 1 2)))"))
                     .unwrap()
-                    .last()
+                    .next()
                     .unwrap()
-                    .unwrap();
+                    .unwrap()
+            } else {
+                last.unwrap()
+            };
+            let tested = phase.commands.pop().unwrap();
+            phase.commands = vec![tested];
+            if matches!(case, "wrong-sort" | "unknown") {
                 let Some(pb::command::Kind::Fail(child)) = &phase.commands[0].kind else {
                     unreachable!()
                 };
@@ -1261,10 +1309,7 @@ fn recursive_fail_matches_native_checks_in_every_execution_mode() {
                         args: vec![],
                     }));
                 }
-                phase
-            } else {
-                last.unwrap()
-            };
+            }
             assert!(matches!(
                 phase.commands[0].kind,
                 Some(pb::command::Kind::Fail(_))
@@ -1385,11 +1430,13 @@ fn recursive_fail_matches_native_checks_in_every_execution_mode() {
                 );
             }
             for (marker, present) in [(5, true), (10, !preparation), (20, expected)] {
-                let read = Source::new(None, &format!("{setup} (check (M {marker}))"))
+                let mut read = Source::new(None, &format!("{setup} (check (M {marker}))"))
                     .unwrap()
-                    .last()
+                    .next()
                     .unwrap()
                     .unwrap();
+                let check = read.commands.pop().unwrap();
+                read.commands = vec![check];
                 let response = run(&mut engine, id, read);
                 assert_eq!(
                     response.error.is_none(),
@@ -1399,18 +1446,18 @@ fn recursive_fail_matches_native_checks_in_every_execution_mode() {
             }
             // A new request remains usable after either an expected failure,
             // unexpected success, or a rejected helper preparation.
-            let mut recovery =
-                Source::new(None, &format!("{setup} (M 30) (check (M 30))")).unwrap();
-            recovery.next().unwrap().unwrap();
-            recovery.next().unwrap().unwrap();
-            recovery.next().unwrap().unwrap();
-            for phase in recovery {
-                assert_eq!(
-                    run(&mut engine, id, phase.unwrap()).error,
-                    None,
-                    "recovery {mode:?} {case}"
-                );
-            }
+            let mut recovery = Source::new(None, &format!("{setup} (M 30) (check (M 30))"))
+                .unwrap()
+                .next()
+                .unwrap()
+                .unwrap();
+            assert_eq!(recovery.commands.len(), 3);
+            recovery.commands.remove(0);
+            assert_eq!(
+                run(&mut engine, id, recovery).error,
+                None,
+                "recovery {mode:?} {case}"
+            );
         }
     }
 }
@@ -1427,19 +1474,21 @@ fn double_fail_suppresses_successful_proof_without_erasing_prior_output() {
         let mut engine = Engine::default();
         let id = create(&mut engine, mode);
         let mut source = Source::new(Some("nested-proof.egg".into()), source).unwrap();
-        for _ in 0..4 {
-            assert_eq!(
-                run(&mut engine, id, source.next().unwrap().unwrap()).error,
-                None
-            );
-        }
-        let mut program = source.next().unwrap().unwrap();
-        let nested = source.next().unwrap().unwrap();
-        // ProveExists has no node references; both phases own identical sorts
-        // and source files, so retaining the authored wrapper needs no remap.
-        assert_eq!(program.sorts, nested.sorts);
-        assert_eq!(program.files, nested.files);
-        program.commands.extend(nested.commands);
+        let mut setup = source.next().unwrap().unwrap();
+        let position = setup
+            .commands
+            .iter()
+            .position(|command| matches!(command.kind, Some(pb::command::Kind::ProveExists(_))))
+            .unwrap();
+        let mut program = setup.clone();
+        program.commands = setup.commands.split_off(position);
+        program.declarations.clear();
+        program.rulesets.clear();
+        // Both command stages retain their common arena and source files;
+        // the proof and its authored wrapper require no index relocation.
+        assert_eq!(program.sorts, setup.sorts);
+        assert_eq!(program.files, setup.files);
+        assert_eq!(run(&mut engine, id, setup).error, None);
         let response = run(&mut engine, id, program);
         assert_eq!(response.error, None);
         assert_eq!(response.output.outputs.len(), 1);
@@ -1524,14 +1573,35 @@ fn binary_source_unions_keep_native_modes_and_checked_proof_attribution() {
                         &mut |_, _| {},
                     )
                     .unwrap();
+                let positions: Vec<_> = phase
+                    .commands
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(index, command)| {
+                        let requested = match command.kind {
+                            Some(
+                                pb::command::Kind::Run(_)
+                                | pb::command::Kind::Prove(_)
+                                | pb::command::Kind::ProveExists(_),
+                            ) => true,
+                            Some(pb::command::Kind::Check(_)) => {
+                                mode == pb::ExecutionMode::ProofTesting
+                            }
+                            _ => false,
+                        };
+                        requested.then_some(u32::try_from(index).unwrap())
+                    })
+                    .collect();
                 let response = run(&mut engine, id, phase);
                 assert_eq!(response.error, None, "{case} {mode:?}: {text}");
+                assert_eq!(response.output.outputs.len(), positions.len());
                 let actual: Vec<_> = response
                     .output
                     .outputs
                     .iter()
-                    .map(|output| {
-                        assert_eq!(output.location.as_ref().unwrap().path, [0]);
+                    .enumerate()
+                    .map(|(index, output)| {
+                        assert_eq!(output.location.as_ref().unwrap().path, [positions[index]]);
                         match &output.kind {
                             Some(pb::command_output::Kind::Run(_)) => "run",
                             Some(pb::command_output::Kind::Proof(proof)) => {
@@ -1596,11 +1666,14 @@ fn set_collapse_proof_and_get_validator_boundary_survive_bytes() {
         assert_eq!(proofs, 1);
         let id = create(&mut engine, mode);
         let mut source = Source::new(None, "(sort S (Set i64)) (set-get (set-of 1) 0)").unwrap();
-        assert_eq!(
-            run(&mut engine, id, source.next().unwrap().unwrap()).error,
-            None
-        );
-        let response = run(&mut engine, id, source.next().unwrap().unwrap());
+        let program = source.next().unwrap().unwrap();
+        let setup = pb::Program {
+            sorts: program.sorts.clone(),
+            files: program.files.clone(),
+            ..Default::default()
+        };
+        assert_eq!(run(&mut engine, id, setup).error, None);
+        let response = run(&mut engine, id, program);
         let error = response
             .error
             .expect("set-get still lacks a proof validator");
@@ -1851,15 +1924,15 @@ fn logical_table_rows_match_native_views_in_every_mode() {
                     _ => None,
                 })
                 .collect::<Vec<_>>();
-            if observations == tables.len() * 3 && !requests.is_empty() {
-                // Advance the independent native state through the same
-                // mutations once, before the first post-mutation observation.
-                native.parse_and_run_program(None, mutations).unwrap();
-            }
             let response = run(&mut engine, id, phase);
             assert_eq!(response.error, None, "{mode:?}");
             assert_eq!(response.output.outputs.len(), requests.len());
             for (output, request) in response.output.outputs.iter().zip(requests) {
+                if observations == tables.len() * 3 {
+                    // Advance the independent native state before this exact
+                    // post-mutation observation, even within one Source block.
+                    native.parse_and_run_program(None, mutations).unwrap();
+                }
                 let Some(pb::command_output::Kind::TableRows(table)) = &output.kind else {
                     panic!("table observation")
                 };
@@ -2898,8 +2971,8 @@ fn source_and_renderer_keep_proof_commands_authored() {
                 .iter()
                 .any(|c| matches!(c.kind, Some(pb::command::Kind::Prove(_))))
             {
-                assert!(phase.declarations.is_empty());
-                assert_eq!(phase.commands.len(), 1);
+                assert!(!phase.declarations.is_empty());
+                assert_eq!(phase.commands.len(), 5);
             }
             let text = renderer.render(&phase).unwrap();
             let mut requested = vec![];
@@ -2942,10 +3015,7 @@ fn source_and_renderer_keep_proof_commands_authored() {
                 .collect();
             assert_eq!(actual, requested);
         }
-        assert_eq!(
-            kinds,
-            ["add", "add", "action", "run", "check", "prove", "exists"]
-        );
+        assert_eq!(kinds, ["add", "action", "run", "check", "prove", "exists"]);
         assert_eq!(
             proofs,
             if mode == pb::ExecutionMode::ProofTesting {
@@ -3366,13 +3436,21 @@ fn schedule_controls_match_native_flags_and_execution_in_every_mode() {
             let mut proofs = 0;
             for phase in Source::new(Some("rendered-control.egg".into()), &rendered).unwrap() {
                 let phase = phase.unwrap();
-                let check_phase = matches!(
-                    phase.commands.as_slice(),
-                    [pb::Command {
-                        kind: Some(pb::command::Kind::Check(_)),
-                        ..
-                    }]
-                );
+                let checks: Vec<_> = phase
+                    .commands
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(index, command)| {
+                        matches!(command.kind, Some(pb::command::Kind::Check(_)))
+                            .then_some(u32::try_from(index).unwrap())
+                    })
+                    .collect();
+                let control_position = phase.commands.iter().position(|command| {
+                    matches!(
+                        command.kind,
+                        Some(pb::command::Kind::Run(_) | pb::command::Kind::Loop(_))
+                    )
+                });
                 let replay = Observed::from_frames(
                     engine
                         .run(
@@ -3390,7 +3468,9 @@ fn schedule_controls_match_native_flags_and_execution_in_every_mode() {
                 assert_eq!(replay.error, None, "{mode:?}/{case}: {rendered}");
                 for output in &replay.output.outputs {
                     if let Some(pb::command_output::Kind::Proof(proof)) = &output.kind {
-                        assert!(check_phase);
+                        let location = output.location.as_ref().unwrap();
+                        assert_eq!(location.path.len(), 1);
+                        assert!(checks.contains(&location.path[0]));
                         assert_eq!(mode, pb::ExecutionMode::ProofTesting);
                         assert!(!proof.terms.is_empty());
                         assert!((proof.root.unwrap() as usize) < proof.proofs.len());
@@ -3400,7 +3480,10 @@ fn schedule_controls_match_native_flags_and_execution_in_every_mode() {
                     match &output.kind {
                         Some(pb::command_output::Kind::Run(outcome)) => {
                             loops += 1;
-                            assert_eq!(output.location.as_ref().unwrap().path, [0]);
+                            assert_eq!(
+                                output.location.as_ref().unwrap().path,
+                                [u32::try_from(control_position.unwrap()).unwrap()]
+                            );
                             assert_eq!(
                                 (outcome.updated, outcome.can_stop),
                                 (expected_report.updated, expected_report.can_stop)
