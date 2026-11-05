@@ -13,6 +13,19 @@ jobs:
         tool: nextest
     - uses: Swatinem/rust-cache@v2
     - run: make test
+  # Downstreams install this crate with `cargo install`, which ignores the
+  # committed Cargo.lock and re-resolves every dependency to the latest
+  # compatible version. Reproduce that here so upstream dependency drift is
+  # caught in this repo instead of in downstream projects (e.g. Herbie).
+  # `cargo update` refreshes the lock to latest; the build then uses it.
+  latest-deps:
+    runs-on: ubuntu-latest
+    steps:
+    - run: echo "CARGO_INCREMENTAL=0" >> "$GITHUB_ENV"
+    - uses: actions/checkout@v3
+    - uses: Swatinem/rust-cache@v2
+    - run: cargo update
+    - run: cargo build --release --all-targets
   nits:
     runs-on: ubuntu-latest
     steps:
