@@ -15,7 +15,7 @@ pub trait FunctionArgs: Clone + Debug + Eq + Hash + Send + Sync + 'static {
 /// A typed symbolic function, represented by the shared structural Func sort.
 /// Computed callbacks author Lambda code with explicit evaluated captures.
 /// `new` defers its complete symbolic body; `with_captures` retains supplied
-/// values at function-value construction. Union bodies are currently rejected.
+/// values at function-value construction. Eq bodies are currently rejected.
 /// Parameter and capture tuples support up to twelve values.
 ///
 /// ```compile_fail,E0277
@@ -61,13 +61,13 @@ macro_rules! function_parameters {
             fn sorts() -> std::vec::Vec<SortRef> { vec![$($t::sort_ref()),*] }
             fn expressions(&self) -> std::vec::Vec<Expr> { vec![$(self.$i.expression().clone()),*] }
             #[allow(clippy::unused_unit, reason = "The zero-parameter tuple is unit.")]
-            fn variables(scope: u64) -> Self { let _ = scope; ($(variable::<$t>(scope, $i),)*) }
+            fn variables(scope: u64) -> Self { let _ = scope; ($(variable::<$t>(scope, $i, None),)*) }
         }
         impl<R: EgglogValue, $($t: EgglogValue,)*> Function<($($t,)*), R> {
             /// Author a callback without evaluating its body or captured values.
             pub fn new(callback: impl FnOnce($(&$t),*) -> R) -> Result<Self, TypedError> {
                 let scope = fresh_scope(); let _ = scope;
-                let parameters = ($(variable::<$t>(scope, $i),)*); let _ = &parameters;
+                let parameters = ($(variable::<$t>(scope, $i, None),)*); let _ = &parameters;
                 let body = callback($(&parameters.$i),*);
                 Ok(Self::from_expression(Expr::function(body.expression().clone(), vec![$(parameters.$i.expression().clone()),*], vec![], Self::sort_ref())?))
             }
@@ -77,7 +77,7 @@ macro_rules! function_parameters {
             /// its remaining syntax is deferred until each application.
             pub fn with_captures<C: FunctionArgs>(captures: C, callback: impl FnOnce(C, $(&$t),*) -> R) -> Result<Self, TypedError> {
                 let scope = fresh_scope(); let _ = scope;
-                let parameters = ($(variable::<$t>(scope, $i),)*); let _ = &parameters;
+                let parameters = ($(variable::<$t>(scope, $i, None),)*); let _ = &parameters;
                 let captured_parameters = C::variables(fresh_scope());
                 let mut formals = captured_parameters.expressions();
                 formals.extend([$(parameters.$i.expression().clone()),*]);

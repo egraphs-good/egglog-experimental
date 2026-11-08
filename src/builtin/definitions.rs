@@ -5,25 +5,86 @@ type HashMap<K, V> = std::collections::HashMap<K, V>;
 type HashSet<T> = std::collections::HashSet<T>;
 use crate::proto as pb;
 
-/// Callable spellings share one namespace; sorts and bindings are separate.
-fn declaration_identity(d: &pb::Declaration) -> Result<&str, String> {
-    if d.table_name.is_some()
-        && !matches!(
-            d.kind,
-            Some(
-                pb::declaration::Kind::Constructor(_)
-                    | pb::declaration::Kind::Function(_)
-                    | pb::declaration::Kind::Relation(_)
-            )
+/// A borrowed cross-kind view keeps one callable namespace and dependency graph
+/// without introducing an owned declaration record beside the wire messages.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum Declaration<'a> {
+    Constructor(&'a pb::Constructor),
+    Function(&'a pb::Function),
+    Relation(&'a pb::Relation),
+    UserDefinedPrimitive(&'a pb::UserDefinedPrimitive),
+}
+
+pub(crate) enum DeclarationMut<'a> {
+    Constructor(&'a mut pb::Constructor),
+    Function(&'a mut pb::Function),
+    Relation(&'a mut pb::Relation),
+    UserDefinedPrimitive(&'a mut pb::UserDefinedPrimitive),
+}
+
+/// Locations remain stable when a later request appends a different kind.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum DeclarationIndex {
+    Constructor(usize),
+    Function(usize),
+    Relation(usize),
+    UserDefinedPrimitive(usize),
+}
+
+pub(crate) fn declarations(p: &pb::Program) -> impl Iterator<Item = Declaration<'_>> {
+    p.constructors
+        .iter()
+        .map(Declaration::Constructor)
+        .chain(p.functions.iter().map(Declaration::Function))
+        .chain(p.relations.iter().map(Declaration::Relation))
+        .chain(
+            p.user_defined_primitives
+                .iter()
+                .map(Declaration::UserDefinedPrimitive),
         )
-    {
-        return Err("only table declarations may have a reflective table prefix".into());
+}
+
+pub(crate) fn declarations_mut(p: &mut pb::Program) -> impl Iterator<Item = DeclarationMut<'_>> {
+    p.constructors
+        .iter_mut()
+        .map(DeclarationMut::Constructor)
+        .chain(p.functions.iter_mut().map(DeclarationMut::Function))
+        .chain(p.relations.iter_mut().map(DeclarationMut::Relation))
+        .chain(
+            p.user_defined_primitives
+                .iter_mut()
+                .map(DeclarationMut::UserDefinedPrimitive),
+        )
+}
+
+/// Keep membership against original kind-local indices while compacting each list.
+pub(crate) fn retain_declarations(
+    p: &mut pb::Program,
+    mut keep: impl FnMut(DeclarationIndex) -> bool,
+) {
+    macro_rules! retain {
+        ($field:ident, $kind:ident) => {{
+            let mut index = 0;
+            p.$field.retain(|_| {
+                let retain = keep(DeclarationIndex::$kind(index));
+                index += 1;
+                retain
+            });
+        }};
     }
-    let name = match d.kind.as_ref().ok_or("missing declaration kind")? {
-        pb::declaration::Kind::Constructor(c) => &c.name,
-        pb::declaration::Kind::Function(f) => &f.name,
-        pb::declaration::Kind::Relation(r) => &r.name,
-        pb::declaration::Kind::UserDefinedPrimitive(p) => &p.name,
+    retain!(constructors, Constructor);
+    retain!(functions, Function);
+    retain!(relations, Relation);
+    retain!(user_defined_primitives, UserDefinedPrimitive);
+}
+
+/// Callable spellings share one namespace; sorts and bindings are separate.
+fn declaration_identity(d: Declaration<'_>) -> Result<&str, String> {
+    let name = match d {
+        Declaration::Constructor(c) => &c.name,
+        Declaration::Function(f) => &f.name,
+        Declaration::Relation(r) => &r.name,
+        Declaration::UserDefinedPrimitive(p) => &p.name,
     };
     if name.is_empty() {
         return Err("empty declaration name".into());
@@ -52,7 +113,7 @@ fn node_edges(
                 f(i)?;
             }
         }
-        N::Union(u) => {
+        N::Eq(u) => {
             for i in &mut u.members {
                 f(i)?;
             }
@@ -97,82 +158,40 @@ fn node_edges(
 }
 
 fn declaration_refs(
-    d: &mut pb::Declaration,
+    d: DeclarationMut<'_>,
     mut sort: impl FnMut(&mut u32) -> Result<(), String>,
     mut node: impl FnMut(&mut u32) -> Result<(), String>,
 ) -> Result<(), String> {
-    match d.kind.as_mut().ok_or("missing declaration kind")? {
-        pb::declaration::Kind::Constructor(c) => {
-            for a in &mut c.inputs {
-                sort(&mut a.sort)?;
-            }
-            sort(&mut c.output)?;
+    let (inputs, output) = match d {
+        DeclarationMut::Constructor(c) => {
             if let Some(i) = &mut c.cost {
                 node(i)?;
             }
+            (&mut c.inputs, Some(&mut c.output))
         }
-        pb::declaration::Kind::Function(c) => {
-            for a in &mut c.inputs {
-                sort(&mut a.sort)?;
-            }
-            sort(&mut c.output)?;
+        DeclarationMut::Function(c) => {
             if let Some(i) = &mut c.merge {
                 node(i)?;
             }
+            (&mut c.inputs, Some(&mut c.output))
         }
-        pb::declaration::Kind::Relation(r) => {
-            for a in &mut r.inputs {
-                sort(&mut a.sort)?;
-            }
-        }
-        pb::declaration::Kind::UserDefinedPrimitive(p) => {
-            for a in &mut p.inputs {
-                sort(&mut a.sort)?;
-            }
-            sort(&mut p.output)?;
+        DeclarationMut::Relation(r) => (&mut r.inputs, None),
+        DeclarationMut::UserDefinedPrimitive(p) => {
             node(p.body.as_mut().ok_or("missing primitive body")?)?;
+            (&mut p.inputs, Some(&mut p.output))
         }
+    };
+    for a in inputs {
+        sort(a)?;
     }
-    Ok(())
-}
-
-fn relocate_span(
-    span: &mut Option<pb::Span>,
-    source: &pb::Program,
-    files: &[u32],
-) -> Result<(), String> {
-    if let Some(span) = span {
-        let file = source
-            .files
-            .get(span.file as usize)
-            .ok_or("span file out of bounds")?;
-        if span.start > span.end
-            || file.contents.as_ref().is_some_and(|s| {
-                !s.is_char_boundary(span.start as usize) || !s.is_char_boundary(span.end as usize)
-            })
-        {
-            return Err("invalid span range".into());
-        }
-        span.file = files[span.file as usize];
+    if let Some(output) = output {
+        sort(output)?;
     }
     Ok(())
 }
 
 // Declaration bodies/costs and rules use the same canonical arenas.
-fn import_arenas(
-    source: &pb::Program,
-    destination: &mut pb::Program,
-) -> Result<(Vec<u32>, Vec<u32>), String> {
-    let mut files = Vec::new();
-    for file in &source.files {
-        let index = if let Some(index) = destination.files.iter().position(|old| old == file) {
-            index
-        } else {
-            destination.files.push(file.clone());
-            destination.files.len() - 1
-        };
-        files.push(u32::try_from(index).map_err(|_| "too many source files")?);
-    }
+fn import_arenas(source: &pb::Program, destination: &mut pb::Program) -> Result<Vec<u32>, String> {
     let mut input_sorts = source.sorts.clone();
     for sort in &mut input_sorts {
         if matches!(&sort.kind, Some(pb::sort::Kind::Eq(name)) if name.is_empty()) {
@@ -181,7 +200,6 @@ fn import_arenas(
         if sort.doc.is_some() && !matches!(sort.kind, Some(pb::sort::Kind::Eq(_))) {
             return Err("sort docs require an equality sort".into());
         }
-        relocate_span(&mut sort.span, source, &files)?;
     }
     let mut sorts = Vec::new();
     for index in 0..input_sorts.len() {
@@ -191,23 +209,20 @@ fn import_arenas(
             &mut destination.sorts,
         )?);
     }
-    Ok((sorts, files))
+    Ok(sorts)
 }
 
 // One reference visitor serves import, structural comparison and retention.
 pub(crate) fn rule_refs(
     rule: &mut pb::Rule,
     mut node: impl FnMut(&mut u32) -> Result<(), String>,
-    mut span: impl FnMut(&mut Option<pb::Span>) -> Result<(), String>,
 ) -> Result<(), String> {
-    span(&mut rule.span)?;
     match rule.kind.as_mut().ok_or("missing rule kind")? {
         pb::rule::Kind::Rule(rule) => {
             for root in &mut rule.query {
                 node(root)?;
             }
-            for action in &mut rule.head {
-                span(&mut action.span)?;
+            for action in &mut rule.actions {
                 let call = match action.kind.as_mut().ok_or("missing action kind")? {
                     pb::action::Kind::Term(root) => {
                         node(root)?;
@@ -252,7 +267,6 @@ pub(crate) fn rule_refs(
 struct NodeImport<'a> {
     source: &'a pb::Program,
     sorts: &'a [u32],
-    files: &'a [u32],
     nodes: &'a mut Vec<pb::Node>,
     imported: HashMap<u32, u32>,
     active: HashSet<u32>,
@@ -284,7 +298,6 @@ impl NodeImport<'_> {
                         .sorts
                         .get(node.sort_id as usize)
                         .ok_or("node sort out of bounds")?;
-                    relocate_span(&mut node.span, self.source, self.files)?;
                     let mut children = Vec::new();
                     node_edges(node.kind.as_mut().ok_or("missing node kind")?, |child| {
                         children.push(*child);
@@ -333,7 +346,7 @@ impl NodeComparison {
         if left.sort_id != right.sort_id {
             return Ok(false);
         }
-        if matches!(left.kind, Some(pb::node::Kind::Union(_))) {
+        if matches!(left.kind, Some(pb::node::Kind::Eq(_))) {
             if self.unions.get(&a).is_some_and(|old| *old != b)
                 || self.reverse.get(&b).is_some_and(|old| *old != a)
             {
@@ -373,52 +386,58 @@ impl NodeComparison {
 
 fn compatible_semantics(
     p: &pb::Program,
-    a: &pb::Declaration,
-    b: &pb::Declaration,
+    a: Declaration<'_>,
+    b: Declaration<'_>,
 ) -> Result<bool, String> {
     let mut roots = [vec![], vec![]];
-    let mut declarations = [a.clone(), b.clone()];
-    for (d, roots) in declarations.iter_mut().zip(&mut roots) {
-        if let Some(pb::declaration::TableName::DefaultName(name)) = &d.table_name
-            && declaration_identity(d)? == name
-        {
-            d.table_name = None;
-        }
-        d.span = None;
-        d.doc = None;
-        match d.kind.as_mut().unwrap() {
-            pb::declaration::Kind::Constructor(c) => {
-                for a in &mut c.inputs {
-                    a.name.clear();
+    macro_rules! compare {
+        ($a:expr, $b:expr, $kind:ident, $table:ident) => {{
+            let mut records = [$a.clone(), $b.clone()];
+            for (d, roots) in records.iter_mut().zip(&mut roots) {
+                if let Some(pb::$table::TableName::DefaultName(name)) = &d.table_name
+                    && d.name == *name
+                {
+                    d.table_name = None;
                 }
+                d.doc = None;
+                declaration_refs(
+                    DeclarationMut::$kind(d),
+                    |_| Ok(()),
+                    |i| {
+                        roots.push(*i);
+                        *i = 0;
+                        Ok(())
+                    },
+                )?;
             }
-            pb::declaration::Kind::Function(c) => {
-                for a in &mut c.inputs {
-                    a.name.clear();
-                }
-            }
-            pb::declaration::Kind::Relation(r) => {
-                for a in &mut r.inputs {
-                    a.name.clear();
-                }
-            }
-            pb::declaration::Kind::UserDefinedPrimitive(c) => {
-                for a in &mut c.inputs {
-                    a.name.clear();
-                }
-            }
-        }
-        declaration_refs(
-            d,
-            |_| Ok(()),
-            |i| {
-                roots.push(*i);
-                *i = 0;
-                Ok(())
-            },
-        )?;
+            records[0] == records[1]
+        }};
     }
-    if declarations[0] != declarations[1] || roots[0].len() != roots[1].len() {
+    let equal = match (a, b) {
+        (Declaration::Constructor(a), Declaration::Constructor(b)) => {
+            compare!(a, b, Constructor, constructor)
+        }
+        (Declaration::Function(a), Declaration::Function(b)) => compare!(a, b, Function, function),
+        (Declaration::Relation(a), Declaration::Relation(b)) => compare!(a, b, Relation, relation),
+        (Declaration::UserDefinedPrimitive(a), Declaration::UserDefinedPrimitive(b)) => {
+            let mut records = [a.clone(), b.clone()];
+            for (d, roots) in records.iter_mut().zip(&mut roots) {
+                d.doc = None;
+                declaration_refs(
+                    DeclarationMut::UserDefinedPrimitive(d),
+                    |_| Ok(()),
+                    |i| {
+                        roots.push(*i);
+                        *i = 0;
+                        Ok(())
+                    },
+                )?;
+            }
+            records[0] == records[1]
+        }
+        _ => false,
+    };
+    if !equal || roots[0].len() != roots[1].len() {
         return Ok(false);
     }
     let mut comparison = NodeComparison::default();
@@ -437,11 +456,10 @@ pub fn reconcile_declarations(
     destination: &mut pb::Program,
 ) -> Result<Vec<bool>, String> {
     let mut staged = destination.clone();
-    let (sorts, files) = import_arenas(source, &mut staged)?;
+    let sorts = import_arenas(source, &mut staged)?;
     let mut importer = NodeImport {
         source,
         sorts: &sorts,
-        files: &files,
         nodes: &mut staged.nodes,
         imported: HashMap::default(),
         active: HashSet::default(),
@@ -476,10 +494,17 @@ pub fn reconcile_declarations(
             bindings.insert(name.clone(), (imported, sort));
         }
     }
-    let mut incoming = source.declarations.clone();
-    for d in &mut incoming {
+    let mut incoming = pb::Program {
+        constructors: source.constructors.clone(),
+        functions: source.functions.clone(),
+        relations: source.relations.clone(),
+        user_defined_primitives: source.user_defined_primitives.clone(),
+        ..Default::default()
+    };
+    for d in declarations(&incoming) {
         declaration_identity(d)?;
-        relocate_span(&mut d.span, source, &files)?;
+    }
+    for d in declarations_mut(&mut incoming) {
         declaration_refs(
             d,
             |i| {
@@ -495,20 +520,26 @@ pub fn reconcile_declarations(
         )?;
     }
     let mut added = vec![];
-    for d in incoming {
-        let identity = declaration_identity(&d)?;
-        let existing = staged
-            .declarations
-            .iter()
-            .position(|old| declaration_identity(old).ok() == Some(identity));
-        if let Some(i) = existing {
-            let old = staged.declarations[i].clone();
-            if !compatible_semantics(&staged, &old, &d)? {
+    for d in declarations(&incoming) {
+        let identity = declaration_identity(d)?;
+        let existing = declarations(&staged)
+            .find(|old| declaration_identity(*old).ok() == Some(identity))
+            .map(|old| compatible_semantics(&staged, old, d))
+            .transpose()?;
+        if let Some(compatible) = existing {
+            if !compatible {
                 return Err(format!("conflicting declaration {}", identity));
             }
             added.push(false);
         } else {
-            staged.declarations.push(d);
+            match d {
+                Declaration::Constructor(d) => staged.constructors.push(d.clone()),
+                Declaration::Function(d) => staged.functions.push(d.clone()),
+                Declaration::Relation(d) => staged.relations.push(d.clone()),
+                Declaration::UserDefinedPrimitive(d) => {
+                    staged.user_defined_primitives.push(d.clone())
+                }
+            }
             added.push(true);
         }
     }
@@ -524,7 +555,6 @@ pub fn reconcile_declarations(
 fn retain_imported_closures(p: &mut pb::Program, previous: &pb::Program) -> Result<(), String> {
     let mut nodes = (0..previous.nodes.len() as u32).collect::<HashSet<_>>();
     let mut sorts = (0..previous.sorts.len() as u32).collect::<HashSet<_>>();
-    let mut files = (0..previous.files.len() as u32).collect::<HashSet<_>>();
     let mut pending = nodes.iter().copied().collect::<Vec<_>>();
     pending.extend(p.nodes.iter().enumerate().filter_map(|(i, n)| {
         matches!(n.kind, Some(pb::node::Kind::Binding(_))).then_some(i as u32)
@@ -535,10 +565,7 @@ fn retain_imported_closures(p: &mut pb::Program, previous: &pb::Program) -> Resu
             .enumerate()
             .filter_map(|(i, s)| matches!(s.kind, Some(pb::sort::Kind::Eq(_))).then_some(i as u32)),
     );
-    for d in &mut p.declarations {
-        if let Some(s) = d.span {
-            files.insert(s.file);
-        }
+    for d in declarations_mut(p) {
         declaration_refs(
             d,
             |i| {
@@ -552,19 +579,10 @@ fn retain_imported_closures(p: &mut pb::Program, previous: &pb::Program) -> Resu
         )?;
     }
     for rule in crate::protobuf::graph::rules_mut(p) {
-        rule_refs(
-            rule,
-            |root| {
-                pending.push(*root);
-                Ok(())
-            },
-            |span| {
-                if let Some(span) = span {
-                    files.insert(span.file);
-                }
-                Ok(())
-            },
-        )?;
+        rule_refs(rule, |root| {
+            pending.push(*root);
+            Ok(())
+        })?;
     }
     let mut walked = HashSet::default();
     while let Some(i) = pending.pop() {
@@ -574,9 +592,6 @@ fn retain_imported_closures(p: &mut pb::Program, previous: &pb::Program) -> Resu
         nodes.insert(i);
         let n = &mut p.nodes[i as usize];
         sorts.insert(n.sort_id);
-        if let Some(s) = n.span {
-            files.insert(s.file);
-        }
         node_edges(n.kind.as_mut().ok_or("missing retained node kind")?, |i| {
             pending.push(*i);
             Ok(())
@@ -590,9 +605,6 @@ fn retain_imported_closures(p: &mut pb::Program, previous: &pb::Program) -> Resu
         }
         sorts.insert(i);
         let s = &p.sorts[i as usize];
-        if let Some(s) = s.span {
-            files.insert(s.file);
-        }
         if let Some(pb::sort::Kind::Primitive(f)) = &s.kind {
             pending.extend(&f.args);
         } else if let Some(pb::sort::Kind::Func(f)) = &s.kind {
@@ -602,12 +614,7 @@ fn retain_imported_closures(p: &mut pb::Program, previous: &pb::Program) -> Resu
     }
     let mut node_map = vec![None; p.nodes.len()];
     let mut sort_map = vec![None; p.sorts.len()];
-    let mut file_map = vec![None; p.files.len()];
-    for (keep, map) in [
-        (&nodes, &mut node_map),
-        (&sorts, &mut sort_map),
-        (&files, &mut file_map),
-    ] {
+    for (keep, map) in [(&nodes, &mut node_map), (&sorts, &mut sort_map)] {
         let mut next = 0;
         for (i, slot) in map.iter_mut().enumerate() {
             if keep.contains(&(i as u32)) {
@@ -626,25 +633,14 @@ fn retain_imported_closures(p: &mut pb::Program, previous: &pb::Program) -> Resu
         .enumerate()
         .filter_map(|(i, s)| sorts.contains(&(i as u32)).then_some(s))
         .collect();
-    p.files = std::mem::take(&mut p.files)
-        .into_iter()
-        .enumerate()
-        .filter_map(|(i, f)| files.contains(&(i as u32)).then_some(f))
-        .collect();
     for n in &mut p.nodes {
         n.sort_id = sort_map[n.sort_id as usize].unwrap();
-        if let Some(s) = &mut n.span {
-            s.file = file_map[s.file as usize].unwrap();
-        }
         node_edges(n.kind.as_mut().unwrap(), |i| {
             *i = node_map[*i as usize].unwrap();
             Ok(())
         })?;
     }
     for s in &mut p.sorts {
-        if let Some(span) = &mut s.span {
-            span.file = file_map[span.file as usize].unwrap();
-        }
         if let Some(pb::sort::Kind::Primitive(f)) = &mut s.kind {
             for i in &mut f.args {
                 *i = sort_map[*i as usize].unwrap();
@@ -655,10 +651,7 @@ fn retain_imported_closures(p: &mut pb::Program, previous: &pb::Program) -> Resu
             }
         }
     }
-    for d in &mut p.declarations {
-        if let Some(s) = &mut d.span {
-            s.file = file_map[s.file as usize].unwrap();
-        }
+    for d in declarations_mut(p) {
         declaration_refs(
             d,
             |i| {
@@ -672,19 +665,10 @@ fn retain_imported_closures(p: &mut pb::Program, previous: &pb::Program) -> Resu
         )?;
     }
     for rule in crate::protobuf::graph::rules_mut(p) {
-        rule_refs(
-            rule,
-            |root| {
-                *root = node_map[*root as usize].unwrap();
-                Ok(())
-            },
-            |span| {
-                if let Some(span) = span {
-                    span.file = file_map[span.file as usize].unwrap();
-                }
-                Ok(())
-            },
-        )?;
+        rule_refs(rule, |root| {
+            *root = node_map[*root as usize].unwrap();
+            Ok(())
+        })?;
     }
     Ok(())
 }
@@ -720,12 +704,12 @@ fn pattern_scope(p: &pb::Program, index: u32, parameters: usize) -> Result<(), S
 
 /// Validate semantic signature scopes and authored primitive bodies without execution.
 fn validate_semantics(p: &pb::Program) -> Result<(), String> {
-    for d in &p.declarations {
-        let (inputs, output) = match d.kind.as_ref().ok_or("missing declaration kind")? {
-            pb::declaration::Kind::Constructor(c) => (&c.inputs, Some(c.output)),
-            pb::declaration::Kind::Function(f) => (&f.inputs, Some(f.output)),
-            pb::declaration::Kind::Relation(r) => (&r.inputs, None),
-            pb::declaration::Kind::UserDefinedPrimitive(primitive) => {
+    for d in declarations(p) {
+        let (inputs, output) = match d {
+            Declaration::Constructor(c) => (&c.inputs, Some(c.output)),
+            Declaration::Function(f) => (&f.inputs, Some(f.output)),
+            Declaration::Relation(r) => (&r.inputs, None),
+            Declaration::UserDefinedPrimitive(primitive) => {
                 let root = primitive.body.ok_or("missing primitive body")?;
                 if p.nodes
                     .get(root as usize)
@@ -756,7 +740,7 @@ fn validate_semantics(p: &pb::Program) -> Result<(), String> {
                             .filter(|index| name == &format!("_{index}"));
                         if index
                             .and_then(|index| primitive.inputs.get(index))
-                            .is_none_or(|arg| arg.sort != node.sort_id)
+                            .is_none_or(|arg| *arg != node.sort_id)
                         {
                             return Err(format!(
                                 "unbound or inconsistently typed primitive variable {name}"
@@ -771,7 +755,7 @@ fn validate_semantics(p: &pb::Program) -> Result<(), String> {
                 (&primitive.inputs, Some(primitive.output))
             }
         };
-        for i in inputs.iter().map(|a| a.sort).chain(output) {
+        for i in inputs.iter().copied().chain(output) {
             pattern_scope(p, i, 0)?;
         }
     }

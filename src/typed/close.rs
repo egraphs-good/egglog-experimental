@@ -49,7 +49,7 @@ pub(super) fn binder(roots: &[Record]) -> Result<HashMap<String, String>, TypedE
                     used.insert(name.clone());
                     result.insert(token.clone(), name);
                 } else if token.starts_with("@typed:f:") {
-                    order.push(token.clone());
+                    order.push((token.clone(), owner.variable_hint));
                 } else {
                     return Err(TypedError::Invalid(
                         "foreign open binders require explicit adoption".into(),
@@ -90,7 +90,7 @@ pub(super) fn binder(roots: &[Record]) -> Result<HashMap<String, String>, TypedE
                     pending.push(r.resolve(Arena::Node, *i)?);
                 }
             }
-            Some(pb::node::Kind::Union(u)) => {
+            Some(pb::node::Kind::Eq(u)) => {
                 for i in u.members.iter().rev() {
                     pending.push(r.resolve(Arena::Node, *i)?);
                 }
@@ -152,8 +152,20 @@ pub(super) fn binder(roots: &[Record]) -> Result<HashMap<String, String>, TypedE
             _ => return Err(TypedError::Invalid("unsupported binder shape".into())),
         }
     }
+    // Explicit named variables keep their spelling. Reserve available hints
+    // before allocating generated names so a fresh scope never captures another.
+    for (token, hint) in &order {
+        if let Some(hint) = hint
+            && used.insert((*hint).to_owned())
+        {
+            result.insert(token.clone(), (*hint).to_owned());
+        }
+    }
     let mut next = 0usize;
-    for token in order {
+    for (token, _) in order {
+        if result.contains_key(&token) {
+            continue;
+        }
         loop {
             let name = format!("__typed_v_{next}");
             next += 1;

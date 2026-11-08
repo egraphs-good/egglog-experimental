@@ -543,13 +543,13 @@ fn remaining_scalar_catalog_preserves_closed_providers() {
             let index = if mutation == "output" {
                 s.output.unwrap()
             } else {
-                s.inputs[0].sort
+                s.inputs[0]
             };
             let other = catalog.sorts.iter().position(|sort| matches!(&sort.kind,
                 Some(proto::sort::Kind::Primitive(f)) if f.args.is_empty() && f.name != names[if mutation == "output" {names.len()-1} else {0}])).unwrap() as u32;
             assert_ne!(other, index);
             match mutation {
-                "input" => s.inputs[0].sort = other,
+                "input" => s.inputs[0] = other,
                 "output" => s.output = Some(other),
                 _ => {
                     s.inputs.pop();
@@ -596,9 +596,9 @@ fn remaining_scalar_generic_catalog_preserves_homogeneous_providers() {
         assert_eq!(signature.type_param_count, 1);
         assert_eq!(signature.inputs.len(), 2);
         assert!(signature.varargs.is_empty());
-        assert_eq!(signature.inputs[0].sort, signature.inputs[1].sort);
+        assert_eq!(signature.inputs[0], signature.inputs[1]);
         assert_eq!(
-            catalog.sorts[signature.inputs[0].sort as usize].kind,
+            catalog.sorts[signature.inputs[0] as usize].kind,
             Some(proto::sort::Kind::Var(0))
         );
         assert!(
@@ -759,9 +759,9 @@ fn inequality_catalog_uses_one_generic_registration() {
     assert_eq!(signature.type_param_count, 1);
     assert_eq!(signature.inputs.len(), 2);
     assert!(signature.varargs.is_empty());
-    assert_eq!(signature.inputs[0].sort, signature.inputs[1].sort);
+    assert_eq!(signature.inputs[0], signature.inputs[1]);
     assert_eq!(
-        catalog.definitions.sorts[signature.inputs[0].sort as usize].kind,
+        catalog.definitions.sorts[signature.inputs[0] as usize].kind,
         Some(proto::sort::Kind::Var(0))
     );
     assert!(
@@ -1076,7 +1076,7 @@ fn closed_i64_catalog_preserves_signatures_aliases_and_borrowed_views() {
             if corrupt_output {
                 signature.output = Some(float);
             } else {
-                signature.inputs[0].sort = float;
+                signature.inputs[0] = float;
             }
             assert!(
                 graph
@@ -1322,7 +1322,7 @@ fn exact_integer_families_and_constructors_use_actual_native_providers() {
         for (sort, name) in s
             .inputs
             .iter()
-            .map(|arg| arg.sort)
+            .copied()
             .chain(s.output)
             .zip(inputs.iter().copied().chain([output]))
         {
@@ -1476,38 +1476,24 @@ fn flat_map_export_packs_existing_refs_without_native_pair_vec_aliases() {
             panic!("primitive")
         };
         let mut program = proto::Program {
-            files: vec![proto::SourceFile {
-                name: "map.egg".into(),
-                contents: None,
-            }],
             ..Default::default()
         };
         assert!(primitive.export_builtin(&mut program).is_err());
         let sort_id = graph.export_sort(&n, &mut program.sorts).unwrap();
-        for offset in [0, 2] {
+        for _ in [0, 2] {
             program.nodes.push(proto::Node {
                 sort_id,
-                kind: Some(proto::node::Kind::Union(proto::Union::default())),
-                span: Some(proto::Span {
-                    file: 0,
-                    start: offset,
-                    end: offset + 1,
-                }),
+                kind: Some(proto::node::Kind::Eq(proto::Eq::default())),
             });
         }
         let original = program.nodes.clone();
         let args = [0, 1, 0, 0, 1, 0][..count * 2].to_vec();
-        let span = Some(proto::Span {
-            file: 0,
-            start: 0,
-            end: 10,
-        });
         let mut invalid = args.clone();
         invalid.push(0);
         let before = program.clone();
         assert!(
             primitive
-                .export_builtin_call(&graph, &invalid, span, &mut program)
+                .export_builtin_call(&graph, &invalid, &mut program)
                 .is_err()
         );
         assert_eq!(
@@ -1519,7 +1505,7 @@ fn flat_map_export_packs_existing_refs_without_native_pair_vec_aliases() {
             *first = program.nodes.len() as u32;
             assert!(
                 primitive
-                    .export_builtin_call(&graph, &invalid, span, &mut program)
+                    .export_builtin_call(&graph, &invalid, &mut program)
                     .is_err()
             );
             assert_eq!(
@@ -1528,7 +1514,7 @@ fn flat_map_export_packs_existing_refs_without_native_pair_vec_aliases() {
             );
         }
         let call = primitive
-            .export_builtin_call(&graph, &args, span, &mut program)
+            .export_builtin_call(&graph, &args, &mut program)
             .unwrap();
         assert_eq!(call.func, "egglog.core.map.of");
         assert_eq!(call.args.len(), 1);
@@ -1543,7 +1529,6 @@ fn flat_map_export_packs_existing_refs_without_native_pair_vec_aliases() {
             };
             assert_eq!(value.first, Some(fields[0]));
             assert_eq!(value.second, Some(fields[1]));
-            assert_eq!(pair.span, span);
         }
         let Some(proto::node::Kind::PrimitiveValue(proto::PrimitiveValue {
             value: Some(proto::primitive_value::Value::Vec(vector)),
@@ -1552,9 +1537,11 @@ fn flat_map_export_packs_existing_refs_without_native_pair_vec_aliases() {
             panic!("vector value")
         };
         assert_eq!(vector.items, (2..2 + count as u32).collect::<Vec<_>>());
-        assert_eq!(program.nodes.last().unwrap().span, span);
         assert!(
-            program.declarations.is_empty(),
+            program.constructors.is_empty()
+                && program.functions.is_empty()
+                && program.relations.is_empty()
+                && program.user_defined_primitives.is_empty(),
             "builtin signatures stay in GetBuiltins"
         );
         let catalog = graph
@@ -1580,7 +1567,7 @@ fn flat_map_export_packs_existing_refs_without_native_pair_vec_aliases() {
         assert_eq!(signature.inputs.len(), 1);
         assert!(signature.varargs.is_empty());
         let Some(proto::sort::Kind::Primitive(vector)) =
-            &catalog.sorts[signature.inputs[0].sort as usize].kind
+            &catalog.sorts[signature.inputs[0] as usize].kind
         else {
             panic!("Vec<Pair<K, V>> signature input")
         };
@@ -1630,7 +1617,7 @@ fn map_catalog_precedes_instances_and_uses_one_vec_of_pairs_input() {
             assert_eq!(signature.inputs.len(), 1);
             assert!(signature.varargs.is_empty());
             let Some(proto::sort::Kind::Primitive(vec)) =
-                &before.sorts[signature.inputs[0].sort as usize].kind
+                &before.sorts[signature.inputs[0] as usize].kind
             else {
                 panic!("Vec")
             };
@@ -1770,10 +1757,9 @@ fn resolved_call_export_checks_direct_annotations_and_preserves_ordinary_calls()
             kind: Some(proto::node::Kind::PrimitiveValue(proto::PrimitiveValue {
                 value: Some(proto::primitive_value::Value::I64(2)),
             })),
-            ..Default::default()
         });
         let call = primitive
-            .export_builtin_call(&graph, &[0, 0], None, &mut source.clone())
+            .export_builtin_call(&graph, &[0, 0], &mut source.clone())
             .unwrap();
         assert_eq!(call.func, key);
         if name != "map-of" {
@@ -1782,7 +1768,7 @@ fn resolved_call_export_checks_direct_annotations_and_preserves_ordinary_calls()
         for args in [&[0][..], &[0, 9][..], &[0, 0, 0][..]] {
             assert!(
                 primitive
-                    .export_builtin_call(&graph, args, None, &mut source.clone())
+                    .export_builtin_call(&graph, args, &mut source.clone())
                     .is_err()
             );
         }
@@ -1802,7 +1788,7 @@ fn resolved_call_export_checks_direct_annotations_and_preserves_ordinary_calls()
             bad.sorts[0].kind = Some(wrong);
             assert!(
                 primitive
-                    .export_builtin_call(&graph, &[0, 0], None, &mut bad)
+                    .export_builtin_call(&graph, &[0, 0], &mut bad)
                     .is_err()
             );
         }
@@ -1816,7 +1802,7 @@ fn resolved_call_export_checks_direct_annotations_and_preserves_ordinary_calls()
         );
         relocated.nodes[0].sort_id += 1;
         primitive
-            .export_builtin_call(&graph, &[0, 0], None, &mut relocated)
+            .export_builtin_call(&graph, &[0, 0], &mut relocated)
             .unwrap();
     }
     let ResolvedCall::Primitive(unsupported) = ResolvedCall::from_resolution(
@@ -1840,13 +1826,12 @@ fn resolved_call_export_checks_direct_annotations_and_preserves_ordinary_calls()
         nodes: vec![proto::Node {
             sort_id: 0,
             kind: Some(proto::node::Kind::Var("x".into())),
-            ..Default::default()
         }],
         ..Default::default()
     };
     assert!(
         unsupported
-            .export_builtin_call(&graph, &[0, 0], None, &mut source)
+            .export_builtin_call(&graph, &[0, 0], &mut source)
             .is_err()
     );
 }
@@ -1896,7 +1881,7 @@ fn constant_catalog_export_does_not_execute_the_body_or_validator() {
     let mut exported = proto::Program::default();
     assert_eq!(
         primitive
-            .export_builtin_call(&graph, &[], None, &mut exported)
+            .export_builtin_call(&graph, &[], &mut exported)
             .unwrap()
             .func,
         "test.constant"
@@ -2111,12 +2096,11 @@ fn scalar_variadic_aliases_share_resolved_provider_contexts_and_validators() {
                         kind: Some(proto::node::Kind::PrimitiveValue(proto::PrimitiveValue {
                             value: Some(value),
                         })),
-                        ..Default::default()
                     });
                 }
                 let args = (0..count as u32).rev().collect::<Vec<_>>();
                 let call = alias_prim
-                    .export_builtin_call(&graph, &args, None, &mut exported)
+                    .export_builtin_call(&graph, &args, &mut exported)
                     .unwrap();
                 assert_eq!(call.func, key);
                 assert_eq!(call.args, args);
@@ -2691,7 +2675,7 @@ fn pair_definitions_precede_instances_and_preserve_nominal_overloads() {
                 .unwrap() as u32,
         ];
         assert_eq!(
-            s.inputs.iter().map(|a| a.sort).collect::<Vec<_>>(),
+            s.inputs,
             inputs.into_iter().map(|i| patterns[i]).collect::<Vec<_>>()
         );
         assert_eq!(s.output, Some(patterns[output]));
@@ -2700,14 +2684,6 @@ fn pair_definitions_precede_instances_and_preserve_nominal_overloads() {
             unreachable!()
         };
         assert_eq!(f.args, patterns[..2]);
-        assert_eq!(
-            s.inputs.iter().map(|a| a.name.as_str()).collect::<Vec<_>>(),
-            if key == "make" {
-                vec!["first", "second"]
-            } else {
-                vec!["pair"]
-            }
-        );
     }
     graph
         .parse_and_run_program(
@@ -3315,14 +3291,8 @@ fn vec_tail_receiver_and_equality_restriction_are_exact() {
         let union = primitive.name.ends_with("union");
         assert_eq!(signature.type_param_count, 1);
         assert_eq!(signature.output, Some(1));
-        assert_eq!(
-            signature.inputs.iter().map(|a| a.sort).collect::<Vec<_>>(),
-            if union { vec![1, 1] } else { vec![] }
-        );
-        assert_eq!(
-            signature.varargs.iter().map(|a| a.sort).collect::<Vec<_>>(),
-            if union { vec![] } else { vec![1] }
-        );
+        assert_eq!(signature.inputs, if union { vec![1, 1] } else { vec![] });
+        assert_eq!(signature.varargs, if union { vec![] } else { vec![1] });
         let mut installed = proto::BuiltinCatalog::default();
         builtin::import_definition(&definition, &mut installed).unwrap();
         let mut invalid = definition.clone();
@@ -3408,11 +3378,6 @@ fn generic_signature_import_remaps_children_and_ignores_binder_labels() {
     };
     builtin::import_definition(&definition, &mut destination).unwrap();
     let before = destination.clone();
-    let primitive = &mut definition.primitives.last_mut().unwrap();
-    let Some(signature) = &mut primitive.signature else {
-        unreachable!()
-    };
-    signature.varargs[0].name = "renamed".into();
     builtin::import_definition(&definition, &mut destination).unwrap();
     assert_eq!(destination, before);
     definition.sorts[0].kind = Some(proto::sort::Kind::Var(1));
@@ -3432,20 +3397,12 @@ fn program_primitive_reconciliation_checks_body_scope_and_identity() {
         nodes: vec![proto::Node {
             sort_id: 0,
             kind: Some(proto::node::Kind::Var("_0".into())),
-            ..Default::default()
         }],
-        declarations: vec![proto::Declaration {
-            kind: Some(proto::declaration::Kind::UserDefinedPrimitive(
-                proto::UserDefinedPrimitive {
-                    name: "identity".into(),
-                    inputs: vec![proto::Arg {
-                        name: "value".into(),
-                        sort: 0,
-                    }],
-                    output: 0,
-                    body: Some(0),
-                },
-            )),
+        user_defined_primitives: vec![proto::UserDefinedPrimitive {
+            name: "identity".into(),
+            inputs: vec![0],
+            output: 0,
+            body: Some(0),
             ..Default::default()
         }],
         ..Default::default()
@@ -3463,7 +3420,6 @@ fn program_primitive_reconciliation_checks_body_scope_and_identity() {
     );
     let before = destination.clone();
     for mutation in [
-        "label",
         "missing",
         "bounds",
         "free",
@@ -3476,13 +3432,8 @@ fn program_primitive_reconciliation_checks_body_scope_and_identity() {
         "lambda",
     ] {
         let mut candidate = source.clone();
-        let Some(proto::declaration::Kind::UserDefinedPrimitive(primitive)) =
-            &mut candidate.declarations[0].kind
-        else {
-            unreachable!()
-        };
+        let primitive = &mut candidate.user_defined_primitives[0];
         match mutation {
-            "label" => primitive.inputs[0].name = "renamed".into(),
             "missing" => primitive.body = None,
             "bounds" => primitive.body = Some(9),
             "free" => candidate.nodes[0].kind = Some(proto::node::Kind::Var("outer".into())),
@@ -3504,17 +3455,15 @@ fn program_primitive_reconciliation_checks_body_scope_and_identity() {
                         value: Some(proto::primitive_value::Value::I64(1)),
                     }))
             }
-            "shared-scope" => candidate.declarations.push(proto::Declaration {
-                kind: Some(proto::declaration::Kind::UserDefinedPrimitive(
-                    proto::UserDefinedPrimitive {
-                        name: "nullary".into(),
-                        inputs: vec![],
-                        output: 0,
-                        body: Some(0),
-                    },
-                )),
-                ..Default::default()
-            }),
+            "shared-scope" => candidate
+                .user_defined_primitives
+                .push(proto::UserDefinedPrimitive {
+                    name: "nullary".into(),
+                    inputs: vec![],
+                    output: 0,
+                    body: Some(0),
+                    ..Default::default()
+                }),
             "cycle" => {
                 candidate.nodes[0].kind = Some(proto::node::Kind::Call(proto::Call {
                     func: "identity".into(),
@@ -3533,11 +3482,7 @@ fn program_primitive_reconciliation_checks_body_scope_and_identity() {
             _ => unreachable!(),
         }
         let result = builtin::definitions::reconcile_declarations(&candidate, &mut destination);
-        assert_eq!(
-            result.is_ok(),
-            mutation == "label",
-            "{mutation}: {result:?}"
-        );
+        assert!(result.is_err(), "{mutation}: {result:?}");
         assert_eq!(destination, before, "{mutation}");
         let mut fresh = proto::Program::default();
         let fresh_result = builtin::definitions::reconcile_declarations(&candidate, &mut fresh);
@@ -3548,17 +3493,13 @@ fn program_primitive_reconciliation_checks_body_scope_and_identity() {
         );
     }
     let mut distinct = source;
-    let Some(proto::declaration::Kind::UserDefinedPrimitive(primitive)) =
-        &mut distinct.declarations[0].kind
-    else {
-        unreachable!()
-    };
+    let primitive = &mut distinct.user_defined_primitives[0];
     primitive.name = "another_identity".into();
     assert_eq!(
         builtin::definitions::reconcile_declarations(&distinct, &mut destination).unwrap(),
         [true]
     );
-    assert_eq!(destination.declarations.len(), 2);
+    assert_eq!(destination.user_defined_primitives.len(), 2);
 }
 
 #[test]
@@ -3776,7 +3717,7 @@ fn native_builtin_arity_errors_keep_source_aliases() {
 }
 
 #[test]
-fn imported_signatures_keep_namespaces_and_diagnostic_labels_separate() {
+fn imported_signatures_keep_namespaces_separate_and_reject_changed_arity() {
     let graph = EGraph::default();
     let sort = graph.get_sort_by_name("i64").unwrap().clone();
     let definition =
@@ -3791,17 +3732,13 @@ fn imported_signatures_keep_namespaces_and_diagnostic_labels_separate() {
         destination.primitives[0].name
     );
     let before = destination.clone();
-    let mut relabeled = definition.clone();
-    let Some(signature) = &mut relabeled.primitives[0].signature else {
-        unreachable!()
-    };
-    signature.inputs[0].name = "diagnostic label".into();
-    builtin::import_definition(&relabeled, &mut destination).unwrap();
+    let mut changed = definition.clone();
+    builtin::import_definition(&changed, &mut destination).unwrap();
     assert_eq!(destination, before);
-    let Some(signature) = &mut relabeled.primitives[0].signature else {
+    let Some(signature) = &mut changed.primitives[0].signature else {
         unreachable!()
     };
     signature.inputs.clear();
-    assert!(builtin::import_definition(&relabeled, &mut destination).is_err());
+    assert!(builtin::import_definition(&changed, &mut destination).is_err());
     assert_eq!(destination, before);
 }

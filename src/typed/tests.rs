@@ -5,6 +5,7 @@ use super::{
     pb,
     storage::{Arena, DeclarationKind, Packer, Record, Slot, publish},
 };
+use crate::builtin::definitions::{Declaration, declarations};
 pub(super) use crate::protobuf::fixtures as observations;
 
 use observations::Observed;
@@ -79,10 +80,7 @@ fn function_values_author_computed_lambda_bodies_without_helper_declarations() {
                 value: Some(pb::primitive_value::Value::Lambda(_))
             }))
         )));
-        assert!(!program.declarations.iter().any(|declaration| matches!(
-            &declaration.kind,
-            Some(pb::declaration::Kind::UserDefinedPrimitive(_))
-        )));
+        assert!(program.user_defined_primitives.is_empty());
     }
     assert!(graph.check(eq(plus_one.call(5), 6)).unwrap());
     let sort = Function::<(I64,), I64>::sort_ref();
@@ -260,7 +258,7 @@ fn function_values_reject_deferred_unions_without_eager_allocation() {
         publish(
             pb::Program {
                 nodes: vec![pb::Node {
-                    kind: Some(pb::node::Kind::Union(pb::Union { members: vec![] })),
+                    kind: Some(pb::node::Kind::Eq(pb::Eq { members: vec![] })),
                     ..Default::default()
                 }],
                 ..Default::default()
@@ -274,7 +272,7 @@ fn function_values_reject_deferred_unions_without_eager_allocation() {
         .unwrap(),
     ));
     let error = Function::<(), ActionTerm>::new(|| fresh).unwrap_err();
-    assert!(error.to_string().contains("Unions in callback bodies"));
+    assert!(error.to_string().contains("Eq nodes in callback bodies"));
 }
 
 #[test]
@@ -443,8 +441,7 @@ fn union_subsume_records_preserve_operands_closure_and_identity() {
             kind: Some(pb::action::Kind::Subsume(call)), ..
         })) if call.func == name && call.args == args)
         );
-        assert!(program.declarations.iter().any(|d| matches!(&d.kind,
-            Some(pb::declaration::Kind::Constructor(c)) if c.name == name)));
+        assert!(program.constructors.iter().any(|c| c.name == name));
     }
     assert_eq!(
         pb::Program::decode(program.encode_to_vec().as_slice()).unwrap(),
@@ -467,7 +464,7 @@ fn union_subsume_records_preserve_operands_closure_and_identity() {
         .collect();
     assert_eq!(roots[0], roots[1]);
     assert_ne!(roots[0], roots[2]);
-    let Some(pb::node::Kind::Union(first)) = &program.nodes[roots[0] as usize].kind else {
+    let Some(pb::node::Kind::Eq(first)) = &program.nodes[roots[0] as usize].kind else {
         panic!()
     };
     assert_eq!(first.members.len(), 2);
@@ -532,7 +529,12 @@ fn typed_table_actions_preserve_exact_wire_operands_and_real_execution() {
             }))
         );
     }
-    assert!(program.declarations.iter().any(|d| matches!(&d.kind, Some(pb::declaration::Kind::Function(f)) if f.name == "Read" && f.inputs.len() == 1 && f.merge.is_none())));
+    assert!(
+        program
+            .functions
+            .iter()
+            .any(|f| f.name == "Read" && f.inputs.len() == 1 && f.merge.is_none())
+    );
     let mut decoded = pb::Program::decode(program.encode_to_vec().as_slice()).unwrap();
     assert_eq!(decoded, program);
     decoded.nodes.push(pb::Node {
@@ -541,7 +543,6 @@ fn typed_table_actions_preserve_exact_wire_operands_and_real_execution() {
             func: "Read".into(),
             args: vec![0],
         })),
-        ..Default::default()
     });
     let extraction = pb::Command {
         kind: Some(pb::command::Kind::Extract(pb::Extract {
@@ -550,7 +551,6 @@ fn typed_table_actions_preserve_exact_wire_operands_and_real_execution() {
             extractor: pb::Extractor::Tree.into(),
             ..Default::default()
         })),
-        ..Default::default()
     };
     decoded.commands.insert(1, extraction.clone());
     decoded.commands.push(extraction);
@@ -627,7 +627,7 @@ fn typed_table_heads_import_nullary_targets_close_one_binder_and_keep_shared_uni
         I64::sort_ref(),
         None::<fn(Expr, Expr) -> Expr>,
     );
-    let x = super::expr::variable::<I64>(super::expr::fresh_scope(), 0);
+    let x = super::expr::variable::<I64>(super::expr::fresh_scope(), 0, None);
     let shared = I64::from_expression(eq(&x, 1).0);
     let target = I64::from_expression(Expr::call(&definition, vec![shared.expression().clone()]));
     let nullary = I64::from_expression(Expr::call(&nullary, vec![]));
@@ -656,37 +656,34 @@ fn typed_table_heads_import_nullary_targets_close_one_binder_and_keep_shared_uni
     for name in ["HeadOnly", "Nullary"] {
         let record = &packer.declarations[name];
         assert!(matches!(
-            &record.owner.as_ref().unwrap().program().unwrap().declarations[record.index as usize].kind,
-            Some(pb::declaration::Kind::Function(function)) if function.name == name
+            record.callable().unwrap(),
+            Declaration::Function(function) if function.name == name
         ));
-        assert!(packer.program.declarations.iter().any(
-            |d| matches!(&d.kind, Some(pb::declaration::Kind::Function(f)) if f.name == name)
-        ));
+        assert!(packer.program.functions.iter().any(|f| f.name == name));
     }
     let Some(pb::rule::Kind::Rule(body)) = &packer.rules[0].kind else {
         panic!()
     };
-    let Some(pb::action::Kind::Set(first)) = &body.head[0].kind else {
+    let Some(pb::action::Kind::Set(first)) = &body.actions[0].kind else {
         panic!()
     };
-    let Some(pb::action::Kind::Delete(second)) = &body.head[1].kind else {
+    let Some(pb::action::Kind::Delete(second)) = &body.actions[1].kind else {
         panic!()
     };
     assert_eq!(first.target.as_ref().unwrap().args, second.args);
     assert_eq!(
         first.value,
         Some(second.args[0]),
-        "one imported Union occurrence stays one node"
+        "one imported Eq occurrence stays one node"
     );
-    let Some(pb::node::Kind::Union(shared)) = &packer.program.nodes[second.args[0] as usize].kind
+    let Some(pb::node::Kind::Eq(shared)) = &packer.program.nodes[second.args[0] as usize].kind
     else {
         panic!()
     };
-    let Some(pb::node::Kind::Union(query)) = &packer.program.nodes[body.query[0] as usize].kind
-    else {
+    let Some(pb::node::Kind::Eq(query)) = &packer.program.nodes[body.query[0] as usize].kind else {
         panic!()
     };
-    let Some(pb::action::Kind::Set(last)) = &body.head[2].kind else {
+    let Some(pb::action::Kind::Set(last)) = &body.actions[2].kind else {
         panic!()
     };
     assert!(last.target.as_ref().unwrap().args.is_empty());
@@ -695,7 +692,7 @@ fn typed_table_heads_import_nullary_targets_close_one_binder_and_keep_shared_uni
     let Some(pb::rule::Kind::Rule(other)) = &packer.rules[1].kind else {
         panic!()
     };
-    let Some(pb::action::Kind::Set(other)) = &other.head[0].kind else {
+    let Some(pb::action::Kind::Set(other)) = &other.actions[0].kind else {
         panic!()
     };
     assert_ne!(
@@ -875,9 +872,59 @@ fn exact_number_literals_close_pack_compare_and_hash_by_canonical_payload() {
 }
 
 #[test]
+fn preferred_variable_names_preserve_fresh_identity_and_avoid_capture() {
+    use super::expr::{fresh_scope, variable};
+    use super::{EgglogValue, builtins::I64, var};
+    use std::hash::{DefaultHasher, Hash, Hasher};
+    let scope = fresh_scope();
+    let hinted = variable::<I64>(scope, 0, Some("e"));
+    let relabeled = variable::<I64>(scope, 0, Some("other presentation"));
+    assert_eq!(hinted, relabeled, "presentation is not lexical identity");
+    let mut hinted_hash = DefaultHasher::new();
+    let mut relabeled_hash = DefaultHasher::new();
+    hinted.hash(&mut hinted_hash);
+    relabeled.hash(&mut relabeled_hash);
+    assert_eq!(hinted_hash.finish(), relabeled_hash.finish());
+    let cloned = hinted.clone();
+    let other = variable::<I64>(fresh_scope(), 0, Some("e"));
+    let named = var::<I64>("e");
+    let reserved = variable::<I64>(fresh_scope(), 0, Some("__typed_v_0"));
+    let anonymous = variable::<I64>(fresh_scope(), 0, None);
+    assert_ne!(hinted, other);
+    assert_ne!(hinted, named);
+    let roots: Vec<_> = [&hinted, &cloned, &other, &named, &reserved, &anonymous]
+        .into_iter()
+        .map(|value| value.expression().0.clone())
+        .collect();
+    let closed = super::close::binder(&roots).unwrap();
+    let names: Vec<_> = roots
+        .iter()
+        .map(|root| {
+            let Some(pb::node::Kind::Var(token)) =
+                &root.owner.as_ref().unwrap().program().unwrap().nodes[root.index as usize].kind
+            else {
+                panic!("variable")
+            };
+            closed[token].as_str()
+        })
+        .collect();
+    assert_eq!(
+        names,
+        [
+            "__typed_v_1",
+            "__typed_v_1",
+            "__typed_v_2",
+            "e",
+            "__typed_v_0",
+            "__typed_v_3"
+        ]
+    );
+}
+
+#[test]
 fn rule_conditions_relocate_once_and_close_the_whole_ordered_binder() {
     use super::{builtins::I64, eq, rule, var};
-    let fresh = super::expr::variable::<I64>(super::expr::fresh_scope(), 0);
+    let fresh = super::expr::variable::<I64>(super::expr::fresh_scope(), 0, None);
     let named = var::<I64>("__typed_v_0");
     let original = rule(eq(&fresh, 7), (&fresh, &named));
     let unchanged = original.clone().when(());
@@ -904,10 +951,10 @@ fn rule_conditions_relocate_once_and_close_the_whole_ordered_binder() {
         panic!()
     };
     assert_eq!(body.query.len(), 3);
-    assert_eq!(body.head.len(), 2);
+    assert_eq!(body.actions.len(), 2);
     let mut variables = vec![];
     for (fact, value) in body.query.iter().zip([7, 8, 9]) {
-        let Some(pb::node::Kind::Union(equality)) = &program.nodes[*fact as usize].kind else {
+        let Some(pb::node::Kind::Eq(equality)) = &program.nodes[*fact as usize].kind else {
             panic!()
         };
         assert_eq!(equality.members.len(), 2);
@@ -921,7 +968,7 @@ fn rule_conditions_relocate_once_and_close_the_whole_ordered_binder() {
     }
     assert_eq!(variables[0], variables[2]);
     for (action, (variable, name)) in body
-        .head
+        .actions
         .iter()
         .zip(variables.iter().zip(["__typed_v_1", "__typed_v_0"]))
     {
@@ -953,11 +1000,11 @@ fn registration_and_rule_heads_use_the_same_canonical_action_input() {
         panic!()
     };
     assert!(body.query.is_empty());
-    assert_eq!(body.head.len(), 3);
+    assert_eq!(body.actions.len(), 3);
     assert_eq!(packed.program.nodes, commands.nodes);
     assert_eq!(packed.program.sorts, commands.sorts);
-    assert_eq!(packed.program.declarations, commands.declarations);
-    for (head, command) in body.head.iter().zip(commands.commands) {
+    assert!(declarations(&packed.program).eq(declarations(&commands)));
+    for (head, command) in body.actions.iter().zip(commands.commands) {
         assert_eq!(command.kind, Some(pb::command::Kind::Action(head.clone())));
     }
 }
@@ -984,12 +1031,10 @@ fn nested_fail_keeps_packed_roots_and_fragment_admission() {
         kind: Some(pb::command::Kind::Check(pb::Check {
             facts: facts.clone(),
         })),
-        ..Default::default()
     };
     for _ in 0..2 {
         command = pb::Command {
             kind: Some(pb::command::Kind::Fail(Box::new(command))),
-            ..Default::default()
         };
     }
     packer.program.commands.push(command);
@@ -1007,10 +1052,10 @@ fn nested_fail_keeps_packed_roots_and_fragment_admission() {
             facts: facts.clone(),
         }))
     );
-    let Some(pb::node::Kind::Union(first)) = &program.nodes[facts[0] as usize].kind else {
+    let Some(pb::node::Kind::Eq(first)) = &program.nodes[facts[0] as usize].kind else {
         panic!("missing first equality")
     };
-    let Some(pb::node::Kind::Union(second)) = &program.nodes[facts[1] as usize].kind else {
+    let Some(pb::node::Kind::Eq(second)) = &program.nodes[facts[1] as usize].kind else {
         panic!("missing second equality")
     };
     assert_eq!(program.nodes.len(), 4);
@@ -1183,16 +1228,16 @@ fn namespace_fragment(imported: bool, reversed: bool, missing: Option<Declaratio
         ..Default::default()
     })
     .unwrap();
-    let mut declarations = vec![(
-        DeclarationKind::Callable,
-        pb::declaration::Kind::Constructor(pb::Constructor {
+    let mut constructors = (missing != Some(DeclarationKind::Callable))
+        .then(|| pb::Constructor {
             name: "Shared".into(),
             output: 0,
             ..Default::default()
-        }),
-    )];
+        })
+        .into_iter()
+        .collect::<Vec<_>>();
     if reversed {
-        declarations.reverse();
+        constructors.reverse();
     }
     let mut program = pb::Program {
         sorts: vec![
@@ -1214,16 +1259,8 @@ fn namespace_fragment(imported: bool, reversed: bool, missing: Option<Declaratio
                 func: "Shared".into(),
                 args: vec![],
             })),
-            ..Default::default()
         }],
-        declarations: declarations
-            .into_iter()
-            .filter(|(kind, _)| Some(*kind) != missing)
-            .map(|(_, kind)| pb::Declaration {
-                kind: Some(kind),
-                ..Default::default()
-            })
-            .collect(),
+        constructors,
         ..Default::default()
     };
     let slots = || {
@@ -1242,12 +1279,12 @@ fn namespace_fragment(imported: bool, reversed: bool, missing: Option<Declaratio
             vec![],
         )
         .unwrap();
-        imports.extend((0..program.declarations.len()).map(|index| Record {
+        imports.extend((0..program.constructors.len()).map(|index| Record {
             owner: source.owner.clone(),
-            arena: Arena::Declaration,
+            arena: Arena::Constructor,
             index: index as u32,
         }));
-        program.declarations.clear();
+        program.constructors.clear();
     }
     publish(program, slots(), imports, Arena::Node, 0, vec![]).unwrap()
 }
@@ -1277,20 +1314,13 @@ fn nominal_family_and_callable_names_close_independently() {
                         matches!(&declaration.owner.as_ref().unwrap().program().unwrap().sorts[declaration.index as usize].kind, Some(pb::sort::Kind::Eq(name)) if name == "Shared")
                     );
                 } else {
-                    let definition = &declaration
-                        .owner
-                        .as_ref()
-                        .unwrap()
-                        .program()
-                        .unwrap()
-                        .declarations[declaration.index as usize];
-                    assert!(matches!(
-                        &definition.kind,
-                        Some(pb::declaration::Kind::Constructor(_))
-                    ));
+                    let Declaration::Constructor(definition) = declaration.callable().unwrap()
+                    else {
+                        panic!("constructor")
+                    };
                     // Wrong-kind local records must not shadow the correct import.
                     let mut program = root.owner.as_ref().unwrap().program().unwrap().clone();
-                    program.declarations.retain(|d| d != definition);
+                    program.constructors.retain(|d| d != definition);
                     let mut slots = std::array::from_fn(|_| vec![]);
                     slots[Arena::Sort as usize] = vec![Slot::Local(0), Slot::Local(1)];
                     let mixed = publish(
@@ -1332,12 +1362,17 @@ fn nominal_family_and_callable_names_close_independently() {
                     packer.intern(record, 0);
                 }
                 packer.finish().unwrap();
-                assert_eq!(packer.program.declarations.len(), 1);
+                assert_eq!(packer.program.constructors.len(), 1);
                 assert!(packer.program.sorts.iter().any(
                     |s| matches!(&s.kind, Some(pb::sort::Kind::Eq(name)) if name == "Shared")
                 ));
-                assert!(packer.program.declarations.iter().any(|d| matches!(&d.kind,
-                    Some(pb::declaration::Kind::Constructor(d)) if d.name == "Shared")));
+                assert!(
+                    packer
+                        .program
+                        .constructors
+                        .iter()
+                        .any(|d| d.name == "Shared")
+                );
                 assert!(
                     packer
                         .builtin_demands
@@ -1389,18 +1424,16 @@ fn namespace_split_keeps_same_kind_and_callable_kind_conflicts() {
         let mut imports = root.owner.as_ref().unwrap().declarations.clone();
         match changed {
             1 => {
-                let Some(pb::declaration::Kind::Constructor(d)) = &mut program.declarations[0].kind
-                else {
-                    panic!()
-                };
+                let d = &mut program.constructors[0];
                 d.unextractable = true;
             }
             2 => {
-                program.declarations[0].kind = Some(pb::declaration::Kind::Function(pb::Function {
+                program.constructors.clear();
+                program.functions.push(pb::Function {
                     name: "Shared".into(),
                     output: 0,
                     ..Default::default()
-                }))
+                });
             }
             3 => {
                 imports = vec![
@@ -1545,25 +1578,12 @@ fn generic_tail_patterns_keep_group_width_and_share_every_binding() {
                 name: "test.grouped".into(),
                 signature: Some(pb::GenericSignature {
                     type_param_count: parameters,
-                    inputs: inputs
-                        .iter()
-                        .map(|sort| pb::Arg {
-                            sort: *sort,
-                            ..Default::default()
-                        })
-                        .collect(),
-                    varargs: tail
-                        .iter()
-                        .map(|sort| pb::Arg {
-                            sort: *sort,
-                            ..Default::default()
-                        })
-                        .collect(),
+                    inputs: inputs.to_vec(),
+                    varargs: tail.to_vec(),
                     output: Some(output),
                 }),
                 ..Default::default()
             }],
-            ..Default::default()
         })
         .unwrap();
         Callable(
@@ -1682,25 +1702,13 @@ fn grouped_builtin_demands_retain_every_tail_position() {
             primitives: vec![pb::Primitive {
                 name: "test.relocated.group".into(),
                 signature: Some(pb::GenericSignature {
-                    inputs: vec![pb::Arg {
-                        sort: tail[0],
-                        name: "prefix".into(),
-                    }],
+                    inputs: vec![tail[0]],
                     output: Some(tail[0]),
-                    varargs: tail
-                        .into_iter()
-                        .enumerate()
-                        .map(|(i, sort)| pb::Arg {
-                            sort,
-                            name: format!("item{i}"),
-                        })
-                        .collect(),
+                    varargs: tail,
                     ..Default::default()
                 }),
                 doc: Some("retain complete grouped record".into()),
-                ..Default::default()
             }],
-            ..Default::default()
         })
         .unwrap();
         Callable(
@@ -1718,7 +1726,7 @@ fn grouped_builtin_demands_retain_every_tail_position() {
         let mut packer = Packer::default();
         packer.intern(callable.0.clone(), 0);
         packer.finish().unwrap();
-        assert!(packer.program.declarations.is_empty());
+        assert!(declarations(&packer.program).next().is_none());
         assert!(packer.program.sorts.is_empty());
         let demand = &packer.builtin_demands[0];
         let primitive = demand.primitive().unwrap();
@@ -1730,15 +1738,9 @@ fn grouped_builtin_demands_retain_every_tail_position() {
             panic!()
         };
         assert_eq!(signature.varargs.len(), 3);
-        for (position, (arg, name)) in signature
-            .varargs
-            .iter()
-            .zip(["i64", "f64", "i64"])
-            .enumerate()
-        {
-            assert_eq!(arg.name, format!("item{position}"));
+        for (arg, name) in signature.varargs.iter().zip(["i64", "f64", "i64"]) {
             assert!(
-                matches!(&demand.resolve(Arena::Sort,arg.sort).unwrap().sort().unwrap().kind,
+                matches!(&demand.resolve(Arena::Sort,*arg).unwrap().sort().unwrap().kind,
                 Some(pb::sort::Kind::Primitive(f)) if f.name == name)
             );
         }
@@ -1797,7 +1799,7 @@ fn set_values_relocate_without_changing_order_multiplicity_or_occurrences() {
     );
 
     let named = super::var::<I64>("__typed_v_0");
-    let fresh = super::expr::variable::<I64>(super::expr::fresh_scope(), 0);
+    let fresh = super::expr::variable::<I64>(super::expr::fresh_scope(), 0, None);
     let open = value(
         vec![1, 0, 1],
         vec![named.expression().0.clone(), fresh.expression().0.clone()],
@@ -1830,7 +1832,7 @@ fn set_values_relocate_without_changing_order_multiplicity_or_occurrences() {
     let union = || {
         node(
             &atom,
-            pb::node::Kind::Union(pb::Union { members: vec![] }),
+            pb::node::Kind::Eq(pb::Eq { members: vec![] }),
             vec![],
             vec![],
         )
@@ -1864,7 +1866,7 @@ fn set_values_relocate_without_changing_order_multiplicity_or_occurrences() {
         for index in &items.items {
             assert!(matches!(
                 packed.nodes[*index as usize].kind,
-                Some(pb::node::Kind::Union(_))
+                Some(pb::node::Kind::Eq(_))
             ));
         }
     }
@@ -1977,7 +1979,7 @@ fn map_values_preserve_order_aliases_structural_hash_and_open_binders() {
         vec![[0, 1]],
         vec![
             super::var::<I64>("key").expression().0.clone(),
-            super::expr::variable::<I64>(super::expr::fresh_scope(), 0)
+            super::expr::variable::<I64>(super::expr::fresh_scope(), 0, None)
                 .expression()
                 .0
                 .clone(),
@@ -2161,7 +2163,7 @@ fn map_publication_requires_both_refs_and_preserves_union_identity() {
     let union = || {
         node(
             &atom,
-            pb::node::Kind::Union(pb::Union { members: vec![] }),
+            pb::node::Kind::Eq(pb::Eq { members: vec![] }),
             vec![],
             vec![],
         )
@@ -2195,7 +2197,7 @@ fn map_publication_requires_both_refs_and_preserves_union_identity() {
     assert_eq!(map.entries[0].key, map.entries[0].value);
     assert!(matches!(
         packed.nodes[map.entries[0].key.unwrap() as usize].kind,
-        Some(pb::node::Kind::Union(_))
+        Some(pb::node::Kind::Eq(_))
     ));
 }
 
@@ -2258,7 +2260,7 @@ fn pair_fields_relocate_preserve_aliases_and_reject_impostors() {
     assert_eq!(i64::try_from(&I64::from_expression(left)).unwrap(), 7);
 
     let variable = super::var::<I64>("named");
-    let fresh = super::expr::variable::<I64>(super::expr::fresh_scope(), 0);
+    let fresh = super::expr::variable::<I64>(super::expr::fresh_scope(), 0, None);
     let open = value(
         [1, 0],
         vec![
@@ -2379,7 +2381,7 @@ fn pair_values_keep_union_allocation_identity() {
     let union = || {
         node(
             &atom,
-            pb::node::Kind::Union(pb::Union { members: vec![] }),
+            pb::node::Kind::Eq(pb::Eq { members: vec![] }),
             vec![],
             vec![],
         )
@@ -2415,7 +2417,7 @@ fn pair_values_keep_union_allocation_identity() {
     assert_eq!(pair.first, pair.second);
     assert!(matches!(
         packed.nodes[pair.first.unwrap() as usize].kind,
-        Some(pb::node::Kind::Union(_))
+        Some(pb::node::Kind::Eq(_))
     ));
 }
 
@@ -2480,7 +2482,7 @@ fn vec_calls_and_values_preserve_actual_ordered_child_records() {
     );
 
     let named = super::var::<I64>("__typed_v_0");
-    let fresh = super::expr::variable::<I64>(super::expr::fresh_scope(), 0);
+    let fresh = super::expr::variable::<I64>(super::expr::fresh_scope(), 0, None);
     let with_variables = value(
         vec![1, 0, 1],
         vec![named.expression().0.clone(), fresh.expression().0.clone()],
@@ -2551,7 +2553,7 @@ fn scalar_records_remain_authoritative_and_parents_are_reclaimed() {
             })) if *value == expected));
     }
     assert_eq!(
-        packed.declarations.len(),
+        declarations(&packed).count(),
         0,
         "builtin descriptors remain in the ambient catalog"
     );
@@ -2605,7 +2607,7 @@ fn builtin_calls_read_owned_definitions_not_cached_signatures() {
         matches!(&packed.nodes[0].kind,Some(pb::node::Kind::Call(c)) if c.func == "test.changed.generated.key")
     );
     assert!(
-        packed.declarations.is_empty(),
+        declarations(&packed).next().is_none(),
         "backend descriptors never enter Programs"
     );
 }
@@ -2644,7 +2646,6 @@ fn packed_query(roots: &[Record]) -> pb::Program {
     let facts = roots.iter().map(|r| packer.intern(r.clone(), 1)).collect();
     packer.program.commands.push(pb::Command {
         kind: Some(pb::command::Kind::Check(pb::Check { facts })),
-        ..Default::default()
     });
     packer.finish().unwrap();
     packer.program
@@ -2798,12 +2799,8 @@ fn context_sensitive_packing_and_slot_permutation() {
         vec![call.0, other.0],
     );
     let packed = packed_query(&[changed]);
-    assert!(packed.declarations.iter().any(
-        |d| matches!(&d.kind, Some(pb::declaration::Kind::Constructor(c)) if c.name == "Other")
-    ));
-    assert!(!packed.declarations.iter().any(
-        |d| matches!(&d.kind, Some(pb::declaration::Kind::Constructor(c)) if c.name == "Pair")
-    ));
+    assert!(packed.constructors.iter().any(|c| c.name == "Other"));
+    assert!(!packed.constructors.iter().any(|c| c.name == "Pair"));
 }
 
 #[test]
@@ -2811,13 +2808,13 @@ fn shared_union_identity_and_flat_cycle_reclamation() {
     let sort = SortRef::equality("M");
     let a = node(
         &sort,
-        pb::node::Kind::Union(pb::Union { members: vec![] }),
+        pb::node::Kind::Eq(pb::Eq { members: vec![] }),
         vec![],
         vec![],
     );
     let b = node(
         &sort,
-        pb::node::Kind::Union(pb::Union { members: vec![] }),
+        pb::node::Kind::Eq(pb::Eq { members: vec![] }),
         vec![],
         vec![],
     );
@@ -2833,7 +2830,7 @@ fn shared_union_identity_and_flat_cycle_reclamation() {
     let cycle = publish(
         pb::Program {
             nodes: vec![pb::Node {
-                kind: Some(pb::node::Kind::Union(pb::Union { members: vec![0] })),
+                kind: Some(pb::node::Kind::Eq(pb::Eq { members: vec![0] })),
                 ..Default::default()
             }],
             ..Default::default()
@@ -2851,7 +2848,7 @@ fn shared_union_identity_and_flat_cycle_reclamation() {
     p.finish().unwrap();
     assert_eq!(
         p.program.nodes[0].kind,
-        Some(pb::node::Kind::Union(pb::Union { members: vec![0] }))
+        Some(pb::node::Kind::Eq(pb::Eq { members: vec![0] }))
     );
     drop((p, cycle));
     assert!(weak.upgrade().is_none());
@@ -2949,89 +2946,89 @@ fn declaration_diagnostics_do_not_change_local_compatibility() {
         &Callable::constructor("Leaf", vec![], sort.clone(), None, false),
         vec![],
     );
-    let declaration = |label: &str, doc: Option<&str>, unextractable: bool| {
-        let mut slots = std::array::from_fn(|_| vec![]);
-        slots[Arena::Sort as usize] = vec![Slot::External(sort.0.clone())];
-        Callable(
-            publish(
-                pb::Program {
-                    declarations: vec![pb::Declaration {
-                        kind: Some(pb::declaration::Kind::Constructor(pb::Constructor {
+    let declaration =
+        |doc: Option<&str>, table_name: Option<pb::constructor::TableName>, unextractable: bool| {
+            let mut slots = std::array::from_fn(|_| vec![]);
+            slots[Arena::Sort as usize] = vec![Slot::External(sort.0.clone())];
+            Callable(
+                publish(
+                    pb::Program {
+                        constructors: vec![pb::Constructor {
                             name: "Wrap".into(),
-                            inputs: vec![pb::Arg {
-                                sort: 0,
-                                name: label.into(),
-                            }],
+                            inputs: vec![0],
                             output: 0,
                             unextractable,
+                            doc: doc.map(str::to_owned),
+                            table_name,
                             ..Default::default()
-                        })),
-                        doc: doc.map(str::to_owned),
+                        }],
                         ..Default::default()
-                    }],
-                    ..Default::default()
-                },
-                slots,
-                vec![],
-                Arena::Declaration,
-                0,
-                vec![],
+                    },
+                    slots,
+                    vec![],
+                    Arena::Constructor,
+                    0,
+                    vec![],
+                )
+                .unwrap(),
             )
-            .unwrap(),
-        )
-    };
-    for doc in [None, Some(""), Some("first docs")] {
-        let first = declaration("old label", doc, false);
-        let mut packed = Packer::default();
-        packed.intern(Expr::call(&first, vec![leaf.clone()]).0, 0);
-        for resupplied in [None, Some(""), Some("second docs")] {
-            let second = declaration("new label", resupplied, false);
-            assert!(super::decl::same_callable(&first.0, &second.0).unwrap());
-            packed.intern(Expr::call(&second, vec![leaf.clone()]).0, 0);
-        }
-        packed
-            .finish()
-            .expect("diagnostic-only changes are compatible");
-        let wraps: Vec<_> = packed
-            .program
-            .declarations
-            .iter()
-            .filter(
-                |d| matches!(&d.kind, Some(pb::declaration::Kind::Constructor(c)) if c.name == "Wrap"),
-            )
-            .collect();
-        assert_eq!(wraps.len(), 1);
-        assert_eq!(
-            *wraps[0],
-            first
-                .0
-                .owner
-                .as_ref()
-                .unwrap()
-                .program()
-                .unwrap()
-                .declarations[0],
-            "packing retains the complete first record, including documentation presence"
-        );
-        let encoded = packed.program.encode_to_vec();
-        assert_eq!(
-            pb::Program::decode(encoded.as_slice()).unwrap(),
-            packed.program
-        );
+        };
+    for table_name in [
+        None,
+        Some(pb::constructor::TableName::PublicAlias("PublicWrap".into())),
+        Some(pb::constructor::TableName::DefaultName("Wrap".into())),
+    ] {
+        for doc in [None, Some(""), Some("first docs")] {
+            let first = declaration(doc, table_name.clone(), false);
+            let mut packed = Packer::default();
+            packed.intern(Expr::call(&first, vec![leaf.clone()]).0, 0);
+            for resupplied in [None, Some(""), Some("second docs")] {
+                let second = declaration(resupplied, table_name.clone(), false);
+                assert!(super::decl::same_callable(&first.0, &second.0).unwrap());
+                packed.intern(Expr::call(&second, vec![leaf.clone()]).0, 0);
+            }
+            packed
+                .finish()
+                .expect("diagnostic-only changes are compatible");
+            let wraps: Vec<_> = packed
+                .program
+                .constructors
+                .iter()
+                .filter(|c| c.name == "Wrap")
+                .collect();
+            assert_eq!(wraps.len(), 1);
+            assert_eq!(
+                *wraps[0],
+                first
+                    .0
+                    .owner
+                    .as_ref()
+                    .unwrap()
+                    .program()
+                    .unwrap()
+                    .constructors[0],
+                "packing retains the complete first record, including documentation and table-name presence"
+            );
+            let encoded = packed.program.encode_to_vec();
+            assert_eq!(
+                pb::Program::decode(encoded.as_slice()).unwrap(),
+                packed.program
+            );
 
-        let mut conflict = Packer::default();
-        conflict.intern(Expr::call(&first, vec![leaf.clone()]).0, 0);
-        conflict.intern(
-            Expr::call(
-                &declaration("ignored", Some("ignored"), true),
-                vec![leaf.clone()],
-            )
-            .0,
-            0,
-        );
-        assert!(
-            conflict.finish().is_err(),
-            "semantic constructor options still conflict"
-        );
+            let mut conflict = Packer::default();
+            conflict.intern(Expr::call(&first, vec![leaf.clone()]).0, 0);
+            conflict.intern(
+                Expr::call(
+                    &declaration(Some("ignored"), table_name.clone(), true),
+                    vec![leaf.clone()],
+                )
+                .0,
+                0,
+            );
+            assert!(
+                conflict.finish().is_err(),
+                "semantic constructor options still conflict"
+            );
+        }
     }
 }

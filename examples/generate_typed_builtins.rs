@@ -556,7 +556,7 @@ impl ::core::convert::From<&::core::primitive::str> for self::{name} {{
                 if let Some(receiver) = &view.receiver {
                     let slot = receiver.core_input.ok_or("missing receiver slot")? as usize;
                     let input = inputs.get(slot).ok_or("receiver slot out of range")?;
-                    if types.get(&input.sort) != owner {
+                    if types.get(*input) != owner {
                         return Err("Rust receiver differs from owner".into());
                     }
                     arguments[slot] = Some("::core::clone::Clone::clone(&self.0)".to_string());
@@ -574,9 +574,7 @@ impl ::core::convert::From<&::core::primitive::str> for self::{name} {{
                         if arguments[slot].is_some() {
                             return Err("repeated scalar Rust input slot".into());
                         }
-                        let ty = types
-                            .get(&input.sort)
-                            .ok_or("unsupported scalar Rust input")?;
+                        let ty = types.get(*input).ok_or("unsupported scalar Rust input")?;
                         params.push(format!("{name}: impl ::core::convert::Into<self::{ty}>"));
                         arguments[slot] = Some(format!(
                             "{{ let {value_local}: self::{ty} = ::core::convert::Into::into({name}); ::core::clone::Clone::clone(&{value_local}.0) }}"
@@ -586,9 +584,7 @@ impl ::core::convert::From<&::core::primitive::str> for self::{name} {{
                         && tail_argument.is_none()
                         && let Some(tail) = tail
                     {
-                        let ty = types
-                            .get(&tail.sort)
-                            .ok_or("unsupported scalar Rust tail")?;
+                        let ty = types.get(tail).ok_or("unsupported scalar Rust tail")?;
                         params.push(format!("{name}: impl ::core::iter::IntoIterator<Item = impl ::core::convert::Into<self::{ty}>>"));
                         tail_argument = Some((name, ty));
                     } else {
@@ -672,7 +668,7 @@ impl ::core::convert::From<&::core::primitive::str> for self::{name} {{
                     primitive.name
                 ));
             }
-            if receiver_index >= arity || types.get(&inputs[receiver_index].sort) != Some(owner) {
+            if receiver_index >= arity || types.get(inputs[receiver_index]) != Some(owner) {
                 return Err("Rust receiver mapping disagrees with signature".into());
             }
             if arity == 1 {
@@ -719,15 +715,13 @@ impl ::core::ops::{trait_name} for {self_type} {{
                         .as_ref()
                         .ok_or("missing trait argument sort")?
                         .root,
-                ) != types.get(&inputs[rhs_index].sort)
+                ) != types.get(inputs[rhs_index])
             {
                 return Err(
                     "Rust receiver/parameter/trait mapping disagrees with signature".into(),
                 );
             }
-            let rhs_type = types
-                .get(&inputs[rhs_index].sort)
-                .ok_or("unsupported RHS sort")?;
+            let rhs_type = types.get(inputs[rhs_index]).ok_or("unsupported RHS sort")?;
             // Presentation names remain in the local map, not binding
             // patterns: valid names such as Some are prelude variants in Rust.
             let rhs_name = local_name("rhs", &occupied);
@@ -1143,7 +1137,7 @@ fn emit_generic_views(
         .inputs
         .iter()
         .chain(&signature.varargs)
-        .map(|arg| arg.sort)
+        .copied()
         .chain(signature.output)
         .collect::<Vec<_>>();
     let mut seen = HashSet::new();
@@ -1207,7 +1201,7 @@ fn emit_generic_views(
                     .ok_or("invalid generic input mapping")?;
                 if let Some(pb::sort::Kind::Var(binder)) = program
                     .sorts
-                    .get(input.sort as usize)
+                    .get(*input as usize)
                     .and_then(|s| s.kind.as_ref())
                 {
                     anchors
@@ -1219,11 +1213,7 @@ fn emit_generic_views(
             concrete_inputs = anchors.iter().any(Option::is_none);
             if concrete_inputs {
                 let mut determined = vec![false; parameters.len()];
-                let mut pending = signature
-                    .inputs
-                    .iter()
-                    .map(|arg| arg.sort)
-                    .collect::<Vec<_>>();
+                let mut pending = signature.inputs.to_vec();
                 let mut seen = HashSet::new();
                 while let Some(index) = pending.pop() {
                     if !seen.insert(index) {
@@ -1350,7 +1340,7 @@ fn emit_generic_views(
                 .get(slot)
                 .or_else(|| consumes_tail.then(|| &signature.varargs[0]))
                 .ok_or("receiver slot out of range")?;
-            if Some(rust_type(program, presentation, input.sort, &types)?) != owner {
+            if Some(rust_type(program, presentation, *input, &types)?) != owner {
                 return Err("receiver differs from owner".into());
             }
             inputs[slot] = Some("::core::clone::Clone::clone(&self.0)".to_string());
@@ -1371,11 +1361,10 @@ fn emit_generic_views(
                 let ty = rust_type(
                     program,
                     presentation,
-                    signature
+                    *signature
                         .inputs
                         .get(slot)
-                        .unwrap_or_else(|| &signature.varargs[0])
-                        .sort,
+                        .unwrap_or_else(|| &signature.varargs[0]),
                     &types,
                 )?;
                 if inputs[slot].is_some() {
@@ -1403,11 +1392,7 @@ fn emit_generic_views(
                 let ty = rust_type(
                     program,
                     presentation,
-                    signature
-                        .varargs
-                        .first()
-                        .ok_or("unexpected tail slot")?
-                        .sort,
+                    *signature.varargs.first().ok_or("unexpected tail slot")?,
                     &types,
                 )?;
                 params.push(format!("{name}: impl ::core::iter::IntoIterator<Item = impl ::core::convert::Into<{ty}>>"));
@@ -1473,15 +1458,11 @@ fn emit_generic_views(
                 &[]
             };
             if family.name != expected
-                || signature
-                    .inputs
-                    .iter()
-                    .map(|arg| arg.sort)
-                    .ne(fixed.iter().copied())
+                || signature.inputs.iter().copied().ne(fixed.iter().copied())
                 || signature
                     .varargs
                     .iter()
-                    .map(|arg| arg.sort)
+                    .copied()
                     .ne(repeated.iter().copied())
             {
                 return Err(

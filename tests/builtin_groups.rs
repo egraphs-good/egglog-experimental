@@ -70,14 +70,7 @@ mod native_signature {
                     name: "test.native_signature".into(),
                     signature: Some(pb::GenericSignature {
                         type_param_count: binders,
-                        inputs: inputs
-                            .into_iter()
-                            .enumerate()
-                            .map(|(i, sort)| pb::Arg {
-                                name: format!("arg{i}"),
-                                sort,
-                            })
-                            .collect(),
+                        inputs,
                         output: Some(output),
                         ..Default::default()
                     }),
@@ -90,7 +83,6 @@ mod native_signature {
                         ..Default::default()
                     })
                     .collect(),
-                ..Default::default()
             }]
         }
     }
@@ -1028,20 +1020,8 @@ impl Grouped {
                 name: "test.grouped".into(),
                 signature: Some(pb::GenericSignature {
                     type_param_count: 2,
-                    inputs: vec![pb::Arg {
-                        name: "prefix".into(),
-                        sort: 3,
-                    }],
-                    varargs: vec![
-                        pb::Arg {
-                            name: "key".into(),
-                            sort: 0,
-                        },
-                        pb::Arg {
-                            name: "value".into(),
-                            sort: 1,
-                        },
-                    ],
+                    inputs: vec![3],
+                    varargs: vec![0, 1],
                     output: Some(2),
                 }),
                 ..Default::default()
@@ -1070,7 +1050,6 @@ impl Grouped {
                     ..Default::default()
                 },
             ],
-            ..Default::default()
         }]
     }
 }
@@ -1149,10 +1128,7 @@ impl<const INPUT: u32, const SWAP: bool> Foreign<INPUT, SWAP> {
         let Some(signature) = &mut primitive.signature else {
             unreachable!()
         };
-        signature.inputs = vec![pb::Arg {
-            name: "entries".into(),
-            sort: INPUT,
-        }];
+        signature.inputs = vec![INPUT];
         signature.varargs.clear();
         vec![definition]
     }
@@ -1815,8 +1791,7 @@ fn grouped_signature_identity_preserves_width_and_order_after_relocation() {
     };
     signature.output = signature.output.map(|i| (i + 3) % 4);
     for arg in signature.inputs.iter_mut().chain(&mut signature.varargs) {
-        arg.sort = (arg.sort + 3) % 4;
-        arg.name = "renamed".into();
+        *arg = (*arg + 3) % 4;
     }
     builtin::import_definition(&definition, &mut destination).unwrap();
     assert_eq!(destination, before);
@@ -1836,8 +1811,8 @@ fn grouped_signature_identity_preserves_width_and_order_after_relocation() {
                 signature.varargs.pop();
             }
             1 => signature.varargs.reverse(),
-            2 => signature.varargs.push(signature.varargs[0].clone()),
-            _ => signature.varargs[1] = signature.varargs[0].clone(),
+            2 => signature.varargs.push(signature.varargs[0]),
+            _ => signature.varargs[1] = signature.varargs[0],
         }
         let primitive = &invalid.primitives[0];
         assert!(
@@ -1854,7 +1829,7 @@ fn grouped_signature_identity_preserves_width_and_order_after_relocation() {
     let Some(signature) = &mut primitive.signature else {
         unreachable!()
     };
-    signature.varargs[1] = signature.varargs[0].clone();
+    signature.varargs[1] = signature.varargs[0];
     let mut equal_positions = pb::BuiltinCatalog::default();
     builtin::import_definition(&definition, &mut equal_positions).unwrap();
     let frozen = equal_positions.clone();

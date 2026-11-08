@@ -2,7 +2,7 @@
 
 use super::{Engine, TransportError, graph, pb, rules};
 use prost::Message;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 // Resolve historic name selections against this request's post-setup values.
@@ -11,7 +11,42 @@ use std::sync::Arc;
 pub(super) fn capture(
     mut program: pb::Program,
     registry: &rules::Registry,
-) -> Result<pb::Program, String> {
+    candidates: &[rules::Candidate],
+) -> Result<Recorded, String> {
+    let mut uses = vec![];
+    let mut owners: HashMap<Vec<u8>, Arc<graph::RuleRecord>> = HashMap::new();
+    for (rule, candidate) in graph::rules(&program).zip(candidates) {
+        let fragment = pb::Program {
+            rulesets: vec![pb::RulesetBinding {
+                value: Some(pb::Ruleset {
+                    rules: vec![rule.clone()],
+                }),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let (owned, mapping) = graph::compact(&program, fragment)?;
+        if owned != *candidate.record.program
+            || !graph::preserves_sort_metadata(&program, &owned, &mapping)?
+        {
+            continue;
+        }
+        let owner = owners.entry(candidate.key.clone()).or_insert_with(|| {
+            registry
+                .keys
+                .get(&candidate.key)
+                .map(|index| registry.rules[*index].candidate.record.clone())
+                .unwrap_or_else(|| candidate.record.clone())
+        });
+        // Semantic registration keys erase metadata; storage correspondence does
+        // not. A differently spelled or documented occurrence stays independent.
+        let owner = if owner.program == candidate.record.program {
+            owner.clone()
+        } else {
+            candidate.record.clone()
+        };
+        uses.push((owner, mapping));
+    }
     let mut bindings: HashMap<_, _> = program
         .rulesets
         .iter()
@@ -40,7 +75,6 @@ pub(super) fn capture(
         })
         .collect();
     let mut imported: HashMap<usize, pb::Rule> = HashMap::new();
-    let mut files = HashMap::new();
     for name in names {
         if bindings.contains_key(&name) {
             continue;
@@ -50,11 +84,15 @@ pub(super) fn capture(
             let rule = if let Some(rule) = imported.get(&index) {
                 rule.clone()
             } else {
-                let rule = graph::append_rule(
-                    &mut program,
-                    &registry.rules[index].candidate.record,
-                    &mut files,
-                )?;
+                let offset = program.nodes.len() as u32;
+                let owner = registry.rules[index].candidate.record.clone();
+                let rule = graph::append_rule(&mut program, &owner)?;
+                uses.push((
+                    owner.clone(),
+                    (0..owner.program.nodes.len() as u32)
+                        .map(|index| (index + offset, index))
+                        .collect(),
+                ));
                 imported.insert(index, rule.clone());
                 rule
             };
@@ -78,11 +116,73 @@ pub(super) fn capture(
             _ => (),
         }
     }
-    Ok(program)
+    // Only private recipe graphs can be reused across requests. A recipe sharing
+    // data locations with an action/Let must retain that request's fresh arena.
+    let mut data = program.clone();
+    data.rulesets.clear();
+    let mut pending: Vec<_> = data.commands.iter_mut().collect();
+    while let Some(command) = pending.pop() {
+        match &mut command.kind {
+            Some(pb::command::Kind::Run(run)) => run.rulesets.clear(),
+            Some(pb::command::Kind::Loop(body)) => pending.extend(&mut body.body),
+            Some(pb::command::Kind::Fail(child)) => pending.push(child),
+            _ => (),
+        }
+    }
+    let mut pending = vec![];
+    super::source::source_phase_refs(&mut data, |index| {
+        pending.push(*index);
+        Ok(())
+    })?;
+    let mut protected = HashSet::new();
+    while let Some(index) = pending.pop() {
+        if !protected.insert(index) {
+            continue;
+        }
+        let mut node = program.nodes[index as usize].clone();
+        super::source::source_node_refs(&mut node, |child| {
+            pending.push(*child);
+            Ok(())
+        })?;
+    }
+    let mut memberships: HashMap<u32, HashSet<usize>> = HashMap::new();
+    for (owner, mapping) in &uses {
+        for index in mapping.keys() {
+            if !matches!(
+                program.nodes[*index as usize].kind,
+                Some(pb::node::Kind::Binding(_))
+            ) {
+                memberships
+                    .entry(*index)
+                    .or_default()
+                    .insert(Arc::as_ptr(owner) as usize);
+            }
+        }
+    }
+    let mut aliases = graph::RuleAliases::new();
+    for (owner, mapping) in uses {
+        if mapping.keys().any(|index| {
+            !matches!(
+                program.nodes[*index as usize].kind,
+                Some(pb::node::Kind::Binding(_))
+            ) && (protected.contains(index) || memberships[index].len() != 1)
+        }) {
+            continue;
+        }
+        for (index, owned) in mapping {
+            aliases.insert(index, (owner.clone(), owned));
+        }
+    }
+    Ok(Recorded { program, aliases })
+}
+
+pub(super) struct Recorded {
+    program: pb::Program,
+    aliases: graph::RuleAliases,
 }
 
 struct Link {
-    program: pb::Program,
+    recorded: Recorded,
     previous: Option<Arc<Link>>,
 }
 
@@ -103,9 +203,9 @@ pub(super) struct HistoryLog {
 }
 
 impl HistoryLog {
-    pub(super) fn append(&mut self, program: pb::Program) {
+    pub(super) fn append(&mut self, recorded: Recorded) {
         self.head = Some(Arc::new(Link {
-            program,
+            recorded,
             previous: self.head.take(),
         }));
     }
@@ -114,18 +214,18 @@ impl HistoryLog {
         let mut links = vec![];
         let mut link = self.head.as_deref();
         while let Some(current) = link {
-            links.push(&current.program);
+            links.push(&current.recorded);
             link = current.previous.as_deref();
         }
         let mut result = pb::Program::default();
         // Reconcile only definition metadata/closures, never the growing command
         // graph. Append each submitted data arena once after the header is built.
-        for program in links.iter().rev() {
-            crate::builtin::definitions::reconcile_declarations(program, &mut result)?;
+        for recorded in links.iter().rev() {
+            crate::builtin::definitions::reconcile_declarations(&recorded.program, &mut result)?;
         }
-        for program in links.into_iter().rev() {
-            let files = u32::try_from(result.files.len()).map_err(|_| "too many files")?;
-            graph::append(&mut result, program, files)?;
+        let mut storage = graph::RecordedStorage::new(&result);
+        for recorded in links.into_iter().rev() {
+            storage.append(&mut result, &recorded.program, &recorded.aliases)?;
         }
         let mut latest = HashMap::new();
         for (index, binding) in result.rulesets.iter().enumerate() {
@@ -255,6 +355,299 @@ mod tests {
     }
 
     #[test]
+    fn recorded_named_runs_reuse_their_owned_private_rule_storage() {
+        let (mut engine, id) = recorded_engine();
+        let program = super::super::source::Source::new(
+            None,
+            "(datatype E (N i64)) (rule ((= e (N a))) ((union e (N (+ a 1)))) :name \"fold\")",
+        )
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap();
+        let frames = engine
+            .run(
+                &pb::RunProgramRequest {
+                    egraph_id: id,
+                    program: Some(program),
+                    diagnostics: false,
+                }
+                .encode_to_vec(),
+            )
+            .unwrap();
+        assert_eq!(
+            Observed::from_frames(
+                frames
+                    .iter()
+                    .map(|bytes| pb::RunProgramResponse::decode(bytes.as_slice()).unwrap())
+            )
+            .error,
+            None
+        );
+        let before = engine.histories[&id].export().unwrap();
+        for _ in 0..2 {
+            let run = pb::Program {
+                commands: vec![pb::Command {
+                    kind: Some(pb::command::Kind::Run(pb::Run {
+                        rulesets: vec![pb::RulesetSelection {
+                            kind: Some(pb::ruleset_selection::Kind::Name(String::new())),
+                        }],
+                        ..Default::default()
+                    })),
+                }],
+                ..Default::default()
+            };
+            let frames = engine
+                .run(
+                    &pb::RunProgramRequest {
+                        egraph_id: id,
+                        program: Some(run),
+                        diagnostics: false,
+                    }
+                    .encode_to_vec(),
+                )
+                .unwrap();
+            assert_eq!(
+                Observed::from_frames(
+                    frames
+                        .iter()
+                        .map(|bytes| pb::RunProgramResponse::decode(bytes.as_slice()).unwrap())
+                )
+                .error,
+                None
+            );
+        }
+        let after = engine.histories[&id].export().unwrap();
+        assert_eq!(before.nodes, after.nodes);
+        assert_eq!(before.sorts, after.sorts);
+        assert_eq!(
+            after.rulesets[0].value.as_ref().unwrap().rules[0]
+                .name
+                .as_deref(),
+            Some("fold")
+        );
+        assert_eq!(
+            after
+                .nodes
+                .iter()
+                .filter(|node| matches!(node.kind, Some(pb::node::Kind::Var(_))))
+                .count(),
+            2
+        );
+        assert_eq!(after.commands.len(), 2);
+    }
+
+    #[test]
+    fn rule_data_aliases_survive_without_merging_separate_request_locations() {
+        let rule = pb::Rule {
+            kind: Some(pb::rule::Kind::Rule(pb::RuleBody {
+                query: vec![0],
+                actions: vec![pb::Action {
+                    kind: Some(pb::action::Kind::Term(0)),
+                }],
+            })),
+            name: Some("alias".into()),
+            ..Default::default()
+        };
+        let program = pb::Program {
+            sorts: vec![pb::Sort {
+                kind: Some(pb::sort::Kind::Eq("E".into())),
+                ..Default::default()
+            }],
+            nodes: vec![
+                pb::Node {
+                    kind: Some(pb::node::Kind::Eq(pb::Eq {
+                        members: vec![1, 2, 0],
+                    })),
+                    ..Default::default()
+                },
+                pb::Node {
+                    kind: Some(pb::node::Kind::Call(pb::Call {
+                        func: "N".into(),
+                        args: vec![],
+                    })),
+                    ..Default::default()
+                },
+                pb::Node {
+                    kind: Some(pb::node::Kind::Call(pb::Call {
+                        func: "N".into(),
+                        args: vec![],
+                    })),
+                    ..Default::default()
+                },
+                pb::Node {
+                    kind: Some(pb::node::Kind::Binding("unused".into())),
+                    ..Default::default()
+                },
+            ],
+            constructors: vec![pb::Constructor {
+                name: "N".into(),
+                ..Default::default()
+            }],
+            rulesets: vec![pb::RulesetBinding {
+                value: Some(pb::Ruleset {
+                    rules: vec![rule.clone()],
+                }),
+                ..Default::default()
+            }],
+            commands: vec![pb::Command {
+                kind: Some(pb::command::Kind::Action(pb::Action {
+                    kind: Some(pb::action::Kind::Term(0)),
+                })),
+            }],
+            ..Default::default()
+        };
+        let candidate = rules::Candidate {
+            record: Arc::new(graph::RuleRecord {
+                program: Arc::new(graph::rule(&program, &rule).unwrap()),
+            }),
+            key: vec![0],
+            name: "alias".into(),
+            commands: vec![],
+        };
+        let mut history = HistoryLog::default();
+        for _ in 0..2 {
+            let captured = capture(
+                program.clone(),
+                &rules::Registry::default(),
+                std::slice::from_ref(&candidate),
+            )
+            .unwrap();
+            assert!(captured.aliases.is_empty());
+            history.append(captured);
+        }
+        let exported = history.export().unwrap();
+        let roots: Vec<_> = exported
+            .commands
+            .iter()
+            .map(|command| {
+                let Some(pb::command::Kind::Action(pb::Action {
+                    kind: Some(pb::action::Kind::Term(index)),
+                })) = command.kind
+                else {
+                    panic!("term action")
+                };
+                index
+            })
+            .collect();
+        assert_ne!(roots[0], roots[1]);
+        for root in &roots {
+            let Some(pb::node::Kind::Eq(eq)) = &exported.nodes[*root as usize].kind else {
+                panic!("Eq")
+            };
+            assert_eq!(eq.members[2], *root);
+            assert_ne!(eq.members[0], eq.members[1]);
+        }
+        let saved = &exported.rulesets[0].value.as_ref().unwrap().rules[0];
+        let Some(pb::rule::Kind::Rule(body)) = &saved.kind else {
+            panic!("rule")
+        };
+        assert_eq!(body.query, vec![roots[1]]);
+        assert_eq!(
+            exported
+                .nodes
+                .iter()
+                .filter(|node| matches!(node.kind, Some(pb::node::Kind::Call(_))))
+                .count(),
+            4
+        );
+        assert_eq!(
+            exported
+                .nodes
+                .iter()
+                .filter(|node| matches!(node.kind, Some(pb::node::Kind::Binding(_))))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn recorded_recipe_edges_preserve_same_kind_sort_documentation() {
+        let rule = pb::Rule {
+            kind: Some(pb::rule::Kind::Rule(pb::RuleBody {
+                query: vec![0, 1],
+                actions: vec![],
+            })),
+            name: Some("metadata".into()),
+            ..Default::default()
+        };
+        let mut program = pb::Program {
+            sorts: ["A", "B"]
+                .into_iter()
+                .map(|doc| pb::Sort {
+                    kind: Some(pb::sort::Kind::Eq("E".into())),
+                    doc: Some(doc.into()),
+                })
+                .collect(),
+            nodes: ["x", "y"]
+                .into_iter()
+                .enumerate()
+                .map(|(index, name)| pb::Node {
+                    sort_id: index as u32,
+                    kind: Some(pb::node::Kind::Var(name.into())),
+                })
+                .collect(),
+            commands: vec![pb::Command {
+                kind: Some(pb::command::Kind::Run(pb::Run {
+                    rulesets: vec![pb::RulesetSelection {
+                        kind: Some(pb::ruleset_selection::Kind::Ruleset(pb::Ruleset {
+                            rules: vec![rule.clone()],
+                        })),
+                    }],
+                    ..Default::default()
+                })),
+            }],
+            ..Default::default()
+        };
+        let candidate = rules::Candidate {
+            record: Arc::new(graph::RuleRecord {
+                program: Arc::new(graph::rule(&program, &rule).unwrap()),
+            }),
+            key: vec![0],
+            name: "metadata".into(),
+            commands: vec![],
+        };
+        let mut history = HistoryLog::default();
+        let captured = capture(
+            program.clone(),
+            &rules::Registry::default(),
+            std::slice::from_ref(&candidate),
+        )
+        .unwrap();
+        assert!(
+            captured.aliases.is_empty(),
+            "compaction lost the B sort alias metadata"
+        );
+        history.append(captured);
+        program.nodes[1].sort_id = 0;
+        history.append(
+            capture(
+                program,
+                &rules::Registry::default(),
+                std::slice::from_ref(&candidate),
+            )
+            .unwrap(),
+        );
+        let exported = history.export().unwrap();
+        for (command, expected) in exported.commands.iter().zip(["B", "A"]) {
+            let Some(pb::command::Kind::Run(run)) = &command.kind else {
+                panic!("run")
+            };
+            let Some(pb::ruleset_selection::Kind::Ruleset(group)) = &run.rulesets[0].kind else {
+                panic!("literal")
+            };
+            let Some(pb::rule::Kind::Rule(body)) = &group.rules[0].kind else {
+                panic!("rule")
+            };
+            let node = &exported.nodes[body.query[1] as usize];
+            assert_eq!(
+                exported.sorts[node.sort_id as usize].doc.as_deref(),
+                Some(expected)
+            );
+        }
+    }
+
+    #[test]
     fn history_records_accepted_inputs_and_preserves_request_local_union_locations() {
         let (mut engine, id) = recorded_engine();
         let declaration = super::super::source::Source::new(None, "(sort E)")
@@ -278,15 +671,13 @@ mod tests {
                 ..Default::default()
             }],
             nodes: vec![pb::Node {
-                kind: Some(pb::node::Kind::Union(pb::Union { members: vec![] })),
+                kind: Some(pb::node::Kind::Eq(pb::Eq { members: vec![] })),
                 ..Default::default()
             }],
             commands: vec![pb::Command {
                 kind: Some(pb::command::Kind::Action(pb::Action {
                     kind: Some(pb::action::Kind::Term(0)),
-                    ..Default::default()
                 })),
-                ..Default::default()
             }],
             ..Default::default()
         };
@@ -316,9 +707,7 @@ mod tests {
             commands: vec![pb::Command {
                 kind: Some(pb::command::Kind::Action(pb::Action {
                     kind: Some(pb::action::Kind::Term(99)),
-                    ..Default::default()
                 })),
-                ..Default::default()
             }],
             ..Default::default()
         };
@@ -351,9 +740,7 @@ mod tests {
                 .map(|message| pb::Command {
                     kind: Some(pb::command::Kind::Action(pb::Action {
                         kind: Some(pb::action::Kind::Panic(message.into())),
-                        ..Default::default()
                     })),
-                    ..Default::default()
                 })
                 .collect(),
             ..Default::default()
@@ -395,15 +782,16 @@ mod tests {
             .collect();
         assert_eq!(roots.len(), 2);
         assert_ne!(roots[0], roots[1]);
-        assert!(history.declarations.is_empty());
-        // Each accepted input retains its own self-declaring Eq arena root.
+        assert!(crate::protobuf::declarations(&history).next().is_none());
+        // Repeated sort storage shares one definition; data Eq locations remain
+        // separate across accepted requests, as checked by the roots above.
         assert_eq!(
             history
                 .sorts
                 .iter()
                 .filter(|sort| matches!(&sort.kind, Some(pb::sort::Kind::Eq(name)) if name == "E"))
                 .count(),
-            4
+            1
         );
         engine.graphs[&id].prepare(&mut history).unwrap();
         assert_eq!(

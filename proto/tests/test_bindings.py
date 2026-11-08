@@ -26,14 +26,14 @@ class SemanticHeaderTests(unittest.TestCase):
 
 
     def test_user_namespaces_resolve_primitive_sort_refs_ambiently(self):
-        callable_ = ir.Declaration(kind=Oneof("constructor", ir.Constructor(
-            name="Pair", inputs=[ir.Arg(sort=1)], output=0,
-        )))
+        callable_ = ir.Constructor(
+            name="Pair", inputs=[1], output=0,
+        )
         sorts = [
             ir.Sort(kind=Oneof("eq", "Pair")),
             ir.Sort(kind=Oneof("primitive", ir.PrimitiveSortRef(name="Pair", args=[0, 0]))),
         ]
-        program = ir.Program(sorts=sorts, declarations=[callable_])
+        program = ir.Program(sorts=sorts, constructors=[callable_])
         validate(program)
         self.assertEqual(ir.Program.from_binary(program.to_binary()), program)
 
@@ -44,10 +44,45 @@ class SemanticHeaderTests(unittest.TestCase):
         )
         validate(program)
         self.assertFalse(program.commands)
-        self.assertFalse(program.declarations)
+        self.assertFalse(program.constructors)
+        self.assertFalse(program.functions)
+        self.assertFalse(program.relations)
+        self.assertFalse(program.user_defined_primitives)
         self.assertEqual(ir.Program.from_binary(program.to_binary()), program)
         self.assertEqual(ir.Program.from_json(program.to_json()), program)
         self.assertFalse(hasattr(ir, "EqSort"))
+
+    def test_flat_setup_collections_preserve_duplicates_and_sort_roots(self):
+        for collection, declaration in (
+            ("constructors", ir.Constructor(name="C", inputs=[0], output=0)),
+            ("functions", ir.Function(name="f", inputs=[0], output=0)),
+            ("relations", ir.Relation(name="R", inputs=[0])),
+            ("user_defined_primitives", ir.UserDefinedPrimitive(
+                name="p", inputs=[0], output=0, body=0,
+            )),
+        ):
+            with self.subTest(collection=collection):
+                program = ir.Program(
+                    sorts=[ir.Sort(kind=Oneof("eq", "E"))],
+                    nodes=[ir.Node(kind=Oneof("eq", ir.Eq()))],
+                    **{collection: [declaration, declaration]},
+                )
+                validate(program)
+                for decoded in (
+                    ir.Program.from_binary(program.to_binary()),
+                    ir.Program.from_json(program.to_json()),
+                ):
+                    self.assertEqual(decoded, program)
+                    self.assertEqual(len(getattr(decoded, collection)), 2)
+                    self.assertEqual(getattr(decoded, collection)[0].inputs, [0])
+                declaration.inputs[0] = 1
+                with self.assertRaises(ValidationError):
+                    validate(program)
+                declaration.inputs[0] = 0
+                if collection != "relations":
+                    declaration.output = 1
+                    with self.assertRaises(ValidationError):
+                        validate(program)
 
     def test_global_lookup_and_lexical_variable_are_distinct(self):
         local = ir.Node(kind=Oneof("var", "x"))
@@ -84,7 +119,7 @@ class SemanticHeaderTests(unittest.TestCase):
         catalog = ir.BuiltinCatalog(
             sorts=[ir.Sort(kind=Oneof("var", 0))],
             primitives=[ir.Primitive(name="p", signature=ir.GenericSignature(
-                type_param_count=1, inputs=[ir.Arg(sort=0)], output=0,
+                type_param_count=1, inputs=[0], output=0,
             ))],
         )
         validate(catalog)

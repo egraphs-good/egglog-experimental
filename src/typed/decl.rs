@@ -4,6 +4,7 @@ use super::{
     pb,
     storage::{Arena, DeclarationKind, Packer, Record, Slot, publish},
 };
+use crate::builtin::definitions::Declaration;
 use std::{
     collections::{HashMap, HashSet},
     hash::{DefaultHasher, Hash, Hasher},
@@ -335,7 +336,6 @@ impl Callable {
         for sort in arguments.iter().chain([output]) {
             sort.validate_closed()?;
         }
-        let owner = self.0.owner.as_ref().unwrap();
         let (name, inputs, result, signature) = if self.0.arena == Arena::Primitive {
             let p = self.0.primitive()?;
             match &p.signature {
@@ -349,12 +349,10 @@ impl Callable {
                 _ => return Err(TypedError::Invalid("unsupported callable typing".into())),
             }
         } else {
-            match &owner.program()?.declarations[self.0.index as usize].kind {
-                Some(pb::declaration::Kind::Constructor(c)) => (&c.name, &c.inputs, c.output, None),
-                Some(pb::declaration::Kind::Function(f)) => (&f.name, &f.inputs, f.output, None),
-                Some(pb::declaration::Kind::UserDefinedPrimitive(p)) => {
-                    (&p.name, &p.inputs, p.output, None)
-                }
+            match self.0.callable()? {
+                Declaration::Constructor(c) => (&c.name, &c.inputs, c.output, None),
+                Declaration::Function(f) => (&f.name, &f.inputs, f.output, None),
+                Declaration::UserDefinedPrimitive(p) => (&p.name, &p.inputs, p.output, None),
                 _ => return Err(TypedError::Invalid("expected a value callable".into())),
             }
         };
@@ -374,7 +372,7 @@ impl Callable {
             .iter()
             .zip(inputs.iter().chain(tail.iter().cycle()))
         {
-            SortRef(self.0.resolve(Arena::Sort, expected.sort)?).match_pattern(
+            SortRef(self.0.resolve(Arena::Sort, *expected)?).match_pattern(
                 argument,
                 &mut bindings,
                 type_param_count,
@@ -395,14 +393,8 @@ impl Callable {
         assert!(!name.is_empty(), "relation names must not be empty");
         let relation = pb::Relation {
             name: name.into(),
-            inputs: inputs
-                .iter()
-                .enumerate()
-                .map(|(index, _)| pb::Arg {
-                    sort: index as u32,
-                    name: String::new(),
-                })
-                .collect(),
+            inputs: (0..inputs.len() as u32).collect(),
+            ..Default::default()
         };
         let mut slots = std::array::from_fn(|_| vec![]);
         slots[Arena::Sort as usize] = inputs
@@ -412,15 +404,12 @@ impl Callable {
         Self(
             publish(
                 pb::Program {
-                    declarations: vec![pb::Declaration {
-                        kind: Some(pb::declaration::Kind::Relation(relation)),
-                        ..Default::default()
-                    }],
+                    relations: vec![relation],
                     ..Default::default()
                 },
                 slots,
                 vec![],
-                Arena::Declaration,
+                Arena::Relation,
                 0,
                 vec![],
             )
@@ -444,17 +433,11 @@ impl Callable {
         let merge_parameters = merge.as_ref().map(|_| (0, [0, 1]));
         let function = pb::Function {
             name: name.into(),
-            inputs: inputs
-                .iter()
-                .enumerate()
-                .map(|(i, _)| pb::Arg {
-                    sort: i as u32,
-                    name: String::new(),
-                })
-                .collect(),
+            inputs: (0..inputs.len() as u32).collect(),
             output: inputs.len() as u32,
             merge: merge.as_ref().map(|_| 2),
             hidden: false,
+            ..Default::default()
         };
         let mut slots = std::array::from_fn(|_| vec![]);
         slots[Arena::Node as usize] = merge
@@ -469,15 +452,12 @@ impl Callable {
             .collect();
         let mut record = publish(
             pb::Program {
-                declarations: vec![pb::Declaration {
-                    kind: Some(pb::declaration::Kind::Function(function)),
-                    ..Default::default()
-                }],
+                functions: vec![function],
                 ..Default::default()
             },
             slots,
             vec![],
-            Arena::Declaration,
+            Arena::Function,
             0,
             vec![],
         )
@@ -500,18 +480,12 @@ impl Callable {
         assert!(!name.is_empty(), "constructor names must not be empty");
         let constructor = pb::Constructor {
             name: name.into(),
-            inputs: inputs
-                .iter()
-                .enumerate()
-                .map(|(i, _)| pb::Arg {
-                    sort: i as u32,
-                    name: String::new(),
-                })
-                .collect(),
+            inputs: (0..inputs.len() as u32).collect(),
             output: inputs.len() as u32,
             cost: cost.as_ref().map(|_| 0),
             unextractable,
             hidden: false,
+            ..Default::default()
         };
         let mut slots = std::array::from_fn(|_| vec![]);
         slots[Arena::Sort as usize] = inputs
@@ -524,13 +498,10 @@ impl Callable {
             .map(|cost| Slot::External(cost.0))
             .collect();
         let program = pb::Program {
-            declarations: vec![pb::Declaration {
-                kind: Some(pb::declaration::Kind::Constructor(constructor)),
-                ..Default::default()
-            }],
+            constructors: vec![constructor],
             ..Default::default()
         };
-        Self(publish(program, slots, vec![], Arena::Declaration, 0, vec![]).unwrap())
+        Self(publish(program, slots, vec![], Arena::Constructor, 0, vec![]).unwrap())
     }
 }
 
@@ -541,23 +512,21 @@ pub(super) fn same_callable(a: &Record, b: &Record) -> Result<bool, TypedError> 
     let name_a = if a.arena == Arena::Primitive {
         &a.primitive()?.name
     } else {
-        match &a.owner.as_ref().unwrap().program()?.declarations[a.index as usize].kind {
-            Some(pb::declaration::Kind::Constructor(c)) => &c.name,
-            Some(pb::declaration::Kind::Function(f)) => &f.name,
-            Some(pb::declaration::Kind::Relation(r)) => &r.name,
-            Some(pb::declaration::Kind::UserDefinedPrimitive(p)) => &p.name,
-            _ => return Err(TypedError::Invalid("expected a callable record".into())),
+        match a.callable()? {
+            Declaration::Constructor(c) => &c.name,
+            Declaration::Function(f) => &f.name,
+            Declaration::Relation(r) => &r.name,
+            Declaration::UserDefinedPrimitive(p) => &p.name,
         }
     };
     let name_b = if b.arena == Arena::Primitive {
         &b.primitive()?.name
     } else {
-        match &b.owner.as_ref().unwrap().program()?.declarations[b.index as usize].kind {
-            Some(pb::declaration::Kind::Constructor(c)) => &c.name,
-            Some(pb::declaration::Kind::Function(f)) => &f.name,
-            Some(pb::declaration::Kind::Relation(r)) => &r.name,
-            Some(pb::declaration::Kind::UserDefinedPrimitive(p)) => &p.name,
-            _ => return Err(TypedError::Invalid("expected a callable record".into())),
+        match b.callable()? {
+            Declaration::Constructor(c) => &c.name,
+            Declaration::Function(f) => &f.name,
+            Declaration::Relation(r) => &r.name,
+            Declaration::UserDefinedPrimitive(p) => &p.name,
         }
     };
     if name_a != name_b {
@@ -612,15 +581,9 @@ pub(super) fn same_builtin(a: &Record, b: &Record) -> Result<bool, TypedError> {
                 .inputs
                 .iter()
                 .chain(&sa.varargs)
-                .map(|arg| arg.sort)
+                .copied()
                 .chain([oa])
-                .zip(
-                    sb.inputs
-                        .iter()
-                        .chain(&sb.varargs)
-                        .map(|arg| arg.sort)
-                        .chain([ob]),
-                )
+                .zip(sb.inputs.iter().chain(&sb.varargs).copied().chain([ob]))
             {
                 if SortRef(a.resolve(Arena::Sort, ia)?) != SortRef(b.resolve(Arena::Sort, ib)?) {
                     return Ok(false);

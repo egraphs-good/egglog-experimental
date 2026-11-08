@@ -269,28 +269,26 @@ pub(super) fn observation(
         pending: vec![],
     };
     export.program.commands.clear();
-    let declarations = export.program.declarations.clone();
+    let tables_to_export: Vec<_> = declarations(&export.program)
+        .filter_map(|declaration| match declaration {
+            Declaration::Constructor(c) => Some((c.name.clone(), false, true)),
+            Declaration::Function(f) => Some((f.name.clone(), false, false)),
+            Declaration::Relation(r) => Some((r.name.clone(), true, true)),
+            Declaration::UserDefinedPrimitive(_) => None,
+        })
+        .collect();
     let mut tables = HashSet::new();
     let mut relation_sorts = HashSet::new();
-    for declaration in &declarations {
-        let name = match &declaration.kind {
-            Some(pb::declaration::Kind::Constructor(c)) => &c.name,
-            Some(pb::declaration::Kind::Function(f)) => &f.name,
-            Some(pb::declaration::Kind::Relation(r)) => &r.name,
-            _ => continue,
-        };
+    for (name, relation, constructor) in &tables_to_export {
         let native = native_name("call", name);
         let function = session.graph.get_function(&native).ok_or_else(|| {
             egglog::Error::BackendError(format!("Freeze declaration has no native table {name}"))
         })?;
-        if matches!(declaration.kind, Some(pb::declaration::Kind::Relation(_))) {
+        if *relation {
             relation_sorts.insert(function.func_type().output.name().to_owned());
         }
         tables.insert(native);
-        if matches!(
-            declaration.kind,
-            Some(pb::declaration::Kind::Constructor(_))
-        ) {
+        if *constructor {
             let cost_table = crate::set_cost::get_cost_table_name(&native_name("call", name));
             if session.graph.get_function(&cost_table).is_some() {
                 tables.insert(cost_table);
@@ -329,8 +327,7 @@ pub(super) fn observation(
         let sort_id = export.sort(sort)?;
         let index = export.append(pb::Node {
             sort_id,
-            kind: Some(pb::node::Kind::Union(pb::Union { members: vec![] })),
-            ..Default::default()
+            kind: Some(pb::node::Kind::Eq(pb::Eq { members: vec![] })),
         })?;
         export
             .classes
@@ -338,21 +335,14 @@ pub(super) fn observation(
         export.program.commands.push(pb::Command {
             kind: Some(pb::command::Kind::Action(pb::Action {
                 kind: Some(pb::action::Kind::Term(index)),
-                ..Default::default()
             })),
-            ..Default::default()
         });
     }
     let mut row_commands = vec![];
     let mut assigned_costs = vec![];
     let mut subsumed = vec![];
-    for declaration in &declarations {
-        let (name, relation, constructor) = match &declaration.kind {
-            Some(pb::declaration::Kind::Constructor(c)) => (&c.name, false, true),
-            Some(pb::declaration::Kind::Function(f)) => (&f.name, false, false),
-            Some(pb::declaration::Kind::Relation(r)) => (&r.name, true, true),
-            _ => continue,
-        };
+    for (name, relation, constructor) in tables_to_export {
+        let name = &name;
         let native = native_name("call", name);
         let signature = session.graph.get_function(&native).unwrap().func_type();
         let mut rows = vec![];
@@ -405,13 +395,12 @@ pub(super) fn observation(
                 let index = export.append(pb::Node {
                     sort_id,
                     kind: Some(pb::node::Kind::Call(call.clone())),
-                    ..Default::default()
                 })?;
                 if relation {
                     row_commands.push(pb::action::Kind::Term(index));
                 } else {
                     let class = export.value(sort, value)?;
-                    let Some(pb::node::Kind::Union(union)) =
+                    let Some(pb::node::Kind::Eq(union)) =
                         &mut export.program.nodes[class as usize].kind
                     else {
                         unreachable!("reserved class")
@@ -456,7 +445,6 @@ pub(super) fn observation(
                     binding: Some(binding),
                     value: Some(value),
                 })),
-                ..Default::default()
             });
         }
     }
@@ -471,11 +459,7 @@ pub(super) fn observation(
             .chain(assigned_costs)
             .chain(subsumed)
             .map(|kind| pb::Command {
-                kind: Some(pb::command::Kind::Action(pb::Action {
-                    kind: Some(kind),
-                    ..Default::default()
-                })),
-                ..Default::default()
+                kind: Some(pb::command::Kind::Action(pb::Action { kind: Some(kind) })),
             }),
     );
     export.program.commands.extend(binding_commands);
@@ -552,7 +536,6 @@ mod tests {
             pb::Program {
                 commands: vec![pb::Command {
                     kind: Some(pb::command::Kind::Freeze(pb::Freeze {})),
-                    ..Default::default()
                 }],
                 ..Default::default()
             },
@@ -569,7 +552,7 @@ mod tests {
             Some(pb::sort::Kind::Primitive(family)) if family.name == "i64" && family.args.is_empty()
         ));
         assert!(program.nodes.is_empty());
-        assert!(program.declarations.is_empty());
+        assert!(declarations(program).next().is_none());
     }
 
     #[test]
@@ -610,15 +593,11 @@ mod tests {
                 if family.name == "i64" && family.args.is_empty()
         )));
         assert_eq!(
-            program
-                .declarations
-                .iter()
+            declarations(program)
                 .filter(|declaration| matches!(
-                    &declaration.kind,
-                    Some(
-                        pb::declaration::Kind::Constructor(pb::Constructor { hidden: true, .. })
-                            | pb::declaration::Kind::Function(pb::Function { hidden: true, .. })
-                    )
+                    declaration,
+                    Declaration::Constructor(pb::Constructor { hidden: true, .. })
+                        | Declaration::Function(pb::Function { hidden: true, .. })
                 ))
                 .count(),
             2
@@ -733,9 +712,7 @@ mod tests {
     // Two classes: one has three alternatives and a self-cycle; the other has
     // no producers. Container slots repeat the first class around the second.
     fn fixture() -> pb::Program {
-        use pb::{
-            action::Kind as A, declaration::Kind as D, node::Kind as N, primitive_value::Value as V,
-        };
+        use pb::{action::Kind as A, node::Kind as N, primitive_value::Value as V};
         pb::Program {
             sorts: vec![
                 pb::Sort {
@@ -778,105 +755,93 @@ mod tests {
                     ..Default::default()
                 },
             ],
-            declarations: vec![
-                D::Constructor(pb::Constructor {
+            constructors: vec![
+                pb::Constructor {
                     name: "Num".into(),
-                    inputs: vec![pb::Arg {
-                        name: "n".into(),
-                        sort: 1,
-                    }],
+                    inputs: vec![1],
                     output: 0,
                     ..Default::default()
-                }),
-                D::Constructor(pb::Constructor {
+                },
+                pb::Constructor {
                     name: "Next".into(),
-                    inputs: vec![pb::Arg {
-                        name: "state".into(),
-                        sort: 0,
-                    }],
+                    inputs: vec![0],
                     output: 0,
                     ..Default::default()
-                }),
-                D::Constructor(pb::Constructor {
+                },
+                pb::Constructor {
                     name: "Float".into(),
-                    inputs: vec![pb::Arg {
-                        name: "n".into(),
-                        sort: 4,
-                    }],
+                    inputs: vec![4],
                     output: 0,
                     ..Default::default()
-                }),
-                D::Function(pb::Function {
+                },
+            ],
+            functions: vec![
+                pb::Function {
                     hidden: false,
                     name: "score".into(),
-                    inputs: vec![pb::Arg {
-                        name: "state".into(),
-                        sort: 0,
-                    }],
+                    inputs: vec![0],
                     output: 1,
                     merge: None,
-                }),
-                D::Function(pb::Function {
+                    ..Default::default()
+                },
+                pb::Function {
                     hidden: false,
                     name: "store".into(),
                     inputs: vec![],
                     output: 3,
                     merge: None,
-                }),
-                D::Function(pb::Function {
+                    ..Default::default()
+                },
+                pb::Function {
                     hidden: false,
                     name: "ready".into(),
                     inputs: vec![],
                     output: 2,
                     merge: None,
-                }),
-                D::Relation(pb::Relation {
-                    name: "marked".into(),
-                    inputs: vec![pb::Arg {
-                        name: "state".into(),
-                        sort: 0,
-                    }],
-                }),
-                D::UserDefinedPrimitive(pb::UserDefinedPrimitive {
-                    name: "saved_identity".into(),
-                    inputs: vec![pb::Arg {
-                        name: "value".into(),
-                        sort: 1,
-                    }],
-                    output: 1,
-                    body: Some(10),
-                }),
-                D::Function(pb::Function {
+                    ..Default::default()
+                },
+                pb::Function {
                     hidden: false,
                     name: "computed".into(),
                     inputs: vec![],
                     output: 1,
                     merge: None,
-                }),
-                D::UserDefinedPrimitive(pb::UserDefinedPrimitive {
-                    name: "saved_vector".into(),
-                    inputs: vec![],
-                    output: 5,
-                    body: Some(12),
-                }),
-                D::Function(pb::Function {
+                    ..Default::default()
+                },
+                pb::Function {
                     hidden: false,
                     name: "computed_vector".into(),
                     inputs: vec![],
                     output: 5,
                     merge: None,
-                }),
-            ]
-            .into_iter()
-            .map(|kind| pb::Declaration {
-                kind: Some(kind),
+                    ..Default::default()
+                },
+            ],
+            relations: vec![pb::Relation {
+                name: "marked".into(),
+                inputs: vec![0],
                 ..Default::default()
-            })
-            .collect(),
+            }],
+            user_defined_primitives: vec![
+                pb::UserDefinedPrimitive {
+                    name: "saved_identity".into(),
+                    inputs: vec![1],
+                    output: 1,
+                    body: Some(10),
+                    ..Default::default()
+                },
+                pb::UserDefinedPrimitive {
+                    name: "saved_vector".into(),
+                    inputs: vec![],
+                    output: 5,
+                    body: Some(12),
+                    ..Default::default()
+                },
+            ],
             nodes: vec![
                 (
                     0,
-                    N::Union(pb::Union {
+                    N::Eq(pb::Eq {
                         members: vec![1, 2, 9],
                     }),
                 ),
@@ -894,7 +859,7 @@ mod tests {
                         args: vec![0],
                     }),
                 ),
-                (0, N::Union(pb::Union { members: vec![] })),
+                (0, N::Eq(pb::Eq { members: vec![] })),
                 (
                     1,
                     N::PrimitiveValue(pb::PrimitiveValue {
@@ -961,7 +926,6 @@ mod tests {
             .map(|(sort_id, kind)| pb::Node {
                 sort_id,
                 kind: Some(kind),
-                ..Default::default()
             })
             .collect(),
             commands: vec![
@@ -1010,15 +974,10 @@ mod tests {
             ]
             .into_iter()
             .map(|kind| pb::Command {
-                kind: Some(pb::command::Kind::Action(pb::Action {
-                    kind: Some(kind),
-                    ..Default::default()
-                })),
-                ..Default::default()
+                kind: Some(pb::command::Kind::Action(pb::Action { kind: Some(kind) })),
             })
             .chain([pb::Command {
                 kind: Some(pb::command::Kind::Freeze(pb::Freeze {})),
-                ..Default::default()
             }])
             .collect(),
             ..Default::default()
@@ -1034,25 +993,17 @@ mod tests {
             pb::ExecutionMode::Normal as i32
         );
         assert_eq!(
-            program
-                .declarations
-                .iter()
-                .filter(|d| matches!(&d.kind,
-            Some(pb::declaration::Kind::UserDefinedPrimitive(p)) if p.name == "saved_identity"))
+            declarations(program)
+                .filter(|d| matches!(d,
+            Declaration::UserDefinedPrimitive(p) if p.name == "saved_identity"))
                 .count(),
             1
         );
-        assert!(program.declarations.iter().all(|d| !matches!(&d.kind,
-            Some(pb::declaration::Kind::UserDefinedPrimitive(p)) if p.name.starts_with("__egglog"))));
-        let saved = program
-            .declarations
-            .iter()
-            .find_map(|d| match &d.kind {
-                Some(pb::declaration::Kind::UserDefinedPrimitive(p))
-                    if p.name == "saved_vector" =>
-                {
-                    Some(p)
-                }
+        assert!(declarations(program).all(|d| !matches!(d,
+            Declaration::UserDefinedPrimitive(p) if p.name.starts_with("__egglog"))));
+        let saved = declarations(program)
+            .find_map(|d| match d {
+                Declaration::UserDefinedPrimitive(p) if p.name == "saved_vector" => Some(p),
                 _ => None,
             })
             .unwrap();
@@ -1069,7 +1020,7 @@ mod tests {
                 Some(pb::command::Kind::Action(pb::Action {
                     kind: Some(A::Term(index)),
                     ..
-                })) if matches!(program.nodes[*index as usize].kind, Some(N::Union(_))) => {
+                })) if matches!(program.nodes[*index as usize].kind, Some(N::Eq(_))) => {
                     Some(*index)
                 }
                 _ => None,
@@ -1080,9 +1031,9 @@ mod tests {
             2,
             "relation row IDs are not equality classes"
         );
-        let full = *classes.iter().find(|index| matches!(&program.nodes[**index as usize].kind, Some(N::Union(u)) if u.members.len() == 3)).unwrap();
-        let empty = *classes.iter().find(|index| matches!(&program.nodes[**index as usize].kind, Some(N::Union(u)) if u.members.is_empty())).unwrap();
-        let Some(N::Union(union)) = &program.nodes[full as usize].kind else {
+        let full = *classes.iter().find(|index| matches!(&program.nodes[**index as usize].kind, Some(N::Eq(u)) if u.members.len() == 3)).unwrap();
+        let empty = *classes.iter().find(|index| matches!(&program.nodes[**index as usize].kind, Some(N::Eq(u)) if u.members.is_empty())).unwrap();
+        let Some(N::Eq(union)) = &program.nodes[full as usize].kind else {
             unreachable!()
         };
         assert!(union.members.iter().any(|index| matches!(&program.nodes[*index as usize].kind, Some(N::Call(c)) if c.func == "Next" && c.args == [full])));
@@ -1147,7 +1098,6 @@ mod tests {
         let mut program = snapshot.program.clone().unwrap();
         program.commands.push(pb::Command {
             kind: Some(pb::command::Kind::Freeze(pb::Freeze {})),
-            ..Default::default()
         });
         let restored = run(&mut engine, next, program);
         assert!(restored.error.is_none(), "{:?}", restored.error);
@@ -1174,7 +1124,6 @@ mod tests {
                 pb::Program {
                     commands: vec![pb::Command {
                         kind: Some(pb::command::Kind::Freeze(pb::Freeze {})),
-                        ..Default::default()
                     }],
                     ..Default::default()
                 },

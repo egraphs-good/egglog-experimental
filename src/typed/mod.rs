@@ -231,6 +231,8 @@
 //! `#[ruleset]` turns a monomorphic, safe Rust function into one lazily initialized
 //! immutable group. Its ordinary body and concrete or inferred output author
 //! rules through the existing callback, with up to 64 immutable borrowed inputs.
+//! Parameter identifiers supply preferred query names while retaining fresh
+//! lexical identity; collisions with other scopes or explicit variables stay distinct.
 //! The default native binding name is the module-qualified function name;
 //! `#[ruleset(name = expression)]` uses that exact name expression once, after
 //! the body. Named composition captures the explicitly authored rule values
@@ -279,7 +281,7 @@
 //! Observe an established root to avoid reauthoring the subsumed constructor.
 //! A cloned union action retains its occurrence: repeating it in one submission
 //! or one rule head rejects; independently authored unions stay distinct.
-//! Nested Union values are not supported. Captures remain forbidden in rules.
+//! Nested Eq values are not supported. Captures remain forbidden in rules.
 //!
 //! ```
 //! use egglog_experimental::typed::prelude::*;
@@ -362,7 +364,7 @@
 //!
 //! This Normal-mode capture subset admits direct fallible/table-read initializers
 //! and fresh captures nested in constructor/value-only surrounding syntax. Fresh
-//! capture nesting beside a table read, Union or host call is rejected before
+//! capture nesting beside a table read, Eq or host call is rejected before
 //! execution. Established captures are closed leaves. Full nested-host support
 //! awaits authoritative totality/effect metadata; no local builtin-name list or
 //! evaluated-value cache substitutes for it.
@@ -372,6 +374,7 @@
 //! borrowed left operands and right operands convertible to the declared sort.
 //! They construct Calls, not host arithmetic. The original Rust signature must
 //! still agree with the declared trait RHS and associated output.
+//! An omitted RHS uses the implementation's `Self` type, as in ordinary Rust.
 //! Operator names are evaluated once in a nongeneric definition context, not
 //! in an owned/borrowed operator call. Literals and module-level function calls
 //! are supported; generated `Self` and operand-dependent names are not.
@@ -406,6 +409,15 @@
 //! impl std::ops::Add<I64> for &Term {
 //!     type Output = Term;
 //!     #[constructor] fn add(self, rhs: &Term) -> Term;
+//! }
+//! ```
+//! ```compile_fail,E0053
+//! use egglog_experimental::typed::{builtins::I64, prelude::*};
+//! #[sort] struct Term;
+//! #[declarations]
+//! impl std::ops::Add for Term {
+//!     type Output = Term;
+//!     #[constructor] fn add(self, rhs: I64) -> Term;
 //! }
 //! ```
 //! ```compile_fail,E0053
@@ -581,7 +593,7 @@
 //! # Ok::<(), TypedError>(())
 //! ```
 //!
-//! Query equalities cannot be registered or used as a rule head:
+//! Query equalities cannot be registered or used as rule actions:
 //!
 //! ```compile_fail,E0277
 //! use egglog_experimental::typed::{builtins::I64, prelude::*};
@@ -1202,7 +1214,9 @@ pub enum TypedError {
     Invalid(String),
     /// A result does not have the requested concrete representation.
     Decode(String),
-    /// The actual terminal error frame, retaining its source-file owner.
+    /// The actual terminal error frame. Its optional context Program and site
+    /// describe authored code using response-local arenas, independently of the
+    /// original request or history.
     Engine(Box<pb::RunProgramResponse>),
     /// An ordered retained root could not be observed or reconstructed.
     UnresolvedRoot {

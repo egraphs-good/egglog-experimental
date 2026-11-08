@@ -9,16 +9,20 @@ from gen.python.egglog.v1 import egglog_pb as ir
 
 
 class ReportSchemaTests(unittest.TestCase):
-    def test_success_and_error_frames_are_exclusive_with_error_only_origins(self):
+    def test_success_and_error_frames_are_exclusive_with_authored_context(self):
         output = ir.RunProgramOutput(outputs=[ir.CommandOutput(
             kind=Oneof("run", ir.RunResult(updated=True)), location=ir.CommandLocation(path=[0]),
         )])
         frames = [
             ir.RunProgramResponse(result=Oneof("output", output)),
             ir.RunProgramResponse(result=Oneof("error", ir.Error(
-                code=ir.ErrorCode.RUNTIME_FAILURE, message="failed", span=ir.Span(start=0, end=1),
+                code=ir.ErrorCode.RUNTIME_FAILURE, message="failed",
                 location=ir.CommandLocation(path=[1]),
-            )), files=[ir.SourceFile(name="rule.egg", contents="x")]),
+                context=ir.Program(commands=[ir.Command(kind=Oneof("action", ir.Action(
+                    kind=Oneof("panic", "failed"),
+                )))]),
+                site=ir.ErrorSite(path=[5, 0, 1]),
+            ))),
         ]
         for frame in frames:
             validate(frame)
@@ -30,61 +34,58 @@ class ReportSchemaTests(unittest.TestCase):
         validate(complete)
         self.assertEqual(complete.to_binary(), b"\x0a\x00")
 
-    def test_response_files_belong_only_to_the_one_located_error(self):
-        for located, file_index, files, accepted in (
-            (False, 0, [], True),
-            (False, 0, [ir.SourceFile(name="unused")], False),
-            (True, 0, [ir.SourceFile(name="used")], True),
-            (True, 1, [ir.SourceFile(name="used")], False),
-            (True, 0, [], False),
-            (True, 0, [ir.SourceFile(name="used"), ir.SourceFile(name="unused")], False),
-        ):
-            error = ir.Error(code=ir.ErrorCode.RUNTIME_FAILURE, message="failed")
-            if located:
-                error.span = ir.Span(file=file_index)
-            frame = ir.RunProgramResponse(result=Oneof("error", error), files=files)
-            with self.subTest(located=located, file_index=file_index, files=len(files)):
-                if accepted:
-                    validate(frame)
-                else:
-                    with self.assertRaises(ValidationError):
-                        validate(frame)
-        with self.assertRaises(ValidationError):
-            validate(ir.RunProgramResponse(
-                result=Oneof("output", ir.RunProgramOutput()), files=[ir.SourceFile(name="unused")],
-            ))
-
-    def test_source_locations_belong_to_inputs_not_success_or_snapshot_data(self):
-        program = ir.Program(
+    def test_error_site_requires_its_context_and_local_node_bounds(self):
+        context = ir.Program(
             sorts=[ir.Sort(kind=Oneof("primitive", ir.PrimitiveSortRef(name="i64")))],
             nodes=[ir.Node(kind=Oneof("primitive_value", ir.PrimitiveValue(value=Oneof("i64", 1))))],
-            declarations=[ir.Declaration(kind=Oneof("function", ir.Function(name="f")))],
+        )
+        for program, site, accepted in (
+            (None, None, True),
+            (context, None, True),
+            (None, ir.ErrorSite(path=[2, 0]), False),
+            (context, ir.ErrorSite(), False),
+            (context, ir.ErrorSite(path=[2, 0]), True),
+            (context, ir.ErrorSite(path=[2, 0], node_id=0), True),
+            (context, ir.ErrorSite(path=[2, 0], node_id=1), False),
+        ):
+            error = ir.Error(
+                code=ir.ErrorCode.RUNTIME_FAILURE, message="failed", context=program, site=site,
+            )
+            with self.subTest(context=program is not None, site=site):
+                if accepted:
+                    validate(error)
+                    self.assertEqual(ir.Error.from_binary(error.to_binary()), error)
+                    self.assertEqual(ir.Error.from_json(error.to_json()), error)
+                else:
+                    with self.assertRaises(ValidationError):
+                        validate(error)
+
+    def test_error_context_reuses_program_arenas_and_existing_code_records(self):
+        program = ir.Program(
+            sorts=[
+                ir.Sort(kind=Oneof("primitive", ir.PrimitiveSortRef(name="i64"))),
+                ir.Sort(kind=Oneof("eq", "E")),
+            ],
+            nodes=[ir.Node(kind=Oneof("primitive_value", ir.PrimitiveValue(value=Oneof("i64", 1))))],
+            constructors=[ir.Constructor(name="C", output=1)],
+            functions=[ir.Function(name="f")],
+            relations=[ir.Relation(name="R")],
+            user_defined_primitives=[ir.UserDefinedPrimitive(name="p", body=0)],
             commands=[ir.Command(kind=Oneof("action", ir.Action(kind=Oneof("term", 0))))],
             rulesets=[ir.RulesetBinding(value=ir.Ruleset(rules=[ir.Rule(
-                kind=Oneof("rule", ir.RuleBody(head=[ir.Action(kind=Oneof("term", 0))])),
+                kind=Oneof("rule", ir.RuleBody(actions=[ir.Action(kind=Oneof("term", 0))])),
                 eval_mode=ir.RuleEvalMode.SEMINAIVE,
             )]))],
         )
-        options = ir.EGraphOptions(cost_sort=0)
-        validate(ir.EGraphSnapshot(options=options, program=program))
-        located = ir.Program.from_binary(program.to_binary())
-        located.files.append(ir.SourceFile(name="input.egg", contents="x"))
-        located.nodes[0].span = ir.Span(end=1)
-        validate(located)
-        for target in (
-            lambda p: p.sorts[0], lambda p: p.nodes[0], lambda p: p.declarations[0],
-            lambda p: p.commands[0], lambda p: p.commands[0].kind.value,
-            lambda p: p.rulesets[0].value.rules[0],
-            lambda p: p.rulesets[0].value.rules[0].kind.value.head[0],
-        ):
-            observed = ir.Program.from_binary(program.to_binary())
-            target(observed).span = ir.Span()
-            with self.assertRaises(ValidationError):
-                validate(ir.EGraphSnapshot(options=options, program=observed))
-        with self.assertRaises(ValidationError):
-            validate(ir.EGraphSnapshot(options=options, program=located))
-        with self.assertRaises(ValidationError):
-            validate(ir.RunProgramOutput(nodes=located.nodes, sorts=located.sorts))
+        error = ir.Error(
+            code=ir.ErrorCode.RUNTIME_FAILURE, message="failed", context=program,
+            site=ir.ErrorSite(path=[7, 0, 2, 1, 0, 1, 3, 0], node_id=0),
+        )
+        validate(error)
+        self.assertEqual(ir.Error.from_binary(error.to_binary()), error)
+        self.assertEqual(error.context.rulesets[0].value.rules[0].kind.value.actions[0].kind.value, 0)
+        validate(ir.EGraphSnapshot(options=ir.EGraphOptions(cost_sort=0), program=program))
+        validate(ir.RunProgramOutput(nodes=program.nodes, sorts=program.sorts))
 
     def test_small_run_result_has_only_control_flags(self):
         for result in (

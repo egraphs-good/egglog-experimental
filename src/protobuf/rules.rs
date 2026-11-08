@@ -207,7 +207,6 @@ impl Registry {
 
     pub(super) fn reconstruct(&self, destination: &mut pb::Program) -> Result<(), String> {
         let mut mapping: HashMap<usize, pb::Rule> = HashMap::new();
-        let mut file_offsets = HashMap::new();
         let mut groups: Vec<_> = self.groups.iter().collect();
         groups.sort_unstable_by(|a, b| a.0.cmp(b.0));
         for (group, rules) in groups {
@@ -216,11 +215,8 @@ impl Registry {
                 let rule = if let Some(rule) = mapping.get(&index) {
                     rule.clone()
                 } else {
-                    let rule = graph::append_rule(
-                        destination,
-                        &self.rules[index].candidate.record,
-                        &mut file_offsets,
-                    )?;
+                    let rule =
+                        graph::append_rule(destination, &self.rules[index].candidate.record)?;
                     mapping.insert(index, rule.clone());
                     rule
                 };

@@ -161,14 +161,14 @@ impl PrintFunction {
         let program = pb::Program {
             sorts: std::mem::take(&mut response.sorts),
             nodes: std::mem::take(&mut response.nodes),
-            files: std::mem::take(&mut frame.files),
+
             ..Default::default()
         };
-        let native_spans = NativeSpans::default();
+        let authored_origins = AuthoredOrigins::default();
         let cell = |cell: &pb::TableCell| -> Result<String, TransportError> {
             match cell.kind {
                 Some(pb::table_cell::Kind::Term(index)) => {
-                    expression(&program, index, &mut HashSet::new(), &native_spans)
+                    expression(&program, index, &mut HashSet::new(), &authored_origins)
                         .map(|expr| expr.to_string())
                         .map_err(TransportError)
                 }
@@ -220,7 +220,6 @@ impl PrintFunction {
         }
         response.sorts = program.sorts;
         response.nodes = program.nodes;
-        frame.files = program.files;
         if let Some(file) = &mut file {
             file.write_all(text.as_bytes()).map_err(|error| {
                 TransportError(
@@ -276,7 +275,7 @@ pub struct Source {
     schedulers: HashSet<String>,
     cost_origins: std::sync::Arc<std::sync::Mutex<crate::set_cost::CostOrigins>>,
     // Expanded once, then retained across an ambient-binding boundary.
-    pending_expansion: Option<(Vec<Command>, Option<String>, bool)>,
+    pending_expansion: Option<(Vec<Command>, bool)>,
     ambient_runs: HashSet<String>,
 }
 
@@ -301,7 +300,7 @@ pub(super) fn source_node_refs(
                 visit(index)?;
             }
         }
-        Some(N::Union(union)) => {
+        Some(N::Eq(union)) => {
             for index in &mut union.members {
                 visit(index)?;
             }
@@ -402,12 +401,12 @@ pub(super) fn source_phase_refs(
         }
         Ok(())
     }
-    for declaration in &mut program.declarations {
-        let root = match &mut declaration.kind {
-            Some(pb::declaration::Kind::Constructor(constructor)) => constructor.cost.as_mut(),
-            Some(pb::declaration::Kind::Function(function)) => function.merge.as_mut(),
-            Some(pb::declaration::Kind::UserDefinedPrimitive(primitive)) => primitive.body.as_mut(),
-            Some(pb::declaration::Kind::Relation(_)) | None => None,
+    for declaration in declarations_mut(program) {
+        let root = match declaration {
+            DeclarationMut::Constructor(constructor) => constructor.cost.as_mut(),
+            DeclarationMut::Function(function) => function.merge.as_mut(),
+            DeclarationMut::UserDefinedPrimitive(primitive) => primitive.body.as_mut(),
+            DeclarationMut::Relation(_) => None,
         };
         if let Some(index) = root {
             visit(index)?;
@@ -419,7 +418,7 @@ pub(super) fn source_phase_refs(
                 for index in &mut rule.query {
                     visit(index)?;
                 }
-                for head in &mut rule.head {
+                for head in &mut rule.actions {
                     action(head, &mut visit)?;
                 }
             }
@@ -493,7 +492,7 @@ pub(super) fn source_phase_refs(
 
 // Keep the private authoring arena, but copy only this phase's fresh validation
 // obligations and reachable nodes. Allocate an identity
-// before following edges: shared and distinct Unions, including cycles, survive.
+// before following edges: shared and distinct Eq nodes, including cycles, survive.
 fn project_source_nodes(
     arena: &[pb::Node],
     first_node: usize,
@@ -553,7 +552,6 @@ fn append_input_rows(
     program: &mut pb::Program,
     target: InputSignature,
     rows: Vec<Vec<Literal>>,
-    span: Option<pb::Span>,
 ) -> Result<(), String> {
     for row in rows {
         let mut values = Vec::with_capacity(row.len());
@@ -569,7 +567,7 @@ fn append_input_rows(
             values.push(u32::try_from(program.nodes.len()).map_err(|_| "too many input nodes")?);
             program.nodes.push(pb::Node {
                 sort_id,
-                span,
+
                 kind: Some(pb::node::Kind::PrimitiveValue(value)),
             });
         }
@@ -589,17 +587,13 @@ fn append_input_rows(
             let root = u32::try_from(program.nodes.len()).map_err(|_| "too many input nodes")?;
             program.nodes.push(pb::Node {
                 sort_id: target.output,
-                span,
+
                 kind: Some(pb::node::Kind::Call(call)),
             });
             pb::action::Kind::Term(root)
         };
         program.commands.push(pb::Command {
-            span,
-            kind: Some(pb::command::Kind::Action(pb::Action {
-                span,
-                kind: Some(kind),
-            })),
+            kind: Some(pb::command::Kind::Action(pb::Action { kind: Some(kind) })),
         });
     }
     Ok(())
@@ -633,7 +627,7 @@ pub fn produce_input(
     compiler
         .session
         .install(prepared, &mut pb::RunProgramOutput::default())
-        .map_err(|(error, _)| TransportError(error.message))?;
+        .map_err(|error| TransportError(error.message))?;
     let signature = compiler
         .session
         .graph
@@ -641,64 +635,51 @@ pub fn produce_input(
         .get_func_type(&native_name("call", table))
         .cloned()
         .ok_or_else(|| TransportError(format!("unknown input table {table}")))?;
-    let declaration = descriptor
-        .declarations
-        .iter()
-        .find_map(|declaration| match &declaration.kind {
-            Some(pb::declaration::Kind::Function(function)) if function.name == table => {
+    let declaration = declarations(descriptor)
+        .find_map(|declaration| match declaration {
+            Declaration::Function(function) if function.name == table => Some(InputSignature {
+                table: table.into(),
+                inputs: function.inputs.clone(),
+                output: function.output,
+                custom: true,
+            }),
+            Declaration::Constructor(constructor) if constructor.name == table => {
                 Some(InputSignature {
                     table: table.into(),
-                    inputs: function.inputs.iter().map(|arg| arg.sort).collect(),
-                    output: function.output,
-                    custom: true,
-                })
-            }
-            Some(pb::declaration::Kind::Constructor(constructor)) if constructor.name == table => {
-                Some(InputSignature {
-                    table: table.into(),
-                    inputs: constructor.inputs.iter().map(|arg| arg.sort).collect(),
+                    inputs: constructor.inputs.clone(),
                     output: constructor.output,
                     custom: false,
                 })
             }
-            Some(pb::declaration::Kind::Relation(relation)) if relation.name == table => {
-                Some(InputSignature {
-                    table: table.into(),
-                    inputs: relation.inputs.iter().map(|arg| arg.sort).collect(),
-                    output: 0,
-                    custom: false,
-                })
-            }
+            Declaration::Relation(relation) if relation.name == table => Some(InputSignature {
+                table: table.into(),
+                inputs: relation.inputs.clone(),
+                output: 0,
+                custom: false,
+            }),
             _ => None,
         })
         .ok_or_else(|| TransportError("input requires a table-backed callable".into()))?;
     let mut program = descriptor.clone();
-    let file = u32::try_from(program.files.len())
-        .map_err(|_| TransportError("too many input source files".into()))?;
-    program.files.push(pb::SourceFile {
-        name: path.into(),
-        // A displayable empty diagnostic excerpt, not the CSV contents.
-        contents: Some(String::new()),
-    });
-    let span = Some(pb::Span {
-        file,
-        start: 0,
-        end: 0,
-    });
-    let native_spans = NativeSpans::default();
-    let rows = egglog::parse_input_file(
-        &signature,
-        path,
-        fact_directory,
-        native_span(&program, span.as_ref(), &native_spans).map_err(TransportError)?,
-    )
-    .map_err(|error| TransportError(error.to_string()))?;
+    let rows = egglog::parse_input_file(&signature, path, fact_directory, span!())
+        .map_err(|error| TransportError(format!("{path}: {error}")))?;
     let mut declaration = declaration;
-    if descriptor.declarations.iter().any(|row| matches!(&row.kind, Some(pb::declaration::Kind::Relation(relation)) if relation.name == table)) {
-        let unit = compiler.session.graph.authoring_type_info().get_sort_by_name("Unit").unwrap();
-        declaration.output = compiler.session.graph.export_sort(unit, &mut program.sorts).map_err(TransportError)?;
+    if declarations(descriptor)
+        .any(|row| matches!(row, Declaration::Relation(relation) if relation.name == table))
+    {
+        let unit = compiler
+            .session
+            .graph
+            .authoring_type_info()
+            .get_sort_by_name("Unit")
+            .unwrap();
+        declaration.output = compiler
+            .session
+            .graph
+            .export_sort(unit, &mut program.sorts)
+            .map_err(TransportError)?;
     }
-    append_input_rows(&mut program, declaration, rows, span).map_err(TransportError)?;
+    append_input_rows(&mut program, declaration, rows).map_err(TransportError)?;
     Ok(program)
 }
 
@@ -750,27 +731,20 @@ pub(crate) fn primitive_definition(
     let source = &mut projection.source;
     let inputs = inputs
         .iter()
-        .enumerate()
-        .map(|(index, sort)| {
-            Ok(pb::Arg {
-                name: format!("_{index}"),
-                sort: source.sort(sort.name())?,
-            })
-        })
+        .map(|sort| source.sort(sort.name()))
         .collect::<Result<Vec<_>, String>>()?;
     let output = source.sort(output.name())?;
     let body = source.expr(body, None, 0)?;
-    source.program.declarations.push(pb::Declaration {
-        kind: Some(pb::declaration::Kind::UserDefinedPrimitive(
-            pb::UserDefinedPrimitive {
-                name: name.into(),
-                inputs,
-                output,
-                body: Some(body),
-            },
-        )),
-        ..Default::default()
-    });
+    source
+        .program
+        .user_defined_primitives
+        .push(pb::UserDefinedPrimitive {
+            name: name.into(),
+            inputs,
+            output,
+            body: Some(body),
+            ..Default::default()
+        });
     Ok(std::mem::take(&mut source.program))
 }
 
@@ -898,8 +872,8 @@ impl Source {
         let first_node = self.program.nodes.len();
         let mut authored = false;
         let result = loop {
-            if let Some((expanded, alias, input)) = self.pending_expansion.take() {
-                if let Err(error) = self.compile_expanded(expanded, alias) {
+            if let Some((expanded, input)) = self.pending_expansion.take() {
+                if let Err(error) = self.compile_expanded(expanded) {
                     break Err(error);
                 }
                 if input {
@@ -1138,14 +1112,6 @@ impl Source {
     }
 
     fn compile(&mut self, command: Command, authored: bool) -> Result<bool, String> {
-        let explicit_sort_alias = match &command {
-            Command::Sort {
-                name,
-                presort_and_args: Some(_),
-                ..
-            } => Some(name.clone()),
-            _ => None,
-        };
         let expanded = self
             .graph
             .expand_command_macros(command)
@@ -1178,22 +1144,18 @@ impl Source {
             input |= matches!(command, Command::Input { .. });
         }
         if replaces_ambient || input && authored {
-            self.pending_expansion = Some((expanded, explicit_sort_alias, input));
+            self.pending_expansion = Some((expanded, input));
             return Ok(false);
         }
-        self.compile_expanded(expanded, explicit_sort_alias)?;
+        self.compile_expanded(expanded)?;
         Ok(!input)
     }
 
     // Lower already expanded commands without applying user macros again.
-    fn compile_expanded(
-        &mut self,
-        expanded: Vec<Command>,
-        explicit_sort_alias: Option<String>,
-    ) -> Result<(), String> {
+    fn compile_expanded(&mut self, expanded: Vec<Command>) -> Result<(), String> {
         if expanded.len() > 1 {
             for command in expanded {
-                self.compile_expanded(vec![command], None)?;
+                self.compile_expanded(vec![command])?;
             }
             return Ok(());
         }
@@ -1384,7 +1346,7 @@ impl Source {
                     signature.output.name()
                 })?;
                 let first = self.program.commands.len();
-                let located = self.span(span)?;
+
                 append_input_rows(
                     &mut self.program,
                     InputSignature {
@@ -1394,21 +1356,18 @@ impl Source {
                         custom: signature.subtype == ast::FunctionSubtype::Custom,
                     },
                     rows,
-                    located,
                 )?;
                 if !fail_spans.is_empty() {
                     let body = self.program.commands.drain(first..).collect();
                     let mut command = pb::Command {
-                        span: located,
                         kind: Some(pb::command::Kind::Loop(pb::Loop {
                             max_iterations: Some(1),
                             body,
                             until: vec![],
                         })),
                     };
-                    for span in fail_spans.into_iter().rev() {
+                    for _span in fail_spans.into_iter().rev() {
                         command = pb::Command {
-                            span: self.span(&span)?,
                             kind: Some(pb::command::Kind::Fail(Box::new(command))),
                         };
                     }
@@ -1439,7 +1398,7 @@ impl Source {
                 Command::Rewrite(_, _, subsume) => Some(RewriteKind::Directional(*subsume)),
                 Command::BiRewrite(..) => Some(RewriteKind::Bidirectional),
                 Command::Relation {
-                    span,
+                    span: _,
                     name,
                     inputs,
                     table_name,
@@ -1459,21 +1418,16 @@ impl Source {
                     }
                     let inputs = inputs
                         .iter()
-                        .map(|name| {
-                            Ok(pb::Arg {
-                                sort: self.sort(name)?,
-                                name: String::new(),
-                            })
-                        })
+                        .map(|name| self.sort(name))
                         .collect::<Result<_, String>>()?;
-                    let span = self.span(span)?;
+
                     let table_name = match table_name {
                         None => None,
                         Some(ast::TableName::Public(name)) => {
-                            Some(pb::declaration::TableName::PublicAlias(name.clone()))
+                            Some(pb::relation::TableName::PublicAlias(name.clone()))
                         }
                         Some(ast::TableName::Default(name)) => {
-                            Some(pb::declaration::TableName::DefaultName(name.clone()))
+                            Some(pb::relation::TableName::DefaultName(name.clone()))
                         }
                         Some(ast::TableName::Internal(_)) => {
                             return Err(
@@ -1482,12 +1436,10 @@ impl Source {
                         }
                     };
                     self.relations.insert(name.clone());
-                    self.program.declarations.push(pb::Declaration {
-                        kind: Some(pb::declaration::Kind::Relation(pb::Relation {
-                            name: name.clone(),
-                            inputs,
-                        })),
-                        span,
+                    self.program.relations.push(pb::Relation {
+                        name: name.clone(),
+                        inputs,
+
                         table_name,
                         ..Default::default()
                     });
@@ -1523,7 +1475,7 @@ impl Source {
                     };
                     Command::Extract(span, expr, variants)
                 }
-                Command::UserDefined(span, name, args) if name == "multi-extract" => {
+                Command::UserDefined(_, name, args) if name == "multi-extract" => {
                     let parsed = crate::parse_multi_extract_args(&args)
                         .map_err(|error| error.to_string())?;
                     let Expr::Lit(_, Literal::Int(count)) = parsed.variants else {
@@ -1550,9 +1502,8 @@ impl Source {
                         };
                         roots.push(self.expr(root, None, 0)?);
                     }
-                    let span = self.span(&span)?;
+
                     self.program.commands.push(pb::Command {
-                        span,
                         kind: Some(pb::command::Kind::Extract(pb::Extract {
                             roots,
                             variants: count,
@@ -1567,7 +1518,7 @@ impl Source {
                     });
                     continue;
                 }
-                Command::UserDefined(span, name, args) if name == "keep-best" => {
+                Command::UserDefined(_, name, args) if name == "keep-best" => {
                     let (args, greedy) = crate::greedy_dag_extract::split_trailing_extractor(&args)
                         .map_err(|error| error.to_string())?;
                     if args.is_empty() {
@@ -1588,9 +1539,8 @@ impl Source {
                             Ok(name.clone())
                         })
                         .collect::<Result<_, String>>()?;
-                    let span = self.span(&span)?;
+
                     self.program.commands.push(pb::Command {
-                        span,
                         kind: Some(pb::command::Kind::KeepBest(pb::KeepBest {
                             tables,
                             extractor: if greedy {
@@ -1625,7 +1575,7 @@ impl Source {
                 command => command,
             };
             if let Command::Sort {
-                span,
+                span: _,
                 name,
                 presort_and_args: Some(_),
                 uf: None,
@@ -1642,12 +1592,7 @@ impl Source {
                     .ok_or("missing resolved source sort")?
                     .clone();
                 let mut sorts = self.program.sorts.clone();
-                let index = self.graph.export_sort(&native, &mut sorts)?;
-                if explicit_sort_alias.as_ref() == Some(name)
-                    && sorts[index as usize].span.is_none()
-                {
-                    sorts[index as usize].span = self.span(span)?;
-                }
+                self.graph.export_sort(&native, &mut sorts)?;
                 self.program.sorts = sorts;
             }
             let mut resolved = if let Some(resolved) = registered_commands.take() {
@@ -1720,7 +1665,7 @@ impl Source {
                         self.sort(&name)?;
                     }
                     N::Sort {
-                        span,
+                        span: _,
                         name,
                         presort_and_args: None,
                         uf,
@@ -1729,9 +1674,7 @@ impl Source {
                         proof_constructors: None,
                         unionable: true,
                     } if uf.as_ref().is_none_or(|(_, index)| index.is_none()) => {
-                        let span = self.span(&span)?;
-                        let index = self.sort(&name)?;
-                        self.program.sorts[index as usize].span = span;
+                        self.sort(&name)?;
                     }
                     N::Function(function) => {
                         let constructor = self
@@ -1781,43 +1724,43 @@ impl Source {
                             .schema
                             .input
                             .iter()
-                            .map(|name| {
-                                Ok(pb::Arg {
-                                    sort: self.sort(name)?,
-                                    name: String::new(),
-                                })
-                            })
+                            .map(|name| self.sort(name))
                             .collect::<Result<_, String>>()?;
                         let output = self.sort(&function.schema.output)?;
                         let hidden = function.internal_hidden;
-                        let table_name = match &function.table_name {
-                            None => None,
-                            Some(ast::TableName::Public(name)) => {
-                                Some(pb::declaration::TableName::PublicAlias(name.clone()))
-                            }
-                            Some(ast::TableName::Default(name)) => {
-                                Some(pb::declaration::TableName::DefaultName(name.clone()))
-                            }
+
+                        let (public_alias, default_name) = match &function.table_name {
+                            None => (None, None),
+                            Some(ast::TableName::Public(name)) => (Some(name.clone()), None),
+                            Some(ast::TableName::Default(name)) => (None, Some(name.clone())),
                             Some(ast::TableName::Internal(_)) => {
                                 return Err(
                                     "internal table names require separate source lowering".into(),
                                 );
                             }
                         };
-                        let kind = match function.subtype {
+                        match function.subtype {
                             ast::FunctionSubtype::Constructor => {
                                 let cost = function.cost.map(|cost| {
                                     let cost = i64::try_from(cost).map_err(|_| "constructor cost exceeds this adapter's i64 domain")?;
                                     self.expr(&ResolvedExpr::Lit(function.span.clone(), Literal::Int(cost)), None, 0)
                                 }).transpose()?;
-                                pb::declaration::Kind::Constructor(pb::Constructor {
+                                self.program.constructors.push(pb::Constructor {
                                     name: function.name,
                                     inputs,
                                     output,
                                     cost,
                                     unextractable: function.unextractable,
                                     hidden,
-                                })
+
+                                    table_name: public_alias
+                                        .map(pb::constructor::TableName::PublicAlias)
+                                        .or_else(|| {
+                                            default_name
+                                                .map(pb::constructor::TableName::DefaultName)
+                                        }),
+                                    ..Default::default()
+                                });
                             }
                             ast::FunctionSubtype::Custom => {
                                 if !function.unextractable {
@@ -1828,22 +1771,22 @@ impl Source {
                                     .as_ref()
                                     .map(|expr| self.expr(expr, None, 0))
                                     .transpose()?;
-                                pb::declaration::Kind::Function(pb::Function {
+                                self.program.functions.push(pb::Function {
                                     name: function.name,
                                     inputs,
                                     output,
                                     merge,
                                     hidden,
-                                })
+
+                                    table_name: public_alias
+                                        .map(pb::function::TableName::PublicAlias)
+                                        .or_else(|| {
+                                            default_name.map(pb::function::TableName::DefaultName)
+                                        }),
+                                    ..Default::default()
+                                });
                             }
-                        };
-                        let span = self.span(&function.span)?;
-                        self.program.declarations.push(pb::Declaration {
-                            kind: Some(kind),
-                            table_name,
-                            span,
-                            ..Default::default()
-                        });
+                        }
                     }
                     command @ (N::AddRuleset(..) | N::UnstableCombinedRuleset(..)) => {
                         let (name, kind) = match command {
@@ -1873,50 +1816,45 @@ impl Source {
                     N::NormRule { rule } => {
                         self.rule(rule, rewrite)?;
                     }
-                    N::CoreAction(ResolvedAction::Let(span, var, expr)) => {
+                    N::CoreAction(ResolvedAction::Let(_, var, expr)) => {
                         if matches!(&expr, ResolvedExpr::Call(_, ResolvedCall::Func(function), _) if self.relations.contains(&function.name))
                         {
                             return Err("relations are predicates, not binding values".into());
                         }
                         let value = self.expr(&expr, None, 0)?;
                         let output = self.program.nodes[value as usize].sort_id;
-                        let span = self.span(&span)?;
+
                         let binding = u32::try_from(self.program.nodes.len())
                             .map_err(|_| "too many source nodes")?;
                         self.program.nodes.push(pb::Node {
                             sort_id: output,
                             kind: Some(pb::node::Kind::Binding(var.name)),
-                            span,
                         });
                         self.program.commands.push(pb::Command {
                             kind: Some(pb::command::Kind::Let(pb::Let {
                                 binding: Some(binding),
                                 value: Some(value),
                             })),
-                            span,
                         });
                     }
 
                     N::CoreAction(action) => {
                         let action = self.action(&action, None)?;
                         self.program.commands.push(pb::Command {
-                            span: action.span,
                             kind: Some(pb::command::Kind::Action(action)),
                         });
                     }
-                    N::ActionScope(span, actions) => {
+                    N::ActionScope(_, actions) => {
                         let action = self.action_scope(&actions)?;
-                        let span = self.span(&span)?;
+
                         self.program.commands.push(pb::Command {
-                            span,
                             kind: Some(pb::command::Kind::Action(action)),
                         });
                     }
-                    N::Check(span, facts) => {
+                    N::Check(_, facts) => {
                         let facts = self.facts(&facts)?;
-                        let span = self.span(&span)?;
+
                         self.program.commands.push(pb::Command {
-                            span,
                             kind: Some(if prove {
                                 pb::command::Kind::Prove(pb::Prove { facts })
                             } else {
@@ -1924,14 +1862,12 @@ impl Source {
                             }),
                         });
                     }
-                    N::PrintOverallStatistics(span, None) => {
-                        let span = self.span(&span)?;
+                    N::PrintOverallStatistics(_, None) => {
                         self.program.commands.push(pb::Command {
-                            span,
                             kind: Some(pb::command::Kind::Stats(pb::Unit {})),
                         });
                     }
-                    N::PrintFunction(span, table, limit, file, mode) => {
+                    N::PrintFunction(_, table, limit, file, mode) => {
                         if file.is_some() || mode != ast::PrintFunctionMode::Default {
                             return Err(
                                 "source table printing requires default mode without a file".into(),
@@ -1941,28 +1877,26 @@ impl Source {
                             .map(u64::try_from)
                             .transpose()
                             .map_err(|_| "table row limit exceeds wire u64")?;
-                        let span = self.span(&span)?;
+
                         self.program.commands.push(pb::Command {
-                            span,
                             kind: Some(pb::command::Kind::TableRows(pb::GetTableRows {
                                 table,
                                 max_rows,
                             })),
                         });
                     }
-                    N::ProveExists(span, call) => {
+                    N::ProveExists(_, call) => {
                         let ResolvedCall::Func(function) = call else {
                             return Err("source prove-exists requires a constructor".into());
                         };
-                        let span = self.span(&span)?;
+
                         self.program.commands.push(pb::Command {
-                            span,
                             kind: Some(pb::command::Kind::ProveExists(pb::ProveExists {
                                 constructor: function.name.clone(),
                             })),
                         });
                     }
-                    N::Extract(span, expr, variants) => {
+                    N::Extract(_, expr, variants) => {
                         let ResolvedExpr::Lit(_, Literal::Int(count)) = variants else {
                             return Err("source extraction requires a literal variant count".into());
                         };
@@ -1970,9 +1904,8 @@ impl Source {
                             .map_err(|_| "source extraction variant count out of range")?
                             .max(1);
                         let root = self.expr(&expr, None, 0)?;
-                        let span = self.span(&span)?;
+
                         self.program.commands.push(pb::Command {
-                            span,
                             kind: Some(pb::command::Kind::Extract(pb::Extract {
                                 roots: vec![root],
                                 variants: count,
@@ -2024,13 +1957,12 @@ impl Source {
                         if !self.schedulers.insert(bind.name.clone()) {
                             return Err(format!("scheduler {} already exists", bind.name));
                         }
-                        let span = self.span(&span)?;
+
                         self.program.commands.push(pb::Command {
-                            span,
                             kind: Some(pb::command::Kind::BindScheduler(bind)),
                         });
                     }
-                    N::UserDefined(span, name, args) if name == "run-schedule" => {
+                    N::UserDefined(_, name, args) if name == "run-schedule" => {
                         let mut locals = HashSet::new();
                         let body = args
                             .iter()
@@ -2049,7 +1981,6 @@ impl Source {
                                 command.clone()
                             }
                             _ => pb::Command {
-                                span: self.span(&span)?,
                                 kind: Some(pb::command::Kind::Loop(pb::Loop {
                                     max_iterations: Some(1),
                                     body,
@@ -2059,10 +1990,8 @@ impl Source {
                         };
                         self.program.commands.push(command);
                     }
-                    N::PrintSize(span, table) => {
-                        let span = self.span(&span)?;
+                    N::PrintSize(_, table) => {
                         self.program.commands.push(pb::Command {
-                            span,
                             kind: Some(pb::command::Kind::TableSizes(pb::GetTableSizes {
                                 tables: table.into_iter().collect(),
                             })),
@@ -2076,9 +2005,8 @@ impl Source {
                     return Err("source Fail requires exactly one authored command".into());
                 }
                 let mut command = self.program.commands.pop().unwrap();
-                for span in fail_spans.into_iter().rev() {
+                for _span in fail_spans.into_iter().rev() {
                     command = pb::Command {
-                        span: self.span(&span)?,
                         kind: Some(pb::command::Kind::Fail(Box::new(command))),
                     };
                 }
@@ -2095,8 +2023,11 @@ impl Source {
         Ok(pb::Program {
             sorts: self.program.sorts.clone(),
             nodes: vec![],
-            files: self.program.files.clone(),
-            declarations: std::mem::take(&mut self.program.declarations),
+
+            constructors: std::mem::take(&mut self.program.constructors),
+            functions: std::mem::take(&mut self.program.functions),
+            relations: std::mem::take(&mut self.program.relations),
+            user_defined_primitives: std::mem::take(&mut self.program.user_defined_primitives),
             commands,
             rulesets: std::mem::take(&mut self.program.rulesets),
         })
@@ -2198,11 +2129,9 @@ impl Source {
                 _ => return Err("native set-cost resolved action order changed".into()),
             }
         }
-        let span = self.span(&span)?;
+
         self.program.commands.push(pb::Command {
-            span,
             kind: Some(pb::command::Kind::Action(pb::Action {
-                span,
                 kind: Some(if deleting {
                     pb::action::Kind::Delete(pb::Call {
                         func: constructor,
@@ -2269,7 +2198,7 @@ impl Source {
         schedule: ast::GenericSchedule<ResolvedCall, ast::ResolvedVar>,
     ) -> Result<pb::Command, String> {
         use ast::GenericSchedule as S;
-        let (span, kind) = match schedule {
+        let (_span, kind) = match schedule {
             S::Run(span, config) => {
                 let kind = pb::command::Kind::Run(pb::Run {
                     rulesets: self.select_groups(&config.ruleset)?,
@@ -2288,10 +2217,7 @@ impl Source {
                         pb::command::Kind::Loop(pb::Loop {
                             max_iterations: Some(1),
                             until,
-                            body: vec![pb::Command {
-                                span: self.span(&span)?,
-                                kind: Some(kind),
-                            }],
+                            body: vec![pb::Command { kind: Some(kind) }],
                         }),
                     )
                 } else {
@@ -2346,10 +2272,7 @@ impl Source {
                 (span, kind)
             }
         };
-        Ok(pb::Command {
-            span: self.span(&span)?,
-            kind: Some(kind),
-        })
+        Ok(pb::Command { kind: Some(kind) })
     }
 
     // Project the actual experimental extension syntax, without invoking its
@@ -2388,7 +2311,6 @@ impl Source {
                 .map(|child| self.extended_schedule(child, &mut nested, depth + 1))
                 .collect::<Result<Vec<_>, _>>()?;
             return Ok(pb::Command {
-                span: self.span(&span)?,
                 kind: Some(pb::command::Kind::Loop(pb::Loop {
                     max_iterations: header.bound,
                     until,
@@ -2403,7 +2325,6 @@ impl Source {
                 };
                 let child = self.extended_schedule(child, locals, depth + 1)?;
                 return Ok(pb::Command {
-                    span: self.span(&span)?,
                     kind: Some(pb::command::Kind::Fail(Box::new(child))),
                 });
             }
@@ -2445,7 +2366,6 @@ impl Source {
                 };
                 let action = self.action(action, None)?;
                 return Ok(pb::Command {
-                    span: self.span(&span)?,
                     kind: Some(pb::command::Kind::Action(action)),
                 });
             }
@@ -2489,7 +2409,6 @@ impl Source {
                     return Err(format!("scheduler {} already exists", bind.name));
                 }
                 return Ok(pb::Command {
-                    span: self.span(&span)?,
                     kind: Some(pb::command::Kind::BindScheduler(bind)),
                 });
             }
@@ -2519,10 +2438,7 @@ impl Source {
                         ..Default::default()
                     })
                 };
-                return Ok(pb::Command {
-                    span: self.span(&span)?,
-                    kind: Some(kind),
-                });
+                return Ok(pb::Command { kind: Some(kind) });
             }
             Expr::Call(_, head, args) if head == "print-size" => {
                 let tables = match args.as_slice() {
@@ -2531,14 +2447,12 @@ impl Source {
                     _ => return Err("source print-size requires at most one table".into()),
                 };
                 return Ok(pb::Command {
-                    span: self.span(&span)?,
                     kind: Some(pb::command::Kind::TableSizes(pb::GetTableSizes { tables })),
                 });
             }
             _ => return Err("source schedule body has no supported native projection".into()),
         };
         let run = pb::Command {
-            span: self.span(&span)?,
             kind: Some(pb::command::Kind::Run(pb::Run {
                 rulesets: self.select_groups(ruleset)?,
                 scheduler: scheduler.into(),
@@ -2559,7 +2473,6 @@ impl Source {
             };
             let until = self.facts(facts)?;
             Ok(pb::Command {
-                span: self.span(&span)?,
                 kind: Some(pb::command::Kind::Loop(pb::Loop {
                     max_iterations: Some(1),
                     until,
@@ -2830,23 +2743,25 @@ impl Source {
                     index += 2;
                     continue;
                 }
-                if let ResolvedAction::Let(span, var, expr) = action {
+                if let ResolvedAction::Let(_, var, expr) = action {
                     let node = self.expr(expr, Some(&aliases), 0)?;
                     aliases.insert(var.name.clone(), node);
                     // Preserve every authored first-demand position, including
                     // unused/fallible calls and duplicate retained roots.
                     head.push(pb::Action {
                         kind: Some(pb::action::Kind::Term(node)),
-                        span: self.span(span)?,
                     });
                 } else {
                     head.push(self.action(action, Some(&aliases))?);
                 }
                 index += 1;
             }
-            pb::rule::Kind::Rule(pb::RuleBody { query, head })
+            pb::rule::Kind::Rule(pb::RuleBody {
+                query,
+                actions: head,
+            })
         };
-        let span = self.span(&rule.span)?;
+
         let index = u32::try_from(self.rules.len()).map_err(|_| "too many source rules")?;
         let ruleset_name = rule.ruleset.clone();
         self.rules.push(pb::Rule {
@@ -2860,7 +2775,7 @@ impl Source {
             .into(),
             no_decomp: rule.no_decomp,
             include_subsumed: rule.include_subsumed,
-            span,
+
             ..Default::default()
         });
         let SourceRuleset::Rules { rules: list, owned } =
@@ -2897,18 +2812,17 @@ impl Source {
             .iter()
             .map(|fact| match fact {
                 ResolvedFact::Fact(expr) => self.expr(expr, None, 0),
-                ResolvedFact::Eq(span, lhs, rhs) => {
+                ResolvedFact::Eq(_, lhs, rhs) => {
                     let lhs = self.expr(lhs, None, 0)?;
                     let rhs = self.expr(rhs, None, 0)?;
-                    let span = self.span(span)?;
+
                     let index = u32::try_from(self.program.nodes.len())
                         .map_err(|_| "too many source nodes")?;
                     self.program.nodes.push(pb::Node {
                         sort_id: self.program.nodes[lhs as usize].sort_id,
-                        kind: Some(pb::node::Kind::Union(pb::Union {
+                        kind: Some(pb::node::Kind::Eq(pb::Eq {
                             members: vec![lhs, rhs],
                         })),
-                        span,
                     });
                     Ok(index)
                 }
@@ -2994,17 +2908,16 @@ impl Source {
         }
         let action = self.action(terminal, Some(&aliases))?;
         if !constructor_only {
-            let native_spans = NativeSpans::default();
+            let authored_origins = AuthoredOrigins::default();
             // Keep authored data intact while sharing receiver admission.
             let mut admission = self.program.clone();
             lower_container_values(&mut admission)?;
-            validate_node_graph(&admission, &native_spans)?;
+            validate_node_graph(&admission, &authored_origins)?;
             // Reuse admission and first-demand lowering. Inlining locals must
             // reproduce their actual order once.
             let position = admission.commands.len() as u32;
             admission.commands.push(pb::Command {
                 kind: Some(pb::command::Kind::Action(action.clone())),
-                ..Default::default()
             });
             let selected = classify_action_dags(&admission)?;
             let _reachable = selected
@@ -3014,7 +2927,7 @@ impl Source {
                 &admission,
                 &action,
                 |_| false,
-                &native_spans,
+                &authored_origins,
                 &mut HashMap::new(),
                 &mut 0,
             )?;
@@ -3044,7 +2957,7 @@ impl Source {
         } else {
             None
         };
-        let (span, kind) = match action {
+        let (_span, kind) = match action {
             ResolvedAction::Expr(span, expr) => {
                 (span, pb::action::Kind::Term(self.expr(expr, aliases, 0)?))
             }
@@ -3053,15 +2966,14 @@ impl Source {
                 let rhs = self.expr(rhs, aliases, 0)?;
                 let index =
                     u32::try_from(self.program.nodes.len()).map_err(|_| "too many source nodes")?;
-                let node_span = self.span(span)?;
-                // Each authored action owns a fresh Union occurrence, even
+
+                // Each authored action owns a fresh Eq occurrence, even
                 // when its member expressions match another action's members.
                 self.program.nodes.push(pb::Node {
                     sort_id: self.program.nodes[lhs as usize].sort_id,
-                    kind: Some(pb::node::Kind::Union(pb::Union {
+                    kind: Some(pb::node::Kind::Eq(pb::Eq {
                         members: vec![lhs, rhs],
                     })),
-                    span: node_span,
                 });
                 (span, pb::action::Kind::Term(index))
             }
@@ -3104,7 +3016,7 @@ impl Source {
                         );
                     }
                     pb::action::Kind::Set(pb::Set {
-                        target: Some(self.call(function, args, aliases, 0, span)?),
+                        target: Some(self.call(function, args, aliases, 0)?),
                         value: Some(self.expr(value, aliases, 0)?),
                     })
                 },
@@ -3121,7 +3033,7 @@ impl Source {
                             .into(),
                     );
                 }
-                let call = self.call(function, args, aliases, 0, span)?;
+                let call = self.call(function, args, aliases, 0)?;
                 (
                     span,
                     match change {
@@ -3135,10 +3047,7 @@ impl Source {
             }
             _ => return Err("source local binding requires rule-head lowering".into()),
         };
-        Ok(pb::Action {
-            kind: Some(kind),
-            span: self.span(span)?,
-        })
+        Ok(pb::Action { kind: Some(kind) })
     }
 
     fn call(
@@ -3147,7 +3056,6 @@ impl Source {
         args: &[ResolvedExpr],
         aliases: Option<&HashMap<String, u32>>,
         depth: usize,
-        span: &ast::Span,
     ) -> Result<pb::Call, String> {
         let mut children = Vec::with_capacity(args.len());
         for expr in args {
@@ -3159,8 +3067,7 @@ impl Source {
                 args: children,
             }),
             ResolvedCall::Primitive(primitive) => {
-                let span = self.span(span)?;
-                primitive.export_builtin_call(&self.graph, &children, span, &mut self.program)
+                primitive.export_builtin_call(&self.graph, &children, &mut self.program)
             }
         }
     }
@@ -3202,7 +3109,7 @@ impl Source {
                     },
                 )
             }
-            ResolvedExpr::Call(span, function, args) => (
+            ResolvedExpr::Call(_, function, args) => (
                 if matches!(function, ResolvedCall::Func(function) if self.relations.contains(&function.name))
                 {
                     "Unit"
@@ -3214,15 +3121,10 @@ impl Source {
                         .iter()
                         .map(|expr| self.expr(expr, aliases, depth + 1))
                         .collect::<Result<Vec<_>, _>>()?;
-                    let span = self.span(span)?;
-                    primitive.export_builtin_node(
-                        &self.graph,
-                        &children,
-                        span,
-                        &mut self.program,
-                    )?
+
+                    primitive.export_builtin_node(&self.graph, &children, &mut self.program)?
                 } else {
-                    let mut call = self.call(function, args, aliases, depth, span)?;
+                    let mut call = self.call(function, args, aliases, depth)?;
                     if let ResolvedCall::Func(function) = function
                         && let Some(constructor) = self
                             .graph
@@ -3238,12 +3140,11 @@ impl Source {
             ),
         };
         let sort_id = self.sort(sort)?;
-        let span = self.span(&expr.span())?;
+
         let index = u32::try_from(self.program.nodes.len()).map_err(|_| "too many source nodes")?;
         self.program.nodes.push(pb::Node {
             sort_id,
             kind: Some(kind),
-            span,
         });
         Ok(index)
     }
@@ -3255,30 +3156,6 @@ impl Source {
             .get_sort_by_name(name)
             .ok_or_else(|| format!("unknown sort {name}"))?;
         self.graph.export_sort(native, &mut self.program.sorts)
-    }
-
-    fn span(&mut self, span: &ast::Span) -> Result<Option<pb::Span>, String> {
-        let ast::Span::Egglog(span) = span else {
-            return Ok(None);
-        };
-        let file = pb::SourceFile {
-            name: span.file.name.clone().unwrap_or_default(),
-            contents: Some(span.file.contents.clone()),
-        };
-        let index = self
-            .program
-            .files
-            .iter()
-            .position(|existing| existing == &file)
-            .unwrap_or_else(|| {
-                self.program.files.push(file);
-                self.program.files.len() - 1
-            });
-        Ok(Some(pb::Span {
-            file: u32::try_from(index).map_err(|_| "too many source files")?,
-            start: u32::try_from(span.i).map_err(|_| "source span exceeds u32")?,
-            end: u32::try_from(span.j).map_err(|_| "source span exceeds u32")?,
-        }))
     }
 }
 
@@ -3348,6 +3225,7 @@ pub struct Renderer {
     dialect: Dialect,
     session: Session,
     sort_names: HashMap<String, String>,
+    callable_names: HashMap<String, String>,
     private_selectors: HashSet<String>,
     binding_names: HashMap<String, String>,
     initialized_bindings: HashSet<String>,
@@ -3358,6 +3236,7 @@ pub struct Renderer {
 struct RendererScope {
     session: Session,
     sort_names: HashMap<String, String>,
+    callable_names: HashMap<String, String>,
     private_selectors: HashSet<String>,
     binding_names: HashMap<String, String>,
     initialized_bindings: HashSet<String>,
@@ -3398,6 +3277,7 @@ impl Renderer {
         Self {
             dialect,
             sort_names: HashMap::new(),
+            callable_names: HashMap::new(),
             private_selectors: HashSet::new(),
             binding_names: HashMap::new(),
             initialized_bindings: HashSet::new(),
@@ -3448,6 +3328,7 @@ impl Renderer {
                     self.scopes.push(RendererScope {
                         session: self.session.clone(),
                         sort_names: self.sort_names.clone(),
+                        callable_names: self.callable_names.clone(),
                         private_selectors: self.private_selectors.clone(),
                         binding_names: self.binding_names.clone(),
                         initialized_bindings: self.initialized_bindings.clone(),
@@ -3465,6 +3346,7 @@ impl Renderer {
                     self.session.graph.restore_from(saved_graph);
                     self.session.request = active.request;
                     self.sort_names = saved.sort_names;
+                    self.callable_names = saved.callable_names;
                     self.private_selectors = saved.private_selectors;
                     self.binding_names = saved.binding_names;
                     self.initialized_bindings = saved.initialized_bindings;
@@ -3483,7 +3365,7 @@ impl Renderer {
             ))
             || graph::rules(program).any(|rule| matches!(
                 &rule.kind,
-                Some(pb::rule::Kind::Rule(rule)) if rule.head.iter().any(|action| matches!(action.kind, Some(pb::action::Kind::SetCost(_))))
+                Some(pb::rule::Kind::Rule(rule)) if rule.actions.iter().any(|action| matches!(action.kind, Some(pb::action::Kind::SetCost(_))))
             )))
         {
             return Err(TransportError("assigned-cost source rendering is not supported".into()));
@@ -3501,14 +3383,9 @@ impl Renderer {
         );
         lowered.commands = authored_commands.commands;
         if self.dialect == Dialect::Experimental {
-            let unextractable: HashSet<_> = prepared
-                .definitions
-                .declarations
-                .iter()
-                .filter_map(|declaration| match &declaration.kind {
-                    Some(pb::declaration::Kind::Constructor(constructor))
-                        if constructor.unextractable =>
-                    {
+            let unextractable: HashSet<_> = declarations(&prepared.definitions)
+                .filter_map(|declaration| match declaration {
+                    Declaration::Constructor(constructor) if constructor.unextractable => {
                         Some(native_name("call", &constructor.name))
                     }
                     _ => None,
@@ -3518,7 +3395,7 @@ impl Renderer {
                 || super::command_tree(&lowered.commands).filter_map(|command| match &command.kind {
                     Some(pb::command::Kind::Action(action)) => Some(action), _ => None,
                 }).chain(graph::rules(&lowered).flat_map(|rule| match &rule.kind {
-                    Some(pb::rule::Kind::Rule(rule)) => rule.head.as_slice(), _ => &[],
+                    Some(pb::rule::Kind::Rule(rule)) => rule.actions.as_slice(), _ => &[],
                 })).any(|action| match &action.kind {
                     Some(pb::action::Kind::SetCost(set)) => set.target.as_ref().is_some_and(|call| unextractable.contains(&call.func)),
                     Some(pb::action::Kind::Delete(call)) => unextractable.contains(&call.func),
@@ -3526,6 +3403,7 @@ impl Renderer {
                 })
             { return Err(TransportError("source dynamic-cost helpers do not exist for unextractable constructors".into())); }
         }
+        let mut callable_names = self.callable_names.clone();
         let mut authored = if self.dialect == Dialect::Core {
             // Preparation filters compatible resupply from `lowered`, so use
             // the complete canonical definitions, not just this phase's names.
@@ -3558,8 +3436,8 @@ impl Renderer {
         } else {
             // Reserve a bounded alias at the first canonical occurrence, even
             // when a nominal sort references a table before its declaration. Later
-            // headers reuse it; append-stable definition order and scope restore
-            // preserve earlier aliases without decoding generated spellings.
+            // headers reuse cached callable aliases across kind-local appends;
+            // scope restore preserves them without decoding generated spellings.
             let mut names = NativeNames::default();
             for (index, sort) in prepared.definitions.sorts.iter().enumerate() {
                 if let Some(pb::sort::Kind::Eq(name)) = &sort.kind {
@@ -3569,28 +3447,23 @@ impl Renderer {
                         .or_insert_with(|| format!("__egglog_source_sort_{index}"));
                 }
             }
-            for (index, declaration) in prepared.definitions.declarations.iter().enumerate() {
-                let (namespace, logical) = match &declaration.kind {
-                    Some(pb::declaration::Kind::Constructor(function)) => ("call", &function.name),
-                    Some(pb::declaration::Kind::Function(function)) => ("call", &function.name),
-                    Some(pb::declaration::Kind::Relation(relation)) => ("call", &relation.name),
-                    Some(pb::declaration::Kind::UserDefinedPrimitive(primitive)) => {
-                        ("call", &primitive.name)
-                    }
-                    _ => continue,
+            for declaration in declarations(&prepared.definitions) {
+                let logical = match declaration {
+                    Declaration::Constructor(function) => &function.name,
+                    Declaration::Function(function) => &function.name,
+                    Declaration::Relation(relation) => &relation.name,
+                    Declaration::UserDefinedPrimitive(primitive) => &primitive.name,
                 };
                 // Distinct from projected unknown references and structural
                 // aliases. A logical spelling equal to this alias is projected
                 // normally and cannot acquire another declaration's identity.
-                let alias = format!("__egglog_source_{namespace}_{index}");
-                let target = if namespace == "sort" {
-                    &mut names.sorts
-                } else {
-                    &mut names.callables
-                };
-                target
-                    .entry(native_name(namespace, logical))
-                    .or_insert(alias);
+                let next = callable_names.len();
+                let native = native_name("call", logical);
+                let alias = callable_names
+                    .entry(native.clone())
+                    .or_insert_with(|| format!("__egglog_source_call_{next}"))
+                    .clone();
+                names.callables.insert(native, alias);
             }
             for alias in names.sorts.values().chain(names.callables.values()) {
                 if self.session.graph.get_sort_by_name(alias).is_some()
@@ -3746,8 +3619,8 @@ impl Renderer {
                     constructor_cost_tables.insert(name.clone(), constructor.clone());
                 }
             }
-            for declaration in &prepared.definitions.declarations {
-                if let Some(pb::declaration::Kind::Constructor(constructor)) = &declaration.kind {
+            for declaration in declarations(&prepared.definitions) {
+                if let Declaration::Constructor(constructor) = declaration {
                     let constructor = native_name("call", &constructor.name);
                     let helper = crate::set_cost::get_cost_table_name(&constructor);
                     if self
@@ -3832,7 +3705,7 @@ impl Renderer {
         let mut session = self.session.clone();
         let context = session
             .install(prepared, &mut pb::RunProgramOutput::default())
-            .map_err(|(error, _)| TransportError(error.message))?;
+            .map_err(|error| TransportError(error.message))?;
         // Retain inert definitions only, never scheduler work. Preparation of
         // the next phase reads this same native binding metadata. The cloned
         // Session is adopted only after text and all registrations succeeded.
@@ -3856,6 +3729,7 @@ impl Renderer {
         session.registry = context.registry;
         self.session = session;
         self.sort_names = sort_names;
+        self.callable_names = callable_names;
         self.private_selectors = private_selectors;
         self.binding_names = binding_names;
         self.initialized_bindings = initialized_bindings;
@@ -3916,14 +3790,14 @@ fn source_cost_actions(
     request: u64,
     in_rule: bool,
     helpers: &HashMap<String, String>,
-    native_spans: &NativeSpans,
+    authored_origins: &AuthoredOrigins,
 ) -> Result<Vec<Action>, String> {
-    let span = native_span(program, action.span.as_ref(), native_spans)?;
+    let span = authored_span(None, authored_origins);
     // Project authored binders before introducing any private capture name.
     // Mapping the completed head would let an authored wire variable capture
     // the generated Let, unlike the runtime's ordinary SSA lowering.
     let expr = |index| -> Result<Expr, String> {
-        let expr = expression(program, index, &mut HashSet::new(), native_spans)?;
+        let expr = expression(program, index, &mut HashSet::new(), authored_origins)?;
         Ok(if in_rule {
             expr.map_symbols(&mut |name| name, &mut |name: String| {
                 native_name("var", &name)
@@ -3985,7 +3859,7 @@ fn source_cost_actions(
             Ok(actions)
         }
         _ => {
-            let actions = lower_action(program, action, native_spans)?;
+            let actions = lower_action(program, action, authored_origins)?;
             Ok(if in_rule {
                 ast::GenericActions(actions)
                     .map_symbols(&mut |name| name, &mut |name: String| {
@@ -4012,10 +3886,10 @@ fn render_prepared(
     binding_names: &HashMap<String, String>,
     initialized_bindings: &mut HashSet<String>,
 ) -> Result<String, TransportError> {
-    let native_spans = &prepared.context.native_spans;
+    let authored_origins = &prepared.context.authored_origins;
     let initial_bindings = initialized_bindings.clone();
     let result = (|| -> Result<Vec<Command>, String> {
-        validate_union_occurrences(program)?;
+        validate_eq_occurrences(program)?;
         // Native AST Display assumes symbols are source atoms; protobuf names
         // need not be. Validate every interpolated identifier before formatting,
         // using the native parser rather than maintaining another token grammar.
@@ -4035,13 +3909,12 @@ fn render_prepared(
                 _ => (),
             }
         }
-        for declaration in &program.declarations {
-            match &declaration.kind {
-                Some(pb::declaration::Kind::Constructor(constructor)) => names.push(constructor.name.as_str()),
-                Some(pb::declaration::Kind::Function(function)) => names.push(function.name.as_str()),
-                Some(pb::declaration::Kind::Relation(relation)) => names.push(relation.name.as_str()),
-                Some(pb::declaration::Kind::UserDefinedPrimitive(primitive)) => names.push(primitive.name.as_str()),
-                _ => (),
+        for declaration in declarations(program) {
+            match declaration {
+                Declaration::Constructor(constructor) => names.push(constructor.name.as_str()),
+                Declaration::Function(function) => names.push(function.name.as_str()),
+                Declaration::Relation(relation) => names.push(relation.name.as_str()),
+                Declaration::UserDefinedPrimitive(primitive) => names.push(primitive.name.as_str()),
             }
         }
         // These are the exact strings emitted by the typed AST mapping below.
@@ -4067,7 +3940,7 @@ fn render_prepared(
         for action in super::command_tree(&program.commands).filter_map(|command| match &command.kind {
             Some(pb::command::Kind::Action(action)) => Some(action), _ => None,
         }).chain(graph::rules(program).flat_map(|rule| match &rule.kind {
-            Some(pb::rule::Kind::Rule(rule)) => rule.head.as_slice(), _ => &[],
+            Some(pb::rule::Kind::Rule(rule)) => rule.actions.as_slice(), _ => &[],
         })) {
             match &action.kind {
                 Some(pb::action::Kind::Set(set)) => {
@@ -4107,23 +3980,21 @@ fn render_prepared(
         }));
         commands.extend(prepared.materialized.iter().cloned());
         let table_names = project_names(&mut pb::Program::default(), &prepared.definitions, &crate::proto::BuiltinCatalog::default()).callables;
+        let submitted_declarations: Vec<_> = declarations(program).collect();
         for &index in declaration_order {
-            let declaration = &program.declarations[index];
-            let span = native_span(program, declaration.span.as_ref(), native_spans)?;
-            let name = match &declaration.kind {
-                Some(pb::declaration::Kind::Constructor(table)) => Some(&table.name),
-                Some(pb::declaration::Kind::Function(table)) => Some(&table.name),
-                Some(pb::declaration::Kind::Relation(table)) => Some(&table.name),
+            let declaration = submitted_declarations[index];
+            let span = authored_span(None, authored_origins);
+            let name = match declaration {
+                Declaration::Constructor(table) => Some(&table.name),
+                Declaration::Function(table) => Some(&table.name),
+                Declaration::Relation(table) => Some(&table.name),
                 _ => None,
             };
             let table_name = name.map(|name| native_table_name(declaration, &table_names[name]));
             commands.push(
                 match declaration
-                    .kind
-                    .as_ref()
-                    .ok_or("missing declaration kind")?
                 {
-                    pb::declaration::Kind::Constructor(constructor) => Command::Constructor {
+                    Declaration::Constructor(constructor) => Command::Constructor {
                         span,
                         name: constructor.name.clone(),
                         table_name,
@@ -4131,7 +4002,7 @@ fn render_prepared(
                         cost: constructor
                             .cost
                             .map(|index| -> Result<u64, String> {
-                                match expression(program, index, &mut HashSet::new(), native_spans)? {
+                                match expression(program, index, &mut HashSet::new(), authored_origins)? {
                                     Expr::Lit(_, Literal::Int(cost)) => u64::try_from(cost)
                                         .map_err(|_| "negative constructor cost".into()),
                                     _ => Err("source constructor cost must be an inert i64".into()),
@@ -4143,31 +4014,31 @@ fn render_prepared(
                         let_binding: false,
                         term_constructor: None,
                     },
-                    pb::declaration::Kind::Function(function) => Command::Function {
+                    Declaration::Function(function) => Command::Function {
                         span,
                         name: function.name.clone(),
                         table_name,
                         schema: signature(program, &function.inputs, function.output)?,
                         merge: function
                             .merge
-                            .map(|index| expression(program, index, &mut HashSet::new(), native_spans))
+                            .map(|index| expression(program, index, &mut HashSet::new(), authored_origins))
                             .transpose()?,
                         hidden: function.hidden,
                         let_binding: false,
                         term_constructor: None,
                         unextractable: true,
                     },
-                    pb::declaration::Kind::UserDefinedPrimitive(primitive) => {
+                    Declaration::UserDefinedPrimitive(primitive) => {
                         if dialect == Dialect::Core {
                             return Err("program-defined primitive source requires the Experimental provider".into());
                         }
-                        primitive_command(program, primitive, span, native_spans)?
+                        primitive_command(program, primitive, span, authored_origins)?
                     },
-                    pb::declaration::Kind::Relation(relation) => Command::Relation {
+                    Declaration::Relation(relation) => Command::Relation {
                         span,
                         name: relation.name.clone(),
                         table_name,
-                        inputs: relation.inputs.iter().map(|arg| sort_name(&program.sorts, arg.sort)).collect::<Result<_, _>>()?,
+                        inputs: relation.inputs.iter().map(|arg| sort_name(&program.sorts, *arg)).collect::<Result<_, _>>()?,
                     },
                 },
             );
@@ -4304,7 +4175,7 @@ fn render_prepared(
         for (position, mut command) in render_program.commands.iter().enumerate() {
             let mut fail_spans = vec![];
             while let Some(pb::command::Kind::Fail(child)) = &command.kind {
-                fail_spans.push(native_span(program, command.span.as_ref(), native_spans)?);
+                fail_spans.push(authored_span(None, authored_origins));
                 command = child;
             }
             if !fail_spans.is_empty() && matches!(&command.kind,
@@ -4328,7 +4199,7 @@ fn render_prepared(
                 return Err("Fail requires a supported native command; observation and loop wrappers are not implemented".into());
             }
             let first_command = commands.len();
-            let span = native_span(program, command.span.as_ref(), native_spans)?;
+            let span = authored_span(None, authored_origins);
             match command.kind.as_ref().ok_or("missing command kind")? {
                 pb::command::Kind::Freeze(_) => continue,
                 pb::command::Kind::Let(value) => {
@@ -4336,26 +4207,26 @@ fn render_prepared(
                     let binding = value.binding.and_then(|index| program.nodes.get(index as usize)).ok_or("missing Let binding")?;
                     let Some(pb::node::Kind::Binding(name)) = &binding.kind else { return Err("Let target is not a binding".into()); };
                     if !initialized_bindings.insert(name.clone()) { return Err("source rendering does not support global rebinding".into()); }
-                    commands.push(Command::Action(Action::Let(span, binding_names[name].clone(), expression(program, value.value.ok_or("missing Let value")?, &mut HashSet::new(), native_spans)?)));
+                    commands.push(Command::Action(Action::Let(span, binding_names[name].clone(), expression(program, value.value.ok_or("missing Let value")?, &mut HashSet::new(), authored_origins)?)));
                 }
                 pb::command::Kind::Action(action) => {
                     if prepared.context.action_dags.contains_key(&vec![position as u32]) {
                         commands.push(Command::ActionScope(span, ast::GenericActions(
                             action_dag_actions(program, action, &query_occupied,
-                                native_spans, &mut HashMap::new(), &mut 0)?.0,
+                                authored_origins, &mut HashMap::new(), &mut 0)?.0,
                         )));
                     } else {
                         commands.extend(
                             (if dialect == Dialect::Experimental {
-                                source_cost_actions(program, action, first_command, prepared.request, false, constructor_cost_tables, native_spans)?
-                            } else { lower_action(program, action, native_spans)? })
+                                source_cost_actions(program, action, first_command, prepared.request, false, constructor_cost_tables, authored_origins)?
+                            } else { lower_action(program, action, authored_origins)? })
                                 .into_iter()
                                 .map(Command::Action),
                         );
                     }
                 }
                 pb::command::Kind::Check(check) => {
-                    commands.push(Command::Check(span, facts(program, &check.facts, native_spans, None, &query_occupied)?.0))
+                    commands.push(Command::Check(span, facts(program, &check.facts, authored_origins, None, &query_occupied)?.0))
                 }
                 pb::command::Kind::Stats(_) => {
                     commands.push(Command::PrintOverallStatistics(span, None));
@@ -4376,7 +4247,7 @@ fn render_prepared(
                     commands.push(Command::UserDefined(span, name, args));
                 }
                 pb::command::Kind::Prove(prove) => {
-                    commands.push(Command::Prove(span, facts(program, &prove.facts, native_spans, None, &query_occupied)?.0))
+                    commands.push(Command::Prove(span, facts(program, &prove.facts, authored_origins, None, &query_occupied)?.0))
                 }
                 pb::command::Kind::ProveExists(prove) => {
                     commands.push(Command::ProveExists(span, prove.constructor.clone()))
@@ -4402,7 +4273,7 @@ fn render_prepared(
                         args.extend(extract.roots.iter().map(|root| {
                             // Generic command traversal skips UserDefined args;
                             // only these typed root positions contain callables.
-                            Ok(expression(program, *root, &mut HashSet::new(), native_spans)?.map_symbols(
+                            Ok(expression(program, *root, &mut HashSet::new(), authored_origins)?.map_symbols(
                                 &mut |name: String| authored.callables.get(&name).cloned().unwrap_or(name),
                                 &mut |name| name,
                             ))
@@ -4414,7 +4285,7 @@ fn render_prepared(
                         continue;
                     }
                     for root in &extract.roots {
-                        let root = expression(program, *root, &mut HashSet::new(), native_spans)?;
+                        let root = expression(program, *root, &mut HashSet::new(), authored_origins)?;
                         let variants = Expr::Lit(span.clone(), Literal::Int(if extract.variants == 1 { 0 } else { i64::from(extract.variants) }));
                         commands.push(if extract.extractor == i32::from(pb::Extractor::GreedyDag) {
                             Command::UserDefined(span.clone(), "extract".into(), vec![root, variants,
@@ -4455,7 +4326,7 @@ fn render_prepared(
                         ]));
                     } else {
                         commands.push(Command::RunSchedule(source_schedule(
-                            program, command, native_spans, &query_occupied,
+                            program, command, authored_origins, &query_occupied,
                         )?));
                     }
                 }
@@ -4849,7 +4720,7 @@ fn source_extended_schedule(
     if depth > 256 {
         return Err("source schedule nesting exceeds 256".into());
     }
-    let span = native_span(program, command.span.as_ref(), &context.native_spans)?;
+    let span = authored_span(None, &context.authored_origins);
     let header = match &command.kind {
         Some(pb::command::Kind::Loop(body)) => {
             Some(("saturate", body.max_iterations, &body.until, &body.body))
@@ -4877,7 +4748,7 @@ fn source_extended_schedule(
             ));
         }
         if !until.is_empty() {
-            let conditions = facts(program, until, &context.native_spans, None, occupied)?
+            let conditions = facts(program, until, &context.authored_origins, None, occupied)?
                 .0
                 .into_iter()
                 .map(|fact| {
@@ -4920,7 +4791,7 @@ fn source_extended_schedule(
             )?],
         ),
         pb::command::Kind::Action(action) => {
-            let [action]: [Action; 1] = lower_action(program, action, &context.native_spans)?
+            let [action]: [Action; 1] = lower_action(program, action, &context.authored_origins)?
                 .try_into()
                 .map_err(|_| "source schedule action requires one native action")?;
             let action = action.map_symbols(
@@ -5030,10 +4901,10 @@ fn source_extended_schedule(
 fn source_schedule(
     program: &pb::Program,
     command: &pb::Command,
-    native_spans: &NativeSpans,
+    authored_origins: &AuthoredOrigins,
     occupied: &dyn Fn(&str) -> bool,
 ) -> Result<ast::Schedule, String> {
-    let span = native_span(program, command.span.as_ref(), native_spans)?;
+    let span = authored_span(None, authored_origins);
     if let Some(pb::command::Kind::Loop(repeat)) = &command.kind
         && repeat.max_iterations == Some(1)
         && !repeat.until.is_empty()
@@ -5050,11 +4921,11 @@ fn source_schedule(
             return Err("source loop-until requires one conditional Run without scheduler".into());
         }
         let ast::Schedule::Run(_, mut config) =
-            source_schedule(program, child, native_spans, occupied)?
+            source_schedule(program, child, authored_origins, occupied)?
         else {
             unreachable!("conditional child is a Run")
         };
-        config.until = Some(facts(program, &repeat.until, native_spans, None, occupied)?.0);
+        config.until = Some(facts(program, &repeat.until, authored_origins, None, occupied)?.0);
         return Ok(ast::Schedule::Run(span, config));
     }
     let (body, bound, sequence) = match command.kind.as_ref().ok_or("missing schedule")? {
@@ -5087,7 +4958,7 @@ fn source_schedule(
     let children = body
         .iter()
         .filter(|child| !matches!(child.kind, Some(pb::command::Kind::Freeze(_))))
-        .map(|child| source_schedule(program, child, native_spans, occupied))
+        .map(|child| source_schedule(program, child, authored_origins, occupied))
         .collect::<Result<_, _>>()?;
     let body = ast::Schedule::Sequence(span.clone(), children);
     Ok(if sequence {
@@ -5135,6 +5006,21 @@ mod node_projection_tests {
     use super::*;
 
     #[test]
+    fn renderer_retains_callable_aliases_when_a_later_kind_precedes_an_existing_one() {
+        let mut renderer = Renderer::default();
+        let mut native = crate::new_experimental_egraph();
+        for text in [
+            "(function value () i64 :merge new) (set (value) 1)",
+            "(datatype E (N)) (N)",
+            "(function value () i64 :merge new) (set (value) 2) (check (= (value) 2))",
+        ] {
+            let program = Source::new(None, text).unwrap().next().unwrap().unwrap();
+            let rendered = renderer.render(&program).unwrap();
+            native.parse_and_run_program(None, &rendered).unwrap();
+        }
+    }
+
+    #[test]
     fn renderer_replaces_membership_and_replays_literal_named_unions() {
         let source = r#"
             (relation Seed (i64)) (relation Seen (i64)) (ruleset r)
@@ -5167,7 +5053,10 @@ mod node_projection_tests {
                 .commands
                 .iter()
                 .map(|command| pb::Program {
-                    declarations: vec![],
+                    constructors: vec![],
+                    functions: vec![],
+                    relations: vec![],
+                    user_defined_primitives: vec![],
                     rulesets: vec![],
                     commands: vec![command.clone()],
                     ..program.clone()
@@ -5190,7 +5079,6 @@ mod node_projection_tests {
                         }],
                         ..Default::default()
                     })),
-                    ..Default::default()
                 }],
                 ..Default::default()
             };
@@ -5221,7 +5109,6 @@ mod node_projection_tests {
                     ],
                     ..Default::default()
                 })),
-                ..Default::default()
             }];
             native
                 .parse_and_run_program(None, &renderer.render(&literal).unwrap())
@@ -5263,13 +5150,13 @@ mod node_projection_tests {
                 .is_err()
         );
         assert!(Arc::ptr_eq(&builtins, &renderer.session.builtins));
-        assert!(renderer.session.definitions.declarations.is_empty());
+        assert!(declarations(&renderer.session.definitions).next().is_none());
         assert_eq!(renderer.render(&pb::Program::default()).unwrap(), "");
         let mut cloned = renderer.clone();
         for renderer in [&mut renderer, &mut cloned] {
             assert!(Arc::ptr_eq(&builtins, &renderer.session.builtins));
             assert_eq!(renderer.render(&pb::Program::default()).unwrap(), "");
-            assert!(renderer.session.definitions.declarations.is_empty());
+            assert!(declarations(&renderer.session.definitions).next().is_none());
         }
     }
 
@@ -5283,13 +5170,13 @@ mod node_projection_tests {
             N::PrimitiveValue(pb::PrimitiveValue {
                 value: Some(V::I64(7)),
             }),
-            N::Union(pb::Union { members: vec![3] }),
+            N::Eq(pb::Eq { members: vec![3] }),
             N::Call(pb::Call {
                 func: "Next".into(),
                 args: vec![2],
             }),
-            N::Union(pb::Union { members: vec![] }),
-            N::Union(pb::Union { members: vec![] }),
+            N::Eq(pb::Eq { members: vec![] }),
+            N::Eq(pb::Eq { members: vec![] }),
             N::PrimitiveValue(pb::PrimitiveValue {
                 value: Some(V::Lambda(pb::Lambda {
                     captures: vec![2],
@@ -5314,26 +5201,17 @@ mod node_projection_tests {
                 .map(|index| pb::Command {
                     kind: Some(pb::command::Kind::Action(pb::Action {
                         kind: Some(pb::action::Kind::Term(index)),
-                        ..Default::default()
                     })),
-                    ..Default::default()
                 })
                 .collect(),
-            files: vec![pb::SourceFile {
-                name: "source.egg".into(),
-                contents: Some("unchanged".into()),
-            }],
+
             sorts: vec![pb::Sort::default()],
             ..Default::default()
         };
-        let files = program.files.clone();
         let sorts = program.sorts.clone();
         project_source_nodes(&arena, 6, &mut program).unwrap();
         assert_eq!(program.nodes.len(), 7);
-        assert_eq!(
-            (program.files.clone(), program.sorts.clone()),
-            (files, sorts)
-        );
+        assert_eq!(program.sorts, sorts);
         assert!(!program.nodes.iter().any(|node| matches!(
             &node.kind,
             Some(N::PrimitiveValue(pb::PrimitiveValue {
@@ -5369,7 +5247,7 @@ mod node_projection_tests {
             program.nodes[roots[1] as usize],
             program.nodes[roots[2] as usize]
         );
-        let Some(N::Union(union)) = &program.nodes[roots[0] as usize].kind else {
+        let Some(N::Eq(union)) = &program.nodes[roots[0] as usize].kind else {
             panic!("cycle root")
         };
         let Some(N::Call(call)) = &program.nodes[union.members[0] as usize].kind else {
@@ -5382,31 +5260,18 @@ mod node_projection_tests {
     #[test]
     fn projection_roots_include_saved_code_defaults_rules_and_nested_controls() {
         let mut program = pb::Program {
-            declarations: vec![
-                pb::Declaration {
-                    kind: Some(pb::declaration::Kind::Constructor(pb::Constructor {
-                        cost: Some(1),
-                        ..Default::default()
-                    })),
-                    ..Default::default()
-                },
-                pb::Declaration {
-                    kind: Some(pb::declaration::Kind::Function(pb::Function {
-                        merge: Some(2),
-                        ..Default::default()
-                    })),
-                    ..Default::default()
-                },
-                pb::Declaration {
-                    kind: Some(pb::declaration::Kind::UserDefinedPrimitive(
-                        pb::UserDefinedPrimitive {
-                            body: Some(3),
-                            ..Default::default()
-                        },
-                    )),
-                    ..Default::default()
-                },
-            ],
+            constructors: vec![pb::Constructor {
+                cost: Some(1),
+                ..Default::default()
+            }],
+            functions: vec![pb::Function {
+                merge: Some(2),
+                ..Default::default()
+            }],
+            user_defined_primitives: vec![pb::UserDefinedPrimitive {
+                body: Some(3),
+                ..Default::default()
+            }],
 
             rulesets: vec![pb::RulesetBinding {
                 name: String::new(),
@@ -5415,7 +5280,7 @@ mod node_projection_tests {
                         pb::Rule {
                             kind: Some(pb::rule::Kind::Rule(pb::RuleBody {
                                 query: vec![5],
-                                head: vec![
+                                actions: vec![
                                     pb::Action {
                                         kind: Some(pb::action::Kind::Set(pb::Set {
                                             target: Some(pb::Call {
@@ -5424,7 +5289,6 @@ mod node_projection_tests {
                                             }),
                                             value: Some(7),
                                         })),
-                                        ..Default::default()
                                     },
                                     pb::Action {
                                         kind: Some(pb::action::Kind::SetCost(pb::SetCost {
@@ -5434,25 +5298,21 @@ mod node_projection_tests {
                                             }),
                                             cost: Some(9),
                                         })),
-                                        ..Default::default()
                                     },
                                     pb::Action {
                                         kind: Some(pb::action::Kind::Delete(pb::Call {
                                             args: vec![10],
                                             ..Default::default()
                                         })),
-                                        ..Default::default()
                                     },
                                     pb::Action {
                                         kind: Some(pb::action::Kind::Subsume(pb::Call {
                                             args: vec![11],
                                             ..Default::default()
                                         })),
-                                        ..Default::default()
                                     },
                                     pb::Action {
                                         kind: Some(pb::action::Kind::Term(12)),
-                                        ..Default::default()
                                     },
                                 ],
                             })),
@@ -5490,20 +5350,17 @@ mod node_projection_tests {
                                         kind: Some(pb::command::Kind::Check(pb::Check {
                                             facts: vec![21],
                                         })),
-                                        ..Default::default()
                                     },
                                     pb::Command {
                                         kind: Some(pb::command::Kind::Prove(pb::Prove {
                                             facts: vec![22],
                                         })),
-                                        ..Default::default()
                                     },
                                     pb::Command {
                                         kind: Some(pb::command::Kind::Extract(pb::Extract {
                                             roots: vec![23],
                                             ..Default::default()
                                         })),
-                                        ..Default::default()
                                     },
                                     pb::Command {
                                         kind: Some(pb::command::Kind::Action(pb::Action {
@@ -5514,20 +5371,15 @@ mod node_projection_tests {
                                                 }),
                                                 value: Some(25),
                                             })),
-                                            ..Default::default()
                                         })),
-                                        ..Default::default()
                                     },
                                 ],
                                 ..Default::default()
                             })),
-                            ..Default::default()
                         }],
                         ..Default::default()
                     })),
-                    ..Default::default()
                 }))),
-                ..Default::default()
             }],
             ..Default::default()
         };

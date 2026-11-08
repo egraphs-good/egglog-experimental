@@ -82,7 +82,7 @@ impl Snapshot {
                     let node = program.nodes.get(*index as usize).ok_or_else(|| {
                         TypedError::Decode("snapshot inventory index out of bounds".into())
                     })?;
-                    if let Some(pb::node::Kind::Union(union)) = &node.kind {
+                    if let Some(pb::node::Kind::Eq(union)) = &node.kind {
                         if membership.insert(*index, *index).is_some() {
                             return Err(TypedError::Decode("duplicate snapshot class".into()));
                         }
@@ -184,7 +184,7 @@ impl Snapshot {
         ensure_sort(Expr(self.source.resolve(Arena::Node, index)?))
     }
 
-    /// Inventory stored classes only; Unions in saved code are not observations.
+    /// Inventory stored classes only; Eq nodes in saved code are not observations.
     pub fn eclasses(&self) -> impl ExactSizeIterator<Item = ClassRef<'_>> + Clone {
         self.classes.iter().map(|index| ClassRef {
             snapshot: self,
@@ -354,7 +354,7 @@ impl<'s> TableRowRef<'s> {
 impl<'s> ClassRef<'s> {
     /// Producers in the export's captured order, including subsumed rows.
     pub fn nodes(self) -> impl ExactSizeIterator<Item = ProducerRef<'s>> + Clone {
-        let Some(pb::node::Kind::Union(union)) = &self
+        let Some(pb::node::Kind::Eq(union)) = &self
             .snapshot
             .source
             .owner
@@ -441,18 +441,14 @@ impl<'s> ProducerRef<'s> {
             .unwrap()
             .program()
             .unwrap()
-            .declarations
+            .constructors
             .iter()
-            .find_map(|declaration| match &declaration.kind {
-                Some(pb::declaration::Kind::Constructor(constructor))
-                    if constructor.name == self.name() =>
-                {
-                    constructor.cost.map(|index| ValueRef {
-                        snapshot: self.snapshot,
-                        index,
-                    })
-                }
-                _ => None,
+            .find(|constructor| constructor.name == self.name())
+            .and_then(|constructor| {
+                constructor.cost.map(|index| ValueRef {
+                    snapshot: self.snapshot,
+                    index,
+                })
             })
     }
 }
@@ -660,8 +656,7 @@ mod tests {
                     nodes: vec![
                         pb::Node {
                             sort_id: 1,
-                            kind: Some(pb::node::Kind::Union(pb::Union { members: vec![1] })),
-                            ..Default::default()
+                            kind: Some(pb::node::Kind::Eq(pb::Eq { members: vec![1] })),
                         },
                         pb::Node {
                             sort_id: 1,
@@ -669,7 +664,6 @@ mod tests {
                                 func: "Box".into(),
                                 args: vec![2],
                             })),
-                            ..Default::default()
                         },
                         pb::Node {
                             sort_id: 2,
@@ -679,14 +673,12 @@ mod tests {
                                     args: vec![0, 3, 0, 3],
                                 })),
                             })),
-                            ..Default::default()
                         },
                         pb::Node {
                             sort_id: 0,
                             kind: Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
                                 value: Some(pb::primitive_value::Value::I64(7)),
                             })),
-                            ..Default::default()
                         },
                         pb::Node {
                             sort_id: 2,
@@ -696,15 +688,12 @@ mod tests {
                                     args: vec![],
                                 })),
                             })),
-                            ..Default::default()
                         },
                     ],
                     commands: vec![pb::Command {
                         kind: Some(pb::command::Kind::Action(pb::Action {
                             kind: Some(pb::action::Kind::Term(0)),
-                            ..Default::default()
                         })),
-                        ..Default::default()
                     }],
                     ..Default::default()
                 }),

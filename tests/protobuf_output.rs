@@ -53,7 +53,7 @@ fn submit(
 }
 
 #[test]
-fn streamed_snapshots_drop_sources_while_live_rules_and_input_history_keep_them() {
+fn streamed_snapshots_and_restored_rules_keep_independent_authored_error_context() {
     let text = "(datatype E (N i64)) (ruleset boom) \
         (rule ((N e)) ((panic \"old-rule\")) :ruleset boom :name \"saved-label\") \
         (N 7) (extract (N 7)) (panic \"after export\")";
@@ -63,14 +63,9 @@ fn streamed_snapshots_drop_sources_while_live_rules_and_input_history_keep_them(
         .unwrap()
         .unwrap();
     input.rulesets[0].value.as_mut().unwrap().rules[0].doc = "rule docs".into();
-    input.files.push(pb::SourceFile {
-        name: "unused.egg".into(),
-        contents: Some("unrelated".into()),
-    });
     let panic = input.commands.pop().unwrap();
     input.commands.push(pb::Command {
         kind: Some(pb::command::Kind::Freeze(pb::Freeze {})),
-        ..Default::default()
     });
     input.commands.push(panic);
     let original = input.clone();
@@ -81,9 +76,6 @@ fn streamed_snapshots_drop_sources_while_live_rules_and_input_history_keep_them(
     let mut extractions = 0;
     for frame in &frames {
         if let Some(pb::run_program_response::Result::Output(output)) = &frame.result {
-            assert!(frame.files.is_empty());
-            assert!(output.nodes.iter().all(|node| node.span.is_none()));
-            assert!(output.sorts.iter().all(|sort| sort.span.is_none()));
             for observation in &output.outputs {
                 match &observation.kind {
                     Some(pb::command_output::Kind::Extraction(_)) => extractions += 1,
@@ -97,15 +89,6 @@ fn streamed_snapshots_drop_sources_while_live_rules_and_input_history_keep_them(
     }
     assert_eq!(extractions, 1, "prefix was delivered before the error");
     let snapshot = snapshot.unwrap();
-    assert!(snapshot.files.is_empty());
-    assert!(snapshot.nodes.iter().all(|node| node.span.is_none()));
-    assert!(snapshot.sorts.iter().all(|sort| sort.span.is_none()));
-    assert!(
-        snapshot
-            .declarations
-            .iter()
-            .all(|declaration| declaration.span.is_none())
-    );
     let rule = &snapshot
         .rulesets
         .iter()
@@ -117,32 +100,36 @@ fn streamed_snapshots_drop_sources_while_live_rules_and_input_history_keep_them(
         .rules[0];
     assert_eq!(rule.name.as_deref(), Some("saved-label"));
     assert_eq!(rule.doc, "rule docs");
-    assert!(rule.span.is_none());
     let Some(pb::rule::Kind::Rule(body)) = &rule.kind else {
         panic!("rule")
     };
-    assert!(body.head.iter().all(|action| action.span.is_none()));
+    assert!(
+        matches!(body.actions[0].kind, Some(pb::action::Kind::Panic(ref message)) if message == "old-rule")
+    );
     let terminal = frames.last().unwrap();
     let Some(pb::run_program_response::Result::Error(error)) = &terminal.result else {
         panic!("late panic")
     };
-    let span = error.span.unwrap();
-    assert_eq!(span.file, 0);
-    assert_eq!(terminal.files, [input.files[0].clone()]);
-    assert!(text[span.start as usize..span.end as usize].contains("after export"));
+    let context = error.context.as_ref().unwrap();
+    assert_eq!(context.commands, [input.commands.last().unwrap().clone()]);
+    assert_eq!(error.site.as_ref().unwrap().path, [5, 0, 1]);
     assert_eq!(input, original);
     let bytes = engine
         .get_history(&pb::GetHistoryRequest { egraph_id: id }.encode_to_vec())
         .unwrap();
     let history = pb::Program::decode(bytes.as_slice()).unwrap();
-    assert!(history.files.contains(&input.files[0]));
-    assert!(
+    assert_eq!(
+        history.rulesets[0].value.as_ref().unwrap().rules[0].doc,
+        "rule docs"
+    );
+    assert_eq!(
         history.rulesets[0].value.as_ref().unwrap().rules[0]
-            .span
-            .is_some()
+            .name
+            .as_deref(),
+        Some("saved-label")
     );
 
-    let mut run = Source::new(Some("new.egg".into()), "(run-schedule boom)")
+    let run = Source::new(Some("new.egg".into()), "(run-schedule boom)")
         .unwrap()
         .next()
         .unwrap()
@@ -151,43 +138,41 @@ fn streamed_snapshots_drop_sources_while_live_rules_and_input_history_keep_them(
         run.commands[0].kind,
         Some(pb::command::Kind::Run(_))
     ));
-    run.files.insert(0, input.files[1].clone());
-    run.commands[0].span.as_mut().unwrap().file = 1;
-    let mut new_span = run.commands[0].span.unwrap();
-    new_span.file = 0;
     let live = submit(&mut engine, id, run.clone()).pop().unwrap();
     let Some(pb::run_program_response::Result::Error(error)) = live.result else {
         panic!("saved panic")
     };
-    let span = error.span.unwrap();
-    assert_eq!(span.file, 0);
-    assert_eq!(live.files, [input.files[0].clone()]);
-    assert!(text[span.start as usize..span.end as usize].contains("old-rule"));
-    for located in [true, false] {
-        let restored = create(&mut engine);
-        assert!(
-            submit(&mut engine, restored, snapshot.clone())
-                .iter()
-                .all(|frame| frame.files.is_empty()
-                    && matches!(
-                        frame.result,
-                        Some(pb::run_program_response::Result::Output(_))
-                    ))
-        );
-        if !located {
-            run.files.clear();
-            run.commands[0].span = None;
-        }
-        let thawed = submit(&mut engine, restored, run.clone()).pop().unwrap();
-        let Some(pb::run_program_response::Result::Error(error)) = thawed.result else {
-            panic!("restored saved panic")
-        };
-        if located {
-            assert_eq!(thawed.files, [run.files[1].clone()]);
-            assert_eq!(error.span, Some(new_span));
-        } else {
-            assert!(thawed.files.is_empty());
-            assert!(error.span.is_none());
-        }
-    }
+    let context = error.context.as_ref().unwrap();
+    let rule = &context.rulesets[0].value.as_ref().unwrap().rules[0];
+    assert_eq!(rule.name.as_deref(), Some("saved-label"));
+    assert_eq!(rule.doc, "rule docs");
+    assert_eq!(error.site.as_ref().unwrap().path, [7, 0, 2, 1, 0, 1, 3, 0]);
+    assert!(
+        context
+            .constructors
+            .iter()
+            .any(|constructor| constructor.name == input.constructors[0].name)
+    );
+    let restored = create(&mut engine);
+    assert!(
+        submit(&mut engine, restored, snapshot)
+            .iter()
+            .all(|frame| matches!(
+                frame.result,
+                Some(pb::run_program_response::Result::Output(_))
+            ))
+    );
+    let thawed = submit(&mut engine, restored, run).pop().unwrap();
+    let Some(pb::run_program_response::Result::Error(restored_error)) = thawed.result else {
+        panic!("restored saved panic")
+    };
+    let restored_context = restored_error.context.unwrap();
+    let restored_rule = &restored_context.rulesets[0].value.as_ref().unwrap().rules[0];
+    assert_eq!(restored_rule.name, rule.name);
+    assert_eq!(restored_rule.doc, rule.doc);
+    assert_eq!(
+        restored_error.site.as_ref().unwrap().path,
+        error.site.as_ref().unwrap().path
+    );
+    assert_eq!(restored_error.location, error.location);
 }

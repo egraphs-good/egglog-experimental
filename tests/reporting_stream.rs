@@ -81,16 +81,13 @@ fn loop_program() -> pb::Program {
                                 }],
                                 ..Default::default()
                             })),
-                            ..Default::default()
                         },
                         pb::Command {
                             kind: Some(pb::command::Kind::Freeze(pb::Freeze {})),
-                            ..Default::default()
                         },
                     ],
                     ..Default::default()
                 })),
-                ..Default::default()
             },
             pb::Command {
                 kind: Some(pb::command::Kind::Extract(pb::Extract {
@@ -99,7 +96,6 @@ fn loop_program() -> pb::Program {
                     extractor: pb::Extractor::Tree.into(),
                     ..Default::default()
                 })),
-                ..Default::default()
             },
             pb::Command {
                 kind: Some(pb::command::Kind::Extract(pb::Extract {
@@ -108,7 +104,6 @@ fn loop_program() -> pb::Program {
                     extractor: pb::Extractor::Tree.into(),
                     ..Default::default()
                 })),
-                ..Default::default()
             },
         ],
         ..Default::default()
@@ -124,7 +119,6 @@ fn census(engine: &mut Engine, id: u64) -> u64 {
                 kind: Some(pb::command::Kind::TableSizes(pb::GetTableSizes {
                     tables: vec!["N".into()],
                 })),
-                ..Default::default()
             }],
             ..Default::default()
         },
@@ -292,7 +286,6 @@ fn default_off_diagnostics_explain_and_opt_in_preserve_control_and_data() {
                 kind: Some(pb::command::Kind::Explain(pb::Explain {
                     groups: vec!["step".into()],
                 })),
-                ..Default::default()
             }],
             ..Default::default()
         },
@@ -351,7 +344,6 @@ fn default_off_diagnostics_explain_and_opt_in_preserve_control_and_data() {
             pb::Program {
                 commands: vec![pb::Command {
                     kind: Some(pb::command::Kind::Stats(pb::Unit {})),
-                    ..Default::default()
                 }],
                 ..Default::default()
             },
@@ -390,9 +382,7 @@ fn later_loop_failure_keeps_delivered_observation_and_has_no_completed_result() 
     repeat.body.push(pb::Command {
         kind: Some(pb::command::Kind::Action(pb::Action {
             kind: Some(pb::action::Kind::Panic("stop after snapshot".into())),
-            ..Default::default()
         })),
-        ..Default::default()
     });
     let mut observed = 0;
     let mut final_error = None;
@@ -460,7 +450,6 @@ fn backoff_quiet_deferred_rounds_preserve_readiness_with_collection_off_and_on()
                             }],
                             scheduler: "bo".into(),
                         })),
-                        ..Default::default()
                     }],
                     ..Default::default()
                 },
@@ -509,9 +498,7 @@ fn cancellation_stops_before_authored_fail_and_cannot_turn_into_caught_success()
                 body: repeat.body.clone(),
                 ..Default::default()
             })),
-            ..Default::default()
         }))),
-        ..Default::default()
     });
     let mut delivered = 0;
     let error = engine
@@ -554,9 +541,7 @@ fn terminal_callback_break_preserves_actual_errors_and_completed_success() {
                 commands: vec![pb::Command {
                     kind: Some(pb::command::Kind::Action(pb::Action {
                         kind: Some(pb::action::Kind::Panic("original engine failure".into())),
-                        ..Default::default()
                     })),
-                    ..Default::default()
                 }],
                 ..Default::default()
             }),
@@ -618,7 +603,6 @@ fn decomposed_diagnostics_keep_actual_text_and_preserve_execution() {
                 }],
                 ..Default::default()
             })),
-            ..Default::default()
         }],
         ..Default::default()
     };
@@ -666,7 +650,6 @@ fn decomposed_diagnostics_keep_actual_text_and_preserve_execution() {
                     kind: Some(pb::command::Kind::TableSizes(pb::GetTableSizes {
                         tables: vec!["Out".into()],
                     })),
-                    ..Default::default()
                 }],
                 ..Default::default()
             },

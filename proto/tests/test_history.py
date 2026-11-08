@@ -24,12 +24,12 @@ class HistorySchemaTests(unittest.TestCase):
 
     def test_history_program_keeps_command_order_and_distinct_union_locations(self):
         rule = ir.Rule(
-            kind=Oneof("rule", ir.RuleBody(query=[0], head=[ir.Action(kind=Oneof("term", 1))])),
+            kind=Oneof("rule", ir.RuleBody(query=[0], actions=[ir.Action(kind=Oneof("term", 1))])),
             eval_mode=ir.RuleEvalMode.SEMINAIVE,
         )
         program = ir.Program(
             sorts=[ir.Sort(kind=Oneof("eq", "E"))],
-            nodes=[ir.Node(kind=Oneof("union", ir.Union())) for _ in range(2)],
+            nodes=[ir.Node(kind=Oneof("eq", ir.Eq())) for _ in range(2)],
             rulesets=[ir.RulesetBinding(name="g", value=ir.Ruleset(rules=[rule, rule]))],
             commands=[
                 ir.Command(kind=Oneof("action", ir.Action(kind=Oneof("term", 0)))),
@@ -49,7 +49,7 @@ class HistorySchemaTests(unittest.TestCase):
             self.assertEqual([command.kind.field for command in decoded.commands],
                              ["action", "freeze", "run"])
             self.assertEqual(decoded.rulesets[0].value.rules[0].kind.value.query, [0])
-            self.assertEqual(decoded.rulesets[0].value.rules[0].kind.value.head[0].kind.value, 1)
+            self.assertEqual(decoded.rulesets[0].value.rules[0].kind.value.actions[0].kind.value, 1)
             self.assertEqual(decoded.commands[2].kind.value.rulesets[0].kind.value.rules,
                              decoded.rulesets[0].value.rules)
             self.assertEqual(len(decoded.nodes), 2)

@@ -33,9 +33,9 @@ prost = "0.14.4"
 serde_json = "1.0"
 csv = "1.4.0"
 egglog-experimental-typed-macros = { path = "typed-macros", version = "3.0.0", optional = true }
-egglog = { version = "3.0.0", git = "https://github.com/egraphs-good/egglog.git", rev = "bd7de1657a529dad3b731001edc78386874864fc", default-features = false }
-egglog-ast = { version = "3.0.0", git = "https://github.com/egraphs-good/egglog.git", rev = "bd7de1657a529dad3b731001edc78386874864fc", default-features = false }
-egglog-reports = { version = "3.0.0", git = "https://github.com/egraphs-good/egglog.git", rev = "bd7de1657a529dad3b731001edc78386874864fc", default-features = false }
+egglog = { version = "3.0.0", git = "https://github.com/egraphs-good/egglog.git", rev = "f766cabf3f0602ed6908b343e608c88ec725593e", default-features = false }
+egglog-ast = { version = "3.0.0", git = "https://github.com/egraphs-good/egglog.git", rev = "f766cabf3f0602ed6908b343e608c88ec725593e", default-features = false }
+egglog-reports = { version = "3.0.0", git = "https://github.com/egraphs-good/egglog.git", rev = "f766cabf3f0602ed6908b343e608c88ec725593e", default-features = false }
 
 num = "0.4.3"
 lazy_static = "1.4"
@@ -46,7 +46,7 @@ fixedbitset = "0.5.7"
 hashbrown = "0.16.0"
 
 [dev-dependencies]
-egglog-bridge = { version = "3.0.0", git = "https://github.com/egraphs-good/egglog.git", rev = "bd7de1657a529dad3b731001edc78386874864fc", default-features = false }
+egglog-bridge = { version = "3.0.0", git = "https://github.com/egraphs-good/egglog.git", rev = "f766cabf3f0602ed6908b343e608c88ec725593e", default-features = false }
 glob = "0.3.1"
 libtest-mimic = "0.8.1"
 

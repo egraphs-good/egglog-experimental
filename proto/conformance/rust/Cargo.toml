@@ -1,0 +1,19 @@
+[package]
+name = "constant-folding-conformance"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[dependencies]
+egglog-experimental = { path = "../../..", default-features = false, features = ["typed"] }
+prost = "0.14.4"
+
+[[bin]]
+name = "constant-folding-conformance"
+path = "capture.rs"
+
+[[bin]]
+name = "constant-folding-example"
+path = "constant_folding.rs"

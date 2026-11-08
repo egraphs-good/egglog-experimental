@@ -507,6 +507,56 @@ mod trait_operators {
         Ok(())
     }
 
+    #[sort]
+    struct OwnedDefault;
+    #[declarations]
+    impl OwnedDefault {
+        fn leaf(value: I64) -> Self;
+    }
+    #[declarations]
+    impl std::ops::Add for OwnedDefault {
+        type Output = OwnedDefault;
+        #[constructor(name = "OwnedDefaultAdd")]
+        fn add(self, rhs: Self) -> Self;
+    }
+
+    #[sort]
+    struct BorrowedDefault;
+    #[declarations]
+    impl BorrowedDefault {
+        fn leaf(value: I64) -> Self;
+    }
+    #[declarations]
+    impl std::ops::Add for &BorrowedDefault {
+        type Output = BorrowedDefault;
+        #[constructor(name = "BorrowedDefaultAdd")]
+        fn add(self, rhs: Self) -> BorrowedDefault;
+    }
+
+    #[test]
+    fn omitted_rhs_uses_the_actual_owned_or_borrowed_self_type() -> Result<(), TypedError> {
+        let left = OwnedDefault::leaf(11);
+        let right = OwnedDefault::leaf(7);
+        let owned = &left + &right;
+        let (a, b) = get_args(&owned, |a: &OwnedDefault, b: &OwnedDefault| a + b)?.unwrap();
+        assert_eq!(a, left);
+        assert_eq!(b, right);
+        assert_eq!(owned, left + right);
+        let left = BorrowedDefault::leaf(13);
+        let right = BorrowedDefault::leaf(5);
+        let borrowed = &left + &right;
+        let (a, b) =
+            get_args(&borrowed, |a: &BorrowedDefault, b: &BorrowedDefault| a + b)?.unwrap();
+        assert_eq!(a, left);
+        assert_eq!(b, right);
+        assert_eq!(borrowed, left + right);
+        let mut graph = EGraph::new()?;
+        graph.register((&owned, &borrowed))?;
+        assert_eq!(graph.extract(&owned)?, owned);
+        assert_eq!(graph.extract(&borrowed)?, borrowed);
+        Ok(())
+    }
+
     struct Ordinary;
     #[declarations]
     impl std::ops::Add<&Ordinary> for &Ordinary {
@@ -1370,7 +1420,7 @@ fn typed_union_subsume_invalid_targets_captures_and_occurrences() -> Result<(), 
     graph.register(delete(Read(72)))?;
     assert!(!graph.check(Read(72))?);
     assert!(matches!(graph.run(ruleset(rule((), (&shared, &shared)))),
-        Err(TypedError::Engine(frame)) if matches!(&frame.result, Some(pb::run_program_response::Result::Error(error)) if error.message.contains("repeated action Union occurrence"))));
+        Err(TypedError::Engine(frame)) if matches!(&frame.result, Some(pb::run_program_response::Result::Error(error)) if error.message.contains("repeated action Eq occurrence"))));
     assert!(!graph.check(Read(72))?);
     graph.register((
         union(input.clone(), copied.clone()),

@@ -7,12 +7,12 @@
 // Every arena index must name an entry in its enclosing arena-owning message.
 // CEL checks direct node/sort edges; remaining references, including command
 // and output roots, are normative verifier obligations.
-// A fact is a node index; equality `(= a b)` names a `Union` of a and b.
+// A fact is a node index; equality `(= a b)` names an `Eq` of a and b.
 // Unknown enum values are errors; Rust consumers must check raw enum values.
 // Producers expand datatype/default-argument/include syntax before this boundary.
 
 // ---------------------------------------------------------------------------
-// PROGRAM AND PROVENANCE — the request payload and the shared span vocabulary.
+// PROGRAM — typed arenas, declarations and ordered commands.
 // ---------------------------------------------------------------------------
 
 /// A typed program against one e-graph handle. CEL rules are executable reference
@@ -23,7 +23,7 @@
 /// where required during preparation. Requested Check query planning, including
 /// its groundedness failures, occurs during execution; generated helper/rule
 /// validation remains preparation.
-/// Sorts are acyclic; expression cycles must pass through a `Union` node.
+/// Sorts are acyclic; expression cycles must pass through an `Eq` node.
 /// Declarations form one batch for the whole Program. Install them before any
 /// command, order-independently and without executing their bodies. Resolving
 /// declaration dependencies is not loop execution: loop bodies contain only
@@ -31,77 +31,54 @@
 /// setup: install complete replacements before commands, retaining omitted names.
 /// Prepare all rule values before execution, including literals in zero-iteration
 /// loop bodies. Native installation failures need not roll back completed setup.
+/// Input Sort.eq entries establish nominal equality sorts; Node.binding entries
+/// establish typed global slots, including unused entries. These are setup roots,
+/// not value evaluation. Compatible names coalesce; conflicting sorts are errors.
 /// Definitions installed on this handle may be referenced by name without
 /// resending them. Node and sort indices refer to this Program's
 /// arenas, not previous requests; all referenced entries must be included here.
 /// Execute only commands, in order, and the expressions they demand. Unused
 /// arena entries are not executed; arena membership is not an execution root.
-/// Direct Actions in one execution of a command list share a Union identity
+/// Direct Actions and Let initializers in one command list share an Eq identity
 /// scope, even across intervening non-Action commands. Program.commands is one
 /// such list. Each loop-body iteration starts an independent scope; nested lists
 /// never inherit the outer mapping, which resumes after they return. Rule
-/// firings and other commands' evaluated inputs have their own scopes as in Union.
-/// Fail is transparent to these scopes: a wrapped direct Action still belongs
-/// to its enclosing command list, and the wrapper adds no Union identity scope.
+/// firings and other commands' evaluated inputs have their own scopes as in Eq.
+/// Fail is transparent to these scopes: a wrapped direct Action or Let belongs
+/// to its enclosing command list, and the wrapper adds no Eq identity scope.
 /// Sort.var is legal only in BuiltinCatalog signatures. Node sorts, lambda
 /// parameter sorts, cost sorts and concrete declaration signatures must be
 /// recursively closed. CEL rejects direct variable roots; closure is normative.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct Program {
-    /// Expression arena. Evaluate shared ordinary nodes lazily at first demand,
+    /// Expression arena. Binding nodes also establish typed global slots at setup.
+    /// Evaluate shared ordinary nodes lazily at first demand,
     /// retaining results within one Action command execution (including actions
-    /// in loops) or one rule firing's ordered head. Start a fresh ordinary memo for
+    /// in loops) or one rule firing's ordered actions. Start a fresh ordinary memo for
     /// each such execution. Query patterns do not use this evaluation memo.
-    /// `Union` locations have separate identity scopes; see `Union`.
+    /// `Eq` locations have separate identity scopes; see `Eq`.
     #[prost(message, repeated, tag = "2")]
     pub nodes: ::prost::alloc::vec::Vec<Node>,
-    /// Sort arena, separate from expression nodes.
+    /// Sort arena. Every equality entry establishes its nominal sort at setup.
     #[prost(message, repeated, tag = "3")]
     pub sorts: ::prost::alloc::vec::Vec<Sort>,
+    /// Order-independent callable definitions sharing one namespace.
     #[prost(message, repeated, tag = "4")]
-    pub declarations: ::prost::alloc::vec::Vec<Declaration>,
+    pub constructors: ::prost::alloc::vec::Vec<Constructor>,
+    #[prost(message, repeated, tag = "8")]
+    pub functions: ::prost::alloc::vec::Vec<Function>,
+    #[prost(message, repeated, tag = "9")]
+    pub relations: ::prost::alloc::vec::Vec<Relation>,
+    #[prost(message, repeated, tag = "10")]
+    pub user_defined_primitives: ::prost::alloc::vec::Vec<UserDefinedPrimitive>,
     #[prost(message, repeated, tag = "5")]
     pub commands: ::prost::alloc::vec::Vec<Command>,
-    /// Optional provenance. Omit spans for a normalized/unlocated program.
-    #[prost(message, repeated, tag = "6")]
-    pub files: ::prost::alloc::vec::Vec<SourceFile>,
     /// Complete persistent binding replacements, with unique names in this batch.
     /// Empty values clear membership; omission leaves a binding unchanged.
     /// Publish bindings together after successful setup installation. Native
     /// effects completed before a setup failure remain.
     #[prost(message, repeated, tag = "7")]
     pub rulesets: ::prost::alloc::vec::Vec<RulesetBinding>,
-}
-/// A source file shared by diagnostic/documentation spans in the enclosing
-/// payload. Source metadata does not preserve formatting or arbitrary comments.
-#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct SourceFile {
-    #[prost(string, tag = "1")]
-    pub name: ::prost::alloc::string::String,
-    /// Optional contents for diagnostic excerpts when the source is unavailable.
-    /// In-process consumers may use name as a file path.
-    #[prost(string, optional, tag = "2")]
-    pub contents: ::core::option::Option<::prost::alloc::string::String>,
-}
-/// A byte range. Resolve `file` against the nearest arena-owning payload's
-/// `files`: `Program`, `BuiltinCatalog`, `CreateEGraphRequest`, `RunProgramResponse`, or
-/// a nested exported `Program`. Re-emission must remap or include those files,
-/// or strip spans, including origins from definitions installed by earlier requests;
-/// dangling indices are invalid. The range is half-open [start, end), with
-/// start <= end. If contents are present, both offsets must be UTF-8 character
-/// boundaries within their byte length, including for an explicitly empty
-/// source. File bounds, content length and character boundaries are normative.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct Span {
-    /// index into the enclosing message's `files`
-    #[prost(uint32, tag = "1")]
-    pub file: u32,
-    /// byte offset
-    #[prost(uint32, tag = "2")]
-    pub start: u32,
-    /// byte offset
-    #[prost(uint32, tag = "3")]
-    pub end: u32,
 }
 // ---------------------------------------------------------------------------
 // SORTS — shared concrete types and signature patterns.
@@ -110,20 +87,18 @@ pub struct Span {
 /// Closed sorts are structurally interned: equal container/function shapes
 /// denote the same sort. GenericSignature variables are binder-local; shared
 /// patterns never share substitutions between signatures or calls.
-/// Sorts are acyclic through SortApplication.args and FuncSort.params/result.
+/// Sorts are acyclic through PrimitiveSortRef.args and FuncSort.params/result.
 /// CEL checks direct indices, not acyclicity or nested variable scope.
-/// References do not declare sorts: eq resolves a user EqSort; application
-/// resolves a configured-backend PrimitiveSort from GetBuiltins. These nominal
-/// namespaces are distinct even when names have the same spelling.
-/// Missing names and family-arity mismatches are errors. Builtin references need
-/// no descriptor declarations. Output references resolve against the associated
-/// handle; output arenas do not redeclare definitions.
+/// In an input Program, eq establishes a nominal equality sort, idempotently by
+/// name. Other arena owners describe types without installing them. Primitive
+/// references resolve a configured-backend PrimitiveSort from GetBuiltins; missing
+/// names and family-arity mismatches are errors. Equality-sort, primitive-sort,
+/// callable and global-binding namespaces are distinct.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct Sort {
-    /// Optional representative type-use origin; excluded from sort identity.
-    /// Documentation belongs to the defining Declaration or catalog entry.
-    #[prost(message, optional, tag = "5")]
-    pub span: ::core::option::Option<Span>,
+    /// Definition documentation does not establish sort identity.
+    #[prost(string, optional, tag = "6")]
+    pub doc: ::core::option::Option<::prost::alloc::string::String>,
     #[prost(oneof = "sort::Kind", tags = "1, 2, 4, 7")]
     pub kind: ::core::option::Option<sort::Kind>,
 }
@@ -134,7 +109,7 @@ pub mod sort {
         #[prost(string, tag = "1")]
         Eq(::prost::alloc::string::String),
         #[prost(message, tag = "2")]
-        Application(super::SortApplication),
+        Primitive(super::PrimitiveSortRef),
         #[prost(message, tag = "4")]
         Func(super::FuncSort),
         /// index into the enclosing GenericSignature binder
@@ -142,19 +117,19 @@ pub mod sort {
         Var(u32),
     }
 }
-/// A primitive-sort application: no args for i64/Unit, or e.g. Vec<i64> and
-/// Map<String, Math>. Arg count equals declared family arity, including zero.
+/// A primitive-sort reference: no args for i64/Unit, or e.g. Vec<i64> and
+/// Map<String, Math>. Argument count equals declared family arity, including zero.
 /// Args may be patterns only in a GenericSignature; otherwise
 /// recursively closed. Primitive sorts are not equality sorts.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct SortApplication {
+pub struct PrimitiveSortRef {
     #[prost(string, tag = "1")]
     pub name: ::prost::alloc::string::String,
     /// index into the enclosing `sorts`
     #[prost(uint32, repeated, tag = "2")]
     pub args: ::prost::alloc::vec::Vec<u32>,
 }
-/// A structural function type, not a PrimitiveSort application. Its parameter and
+/// A structural function type, separate from PrimitiveSortRef. Its parameter and
 /// result sorts may be patterns in a GenericSignature;
 /// otherwise closed.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
@@ -167,7 +142,7 @@ pub struct FuncSort {
     pub result: u32,
 }
 // ---------------------------------------------------------------------------
-// EXPRESSIONS — the node arena, `Union`, and the other `Node.kind` payloads.
+// EXPRESSIONS — the node arena, `Eq`, and the other `Node.kind` payloads.
 // ---------------------------------------------------------------------------
 
 /// Typed syntax. The producer supplies the resolved sort; the verifier checks
@@ -176,25 +151,30 @@ pub struct FuncSort {
 /// Every use must be valid independently, even when a node is shared between
 /// code and data. The contexts are query, action, deferred code and inert data:
 /// Rule queries, rewrite LHSs/conditions, checks, and loop-until facts are queries.
-/// Rule heads, rewrite RHSs, top-level actions, and operations' evaluated inputs
+/// Rule actions, rewrite RHSs, top-level actions, and operations' evaluated inputs
 /// use the action context.
-/// - Queries share one binder across all facts. Rule heads and rewrite RHSs may
-///    use that binder; top-level evaluated inputs have no free variables.
-///    Every variable must belong to its use's binder.
+/// - Queries share one binder across all facts. Rule actions and rewrite RHSs may
+///   use that binder; top-level evaluated inputs have no free variables.
+///   Every variable must belong to its use's binder.
+/// - Binding nodes name global slots, independent of lexical binders. Their
+///   resolved sorts must agree across the input and installed state. Direct reads
+///   of unset slots fail; query reads contribute no match. Evaluated rule-action
+///   references capture globals in the query, as in native global lowering;
+///   deferred code instead obeys its own read/effect context.
 /// - Function merges, primitives and lambda bodies use only their own binders
-///    (see those messages). Their bodies and transitive callees must be legal in
-///    each execution context. Hosts publish ambient primitive capabilities;
-///    receivers check them. An evaluated Union can write even in an expression body.
+///   (see those messages). Their bodies and transitive callees must be legal in
+///   each execution context. Hosts publish ambient primitive capabilities;
+///   receivers check them. An evaluated Eq can write even in an expression body.
 /// - Inert values (declared costs and extracted data) must be finite and contain
-///    no variables, get_cost reads or Union. Saved code retains its own binders;
-///    these restrictions apply at each use, not to the entire arena.
+///   no variable or binding reads, get_cost reads or Eq. Saved code retains its binders;
+///   these restrictions apply at each use, not to the entire arena.
 ///
 /// Scalar values are inert. Child-bearing values follow the surrounding
 /// context; constructing a value does not grant inverse query matching or
 /// relax groundedness. Calls and host value materialization must obey their
 /// enclosing execution context's capabilities, including query-mode restrictions.
 ///
-/// Call/get_cost arguments, Apply's function/arguments, Union members and
+/// Call/get_cost arguments, Apply's function/arguments, Eq members and
 /// PrimitiveValue children inherit the surrounding context and binder. Each is
 /// a value position; row positions never propagate to children. A lambda body
 /// starts its own code context and binder, also in a value position. See Call
@@ -206,13 +186,7 @@ pub struct Node {
     /// index into the enclosing `sorts`
     #[prost(uint32, tag = "1")]
     pub sort_id: u32,
-    /// One optional origin. Producers may share ordinary syntax with one chosen
-    /// location or emit separate nodes for distinct locations, sharing children.
-    /// Do not duplicate identity-bearing Union locations merely to attach spans.
-    /// Spans never participate in a row's key.
-    #[prost(message, optional, tag = "8")]
-    pub span: ::core::option::Option<Span>,
-    #[prost(oneof = "node::Kind", tags = "2, 3, 4, 10, 7, 9")]
+    #[prost(oneof = "node::Kind", tags = "2, 11, 3, 4, 10, 7, 9")]
     pub kind: ::core::option::Option<node::Kind>,
 }
 /// Nested message and enum types in `Node`.
@@ -225,15 +199,21 @@ pub mod node {
         /// lambda/primitive parameters _0, _1, ....
         #[prost(string, tag = "2")]
         Var(::prost::alloc::string::String),
+        /// In input Programs, establish a typed global slot during setup. Evaluating
+        /// this node reads its current value; Let addresses it without reading it.
+        /// Names are exact UTF-8, including empty names. Reusing this node does not assign a
+        /// value. Unset slots remain represented by these setup roots in Freeze.
+        #[prost(string, tag = "11")]
+        Binding(::prost::alloc::string::String),
         #[prost(message, tag = "3")]
         PrimitiveValue(super::PrimitiveValue),
         #[prost(message, tag = "4")]
         Call(super::Call),
         #[prost(message, tag = "10")]
         Apply(super::Apply),
-        /// An explicit identity-bearing class/equality group. See `Union`.
+        /// An explicit identity-bearing class/equality group. See `Eq`.
         #[prost(message, tag = "7")]
-        Union(super::Union),
+        Eq(super::Eq),
         /// Read a Constructor row's explicitly assigned per-row cost, yielding C.
         /// The target addresses the row without evaluating/inserting the constructor.
         /// Functions, Relations and primitives are invalid targets. No declared-cost
@@ -243,32 +223,35 @@ pub mod node {
         /// It has seminaive dependencies like a table lookup, not a Pure-only primitive.
         /// When evaluated, evaluate args once each, left-to-right, then read the cost;
         /// absence fails with RUNTIME_FAILURE. This requires a read-capable context,
-        /// so is invalid in SEMINAIVE heads or Pure/Write code. Args inherit the use's
+        /// so is invalid in SEMINAIVE actions or Pure/Write code. Args inherit the use's
         /// context/binder. Not inert data; saved code may use it under these rules.
         #[prost(message, tag = "9")]
         GetCost(super::Call),
     }
 }
-/// A class/equality group identified by its node index and typed by sort_id.
+/// A common-value group identified by its node index and typed by sort_id.
+/// It yields the common value rather than a Boolean comparison result.
+/// An empty action group creates a fresh e-class.
 /// A constructor Call member is a stored extraction alternative; a function Call
 /// is a lookup whose result participates in the equality, never an alternative.
 /// A PrimitiveValue member contributes its exact concrete value. Exports recreate
 /// function rows with Set, including Unit outputs, rather than Call members.
-/// Relation rows use bare Calls and cannot be Union members.
+/// Relation rows use bare Calls and cannot be Eq members.
 ///
 /// Context propagates through nested expressions, including call arguments:
 /// - In queries, members constrain one common value without mutation. Nonempty
-///    unions may have primitive sorts; empty unions are invalid.
+///   groups may have primitive sorts; empty groups are invalid.
 /// - In actions, merge the members' classes and yield that class. The sort must
-///    be an equality sort; primitive-sort writes require directional Set instead.
-///    An empty Union allocates a fresh class without a temporary constructor row.
+///   be an equality sort; primitive-sort writes require directional Set instead.
+///   An empty Eq allocates a fresh class without a temporary constructor row.
+///
 /// Top-level nodes run only when a command demands them. Nesting never permits
 /// reordering around reads, effects or row conflicts. Extracted data forbids
-/// unions; deferred code follows Node's execution-context rules.
+/// equality groups; deferred code follows Node's execution-context rules.
 ///
-/// During one rule firing, a Union location identifies one class across the
-/// whole ordered head. Direct Actions in an executed command list share one
-/// unit as specified on Program; each loop iteration uses a fresh unit.
+/// During one rule firing, an Eq location identifies one class across the
+/// entire ordered action list. Direct Actions and Let initializers in a command
+/// list share one unit as specified on Program; each loop iteration uses a fresh unit.
 /// Each primitive/lambda invocation starts a fresh unit. All evaluated inputs
 /// of another command share one independent unit for that command execution.
 /// On first action use, establish the class identity before evaluating members;
@@ -285,16 +268,16 @@ pub mod node {
 /// is its callable and canonical arguments, not its Call node index; duplicate
 /// Call nodes cannot be subsumed independently.
 ///
-/// Every expression cycle must pass through Union. Removing its outgoing edges
+/// Every expression cycle must pass through Eq. Removing its outgoing edges
 /// must leave an acyclic graph of Call/get_cost arguments, Apply's function and
 /// arguments, and every PrimitiveValue child, including custom args and lambda
-/// bodies/captures. Union members retain their inherited use context and bounds.
-/// Self-reaching calls without a Union boundary are invalid. CEL does not check
+/// bodies/captures. Eq members retain their inherited use context and bounds.
+/// Self-reaching calls without an Eq boundary are invalid. CEL does not check
 /// cycles; consumers must track visited nodes when traversing the graph.
-/// Producers must append Union nodes positionally, never hash-cons or deduplicate
+/// Producers must append Eq nodes positionally, never hash-cons or deduplicate
 /// them: equal-looking locations may denote distinct classes.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct Union {
+pub struct Eq {
     /// index into the enclosing `nodes`
     #[prost(uint32, repeated, tag = "1")]
     pub members: ::prost::alloc::vec::Vec<u32>,
@@ -314,7 +297,7 @@ pub struct Union {
 /// For Node.call, the enclosing node's sort matches the result; relation calls
 /// use Unit. Relation calls are restricted to row positions: a query fact,
 /// `Action.term`, or `Action.delete`. They cannot be value
-/// arguments, `Set.value`, `Union` members, lambda captures/results, or deferred
+/// arguments, `Set.value`, `Eq` members, lambda captures/results, or deferred
 /// code. This restriction covers installed, ambient and locally declared names.
 /// A relation row is the bare `Call` node itself.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
@@ -345,7 +328,12 @@ pub struct Apply {
 /// Captures inherit the surrounding use context, including its data restrictions;
 /// the body is separately scoped deferred code, even in a stored/extracted value.
 /// Function values use PrimitiveValue.lambda; application uses Apply.
-/// Node sharing does not determine function-value equality.
+/// Code identity uses the typed body and capture/parameter/result sorts, excluding
+/// arena numbering, sharing of the Lambda node itself, and diagnostic metadata.
+/// Evaluated Lambda values compare by code identity and captured values;
+/// capture expressions are not part of code identity.
+/// Observations of anonymous functions retain this code and actual captured
+/// values as Lambda data, never implementation-generated helper names.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct Lambda {
     /// Evaluated when the lambda is constructed; bound as _0 through _(k-1).
@@ -361,7 +349,7 @@ pub struct Lambda {
 /// arms retain their exact payloads: f64_bits preserves IEEE-754 bits,
 /// while Egglog equality identifies signed zeroes and all NaN bit patterns.
 /// BigInt/BigRat/Rational and vec/set/multiset/map/pair/maybe use their matching
-/// SortApplication family applications; lambda/partial_call use FuncSort.
+/// PrimitiveSortRef family applications; lambda/partial_call use FuncSort.
 /// CustomValue supports other primitive sorts, including nullary families with value children.
 /// Verify payload/sort agreement and child types; CEL checks their indices only.
 ///
@@ -422,8 +410,9 @@ pub mod primitive_value {
         Maybe(super::MaybeValue),
         #[prost(message, tag = "15")]
         Lambda(super::Lambda),
-        /// A function value with a named callable's argument prefix captured, never
-        /// a dynamic function value. The enclosing node has a closed FuncSort.
+        /// A named function value with its leading arguments bound (possibly none),
+        /// not a general Partial operation on a function-valued expression. Its code
+        /// identity is the named callable's identity. The node has a closed FuncSort.
         /// Concatenate captured arg sorts with its remaining params and use its result
         /// to check one effective complete call under the callee's typing form,
         /// including varargs. This must determine all generic
@@ -497,7 +486,7 @@ pub struct MaybeValue {
 /// For primitive sorts without a dedicated PrimitiveValue arm. The exact enclosing
 /// sort selects the codec and its valid arg arity/sorts; no separate type tag.
 /// A nullary family may still have value args (e.g. PyObject); these are not
-/// SortApplication's type args and need not have the same arity.
+/// PrimitiveSortRef's type args and need not have the same arity.
 /// All Egglog references are explicit args. Payload bytes may refer to arg slots,
 /// never arena/class indices, engine Value IDs or raw process pointers. Traversal,
 /// rebuilding and remapping must rewrite args regardless of sort kind, without
@@ -523,25 +512,20 @@ pub struct CustomValue {
 pub struct Unit {
 }
 // ---------------------------------------------------------------------------
-// ACTIONS — mutations, usable in a rule head or as a command.
+// ACTIONS — mutations, usable in rules or as commands.
 // ---------------------------------------------------------------------------
 
 /// An ordered mutation or expression evaluation. Shared ordinary nodes retain
 /// their first-demand result within this Action or the enclosing rule firing's
-/// ordered head. No evaluation moves before its first demand. Persistent
-/// top-level captures lower to nullary functions plus sets.
+/// ordered actions. No evaluation moves before its first demand. Persistent
+/// global assignment uses Command.let rather than a rule action.
 /// Set, delete, subsume and SetCost are standalone actions, not value expressions.
 /// Execute action lists in order; each Set uses the function's conflict policy
 /// if that write conflicts. Rule matches and rebuilds have no global order here.
 /// Ordinary memos reset for each Action command execution, including inside loops.
-/// Writes commit in command order; Union has its own separate identity lifetime.
+/// Writes commit in command order; Eq has its own separate identity lifetime.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct Action {
-    /// Optional origin; omit for an unlocated program. When present, this is the
-    /// authoritative action location, since a shared node's span may be dropped
-    /// or merged. A located `panic` needs this span because it has no operand node.
-    #[prost(message, optional, tag = "6")]
-    pub span: ::core::option::Option<Span>,
     #[prost(oneof = "action::Kind", tags = "1, 2, 3, 7, 4, 5")]
     pub kind: ::core::option::Option<action::Kind>,
 }
@@ -550,12 +534,12 @@ pub mod action {
     #[derive(Clone, PartialEq, Eq, Hash, ::prost::Oneof)]
     pub enum Kind {
         /// Evaluate/materialize this expression, insert a relation row, or — when
-        /// it names a `Union` node — merge the group's members.
+        /// it names an `Eq` node — merge the group's members.
         ///
         /// index into the enclosing `nodes`
         #[prost(uint32, tag = "1")]
         Term(u32),
-        /// Write a function row. Directional, unlike the symmetric `Union`, and so
+        /// Write a function row. Directional, unlike the symmetric `Eq`, and so
         /// NOT subsumable into one: it chooses which row is written.
         #[prost(message, tag = "2")]
         Set(super::Set),
@@ -584,7 +568,7 @@ pub struct Set {
     #[prost(uint32, optional, tag = "2")]
     pub value: ::core::option::Option<u32>,
 }
-/// Write one constructor row's extraction cost. Usable in rule heads.
+/// Write one constructor row's extraction cost. Usable in rule actions.
 ///
 /// Names a row and a value, not a table: where the engine stores the cost is not
 /// part of this contract. The cost expression has the handle's immutable cost
@@ -614,95 +598,40 @@ pub struct SetCost {
 // DECLARATIONS — immutable sort and callable definitions.
 // ---------------------------------------------------------------------------
 
-/// Order-independent, immutable definitions. New names may be added. Resending
-/// a complete definition is optional and checks compatibility: identical
-/// definitions are no-ops; conflicting definitions are errors. User tables and
-/// computed primitives have complete, concrete definitions. Builtin primitives
-/// and primitive sorts are resolved by canonical name against GetBuiltins;
-/// their descriptors are not input declarations.
-/// Compare referenced expression subgraphs structurally, not request-local
-/// indices. Provenance, documentation and argument labels do not participate
-/// in semantic identity.
-/// Comparison must preserve Union sharing/identity topology; ordinary syntax
-/// sharing may differ. One empty Union reused twice is not two fresh Unions.
-/// Callable names are unique across Constructor, Function, Relation and
-/// UserDefinedPrimitive, including ambient builtin primitives. Equality sorts
-/// and primitive sorts occupy distinct nominal namespaces, selected by Sort's
-/// kind. Equal spellings may coexist across namespaces. Compatible resends retain
-/// the definition; conflicts within a namespace never shadow definitions.
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct Declaration {
-    /// Optional diagnostic origin; excluded from semantic identity.
-    #[prost(message, optional, tag = "7")]
-    pub span: ::core::option::Option<Span>,
-    /// Optional documentation; excluded from semantic identity. Absent and
-    /// explicitly empty documentation remain distinct.
-    #[prost(string, optional, tag = "9")]
-    pub doc: ::core::option::Option<::prost::alloc::string::String>,
-    #[prost(oneof = "declaration::Kind", tags = "1, 2, 3, 4, 10")]
-    pub kind: ::core::option::Option<declaration::Kind>,
-    /// Reflective String selector, distinct from the callable key. Absent means a
-    /// soft default of that key. Explicit public aliases take priority over soft
-    /// defaults; public_alias=key differs from absence, while default_name=key
-    /// is compatible with absence. Empty strings are valid in either arm. Live
-    /// public aliases and live soft defaults are each unique; an alias may shadow a soft
-    /// default. Structural references, including table observation commands, use keys.
-    #[prost(oneof = "declaration::TableName", tags = "12, 13")]
-    pub table_name: ::core::option::Option<declaration::TableName>,
-}
-/// Nested message and enum types in `Declaration`.
-pub mod declaration {
-    #[derive(Clone, PartialEq, ::prost::Oneof)]
-    pub enum Kind {
-        #[prost(message, tag = "1")]
-        Constructor(super::Constructor),
-        #[prost(message, tag = "2")]
-        Function(super::Function),
-        #[prost(message, tag = "3")]
-        Relation(super::Relation),
-        #[prost(message, tag = "4")]
-        UserDefinedPrimitive(super::UserDefinedPrimitive),
-        #[prost(message, tag = "10")]
-        EqSort(super::EqSort),
-    }
-    /// Reflective String selector, distinct from the callable key. Absent means a
-    /// soft default of that key. Explicit public aliases take priority over soft
-    /// defaults; public_alias=key differs from absence, while default_name=key
-    /// is compatible with absence. Empty strings are valid in either arm. Live
-    /// public aliases and live soft defaults are each unique; an alias may shadow a soft
-    /// default. Structural references, including table observation commands, use keys.
-    #[derive(Clone, PartialEq, Eq, Hash, ::prost::Oneof)]
-    pub enum TableName {
-        #[prost(string, tag = "12")]
-        PublicAlias(::prost::alloc::string::String),
-        #[prost(string, tag = "13")]
-        DefaultName(::prost::alloc::string::String),
-    }
-}
-/// An argument's sort and optional label. Calls are positional; labels are not
-/// part of declaration identity.
-#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct Arg {
-    /// index into the enclosing `sorts`
-    #[prost(uint32, tag = "1")]
-    pub sort: u32,
-    #[prost(string, tag = "2")]
-    pub name: ::prost::alloc::string::String,
-}
-/// A concrete nullary equality-sort definition. Its nominal namespace is distinct
-/// from primitive sorts and callables; same-name compatible resends are idempotent.
-#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct EqSort {
-    #[prost(string, tag = "1")]
-    pub name: ::prost::alloc::string::String,
-}
+// Order-independent, immutable definitions. New names may be added. Resending
+// a complete definition is optional and checks compatibility: identical
+// definitions are no-ops; conflicting definitions are errors. User tables and
+// computed primitives have complete, concrete definitions. Equality sorts are
+// established by Program.sorts, not callable declarations. Builtin primitives
+// and primitive sorts are resolved by canonical name against GetBuiltins;
+// their descriptors are not input declarations.
+// Compare referenced expression subgraphs structurally, not request-local
+// indices. Provenance and documentation do not participate
+// in semantic identity.
+// Comparison must preserve Eq sharing/identity topology; ordinary syntax
+// sharing may differ. One empty Eq reused twice is not two fresh Unions.
+// Callable names are unique across Constructor, Function, Relation and
+// UserDefinedPrimitive, including ambient builtin primitives. Equality sorts
+// and primitive sorts occupy distinct nominal namespaces, selected by Sort's
+// kind. Equal spellings may coexist across namespaces. Compatible resends retain
+// the definition; conflicts within a namespace never shadow definitions.
+// Optional documentation does not affect semantic identity.
+// Absent and explicitly empty documentation remain distinct.
+// Table naming is a reflective String selector, distinct from the callable key.
+// Absence is a soft default of that key. Explicit public aliases take priority
+// over soft defaults; public_alias=key differs from absence, while
+// default_name=key is compatible with absence. Empty strings are valid. Live
+// public aliases and live soft defaults are each unique; an alias may shadow a
+// soft default. Structural references, including table commands, use keys.
+
 /// A concrete constructor whose output is an equality sort.
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct Constructor {
     #[prost(string, tag = "1")]
     pub name: ::prost::alloc::string::String,
-    #[prost(message, repeated, tag = "2")]
-    pub inputs: ::prost::alloc::vec::Vec<Arg>,
+    /// ordered indices into the enclosing `sorts`
+    #[prost(uint32, repeated, tag = "2")]
+    pub inputs: ::prost::alloc::vec::Vec<u32>,
     /// index into the enclosing `sorts`
     #[prost(uint32, tag = "3")]
     pub output: u32,
@@ -721,14 +650,29 @@ pub struct Constructor {
     /// retain its rows in queries and snapshots.
     #[prost(bool, tag = "6")]
     pub hidden: bool,
+    #[prost(string, optional, tag = "9")]
+    pub doc: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(oneof = "constructor::TableName", tags = "12, 13")]
+    pub table_name: ::core::option::Option<constructor::TableName>,
+}
+/// Nested message and enum types in `Constructor`.
+pub mod constructor {
+    #[derive(Clone, PartialEq, Eq, Hash, ::prost::Oneof)]
+    pub enum TableName {
+        #[prost(string, tag = "12")]
+        PublicAlias(::prost::alloc::string::String),
+        #[prost(string, tag = "13")]
+        DefaultName(::prost::alloc::string::String),
+    }
 }
 /// A concrete table-backed function.
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct Function {
     #[prost(string, tag = "1")]
     pub name: ::prost::alloc::string::String,
-    #[prost(message, repeated, tag = "2")]
-    pub inputs: ::prost::alloc::vec::Vec<Arg>,
+    /// ordered indices into the enclosing `sorts`
+    #[prost(uint32, repeated, tag = "2")]
+    pub inputs: ::prost::alloc::vec::Vec<u32>,
     /// index into the enclosing `sorts`
     #[prost(uint32, tag = "3")]
     pub output: u32,
@@ -741,28 +685,58 @@ pub struct Function {
     /// Exclude this function from aggregate observations; retain its rows.
     #[prost(bool, tag = "5")]
     pub hidden: bool,
+    #[prost(string, optional, tag = "9")]
+    pub doc: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(oneof = "function::TableName", tags = "12, 13")]
+    pub table_name: ::core::option::Option<function::TableName>,
+}
+/// Nested message and enum types in `Function`.
+pub mod function {
+    #[derive(Clone, PartialEq, Eq, Hash, ::prost::Oneof)]
+    pub enum TableName {
+        #[prost(string, tag = "12")]
+        PublicAlias(::prost::alloc::string::String),
+        #[prost(string, tag = "13")]
+        DefaultName(::prost::alloc::string::String),
+    }
 }
 /// A concrete set of tuples, inserted by an action call and matched by row existence.
 /// The declaration has no output field; typed calls have implicit sort Unit.
 /// It has no merge body and is not a valid `Set` target.
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct Relation {
     #[prost(string, tag = "1")]
     pub name: ::prost::alloc::string::String,
-    #[prost(message, repeated, tag = "2")]
-    pub inputs: ::prost::alloc::vec::Vec<Arg>,
+    /// ordered indices into the enclosing `sorts`
+    #[prost(uint32, repeated, tag = "2")]
+    pub inputs: ::prost::alloc::vec::Vec<u32>,
+    #[prost(string, optional, tag = "9")]
+    pub doc: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(oneof = "relation::TableName", tags = "12, 13")]
+    pub table_name: ::core::option::Option<relation::TableName>,
+}
+/// Nested message and enum types in `Relation`.
+pub mod relation {
+    #[derive(Clone, PartialEq, Eq, Hash, ::prost::Oneof)]
+    pub enum TableName {
+        #[prost(string, tag = "12")]
+        PublicAlias(::prost::alloc::string::String),
+        #[prost(string, tag = "13")]
+        DefaultName(::prost::alloc::string::String),
+    }
 }
 /// A concrete program-defined computed function, distinct from Primitive.
 /// Its body and transitive callees must be legal at every use, using
-/// backend-published ambient capabilities checked by the receiver. Union may
+/// backend-published ambient capabilities checked by the receiver. Eq may
 /// write even in an expression-only body. No effect-inference algorithm or
 /// fallback for recursive definitions is prescribed.
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct UserDefinedPrimitive {
     #[prost(string, tag = "1")]
     pub name: ::prost::alloc::string::String,
-    #[prost(message, repeated, tag = "2")]
-    pub inputs: ::prost::alloc::vec::Vec<Arg>,
+    /// ordered indices into the enclosing `sorts`
+    #[prost(uint32, repeated, tag = "2")]
+    pub inputs: ::prost::alloc::vec::Vec<u32>,
     /// index into the enclosing `sorts`
     #[prost(uint32, tag = "3")]
     pub output: u32,
@@ -772,10 +746,12 @@ pub struct UserDefinedPrimitive {
     /// index into the enclosing `nodes`
     #[prost(uint32, optional, tag = "4")]
     pub body: ::core::option::Option<u32>,
+    #[prost(string, optional, tag = "9")]
+    pub doc: ::core::option::Option<::prost::alloc::string::String>,
 }
 /// Read-only configured-backend catalog. Signatures and their sort patterns are
 /// authoritative machine data; frontend presentation mappings remain external.
-/// All sort and file indices refer to this message. It is independent of graph
+/// All sort indices refer to this message. It is independent of graph
 /// contents, execution mode and creation settings, and is never part of Program,
 /// Freeze or input history. Implementations and value codecs remain external.
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -786,44 +762,38 @@ pub struct BuiltinCatalog {
     pub primitive_sorts: ::prost::alloc::vec::Vec<PrimitiveSort>,
     #[prost(message, repeated, tag = "3")]
     pub primitives: ::prost::alloc::vec::Vec<Primitive>,
-    #[prost(message, repeated, tag = "4")]
-    pub files: ::prost::alloc::vec::Vec<SourceFile>,
 }
 /// A backend-provided sort family, including nullary scalar sorts. Every
-/// application uses SortApplication, with exactly arity arguments.
+/// reference uses PrimitiveSortRef, with exactly arity arguments.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct PrimitiveSort {
     #[prost(string, tag = "1")]
     pub name: ::prost::alloc::string::String,
     #[prost(uint32, tag = "2")]
     pub arity: u32,
-    #[prost(message, optional, tag = "3")]
-    pub span: ::core::option::Option<Span>,
     #[prost(string, optional, tag = "4")]
     pub doc: ::core::option::Option<::prost::alloc::string::String>,
 }
 /// A backend-provided callable. A Program calls its canonical name without
 /// declaring it. Its implementation and context capabilities remain native.
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct Primitive {
     #[prost(string, tag = "1")]
     pub name: ::prost::alloc::string::String,
     #[prost(message, optional, tag = "2")]
     pub signature: ::core::option::Option<GenericSignature>,
-    #[prost(message, optional, tag = "4")]
-    pub span: ::core::option::Option<Span>,
     #[prost(string, optional, tag = "5")]
     pub doc: ::core::option::Option<::prost::alloc::string::String>,
 }
 /// An ordinary primitive signature: a fixed prefix followed by zero or more
 /// repetitions of the ordered varargs pattern. An empty pattern means no tail
-/// (exact fixed arity); one Arg describes homogeneous varargs. For a nonempty
+/// (exact fixed arity); one sort describes homogeneous varargs. For a nonempty
 /// pattern, the actual argument count minus the fixed prefix must be a multiple
 /// of the pattern width. Pattern order and width are semantic, even \[T, T\];
 /// arguments remain flat, with no tuple/group node. Sort indices reference
 /// BuiltinCatalog.sorts.
 /// Sort.var indices bind in [0, type_param_count), without parameter names or
-/// kind constraints. All uses, including nested SortApplication and FuncSort
+/// kind constraints. All uses, including nested PrimitiveSortRef and FuncSort
 /// patterns, must be in this signature's binder. Each actual call
 /// matches all concrete argument and result sorts structurally to obtain one
 /// consistent, complete substitution across all repetitions and the result.
@@ -834,23 +804,25 @@ pub struct Primitive {
 /// This describes ordinary structural typing. Native primitive-specific sort
 /// and domain applicability is checked at submission before execution; this
 /// signature does not promise that every structural instantiation is supported.
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct GenericSignature {
     #[prost(uint32, tag = "1")]
     pub type_param_count: u32,
-    #[prost(message, repeated, tag = "2")]
-    pub inputs: ::prost::alloc::vec::Vec<Arg>,
+    /// ordered indices into the enclosing `sorts`
+    #[prost(uint32, repeated, tag = "2")]
+    pub inputs: ::prost::alloc::vec::Vec<u32>,
     #[prost(uint32, optional, tag = "3")]
     pub output: ::core::option::Option<u32>,
-    #[prost(message, repeated, tag = "4")]
-    pub varargs: ::prost::alloc::vec::Vec<Arg>,
+    /// ordered indices into BuiltinCatalog.sorts
+    #[prost(uint32, repeated, tag = "4")]
+    pub varargs: ::prost::alloc::vec::Vec<u32>,
 }
 // ---------------------------------------------------------------------------
 // RULE DEFINITIONS — immutable content and replaceable named collections.
 // ---------------------------------------------------------------------------
 
 /// An immutable rule/rewrite value. Content identity includes its resolved typed
-/// body, ordered query/head, options and represented graph sharing; arena IDs,
+/// body, ordered query/actions, options and represented graph sharing; arena IDs,
 /// labels, documentation and provenance do not identify it. Intern content on the
 /// handle independently of collection names, retaining its compiled state and
 /// cursors through replacement, omission and readdition. Old effects remain.
@@ -867,10 +839,7 @@ pub struct Rule {
     pub no_decomp: bool,
     #[prost(bool, tag = "7")]
     pub include_subsumed: bool,
-    /// Origin and documentation of the whole rule/rewrite form; excluded from
-    /// semantic identity. The span attributes a runtime panic to this occurrence.
-    #[prost(message, optional, tag = "8")]
-    pub span: ::core::option::Option<Span>,
+    /// Documentation does not establish rule identity.
     #[prost(string, tag = "9")]
     pub doc: ::prost::alloc::string::String,
     #[prost(oneof = "rule::Kind", tags = "1, 2, 3")]
@@ -895,7 +864,7 @@ pub struct RuleBody {
     #[prost(uint32, repeated, tag = "2")]
     pub query: ::prost::alloc::vec::Vec<u32>,
     #[prost(message, repeated, tag = "3")]
-    pub head: ::prost::alloc::vec::Vec<Action>,
+    pub actions: ::prost::alloc::vec::Vec<Action>,
 }
 /// A guarded directional rewrite, optionally subsuming its left side.
 /// Match lhs and conditions together in one query binder. For each match,
@@ -973,12 +942,7 @@ pub mod ruleset_selection {
 /// `Loop`. Declarations and ruleset bindings are installed at Program scope.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct Command {
-    /// Origin. Locates a failure attributed to a command rather than an
-    /// expression: a failed `check`, run or extraction.
-    /// Surfaces as `Error.span`.
-    #[prost(message, optional, tag = "13")]
-    pub span: ::core::option::Option<Span>,
-    #[prost(oneof = "command::Kind", tags = "1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 14, 15, 16, 17, 19")]
+    #[prost(oneof = "command::Kind", tags = "1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 14, 15, 16, 17, 19, 20")]
     pub kind: ::core::option::Option<command::Kind>,
 }
 /// Nested message and enum types in `Command`.
@@ -1020,7 +984,7 @@ pub mod command {
         /// maintenance/invariant checks retain their native boundaries.
         /// This is not rollback and does not catch process panics. Nested wrappers
         /// retain their distinct expectations and output suppression.
-        /// Adds no binder, command list, Union identity scope, or loop iteration.
+        /// Adds no binder, command list, Eq identity scope, or loop iteration.
         #[prost(message, tag = "16")]
         Fail(::prost::alloc::boxed::Box<super::Command>),
         /// Observe previously collected cumulative backend diagnostics. No file
@@ -1029,7 +993,24 @@ pub mod command {
         Stats(super::Unit),
         #[prost(message, tag = "19")]
         Explain(super::Explain),
+        #[prost(message, tag = "20")]
+        Let(super::Let),
     }
+}
+/// Assign a global slot at this command's position, including inside Loop or Fail.
+/// binding must directly index a Node.binding; value must have the same resolved
+/// sort. Evaluate value before replacing the old value. A self-read sees the old
+/// value; failed evaluation retains it and any completed prefix effects. Sequential
+/// same-sort assignments overwrite.
+/// The slot's type exists after setup even if this command never executes.
+/// Initializers use the enclosing direct-Action Eq scope and a fresh ordinary
+/// memo. Reassignment contributes to loop progress through ordinary write tracking.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct Let {
+    #[prost(uint32, optional, tag = "1")]
+    pub binding: ::core::option::Option<u32>,
+    #[prost(uint32, optional, tag = "2")]
+    pub value: ::core::option::Option<u32>,
 }
 /// One conjunctive query. All facts share the same variable bindings.
 /// Resolve names and types during preparation, but plan the requested query
@@ -1151,13 +1132,16 @@ pub struct Extract {
     pub cost_model: ::prost::alloc::string::String,
 }
 /// Export complete logical options and a reconstruction Program; no filtering.
-/// Returns CommandOutput.snapshot; its Program owns nodes, sorts and source files.
+/// Returns CommandOutput.snapshot; its Program owns nodes and sorts, without
+/// frontend source locations. Saved code retains its semantic structure.
 /// This is current state, not request history or an engine checkpoint: omit
 /// scheduler instances, execution cursors, caches, reports, proof history and
 /// host resources. Preserve execution_mode, but reconstruction does not preserve
 /// original derivations or promise equivalent proof results.
 ///
-/// Include every installed declaration and sort, even unused or empty tables,
+/// Include every installed declaration and nominal equality sort, even unused,
+/// and every global slot as a binding node, including unset slots. Include only
+/// referenced primitive/structural sorts and their children, not backend inventory,
 /// and preserve current named ruleset bindings and their ordered rule values,
 /// including empty bindings. A shared value appears in each relevant binding.
 /// Omit rules retained only in private registration caches. Backend builtin
@@ -1172,15 +1156,18 @@ pub struct Extract {
 /// installation follows Program's normal rules; scheduler/seminaive history
 /// is not resumed.
 ///
-/// Export commands contain only data Actions, with no queries, Runs or loops.
+/// Export commands contain data Actions followed by Let assignments for populated
+/// global slots, with no queries, Runs or loops.
 /// Emit exactly one direct Action.term for each canonical equality
-/// class, naming its unique Union location with all its constructor rows as
+/// class, naming its unique Eq location with all its constructor rows as
 /// members. Include empty/unreachable classes.
 /// Emit relation rows as direct Action.term Calls; write every function row,
 /// including Unit outputs, with Set. Then emit SetCost annotations, then subsume
 /// for subsumed constructor rows; no delete or panic actions.
+/// Emit one Let for each populated global slot, referencing its exported value;
+/// emit no assignment for unset slots. Preserve these binding nodes as setup roots.
 /// These explicit roots inventory stored classes, not arbitrary arena nodes or
-/// Union locations in saved code. Shared Union locations preserve references
+/// Eq locations in saved code. Shared Eq locations preserve references
 /// across this list. Keep all canonical rows and extant cost/subsumption
 /// annotations. A row is its typed callee and canonical arguments, not a Call
 /// node's identity. Each constructor/relation row has one inventory occurrence;
@@ -1288,8 +1275,6 @@ pub struct CreateEGraphRequest {
     pub sorts: ::prost::alloc::vec::Vec<Sort>,
     #[prost(message, optional, tag = "2")]
     pub options: ::core::option::Option<EGraphOptions>,
-    #[prost(message, repeated, tag = "3")]
-    pub files: ::prost::alloc::vec::Vec<SourceFile>,
     /// Resource request, never exported as logical state. Absent leaves policy to
     /// the receiver; zero requests automatic parallelism; positive requests that
     /// thread count. Reject unsupported requests rather than silently ignoring.
@@ -1315,7 +1300,7 @@ pub struct CreateEGraphResponse {
     #[prost(uint64, tag = "2")]
     pub threads: u64,
 }
-/// Portable logical state with all arenas/files owned by program, including
+/// Portable logical state with all arenas owned by program, including
 /// the concrete cost sort C selected by options. Builtin patterns remain in
 /// GetBuiltins. For fresh-handle restoration, remap C's closed backend sort graph
 /// into CreateEGraphRequest, choose receiver resources, then execute program on
@@ -1323,7 +1308,7 @@ pub struct CreateEGraphResponse {
 /// admission is preserved; scheduler/delta state, query plans and runtime
 /// resource/planner settings are not resumed. Execution against an existing
 /// handle follows ordinary Program semantics; restoration equivalence requires
-/// compatible options.
+/// compatible options. This is logical state, not execution history.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct EGraphSnapshot {
     #[prost(message, optional, tag = "1")]
@@ -1358,7 +1343,7 @@ pub struct DestroyEGraphResponse {
 /// before installation/commands. Rejected preparation contributes no input;
 /// later execution failure retains the accepted input, including its suffix.
 /// This records inputs only: no outcomes, resource/lifecycle events or raw bytes.
-/// Remap arenas while preserving command order, graph sharing and distinct Union
+/// Remap arenas while preserving command order, graph sharing and distinct Eq
 /// locations. Declarations are cumulative, so earlier Freeze observations may
 /// contain extra definition metadata. This is not exact replay after failure.
 /// Capture historic named Run selections as needed when combining inputs, also
@@ -1391,10 +1376,6 @@ pub struct RunProgramRequest {
 /// command boundaries and does not roll back.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct RunProgramResponse {
-    /// Origins for this frame's payload, including definitions installed earlier.
-    /// Nested exported Programs own their files independently.
-    #[prost(message, repeated, tag = "3")]
-    pub files: ::prost::alloc::vec::Vec<SourceFile>,
     #[prost(oneof = "run_program_response::Result", tags = "1, 2")]
     pub result: ::core::option::Option<run_program_response::Result>,
 }
@@ -1409,8 +1390,7 @@ pub mod run_program_response {
     }
 }
 /// One completed output batch with self-contained node and sort arenas.
-/// Spans index the enclosing RunProgramResponse.files. Earlier success frames
-/// remain valid when a later terminal frame reports an error.
+/// Earlier success frames remain valid when a later terminal frame reports an error.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct RunProgramOutput {
     #[prost(message, repeated, tag = "1")]
@@ -1426,7 +1406,7 @@ pub struct RunProgramOutput {
 /// Program.commands; each later component indexes the previous Loop
 /// command's body, resolving through any Fail wrappers at that position.
 /// Wrappers add no path component or iteration coordinate. A list-site failure
-/// locates the outer wrapper, with the most specific source span in Error.span.
+/// locates the outer wrapper; Error.site separately identifies authored code.
 /// iterations gives the zero-based iteration of each enclosing
 /// loop, outermost first. It does not include the target loop's own iteration.
 /// Bounds and command kinds are checked against the request, not this response.
@@ -1444,26 +1424,47 @@ pub struct CommandLocation {
 /// Engine failures only. A decode fault, an unknown method and an unknown
 /// `egraph_id` are transport faults and never appear here.
 ///
-/// Source and command locators are independent: a rule expression can supply
-/// the span while its executing Run supplies the command location.
-#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+/// The executing command and the authored failure site are independent: a Run
+/// may invoke code installed by an earlier Program. Source mapping belongs to
+/// frontends; the returned context is inspectable without the original request.
+#[derive(Clone, PartialEq, ::prost::Message)]
 pub struct Error {
     #[prost(enumeration = "ErrorCode", tag = "1")]
     pub code: i32,
     /// Engine text, formatted for humans. NEVER parsed; wording is not contract.
     #[prost(string, tag = "2")]
     pub message: ::prost::alloc::string::String,
-    /// Most specific known user-source origin: failing expression, then Action,
-    /// then rule; fall back to the active command's span. Absent if none is known,
-    /// never represented by a fabricated zero offset.
-    #[prost(message, optional, tag = "3")]
-    pub span: ::core::option::Option<Span>,
-    /// Innermost active command, not its enclosing top-level loop. A failure in
-    /// a loop's own pre-check locates that loop, with only its enclosing iteration
-    /// coordinates. Absent when the failure precedes command execution, including
-    /// runtime helper failure during definition installation.
+    /// Compact authored code with its reachable nodes, sorts and user declarations.
+    /// All references are local to this Program; shared nodes and Eq cycles retain
+    /// their identity. Builtin implementations still belong to the backend catalog.
+    /// This is code context, not the database or values of a particular firing.
+    /// Optional when no valid authored context exists, including malformed inputs.
+    #[prost(message, optional, boxed, tag = "3")]
+    pub context: ::core::option::Option<::prost::alloc::boxed::Box<Program>>,
+    /// Innermost active command in the submitted request. Loop pre-checks locate
+    /// that loop with its enclosing iteration coordinates. Absent before command
+    /// execution, including failures during setup.
     #[prost(message, optional, tag = "4")]
     pub location: ::core::option::Option<CommandLocation>,
+    #[prost(message, optional, tag = "5")]
+    pub site: ::core::option::Option<ErrorSite>,
+}
+/// A location in Error.context, never in the original request. Traverse protobuf
+/// field numbers, consuming an entry index after every repeated field. The path
+/// ends at an authored message, such as a rule action or function definition;
+/// it does not follow arena references. Every step must exist in context.
+/// Report only known precision. A delayed merge failure identifies its definition,
+/// not a guessed triggering action. Native helper names are not authored locations.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ErrorSite {
+    #[prost(uint32, repeated, packed = "false", tag = "1")]
+    pub path: ::prost::alloc::vec::Vec<u32>,
+    /// Exact failing expression, when known. Separate because one DAG node may be
+    /// referenced by several actions; path identifies the relevant occurrence.
+    ///
+    /// index into Error.context.nodes
+    #[prost(uint32, optional, tag = "2")]
+    pub node_id: ::core::option::Option<u32>,
 }
 // ---------------------------------------------------------------------------
 // COMMAND OUTPUTS — the `CommandOutput.kind` arms, in arm order.
@@ -1521,30 +1522,22 @@ pub struct ProofResult {
 }
 /// The native TermDag syntax, without invented sorts or executable call typing.
 /// A function-row proposition may include both inputs and output as children.
-#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+#[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ProofTerm {
-    #[prost(oneof = "proof_term::Kind", tags = "1, 2, 3, 4, 5, 6, 7")]
+    #[prost(oneof = "proof_term::Kind", tags = "6, 7, 8")]
     pub kind: ::core::option::Option<proof_term::Kind>,
 }
 /// Nested message and enum types in `ProofTerm`.
 pub mod proof_term {
-    #[derive(Clone, PartialEq, Eq, Hash, ::prost::Oneof)]
+    #[derive(Clone, PartialEq, ::prost::Oneof)]
     pub enum Kind {
-        #[prost(int64, tag = "1")]
-        I64(i64),
-        /// Preserve all IEEE-754 bits, including signed zero and NaN payloads.
-        #[prost(fixed64, tag = "2")]
-        F64Bits(u64),
-        #[prost(string, tag = "3")]
-        String(::prost::alloc::string::String),
-        #[prost(bool, tag = "4")]
-        Bool(bool),
-        #[prost(message, tag = "5")]
-        Unit(super::Unit),
         #[prost(string, tag = "6")]
         Var(::prost::alloc::string::String),
         #[prost(message, tag = "7")]
         App(super::ProofApp),
+        /// The same inert scalar payloads as Node values, with no child arena.
+        #[prost(message, tag = "8")]
+        PrimitiveValue(super::PrimitiveValue),
     }
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
@@ -1675,7 +1668,7 @@ pub struct ExtractedRoot {
     pub variants: ::prost::alloc::vec::Vec<ExtractedTerm>,
 }
 /// One extracted variant; its sort is carried by its response-arena node.
-/// The term and any cost are finite, closed data, with no `Union` class groups
+/// The term and any cost are finite, closed data, with no `Eq` class groups
 /// in data positions. Lambda bodies are separately scoped code.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ExtractedTerm {
@@ -1808,12 +1801,12 @@ pub struct OutDegreeStats {
 pub enum RuleEvalMode {
     Unspecified = 0,
     /// Delta matching. Query primitives use Pure context (no database reads or
-    /// writes); head primitives use Write context (writes but no database reads).
+    /// writes); action primitives use Write context (writes but no database reads).
     Seminaive = 1,
     /// Match the whole database each iteration. Query primitives use Read
-    /// context; head primitives use Full context (both database reads and writes).
+    /// context; action primitives use Full context (both database reads and writes).
     Naive = 2,
-    /// Delta matching with the same Read/Full contexts as NAIVE. Unsafe: a head
+    /// Delta matching with the same Read/Full contexts as NAIVE. Unsafe: an action
     /// read sees the database mid-iteration; changes to the value read do not
     /// by themselves trigger reevaluation.
     UnsafeSeminaive = 3,

@@ -1,5 +1,5 @@
 //! Anonymous code is interned independently of its evaluated environment.
-use super::{pb, source};
+use super::{Declaration, declarations, pb, source};
 use prost::Message;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -38,7 +38,6 @@ impl Code {
             return Err("Lambda requires a function sort".into());
         };
         let mut result = pb::Program {
-            files: program.files.clone(),
             ..Default::default()
         };
         let mut inputs = vec![];
@@ -55,14 +54,11 @@ impl Code {
             .chain(function.params.iter().copied().map(Ok))
         {
             let sort = crate::builtin::import_sort(&program.sorts, sort?, &mut result.sorts)?;
-            inputs.push(pb::Arg {
-                name: String::new(),
-                sort,
-            });
+            inputs.push(sort);
         }
         let output =
             crate::builtin::import_sort(&program.sorts, function.result, &mut result.sorts)?;
-        let binder = inputs.iter().map(|arg| arg.sort).collect::<Vec<_>>();
+        let binder = inputs.to_vec();
         let body = BodyCopier {
             source_program: program,
             result: &mut result,
@@ -74,17 +70,15 @@ impl Code {
         if result.nodes[body as usize].sort_id != output {
             return Err("Lambda body result sort mismatch".into());
         }
-        result.declarations.push(pb::Declaration {
-            kind: Some(pb::declaration::Kind::UserDefinedPrimitive(
-                pb::UserDefinedPrimitive {
-                    name: String::new(),
-                    inputs,
-                    output,
-                    body: Some(body),
-                },
-            )),
-            ..Default::default()
-        });
+        result
+            .user_defined_primitives
+            .push(pb::UserDefinedPrimitive {
+                name: String::new(),
+                inputs,
+                output,
+                body: Some(body),
+                ..Default::default()
+            });
         Ok(Self {
             program: result,
             captures: lambda.captures.len(),
@@ -93,12 +87,7 @@ impl Code {
 
     fn key(&self) -> Vec<u8> {
         let mut program = self.program.clone();
-        program.files.clear();
-        for node in &mut program.nodes {
-            node.span = None;
-        }
         for sort in &mut program.sorts {
-            sort.span = None;
             sort.doc = None;
         }
         let mut key = (self.captures as u64).to_le_bytes().to_vec();
@@ -110,7 +99,7 @@ impl Code {
 }
 
 // Bodies have positional binders, including a new binder at each nested Lambda.
-// Union is deliberately excluded: ordinary Expr evaluation has no deferred fresh
+// Eq is deliberately excluded: ordinary Expr evaluation has no deferred fresh
 // identity scope. Hashconsing syntax here therefore never merges fresh locations.
 struct BodyCopier<'a> {
     source_program: &'a pb::Program,
@@ -159,8 +148,8 @@ impl BodyCopier<'_> {
                     return Err("unbound or inconsistently typed Lambda variable".into());
                 }
             }
-            pb::node::Kind::Union(_) => {
-                return Err("deferred Union bodies are not supported".into());
+            pb::node::Kind::Eq(_) => {
+                return Err("deferred Eq bodies are not supported".into());
             }
             pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
                 value: Some(pb::primitive_value::Value::Lambda(lambda)),
@@ -187,8 +176,7 @@ impl BodyCopier<'_> {
             })?,
         }
         self.active.remove(&index);
-        let mut semantic = node.clone();
-        semantic.span = None;
+        let semantic = node.clone();
         let key = semantic.encode_to_vec();
         if let Some(copied) = self.interned.get(&key) {
             self.memo.insert((index, scope), *copied);
@@ -204,33 +192,12 @@ impl BodyCopier<'_> {
 }
 
 // Import code and its signature without importing any construction environment.
-fn append_code(
-    code: &Code,
-    target: &mut pb::Program,
-    diagnostics: bool,
-) -> Result<pb::UserDefinedPrimitive, String> {
-    let file_offset =
-        u32::try_from(target.files.len()).map_err(|_| "too many Lambda source files")?;
-    if diagnostics {
-        target.files.extend(code.program.files.iter().cloned());
-    }
-    let mut source_sorts = code.program.sorts.clone();
-    for sort in &mut source_sorts {
-        if diagnostics {
-            if let Some(span) = &mut sort.span {
-                span.file = span
-                    .file
-                    .checked_add(file_offset)
-                    .ok_or("too many Lambda source files")?;
-            }
-        } else {
-            sort.span = None;
-        }
-    }
+fn append_code(code: &Code, target: &mut pb::Program) -> Result<pb::UserDefinedPrimitive, String> {
+    let source_sorts = &code.program.sorts;
     let mut sorts = vec![];
     for index in 0..source_sorts.len() {
         sorts.push(crate::builtin::import_sort(
-            &source_sorts,
+            source_sorts,
             index as u32,
             &mut target.sorts,
         )?);
@@ -238,29 +205,15 @@ fn append_code(
     let offset = u32::try_from(target.nodes.len()).map_err(|_| "too many Lambda nodes")?;
     for mut node in code.program.nodes.iter().cloned() {
         node.sort_id = sorts[node.sort_id as usize];
-        if diagnostics {
-            if let Some(span) = &mut node.span {
-                span.file = span
-                    .file
-                    .checked_add(file_offset)
-                    .ok_or("too many Lambda source files")?;
-            }
-        } else {
-            node.span = None;
-        }
         source::source_node_refs(&mut node, |index| {
             *index = index.checked_add(offset).ok_or("too many Lambda nodes")?;
             Ok(())
         })?;
         target.nodes.push(node);
     }
-    let Some(pb::declaration::Kind::UserDefinedPrimitive(mut definition)) =
-        code.program.declarations[0].kind.clone()
-    else {
-        unreachable!("canonical anonymous code declaration")
-    };
+    let mut definition = code.program.user_defined_primitives[0].clone();
     for arg in &mut definition.inputs {
-        arg.sort = sorts[arg.sort as usize];
+        *arg = sorts[*arg as usize];
     }
     definition.output = sorts[definition.output as usize];
     definition.body = definition.body.map(|index| index + offset);
@@ -274,16 +227,13 @@ impl Registry {
         installed: &pb::Program,
     ) -> Result<(), String> {
         let authored = program.clone();
-        let mut unavailable: HashSet<_> = installed
-            .declarations
-            .iter()
-            .chain(&authored.declarations)
-            .filter_map(|declaration| match &declaration.kind {
-                Some(pb::declaration::Kind::UserDefinedPrimitive(p)) => Some(p.name.clone()),
-                Some(pb::declaration::Kind::Function(f)) => Some(f.name.clone()),
-                Some(pb::declaration::Kind::Constructor(c)) => Some(c.name.clone()),
-                Some(pb::declaration::Kind::Relation(r)) => Some(r.name.clone()),
-                _ => None,
+        let mut unavailable: HashSet<_> = declarations(installed)
+            .chain(declarations(&authored))
+            .map(|declaration| match declaration {
+                Declaration::UserDefinedPrimitive(p) => p.name.clone(),
+                Declaration::Function(f) => f.name.clone(),
+                Declaration::Constructor(c) => c.name.clone(),
+                Declaration::Relation(r) => r.name.clone(),
             })
             .collect();
         for node in &authored.nodes {
@@ -301,18 +251,16 @@ impl Registry {
                 unavailable.insert(call.func.clone());
             }
         }
-        for declaration in &authored.declarations {
-            if let Some(pb::declaration::Kind::UserDefinedPrimitive(p)) = &declaration.kind
+        for declaration in declarations(&authored) {
+            if let Declaration::UserDefinedPrimitive(p) = declaration
                 && self.names.contains_key(&p.name)
             {
                 return Err("anonymous code targets are private".into());
             }
         }
-        let mut emitted: HashSet<_> = installed
-            .declarations
-            .iter()
+        let mut emitted: HashSet<_> = declarations(installed)
             .filter_map(|declaration| {
-                if let Some(pb::declaration::Kind::UserDefinedPrimitive(p)) = &declaration.kind {
+                if let Declaration::UserDefinedPrimitive(p) = declaration {
                     self.names.contains_key(&p.name).then(|| p.name.clone())
                 } else {
                     None
@@ -421,13 +369,9 @@ impl Registry {
                     captures: code.captures,
                 },
                 target,
-                true,
             )?;
             definition.name = name.clone();
-            target.declarations.push(pb::Declaration {
-                kind: Some(pb::declaration::Kind::UserDefinedPrimitive(definition)),
-                ..Default::default()
-            });
+            target.user_defined_primitives.push(definition);
         }
         Ok(name)
     }
@@ -445,7 +389,7 @@ impl Registry {
         if captures.len() != code.captures {
             return Err("anonymous function capture count mismatch".into());
         }
-        let body = append_code(code, program, false)?
+        let body = append_code(code, program)?
             .body
             .expect("canonical anonymous body");
         Ok(Some(pb::PrimitiveValue {
@@ -461,8 +405,9 @@ impl Registry {
         definitions: &pb::Program,
     ) -> Result<pb::Program, String> {
         let mut result = definitions.clone();
-        result.declarations.retain(|declaration| !matches!(&declaration.kind,
-            Some(pb::declaration::Kind::UserDefinedPrimitive(p)) if self.names.contains_key(&p.name)));
+        result
+            .user_defined_primitives
+            .retain(|p| !self.names.contains_key(&p.name));
         for index in 0..result.nodes.len() {
             let Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
                 value: Some(pb::primitive_value::Value::PartialCall(call)),
@@ -504,7 +449,6 @@ mod tests {
             nodes: vec![pb::Node {
                 sort_id: 0,
                 kind: Some(pb::node::Kind::Var("_0".into())),
-                ..Default::default()
             }],
             ..Default::default()
         };
@@ -515,7 +459,6 @@ mod tests {
                     func: "egglog.core.i64.add".into(),
                     args: vec![previous, previous],
                 })),
-                ..Default::default()
             });
         }
         program.nodes.push(pb::Node {
@@ -526,7 +469,6 @@ mod tests {
                     body: 32,
                 })),
             })),
-            ..Default::default()
         });
         let code = Code::from_node(&program, 33).unwrap();
         assert_eq!(code.program.nodes.len(), 33);
@@ -540,7 +482,6 @@ mod tests {
             kind: Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
                 value: Some(pb::primitive_value::Value::I64(10)),
             })),
-            ..Default::default()
         });
         program.nodes.push(pb::Node {
             sort_id: 1,
@@ -550,7 +491,6 @@ mod tests {
                     body: 0,
                 })),
             })),
-            ..Default::default()
         });
         program.nodes.push(pb::Node {
             sort_id: 0,
@@ -558,7 +498,6 @@ mod tests {
                 function: Some(35),
                 args: vec![34],
             })),
-            ..Default::default()
         });
         let Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
             value: Some(pb::primitive_value::Value::Lambda(lambda)),

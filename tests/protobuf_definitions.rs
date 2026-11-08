@@ -24,22 +24,10 @@ fn relation_definition_fixture(reversed: bool) -> pb::Program {
             kind: Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
                 value: Some(pb::primitive_value::Value::I64(7)),
             })),
-            ..Default::default()
         }],
-        declarations: vec![pb::Declaration {
-            kind: Some(pb::declaration::Kind::Relation(pb::Relation {
-                name: "ordered_inputs".into(),
-                inputs: vec![
-                    pb::Arg {
-                        sort: list_sort,
-                        name: "list".into(),
-                    },
-                    pb::Arg {
-                        sort: number_sort,
-                        name: "index".into(),
-                    },
-                ],
-            })),
+        relations: vec![pb::Relation {
+            name: "ordered_inputs".into(),
+            inputs: vec![list_sort, number_sort],
             ..Default::default()
         }],
         ..Default::default()
@@ -53,35 +41,22 @@ fn relation_definitions_reconcile_and_relocate_input_only_records() {
     reconcile_declarations(&source, &mut destination)
         .expect("canonical input-only Relation must participate in declaration reconciliation");
     let installed = destination.clone();
-    let mut relocated = relation_definition_fixture(true);
-    let Some(pb::declaration::Kind::Relation(relation)) = &mut relocated.declarations[0].kind
-    else {
-        unreachable!()
-    };
-    relation.inputs[0].name = "renamed_list".into();
-    relation.inputs[1].name = "renamed_index".into();
+    let relocated = relation_definition_fixture(true);
     reconcile_declarations(&relocated, &mut destination).unwrap();
     assert_eq!(
         destination, installed,
         "compatible resupply must not grow the closure"
     );
-    let relations = destination
-        .declarations
-        .iter()
-        .filter_map(|declaration| match &declaration.kind {
-            Some(pb::declaration::Kind::Relation(relation)) => Some(relation),
-            _ => None,
-        })
-        .collect::<Vec<_>>();
+    let relations = &destination.relations;
     assert_eq!(relations.len(), 1);
-    let relation = relations[0];
+    let relation = &relations[0];
     assert_eq!(relation.name, "ordered_inputs");
     assert!(matches!(
-        &destination.sorts[relation.inputs[0].sort as usize].kind,
+        &destination.sorts[relation.inputs[0] as usize].kind,
         Some(pb::sort::Kind::Eq(name)) if name == "IList"
     ));
     assert!(matches!(
-        &destination.sorts[relation.inputs[1].sort as usize].kind,
+        &destination.sorts[relation.inputs[1] as usize].kind,
         Some(pb::sort::Kind::Primitive(family)) if family.name == "i64" && family.args.is_empty()
     ));
     assert!(
@@ -89,10 +64,13 @@ fn relation_definitions_reconcile_and_relocate_input_only_records() {
         "unused expression data is not a semantic declaration dependency"
     );
     assert_eq!(
-        destination.declarations.len(),
+        destination.relations.len(),
         1,
         "no synthetic Function/Constructor output carrier"
     );
+    assert!(destination.constructors.is_empty());
+    assert!(destination.functions.is_empty());
+    assert!(destination.user_defined_primitives.is_empty());
 }
 
 #[test]
@@ -109,34 +87,31 @@ fn relation_definitions_kind_signature_and_reference_conflicts_are_atomic() {
         "empty-name",
     ] {
         let mut conflicting = source.clone();
-        let Some(pb::declaration::Kind::Relation(relation)) = &mut conflicting.declarations[0].kind
-        else {
-            unreachable!()
-        };
+        let relation = &mut conflicting.relations[0];
         match case {
             "arity" => {
                 relation.inputs.pop();
             }
             "order" => relation.inputs.swap(0, 1),
-            "unknown-sort" => relation.inputs[0].sort = 99,
+            "unknown-sort" => relation.inputs[0] = 99,
             "empty-name" => relation.name.clear(),
             "function" => {
-                conflicting.declarations[0].kind =
-                    Some(pb::declaration::Kind::Function(pb::Function {
-                        name: relation.name.clone(),
-                        inputs: relation.inputs.clone(),
-                        output: 1,
-                        ..Default::default()
-                    }));
+                conflicting.functions.push(pb::Function {
+                    name: relation.name.clone(),
+                    inputs: relation.inputs.clone(),
+                    output: 1,
+                    ..Default::default()
+                });
+                conflicting.relations.clear();
             }
             "constructor" => {
-                conflicting.declarations[0].kind =
-                    Some(pb::declaration::Kind::Constructor(pb::Constructor {
-                        name: relation.name.clone(),
-                        inputs: relation.inputs.clone(),
-                        output: 0,
-                        ..Default::default()
-                    }));
+                conflicting.constructors.push(pb::Constructor {
+                    name: relation.name.clone(),
+                    inputs: relation.inputs.clone(),
+                    output: 0,
+                    ..Default::default()
+                });
+                conflicting.relations.clear();
             }
             _ => unreachable!(),
         }
@@ -227,18 +202,32 @@ fn compiler_sort_aliases_share_types_without_registering_native_instances() {
 fn documentation_presence_is_retained_but_not_semantic_identity() {
     for first in [None, Some(""), Some(" docs\n")] {
         let mut source = box_definition();
-        for d in &mut source.declarations {
-            d.doc = first.map(str::to_owned);
-        }
+        source.relations.push(pb::Relation {
+            name: "seen".into(),
+            inputs: vec![0],
+            ..Default::default()
+        });
+        source
+            .user_defined_primitives
+            .push(pb::UserDefinedPrimitive {
+                name: "saved".into(),
+                output: 0,
+                body: Some(0),
+                ..Default::default()
+            });
+        source.relations[0].doc = first.map(str::to_owned);
+        source.user_defined_primitives[0].doc = first.map(str::to_owned);
+        source.constructors[0].doc = first.map(str::to_owned);
+        source.functions[0].doc = first.map(str::to_owned);
         source.sorts[1].doc = first.map(str::to_owned);
         let mut destination = pb::Program::default();
         reconcile_declarations(&source, &mut destination).unwrap();
         let installed = destination.clone();
         assert!(
-            destination
-                .declarations
-                .iter()
-                .all(|d| d.doc.as_deref() == first)
+            destination.constructors[0].doc.as_deref() == first
+                && destination.functions[0].doc.as_deref() == first
+                && destination.relations[0].doc.as_deref() == first
+                && destination.user_defined_primitives[0].doc.as_deref() == first
         );
         assert_eq!(
             destination
@@ -252,9 +241,10 @@ fn documentation_presence_is_retained_but_not_semantic_identity() {
         );
         for later in [None, Some(""), Some("other")] {
             let mut resupply = source.clone();
-            for d in &mut resupply.declarations {
-                d.doc = later.map(str::to_owned);
-            }
+            resupply.constructors[0].doc = later.map(str::to_owned);
+            resupply.functions[0].doc = later.map(str::to_owned);
+            resupply.relations[0].doc = later.map(str::to_owned);
+            resupply.user_defined_primitives[0].doc = later.map(str::to_owned);
             resupply.sorts[1].doc = later.map(str::to_owned);
             let mut independent = destination.clone();
             reconcile_declarations(&resupply, &mut independent).unwrap();
@@ -263,17 +253,11 @@ fn documentation_presence_is_retained_but_not_semantic_identity() {
                 "resupply retains first-record diagnostics"
             );
             assert_eq!(destination, installed);
-            let Some(pb::declaration::Kind::Constructor(c)) = &mut resupply.declarations[0].kind
-            else {
-                unreachable!()
-            };
+            let c = &mut resupply.constructors[0];
             c.unextractable = true;
             assert!(reconcile_declarations(&resupply, &mut independent).is_err());
             assert_eq!(independent, installed);
-            let Some(pb::declaration::Kind::Constructor(c)) = &mut resupply.declarations[0].kind
-            else {
-                unreachable!()
-            };
+            let c = &mut resupply.constructors[0];
             c.unextractable = false;
             reconcile_declarations(&resupply, &mut independent).unwrap();
             assert_eq!(independent, installed);
@@ -302,7 +286,6 @@ fn box_definition() -> pb::Program {
                 kind: Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
                     value: Some(pb::primitive_value::Value::I64(4)),
                 })),
-                ..Default::default()
             },
             pb::Node {
                 sort_id: 0,
@@ -310,38 +293,26 @@ fn box_definition() -> pb::Program {
                     func: "current".into(),
                     args: vec![],
                 })),
-                ..Default::default()
             },
             pb::Node {
                 sort_id: 0,
                 kind: Some(pb::node::Kind::Var("new".into())),
-                ..Default::default()
             },
         ],
-        declarations: vec![
-            pb::Declaration {
-                kind: Some(pb::declaration::Kind::Constructor(pb::Constructor {
-                    name: "Box".into(),
-                    inputs: vec![pb::Arg {
-                        sort: 0,
-                        name: "value".into(),
-                    }],
-                    output: 1,
-                    ..Default::default()
-                })),
-                ..Default::default()
-            },
-            pb::Declaration {
-                kind: Some(pb::declaration::Kind::Function(pb::Function {
-                    name: "current".into(),
-                    inputs: vec![],
-                    output: 0,
-                    hidden: false,
-                    merge: Some(2),
-                })),
-                ..Default::default()
-            },
-        ],
+        constructors: vec![pb::Constructor {
+            name: "Box".into(),
+            inputs: vec![0],
+            output: 1,
+            ..Default::default()
+        }],
+        functions: vec![pb::Function {
+            name: "current".into(),
+            inputs: vec![],
+            output: 0,
+            hidden: false,
+            merge: Some(2),
+            ..Default::default()
+        }],
         ..Default::default()
     }
 }
@@ -361,18 +332,14 @@ fn declaration_closures_relocate_and_resupply_structurally() {
     for n in &mut permuted.nodes {
         n.sort_id = 1 - n.sort_id;
     }
-    let Some(pb::declaration::Kind::Constructor(c)) = &mut permuted.declarations[0].kind else {
-        unreachable!()
-    };
-    c.inputs[0].sort = 1;
-    c.inputs[0].name = "diagnostic alpha rename".into();
+    let c = &mut permuted.constructors[0];
+    c.inputs[0] = 1;
     c.output = 0;
-    let Some(pb::declaration::Kind::Function(f)) = &mut permuted.declarations[1].kind else {
-        unreachable!()
-    };
+    let f = &mut permuted.functions[0];
     f.output = 1;
     f.merge = Some(0);
-    permuted.declarations.reverse();
+    permuted.constructors.reverse();
+    permuted.functions.reverse();
     assert_eq!(
         reconcile_declarations(&permuted, &mut destination).unwrap(),
         [false, false]
@@ -382,10 +349,76 @@ fn declaration_closures_relocate_and_resupply_structurally() {
         "compatible resupply must not retain unreachable template copies"
     );
     let before = destination.clone();
-    let Some(pb::declaration::Kind::Function(f)) = &mut permuted.declarations[0].kind else {
-        unreachable!()
-    };
+    let f = &mut permuted.functions[0];
     f.merge = None;
     assert!(reconcile_declarations(&permuted, &mut destination).is_err());
     assert_eq!(destination, before);
+}
+
+#[test]
+fn flat_callable_lists_share_one_namespace_and_coalesce_compatible_duplicates() {
+    let base = box_definition();
+    let mut sources = std::array::from_fn::<_, 4, _>(|_| pb::Program {
+        sorts: base.sorts.clone(),
+        nodes: base.nodes.clone(),
+        ..Default::default()
+    });
+    let input = 0;
+    sources[0].constructors = vec![
+        pb::Constructor {
+            name: "shared".into(),
+            inputs: vec![input],
+            output: 1,
+            ..Default::default()
+        };
+        2
+    ];
+    sources[1].functions = vec![
+        pb::Function {
+            name: "shared".into(),
+            inputs: vec![input],
+            output: 0,
+            ..Default::default()
+        };
+        2
+    ];
+    sources[2].relations = vec![
+        pb::Relation {
+            name: "shared".into(),
+            inputs: vec![input],
+            ..Default::default()
+        };
+        2
+    ];
+    sources[3].user_defined_primitives = vec![
+        pb::UserDefinedPrimitive {
+            name: "shared".into(),
+            inputs: vec![input],
+            output: 0,
+            body: Some(0),
+            ..Default::default()
+        };
+        2
+    ];
+    for (kind, source) in sources.iter().enumerate() {
+        let mut destination = pb::Program::default();
+        assert_eq!(
+            reconcile_declarations(source, &mut destination).unwrap(),
+            [true, false]
+        );
+        let installed = destination.clone();
+        for (other, candidate) in sources.iter().enumerate() {
+            let result = reconcile_declarations(candidate, &mut destination);
+            if kind == other {
+                assert_eq!(result.unwrap(), [false, false]);
+            } else {
+                assert!(
+                    result
+                        .unwrap_err()
+                        .contains("conflicting declaration shared")
+                );
+            }
+            assert_eq!(destination, installed, "kind {kind}, candidate {other}");
+        }
+    }
 }

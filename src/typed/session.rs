@@ -115,21 +115,10 @@ impl CapturePlan {
                         "free variable in evaluated input".into(),
                     ));
                 }
-                Some(pb::node::Kind::Union(_) | pb::node::Kind::Apply(_)) => eligible = false,
+                Some(pb::node::Kind::Eq(_) | pb::node::Kind::Apply(_)) => eligible = false,
                 Some(pb::node::Kind::Call(call)) => {
                     let declaration = record.declaration(&call.func, DeclarationKind::Callable)?;
-                    eligible &= declaration.arena == Arena::Declaration
-                        && matches!(
-                            declaration
-                                .owner
-                                .as_ref()
-                                .unwrap()
-                                .program()
-                                .unwrap()
-                                .declarations[declaration.index as usize]
-                                .kind,
-                            Some(pb::declaration::Kind::Constructor(_))
-                        );
+                    eligible &= declaration.arena == Arena::Constructor;
                 }
                 _ => (),
             }
@@ -837,9 +826,8 @@ impl EGraph {
         let mut packer = Packer::default();
         packer.program.commands.push(pb::Command {
             kind: Some(pb::command::Kind::Stats(pb::Unit {})),
-            ..Default::default()
         });
-        let (response, _files) = one_observation(self.execute(packer, false)?)?;
+        let response = one_observation(self.execute(packer, false)?)?;
         let [output] = response.outputs.as_slice() else {
             return Err(TypedError::Decode(
                 "missing or extra statistics observation".into(),
@@ -866,9 +854,8 @@ impl EGraph {
         let mut packer = Packer::default();
         packer.program.commands.push(pb::Command {
             kind: Some(pb::command::Kind::Freeze(pb::Freeze {})),
-            ..Default::default()
         });
-        let (response, _files) = one_observation(self.execute(packer, false)?)?;
+        let response = one_observation(self.execute(packer, false)?)?;
         let mut outputs = response.outputs.into_iter();
         let Some(pb::CommandOutput {
             kind: Some(pb::command_output::Kind::Snapshot(snapshot)),
@@ -912,9 +899,8 @@ impl EGraph {
         let mut packer = Packer::default();
         packer.program.commands.push(pb::Command {
             kind: Some(pb::command::Kind::TableSizes(pb::GetTableSizes::default())),
-            ..Default::default()
         });
-        let (response, _files) = one_observation(self.execute(packer, false)?)?;
+        let response = one_observation(self.execute(packer, false)?)?;
         let mut outputs = response.outputs.into_iter();
         let Some(pb::CommandOutput {
             kind: Some(pb::command_output::Kind::Sizes(sizes)),
@@ -945,7 +931,6 @@ impl EGraph {
         let facts = roots.into_iter().map(|r| packer.intern(r, 1)).collect();
         packer.program.commands.push(pb::Command {
             kind: Some(pb::command::Kind::Check(pb::Check { facts })),
-            ..Default::default()
         });
         match self.execute(packer, false) {
             Ok(_) => Ok(true),
@@ -956,8 +941,26 @@ impl EGraph {
         }
     }
 
-    /// Tree-extract a value and own its finite constructor/scalar/container closure.
+    /// Tree-extract the best finite constructor/scalar/container closure.
     pub fn extract<L: ValueInput>(&mut self, root: L) -> Result<L::Owned, TypedError> {
+        self.extract_multiple(root, 1)?
+            .into_iter()
+            .next()
+            .ok_or_else(|| TypedError::Decode("missing extraction result".into()))
+    }
+
+    /// Tree-extract up to `variants` representatives, best first.
+    /// An empty result means the root has no finite extraction.
+    pub fn extract_multiple<L: ValueInput>(
+        &mut self,
+        root: L,
+        variants: u32,
+    ) -> Result<Vec<L::Owned>, TypedError> {
+        if variants == 0 {
+            return Err(TypedError::Invalid(
+                "extraction variants must be positive".into(),
+            ));
+        }
         let mut packer = Packer::default();
         let root = root.borrow().expression().0.clone();
         let mut captures = CapturePlan::new(self, std::slice::from_ref(&root))?;
@@ -966,29 +969,33 @@ impl EGraph {
         packer.program.commands.push(pb::Command {
             kind: Some(pb::command::Kind::Extract(pb::Extract {
                 roots: vec![index],
-                variants: 1,
+                variants,
                 extractor: pb::Extractor::Tree.into(),
                 ..Default::default()
             })),
-            ..Default::default()
         });
-        let (response, _files) = one_observation(self.execute(packer, false)?)?;
-        let term = response
+        let response = one_observation(self.execute(packer, false)?)?;
+        let variants = response
             .outputs
             .iter()
             .find_map(|output| match &output.kind {
                 Some(pb::command_output::Kind::Extraction(result)) => {
-                    result.roots.first()?.variants.first().map(|v| v.term)
+                    result.roots.first().map(|root| &root.variants)
                 }
                 _ => None,
             })
             .ok_or_else(|| TypedError::Decode("missing extraction result".into()))?;
-        ensure_sort(adopt(
-            &response,
-            term,
-            self.declarations.values().cloned().collect(),
-            &self.builtins,
-        )?)
+        variants
+            .iter()
+            .map(|variant| {
+                ensure_sort(adopt(
+                    &response,
+                    variant.term,
+                    self.declarations.values().cloned().collect(),
+                    &self.builtins,
+                )?)
+            })
+            .collect()
     }
 }
 
@@ -1116,7 +1123,6 @@ fn pack_schedule(schedule: super::Schedule, snapshots: bool) -> Result<Packer, T
                 max_iterations: Some(1),
                 ..Default::default()
             })),
-            ..Default::default()
         }];
     }
     Ok(packer)
@@ -1175,7 +1181,7 @@ fn select_run(
 // Empty completion frames carry no observation and are never a data owner.
 fn one_observation(
     frames: Vec<pb::RunProgramResponse>,
-) -> Result<(pb::RunProgramOutput, Vec<pb::SourceFile>), TypedError> {
+) -> Result<pb::RunProgramOutput, TypedError> {
     let mut selected = None;
     for frame in frames {
         let Some(pb::run_program_response::Result::Output(output)) = frame.result else {
@@ -1189,7 +1195,7 @@ fn one_observation(
         if output.outputs.len() != 1 || selected.is_some() {
             return Err(TypedError::Decode("missing or extra observation".into()));
         }
-        selected = Some((output, frame.files));
+        selected = Some(output);
     }
     selected.ok_or_else(|| TypedError::Decode("missing observation".into()))
 }
@@ -1411,21 +1417,35 @@ mod tests {
                         })
                         .map(|i| (Arena::Primitive, i)),
                     OwnedGraph::Program(program) => program
-                        .declarations
+                        .constructors
                         .iter()
-                        .position(|d| {
+                        .enumerate()
+                        .map(|(i, d)| (Arena::Constructor, i, &d.name))
+                        .chain(
+                            program
+                                .functions
+                                .iter()
+                                .enumerate()
+                                .map(|(i, d)| (Arena::Function, i, &d.name)),
+                        )
+                        .chain(
+                            program
+                                .relations
+                                .iter()
+                                .enumerate()
+                                .map(|(i, d)| (Arena::Relation, i, &d.name)),
+                        )
+                        .chain(
+                            program
+                                .user_defined_primitives
+                                .iter()
+                                .enumerate()
+                                .map(|(i, d)| (Arena::UserDefinedPrimitive, i, &d.name)),
+                        )
+                        .find_map(|(arena, i, candidate)| {
                             *probes += 1;
-                            match &d.kind {
-                                Some(pb::declaration::Kind::Constructor(d)) => d.name == name,
-                                Some(pb::declaration::Kind::Function(d)) => d.name == name,
-                                Some(pb::declaration::Kind::Relation(d)) => d.name == name,
-                                Some(pb::declaration::Kind::UserDefinedPrimitive(d)) => {
-                                    d.name == name
-                                }
-                                _ => false,
-                            }
-                        })
-                        .map(|i| (Arena::Declaration, i)),
+                            (candidate == name).then_some((arena, i))
+                        }),
                 };
                 if let Some((arena, index)) = found {
                     return Record {
@@ -1496,7 +1516,6 @@ mod tests {
                             items: (1..=size).collect(),
                         })),
                     })),
-                    ..Default::default()
                 }],
                 ..Default::default()
             };
@@ -1506,14 +1525,12 @@ mod tests {
                     func: name.clone(),
                     args: vec![size + 1 + i],
                 })),
-                ..Default::default()
             }));
             output.nodes.extend((0..size).map(|i| pb::Node {
                 sort_id: 1,
                 kind: Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
                     value: Some(pb::primitive_value::Value::I64(i64::from(i))),
                 })),
-                ..Default::default()
             }));
             LINK_WORK.with(|work| work.set([0; 5]));
             let adopted = adopt(&output, 0, declarations, &builtins).unwrap();
@@ -1527,7 +1544,7 @@ mod tests {
             assert_eq!(retained, [size as usize + 2, size as usize + 2, 0]);
             assert!(cold.iter().sum::<usize>() <= 32 * (size as usize + catalog_size));
 
-            let parameter = variable::<I64>(fresh_scope(), 0).expression().clone();
+            let parameter = variable::<I64>(fresh_scope(), 0, None).expression().clone();
             let pattern = Expr::call(&Callable(selected.clone()), vec![parameter.clone()]);
             LINK_WORK.with(|work| work.set([0; 5]));
             let mut former_probes = 0;
@@ -1965,7 +1982,6 @@ mod tests {
                     kind: Some(pb::command::Kind::TableSizes(pb::GetTableSizes {
                         tables: vec!["ActionAbsent".into()],
                     })),
-                    ..Default::default()
                 });
                 let response = Observed::from_frames(graph.execute(packer, false).unwrap());
                 let Some(pb::command_output::Kind::Sizes(sizes)) = &response.output.outputs[0].kind
@@ -2124,7 +2140,7 @@ mod tests {
                 let Some(pb::rule::Kind::Rule(body)) = &ruleset.rules[0].kind else {
                     panic!()
                 };
-                body.head.iter().collect()
+                body.actions.iter().collect()
             } else {
                 program
                     .commands
@@ -2163,7 +2179,7 @@ mod tests {
                 program.sorts[node.sort_id as usize].kind,
                 Some(pb::sort::Kind::Eq("ActionTerm".into()))
             );
-            let Some(pb::node::Kind::Union(merge)) = &node.kind else {
+            let Some(pb::node::Kind::Eq(merge)) = &node.kind else {
                 panic!()
             };
             assert_eq!(merge.members.len(), 2);
@@ -2205,7 +2221,7 @@ mod tests {
                 Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
                     value: Some(pb::primitive_value::Value::I64(2)),
                 }));
-            let Some(pb::node::Kind::Union(merge)) = &mut program.nodes[root as usize].kind else {
+            let Some(pb::node::Kind::Eq(merge)) = &mut program.nodes[root as usize].kind else {
                 panic!()
             };
             merge.members[1] = u32::MAX;
@@ -2308,7 +2324,12 @@ mod tests {
         assert!(
             matches!(&program.commands[2].kind, Some(pb::command::Kind::Action(pb::Action { kind: Some(pb::action::Kind::Delete(call)), .. })) if call.func == "CaptureRead")
         );
-        assert!(program.declarations.iter().all(|d| !matches!(&d.kind, Some(pb::declaration::Kind::Function(f)) if f.name == "before" || f.name == "after")));
+        assert!(
+            program
+                .functions
+                .iter()
+                .all(|f| f.name != "before" && f.name != "after")
+        );
         assert_eq!(i64::try_from(&graph.extract(&before).unwrap()).unwrap(), 10);
         assert_eq!(i64::try_from(&graph.extract(&after).unwrap()).unwrap(), 20);
         graph
@@ -2385,7 +2406,14 @@ mod tests {
         assert_eq!(i64::try_from(&graph.extract(&lazy).unwrap()).unwrap(), 7);
         let request =
             pb::RunProgramRequest::decode(graph.last_wire.as_ref().unwrap().0.as_slice()).unwrap();
-        assert!(request.program.unwrap().declarations.iter().all(|declaration| !matches!(&declaration.kind, Some(pb::declaration::Kind::Function(function)) if function.name == "CaptureRead")));
+        assert!(
+            request
+                .program
+                .unwrap()
+                .functions
+                .iter()
+                .all(|function| function.name != "CaptureRead")
+        );
         let fresh = let_("fresh", CaptureRead(993));
         graph.run(sequence(set(&fresh, &rhs)).repeat(0)).unwrap();
         assert!(
@@ -2530,7 +2558,6 @@ mod tests {
                     location: Some(pb::CommandLocation { path, iterations }),
                     ..Default::default()
                 })),
-                ..Default::default()
             };
             assert!(matches!(
                 graph.accept_response(packer, &[response.encode_to_vec()]),
@@ -2585,7 +2612,6 @@ mod tests {
             kind: Some(pb::command::Kind::Check(pb::Check {
                 facts: vec![u32::MAX],
             })),
-            ..Default::default()
         });
         let Err(TypedError::Engine(frame)) = graph.execute(packer, false) else {
             panic!("invalid packet")
@@ -2935,9 +2961,7 @@ mod tests {
         fail.program.commands.push(pb::Command {
             kind: Some(pb::command::Kind::Action(pb::Action {
                 kind: Some(pb::action::Kind::Panic("after collected work".into())),
-                ..Default::default()
             })),
-            ..Default::default()
         });
         assert!(matches!(
             graph.execute(fail, false),
@@ -3119,7 +3143,6 @@ mod tests {
                     kind: Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
                         value: Some(value.clone()),
                     })),
-                    ..Default::default()
                 }],
                 ..Default::default()
             };
@@ -3252,7 +3275,6 @@ mod tests {
                     extractor: pb::Extractor::Tree.into(),
                     ..Default::default()
                 })),
-                ..Default::default()
             });
             let mut graph = EGraph::default();
             let response = Observed::from_frames(graph.execute(packer, false).unwrap());
@@ -3384,12 +3406,9 @@ mod tests {
             ("stored_pairs", program.nodes[argument].sort_id),
             ("stored_map", program.nodes[root as usize].sort_id),
         ] {
-            program.declarations.push(pb::Declaration {
-                kind: Some(pb::declaration::Kind::Function(pb::Function {
-                    name: name.into(),
-                    output,
-                    ..Default::default()
-                })),
+            program.functions.push(pb::Function {
+                name: name.into(),
+                output,
                 ..Default::default()
             });
         }
@@ -3403,9 +3422,7 @@ mod tests {
                         }),
                         value: Some(value),
                     })),
-                    ..Default::default()
                 })),
-                ..Default::default()
             });
         }
         program.commands.push(pb::Command {
@@ -3415,22 +3432,18 @@ mod tests {
                 extractor: pb::Extractor::Tree.into(),
                 ..Default::default()
             })),
-            ..Default::default()
         });
         let table = pb::Command {
             kind: Some(pb::command::Kind::TableRows(pb::GetTableRows {
                 table: "stored_map".into(),
                 max_rows: Some(10),
             })),
-            ..Default::default()
         };
         program.commands.push(table.clone());
         program.commands.push(pb::Command {
             kind: Some(pb::command::Kind::Action(pb::Action {
                 kind: Some(pb::action::Kind::Term(missing)),
-                ..Default::default()
             })),
-            ..Default::default()
         });
         let graph = EGraph::default();
         let request = pb::RunProgramRequest {
@@ -3567,7 +3580,6 @@ mod tests {
                     kind: Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
                         value: Some(pb::primitive_value::Value::I64(7)),
                     })),
-                    ..Default::default()
                 },
                 pb::Node::default(), // An unrelated response node is not this closure's root.
                 pb::Node {
@@ -3586,14 +3598,12 @@ mod tests {
                             ],
                         })),
                     })),
-                    ..Default::default()
                 },
                 pb::Node {
                     sort_id: 0,
                     kind: Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
                         value: Some(pb::primitive_value::Value::F64Bits(1.5_f64.to_bits())),
                     })),
-                    ..Default::default()
                 },
             ],
             ..Default::default()
@@ -3784,7 +3794,6 @@ mod tests {
                     kind: Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
                         value: Some(pb::primitive_value::Value::I64(7)),
                     })),
-                    ..Default::default()
                 },
                 pb::Node::default(), // Unselected malformed data is not adopted.
                 pb::Node {
@@ -3795,14 +3804,12 @@ mod tests {
                             second: Some(3),
                         })),
                     })),
-                    ..Default::default()
                 },
                 pb::Node {
                     sort_id: 0,
                     kind: Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
                         value: Some(pb::primitive_value::Value::F64Bits(1.5_f64.to_bits())),
                     })),
-                    ..Default::default()
                 },
             ],
             ..Default::default()
@@ -3969,7 +3976,6 @@ mod tests {
                     kind: Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
                         value: Some(pb::primitive_value::Value::I64(7)),
                     })),
-                    ..Default::default()
                 },
                 pb::Node::default(), // Unselected malformed data is not adopted.
                 pb::Node {
@@ -3979,7 +3985,6 @@ mod tests {
                             value: Some(0),
                         })),
                     })),
-                    ..Default::default()
                 },
                 pb::Node {
                     sort_id: 2,
@@ -3988,7 +3993,6 @@ mod tests {
                             items: vec![2, 2],
                         })),
                     })),
-                    ..Default::default()
                 },
             ],
             ..Default::default()
@@ -4141,7 +4145,6 @@ mod tests {
                             items: vec![1, 2, 1],
                         })),
                     })),
-                    ..Default::default()
                 },
                 pb::Node {
                     kind: Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
@@ -4227,7 +4230,6 @@ mod tests {
                             items: vec![1],
                         })),
                     })),
-                    ..Default::default()
                 },
                 pb::Node {
                     kind: Some(pb::node::Kind::Call(pb::Call {
@@ -4375,7 +4377,6 @@ mod tests {
                     extractor: pb::Extractor::Tree.into(),
                     ..Default::default()
                 })),
-                ..Default::default()
             });
             let mut graph = EGraph::default();
             let response = Observed::from_frames(graph.execute(packer, false).unwrap());
@@ -4544,7 +4545,6 @@ mod tests {
                 kind: Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
                     value: Some(pb::primitive_value::Value::I64(value)),
                 })),
-                ..Default::default()
             });
         }
         response.output.nodes[term as usize].kind = Some(pb::node::Kind::Call(pb::Call {
@@ -4719,7 +4719,6 @@ mod tests {
                     kind: Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
                         value: Some(pb::primitive_value::Value::I64(7)),
                     })),
-                    ..Default::default()
                 },
                 pb::Node {
                     kind: Some(pb::node::Kind::Var("unrelated invalid observation".into())),
@@ -4732,14 +4731,12 @@ mod tests {
                             items: vec![3, 0],
                         })),
                     })),
-                    ..Default::default()
                 },
                 pb::Node {
                     sort_id: 1,
                     kind: Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
                         value: Some(pb::primitive_value::Value::I64(11)),
                     })),
-                    ..Default::default()
                 },
             ],
             ..Default::default()
@@ -4861,7 +4858,6 @@ mod tests {
                             items: vec![1],
                         })),
                     })),
-                    ..Default::default()
                 },
                 pb::Node {
                     kind: Some(pb::node::Kind::Call(pb::Call {
@@ -4932,13 +4928,24 @@ mod tests {
             let mut slots = std::array::from_fn(|_| vec![]);
             slots[Arena::Sort as usize] =
                 (0..program.sorts.len() as u32).map(Slot::Local).collect();
-            slots[Arena::Declaration as usize] = (0..program.declarations.len() as u32)
-                .map(Slot::Local)
-                .collect();
+            for (arena, len) in [
+                (Arena::Constructor, program.constructors.len()),
+                (Arena::Function, program.functions.len()),
+                (Arena::Relation, program.relations.len()),
+                (
+                    Arena::UserDefinedPrimitive,
+                    program.user_defined_primitives.len(),
+                ),
+            ] {
+                slots[arena as usize] = (0..len as u32).map(Slot::Local).collect();
+            }
             let sorts = publish(
                 pb::Program {
                     sorts: program.sorts.clone(),
-                    declarations: program.declarations.clone(),
+                    constructors: program.constructors.clone(),
+                    functions: program.functions.clone(),
+                    relations: program.relations.clone(),
+                    user_defined_primitives: program.user_defined_primitives.clone(),
                     ..Default::default()
                 },
                 slots,
@@ -4972,10 +4979,10 @@ mod tests {
             assert_eq!(signature.type_param_count as usize, 1);
             assert_eq!(signature.inputs.len(), 2);
             assert!(signature.varargs.is_empty());
-            assert_eq!(signature.inputs[0].sort, signature.inputs[1].sort);
+            assert_eq!(signature.inputs[0], signature.inputs[1]);
             assert_eq!(
                 declaration
-                    .resolve(Arena::Sort, signature.inputs[0].sort)
+                    .resolve(Arena::Sort, signature.inputs[0])
                     .unwrap()
                     .sort()
                     .unwrap()
@@ -5160,7 +5167,6 @@ mod tests {
                 extractor: pb::Extractor::Tree.into(),
                 ..Default::default()
             })),
-            ..Default::default()
         });
         let mut graph = EGraph::default();
         let response = graph.execute(packer, false).unwrap();

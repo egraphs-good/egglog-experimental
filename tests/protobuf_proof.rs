@@ -207,7 +207,6 @@ fn source_globals_are_typed_ordered_slots_in_every_receiving_mode() {
                     kind: Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
                         value: Some(pb::primitive_value::Value::I64(1)),
                     })),
-                    ..Default::default()
                 },
                 pb::Node {
                     sort_id,
@@ -215,21 +214,18 @@ fn source_globals_are_typed_ordered_slots_in_every_receiving_mode() {
                         func: "N".into(),
                         args: vec![value],
                     })),
-                    ..Default::default()
                 },
                 pb::Node {
                     sort_id,
-                    kind: Some(pb::node::Kind::Union(pb::Union {
+                    kind: Some(pb::node::Kind::Eq(pb::Eq {
                         members: vec![binding, value + 1],
                     })),
-                    ..Default::default()
                 },
             ]);
             observation.commands = vec![pb::Command {
                 kind: Some(pb::command::Kind::Check(pb::Check {
                     facts: vec![value + 2],
                 })),
-                ..Default::default()
             }];
             assert_eq!(
                 run(&mut engine, id, observation).error,
@@ -450,7 +446,6 @@ fn source_receiving_mode_preserves_native_global_boundaries() {
                         kind: Some(pb::command::Kind::TableSizes(pb::GetTableSizes {
                             tables: vec!["N".into()],
                         })),
-                        ..Default::default()
                     }],
                     ..Default::default()
                 },
@@ -653,7 +648,6 @@ fn source_receiving_modes_preserve_typed_multi_vec_empty_context() {
                     kind: Some(pb::command::Kind::TableSizes(pb::GetTableSizes {
                         tables: vec!["XW".into()],
                     })),
-                    ..Default::default()
                 }],
                 ..Default::default()
             },
@@ -761,7 +755,12 @@ fn source_receiving_mode_is_fixed_before_first_submission_and_globals_stay_bindi
         .unwrap()
         .collect::<Result<Vec<_>, _>>()
         .unwrap();
-    assert!(programs.iter().flat_map(|program| &program.declarations).all(|declaration| !matches!(&declaration.kind, Some(pb::declaration::Kind::Function(function)) if function.name == "$cap")));
+    assert!(
+        programs
+            .iter()
+            .flat_map(|program| &program.functions)
+            .all(|function| function.name != "$cap")
+    );
     assert!(
         programs.iter().flat_map(|program| &program.nodes).any(
             |node| matches!(&node.kind, Some(pb::node::Kind::Binding(name)) if name == "$cap")
@@ -950,7 +949,8 @@ fn core_source_failed_control_and_fail_wrappers_keep_prefixes_in_every_mode() {
                     if let Some(error) = response.error {
                         failed = true;
                         assert_eq!(error.code, i32::from(pb::ErrorCode::RuntimeFailure));
-                        assert!(error.span.is_some());
+                        assert!(error.context.is_some());
+                        assert!(error.site.is_some());
                         let location = error.location.unwrap();
                         let position = u32::try_from(control_position.unwrap()).unwrap();
                         assert_eq!(
@@ -975,7 +975,6 @@ fn core_source_failed_control_and_fail_wrappers_keep_prefixes_in_every_mode() {
                     pb::Program {
                         commands: vec![pb::Command {
                             kind: Some(pb::command::Kind::Stats(pb::Unit {})),
-                            ..Default::default()
                         }],
                         ..Default::default()
                     },
@@ -991,7 +990,6 @@ fn core_source_failed_control_and_fail_wrappers_keep_prefixes_in_every_mode() {
                                 table: "N".into(),
                                 max_rows: None,
                             })),
-                            ..Default::default()
                         }],
                         ..Default::default()
                     },
@@ -1027,7 +1025,6 @@ fn core_source_failed_control_and_fail_wrappers_keep_prefixes_in_every_mode() {
                 }
                 let suffix = pb::Command {
                     kind: Some(pb::command::Kind::Check(pb::Check { facts: vec![3] })),
-                    ..Default::default()
                 };
                 let checked = run(
                     &mut engine,
@@ -1053,7 +1050,6 @@ fn core_source_failed_control_and_fail_wrappers_keep_prefixes_in_every_mode() {
                                 kind: Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
                                     value: Some(pb::primitive_value::Value::I64(value)),
                                 })),
-                                ..Default::default()
                             })
                             .chain([0, 1].into_iter().map(|arg| pb::Node {
                                 sort_id: 1,
@@ -1061,20 +1057,17 @@ fn core_source_failed_control_and_fail_wrappers_keep_prefixes_in_every_mode() {
                                     func: "N".into(),
                                     args: vec![arg],
                                 })),
-                                ..Default::default()
                             }))
                             .collect(),
                         commands: vec![
                             pb::Command {
                                 kind: Some(pb::command::Kind::Check(pb::Check { facts: vec![2] })),
-                                ..Default::default()
                             },
                             if depth == 1 {
                                 suffix
                             } else {
                                 pb::Command {
                                     kind: Some(pb::command::Kind::Fail(Box::new(suffix))),
-                                    ..Default::default()
                                 }
                             },
                         ],
@@ -1175,7 +1168,6 @@ fn scope_pop_restores_proof_state_and_can_prove_again() {
             kind: Some(pb::command::Kind::Fail(Box::new(
                 absent.commands[2].clone(),
             ))),
-            ..Default::default()
         }];
         let restored = run(&mut engine, saved, absent);
         assert_eq!(
@@ -1390,7 +1382,7 @@ fn recursive_fail_matches_native_checks_in_every_execution_mode() {
                 };
                 let fact = check.facts[0] as usize;
                 if case == "wrong-sort" {
-                    let Some(pb::node::Kind::Union(union)) = &phase.nodes[fact].kind else {
+                    let Some(pb::node::Kind::Eq(union)) = &phase.nodes[fact].kind else {
                         unreachable!()
                     };
                     let right = union.members[1] as usize;
@@ -1430,7 +1422,6 @@ fn recursive_fail_matches_native_checks_in_every_execution_mode() {
                     kind: Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
                         value: Some(pb::primitive_value::Value::I64(value)),
                     })),
-                    ..Default::default()
                 });
                 let call = phase.nodes.len() as u32;
                 phase.nodes.push(pb::Node {
@@ -1439,16 +1430,13 @@ fn recursive_fail_matches_native_checks_in_every_execution_mode() {
                         func: "M".into(),
                         args: vec![argument],
                     })),
-                    ..Default::default()
                 });
                 phase.commands.insert(
                     position,
                     pb::Command {
                         kind: Some(pb::command::Kind::Action(pb::Action {
                             kind: Some(pb::action::Kind::Term(call)),
-                            ..Default::default()
                         })),
-                        ..Default::default()
                     },
                 );
             }
@@ -1585,12 +1573,15 @@ fn double_fail_suppresses_successful_proof_without_erasing_prior_output() {
             .unwrap();
         let mut program = setup.clone();
         program.commands = setup.commands.split_off(position);
-        program.declarations.clear();
+        program.constructors.clear();
+        program.functions.clear();
+        program.relations.clear();
+        program.user_defined_primitives.clear();
         program.rulesets.clear();
-        // Both command stages retain their common arena and source files;
+        // Both command stages retain their common arena;
         // the proof and its authored wrapper require no index relocation.
         assert_eq!(program.sorts, setup.sorts);
-        assert_eq!(program.files, setup.files);
+        assert_eq!(program.nodes, setup.nodes);
         assert_eq!(run(&mut engine, id, setup).error, None);
         let response = run(&mut engine, id, program);
         assert_eq!(response.error, None);
@@ -1772,7 +1763,7 @@ fn set_collapse_proof_and_get_validator_boundary_survive_bytes() {
         let program = source.next().unwrap().unwrap();
         let setup = pb::Program {
             sorts: program.sorts.clone(),
-            files: program.files.clone(),
+
             ..Default::default()
         };
         assert_eq!(run(&mut engine, id, setup).error, None);
@@ -2088,7 +2079,6 @@ fn logical_table_rows_match_native_views_in_every_mode() {
             pb::Program {
                 commands: vec![pb::Command {
                     kind: Some(pb::command::Kind::Freeze(pb::Freeze {})),
-                    ..Default::default()
                 }],
                 ..Default::default()
             },
@@ -2128,22 +2118,15 @@ fn logical_table_rows_match_native_views_in_every_mode() {
                 if populated {
                     let value = writes[0].value.expect("populated slot value");
                     assert_eq!(program.nodes[value as usize].sort_id, node.sort_id);
-                    let Some(pb::node::Kind::Union(class)) = &program.nodes[value as usize].kind
+                    let Some(pb::node::Kind::Eq(class)) = &program.nodes[value as usize].kind
                     else {
                         panic!("closed stored class")
                     };
                     assert!(class.members.iter().any(|member| matches!(&program.nodes[*member as usize].kind, Some(pb::node::Kind::Call(call)) if call.func == "Visible" && call.args.is_empty())));
                 }
                 assert!(
-                    program
-                        .declarations
-                        .iter()
-                        .all(|declaration| match &declaration.kind {
-                            Some(pb::declaration::Kind::Constructor(row)) => row.name != name,
-                            Some(pb::declaration::Kind::Function(row)) => row.name != name,
-                            _ => true,
-                        }),
-                    "slot {name} has no synthetic public callable"
+                    program.constructors.iter().all(|row| row.name != name)
+                        && program.functions.iter().all(|row| row.name != name),
                 );
             }
         } else {
@@ -2175,13 +2158,13 @@ fn logical_table_rows_match_native_views_in_every_mode() {
                     ..Default::default()
                 },
                 pb::Node {
-                    kind: Some(pb::node::Kind::Union(pb::Union {
+                    kind: Some(pb::node::Kind::Eq(pb::Eq {
                         members: vec![0, 2],
                     })),
                     ..Default::default()
                 },
                 pb::Node {
-                    kind: Some(pb::node::Kind::Union(pb::Union {
+                    kind: Some(pb::node::Kind::Eq(pb::Eq {
                         members: vec![1, 5],
                     })),
                     ..Default::default()
@@ -2194,14 +2177,11 @@ fn logical_table_rows_match_native_views_in_every_mode() {
             commands: vec![
                 pb::Command {
                     kind: Some(pb::command::Kind::Check(pb::Check { facts: vec![3] })),
-                    ..Default::default()
                 },
                 pb::Command {
                     kind: Some(pb::command::Kind::Fail(Box::new(pb::Command {
                         kind: Some(pb::command::Kind::Check(pb::Check { facts: vec![4] })),
-                        ..Default::default()
                     }))),
-                    ..Default::default()
                 },
             ],
             ..Default::default()
@@ -2221,7 +2201,6 @@ fn logical_table_rows_match_native_views_in_every_mode() {
                             table: table.into(),
                             max_rows: None,
                         })),
-                        ..Default::default()
                     }],
                     ..Default::default()
                 },
@@ -2261,7 +2240,7 @@ fn table_observation_keeps_completed_prefix_and_encoding_errors_are_not_unavaila
             _: &egglog::EGraph,
             _: &egglog::ArcSort,
             _: &pb::CustomValue,
-            _: Option<pb::Span>,
+
             _: &mut pb::Program,
         ) -> Result<pb::Call, String> {
             Err("unused custom lowering".into())
@@ -2293,7 +2272,6 @@ fn table_observation_keeps_completed_prefix_and_encoding_errors_are_not_unavaila
                     table: "N".into(),
                     max_rows: None,
                 })),
-                ..Default::default()
             },
             fixture().commands[2].clone(),
         ];
@@ -2315,14 +2293,12 @@ fn table_observation_keeps_completed_prefix_and_encoding_errors_are_not_unavaila
                 kind: Some(pb::command::Kind::TableSizes(pb::GetTableSizes {
                     tables: vec!["N".into()],
                 })),
-                ..Default::default()
             },
             pb::Command {
                 kind: Some(pb::command::Kind::TableRows(pb::GetTableRows {
                     table: "N".into(),
                     max_rows: None,
                 })),
-                ..Default::default()
             },
         ];
         let response = run(&mut engine, id, program.clone());
@@ -2417,7 +2393,6 @@ fn fixture() -> pb::Program {
         kind: Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
             value: Some(pb::primitive_value::Value::I64(n)),
         })),
-        ..Default::default()
     };
     let call = |name: &str, args| pb::Node {
         sort_id: 1,
@@ -2425,20 +2400,13 @@ fn fixture() -> pb::Program {
             func: name.into(),
             args,
         })),
-        ..Default::default()
     };
     let mut declarations = vec![];
     for name in ["N", "Goal", "Absent"] {
-        declarations.push(pb::Declaration {
-            kind: Some(pb::declaration::Kind::Constructor(pb::Constructor {
-                name: name.into(),
-                inputs: vec![pb::Arg {
-                    name: "x".into(),
-                    sort: 0,
-                }],
-                output: 1,
-                ..Default::default()
-            })),
+        declarations.push(pb::Constructor {
+            name: name.into(),
+            inputs: vec![0],
+            output: 1,
             ..Default::default()
         });
     }
@@ -2447,9 +2415,8 @@ fn fixture() -> pb::Program {
         eval_mode: pb::RuleEvalMode::Seminaive.into(),
         kind: Some(pb::rule::Kind::Rule(pb::RuleBody {
             query: vec![3],
-            head: vec![pb::Action {
+            actions: vec![pb::Action {
                 kind: Some(pb::action::Kind::Term(4)),
-                ..Default::default()
             }],
         })),
         ..Default::default()
@@ -2473,13 +2440,12 @@ fn fixture() -> pb::Program {
                 ..Default::default()
             },
         ],
-        declarations,
+        constructors: declarations,
         nodes: vec![
             int(1),
             pb::Node {
                 sort_id: 0,
                 kind: Some(pb::node::Kind::Var("x".into())),
-                ..Default::default()
             },
             call("N", vec![0]),
             call("N", vec![1]),
@@ -2494,9 +2460,7 @@ fn fixture() -> pb::Program {
             pb::Command {
                 kind: Some(pb::command::Kind::Action(pb::Action {
                     kind: Some(pb::action::Kind::Term(2)),
-                    ..Default::default()
                 })),
-                ..Default::default()
             },
             pb::Command {
                 kind: Some(pb::command::Kind::Run(pb::Run {
@@ -2508,21 +2472,17 @@ fn fixture() -> pb::Program {
                         .collect(),
                     ..Default::default()
                 })),
-                ..Default::default()
             },
             pb::Command {
                 kind: Some(pb::command::Kind::Check(pb::Check { facts: vec![5] })),
-                ..Default::default()
             },
             pb::Command {
                 kind: Some(pb::command::Kind::Prove(pb::Prove { facts: vec![5] })),
-                ..Default::default()
             },
             pb::Command {
                 kind: Some(pb::command::Kind::ProveExists(pb::ProveExists {
                     constructor: "Goal".into(),
                 })),
-                ..Default::default()
             },
         ],
         ..Default::default()
@@ -2538,12 +2498,10 @@ fn shared_content_resupply_groups_and_clone_keep_native_proofs_and_cursors() {
         pb::ExecutionMode::ProofTesting,
     ] {
         let mut program = fixture();
-        let mut ready = program.declarations[0].clone();
-        let Some(pb::declaration::Kind::Constructor(c)) = &mut ready.kind else {
-            unreachable!()
-        };
+        let mut ready = program.constructors[0].clone();
+        let c = &mut ready;
         c.name = "Ready".into();
-        program.declarations.push(ready);
+        program.constructors.push(ready);
         for arg in [1, 0, 6] {
             program.nodes.push(pb::Node {
                 sort_id: 1,
@@ -2551,7 +2509,6 @@ fn shared_content_resupply_groups_and_clone_keep_native_proofs_and_cursors() {
                     func: "Ready".into(),
                     args: vec![arg],
                 })),
-                ..Default::default()
             });
         }
         let registration = program.rulesets[0].value.as_mut().unwrap();
@@ -2560,18 +2517,8 @@ fn shared_content_resupply_groups_and_clone_keep_native_proofs_and_cursors() {
             unreachable!()
         };
         rule.query.push(10);
-        program.files = vec![pb::SourceFile {
-            name: "rule.egg".into(),
-            contents: Some("derive".into()),
-        }];
-        original.span = Some(pb::Span {
-            file: 0,
-            start: 0,
-            end: 6,
-        });
         let mut same_content = original.clone();
         same_content.name = Some("another label".into());
-        same_content.span = None;
         same_content.doc = "diagnostics do not create another native rule".into();
         program.rulesets = vec![
             pb::RulesetBinding {
@@ -2592,9 +2539,7 @@ fn shared_content_resupply_groups_and_clone_keep_native_proofs_and_cursors() {
             pb::Command {
                 kind: Some(pb::command::Kind::Action(pb::Action {
                     kind: Some(pb::action::Kind::Term(11)),
-                    ..Default::default()
                 })),
-                ..Default::default()
             },
         ];
         for groups in [
@@ -2613,7 +2558,6 @@ fn shared_content_resupply_groups_and_clone_keep_native_proofs_and_cursors() {
                         .collect(),
                     ..Default::default()
                 })),
-                ..Default::default()
             });
         }
         if matches!(
@@ -2632,7 +2576,6 @@ fn shared_content_resupply_groups_and_clone_keep_native_proofs_and_cursors() {
                     for rule in &mut registration.rules {
                         if index == 0 {
                             rule.name = None;
-                            rule.span = None;
                             rule.doc = "resupply keeps first-registration diagnostics".into();
                         } else {
                             rule.name = Some("resupplied label".into());
@@ -2708,7 +2651,6 @@ fn shared_content_resupply_groups_and_clone_keep_native_proofs_and_cursors() {
                         .collect(),
                     ..Default::default()
                 })),
-                ..Default::default()
             }],
             ..Default::default()
         };
@@ -2731,18 +2673,12 @@ fn shared_content_resupply_groups_and_clone_keep_native_proofs_and_cursors() {
                 kind: Some(pb::ruleset_selection::Kind::Name(name)),
             })
             .collect();
-        program.files = vec![pb::SourceFile {
-            name: "later.egg".into(),
-            contents: None,
-        }];
         program.commands = [7, 12]
             .into_iter()
             .map(|i| pb::Command {
                 kind: Some(pb::command::Kind::Action(pb::Action {
                     kind: Some(pb::action::Kind::Term(i)),
-                    ..Default::default()
                 })),
-                ..Default::default()
             })
             .chain(name_only.commands.clone())
             .collect();
@@ -2774,11 +2710,7 @@ fn all_modes_return_requested_proofs_control_and_optional_diagnostics() {
             let id = create(&mut engine, mode);
             let mut program = fixture();
             // Core sort and callable namespaces can share a wire spelling.
-            let Some(pb::declaration::Kind::Constructor(constructor)) =
-                &mut program.declarations[0].kind
-            else {
-                unreachable!()
-            };
+            let constructor = &mut program.constructors[0];
             constructor.name = "Num".into();
             for node in &mut program.nodes {
                 if let Some(pb::node::Kind::Call(call)) = &mut node.kind
@@ -2922,33 +2854,30 @@ fn proof_failure_preserves_owned_prefix_clone_mode_and_native_error_order() {
             .unwrap()
             .egraph_id;
         let mut program = fixture();
-        program.declarations.clear();
+        program.constructors.clear();
+        program.functions.clear();
+        program.relations.clear();
+        program.user_defined_primitives.clear();
         program.commands = vec![
             pb::Command {
                 kind: Some(pb::command::Kind::ProveExists(pb::ProveExists {
                     constructor: "Goal".into(),
                 })),
-                ..Default::default()
             },
             pb::Command {
                 kind: Some(pb::command::Kind::Action(pb::Action {
                     kind: Some(pb::action::Kind::Term(7)),
-                    ..Default::default()
                 })),
-                ..Default::default()
             },
             pb::Command {
                 kind: Some(pb::command::Kind::ProveExists(pb::ProveExists {
                     constructor: "Absent".into(),
                 })),
-                ..Default::default()
             },
             pb::Command {
                 kind: Some(pb::command::Kind::Action(pb::Action {
                     kind: Some(pb::action::Kind::Term(9)),
-                    ..Default::default()
                 })),
-                ..Default::default()
             },
         ];
         let proofs = matches!(
@@ -2970,7 +2899,6 @@ fn proof_failure_preserves_owned_prefix_clone_mode_and_native_error_order() {
             let mut check = program.clone();
             check.commands = vec![pb::Command {
                 kind: Some(pb::command::Kind::Check(pb::Check { facts: vec![node] })),
-                ..Default::default()
             }];
             assert_eq!(run(&mut engine, handle, check).error.is_none(), succeeds);
         }
@@ -3021,13 +2949,11 @@ fn malformed_later_commands_unentered_rules_and_observations_are_atomic_preparat
             match invalid {
                 0 => program.commands.push(pb::Command {
                     kind: Some(pb::command::Kind::Prove(pb::Prove { facts: vec![999] })),
-                    ..Default::default()
                 }),
                 1 => program.commands.push(pb::Command {
                     kind: Some(pb::command::Kind::ProveExists(pb::ProveExists {
                         constructor: "missing".into(),
                     })),
-                    ..Default::default()
                 }),
                 2 => {
                     let mut literal = program.rulesets.remove(0).value.unwrap();
@@ -3042,7 +2968,6 @@ fn malformed_later_commands_unentered_rules_and_observations_are_atomic_preparat
                             }],
                             ..Default::default()
                         })),
-                        ..Default::default()
                     };
                     program.commands.push(pb::Command {
                         kind: Some(pb::command::Kind::Loop(pb::Loop {
@@ -3050,7 +2975,6 @@ fn malformed_later_commands_unentered_rules_and_observations_are_atomic_preparat
                             max_iterations: Some(0),
                             ..Default::default()
                         })),
-                        ..Default::default()
                     });
                 }
                 3 => program.commands.push(pb::Command {
@@ -3060,39 +2984,30 @@ fn malformed_later_commands_unentered_rules_and_observations_are_atomic_preparat
                         extractor: pb::Extractor::Tree.into(),
                         ..Default::default()
                     })),
-                    ..Default::default()
                 }),
                 4 | 5 => {
                     if invalid == 5 {
-                        program.declarations.push(pb::Declaration {
-                            kind: Some(pb::declaration::Kind::UserDefinedPrimitive(
-                                pb::UserDefinedPrimitive {
-                                    name: "computed".into(),
-                                    inputs: vec![],
-                                    output: 0,
-                                    body: Some(0),
-                                },
-                            )),
-                            ..Default::default()
-                        });
+                        program
+                            .user_defined_primitives
+                            .push(pb::UserDefinedPrimitive {
+                                name: "computed".into(),
+                                inputs: vec![],
+                                output: 0,
+                                body: Some(0),
+                                ..Default::default()
+                            });
                     }
                     program.commands.push(pb::Command {
                         kind: Some(pb::command::Kind::TableRows(pb::GetTableRows {
                             table: if invalid == 5 { "computed" } else { "missing" }.into(),
                             max_rows: Some(0),
                         })),
-                        ..Default::default()
                     });
                 }
                 _ => {
-                    program.declarations.push(pb::Declaration {
-                        kind: Some(pb::declaration::Kind::Relation(pb::Relation {
-                            name: "Predicate".into(),
-                            inputs: vec![pb::Arg {
-                                name: "x".into(),
-                                sort: 0,
-                            }],
-                        })),
+                    program.relations.push(pb::Relation {
+                        name: "Predicate".into(),
+                        inputs: vec![0],
                         ..Default::default()
                     });
                     program.commands.push(pb::Command {
@@ -3101,9 +3016,7 @@ fn malformed_later_commands_unentered_rules_and_observations_are_atomic_preparat
                                 func: "Predicate".into(),
                                 args: vec![0],
                             })),
-                            ..Default::default()
                         })),
-                        ..Default::default()
                     });
                 }
             }
@@ -3124,7 +3037,6 @@ fn malformed_later_commands_unentered_rules_and_observations_are_atomic_preparat
             let mut retry = fixture();
             retry.commands = vec![pb::Command {
                 kind: Some(pb::command::Kind::Check(pb::Check { facts: vec![2] })),
-                ..Default::default()
             }];
             let retry = run(&mut engine, id, retry);
             let error = retry.error.unwrap();
@@ -3170,7 +3082,12 @@ fn source_and_renderer_keep_proof_commands_authored() {
                 .iter()
                 .any(|c| matches!(c.kind, Some(pb::command::Kind::Prove(_))))
             {
-                assert!(!phase.declarations.is_empty());
+                assert!(
+                    !phase.constructors.is_empty()
+                        || !phase.functions.is_empty()
+                        || !phase.relations.is_empty()
+                        || !phase.user_defined_primitives.is_empty()
+                );
                 assert_eq!(phase.commands.len(), 5);
             }
             let text = renderer.render(&phase).unwrap();
@@ -3458,7 +3375,6 @@ fn schedule_controls_match_native_flags_and_execution_in_every_mode() {
                             body: vec![run_leaf],
                             ..Default::default()
                         })),
-                        ..Default::default()
                     },
                 ];
                 native_body = vec![
@@ -3476,7 +3392,6 @@ fn schedule_controls_match_native_flags_and_execution_in_every_mode() {
                         body,
                         ..Default::default()
                     })),
-                    ..Default::default()
                 }];
                 native_body = vec![Schedule::Repeat(
                     egglog::span!(),
@@ -3555,10 +3470,7 @@ fn schedule_controls_match_native_flags_and_execution_in_every_mode() {
                 assert_eq!(native_runs, if case == 7 { 2 } else { 3 });
             }
             program.commands.truncate(1);
-            program.commands.push(pb::Command {
-                kind: Some(kind),
-                ..Default::default()
-            });
+            program.commands.push(pb::Command { kind: Some(kind) });
             let mut engine = Engine::default();
             let id = create(&mut engine, mode);
             let response = Observed::from_frames(
@@ -3615,16 +3527,13 @@ fn schedule_controls_match_native_flags_and_execution_in_every_mode() {
             let mut replay_program = program.clone();
             replay_program.commands.push(pb::Command {
                 kind: Some(pb::command::Kind::Check(pb::Check { facts: vec![2] })),
-                ..Default::default()
             });
             let goal = pb::Command {
                 kind: Some(pb::command::Kind::Check(pb::Check { facts: vec![5] })),
-                ..Default::default()
             };
             replay_program.commands.push(if matches!(case, 0 | 5) {
                 pb::Command {
                     kind: Some(pb::command::Kind::Fail(Box::new(goal))),
-                    ..Default::default()
                 }
             } else {
                 goal
@@ -3731,7 +3640,6 @@ fn dead_schedule_bodies_are_validated_before_effects_in_every_mode() {
             "until",
             "scheduler",
             "unknown",
-            "span",
         ] {
             let mut program = fixture();
             let mut invalid = program.commands[1].clone();
@@ -3746,14 +3654,12 @@ fn dead_schedule_bodies_are_validated_before_effects_in_every_mode() {
                             }],
                             ..Default::default()
                         })),
-                        ..Default::default()
                     }
                 }
                 "action" => invalid = program.commands[0].clone(),
                 "fail" => {
                     invalid = pb::Command {
                         kind: Some(pb::command::Kind::Fail(Box::new(invalid))),
-                        ..Default::default()
                     }
                 }
                 "stats" => invalid.kind = Some(pb::command::Kind::Stats(pb::Unit {})),
@@ -3773,13 +3679,6 @@ fn dead_schedule_bodies_are_validated_before_effects_in_every_mode() {
                         until: vec![2],
                         ..Default::default()
                     }))
-                }
-                "span" => {
-                    invalid.span = Some(pb::Span {
-                        file: 999,
-                        start: 0,
-                        end: 1,
-                    })
                 }
                 _ => {
                     let Some(pb::command::Kind::Run(run)) = &mut invalid.kind else {
@@ -3804,7 +3703,6 @@ fn dead_schedule_bodies_are_validated_before_effects_in_every_mode() {
                     body: vec![invalid],
                     ..Default::default()
                 })),
-                ..Default::default()
             });
             let mut engine = Engine::default();
             let id = create(&mut engine, mode);
@@ -3847,13 +3745,11 @@ fn dead_schedule_bodies_are_validated_before_effects_in_every_mode() {
             // during preparation, before even that seed can have effects.
             program.commands = vec![pb::Command {
                 kind: Some(pb::command::Kind::Check(pb::Check { facts: vec![2] })),
-                ..Default::default()
             }];
             let checked = run(&mut engine, id, program.clone());
             assert_eq!(checked.error.is_none(), valid, "{mode:?}/{case}");
             program.commands = vec![pb::Command {
                 kind: Some(pb::command::Kind::Check(pb::Check { facts: vec![5] })),
-                ..Default::default()
             }];
             assert!(run(&mut engine, id, program.clone()).error.is_some());
             // Successful preparation installed the setup binding. Its group
@@ -3925,7 +3821,8 @@ fn repeated_leaf_failure_has_no_completed_result_and_retains_prefix() {
             )
             .unwrap_err();
         assert!(
-            matches!(error, egglog::Error::BackendError(_)),
+            matches!(&error, egglog::Error::Runtime { message, rule: Some(rule), .. }
+                if rule == "derive" && message.contains("call of primitive + failed")),
             "{mode:?}: {error:?}"
         );
         assert_eq!(leaves, [Some(1), None], "{mode:?}");
@@ -3943,7 +3840,6 @@ fn repeated_leaf_failure_has_no_completed_result_and_retains_prefix() {
             kind: Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
                 value: Some(pb::primitive_value::Value::I64(1)),
             })),
-            ..Default::default()
         });
         let sum = program.nodes.len() as u32;
         program.nodes.push(pb::Node {
@@ -3952,7 +3848,6 @@ fn repeated_leaf_failure_has_no_completed_result_and_retains_prefix() {
                 func: "egglog.core.i64.add".into(),
                 args: vec![1, one],
             })),
-            ..Default::default()
         });
         program.nodes[4].kind = Some(pb::node::Kind::Call(pb::Call {
             func: "N".into(),
@@ -3969,7 +3864,6 @@ fn repeated_leaf_failure_has_no_completed_result_and_retains_prefix() {
                             body: vec![program.commands[1].clone()],
                             ..Default::default()
                         })),
-                        ..Default::default()
                     }],
                     ..Default::default()
                 })
@@ -3980,7 +3874,6 @@ fn repeated_leaf_failure_has_no_completed_result_and_retains_prefix() {
                     ..Default::default()
                 })
             }),
-            ..Default::default()
         };
         let mut engine = Engine::default();
         let id = create(&mut engine, mode);
@@ -4001,7 +3894,6 @@ fn repeated_leaf_failure_has_no_completed_result_and_retains_prefix() {
         }));
         retained.commands = vec![pb::Command {
             kind: Some(pb::command::Kind::Check(pb::Check { facts: vec![2] })),
-            ..Default::default()
         }];
         assert_eq!(
             run(&mut engine, id, retained).error,
@@ -4028,7 +3920,6 @@ fn failed_authored_run_has_no_fabricated_result_and_keeps_seed() {
             kind: Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
                 value: Some(pb::primitive_value::Value::I64(i64::MAX)),
             })),
-            ..Default::default()
         });
         let overflow = program.nodes.len() as u32;
         program.nodes.push(pb::Node {
@@ -4037,7 +3928,6 @@ fn failed_authored_run_has_no_fabricated_result_and_keeps_seed() {
                 func: "egglog.core.i64.add".into(),
                 args: vec![1, limit],
             })),
-            ..Default::default()
         });
         let goal = program.nodes.len() as u32;
         program.nodes.push(pb::Node {
@@ -4046,15 +3936,13 @@ fn failed_authored_run_has_no_fabricated_result_and_keeps_seed() {
                 func: "Goal".into(),
                 args: vec![overflow],
             })),
-            ..Default::default()
         });
         let registration = program.rulesets[0].value.as_mut().unwrap();
         let Some(pb::rule::Kind::Rule(rule)) = &mut registration.rules[0].kind else {
             unreachable!()
         };
-        rule.head = vec![pb::Action {
+        rule.actions = vec![pb::Action {
             kind: Some(pb::action::Kind::Term(goal)),
-            ..Default::default()
         }];
         program.commands.truncate(2);
         let response = run(&mut engine, id, program);
@@ -4065,7 +3953,6 @@ fn failed_authored_run_has_no_fabricated_result_and_keeps_seed() {
         let mut retry = fixture();
         retry.commands = vec![pb::Command {
             kind: Some(pb::command::Kind::Check(pb::Check { facts: vec![2] })),
-            ..Default::default()
         }];
         let response = engine
             .run(

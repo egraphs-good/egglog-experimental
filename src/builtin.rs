@@ -22,7 +22,7 @@ pub fn signature_sorts(
     if primitive.name.is_empty() || signature.type_param_count != 0 {
         return Err("builtin typing currently requires a named closed signature".into());
     }
-    signature.inputs.iter().chain(&signature.varargs).map(|arg| arg.sort).chain(std::iter::once(signature.output.ok_or("missing builtin result sort")?)).map(|index| {
+    signature.inputs.iter().chain(&signature.varargs).copied().chain(std::iter::once(signature.output.ok_or("missing builtin result sort")?)).map(|index| {
         let sort = program.sorts.get(index as usize).ok_or("builtin signature sort index out of bounds")?;
         match &sort.kind {
             Some(pb::sort::Kind::Primitive(family)) if family.args.is_empty() && !family.name.is_empty() => Ok(family.name.clone()),
@@ -156,12 +156,13 @@ fn wire_description(
     if referenced.len() != signature.type_param_count as usize {
         return Err("undetermined builtin type parameter".into());
     }
-    let arguments = |args: &[pb::Arg]| {
+    let arguments = |args: &[u32]| {
         args.iter()
-            .map(|arg| {
+            .enumerate()
+            .map(|(index, sort)| {
                 Ok(Argument {
-                    name: arg.name.clone(),
-                    sort: native_pattern(&program.sorts, arg.sort, 0)?,
+                    name: format!("arg{index}"),
+                    sort: native_pattern(&program.sorts, *sort, 0)?,
                 })
             })
             .collect::<Result<Vec<_>, String>>()
@@ -269,12 +270,7 @@ fn project_primitive(
     };
     let mut arguments = |args: &[Argument]| {
         args.iter()
-            .map(|arg| {
-                Ok(pb::Arg {
-                    name: arg.name.clone(),
-                    sort: export_pattern(&arg.sort, sorts)?,
-                })
-            })
+            .map(|arg| export_pattern(&arg.sort, sorts))
             .collect::<Result<Vec<_>, String>>()
     };
     let inputs = arguments(&signature.fixed)?;
@@ -439,15 +435,11 @@ impl PortableTypeInfo for TypeInfo {
                         let inputs = defined
                             .input
                             .iter()
-                            .enumerate()
-                            .map(|(index, sort)| {
-                                Ok(pb::Arg {
-                                    name: format!("_{index}"),
-                                    sort: export_pattern(
-                                        &self.native_sort_pattern(sort)?,
-                                        &mut result.definitions.sorts,
-                                    )?,
-                                })
+                            .map(|sort| {
+                                export_pattern(
+                                    &self.native_sort_pattern(sort)?,
+                                    &mut result.definitions.sorts,
+                                )
                             })
                             .collect::<Result<_, String>>()?;
                         let output = export_pattern(
@@ -558,16 +550,12 @@ fn application_adapter(
     let mut nodes = vec![];
     for (index, sort) in inputs.iter().enumerate() {
         let sort = export_pattern(&types.native_sort_pattern(sort)?, &mut adapter.sorts)?;
-        arguments.push(pb::Arg {
-            sort,
-            name: format!("_{index}"),
-        });
+        arguments.push(sort);
         let node =
             u32::try_from(adapter.nodes.len()).map_err(|_| "too many application adapter nodes")?;
         adapter.nodes.push(pb::Node {
             sort_id: sort,
             kind: Some(pb::node::Kind::Var(format!("_{index}"))),
-            ..Default::default()
         });
         nodes.push(node);
     }
@@ -583,19 +571,16 @@ fn application_adapter(
             function: Some(*function),
             args: args.to_vec(),
         })),
-        ..Default::default()
     });
-    adapter.declarations.push(pb::Declaration {
-        kind: Some(pb::declaration::Kind::UserDefinedPrimitive(
-            pb::UserDefinedPrimitive {
-                name: name.clone(),
-                inputs: arguments,
-                output,
-                body: Some(body),
-            },
-        )),
-        ..Default::default()
-    });
+    adapter
+        .user_defined_primitives
+        .push(pb::UserDefinedPrimitive {
+            name: name.clone(),
+            inputs: arguments,
+            output,
+            body: Some(body),
+            ..Default::default()
+        });
     definitions::reconcile_declarations(&adapter, destination)?;
     Ok(name)
 }
@@ -704,7 +689,7 @@ pub trait PortablePrimitive {
         &self,
         graph: &EGraph,
         args: &[u32],
-        span: Option<pb::Span>,
+
         destination: &mut pb::Program,
     ) -> Result<pb::node::Kind, String>;
     /// Project a table call, rejecting source facades that produce values.
@@ -712,7 +697,7 @@ pub trait PortablePrimitive {
         &self,
         graph: &EGraph,
         args: &[u32],
-        span: Option<pb::Span>,
+
         destination: &mut pb::Program,
     ) -> Result<pb::Call, String>;
 }
@@ -743,7 +728,7 @@ impl PortablePrimitive for SpecializedPrimitive {
         &self,
         graph: &EGraph,
         args: &[u32],
-        span: Option<pb::Span>,
+
         destination: &mut pb::Program,
     ) -> Result<pb::node::Kind, String> {
         let types = graph.authoring_type_info();
@@ -835,7 +820,7 @@ impl PortablePrimitive for SpecializedPrimitive {
                 let index = destination.nodes.len() as u32;
                 destination.nodes.push(pb::Node {
                     sort_id: pair_sort,
-                    span,
+
                     kind: Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
                         value: Some(pb::primitive_value::Value::Pair(pb::PairValue {
                             first: Some(children[0]),
@@ -848,7 +833,7 @@ impl PortablePrimitive for SpecializedPrimitive {
             let vector = destination.nodes.len() as u32;
             destination.nodes.push(pb::Node {
                 sort_id: vector_sort,
-                span,
+
                 kind: Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
                     value: Some(pb::primitive_value::Value::Vec(pb::ValueList { items })),
                 })),
@@ -868,10 +853,10 @@ impl PortablePrimitive for SpecializedPrimitive {
         &self,
         graph: &EGraph,
         args: &[u32],
-        span: Option<pb::Span>,
+
         destination: &mut pb::Program,
     ) -> Result<pb::Call, String> {
-        match self.export_builtin_node(graph, args, span, destination)? {
+        match self.export_builtin_node(graph, args, destination)? {
             pb::node::Kind::Call(call) => Ok(call),
             _ => Err("resolved primitive produces a structured value, not a table call".into()),
         }
@@ -964,14 +949,13 @@ pub(crate) fn normalized_signature(
         .iter_mut()
         .chain(signature.varargs.iter_mut())
     {
-        arg.name.clear();
-        arg.sort = import_sort(&program.sorts, arg.sort, sorts)?;
+        *arg = import_sort(&program.sorts, *arg, sorts)?;
     }
     let mut pending: Vec<_> = signature
         .inputs
         .iter()
-        .map(|a| a.sort)
-        .chain(signature.varargs.iter().map(|a| a.sort))
+        .copied()
+        .chain(signature.varargs.iter().copied())
         .chain(signature.output)
         .collect();
     let mut seen = HashSet::default();
@@ -1044,7 +1028,7 @@ pub fn import_definition(
             .iter_mut()
             .chain(signature.varargs.iter_mut())
         {
-            argument.sort = import_sort(&source.sorts, argument.sort, &mut destination.sorts)?;
+            *argument = import_sort(&source.sorts, *argument, &mut destination.sorts)?;
         }
         let result = signature
             .output
@@ -1065,16 +1049,6 @@ pub fn import_definition(
             destination.primitive_sorts.push(family.clone());
         }
     }
-    // Generated proof fragments normally omit origins; preserve them when present.
-    let offset =
-        u32::try_from(destination.files.len()).map_err(|_| "too many builtin source files")?;
-    if let Some(span) = &mut primitive.span {
-        span.file = span
-            .file
-            .checked_add(offset)
-            .ok_or("too many builtin source files")?;
-    }
-    destination.files.extend(source.files.iter().cloned());
     destination.primitives.push(primitive);
     Ok(key)
 }

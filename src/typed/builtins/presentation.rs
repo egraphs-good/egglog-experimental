@@ -430,9 +430,6 @@ fn import_sort(
             continue;
         }
         let mut sort = graph.sorts[index as usize].clone();
-        if sort.span.is_some() {
-            return Err("source spans are unsupported on Rust presentation type patterns".into());
-        }
         let kind = sort.kind.as_mut().ok_or("missing presentation sort kind")?;
         if !finish {
             pending.push((index, true));

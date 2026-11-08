@@ -4,6 +4,7 @@ use super::{
     pb,
     storage::{Arena, DeclarationKind, Key, Record, Slot, publish},
 };
+use crate::builtin::definitions::Declaration;
 use std::{
     collections::{HashMap, HashSet},
     hash::{DefaultHasher, Hash, Hasher},
@@ -125,7 +126,6 @@ pub fn let_<I: ValueInput>(name: impl Into<Arc<str>>, initializer: I) -> I::Owne
                     binding: Some(1),
                     value: Some(0),
                 })),
-                ..Default::default()
             }],
             ..Default::default()
         },
@@ -143,11 +143,16 @@ pub fn let_<I: ValueInput>(name: impl Into<Arc<str>>, initializer: I) -> I::Owne
     I::Owned::from_expression(Expr(record))
 }
 #[doc(hidden)]
-pub fn variable<S: EgglogValue>(scope: u64, slot: usize) -> S {
-    S::from_expression(Expr::variable(
-        S::sort_ref(),
-        format!("@typed:f:{scope}:{slot}"),
-    ))
+pub fn variable<S: EgglogValue>(
+    scope: u64,
+    slot: usize,
+    preferred_name: Option<&'static str>,
+) -> S {
+    let mut expression = Expr::variable(S::sort_ref(), format!("@typed:f:{scope}:{slot}"));
+    Arc::get_mut(expression.0.owner.as_mut().unwrap())
+        .expect("unpublished variable owner")
+        .variable_hint = preferred_name;
+    S::from_expression(expression)
 }
 
 impl Expr {
@@ -260,7 +265,6 @@ impl Expr {
     }
 
     pub fn call(callable: &Callable, arguments: Vec<Self>) -> Self {
-        let owner = callable.0.owner.as_ref().unwrap();
         let (name, inputs, output) = if callable.0.arena == Arena::Primitive {
             let primitive = callable.0.primitive().expect("owned builtin primitive");
             let Some(signature) = &primitive.signature else {
@@ -276,17 +280,11 @@ impl Expr {
                 Some(signature.output.expect("callable result sort")),
             )
         } else {
-            match &owner.program().expect("owned user callable").declarations
-                [callable.0.index as usize]
-                .kind
-            {
-                Some(pb::declaration::Kind::Constructor(c)) => (&c.name, &c.inputs, Some(c.output)),
-                Some(pb::declaration::Kind::Function(f)) => (&f.name, &f.inputs, Some(f.output)),
-                Some(pb::declaration::Kind::UserDefinedPrimitive(p)) => {
-                    (&p.name, &p.inputs, Some(p.output))
-                }
-                Some(pb::declaration::Kind::Relation(r)) => (&r.name, &r.inputs, None),
-                _ => panic!("unsupported callable declaration"),
+            match callable.0.callable().expect("owned user callable") {
+                Declaration::Constructor(c) => (&c.name, &c.inputs, Some(c.output)),
+                Declaration::Function(f) => (&f.name, &f.inputs, Some(f.output)),
+                Declaration::UserDefinedPrimitive(p) => (&p.name, &p.inputs, Some(p.output)),
+                Declaration::Relation(r) => (&r.name, &r.inputs, None),
             }
         };
         assert_eq!(inputs.len(), arguments.len(), "callable arity");
@@ -295,7 +293,7 @@ impl Expr {
                 &arg.0.owner.as_ref().unwrap().program().unwrap().nodes[arg.0.index as usize];
             assert!(
                 SortRef(arg.0.resolve(Arena::Sort, node.sort_id).unwrap())
-                    == SortRef(callable.0.resolve(Arena::Sort, expected.sort).unwrap()),
+                    == SortRef(callable.0.resolve(Arena::Sort, *expected).unwrap()),
                 "callable input sort"
             );
         }
@@ -405,7 +403,7 @@ impl Expr {
 
     // Author deferred typed code; the shared receiver owns native lifting.
     // Captures are explicit; parameter-independent reads and effects remain
-    // deferred. Fresh Union bodies are rejected until they have a native scope.
+    // deferred. Fresh Eq bodies are rejected until they have a native scope.
     pub(super) fn function(
         body: Self,
         parameters: Vec<Self>,
@@ -439,19 +437,7 @@ impl Expr {
                 })
         {
             let declaration = body.0.declaration(&call.func, DeclarationKind::Callable)?;
-            if declaration.arena == Arena::Declaration
-                && matches!(
-                    declaration
-                        .owner
-                        .as_ref()
-                        .unwrap()
-                        .program()
-                        .unwrap()
-                        .declarations[declaration.index as usize]
-                        .kind,
-                    Some(pb::declaration::Kind::Relation(_))
-                )
-            {
+            if declaration.arena == Arena::Relation {
                 return Err(TypedError::Invalid(
                     "relations are predicates, not function values".into(),
                 ));
@@ -479,9 +465,9 @@ impl Expr {
             let mut node = record.owner.as_ref().unwrap().program().unwrap().nodes
                 [record.index as usize]
                 .clone();
-            if matches!(node.kind, Some(pb::node::Kind::Union(_))) {
+            if matches!(node.kind, Some(pb::node::Kind::Eq(_))) {
                 return Err(TypedError::Invalid(
-                    "Unions in callback bodies are not supported yet".into(),
+                    "Eq nodes in callback bodies are not supported yet".into(),
                 ));
             }
             let sort = record.resolve(Arena::Sort, node.sort_id)?;
@@ -572,7 +558,6 @@ impl Expr {
                     body: 0,
                 })),
             })),
-            ..Default::default()
         });
         Ok(Self(publish(
             program,
@@ -1011,15 +996,7 @@ impl Expr {
                 }
                 Some(pb::node::Kind::Call(call)) => {
                     let declaration = record.declaration(&call.func, DeclarationKind::Callable)?;
-                    let Some(pb::declaration::Kind::Constructor(constructor)) = declaration
-                        .owner
-                        .as_ref()
-                        .unwrap()
-                        .program()
-                        .ok()
-                        .and_then(|program| program.declarations.get(declaration.index as usize))
-                        .and_then(|declaration| declaration.kind.as_ref())
-                    else {
+                    let Ok(Declaration::Constructor(constructor)) = declaration.callable() else {
                         return Err(TypedError::Decode(
                             "extracted call is not a constructor".into(),
                         ));
@@ -1037,7 +1014,7 @@ impl Expr {
                         let node = &child.owner.as_ref().unwrap().program().unwrap().nodes
                             [child.index as usize];
                         if SortRef(child.resolve(Arena::Sort, node.sort_id)?)
-                            != SortRef(declaration.resolve(Arena::Sort, input.sort)?)
+                            != SortRef(declaration.resolve(Arena::Sort, *input)?)
                         {
                             return Err(TypedError::Decode(format!(
                                 "invalid extraction argument sort for {}",
@@ -1083,23 +1060,10 @@ impl Expr {
         let declaration = pattern
             .0
             .declaration(&call.func, DeclarationKind::Callable)?;
-        if declaration.arena != Arena::Declaration
-            || !matches!(
-                &declaration
-                    .owner
-                    .as_ref()
-                    .unwrap()
-                    .program()
-                    .unwrap()
-                    .declarations[declaration.index as usize]
-                    .kind,
-                Some(
-                    pb::declaration::Kind::Constructor(_)
-                        | pb::declaration::Kind::Function(_)
-                        | pb::declaration::Kind::Relation(_)
-                )
-            )
-        {
+        if !matches!(
+            declaration.arena,
+            Arena::Constructor | Arena::Function | Arena::Relation
+        ) {
             return Err(TypedError::Invalid(
                 "selector must return a constructor, function or relation, not a host operation"
                     .into(),
@@ -1314,7 +1278,7 @@ impl PartialEq for Expr {
                         ));
                     }
                 }
-                // Union identity is allocation identity; never hash-cons it.
+                // Eq identity is allocation identity; never hash-cons it.
                 _ => return false,
             }
         }
@@ -1441,7 +1405,7 @@ impl Hash for Expr {
                             .hash(&mut h);
                     }
                 }
-                Some(pb::node::Kind::Union(_)) => {
+                Some(pb::node::Kind::Eq(_)) => {
                     2u8.hash(&mut h);
                     key.hash(&mut h);
                 }
@@ -1563,7 +1527,7 @@ impl std::fmt::Debug for Expr {
             Some(pb::node::Kind::Apply(apply)) => write!(f, "Apply({} args)", apply.args.len()),
             Some(pb::node::Kind::Var(v)) => write!(f, "Var({v:?})"),
             Some(pb::node::Kind::Binding(v)) => write!(f, "Binding({v:?})"),
-            Some(pb::node::Kind::Union(u)) => write!(f, "Union({} members)", u.members.len()),
+            Some(pb::node::Kind::Eq(u)) => write!(f, "Eq({} members)", u.members.len()),
             Some(pb::node::Kind::PrimitiveValue(v)) => write!(f, "Literal({:?})", v.value),
             _ => f.write_str("unsupported node"),
         }

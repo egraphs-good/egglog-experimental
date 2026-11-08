@@ -22,7 +22,6 @@ impl From<&Ruleset> for Schedule {
         Self {
             commands: vec![pb::Command {
                 kind: Some(pb::command::Kind::Run(pb::Run::default())),
-                ..Default::default()
             }],
             rulesets: vec![ruleset.clone()],
             operands: vec![],
@@ -91,7 +90,6 @@ impl Schedule {
     pub fn with_snapshots(mut self) -> Self {
         self.commands.push(pb::Command {
             kind: Some(pb::command::Kind::Freeze(pb::Freeze {})),
-            ..Default::default()
         });
         self
     }
@@ -106,7 +104,6 @@ impl Schedule {
                     max_iterations: Some(max_iterations),
                     ..Default::default()
                 })),
-                ..Default::default()
             }],
             rulesets: self.rulesets,
             operands: self.operands,
@@ -122,7 +119,6 @@ impl Schedule {
                     body: self.commands,
                     ..Default::default()
                 })),
-                ..Default::default()
             }],
             rulesets: self.rulesets,
             operands: self.operands,

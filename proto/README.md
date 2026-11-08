@@ -6,22 +6,22 @@ the wire format may change.
 
 [egglog.proto](egglog/v1/egglog.proto) is the reference: its comments and validation
 annotations define the contract. This overview explains the model. Execution
-prototypes are being tested separately; this PR contains the schema, generated
-messages and wire-validation tests.
+prototypes are being tested separately; this PR contains the schema, generation
+tooling and wire-validation tests.
 
 [Worked example: constant folding](examples/constant-folding.md) shows Egglog
-source, a complete protobuf request, and its actual extraction and Freeze responses.
+source, a complete protobuf request, and its actual extraction, Freeze and error responses.
 
 ## Programs, definitions and execution
 
-A `Program` contains expression and sort arenas, declarations, ordered commands,
-and optional source files. Arena indices are local to the owning message;
+A `Program` contains expression and sort arenas, declarations and ordered commands.
+Arena indices are local to the owning message;
 references from an earlier request cannot be reused without importing them.
 
 | Record | Purpose |
 | --- | --- |
 | `Sort`, `Node` | Explicit types and shared expression graphs |
-| `Declaration` | Immutable constructor, function, relation or program-defined primitive definitions |
+| `Constructor`, `Function`, `Relation`, `UserDefinedPrimitive` | Immutable callable definitions in separate Program collections |
 | `Rule`, `Ruleset`, `RulesetBinding` | Immutable inline rule collections and replaceable named bindings |
 | `Command`, `Action`, `Loop` | Ordered execution and repeated command bodies |
 | `BuiltinCatalog` | Backend-provided primitive sorts and signatures |
@@ -29,6 +29,8 @@ references from an earlier request cannot be reused without importing them.
 
 Declarations establish the vocabulary for the whole Program. They are installed
 before commands, without executing their bodies, and cannot occur in `Loop`.
+`constructors`, `functions`, `relations` and `user_defined_primitives` share one
+callable namespace; their field order does not determine installation order.
 Input `Sort.eq` entries establish nominal equality sorts; `Node.binding` entries
 establish typed global slots, including unused entries. Compatible names
 coalesce. Primitive-sort references resolve against the backend catalog.
@@ -41,12 +43,17 @@ is harmless; conflicting definitions do not replace installed ones. A later
 Program can use an installed definition without resending it. Callables share
 one namespace; equality sorts, primitive sorts and global bindings have their own.
 
+Callable inputs are ordered sort indices. Parameter names, keyword arguments and
+defaults belong to frontend presentation mappings. A frontend can explicitly
+choose an Egglog declaration name; that exact name is its identity, without an
+implicit namespace added to the override.
+
 `Node.var` is local to its rule/query or code binder. `Node.binding` reads a global
 slot; the same spelling can appear in both. `Let{binding,value}` addresses a
 binding-node index without reading it, evaluates the value, then assigns it.
 Same-sort rebinding is allowed, including inside loops. An unset slot fails
 direct evaluation and contributes no query match. Its type exists after setup
-even when its Let never executes. Rule-head reads capture globals in the query;
+even when its Let never executes. Rule actions capture global reads in the query;
 deferred code follows its own read/effect context.
 
 `Ruleset{rules}` is an immutable ordered collection containing inline rule
@@ -70,7 +77,8 @@ only after setup installation succeeds; completed native effects survive failure
 
 Rule content identity and incremental state are independent of collection names.
 Replacement, omission and readdition retain existing cursors and effects.
-Labels, documentation and source locations are diagnostic metadata. Overlapping
+`RuleBody.query` is a conjunctive match; `RuleBody.actions` execute in order.
+Labels and documentation are diagnostic metadata. Overlapping
 named memberships can represent basic tags; frontends assemble each complete
 collection without a stored dependency graph between bindings.
 
@@ -98,13 +106,13 @@ intrinsic `Apply{function,args}`. There is no public application primitive;
 frontends can wrap Apply in deferred code for first-class callbacks.
 
 Ordinary shared nodes retain their first-demand result within one Action
-execution or one rule firing's ordered head. `Union` also carries class identity:
-reusing an empty equality-sort Union can make two actions refer to one fresh
+execution or one rule firing's ordered actions. `Eq` also carries class identity:
+reusing an empty equality-sort Eq can make two actions refer to one fresh
 class. Its identity lasts for the enclosing command-list execution; each loop
-iteration has a fresh mapping. Queries instead use Union as an equality pattern.
+iteration has a fresh mapping. Queries instead use Eq as an equality pattern.
 The reference specifies the other evaluation and identity scopes.
 
-Union references also represent cyclic and empty classes in exported data.
+Eq references also represent cyclic and empty classes in exported data.
 This avoids extracting a finite tree merely to inspect the graph. Variable,
 effect and cycle validity depend on use context; arena membership alone grants
 no permission to evaluate a node.
@@ -112,8 +120,15 @@ no permission to evaluate a node.
 ## Results and observations
 
 `RunProgram` streams output frames followed by completion, or a terminal error.
-Output frames own their node/sort arenas, without source spans or files.
-Located errors carry only their referenced file, with the span remapped to it.
+Output frames own their node/sort arenas. An escaping error may include a compact
+`Program` containing the offending rule, command or definition and its reachable
+nodes, sorts and user declarations. `ErrorSite.path` locates an authored construct
+within that returned Program; optional `node_id` identifies the failing expression.
+Shared nodes and cycles are preserved. The executing `CommandLocation` refers to
+the current request independently of code installed by an earlier request.
+Frontends own source mapping and render this context without evaluating it.
+Query no-match and failures consumed by `Fail` do not produce terminal errors.
+Malformed inputs and failures without authored context retain code and message.
 Completed outputs and effects remain visible if a later operation fails.
 Preparation checks precede execution; execution is not an atomic transaction.
 
@@ -148,11 +163,6 @@ installed equality sorts and referenced primitive/structural types, without unus
 backend sorts. Private registration caches are omitted. No loading instruction is
 needed. Native `keep_best` compaction may unset globals; their slot types remain.
 
-Snapshots omit source spans/files, including from saved code and declarations.
-These input origins do not describe e-node derivations. A restored graph loses
-the original source locations; live input diagnostics and recorded history keep
-them.
-
 Reconstruction on a fresh compatible engine uses all snapshot logical options,
 including `execution_mode` and `seminaive`, with `cost_sort` remapped into the
 creation sort arena, then executes the Program. Builtin catalogs, primitive
@@ -186,7 +196,8 @@ and file output stay in the frontend.
 
 Current adapter limits include i64 cost annotations, Normal-only Extract/Freeze,
 native proof-mode restrictions and context-specific expansion budgets. Deferred
-Union bodies and self-referential closures are not yet lowered. These are
+Eq bodies, recursive computed/merge dependencies and self-referential closures
+are not yet lowered. These are
 prototype limits, not additional restrictions on the schema. Text export fails
 explicitly when current text syntax cannot preserve a value or graph, such as
 an unset global, mutable rebinding, Let in a loop, an exact NaN payload, or
@@ -194,11 +205,21 @@ some fresh/cyclic class frames. It never substitutes lossy literals or artificia
 constructors. Wire validation or a binary roundtrip
 alone does not establish frontend or execution conformance.
 
+The [three-frontend conformance check](conformance/README.md) runs the same
+program through text, Python and Rust. Their recorded Programs must match one
+TextProto expectation after ordering-only normalization; execution results are
+checked separately.
+
 ## Generated messages and checks
 
-Checked-in [Python](../gen/python/egglog/v1/egglog_pb.py) messages use
-`protobuf-py`; [Rust](../gen/rust/egglog/v1/egglog.v1.rs) uses `prost` in the
-`egglog-proto` crate. No gRPC transport is generated or required. Consumers must
+Generated Python messages use `protobuf-py`; Rust uses `prost` in the
+`egglog-proto` crate. This integration checkout versions message sources under
+`gen/python` and `gen/rust` so downstream Git dependencies build without a
+generation step. Regenerate them with `make proto-gen` after schema changes.
+The separate schema-only branch ignores generated message sources and requires
+`make proto-gen` before building either SDK. Package manifests, root modules
+and licenses remain versioned in both. No gRPC transport is generated or
+required. Consumers must
 select matching schema revisions: the `egglog.v1` package name is not a version
 handshake in raw bytes.
 
@@ -217,11 +238,10 @@ make proto-lint
 make proto-test
 ```
 
-Commit generated sources with schema comment changes too. `make proto-drift`
-checks regeneration drift. `make proto-test` validates wire/CEL behavior; it does
-not execute Egglog or independently check proofs.
+`make proto-test` validates wire/CEL behavior after generation; it does not
+execute Egglog or independently check proofs.
 
-A wire-validation example, after `uv sync --locked`:
+A wire-validation example, after `make proto-gen`:
 
 ```sh
 uv run python - <<'PY'

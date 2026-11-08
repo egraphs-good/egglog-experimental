@@ -1,5 +1,6 @@
 //! Immutable protobuf records and location-only imports. No semantic shadow IR.
 use super::{TypedError, pb};
+use crate::builtin::definitions::{Declaration, DeclarationMut, declarations};
 use prost::Message;
 use std::{
     collections::HashMap,
@@ -27,7 +28,10 @@ pub(super) fn builtin_catalog() -> &'static Record {
 pub(super) enum Arena {
     Node,
     Sort,
-    Declaration,
+    Constructor,
+    Function,
+    Relation,
+    UserDefinedPrimitive,
     Rule,
     Command,
     PrimitiveSort,
@@ -83,7 +87,7 @@ pub(super) struct Owner {
     pub graph: OwnedGraph,
     // Reusable authored protobuf rules live privately, outside the wire Program.
     pub rules: Vec<pb::Rule>,
-    pub slots: [Vec<Slot>; 7],
+    pub slots: [Vec<Slot>; 10],
     // Candidate declaration locations, not names/signatures copied from them.
     pub declarations: Vec<Record>,
     pub ambient: Option<Arc<Owner>>,
@@ -91,6 +95,8 @@ pub(super) struct Owner {
     pub capture: Option<(u32, u32)>,
     // Function declaration and its two exact parameter locations in Node slots.
     pub merge_parameters: Option<(u32, [u32; 2])>,
+    // Presentation only: fresh-variable identity remains its scope/slot token.
+    pub variable_hint: Option<&'static str>,
     // Snapshot data are inspectable records, never live authoring inputs.
     pub observed: bool,
     // Diagnostic presentations share their underlying authored rule record.
@@ -133,17 +139,41 @@ impl Owner {
                                 .or_insert((Arena::Sort, index as u32));
                         }
                     }
-                    for (index, declaration) in program.declarations.iter().enumerate() {
-                        if let Some(key) = declaration.kind.as_ref().map(declaration_name) {
-                            definitions
-                                .entry((key.0, key.1.to_owned()))
-                                .or_insert((Arena::Declaration, index as u32));
-                        }
+                    for (arena, index, name) in program
+                        .constructors
+                        .iter()
+                        .enumerate()
+                        .map(|(i, d)| (Arena::Constructor, i, &d.name))
+                        .chain(
+                            program
+                                .functions
+                                .iter()
+                                .enumerate()
+                                .map(|(i, d)| (Arena::Function, i, &d.name)),
+                        )
+                        .chain(
+                            program
+                                .relations
+                                .iter()
+                                .enumerate()
+                                .map(|(i, d)| (Arena::Relation, i, &d.name)),
+                        )
+                        .chain(
+                            program
+                                .user_defined_primitives
+                                .iter()
+                                .enumerate()
+                                .map(|(i, d)| (Arena::UserDefinedPrimitive, i, &d.name)),
+                        )
+                    {
+                        definitions
+                            .entry((DeclarationKind::Callable, name.clone()))
+                            .or_insert((arena, index as u32));
                     }
                     #[cfg(test)]
                     LINK_WORK.with(|work| {
                         let mut n = work.get();
-                        n[0] += program.declarations.len();
+                        n[0] += declarations(program).count();
                         work.set(n);
                     });
                 }
@@ -224,11 +254,18 @@ impl Owner {
                         }
                         OwnedGraph::BuiltinCatalog(_) => None,
                     },
-                    Arena::Declaration => owner.program().unwrap().declarations
-                        [record.index as usize]
-                        .kind
-                        .as_ref()
-                        .map(declaration_name),
+                    Arena::Constructor
+                    | Arena::Function
+                    | Arena::Relation
+                    | Arena::UserDefinedPrimitive => Some((
+                        DeclarationKind::Callable,
+                        match record.callable().unwrap() {
+                            Declaration::Constructor(d) => d.name.as_str(),
+                            Declaration::Function(d) => d.name.as_str(),
+                            Declaration::Relation(d) => d.name.as_str(),
+                            Declaration::UserDefinedPrimitive(d) => d.name.as_str(),
+                        },
+                    )),
                     Arena::Primitive => Some((
                         DeclarationKind::Callable,
                         record.primitive().unwrap().name.as_str(),
@@ -356,15 +393,6 @@ impl Owner {
     }
 }
 
-fn declaration_name(kind: &pb::declaration::Kind) -> (DeclarationKind, &str) {
-    match kind {
-        pb::declaration::Kind::Constructor(d) => (DeclarationKind::Callable, &d.name),
-        pb::declaration::Kind::Function(d) => (DeclarationKind::Callable, &d.name),
-        pb::declaration::Kind::Relation(d) => (DeclarationKind::Callable, &d.name),
-        pb::declaration::Kind::UserDefinedPrimitive(d) => (DeclarationKind::Callable, &d.name),
-    }
-}
-
 // A validated, temporary view of a Binding node and its Let initialization.
 pub(super) struct CaptureRecipe {
     pub name: String,
@@ -448,6 +476,25 @@ impl Record {
             _ => None,
         }
         .ok_or_else(|| TypedError::Invalid("expected an owned primitive descriptor".into()))
+    }
+
+    pub fn callable(&self) -> Result<Declaration<'_>, TypedError> {
+        let program = self.owner.as_ref().unwrap().program()?;
+        let index = self.index as usize;
+        match self.arena {
+            Arena::Constructor => program
+                .constructors
+                .get(index)
+                .map(Declaration::Constructor),
+            Arena::Function => program.functions.get(index).map(Declaration::Function),
+            Arena::Relation => program.relations.get(index).map(Declaration::Relation),
+            Arena::UserDefinedPrimitive => program
+                .user_defined_primitives
+                .get(index)
+                .map(Declaration::UserDefinedPrimitive),
+            _ => None,
+        }
+        .ok_or_else(|| TypedError::Invalid("expected an owned callable definition".into()))
     }
 
     pub fn key(&self) -> Key {
@@ -600,7 +647,7 @@ pub(super) fn publish_catalog(catalog: pb::BuiltinCatalog) -> Result<Record, Typ
                     .inputs
                     .iter()
                     .chain(&signature.varargs)
-                    .map(|arg| arg.sort)
+                    .copied()
                     .chain([output])
                     .any(|i| i as usize >= catalog.sorts.len())
                 {
@@ -633,6 +680,7 @@ pub(super) fn publish_catalog(catalog: pb::BuiltinCatalog) -> Result<Record, Typ
             ambient: None,
             capture: None,
             merge_parameters: None,
+            variable_hint: None,
             observed: false,
             rule_origin: None,
             definitions: OnceLock::new(),
@@ -657,7 +705,10 @@ pub(super) fn observe(
     let lengths = [
         program.nodes.len(),
         program.sorts.len(),
-        program.declarations.len(),
+        program.constructors.len(),
+        program.functions.len(),
+        program.relations.len(),
+        program.user_defined_primitives.len(),
         0,
         program.commands.len(),
         0,
@@ -677,6 +728,7 @@ pub(super) fn observe(
             ambient: builtins.owner.clone(),
             capture: None,
             merge_parameters: None,
+            variable_hint: None,
             observed: true,
             rule_origin: None,
             definitions: OnceLock::new(),
@@ -716,7 +768,7 @@ pub(super) fn closure(roots: &[Record]) -> Result<Vec<Record>, TypedError> {
                         .inputs
                         .iter()
                         .chain(&signature.varargs)
-                        .map(|arg| arg.sort)
+                        .copied()
                         .chain([output])
                     {
                         pending.push(record.resolve(Arena::Sort, sort)?);
@@ -759,9 +811,18 @@ pub(super) fn closure(roots: &[Record]) -> Result<Vec<Record>, TypedError> {
                 }
                 one.sorts.push(sort.clone());
             }
-            Arena::Declaration => one
-                .declarations
-                .push(owner.program().unwrap().declarations[record.index as usize].clone()),
+            Arena::Constructor => one
+                .constructors
+                .push(owner.program()?.constructors[record.index as usize].clone()),
+            Arena::Function => one
+                .functions
+                .push(owner.program()?.functions[record.index as usize].clone()),
+            Arena::Relation => one
+                .relations
+                .push(owner.program()?.relations[record.index as usize].clone()),
+            Arena::UserDefinedPrimitive => one
+                .user_defined_primitives
+                .push(owner.program()?.user_defined_primitives[record.index as usize].clone()),
             Arena::Rule => {
                 one_rules.push(owner.rules[record.index as usize].clone());
                 pending.extend(owner.declarations.iter().cloned());
@@ -786,15 +847,12 @@ pub(super) fn closure(roots: &[Record]) -> Result<Vec<Record>, TypedError> {
     Ok(result)
 }
 
-/// One operand-order/validation algorithm for owned actions and inline heads.
+/// One operand-order/validation algorithm for owned actions and inline rule actions.
 pub(super) fn visit_action(
     action: &mut pb::Action,
     mut node: impl FnMut(u32) -> Result<u32, TypedError>,
 ) -> Result<(), TypedError> {
     let invalid = || TypedError::Invalid("unsupported protobuf action in typed subset".into());
-    if action.span.is_some() {
-        return Err(invalid());
-    }
     match action.kind.as_mut().ok_or_else(invalid)? {
         pb::action::Kind::Term(index) => *index = node(*index)?,
         pb::action::Kind::Set(set) => {
@@ -820,9 +878,6 @@ pub(super) fn visit_command(
     mut node: impl FnMut(u32) -> Result<u32, TypedError>,
 ) -> Result<(), TypedError> {
     let invalid = || TypedError::Invalid("unsupported protobuf command in typed subset".into());
-    if command.span.is_some() {
-        return Err(invalid());
-    }
     match command.kind.as_mut().ok_or_else(invalid)? {
         pb::command::Kind::Action(action) => visit_action(action, node),
         pb::command::Kind::Let(value) => {
@@ -841,15 +896,12 @@ pub(super) fn visit_rule(
     mut map: impl FnMut(Arena, u32) -> Result<u32, TypedError>,
 ) -> Result<(), TypedError> {
     let invalid = || TypedError::Invalid("unsupported protobuf rule in typed subset".into());
-    if rule.span.is_some() {
-        return Err(invalid());
-    }
     match rule.kind.as_mut().ok_or_else(invalid)? {
         pb::rule::Kind::Rule(r) => {
             for fact in &mut r.query {
                 *fact = map(Arena::Node, *fact)?;
             }
-            for action in &mut r.head {
+            for action in &mut r.actions {
                 visit_action(action, |index| map(Arena::Node, index))?;
             }
         }
@@ -876,9 +928,6 @@ pub(super) fn visit(
     match arena {
         Arena::Node => {
             let n = &mut program.nodes[index as usize];
-            if n.span.is_some() {
-                return Err(invalid());
-            }
             n.sort_id = map(Arena::Sort, n.sort_id)?;
             match n.kind.as_mut().ok_or_else(invalid)? {
                 pb::node::Kind::Call(c) | pb::node::Kind::GetCost(c) => {
@@ -893,7 +942,7 @@ pub(super) fn visit(
                         *argument = map(Arena::Node, *argument)?;
                     }
                 }
-                pb::node::Kind::Union(u) => {
+                pb::node::Kind::Eq(u) => {
                     for a in &mut u.members {
                         *a = map(Arena::Node, *a)?;
                     }
@@ -969,9 +1018,6 @@ pub(super) fn visit(
         }
         Arena::Sort => {
             let s = &mut program.sorts[index as usize];
-            if s.span.is_some() {
-                return Err(invalid());
-            }
             match s.kind.as_mut().ok_or_else(invalid)? {
                 pb::sort::Kind::Eq(_) | pb::sort::Kind::Var(_) => {}
                 pb::sort::Kind::Primitive(f) => {
@@ -987,43 +1033,40 @@ pub(super) fn visit(
                 }
             }
         }
-        Arena::Declaration => {
-            let d = &mut program.declarations[index as usize];
-            if d.span.is_some() {
-                return Err(invalid());
+        Arena::Constructor | Arena::Function | Arena::Relation | Arena::UserDefinedPrimitive => {
+            let declaration = match arena {
+                Arena::Constructor => {
+                    DeclarationMut::Constructor(&mut program.constructors[index as usize])
+                }
+                Arena::Function => DeclarationMut::Function(&mut program.functions[index as usize]),
+                Arena::Relation => DeclarationMut::Relation(&mut program.relations[index as usize]),
+                Arena::UserDefinedPrimitive => DeclarationMut::UserDefinedPrimitive(
+                    &mut program.user_defined_primitives[index as usize],
+                ),
+                _ => unreachable!(),
+            };
+            let (inputs, output, body) = match declaration {
+                DeclarationMut::Constructor(c) => {
+                    (&mut c.inputs, Some(&mut c.output), c.cost.as_mut())
+                }
+                DeclarationMut::Function(f) => {
+                    (&mut f.inputs, Some(&mut f.output), f.merge.as_mut())
+                }
+                DeclarationMut::Relation(r) => (&mut r.inputs, None, None),
+                DeclarationMut::UserDefinedPrimitive(p) => (
+                    &mut p.inputs,
+                    Some(&mut p.output),
+                    Some(p.body.as_mut().ok_or_else(invalid)?),
+                ),
+            };
+            for input in inputs {
+                *input = map(Arena::Sort, *input)?;
             }
-            match d.kind.as_mut().ok_or_else(invalid)? {
-                pb::declaration::Kind::Constructor(c) => {
-                    for a in &mut c.inputs {
-                        a.sort = map(Arena::Sort, a.sort)?;
-                    }
-                    c.output = map(Arena::Sort, c.output)?;
-                    if let Some(cost) = &mut c.cost {
-                        *cost = map(Arena::Node, *cost)?;
-                    }
-                }
-                pb::declaration::Kind::Function(f) => {
-                    for arg in &mut f.inputs {
-                        arg.sort = map(Arena::Sort, arg.sort)?;
-                    }
-                    f.output = map(Arena::Sort, f.output)?;
-                    if let Some(merge) = &mut f.merge {
-                        *merge = map(Arena::Node, *merge)?;
-                    }
-                }
-                pb::declaration::Kind::Relation(relation) => {
-                    for arg in &mut relation.inputs {
-                        arg.sort = map(Arena::Sort, arg.sort)?;
-                    }
-                }
-                pb::declaration::Kind::UserDefinedPrimitive(primitive) => {
-                    for arg in &mut primitive.inputs {
-                        arg.sort = map(Arena::Sort, arg.sort)?;
-                    }
-                    primitive.output = map(Arena::Sort, primitive.output)?;
-                    let body = primitive.body.as_mut().ok_or_else(invalid)?;
-                    *body = map(Arena::Node, *body)?;
-                }
+            if let Some(output) = output {
+                *output = map(Arena::Sort, *output)?;
+            }
+            if let Some(body) = body {
+                *body = map(Arena::Node, *body)?;
             }
         }
         Arena::Rule => return Err(invalid()),
@@ -1037,14 +1080,13 @@ pub(super) fn visit(
 
 pub(super) fn publish(
     mut program: pb::Program,
-    slots: [Vec<Slot>; 7],
+    slots: [Vec<Slot>; 10],
     declarations: Vec<Record>,
     arena: Arena,
     index: u32,
     mut rules: Vec<pb::Rule>,
 ) -> Result<Record, TypedError> {
-    if !program.files.is_empty()
-        || !program.rulesets.is_empty()
+    if !program.rulesets.is_empty()
         || program.commands.iter().any(|c| {
             !matches!(
                 c.kind,
@@ -1059,7 +1101,10 @@ pub(super) fn publish(
     let lengths = [
         program.nodes.len(),
         program.sorts.len(),
-        program.declarations.len(),
+        program.constructors.len(),
+        program.functions.len(),
+        program.relations.len(),
+        program.user_defined_primitives.len(),
         rules.len(),
         program.commands.len(),
         0,
@@ -1082,7 +1127,10 @@ pub(super) fn publish(
     for (arena, len) in [
         Arena::Node,
         Arena::Sort,
-        Arena::Declaration,
+        Arena::Constructor,
+        Arena::Function,
+        Arena::Relation,
+        Arena::UserDefinedPrimitive,
         Arena::Rule,
         Arena::Command,
     ]
@@ -1137,6 +1185,7 @@ pub(super) fn publish(
             ambient: None,
             capture: None,
             merge_parameters: None,
+            variable_hint: None,
             observed: false,
             rule_origin: None,
             definitions: OnceLock::new(),
@@ -1219,9 +1268,23 @@ impl Packer {
                 self.program.sorts.push(pb::Sort::default());
                 self.program.sorts.len() - 1
             }
-            Arena::Declaration => {
-                self.program.declarations.push(pb::Declaration::default());
-                self.program.declarations.len() - 1
+            Arena::Constructor => {
+                self.program.constructors.push(pb::Constructor::default());
+                self.program.constructors.len() - 1
+            }
+            Arena::Function => {
+                self.program.functions.push(pb::Function::default());
+                self.program.functions.len() - 1
+            }
+            Arena::Relation => {
+                self.program.relations.push(pb::Relation::default());
+                self.program.relations.len() - 1
+            }
+            Arena::UserDefinedPrimitive => {
+                self.program
+                    .user_defined_primitives
+                    .push(pb::UserDefinedPrimitive::default());
+                self.program.user_defined_primitives.len() - 1
             }
             Arena::Rule => {
                 self.rules.push(pb::Rule::default());
@@ -1298,11 +1361,12 @@ impl Packer {
                     }
                     one.sorts.push(s);
                 }
-                Arena::Declaration => {
-                    let mut declaration =
-                        owner.program().unwrap().declarations[record.index as usize].clone();
-                    match &mut declaration.kind {
-                        Some(pb::declaration::Kind::Function(f)) => {
+                Arena::Constructor
+                | Arena::Function
+                | Arena::Relation
+                | Arena::UserDefinedPrimitive => {
+                    match record.callable()? {
+                        Declaration::Function(f) => {
                             if let Some(merge) = f.merge {
                                 let output = super::SortRef(record.resolve(Arena::Sort, f.output)?);
                                 let Some((declaration, parameter_slots)) = owner.merge_parameters
@@ -1418,7 +1482,7 @@ impl Packer {
                                 ]));
                             }
                         }
-                        Some(pb::declaration::Kind::Constructor(c)) => {
+                        Declaration::Constructor(c) => {
                             if let Some(index) = c.cost {
                                 let cost = record.resolve(Arena::Node, index)?;
                                 let node = &cost.owner.as_ref().unwrap().program().unwrap().nodes
@@ -1439,8 +1503,8 @@ impl Packer {
                                 }
                             }
                         }
-                        Some(pb::declaration::Kind::Relation(_)) => {}
-                        Some(pb::declaration::Kind::UserDefinedPrimitive(p)) => {
+                        Declaration::Relation(_) => {}
+                        Declaration::UserDefinedPrimitive(p) => {
                             binder = self.binders.len();
                             self.binders.push(
                                 (0..p.inputs.len())
@@ -1451,9 +1515,15 @@ impl Packer {
                                     .collect(),
                             );
                         }
-                        _ => (),
                     }
-                    one.declarations.push(declaration);
+                    match record.callable()? {
+                        Declaration::Constructor(d) => one.constructors.push(d.clone()),
+                        Declaration::Function(d) => one.functions.push(d.clone()),
+                        Declaration::Relation(d) => one.relations.push(d.clone()),
+                        Declaration::UserDefinedPrimitive(d) => {
+                            one.user_defined_primitives.push(d.clone())
+                        }
+                    }
                 }
                 Arena::Rule => {
                     one_rules.push(owner.rules[record.index as usize].clone());
@@ -1519,20 +1589,38 @@ impl Packer {
             match record.arena {
                 Arena::Node => self.program.nodes[index as usize] = one.nodes.pop().unwrap(),
                 Arena::Sort => self.program.sorts[index as usize] = one.sorts.pop().unwrap(),
-                Arena::Declaration => {
-                    let d = one.declarations.pop().unwrap();
+                Arena::Constructor
+                | Arena::Function
+                | Arena::Relation
+                | Arena::UserDefinedPrimitive => {
                     // Keep authoritative callable closures for finite data and
                     // extracted function values, including deferred bodies.
-                    let name = match &d.kind {
-                        Some(pb::declaration::Kind::Constructor(c)) => Some(&c.name),
-                        Some(pb::declaration::Kind::Function(f)) => Some(&f.name),
-                        Some(pb::declaration::Kind::UserDefinedPrimitive(p)) => Some(&p.name),
-                        _ => None,
+                    let name = match record.callable()? {
+                        Declaration::Constructor(c) => Some(&c.name),
+                        Declaration::Function(f) => Some(&f.name),
+                        Declaration::UserDefinedPrimitive(p) => Some(&p.name),
+                        Declaration::Relation(_) => None,
                     };
                     if let Some(name) = name {
                         self.declarations.insert(name.clone(), record.clone());
                     }
-                    self.program.declarations[index as usize] = d;
+                    match record.arena {
+                        Arena::Constructor => {
+                            self.program.constructors[index as usize] =
+                                one.constructors.pop().unwrap()
+                        }
+                        Arena::Function => {
+                            self.program.functions[index as usize] = one.functions.pop().unwrap()
+                        }
+                        Arena::Relation => {
+                            self.program.relations[index as usize] = one.relations.pop().unwrap()
+                        }
+                        Arena::UserDefinedPrimitive => {
+                            self.program.user_defined_primitives[index as usize] =
+                                one.user_defined_primitives.pop().unwrap()
+                        }
+                        _ => unreachable!(),
+                    }
                 }
                 Arena::Rule => self.rules[index as usize] = one_rules.pop().unwrap(),
                 Arena::Command => {
@@ -1546,32 +1634,35 @@ impl Packer {
         }
         // Independent compatible declarations can have distinct owners. Compare
         // complete node bodies, but keep the original arena references below.
-        let mut seen = HashMap::new();
-        let mut kept = vec![];
-        for d in &self.program.declarations {
-            let (kind, name) = match &d.kind {
-                Some(pb::declaration::Kind::Constructor(d)) => (DeclarationKind::Callable, &d.name),
-                Some(pb::declaration::Kind::Function(d)) => (DeclarationKind::Callable, &d.name),
-                Some(pb::declaration::Kind::Relation(d)) => (DeclarationKind::Callable, &d.name),
-                Some(pb::declaration::Kind::UserDefinedPrimitive(d)) => {
-                    (DeclarationKind::Callable, &d.name)
-                }
-                _ => unreachable!(),
-            };
-            if seen.insert((kind, name), d).is_none() {
-                kept.push(d.clone());
-            }
-        }
-        if kept.len() != self.program.declarations.len() {
+        let mut seen = std::collections::HashSet::new();
+        let duplicate = declarations(&self.program).any(|d| {
+            !seen.insert(match d {
+                Declaration::Constructor(d) => &d.name,
+                Declaration::Function(d) => &d.name,
+                Declaration::Relation(d) => &d.name,
+                Declaration::UserDefinedPrimitive(d) => &d.name,
+            })
+        });
+        if duplicate {
             crate::builtin::definitions::reconcile_declarations(
                 &self.program,
-                &mut pb::Program {
-                    ..Default::default()
-                },
+                &mut pb::Program::default(),
             )
             .map_err(TypedError::Invalid)?;
+            let mut seen = std::collections::HashSet::new();
+            self.program
+                .constructors
+                .retain(|d| seen.insert(d.name.clone()));
+            self.program
+                .functions
+                .retain(|d| seen.insert(d.name.clone()));
+            self.program
+                .relations
+                .retain(|d| seen.insert(d.name.clone()));
+            self.program
+                .user_defined_primitives
+                .retain(|d| seen.insert(d.name.clone()));
         }
-        self.program.declarations = kept;
         let mut builtins: HashMap<(bool, String), &Record> = HashMap::new();
         for record in &self.builtin_demands {
             let key = if record.arena == Arena::PrimitiveSort {
@@ -1618,15 +1709,7 @@ mod tests {
         packer.intern(compatible.0, 0);
         packer.finish().unwrap();
         assert_eq!(evaluations.get(), 1);
-        let functions = packer
-            .program
-            .declarations
-            .iter()
-            .filter_map(|declaration| match &declaration.kind {
-                Some(pb::declaration::Kind::Function(function)) => Some(function),
-                _ => None,
-            })
-            .collect::<Vec<_>>();
+        let functions = &packer.program.functions;
         assert_eq!(functions.len(), 1);
         let merge = functions[0].merge.unwrap();
         assert!(matches!(
@@ -1667,11 +1750,7 @@ mod tests {
             .push(HashMap::from([("old".into(), "query_old".into())]));
         let query = packer.intern(shared.0.clone(), 1);
         packer.finish().unwrap();
-        let Some(pb::declaration::Kind::Function(function)) =
-            &packer.program.declarations[declaration as usize].kind
-        else {
-            panic!("function declaration")
-        };
+        let function = &packer.program.functions[declaration as usize];
         let merge = function.merge.unwrap();
         assert_ne!(merge, query);
         assert!(matches!(
@@ -1726,9 +1805,7 @@ mod tests {
                         func: "Subsumed".into(),
                         args: vec![0],
                     })),
-                    ..Default::default()
                 })),
-                ..Default::default()
             }],
             ..Default::default()
         };
@@ -1816,27 +1893,24 @@ mod tests {
         slots[Arena::Sort as usize].push(Slot::External(I64::sort_ref().0));
         let mut local = publish(
             pb::Program {
-                declarations: vec![pb::Declaration {
-                    kind: Some(pb::declaration::Kind::Constructor(pb::Constructor {
-                        name: key.into(),
-                        inputs: vec![],
-                        output: 0,
-                        ..Default::default()
-                    })),
+                constructors: vec![pb::Constructor {
+                    name: key.into(),
+                    inputs: vec![],
+                    output: 0,
                     ..Default::default()
                 }],
                 ..Default::default()
             },
             slots,
             vec![imported.0],
-            Arena::Declaration,
+            Arena::Constructor,
             0,
             vec![],
         )
         .unwrap();
         Arc::get_mut(local.owner.as_mut().unwrap()).unwrap().ambient = ambient.owner.clone();
         let selected = local.declaration(key, DeclarationKind::Callable).unwrap();
-        assert_eq!(selected.arena, Arena::Declaration);
+        assert_eq!(selected.arena, Arena::Constructor);
         assert!(Arc::ptr_eq(
             selected.owner.as_ref().unwrap(),
             local.owner.as_ref().unwrap()
@@ -1875,7 +1949,7 @@ mod tests {
             packer.intern(record.clone(), 0);
             packer.finish().unwrap();
             assert!(packer.program.sorts.is_empty() && packer.program.nodes.is_empty());
-            assert!(packer.program.declarations.is_empty());
+            assert!(declarations(&packer.program).next().is_none());
             assert_eq!(packer.builtin_demands[0].primitive().unwrap(), &primitive);
             assert!(
                 matches!(Expr::call_with_result(&Callable(record),vec![],Unit::sort_ref()),
@@ -1902,7 +1976,7 @@ mod tests {
                     panic!()
                 };
                 if case == 2 {
-                    signature.inputs[0].sort = u32::MAX;
+                    signature.inputs[0] = u32::MAX;
                 } else {
                     signature.output = None;
                 }

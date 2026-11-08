@@ -13,6 +13,10 @@
 //! state, with derived indexes for names and diagnostics. No source or previously
 //! supplied AST is accepted by this boundary.
 
+use crate::builtin::definitions::{
+    Declaration, DeclarationIndex, DeclarationMut, declarations, declarations_mut,
+    retain_declarations,
+};
 use crate::builtin::{PortableEGraph, PortablePrimitive, PortableTypeInfo};
 use std::cell::RefCell;
 use std::cmp::Reverse;
@@ -29,7 +33,7 @@ use crate::scheduling::{
 use egglog::ast::{self, Action, Command, Expr, Fact, Literal};
 use egglog::{ArcSort, EGraph, Term, TermDag, TermId, Value, span};
 use egglog::{ExecutionEvent, ExecutionOrigin, RepeatContinuation};
-use egglog_ast::span::{EgglogSpan, SrcFile};
+use egglog_ast::span::ExternalSpan;
 #[cfg(test)]
 use prost::Message;
 
@@ -38,7 +42,6 @@ mod freeze;
 pub(crate) mod graph;
 mod history;
 mod lambda;
-mod output;
 mod proof;
 mod report;
 mod rules;
@@ -48,7 +51,7 @@ pub mod value;
 // Native input paths paired with the actual wire command and its relative
 // list path. This is request-local correspondence, not another control tree.
 type ScheduleSites<'a> = HashMap<Vec<usize>, (&'a pb::Command, Vec<u32>)>;
-type ExecutionFailureSite = (pb::CommandLocation, Option<pb::Span>);
+type ExecutionFailureSite = (pb::CommandLocation, ast::Span);
 
 #[derive(Default)]
 struct ScheduleMeasurements {
@@ -68,7 +71,6 @@ impl OutputStream<'_> {
                 result: Some(pb::run_program_response::Result::Output(std::mem::take(
                     response,
                 ))),
-                files: vec![],
             })
             .is_break();
         }
@@ -82,7 +84,7 @@ impl OutputStream<'_> {
 
 // Fail is path-transparent; only ordered command lists add a path component.
 // These static sites also address Actions nested in controls, whose runtime
-// Union value frame is independently renewed for each iteration.
+// Eq value frame is independently renewed for each iteration.
 fn action_sites(commands: &[pb::Command]) -> impl Iterator<Item = (Vec<u32>, &pb::Action)> {
     let mut pending: Vec<_> = commands
         .iter()
@@ -168,7 +170,7 @@ pub trait NativeExtension: Send + Sync {
         graph: &EGraph,
         native_sort: &ArcSort,
         value: &pb::CustomValue,
-        span: Option<pb::Span>,
+
         destination: &mut pb::Program,
     ) -> Result<pb::Call, String>;
 
@@ -207,8 +209,8 @@ struct Installation {
     binding: Option<(String, String)>,
     command: Option<Command>,
     source_declaration: Option<u32>,
-    span: Option<pb::Span>,
-    declaration: Option<usize>,
+    origin: ast::Span,
+    declaration: Option<DeclarationIndex>,
 }
 
 struct Prepared {
@@ -220,13 +222,68 @@ struct Prepared {
     // Exact native bindings already selected while lowering this request.
     builtin_instances: HashMap<String, egglog::builtin::BuiltinInstance>,
     // Canonical declaration indices whose native installation is still pending.
-    pending_declarations: HashSet<usize>,
+    pending_declarations: HashSet<DeclarationIndex>,
     context: RequestOccurrences,
     bindings: Vec<pb::RulesetBinding>,
 }
 
-#[derive(Default)]
-struct NativeSpans(RefCell<Vec<Option<Arc<SrcFile>>>>);
+struct AuthoredOwner {
+    context: Arc<pb::Program>,
+    nodes: HashMap<u32, u32>,
+}
+
+struct AuthoredSite {
+    context: Arc<pb::Program>,
+    site: pb::ErrorSite,
+}
+
+#[derive(Clone, Default)]
+struct AuthoredOrigins {
+    owner: Option<Arc<AuthoredOwner>>,
+    path: Vec<u32>,
+    // Request-local addresses select owned contexts only while lowering the
+    // immutable execution input. Native spans retain owners, never addresses.
+    commands: Arc<HashMap<usize, AuthoredOrigins>>,
+    actions: Arc<HashMap<usize, AuthoredOrigins>>,
+}
+
+impl AuthoredOrigins {
+    fn fragment(source: &pb::Program, fragment: pb::Program, path: Vec<u32>) -> Self {
+        let Ok((context, nodes)) = graph::compact(source, fragment) else {
+            return Self::default();
+        };
+        Self {
+            owner: Some(Arc::new(AuthoredOwner {
+                context: Arc::new(context),
+                nodes,
+            })),
+            path,
+            ..Default::default()
+        }
+    }
+
+    fn command(&self, command: &pb::Command) -> Self {
+        let mut scoped = self
+            .commands
+            .get(&(command as *const _ as usize))
+            .cloned()
+            .unwrap_or_else(|| self.clone());
+        scoped.commands = self.commands.clone();
+        scoped.actions = self.actions.clone();
+        scoped
+    }
+
+    fn action(&self, action: &pb::Action) -> Self {
+        let mut scoped = self
+            .actions
+            .get(&(action as *const _ as usize))
+            .cloned()
+            .unwrap_or_else(|| self.clone());
+        scoped.commands = self.commands.clone();
+        scoped.actions = self.actions.clone();
+        scoped
+    }
+}
 
 #[derive(Default)]
 struct RequestOccurrences {
@@ -236,9 +293,8 @@ struct RequestOccurrences {
     candidate_offsets: HashMap<rules::Site, std::ops::Range<usize>>,
     literal_rules: HashMap<rules::Site, Vec<usize>>,
     selection: String,
-    files: Vec<pb::SourceFile>,
-    // Indexed by the execution arena, not the response's merged source files.
-    native_spans: NativeSpans,
+    // Private correspondence from execution inputs to compact authored owners.
+    authored_origins: AuthoredOrigins,
     diagnostics: bool,
     scoped_actions: HashSet<Vec<u32>>,
     action_dags: HashMap<Vec<u32>, HashSet<u32>>,
@@ -248,41 +304,39 @@ struct RequestOccurrences {
 
 fn execution_error(
     error: egglog::Error,
-    files: &mut Vec<pb::SourceFile>,
-    span: Option<pb::Span>,
+    fallback: ast::Span,
     location: Option<pb::CommandLocation>,
+    definitions: &pb::Program,
+    lambdas: &lambda::Registry,
 ) -> pb::Error {
-    let native_origin = match &error {
+    let origin = match &error {
         egglog::Error::CheckError(_, span)
         | egglog::Error::NoSuchRuleset(_, span)
         | egglog::Error::ExpectFail(span)
         | egglog::Error::Panic { span, .. }
-        | egglog::Error::ProofError { span, .. } => Some(span),
-        _ => None,
+        | egglog::Error::Runtime { span, .. }
+        | egglog::Error::ProofError { span, .. } => span,
+        _ => &fallback,
     };
-    let span = native_origin
-        .and_then(|origin| {
-            let ast::Span::Egglog(origin) = origin else {
-                return None;
-            };
-            let source = pb::SourceFile {
-                name: origin.file.name.clone().unwrap_or_default(),
-                contents: Some(origin.file.contents.clone()),
-            };
-            let file = match files.iter().position(|file| file == &source) {
-                Some(file) => file,
-                None => {
-                    files.push(source);
-                    files.len() - 1
-                }
-            };
-            Some(pb::Span {
-                file: u32::try_from(file).ok()?,
-                start: u32::try_from(origin.i).ok()?,
-                end: u32::try_from(origin.j).ok()?,
-            })
-        })
-        .or(span);
+    let authored = match origin {
+        ast::Span::External(origin) => origin.0.downcast_ref::<AuthoredSite>(),
+        _ => None,
+    }
+    .or_else(|| match &fallback {
+        ast::Span::External(origin) => origin.0.downcast_ref::<AuthoredSite>(),
+        _ => None,
+    });
+    let diagnostic = authored.and_then(|authored| {
+        let definitions = lambdas.export_definitions(definitions).ok()?;
+        let (context, nodes) = graph::error_context(&authored.context, &definitions).ok()?;
+        let mut site = authored.site.clone();
+        site.node_id = site.node_id.and_then(|node| nodes.get(&node).copied());
+        Some((context, site))
+    });
+    let (context, site) = match diagnostic {
+        Some((context, site)) => (Some(context), Some(site)),
+        None => (None, None),
+    };
     pb::Error {
         code: if matches!(error, egglog::Error::CheckError(..)) {
             pb::ErrorCode::CheckFailed.into()
@@ -290,7 +344,8 @@ fn execution_error(
             pb::ErrorCode::RuntimeFailure.into()
         },
         message: error.to_string(),
-        span,
+        context: context.map(Box::new),
+        site,
         location,
     }
 }
@@ -404,10 +459,9 @@ impl Engine {
         }
         let program = pb::Program {
             sorts: request.sorts,
-            files: request.files,
+
             ..Default::default()
         };
-        let native_spans = NativeSpans::default();
         let mut graph = crate::new_experimental_egraph();
         // Provider setup and the original proof typechecking clone inherit the
         // byte adapter's off policy, before any optional native work can run.
@@ -442,7 +496,6 @@ impl Engine {
                     "creation sort kind mismatch for {name}"
                 )));
             }
-            native_span(&program, sort.span.as_ref(), &native_spans).map_err(TransportError)?;
         }
         if let Some(threads) = request.threads {
             if cfg!(target_family = "wasm") && threads > 1 {
@@ -536,7 +589,6 @@ impl Engine {
         request: pb::RunProgramRequest,
         emit: &mut dyn FnMut(pb::RunProgramResponse) -> ControlFlow<()>,
     ) -> Result<(), TransportError> {
-        let mut emit = |frame| emit(output::source_free_response(frame));
         let original = self
             .histories
             .contains_key(&request.egraph_id)
@@ -553,7 +605,6 @@ impl Engine {
                     message: "missing program".into(),
                     ..Default::default()
                 })),
-                files: vec![],
             });
             return Ok(());
         };
@@ -570,40 +621,37 @@ impl Engine {
                     .set_report_level(egglog_reports::ReportLevel::Off);
                 let _ = emit(pb::RunProgramResponse {
                     result: Some(pb::run_program_response::Result::Error(*error.0)),
-                    files: program.files,
                 });
                 return Ok(());
             }
         };
         if let Some(original) = original {
-            self.histories
-                .get_mut(&request.egraph_id)
-                .unwrap()
-                .append(history::capture(original, &session.registry).map_err(TransportError)?);
+            self.histories.get_mut(&request.egraph_id).unwrap().append(
+                history::capture(original, &session.registry, &prepared.context.candidates)
+                    .map_err(TransportError)?,
+            );
         }
         let mut response = pb::RunProgramOutput::default();
         let mut context = match session.install(prepared, &mut response) {
             Ok(context) => context,
-            Err((error, files)) => {
+            Err(error) => {
                 session
                     .graph
                     .set_report_level(egglog_reports::ReportLevel::Off);
                 if !response.outputs.is_empty() {
                     let _ = emit(pb::RunProgramResponse {
                         result: Some(pb::run_program_response::Result::Output(response)),
-                        files: vec![],
                     });
                 }
                 let _ = emit(pb::RunProgramResponse {
                     result: Some(pb::run_program_response::Result::Error(*error)),
-                    files,
                 });
                 return Ok(());
             }
         };
         context.diagnostics = request.diagnostics;
         let mut stream = OutputStream {
-            emit: &mut emit,
+            emit,
             cancelled: false,
         };
         let mut failure = None;
@@ -626,20 +674,18 @@ impl Engine {
                 break;
             }
             if let Err(error) = result {
-                let (location, span) = failure_site.unwrap_or_else(|| {
+                let (location, origin) = failure_site.unwrap_or_else(|| {
                     (
                         location,
-                        match &command.kind {
-                            Some(pb::command::Kind::Action(action)) => action.span.or(command.span),
-                            _ => command.span,
-                        },
+                        authored_span(None, &context.authored_origins.command(command)),
                     )
                 });
                 failure = Some(execution_error(
                     error,
-                    &mut context.files,
-                    span,
+                    origin,
                     Some(location),
+                    &session.definitions,
+                    &session.lambdas,
                 ));
                 break;
             }
@@ -657,17 +703,14 @@ impl Engine {
                 // the actual error or invalidate the already-completed prefix.
                 let _ = (stream.emit)(pb::RunProgramResponse {
                     result: Some(pb::run_program_response::Result::Output(response)),
-                    files: vec![],
                 });
             }
             let _ = (stream.emit)(pb::RunProgramResponse {
                 result: Some(pb::run_program_response::Result::Error(error)),
-                files: context.files,
             });
         } else {
             let _ = (stream.emit)(pb::RunProgramResponse {
                 result: Some(pb::run_program_response::Result::Output(response)),
-                files: vec![],
             });
         }
         Ok(())
@@ -679,7 +722,7 @@ impl Session {
         &mut self,
         prepared: Prepared,
         response: &mut pb::RunProgramOutput,
-    ) -> Result<RequestOccurrences, (Box<pb::Error>, Vec<pb::SourceFile>)> {
+    ) -> Result<RequestOccurrences, Box<pb::Error>> {
         let Prepared {
             mut definitions,
             lambdas,
@@ -729,16 +772,17 @@ impl Session {
                 }
             }
             if let Err(error) = result {
-                failure = Some((error, installation.span));
+                failure = Some((error, installation.origin));
                 break;
             }
         }
+        // Preserve the complete authored setup only on an installation error;
+        // pending definitions still belong in the diagnostic dependency closure.
+        let diagnostic_definitions = failure.as_ref().map(|_| definitions.clone());
         // Retain completed declarations even when a later native installation fails.
-        definitions.declarations = std::mem::take(&mut definitions.declarations)
-            .into_iter()
-            .enumerate()
-            .filter_map(|(index, d)| (!pending_declarations.contains(&index)).then_some(d))
-            .collect();
+        retain_declarations(&mut definitions, |index| {
+            !pending_declarations.contains(&index)
+        });
         self.definitions = definitions;
         self.lambdas = lambdas;
         self.names = project_names(
@@ -770,14 +814,20 @@ impl Session {
             context.candidates = candidates;
             context.registry = registry;
             if let Err(error) = result {
-                failure = Some((error, None));
+                failure = Some((error, ast::Span::Panic));
             }
         }
         self.registry = context.registry.clone();
         match failure {
             Some((error, span)) => {
-                let error = execution_error(error, &mut context.files, span, None);
-                Err((Box::new(error), context.files))
+                let error = execution_error(
+                    error,
+                    span,
+                    None,
+                    diagnostic_definitions.as_ref().unwrap_or(&self.definitions),
+                    &self.lambdas,
+                );
+                Err(Box::new(error))
             }
             None => Ok(context),
         }
@@ -836,13 +886,23 @@ impl Session {
                 return Err("function application requires Apply, not a named callable".into());
             }
         }
-        let mut authored_input = program.clone();
-        let rule_files = Arc::new(std::mem::take(&mut authored_input.files));
-        let native_spans = NativeSpans::default();
+        let authored_input = program.clone();
+        let authored_declarations: HashMap<_, _> = declarations(&authored_input)
+            .map(|declaration| {
+                let (kind, name) = match declaration {
+                    Declaration::Constructor(d) => (0, &d.name),
+                    Declaration::Function(d) => (1, &d.name),
+                    Declaration::Relation(d) => (2, &d.name),
+                    Declaration::UserDefinedPrimitive(d) => (3, &d.name),
+                };
+                ((kind, native_name("call", name)), declaration)
+            })
+            .collect();
+        let authored_origins = AuthoredOrigins::default();
         validate_relation_uses(program, &self.definitions)?;
         for rule in graph::rules(program) {
             if let Some(pb::rule::Kind::Rule(rule)) = &rule.kind {
-                validate_legacy_union_scope(program, &rule.head)?;
+                validate_legacy_eq_scope(program, &rule.actions)?;
             }
         }
         let mut staged = self.clone();
@@ -852,13 +912,12 @@ impl Session {
             .ok_or("request identity space exhausted")?;
         // Native registrations remain authoritative even for empty requests.
         staged.graph.type_info().builtin_catalog()?;
-        for declaration in &program.declarations {
-            let name = match &declaration.kind {
-                Some(pb::declaration::Kind::Constructor(c)) => &c.name,
-                Some(pb::declaration::Kind::Function(f)) => &f.name,
-                Some(pb::declaration::Kind::Relation(r)) => &r.name,
-                Some(pb::declaration::Kind::UserDefinedPrimitive(p)) => &p.name,
-                _ => continue,
+        for declaration in declarations(program) {
+            let name = match declaration {
+                Declaration::Constructor(c) => &c.name,
+                Declaration::Function(f) => &f.name,
+                Declaration::Relation(r) => &r.name,
+                Declaration::UserDefinedPrimitive(p) => &p.name,
             };
             if self
                 .builtins
@@ -870,16 +929,29 @@ impl Session {
             }
         }
         staged.lambdas.lower(program, &staged.definitions)?;
-        let mut next_declaration = staged.definitions.declarations.len();
+        let mut next_declaration = [
+            staged.definitions.constructors.len(),
+            staged.definitions.functions.len(),
+            staged.definitions.relations.len(),
+            staged.definitions.user_defined_primitives.len(),
+        ];
         let added =
             crate::builtin::definitions::reconcile_declarations(program, &mut staged.definitions)?;
-        let declaration_indices: Vec<_> = added
-            .iter()
-            .map(|added| {
+        let declaration_indices: Vec<_> = declarations(program)
+            .zip(&added)
+            .map(|(declaration, added)| {
                 added.then(|| {
-                    let index = next_declaration;
-                    next_declaration += 1;
-                    index
+                    let (kind, make): (usize, fn(usize) -> DeclarationIndex) = match declaration {
+                        Declaration::Constructor(_) => (0, DeclarationIndex::Constructor),
+                        Declaration::Function(_) => (1, DeclarationIndex::Function),
+                        Declaration::Relation(_) => (2, DeclarationIndex::Relation),
+                        Declaration::UserDefinedPrimitive(_) => {
+                            (3, DeclarationIndex::UserDefinedPrimitive)
+                        }
+                    };
+                    let index = next_declaration[kind];
+                    next_declaration[kind] += 1;
+                    make(index)
                 })
             })
             .collect();
@@ -888,32 +960,27 @@ impl Session {
         staged.names = project_names(program, &staged.definitions, &self.builtins);
         let mut authored = staged.definitions.clone();
         project_names(&mut authored, &staged.definitions, &self.builtins);
-        let mut signatures: HashMap<_, _> = authored
-            .declarations
-            .iter()
-            .filter_map(|d| match &d.kind {
-                Some(pb::declaration::Kind::Constructor(c)) => Some((
+        let mut signatures: HashMap<_, _> = declarations(&authored)
+            .map(|d| match d {
+                Declaration::Constructor(c) => (
                     &c.name,
                     &c.inputs,
                     Some(c.output),
                     Some(ast::FunctionSubtype::Constructor),
-                )),
-                Some(pb::declaration::Kind::Function(f)) => Some((
+                ),
+                Declaration::Function(f) => (
                     &f.name,
                     &f.inputs,
                     Some(f.output),
                     Some(ast::FunctionSubtype::Custom),
-                )),
-                Some(pb::declaration::Kind::UserDefinedPrimitive(p)) => {
-                    Some((&p.name, &p.inputs, Some(p.output), None))
-                }
-                Some(pb::declaration::Kind::Relation(r)) => Some((
+                ),
+                Declaration::UserDefinedPrimitive(p) => (&p.name, &p.inputs, Some(p.output), None),
+                Declaration::Relation(r) => (
                     &r.name,
                     &r.inputs,
                     None,
                     Some(ast::FunctionSubtype::Constructor),
-                )),
-                _ => None,
+                ),
             })
             .map(|(name, inputs, output, subtype)| {
                 Ok((
@@ -927,7 +994,7 @@ impl Session {
                             None => ast::Schema {
                                 input: inputs
                                     .iter()
-                                    .map(|arg| sort_name(&authored.sorts, arg.sort))
+                                    .map(|arg| sort_name(&authored.sorts, *arg))
                                     .collect::<Result<_, _>>()?,
                                 output: "Unit".into(),
                             },
@@ -948,26 +1015,21 @@ impl Session {
                 );
             }
         }
-        let constructor_targets: HashSet<_> = authored
-            .declarations
-            .iter()
-            .filter_map(|declaration| match &declaration.kind {
-                Some(pb::declaration::Kind::Constructor(constructor)) => {
-                    Some(constructor.name.clone())
-                }
+        let constructor_targets: HashSet<_> = declarations(&authored)
+            .filter_map(|declaration| match declaration {
+                Declaration::Constructor(constructor) => Some(constructor.name.clone()),
                 _ => None,
             })
             .collect();
-        for (declaration, added) in program.declarations.iter().zip(&added) {
+        for (declaration, added) in declarations(program).zip(&added) {
             if !added {
                 continue;
             }
-            let name = match &declaration.kind {
-                Some(pb::declaration::Kind::Constructor(f)) => &f.name,
-                Some(pb::declaration::Kind::Function(f)) => &f.name,
-                Some(pb::declaration::Kind::Relation(r)) => &r.name,
-                Some(pb::declaration::Kind::UserDefinedPrimitive(p)) => &p.name,
-                _ => continue,
+            let name = match declaration {
+                Declaration::Constructor(f) => &f.name,
+                Declaration::Function(f) => &f.name,
+                Declaration::Relation(r) => &r.name,
+                Declaration::UserDefinedPrimitive(p) => &p.name,
             };
             if staged.graph.get_sort_by_name(name).is_some()
                 || staged.graph.get_function(name).is_some()
@@ -994,7 +1056,7 @@ impl Session {
                 return Err(format!("native declaration namespace collision: {name}").into());
             }
             let command = Command::Sort {
-                span: native_span(program, sort.span.as_ref(), &native_spans)?,
+                span: authored_span(None, &authored_origins),
                 name: name.clone(),
                 presort_and_args: None,
                 uf: None,
@@ -1011,7 +1073,7 @@ impl Session {
                 binding: None,
                 command: Some(command),
                 source_declaration: None,
-                span: sort.span,
+                origin: ast::Span::Panic,
                 declaration: None,
             });
         }
@@ -1020,24 +1082,27 @@ impl Session {
         lower_custom_values(program, &mut staged.graph, staged.extension.as_deref())?;
         // Container payloads may introduce the Pair/Vec sorts used to construct
         // a Map. Only this staged execution copy receives those helper records.
-        let sort_sites = lower_container_values(program)?;
-        let materialized_sorts =
-            materialize_sorts(program, &mut staged.graph, &mut staged.sorts, &native_spans)?;
+        lower_container_values(program)?;
+        let materialized_sorts = materialize_sorts(
+            program,
+            &mut staged.graph,
+            &mut staged.sorts,
+            &authored_origins,
+        )?;
         let mut materialized = vec![];
-        for (index, command) in materialized_sorts {
+        for (_, command) in materialized_sorts {
             materialized.push(command.clone());
-            let site = sort_sites[index as usize];
             installations.push(Installation {
                 binding: None,
                 command: Some(command),
                 source_declaration: None,
-                span: program.sorts[site as usize].span,
+                origin: ast::Span::Panic,
                 declaration: None,
             });
         }
         for (index, sort) in program.sorts.iter().enumerate() {
             validate_nullary_family(staged.graph.type_info(), sort)?;
-            native_span(program, sort.span.as_ref(), &native_spans)?;
+
             let Some(name) =
                 structural_sort_name(&program.sorts, index as u32, &mut HashSet::new())?
             else {
@@ -1080,13 +1145,13 @@ impl Session {
                 binding: Some((name, sort)),
                 command: None,
                 source_declaration: None,
-                span: node.span,
+                origin: ast::Span::Panic,
                 declaration: None,
             });
         }
         lower_binding_writes(program)?;
         lower_applications(program)?;
-        validate_node_graph(program, &native_spans)?;
+        validate_node_graph(program, &authored_origins)?;
         let mut action_dags = classify_action_dags(program)?;
         let extraction_dags = if self.mode == pb::ExecutionMode::Normal {
             let roots = command_tree(&program.commands)
@@ -1100,7 +1165,7 @@ impl Session {
         } else {
             HashMap::new()
         };
-        let mut scoped_actions = classify_union_actions(
+        let mut scoped_actions = classify_eq_actions(
             program,
             &constructor_targets,
             self.mode == pb::ExecutionMode::Normal,
@@ -1111,18 +1176,50 @@ impl Session {
         action_dags.retain(|path, _| !scoped_actions.contains(path));
         scoped_actions.extend(action_dags.keys().cloned());
         let builtin_instances = lower_builtin_calls(program, &staged.graph, &signatures)?;
-        for index in declaration_order(program, &mut staged.graph)? {
-            let declaration = &program.declarations[index];
+        let declaration_order = declaration_order(program, &mut staged.graph)?;
+        let submitted_declarations: Vec<_> = declarations(program).collect();
+        for index in declaration_order {
+            let declaration = submitted_declarations[index];
             if !added[index] {
                 continue;
             }
-            let span = native_span(program, declaration.span.as_ref(), &native_spans)?;
-            let command = match declaration
-                .kind
-                .as_ref()
-                .ok_or("missing declaration kind")?
-            {
-                pb::declaration::Kind::Constructor(constructor) => {
+            let authored_key = match declaration {
+                Declaration::Constructor(d) => (0, d.name.clone()),
+                Declaration::Function(d) => (1, d.name.clone()),
+                Declaration::Relation(d) => (2, d.name.clone()),
+                Declaration::UserDefinedPrimitive(d) => (3, d.name.clone()),
+            };
+            let authored_origins = match authored_declarations.get(&authored_key).copied() {
+                Some(authored_declaration) => {
+                    let mut fragment = pb::Program::default();
+                    let path = match authored_declaration {
+                        Declaration::Constructor(d) => {
+                            fragment.constructors.push(d.clone());
+                            vec![4, 0]
+                        }
+                        Declaration::Function(d) => {
+                            fragment.functions.push(d.clone());
+                            vec![8, 0]
+                        }
+                        Declaration::Relation(d) => {
+                            fragment.relations.push(d.clone());
+                            vec![9, 0]
+                        }
+                        Declaration::UserDefinedPrimitive(d) => {
+                            fragment.user_defined_primitives.push(d.clone());
+                            vec![10, 0]
+                        }
+                    };
+                    AuthoredOrigins::fragment(&authored_input, fragment, path)
+                }
+                // Anonymous-code helpers are execution records, not authored
+                // declarations. Their failures fall back to the authored caller.
+                None => AuthoredOrigins::default(),
+            };
+            let span = authored_span(None, &authored_origins);
+            let origin = span.clone();
+            let command = match declaration {
+                Declaration::Constructor(constructor) => {
                     if constructor.name.is_empty() {
                         return Err("constructor name must not be empty".into());
                     }
@@ -1168,7 +1265,7 @@ impl Session {
                         term_constructor: None,
                     }
                 }
-                pb::declaration::Kind::Function(function) => {
+                Declaration::Function(function) => {
                     if function.name.is_empty() {
                         return Err("function name must not be empty".into());
                     }
@@ -1197,7 +1294,7 @@ impl Session {
                         merge: function
                             .merge
                             .map(|index| {
-                                expression(program, index, &mut HashSet::new(), &native_spans)
+                                expression(program, index, &mut HashSet::new(), &authored_origins)
                             })
                             .transpose()?,
                         hidden: function.hidden,
@@ -1206,10 +1303,10 @@ impl Session {
                         unextractable: true,
                     }
                 }
-                pb::declaration::Kind::UserDefinedPrimitive(primitive) => {
-                    primitive_command(program, primitive, span, &native_spans)?
+                Declaration::UserDefinedPrimitive(primitive) => {
+                    primitive_command(program, primitive, span, &authored_origins)?
                 }
-                pb::declaration::Kind::Relation(relation) => Command::Relation {
+                Declaration::Relation(relation) => Command::Relation {
                     span,
                     name: relation.name.clone(),
                     table_name: Some(native_table_name(
@@ -1219,7 +1316,7 @@ impl Session {
                     inputs: relation
                         .inputs
                         .iter()
-                        .map(|arg| sort_name(&program.sorts, arg.sort))
+                        .map(|arg| sort_name(&program.sorts, *arg))
                         .collect::<Result<_, _>>()?,
                 },
             };
@@ -1236,7 +1333,7 @@ impl Session {
                     );
                 }
                 let cost_table = Command::Function {
-                    span: native_span(program, declaration.span.as_ref(), &native_spans)?,
+                    span: authored_span(None, &authored_origins),
                     name: cost_table,
                     table_name: Some(ast::TableName::Internal(
                         crate::set_cost::get_cost_table_name(&staged.names.callables[name]),
@@ -1256,7 +1353,7 @@ impl Session {
                     binding: None,
                     command: Some(cost_table),
                     source_declaration: Some(index as u32),
-                    span: declaration.span,
+                    origin: origin.clone(),
                     declaration: None,
                 });
             }
@@ -1269,7 +1366,7 @@ impl Session {
                 binding: None,
                 command: Some(command),
                 source_declaration: Some(index as u32),
-                span: declaration.span,
+                origin: origin.clone(),
                 declaration: declaration_indices[index],
             });
         }
@@ -1316,7 +1413,7 @@ impl Session {
                 _ => None,
             })
             .chain(graph::rules(program).flat_map(|rule| match &rule.kind {
-                Some(pb::rule::Kind::Rule(body)) => body.head.as_slice(),
+                Some(pb::rule::Kind::Rule(body)) => body.actions.as_slice(),
                 _ => &[],
             }))
         {
@@ -1347,7 +1444,7 @@ impl Session {
                 PreparationError(Box::new(pb::Error {
                     code: pb::ErrorCode::RuntimeFailure.into(),
                     message: format!("unknown action target {}", call.func),
-                    span: action.span,
+
                     ..Default::default()
                 }))
             })?;
@@ -1379,14 +1476,40 @@ impl Session {
                 }
             }
         }
+        let mut command_origins = HashMap::new();
+        let mut action_origins = HashMap::new();
+        for (command, authored) in
+            command_tree(&program.commands).zip(command_tree(&authored_input.commands))
+        {
+            let origins = AuthoredOrigins::fragment(
+                &authored_input,
+                pb::Program {
+                    commands: vec![authored.clone()],
+                    ..Default::default()
+                },
+                vec![5, 0],
+            );
+            if let Some(pb::command::Kind::Action(action)) = &command.kind {
+                let mut action_origin = origins.clone();
+                if matches!(authored.kind, Some(pb::command::Kind::Action(_))) {
+                    action_origin.path.push(1);
+                }
+                action_origins.insert(action as *const _ as usize, action_origin);
+            }
+            command_origins.insert(command as *const _ as usize, origins);
+        }
+        let authored_origins = AuthoredOrigins {
+            commands: Arc::new(command_origins),
+            actions: Arc::new(action_origins),
+            ..Default::default()
+        };
         let mut context = RequestOccurrences {
             request: staged.request,
             registry: self.registry.clone(),
-            native_spans,
+            authored_origins,
             scoped_actions,
             action_dags,
             extraction_dags,
-            files: program.files.clone(),
             ..Default::default()
         };
         // Setup already compiled on this context. Compile every rule literal
@@ -1408,41 +1531,47 @@ impl Session {
         {
             let name = format!("__protobuf_{}_rule_{index}", staged.request);
             let holder = format!("{name}_holder");
+            let authored_origins = AuthoredOrigins::fragment(
+                &authored_input,
+                pb::Program {
+                    rulesets: vec![pb::RulesetBinding {
+                        name: String::new(),
+                        value: Some(pb::Ruleset {
+                            rules: vec![authored_rule.clone()],
+                        }),
+                    }],
+                    ..Default::default()
+                },
+                vec![7, 0, 2, 1, 0],
+            );
             let mut commands = vec![Command::AddRuleset(
-                native_span(program, rule.span.as_ref(), &context.native_spans)?,
+                authored_span(None, &authored_origins),
                 holder.clone(),
             )];
             commands.extend(
-                lower_rule(
-                    program,
-                    rule,
-                    &holder,
-                    &name,
-                    &context.native_spans,
-                    |name| {
-                        staged.graph.authoring_type_info().is_global(name)
-                            || staged.graph.get_sort_by_name(name).is_some()
-                            || staged
-                                .graph
-                                .authoring_type_info()
-                                .get_func_type(name)
-                                .is_some()
-                            || staged.graph.authoring_type_info().is_primitive(name)
-                    },
-                )?
+                lower_rule(program, rule, &holder, &name, &authored_origins, |name| {
+                    staged.graph.authoring_type_info().is_global(name)
+                        || staged.graph.get_sort_by_name(name).is_some()
+                        || staged
+                            .graph
+                            .authoring_type_info()
+                            .get_func_type(name)
+                            .is_some()
+                        || staged.graph.authoring_type_info().is_primitive(name)
+                })?
                 .into_iter()
                 .map(|command| capture_rule_bindings(command, program))
                 .map(|command| lower_rule_cost_deletes(command, &constructor_targets, self.mode)),
             );
             validation.extend(commands.clone());
-            let record = graph::rule(&authored_input, authored_rule)?;
+            let record = match &authored_origins.owner {
+                Some(owner) => owner.context.clone(),
+                None => Arc::new(graph::rule(&authored_input, authored_rule)?),
+            };
             let key = graph::rule_key(&record)?;
             context.candidates.push(rules::Candidate {
                 key,
-                record: Arc::new(graph::RuleRecord {
-                    program: record,
-                    files: rule_files.clone(),
-                }),
+                record: Arc::new(graph::RuleRecord { program: record }),
                 name,
                 commands,
             });
@@ -1455,7 +1584,6 @@ impl Session {
             .collect();
         let mut conditions = vec![];
         for (index, command) in program.commands.iter().enumerate() {
-            native_span(program, command.span.as_ref(), &context.native_spans)?;
             validation.extend(staged.validate_control(
                 program,
                 command,
@@ -1487,7 +1615,7 @@ impl Session {
                     false,
                     context.action_dags.get(&path),
                     &mut |_| {},
-                    &context.native_spans,
+                    &context.authored_origins,
                 )
                 .map_err(|error| error.to_string())?;
             }
@@ -1502,7 +1630,7 @@ impl Session {
                             *root,
                             Some(closed),
                             false,
-                            &context.native_spans,
+                            &context.authored_origins,
                         )
                         .map_err(|error| error.to_string())?;
                     }
@@ -1523,18 +1651,15 @@ impl Session {
                 staged
                     .resolve_cost_model(model, extractor)
                     .map_err(|mut error| {
-                        error.0.span = command.span;
+                        error.0.context = None;
                         error
                     })?;
             }
         }
         // Only rendering needs the filtered declaration view. All runtime sites
         // above were captured against the original submitted indices.
-        program.declarations = std::mem::take(&mut program.declarations)
-            .into_iter()
-            .zip(added)
-            .filter_map(|(declaration, added)| added.then_some(declaration))
-            .collect();
+        let mut added = added.into_iter();
+        retain_declarations(program, |_| added.next().unwrap());
         Ok(Prepared {
             lambdas: staged.lambdas,
             definitions: staged.definitions,
@@ -1555,6 +1680,7 @@ impl Session {
         context: &RequestOccurrences,
         sites: &mut ScheduleSites<'a>,
     ) -> Result<Vec<Command>, PreparationError> {
+        let authored_origins = context.authored_origins.command(command);
         if matches!(
             command.kind,
             Some(
@@ -1566,7 +1692,7 @@ impl Session {
         ) {
             return lower_native_observation(&self.graph, program, command, context, sites);
         }
-        let span = native_span(program, command.span.as_ref(), &context.native_spans)?;
+        let span = authored_span(None, &authored_origins);
         let command = match command.kind.as_ref().ok_or("missing command kind")? {
             pb::command::Kind::Fail(child) => {
                 if !matches!(
@@ -1592,14 +1718,14 @@ impl Session {
                 Command::Fail(span, Box::new(child))
             }
             pb::command::Kind::Action(action) => {
-                return Ok(lower_action(program, action, &context.native_spans)?
+                return Ok(lower_action(program, action, &authored_origins)?
                     .into_iter()
                     .map(Command::Action)
                     .collect());
             }
             pb::command::Kind::Prove(prove) => Command::Prove(
                 span,
-                facts(program, &prove.facts, &context.native_spans, None, |name| {
+                facts(program, &prove.facts, &authored_origins, None, |name| {
                     self.graph.authoring_type_info().is_global(name)
                         || self.graph.get_sort_by_name(name).is_some()
                         || self
@@ -1620,11 +1746,13 @@ impl Session {
                         PreparationError(Box::new(pb::Error {
                             code: pb::ErrorCode::RuntimeFailure.into(),
                             message: format!("unknown constructor {}", prove.constructor),
-                            span: command.span,
+
                             ..Default::default()
                         }))
                     })?;
-                if !self.definitions.declarations.iter().any(|d| matches!(&d.kind, Some(pb::declaration::Kind::Constructor(c)) if &c.name == name)) {
+                if !declarations(&self.definitions)
+                    .any(|d| matches!(d, Declaration::Constructor(c) if &c.name == name))
+                {
                     return Err("prove-exists requires a constructor".into());
                 }
                 Command::ProveExists(span, prove.constructor.clone())
@@ -1651,12 +1779,7 @@ impl Session {
                     .map(|index| {
                         Ok(Command::Action(Action::Expr(
                             span.clone(),
-                            expression(
-                                program,
-                                *index,
-                                &mut HashSet::new(),
-                                &context.native_spans,
-                            )?,
+                            expression(program, *index, &mut HashSet::new(), &authored_origins)?,
                         )))
                     })
                     .collect();
@@ -1676,24 +1799,16 @@ impl Session {
                 }
                 for table in &keep.tables {
                     let logical = self.names.callables.get(table);
-                    if !self.definitions.declarations.iter().any(|declaration| {
-                        match &declaration.kind {
-                            Some(pb::declaration::Kind::Constructor(row)) => {
-                                logical == Some(&row.name)
-                            }
-                            Some(pb::declaration::Kind::Function(row)) => {
-                                logical == Some(&row.name)
-                            }
-                            Some(pb::declaration::Kind::Relation(row)) => {
-                                logical == Some(&row.name)
-                            }
-                            _ => false,
-                        }
+                    if !declarations(&self.definitions).any(|declaration| match declaration {
+                        Declaration::Constructor(row) => logical == Some(&row.name),
+                        Declaration::Function(row) => logical == Some(&row.name),
+                        Declaration::Relation(row) => logical == Some(&row.name),
+                        _ => false,
                     }) {
                         return Err(PreparationError(Box::new(pb::Error {
                             code: pb::ErrorCode::RuntimeFailure.into(),
                             message: format!("unknown table {table}"),
-                            span: command.span,
+
                             ..Default::default()
                         })));
                     }
@@ -1708,7 +1823,7 @@ impl Session {
                     PreparationError(Box::new(pb::Error {
                         code: pb::ErrorCode::RuntimeFailure.into(),
                         message: format!("unknown table {}", print.table),
-                        span: command.span,
+
                         ..Default::default()
                     }))
                 })?;
@@ -1738,7 +1853,8 @@ impl Session {
         conditions: &mut Vec<(ast::Span, Vec<Fact>)>,
         path: &[u32],
     ) -> Result<Vec<Command>, PreparationError> {
-        let span = native_span(program, command.span.as_ref(), &context.native_spans)?;
+        let authored_origins = context.authored_origins.command(command);
+        let span = authored_span(None, &authored_origins);
         match command.kind.as_ref().ok_or("missing command kind")? {
             pb::command::Kind::BindScheduler(bind) => {
                 wire_back_off(bind)?;
@@ -1752,7 +1868,7 @@ impl Session {
                     return Err(PreparationError(Box::new(pb::Error {
                         code: pb::ErrorCode::RuntimeFailure.into(),
                         message: format!("unknown scheduler {}", run.scheduler),
-                        span: command.span,
+
                         ..Default::default()
                     })));
                 }
@@ -1764,7 +1880,7 @@ impl Session {
                 if !until.is_empty() {
                     conditions.push((
                         span,
-                        facts(program, until, &context.native_spans, None, |name| {
+                        facts(program, until, &authored_origins, None, |name| {
                             self.graph.authoring_type_info().is_global(name)
                                 || self.graph.get_sort_by_name(name).is_some()
                                 || self
@@ -1825,7 +1941,7 @@ impl Session {
                                     || self.graph.type_info().get_func_type(name).is_some()
                                     || self.graph.type_info().is_primitive(name)
                             },
-                            &context.native_spans,
+                            &authored_origins,
                             &mut HashMap::new(),
                             &mut 0,
                         )?
@@ -1857,12 +1973,12 @@ impl Session {
     }
 
     fn lower_run<'a>(
-        program: &pb::Program,
         command: &'a pb::Command,
         context: &RequestOccurrences,
         sites: &mut ScheduleSites<'a>,
     ) -> Result<ast::Schedule, PreparationError> {
-        let span = native_span(program, command.span.as_ref(), &context.native_spans)?;
+        let authored_origins = context.authored_origins.command(command);
+        let span = authored_span(None, &authored_origins);
         sites.insert(vec![], (command, vec![]));
         match command.kind.as_ref().ok_or("missing schedule command")? {
             pb::command::Kind::Run(_) => {
@@ -1891,6 +2007,7 @@ impl Session {
         failure_site: &mut Option<ExecutionFailureSite>,
         stream: &mut OutputStream<'_>,
     ) -> Result<(), egglog::Error> {
+        let authored_origins = context.authored_origins.command(command);
         let output = match command.kind.as_ref().unwrap() {
             pb::command::Kind::Fail(child) if context.scoped_actions.contains(&location.path) => {
                 let result = self.execute(
@@ -1904,10 +2021,10 @@ impl Session {
                 );
                 *failure_site = None;
                 if result.is_ok() {
-                    return Err(egglog::Error::ExpectFail(
-                        native_span(program, command.span.as_ref(), &context.native_spans)
-                            .expect("validated span"),
-                    ));
+                    return Err(egglog::Error::ExpectFail(authored_span(
+                        None,
+                        &authored_origins,
+                    )));
                 }
                 None
             }
@@ -1918,10 +2035,7 @@ impl Session {
                 let mut anchor = command;
                 let mut fail_spans = vec![];
                 while let Some(pb::command::Kind::Fail(child)) = &anchor.kind {
-                    fail_spans.push(
-                        native_span(program, anchor.span.as_ref(), &context.native_spans)
-                            .expect("validated span"),
-                    );
+                    fail_spans.push(authored_span(None, &authored_origins));
                     anchor = child;
                 }
                 let mut envelope = WireEnvelope {
@@ -1996,7 +2110,7 @@ impl Session {
                     &mut |event| {
                         measurements.observe(event, self.mode, Some(location), &HashMap::new())
                     },
-                    &context.native_spans,
+                    &authored_origins,
                 );
                 *failure_site = measurements.failure.clone();
                 result?;
@@ -2018,7 +2132,7 @@ impl Session {
                             *index,
                             context.extraction_dags.get(index),
                             true,
-                            &context.native_spans,
+                            &authored_origins,
                         )
                         .map(|root| root.expect("executed extraction root"))
                     })
@@ -2085,7 +2199,6 @@ impl Session {
                             kind: Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
                                 value: Some(pb::primitive_value::Value::I64(cost)),
                             })),
-                            ..Default::default()
                         });
                         root.variants.push(pb::ExtractedTerm {
                             term,
@@ -2171,12 +2284,7 @@ impl Session {
                     for (sort, expected) in input_sorts
                         .iter()
                         .chain(expected_output.map(|_| &output_sort))
-                        .zip(
-                            expected_inputs
-                                .iter()
-                                .map(|arg| arg.sort)
-                                .chain(expected_output),
-                        )
+                        .zip(expected_inputs.iter().copied().chain(expected_output))
                     {
                         let expected = crate::builtin::import_sort(
                             &self.definitions.sorts,
@@ -2261,7 +2369,6 @@ impl Session {
                         kind: Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
                             value: Some(pb::primitive_value::Value::Unit(pb::Unit {})),
                         })),
-                        ..Default::default()
                     });
                     Some(pb::TableCell {
                         kind: Some(pb::table_cell::Kind::Term(term)),
@@ -2587,13 +2694,13 @@ impl ScheduleMeasurements {
                 ..
             } if self.failure.is_none() => {
                 self.failure = schedule.and_then(|schedule| {
-                    let (command, path) = sites.get(schedule.path)?;
+                    let (_, path) = sites.get(schedule.path)?;
                     let mut nested = location?.clone();
                     nested.path.extend(path);
                     nested
                         .iterations
                         .extend(schedule.iterations.iter().map(|i| *i as u64));
-                    Some((nested, command.span))
+                    Some((nested, ast::Span::Panic))
                 });
             }
             _ => (),
@@ -2616,15 +2723,16 @@ fn lower_native_observation<'a>(
     context: &RequestOccurrences,
     sites: &mut ScheduleSites<'a>,
 ) -> Result<Vec<Command>, PreparationError> {
-    let span = native_span(program, command.span.as_ref(), &context.native_spans)?;
+    let authored_origins = context.authored_origins.command(command);
+    let span = authored_span(None, &authored_origins);
     Ok(match command.kind.as_ref().ok_or("missing command kind")? {
         pb::command::Kind::Run(_) => vec![Command::RunSchedule(Session::lower_run(
-            program, command, context, sites,
+            command, context, sites,
         )?)],
         pb::command::Kind::Check(check) => {
             vec![Command::Check(
                 span,
-                facts(program, &check.facts, &context.native_spans, None, |name| {
+                facts(program, &check.facts, &authored_origins, None, |name| {
                     graph.authoring_type_info().is_global(name)
                         || graph.get_sort_by_name(name).is_some()
                         || graph.authoring_type_info().get_func_type(name).is_some()
@@ -2812,6 +2920,7 @@ impl ControlContext for WireSchedule<'_, '_> {
         path: &[usize],
         iterations: &[u64],
     ) -> Result<ControlReport, egglog::Error> {
+        let authored_origins = self.context.authored_origins.command(node);
         if self.stream.cancelled {
             return Err(egglog::Error::BackendError("execution cancelled".into()));
         }
@@ -2820,14 +2929,7 @@ impl ControlContext for WireSchedule<'_, '_> {
             let mut anchor = node;
             let mut fail_spans = vec![];
             while let Some(pb::command::Kind::Fail(child)) = &anchor.kind {
-                fail_spans.push(
-                    native_span(
-                        self.program,
-                        anchor.span.as_ref(),
-                        &self.context.native_spans,
-                    )
-                    .expect("validated span"),
-                );
+                fail_spans.push(authored_span(None, &authored_origins));
                 anchor = child;
             }
             let previous = std::mem::take(&mut self.measurements.borrow_mut().changed);
@@ -2871,7 +2973,10 @@ impl ControlContext for WireSchedule<'_, '_> {
             self.partial.report.union(partial.report.clone());
             self.partial.resource_limited |= partial.resource_limited;
             if result.is_err() && self.measurements.borrow().failure.is_none() {
-                self.measurements.borrow_mut().failure = Some((location, node.span));
+                self.measurements.borrow_mut().failure = Some((
+                    location,
+                    authored_span(None, &authored_origins.command(node)),
+                ));
             }
             if self.stream.cancelled {
                 return Err(egglog::Error::BackendError("execution cancelled".into()));
@@ -2975,11 +3080,13 @@ impl ControlContext for WireSchedule<'_, '_> {
                         &HashMap::new(),
                     );
                 },
-                &self.context.native_spans,
+                &authored_origins,
             );
             if result.is_err() {
-                self.measurements.borrow_mut().failure =
-                    Some((location, action.span.or(node.span)));
+                self.measurements.borrow_mut().failure = Some((
+                    location,
+                    authored_span(None, &authored_origins.action(action)),
+                ));
             }
             result?;
             let report = egglog_reports::RunReport {
@@ -2995,7 +3102,7 @@ impl ControlContext for WireSchedule<'_, '_> {
         }
         let mut sites = HashMap::new();
         let commands = if let Some(pb::command::Kind::Action(action)) = &node.kind {
-            lower_action(self.program, action, &self.context.native_spans)
+            lower_action(self.program, action, &authored_origins)
                 .expect("validated action")
                 .into_iter()
                 .map(Command::Action)
@@ -3031,10 +3138,7 @@ impl ControlContext for WireSchedule<'_, '_> {
             self.stream.flush(self.response)?;
         }
         if result.is_err() && self.measurements.borrow().failure.is_none() {
-            let span = match &node.kind {
-                Some(pb::command::Kind::Action(action)) => action.span.or(node.span),
-                _ => node.span,
-            };
+            let span = authored_span(None, &authored_origins.command(node));
             self.measurements.borrow_mut().failure = Some((location, span));
         }
         result?;
@@ -3054,6 +3158,7 @@ impl ControlContext for WireSchedule<'_, '_> {
         path: &[usize],
         iterations: &[u64],
     ) -> Result<bool, egglog::Error> {
+        let authored_origins = self.context.authored_origins.command(node);
         let until = match &node.kind {
             Some(pb::command::Kind::Loop(body)) => &body.until,
             _ => unreachable!(),
@@ -3062,28 +3167,21 @@ impl ControlContext for WireSchedule<'_, '_> {
             return Ok(false);
         }
         let location = self.location(path, iterations);
-        let conditions = facts(
-            self.program,
-            until,
-            &self.context.native_spans,
-            None,
-            |name| {
-                self.executor.graph.authoring_type_info().is_global(name)
-                    || self.executor.graph.get_sort_by_name(name).is_some()
-                    || self
-                        .executor
-                        .graph
-                        .authoring_type_info()
-                        .get_func_type(name)
-                        .is_some()
-                    || self.executor.graph.authoring_type_info().is_primitive(name)
-            },
-        )
+        let conditions = facts(self.program, until, &authored_origins, None, |name| {
+            self.executor.graph.authoring_type_info().is_global(name)
+                || self.executor.graph.get_sort_by_name(name).is_some()
+                || self
+                    .executor
+                    .graph
+                    .authoring_type_info()
+                    .get_func_type(name)
+                    .is_some()
+                || self.executor.graph.authoring_type_info().is_primitive(name)
+        })
         .expect("validated until")
         .0;
         let result = self.executor.graph.check_condition_observed(
-            native_span(self.program, node.span.as_ref(), &self.context.native_spans)
-                .expect("validated span"),
+            authored_span(None, &authored_origins),
             conditions,
             &mut |event| {
                 self.measurements.borrow_mut().observe(
@@ -3101,7 +3199,10 @@ impl ControlContext for WireSchedule<'_, '_> {
                 Ok(false)
             }
             Err(error) => {
-                self.measurements.borrow_mut().failure = Some((location, node.span));
+                self.measurements.borrow_mut().failure = Some((
+                    location,
+                    authored_span(None, &authored_origins.command(node)),
+                ));
                 Err(error)
             }
         }
@@ -3130,13 +3231,25 @@ struct NativeNames {
 
 // Keep reflected priority separate from private callable identity. Absence and
 // an explicit same-key default agree; even Public(key) remains an explicit alias.
-fn native_table_name(declaration: &pb::Declaration, key: &str) -> ast::TableName {
-    match &declaration.table_name {
-        Some(pb::declaration::TableName::PublicAlias(name)) => ast::TableName::Public(name.clone()),
-        Some(pb::declaration::TableName::DefaultName(name)) => {
-            ast::TableName::Default(name.clone())
-        }
-        None => ast::TableName::Default(key.to_owned()),
+fn native_table_name(declaration: Declaration<'_>, key: &str) -> ast::TableName {
+    macro_rules! table_name {
+        ($d:expr, $kind:ident) => {
+            match &$d.table_name {
+                Some(pb::$kind::TableName::PublicAlias(name)) => {
+                    ast::TableName::Public(name.clone())
+                }
+                Some(pb::$kind::TableName::DefaultName(name)) => {
+                    ast::TableName::Default(name.clone())
+                }
+                None => ast::TableName::Default(key.to_owned()),
+            }
+        };
+    }
+    match declaration {
+        Declaration::Constructor(d) => table_name!(d, constructor),
+        Declaration::Function(d) => table_name!(d, function),
+        Declaration::Relation(d) => table_name!(d, relation),
+        Declaration::UserDefinedPrimitive(_) => unreachable!("only tables have reflective names"),
     }
 }
 
@@ -3172,29 +3285,28 @@ fn project_names(
             names.sorts.insert(native_name("sort", name), name.clone());
         }
     }
-    for declaration in &definitions.declarations {
-        match &declaration.kind {
-            Some(pb::declaration::Kind::Constructor(f)) => {
+    for declaration in declarations(definitions) {
+        match declaration {
+            Declaration::Constructor(f) => {
                 names
                     .callables
                     .insert(native_name("call", &f.name), f.name.clone());
             }
-            Some(pb::declaration::Kind::Function(f)) => {
+            Declaration::Function(f) => {
                 names
                     .callables
                     .insert(native_name("call", &f.name), f.name.clone());
             }
-            Some(pb::declaration::Kind::Relation(r)) => {
+            Declaration::Relation(r) => {
                 names
                     .callables
                     .insert(native_name("call", &r.name), r.name.clone());
             }
-            Some(pb::declaration::Kind::UserDefinedPrimitive(p)) => {
+            Declaration::UserDefinedPrimitive(p) => {
                 names
                     .callables
                     .insert(native_name("call", &p.name), p.name.clone());
             }
-            _ => (),
         }
     }
     let project_call = |name: &mut String| {
@@ -3219,13 +3331,12 @@ fn map_callable_names(
     mut project_call: impl FnMut(&mut String),
     mut project_size: impl FnMut(&mut String),
 ) {
-    for declaration in &mut program.declarations {
-        match &mut declaration.kind {
-            Some(pb::declaration::Kind::Constructor(f)) => project_call(&mut f.name),
-            Some(pb::declaration::Kind::Function(f)) => project_call(&mut f.name),
-            Some(pb::declaration::Kind::Relation(r)) => project_call(&mut r.name),
-            Some(pb::declaration::Kind::UserDefinedPrimitive(p)) => project_call(&mut p.name),
-            _ => (),
+    for declaration in declarations_mut(program) {
+        match declaration {
+            DeclarationMut::Constructor(f) => project_call(&mut f.name),
+            DeclarationMut::Function(f) => project_call(&mut f.name),
+            DeclarationMut::Relation(r) => project_call(&mut r.name),
+            DeclarationMut::UserDefinedPrimitive(p) => project_call(&mut p.name),
         }
     }
     for node in &mut program.nodes {
@@ -3276,7 +3387,7 @@ fn map_callable_names(
     let rule_actions = rules
         .into_iter()
         .filter_map(|rule| match &mut rule.kind {
-            Some(pb::rule::Kind::Rule(body)) => Some(&mut body.head),
+            Some(pb::rule::Kind::Rule(body)) => Some(&mut body.actions),
             _ => None,
         })
         .flatten();
@@ -3421,24 +3532,20 @@ fn sort_name(sorts: &[pb::Sort], index: u32) -> Result<String, String> {
 fn stored_table_signature<'a>(
     definitions: &'a pb::Program,
     name: &str,
-) -> Result<(&'a [pb::Arg], Option<u32>), String> {
-    let (inputs, output) = definitions
-        .declarations
-        .iter()
-        .find_map(|declaration| match &declaration.kind {
-            Some(pb::declaration::Kind::Constructor(row)) if row.name == name => {
+) -> Result<(&'a [u32], Option<u32>), String> {
+    let (inputs, output) = declarations(definitions)
+        .find_map(|declaration| match declaration {
+            Declaration::Constructor(row) if row.name == name => {
                 Some((row.inputs.as_slice(), Some(row.output)))
             }
-            Some(pb::declaration::Kind::Function(row)) if row.name == name => {
+            Declaration::Function(row) if row.name == name => {
                 Some((row.inputs.as_slice(), Some(row.output)))
             }
-            Some(pb::declaration::Kind::Relation(row)) if row.name == name => {
-                Some((row.inputs.as_slice(), None))
-            }
+            Declaration::Relation(row) if row.name == name => Some((row.inputs.as_slice(), None)),
             _ => None,
         })
         .ok_or_else(|| format!("{name} is not a stored table"))?;
-    for sort in inputs.iter().map(|arg| arg.sort).chain(output) {
+    for sort in inputs.iter().copied().chain(output) {
         sort_name(&definitions.sorts, sort)?;
     }
     Ok((inputs, output))
@@ -3447,37 +3554,30 @@ fn stored_table_signature<'a>(
 // Declarations install before use. Named computed bodies need their native
 // callees registered first; cycles remain unsupported, never a retry/eval loop.
 fn declaration_order(program: &pb::Program, graph: &mut EGraph) -> Result<Vec<usize>, String> {
-    let mut order: Vec<_> = program
-        .declarations
-        .iter()
+    let mut order: Vec<_> = declarations(program)
         .enumerate()
         .filter(|(_, d)| {
             !matches!(
-                d.kind,
-                Some(
-                    pb::declaration::Kind::Function(_)
-                        | pb::declaration::Kind::UserDefinedPrimitive(_)
-                )
+                d,
+                Declaration::Function(_) | Declaration::UserDefinedPrimitive(_)
             )
         })
         .map(|(i, _)| i)
         .collect();
-    let names: HashMap<_, _> = program
-        .declarations
-        .iter()
+    let names: HashMap<_, _> = declarations(program)
         .enumerate()
-        .filter_map(|(i, d)| match &d.kind {
-            Some(pb::declaration::Kind::Function(f)) => Some((f.name.as_str(), i)),
-            Some(pb::declaration::Kind::UserDefinedPrimitive(p)) => Some((p.name.as_str(), i)),
+        .filter_map(|(i, d)| match d {
+            Declaration::Function(f) => Some((f.name.as_str(), i)),
+            Declaration::UserDefinedPrimitive(p) => Some((p.name.as_str(), i)),
             _ => None,
         })
         .collect();
     let mut pending = vec![];
     let mut installed = HashSet::new();
-    for (i, d) in program.declarations.iter().enumerate() {
-        let (name, body, primitive) = match &d.kind {
-            Some(pb::declaration::Kind::Function(f)) => (f.name.as_str(), f.merge, false),
-            Some(pb::declaration::Kind::UserDefinedPrimitive(p)) => (
+    for (i, d) in declarations(program).enumerate() {
+        let (name, body, primitive) = match d {
+            Declaration::Function(f) => (f.name.as_str(), f.merge, false),
+            Declaration::UserDefinedPrimitive(p) => (
                 p.name.as_str(),
                 Some(p.body.ok_or("missing primitive body")?),
                 true,
@@ -3511,8 +3611,8 @@ fn declaration_order(program: &pb::Program, graph: &mut EGraph) -> Result<Vec<us
                 Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
                     value: Some(pb::primitive_value::Value::PartialCall(call)),
                 })) => Some(call),
-                Some(pb::node::Kind::Union(_)) if primitive => {
-                    return Err("Union in primitive bodies is not supported yet".into());
+                Some(pb::node::Kind::Eq(_)) if primitive => {
+                    return Err("Eq in primitive bodies is not supported yet".into());
                 }
                 _ => None,
             };
@@ -3578,7 +3678,7 @@ fn primitive_command(
     program: &pb::Program,
     primitive: &pb::UserDefinedPrimitive,
     span: ast::Span,
-    native_spans: &NativeSpans,
+    authored_origins: &AuthoredOrigins,
 ) -> Result<Command, String> {
     let schema = signature(program, &primitive.inputs, primitive.output)?;
     let body = primitive.body.ok_or("missing primitive body")?;
@@ -3610,7 +3710,7 @@ fn primitive_command(
             Expr::Var(span.clone(), primitive.name.clone()),
             inputs,
             Expr::Var(span, schema.output),
-            expression(program, body, &mut HashSet::new(), native_spans)?,
+            expression(program, body, &mut HashSet::new(), authored_origins)?,
         ],
     ))
 }
@@ -3621,7 +3721,7 @@ fn materialize_sorts(
     program: &pb::Program,
     graph: &mut EGraph,
     known: &mut HashSet<String>,
-    native_spans: &NativeSpans,
+    authored_origins: &AuthoredOrigins,
 ) -> Result<Vec<(u32, Command)>, String> {
     fn visit(
         program: &pb::Program,
@@ -3630,7 +3730,7 @@ fn materialize_sorts(
         commands: &mut Vec<(u32, Command)>,
         seen: &mut HashSet<u32>,
         known: &mut HashSet<String>,
-        native_spans: &NativeSpans,
+        authored_origins: &AuthoredOrigins,
     ) -> Result<(), String> {
         if !seen.insert(index) {
             return Ok(());
@@ -3655,7 +3755,15 @@ fn materialize_sorts(
             _ => return Ok(()),
         };
         for child in &children {
-            visit(program, *child, graph, commands, seen, known, native_spans)?;
+            visit(
+                program,
+                *child,
+                graph,
+                commands,
+                seen,
+                known,
+                authored_origins,
+            )?;
         }
         if known.contains(&name) {
             return Ok(());
@@ -3692,11 +3800,7 @@ fn materialize_sorts(
                 .collect::<Result<_, _>>()?
         };
         let command = Command::Sort {
-            span: native_span(
-                program,
-                program.sorts[index as usize].span.as_ref(),
-                native_spans,
-            )?,
+            span: authored_span(None, authored_origins),
             name,
             presort_and_args: Some((presort.into(), args)),
             uf: None,
@@ -3721,7 +3825,7 @@ fn materialize_sorts(
             &mut commands,
             &mut seen,
             known,
-            native_spans,
+            authored_origins,
         )?;
     }
     Ok(commands)
@@ -3908,8 +4012,8 @@ fn lower_custom_values(
             .ok_or_else(|| format!("unknown custom value sort {name}"))?;
         validate_nullary_family(graph.type_info(), &program.sorts[node.sort_id as usize])?;
         let extension = extension.ok_or("custom value provider unavailable")?;
-        let (value, span) = (value.clone(), node.span);
-        let call = extension.lower_custom_value(graph, &native_sort, &value, span, program)?;
+        let value = value.clone();
+        let call = extension.lower_custom_value(graph, &native_sort, &value, program)?;
         program.nodes[index].kind = Some(pb::node::Kind::Call(call));
     }
     Ok(())
@@ -3918,8 +4022,7 @@ fn lower_custom_values(
 // The native container constructors intern these ordered payloads.
 // Validate contents first; the resulting calls are internal compatibility code,
 // never a claim that the wire value payload was a symbolic authored Call.
-fn lower_container_values(program: &mut pb::Program) -> Result<Vec<u32>, String> {
-    let sites: Vec<_> = (0..program.sorts.len() as u32).collect();
+fn lower_container_values(program: &mut pb::Program) -> Result<(), String> {
     let mut replacements = vec![];
     for (index, node) in program.nodes.iter().enumerate() {
         if let Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue { value: Some(value) })) =
@@ -4028,7 +4131,7 @@ fn lower_container_values(program: &mut pb::Program) -> Result<Vec<u32>, String>
             args,
         }));
     }
-    Ok(sites)
+    Ok(())
 }
 
 fn node_sort(program: &pb::Program, index: u32) -> Result<String, String> {
@@ -4039,58 +4142,23 @@ fn node_sort(program: &pb::Program, index: u32) -> Result<String, String> {
     sort_name(&program.sorts, node.sort_id)
 }
 
-fn native_span(
-    program: &pb::Program,
-    span: Option<&pb::Span>,
-    native_spans: &NativeSpans,
-) -> Result<ast::Span, String> {
-    let Some(span) = span else {
-        return Ok(span!());
+fn authored_span(node: Option<u32>, origins: &AuthoredOrigins) -> ast::Span {
+    let Some(owner) = &origins.owner else {
+        return span!();
     };
-    let file = program
-        .files
-        .get(span.file as usize)
-        .ok_or("span file out of bounds")?;
-    if span.start > span.end {
-        return Err("span start exceeds end".into());
-    }
-    if let Some(contents) = &file.contents {
-        if !contents.is_char_boundary(span.start as usize)
-            || !contents.is_char_boundary(span.end as usize)
-        {
-            return Err("span must lie within UTF-8 character boundaries".into());
-        }
-        // Each table belongs to one append-only file arena, never a session.
-        let mut files = native_spans.0.borrow_mut();
-        if files.len() < program.files.len() {
-            files.resize_with(program.files.len(), || None);
-        }
-        let file = Arc::clone(files[span.file as usize].get_or_insert_with(|| {
-            Arc::new(SrcFile {
-                name: Some(file.name.clone()),
-                contents: contents.clone(),
-            })
-        }));
-        drop(files);
-        return Ok(ast::Span::Egglog(Arc::new(EgglogSpan {
-            file,
-            i: span.start as usize,
-            j: span.end as usize,
-        })));
-    }
-    // No source contents means no safe native excerpt; the protobuf locator is
-    // still preserved independently in the error response.
-    Ok(span!())
+    ast::Span::External(Arc::new(ExternalSpan(Arc::new(AuthoredSite {
+        context: owner.context.clone(),
+        site: pb::ErrorSite {
+            path: origins.path.clone(),
+            node_id: node.and_then(|node| owner.nodes.get(&node).copied()),
+        },
+    }))))
 }
 
-fn signature(
-    program: &pb::Program,
-    inputs: &[pb::Arg],
-    output: u32,
-) -> Result<ast::Schema, String> {
+fn signature(program: &pb::Program, inputs: &[u32], output: u32) -> Result<ast::Schema, String> {
     let input = inputs
         .iter()
-        .map(|argument| sort_name(&program.sorts, argument.sort))
+        .map(|argument| sort_name(&program.sorts, *argument))
         .collect::<Result<_, _>>()?;
     Ok(ast::Schema {
         input,
@@ -4098,7 +4166,7 @@ fn signature(
     })
 }
 
-// Runtime Let initializers remain in the enclosing command-list Union frame.
+// Runtime Let initializers remain in the enclosing command-list Eq frame.
 // Only this ephemeral program receives private Sets; canonical/history IR keeps Let.
 fn lower_binding_writes(program: &mut pb::Program) -> Result<(), String> {
     let mut commands: Vec<_> = program.commands.iter_mut().collect();
@@ -4129,7 +4197,6 @@ fn lower_binding_writes(program: &mut pb::Program) -> Result<(), String> {
                     }),
                     value: Some(value),
                 })),
-                span: command.span,
             }));
             continue;
         }
@@ -4146,11 +4213,11 @@ fn expression(
     program: &pb::Program,
     index: u32,
     visiting: &mut HashSet<u32>,
-    native_spans: &NativeSpans,
+    authored_origins: &AuthoredOrigins,
 ) -> Result<Expr, String> {
     // Remaining tree-only contexts bound expansion here. Action/query graph
     // planners use this adapter only for fixed-size literal payloads.
-    lower_expression(program, index, visiting, &mut 65_536, native_spans)
+    lower_expression(program, index, visiting, &mut 65_536, authored_origins)
 }
 
 fn lower_expression(
@@ -4158,7 +4225,7 @@ fn lower_expression(
     index: u32,
     visiting: &mut HashSet<u32>,
     remaining: &mut usize,
-    native_spans: &NativeSpans,
+    authored_origins: &AuthoredOrigins,
 ) -> Result<Expr, String> {
     *remaining = remaining
         .checked_sub(1)
@@ -4174,7 +4241,7 @@ fn lower_expression(
         .get(index as usize)
         .ok_or("node index out of bounds")?;
     let sort = node_sort(program, index)?;
-    let span = native_span(program, node.span.as_ref(), native_spans)?;
+    let span = authored_span(Some(index), authored_origins);
     let result = match node.kind.as_ref().ok_or("missing node kind")? {
         pb::node::Kind::Var(name) if !name.is_empty() => Expr::Var(span, name.clone()),
         pb::node::Kind::Binding(name) => Expr::Call(span, native_name("binding", name), vec![]),
@@ -4186,7 +4253,7 @@ fn lower_expression(
                 call.args
                     .iter()
                     .map(|argument| {
-                        lower_expression(program, *argument, visiting, remaining, native_spans)
+                        lower_expression(program, *argument, visiting, remaining, authored_origins)
                     })
                     .collect::<Result<_, _>>()?,
             )
@@ -4197,7 +4264,7 @@ fn lower_expression(
             call.args
                 .iter()
                 .map(|argument| {
-                    lower_expression(program, *argument, visiting, remaining, native_spans)
+                    lower_expression(program, *argument, visiting, remaining, authored_origins)
                 })
                 .collect::<Result<_, _>>()?,
         ),
@@ -4207,7 +4274,7 @@ fn lower_expression(
             call.args
                 .iter()
                 .map(|argument| {
-                    lower_expression(program, *argument, visiting, remaining, native_spans)
+                    lower_expression(program, *argument, visiting, remaining, authored_origins)
                 })
                 .collect::<Result<_, _>>()?,
         ),
@@ -4230,7 +4297,7 @@ fn lower_expression(
                     *argument,
                     visiting,
                     remaining,
-                    native_spans,
+                    authored_origins,
                 )?);
             }
             Expr::Call(
@@ -4252,14 +4319,14 @@ fn lower_expression(
 fn facts(
     program: &pb::Program,
     indices: &[u32],
-    native_spans: &NativeSpans,
+    authored_origins: &AuthoredOrigins,
     capture: Option<u32>,
     mut occupied: impl FnMut(&str) -> bool,
 ) -> Result<(Vec<Fact>, HashMap<u32, Expr>), String> {
     // Query references are logical binders, not evaluated action locals. A
     // first pass classifies value edges so a standalone relation predicate is
     // never bound as a value of its private native row sort. The second pass
-    // emits each node once, with shallow edges, even across Union backedges.
+    // emits each node once, with shallow edges, even across Eq backedges.
     let roots: HashSet<_> = indices.iter().copied().collect();
     let mut pending: Vec<_> = indices.iter().rev().copied().collect();
     if let Some(index) = capture {
@@ -4288,9 +4355,9 @@ fn facts(
             | pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
                 value: Some(pb::primitive_value::Value::PartialCall(call)),
             }) => &call.args,
-            pb::node::Kind::Union(union) => {
+            pb::node::Kind::Eq(union) => {
                 if union.members.is_empty() {
-                    return Err("empty query Union is invalid".into());
+                    return Err("empty query Eq is invalid".into());
                 }
                 values.insert(index);
                 &union.members
@@ -4315,7 +4382,7 @@ fn facts(
     let mut references = HashMap::new();
     for &index in &order {
         let node = &program.nodes[index as usize];
-        let span = native_span(program, node.span.as_ref(), native_spans)?;
+        let span = authored_span(Some(index), authored_origins);
         if let Some(pb::node::Kind::Var(name)) = &node.kind {
             // Rename at this use, never in the arena: the same Var may be a
             // deferred merge's special `old`/`new` in another binder.
@@ -4340,13 +4407,13 @@ fn facts(
                 | pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
                     value: Some(pb::primitive_value::Value::PartialCall(call)),
                 }) => &call.args,
-                pb::node::Kind::Union(union) => &union.members,
+                pb::node::Kind::Eq(union) => &union.members,
                 _ => continue,
             };
             pending.extend(children.iter().rev().map(|child| (*child, false)));
             continue;
         }
-        let span = native_span(program, node.span.as_ref(), native_spans)?;
+        let span = authored_span(Some(index), authored_origins);
         let value = match node.kind.as_ref().unwrap() {
             pb::node::Kind::Apply(apply) => {
                 let call = native_apply(program, node, apply)?;
@@ -4359,7 +4426,7 @@ fn facts(
                         .collect(),
                 )
             }
-            pb::node::Kind::Union(union) => {
+            pb::node::Kind::Eq(union) => {
                 let value = references[&index].clone();
                 for member in &union.members {
                     result.push(Fact::Eq(
@@ -4411,7 +4478,7 @@ fn facts(
                 // This adapter is fixed-size for a concrete payload, not a walk
                 // of graph children. Consume it into shallow definitions so a
                 // shared large String/exact value occurs only once in the AST.
-                let literal = expression(program, index, &mut HashSet::new(), native_spans)?;
+                let literal = expression(program, index, &mut HashSet::new(), authored_origins)?;
                 if let Some(target) = references.get(&index) {
                     enum Leaf {
                         Enter(Expr, Option<Expr>),
@@ -4466,15 +4533,13 @@ fn facts(
 // hidden row sort. Check positions before reconciliation/publication or any
 // effects. Every value edge is checked independently: memoizing a node after a
 // legal standalone use must not authorize its later use as a value. This also
-// leaves ordinary Union cycles to the existing identity-aware validator.
+// leaves ordinary Eq cycles to the existing identity-aware validator.
 fn validate_relation_uses(program: &pb::Program, saved: &pb::Program) -> Result<(), String> {
     use pb::{node::Kind as N, primitive_value::Value as V};
-    let relations: HashSet<_> = program
-        .declarations
-        .iter()
-        .chain(&saved.declarations)
-        .filter_map(|declaration| match &declaration.kind {
-            Some(pb::declaration::Kind::Relation(relation)) => Some(relation.name.as_str()),
+    let relations: HashSet<_> = declarations(program)
+        .chain(declarations(saved))
+        .filter_map(|declaration| match declaration {
+            Declaration::Relation(relation) => Some(relation.name.as_str()),
             _ => None,
         })
         .collect();
@@ -4514,7 +4579,7 @@ fn validate_relation_uses(program: &pb::Program, saved: &pb::Program) -> Result<
                     value(*arg)?;
                 }
             }
-            Some(N::Union(union)) => {
+            Some(N::Eq(union)) => {
                 for member in &union.members {
                     value(*member)?;
                 }
@@ -4597,19 +4662,19 @@ fn validate_relation_uses(program: &pb::Program, saved: &pb::Program) -> Result<
         }
         Ok(())
     };
-    for declaration in &program.declarations {
-        match &declaration.kind {
-            Some(pb::declaration::Kind::Function(function)) => {
+    for declaration in declarations(program) {
+        match declaration {
+            Declaration::Function(function) => {
                 if let Some(merge) = function.merge {
                     value(merge)?;
                 }
             }
-            Some(pb::declaration::Kind::UserDefinedPrimitive(primitive)) => {
+            Declaration::UserDefinedPrimitive(primitive) => {
                 if let Some(body) = primitive.body {
                     value(body)?;
                 }
             }
-            Some(pb::declaration::Kind::Constructor(constructor)) => {
+            Declaration::Constructor(constructor) => {
                 if let Some(cost) = constructor.cost {
                     value(cost)?;
                 }
@@ -4620,7 +4685,7 @@ fn validate_relation_uses(program: &pb::Program, saved: &pb::Program) -> Result<
     for rule in graph::rules(program) {
         match &rule.kind {
             Some(pb::rule::Kind::Rule(rule)) => {
-                for head in &rule.head {
+                for head in &rule.actions {
                     action(head)?;
                 }
             }
@@ -4656,13 +4721,15 @@ fn validate_relation_uses(program: &pb::Program, saved: &pb::Program) -> Result<
 }
 
 // Validate the entire arena, including unused entries, without interpreting it.
-// Removing Union outgoing edges must leave a DAG: every permitted cycle crosses
+// Removing Eq outgoing edges must leave a DAG: every permitted cycle crosses
 // an identity boundary. Value lowering still validates each actual use's context.
-fn validate_node_graph(program: &pb::Program, native_spans: &NativeSpans) -> Result<(), String> {
+fn validate_node_graph(
+    program: &pb::Program,
+    authored_origins: &AuthoredOrigins,
+) -> Result<(), String> {
     let mut edges = Vec::with_capacity(program.nodes.len());
     for (index, node) in program.nodes.iter().enumerate() {
         let sort = node_sort(program, index as u32)?;
-        native_span(program, node.span.as_ref(), native_spans)?;
         let children = match &node.kind {
             Some(pb::node::Kind::Call(call) | pb::node::Kind::GetCost(call)) => call.args.clone(),
             Some(pb::node::Kind::Apply(apply)) => native_apply(program, node, apply)?.args,
@@ -4677,24 +4744,24 @@ fn validate_node_graph(program: &pb::Program, native_spans: &NativeSpans) -> Res
                 }
                 call.args.clone()
             }
-            Some(pb::node::Kind::Union(union)) => {
+            Some(pb::node::Kind::Eq(union)) => {
                 if union.members.is_empty()
                     && !matches!(
                         program.sorts[node.sort_id as usize].kind,
                         Some(pb::sort::Kind::Eq(_))
                     )
                 {
-                    return Err("empty Union requires an equality sort".into());
+                    return Err("empty Eq requires an equality sort".into());
                 }
                 for member in &union.members {
                     if node_sort(program, *member)? != sort {
-                        return Err("Union member sort mismatch".into());
+                        return Err("Eq member sort mismatch".into());
                     }
                 }
                 vec![]
             }
             _ => {
-                expression(program, index as u32, &mut HashSet::new(), native_spans)?;
+                expression(program, index as u32, &mut HashSet::new(), authored_origins)?;
                 vec![]
             }
         };
@@ -4713,7 +4780,7 @@ fn validate_node_graph(program: &pb::Program, native_spans: &NativeSpans) -> Res
             }
             match state[index] {
                 2 => continue,
-                1 => return Err("cyclic expression must cross a Union boundary".into()),
+                1 => return Err("cyclic expression must cross an Eq boundary".into()),
                 _ => (),
             }
             state[index] = 1;
@@ -4729,7 +4796,7 @@ fn validate_node_graph(program: &pb::Program, native_spans: &NativeSpans) -> Res
     Ok(())
 }
 
-// Each evaluated action owns an ordinary value memo. Union identity frames are
+// Each evaluated action owns an ordinary value memo. Eq identity frames are
 // classified separately and can outlive this one action.
 fn classify_action_dags(program: &pb::Program) -> Result<HashMap<Vec<u32>, HashSet<u32>>, String> {
     let mut candidates = vec![];
@@ -4752,7 +4819,7 @@ fn classify_value_dags<K: Eq + std::hash::Hash>(
                 .nodes
                 .get(*index as usize)
                 .ok_or("action node out of bounds")?;
-            matches!(&node.kind, Some(pb::node::Kind::Union(union)) if union.members.len() == 2)
+            matches!(&node.kind, Some(pb::node::Kind::Eq(union)) if union.members.len() == 2)
                 .then_some(*index)
         } else {
             None
@@ -4782,7 +4849,7 @@ fn classify_value_dags<K: Eq + std::hash::Hash>(
                     pending.extend(apply.function.iter().chain(&apply.args));
                     continue;
                 }
-                pb::node::Kind::Union(union) if root_union == Some(index) => &union.members[..],
+                pb::node::Kind::Eq(union) if root_union == Some(index) => &union.members[..],
                 pb::node::Kind::Var(_) | pb::node::Kind::Binding(_) => &[],
                 pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
                     value:
@@ -4843,7 +4910,7 @@ fn action_roots(action: &pb::Action) -> Result<Vec<u32>, String> {
 // use must capture immediately if a later action reuses that same occurrence.
 // Rule heads retain their independent boundary; Fail is transparent and loop
 // bodies get a fresh evaluated-value frame on every iteration.
-fn classify_union_actions(
+fn classify_eq_actions(
     program: &pb::Program,
     constructor_targets: &HashSet<String>,
     constructor_costs: bool,
@@ -4869,12 +4936,12 @@ fn classify_union_actions(
                 .kind
                 .as_ref()
             {
-                Some(pb::node::Kind::Union(union)) => {
+                Some(pb::node::Kind::Eq(union)) => {
                     if !matches!(
                         program.sorts[program.nodes[index as usize].sort_id as usize].kind,
                         Some(pb::sort::Kind::Eq(_))
                     ) {
-                        return Err("action Union requires an equality sort".into());
+                        return Err("action Eq requires an equality sort".into());
                     }
                     unions.insert(index);
                     pending.extend(&union.members);
@@ -4910,7 +4977,7 @@ fn classify_union_actions(
             || reached.iter().any(|union| uses[union] > 1)
             || !matches!(&action.kind, Some(pb::action::Kind::Term(index))
                 if reached.len() == 1 && matches!(&program.nodes[*index as usize].kind,
-                    Some(pb::node::Kind::Union(union)) if union.members.len() == 2));
+                    Some(pb::node::Kind::Eq(union)) if union.members.len() == 2));
         if generalized {
             check_variables(program, &action_roots(action)?, &mut HashMap::new(), false)?;
             scoped.insert(path);
@@ -4921,7 +4988,7 @@ fn classify_union_actions(
 
 // Source rendering and rule heads still use the legacy binary-action lowering;
 // they cannot borrow a direct request's captured native identity frame.
-fn validate_legacy_union_scope<'a>(
+fn validate_legacy_eq_scope<'a>(
     program: &pb::Program,
     actions: impl IntoIterator<Item = &'a pb::Action>,
 ) -> Result<(), String> {
@@ -4932,16 +4999,16 @@ fn validate_legacy_union_scope<'a>(
                 .nodes
                 .get(*index as usize)
                 .ok_or("action node out of bounds")?;
-            if matches!(node.kind, Some(pb::node::Kind::Union(_))) && !seen.insert(*index) {
-                return Err("repeated action Union occurrence requires identity retention, which is not supported yet".into());
+            if matches!(node.kind, Some(pb::node::Kind::Eq(_))) && !seen.insert(*index) {
+                return Err("repeated action Eq occurrence requires identity retention, which is not supported yet".into());
             }
         }
     }
     Ok(())
 }
 
-fn validate_union_occurrences(program: &pb::Program) -> Result<(), String> {
-    validate_legacy_union_scope(
+fn validate_eq_occurrences(program: &pb::Program) -> Result<(), String> {
+    validate_legacy_eq_scope(
         program,
         command_tree(&program.commands).filter_map(|command| match &command.kind {
             Some(pb::command::Kind::Action(action)) => Some(action),
@@ -4950,7 +5017,7 @@ fn validate_union_occurrences(program: &pb::Program) -> Result<(), String> {
     )?;
     for rule in graph::rules(program) {
         if let Some(pb::rule::Kind::Rule(rule)) = &rule.kind {
-            validate_legacy_union_scope(program, &rule.head)?;
+            validate_legacy_eq_scope(program, &rule.actions)?;
         }
     }
     Ok(())
@@ -4962,10 +5029,12 @@ fn action_dag_actions(
     program: &pb::Program,
     action: &pb::Action,
     mut occupied: impl FnMut(&str) -> bool,
-    native_spans: &NativeSpans,
+    authored_origins: &AuthoredOrigins,
     memo: &mut HashMap<u32, Expr>,
     next: &mut usize,
 ) -> Result<(Vec<Action>, Vec<u32>), String> {
+    let action_origins = authored_origins.action(action);
+    let authored_origins = &action_origins;
     enum Walk {
         Enter(u32),
         Call(u32, usize),
@@ -4973,24 +5042,24 @@ fn action_dag_actions(
     }
     let union = match &action.kind {
         Some(pb::action::Kind::Term(index)) => match &program.nodes[*index as usize].kind {
-            Some(pb::node::Kind::Union(union)) => {
+            Some(pb::node::Kind::Eq(union)) => {
                 if !matches!(
                     program.sorts[program.nodes[*index as usize].sort_id as usize].kind,
                     Some(pb::sort::Kind::Eq(_))
                 ) {
-                    return Err("action Union requires an equality sort".into());
+                    return Err("action Eq requires an equality sort".into());
                 }
                 if let Some(value) = memo.get(index) {
                     return Ok((
                         vec![Action::Expr(
-                            native_span(program, action.span.as_ref(), native_spans)?,
+                            authored_span(None, authored_origins),
                             value.clone(),
                         )],
                         vec![],
                     ));
                 }
                 if union.members.len() != 2 {
-                    return Err("rule/action Union currently requires exactly two members".into());
+                    return Err("rule/action Eq currently requires exactly two members".into());
                 }
                 Some((*index, union.members.clone()))
             }
@@ -5022,11 +5091,7 @@ fn action_dag_actions(
         );
     }
     let mut bind_value = |index: u32, value: Expr| -> Result<(String, Expr), String> {
-        let span = native_span(
-            program,
-            program.nodes[index as usize].span.as_ref(),
-            native_spans,
-        )?;
+        let span = authored_span(Some(index), authored_origins);
         let name = loop {
             let candidate = format!("__egglog_proto_action_{next}");
             *next += 1;
@@ -5077,7 +5142,8 @@ fn action_dag_actions(
                                 | pb::primitive_value::Value::Rational(_),
                             ),
                     }) => {
-                        let value = expression(program, index, &mut HashSet::new(), native_spans)?;
+                        let value =
+                            expression(program, index, &mut HashSet::new(), authored_origins)?;
                         if matches!(value, Expr::Var(..)) {
                             memo.insert(index, value.clone());
                             results.push(value);
@@ -5105,7 +5171,7 @@ fn action_dag_actions(
                         args.insert(
                             0,
                             Expr::Lit(
-                                native_span(program, node.span.as_ref(), native_spans)?,
+                                authored_span(Some(index), authored_origins),
                                 Literal::String(call.func.clone()),
                             ),
                         );
@@ -5113,7 +5179,7 @@ fn action_dag_actions(
                     }
                     _ => unreachable!(),
                 };
-                let span = native_span(program, node.span.as_ref(), native_spans)?;
+                let span = authored_span(Some(index), authored_origins);
                 (index, Expr::Call(span, target, args))
             }
             Walk::CostTarget => {
@@ -5124,7 +5190,7 @@ fn action_dag_actions(
                 bind_value(
                     set.cost.unwrap(),
                     Expr::Call(
-                        native_span(program, action.span.as_ref(), native_spans)?,
+                        authored_span(None, authored_origins),
                         target.func.clone(),
                         results.clone(),
                     ),
@@ -5136,7 +5202,7 @@ fn action_dag_actions(
         memo.insert(index, value.clone());
         results.push(value);
     }
-    let span = native_span(program, action.span.as_ref(), native_spans)?;
+    let span = authored_span(None, authored_origins);
     actions.push(match action.kind.as_ref().unwrap() {
         pb::action::Kind::Term(_) => {
             if let Some((index, _)) = union {
@@ -5189,7 +5255,7 @@ fn eval_extract_root(
     index: u32,
     dag: Option<&HashSet<u32>>,
     execute: bool,
-    native_spans: &NativeSpans,
+    authored_origins: &AuthoredOrigins,
 ) -> Result<Option<(ArcSort, Value)>, egglog::Error> {
     let error = egglog::Error::BackendError;
     let sort_name = node_sort(program, index).map_err(error)?;
@@ -5198,7 +5264,8 @@ fn eval_extract_root(
         .cloned()
         .ok_or_else(|| error(format!("unknown extraction root sort {sort_name}")))?;
     if dag.is_none() {
-        let expr = expression(program, index, &mut HashSet::new(), native_spans).map_err(error)?;
+        let expr =
+            expression(program, index, &mut HashSet::new(), authored_origins).map_err(error)?;
         if execute {
             return graph.eval_expr(&expr).map(Some);
         }
@@ -5207,7 +5274,6 @@ fn eval_extract_root(
     }
     let action = pb::Action {
         kind: Some(pb::action::Kind::Term(index)),
-        span: program.nodes[index as usize].span,
     };
     let mut next = 0;
     let (mut actions, _) = action_dag_actions(
@@ -5219,7 +5285,7 @@ fn eval_extract_root(
                 || graph.type_info().get_func_type(name).is_some()
                 || graph.type_info().is_primitive(name)
         },
-        native_spans,
+        authored_origins,
         &mut HashMap::new(),
         &mut next,
     )
@@ -5255,7 +5321,7 @@ fn eval_extract_root(
     Ok(execute.then(|| (sort, captured.pop().expect("executed root capture").1)))
 }
 
-// Only Union locations are retained across direct commands. Ordinary results
+// Only Eq locations are retained across direct commands. Ordinary results
 // share first-demand locals inside this action, in one native action boundary.
 #[allow(clippy::too_many_arguments)]
 fn eval_scoped_action(
@@ -5266,8 +5332,10 @@ fn eval_scoped_action(
     execute: bool,
     dag: Option<&HashSet<u32>>,
     observer: &mut dyn FnMut(ExecutionEvent<'_>),
-    native_spans: &NativeSpans,
+    authored_origins: &AuthoredOrigins,
 ) -> Result<(), egglog::Error> {
+    let action_origins = authored_origins.action(action);
+    let authored_origins = &action_origins;
     if dag.is_some() {
         let (actions, _) = action_dag_actions(
             program,
@@ -5278,14 +5346,13 @@ fn eval_scoped_action(
                     || graph.type_info().get_func_type(name).is_some()
                     || graph.type_info().is_primitive(name)
             },
-            native_spans,
+            authored_origins,
             &mut HashMap::new(),
             &mut 0,
         )
         .map_err(egglog::Error::BackendError)?;
         let command = Command::ActionScope(
-            native_span(program, action.span.as_ref(), native_spans)
-                .map_err(egglog::Error::BackendError)?,
+            authored_span(None, authored_origins),
             ast::GenericActions(actions),
         );
         return if execute {
@@ -5324,9 +5391,9 @@ fn eval_scoped_action(
             continue;
         }
         let children = match program.nodes[index as usize].kind.as_ref().unwrap() {
-            pb::node::Kind::Union(union) => {
+            pb::node::Kind::Eq(union) => {
                 if let Some(value) = values.get(&index) {
-                    let name = format!("__egglog_proto_union_{index}");
+                    let name = format!("__egglog_proto_eq_{index}");
                     inputs.push((
                         name.clone(),
                         node_sort(program, index).map_err(error)?,
@@ -5377,23 +5444,22 @@ fn eval_scoped_action(
             match step {
                 Walk::Enter(index) => {
                     let node = &program.nodes[index as usize];
-                    let span =
-                        native_span(program, node.span.as_ref(), native_spans).map_err(error)?;
+                    let span = authored_span(Some(index), authored_origins);
                     if let Some(value) = memo.get(&index) {
                         results.push(value.clone());
                         continue;
                     }
                     match node.kind.as_ref().expect("validated node") {
-                        pb::node::Kind::Union(union) => {
+                        pb::node::Kind::Eq(union) => {
                             if !matches!(
                                 program.sorts[node.sort_id as usize].kind,
                                 Some(pb::sort::Kind::Eq(_))
                             ) {
-                                return Err(error("action Union requires an equality sort".into()));
+                                return Err(error("action Eq requires an equality sort".into()));
                             }
                             let first_use = match slots.entry(index) {
                                 std::collections::hash_map::Entry::Vacant(entry) => {
-                                    entry.insert(format!("__egglog_proto_union_{index}"));
+                                    entry.insert(format!("__egglog_proto_eq_{index}"));
                                     true
                                 }
                                 std::collections::hash_map::Entry::Occupied(_) => false,
@@ -5434,7 +5500,7 @@ fn eval_scoped_action(
                         }
                         _ => {
                             let value =
-                                expression(program, index, &mut HashSet::new(), native_spans)
+                                expression(program, index, &mut HashSet::new(), authored_origins)
                                     .map_err(error)?;
                             if matches!(value, Expr::Var(..)) {
                                 memo.insert(index, value.clone());
@@ -5452,8 +5518,7 @@ fn eval_scoped_action(
                 }
                 Walk::Call(index, arity) => {
                     let node = &program.nodes[index as usize];
-                    let span =
-                        native_span(program, node.span.as_ref(), native_spans).map_err(error)?;
+                    let span = authored_span(Some(index), authored_origins);
                     let mut args = results.split_off(results.len() - arity);
                     let function = match node.kind.as_ref().unwrap() {
                         pb::node::Kind::Call(call) => call.func.clone(),
@@ -5486,11 +5551,10 @@ fn eval_scoped_action(
                 }
                 Walk::Member(index, position) => {
                     let node = &program.nodes[index as usize];
-                    let pb::node::Kind::Union(union) = node.kind.as_ref().unwrap() else {
+                    let pb::node::Kind::Eq(union) = node.kind.as_ref().unwrap() else {
                         unreachable!()
                     };
-                    let span =
-                        native_span(program, node.span.as_ref(), native_spans).map_err(error)?;
+                    let span = authored_span(Some(index), authored_origins);
                     let value = results.pop().unwrap();
                     if materialized.insert(index) {
                         builder.action(Action::Let(span.clone(), slots[&index].clone(), value))?;
@@ -5516,10 +5580,9 @@ fn eval_scoped_action(
                         unreachable!()
                     };
                     builder.action(Action::Expr(
-                        native_span(program, action.span.as_ref(), native_spans).map_err(error)?,
+                        authored_span(None, authored_origins),
                         Expr::Call(
-                            native_span(program, action.span.as_ref(), native_spans)
-                                .map_err(error)?,
+                            authored_span(None, authored_origins),
                             set.target.as_ref().unwrap().func.clone(),
                             results.clone(),
                         ),
@@ -5527,7 +5590,7 @@ fn eval_scoped_action(
                 }
             }
         }
-        let span = native_span(program, action.span.as_ref(), native_spans).map_err(error)?;
+        let span = authored_span(None, authored_origins);
         let action = match action.kind.as_ref().unwrap() {
             pb::action::Kind::Term(_) => Action::Expr(span, results.pop().unwrap()),
             pb::action::Kind::Set(set) => {
@@ -5598,18 +5661,20 @@ fn eval_scoped_action(
 fn lower_action(
     program: &pb::Program,
     action: &pb::Action,
-    native_spans: &NativeSpans,
+    authored_origins: &AuthoredOrigins,
 ) -> Result<Vec<Action>, String> {
-    let span = native_span(program, action.span.as_ref(), native_spans)?;
+    let action_origins = authored_origins.action(action);
+    let authored_origins = &action_origins;
+    let span = authored_span(None, authored_origins);
     let lowered = match action.kind.as_ref().ok_or("missing action kind")? {
         pb::action::Kind::Term(index) => {
             let node = program
                 .nodes
                 .get(*index as usize)
                 .ok_or("action node out of bounds")?;
-            if let Some(pb::node::Kind::Union(union)) = &node.kind {
+            if let Some(pb::node::Kind::Eq(union)) = &node.kind {
                 let [lhs, rhs] = union.members.as_slice() else {
-                    return Err("action Union currently requires exactly two members".into());
+                    return Err("action Eq currently requires exactly two members".into());
                 };
                 if !matches!(
                     program
@@ -5618,22 +5683,22 @@ fn lower_action(
                         .and_then(|sort| sort.kind.as_ref()),
                     Some(pb::sort::Kind::Eq(_))
                 ) {
-                    return Err("action Union requires an equality sort".into());
+                    return Err("action Eq requires an equality sort".into());
                 }
                 for member in [lhs, rhs] {
                     if node_sort(program, *member)? != node_sort(program, *index)? {
-                        return Err("Union member sort mismatch".into());
+                        return Err("Eq member sort mismatch".into());
                     }
                 }
                 Action::Union(
                     span,
-                    expression(program, *lhs, &mut HashSet::new(), native_spans)?,
-                    expression(program, *rhs, &mut HashSet::new(), native_spans)?,
+                    expression(program, *lhs, &mut HashSet::new(), authored_origins)?,
+                    expression(program, *rhs, &mut HashSet::new(), authored_origins)?,
                 )
             } else {
                 Action::Expr(
                     span,
-                    expression(program, *index, &mut HashSet::new(), native_spans)?,
+                    expression(program, *index, &mut HashSet::new(), authored_origins)?,
                 )
             }
         }
@@ -5645,13 +5710,13 @@ fn lower_action(
                 target
                     .args
                     .iter()
-                    .map(|index| expression(program, *index, &mut HashSet::new(), native_spans))
+                    .map(|index| expression(program, *index, &mut HashSet::new(), authored_origins))
                     .collect::<Result<_, _>>()?,
                 expression(
                     program,
                     set.value.ok_or("missing set value")?,
                     &mut HashSet::new(),
-                    native_spans,
+                    authored_origins,
                 )?,
             )
         }
@@ -5665,7 +5730,7 @@ fn lower_action(
             call.func.clone(),
             call.args
                 .iter()
-                .map(|index| expression(program, *index, &mut HashSet::new(), native_spans))
+                .map(|index| expression(program, *index, &mut HashSet::new(), authored_origins))
                 .collect::<Result<_, _>>()?,
         ),
         pb::action::Kind::Panic(message) => Action::Panic(span, message.clone()),
@@ -5777,7 +5842,7 @@ fn lower_rule(
     rule: &pb::Rule,
     ruleset: &str,
     name: &str,
-    native_spans: &NativeSpans,
+    authored_origins: &AuthoredOrigins,
     mut occupied: impl FnMut(&str) -> bool,
 ) -> Result<Vec<Command>, String> {
     if rule.name.as_ref().is_some_and(String::is_empty) {
@@ -5789,7 +5854,7 @@ fn lower_rule(
         Ok(pb::RuleEvalMode::UnsafeSeminaive) => ast::RuleEvalMode::UnsafeSeminaive,
         _ => return Err(format!("invalid rule evaluation mode {}", rule.eval_mode)),
     };
-    let span = native_span(program, rule.span.as_ref(), native_spans)?;
+    let span = authored_span(None, authored_origins);
     match rule.kind.as_ref().ok_or("missing rule kind")? {
         kind @ (pb::rule::Kind::Rewrite(_) | pb::rule::Kind::Birewrite(_)) => {
             // Native rewrite commands have no option fields. Keep this
@@ -5833,14 +5898,13 @@ fn lower_rule(
                 check_variables(program, conditions, &mut bindings, true)?;
                 let action = pb::Action {
                     kind: Some(pb::action::Kind::Term(rhs)),
-                    span: rule.span,
                 };
                 let mut memo = HashMap::new();
                 let (mut head, _) = action_dag_actions(
                     program,
                     &action,
                     |name| bindings.contains_key(name),
-                    native_spans,
+                    authored_origins,
                     &mut memo,
                     &mut 0,
                 )?;
@@ -5860,7 +5924,7 @@ fn lower_rule(
                 let (body, references) = facts(
                     program,
                     &query_roots,
-                    native_spans,
+                    authored_origins,
                     Some(query),
                     &mut occupied,
                 )?;
@@ -5906,7 +5970,7 @@ fn lower_rule(
             let mut bindings = HashMap::new();
             check_variables(program, &body.query, &mut bindings, true)?;
             let roots = body
-                .head
+                .actions
                 .iter()
                 .map(action_roots)
                 .collect::<Result<Vec<_>, _>>()?
@@ -5917,12 +5981,15 @@ fn lower_rule(
             let mut head = Vec::new();
             let mut memo = HashMap::new();
             let mut next = 0;
-            for action in &body.head {
+            for (index, action) in body.actions.iter().enumerate() {
+                let mut action_origins = authored_origins.clone();
+                action_origins.path.extend([1, 3, index as u32]);
+                let authored_origins = &action_origins;
                 let (actions, _) = action_dag_actions(
                     program,
                     action,
                     |name| bindings.contains_key(name),
-                    native_spans,
+                    authored_origins,
                     &mut memo,
                     &mut next,
                 )?;
@@ -5936,7 +6003,7 @@ fn lower_rule(
                 rule: ast::Rule {
                     span,
                     head: ast::GenericActions(head),
-                    body: facts(program, &body.query, native_spans, None, &mut occupied)?.0,
+                    body: facts(program, &body.query, authored_origins, None, &mut occupied)?.0,
                     name: name.into(),
                     ruleset: ruleset.into(),
                     eval_mode,
@@ -5987,7 +6054,7 @@ fn check_variables(
             pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
                 value: Some(pb::primitive_value::Value::PartialCall(call)),
             }) => pending.extend(&call.args),
-            pb::node::Kind::Union(union) => pending.extend(&union.members),
+            pb::node::Kind::Eq(union) => pending.extend(&union.members),
             pb::node::Kind::Binding(_) | pb::node::Kind::PrimitiveValue(_) => (),
         }
     }
@@ -6120,7 +6187,6 @@ fn encode_term(
     let node = pb::Node {
         sort_id,
         kind: Some(kind),
-        ..Default::default()
     };
     if let Some(index) = encoded.get(&node) {
         return Ok(*index);
@@ -6264,14 +6330,11 @@ mod tests {
             pb::action::Kind::Panic("logical".into()),
         ]
         .into_iter()
-        .map(|kind| pb::Action {
-            kind: Some(kind),
-            ..Default::default()
-        })
+        .map(|kind| pb::Action { kind: Some(kind) })
         .collect();
         let rule = pb::Rule {
             kind: Some(pb::rule::Kind::Rule(pb::RuleBody {
-                head: actions.clone(),
+                actions: actions.clone(),
                 ..Default::default()
             })),
             ..Default::default()
@@ -6280,7 +6343,6 @@ mod tests {
             .into_iter()
             .map(|action| pb::Command {
                 kind: Some(pb::command::Kind::Action(action)),
-                ..Default::default()
             })
             .collect();
         body.push(pb::Command {
@@ -6293,9 +6355,7 @@ mod tests {
                     }],
                     ..Default::default()
                 })),
-                ..Default::default()
             }))),
-            ..Default::default()
         });
         let mut program = pb::Program {
             rulesets: vec![pb::RulesetBinding {
@@ -6307,7 +6367,6 @@ mod tests {
                     body,
                     ..Default::default()
                 })),
-                ..Default::default()
             }],
             ..Default::default()
         };
@@ -6331,162 +6390,12 @@ mod tests {
                 panic!("rule body")
             };
             assert!(
-                matches!(&body.head[4].kind, Some(pb::action::Kind::Panic(message)) if message == "logical")
+                matches!(&body.actions[4].kind, Some(pb::action::Kind::Panic(message)) if message == "logical")
             );
         }
         assert!(action_sites(&program.commands).any(|(_, action)| {
             matches!(&action.kind, Some(pb::action::Kind::Panic(message)) if message == "logical")
         }));
-    }
-
-    #[test]
-    fn native_spans_share_files_and_preserve_validation_boundaries() {
-        let mut program = pb::Program {
-            files: [
-                ("same.egg", Some("aλ")),
-                ("same.egg", Some("other")),
-                ("unused.egg", Some("unused")),
-                ("omitted.egg", None),
-                ("empty.egg", Some("")),
-            ]
-            .into_iter()
-            .map(|(name, contents)| pb::SourceFile {
-                name: name.into(),
-                contents: contents.map(str::to_owned),
-            })
-            .collect(),
-            ..Default::default()
-        };
-        let native_spans = NativeSpans::default();
-        for (file, start, end) in [
-            (99, 0, 0),
-            (0, 2, 0),
-            (0, 2, 3),
-            (0, 0, 2),
-            (0, 4, 4),
-            (3, 2, 1),
-            (4, 0, 1),
-        ] {
-            let span = pb::Span { file, start, end };
-            assert!(native_span(&program, Some(&span), &native_spans).is_err());
-        }
-        assert!(native_spans.0.borrow().is_empty());
-        let mut spans = vec![];
-        for (file, start, end) in [
-            (0, 0, 1),
-            (0, 1, 3),
-            (1, 0, 5),
-            (0, 3, 3),
-            (4, 0, 0),
-            (3, 100, 101),
-        ] {
-            let span = pb::Span { file, start, end };
-            spans.push(native_span(&program, Some(&span), &native_spans).unwrap());
-        }
-        let [
-            ast::Span::Egglog(first),
-            ast::Span::Egglog(second),
-            ast::Span::Egglog(other),
-            ..,
-        ] = spans.as_slice()
-        else {
-            panic!("contents-backed spans")
-        };
-        assert!(Arc::ptr_eq(&first.file, &second.file));
-        assert!(!Arc::ptr_eq(&first.file, &other.file));
-        assert_eq!(
-            spans[..5].iter().map(ast::Span::string).collect::<Vec<_>>(),
-            ["a", "λ", "other", "", ""]
-        );
-        assert!(matches!(&spans[5], ast::Span::Rust(_)));
-        assert!(matches!(
-            native_span(&program, None, &native_spans).unwrap(),
-            ast::Span::Rust(_)
-        ));
-        assert!(native_spans.0.borrow()[2].is_none());
-        assert!(native_spans.0.borrow()[3].is_none());
-        // Providers may append files without replacing the authored arena.
-        program.files.push(pb::SourceFile {
-            name: "helper.egg".into(),
-            contents: Some("helper".into()),
-        });
-        let helper_span = pb::Span {
-            file: 5,
-            start: 0,
-            end: 6,
-        };
-        assert_eq!(
-            native_span(&program, Some(&helper_span), &native_spans)
-                .unwrap()
-                .string(),
-            "helper"
-        );
-        assert!(Arc::ptr_eq(
-            native_spans.0.borrow()[0].as_ref().unwrap(),
-            &first.file
-        ));
-        drop(native_spans);
-        drop(program);
-        assert_eq!(spans[0].to_string(), "In 1:1-1 of same.egg: a");
-    }
-
-    #[test]
-    fn native_spans_follow_preparation_into_action_lowering_not_later_requests() {
-        let (engine, id) = host_default_engine();
-        let mut program = inventory_fixture("(datatype E (N i64)) (N 1)");
-        let prepared = engine.graphs[&id].prepare(&mut program).unwrap();
-        let file = prepared.context.native_spans.0.borrow()[0].clone().unwrap();
-        let declaration = prepared
-            .installations
-            .iter()
-            .find_map(|installation| match &installation.command {
-                Some(Command::Constructor {
-                    span: ast::Span::Egglog(span),
-                    ..
-                }) => Some(span),
-                _ => None,
-            })
-            .unwrap();
-        assert!(Arc::ptr_eq(&file, &declaration.file));
-        let Some(pb::command::Kind::Action(action)) = &program.commands[0].kind else {
-            panic!("action fixture")
-        };
-        let actions = lower_action(&program, action, &prepared.context.native_spans).unwrap();
-        let [Action::Expr(ast::Span::Egglog(span), expr)] = actions.as_slice() else {
-            panic!("ordinary constructor action")
-        };
-        let ast::Span::Egglog(expression_span) = expr.span() else {
-            panic!("expression span")
-        };
-        let action_file = prepared.context.native_spans.0.borrow()
-            [action.span.unwrap().file as usize]
-            .clone()
-            .unwrap();
-        assert!(Arc::ptr_eq(&action_file, &span.file));
-        assert!(Arc::ptr_eq(&action_file, &expression_span.file));
-        let mut later = pb::Program {
-            files: vec![pb::SourceFile {
-                name: "fixture.egg".into(),
-                contents: Some("other".into()),
-            }],
-            ..Default::default()
-        };
-        let next = engine.graphs[&id].prepare(&mut later).unwrap();
-        let origin = pb::Span {
-            file: 0,
-            start: 0,
-            end: 5,
-        };
-        let ast::Span::Egglog(next_span) =
-            native_span(&later, Some(&origin), &next.context.native_spans).unwrap()
-        else {
-            panic!("next request")
-        };
-        assert!(!Arc::ptr_eq(&file, &next_span.file));
-        assert_eq!(next_span.file.contents, "other");
-        drop(prepared);
-        drop(program);
-        assert_eq!(expr.span().string(), "(N 1)");
     }
 
     mod partial_call_staging {
@@ -6567,7 +6476,6 @@ mod tests {
                             args: vec![],
                         })),
                     })),
-                    ..Default::default()
                 },
                 pb::Node {
                     sort_id: function,
@@ -6575,7 +6483,6 @@ mod tests {
                         func: "factory".into(),
                         args: vec![],
                     })),
-                    ..Default::default()
                 },
                 pb::Node {
                     sort_id: output,
@@ -6583,20 +6490,17 @@ mod tests {
                         function: Some(partial + 1),
                         args: vec![argument],
                     })),
-                    ..Default::default()
                 },
             ]);
-            program.declarations.push(pb::Declaration {
-                kind: Some(pb::declaration::Kind::UserDefinedPrimitive(
-                    pb::UserDefinedPrimitive {
-                        name: "factory".into(),
-                        inputs: vec![],
-                        output: function,
-                        body: Some(partial),
-                    },
-                )),
-                ..Default::default()
-            });
+            program
+                .user_defined_primitives
+                .push(pb::UserDefinedPrimitive {
+                    name: "factory".into(),
+                    inputs: vec![],
+                    output: function,
+                    body: Some(partial),
+                    ..Default::default()
+                });
             // Creating a constructor function value needs Write, so evaluate
             // the new factory in Full context rather than a Read-only Check.
             program.commands.last_mut().unwrap().kind =
@@ -6619,7 +6523,10 @@ mod tests {
                 for reversed in [false, true] {
                     let mut program = table_factory_fixture(target);
                     if reversed {
-                        program.declarations.reverse();
+                        program.constructors.reverse();
+                        program.functions.reverse();
+                        program.relations.reverse();
+                        program.user_defined_primitives.reverse();
                     }
                     let (mut engine, id) = host_default_engine();
                     let session = &engine.graphs[&id];
@@ -6646,9 +6553,7 @@ mod tests {
                         missing.commands = vec![pb::Command {
                             kind: Some(pb::command::Kind::Action(pb::Action {
                                 kind: Some(pb::action::Kind::Term(program.nodes.len() as u32 - 1)),
-                                ..Default::default()
                             })),
-                            ..Default::default()
                         }];
                         let response = run_host_default(&mut engine, id, missing);
                         assert_eq!(
@@ -6758,7 +6663,6 @@ mod tests {
                     kind: Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
                         value: Some(pb::primitive_value::Value::I64(1)),
                     })),
-                    ..Default::default()
                 });
                 let function_sort = program
                     .nodes
@@ -6856,7 +6760,6 @@ mod tests {
                         ..Default::default()
                     }));
                     program.commands = vec![command];
-                    let span = program.commands[0].span;
                     let model = if invalid == "unknown" {
                         "missing-model".into()
                     } else {
@@ -6890,7 +6793,6 @@ mod tests {
                         Ok(_) => assert_eq!(invalid, "none"),
                         Err(error) => {
                             assert_ne!(invalid, "none", "{}", error.0.message);
-                            assert_eq!(error.0.span, span);
                             let expected = match invalid {
                                 "unknown" => "unknown cost model",
                                 "annotation" => "stored annotation sort",
@@ -6969,7 +6871,7 @@ mod tests {
         }
 
         #[test]
-        fn recursive_model_controls_keep_admission_and_original_spans() {
+        fn recursive_model_controls_keep_admission() {
             let (mut engine, id) = host_default_engine();
             let calls = Arc::new(AtomicUsize::new(0));
             let name = engine
@@ -6989,7 +6891,6 @@ mod tests {
                         "(sort A) (constructor Target () A) (Target) (extract (Target))",
                     );
                     let mut child = program.commands.pop().unwrap();
-                    let span = child.span;
                     if keep {
                         child.kind = Some(pb::command::Kind::KeepBest(pb::KeepBest {
                             tables: vec!["Target".into()],
@@ -7016,10 +6917,7 @@ mod tests {
                         }),
                         _ => unreachable!(),
                     };
-                    program.commands.push(pb::Command {
-                        kind: Some(kind),
-                        span,
-                    });
+                    program.commands.push(pb::Command { kind: Some(kind) });
                     let response = run_host_default(&mut engine, id, program);
                     let error = response.error.unwrap();
                     assert_eq!(error.code, i32::from(pb::ErrorCode::InvalidProgram));
@@ -7039,42 +6937,6 @@ mod tests {
                     );
                 }
             }
-            let spans: Vec<_> = (0..4)
-                .map(|start| {
-                    Some(pb::Span {
-                        file: 0,
-                        start,
-                        end: start + 1,
-                    })
-                })
-                .collect();
-            let commands = vec![pb::Command {
-                span: spans[0],
-                kind: Some(pb::command::Kind::Fail(Box::new(pb::Command {
-                    span: spans[1],
-                    kind: Some(pb::command::Kind::Loop(pb::Loop {
-                        max_iterations: Some(0),
-                        until: vec![],
-                        body: vec![pb::Command {
-                            span: spans[2],
-                            kind: Some(pb::command::Kind::Loop(pb::Loop {
-                                max_iterations: Some(1),
-                                until: vec![],
-                                body: vec![pb::Command {
-                                    span: spans[3],
-                                    kind: Some(pb::command::Kind::Extract(pb::Extract::default())),
-                                }],
-                            })),
-                        }],
-                    })),
-                }))),
-            }];
-            assert_eq!(
-                command_tree(&commands)
-                    .map(|command| command.span)
-                    .collect::<Vec<_>>(),
-                spans
-            );
         }
     }
 
@@ -7111,7 +6973,7 @@ mod tests {
         assert_eq!(empty.error, None);
         assert!(empty.output.outputs.is_empty());
         assert_eq!(engine.graphs[&id].definitions, definitions);
-        program.declarations.clear();
+        retain_declarations(&mut program, |_| false);
         program.commands = commands;
         assert_eq!(run_host_default(&mut engine, id, program).error, None);
     }
@@ -7140,7 +7002,10 @@ mod tests {
             (run r 1) (check (Keep (vec-empty))) (check (= (observe) 30))
         "#,
         );
-        program.declarations.reverse();
+        program.constructors.reverse();
+        program.functions.reverse();
+        program.relations.reverse();
+        program.user_defined_primitives.reverse();
         let (mut engine, id) = host_default_engine();
         let clones = Arc::new(AtomicUsize::new(0));
         *engine
@@ -7154,7 +7019,11 @@ mod tests {
         assert_eq!(clones.load(Ordering::SeqCst), 1);
         assert!(!prepared.installations.is_empty());
         assert!(!prepared.materialized.is_empty());
-        assert!(engine.graphs[&id].definitions.declarations.is_empty());
+        assert!(
+            declarations(&engine.graphs[&id].definitions)
+                .next()
+                .is_none()
+        );
         assert_eq!(engine.graphs[&id].graph.num_tuples(), 0);
         drop(prepared);
         for _ in 0..3 {
@@ -7197,8 +7066,8 @@ mod tests {
             check.commands[0].kind,
             Some(pb::command::Kind::Check(_))
         ));
-        assert!(!setup.declarations.is_empty());
-        assert!(!check.declarations.is_empty());
+        assert!(declarations(&setup).next().is_some());
+        assert!(declarations(&check).next().is_some());
 
         let (mut engine, id) = host_default_engine();
         let clones = Arc::new(AtomicUsize::new(0));
@@ -7336,7 +7205,6 @@ mod tests {
                         max_iterations: Some(bound),
                         ..Default::default()
                     })),
-                    ..Default::default()
                 });
                 clones.store(0, Ordering::SeqCst);
                 session.prepare(&mut condition).unwrap();
@@ -7348,18 +7216,13 @@ mod tests {
                 assert_eq!(session.graph.num_tuples(), tuples);
             }
 
-            let mut failure = inventory_fixture("(panic \"single-preparation\")");
-            failure.files[0].name = "single-preparation.egg".into();
-            let span = failure.commands[0].span;
+            let failure = inventory_fixture("(panic \"single-preparation\")");
             let response = run_host_default(&mut engine, id, failure);
             let error = response.error.unwrap();
             assert_eq!(error.code, i32::from(pb::ErrorCode::RuntimeFailure));
-            assert_eq!(error.span, span);
+            assert!(error.context.is_some());
+            assert_eq!(error.site.unwrap().path, [5, 0, 1]);
             assert_eq!(error.location.unwrap().path, [0]);
-            assert_eq!(
-                response.files[span.unwrap().file as usize].name,
-                "single-preparation.egg"
-            );
             assert!(error.message.contains("single-preparation"));
         }
     }
@@ -7450,7 +7313,7 @@ mod tests {
 
     #[test]
     fn constructor_dag_scoped_compilation_is_inert_and_drops_partial_builders() {
-        let native_spans = NativeSpans::default();
+        let authored_origins = AuthoredOrigins::default();
         let mut graph = crate::new_experimental_egraph();
         graph
             .parse_and_run_program(None, "(datatype A (Leaf) (Wrap A))")
@@ -7472,13 +7335,11 @@ mod tests {
                     func: "Wrap".into(),
                     args: vec![root],
                 })),
-                ..Default::default()
             });
             root = program.nodes.len() as u32 - 1;
         }
         let action = pb::Action {
             kind: Some(pb::action::Kind::Term(root)),
-            ..Default::default()
         };
         let mut values = HashMap::new();
         let closed = (0..=root).collect();
@@ -7490,7 +7351,7 @@ mod tests {
             false,
             Some(&closed),
             &mut |_| {},
-            &native_spans,
+            &authored_origins,
         )
         .unwrap();
         assert_eq!(graph.num_tuples(), 0);
@@ -7506,11 +7367,9 @@ mod tests {
                 func: "missing-after-locals".into(),
                 args: vec![root],
             })),
-            ..Default::default()
         });
         let invalid = pb::Action {
             kind: Some(pb::action::Kind::Term(root + 1)),
-            ..Default::default()
         };
         assert!(
             eval_scoped_action(
@@ -7521,7 +7380,7 @@ mod tests {
                 false,
                 Some(&closed),
                 &mut |_| {},
-                &native_spans,
+                &authored_origins,
             )
             .is_err()
         );
@@ -7536,7 +7395,7 @@ mod tests {
             true,
             Some(&closed),
             &mut |_| {},
-            &native_spans,
+            &authored_origins,
         )
         .unwrap();
         assert_eq!(graph.get_size("Wrap"), 1050);
@@ -7564,7 +7423,6 @@ mod tests {
                     func: "Pair".into(),
                     args: vec![root, root],
                 })),
-                ..Default::default()
             });
             root = program.nodes.len() as u32 - 1;
         }
@@ -7573,13 +7431,12 @@ mod tests {
             kind: Some(pb::command::Kind::TableSizes(pb::GetTableSizes {
                 tables: vec!["Leaf".into(), "Pair".into()],
             })),
-            ..Default::default()
         });
 
         // R=1, V=C=22,001, E=44,000: both former ordinary traversal
         // counters charged 66,002 steps to this compact, acyclic graph.
-        let native_spans = NativeSpans::default();
-        validate_node_graph(&program, &native_spans).unwrap();
+        let authored_origins = AuthoredOrigins::default();
+        validate_node_graph(&program, &authored_origins).unwrap();
         let closed = classify_action_dags(&program).unwrap();
         assert_eq!(closed[&vec![0]].len(), 22_001);
         let Some(pb::command::Kind::Action(action)) = &program.commands[0].kind else {
@@ -7590,7 +7447,7 @@ mod tests {
             &program,
             action,
             |_| false,
-            &native_spans,
+            &authored_origins,
             &mut memo,
             &mut 0,
         )
@@ -7657,7 +7514,6 @@ mod tests {
                     kind: Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
                         value: Some(V::String(text.clone())),
                     })),
-                    ..Default::default()
                 },
                 pb::Node {
                     sort_id: 1,
@@ -7667,7 +7523,6 @@ mod tests {
                             denominator: "2".into(),
                         })),
                     })),
-                    ..Default::default()
                 },
                 pb::Node {
                     sort_id: 2,
@@ -7675,21 +7530,19 @@ mod tests {
                         func: "Leaf".into(),
                         args: vec![1, 0, 1, 0],
                     })),
-                    ..Default::default()
                 },
             ],
             ..Default::default()
         };
         let action = pb::Action {
             kind: Some(pb::action::Kind::Term(2)),
-            ..Default::default()
         };
         let mut memo = HashMap::new();
         let (actions, evaluated) = action_dag_actions(
             &program,
             &action,
             |_| false,
-            &NativeSpans::default(),
+            &AuthoredOrigins::default(),
             &mut memo,
             &mut 0,
         )
@@ -7727,9 +7580,13 @@ mod tests {
             assert!(matches!(&memo[&index], Expr::Var(_, actual) if actual == name));
         }
 
-        let (query, references) = facts(&program, &[2, 2], &NativeSpans::default(), None, |name| {
-            name == "__egglog_proto_query_0"
-        })
+        let (query, references) = facts(
+            &program,
+            &[2, 2],
+            &AuthoredOrigins::default(),
+            None,
+            |name| name == "__egglog_proto_query_0",
+        )
         .unwrap();
         let [
             Fact::Eq(_, Expr::Lit(_, literal @ Literal::Native(_)), number_reference),
@@ -7777,7 +7634,6 @@ mod tests {
                 func: "Leaf".into(),
                 args: vec![],
             })),
-            ..Default::default()
         });
         let mut root = leaf;
         for _ in 0..28 {
@@ -7788,17 +7644,16 @@ mod tests {
                     func: "Pair".into(),
                     args: vec![root, root],
                 })),
-                ..Default::default()
             });
             root = index;
         }
-        let spans = NativeSpans::default();
+        let spans = AuthoredOrigins::default();
         let (query, _) = facts(&program, &[root, root], &spans, None, |_| false).unwrap();
         assert_eq!(query.len(), 29);
         for kind in [
             pb::rule::Kind::Rule(pb::RuleBody {
                 query: vec![root],
-                head: vec![],
+                actions: vec![],
             }),
             pb::rule::Kind::Rewrite(pb::Rewrite {
                 lhs: root,
@@ -7869,7 +7724,6 @@ mod tests {
                     func: "egglog.core.vec.of".into(),
                     args: vec![root, root],
                 })),
-                ..Default::default()
             });
             root = program.nodes.len() as u32;
             program.nodes.push(pb::Node {
@@ -7878,7 +7732,6 @@ mod tests {
                     func: "Branch".into(),
                     args: vec![children],
                 })),
-                ..Default::default()
             });
         }
         let Some(pb::command::Kind::Action(pb::Action {
@@ -7936,7 +7789,6 @@ mod tests {
                     func: "Leaf".into(),
                     args: vec![],
                 })),
-                ..Default::default()
             });
             for _ in 0..28 {
                 let parent = program.nodes.len() as u32;
@@ -7946,13 +7798,11 @@ mod tests {
                         func: "Pair".into(),
                         args: vec![root, root],
                     })),
-                    ..Default::default()
                 });
                 root = parent;
             }
             let action = pb::Action {
                 kind: Some(pb::action::Kind::Term(root)),
-                ..Default::default()
             };
             if in_rule {
                 let rules = vec![pb::Rule {
@@ -7960,7 +7810,7 @@ mod tests {
                     eval_mode: pb::RuleEvalMode::Seminaive.into(),
                     kind: Some(pb::rule::Kind::Rule(pb::RuleBody {
                         query: vec![trigger],
-                        head: vec![action.clone(), action],
+                        actions: vec![action.clone(), action],
                     })),
                     ..Default::default()
                 }];
@@ -7978,14 +7828,13 @@ mod tests {
                             .collect(),
                         ..Default::default()
                     })),
-                    ..Default::default()
                 });
                 let lowered = lower_rule(
                     &program,
                     graph::rules(&program).next().unwrap(),
                     "dag",
                     "diamond",
-                    &NativeSpans::default(),
+                    &AuthoredOrigins::default(),
                     |_| false,
                 )
                 .unwrap();
@@ -8004,7 +7853,6 @@ mod tests {
             } else {
                 program.commands = vec![pb::Command {
                     kind: Some(pb::command::Kind::Action(action)),
-                    ..Default::default()
                 }];
             }
             let text = source::Renderer::default().render(&program).unwrap();
@@ -8054,16 +7902,14 @@ mod tests {
                         // declarations. Use this session's exported handles,
                         // not the original program's pre-render names.
                         let definitions = &engine.graphs[&id].definitions;
-                        let pair = definitions
-                            .declarations
-                            .iter()
-                            .find_map(|declaration| match &declaration.kind {
-                                Some(pb::declaration::Kind::Constructor(constructor))
+                        let pair = declarations(definitions)
+                            .find_map(|declaration| match declaration {
+                                Declaration::Constructor(constructor)
                                     if constructor.inputs.len() == 2
                                         && constructor
                                             .inputs
                                             .iter()
-                                            .all(|arg| arg.sort == constructor.output) =>
+                                            .all(|arg| *arg == constructor.output) =>
                                 {
                                     Some(constructor)
                                 }
@@ -8071,7 +7917,6 @@ mod tests {
                             })
                             .unwrap();
                         let proof_sort = definitions.sorts[pair.output as usize].clone();
-                        let proof_files = definitions.files.clone();
                         let pair_name = pair.name.clone();
                         // Direct construction has a Fiat justification; native
                         // ProveExists expects a rule justification. The shallow
@@ -8089,12 +7934,11 @@ mod tests {
                             id,
                             pb::Program {
                                 sorts: vec![proof_sort],
-                                files: proof_files,
+
                                 nodes: vec![
                                     pb::Node {
                                         sort_id: 0,
                                         kind: Some(pb::node::Kind::Var("witness".into())),
-                                        ..Default::default()
                                     },
                                     pb::Node {
                                         sort_id: 0,
@@ -8102,12 +7946,10 @@ mod tests {
                                             func: pair_name,
                                             args: vec![0, 0],
                                         })),
-                                        ..Default::default()
                                     },
                                 ],
                                 commands: vec![pb::Command {
                                     kind: Some(proof_command),
-                                    ..Default::default()
                                 }],
                                 ..Default::default()
                             },
@@ -8159,7 +8001,7 @@ mod tests {
             &execution,
             action,
             |_| false,
-            &prepared.context.native_spans,
+            &prepared.context.authored_origins,
             &mut HashMap::new(),
             &mut 0,
         )
@@ -8498,7 +8340,6 @@ mod tests {
                         pb::Program {
                             commands: vec![pb::Command {
                                 kind: Some(pb::command::Kind::Freeze(pb::Freeze::default())),
-                                ..Default::default()
                             }],
                             ..Default::default()
                         },
@@ -8552,7 +8393,7 @@ mod tests {
                                 ..Default::default()
                             },
                             pb::Node {
-                                kind: Some(pb::node::Kind::Union(pb::Union {
+                                kind: Some(pb::node::Kind::Eq(pb::Eq {
                                     members: vec![0, 1],
                                 })),
                                 ..Default::default()
@@ -8560,7 +8401,6 @@ mod tests {
                         ],
                         commands: vec![pb::Command {
                             kind: Some(pb::command::Kind::Prove(pb::Prove { facts: vec![2] })),
-                            ..Default::default()
                         }],
                         ..Default::default()
                     };
@@ -8832,7 +8672,6 @@ mod tests {
                         func: "effectful_child".into(),
                         args: vec![],
                     })),
-                    ..Default::default()
                 },
                 pb::Node {
                     sort_id: 0,
@@ -8840,7 +8679,6 @@ mod tests {
                         func: "another_child".into(),
                         args: vec![],
                     })),
-                    ..Default::default()
                 },
                 pb::Node {
                     sort_id: 1,
@@ -8849,7 +8687,6 @@ mod tests {
                             items: vec![0, 1, 0],
                         })),
                     })),
-                    ..Default::default()
                 },
             ],
             ..Default::default()
@@ -9011,15 +8848,12 @@ mod tests {
                         })),
                         ..Default::default()
                     }],
-                    declarations: if namespace == "sort" {
+                    functions: if namespace == "sort" {
                         vec![]
                     } else {
-                        vec![pb::Declaration {
-                            kind: Some(pb::declaration::Kind::Function(pb::Function {
-                                name: "Public".into(),
-                                output: 0,
-                                ..Default::default()
-                            })),
+                        vec![pb::Function {
+                            name: "Public".into(),
+                            output: 0,
                             ..Default::default()
                         }]
                     },
@@ -9097,16 +8931,10 @@ mod tests {
                         ..Default::default()
                     },
                 ],
-                declarations: vec![pb::Declaration {
-                    kind: Some(pb::declaration::Kind::Constructor(pb::Constructor {
-                        name: "N".into(),
-                        inputs: vec![pb::Arg {
-                            name: "x".into(),
-                            sort: 0,
-                        }],
-                        output: 1,
-                        ..Default::default()
-                    })),
+                constructors: vec![pb::Constructor {
+                    name: "N".into(),
+                    inputs: vec![0],
+                    output: 1,
                     ..Default::default()
                 }],
                 nodes: vec![
@@ -9115,7 +8943,6 @@ mod tests {
                         kind: Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
                             value: Some(pb::primitive_value::Value::I64(1)),
                         })),
-                        ..Default::default()
                     },
                     pb::Node {
                         sort_id: 0,
@@ -9123,7 +8950,6 @@ mod tests {
                             func: "test.counted".into(),
                             args: vec![0],
                         })),
-                        ..Default::default()
                     },
                     pb::Node {
                         sort_id: 1,
@@ -9131,12 +8957,10 @@ mod tests {
                             func: "N".into(),
                             args: vec![1],
                         })),
-                        ..Default::default()
                     },
                     pb::Node {
                         sort_id: 0,
                         kind: Some(pb::node::Kind::Var("x".into())),
-                        ..Default::default()
                     },
                     pb::Node {
                         sort_id: 0,
@@ -9144,14 +8968,12 @@ mod tests {
                             func: "test.counted".into(),
                             args: vec![3],
                         })),
-                        ..Default::default()
                     },
                     pb::Node {
                         sort_id: 0,
-                        kind: Some(pb::node::Kind::Union(pb::Union {
+                        kind: Some(pb::node::Kind::Eq(pb::Eq {
                             members: vec![4, 0],
                         })),
-                        ..Default::default()
                     },
                     pb::Node {
                         sort_id: 1,
@@ -9159,20 +8981,16 @@ mod tests {
                             func: "N".into(),
                             args: vec![3],
                         })),
-                        ..Default::default()
                     },
                 ],
                 commands: vec![
                     pb::Command {
                         kind: Some(pb::command::Kind::Action(pb::Action {
                             kind: Some(pb::action::Kind::Term(2)),
-                            ..Default::default()
                         })),
-                        ..Default::default()
                     },
                     pb::Command {
                         kind: Some(pb::command::Kind::Prove(pb::Prove { facts: vec![2] })),
-                        ..Default::default()
                     },
                 ],
                 ..Default::default()
@@ -9180,7 +8998,6 @@ mod tests {
             let mut invalid = program.clone();
             invalid.commands.push(pb::Command {
                 kind: Some(pb::command::Kind::Prove(pb::Prove { facts: vec![999] })),
-                ..Default::default()
             });
             assert!(run_host_default(&mut engine, id, invalid).error.is_some());
             let mut ungrounded = program.clone();
@@ -9194,9 +9011,8 @@ mod tests {
                                     rules: vec![pb::Rule {
                                         kind: Some(pb::rule::Kind::Rule(pb::RuleBody {
                                             query: vec![5],
-                                            head: vec![pb::Action {
+                                            actions: vec![pb::Action {
                                                 kind: Some(pb::action::Kind::Term(6)),
-                                                ..Default::default()
                                             }],
                                         })),
                                         eval_mode: pb::RuleEvalMode::Seminaive.into(),
@@ -9206,11 +9022,9 @@ mod tests {
                             }],
                             ..Default::default()
                         })),
-                        ..Default::default()
                     }],
                     ..Default::default()
                 })),
-                ..Default::default()
             });
             let error = run_host_default(&mut engine, id, ungrounded).error.unwrap();
             assert!(error.message.contains("ungrounded"), "{}", error.message);
@@ -9288,7 +9102,7 @@ mod tests {
                             rules: vec![pb::Rule {
                                 kind: Some(pb::rule::Kind::Rule(pb::RuleBody {
                                     query: vec![query],
-                                    head: vec![pb::Action {
+                                    actions: vec![pb::Action {
                                         kind: Some(pb::action::Kind::Set(pb::Set {
                                             target: Some(pb::Call {
                                                 func: "copy".into(),
@@ -9296,7 +9110,6 @@ mod tests {
                                             }),
                                             value: Some(binding),
                                         })),
-                                        ..Default::default()
                                     }],
                                 })),
                                 eval_mode: pb::RuleEvalMode::Seminaive.into(),
@@ -9306,12 +9119,11 @@ mod tests {
                     }],
                     ..Default::default()
                 })),
-                ..Default::default()
             });
             let response = run_host_default(&mut engine, id, input);
             assert_eq!(response.error, None, "mode {mode:?}");
             assert_eq!(
-                engine.graphs[&id].definitions.declarations.len(),
+                declarations(&engine.graphs[&id].definitions).count(),
                 2,
                 "slots are not public callables"
             );
@@ -9326,7 +9138,6 @@ mod tests {
                 pb::Sort {
                     kind: Some(pb::sort::Kind::Eq("A".into())),
                     doc: Some("nominal docs".into()),
-                    ..Default::default()
                 },
                 pb::Sort {
                     kind: Some(pb::sort::Kind::Primitive(pb::PrimitiveSortRef {
@@ -9344,40 +9155,33 @@ mod tests {
                 pb::Node {
                     sort_id: 0,
                     kind: Some(pb::node::Kind::Binding("".into())),
-                    ..Default::default()
                 },
                 pb::Node {
                     sort_id: 0,
-                    kind: Some(pb::node::Kind::Union(pb::Union { members: vec![] })),
-                    ..Default::default()
+                    kind: Some(pb::node::Kind::Eq(pb::Eq { members: vec![] })),
                 },
                 pb::Node {
                     sort_id: 1,
                     kind: Some(pb::node::Kind::Binding("未実行".into())),
-                    ..Default::default()
                 },
                 pb::Node {
                     sort_id: 1,
                     kind: Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
                         value: Some(pb::primitive_value::Value::I64(4)),
                     })),
-                    ..Default::default()
                 },
             ],
             commands: vec![
                 pb::Command {
                     kind: Some(pb::command::Kind::Action(pb::Action {
                         kind: Some(pb::action::Kind::Term(1)),
-                        ..Default::default()
                     })),
-                    ..Default::default()
                 },
                 pb::Command {
                     kind: Some(pb::command::Kind::Let(pb::Let {
                         binding: Some(0),
                         value: Some(1),
                     })),
-                    ..Default::default()
                 },
                 pb::Command {
                     kind: Some(pb::command::Kind::Loop(pb::Loop {
@@ -9387,15 +9191,12 @@ mod tests {
                                 binding: Some(2),
                                 value: Some(3),
                             })),
-                            ..Default::default()
                         }],
                         ..Default::default()
                     })),
-                    ..Default::default()
                 },
                 pb::Command {
                     kind: Some(pb::command::Kind::Freeze(pb::Freeze {})),
-                    ..Default::default()
                 },
             ],
             ..Default::default()
@@ -9405,7 +9206,7 @@ mod tests {
         assert_eq!(
             engine.graphs[&id].graph.materialized_eq_classes().len(),
             1,
-            "Let reuses the command-list Union identity"
+            "Let reuses the command-list Eq identity"
         );
         let snapshot = response
             .output
@@ -9417,7 +9218,7 @@ mod tests {
             })
             .expect("snapshot");
         let frozen = snapshot.program.as_ref().unwrap();
-        assert!(frozen.declarations.is_empty());
+        assert!(declarations(frozen).next().is_none());
         assert_eq!(
             frozen
                 .nodes
@@ -9466,7 +9267,6 @@ mod tests {
         wrong.nodes.push(pb::Node {
             sort_id: 0,
             kind: Some(pb::node::Kind::Binding("未実行".into())),
-            ..Default::default()
         });
         assert!(
             run_host_default(&mut restored, restored_id, wrong)
@@ -9492,9 +9292,9 @@ mod tests {
         .unwrap()
         .unwrap();
         program
-            .declarations
-            .insert(0, program.declarations[0].clone());
-        program.declarations.push(program.declarations[2].clone()); // compatible resupply
+            .constructors
+            .insert(0, program.constructors[0].clone());
+        program.functions.push(program.functions[0].clone()); // compatible resupply
         let i64_sort = program
             .sorts
             .iter()
@@ -9533,8 +9333,8 @@ mod tests {
 
     // These inventory controls deliberately bind all definitions before their
     // combined command list; they do not model Source's submission boundaries.
-    // Concatenation preserves each packet's node/Union occurrences, while the
-    // producer's monotone sort/file arenas remain cumulative in this flat input.
+    // Concatenation preserves each packet's node/Eq occurrences, while the
+    // producer's monotone sort arenas remain cumulative in this flat input.
     fn inventory_fixture(source: &str) -> pb::Program {
         let mut program = pb::Program::default();
         let phases = source::Source::new(None, source)
@@ -9545,8 +9345,7 @@ mod tests {
             crate::builtin::definitions::reconcile_declarations(phase, &mut program).unwrap();
         }
         for phase in &phases {
-            let files = program.files.len() as u32;
-            graph::append(&mut program, phase, files).unwrap();
+            graph::append(&mut program, phase).unwrap();
         }
         let mut seen = HashSet::new();
         program.rulesets.reverse();
@@ -9568,15 +9367,12 @@ mod tests {
         });
         program.nodes.push(pb::Node {
             sort_id,
-            kind: Some(pb::node::Kind::Union(pb::Union { members: vec![] })),
-            ..Default::default()
+            kind: Some(pb::node::Kind::Eq(pb::Eq { members: vec![] })),
         });
         let action = pb::Command {
             kind: Some(pb::command::Kind::Action(pb::Action {
                 kind: Some(pb::action::Kind::Term(0)),
-                ..Default::default()
             })),
-            ..Default::default()
         };
         program.commands.push(pb::Command {
             kind: Some(pb::command::Kind::Loop(pb::Loop {
@@ -9588,10 +9384,8 @@ mod tests {
                         until: vec![],
                         body: vec![action.clone(), action],
                     })),
-                    ..Default::default()
                 }],
             })),
-            ..Default::default()
         });
         let response = run_host_default(&mut engine, id, program);
         assert_eq!(response.error, None);
@@ -9606,7 +9400,7 @@ mod tests {
                 .filter(|(name, _)| name.as_ref() == native_name("sort", "A"))
                 .count(),
             6,
-            "two uses retain one Union identity inside each body; six body executions mint six classes"
+            "two uses retain one Eq identity inside each body; six body executions mint six classes"
         );
     }
 
@@ -9702,8 +9496,7 @@ mod tests {
         for members in [vec![], vec![item], vec![]] {
             program.nodes.push(pb::Node {
                 sort_id,
-                kind: Some(pb::node::Kind::Union(pb::Union { members })),
-                ..Default::default()
+                kind: Some(pb::node::Kind::Eq(pb::Eq { members })),
             });
         }
         program.commands.clear();
@@ -9711,9 +9504,7 @@ mod tests {
             program.commands.push(pb::Command {
                 kind: Some(pb::command::Kind::Action(pb::Action {
                     kind: Some(pb::action::Kind::Term(index)),
-                    ..Default::default()
                 })),
-                ..Default::default()
             });
         }
         program.commands.push(pb::Command {
@@ -9725,9 +9516,7 @@ mod tests {
                     }),
                     value: Some(empty),
                 })),
-                ..Default::default()
             })),
-            ..Default::default()
         });
         let response = run_host_default(&mut engine, id, program);
         assert_eq!(response.error, None);
@@ -9755,8 +9544,6 @@ mod tests {
                 let (mut engine, id) = host_default_engine();
                 let mut program = inventory_fixture(&source);
                 let failure_index = program.commands.len() - 1;
-                let span = program.commands[failure_index].span;
-                let source_file = program.files[span.unwrap().file as usize].clone();
                 if reused {
                     program
                         .commands
@@ -9766,10 +9553,8 @@ mod tests {
                 let error = response.error.unwrap();
                 assert_eq!(error.code, i32::from(pb::ErrorCode::RuntimeFailure));
                 assert_eq!(error.location.unwrap().path, [failure_index as u32]);
-                let actual = error.span.unwrap();
-                let expected = span.unwrap();
-                assert_eq!((actual.start, actual.end), (expected.start, expected.end));
-                assert_eq!(response.files[actual.file as usize], source_file);
+                assert!(error.context.is_some());
+                assert!(error.site.is_some());
                 assert!(response.output.outputs.is_empty());
                 let graph = &engine.graphs[&id].graph;
                 assert_eq!(graph.materialized_eq_classes().len(), expected_classes);
@@ -9799,7 +9584,7 @@ mod tests {
         let mut definitions = program.clone();
         definitions.commands.clear();
         assert_eq!(run_host_default(&mut engine, id, definitions).error, None);
-        program.declarations.clear();
+        retain_declarations(&mut program, |_| false);
         program.rulesets.clear();
         program.rulesets.clear();
         let Some(pb::command::Kind::Run(run)) = &mut program.commands[1].kind else {
@@ -9811,20 +9596,8 @@ mod tests {
                 kind: Some(pb::ruleset_selection::Kind::Name(name)),
             })
             .collect();
-        let command_span = pb::Span {
-            file: 0,
-            start: 0,
-            end: 1,
-        };
-        program.commands[3].span = Some(command_span);
-        let Some(pb::command::Kind::Action(action)) = &program.commands[3].kind else {
-            panic!("fixture Union")
-        };
-        let action_span = action.span.unwrap();
-        let action_file = program.files[action_span.file as usize].clone();
-        assert_ne!(action_span, command_span);
         // Force first-use retention; the duplicate and After marker must remain
-        // unentered after the first Union's later member fails.
+        // unentered after the first Eq's later member fails.
         program.commands.insert(4, program.commands[3].clone());
         let response = Observed::from_frames(
             (engine
@@ -9844,9 +9617,8 @@ mod tests {
         assert_eq!(error.code, i32::from(pb::ErrorCode::RuntimeFailure));
         assert_eq!(error.location.as_ref().unwrap().path, [3]);
         assert!(error.location.as_ref().unwrap().iterations.is_empty());
-        let span = error.span.unwrap();
-        assert_eq!((span.start, span.end), (action_span.start, action_span.end));
-        assert_eq!(response.files[span.file as usize], action_file);
+        assert!(error.context.is_some());
+        assert!(error.site.is_some());
         assert_eq!(response.output.outputs.len(), 3);
         for (output, path) in response.output.outputs.iter().zip([1, 1, 2]) {
             assert_eq!(output.location.as_ref().unwrap().path, [path]);
@@ -9899,7 +9671,7 @@ mod tests {
         let mut retry = inventory_fixture(&format!(
             "{declarations} (print-stats) (set (keep) (After)) (check (= (keep) (After)))"
         ));
-        retry.declarations.clear();
+        retain_declarations(&mut retry, |_| false);
         let Some(pb::command::Kind::Action(pb::Action {
             kind: Some(pb::action::Kind::Set(set)),
             ..
@@ -9911,10 +9683,9 @@ mod tests {
         set.value = Some(retry.nodes.len() as u32);
         retry.nodes.push(pb::Node {
             sort_id: retry.nodes[after as usize].sort_id,
-            kind: Some(pb::node::Kind::Union(pb::Union {
+            kind: Some(pb::node::Kind::Eq(pb::Eq {
                 members: vec![after],
             })),
-            ..Default::default()
         });
         let reused = Observed::from_frames(
             (engine
@@ -9966,31 +9737,31 @@ mod tests {
         // Two distinct self cycles; one mutual cycle whose backedge is reached
         // before its first member completes; one cycle anchored by an atom.
         let kinds = [
-            pb::node::Kind::Union(pb::Union {
+            pb::node::Kind::Eq(pb::Eq {
                 members: vec![start + 1],
             }),
             pb::node::Kind::Call(pb::Call {
                 func: "Box".into(),
                 args: vec![start],
             }),
-            pb::node::Kind::Union(pb::Union {
+            pb::node::Kind::Eq(pb::Eq {
                 members: vec![start + 3],
             }),
             pb::node::Kind::Call(pb::Call {
                 func: "Box".into(),
                 args: vec![start + 2],
             }),
-            pb::node::Kind::Union(pb::Union {
+            pb::node::Kind::Eq(pb::Eq {
                 members: vec![start + 5],
             }),
-            pb::node::Kind::Union(pb::Union {
+            pb::node::Kind::Eq(pb::Eq {
                 members: vec![start + 6],
             }),
             pb::node::Kind::Call(pb::Call {
                 func: "Box".into(),
                 args: vec![start + 4],
             }),
-            pb::node::Kind::Union(pb::Union {
+            pb::node::Kind::Eq(pb::Eq {
                 members: vec![atom, start + 8],
             }),
             pb::node::Kind::Call(pb::Call {
@@ -10001,22 +9772,18 @@ mod tests {
         program.nodes.extend(kinds.into_iter().map(|kind| pb::Node {
             sort_id,
             kind: Some(kind),
-            ..Default::default()
         }));
         for index in [start, start + 2, start + 4, start + 7, start + 5, start] {
             program.commands.push(pb::Command {
                 kind: Some(pb::command::Kind::Action(pb::Action {
                     kind: Some(pb::action::Kind::Term(index)),
-                    ..Default::default()
                 })),
-                ..Default::default()
             });
         }
         program.commands.push(pb::Command {
             kind: Some(pb::command::Kind::Check(pb::Check {
                 facts: vec![start, start + 2, start + 4, start + 7],
             })),
-            ..Default::default()
         });
         let response = run_host_default(&mut engine, id, program);
         assert_eq!(response.error, None);
@@ -10058,7 +9825,7 @@ mod tests {
             .unwrap() as u32;
         assert!(program.nodes.is_empty());
         for (sort_id, kind) in [
-            (eq, pb::node::Kind::Union(pb::Union { members: vec![1] })),
+            (eq, pb::node::Kind::Eq(pb::Eq { members: vec![1] })),
             (
                 eq,
                 pb::node::Kind::Call(pb::Call {
@@ -10074,7 +9841,7 @@ mod tests {
                     })),
                 }),
             ),
-            (eq, pb::node::Kind::Union(pb::Union { members: vec![] })),
+            (eq, pb::node::Kind::Eq(pb::Eq { members: vec![] })),
             (
                 eq,
                 pb::node::Kind::Call(pb::Call {
@@ -10094,16 +9861,13 @@ mod tests {
             program.nodes.push(pb::Node {
                 sort_id,
                 kind: Some(kind),
-                ..Default::default()
             });
         }
         for index in [0, 0, 4, 4, 3] {
             program.commands.push(pb::Command {
                 kind: Some(pb::command::Kind::Action(pb::Action {
                     kind: Some(pb::action::Kind::Term(index)),
-                    ..Default::default()
                 })),
-                ..Default::default()
             });
         }
         let response = run_host_default(&mut engine, id, program);
@@ -10155,9 +9919,7 @@ mod tests {
                     }),
                     value: Some(union),
                 })),
-                ..Default::default()
             })),
-            ..Default::default()
         });
         let response = run_host_default(&mut engine, id, program.clone());
         assert_eq!(response.error, None);
@@ -10170,7 +9932,7 @@ mod tests {
         assert_eq!(
             graph.get_size(&native_name("call", "Atom")),
             0,
-            "reusing a Union must not reevaluate deleted members"
+            "reusing an Eq must not reevaluate deleted members"
         );
         assert_eq!(graph.get_size(&native_name("call", "keep")), 1);
         assert_eq!(graph.materialized_eq_classes().len(), 1);
@@ -10210,10 +9972,9 @@ mod tests {
         let union = program.nodes.len() as u32;
         program.nodes.push(pb::Node {
             sort_id: program.nodes[call as usize].sort_id,
-            kind: Some(pb::node::Kind::Union(pb::Union {
+            kind: Some(pb::node::Kind::Eq(pb::Eq {
                 members: vec![call],
             })),
-            ..Default::default()
         });
         let original = program.commands[1].clone();
         let Some(pb::command::Kind::Action(action)) = &mut program.commands[1].kind else {
@@ -10230,9 +9991,7 @@ mod tests {
                     }),
                     value: Some(union),
                 })),
-                ..Default::default()
             })),
-            ..Default::default()
         });
         let response = run_host_default(&mut engine, id, program);
         assert_eq!(response.error, None);
@@ -10272,20 +10031,16 @@ mod tests {
             let union = program.nodes.len() as u32;
             program.nodes.push(pb::Node {
                 sort_id,
-                kind: Some(pb::node::Kind::Union(pb::Union::default())),
-                ..Default::default()
+                kind: Some(pb::node::Kind::Eq(pb::Eq::default())),
             });
             let action = pb::Command {
                 kind: Some(pb::command::Kind::Action(pb::Action {
                     kind: Some(pb::action::Kind::Term(union)),
-                    ..Default::default()
                 })),
-                ..Default::default()
             };
             match case {
                 0 => program.commands.push(pb::Command {
                     kind: Some(pb::command::Kind::Fail(Box::new(action))),
-                    ..Default::default()
                 }),
                 1 => {
                     program.nodes[union as usize].kind = Some(pb::node::Kind::Call(pb::Call {
@@ -10296,7 +10051,6 @@ mod tests {
                 }
                 2 => program.commands.push(pb::Command {
                     kind: Some(pb::command::Kind::Check(pb::Check { facts: vec![union] })),
-                    ..Default::default()
                 }),
                 3 => {
                     let scalar = program
@@ -10306,7 +10060,7 @@ mod tests {
                             matches!(node.kind, Some(pb::node::Kind::PrimitiveValue(_)))
                         })
                         .unwrap() as u32;
-                    program.nodes[union as usize].kind = Some(pb::node::Kind::Union(pb::Union {
+                    program.nodes[union as usize].kind = Some(pb::node::Kind::Eq(pb::Eq {
                         members: vec![scalar],
                     }));
                 }
@@ -10337,9 +10091,8 @@ mod tests {
                                             eval_mode: pb::RuleEvalMode::Seminaive.into(),
                                             kind: Some(pb::rule::Kind::Rule(pb::RuleBody {
                                                 query: vec![],
-                                                head: vec![pb::Action {
+                                                actions: vec![pb::Action {
                                                     kind: Some(pb::action::Kind::Term(union)),
-                                                    ..Default::default()
                                                 }],
                                             })),
                                             ..Default::default()
@@ -10348,30 +10101,25 @@ mod tests {
                                 }],
                                 ..Default::default()
                             })),
-                            ..Default::default()
                         }],
                         ..Default::default()
                     })),
-                    ..Default::default()
                 }),
-                8 => program.declarations.push(pb::Declaration {
-                    kind: Some(pb::declaration::Kind::UserDefinedPrimitive(
-                        pb::UserDefinedPrimitive {
-                            name: "deferred".into(),
-                            inputs: vec![],
-                            output: sort_id,
-                            body: Some(union),
-                        },
-                    )),
-                    ..Default::default()
-                }),
+                8 => program
+                    .user_defined_primitives
+                    .push(pb::UserDefinedPrimitive {
+                        name: "deferred".into(),
+                        inputs: vec![],
+                        output: sort_id,
+                        body: Some(union),
+                        ..Default::default()
+                    }),
                 _ => program.commands.push(pb::Command {
                     kind: Some(pb::command::Kind::Loop(pb::Loop {
                         body: vec![action],
                         max_iterations: Some(u64::from(case == 9)),
                         until: vec![],
                     })),
-                    ..Default::default()
                 }),
             }
             let response = run_host_default(&mut engine, id, program);
@@ -10393,7 +10141,7 @@ mod tests {
                 assert_eq!(
                     graph.materialized_eq_classes().len(),
                     if case == 10 { 1 } else { 2 },
-                    "case {case}: Fail retains its successful prefix; Repeat0 does not mint a Union identity"
+                    "case {case}: Fail retains its successful prefix; Repeat0 does not mint an Eq identity"
                 );
                 continue;
             }
@@ -10433,10 +10181,9 @@ mod tests {
             set.value = Some(program.nodes.len() as u32);
             program.nodes.push(pb::Node {
                 sort_id: program.nodes[original as usize].sort_id,
-                kind: Some(pb::node::Kind::Union(pb::Union {
+                kind: Some(pb::node::Kind::Eq(pb::Eq {
                     members: vec![original],
                 })),
-                ..Default::default()
             });
             let response = run_host_default(&mut engine, id, program);
             assert_eq!(response.error.is_some(), baseline.is_err());
@@ -10475,8 +10222,7 @@ mod tests {
         let union = program.nodes.len() as u32;
         program.nodes.push(pb::Node {
             sort_id,
-            kind: Some(pb::node::Kind::Union(pb::Union::default())),
-            ..Default::default()
+            kind: Some(pb::node::Kind::Eq(pb::Eq::default())),
         });
         program.nodes.push(pb::Node {
             sort_id: integer,
@@ -10484,7 +10230,6 @@ mod tests {
                 func: "read".into(),
                 args: vec![union],
             })),
-            ..Default::default()
         });
         program.commands.push(pb::Command {
             kind: Some(pb::command::Kind::Action(pb::Action {
@@ -10495,17 +10240,13 @@ mod tests {
                     }),
                     value: Some(union),
                 })),
-                ..Default::default()
             })),
-            ..Default::default()
         });
         program.commands.push(run);
         program.commands.push(pb::Command {
             kind: Some(pb::command::Kind::Action(pb::Action {
                 kind: Some(pb::action::Kind::Term(union + 1)),
-                ..Default::default()
             })),
-            ..Default::default()
         });
         let response = run_host_default(&mut engine, id, program);
         assert_eq!(response.error, None);
@@ -10574,7 +10315,6 @@ mod tests {
                         .collect(),
                     ..Default::default()
                 })),
-                ..Default::default()
             }];
             let (retry, matches) = run_diagnostic_matches(&mut engine, id, input.clone());
             assert_eq!(retry.error, None);
@@ -10588,7 +10328,6 @@ mod tests {
                 pb::Program {
                     commands: vec![pb::Command {
                         kind: Some(pb::command::Kind::Stats(pb::Unit {})),
-                        ..Default::default()
                     }],
                     ..Default::default()
                 },
@@ -10628,7 +10367,6 @@ mod tests {
                                     .collect(),
                                 ..Default::default()
                             })),
-                            ..Default::default()
                         }],
                         ..Default::default()
                     },
@@ -10656,7 +10394,6 @@ mod tests {
         });
         input.commands.push(pb::Command {
             kind: Some(pb::command::Kind::Freeze(pb::Freeze {})),
-            ..Default::default()
         });
         let response = run_host_default(&mut engine, id, input);
         assert_eq!(response.error, None);
@@ -10701,7 +10438,6 @@ mod tests {
                 body: input.commands,
                 ..Default::default()
             })),
-            ..Default::default()
         }];
         input.commands.push(check);
         let initial = renderer.render(&input).unwrap();
@@ -10725,11 +10461,9 @@ mod tests {
                             .collect(),
                         ..Default::default()
                     })),
-                    ..Default::default()
                 }],
                 ..Default::default()
             })),
-            ..Default::default()
         }];
         let retry = renderer.render(&input).unwrap();
         assert!(!retry.contains("(rule "), "{retry}");
@@ -10822,7 +10556,6 @@ mod tests {
                     .collect(),
                 ..Default::default()
             })),
-            ..Default::default()
         };
         let (before_retry, matches) = run_diagnostic_matches(
             &mut engine,
@@ -10859,21 +10592,16 @@ mod tests {
     }
 
     #[test]
-    fn additive_rule_provenance_is_shared_and_imported_once_per_submission() {
+    fn additive_rules_retain_authored_labels_in_compact_records() {
         let (mut engine, id) = host_default_engine();
         let first = pb::Rule {
             name: Some("first".into()),
             eval_mode: pb::RuleEvalMode::Seminaive.into(),
-            span: Some(pb::Span {
-                file: 0,
-                start: 0,
-                end: 1,
-            }),
+
             kind: Some(pb::rule::Kind::Rule(pb::RuleBody {
                 query: vec![],
-                head: vec![pb::Action {
+                actions: vec![pb::Action {
                     kind: Some(pb::action::Kind::Term(0)),
-                    ..Default::default()
                 }],
             })),
             ..Default::default()
@@ -10902,10 +10630,7 @@ mod tests {
                 })),
                 ..Default::default()
             }],
-            files: vec![pb::SourceFile {
-                name: "shared.egg".into(),
-                contents: Some("x".repeat(100_000)),
-            }],
+
             commands: vec![pb::Command {
                 kind: Some(pb::command::Kind::Run(pb::Run {
                     rulesets: (vec!["g".into()])
@@ -10916,38 +10641,19 @@ mod tests {
                         .collect(),
                     ..Default::default()
                 })),
-                ..Default::default()
             }],
             ..Default::default()
         };
         let response = run_host_default(&mut engine, id, input);
         assert_eq!(response.error, None);
         let rules = &engine.graphs[&id].registry.rules;
-        assert!(Arc::ptr_eq(
-            &rules[0].candidate.record.files,
-            &rules[1].candidate.record.files
-        ));
-        assert_eq!(rules[0].candidate.record.files[0].name, "shared.egg");
-        assert_eq!(
-            rules[0].candidate.record.files[0]
-                .contents
-                .as_ref()
-                .unwrap()
-                .len(),
-            100_000
-        );
-        assert!(
-            rules
-                .iter()
-                .all(|rule| rule.candidate.record.program.files.is_empty())
-        );
+        assert_eq!(rules.len(), 2);
         let frozen = run_host_default(
             &mut engine,
             id,
             pb::Program {
                 commands: vec![pb::Command {
                     kind: Some(pb::command::Kind::Freeze(pb::Freeze {})),
-                    ..Default::default()
                 }],
                 ..Default::default()
             },
@@ -10958,9 +10664,7 @@ mod tests {
         };
         let program = snapshot.program.as_ref().unwrap();
         assert_eq!(graph::rules(program).count(), 2);
-        assert!(program.files.is_empty());
         for rule in graph::rules(program) {
-            assert!(rule.span.is_none());
             assert!(matches!(rule.name.as_deref(), Some("first" | "second")));
         }
     }
@@ -10979,7 +10683,6 @@ mod tests {
                     body: vec![run],
                     ..Default::default()
                 })),
-                ..Default::default()
             });
             input.commands.push(check);
             let text = source::Renderer::default().render(&input).unwrap();
@@ -11025,7 +10728,6 @@ mod tests {
                         .collect(),
                     ..Default::default()
                 })),
-                ..Default::default()
             }],
             ..Default::default()
         };
@@ -11095,7 +10797,6 @@ mod tests {
                 ],
                 ..Default::default()
             })),
-            ..Default::default()
         }];
         let (response, matches) = run_diagnostic_matches(&mut engine, id, omitted);
         assert_eq!(response.error, None);
@@ -11117,13 +10818,11 @@ mod tests {
                     }],
                     ..Default::default()
                 })),
-                ..Default::default()
             }],
             ..Default::default()
         };
         empty.commands.push(pb::Command {
             kind: Some(pb::command::Kind::Freeze(pb::Freeze {})),
-            ..Default::default()
         });
         let child = engine
             .clone_request(pb::CloneEGraphRequest { egraph_id: id })
@@ -11198,11 +10897,9 @@ mod tests {
                                 rulesets: vec![pb::RulesetSelection::default()],
                                 ..Default::default()
                             })),
-                            ..Default::default()
                         }],
                         ..Default::default()
                     })),
-                    ..Default::default()
                 }),
                 _ => unreachable!(),
             }
@@ -11211,9 +10908,7 @@ mod tests {
                 pb::Command {
                     kind: Some(pb::command::Kind::Action(pb::Action {
                         kind: Some(pb::action::Kind::Panic("must not execute".into())),
-                        ..Default::default()
                     })),
-                    ..Default::default()
                 },
             );
             let response = run_host_default(&mut engine, id, program);
@@ -11226,4 +10921,5 @@ mod tests {
     }
 
     include!("protobuf/lambda_tests.rs");
+    include!("protobuf/diagnostic_tests.rs");
 }

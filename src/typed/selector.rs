@@ -41,7 +41,7 @@ macro_rules! selectors {
         where F: FnOnce($(&$t),*) -> N {
             fn select(self, node: &N) -> Result<Option<($($t,)*)>, TypedError> {
                 let scope = fresh_scope(); let _ = scope;
-                let variables = ($(variable::<$t>(scope, $i),)*); let _ = &variables;
+                let variables = ($(variable::<$t>(scope, $i, None),)*); let _ = &variables;
                 let pattern = self($(&variables.$i),*);
                 let expressions: Vec<Expr> = vec![$(variables.$i.expression().clone()),*];
                 let Some(args) = node.expression().select(pattern.expression(), &expressions)? else { return Ok(None); };

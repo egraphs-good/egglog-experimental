@@ -1738,13 +1738,14 @@ fn partial_call_oracle_case(setup: &str) -> Result<PartialCallOracleCase, String
     let mut application_adapters = HashMap::new();
     for phase in Source::new(None, &text).map_err(|error| error.to_string())? {
         let phase = phase.map_err(|error| error.to_string())?;
-        for declaration in &phase.declarations {
-            if let Some(pb::declaration::Kind::UserDefinedPrimitive(primitive)) = &declaration.kind
-                && primitive.name.starts_with("__egglog_application_")
-            {
+        for primitive in &phase.user_defined_primitives {
+            if primitive.name.starts_with("__egglog_application_") {
                 let mut adapter = phase.clone();
                 adapter.commands.clear();
-                adapter.declarations = vec![declaration.clone()];
+                adapter.constructors.clear();
+                adapter.functions.clear();
+                adapter.relations.clear();
+                adapter.user_defined_primitives = vec![primitive.clone()];
                 application_adapters
                     .entry(primitive.name.clone())
                     .or_insert(adapter);
@@ -1903,11 +1904,11 @@ fn partial_call_oracle_trials() -> Vec<Trial> {
                 assert_eq!(native_target, if name == "nested-capture" { "unstable-app" } else { "+" });
                 if name == "nested-capture" {
                     let adapter = case.application_adapters.get(&call.func).ok_or("missing application adapter definition")?;
-                    let Some(pb::declaration::Kind::UserDefinedPrimitive(primitive)) = &adapter.declarations[0].kind else { unreachable!() };
+                    let primitive = &adapter.user_defined_primitives[0];
                     assert_eq!(primitive.inputs.len(), 2);
-                    assert_eq!(primitive.output, primitive.inputs[1].sort);
-                    let Some(pb::sort::Kind::Func(signature)) = &adapter.sorts[primitive.inputs[0].sort as usize].kind else { unreachable!() };
-                    assert_eq!(signature.params, [primitive.inputs[1].sort]);
+                    assert_eq!(primitive.output, primitive.inputs[1]);
+                    let Some(pb::sort::Kind::Func(signature)) = &adapter.sorts[primitive.inputs[0] as usize].kind else { unreachable!() };
+                    assert_eq!(signature.params, [primitive.inputs[1]]);
                     assert_eq!(signature.result, primitive.output);
                     let Some(pb::node::Kind::Apply(apply)) = &adapter.nodes[primitive.body.unwrap() as usize].kind else { unreachable!() };
                     assert_eq!(apply.args.len(), 1);
@@ -2069,7 +2070,6 @@ fn partial_call_oracle_trials() -> Vec<Trial> {
                                 args: vec![],
                             })),
                         })),
-                        ..Default::default()
                     }],
                     ..Default::default()
                 },
@@ -2106,7 +2106,6 @@ fn partial_call_oracle_trials() -> Vec<Trial> {
                             args: vec![child, child],
                         })),
                     })),
-                    ..Default::default()
                 });
             }
             let mut decoder = FrozenDecoder {
@@ -2129,7 +2128,6 @@ fn partial_call_oracle_trials() -> Vec<Trial> {
                             args: vec![child],
                         })),
                     })),
-                    ..Default::default()
                 });
             }
             let mut decoder = FrozenDecoder {
@@ -2163,7 +2161,6 @@ fn partial_call_oracle_trials() -> Vec<Trial> {
                             kind: Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
                                 value: Some(pb::primitive_value::Value::I64(value)),
                             })),
-                            ..Default::default()
                         })
                         .collect(),
                     ..Default::default()
@@ -2182,7 +2179,6 @@ fn partial_call_oracle_trials() -> Vec<Trial> {
                             .collect(),
                     })),
                 })),
-                ..Default::default()
             });
             let mut decoder = FrozenDecoder {
                 response: &map,
@@ -2289,13 +2285,11 @@ fn public_callable_oracle_trial() -> Trial {
         let mut saw_extract = false;
         for phase in Source::new(None, &rendered).map_err(|error| error.to_string())? {
             let program = phase.map_err(|error| error.to_string())?;
-            for declaration in &program.declarations {
-                if let Some(pb::declaration::Kind::Constructor(constructor)) = &declaration.kind
-                    && constructor.name == constructor_names[0]
-                {
+            for constructor in &program.constructors {
+                if constructor.name == constructor_names[0] {
                     assert_eq!(constructor.inputs.len(), 1);
                     assert!(
-                        matches!(&program.sorts[constructor.inputs[0].sort as usize].kind,
+                        matches!(&program.sorts[constructor.inputs[0] as usize].kind,
                         Some(pb::sort::Kind::Primitive(family)) if family.name == "i64" && family.args.is_empty())
                     );
                     assert!(matches!(
@@ -2498,7 +2492,6 @@ fn multi_extract_oracle_trial() -> Trial {
                     kind: Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
                         value: Some(pb::primitive_value::Value::I64(42)),
                     })),
-                    ..Default::default()
                 }])
                 .collect(),
             commands: vec![pb::Command {
@@ -2508,7 +2501,6 @@ fn multi_extract_oracle_trial() -> Trial {
                     extractor: pb::Extractor::Tree.into(),
                     ..Default::default()
                 })),
-                ..Default::default()
             }],
             ..Default::default()
         };

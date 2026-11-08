@@ -165,6 +165,28 @@ fn static_constructor_options_survive_bytes_and_conflicts_remain_semantic() -> R
 }
 
 #[test]
+fn multiple_extraction_ranks_available_terms_and_rejects_zero_before_effects()
+-> Result<(), TypedError> {
+    let low = CostTerm::Zero();
+    let high = CostTerm::Costly();
+    let root = let_("multiple-root", &high);
+    let mut graph = EGraph::with_recording(true)?;
+    graph.register((&root, union(&root, &low)))?;
+    assert_eq!(graph.extract_multiple(&root, 2)?, [low.clone(), high]);
+    assert_eq!(graph.extract(&root)?, low);
+
+    let fresh = let_("not-initialized", CostTerm::Costly());
+    let before = graph.history()?;
+    assert!(matches!(
+        graph.extract_multiple(&fresh, 0),
+        Err(TypedError::Invalid(_))
+    ));
+    assert_eq!(graph.history()?, before);
+    assert!(graph.freeze()?.lookup(&fresh).is_err());
+    Ok(())
+}
+
+#[test]
 fn snapshot_keeps_cycles_empty_classes_and_observation_provenance() -> Result<(), TypedError> {
     let root = let_("root", Node::Number(7));
     let empty = let_("empty", Node::Number(9));

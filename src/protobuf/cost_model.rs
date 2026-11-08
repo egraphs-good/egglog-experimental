@@ -309,7 +309,7 @@ impl Session {
                     *index,
                     context.extraction_dags.get(index),
                     true,
-                    &context.native_spans,
+                    &context.authored_origins,
                 )
                 .map(|root| root.expect("executed extraction root"))
             })
@@ -402,7 +402,6 @@ impl Session {
                         response.nodes.push(pb::Node {
                             sort_id: objective,
                             kind: Some(pb::node::Kind::PrimitiveValue(value)),
-                            ..Default::default()
                         });
                         Some(index)
                     } else {
@@ -557,7 +556,6 @@ mod tests {
                         kind: Some(pb::node::Kind::PrimitiveValue(pb::PrimitiveValue {
                             value: Some(pb::primitive_value::Value::I64(1)),
                         })),
-                        ..Default::default()
                     }],
                     commands: vec![pb::Command {
                         kind: Some(pb::command::Kind::Extract(pb::Extract {
@@ -566,7 +564,6 @@ mod tests {
                             extractor: pb::Extractor::Tree.into(),
                             cost_model: name.clone(),
                         })),
-                        ..Default::default()
                     }],
                     ..Default::default()
                 }),

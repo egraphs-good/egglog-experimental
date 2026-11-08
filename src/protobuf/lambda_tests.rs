@@ -25,17 +25,14 @@ fn anonymous_arithmetic(captured: i64) -> pb::Program {
                 kind: Some(N::PrimitiveValue(pb::PrimitiveValue {
                     value: Some(V::I64(captured)),
                 })),
-                ..Default::default()
             },
             pb::Node {
                 sort_id: 0,
                 kind: Some(N::Var("_0".into())),
-                ..Default::default()
             },
             pb::Node {
                 sort_id: 0,
                 kind: Some(N::Var("_1".into())),
-                ..Default::default()
             },
             pb::Node {
                 sort_id: 0,
@@ -43,7 +40,6 @@ fn anonymous_arithmetic(captured: i64) -> pb::Program {
                     func: "egglog.core.i64.add".into(),
                     args: vec![2, 1],
                 })),
-                ..Default::default()
             },
             pb::Node {
                 sort_id: 1,
@@ -53,14 +49,12 @@ fn anonymous_arithmetic(captured: i64) -> pb::Program {
                         body: 3,
                     })),
                 })),
-                ..Default::default()
             },
             pb::Node {
                 sort_id: 0,
                 kind: Some(N::PrimitiveValue(pb::PrimitiveValue {
                     value: Some(V::I64(5)),
                 })),
-                ..Default::default()
             },
             pb::Node {
                 sort_id: 0,
@@ -68,7 +62,6 @@ fn anonymous_arithmetic(captured: i64) -> pb::Program {
                     function: Some(4),
                     args: vec![5],
                 })),
-                ..Default::default()
             },
         ],
         commands: vec![pb::Command {
@@ -78,7 +71,6 @@ fn anonymous_arithmetic(captured: i64) -> pb::Program {
                 extractor: pb::Extractor::Tree.into(),
                 ..Default::default()
             })),
-            ..Default::default()
         }],
         ..Default::default()
     }
@@ -131,7 +123,6 @@ fn anonymous_lambda_executes_observes_and_restores_without_helper_names() {
         kind: Some(N::PrimitiveValue(pb::PrimitiveValue {
             value: Some(V::I64(7)),
         })),
-        ..Default::default()
     });
     let applied = replay.nodes.len() as u32;
     replay.nodes.push(pb::Node {
@@ -140,7 +131,6 @@ fn anonymous_lambda_executes_observes_and_restores_without_helper_names() {
             function: Some(extract.roots[0].variants[0].term),
             args: vec![value],
         })),
-        ..Default::default()
     });
     replay.commands.push(pb::Command {
         kind: Some(pb::command::Kind::Extract(pb::Extract {
@@ -149,7 +139,6 @@ fn anonymous_lambda_executes_observes_and_restores_without_helper_names() {
             extractor: pb::Extractor::Tree.into(),
             ..Default::default()
         })),
-        ..Default::default()
     });
     let (mut fresh, id) = host_default_engine();
     let observed = run_host_default(&mut fresh, id, replay);
@@ -167,16 +156,10 @@ fn anonymous_lambda_identity_excludes_environment_and_arena_metadata() {
     use pb::{node::Kind as N, primitive_value::Value as V};
     let (mut engine, id) = host_default_engine();
     let mut program = anonymous_arithmetic(10);
-    program.declarations.push(pb::Declaration {
-        kind: Some(pb::declaration::Kind::Function(pb::Function {
-            name: "held".into(),
-            inputs: vec![pb::Arg {
-                name: "key".into(),
-                sort: 0,
-            }],
-            output: 1,
-            ..Default::default()
-        })),
+    program.functions.push(pb::Function {
+        name: "held".into(),
+        inputs: vec![0],
+        output: 1,
         ..Default::default()
     });
     program.commands = vec![pb::Command {
@@ -188,9 +171,7 @@ fn anonymous_lambda_identity_excludes_environment_and_arena_metadata() {
                 }),
                 value: Some(4),
             })),
-            ..Default::default()
         })),
-        ..Default::default()
     }];
     assert_eq!(
         run_host_default(&mut engine, id, program.clone()).error,
@@ -208,18 +189,8 @@ fn anonymous_lambda_identity_excludes_environment_and_arena_metadata() {
             kind: Some(N::PrimitiveValue(pb::PrimitiveValue {
                 value: Some(V::I64(value)),
             })),
-            ..Default::default()
         });
     }
-    changed.files.push(pb::SourceFile {
-        name: "other-author.egg".into(),
-        contents: Some("lambda".into()),
-    });
-    changed.nodes[3].span = Some(pb::Span {
-        file: 0,
-        start: 0,
-        end: 6,
-    });
     // Duplicate a variable location used by the body, preserving typed syntax.
     changed.nodes.push(changed.nodes[2].clone());
     let last = changed.nodes.len() as u32 - 1;
@@ -231,11 +202,8 @@ fn anonymous_lambda_identity_excludes_environment_and_arena_metadata() {
         None,
         "same code and evaluated environment must be the same native value"
     );
-    let code_count = engine.graphs[&id]
-        .definitions
-        .declarations
-        .iter()
-        .filter(|d| matches!(d.kind, Some(pb::declaration::Kind::UserDefinedPrimitive(_))))
+    let code_count = declarations(&engine.graphs[&id].definitions)
+        .filter(|d| matches!(d, Declaration::UserDefinedPrimitive(_)))
         .count();
     assert_eq!(code_count, 1);
     program.nodes[0].kind = Some(N::PrimitiveValue(pb::PrimitiveValue {
@@ -251,7 +219,6 @@ fn anonymous_lambda_identity_excludes_environment_and_arena_metadata() {
         pb::Program {
             commands: vec![pb::Command {
                 kind: Some(pb::command::Kind::Freeze(pb::Freeze {})),
-                ..Default::default()
             }],
             ..Default::default()
         },
@@ -282,8 +249,7 @@ fn anonymous_lambda_captures_now_and_defers_body_reads() {
             }));
         }
         let base = program.nodes.len() as u32;
-        let files = program.files.len() as u32;
-        graph::append(&mut program, &code, files).unwrap();
+        graph::append(&mut program, &code).unwrap();
         let int = program.nodes[base as usize].sort_id;
         let function = program.nodes[base as usize + 4].sort_id;
         let twenty = program.nodes.len() as u32;
@@ -292,7 +258,6 @@ fn anonymous_lambda_captures_now_and_defers_body_reads() {
             kind: Some(N::PrimitiveValue(pb::PrimitiveValue {
                 value: Some(V::I64(20)),
             })),
-            ..Default::default()
         });
         let held = program.nodes.len() as u32;
         program.nodes.push(pb::Node {
@@ -301,7 +266,6 @@ fn anonymous_lambda_captures_now_and_defers_body_reads() {
                 func: "held".into(),
                 args: vec![],
             })),
-            ..Default::default()
         });
         let applied = program.nodes.len() as u32;
         program.nodes.push(pb::Node {
@@ -310,7 +274,6 @@ fn anonymous_lambda_captures_now_and_defers_body_reads() {
                 function: Some(held),
                 args: vec![base + 5],
             })),
-            ..Default::default()
         });
         for (name, value) in [("held", base + 4), ("cell", twenty)] {
             program.commands.push(pb::Command {
@@ -322,9 +285,7 @@ fn anonymous_lambda_captures_now_and_defers_body_reads() {
                         }),
                         value: Some(value),
                     })),
-                    ..Default::default()
                 })),
-                ..Default::default()
             });
         }
         program.commands.push(pb::Command {
@@ -334,7 +295,6 @@ fn anonymous_lambda_captures_now_and_defers_body_reads() {
                 extractor: pb::Extractor::Tree.into(),
                 ..Default::default()
             })),
-            ..Default::default()
         });
         let result = run_host_default(&mut engine, id, program);
         assert_eq!(result.error, None, "deferred={deferred}");
@@ -371,7 +331,6 @@ fn anonymous_lambda_nested_binders_and_clone_scopes_keep_code() {
     program.nodes.push(pb::Node {
         sort_id: 0,
         kind: Some(N::Var("_2".into())),
-        ..Default::default()
     });
     let xy = program.nodes.len() as u32;
     program.nodes.push(pb::Node {
@@ -380,7 +339,6 @@ fn anonymous_lambda_nested_binders_and_clone_scopes_keep_code() {
             func: "egglog.core.i64.add".into(),
             args: vec![2, y],
         })),
-        ..Default::default()
     });
     let sum = program.nodes.len() as u32;
     program.nodes.push(pb::Node {
@@ -389,7 +347,6 @@ fn anonymous_lambda_nested_binders_and_clone_scopes_keep_code() {
             func: "egglog.core.i64.add".into(),
             args: vec![xy, 1],
         })),
-        ..Default::default()
     });
     let inner = program.nodes.len() as u32;
     program.nodes.push(pb::Node {
@@ -400,7 +357,6 @@ fn anonymous_lambda_nested_binders_and_clone_scopes_keep_code() {
                 body: sum,
             })),
         })),
-        ..Default::default()
     });
     if let Some(N::PrimitiveValue(pb::PrimitiveValue {
         value: Some(V::Lambda(lambda)),
@@ -416,7 +372,6 @@ fn anonymous_lambda_nested_binders_and_clone_scopes_keep_code() {
             function: Some(6),
             args: vec![5],
         })),
-        ..Default::default()
     });
     if let Some(pb::command::Kind::Extract(extract)) = &mut program.commands[0].kind {
         extract.roots = vec![4, 6, applied];
@@ -430,18 +385,18 @@ fn anonymous_lambda_nested_binders_and_clone_scopes_keep_code() {
         }))
     )));
     assert!(!String::from_utf8_lossy(&result.output.encode_to_vec()).contains("__egglog_lambda"));
-    let count = engine.graphs[&id].definitions.declarations.len();
+    let count = declarations(&engine.graphs[&id].definitions).count();
     let child = engine
         .clone_request(pb::CloneEGraphRequest { egraph_id: id })
         .unwrap()
         .egraph_id;
     assert_eq!(run_host_default(&mut engine, child, program).error, None);
     assert_eq!(
-        engine.graphs[&child].definitions.declarations.len(),
+        declarations(&engine.graphs[&child].definitions).count(),
         count,
         "resupply reuses native code in a clone"
     );
-    assert_eq!(engine.graphs[&id].definitions.declarations.len(), count);
+    assert_eq!(declarations(&engine.graphs[&id].definitions).count(), count);
     engine
         .destroy_request(pb::DestroyEGraphRequest { egraph_id: child })
         .unwrap();
@@ -455,13 +410,13 @@ fn anonymous_lambda_nested_binders_and_clone_scopes_keep_code() {
 #[test]
 fn anonymous_lambda_rejects_bad_binders_and_deferred_fresh_values_before_effects() {
     use pb::{node::Kind as N, primitive_value::Value as V};
-    for invalid in ["binder", "sort", "union", "self"] {
+    for invalid in ["binder", "sort", "eq", "self"] {
         let (mut engine, id) = host_default_engine();
         let mut program = anonymous_arithmetic(10);
         match invalid {
             "binder" => program.nodes[1].kind = Some(N::Var("_2".into())),
             "sort" => program.nodes[1].sort_id = 1,
-            "union" => program.nodes[3].kind = Some(N::Union(pb::Union { members: vec![] })),
+            "eq" => program.nodes[3].kind = Some(N::Eq(pb::Eq { members: vec![] })),
             "self" => {
                 if let Some(N::PrimitiveValue(pb::PrimitiveValue {
                     value: Some(V::Lambda(lambda)),
@@ -479,7 +434,11 @@ fn anonymous_lambda_rejects_bad_binders_and_deferred_fresh_values_before_effects
             "{invalid}"
         );
         assert_eq!(engine.graphs[&id].request, 0);
-        assert!(engine.graphs[&id].definitions.declarations.is_empty());
+        assert!(
+            declarations(&engine.graphs[&id].definitions)
+                .next()
+                .is_none()
+        );
     }
 }
 
@@ -500,7 +459,6 @@ fn anonymous_lambda_evaluates_failing_unused_captures_in_order() {
         kind: Some(N::PrimitiveValue(pb::PrimitiveValue {
             value: Some(V::I64(0)),
         })),
-        ..Default::default()
     });
     let failing = code.nodes.len() as u32;
     code.nodes.push(pb::Node {
@@ -509,7 +467,6 @@ fn anonymous_lambda_evaluates_failing_unused_captures_in_order() {
             func: "egglog.core.i64.div".into(),
             args: vec![0, zero],
         })),
-        ..Default::default()
     });
     let later = code.nodes.len() as u32;
     code.nodes.push(pb::Node {
@@ -518,7 +475,6 @@ fn anonymous_lambda_evaluates_failing_unused_captures_in_order() {
             func: "M".into(),
             args: vec![5],
         })),
-        ..Default::default()
     });
     if let Some(N::PrimitiveValue(pb::PrimitiveValue {
         value: Some(V::Lambda(lambda)),
@@ -528,14 +484,11 @@ fn anonymous_lambda_evaluates_failing_unused_captures_in_order() {
         lambda.body = 5; // Both captures are unused; construction is still strict.
     }
     let base = program.nodes.len() as u32;
-    let files = program.files.len() as u32;
-    graph::append(&mut program, &code, files).unwrap();
+    graph::append(&mut program, &code).unwrap();
     program.commands.push(pb::Command {
         kind: Some(pb::command::Kind::Action(pb::Action {
             kind: Some(pb::action::Kind::Term(base + 4)),
-            ..Default::default()
         })),
-        ..Default::default()
     });
     let result = run_host_default(&mut engine, id, program);
     assert_eq!(
@@ -601,17 +554,13 @@ fn anonymous_lambda_bodies_retain_native_context_admission() {
                     body,
                 })),
             })),
-            ..Default::default()
         });
         program.commands.clear();
         assert_eq!(run_host_default(&mut engine, id, program).error, None);
         let session = engine.graphs.get_mut(&id).unwrap();
-        let helper = session
-            .definitions
-            .declarations
-            .iter()
+        let helper = declarations(&session.definitions)
             .find_map(|d| {
-                if let Some(pb::declaration::Kind::UserDefinedPrimitive(p)) = &d.kind {
+                if let Declaration::UserDefinedPrimitive(p) = d {
                     Some(&p.name)
                 } else {
                     None

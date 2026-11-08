@@ -1,6 +1,7 @@
 #![cfg(feature = "typed")]
 #![allow(non_snake_case)] // These valid authored spellings are the regression.
 
+use egglog_experimental::typed::builtins::I64;
 use egglog_experimental::typed::prelude::*;
 
 #[sort]
@@ -68,5 +69,37 @@ fn generated_bindings_do_not_capture_authored_names() -> Result<(), TypedError> 
     assert_eq!(fields.__egglog_definition, atom);
     assert_eq!(fields.__EGGLOG_DEFINITION, atom);
     assert_eq!(Atom::from(fields), read);
+    Ok(())
+}
+
+#[relation]
+fn input_pair(left: I64, right: I64);
+#[relation]
+fn output_pair(left: I64, right: I64);
+
+#[ruleset]
+fn parameter_names(r#type: &I64, __egglog_scope: &I64) -> Rule {
+    rule(
+        input_pair(r#type, __egglog_scope),
+        output_pair(r#type, __egglog_scope),
+    )
+}
+
+#[test]
+fn ruleset_parameters_keep_authored_names_and_macro_hygiene() -> Result<(), TypedError> {
+    let mut graph = EGraph::with_recording(true)?;
+    graph.register(input_pair(11, 17))?;
+    graph.run(&parameter_names)?;
+    assert!(graph.check(output_pair(11, 17))?);
+    let names: std::collections::HashSet<_> = graph
+        .history()?
+        .nodes
+        .into_iter()
+        .filter_map(|node| match node.kind {
+            Some(egglog_experimental::proto::node::Kind::Var(name)) => Some(name),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(names, ["type".into(), "__egglog_scope".into()].into());
     Ok(())
 }

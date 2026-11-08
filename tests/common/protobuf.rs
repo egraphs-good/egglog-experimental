@@ -2,45 +2,25 @@
 //! Relocate each local arena once; never identify distinct node locations.
 
 use egglog_proto as pb;
-use std::collections::HashMap;
 
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Observed {
     pub output: pb::RunProgramOutput,
-    pub files: Vec<pb::SourceFile>,
     pub error: Option<pb::Error>,
 }
 
 impl Observed {
     pub fn from_frames(frames: impl IntoIterator<Item = pb::RunProgramResponse>) -> Self {
         let mut result = Self::default();
-        let mut sources = HashMap::new();
         let mut count = 0;
         for frame in frames {
             count += 1;
             assert!(result.error.is_none(), "frame follows terminal error");
-            let files: Vec<_> = frame
-                .files
-                .into_iter()
-                .map(|file| {
-                    *sources.entry(file.clone()).or_insert_with(|| {
-                        let index = u32::try_from(result.files.len()).unwrap();
-                        result.files.push(file);
-                        index
-                    })
-                })
-                .collect();
-            let span = |span: &mut Option<pb::Span>| {
-                if let Some(span) = span {
-                    span.file = files[span.file as usize];
-                }
-            };
             let Some(outcome) = frame.result else {
                 panic!("frame has no result")
             };
             let mut output = match outcome {
-                pb::run_program_response::Result::Error(mut error) => {
-                    span(&mut error.span);
+                pb::run_program_response::Result::Error(error) => {
                     result.error = Some(error);
                     continue;
                 }
@@ -52,7 +32,6 @@ impl Observed {
                 *index = index.checked_add(offset).unwrap();
             };
             for sort in &mut output.sorts {
-                span(&mut sort.span);
                 match &mut sort.kind {
                     Some(pb::sort::Kind::Primitive(primitive)) => {
                         for child in &mut primitive.args {
@@ -69,7 +48,6 @@ impl Observed {
                 }
             }
             for node in &mut output.nodes {
-                span(&mut node.span);
                 bump(&mut node.sort_id, sorts);
                 use pb::{node::Kind as N, primitive_value::Value as V};
                 match &mut node.kind {
@@ -78,7 +56,7 @@ impl Observed {
                             bump(child, nodes);
                         }
                     }
-                    Some(N::Union(union)) => {
+                    Some(N::Eq(union)) => {
                         for child in &mut union.members {
                             bump(child, nodes);
                         }

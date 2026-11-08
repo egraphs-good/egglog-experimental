@@ -547,7 +547,7 @@ fn callable(
             #(#cfg)* impl #record {
                 pub fn fresh() -> Self {
                     let #scope = ::egglog_experimental::typed::__private::fresh_scope(); let _ = #scope;
-                    Self { #(#names: ::egglog_experimental::typed::__private::variable::<#types>(#scope, #indices),)* }
+                    Self { #(#names: ::egglog_experimental::typed::__private::variable::<#types>(#scope, #indices, ::std::option::Option::None),)* }
                 }
                 pub fn get_args(#value: &#output) -> Result<Option<Self>, ::egglog_experimental::typed::TypedError> {
                     let Some((#(#hidden,)*)) = ::egglog_experimental::typed::get_args(#value, |#(#hidden: &#types),*| #target(#(#hidden),*))? else { return Ok(None); };
@@ -788,25 +788,21 @@ fn operator_declarations(item: Declarations) -> syn::Result<Tokens> {
             ));
         }
     };
-    let syn::PathArguments::AngleBracketed(args) = &segments[2].arguments else {
-        return Err(syn::Error::new_spanned(
-            &trait_path,
-            "binary constructor traits require one explicit RHS type",
-        ));
+    let trait_rhs = match &segments[2].arguments {
+        syn::PathArguments::None => syn::parse_quote!(Self),
+        syn::PathArguments::AngleBracketed(args) if args.args.len() == 1 => {
+            let Some(syn::GenericArgument::Type(rhs)) = args.args.first() else {
+                return Err(syn::Error::new_spanned(args, "operator RHS must be a type"));
+            };
+            rhs.clone()
+        }
+        arguments => {
+            return Err(syn::Error::new_spanned(
+                arguments,
+                "binary constructor traits accept one RHS type, defaulting to Self",
+            ));
+        }
     };
-    if args.args.len() != 1 {
-        return Err(syn::Error::new_spanned(
-            args,
-            "binary constructor traits require one explicit RHS type",
-        ));
-    }
-    let Some(syn::GenericArgument::Type(trait_rhs)) = args.args.first() else {
-        return Err(syn::Error::new_spanned(
-            args,
-            "binary constructor traits require one explicit RHS type",
-        ));
-    };
-    let trait_rhs = trait_rhs.clone();
     let mut declaration = None;
     let mut associated_output = None;
     for member in members {
@@ -984,6 +980,8 @@ fn ruleset_item(mut item: syn::ItemFn, opts: Vec<Meta>) -> syn::Result<Tokens> {
             "rulesets support at most 64 borrowed arguments",
         ));
     }
+    let mut argument_names = vec![];
+    let mut argument_types = vec![];
     for input in &sig.inputs {
         let FnArg::Typed(arg) = input else {
             return Err(syn::Error::new_spanned(
@@ -1021,6 +1019,8 @@ fn ruleset_item(mut item: syn::ItemFn, opts: Vec<Meta>) -> syn::Result<Tokens> {
                 "ruleset callbacks do not support impl Trait inputs",
             ));
         }
+        argument_names.push(pat.ident.unraw().to_string());
+        argument_types.push(reference.elem.as_ref().clone());
     }
     if matches!(&sig.output, ReturnType::Type(_, ty) if matches!(ty.as_ref(), Type::ImplTrait(_))) {
         return Err(syn::Error::new_spanned(
@@ -1056,13 +1056,32 @@ fn ruleset_item(mut item: syn::ItemFn, opts: Vec<Meta>) -> syn::Result<Tokens> {
     let ident = sig.ident;
     let inputs = sig.inputs;
     let output = sig.output;
+    let mut occupied = argument_names.iter().cloned().collect();
+    let scope = fresh_ident("__egglog_scope", &mut occupied);
+    let indices = 0..argument_names.len();
+    let construction = if argument_names.is_empty() {
+        quote!(::egglog_experimental::typed::__private::named_ruleset(
+            || ::std::option::Option::Some((#name).into()), |#inputs| #output #block,
+        ))
+    } else {
+        quote!({
+            let #scope = ::egglog_experimental::typed::__private::fresh_scope();
+            let _ = #scope;
+            ::egglog_experimental::typed::__private::named_ruleset(
+                || ::std::option::Option::Some((#name).into()),
+                (|#inputs| #output #block)(#(
+                    &::egglog_experimental::typed::__private::variable::<#argument_types>(
+                        #scope, #indices, ::std::option::Option::Some(#argument_names)
+                    ),
+                )*),
+            )
+        })
+    };
     Ok(quote! {
         #(#attrs)*
         #[allow(non_upper_case_globals)]
         #vis static #ident: ::std::sync::LazyLock<::egglog_experimental::typed::Ruleset> =
-            ::std::sync::LazyLock::new(|| ::egglog_experimental::typed::__private::named_ruleset(
-                || ::std::option::Option::Some((#name).into()), |#inputs| #output #block,
-            ));
+            ::std::sync::LazyLock::new(|| #construction);
     })
 }
 
@@ -1663,7 +1682,7 @@ mod tests {
         for source in [
             "impl custom::Add<&Right> for &Left { type Output = Left; fn add(self, rhs: &Right) -> Left; }",
             "impl std::ops::BitAnd<&Right> for &Left { type Output = Left; fn bitand(self, rhs: &Right) -> Left; }",
-            "impl std::ops::Add for Left { type Output = Left; fn add(self, rhs: Left) -> Left; }",
+            "impl std::ops::Add<Left, Right> for Left { type Output = Left; fn add(self, rhs: Left) -> Left; }",
             "impl std::ops::Add<&Right> for &Left { type Output = Left; #[function(no_merge)] fn add(self, rhs: &Right) -> Left; }",
             "impl std::ops::Add<&Right> for &Left { type Output = Left; #[constructor(from)] fn add(self, rhs: &Right) -> Left; }",
             "impl std::ops::Add<&Right> for &Left { type Output = Left; fn add(&mut self, rhs: &Right) -> Left; }",
@@ -2023,13 +2042,24 @@ mod tests {
             #[allow(unused_variables)]
             #[allow(non_upper_case_globals)]
             pub(crate) static authored: ::std::sync::LazyLock<::egglog_experimental::typed::Ruleset> =
-                ::std::sync::LazyLock::new(|| ::egglog_experimental::typed::__private::named_ruleset(
-                    || ::std::option::Option::Some((concat!(module_path!(), "::", stringify!(authored))).into()),
-                    |mut first: &I64, second: &Bool| -> Vec<Rule> {
-                        let chosen = first;
-                        vec![rewrite(chosen, second)]
-                    },
-                ));
+                ::std::sync::LazyLock::new(|| {
+                    let __egglog_scope = ::egglog_experimental::typed::__private::fresh_scope();
+                    let _ = __egglog_scope;
+                    ::egglog_experimental::typed::__private::named_ruleset(
+                        || ::std::option::Option::Some((concat!(module_path!(), "::", stringify!(authored))).into()),
+                        (|mut first: &I64, second: &Bool| -> Vec<Rule> {
+                            let chosen = first;
+                            vec![rewrite(chosen, second)]
+                        })(
+                            &::egglog_experimental::typed::__private::variable::<I64>(
+                                __egglog_scope, 0usize, ::std::option::Option::Some("first")
+                            ),
+                            &::egglog_experimental::typed::__private::variable::<Bool>(
+                                __egglog_scope, 1usize, ::std::option::Option::Some("second")
+                            ),
+                        ),
+                    )
+                });
         };
         assert_eq!(expanded.to_string(), expected.to_string());
     }

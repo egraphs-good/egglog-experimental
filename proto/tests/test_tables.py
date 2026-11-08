@@ -28,27 +28,26 @@ def table_response(rows):
 
 class TableSchemaTests(unittest.TestCase):
     def test_reflective_prefix_is_optional_table_metadata_including_empty(self):
-        for tag, table in (
-            ("constructor", ir.Constructor(name="C", output=0)),
-            ("function", ir.Function(name="f", output=0)),
-            ("relation", ir.Relation(name="R")),
+        for table_type, callable_name in (
+            (ir.Constructor, "C"),
+            (ir.Function, "f"),
+            (ir.Relation, "R"),
         ):
             for prefix in [None] + [
                 Oneof(arm, name)
                 for arm in ("public_alias", "default_name")
-                for name in ("", table.name, "other-prefix")
+                for name in ("", callable_name, "other-prefix")
             ]:
-                declaration = ir.Declaration(kind=Oneof(tag, table), table_name=prefix)
-                validate(declaration)
+                table = table_type(name=callable_name, table_name=prefix)
+                validate(table)
                 for decoded in (
-                    ir.Declaration.from_binary(declaration.to_binary()),
-                    ir.Declaration.from_json(declaration.to_json()),
+                    table_type.from_binary(table.to_binary()),
+                    table_type.from_json(table.to_json()),
                 ):
-                    self.assertEqual(decoded, declaration)
+                    self.assertEqual(decoded, table)
                     self.assertEqual(decoded.table_name, prefix)
-        with self.assertRaises(ValidationError):
-            validate(ir.Declaration(kind=Oneof("user_defined_primitive",
-                ir.UserDefinedPrimitive(name="p", body=0)), table_name=Oneof("public_alias", "")))
+        with self.assertRaises(TypeError):
+            ir.UserDefinedPrimitive(name="p", body=0, table_name=Oneof("public_alias", ""))
 
     def test_internal_parent_is_not_public_sort_metadata(self):
         sort = ir.Sort(kind=Oneof("eq", "S"))
@@ -58,15 +57,14 @@ class TableSchemaTests(unittest.TestCase):
             ir.Sort(kind=Oneof("eq", "S"), uf_parent="Pending")
 
     def test_hidden_is_owned_by_constructor_or_function(self):
-        for tag, table in (
-            ("constructor", ir.Constructor(name="C", output=0, hidden=True)),
-            ("function", ir.Function(name="f", output=0, hidden=True)),
+        for table in (
+            ir.Constructor(name="C", output=0, hidden=True),
+            ir.Function(name="f", output=0, hidden=True),
         ):
-            declaration = ir.Declaration(kind=Oneof(tag, table))
-            validate(declaration)
-            self.assertTrue(ir.Declaration.from_binary(declaration.to_binary()).kind.value.hidden)
-            self.assertTrue(ir.Declaration.from_json(declaration.to_json()).kind.value.hidden)
-        for message in (ir.Declaration, ir.Relation, ir.Sort, ir.UserDefinedPrimitive):
+            validate(table)
+            self.assertTrue(type(table).from_binary(table.to_binary()).hidden)
+            self.assertTrue(type(table).from_json(table.to_json()).hidden)
+        for message in (ir.Relation, ir.Sort, ir.UserDefinedPrimitive):
             with self.subTest(message=message), self.assertRaises(TypeError):
                 message(hidden=True)
 

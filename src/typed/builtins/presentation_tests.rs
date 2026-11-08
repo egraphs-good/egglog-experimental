@@ -176,7 +176,7 @@ fn generic_free_functions_reject_unsupported_or_ambiguous_views() {
                 if case == 10 {
                     s.type_param_count += 1;
                 } else {
-                    s.varargs.push(s.inputs[0].clone());
+                    s.varargs.push(s.inputs[0]);
                 }
             }
             12 => {
@@ -310,8 +310,8 @@ fn map_data_codec_and_operations_follow_their_own_typed_records() {
                 s.type_param_count -= 1;
             }
             2 => s.inputs.clear(),
-            3 => s.output = Some(s.inputs[0].sort),
-            _ => s.varargs.push(s.inputs[0].clone()),
+            3 => s.output = Some(s.inputs[0]),
+            _ => s.varargs.push(s.inputs[0]),
         }
         if case == 3 {
             // from_pairs is a catalog operation; its declared result determines
@@ -371,9 +371,9 @@ fn maybe_codec_follows_catalog_identity_and_checks_optional_child_scheme() {
         let Some(s) = &mut p.signature else { panic!() };
         match case {
             0 => s.inputs.clear(),
-            1 => s.output = Some(s.inputs[0].sort),
+            1 => s.output = Some(s.inputs[0]),
             2 => s.type_param_count += 1,
-            _ => s.varargs.push(s.inputs[0].clone()),
+            _ => s.varargs.push(s.inputs[0]),
         }
         assert!(
             generate(&changed, &mapping).is_err(),
@@ -412,11 +412,11 @@ fn pair_codec_follows_catalog_identity_paths_and_two_binders() {
             0 => {
                 s.inputs.pop();
             }
-            1 => s.output = Some(s.inputs[0].sort),
+            1 => s.output = Some(s.inputs[0]),
             2 => {
                 s.type_param_count -= 1;
             }
-            _ => s.varargs.push(s.inputs[0].clone()),
+            _ => s.varargs.push(s.inputs[0]),
         }
         assert!(
             generate(&changed, &mapping).is_err(),
@@ -508,7 +508,7 @@ fn grouped_tail_views_are_explicitly_rejected_but_records_are_retained() {
         s.varargs = s.inputs.clone();
         s.inputs.clear();
     }
-    s.varargs.push(s.varargs[0].clone());
+    s.varargs.push(s.varargs[0]);
     let before = changed.encode_to_vec();
     assert!(generate(&changed, &mapping).is_err());
     assert_eq!(changed.encode_to_vec(), before);
@@ -763,7 +763,7 @@ fn native_records_determine_paths_locations_and_argument_order() {
     for primitive in &mut changed.primitives {
         if let Some(s) = &mut primitive.signature {
             for a in s.inputs.iter_mut().chain(&mut s.varargs) {
-                a.sort = last - a.sort
+                *a = last - *a
             }
             let output = s.output.as_mut().unwrap();
             *output = last - *output;

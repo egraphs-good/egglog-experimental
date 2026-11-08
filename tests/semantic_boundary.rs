@@ -82,7 +82,6 @@ fn builtins_are_backend_wide_and_absent_from_user_state_and_history() {
         pb::Program {
             commands: vec![pb::Command {
                 kind: Some(pb::command::Kind::Freeze(pb::Freeze {})),
-                ..Default::default()
             }],
             ..Default::default()
         },
@@ -104,8 +103,19 @@ fn builtins_are_backend_wide_and_absent_from_user_state_and_history() {
         })
         .unwrap();
     let restored = snapshot.program.as_ref().unwrap();
-    assert_eq!(restored.declarations.len(), 2);
-    assert!(restored.declarations.iter().any(|declaration| matches!(&declaration.kind, Some(pb::declaration::Kind::UserDefinedPrimitive(primitive)) if primitive.name == "inc")));
+    assert_eq!(
+        restored.constructors.len()
+            + restored.functions.len()
+            + restored.relations.len()
+            + restored.user_defined_primitives.len(),
+        2
+    );
+    assert!(
+        restored
+            .user_defined_primitives
+            .iter()
+            .any(|primitive| primitive.name == "inc")
+    );
     assert!(
         restored
             .sorts
@@ -119,7 +129,13 @@ fn builtins_are_backend_wide_and_absent_from_user_state_and_history() {
             .as_slice(),
     )
     .unwrap();
-    assert_eq!(history.declarations.len(), 2);
+    assert_eq!(
+        history.constructors.len()
+            + history.functions.len()
+            + history.relations.len()
+            + history.user_defined_primitives.len(),
+        2
+    );
     assert!(
         history
             .sorts
@@ -151,7 +167,7 @@ impl NativeExtension for ComputedProvider {
         _graph: &egglog_experimental::EGraph,
         _sort: &egglog_experimental::ArcSort,
         _value: &pb::CustomValue,
-        _span: Option<pb::Span>,
+
         _destination: &mut pb::Program,
     ) -> Result<pb::Call, String> {
         Err("no custom values".into())
@@ -176,7 +192,12 @@ fn configured_computed_implementation_is_an_ambient_signature_not_a_user_body() 
         Source::with_extension(None, "(check (= (configured_inc 2) 3))", extension).unwrap()
     {
         let program = program.unwrap();
-        assert!(program.declarations.is_empty());
+        assert!(
+            program.constructors.is_empty()
+                && program.functions.is_empty()
+                && program.relations.is_empty()
+                && program.user_defined_primitives.is_empty()
+        );
         renderer.render(&program).unwrap();
         for frame in run(&mut engine, id, program) {
             let Some(pb::run_program_response::Result::Output(output)) = frame.result else {
@@ -184,7 +205,13 @@ fn configured_computed_implementation_is_an_ambient_signature_not_a_user_body() 
             };
             for output in output.outputs {
                 if let Some(pb::command_output::Kind::Snapshot(snapshot)) = output.kind {
-                    assert!(snapshot.program.unwrap().declarations.is_empty());
+                    let program = snapshot.program.unwrap();
+                    assert!(
+                        program.constructors.is_empty()
+                            && program.functions.is_empty()
+                            && program.relations.is_empty()
+                            && program.user_defined_primitives.is_empty()
+                    );
                 }
             }
         }
@@ -195,7 +222,6 @@ fn configured_computed_implementation_is_an_ambient_signature_not_a_user_body() 
         pb::Program {
             commands: vec![pb::Command {
                 kind: Some(pb::command::Kind::Freeze(pb::Freeze {})),
-                ..Default::default()
             }],
             ..Default::default()
         },
@@ -209,10 +235,6 @@ fn configured_computed_implementation_is_an_ambient_signature_not_a_user_body() 
 #[test]
 fn stream_and_buffer_preserve_prefix_before_exclusive_terminal_error() {
     let program = pb::Program {
-        files: vec![pb::SourceFile {
-            name: "prefix.egg".into(),
-            contents: Some("panic".into()),
-        }],
         sorts: ["i64", "Unit"]
             .into_iter()
             .map(|name| pb::Sort {
@@ -240,7 +262,6 @@ fn stream_and_buffer_preserve_prefix_before_exclusive_terminal_error() {
                             func: "Row".into(),
                             args: vec![2 * index as u32],
                         })),
-                        ..Default::default()
                     },
                 ]
             })
@@ -249,33 +270,22 @@ fn stream_and_buffer_preserve_prefix_before_exclusive_terminal_error() {
             pb::Command {
                 kind: Some(pb::command::Kind::Action(pb::Action {
                     kind: Some(pb::action::Kind::Term(1)),
-                    ..Default::default()
                 })),
-                ..Default::default()
             },
             pb::Command {
                 kind: Some(pb::command::Kind::TableSizes(pb::GetTableSizes {
                     tables: vec!["Row".into()],
                 })),
-                ..Default::default()
             },
             pb::Command {
                 kind: Some(pb::command::Kind::Action(pb::Action {
                     kind: Some(pb::action::Kind::Panic("stop".into())),
-                    span: Some(pb::Span {
-                        file: 0,
-                        start: 0,
-                        end: 5,
-                    }),
                 })),
-                ..Default::default()
             },
             pb::Command {
                 kind: Some(pb::command::Kind::Action(pb::Action {
                     kind: Some(pb::action::Kind::Term(3)),
-                    ..Default::default()
                 })),
-                ..Default::default()
             },
         ],
         ..Default::default()
@@ -312,15 +322,10 @@ fn stream_and_buffer_preserve_prefix_before_exclusive_terminal_error() {
     let Some(pb::run_program_response::Result::Error(error)) = &terminal.result else {
         unreachable!()
     };
-    let span = error.span.unwrap();
-    assert_eq!(
-        terminal.files[span.file as usize]
-            .contents
-            .as_deref()
-            .unwrap()
-            .get(span.start as usize..span.end as usize),
-        Some("panic")
-    );
+    let context = error.context.as_ref().unwrap();
+    assert!(matches!(context.commands[0].kind,
+        Some(pb::command::Kind::Action(pb::Action { kind: Some(pb::action::Kind::Panic(ref message)) })) if message == "stop"));
+    assert_eq!(error.site.as_ref().unwrap().path, [5, 0, 1]);
     let rejected = source(&mut buffered, id, "(relation Row (i64)) (check (Row 3))");
     assert!(
         matches!(&rejected.last().unwrap().result,Some(pb::run_program_response::Result::Error(error)) if error.code==pb::ErrorCode::CheckFailed as i32)
@@ -423,7 +428,10 @@ fn source_application_is_intrinsic_and_first_class_application_has_a_body() {
             .nodes
             .iter()
             .any(|node| matches!(node.kind, Some(pb::node::Kind::Apply(_))));
-        adapter |= program.declarations.iter().any(|declaration| matches!(&declaration.kind, Some(pb::declaration::Kind::UserDefinedPrimitive(primitive)) if primitive.name.starts_with("__egglog_application_")));
+        adapter |= program
+            .user_defined_primitives
+            .iter()
+            .any(|primitive| primitive.name.starts_with("__egglog_application_"));
         for node in &program.nodes {
             let name = match &node.kind {
                 Some(pb::node::Kind::Call(call)) => &call.func,
@@ -453,7 +461,6 @@ fn source_application_is_intrinsic_and_first_class_application_has_a_body() {
         pb::Program {
             commands: vec![pb::Command {
                 kind: Some(pb::command::Kind::Freeze(pb::Freeze {})),
-                ..Default::default()
             }],
             ..Default::default()
         },

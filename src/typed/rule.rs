@@ -25,9 +25,7 @@ impl<I: ValueInput> From<I> for Action {
                     commands: vec![pb::Command {
                         kind: Some(pb::command::Kind::Action(pb::Action {
                             kind: Some(pb::action::Kind::Term(0)),
-                            ..Default::default()
                         })),
-                        ..Default::default()
                     }],
                     ..Default::default()
                 },
@@ -113,7 +111,6 @@ fn row_action(target: &Expr, mut action: pb::action::Kind, value: Option<Expr>) 
                             binding: Some(0),
                             value: Some(1),
                         })),
-                        ..Default::default()
                     }],
                     ..Default::default()
                 },
@@ -132,30 +129,15 @@ fn row_action(target: &Expr, mut action: pb::action::Kind, value: Option<Expr>) 
         let declaration = target
             .0
             .declaration(&call.func, DeclarationKind::Callable)?;
-        let kind = declaration
-            .owner
-            .as_ref()
-            .unwrap()
-            .program()
-            .ok()
-            .and_then(|program| program.declarations.get(declaration.index as usize))
-            .and_then(|declaration| declaration.kind.as_ref());
+        let kind = declaration.arena;
         if !matches!(
             (kind, &action),
-            (
-                Some(pb::declaration::Kind::Function(_)),
-                pb::action::Kind::Set(_)
-            ) | (
-                Some(
-                    pb::declaration::Kind::Function(_)
-                        | pb::declaration::Kind::Constructor(_)
-                        | pb::declaration::Kind::Relation(_)
-                ),
-                pb::action::Kind::Delete(_)
-            ) | (
-                Some(pb::declaration::Kind::Constructor(_)),
-                pb::action::Kind::Subsume(_)
-            )
+            (Arena::Function, pb::action::Kind::Set(_))
+                | (
+                    Arena::Function | Arena::Constructor | Arena::Relation,
+                    pb::action::Kind::Delete(_)
+                )
+                | (Arena::Constructor, pb::action::Kind::Subsume(_))
         ) {
             return Err(TypedError::Invalid(
                 "Set requires a function; Delete requires a constructor, function or relation; Subsume requires a constructor".into(),
@@ -184,11 +166,7 @@ fn row_action(target: &Expr, mut action: pb::action::Kind, value: Option<Expr>) 
         publish(
             pb::Program {
                 commands: vec![pb::Command {
-                    kind: Some(pb::command::Kind::Action(pb::Action {
-                        kind: Some(action),
-                        ..Default::default()
-                    })),
-                    ..Default::default()
+                    kind: Some(pb::command::Kind::Action(pb::Action { kind: Some(action) })),
                 }],
                 ..Default::default()
             },
@@ -215,8 +193,8 @@ pub fn eq<L: ValueInput>(left: L, right: impl Into<L::Owned>) -> Fact {
 }
 
 /// Union two equality-sort values as an explicit ordered action.
-/// Clones retain the Union occurrence. NORMAL direct actions support repeated
-/// occurrences and nested Unions; generalized rule-head, deferred, query and
+/// Clones retain the Eq occurrence. NORMAL direct actions support repeated
+/// occurrences and nested Eq nodes; generalized rule-head, deferred, query and
 /// encoded-mode use remains unsupported. Fresh nested captures remain unsupported;
 /// established captures may be used in top-level actions.
 pub fn union<L: ValueInput>(left: L, right: impl Into<L::Owned>) -> Action
@@ -232,9 +210,7 @@ where
                 commands: vec![pb::Command {
                     kind: Some(pb::command::Kind::Action(pb::Action {
                         kind: Some(pb::action::Kind::Term(0)),
-                        ..Default::default()
                     })),
-                    ..Default::default()
                 }],
                 ..Default::default()
             },
@@ -262,7 +238,7 @@ fn equality_node(left: &Expr, right: &Expr) -> Expr {
     )];
     let program = pb::Program {
         nodes: vec![pb::Node {
-            kind: Some(pb::node::Kind::Union(pb::Union {
+            kind: Some(pb::node::Kind::Eq(pb::Eq {
                 members: vec![0, 1],
             })),
             ..Default::default()
@@ -322,7 +298,10 @@ pub fn rule(lhs: impl Facts, rhs: impl Actions) -> Rule {
             Arena::Rule,
             0,
             vec![pb::Rule {
-                kind: Some(pb::rule::Kind::Rule(pb::RuleBody { query, head })),
+                kind: Some(pb::rule::Kind::Rule(pb::RuleBody {
+                    query,
+                    actions: head,
+                })),
                 eval_mode: pb::RuleEvalMode::Seminaive.into(),
                 ..Default::default()
             }],
@@ -509,7 +488,7 @@ macro_rules! callbacks {
             fn append(self, rules: &mut Vec<Rule>) {
                 let scope = fresh_scope();
                 let _ = scope;
-                self($(&variable::<$t>(scope, $i)),*).append(rules);
+                self($(&variable::<$t>(scope, $i, None)),*).append(rules);
             }
         }
     };
@@ -613,9 +592,7 @@ pub(super) mod action_input {
                     kind: Some(pb::action::Kind::Term(node(
                         self.borrow().expression().clone(),
                     ))),
-                    ..Default::default()
                 })),
-                ..Default::default()
             });
             Ok(())
         }
