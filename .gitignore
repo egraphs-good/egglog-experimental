@@ -5,6 +5,7 @@
 /gen/python/egglog/
 /gen/python/buf/
 /gen/python/build/
+/gen/python/dist/
 /gen/python/*.egg-info/
 /gen/rust/egglog/
 /gen/rust/buf/
