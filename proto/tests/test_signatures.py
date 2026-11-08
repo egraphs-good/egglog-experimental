@@ -21,8 +21,8 @@ def signature_program(pattern):
         ],
         primitive_sorts=[ir.PrimitiveSort(name="i64"), ir.PrimitiveSort(name="Map", arity=2)],
         primitives=[ir.Primitive(name="test.pairs", signature=ir.GenericSignature(
-            type_param_count=2, inputs=[ir.Arg(name="prefix", sort=0)], output=3,
-            varargs=[ir.Arg(name=f"tail{i}", sort=sort) for i, sort in enumerate(pattern)],
+            type_param_count=2, inputs=[0], output=3,
+            varargs=list(pattern),
         ))],
     )
 
@@ -36,7 +36,7 @@ class SignatureSchemaTests(unittest.TestCase):
                 decoded = ir.BuiltinCatalog.from_binary(program.to_binary())
                 self.assertEqual(decoded, program)
                 self.assertEqual(
-                    [arg.sort for arg in decoded.primitives[-1].signature.varargs],
+                    list(decoded.primitives[-1].signature.varargs),
                     pattern,
                 )
 
@@ -56,7 +56,7 @@ class SignatureSchemaTests(unittest.TestCase):
 
 
     def test_signature_count_has_no_labels_or_kind_constraints(self):
-        signature = ir.GenericSignature(type_param_count=1, inputs=[ir.Arg(sort=1)], output=1)
+        signature = ir.GenericSignature(type_param_count=1, inputs=[1], output=1)
         self.assertEqual(ir.GenericSignature.from_binary(signature.to_binary()), signature)
         self.assertEqual(json.loads(signature.to_json())["typeParamCount"], 1)
         with self.assertRaises(TypeError):
@@ -68,9 +68,9 @@ class SignatureSchemaTests(unittest.TestCase):
         self.assertFalse(hasattr(ir, "FunctionApplication"))
 
     def test_protojson_tail_is_an_array_not_the_old_object(self):
-        signature = ir.GenericSignature(output=0, varargs=[ir.Arg(sort=1), ir.Arg(sort=2)])
+        signature = ir.GenericSignature(output=0, varargs=[1, 2])
         encoded = signature.to_json()
-        self.assertEqual(json.loads(encoded)["varargs"], [{"sort": 1}, {"sort": 2}])
+        self.assertEqual(json.loads(encoded)["varargs"], [1, 2])
         self.assertEqual(ir.GenericSignature.from_json(encoded), signature)
         with self.assertRaises(TypeError):
             ir.GenericSignature.from_json('{"output":0,"varargs":{"sort":1}}')

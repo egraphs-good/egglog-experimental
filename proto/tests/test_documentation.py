@@ -12,15 +12,17 @@ from gen.python.egglog.v1 import egglog_pb as ir
 class DocumentationSchemaTests(unittest.TestCase):
     def test_callable_and_sort_docs_preserve_all_three_states(self):
         kinds = [
-            (ir.Declaration, Oneof("function", ir.Function(name="f"))),
-            (ir.Declaration, Oneof("constructor", ir.Constructor(name="C"))),
-            (ir.Sort, Oneof("eq", "Box")),
+            (ir.Function, {"name": "f"}),
+            (ir.Constructor, {"name": "C"}),
+            (ir.Relation, {"name": "R"}),
+            (ir.UserDefinedPrimitive, {"name": "p", "body": 0}),
+            (ir.Sort, {"kind": Oneof("eq", "Box")}),
         ]
-        for record_type, kind in kinds:
+        for record_type, fields in kinds:
             binaries = []
             for doc in [None, "", " docs\n"]:
-                with self.subTest(kind=kind.field, doc=doc):
-                    declaration = record_type(kind=kind, doc=doc)
+                with self.subTest(kind=record_type.__name__, doc=doc):
+                    declaration = record_type(**fields, doc=doc)
                     validate(declaration)
                     binary = declaration.to_binary()
                     binaries.append(binary)
@@ -31,39 +33,14 @@ class DocumentationSchemaTests(unittest.TestCase):
                     self.assertEqual(decoded.doc if decoded.has_field("doc") else None, doc)
                     self.assertEqual(decoded.has_field("doc"), doc is not None)
                     encoded_json = declaration.to_json()
-                    fields = json.loads(encoded_json)
-                    self.assertEqual("doc" in fields, doc is not None)
+                    encoded_fields = json.loads(encoded_json)
+                    self.assertEqual("doc" in encoded_fields, doc is not None)
                     if doc is not None:
-                        self.assertEqual(fields["doc"], doc)
+                        self.assertEqual(encoded_fields["doc"], doc)
                     self.assertEqual(record_type.from_json(encoded_json), declaration)
             self.assertEqual(len(set(binaries)), 3)
-        # ProtoJSON null uses ordinary unset semantics, not explicit empty.
-        self.assertFalse(ir.Declaration.from_json('{"doc":null}').has_field("doc"))
-
-    def test_old_absent_and_nonempty_canonical_bytes_are_unchanged(self):
-        # Captured from the published S9f7e335 implicit-string Python decoder.
-        for doc, old_hex in [
-            (None, "12030a0166"),
-            (" docs\n", "12030a01664a0620646f63730a"),
-        ]:
-            with self.subTest(doc=doc):
-                declaration = ir.Declaration(kind=Oneof("function", ir.Function(name="f")), doc=doc)
-                old = bytes.fromhex(old_hex)
-                self.assertEqual(declaration.to_binary(), old)
-                self.assertEqual(ir.Declaration.from_binary(old), declaration)
-
-    def test_old_receiver_loses_explicit_empty_presence(self):
-        present_empty = bytes.fromhex("12030a01664a00")
-        # Actual old S9f7e335 Python decoder reencoded the above without field9.
-        old_receiver_output = bytes.fromhex("12030a0166")
-        empty = ir.Declaration.from_binary(present_empty)
-        absent = ir.Declaration.from_binary(old_receiver_output)
-        self.assertEqual(empty.doc, "")
-        self.assertTrue(empty.has_field("doc"))
-        self.assertFalse(absent.has_field("doc"))
-        self.assertNotEqual(empty, absent)
-        self.assertEqual(empty.to_binary(), present_empty)
-        self.assertEqual(absent.to_binary(), old_receiver_output)
+            # ProtoJSON null uses ordinary unset semantics, not explicit empty.
+            self.assertFalse(record_type.from_json('{"doc":null}').has_field("doc"))
 
     def test_unrelated_rule_documentation_keeps_implicit_string_shape(self):
         self.assertEqual(ir.Rule().doc, "")

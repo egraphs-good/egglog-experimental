@@ -21,7 +21,7 @@ class ResourceSchemaTests(unittest.TestCase):
         with self.assertRaises(ValidationError):
             validate(request)
         with self.assertRaises(TypeError):
-            ir.CreateEGraphRequest(declarations=[])
+            ir.CreateEGraphRequest(constructors=[])
 
     def test_creation_resources_can_be_requested_together(self):
         request = ir.CreateEGraphRequest(

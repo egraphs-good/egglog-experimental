@@ -16,6 +16,7 @@ plugins:
     # Repeated MapEntry suppresses prost's automatic Eq/Hash derivation up to
     # Node. These preserve syntax hashing, not semantic host-value equality.
     opt:
+      - boxed=.egglog.v1.Error.context
       - 'type_attribute=.egglog.v1.MapValue=#[derive(Eq\, Hash)]'
       - 'type_attribute=.egglog.v1.PrimitiveValue=#[derive(Eq\, Hash)]'
       - 'type_attribute=.egglog.v1.Node=#[derive(Eq\, Hash)]'

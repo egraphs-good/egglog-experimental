@@ -1,6 +1,5 @@
 """Proof/response wire checks; no native proof or registration execution."""
 
-import json
 import unittest
 
 from protobuf import Oneof
@@ -10,7 +9,7 @@ from gen.python.egglog.v1 import egglog_pb as ir
 
 
 class ExpectedFailureSchemaTests(unittest.TestCase):
-    def test_nested_fail_roundtrips_with_distinct_wrapper_and_leaf_spans(self):
+    def test_nested_fail_roundtrips_with_distinct_wrapper_and_leaf_commands(self):
         for kind in (
             Oneof("check", ir.Check()),
             Oneof("prove", ir.Prove()),
@@ -19,13 +18,12 @@ class ExpectedFailureSchemaTests(unittest.TestCase):
             Oneof("run", ir.Run(rulesets=[ir.RulesetSelection(kind=Oneof("name", ""))])),
         ):
             with self.subTest(kind=kind.field):
-                command = ir.Command(kind=kind, span=ir.Span(start=12, end=19))
-                for start in (6, 0):
+                command = ir.Command(kind=kind)
+                for _ in range(2):
                     command = ir.Command(
-                        kind=Oneof("fail", command), span=ir.Span(start=start, end=20),
+                        kind=Oneof("fail", command),
                     )
                 program = ir.Program(
-                    files=[ir.SourceFile(name="expected.egg")],
                     commands=[command],
                 )
                 validate(program)
@@ -36,10 +34,6 @@ class ExpectedFailureSchemaTests(unittest.TestCase):
                     validate(decoded)
                     self.assertEqual(decoded, program)
                     self.assertEqual(decoded.commands[0].kind.value.kind.value.kind, kind)
-                self.assertEqual(
-                    json.loads(program.to_json())["commands"][0]["fail"]["fail"]["span"]["start"],
-                    12,
-                )
 
     def test_fail_uses_tag_16_and_requires_a_command_at_every_depth(self):
         nested = ir.Command(kind=Oneof("fail", ir.Command(kind=Oneof(
@@ -54,7 +48,6 @@ class ExpectedFailureSchemaTests(unittest.TestCase):
             ir.Command(),
             ir.Command(kind=Oneof("action", ir.Action())),
             ir.Command(kind=Oneof("prove_exists", ir.ProveExists())),
-            ir.Command(kind=Oneof("check", ir.Check()), span=ir.Span(start=2, end=1)),
         ):
             for _ in range(2):
                 invalid = ir.Command(kind=Oneof("fail", invalid))
@@ -153,7 +146,7 @@ class RulesetSchemaTests(unittest.TestCase):
         invalid_rules = [
             ir.Rule(),
             ir.Rule(kind=Oneof("rule", ir.RuleBody(query=[0])), eval_mode=ir.RuleEvalMode.SEMINAIVE),
-            ir.Rule(kind=Oneof("rule", ir.RuleBody(head=[ir.Action(kind=Oneof("term", 0))])),
+            ir.Rule(kind=Oneof("rule", ir.RuleBody(actions=[ir.Action(kind=Oneof("term", 0))])),
                     eval_mode=ir.RuleEvalMode.SEMINAIVE),
             ir.Rule(kind=Oneof("rewrite", ir.Rewrite(lhs=0, rhs=0)),
                     eval_mode=ir.RuleEvalMode.SEMINAIVE),
