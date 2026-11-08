@@ -1,0 +1,257 @@
+nodes {
+  eq {
+    members: 2
+    members: 10
+  }
+}
+nodes {
+  eq {
+    members: 2
+    members: 11
+  }
+}
+nodes {
+  var: "e"
+}
+nodes {
+  sort_id: 1
+  call {
+    func: "egglog.core.i64.add"
+    args: 12
+    args: 13
+  }
+}
+nodes {
+  call {
+    func: "Num"
+    args: 12
+  }
+}
+nodes {
+  call {
+    func: "Num"
+    args: 13
+  }
+}
+nodes {
+  binding: "sum"
+}
+nodes {
+  call {
+    func: "Add"
+    args: 14
+    args: 15
+  }
+}
+nodes {
+  eq {
+    members: 6
+    members: 16
+  }
+}
+nodes {
+  sort_id: 1
+  eq {
+    members: 17
+    members: 18
+  }
+}
+nodes {
+  call {
+    func: "Add"
+    args: 19
+    args: 20
+  }
+}
+nodes {
+  call {
+    func: "Num"
+    args: 21
+  }
+}
+nodes {
+  sort_id: 1
+  var: "a"
+}
+nodes {
+  sort_id: 1
+  var: "b"
+}
+nodes {
+  call {
+    func: "Num"
+    args: 22
+  }
+}
+nodes {
+  call {
+    func: "Num"
+    args: 23
+  }
+}
+nodes {
+  call {
+    func: "Num"
+    args: 24
+  }
+}
+nodes {
+  sort_id: 1
+  call {
+    func: "value"
+    args: 6
+  }
+}
+nodes {
+  sort_id: 1
+  primitive_value {
+    i64: 5
+  }
+}
+nodes {
+  call {
+    func: "Num"
+    args: 12
+  }
+}
+nodes {
+  call {
+    func: "Num"
+    args: 13
+  }
+}
+nodes {
+  sort_id: 1
+  call {
+    func: "egglog.core.i64.add"
+    args: 12
+    args: 13
+  }
+}
+nodes {
+  sort_id: 1
+  primitive_value {
+    i64: 2
+  }
+}
+nodes {
+  sort_id: 1
+  primitive_value {
+    i64: 3
+  }
+}
+nodes {
+  sort_id: 1
+  primitive_value {
+    i64: 5
+  }
+}
+sorts {
+  eq: "Math"
+}
+sorts {
+  primitive {
+    name: "i64"
+  }
+}
+constructors {
+  name: "Add"
+  inputs: 0
+  inputs: 0
+}
+constructors {
+  name: "Num"
+  inputs: 1
+}
+commands {
+  let {
+    binding: 6
+    value: 7
+  }
+}
+commands {
+  run {
+    rulesets {
+      ruleset {
+        rules {
+          rule {
+            query: 0
+            actions {
+              term: 1
+            }
+            actions {
+              set {
+                target {
+                  func: "value"
+                  args: 2
+                }
+                value: 3
+              }
+            }
+            actions {
+              subsume {
+                func: "Add"
+                args: 4
+                args: 5
+              }
+            }
+          }
+          name: "fold"
+          eval_mode: RULE_EVAL_MODE_SEMINAIVE
+        }
+      }
+    }
+  }
+}
+commands {
+  check {
+    facts: 8
+    facts: 9
+  }
+}
+commands {
+  extract {
+    roots: 6
+    variants: 1
+    extractor: EXTRACTOR_TREE
+  }
+}
+commands {
+  freeze {
+  }
+}
+rulesets {
+  value {
+    rules {
+      rule {
+        query: 0
+        actions {
+          term: 1
+        }
+        actions {
+          set {
+            target {
+              func: "value"
+              args: 2
+            }
+            value: 3
+          }
+        }
+        actions {
+          subsume {
+            func: "Add"
+            args: 4
+            args: 5
+          }
+        }
+      }
+      name: "fold"
+      eval_mode: RULE_EVAL_MODE_SEMINAIVE
+    }
+  }
+}
+functions {
+  name: "value"
+  inputs: 0
+  output: 1
+}

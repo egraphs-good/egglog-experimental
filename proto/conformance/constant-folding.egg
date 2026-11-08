@@ -1,0 +1,13 @@
+(datatype Math
+  (Num i64)
+  (Add Math Math))
+(function value (Math) i64 :no-merge)
+(let sum (Add (Num 2) (Num 3)))
+(rule ((= e (Add (Num a) (Num b))))
+      ((union e (Num (+ a b)))
+       (set (value e) (+ a b))
+       (subsume (Add (Num a) (Num b))))
+      :name "fold")
+(run 1)
+(check (= sum (Num 5)) (= (value sum) 5))
+(extract sum 1)

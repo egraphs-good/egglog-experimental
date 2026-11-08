@@ -1,0 +1,20 @@
+# For details on buf.yaml configuration, visit https://buf.build/docs/configuration/v2/buf-yaml
+version: v2
+modules:
+  # The module root is `proto/`, not `.`. buf walks its module root and does NOT
+  # honour .gitignore, so rooting it at the repo would pull in any stray .proto
+  # under the tree — a Python venv in the working directory silently contributed
+  # 15 grpc_tools protos during development.
+  - path: proto
+deps:
+  - buf.build/bufbuild/protovalidate
+lint:
+  use:
+    - STANDARD
+    # Compiles the CEL in every protovalidate option. `buf build` alone does
+    # NOT: an expression naming a field that does not exist builds clean and
+    # fails only at runtime.
+    - PROTOVALIDATE
+breaking:
+  use:
+    - FILE

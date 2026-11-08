@@ -20,3 +20,16 @@ jobs:
     - uses: actions/checkout@v3
     - uses: Swatinem/rust-cache@v2
     - run: make nits
+  proto:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v3
+    - uses: taiki-e/install-action@v2
+      with:
+        tool: uv, protoc-gen-prost@0.5.0
+    - uses: bufbuild/buf-action@v1
+      with:
+        setup_only: true
+        pr_comment: false
+    - run: make proto-lint proto-test
+    - run: cargo check --manifest-path gen/rust/Cargo.toml

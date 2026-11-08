@@ -1,0 +1,3 @@
+include _build_backend/backend.py
+recursive-include egglog *.py
+recursive-include buf *.py
